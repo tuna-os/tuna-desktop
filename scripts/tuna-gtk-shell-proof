@@ -260,6 +260,14 @@
 #                  the session before sleep
 #   G-UNLOCK       GNOME's lock screen: a wrong password is refused and
 #                  the right one unlocks through PAM (pam_wrapper)
+#   G-LOCK-CURTAIN-CLOCK a key lifts the unlock dialog's clock curtain and
+#                  Escape lowers it over 300 ms ease-out quad, sampled on
+#                  the frozen animation clock (unlockDialog.js 51, #502)
+#   G-LOCK-CURTAIN-POLICY Reduced Motion keeps the unlock dialog's fade
+#                  without motion; animations off switch it at once
+#   G-LOCK-CURTAIN-DRAG a real pointer drag moves the curtain; releases
+#                  settle on swipeTracker.js's projection and ease-out
+#                  cubic, a flick reaches the prompt, which unlocks
 #   G-TRANSIENT-OFF with animations off the OSD, banners and panel menus
 #                  show and close at once; Reduced Motion keeps the fades
 #                  and drops the panel menu's rise (#501)
@@ -9503,6 +9511,224 @@ if [ -n "$PAM_ON" ]; then
     pass G-LOCK-SLIDE "the curtain lowers on lock and lifts only after PAM on GNOME's exact curves; fades only under Reduced Motion; instant with animations off"
 
     pass G-DBUS-LOCK "org.gnome.Shell exposes the screen-saver object and Lock waits for confirmation"
+
+    # GNOME's unlock dialog (unlockDialog.js and swipeTracker.js, 51.0).
+    # A key lifts the clock curtain over CROSSFADE_TIME 300 ms ease-out
+    # quad: the clock fades, rises 200 px and shrinks toward 30% while the
+    # prompt fades in from 200 px below at 30%; Escape brings the clock
+    # back the same way. The shell reads this proof's animation clock, so
+    # its traced frames are sampled at exact delays and checked against
+    # GNOME's formulas (scripts/lib/lock-curtain-proof.py).
+    curtain_here() { curtain_from=$(($(wc -l < "$LOG") + 1)); }
+    curtain() {
+        curtain_command=$1
+        shift
+        "$PY" "$ROOT/scripts/lib/lock-curtain-proof.py" "$curtain_command" "$LOG" "$curtain_from" "$@"
+    }
+    curtain_clock=0
+    # Move the frozen animation clock on by $1 ms.
+    curtain_after() {
+        curtain_clock=$((curtain_clock + $1))
+        anim_clock "$curtain_clock"
+    }
+    curtain_x=$((WIDTH / 2))
+    curtain_y=$((HEIGHT * 3 / 4))
+    # Move the held pointer through steps $1..$2 of 10 px up from the
+    # press, slowly.
+    curtain_move() {
+        for curtain_step in $(seq "$1" "$2"); do
+            xdotool mousemove --window "$WID" "$curtain_x" $((curtain_y - curtain_step * 10))
+            sleep 0.05
+        done
+    }
+    xdotool key super+l
+    cstate '.locked' "unlock dialog locked" 10 || fail G-LOCK-CURTAIN-CLOCK "Super+L did not lock"
+    sleep 1
+    anim_clock 0
+    cstate '.animation_clock_manual' "frozen unlock dialog clock" ||
+        fail G-LOCK-CURTAIN-CLOCK "the clock file did not freeze animation time"
+    first_password_char=${UNLOCK_PASSWORD%"${UNLOCK_PASSWORD#?}"}
+    curtain_here
+    xdotool type --delay 30 "$first_password_char"
+    curtain line "ease to=prompt from=0.0000 duration=300 nominal=300 mode=ease-out-quad motion=true clock=manual" ||
+        fail G-LOCK-CURTAIN-CLOCK "a printable key did not start GNOME's 300 ms ease-out quad on the frozen clock"
+    curtain_after 150
+    curtain frame 0.75 true ||
+        fail G-LOCK-CURTAIN-CLOCK "150 ms in, the curtain was not at ease-out quad 75% (clock 150 px up at 47.5%, prompt 50 px below at 82.5%)"
+    scrot "$ARTIFACTS/29a-unlock-dialog-150ms.png" >/dev/null
+    curtain_after 150
+    curtain line "settled page=prompt progress=1.0000" ||
+        fail G-LOCK-CURTAIN-CLOCK "the prompt did not settle 300 ms after the key"
+    curtain_here
+    xdotool key Escape
+    curtain line "ease to=clock from=1.0000 duration=300 nominal=300 mode=ease-out-quad motion=true clock=manual" ||
+        fail G-LOCK-CURTAIN-CLOCK "Escape did not ease the clock back over 300 ms"
+    curtain_after 150
+    curtain frame 0.25 true ||
+        fail G-LOCK-CURTAIN-CLOCK "150 ms after Escape, the curtain was not at ease-out quad 25%"
+    scrot "$ARTIFACTS/29b-unlock-dialog-escape-150ms.png" >/dev/null
+    curtain_after 150
+    curtain line "settled page=clock progress=0.0000" ||
+        fail G-LOCK-CURTAIN-CLOCK "the clock did not settle 300 ms after Escape"
+    cstate '.locked' "still locked after the unlock dialog" 2 ||
+        fail G-LOCK-CURTAIN-CLOCK "the curtain unlocked the session"
+    pass G-LOCK-CURTAIN-CLOCK "a key lifts the curtain and Escape lowers it over 300 ms ease-out quad; frames at 0, 150 and 300 ms on the frozen clock match unlockDialog.js 51"
+
+    # Reduced Motion keeps the opacity change and drops the translation
+    # and scale; with animations off the pages switch at once.
+    gsettings set org.gnome.desktop.a11y.interface reduced-motion 'reduce'
+    cstate '.motion_policy == "fade-only"' "reduced unlock dialog" ||
+        fail G-LOCK-CURTAIN-POLICY "Reduced Motion did not reach the session"
+    curtain_here
+    xdotool key Return
+    curtain line "ease to=prompt from=0.0000 duration=300 nominal=300 mode=ease-out-quad motion=false clock=manual" ||
+        fail G-LOCK-CURTAIN-POLICY "Reduced Motion did not keep the 300 ms fade"
+    curtain_after 150
+    curtain frame 0.75 false ||
+        fail G-LOCK-CURTAIN-POLICY "under Reduced Motion the pages moved or scaled, or did not fade"
+    curtain_after 150
+    curtain line "settled page=prompt progress=1.0000" ||
+        fail G-LOCK-CURTAIN-POLICY "the reduced-motion prompt did not settle"
+    curtain_here
+    xdotool key Escape
+    curtain_after 150
+    curtain frame 0.25 false ||
+        fail G-LOCK-CURTAIN-POLICY "under Reduced Motion Escape did not fade the clock back in place"
+    curtain_after 150
+    curtain line "settled page=clock progress=0.0000" ||
+        fail G-LOCK-CURTAIN-POLICY "the reduced-motion clock did not settle"
+    gsettings reset org.gnome.desktop.a11y.interface reduced-motion
+    cstate '.motion_policy == "full"' "full unlock dialog motion" ||
+        fail G-LOCK-CURTAIN-POLICY "the full motion policy did not return"
+    gsettings set org.gnome.desktop.interface enable-animations false
+    cstate '(.animations_enabled | not)' "unlock dialog without animations" ||
+        fail G-LOCK-CURTAIN-POLICY "enable-animations false did not reach the session"
+    curtain_here
+    xdotool key Return
+    curtain line "ease to=prompt from=0.0000 duration=0 nominal=300 mode=ease-out-quad motion=false clock=instant" ||
+        fail G-LOCK-CURTAIN-POLICY "with animations off the prompt did not come at once"
+    curtain line "settled page=prompt progress=1.0000" ||
+        fail G-LOCK-CURTAIN-POLICY "with animations off the prompt did not settle at once"
+    curtain_here
+    xdotool key Escape
+    curtain line "ease to=clock from=1.0000 duration=0 nominal=300 mode=ease-out-quad motion=false clock=instant" ||
+        fail G-LOCK-CURTAIN-POLICY "with animations off the clock did not come back at once"
+    curtain line "settled page=clock progress=0.0000" ||
+        fail G-LOCK-CURTAIN-POLICY "with animations off the clock did not settle at once"
+    gsettings set org.gnome.desktop.interface enable-animations true
+    cstate '.motion_policy == "full"' "unlock dialog motion restored" ||
+        fail G-LOCK-CURTAIN-POLICY "enable-animations true did not reach the session"
+    pass G-LOCK-CURTAIN-POLICY "Reduced Motion keeps the unlock dialog's 300 ms fade without motion; with animations off it switches at once"
+
+    # A real pointer drag (xdotool through the nested compositor): once
+    # past Clutter's 16 px the curtain follows the pointer over a page of
+    # the stack's height; a slow release settles on the nearer page and a
+    # flick reaches the prompt from a short drag, both on swipeTracker.js's
+    # projection and ease-out cubic duration, sampled on the frozen clock.
+    curtain_here
+    xdotool mousemove --window "$WID" "$curtain_x" "$curtain_y" mousedown 1
+    curtain_move 1 3
+    curtain_distance=$(curtain distance) ||
+        fail G-LOCK-CURTAIN-DRAG "a 30 px drag did not take the curtain"
+    # 30% of the page, then held still so no velocity remains.
+    curtain_steps=$((curtain_distance * 3 / 100))
+    [ "$curtain_steps" -ge 3 ] || curtain_steps=3
+    curtain_move 4 "$curtain_steps"
+    sleep 0.4
+    curtain follow $((curtain_steps * 10)) 10 >/dev/null ||
+        fail G-LOCK-CURTAIN-DRAG "the curtain did not follow the held pointer"
+    scrot "$ARTIFACTS/29c-unlock-dialog-drag-held.png" >/dev/null
+    xdotool mouseup 1
+    curtain_result=$(curtain release) ||
+        fail G-LOCK-CURTAIN-DRAG "the slow release did not follow swipeTracker.js"
+    # shellcheck disable=SC2086 # END DURATION PROGRESS VELOCITY
+    set -- $curtain_result
+    curtain_end=$1 curtain_ms=$2
+    [ "$curtain_end" = 0 ] ||
+        fail G-LOCK-CURTAIN-DRAG "a slow release short of half way did not fall back to the clock ($curtain_result)"
+    curtain line "mode=ease-out-cubic motion=true clock=manual" ||
+        fail G-LOCK-CURTAIN-DRAG "the release did not ease out cubic on the frozen clock"
+    curtain_after 100
+    curtain eased 100 true >/dev/null ||
+        fail G-LOCK-CURTAIN-DRAG "100 ms into the release the curtain was off GNOME's ease-out cubic"
+    curtain_after $((${curtain_ms%.*} + 1))
+    curtain line "settled page=clock progress=0.0000" ||
+        fail G-LOCK-CURTAIN-DRAG "the released curtain did not settle on the clock"
+    # A flick: about a third of the page in 20 px steps 25 ms apart,
+    # released at once. The release velocity comes from the compositor's
+    # event times, so a loaded runner may merge events; every attempt must
+    # still follow GNOME, and one must be fast enough to project.
+    curtain_flick_steps=$((curtain_distance * 35 / 2000))
+    [ "$curtain_flick_steps" -ge 2 ] || curtain_flick_steps=2
+    curtain_flicked=
+    for _ in 1 2 3; do
+        curtain_here
+        set -- mousemove --window "$WID" "$curtain_x" "$curtain_y" mousedown 1
+        for curtain_step in $(seq 1 "$curtain_flick_steps"); do
+            set -- "$@" sleep 0.025 mousemove --window "$WID" "$curtain_x" $((curtain_y - curtain_step * 20))
+        done
+        xdotool "$@" mouseup 1
+        curtain_result=$(curtain release) ||
+            fail G-LOCK-CURTAIN-DRAG "a flick's release did not follow swipeTracker.js"
+        # shellcheck disable=SC2086 # END DURATION PROGRESS VELOCITY
+        set -- $curtain_result
+        curtain_end=$1 curtain_ms=$2 curtain_progress=$3 curtain_velocity=$4
+        curtain_after $((${curtain_ms%.*} + 1))
+        if [ "$curtain_end" = 1 ] &&
+            "$PY" -c 'import sys; sys.exit(not (float(sys.argv[1]) >= 0.3 and float(sys.argv[2]) < 0.5))' \
+                "$curtain_velocity" "$curtain_progress"; then
+            curtain line "settled page=prompt progress=1.0000" ||
+                fail G-LOCK-CURTAIN-DRAG "the flicked prompt did not settle"
+            curtain_flicked=1
+            break
+        fi
+        echo "tuna-gtk-shell-proof: G-LOCK-CURTAIN-DRAG flick too slow to project ($curtain_result), again"
+        curtain line "settled page=" || fail G-LOCK-CURTAIN-DRAG "a flick did not settle"
+        if [ "$curtain_end" = 1 ]; then
+            curtain_here
+            xdotool key Escape
+            curtain_after 300
+            curtain line "settled page=clock progress=0.0000" ||
+                fail G-LOCK-CURTAIN-DRAG "Escape did not bring the clock back after a flick"
+        fi
+    done
+    [ -n "$curtain_flicked" ] ||
+        fail G-LOCK-CURTAIN-DRAG "no flick from a third of the page reached the prompt on its velocity"
+    scrot "$ARTIFACTS/29d-unlock-dialog-flicked.png" >/dev/null
+    curtain_here
+    xdotool key Escape
+    curtain_after 300
+    curtain line "settled page=clock progress=0.0000" ||
+        fail G-LOCK-CURTAIN-DRAG "Escape did not bring the clock back after the flick"
+    # Past half way and held: released, the prompt comes up and takes the
+    # password; PAM unlocks as ever.
+    curtain_here
+    xdotool mousemove --window "$WID" "$curtain_x" "$curtain_y" mousedown 1
+    curtain_steps=$((curtain_distance * 7 / 100))
+    curtain_move 1 "$curtain_steps"
+    sleep 0.4
+    curtain follow $((curtain_steps * 10)) 10 >/dev/null ||
+        fail G-LOCK-CURTAIN-DRAG "the curtain did not follow the pointer past half way"
+    xdotool mouseup 1
+    curtain_result=$(curtain release) ||
+        fail G-LOCK-CURTAIN-DRAG "the release past half way did not follow swipeTracker.js"
+    # shellcheck disable=SC2086 # END DURATION PROGRESS VELOCITY
+    set -- $curtain_result
+    curtain_end=$1 curtain_ms=$2
+    [ "$curtain_end" = 1 ] ||
+        fail G-LOCK-CURTAIN-DRAG "a slow release past half way did not settle on the prompt ($curtain_result)"
+    curtain_after 100
+    curtain eased 100 true >/dev/null ||
+        fail G-LOCK-CURTAIN-DRAG "100 ms into the release the prompt was off GNOME's ease-out cubic"
+    curtain_after $((${curtain_ms%.*} + 1))
+    curtain line "settled page=prompt progress=1.0000" ||
+        fail G-LOCK-CURTAIN-DRAG "the dragged prompt did not settle"
+    xdotool type --delay 30 "$UNLOCK_PASSWORD"
+    xdotool key Return
+    cstate '(.locked | not)' "unlock dialog drag unlocked through PAM" 15 ||
+        fail G-LOCK-CURTAIN-DRAG "the prompt a drag lifted did not unlock through PAM"
+    real_clock || fail G-LOCK-CURTAIN-DRAG "removing the clock file did not resume real time"
+    pass G-LOCK-CURTAIN-DRAG "a real pointer drag moves the curtain with the pointer past 16 px; slow releases settle on the nearer page and a flick on its velocity, on swipeTracker.js's projection and ease-out cubic; the dragged prompt unlocks through PAM"
 
     # A short idle policy must fade, cancel on activity, then latch only
     # after the configured lock delay. Waking the blank stage cannot unlock.

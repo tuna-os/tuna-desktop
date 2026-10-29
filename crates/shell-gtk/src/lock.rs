@@ -2,11 +2,12 @@
 //!
 //! The compositor owns the lock: it decides when the session is locked,
 //! draws the blurred, dimmed wallpaper underneath, and verifies the
-//! password. This module only draws GNOME's curtain (clock, date and
-//! "Click or press a key"), switches to the unlock prompt on a key or
-//! click, and sends what is typed in a redacted `Unlock` command. It
-//! releases its lock surfaces once the compositor's snapshot says the
-//! session is unlocked, never on its own.
+//! password. This module only draws GNOME's unlock dialog: the clock
+//! curtain (clock, date and "Click or press a key") and the unlock
+//! prompt, moved between on GNOME's transition (`lock_curtain.rs`), and
+//! sends what is typed in a redacted `Unlock` command. It releases its
+//! lock surfaces once the compositor's snapshot says the session is
+//! unlocked, never on its own.
 //!
 //! Measurements are from GNOME Shell 51's own lock screen at 1280x800
 //! (docs/gnome-parity.md, states 11 and 11b).
@@ -19,6 +20,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4_session_lock as session_lock;
 
+use crate::lock_curtain::{self, Curtain, Page};
 use crate::logic;
 
 /// GNOME's wrong-password message (authPrompt.js).
@@ -29,7 +31,7 @@ pub type SendUnlock = Rc<dyn Fn(String) -> Option<u64>>;
 
 /// One monitor's lock window.
 struct Screen {
-    stack: gtk::Stack,
+    curtain: Curtain,
     clock: gtk::Label,
     date: gtk::Label,
     entry: gtk::PasswordEntry,
@@ -139,7 +141,7 @@ impl LockUi {
         }
         self.pending.set(None);
         for screen in self.screens.borrow().iter() {
-            screen.stack.set_visible_child_name("prompt");
+            screen.curtain.show_page(Page::Prompt);
             reset_prompt(&screen.entry, &screen.message);
         }
     }
@@ -157,7 +159,7 @@ impl LockUi {
         for screen in self.screens.borrow().iter() {
             screen.entry.set_sensitive(true);
             if !applied {
-                screen.stack.set_visible_child_name("prompt");
+                screen.curtain.show_page(Page::Prompt);
                 screen.entry.set_text("");
                 screen.message.set_label(FAILED);
                 screen.entry.grab_focus();
@@ -178,7 +180,7 @@ impl LockUi {
     }
 
     /// Build one monitor's lock window: GNOME's unlock-screen top bar
-    /// over a stack of the clock and the prompt.
+    /// over the clock curtain and the prompt.
     fn screen(self: &Rc<Self>, app: &gtk::Application) -> gtk::Window {
         let window = gtk::Window::new();
         window.set_application(Some(app));
@@ -292,13 +294,9 @@ impl LockUi {
         prompt.append(&caps);
         prompt.append(&message);
 
-        let stack = gtk::Stack::new();
-        stack.set_transition_type(gtk::StackTransitionType::Crossfade);
-        stack.set_transition_duration(300);
-        stack.add_named(&clock_box, Some("clock"));
-        stack.add_named(&prompt, Some("prompt"));
-        stack.set_visible_child_name("clock");
-        stack.set_vexpand(true);
+        // The clock curtain over the prompt, on GNOME's transition.
+        let curtain = Curtain::new(&clock_box, &prompt);
+        curtain.set_vexpand(true);
 
         // GNOME's #panel.unlock-screen: transparent, the system menu's
         // power icon alone at the right.
@@ -311,7 +309,7 @@ impl LockUi {
         bar.append(&power);
 
         let overlay = gtk::Overlay::new();
-        overlay.set_child(Some(&stack));
+        overlay.set_child(Some(&curtain));
         bar.set_valign(gtk::Align::Start);
         overlay.add_overlay(&bar);
         window.set_child(Some(&overlay));
@@ -334,38 +332,40 @@ impl LockUi {
             });
         }
 
-        // Any key or click on the curtain shows the prompt; a printable
-        // key starts the password with it (GNOME's shape). Escape on the
-        // prompt goes back to the curtain.
+        // GNOME's unlockDialog.js: any key but Shift or Caps Lock, a click
+        // or a wheel step down lifts the curtain, a printable key starting
+        // the password with it; Escape on the prompt, or a wheel step up,
+        // brings the clock back. A vertical drag (pointer, or touch, which
+        // the session delivers as the primary button) moves the curtain.
         let show_prompt = {
-            let (stack, entry) = (stack.clone(), entry.clone());
+            let (curtain, entry) = (curtain.clone(), entry.clone());
             move || {
-                if stack.visible_child_name().as_deref() != Some("prompt") {
-                    stack.set_visible_child_name("prompt");
-                }
+                curtain.show_page(Page::Prompt);
                 entry.grab_focus();
             }
         };
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         {
-            let (stack, entry, message, show_prompt) = (
-                stack.clone(),
+            let (curtain, entry, message, show_prompt) = (
+                curtain.clone(),
                 entry.clone(),
                 message.clone(),
                 show_prompt.clone(),
             );
             keys.connect_key_pressed(move |_, key, _, _| {
-                let on_prompt = stack.visible_child_name().as_deref() == Some("prompt");
-                if key == gtk::gdk::Key::Escape {
-                    if on_prompt {
-                        entry.set_text("");
-                        message.set_label("");
-                        stack.set_visible_child_name("clock");
-                    }
+                if key == gtk::gdk::Key::Escape && curtain.active() == Page::Prompt {
+                    entry.set_text("");
+                    message.set_label("");
+                    curtain.show_page(Page::Clock);
                     return glib::Propagation::Stop;
                 }
-                if on_prompt {
+                // A prompt on screen, even on its way off, takes the keys
+                // itself (`_onKeyPress`).
+                if curtain.active() == Page::Prompt || curtain.prompt_shown() {
+                    if key == gtk::gdk::Key::Escape {
+                        return glib::Propagation::Stop;
+                    }
                     if matches!(
                         key,
                         gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter | gtk::gdk::Key::ISO_Enter
@@ -397,32 +397,135 @@ impl LockUi {
             });
         }
         window.add_controller(keys);
+        // `Clutter.ClickGesture` recognizes on release, so a drag that
+        // moved the curtain is never also a click.
         let click = gtk::GestureClick::new();
         {
-            let (stack, show_prompt) = (stack.clone(), show_prompt.clone());
-            click.connect_pressed(move |_, _, _, _| {
-                if stack.visible_child_name().as_deref() != Some("prompt") {
+            let (curtain, show_prompt) = (curtain.clone(), show_prompt.clone());
+            click.connect_released(move |_, _, _, _| {
+                if curtain.active() != Page::Prompt {
                     show_prompt();
                 }
             });
         }
-        clock_box.add_controller(click);
-        let curtain_click = gtk::GestureClick::new();
+        window.add_controller(click);
+        // `SwipeTracker`'s `Clutter.PanGesture`: a vertical pointer or
+        // touch drag moves the curtain once past its threshold, and the
+        // release velocity picks the page.
+        let drag = gtk::GestureDrag::new();
         {
-            let (stack, show_prompt) = (stack.clone(), show_prompt.clone());
-            curtain_click.connect_pressed(move |_, _, _, _| {
-                if stack.visible_child_name().as_deref() != Some("prompt") {
+            let pan: Rc<RefCell<Option<lock_curtain::Pan>>> = Rc::default();
+            let distance = Rc::new(Cell::new(1.0));
+            {
+                let pan = pan.clone();
+                drag.connect_drag_begin(move |gesture, _, _| {
+                    *pan.borrow_mut() = Some(lock_curtain::Pan::new(gesture.current_event_time()));
+                });
+            }
+            {
+                let (pan, distance, curtain) = (pan.clone(), distance.clone(), curtain.clone());
+                drag.connect_drag_update(move |gesture, _, offset_y| {
+                    let time = gesture.current_event_time();
+                    let Some(delta) = pan
+                        .borrow_mut()
+                        .as_mut()
+                        .and_then(|pan| pan.motion(offset_y, time))
+                    else {
+                        return;
+                    };
+                    if !curtain.swiping() {
+                        gesture.set_state(gtk::EventSequenceState::Claimed);
+                        distance.set(curtain.swipe_begin("drag"));
+                    }
+                    // Up lifts the curtain (`_getGestureDirFactor`).
+                    curtain.swipe_update(-delta, distance.get());
+                });
+            }
+            {
+                let (pan, distance, curtain, entry) = (
+                    pan.clone(),
+                    distance.clone(),
+                    curtain.clone(),
+                    entry.clone(),
+                );
+                drag.connect_drag_end(move |gesture, _, _| {
+                    let time = gesture.current_event_time();
+                    let Some(pan) = pan.borrow_mut().take() else {
+                        return;
+                    };
+                    if !pan.recognized() {
+                        return;
+                    }
+                    let velocity = -pan.velocity(time);
+                    if curtain.swipe_end("drag", velocity, distance.get(), false)
+                        == Some(Page::Prompt)
+                    {
+                        entry.grab_focus();
+                    }
+                });
+            }
+            {
+                let curtain = curtain.clone();
+                drag.connect_cancel(move |_, _| {
+                    let Some(pan) = pan.borrow_mut().take() else {
+                        return;
+                    };
+                    if pan.recognized() {
+                        curtain.swipe_end("drag", 0.0, distance.get(), true);
+                    }
+                });
+            }
+        }
+        window.add_controller(drag);
+        // Wheel steps switch pages, GNOME's discrete `ScrollController`
+        // (down the prompt, up the clock). Touchpad scrolls stay still:
+        // GNOME's `ScrollGesture` follows them and settles when the
+        // fingers lift, and the session forwards no axis stop to say so.
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        {
+            let wheel = Rc::new(Cell::new(0.0));
+            let (curtain, show_prompt) = (curtain.clone(), show_prompt.clone());
+            scroll.connect_scroll(move |controller, _, dy| {
+                if controller.unit() != gtk::gdk::ScrollUnit::Wheel {
+                    return glib::Propagation::Proceed;
+                }
+                let steps = wheel.get() + dy;
+                if steps.abs() < 1.0 {
+                    wheel.set(steps);
+                    return glib::Propagation::Stop;
+                }
+                wheel.set(0.0);
+                if steps > 0.0 {
                     show_prompt();
+                } else {
+                    curtain.show_page(Page::Clock);
+                }
+                glib::Propagation::Stop
+            });
+        }
+        window.add_controller(scroll);
+        {
+            // GNOME destroys the prompt once the clock is back
+            // (`_maybeDestroyAuthPrompt`): nothing typed outlives it.
+            let (entry, message) = (entry.downgrade(), message.downgrade());
+            curtain.connect_settled(move |page| {
+                if page != Page::Clock {
+                    return;
+                }
+                if let Some(entry) = entry.upgrade() {
+                    entry.set_text("");
+                }
+                if let Some(message) = message.upgrade() {
+                    message.set_label("");
                 }
             });
         }
-        window.add_controller(curtain_click);
         {
-            let (stack, entry, message) = (stack.clone(), entry.clone(), message.clone());
+            let (curtain, entry, message) = (curtain.clone(), entry.clone(), message.clone());
             cancel.connect_clicked(move |_| {
                 entry.set_text("");
                 message.set_label("");
-                stack.set_visible_child_name("clock");
+                curtain.show_page(Page::Clock);
             });
         }
         {
@@ -451,7 +554,7 @@ impl LockUi {
         }
 
         self.screens.borrow_mut().push(Screen {
-            stack,
+            curtain,
             clock,
             date,
             entry,

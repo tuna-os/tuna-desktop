@@ -106,7 +106,7 @@ gnome-shell `2177bdf9` (`js/ui/ctrlAltTab.js`,
 | Window preview click (focus) | Alt+Tab switcher (compositor WM chord) | Implemented (WM-owned) |
 | Drag preview to workspace card | Move-to-workspace chords (compositor WM chord) | Implemented (WM-owned) |
 | Notification banner buttons | Super+N, then Tab + Enter; Escape releases | Implemented; proof open |
-| Lock-screen unlock typing | Type the password, Enter submits; Escape returns to the curtain | Implemented (WM/lock-owned) |
+| Lock-screen curtain click or drag; unlock typing | Any key but Shift or Caps Lock lifts the curtain (a printable key starts the password), Enter submits; Escape returns to the curtain | Implemented (WM/lock-owned; proof G-LOCK-CURTAIN-CLOCK, G-LOCK-FIRST-PRINTABLE) |
 | Screenshot/polkit/network/consent/end-session/folder dialogs | Exclusive keyboard, first control focused, Escape cancels | Verified (proof G-POWER-ESCAPE, G-POLKIT, G-SCREENSHOT-UI) |
 | Window menu rows (Alt+Space) | Tab + Enter work; Up/Down do not move between rows | Handoff to #347 (WM surface/focus policy) |
 | Ctrl+Alt+Tab group-switcher dialog | Tuna focuses its single bar directly; GNOME lists Windows/bar/tray groups | Open follow-up (shell-side) |
