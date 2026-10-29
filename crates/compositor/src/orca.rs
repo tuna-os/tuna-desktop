@@ -51,6 +51,10 @@ pub struct Reader {
     departing: Option<Receiver<()>>,
     /// Killed child still awaiting its non-blocking reap in poll().
     reaping: bool,
+    /// Last child poll() reaped, until another starts: a reader that already
+    /// exited (on systemd's own SIGTERM, say) still gets its session-end
+    /// receipt, and nothing is signalled.
+    reaped: Option<u32>,
     state: State,
     sent: State,
     attempts: u8,
@@ -68,6 +72,7 @@ impl Reader {
             observed: None,
             departing: None,
             reaping: false,
+            reaped: None,
             state: State::Disabled,
             sent: State::Disabled,
             attempts: 0,
@@ -136,15 +141,32 @@ impl Reader {
     /// Reader's own unreaped child's group is signalled, never another
     /// session's reader.
     pub fn shutdown(&mut self) {
+        if let Some(receipt) = self.retire() {
+            use std::io::Write;
+            // The VM lane requires this receipt before the compositor exits.
+            // Teardown never panics on a closed stderr.
+            let _ = writeln!(std::io::stderr(), "{receipt}");
+        }
+    }
+    fn retire(&mut self) -> Option<Receipt> {
         self.enabled = false;
         self.observed = None;
         if let Some(keyboard) = &self.keyboard {
             keyboard.revoke_reader();
         }
         let Some(mut child) = self.child.take() else {
-            return;
+            return self.reaped.take().map(|pid| Receipt {
+                pid,
+                retirement: Retirement {
+                    terminated: false,
+                    exited_in_grace: true,
+                },
+                reaped: true,
+                elapsed_ms: 0,
+            });
         };
         self.reaping = false;
+        self.reaped = None;
         let pid = child.id();
         let started = Instant::now();
         let retirement = retire_group(
@@ -162,13 +184,12 @@ impl Reader {
                 _ => break false,
             }
         };
-        // The VM lane requires this receipt before the compositor exits.
-        eprintln!(
-            "tuna-compositor: screen reader retired pid={pid} terminated={} exited_in_grace={} reaped={reaped} elapsed_ms={}",
-            retirement.terminated,
-            retirement.exited_in_grace,
-            started.elapsed().as_millis()
-        );
+        Some(Receipt {
+            pid,
+            retirement,
+            reaped,
+            elapsed_ms: started.elapsed().as_millis(),
+        })
     }
     fn await_departure(&mut self, pid: u32) {
         let (sender, receiver) = mpsc::channel();
@@ -213,6 +234,7 @@ impl Reader {
                         eprintln!("TUNA_ORCA_DIAGNOSTIC stage=child-exit pid={} attempt={} code={} signal={}", child.id(), self.attempts, status.code().unwrap_or(-1), status.signal().unwrap_or(0));
                     }
                     let pid = child.id();
+                    self.reaped = Some(pid);
                     if let Some(keyboard) = &self.keyboard {
                         keyboard.revoke_reader();
                     }
@@ -332,6 +354,7 @@ impl Reader {
                     let (sender, receiver) = mpsc::channel();
                     let cancel = Arc::new(AtomicBool::new(false));
                     self.child = Some(child);
+                    self.reaped = None;
                     self.state = State::Starting;
                     self.observed = Some(Observation {
                         receiver,
@@ -380,12 +403,16 @@ impl Drop for Reader {
     }
 }
 
-/// Signal the owned reader's whole process group. Its leader `child` is still
+/// Signal the owned reader's process group. Its leader `child` is still
 /// unreaped, so the PID, and with it the group ID, cannot name anyone else.
 fn signal_group(child: &Child, signal: libc::c_int) {
-    // SAFETY: kill(2) only; the target is our own unreaped child's group.
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: getpgid(2)/kill(2) only, on our own unreaped child.
     unsafe {
-        libc::kill(-(child.id() as libc::pid_t), signal);
+        // Readers spawned through parent_lifetime() lead their own group; a
+        // child that merely joined another group is signalled alone.
+        let target = if libc::getpgid(pid) == pid { -pid } else { pid };
+        libc::kill(target, signal);
     }
 }
 
@@ -410,12 +437,30 @@ fn exited_unreaped(pid: u32) -> bool {
     unsafe { info.si_pid() == pid as libc::pid_t }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Retirement {
     /// SIGTERM went to a still running group.
     terminated: bool,
     /// The leader had exited, or exited within the grace.
     exited_in_grace: bool,
+}
+
+/// The session-end receipt the VM lane reads (`orca_logout_retirement`).
+#[derive(Debug, PartialEq, Eq)]
+struct Receipt {
+    pid: u32,
+    retirement: Retirement,
+    reaped: bool,
+    elapsed_ms: u128,
+}
+impl std::fmt::Display for Receipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tuna-compositor: screen reader retired pid={} terminated={} exited_in_grace={} reaped={} elapsed_ms={}",
+            self.pid, self.retirement.terminated, self.retirement.exited_in_grace, self.reaped, self.elapsed_ms
+        )
+    }
 }
 
 /// SIGTERM the owned group and wait up to `grace` for its leader to exit
@@ -961,20 +1006,78 @@ mod tests {
         reader.enabled = true;
         reader.child = Some(child);
         let started = Instant::now();
-        reader.shutdown();
+        let receipt = reader.retire().unwrap();
         assert!(started.elapsed() >= SHUTDOWN_GRACE);
         assert!(started.elapsed() < SHUTDOWN_GRACE + REAP_BOUND + Duration::from_millis(500));
+        assert_eq!(
+            (receipt.pid, receipt.retirement, receipt.reaped),
+            (
+                pid,
+                Retirement {
+                    terminated: true,
+                    exited_in_grace: false
+                },
+                true
+            )
+        );
+        assert!(receipt.elapsed_ms >= SHUTDOWN_GRACE.as_millis());
+        assert_eq!(
+            receipt.to_string(),
+            format!(
+                "tuna-compositor: screen reader retired pid={pid} terminated=true \
+                 exited_in_grace=false reaped=true elapsed_ms={}",
+                receipt.elapsed_ms
+            )
+        );
         assert!(reader.pid().is_none());
         assert!(!reader.enabled);
-        // Reaped by shutdown(), not left as our zombie.
+        // Reaped by retire(), not left as our zombie.
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
         let until = Instant::now() + Duration::from_secs(1);
         while !gone(member) && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(gone(member));
-        // Idempotent: Drop's repeat signals nothing.
-        reader.shutdown();
+        // Idempotent: Drop's repeat signals nothing and reports nothing.
+        assert!(reader.retire().is_none());
+    }
+    #[test]
+    fn reader_already_reaped_by_poll_still_gets_its_session_end_receipt() {
+        // A reader that honoured systemd's own SIGTERM is reaped by poll()
+        // before the loop observes shutdown; it is gone, nothing is signalled.
+        let (child, _) = group_child("echo 0; exec sleep 30");
+        let pid = child.id();
+        let mut reader = Reader::new("isolated-test", None);
+        reader.enabled = true;
+        reader.child = Some(child);
+        signal_group(reader.child.as_ref().unwrap(), libc::SIGTERM);
+        let until = Instant::now() + Duration::from_secs(2);
+        while reader.pid().is_some() && Instant::now() < until {
+            reader.poll(false);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reader.pid().is_none());
+        let receipt = reader.retire().unwrap();
+        assert_eq!(
+            receipt,
+            Receipt {
+                pid,
+                retirement: Retirement {
+                    terminated: false,
+                    exited_in_grace: true
+                },
+                reaped: true,
+                elapsed_ms: 0
+            }
+        );
+        assert!(reader.retire().is_none());
+    }
+    #[test]
+    fn child_outside_its_own_group_is_signalled_alone() {
+        // Never a group it merely joined (here: the test runner's own).
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        signal_group(&child, libc::SIGKILL);
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
     }
 }
 

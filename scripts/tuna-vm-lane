@@ -2256,7 +2256,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         departing_orca = await_orca(True)
         with open(os.path.join(evidence, "orca-before-logout.json"), "w") as stream:
             json.dump(departing_orca, stream, indent=2)
-    logout_offset = len(read_text(serial_path))
+    logout_offset, logout_started = len(read_text(serial_path)), time.monotonic()
     agent.run("logout")
     deadline = time.monotonic() + 30
     greeter = {}
@@ -2302,12 +2302,16 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     elif orca_failure:
         record("V-ORCA-LOGOUT", False, f"not exercised: Screen Reader activation failed ({orca_failure})")
     else:
+        closed_orca = agent.run("orca-departed", departing_orca["pid"], departing_orca["start_ticks"])
+        with open(os.path.join(evidence, "orca-after-logout.json"), "w") as stream:
+            json.dump(closed_orca, stream, indent=2)
         # The compositor's own receipt that it retired and reaped this
-        # original reader's group before exiting (#836); V-ORCA-LOGOUT below
-        # still independently requires no surviving child or bus owner.
+        # original reader's group before exiting (#836). Read from the serial
+        # log only, after the unchanged departure probe, so the user runtime
+        # that probe reads is not given time to go away.
         retirement = None
         if not published:
-            until = time.monotonic() + 15
+            until = logout_started + 15
             while True:
                 retirement = orca_logout_retirement(read_text(serial_path)[logout_offset:],
                                                     departing_orca["pid"])
@@ -2321,11 +2325,8 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                    "published build predates the compositor's reader retirement receipt; the current-build lanes prove it")
         else:
             record("V-ORCA-LOGOUT-REAP", retirement is not None,
-                   "session end: the compositor SIGTERMs its own Orca group, kills it after a bounded grace "
-                   "and reaps it before exiting")
-        closed_orca = agent.run("orca-departed", departing_orca["pid"], departing_orca["start_ticks"])
-        with open(os.path.join(evidence, "orca-after-logout.json"), "w") as stream:
-            json.dump(closed_orca, stream, indent=2)
+                   "session end: the compositor retires its own Orca group (SIGTERM, bounded grace, SIGKILL) "
+                   "or has already reaped it, and reports the reap before exiting")
         record("V-ORCA-LOGOUT", closed_orca["owner"] is None and not closed_orca["original_alive"],
                "hardware logout stops only session-owned Orca; no original child/bus owner survives")
         if closed_orca["owner"] is not None or closed_orca["original_alive"]:

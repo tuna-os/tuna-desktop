@@ -4088,8 +4088,8 @@ class OrcaLogoutRetirement(unittest.TestCase):
 
     def test_compositor_format_matches_the_lane_receipt(self):
         source = (Path(__file__).resolve().parents[2] / "crates/compositor/src/orca.rs").read_text()
-        self.assertIn('"tuna-compositor: screen reader retired pid={pid} terminated={} exited_in_grace={} '
-                      'reaped={reaped} elapsed_ms={}"', source)
+        self.assertIn('"tuna-compositor: screen reader retired pid={} terminated={} exited_in_grace={} '
+                      'reaped={} elapsed_ms={}"', source)
         runtime = (Path(__file__).resolve().parents[2] / "crates/compositor/src/runtime.rs").read_text()
         teardown = runtime[runtime.index("impl Drop for Runtime"):]
         body = teardown[teardown.index("fn drop(&mut self) {") + len("fn drop(&mut self) {"):]
@@ -4119,11 +4119,15 @@ class OrcaLogoutRetirement(unittest.TestCase):
             with self.subTest(trace=trace):
                 self.assertIsNone(lane.orca_logout_retirement(trace, 21699))
 
-    def test_gate_waits_for_receipt_before_and_keeps_v_orca_logout_unchanged(self):
+    def test_departure_probe_runs_first_and_v_orca_logout_stays_unchanged(self):
+        # The unchanged probe must not wait behind the receipt: the user
+        # runtime it reads goes away soon after logout (run 40864799987).
         source = (Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text()
-        reap = source.index('record("V-ORCA-LOGOUT-REAP"')
         departed = source.index('closed_orca = agent.run("orca-departed"')
-        self.assertLess(reap, departed)
+        reap = source.index('record("V-ORCA-LOGOUT-REAP"')
+        survived = source.index('raise RuntimeError("Orca survived the hardware session logout")')
+        self.assertLess(departed, reap)
+        self.assertLess(reap, survived)
         self.assertIn('record("V-ORCA-LOGOUT", closed_orca["owner"] is None and not closed_orca["original_alive"],',
                       source)
 
