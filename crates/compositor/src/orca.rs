@@ -19,6 +19,15 @@ const READINESS_GRACE: Duration = Duration::from_secs(10);
 /// A stopped reader's names drop as soon as the bus daemon processes its
 /// disconnect. This bound only guards against a wedged bus.
 const DEPARTURE_BOUND: Duration = Duration::from_secs(5);
+/// Session end retires the owned reader itself before the session and AT-SPI
+/// buses go away (#836). In passing VM runs Orca exits within ~0.3–0.6 s of
+/// SIGTERM (session scope stopped 0.34 s and 0.57 s after it); Orca 51.1's
+/// handler can instead raise on an already disconnected AT-SPI bus and keep
+/// running. Over three times the slowest normal exit, far under systemd's
+/// 90 s stop timeout, then the whole owned group is killed.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// After SIGKILL only the kernel's exit work remains before the reap.
+const REAP_BOUND: Duration = Duration::from_secs(1);
 
 /// Observer for one owned child. Dropping it cancels the watcher thread.
 struct Observation {
@@ -42,6 +51,10 @@ pub struct Reader {
     departing: Option<Receiver<()>>,
     /// Killed child still awaiting its non-blocking reap in poll().
     reaping: bool,
+    /// Last child poll() reaped, until another starts: a reader that already
+    /// exited (on systemd's own SIGTERM, say) still gets its session-end
+    /// receipt, and nothing is signalled.
+    reaped: Option<u32>,
     state: State,
     sent: State,
     attempts: u8,
@@ -59,6 +72,7 @@ impl Reader {
             observed: None,
             departing: None,
             reaping: false,
+            reaped: None,
             state: State::Disabled,
             sent: State::Disabled,
             attempts: 0,
@@ -111,14 +125,71 @@ impl Reader {
             keyboard.revoke_reader();
         }
         self.observed = None;
-        if let Some(child) = self.child.as_mut() {
+        if let Some(child) = self.child.as_ref() {
             // Keep this unreaped Child as process authority (never a recycled
             // PID or another display's reader) until poll() reaps it on its
             // SIGCHLD wake and starts the bus departure watch. Never
             // sleep/wait on the active compositor frame path.
-            let _ = child.kill();
+            signal_group(child, libc::SIGKILL);
             self.reaping = true;
         }
+    }
+    /// Session end: retire the owned reader before its buses go away (#836).
+    /// The runtime calls this first in its teardown, which every exit path
+    /// reaches (SIGTERM/SIGINT from systemd or the supervisor, logind's
+    /// session stop, a failed loop); Drop repeats it as a no-op. Only this
+    /// Reader's own unreaped child's group is signalled, never another
+    /// session's reader.
+    pub fn shutdown(&mut self) {
+        if let Some(receipt) = self.retire() {
+            use std::io::Write;
+            // The VM lane requires this receipt before the compositor exits.
+            // Teardown never panics on a closed stderr.
+            let _ = writeln!(std::io::stderr(), "{receipt}");
+        }
+    }
+    fn retire(&mut self) -> Option<Receipt> {
+        self.enabled = false;
+        self.observed = None;
+        if let Some(keyboard) = &self.keyboard {
+            keyboard.revoke_reader();
+        }
+        let Some(mut child) = self.child.take() else {
+            return self.reaped.take().map(|pid| Receipt {
+                pid,
+                retirement: Retirement {
+                    terminated: false,
+                    exited_in_grace: true,
+                },
+                reaped: true,
+                elapsed_ms: 0,
+            });
+        };
+        self.reaping = false;
+        self.reaped = None;
+        let pid = child.id();
+        let started = Instant::now();
+        let retirement = retire_group(
+            || exited_unreaped(pid),
+            |signal| signal_group(&child, signal),
+            std::thread::sleep,
+            Instant::now,
+            SHUTDOWN_GRACE,
+        );
+        let until = Instant::now() + REAP_BOUND;
+        let reaped = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+                _ => break false,
+            }
+        };
+        Some(Receipt {
+            pid,
+            retirement,
+            reaped,
+            elapsed_ms: started.elapsed().as_millis(),
+        })
     }
     fn await_departure(&mut self, pid: u32) {
         let (sender, receiver) = mpsc::channel();
@@ -163,6 +234,7 @@ impl Reader {
                         eprintln!("TUNA_ORCA_DIAGNOSTIC stage=child-exit pid={} attempt={} code={} signal={}", child.id(), self.attempts, status.code().unwrap_or(-1), status.signal().unwrap_or(0));
                     }
                     let pid = child.id();
+                    self.reaped = Some(pid);
                     if let Some(keyboard) = &self.keyboard {
                         keyboard.revoke_reader();
                     }
@@ -282,6 +354,7 @@ impl Reader {
                     let (sender, receiver) = mpsc::channel();
                     let cancel = Arc::new(AtomicBool::new(false));
                     self.child = Some(child);
+                    self.reaped = None;
                     self.state = State::Starting;
                     self.observed = Some(Observation {
                         receiver,
@@ -321,22 +394,113 @@ impl Reader {
 }
 impl Drop for Reader {
     fn drop(&mut self) {
-        self.stop();
-        // Only final teardown may wait boundedly for an owned child. Normal
+        // Only final teardown waits (boundedly) for an owned child. Normal
         // preference changes and conflicts retain/reap it through poll().
-        if let Some(child) = self.child.as_mut() {
-            let until = Instant::now() + Duration::from_secs(1);
-            while matches!(child.try_wait(), Ok(None)) && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
+        self.shutdown();
         if let Some(keyboard) = &self.keyboard {
             keyboard.shutdown();
         }
     }
 }
 
+/// Signal the owned reader's process group. Its leader `child` is still
+/// unreaped, so the PID, and with it the group ID, cannot name anyone else.
+fn signal_group(child: &Child, signal: libc::c_int) {
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: getpgid(2)/kill(2) only, on our own unreaped child.
+    unsafe {
+        // Readers spawned through parent_lifetime() lead their own group; a
+        // child that merely joined another group is signalled alone.
+        let target = if libc::getpgid(pid) == pid { -pid } else { pid };
+        libc::kill(target, signal);
+    }
+}
+
+/// Whether our child `pid` has exited, without reaping it (WNOWAIT): until the
+/// group is killed its ID must stay ours.
+fn exited_unreaped(pid: u32) -> bool {
+    // SAFETY: waitid(2) writes only into the zeroed siginfo we own.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        // ECHILD: no longer waitable. EINTR: look again on the next check.
+        return std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR);
+    }
+    // SAFETY: waitid filled (or left zeroed) the siginfo for SIGCHLD.
+    unsafe { info.si_pid() == pid as libc::pid_t }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Retirement {
+    /// SIGTERM went to a still running group.
+    terminated: bool,
+    /// The leader had exited, or exited within the grace.
+    exited_in_grace: bool,
+}
+
+/// The session-end receipt the VM lane reads (`orca_logout_retirement`).
+#[derive(Debug, PartialEq, Eq)]
+struct Receipt {
+    pid: u32,
+    retirement: Retirement,
+    reaped: bool,
+    elapsed_ms: u128,
+}
+impl std::fmt::Display for Receipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tuna-compositor: screen reader retired pid={} terminated={} exited_in_grace={} reaped={} elapsed_ms={}",
+            self.pid, self.retirement.terminated, self.retirement.exited_in_grace, self.reaped, self.elapsed_ms
+        )
+    }
+}
+
+/// SIGTERM the owned group and wait up to `grace` for its leader to exit
+/// (unreaped), then SIGKILL the group in every case: a leader whose own
+/// shutdown handler failed (#836) and any member that outlived it.
+fn retire_group(
+    mut exited: impl FnMut() -> bool,
+    mut signal: impl FnMut(libc::c_int),
+    mut sleep: impl FnMut(Duration),
+    mut now: impl FnMut() -> Instant,
+    grace: Duration,
+) -> Retirement {
+    let mut retirement = Retirement {
+        terminated: false,
+        exited_in_grace: exited(),
+    };
+    if !retirement.exited_in_grace {
+        signal(libc::SIGTERM);
+        retirement.terminated = true;
+        let deadline = now() + grace;
+        loop {
+            if exited() {
+                retirement.exited_in_grace = true;
+                break;
+            }
+            let current = now();
+            if current >= deadline {
+                break;
+            }
+            sleep((deadline - current).min(Duration::from_millis(10)));
+        }
+    }
+    signal(libc::SIGKILL);
+    retirement
+}
+
 fn parent_lifetime(command: &mut Command) {
+    // Its own process group, led by the unreaped child, is what stop() and
+    // session-end shutdown signal (#836), never the compositor's group.
+    command.process_group(0);
     let parent = unsafe { libc::getpid() };
     // Only async-signal-safe libc calls run after fork. Linux clears this setting
     // for a forked child, so speech-dispatcher is not accidentally bound to us.
@@ -595,7 +759,7 @@ mod tests {
     #[test]
     fn child_has_parent_death_signal_before_exec() {
         let mut command = Command::new("/usr/bin/python3");
-        command.args(["-c", "import ctypes; p=ctypes.c_int(); assert ctypes.CDLL(None).prctl(2,ctypes.byref(p)) == 0; assert p.value == 15"]);
+        command.args(["-c", "import ctypes, os; p=ctypes.c_int(); assert ctypes.CDLL(None).prctl(2,ctypes.byref(p)) == 0; assert p.value == 15; assert os.getpgrp() == os.getpid()"]);
         parent_lifetime(&mut command);
         assert!(command.status().unwrap().success());
     }
@@ -718,6 +882,202 @@ mod tests {
         sender.send(()).unwrap();
         assert!(!reader.departure_pending());
         assert!(reader.departing.is_none());
+    }
+    /// Fake clock: `exits_after` checks before the leader is seen exited.
+    fn retire_fake(exits_after: Option<usize>) -> (Retirement, Vec<libc::c_int>, Duration) {
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let checks = std::cell::Cell::new(0usize);
+        let mut signals = Vec::new();
+        let retirement = retire_group(
+            || {
+                checks.set(checks.get() + 1);
+                exits_after.is_some_and(|after| checks.get() > after)
+            },
+            |signal| signals.push(signal),
+            |pause| clock.set(clock.get() + pause),
+            || clock.get(),
+            SHUTDOWN_GRACE,
+        );
+        (retirement, signals, clock.get() - start)
+    }
+    #[test]
+    fn cooperative_reader_gets_term_then_group_sweep_without_waiting_out_the_grace() {
+        let (retirement, signals, waited) = retire_fake(Some(4));
+        assert_eq!(
+            retirement,
+            Retirement {
+                terminated: true,
+                exited_in_grace: true
+            }
+        );
+        assert_eq!(signals, [libc::SIGTERM, libc::SIGKILL]);
+        assert_eq!(waited, Duration::from_millis(30));
+    }
+    #[test]
+    fn reader_whose_shutdown_handler_failed_is_killed_exactly_at_the_grace() {
+        let (retirement, signals, waited) = retire_fake(None);
+        assert_eq!(
+            retirement,
+            Retirement {
+                terminated: true,
+                exited_in_grace: false
+            }
+        );
+        assert_eq!(signals, [libc::SIGTERM, libc::SIGKILL]);
+        assert_eq!(waited, SHUTDOWN_GRACE);
+    }
+    #[test]
+    fn already_exited_reader_only_has_its_group_swept() {
+        let (retirement, signals, waited) = retire_fake(Some(0));
+        assert_eq!(
+            retirement,
+            Retirement {
+                terminated: false,
+                exited_in_grace: true
+            }
+        );
+        assert_eq!(signals, [libc::SIGKILL]);
+        assert_eq!(waited, Duration::ZERO);
+    }
+    fn group_child(script: &str) -> (Child, u32) {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        parent_lifetime(&mut command);
+        let mut child = command.spawn().unwrap();
+        let mut line = String::new();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut byte = [0u8; 1];
+        while stdout.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {
+            line.push(byte[0] as char);
+        }
+        (child, line.trim().parse().unwrap())
+    }
+    fn gone(pid: u32) -> bool {
+        // Reparented members may linger as zombies until init reaps them.
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+            Err(_) => true,
+        }
+    }
+    #[test]
+    fn actual_exit_is_observed_without_reaping_the_group_leader() {
+        let (mut child, member) = group_child("(exec sleep 30) & echo $!; exec sleep 30");
+        let pid = child.id();
+        assert!(!exited_unreaped(pid));
+        let started = Instant::now();
+        let retirement = retire_group(
+            || exited_unreaped(pid),
+            |signal| signal_group(&child, signal),
+            std::thread::sleep,
+            Instant::now,
+            SHUTDOWN_GRACE,
+        );
+        assert_eq!(
+            retirement,
+            Retirement {
+                terminated: true,
+                exited_in_grace: true
+            }
+        );
+        assert!(started.elapsed() < SHUTDOWN_GRACE);
+        // Still unreaped: its PID, so its group ID, stayed ours throughout.
+        assert!(exited_unreaped(pid));
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        assert!(child.wait().unwrap().signal().is_some());
+        let until = Instant::now() + Duration::from_secs(1);
+        while !gone(member) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(gone(member));
+    }
+    #[test]
+    fn session_end_kills_and_reaps_a_reader_group_that_ignores_term() {
+        // Orca 51.1 can survive its SIGTERM when its handler raises (#836).
+        let (child, member) = group_child("trap '' TERM; (exec sleep 30) & echo $!; exec sleep 30");
+        let pid = child.id();
+        let mut reader = Reader::new("isolated-test", None);
+        reader.enabled = true;
+        reader.child = Some(child);
+        let started = Instant::now();
+        let receipt = reader.retire().unwrap();
+        assert!(started.elapsed() >= SHUTDOWN_GRACE);
+        assert!(started.elapsed() < SHUTDOWN_GRACE + REAP_BOUND + Duration::from_millis(500));
+        assert_eq!(
+            (receipt.pid, receipt.retirement, receipt.reaped),
+            (
+                pid,
+                Retirement {
+                    terminated: true,
+                    exited_in_grace: false
+                },
+                true
+            )
+        );
+        assert!(receipt.elapsed_ms >= SHUTDOWN_GRACE.as_millis());
+        assert_eq!(
+            receipt.to_string(),
+            format!(
+                "tuna-compositor: screen reader retired pid={pid} terminated=true \
+                 exited_in_grace=false reaped=true elapsed_ms={}",
+                receipt.elapsed_ms
+            )
+        );
+        assert!(reader.pid().is_none());
+        assert!(!reader.enabled);
+        // Reaped by retire(), not left as our zombie.
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        let until = Instant::now() + Duration::from_secs(1);
+        while !gone(member) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(gone(member));
+        // Idempotent: Drop's repeat signals nothing and reports nothing.
+        assert!(reader.retire().is_none());
+    }
+    #[test]
+    fn reader_already_reaped_by_poll_still_gets_its_session_end_receipt() {
+        // A reader that honoured systemd's own SIGTERM is reaped by poll()
+        // before the loop observes shutdown; it is gone, nothing is signalled.
+        let (child, _) = group_child("echo 0; exec sleep 30");
+        let pid = child.id();
+        let mut reader = Reader::new("isolated-test", None);
+        reader.enabled = true;
+        reader.child = Some(child);
+        signal_group(reader.child.as_ref().unwrap(), libc::SIGTERM);
+        let until = Instant::now() + Duration::from_secs(2);
+        while reader.pid().is_some() && Instant::now() < until {
+            reader.poll(false);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reader.pid().is_none());
+        let receipt = reader.retire().unwrap();
+        assert_eq!(
+            receipt,
+            Receipt {
+                pid,
+                retirement: Retirement {
+                    terminated: false,
+                    exited_in_grace: true
+                },
+                reaped: true,
+                elapsed_ms: 0
+            }
+        );
+        assert!(reader.retire().is_none());
+    }
+    #[test]
+    fn child_outside_its_own_group_is_signalled_alone() {
+        // Never a group it merely joined (here: the test runner's own).
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        signal_group(&child, libc::SIGKILL);
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
     }
 }
 

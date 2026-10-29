@@ -814,7 +814,7 @@ def orca_child_diagnostic(state, pid):
         return {"status": "acquisition-error"}
 
 
-def orca_observation():
+def orca_observation(session_settings=True):
     state = json.loads(STATE.read_text())
     pid = int(state.get("screen_reader_pid") or 0)
     contracts = []
@@ -827,8 +827,11 @@ def orca_observation():
         if len(parts) == 2 and parts[0] == "s":
             contracts.append((name, path, prefix, parts[1], reply))
     owner = contracts[0][3] if contracts else None
-    result = {"enabled": call("gsettings", "get", "org.gnome.desktop.a11y.applications",
-                              "screen-reader-enabled", user=True) == "true",
+    # A departure probe after logout must not read the ended session's
+    # settings: gsettings blocked 15 s while the user bus restarted after
+    # GNOME session shutdown (run 40874548317, marlin-vm-orca51).
+    result = {"enabled": (call("gsettings", "get", "org.gnome.desktop.a11y.applications",
+                               "screen-reader-enabled", user=True) == "true") if session_settings else None,
               "state": state.get("screen_reader_state"), "pid": pid, "owner": owner,
               # None when the image ships no Orca: the lane reports that as
               # the failure instead of a bare probe exit.
@@ -1980,7 +1983,8 @@ print(json.dumps(result))
                      and int((process / "stat").read_text().rsplit(")", 1)[1].split()[19]) == ticks)
         except (FileNotFoundError, ProcessLookupError):
             alive = False
-        result = {"original_alive": alive, **orca_observation()}
+        # Departure needs only the original process and the bus names.
+        result = {"original_alive": alive, **orca_observation(session_settings=False)}
     elif action == "orca-read":
         try:
             result = orca_observation()

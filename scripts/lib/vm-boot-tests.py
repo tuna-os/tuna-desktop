@@ -4081,6 +4081,89 @@ class InventoryProcessRaces(unittest.TestCase):
         self.assertEqual(self.transport(json.dumps({"inventory_error": record, "extra": "private"}))[0], generic)
         self.assertEqual(self.transport(json.dumps({"inventory_error": record}), **{"out-truncated": True})[0], generic)
         self.assertEqual(self.transport("private " * 600)[0], generic)
+class OrcaLogoutRetirement(unittest.TestCase):
+    """#836: the compositor's session-end receipt for its own Orca group."""
+    RECEIPT = ("tuna-compositor: screen reader retired pid=21699 terminated=true "
+               "exited_in_grace=false reaped=true elapsed_ms=2004")
+
+    def test_compositor_format_matches_the_lane_receipt(self):
+        source = (Path(__file__).resolve().parents[2] / "crates/compositor/src/orca.rs").read_text()
+        self.assertIn('"tuna-compositor: screen reader retired pid={} terminated={} exited_in_grace={} '
+                      'reaped={} elapsed_ms={}"', source)
+        runtime = (Path(__file__).resolve().parents[2] / "crates/compositor/src/runtime.rs").read_text()
+        teardown = runtime[runtime.index("impl Drop for Runtime"):]
+        body = teardown[teardown.index("fn drop(&mut self) {") + len("fn drop(&mut self) {"):]
+        # The reader goes first, before any other teardown work.
+        self.assertEqual([line.strip() for line in body.splitlines()
+                          if line.strip() and not line.strip().startswith("//")][0], "self.orca.shutdown();")
+
+    def test_exact_reaped_receipt_for_the_original_reader(self):
+        trace = "\n".join(["[ 535.1] tuna-vm-session[912]: tuna-compositor: modifier super keycode=125 pressed=false",
+                           "[ 537.1] tuna-vm-session[912]: " + self.RECEIPT])
+        self.assertEqual(lane.orca_logout_retirement(trace, 21699),
+                         {"pid": 21699, "terminated": True, "exited_in_grace": False,
+                          "reaped": True, "elapsed_ms": 2004})
+        sheared = ("[ 537.1] tuna-vm-session[912]: tuna-compositor: screen reader retired pid=21699 terminated=\n"
+                   "[ 537.1] tuna-vm-session[1164]: tuna-shell-gtk: unrelated\n"
+                   "[ 537.1] tuna-vm-session[912]: true exited_in_grace=false reaped=true elapsed_ms=2004")
+        self.assertEqual(lane.orca_logout_retirement(sheared, 21699)["elapsed_ms"], 2004)
+
+    def test_missing_unreaped_foreign_duplicate_or_malformed_receipt_refused(self):
+        line = "[ 537.1] tuna-vm-session[912]: "
+        for trace in ["", line + self.RECEIPT.replace("reaped=true", "reaped=false"),
+                      line + self.RECEIPT.replace("pid=21699", "pid=21700"),
+                      line + self.RECEIPT + "\n" + line + self.RECEIPT,
+                      line + self.RECEIPT + " extra",
+                      line + self.RECEIPT.replace("terminated=true", "terminated=yes"),
+                      "[ 537.1] other[912]: " + self.RECEIPT]:
+            with self.subTest(trace=trace):
+                self.assertIsNone(lane.orca_logout_retirement(trace, 21699))
+
+    def test_departure_probe_runs_first_and_v_orca_logout_stays_unchanged(self):
+        # The unchanged probe must not wait behind the receipt: the user
+        # runtime it reads goes away soon after logout (run 40864799987).
+        source = (Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text()
+        departed = source.index('closed_orca = agent.run("orca-departed"')
+        reap = source.index('record("V-ORCA-LOGOUT-REAP"')
+        survived = source.index('raise RuntimeError("Orca survived the hardware session logout")')
+        self.assertLess(departed, reap)
+        self.assertLess(reap, survived)
+        self.assertIn('record("V-ORCA-LOGOUT", closed_orca["owner"] is None and not closed_orca["original_alive"],',
+                      source)
+
+
+class OrcaDepartureProbe(unittest.TestCase):
+    """Run 40874548317: after logout gsettings blocked 15 s on the restarting
+    user bus; departure needs only the original process and the bus names."""
+
+    def observe(self, session_settings):
+        calls = []
+        def call(*args, user=False, check=True):
+            calls.append(args[0])
+            if args[0] == "gsettings":
+                return "true"
+            if args[0] == "busctl":
+                return ""
+            return "orca 51.1-1"
+        scope = lifecycle_scope("orca_observation", shlex=shlex, json=json, call=call,
+                                STATE=SimpleNamespace(read_text=lambda: json.dumps(
+                                    {"screen_reader_pid": 41, "screen_reader_state": "active"})),
+                                orca_child_diagnostic=lambda state, pid: {"status": "gone"})
+        return scope["orca_observation"](session_settings=session_settings), calls
+
+    def test_departure_probe_never_reads_the_ended_sessions_settings(self):
+        departed, calls = self.observe(False)
+        self.assertNotIn("gsettings", calls)
+        self.assertEqual(calls.count("busctl"), 2)
+        self.assertIsNone(departed["enabled"])
+        self.assertIsNone(departed["owner"])
+        live, calls = self.observe(True)
+        self.assertIn("gsettings", calls)
+        self.assertIs(live["enabled"], True)
+
+    def test_orca_departed_action_uses_the_departure_probe(self):
+        source = LIFECYCLE_SOURCE.read_text()
+        self.assertIn('result = {"original_alive": alive, **orca_observation(session_settings=False)}', source)
 
 
 if __name__ == "__main__":
