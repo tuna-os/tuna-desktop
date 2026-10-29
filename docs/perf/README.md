@@ -170,12 +170,18 @@ Identities also retain unsigned 32-bit `stat_flags`, nonnegative signed 32-bit
 `stat_num_threads`, and numeric `status_vmrss_present`/`status_vmsize_present`
 (1 for an exact field label, 0 for absent). Malformed/out-of-range stat metadata
 is null; status presence is null for records exceeding 16,384 characters.
-These reuse the existing proc reads without changing accounting or its input
-limits. Presence does not validate field values. The observations are not atomic
-and neither flags nor absent memory fields classify an exit or justify a fallback.
+These reuse the existing proc reads without changing their input limits.
+Presence does not validate field values, and no memory fallback is derived
+from them. One combination does classify an exit: when `smaps_rollup` fails
+with ESRCH and the re-read shows the same UID and start ticks with `PF_EXITING`
+(0x4) set and both `VmRSS` and `VmSize` absent, the task is inside `do_exit()`
+after `exit_mm()` and its memory is already released. It departs like an
+observed zombie. Stock runs 40887247970 and 40890717926 lost whole sessions,
+and with them every pair, to such tasks still reading S or R. Unknown flags or
+presence, a held mm, a changed identity or any other error remain unreadable.
 The read stages identify bounded Python proc operations, not a kernel syscall
 trace. No exception text, paths or process names are added to these receipts.
 At most 128 failure receipts are retained per sample, with an explicit overflow
 count; the original unreadable list and complete-sample gate are not truncated
-or relaxed. Existing explicitly observed exits remain excluded from accounting,
-now with a diagnostic receipt; persistent unreadable identities still fail.
+or relaxed. Explicitly observed exits remain excluded from accounting, with a
+diagnostic receipt; persistent unreadable identities still fail.

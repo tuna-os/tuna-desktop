@@ -42,6 +42,18 @@ and only for the diagnostic profile. `tuna-perf-profile-pairs` refuses them for
 `test_thread_diagnostics_are_refused_for_stock_before_any_acquisition`) and
 `tuna-perf-gate-tests.py` (`Observer`).
 
+**A second cause: exiting tasks counted as unreadable.** With thread
+diagnostics off, runs 40887247970 and 40890717926 still measured 0 and 1 of 3
+stock pairs. Each lost a Tuna session to one sample in about 262: a user process
+failed `smaps_rollup` with ESRCH and the re-read showed the same task in S or R
+with `PF_EXITING` set and no `VmRSS`/`VmSize`. The task was inside `do_exit()`
+after `exit_mm()` but before it became a zombie. The sampler accepted only Z/X
+as an exit, so it reported the task as unreadable. `tuna-vm-perf` then refused
+the session, and `tuna-perf-profile-pairs` aborts on the first refused session.
+That exact state now departs like a zombie; every other failure still refuses
+the session (`tuna-perf-tests.py`,
+`test_only_an_exiting_task_without_mm_departs_from_a_live_state`).
+
 ## 2. The #782 "pass" and "fails" were not budget decisions
 
 Runs 39186104488 and 39274768751 failed in the *diagnostic* acquisition step

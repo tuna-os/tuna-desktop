@@ -83,7 +83,8 @@ def read_process(path):
         "ppid": int(fields[1]), "start_ticks": int(fields[19]),
         "cpu_ticks": int(fields[11]) + int(fields[12]),
         # Reuse these reads: no new proc race or diagnostic failure may change
-        # accounting. Presence is not a validated memory value or exit proof.
+        # accounting. Presence is not a validated memory value; only
+        # released_by_exit() reads it, together with PF_EXITING.
         "stat_flags": diagnostic_counter(fields, 6, 0xffffffff),
         "stat_num_threads": diagnostic_counter(fields, 17, 0x7fffffff),
         "status_vmrss_present": int("VmRSS" in status) if len(status_text) <= 16384 else None,
@@ -264,6 +265,29 @@ def numeric_identity(row):
             "status_vmsize_present": row.get("status_vmsize_present")}
 
 
+# include/linux/sched.h: set by exit_signals() at the start of do_exit() and
+# never cleared for the task.
+PF_EXITING = 0x00000004
+
+
+def released_by_exit(error, before, after):
+    """The same task is inside do_exit() and has already released its mm.
+
+    smaps_rollup fails with ESRCH once exit_mm() cleared the task's mm, and
+    /proc/<pid>/status then omits every Vm* field. Before exit_notify() the
+    state is still R/S/D, not Z (Marlin stock runs 40887247970 and
+    40890717926: PF_EXITING set, no VmRSS/VmSize, unchanged start ticks). Its
+    memory is gone exactly as for an observed zombie, so it departs like one.
+    Unknown flags or presence (None), a live mm, another identity or another
+    error never do.
+    """
+    return bool(isinstance(error, ProcessLookupError) and after is not None
+                and (after["uid"], after["start_ticks"]) == (before["uid"], before["start_ticks"])
+                and after.get("stat_flags") is not None and after["stat_flags"] & PF_EXITING
+                and after.get("status_vmrss_present") == 0
+                and after.get("status_vmsize_present") == 0)
+
+
 def failure_record(stage, error, before, after, after_error=None):
     """Fixed call-site enum and numeric identity/errno; no exception text/paths."""
     return {"stage": stage, "errno": getattr(error, "errno", None),
@@ -327,7 +351,8 @@ def sample(uid, proc=Path("/proc"), observer=None, thread_diagnostics=False):
             exited = False
             try:
                 identity = read_process(path)
-                exited = identity["state"] in ("Z", "X", "x")
+                exited = (identity["state"] in ("Z", "X", "x")
+                          or released_by_exit(error, row, identity))
             except (FileNotFoundError, ProcessLookupError) as observed:
                 identity_error = observed
                 exited = True

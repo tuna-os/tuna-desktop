@@ -898,19 +898,39 @@ class Accounting(unittest.TestCase):
                     row = guest.numeric_identity(guest.read_process(path))
                     self.assertEqual(row['status_vmrss_present'], 1 if size == 16384 else None)
 
-    def test_exit_metadata_does_not_classify_live_states(self):
-        for state in ('S', 'R', 'D', 'Z', 'X', 'x'):
-            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+    def test_only_an_exiting_task_without_mm_departs_from_a_live_state(self):
+        # Stock runs 40887247970 and 40890717926: smaps_rollup failed with
+        # ESRCH, then the same task read S or R with PF_EXITING and no Vm*
+        # fields (do_exit() after exit_mm(), before exit_notify()).
+        released = dict(stat_flags=0x40000C, stat_num_threads=2,
+                        status_vmrss_present=0, status_vmsize_present=0)
+        esrch = ProcessLookupError(3, 'private')
+        cases = [(state, {}, esrch, False) for state in ('S', 'R', 'D')]
+        cases += [(state, dict(stat_flags=0), esrch, False) for state in ('Z', 'X', 'x')]
+        cases += [
+            ('S', dict(stat_flags=0x400040), esrch, True),          # not exiting
+            ('S', dict(stat_flags=None), esrch, True),              # flags unknown
+            ('S', dict(status_vmrss_present=1), esrch, True),       # mm still held
+            ('R', dict(status_vmsize_present=1), esrch, True),
+            ('S', dict(status_vmrss_present=None, status_vmsize_present=None), esrch, True),
+            ('S', dict(start_ticks=99), esrch, True),               # PID reused
+            ('S', dict(uid=1001), esrch, True),
+            ('S', {}, PermissionError(13, 'private'), True),        # not ESRCH
+            ('S', {}, ValueError('malformed'), True),
+        ]
+        for state, change, error, unreadable in cases:
+            with self.subTest(state=state, change=change, error=type(error).__name__), \
+                    tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 path = self.process(root, 1, 0, 1000, 10, 55)
                 initial = guest.read_process(path)
-                after = dict(initial, state=state, stat_flags=4, stat_num_threads=1,
-                             status_vmrss_present=0, status_vmsize_present=0)
+                after = dict(initial, state=state, **dict(released, **change))
                 with patch.object(guest, 'read_process', side_effect=[initial, after]), \
-                     patch.object(guest, 'read_smaps_rollup', side_effect=ProcessLookupError(3, 'private')):
+                     patch.object(guest, 'read_smaps_rollup', side_effect=error):
                     result = guest.sample(1000, root)
                 self.assertEqual(result['failure_evidence'][0]['after'], guest.numeric_identity(after))
-                self.assertEqual(bool(result['unreadable']), state in ('S', 'R', 'D'))
+                self.assertEqual(result['unreadable'],
+                                 [{'pid': 1, 'error': type(error).__name__}] if unreadable else [])
                 self.assertEqual(result['process_count'], 0)
 
     def test_failure_evidence_preserves_existing_exit_and_reuse_semantics(self):
