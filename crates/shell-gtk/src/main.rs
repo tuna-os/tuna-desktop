@@ -2717,6 +2717,8 @@ fn build(app: &adw::Application) {
                             quiet,
                         );
                     }
+                    Action::ToggleMagnifier => magnifier_sync::toggle(),
+                    Action::MagnifierZoom { zoom_in } => magnifier_sync::zoom(zoom_in),
                     Action::VolumeMute | Action::VolumeMuteQuiet | Action::MicrophoneMute => {
                         media_keys.change(
                             media_keys::VolumeKey::Mute,
@@ -2811,9 +2813,9 @@ fn build(app: &adw::Application) {
                     mutter_settings.as_ref(),
                     media_settings.as_ref(),
                 );
-                let accels: Vec<(String, u32)> = list
+                let accels: Vec<(String, u32, u32)> = list
                     .iter()
-                    .map(|b| (b.accelerator.clone(), b.modes))
+                    .map(|b| (b.accelerator.clone(), b.modes, b.flags))
                     .collect();
                 eprintln!(
                     "tuna-shell-gtk: keybindings: {} grabs, maximize on {:?}",
@@ -2831,7 +2833,7 @@ fn build(app: &adw::Application) {
                     &accels,
                     Rc::new(move |i, mode| {
                         if let Some(action) = actions.get(i) {
-                            if let Some((accelerator, _)) = accels_for_run.get(i) {
+                            if let Some((accelerator, _, _)) = accels_for_run.get(i) {
                                 *fired_accelerator.borrow_mut() = accelerator.clone();
                             }
                             run(*action, mode);
