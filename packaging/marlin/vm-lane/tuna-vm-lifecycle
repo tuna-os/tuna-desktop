@@ -43,20 +43,12 @@ NESTED = f"{PREFIX}-nested-"
 LOCK_PAM = f"/etc/pam.d/{PREFIX}-lock"
 
 
-def login_session(path=pathlib.Path("/usr/share/tuna-vm/display-manager")):
-    """The logind login the fixture qualifies. The current-build fixture runs
-    greetd on VT 1; the published flavor ships GDM (tunaOS#3438), whose PAM
-    service is gdm-password and whose user session takes a new VT (GDM 51.1
-    daemon/gdm-session.c GDM_SESSION_DISPLAY_MODE_NEW_VT)."""
-    manager = path.read_text().strip() if path.exists() else "greetd"
-    if manager == "greetd":
-        return {"manager": "greetd", "unit": "greetd.service", "service": "greetd", "vt": "1"}
-    if manager == "gdm":
-        return {"manager": "gdm", "unit": "gdm.service", "service": "gdm-password", "vt": None}
-    raise RuntimeError("unknown fixture display manager")
+# Both fixtures log in through stock GDM (tunaOS#3438): its PAM service is
+# gdm-password and the user session takes a new VT (GDM 51.1
+# daemon/gdm-session.c GDM_SESSION_DISPLAY_MODE_NEW_VT).
+LOGIN_SERVICE = "gdm-password"
+DISPLAY_MANAGER = pathlib.Path("/etc/systemd/system/display-manager.service")
 
-
-LOGIN_SESSION = login_session()
 
 
 # GDM 51.1 libgdm/gdm-sessions.c collect_sessions(): the greeter searches the
@@ -433,14 +425,13 @@ def owner_login_session():
                            "--property=Service", "--property=Class", check=False)
         properties = dict(item.split("=", 1) for item in description.splitlines())
         vt = properties.get("VTNr", "")
-        if (properties.get("Service") == LOGIN_SESSION["service"]
+        if (properties.get("Service") == LOGIN_SERVICE
                 and vt.isdigit() and vt != "0"
-                and LOGIN_SESSION["vt"] in (None, vt)
                 and properties.get("User") == str(OWNER.pw_uid)
                 and not properties.get("Class", "").startswith("manager")):
             owned.append(properties)
     if len(owned) != 1:
-        raise RuntimeError(f"expected exactly one {LOGIN_SESSION['service']} user session on a VT")
+        raise RuntimeError(f"expected exactly one {LOGIN_SERVICE} user session on a VT")
     return owned[0]
 
 
@@ -2615,36 +2606,33 @@ print(json.dumps(result))
                   "desktop": [name for name in ("tuna-session", COMPOSITOR_COMM, "gnome-shell", "gnome-session-s")
                               if call("pgrep", "-u", str(OWNER.pw_uid), "-x", name, check=False)]}
     elif action == "greeter":
-        result = {"manager": LOGIN_SESSION["manager"],
-                  "manager_active": call("systemctl", "is-active", LOGIN_SESSION["unit"],
+        # GDM's greeter is gnome-shell in a logind greeter-class session of
+        # its own (dynamic) non-root user.
+        result = {"manager": DISPLAY_MANAGER.resolve().stem,
+                  "manager_active": call("systemctl", "is-active", "gdm.service",
                                          check=False) == "active",
                   "probe_uid": os.geteuid(),
                   "compositor_pids": call("pgrep", "-u", str(OWNER.pw_uid), "-x",
                                           COMPOSITOR_COMM, check=False).splitlines()}
-        if LOGIN_SESSION["manager"] == "gdm":
-            # GDM's greeter is gnome-shell in a logind greeter-class session
-            # of its own (dynamic) non-root user.
-            greeter_sessions = []
-            for line in call("loginctl", "list-sessions", "--no-legend", "--no-pager").splitlines():
-                fields = line.split()
-                if not fields:
-                    continue
-                description = call("loginctl", "show-session", fields[0], "--property=Id",
-                                   "--property=User", "--property=Class", "--property=Service",
-                                   "--property=Active", "--property=VTNr", check=False)
-                properties = dict(item.split("=", 1) for item in description.splitlines() if "=" in item)
-                if properties.get("Class") == "greeter":
-                    greeter_sessions.append(properties)
-            greeter_pids = [pid for uid in sorted({s.get("User", "") for s in greeter_sessions} - {""})
-                            for pid in call("pgrep", "-u", uid, "-x", "gnome-shell", check=False).splitlines()]
-            result |= {"greeter_sessions": greeter_sessions,
-                       "sessions": gdm_sessions(),
-                       "fallback_session": gdm_fallback_session()}
-        else:
-            greeter_pids = call("pgrep", "-x", "gtkgreet", check=False).splitlines()
-        result |= {"greeter_pids": greeter_pids,
+        greeter_sessions = []
+        for line in call("loginctl", "list-sessions", "--no-legend", "--no-pager").splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            description = call("loginctl", "show-session", fields[0], "--property=Id",
+                               "--property=User", "--property=Class", "--property=Service",
+                               "--property=Active", "--property=VTNr", check=False)
+            properties = dict(item.split("=", 1) for item in description.splitlines() if "=" in item)
+            if properties.get("Class") == "greeter":
+                greeter_sessions.append(properties)
+        greeter_pids = [pid for uid in sorted({s.get("User", "") for s in greeter_sessions} - {""})
+                        for pid in call("pgrep", "-u", uid, "-x", "gnome-shell", check=False).splitlines()]
+        result |= {"greeter_sessions": greeter_sessions,
+                   "sessions": gdm_sessions(),
+                   "fallback_session": gdm_fallback_session(),
+                   "greeter_pids": greeter_pids,
                    "greeter_uids": [pathlib.Path(f"/proc/{pid}").stat().st_uid for pid in greeter_pids]}
-    elif action == "published":
+    elif action == "payload":
         payload = pathlib.Path("/usr/share/tuna-vm/shipped-payload.sha256")
         call("sha256sum", "--check", str(payload))
         package = pathlib.Path("/usr/share/tuna-vm/shipped-package.txt").read_text().strip()

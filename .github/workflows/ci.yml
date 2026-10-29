@@ -1157,10 +1157,11 @@ jobs:
 
   marlin-vm:
     # Real-VM lane (#68): install the Marlin Tuna Desktop image (plus the CI-only
-    # autologin/serial-journal layer in packaging/marlin/vm-lane) to a
-    # raw disk with bootc, boot it in QEMU/KVM, and prove greetd starts
-    # the Tuna Desktop hardware session on the DRM/KMS backend. The image is
-    # rebuilt rootful here (bootc install reads it from root's storage),
+    # layer in packaging/marlin/vm-lane: tunaOS's tuna-flavor GDM login path,
+    # fixture account, serial journal) to a raw disk with bootc, boot it in
+    # QEMU/KVM, type the fixture password into stock GDM's user list, and prove
+    # GDM starts the Tuna Desktop hardware session on the DRM/KMS backend. The
+    # image is rebuilt rootful here (bootc install reads it from root's storage),
     # in parallel with marlin-image rather than after it.
     name: ${{ matrix.orca == 'distribution' && 'marlin-vm' || 'marlin-vm-orca51' }}
     strategy:

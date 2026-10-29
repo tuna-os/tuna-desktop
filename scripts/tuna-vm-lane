@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """tuna-vm-lane — boot the Marlin Tuna Desktop disk and prove the hardware session (#68).
 
-Boots a raw disk installed from the CI-only test layer
-(packaging/marlin/vm-lane/Containerfile: greetd initial session of tuna-test
-into "Tuna Desktop (preview)", journal mirrored on ttyS0) in QEMU/KVM on OVMF at
-1280x800 with virtio-vga, then asserts from outside the guest:
+Boots a raw disk installed from a CI-only test layer (packaging/marlin/vm-lane/
+Containerfile on the source-built image, Containerfile.published on the
+published marlin:tuna flavor; both log in through stock GDM with tunaOS's
+tuna-flavor GDM configuration, journal mirrored on ttyS0) in QEMU/KVM on OVMF
+at 1280x800 with virtio-vga, types the fixture password into GDM's user list,
+then asserts from outside the guest:
 
   V-DRM      the serial journal shows tuna-compositor lit an output on
              the DRM/KMS backend ("tuna-compositor: drm: output ...")
@@ -31,7 +33,7 @@ T-<section>.png still per section (needs ffmpeg with libvpx and libwebp).
 
 Usage:
   scripts/tuna-vm-lane --disk DISK.raw [--out DIR] [--timeout S] [--tour]
-                        [--meta KEY=VALUE ...]
+                        [--published] [--meta KEY=VALUE ...]
 
 Needs qemu-system-x86_64 and OVMF; KVM strongly recommended. Reuses the
 QMP client from scripts/tuna-baseline.
@@ -87,11 +89,10 @@ PLAY_FPS = 4        # encoded frame rate, not a uniform real-time capture clock
 CARD_HOLD = 10      # frames a title card is held (2.5 s at PLAY_FPS)
 OVMF = ("/usr/share/ovmf/OVMF.fd", "/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/qemu/OVMF.fd")
 
-# Session stderr reaches the serial journal under the current-build fixture's
-# systemd-cat identifier, or, on the published flavor, under the stream GDM's
-# session worker opens for gdm-wayland-session (GDM 51.1
+# Session stderr reaches the serial journal under the stream GDM's session
+# worker opens for gdm-wayland-session (GDM 51.1
 # daemon/gdm-session-worker.c: sd_journal_stream_fd (arguments[0], ...)).
-SESSION_RECORD_RE = re.compile(r"(?:tuna-vm-session|gdm-wayland-session)\[(\d+)\]: (.*)")
+SESSION_RECORD_RE = re.compile(r"gdm-wayland-session\[(\d+)\]: (.*)")
 # A whole record a session process opens without a `tuna-` component
 # prefix: a library's own leveled stderr line, libinput's default handler
 # (`libinput error: `) or Mesa (`MESA-EGL: warning: `), or the compositor's
@@ -345,7 +346,7 @@ def read_text(path):
 def excerpt(serial, n=60):
     lines = serial.splitlines()
     interesting = [ln for ln in lines if re.search(
-        r"tuna|greetd|gdm|panicked|session-|Failed|error", ln, re.I)]
+        r"tuna|gdm|panicked|session-|Failed|error", ln, re.I)]
     return ("--- last relevant serial lines ---\n" + "\n".join(interesting[-n:]) +
             "\n--- last raw serial lines ---\n" + "\n".join(lines[-40:]))
 
@@ -1016,11 +1017,11 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     expected = {"tuna-compositor", "tuna-shell-gtk", "gnome-disks", "gnome-system-monitor", "nautilus"}
     nonroot = (before["probe_uid"] == 0 and before["session_uid"] != 0
                and before["session"]["User"] == str(before["session_uid"])
-               and before["session"]["Service"] == login_service(published)
+               and before["session"]["Service"] == LOGIN_SERVICE
                and all(p["uid"] == before["session_uid"] for p in before["processes"]))
     intact = expected <= {guest_role(p["executable"]) for p in before["processes"]} and len(before["state"]["windows"]) >= 3
     record("V-LIFECYCLE-OWNER", nonroot and intact,
-           f"root probe, non-root {login_service(published)} session and three real app processes/surfaces")
+           f"root probe, non-root {LOGIN_SERVICE} session and three real app processes/surfaces")
     if not nonroot or not intact or before["state"]["locked"]:
         raise RuntimeError("lifecycle preconditions failed")
     if published:
@@ -2584,39 +2585,29 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     deadline = time.monotonic() + 30
     greeter = {}
     greeter_visible = False
-    # The published lane keeps the greeter frame that preceded login. Its
-    # shipped stylesheet paints the variant wallpaper, so the repainted
-    # greeter must match that frame; the CI image's own stylesheet has a
-    # #222226 window background with light controls/text instead. Process
-    # startup, a black scanout or a uniform fill can pass neither.
-    reference_path = os.path.join(out, "greeter-before-login.ppm")
-    reference = read_ppm(reference_path) if os.path.exists(reference_path) else None
+    # Both lanes keep the GDM greeter frame that preceded login. tunaOS's
+    # greeter stylesheet paints the variant wallpaper, so the repainted
+    # greeter must match that frame; process startup, a black scanout or a
+    # uniform fill cannot.
+    reference = read_ppm(os.path.join(out, "greeter-before-login.ppm"))
     while time.monotonic() < deadline:
         greeter = agent.run("greeter")
-        if greeter_ready(greeter, published):
+        if greeter_ready(greeter):
             image = frame("logout-greeter")
             width, height, pixels = image
             colors = {tuple(value >> 4 for value in pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
                       for y in range(0, height, 8) for x in range(0, width, 8)}
-            if reference is not None:
-                changed = difference(reference, image)
-                greeter["paint"] = {"changed_from_pre_login_greeter": changed, "colors": len(colors)}
-                greeter_visible = changed < 0.05 and len(colors) >= 8
-            else:
-                background = sum(all(abs(pixels[i + channel] - value) <= 4
-                                     for channel, value in enumerate((34, 34, 38)))
-                                 for i in range(0, len(pixels), 3)) / (width * height)
-                light = sum(min(pixels[i:i + 3]) > 160 for i in range(0, len(pixels), 3))
-                greeter["paint"] = {"background_fraction": background, "light_pixels": light}
-                greeter_visible = background > 0.25 and light >= 100
+            changed = difference(reference, image)
+            greeter["paint"] = {"changed_from_pre_login_greeter": changed, "colors": len(colors)}
+            greeter_visible = changed < 0.05 and len(colors) >= 8
             if greeter_visible:
                 break
         time.sleep(0.5)
     with open(os.path.join(evidence, "greeter.json"), "w") as stream:
         json.dump(greeter, stream, indent=2)
     record("V-LOGOUT", greeter_visible,
-           f"real session termination returns to a painted {greeter_name(published)} surface under active "
-           f"{'GDM' if published else 'greetd'}, with no original compositor")
+           "real session termination returns to a painted GDM greeter surface under active GDM, "
+           "with no original compositor")
     if older_guest:
         with open(os.path.join(evidence, "orca-after-logout.json"), "w") as stream:
             json.dump({"predates_instrumentation": True}, stream, indent=2)
@@ -2655,36 +2646,28 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         if closed_orca["owner"] is not None or closed_orca["original_alive"]:
             raise RuntimeError("Orca survived the hardware session logout")
     if not greeter_visible:
-        raise RuntimeError(f"live {greeter_name(published)} did not paint its actual visible surface after logout")
+        raise RuntimeError("live GDM greeter did not paint its actual visible surface after logout")
     record("V-LIFECYCLE", True, "all lifecycle operations completed; individual assertions remain mandatory")
 
 
-# The published flavor logs in through GDM (tunaOS#3438); the current-build
-# fixture's CI-only greetd initial session returns to gtkgreet after logout.
-def login_service(published):
-    """logind PAM service of the qualified Tuna Desktop session."""
-    return "gdm-password" if published else "greetd"
+# Both lanes log in through stock GDM (tunaOS#3438): the logind PAM service of
+# the qualified Tuna Desktop session.
+LOGIN_SERVICE = "gdm-password"
 
 
-def greeter_name(published):
-    return "GDM greeter" if published else "gtkgreet"
-
-
-def greeter_ready(greeter, published):
-    """The display manager's non-root greeter runs and no Tuna Desktop
-    compositor of the fixture user survives. GDM's greeter must also hold
-    the active seat as its own gdm-launch-environment greeter session."""
-    ready = (greeter.get("probe_uid") == 0 and greeter.get("manager_active") is True
-             and greeter.get("manager") == ("gdm" if published else "greetd")
-             and bool(greeter.get("greeter_pids"))
-             and all(uid != 0 for uid in greeter.get("greeter_uids", [0]))
-             and not greeter.get("compositor_pids"))
-    if published:
-        ready = ready and any(session.get("Active") == "yes"
-                              and session.get("Service") == "gdm-launch-environment"
-                              and session.get("User", "0") not in ("", "0")
-                              for session in greeter.get("greeter_sessions", []))
-    return ready
+def greeter_ready(greeter):
+    """GDM's non-root greeter runs and holds the active seat as its own
+    gdm-launch-environment greeter session, and no Tuna Desktop compositor of
+    the fixture user survives."""
+    return (greeter.get("probe_uid") == 0 and greeter.get("manager_active") is True
+            and greeter.get("manager") == "gdm"
+            and bool(greeter.get("greeter_pids"))
+            and all(uid != 0 for uid in greeter.get("greeter_uids", [0]))
+            and not greeter.get("compositor_pids")
+            and any(session.get("Active") == "yes"
+                    and session.get("Service") == "gdm-launch-environment"
+                    and session.get("User", "0") not in ("", "0")
+                    for session in greeter.get("greeter_sessions", [])))
 
 
 GREETER_SESSION = ["tuna", "Tuna Desktop"]
@@ -2740,7 +2723,7 @@ def await_login(agent, deadline):
         try:
             login = agent.run("login-session")
             owner = agent.run("inventory")
-            if (owner["session_uid"] != 0 and owner["session"]["Service"] == login_service(True)
+            if (owner["session_uid"] != 0 and owner["session"]["Service"] == LOGIN_SERVICE
                     and owner["session"]["User"] == str(owner["session_uid"])
                     and any(guest_role(p["executable"]) == "tuna-compositor" for p in owner["processes"])):
                 return True, login
@@ -2761,7 +2744,7 @@ def gdm_login(qmp, agent_path, out, record):
             if agent is None:
                 agent = guest_agent.GuestAgent(agent_path)
             greeter = agent.run("greeter")
-            if greeter_ready(greeter, True):
+            if greeter_ready(greeter):
                 break
         except (OSError, RuntimeError, ValueError):
             if agent is not None:
@@ -2773,7 +2756,7 @@ def gdm_login(qmp, agent_path, out, record):
             agent.close()
         raise RuntimeError("shipped GDM greeter did not become ready")
     try:
-        provenance = agent.run("published")
+        provenance = agent.run("payload")
         with open(os.path.join(out, "shipped-payload.json"), "w") as stream:
             json.dump(provenance, stream, indent=2)
         with open(os.path.join(out, "greeter-before-login.json"), "w") as stream:
@@ -3454,8 +3437,8 @@ def repeat_boots(args):
             command.extend(["--strip-image", args.strip_image])
             if getattr(args, "strip_edge", False):
                 command.append("--strip-edge")
-        if args.greeter_login:
-            command.append("--greeter-login")
+        if args.published:
+            command.append("--published")
         if args.require_kvm:
             command.append("--require-kvm")
         command.extend(["--orca-contract", args.orca_contract])
@@ -3513,8 +3496,9 @@ def main():
                     help="after the assertions, record the feature tour video")
     ap.add_argument("--strip-edge", action="store_true", help="explicit four-actor stationary edge consumer on final boot")
     ap.add_argument("--strip-image", help="exact same-run package/final-image receipt; installed strip acceptance on final tour boot")
-    ap.add_argument("--greeter-login", action="store_true",
-                    help="log in through the published flavor's shipped GDM greeter with the fixture credentials")
+    ap.add_argument("--published", action="store_true",
+                    help="the disk holds the published marlin:tuna flavor; released-build gaps qualify "
+                         "where the current-build lanes prove the newer behavior")
     ap.add_argument("--require-kvm", action="store_true",
                     help="refuse emulation when the qualification profile requires KVM")
     ap.add_argument("--meta", action="append", default=[], metavar="KEY=VALUE")
@@ -3562,13 +3546,11 @@ def main():
     manager_ready = False
     try:
         qmp = baseline.Qmp(qmp_path)
-        login_ok = True
-        if a.greeter_login:
-            try:
-                login_ok = gdm_login(qmp, agent_path, out, record)
-            except (OSError, RuntimeError, ValueError) as error:
-                record("V-GDM-LOGIN", False, str(error))
-                login_ok = False
+        try:
+            login_ok = gdm_login(qmp, agent_path, out, record)
+        except (OSError, RuntimeError, ValueError) as error:
+            record("V-GDM-LOGIN", False, str(error))
+            login_ok = False
         n = 0
         drm_at = output_at = None
         stacks = 0
@@ -3640,7 +3622,7 @@ def main():
                 owner = agent.run("inventory")
                 manager_ready = (owner["probe_uid"] == 0 and owner["session_uid"] != 0
                                  and owner["session"]["User"] == str(owner["session_uid"])
-                                 and owner["session"]["Service"] == login_service(a.greeter_login)
+                                 and owner["session"]["Service"] == LOGIN_SERVICE
                                  and any(guest_role(p["executable"]) == "tuna-compositor" and p["uid"] == owner["session_uid"]
                                          for p in owner["processes"]))
                 with open(os.path.join(out, "session-owner.json"), "w") as stream:
@@ -3659,7 +3641,7 @@ def main():
                     try:
                         run_lifecycle(qmp, agent, out, serial_path, record, strip_image=strip_image,
                                       reconnect=lambda: guest_agent.GuestAgent(agent_path), strip_edge=a.strip_edge,
-                                      published=a.greeter_login, orca_contract=a.orca_contract)
+                                      published=a.published, orca_contract=a.orca_contract)
                     finally:
                         agent.close()
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as e:
@@ -3704,7 +3686,7 @@ def main():
         results["V-PANEL"] = (False, results["V-PANEL"][1] + "; Tuna Desktop lost the display"
                               + (" to a GDM greeter session" if greeter else ""))
     record("V-DISPLAY-MANAGER", manager_ready,
-           f"real logind {login_service(a.greeter_login)} session and non-root compositor UID verified; "
+           f"real logind {LOGIN_SERVICE} session and non-root compositor UID verified; "
            "intentional lifecycle VT pauses are permitted")
     for name in PORTAL_PROBES:
         record(f"V-{name.upper()}", f"tuna-vm-health: {name} ready" in text and (name != "portal" or "tuna-vm-health: portal-gnome ready" in text),
@@ -3730,8 +3712,8 @@ def main():
     manifest = {
         "lane": "marlin-vm",
         "orca_contract": a.orca_contract,
-        "session": ("published Tuna Desktop flavor via shipped GDM PAM login, DRM/KMS backend"
-                    if a.greeter_login else "Tuna Desktop (preview) via CI-only greetd initial session, DRM/KMS backend"),
+        "session": ("published Tuna Desktop flavor" if a.published else "source-built Tuna Desktop")
+                   + " via shipped GDM PAM login, DRM/KMS backend",
         "disk": os.path.basename(a.disk),
         "resolution": f"{WIDTH}x{HEIGHT}",
         "kvm": kvm,
