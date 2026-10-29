@@ -554,7 +554,7 @@ impl Action {
 
 /// The current bindings: each key's accelerators from its GNOME schema
 /// (`shell`, `wm` or `mutter`) when installed, else GNOME 51's defaults.
-/// The media-keys schema's keys (volume, mic-mute, screensaver) are
+/// The media-keys schema's keys (volume, mic-mute, screensaver, magnifier) are
 /// gnome-settings-daemon's in GNOME: while `gsd_media_keys` runs it grabs
 /// them through org.gnome.Shell, so the shell binds none of them and the
 /// grabs cannot collide. Without it (the nested preview, which starts no
@@ -913,6 +913,9 @@ mod tests {
             Action::VolumeDownQuiet,
             Action::VolumeMuteQuiet,
             Action::MicrophoneMute,
+            Action::ToggleMagnifier,
+            Action::MagnifierZoom { zoom_in: true },
+            Action::MagnifierZoom { zoom_in: false },
         ];
         for action in media {
             assert!(native.iter().any(|b| b.action == action), "{action:?}");
