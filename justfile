@@ -61,6 +61,9 @@ proof name *args: _disk
         grep -lE "tuna-{{name}}\b" scripts/tuna-* .github/workflows/*.yml 2>/dev/null | grep -v "^$script$" | sed 's/^/  /' >&2
         exit 2
     fi
+    # A CI runner's umask: under 002 the session's directories come out
+    # group-writable and the compositor's ownership checks refuse them.
+    umask 022
     art=$(mktemp -d "${TMPDIR:-/tmp}/tuna-proof-{{name}}.XXXXXX")
     # A fresh home like a CI runner's, so desktop state in yours can't leak in
     # (or block the session's settings upgrade); Cargo and rustup stay yours.
