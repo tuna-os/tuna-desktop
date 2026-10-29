@@ -9,7 +9,7 @@ child. Runs nested (winit, GLES over EGL) or as a DRM/KMS hardware session.
 - `tuna-compositor` (`src/main.rs`): one session on a private socket;
   `--help` lists the flags (`--backend auto|winit|drm`, `--socket`,
   `--shell-bin`, `--xwayland`, `--startup-overview`).
-- `tuna-session` (`src/bin/tuna-session.rs`): what greeters and
+- `tuna-session` (`src/bin/tuna-session.rs`): what GDM and
   `wayland-sessions/tuna.desktop` run; execs the sibling compositor.
 
 ## Public API (`src/lib.rs`)
@@ -29,8 +29,7 @@ Features: `drm` and `xwayland`, both on by default.
 
 ## Depends on / dependents
 
-Uses `tuna-shell-control`, `tuna-greeter` (prompt model and greetd client
-only, without `gtk-ui`), and `tuna-wallpaper`. `tuna-shell-host` uses it
+Uses `tuna-shell-control` and `tuna-wallpaper`. `tuna-shell-host` uses it
 as a dev-dependency for its live tests. Integration tests are in `tests/`.
 
 ## Docs

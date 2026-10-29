@@ -23,7 +23,7 @@ use freedesktop_desktop_entry::{DesktopEntry as CrateEntry, Iter};
 
 use crate::search::{SearchProvider, SearchResult};
 
-/// Locales retained from desktop entries (matches the greeter's pick:
+/// Locales retained from desktop entries (a fixed English fallback list:
 /// full environment locale handling is later work).
 const LOCALES: &[&str] = &["en_US.UTF-8", "en_US", "en", "C"];
 /// How long a freshly launched app counts as "starting" for feedback.

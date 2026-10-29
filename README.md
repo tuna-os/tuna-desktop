@@ -32,7 +32,7 @@ Never post account credentials or API keys in issues or pull requests.
 
   Downloads Corral (checksum-verified), pulls and cosign-verifies the published TunaOS image, and launches Tuna Desktop in local QEMU with a local-only browser console over noVNC. Stop anytime with Ctrl-C. See `scripts/try-tuna-desktop` for options.
 - **Install:** [docs/install.md](docs/install.md) covers the Debian-format
-  package, building from source and greetd wiring. The experimental TunaOS
+  package, building from source and logging in through GDM. The experimental TunaOS
   Marlin image is in [packaging/README.md](packaging/README.md).
 - **Try it in a window** inside your current GNOME, Wayland or X11 session,
   from a checkout with the [build prerequisites](docs/development.md#prerequisites):
@@ -78,7 +78,7 @@ See [capture details](docs/walkthrough/README-media.md) for source revisions and
 **Nested developer preview.** A Smithay compositor supervises a GTK4/libadwaita
 shell with overview window previews, app grid and search, quick settings,
 notifications, calendar, keyboard navigation and AT-SPI accessibility. Tuna Desktop
-also includes its session supervisor, shell host, greetd greeter and versioned
+also includes its session supervisor, shell host and versioned
 control protocol. Floating windows, workspaces, Alt-Tab, half tiling, scrollable
 tiling and XWayland are covered by graphical CI journeys.
 

@@ -1599,17 +1599,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "greetd_ipc"
-version = "0.10.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "700d2e5bfc91a042d1d531b46de245085c6a179debedf149aa97c7ca71492078"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "gsk4"
 version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4225,7 +4214,6 @@ dependencies = [
  "drm-ffi",
  "futures-lite",
  "gio",
- "greetd_ipc",
  "image",
  "libc",
  "libloading 0.9.0",
@@ -4242,7 +4230,6 @@ dependencies = [
  "signal-hook",
  "smithay",
  "tempfile",
- "tuna-greeter",
  "tuna-magnifier",
  "tuna-shell-control",
  "tuna-wallpaper",
@@ -4256,16 +4243,6 @@ dependencies = [
  "xcursor",
  "xkbcommon 0.9.0",
  "zbus",
-]
-
-[[package]]
-name = "tuna-greeter"
-version = "0.1.0"
-dependencies = [
- "greetd_ipc",
- "gtk4",
- "libadwaita",
- "tempfile",
 ]
 
 [[package]]

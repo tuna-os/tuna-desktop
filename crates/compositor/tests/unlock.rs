@@ -1,10 +1,10 @@
-//! Greetd unlock path tests (session-lock unlock task).
+//! Lock-screen unlock path tests (session-lock unlock task).
 //!
 //! Both acceptance criteria, with auth stubbed at the client seam (no
-//! live greetd in CI). A password-checking stub stands in for the
-//! daemon behind [`UnlockClient`](tuna_compositor::unlock::UnlockClient):
-//! it answers `Success` only when the conversation carries the right
-//! secret, exactly what the real daemon decides. First, the correct
+//! PAM stack in these tests). A password-checking stub stands in for the
+//! authenticator behind [`UnlockClient`](tuna_compositor::unlock::UnlockClient):
+//! it answers `Accepted` only when the conversation carries the right
+//! secret, exactly what PAM decides. First, the correct
 //! password dismisses the lock and restores the session intact
 //! (titles back, same revision). Second, three wrong passwords keep
 //! the session locked with no window content leaked anywhere.
@@ -22,20 +22,19 @@ use std::os::unix::net::UnixStream;
 use std::rc::Rc;
 use std::time::Duration;
 
-use greetd_ipc::{codec::Error as CodecError, AuthMessageType, ErrorType, Response};
 use tuna_compositor::control::ControlHub;
 use tuna_compositor::lock::SessionLock;
 use tuna_compositor::overlay::Overlay;
 use tuna_compositor::state::{StateModel, TokenStore};
-use tuna_compositor::unlock::{unlock_session, UnlockClient};
+use tuna_compositor::unlock::{unlock_session, AuthReply, UnlockClient, Unreachable};
 use tuna_compositor::SEAT_NAME;
 use tuna_shell_control::{decode_frame, encode_frame, Message, CURRENT_VERSION};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE: Duration = Duration::from_millis(200);
 
-/// Fake daemon behind the client seam: succeeds only when the
-/// conversation carries the expected secret, fails generic otherwise.
+/// Fake authenticator behind the client seam: accepts only when the
+/// conversation carries the expected secret, refuses otherwise.
 struct CheckingStub {
     expected: String,
     answers: Vec<Option<String>>,
@@ -53,28 +52,24 @@ impl CheckingStub {
 }
 
 impl UnlockClient for CheckingStub {
-    fn create_session(&mut self, _user: &str) -> Result<Response, CodecError> {
-        Ok(Response::AuthMessage {
-            auth_message_type: AuthMessageType::Secret,
-            auth_message: "Password:".to_string(),
+    fn begin(&mut self, _user: &str) -> Result<AuthReply, Unreachable> {
+        Ok(AuthReply::Prompt {
+            text: "Password:".to_string(),
+            secret: true,
         })
     }
 
-    fn answer(&mut self, text: Option<String>) -> Result<Response, CodecError> {
+    fn answer(&mut self, text: Option<String>) -> Result<AuthReply, Unreachable> {
         self.answers.push(text.clone());
         if text.as_deref() == Some(self.expected.as_str()) {
-            Ok(Response::Success)
+            Ok(AuthReply::Accepted)
         } else {
-            Ok(Response::Error {
-                error_type: ErrorType::AuthError,
-                description: "PAM authentication failed".to_string(),
-            })
+            Ok(AuthReply::Refused)
         }
     }
 
-    fn cancel(&mut self) -> Result<(), CodecError> {
+    fn cancel(&mut self) {
         self.cancelled = true;
-        Ok(())
     }
 }
 
@@ -192,7 +187,7 @@ fn correct_password_dismisses_lock_intact() {
     hub.poll(&mut model);
     assert_locked_without_content(&client_read(&mut client));
 
-    // The correct password clears everything through the greeter path.
+    // The correct password clears everything through the unlock path.
     let mut stub = CheckingStub::new("s3cret");
     assert!(unlock_session(
         &mut idle,

@@ -6,8 +6,8 @@
 #
 # Loads vkms (a kernel virtual GPU with a connected virtual output), runs a
 # private seatd, and starts tuna-compositor --backend drm on that device
-# with its supervised shell: the same code path a TTY login through greetd
-# takes, minus real hardware. Asserts on state, not pixels:
+# with its supervised shell: the same code path a GDM or TTY login takes,
+# minus real hardware. Asserts on state, not pixels:
 #   D-OUTPUT   the backend lit the vkms connector
 #   D-SHELL    the shell connected over the control socket (introspection)
 #   D-IDLE     an unchanged scene stops redundant scanout submissions

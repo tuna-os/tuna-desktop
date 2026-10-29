@@ -622,7 +622,7 @@ fn supported_messages(
 ) -> bool {
     !messages.iter().any(|message| {
         matches!(message.style, Style::Secret | Style::Visible)
-            && tuna_greeter::model::is_fingerprint_prompt(&message.text)
+            && crate::pam::is_fingerprint_prompt(&message.text)
     }) && supported_styles(
         messages.iter().map(|message| message.style),
         secret,

@@ -41,7 +41,7 @@ def admission(package, observed, root, commit, image_id, base_image):
 # Executed inside the final immutable image by the existing CI job. No host
 # filesystem mounts, guest configuration changes, or credentials are required.
 IMAGE_INSPECTION = '''import hashlib,json,os,stat,sys
-names=["/usr/bin/tuna-"+n for n in ("compositor","session","shell-host","shell-gtk","ibus-bridge","greeter")]+["/usr/libexec/tuna-vm-input","/usr/libexec/tuna-vm-lifecycle"]
+names=["/usr/bin/tuna-"+n for n in ("compositor","session","shell-host","shell-gtk","ibus-bridge")]+["/usr/libexec/tuna-vm-input","/usr/libexec/tuna-vm-lifecycle"]
 result={}
 for name in names:
  fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW)

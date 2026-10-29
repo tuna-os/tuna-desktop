@@ -2,7 +2,7 @@
 
 > **Backends.** `tuna-compositor --backend auto` (the default) runs as a
 > DRM/KMS hardware session when started without a host display, for example
-> from a TTY through greetd, and as a nested window otherwise. A hardware
+> as a GDM session or from a TTY, and as a nested window otherwise. A hardware
 > session needs a seat from logind or seatd. Hardware support is new: it is
 > proven on the kernel's virtual KMS device in CI (`scripts/tuna-drm-smoke`)
 > and not yet qualified on real GPUs; the cursor is drawn in software and
@@ -58,11 +58,11 @@ where the distribution has no package).
 
 ```sh
 cargo build --release \
-  -p tuna-compositor -p tuna-shell-host -p tuna-shell-gtk -p tuna-greeter
+  -p tuna-compositor -p tuna-shell-host -p tuna-shell-gtk
 ```
 
 Binaries land in `target/release/`: `tuna-compositor`, `tuna-shell-gtk`,
-`tuna-shell-host`, `tuna-greeter`, and `tuna-session` (the last is a second binary target of
+`tuna-shell-host`, and `tuna-session` (the last is a second binary target of
 the compositor crate).
 
 ## Installing
@@ -72,18 +72,9 @@ PREFIX=/usr/local
 install -Dm0755 target/release/tuna-compositor "$DESTDIR$PREFIX/bin/tuna-compositor"
 install -Dm0755 target/release/tuna-shell-gtk  "$DESTDIR$PREFIX/bin/tuna-shell-gtk"
 install -Dm0755 target/release/tuna-shell-host "$DESTDIR$PREFIX/bin/tuna-shell-host"
-install -Dm0755 target/release/tuna-greeter   "$DESTDIR$PREFIX/bin/tuna-greeter"
 install -Dm0755 target/release/tuna-session   "$DESTDIR$PREFIX/bin/tuna-session"
 install -Dm0644 share/wayland-sessions/tuna.desktop \
   "$DESTDIR$PREFIX/share/wayland-sessions/tuna.desktop"
-```
-
-Optional compatibility symlink for configs written against the `rwd`
-working title (the greeter still detects a legacy `rwd.desktop` entry,
-per `legacy_rwd_entry_still_detected_as_default`):
-
-```sh
-ln -s tuna.desktop "$DESTDIR$PREFIX/share/wayland-sessions/rwd.desktop"
 ```
 
 Keep the binaries side by side: `tuna-session` finds its
@@ -92,21 +83,19 @@ from `TUNA_SHELL_BIN` when set, then `tuna-shell-gtk` and then
 `tuna-shell-host` beside it, then the same two on `PATH`. Set
 `TUNA_SHELL_BIN=tuna-shell-host` to run the legacy shell.
 
-## Greetd wiring
+## Logging in through GDM
 
-Any greetd greeter that lists `wayland-sessions` works. The Tuna Desktop greeter
-enumerates `/usr/share/wayland-sessions` (then `xsessions`), marks the
-`Name=Tuna Desktop` entry default, and launches its `Exec=` line — which must be
-`tuna-session`, never the compositor directly, so shell supervision stays
-in the loop. A minimal `/etc/greetd/config.toml` session:
+GDM is the supported login manager. It lists the entries in
+`/usr/share/wayland-sessions`: choose **Tuna Desktop** from the session menu
+on the login screen. The entry's `Exec=` line is `tuna-session`, never the
+compositor directly, so shell supervision stays in the loop, and
+`X-GDM-SessionRegisters=true` tells GDM the session registers itself.
 
-```toml
-[default_session]
-command = "tuna-greeter"
-user = "greeter"
+The lock screen authenticates through the `tuna-lock` PAM service. The
+packages install it; a source install needs it too, or PAM falls back to the
+`other` service (deny on most distributions) and a locked session cannot be
+unlocked:
+
+```sh
+install -Dm0644 share/pam.d/tuna-lock /etc/pam.d/tuna-lock
 ```
-
-(The greeter takes no session-dir flags: it always enumerates the
-system directories. The contract that matters is the session file above
-parsing to `["tuna-session"]`, covered by
-`crates/greeter/tests/shipped.rs`.)

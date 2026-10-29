@@ -45,8 +45,10 @@ OLD_SESSION = 'usr/share/wayland-sessions/roost.desktop'
 NEW_SESSION = 'usr/share/wayland-sessions/tuna.desktop'
 OLD_BINS = ('roost-compositor', 'roost-greeter', 'roost-ibus-bridge',
             'roost-session', 'roost-shell-gtk', 'roost-shell-host')
-NEW_BINS = ('tuna-compositor', 'tuna-greeter', 'tuna-ibus-bridge',
+NEW_BINS = ('tuna-compositor', 'tuna-ibus-bridge',
             'tuna-session', 'tuna-shell-gtk', 'tuna-shell-host', 'tuna-wallpaper-svg')
+# The released betas also shipped the greetd greeter, since removed (GDM only).
+BETA_BINS = NEW_BINS + ('tuna-greeter',)
 PAM_RULES = [['auth', 'include', 'login'], ['account', 'include', 'login']]
 DEFAULT_PAM = b'auth include login\naccount include login\n'
 ORIGINAL_BETA_OLD_PAM = b'''#%PAM-1.0
@@ -297,7 +299,8 @@ Description: synthetic disposable lifecycle fixture, never release qualification
 '''.encode()}
     if name == 'tuna-desktop':
         files['DEBIAN/control'] += b'Replaces: roost\nConflicts: roost\nProvides: roost\n'
-    for binary in (OLD_BINS if flavor.startswith('prerename') else NEW_BINS):
+    bins = OLD_BINS if flavor.startswith('prerename') else BETA_BINS if flavor == 'beta' else NEW_BINS
+    for binary in bins:
         # These deliberate inert payloads are NEVER executed. The one optional
         # PAM process is a compiled, test-only binary in a synthetic old package.
         files['usr/bin/' + binary] = b'SYNTHETIC PACKAGE PAYLOAD: DO NOT EXECUTE\n'
@@ -530,6 +533,8 @@ class DisposableLifecycle(unittest.TestCase):
         self.case['version_relation'] = EVIDENCE.report['version_relations']['beta-to-candidate']
         self.install(self.candidate)
         self.assert_bridge()
+        # The candidate no longer ships the greeter: dpkg removes it.
+        self.assertFalse(os.path.lexists(self.root / 'usr/bin/tuna-greeter'))
 
     def test_beta_administrator_modified_policy_is_preserved(self):
         self.install(self.beta)

@@ -24,22 +24,23 @@ existing password field and silent failure response remain intact.
 The slot tracks the **outer password wrapper**. The existing PAM deadline can
 return while its inner worker still runs. This change does not prove PAM worker
 retirement or strict backend single-flight. The private PAM helper and its stable
-owner are a separate adoption step. Greetd daemon state is also outside the
-outer worker's retirement proof.
+owner are a separate adoption step.
 
 Unit tests use real Unix sockets for connection routing, excess requests,
 half-close with unread data, compaction, reconnect, admission changes and counter
 overflow. Slot tests cover stale and duplicate results, suspend invalidation and
-lock epochs. A required CI fixture runs the actual nested compositor with an
-owned supervised control client and a delayed controlled greetd daemon. It checks
-busy denials, origin loss, late success, fresh success, manual lock and idle lock.
-Its receipt binds source, binaries and the supervised client's process identity.
-Rust and runtime results remain pending until the exact candidate passes CI.
+lock epochs. A required CI fixture runs the actual compositor with an owned
+supervised control client and a delayed controlled PAM module (loaded through
+libpam_wrapper into the private PAM helper). It checks busy denials, origin loss
+waking and retiring the held helper without releasing the module, fresh success
+from the held self image, manual lock and idle lock. Its receipt binds source,
+binaries and the supervised client's process identity. Rust and runtime results
+remain pending until the exact candidate passes CI.
 
-The fixture keeps a 30-second total parent deadline. Its five-second greetd
-accept budget starts only after the supervised client initiates that numbered
-authentication attempt, not while the compositor is still starting. Each
-cross-process JSON receipt (`success.json`, `epoch-injected.json` and
+The fixture keeps a 30-second total parent deadline. The module publishes each
+numbered attempt's helper PID only after the complete PID is written and then
+waits for that attempt's release marker, bounded by the private helper budget
+and the outer watchdog. Each cross-process JSON receipt (`success.json`, `epoch-injected.json` and
 `sync-result.json`) is written to a sibling temporary file and renamed into
 place, so existence signals a complete document. These synchronization rules
 do not relax any ownership, lock-epoch or private PAM retirement assertions.
@@ -55,12 +56,15 @@ same private runtime loop on its main thread through a narrow authentication
 probe. The normal compositor supplies a no-op probe. It gains no environment,
 CLI, configuration or control-wire injection command.
 
-While a correct delayed greetd attempt owns the outer slot, the probe verifies
-that public `Runtime::try_unlock` rejects another attempt. It advances the same
-epoch helper used by the sleep monitor. The late correct result must deny while
-its original connection stays live. A fresh connection can then authenticate.
-After manual relock, the probe calls the real synchronous public unlock path and
-checks its success epoch and lock flags.
+The probe re-executes its own held image as the private PAM helper, like the
+compositor binary. While a delayed controlled PAM attempt owns the outer slot,
+another connection is denied and the probe verifies that public
+`Runtime::try_unlock` rejects another attempt. It advances the same epoch helper
+used by the sleep monitor. The stale attempt must deny while its original
+connection stays live, and its helper must retire without the module ever being
+released to succeed. A fresh connection can then authenticate. After manual
+relock, the probe calls the real synchronous public unlock path and checks its
+success epoch and lock flags.
 
 This is controlled runtime epoch injection. It is not actual logind notification
 or S3, nor an observation of a backend sending a duplicate result. Existing

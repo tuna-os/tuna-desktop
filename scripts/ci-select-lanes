@@ -33,16 +33,16 @@ import sys
 # Selectable ci.yml proof jobs, in workflow order.
 LANES = [
     "fprint-phase-proof", "journey", "app-content", "scroll-proof", "drm-smoke",
-    "grid-cancel-comparison", "greeter", "gtk-shell",
+    "grid-cancel-comparison", "gtk-shell",
     "portal-security", "remote-security", "niri-parity", "arch-package",
     "marlin-image", "marlin-vm", "parity-ledger", "docs-shots",
 ]
 
 # Every code change runs the GTK shell proof: it drives the compositor and
 # the preferred shell together and is what most changes touch. The
-# fingerprint phase, grid-cancel comparison and greeter proofs are short
-# and cover authentication and drag paths no rotated lane does.
-CORE = ["fprint-phase-proof", "grid-cancel-comparison", "greeter", "gtk-shell"]
+# fingerprint phase and grid-cancel comparison proofs are short and cover
+# authentication and drag paths no rotated lane does.
+CORE = ["fprint-phase-proof", "grid-cancel-comparison", "gtk-shell"]
 
 # Interchangeable end-to-end coverage of the same build, rotated per run.
 ROTATION = [
@@ -57,7 +57,7 @@ NEEDS = {
     "niri-parity": ["arch-package"],
     "marlin-image": ["arch-package"],
     "marlin-vm": ["arch-package"],
-    "parity-ledger": ["journey", "greeter", "gtk-shell", "drm-smoke", "marlin-vm"],
+    "parity-ledger": ["journey", "gtk-shell", "drm-smoke", "marlin-vm"],
     "docs-shots": ["journey", "app-content", "scroll-proof"],
 }
 

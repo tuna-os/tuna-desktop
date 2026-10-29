@@ -830,8 +830,9 @@ impl AuthMachine {
         }
     }
 
-    /// Password said Unavailable: no conversation backend (greetd), so the
-    /// prompt sends one password with `Unlock`, as before conversations.
+    /// Password said Unavailable: no conversation (no PAM backend or session
+    /// user, or a quarantined helper), so the prompt sends one password with
+    /// `Unlock`, as before conversations.
     fn fall_back(&mut self, host: &dyn Host) {
         self.legacy = true;
         self.query = None;

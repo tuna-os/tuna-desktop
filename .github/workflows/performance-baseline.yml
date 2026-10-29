@@ -207,7 +207,7 @@ jobs:
             while IFS= read -r loader; do
             sudo podman run --rm "localhost/marlin-tuna-preview:$profile" sh -eu -c 'test -f "$1" && test -x "$1" && sha256sum "$1"' sh "$loader"
             done < <(jq -r '.required_members[] | select(.elf) | .elf.interpreter' perf-artifacts/package-payload.json | sort -u) | tee "$profile_artifacts/installed-interpreters.log"
-            for bin in tuna-compositor tuna-session tuna-shell-host tuna-shell-gtk tuna-ibus-bridge tuna-greeter; do
+            for bin in tuna-compositor tuna-session tuna-shell-host tuna-shell-gtk tuna-ibus-bridge; do
             sudo podman run --rm "localhost/marlin-tuna-preview:$profile" sh -eu -c 'command -v "$1" && ldd "/usr/bin/$1"' sh "$bin" > "$profile_artifacts/runtime-versions/$bin.ldd" 2>&1
             if sudo podman run --rm "localhost/marlin-tuna-preview:$profile" "$bin" --version > "$profile_artifacts/runtime-versions/$bin.version" 2>&1; then
               printf '0\n' > "$profile_artifacts/runtime-versions/$bin.status"

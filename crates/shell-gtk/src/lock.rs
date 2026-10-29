@@ -7,10 +7,10 @@
 //! key") and the unlock prompt, moved between on GNOME's transition
 //! (`lock_curtain.rs`), and drives GNOME's `AuthPrompt` flow over the
 //! control protocol (`lock_auth.rs`): password and fingerprint side by
-//! side, each PAM question in turn, GNOME's messages and Back. Without a
-//! conversation backend (greetd) it falls back to one redacted `Unlock`
-//! command. It releases its lock surfaces once the compositor's snapshot
-//! says the session is unlocked, never on its own.
+//! side, each PAM question in turn, GNOME's messages and Back. When the
+//! password conversation is unavailable it falls back to one redacted
+//! `Unlock` command. It releases its lock surfaces once the compositor's
+//! snapshot says the session is unlocked, never on its own.
 //!
 //! Measurements are from GNOME Shell 51's own lock screen at 1280x800
 //! (docs/gnome-parity.md, states 11 and 11b).

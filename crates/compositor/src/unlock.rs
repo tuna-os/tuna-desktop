@@ -1,85 +1,70 @@
-//! Greetd unlock path (session-lock, unlock task).
+//! Lock-screen unlock path (session-lock, unlock task).
 //!
-//! Credential entry on the lock surface is verified through the greeter
-//! crate's login machinery — [`GreeterClient`] for the greetd
-//! conversation and [`GreeterModel`] for the prompt state machine —
-//! never through a parallel password check. There is no live daemon in
-//! CI, so [`UnlockClient`] is the seam tests stub at; production passes
-//! the real [`GreeterClient`], connected to `$GREETD_SOCK` by the
-//! runtime. When no daemon is reachable the attempt fails closed: the
-//! session stays locked and silent.
+//! Credential entry on the lock surface is verified by PAM's `tuna-lock`
+//! service (see [`crate::pam`]), never by a parallel password check.
+//! [`UnlockClient`] is the conversation seam: [`crate::pam::PamClient`]
+//! is the PAM implementation and tests stub here. When the authenticator
+//! is unreachable the attempt fails closed: the session stays locked and
+//! silent.
 //!
-//! Unlock authenticates only: on success the pending greetd
-//! conversation is cancelled (never started — this session is already
-//! running) and the compositor-owned flag clears, restoring the intact
-//! session on the next hub poll. Failures — bad credentials, daemon
-//! errors, transport drops, endless prompts — all collapse to
-//! [`UnlockOutcome::Denied`], which carries no detail by construction.
-//! Secrets are never logged and daemon text never surfaces.
-//!
-//! [`GreeterClient`]: tuna_greeter::client::GreeterClient
-//! [`GreeterModel`]: tuna_greeter::model::GreeterModel
-
-use greetd_ipc::{codec::Error as CodecError, Response};
-use tuna_greeter::{
-    client::GreeterClient,
-    model::{GreeterModel, ModelEvent},
-};
+//! Unlock authenticates only: on success the pending conversation is
+//! cancelled (nothing starts — this session is already running) and the
+//! compositor-owned flag clears, restoring the intact session on the next
+//! hub poll. Failures — bad credentials, authenticator errors, transport
+//! drops, endless prompts — all collapse to [`UnlockOutcome::Denied`],
+//! which carries no detail by construction. Secrets are never logged and
+//! authenticator text never surfaces.
 
 use crate::control::ControlHub;
 use crate::lock::SessionLock;
 use crate::overlay::Overlay;
 
-/// Environment variable holding the live greetd socket path.
-pub const GREETD_SOCKET_ENV: &str = "GREETD_SOCK";
-
-/// Upper bound on daemon prompt rounds per unlock attempt. A daemon
-/// that keeps prompting (misconfiguration or abuse) denies instead of
-/// looping forever.
+/// Upper bound on authenticator prompt rounds per unlock attempt. An
+/// authenticator that keeps prompting (misconfiguration or abuse) denies
+/// instead of looping forever.
 pub const MAX_AUTH_ROUNDS: usize = 8;
 
 /// Outcome of one unlock attempt. `Denied` covers every failure mode
-/// — wrong credentials, daemon errors, transport drops — and carries
-/// no detail, so failures stay silent and leak nothing.
+/// — wrong credentials, authenticator errors, transport drops — and
+/// carries no detail, so failures stay silent and leak nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnlockOutcome {
-    /// The daemon authenticated the credentials.
+    /// The authenticator accepted the credentials.
     Unlocked,
     /// Anything else: stay locked, say nothing.
     Denied,
 }
 
-/// The client seam [`attempt_unlock`] drives. [`GreeterClient`] is the
-/// production implementation; tests stub here (no live greetd in CI).
+/// One authenticator reply in an unlock conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthReply {
+    /// A question; `secret` masks the answer (PAM's echo-off prompt).
+    Prompt { text: String, secret: bool },
+    /// An informational or error notice that asks nothing: acknowledged
+    /// with an empty answer.
+    Notice,
+    /// The credentials were accepted.
+    Accepted,
+    /// The credentials were refused. Never carries the authenticator's
+    /// detail, which could distinguish bad user from bad secret.
+    Refused,
+}
+
+/// The authenticator could not be reached or the conversation broke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unreachable;
+
+/// The conversation seam [`attempt_unlock`] drives.
+/// [`crate::pam::PamClient`] is the production implementation; tests
+/// stub here.
 pub trait UnlockClient {
-    /// Open a login attempt for `user`; the daemon's first response.
-    fn create_session(&mut self, user: &str) -> Result<Response, CodecError>;
-    /// Answer the last auth message (`None` acknowledges info/error
-    /// messages that carry no question).
-    fn answer(&mut self, text: Option<String>) -> Result<Response, CodecError>;
-    /// Release a successful attempt without starting a session.
-    fn cancel(&mut self) -> Result<(), CodecError>;
-}
-
-impl UnlockClient for GreeterClient {
-    fn create_session(&mut self, user: &str) -> Result<Response, CodecError> {
-        GreeterClient::create_session(self, user)
-    }
-
-    fn answer(&mut self, text: Option<String>) -> Result<Response, CodecError> {
-        GreeterClient::answer(self, text)
-    }
-
-    fn cancel(&mut self) -> Result<(), CodecError> {
-        GreeterClient::cancel(self)
-    }
-}
-
-/// Live greetd socket path from the environment, if configured.
-pub fn greetd_socket_path() -> Option<String> {
-    std::env::var(GREETD_SOCKET_ENV)
-        .ok()
-        .filter(|path| !path.is_empty())
+    /// Open an authentication attempt for `user`; the first reply.
+    fn begin(&mut self, user: &str) -> Result<AuthReply, Unreachable>;
+    /// Answer the last reply (`None` acknowledges a notice that carries
+    /// no question).
+    fn answer(&mut self, text: Option<String>) -> Result<AuthReply, Unreachable>;
+    /// Release the attempt without starting anything.
+    fn cancel(&mut self);
 }
 
 /// Username to authenticate as when unlocking: the session owner's
@@ -91,53 +76,47 @@ pub fn unlock_user() -> Option<String> {
         .filter(|user| !user.is_empty())
 }
 
-/// Verify one entered password through the greeter login path: open a
-/// greetd attempt for `user`, answer at most one ordinary Secret prompt
-/// (info/error notices auto-acknowledge exactly like login), and
-/// report the outcome. Success cancels the pending conversation —
-/// this session is already running, so nothing starts.
+/// Verify one entered password: open an attempt for `user`, answer at
+/// most one ordinary secret prompt with the password (notices
+/// auto-acknowledge), and report the outcome. Success cancels the
+/// pending conversation — this session is already running, so nothing
+/// starts.
 ///
 /// Every failure collapses to [`UnlockOutcome::Denied`] with no
-/// detail: wrong credentials, daemon errors, transport failures, and
-/// prompt loops beyond [`MAX_AUTH_ROUNDS`].
+/// detail: wrong credentials, authenticator errors, transport failures,
+/// and prompt loops beyond [`MAX_AUTH_ROUNDS`]. A visible prompt, a
+/// fingerprint prompt, or a second secret prompt cancels the attempt:
+/// the password is never replayed into a distinct challenge.
 pub fn attempt_unlock(client: &mut impl UnlockClient, user: &str, password: &str) -> UnlockOutcome {
-    let mut model = GreeterModel::new();
-    model.begin_user(user);
-    let mut response = match client.create_session(user) {
-        Ok(response) => response,
-        Err(_) => return UnlockOutcome::Denied,
+    let Ok(mut reply) = client.begin(user) else {
+        return UnlockOutcome::Denied;
     };
     let mut password_used = false;
     for _ in 0..MAX_AUTH_ROUNDS {
-        match model.apply_response(&response) {
-            ModelEvent::NeedAnswer { prompt } => {
-                if prompt.fingerprint || !prompt.secret || password_used {
-                    // This adapter has no typed answer for a device challenge.
-                    // Never replay a password (or acknowledge it as an answer).
-                    let _ = client.cancel();
+        let answer = match reply {
+            AuthReply::Prompt { text, secret } => {
+                if !secret || password_used || crate::pam::is_fingerprint_prompt(&text) {
+                    // No typed answer exists for a device or distinct
+                    // challenge. Never replay the password into it.
+                    client.cancel();
                     return UnlockOutcome::Denied;
                 }
                 password_used = true;
-                response = match client.answer(Some(password.to_string())) {
-                    Ok(response) => response,
-                    Err(_) => return UnlockOutcome::Denied,
-                };
+                Some(password.to_string())
             }
-            ModelEvent::AutoAck => {
-                response = match client.answer(None) {
-                    Ok(response) => response,
-                    Err(_) => return UnlockOutcome::Denied,
-                };
-            }
-            ModelEvent::Authenticated => {
+            AuthReply::Notice => None,
+            AuthReply::Accepted => {
                 // Authenticated only: release the pending attempt
-                // without starting anything; best-effort, the daemon
-                // drops it on disconnect either way.
-                let _ = client.cancel();
+                // without starting anything.
+                client.cancel();
                 return UnlockOutcome::Unlocked;
             }
-            ModelEvent::Failed => return UnlockOutcome::Denied,
-        }
+            AuthReply::Refused => return UnlockOutcome::Denied,
+        };
+        reply = match client.answer(answer) {
+            Ok(reply) => reply,
+            Err(Unreachable) => return UnlockOutcome::Denied,
+        };
     }
     UnlockOutcome::Denied
 }
@@ -262,30 +241,15 @@ pub fn run_fingerprint(
     FingerprintEnd::Failed
 }
 
-/// Verify `password` for `user` the way [`unlock_session`] does, without
-/// touching any lock state: greetd's daemon when one runs, else PAM's
-/// `tuna-lock` service (GDM sessions). Blocking (PAM may delay a
-/// failure for seconds), so the runtime calls it on a worker thread.
-pub(crate) fn verify_greetd(path: &str, user: &str, password: &str) -> bool {
-    let Ok(mut client) = GreeterClient::connect(path) else {
-        return false;
-    };
-    matches!(
-        attempt_unlock(&mut client, user, password),
-        UnlockOutcome::Unlocked
-    )
-}
-
+/// Verify `password` for `user` against PAM's `tuna-lock` service without
+/// touching any lock state. Blocking (PAM may delay a failure for
+/// seconds), so the runtime calls it on a worker thread.
 pub fn verify(user: &str, password: &str) -> bool {
-    if let Some(path) = greetd_socket_path() {
-        return verify_greetd(&path, user, password);
-    }
     crate::pam::authenticate_with_deadline(&crate::pam::service(), user, password)
 }
 
 /// Off-loop ownership path. PAM timeout emits denial while the SAME outer
 /// wrapper waits for actual helper retirement; poison is never a retirement.
-/// Configured greetd remains authoritative and never falls back to PAM.
 pub fn verify_owned(
     user: &str,
     password: tuna_shell_control::Secret,
@@ -306,14 +270,8 @@ pub(crate) fn verify_owned_credential(
     cancel: crate::pam_cancel::Cancellation,
     pending: impl FnMut(),
 ) -> crate::pam_backend::Verification {
-    use crate::pam_backend::Verification;
-    if let Some(path) = greetd_socket_path() {
-        return Verification::Retired {
-            authenticated: verify_greetd(&path, user, password.as_str()),
-        };
-    }
     let Some(backend) = crate::pam_backend::Backend::live() else {
-        return Verification::RejectedBeforeSpawn;
+        return crate::pam_backend::Verification::RejectedBeforeSpawn;
     };
     match backend.begin_credential(crate::pam::service(), user.to_owned(), password, cancel) {
         Ok(ticket) => ticket.wait_retired(pending),
@@ -343,7 +301,7 @@ pub fn session_user() -> Option<String> {
 /// unlocked afterwards.
 ///
 /// An already-unlocked session returns true without contacting the
-/// daemon — nothing is protected, so no credential is needed.
+/// authenticator — nothing is protected, so no credential is needed.
 /// Failures touch nothing: the flag, the hub mirror, and the surface
 /// stay exactly as they were, silently.
 pub fn unlock_session(
@@ -376,40 +334,32 @@ pub fn unlock_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use greetd_ipc::{AuthMessageType, ErrorType};
     use std::collections::VecDeque;
 
-    fn secret_prompt(text: &str) -> Response {
-        Response::AuthMessage {
-            auth_message_type: AuthMessageType::Secret,
-            auth_message: text.to_string(),
+    fn secret_prompt(text: &str) -> AuthReply {
+        AuthReply::Prompt {
+            text: text.to_string(),
+            secret: true,
         }
     }
 
-    fn info_notice(text: &str) -> Response {
-        Response::AuthMessage {
-            auth_message_type: AuthMessageType::Info,
-            auth_message: text.to_string(),
+    fn visible_prompt(text: &str) -> AuthReply {
+        AuthReply::Prompt {
+            text: text.to_string(),
+            secret: false,
         }
     }
 
-    fn auth_error() -> Response {
-        Response::Error {
-            error_type: ErrorType::AuthError,
-            description: "PAM authentication failed".to_string(),
-        }
-    }
-
-    /// Scripted seam stub: canned replies for `create_session` then
-    /// each `answer`, recording every answer verbatim.
+    /// Scripted seam stub: canned replies for `begin` then each
+    /// `answer`, recording every answer verbatim.
     struct ScriptStub {
-        replies: VecDeque<Result<Response, CodecError>>,
+        replies: VecDeque<Result<AuthReply, Unreachable>>,
         answers: Vec<Option<String>>,
         cancelled: bool,
     }
 
     impl ScriptStub {
-        fn new(replies: Vec<Result<Response, CodecError>>) -> Self {
+        fn new(replies: Vec<Result<AuthReply, Unreachable>>) -> Self {
             Self {
                 replies: replies.into(),
                 answers: Vec::new(),
@@ -417,37 +367,31 @@ mod tests {
             }
         }
 
-        fn next_reply(&mut self) -> Result<Response, CodecError> {
-            self.replies.pop_front().unwrap_or(Err(CodecError::Eof))
+        fn next_reply(&mut self) -> Result<AuthReply, Unreachable> {
+            self.replies.pop_front().unwrap_or(Err(Unreachable))
         }
     }
 
     impl UnlockClient for ScriptStub {
-        fn create_session(&mut self, _user: &str) -> Result<Response, CodecError> {
+        fn begin(&mut self, _user: &str) -> Result<AuthReply, Unreachable> {
             self.next_reply()
         }
 
-        fn answer(&mut self, text: Option<String>) -> Result<Response, CodecError> {
+        fn answer(&mut self, text: Option<String>) -> Result<AuthReply, Unreachable> {
             self.answers.push(text);
             self.next_reply()
         }
 
-        fn cancel(&mut self) -> Result<(), CodecError> {
+        fn cancel(&mut self) {
             self.cancelled = true;
-            Ok(())
         }
     }
 
     #[test]
     fn fingerprint_questions_never_receive_password_and_cancel_the_attempt() {
-        for style in [AuthMessageType::Secret, AuthMessageType::Visible] {
-            let mut stub = ScriptStub::new(vec![
-                Ok(Response::AuthMessage {
-                    auth_message_type: style,
-                    auth_message: "Place your finger on the fingerprint reader".into(),
-                }),
-                Ok(Response::Success),
-            ]);
+        let text = "Place your finger on the fingerprint reader";
+        for prompt in [secret_prompt(text), visible_prompt(text)] {
+            let mut stub = ScriptStub::new(vec![Ok(prompt), Ok(AuthReply::Accepted)]);
             assert_eq!(
                 attempt_unlock(&mut stub, "ada", "owned-fixture-secret"),
                 UnlockOutcome::Denied
@@ -461,7 +405,7 @@ mod tests {
         let mut stub = ScriptStub::new(vec![
             Ok(secret_prompt("Password:")),
             Ok(secret_prompt("Swipe your finger again")),
-            Ok(Response::Success),
+            Ok(AuthReply::Accepted),
         ]);
         assert_eq!(
             attempt_unlock(&mut stub, "ada", "owned-fixture-secret"),
@@ -471,11 +415,11 @@ mod tests {
         assert!(stub.cancelled);
     }
     #[test]
-    fn fingerprint_info_remains_empty_ack_then_normal_password_succeeds() {
+    fn fingerprint_notice_remains_empty_ack_then_normal_password_succeeds() {
         let mut stub = ScriptStub::new(vec![
-            Ok(info_notice("Place your finger on the fingerprint reader")),
+            Ok(AuthReply::Notice),
             Ok(secret_prompt("Password:")),
-            Ok(Response::Success),
+            Ok(AuthReply::Accepted),
         ]);
         assert_eq!(
             attempt_unlock(&mut stub, "ada", "owned-fixture-secret"),
@@ -487,7 +431,10 @@ mod tests {
 
     #[test]
     fn correct_password_unlocks_and_releases_the_attempt() {
-        let mut stub = ScriptStub::new(vec![Ok(secret_prompt("Password:")), Ok(Response::Success)]);
+        let mut stub = ScriptStub::new(vec![
+            Ok(secret_prompt("Password:")),
+            Ok(AuthReply::Accepted),
+        ]);
         assert_eq!(
             attempt_unlock(&mut stub, "ada", "s3cret"),
             UnlockOutcome::Unlocked
@@ -500,7 +447,8 @@ mod tests {
 
     #[test]
     fn wrong_password_denies_without_release() {
-        let mut stub = ScriptStub::new(vec![Ok(secret_prompt("Password:")), Ok(auth_error())]);
+        let mut stub =
+            ScriptStub::new(vec![Ok(secret_prompt("Password:")), Ok(AuthReply::Refused)]);
         assert_eq!(
             attempt_unlock(&mut stub, "mallory", "wrong"),
             UnlockOutcome::Denied
@@ -509,8 +457,8 @@ mod tests {
     }
 
     #[test]
-    fn daemon_unreachable_denies_silently() {
-        let mut stub = ScriptStub::new(vec![Err(CodecError::Eof)]);
+    fn authenticator_unreachable_denies_silently() {
+        let mut stub = ScriptStub::new(vec![Err(Unreachable)]);
         assert_eq!(
             attempt_unlock(&mut stub, "ada", "s3cret"),
             UnlockOutcome::Denied
@@ -520,7 +468,7 @@ mod tests {
 
     #[test]
     fn mid_conversation_drop_denies() {
-        let mut stub = ScriptStub::new(vec![Ok(secret_prompt("Password:")), Err(CodecError::Eof)]);
+        let mut stub = ScriptStub::new(vec![Ok(secret_prompt("Password:")), Err(Unreachable)]);
         assert_eq!(
             attempt_unlock(&mut stub, "ada", "s3cret"),
             UnlockOutcome::Denied
@@ -531,15 +479,12 @@ mod tests {
     fn distinct_pin_or_visible_prompt_never_receives_reused_password() {
         for second in [
             secret_prompt("Separate PIN:"),
-            Response::AuthMessage {
-                auth_message_type: AuthMessageType::Visible,
-                auth_message: "Visible second challenge".into(),
-            },
+            visible_prompt("Visible second challenge"),
         ] {
             let mut stub = ScriptStub::new(vec![
                 Ok(secret_prompt("Password:")),
                 Ok(second),
-                Ok(Response::Success),
+                Ok(AuthReply::Accepted),
             ]);
             assert_eq!(
                 attempt_unlock(&mut stub, "ada", "owned-first-answer"),
@@ -548,10 +493,7 @@ mod tests {
             assert_eq!(stub.answers, [Some("owned-first-answer".into())]);
             assert!(stub.cancelled);
         }
-        let mut stub = ScriptStub::new(vec![Ok(Response::AuthMessage {
-            auth_message_type: AuthMessageType::Visible,
-            auth_message: "PIN:".into(),
-        })]);
+        let mut stub = ScriptStub::new(vec![Ok(visible_prompt("PIN:"))]);
         assert_eq!(
             attempt_unlock(&mut stub, "ada", "owned-first-answer"),
             UnlockOutcome::Denied
@@ -575,13 +517,28 @@ mod tests {
     }
 
     #[test]
-    fn info_notice_auto_acknowledges_like_login() {
-        let mut stub = ScriptStub::new(vec![Ok(info_notice("Hello.")), Ok(Response::Success)]);
+    fn endless_notices_deny_bounded() {
+        let mut stub = ScriptStub::new(
+            (0..MAX_AUTH_ROUNDS + 4)
+                .map(|_| Ok(AuthReply::Notice))
+                .collect(),
+        );
+        assert_eq!(
+            attempt_unlock(&mut stub, "ada", "s3cret"),
+            UnlockOutcome::Denied
+        );
+        assert_eq!(stub.answers.len(), MAX_AUTH_ROUNDS);
+        assert!(stub.answers.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn notice_auto_acknowledges_empty() {
+        let mut stub = ScriptStub::new(vec![Ok(AuthReply::Notice), Ok(AuthReply::Accepted)]);
         assert_eq!(
             attempt_unlock(&mut stub, "ada", "s3cret"),
             UnlockOutcome::Unlocked
         );
-        // Info carries no question: acknowledged empty, unprompted.
+        // A notice carries no question: acknowledged empty, unprompted.
         assert_eq!(stub.answers, vec![None]);
     }
 

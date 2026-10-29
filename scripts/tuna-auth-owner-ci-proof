@@ -48,11 +48,6 @@ python3 scripts/lib/auth-display-readiness.py "$out/display" "$xvfb_pid" "$out/d
 IFS= read -r display_num < "$out/display-admitted"
 case "$display_num" in ''|*[!0-9]*) exit 1 ;; esac
 trap - ERR
-DISPLAY=":$display_num" TUNA_REQUIRE_AUTH_OWNER_RUNTIME=1 TUNA_AUTH_OWNER_ARTIFACTS="$out/runtime" \
-    timeout --kill-after=3s 45s \
-    "$test_executable" --exact actual_runtime_owns_delayed_greetd_result_and_lock_epochs --nocapture 2>&1 | tee "$out/test.log"
-grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$out/test.log"
-grep -q '^auth owner compositor runtime receipt: ' "$out/test.log"
 IFS= read -r probe_executable < "$out/probe-executable"
 DISPLAY=":$display_num" TUNA_REQUIRE_AUTH_OWNER_RUNTIME=1 TUNA_AUTH_OWNER_ARTIFACTS="$out/runtime-epoch" TUNA_AUTH_OWNER_PROBE_BIN="$probe_executable" \
     timeout --kill-after=3s 45s \
@@ -82,11 +77,8 @@ assert hashlib.sha256((out/'build.json').read_bytes()).hexdigest()==r['build_sha
 assert hashlib.sha256((out/'metadata.json').read_bytes()).hexdigest()==r['metadata_sha256'],'package metadata changed'
 assert hashlib.sha256((out/'probe-build.json').read_bytes()).hexdigest()==r['probe_build_sha256'],'probe build metadata changed'
 for path,wanted in r['executables'].items():assert hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()==wanted,'binary changed'
-receipt=json.loads((out/'runtime/success.json').read_text());assert receipt['late_closed_origin_success_denied'] and receipt['fresh_origin_success']
-lines=[l.removeprefix('auth owner compositor sha256: ') for l in (out/'test.log').read_text().splitlines() if l.startswith('auth owner compositor sha256: ')]
-assert len(lines)==1 and lines[0] == r['executables'][r['compositor']],'actual compositor mismatched'
 epoch_receipt=json.loads((out/'runtime-epoch/success.json').read_text())
-for key in ['late_epoch_success_denied','busy_public_sync_denied','fresh_origin_success','public_sync_success']:assert epoch_receipt[key] is True
+for key in ['stale_epoch_attempt_denied_retired','busy_other_origin_denied','busy_public_sync_denied','fresh_origin_success','public_sync_success']:assert epoch_receipt[key] is True
 probe_lines=[l.removeprefix('auth owner probe sha256: ') for l in (out/'test-epoch.log').read_text().splitlines() if l.startswith('auth owner probe sha256: ')]
 assert len(probe_lines)==1 and probe_lines[0]==r['executables'][r['probe']],'actual Runtime probe mismatched'
 pam_receipt=json.loads((out/'runtime-pam/success.json').read_text())

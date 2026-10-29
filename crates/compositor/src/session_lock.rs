@@ -6,7 +6,7 @@
 //! compositor-owned). A lock request is granted only to the supervised
 //! shell (the runtime checks the client's pid), and a client's unlock
 //! never unlocks by itself: the session unlocks only once the
-//! compositor has verified the password (PAM or greetd) and cleared its
+//! compositor has verified the password through PAM and cleared its
 //! flag. Until then the lock surfaces are all that is drawn and all that
 //! takes input.
 

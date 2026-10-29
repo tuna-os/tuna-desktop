@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 smithay.workspace = true
-# Lock-screen PAM (unlock under GDM, where no greetd runs): libpam is
+# Lock-screen PAM (the `tuna-lock` service): libpam is
 # loaded at run time, so builds need no PAM headers and a system without
 # it fails closed.
 libc = "0.2"
@@ -45,11 +45,6 @@ wayland-protocols.workspace = true
 wayland-server.workspace = true
 wayland-scanner = "=0.31.11"
 tuna-shell-control = { path = "../shell-control-schema", version = "0.1.0" }
-# The unlock path uses the greeter's prompt model and greetd client only; the
-# GTK window is never constructed here, so `gtk-ui` stays off and the
-# compositor's build needs no GTK system libraries.
-tuna-greeter = { path = "../greeter", version = "0.1.0", default-features = false }
-greetd_ipc.workspace = true
 image.workspace = true
 tempfile = "3"
 tuna-wallpaper = { path = "../wallpaper" }

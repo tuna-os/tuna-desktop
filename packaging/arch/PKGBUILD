@@ -54,7 +54,6 @@ optdepends=(
     'orca: GNOME Screen Reader activation and speech'
     'gnome-keyring: user network secret storage'
     'xdg-desktop-portal-gnome: screenshots and screen sharing for apps'
-    'greetd: login manager driving tuna-greeter'
     'xorg-xwayland: X11 application support'
     'ibus: input methods (tuna-ibus-bridge, as GNOME uses IBus)'
     'gst-plugin-pipewire: screen recording from the screenshot UI'
@@ -91,12 +90,12 @@ build() {
     export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$srcdir/target}"
     export TUNA_VERSION="v${_semver}"
     cargo build --frozen --release \
-        -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-host -p tuna-shell-gtk -p tuna-greeter
+        -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-host -p tuna-shell-gtk
 }
 
 check() {
     local bin
-    for bin in tuna-compositor tuna-session tuna-shell-host tuna-shell-gtk tuna-ibus-bridge tuna-greeter tuna-wallpaper-svg; do
+    for bin in tuna-compositor tuna-session tuna-shell-host tuna-shell-gtk tuna-ibus-bridge tuna-wallpaper-svg; do
         local reported
         reported="$("${CARGO_TARGET_DIR:-$srcdir/target}/release/$bin" --version | awk '{print $NF}')"
         if [[ "$reported" != "$_semver" ]]; then
@@ -110,7 +109,7 @@ package() {
     local root target bin
     root="$(_srcroot)"
     target="${CARGO_TARGET_DIR:-$srcdir/target}/release"
-    for bin in tuna-compositor tuna-session tuna-shell-host tuna-shell-gtk tuna-ibus-bridge tuna-greeter tuna-wallpaper-svg; do
+    for bin in tuna-compositor tuna-session tuna-shell-host tuna-shell-gtk tuna-ibus-bridge tuna-wallpaper-svg; do
         install -Dm0755 "$target/$bin" "$pkgdir/usr/bin/$bin"
     done
     install -Dm0644 "$root/share/wayland-sessions/tuna.desktop" \
@@ -129,7 +128,7 @@ package() {
     # Private GNOME51 scalable cursor fallback; no system Adwaita file conflicts.
     install -d "$pkgdir/usr/share/tuna-desktop/icons"
     cp -a "$root/share/tuna-desktop/icons/." "$pkgdir/usr/share/tuna-desktop/icons/"
-    # Lock-screen PAM service (#62): unlock under GDM, where no greetd runs.
+    # Lock-screen PAM service (#62): the compositor's unlock authenticates here.
     install -Dm0644 "$root/share/pam.d/tuna-lock" "$pkgdir/etc/pam.d/tuna-lock"
     # Both PAM services use pacman backup handling; no migration hooks.
     # tuna-rename: keep-begin

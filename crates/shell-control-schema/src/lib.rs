@@ -373,7 +373,7 @@ pub enum CommandKind {
         active: bool,
     },
     /// The lock screen's password: the compositor verifies it through
-    /// session auth (PAM, or greetd's daemon) off its event loop and
+    /// session auth (PAM) off its event loop and
     /// unlocks only on success. The result comes back as this command's
     /// `CommandResult` (`Applied` unlocked, `Denied` wrong password).
     Unlock {

@@ -24,7 +24,7 @@ MAX_MEMBER = 64 * 1024 * 1024
 MAX_TAR = 512 * 1024 * 1024
 BINS = tuple(f"usr/bin/{name}" for name in (
     "tuna-compositor", "tuna-session", "tuna-shell-host",
-    "tuna-shell-gtk", "tuna-ibus-bridge", "tuna-greeter"))
+    "tuna-shell-gtk", "tuna-ibus-bridge"))
 REQUIRED = BINS + ("usr/share/wayland-sessions/tuna.desktop",
                   "usr/lib/systemd/user/tuna-session.target", "etc/pam.d/tuna-lock")
 

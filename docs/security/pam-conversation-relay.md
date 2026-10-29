@@ -64,8 +64,8 @@ Retired can free it; an owner with poison cannot accept a new job.
 
 ## Compatibility and tests
 
-The single-password PAM adapter still sends at most one secret. The greetd
-compatibility adapter now also sends at most one ordinary Secret answer. It
+The single-password PAM adapter still sends at most one secret. The unlock
+conversation adapter also sends at most one ordinary Secret answer. It
 cancels on another Secret or any Visible question. It cannot reuse a password
 as a PIN or token. The interactive relay uses styles and fresh answers; it does
 not use English text to guess whether a challenge is a password or PIN.

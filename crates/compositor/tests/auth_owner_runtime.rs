@@ -1,9 +1,8 @@
-//! Actual nested runtime, supervised control peer and controlled delayed greetd.
-//! This proves outer ownership, not PAM retirement, GTK UI or installed DRM.
-use greetd_ipc::{codec::SyncCodec, AuthMessageType, Request, Response};
-use std::io;
+//! Actual runtimes, supervised control peer and a controlled delayed PAM
+//! module (libpam_wrapper): outer ownership, lock epochs and private PAM
+//! helper retirement. Not GTK UI, installed DRM, logind or S3.
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -110,7 +109,6 @@ fn client() {
         1,
         "redundant manual lock keeps epoch"
     );
-    std::fs::write(root.join("admitted-1"), b"1").unwrap();
     send(
         &mut a,
         1,
@@ -119,17 +117,15 @@ fn client() {
         },
     );
     wait(|| root.join("started-1").exists());
-    if std::env::var(ROLE).as_deref() == Ok("3") {
-        wait(|| root.join("compositor-pid").exists());
-        // Keep the real source inode held, replace ONLY our own copied path.
-        assert_pam_helper_image(&root, 1);
-        std::fs::remove_file(root.join("compositor-copy")).unwrap();
-        std::fs::write(
-            root.join("compositor-copy"),
-            b"replaced non-executable negative control",
-        )
-        .unwrap();
-    }
+    wait(|| root.join("compositor-pid").exists());
+    // Keep the real source inode held, replace ONLY our own copied path.
+    assert_pam_helper_image(&root, 1);
+    std::fs::remove_file(root.join("compositor-copy")).unwrap();
+    std::fs::write(
+        root.join("compositor-copy"),
+        b"replaced non-executable negative control",
+    )
+    .unwrap();
     send(
         &mut b,
         1,
@@ -157,29 +153,11 @@ fn client() {
     result(&mut replacement, 1, false);
     let canceled = Instant::now();
     drop(a);
-    if std::env::var(ROLE).as_deref() == Ok("3") {
-        let helper: u32 = std::fs::read_to_string(root.join("started-1"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        wait(|| {
-            !Path::new(&format!("/proc/{helper}")).exists()
-                && state(&root)["auth_owner"]["outer_pending"] == false
-        });
-        assert!(
-            canceled.elapsed() < Duration::from_secs(2),
-            "origin loss must wake the actual PAM read"
-        );
-        assert!(
-            !root.join("release-1").exists() && !root.join("done-1").exists(),
-            "retirement must not require releasing the hung module"
-        );
-    } else {
-        std::fs::write(root.join("release-1"), b"1").unwrap();
-        wait(|| {
-            root.join("done-1").exists() && state(&root)["auth_owner"]["outer_pending"] == false
-        });
-    }
+    assert_helper_retired_unreleased(&root, 1);
+    assert!(
+        canceled.elapsed() < Duration::from_secs(2),
+        "origin loss must wake the actual PAM read"
+    );
     assert_eq!(
         state(&root)["locked"],
         true,
@@ -196,10 +174,6 @@ fn client() {
             Err(_) => panic!("replacement closed"),
         }
     }
-    if std::env::var(ROLE).as_deref() != Ok("3") {
-        std::fs::write(root.join("release-2"), b"1").unwrap();
-    }
-    std::fs::write(root.join("admitted-2"), b"1").unwrap();
     send(
         &mut replacement,
         3,
@@ -207,26 +181,22 @@ fn client() {
             password: Secret("controlled-only".into()),
         },
     );
-    if std::env::var(ROLE).as_deref() == Ok("3") {
-        wait(|| root.join("started-2").exists());
-        assert_pam_helper_image(&root, 2);
-        std::fs::write(root.join("release-2"), b"1").unwrap();
-    }
+    wait(|| root.join("started-2").exists());
+    assert_pam_helper_image(&root, 2);
+    std::fs::write(root.join("release-2"), b"1").unwrap();
     result(&mut replacement, 3, true);
-    if std::env::var(ROLE).as_deref() == Ok("3") {
-        let previous: u32 = std::fs::read_to_string(root.join("started-1"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(
-            !PathBuf::from(format!("/proc/{previous}")).exists(),
-            "previous PAM leader must be reaped before fresh grant"
-        );
-        assert_eq!(
-            std::fs::read(root.join("compositor-copy")).unwrap(),
-            b"replaced non-executable negative control"
-        );
-    }
+    let previous: u32 = std::fs::read_to_string(root.join("started-1"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        !PathBuf::from(format!("/proc/{previous}")).exists(),
+        "previous PAM leader must be reaped before fresh grant"
+    );
+    assert_eq!(
+        std::fs::read(root.join("compositor-copy")).unwrap(),
+        b"replaced non-executable negative control"
+    );
     wait(|| state(&root)["locked"] == false && state(&root)["auth_owner"]["epoch"] == 2);
     send(&mut replacement, 12, CommandKind::SetIdleTimeout { ms: 50 });
     result(&mut replacement, 12, true);
@@ -237,12 +207,11 @@ fn client() {
             "supervised_client_pid":std::process::id(), "manual_epoch":1,"unlock_epoch":2,"idle_epoch":3,
             "concurrent_other_same_id_denied":true,"same_session_excess_denied":true,
             "replacement_same_id_busy_denied":true,
-            "late_closed_origin_success_denied":std::env::var(ROLE).as_deref()!=Ok("3"),
-            "closed_origin_canceled_retired":std::env::var(ROLE).as_deref()==Ok("3"),
+            "closed_origin_canceled_retired":true,
             "fresh_origin_success":true,
-            "held_self_path_replaced":std::env::var(ROLE).as_deref()==Ok("3"),
-            "origin_loss_wakes_private_pam_without_fixture_release":std::env::var(ROLE).as_deref()==Ok("3"),
-            "scope":if std::env::var(ROLE).as_deref()==Ok("3") { "actual main Runtime PAM: stable held image, old origin denied, actual retirement; not hardware/MFA/S3" } else { "actual nested outer-wrapper ownership; no PAM retirement" }
+            "held_self_path_replaced":true,
+            "origin_loss_wakes_private_pam_without_fixture_release":true,
+            "scope":"actual main Runtime PAM: stable held image, old origin denied, actual retirement; not hardware/MFA/S3"
         }),
     );
     // Keep the supervised process alive until parent sends graceful termination.
@@ -256,7 +225,6 @@ fn epoch_client() {
     send(&mut original, 10, CommandKind::Lock);
     result(&mut original, 10, true);
     wait(|| state(&root)["auth_owner"]["epoch"] == 1 && state(&root)["locked"] == true);
-    std::fs::write(root.join("admitted-1"), b"1").unwrap();
     send(
         &mut original,
         1,
@@ -265,11 +233,9 @@ fn epoch_client() {
         },
     );
     wait(|| root.join("started-1").exists());
-    std::fs::write(root.join("inject-epoch"), b"1").unwrap();
-    wait(|| root.join("epoch-injected.json").exists());
-    let injected: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.join("epoch-injected.json")).unwrap()).unwrap();
-    assert_eq!(injected["busy_sync_denied"], true);
+    wait(|| root.join("compositor-pid").exists());
+    assert_pam_helper_image(&root, 1);
+    // The held module keeps the outer slot busy for every other origin.
     send(
         &mut other,
         1,
@@ -278,15 +244,20 @@ fn epoch_client() {
         },
     );
     result(&mut other, 1, false);
-    std::fs::write(root.join("release-1"), b"1").unwrap();
+    std::fs::write(root.join("inject-epoch"), b"1").unwrap();
+    wait(|| root.join("epoch-injected.json").exists());
+    let injected: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("epoch-injected.json")).unwrap()).unwrap();
+    assert_eq!(injected["busy_sync_denied"], true);
+    // The stale epoch denies the in-flight attempt and retires its helper
+    // without the module ever being released to succeed.
     result(&mut original, 1, false);
-    wait(|| state(&root)["auth_owner"]["outer_pending"] == false);
+    assert_helper_retired_unreleased(&root, 1);
     assert_eq!(state(&root)["locked"], true);
     assert_eq!(state(&root)["auth_owner"]["epoch"], 2);
     drop(original);
     let mut replacement = connect();
     std::fs::write(root.join("release-2"), b"1").unwrap();
-    std::fs::write(root.join("admitted-2"), b"1").unwrap();
     send(
         &mut replacement,
         1,
@@ -300,7 +271,6 @@ fn epoch_client() {
     result(&mut replacement, 11, true);
     wait(|| state(&root)["locked"] == true && state(&root)["auth_owner"]["epoch"] == 4);
     std::fs::write(root.join("release-3"), b"1").unwrap();
-    std::fs::write(root.join("admitted-3"), b"1").unwrap();
     std::fs::write(root.join("try-sync"), b"1").unwrap();
     wait(|| root.join("sync-result.json").exists());
     let synced: serde_json::Value =
@@ -310,10 +280,11 @@ fn epoch_client() {
     publish_json(
         &root.join("success.json"),
         &serde_json::json!({
-            "supervised_client_pid":std::process::id(),"late_epoch_success_denied":true,
+            "supervised_client_pid":std::process::id(),"stale_epoch_attempt_denied_retired":true,
+            "busy_other_origin_denied":true,
             "busy_public_sync_denied":true,"fresh_origin_success":true,"public_sync_success":true,
             "manual_epoch":1,"injected_epoch":2,"fresh_epoch":3,"relock_epoch":4,"sync_epoch":5,
-            "scope":"actual runtime controlled epoch injection and public try_unlock; not logind/S3/backend duplicate"
+            "scope":"actual runtime PAM: controlled epoch injection and public try_unlock; not logind/S3/backend duplicate"
         }),
     );
     // Parent admits this live process, copies receipts, then terminates the driver.
@@ -361,69 +332,6 @@ impl Drop for Artifacts {
     }
 }
 
-fn greetd(listener: UnixListener, root: PathBuf, attempts: usize, deadline: Instant) {
-    listener.set_nonblocking(true).unwrap();
-    for n in 1..=attempts {
-        // Startup and time between attempts belong to the total parent deadline,
-        // not the backend's per-attempt budget. Only the supervised client can
-        // admit the next attempt in this private fixture directory.
-        while !root.join(format!("admitted-{n}")).exists() {
-            assert!(Instant::now() < deadline, "greetd admission deadline");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let mut connection = None;
-        wait(|| match listener.accept() {
-            Ok((s, _)) => {
-                connection = Some(s);
-                true
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => false,
-            Err(_) => panic!("greetd fixture accept"),
-        });
-        let mut s = connection.unwrap();
-        s.set_read_timeout(Some(LIMIT)).unwrap();
-        s.set_write_timeout(Some(LIMIT)).unwrap();
-        assert!(matches!(
-            Request::read_from(&mut s).unwrap(),
-            Request::CreateSession { username } if Some(username.as_str()) == tuna_compositor::unlock::session_user().as_deref()
-        ));
-        Response::AuthMessage {
-            auth_message_type: AuthMessageType::Secret,
-            auth_message: "controlled prompt".into(),
-        }
-        .write_to(&mut s)
-        .unwrap();
-        assert!(matches!(
-            Request::read_from(&mut s).unwrap(),
-            Request::PostAuthMessageResponse { response: Some(value) } if value == "controlled-only"
-        ));
-        std::fs::write(root.join(format!("started-{n}")), b"1").unwrap();
-        wait(|| root.join(format!("release-{n}")).exists());
-        Response::Success.write_to(&mut s).unwrap();
-        assert!(matches!(
-            Request::read_from(&mut s).unwrap(),
-            Request::CancelSession
-        ));
-        Response::Success.write_to(&mut s).unwrap();
-        std::fs::write(root.join(format!("done-{n}")), b"1").unwrap();
-    }
-}
-
-#[test]
-fn actual_runtime_owns_delayed_greetd_result_and_lock_epochs() {
-    match std::env::var(ROLE).ok().as_deref() {
-        Some("1") => return client(),
-        Some(_) => return,
-        None => {}
-    }
-    run_parent(
-        Path::new(env!("CARGO_BIN_EXE_tuna-compositor")),
-        "1",
-        2,
-        "compositor",
-    );
-}
-
 #[test]
 fn actual_runtime_epoch_invalidation_and_public_sync_unlock() {
     match std::env::var(ROLE).ok().as_deref() {
@@ -441,7 +349,7 @@ fn actual_runtime_epoch_invalidation_and_public_sync_unlock() {
     let bin = PathBuf::from(
         std::env::var_os("TUNA_AUTH_OWNER_PROBE_BIN").expect("admitted probe example"),
     );
-    run_parent(&bin, "2", 3, "probe");
+    run_parent(&bin, "2", "probe");
 }
 
 /// The next conversation step for `request`; its result may not come first.
@@ -600,7 +508,6 @@ fn actual_main_runtime_pam_conversation_relay() {
     run_parent(
         Path::new(env!("CARGO_BIN_EXE_tuna-compositor")),
         "4",
-        0,
         "conversation",
     );
 }
@@ -635,6 +542,24 @@ fn assert_pam_helper_image(root: &Path, attempt: u32) {
     );
 }
 
+/// The attempt's private helper is gone and the outer slot is free, yet the
+/// module was never released: retirement came from cancellation alone.
+fn assert_helper_retired_unreleased(root: &Path, attempt: u32) {
+    let helper: u32 = std::fs::read_to_string(root.join(format!("started-{attempt}")))
+        .unwrap()
+        .parse()
+        .unwrap();
+    wait(|| {
+        !Path::new(&format!("/proc/{helper}")).exists()
+            && state(root)["auth_owner"]["outer_pending"] == false
+    });
+    assert!(
+        !root.join(format!("release-{attempt}")).exists()
+            && !root.join(format!("done-{attempt}")).exists(),
+        "retirement must not require releasing the hung module"
+    );
+}
+
 #[test]
 fn actual_main_runtime_private_pam_retirement_and_held_self() {
     match std::env::var(ROLE).ok().as_deref() {
@@ -642,15 +567,10 @@ fn actual_main_runtime_private_pam_retirement_and_held_self() {
         Some(_) => return,
         None => {}
     }
-    run_parent(
-        Path::new(env!("CARGO_BIN_EXE_tuna-compositor")),
-        "3",
-        2,
-        "pam",
-    );
+    run_parent(Path::new(env!("CARGO_BIN_EXE_tuna-compositor")), "3", "pam");
 }
 
-fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
+fn run_parent(bin: &Path, role: &str, kind: &str) {
     if std::env::var_os("DISPLAY").is_none() {
         assert!(
             std::env::var_os("TUNA_REQUIRE_AUTH_OWNER_RUNTIME").is_none(),
@@ -669,52 +589,39 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
         out: std::env::var_os("TUNA_AUTH_OWNER_ARTIFACTS").map(PathBuf::from),
     };
     let end = Instant::now() + Duration::from_secs(30);
-    let socket = root.path().join("greetd.sock");
-    let pam = role == "3" || role == "4";
-    let server = if pam {
-        None
+    // Role 4 is the interactive relay: the module's multi-prompt mode;
+    // every other role delays a single controlled password.
+    let (service, mode) = if role == "4" {
+        ("runtime-conversation", "multi")
     } else {
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server_root = root.path().to_owned();
-        Some(std::thread::spawn(move || {
-            greetd(listener, server_root, attempts, end)
-        }))
+        ("runtime-delay", "runtime-delay")
     };
+    assert!(
+        Path::new("/usr/lib/x86_64-linux-gnu/libpam_wrapper.so").exists(),
+        "required actual PAM wrapper"
+    );
+    let module = root.path().join("controlled-pam.so");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pam_conversation.c");
+    assert!(Command::new("cc")
+        .args(["-shared", "-fPIC", "-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(source)
+        .arg("-o")
+        .arg(&module)
+        .arg("-lpam")
+        .status()
+        .unwrap()
+        .success());
+    std::fs::create_dir(root.path().join("services")).unwrap();
+    std::fs::write(
+        root.path().join("services").join(service),
+        format!(
+            "auth required {} {mode}\naccount required {} {mode}\n",
+            module.display(),
+            module.display()
+        ),
+    )
+    .unwrap();
     let owned_bin = root.path().join("compositor-copy");
-    if pam {
-        assert!(
-            Path::new("/usr/lib/x86_64-linux-gnu/libpam_wrapper.so").exists(),
-            "required actual PAM wrapper"
-        );
-        let module = root.path().join("controlled-pam.so");
-        let source =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pam_conversation.c");
-        assert!(Command::new("cc")
-            .args(["-shared", "-fPIC", "-O2", "-Wall", "-Wextra", "-Werror"])
-            .arg(source)
-            .arg("-o")
-            .arg(&module)
-            .arg("-lpam")
-            .status()
-            .unwrap()
-            .success());
-        std::fs::create_dir(root.path().join("services")).unwrap();
-        // Role 4 is the interactive relay: the module's multi-prompt mode.
-        let (service, mode) = if role == "3" {
-            ("runtime-delay", "runtime-delay")
-        } else {
-            ("runtime-conversation", "multi")
-        };
-        std::fs::write(
-            root.path().join("services").join(service),
-            format!(
-                "auth required {} {mode}\naccount required {} {mode}\n",
-                module.display(),
-                module.display()
-            ),
-        )
-        .unwrap();
-    }
     if role == "3" {
         std::fs::copy(bin, &owned_bin).unwrap();
     }
@@ -733,28 +640,14 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
             .unwrap()
     );
     let log = std::fs::File::create(root.path().join("compositor.log")).unwrap();
-    let mut command = Command::new(executable);
-    if pam {
-        command
-            .env_remove("GREETD_SOCK")
-            .env(
-                "TUNA_PAM_SERVICE",
-                if role == "3" {
-                    "runtime-delay"
-                } else {
-                    "runtime-conversation"
-                },
-            )
+    let mut child = OwnedChild(
+        Command::new(executable)
+            .env("TUNA_PAM_SERVICE", service)
             .env("LD_PRELOAD", "/usr/lib/x86_64-linux-gnu/libpam_wrapper.so")
             .env("PAM_WRAPPER", "1")
             .env("PAM_WRAPPER_SERVICE_DIR", root.path().join("services"))
             // No reader here: the fingerprint service must say unavailable.
-            .env("TUNA_FPRINTD_OFF", "1");
-    } else {
-        command.env("GREETD_SOCK", &socket);
-    }
-    let mut child = OwnedChild(
-        command
+            .env("TUNA_FPRINTD_OFF", "1")
             .args([
                 "--socket",
                 "auth-owner-proof",
@@ -857,9 +750,6 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
         }
     }
     drop(child);
-    if let Some(server) = server {
-        server.join().unwrap();
-    }
 }
 
 #[test]

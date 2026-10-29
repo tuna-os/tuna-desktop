@@ -29,7 +29,7 @@ M = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(M)
 # Expectations are maintained here, never imported from the policy under test.
 BINS = ('tuna-compositor', 'tuna-session', 'tuna-shell-gtk', 'tuna-shell-host',
-        'tuna-ibus-bridge', 'tuna-greeter', 'tuna-wallpaper-svg')
+        'tuna-ibus-bridge', 'tuna-wallpaper-svg')
 SESSION = 'usr/share/wayland-sessions/tuna.desktop'
 OLD_SESSION = 'usr/share/wayland-sessions/roost.desktop'
 PAM = 'etc/pam.d/tuna-lock'
@@ -195,13 +195,13 @@ Provides: roost
         delegates = work / 'controlled-delegates'
         delegates.mkdir()
         commands = {
-            'cargo': '''test "$*" = 'build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host -p tuna-greeter'
+            'cargo': '''test "$*" = 'build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host'
 test "$TUNA_VERSION" = '0.1.0-beta.1'
 ''',
             'git': '''test "$*" = 'describe --tags --exact-match --match v[0-9]* HEAD'
 printf '%s\\n' v0.1.0-beta.1
 ''',
-            'dpkg-shlibdeps': '''test "$*" = '-O -eusr/bin/tuna-compositor -eusr/bin/tuna-session -eusr/bin/tuna-shell-gtk -eusr/bin/tuna-shell-host -eusr/bin/tuna-ibus-bridge -eusr/bin/tuna-greeter -eusr/bin/tuna-wallpaper-svg'
+            'dpkg-shlibdeps': '''test "$*" = '-O -eusr/bin/tuna-compositor -eusr/bin/tuna-session -eusr/bin/tuna-shell-gtk -eusr/bin/tuna-shell-host -eusr/bin/tuna-ibus-bridge -eusr/bin/tuna-wallpaper-svg'
 printf '%s\\n' 'shlibs:Depends=libc6 (>= 2.34)'
 ''',
         }
