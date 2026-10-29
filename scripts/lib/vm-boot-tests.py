@@ -4132,5 +4132,39 @@ class OrcaLogoutRetirement(unittest.TestCase):
                       source)
 
 
+class OrcaDepartureProbe(unittest.TestCase):
+    """Run 40874548317: after logout gsettings blocked 15 s on the restarting
+    user bus; departure needs only the original process and the bus names."""
+
+    def observe(self, session_settings):
+        calls = []
+        def call(*args, user=False, check=True):
+            calls.append(args[0])
+            if args[0] == "gsettings":
+                return "true"
+            if args[0] == "busctl":
+                return ""
+            return "orca 51.1-1"
+        scope = lifecycle_scope("orca_observation", shlex=shlex, json=json, call=call,
+                                STATE=SimpleNamespace(read_text=lambda: json.dumps(
+                                    {"screen_reader_pid": 41, "screen_reader_state": "active"})),
+                                orca_child_diagnostic=lambda state, pid: {"status": "gone"})
+        return scope["orca_observation"](session_settings=session_settings), calls
+
+    def test_departure_probe_never_reads_the_ended_sessions_settings(self):
+        departed, calls = self.observe(False)
+        self.assertNotIn("gsettings", calls)
+        self.assertEqual(calls.count("busctl"), 2)
+        self.assertIsNone(departed["enabled"])
+        self.assertIsNone(departed["owner"])
+        live, calls = self.observe(True)
+        self.assertIn("gsettings", calls)
+        self.assertIs(live["enabled"], True)
+
+    def test_orca_departed_action_uses_the_departure_probe(self):
+        source = LIFECYCLE_SOURCE.read_text()
+        self.assertIn('result = {"original_alive": alive, **orca_observation(session_settings=False)}', source)
+
+
 if __name__ == "__main__":
     unittest.main()
