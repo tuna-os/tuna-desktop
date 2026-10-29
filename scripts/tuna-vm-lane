@@ -979,6 +979,70 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         record("V-BRIGHTNESS-CONTRACT",True,
             "original shell brightness wire interface, actual empty kernel backlight inventory, false capability and harmless policy resets; no physical-control proof")
 
+    # GNOME 51 settings daemon plugins (#355): the installed session starts
+    # them through GNOME's own user units, and gsd-power drives the
+    # compositor's idle monitor, the shell's brightness dimming and
+    # DisplayConfig PowerSaveMode.
+    if published:
+        record("V-GSD-PLUGINS", True,
+               "published guest predates the settings daemon plugin session; proven by the current-build marlin-vm lane")
+        record("V-GSD-POWER-IDLE", True,
+               "published guest predates the settings daemon plugin session; proven by the current-build marlin-vm lane")
+    else:
+        plugins = agent.run("gsd-plugins")
+        with open(os.path.join(evidence, "gsd-plugins.json"), "w") as stream:
+            json.dump(plugins, stream, indent=2)
+        if not plugins.get("pass"):
+            raise RuntimeError("settings daemon plugins are not the session's own bus owners")
+        record("V-GSD-PLUGINS", True,
+               "12 packaged gsd plugins run as the session user under their GNOME units and own their bus names; "
+               "Color stays with the compositor, MediaKeys and A11ySettings stay off; the compositor holds the leader FIFO")
+        power_idle = {"states": []}
+        started = False
+        try:
+            # The last input starts the idle stretch; no input follows until wake.
+            qmp.keys("ctrl")
+            power_idle["start"] = agent.run("gsd-power-idle-start")
+            started = True
+            begun = time.monotonic()
+
+            def blanked(value):
+                power_idle["states"].append({"elapsed": round(time.monotonic() - begun, 1),
+                                             "locked": value["state"]["locked"],
+                                             "power_save_mode": value["state"].get("power_save_mode")})
+                return value["state"]["locked"] and value["state"].get("power_save_mode") == 3
+            # idle-delay 20 s: gsd-power dims at 10 s, the shield locks at 20 s
+            # and gsd-power blanks 30 s into the idle stretch.
+            await_state(blanked, timeout=90)
+            power_idle["blanked_after"] = round(time.monotonic() - begun, 1)
+            qmp.keys("ret")
+            await_state(lambda value: value["state"].get("power_save_mode") == 0, timeout=15)
+            time.sleep(0.3)
+            qmp.keys("ctrl", "a")
+            qmp.type_text("tuna")
+            qmp.keys("ret")
+            await_state(lambda value: not value["state"]["locked"], timeout=15)
+        finally:
+            if started:
+                power_idle["stop"] = agent.run("gsd-power-idle-stop")
+            with open(os.path.join(evidence, "gsd-power-idle.json"), "w") as stream:
+                json.dump(power_idle, stream, indent=2)
+        owner = power_idle["start"]["power_owner"][0]
+        calls = [(c["call"], c["value"]) for c in power_idle["stop"]["calls"] if c["sender"] == owner]
+        try:
+            blank = calls.index(("PowerSaveMode", 3))
+            dimmed = calls.index(("SetDimming", True)) < blank
+            woke = calls.index(("PowerSaveMode", 0), blank) > blank
+            undimmed = ("SetDimming", False) in calls[blank:]
+        except ValueError:
+            dimmed = woke = undimmed = False
+        restored = power_idle["stop"]["restored_idle_delay"] == power_idle["start"]["original_idle_delay"]
+        if not (dimmed and woke and undimmed and restored):
+            raise RuntimeError(f"gsd-power idle sequence not observed: {calls}")
+        record("V-GSD-POWER-IDLE", True,
+               f"idle-delay 20 s: gsd-power's own SetDimming(true), then the lock and its PowerSaveMode=3 "
+               f"in the compositor snapshot after {power_idle['blanked_after']} s; input wakes it to 0 and undims")
+
     # Real distribution Orca owns a credential-verified bus name under the ordinary
     # session user. Settings writes trigger Tuna Desktop's consumer, not test start/stop.
     orca_observations = []

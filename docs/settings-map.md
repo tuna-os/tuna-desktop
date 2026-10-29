@@ -41,7 +41,7 @@ GNOME 51 `org.gnome.desktop.a11y.interface reduced-motion` is read live and comb
 
 | Schema and key | Status | Notes |
 |---|---|---|
-| org.gnome.desktop.session idle-delay | Honored | Live, through the shell's `SetIdleTimeout` command. Proof G-SETTINGS-IDLE |
+| org.gnome.desktop.session idle-delay | Honored | Live, through the shell's `SetIdleTimeout` command (G-SETTINGS-IDLE); gsd-power dims at half the delay and blanks 30 s into idleness once the shield is up (V-GSD-POWER-IDLE) |
 | org.gnome.desktop.screensaver lock-enabled, lock-delay | Honored | Idle fades to black over ten seconds; lock waits for the larger of fade duration and lock-delay. Activity cancels blanking; an authenticated lock remains latched |
 | org.gnome.desktop.screensaver picture-uri | Honored | Blurred, dimmed lock background; empty or missing files fall back to the desktop wallpaper |
 | org.gnome.desktop.notifications show-banners | Honored | Mirrors Do Not Disturb live in both directions. Proof G-NOTIFY-DND and G-SETTINGS-NOTIFICATIONS (external writes and banner policy) |
@@ -50,8 +50,46 @@ GNOME 51 `org.gnome.desktop.a11y.interface reduced-motion` is read live and comb
 | org.gnome.shell favorite-apps | Honored | Used for the dash when Tuna Desktop has no pins of its own |
 | org.gnome.desktop.app-folders (folder-children and each folder's name, apps, categories, excluded-apps, translate) | Honored | App-grid folders, read on each grid open. Proof G-APP-FOLDERS |
 | org.gnome.shell enabled-extensions | Ignored | GNOME Shell extensions are JavaScript. Tuna Desktop has its own extension point |
-| org.gnome.settings-daemon.plugins.color night-light-enabled | Honored | The Night Light tile writes it; the compositor reads it live and tints every output in GL. Proof G-QS-NIGHT (#339) |
+| org.gnome.settings-daemon.plugins.color night-light-enabled | Honored | The Night Light tile writes it; the compositor reads it live and tints every output in GL. It owns `org.gnome.SettingsDaemon.Color`, so gsd-color is not started. Proof G-QS-NIGHT (#339) |
 | org.gnome.settings-daemon.plugins.color night-light-temperature, night-light-schedule-automatic, night-light-schedule-from, night-light-schedule-to, night-light-last-coordinates | Honored | Read live by the compositor: gsd 51's clamp, local-time automatic and from/to schedules (midnight wrap, DST, runtime zone change), one-hour edge smear and 5 s jump smoothing. Geoclue never updates night-light-last-coordinates, so automatic mode uses the stored value or the from/to window. Proof G-QS-NIGHT drives NightLightPreview against night-light-temperature (#339) |
+| org.gnome.settings-daemon.plugins.power idle-dim, idle-brightness | Honored | gsd-power calls the shell's `org.gnome.Shell.Brightness.SetDimming`; the shell clips to `idle-brightness`. Proof V-GSD-POWER-IDLE (call observed; no physical backlight in the VM) |
+| org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout, sleep-inactive-ac-type, sleep-inactive-battery-timeout, sleep-inactive-battery-type, power-saver-profile-on-low-battery, ambient-enabled | Honored (unqualified) | Consumed by the running gsd-power; automatic suspend, battery policy and ambient light are not proven (gsd-power never suspends a VM) |
+| org.gnome.settings-daemon.plugins.power power-button-action | Ignored | GNOME 51's consumer is gsd-media-keys, which the Tuna session does not start because the shell binds the media keys; logind's own HandlePowerKey applies |
+
+## GNOME Settings Daemon plugins
+
+GNOME 51 starts gnome-settings-daemon's plugins from gnome-session's
+`gnome-session-basic-services.target` and `gnome-session-services.target`
+(gnome-session 51 `data/`), each through the plugin's own
+`org.gnome.SettingsDaemon.<Plugin>.target`, which requires
+`gnome-session-initialized.target`. `tuna-session.target` wants
+`gnome-session.target`, `gnome-session-initialized.target` and the plugin
+targets below; the compositor holds gnome-session's leader FIFO so the targets
+and plugins stop with the session, and starts
+`gnome-session-x11-services-ready.target` when Xwayland is up, as GNOME Shell
+51 does. The compositor serves the `org.gnome.SessionManager` subset the
+plugins read (`InhibitedActions`, `SessionIsActive`, `Inhibit`, `Uninhibit`,
+`IsInhibited`, `GetInhibitors`); idle inhibitors also hold off Tuna's idle lock.
+Proof V-GSD-PLUGINS checks every started plugin's process, user, unit and bus name.
+
+| Plugin (bus name `org.gnome.SettingsDaemon.*`) | GNOME 51 target | Tuna session |
+|---|---|---|
+| Power | basic-services | Started by gsd |
+| Keyboard | basic-services | Started by gsd |
+| Rfkill | basic-services | Started by gsd |
+| Sharing | basic-services | Started by gsd |
+| Smartcard | basic-services | Started by gsd |
+| UsbProtection | basic-services | Started by gsd (acts only with USBGuard) |
+| Datetime | services | Started by gsd |
+| Housekeeping | services | Started by gsd |
+| PrintNotifications | services | Started by gsd |
+| ScreensaverProxy | services | Started by gsd (forwards `org.freedesktop.ScreenSaver` inhibits to the compositor's session manager) |
+| Sound | services | Started by gsd |
+| Wwan | services | Started by gsd |
+| XSettings | x11-services | Started by gsd when Xwayland is ready (`DISPLAY` published then); `org.gnome.Mutter.X11` is not served, so X11 scale falls back to 1 |
+| Color | services | Reimplemented by Tuna: the compositor owns the bus name (Night Light); ICC profiles are missing (P-DS-03) |
+| MediaKeys | basic-services | Reimplemented by Tuna for volume, brightness and lock keys; the other media bindings, including `power-button-action`, are missing |
+| A11ySettings | basic-services | Reimplemented by Tuna: the compositor runs Orca and the shell sets `toolkit-accessibility`; gsd would start a second Orca |
 
 ## Displays
 

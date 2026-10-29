@@ -783,6 +783,8 @@ pub struct Runtime {
     unlock_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// org.gnome.Mutter.IdleMonitor.
     idle_monitor: crate::idle_monitor::IdleMonitor,
+    /// org.gnome.SessionManager's inhibitors and session activity.
+    session_manager: crate::session_manager::Share,
     /// Screen magnifier (#349): Settings file cache plus each
     /// output's tracking state. Captures and casts apply it; the
     /// lock screen never magnifies.
@@ -1325,6 +1327,7 @@ impl Runtime {
             unlock_quarantined: None,
             unlock_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             idle_monitor: crate::idle_monitor::start(),
+            session_manager: crate::session_manager::start(),
             magnifier: crate::magnifier::MagnifierState::new(),
             exit: false,
             stats: RunStats::default(),
@@ -4491,8 +4494,10 @@ impl Runtime {
         // A live idle inhibitor (video, presentation) counts as activity,
         // and so does its end: the loop may have slept through the
         // inhibited stretch, so the idle clock restarts when it ends
-        // instead of the session locking at once (#503).
-        let inhibited = self.state.idle_inhibited();
+        // instead of the session locking at once (#503). An idle
+        // inhibitor held through org.gnome.SessionManager (a portal or
+        // org.freedesktop.ScreenSaver caller) counts the same way.
+        let inhibited = self.state.idle_inhibited() || self.session_manager.idle_inhibited();
         if self
             .lock
             .inhibitor_activity(self.idle_inhibited, inhibited, self.lock_now_ms())
@@ -4602,7 +4607,9 @@ impl Runtime {
                 self.active_x11_client = None;
                 self.x11_failed = false;
                 self.pending_x11_client = None;
-                self.state.xwm = None;
+                if self.state.xwm.take().is_some() {
+                    crate::session_services::x11_display_closed();
+                }
                 if let Some(ime) = &mut self.ime {
                     ime.set_ready_x11_display(None);
                 }

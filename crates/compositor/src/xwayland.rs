@@ -321,6 +321,7 @@ pub fn on_xwayland_event(
                 Ok(xwm) => {
                     runtime.state_mut().xwm = Some(xwm);
                     runtime.set_x11_display(display_number);
+                    crate::session_services::x11_display_ready(display_number);
                     eprintln!(
                         "tuna-compositor: xwayland: window manager started on :{display_number}"
                     );

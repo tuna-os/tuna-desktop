@@ -27,6 +27,7 @@ depends=(
     'dbus'
     'glib2'
     'gnome-settings-daemon'
+    'gnome-session'
     'gdk-pixbuf2'
     'librsvg'
     'glycin'

@@ -63,6 +63,9 @@ RUN set -eux; \
     done \
     && grep -qx 'Name=Tuna Desktop (preview)' /usr/share/wayland-sessions/tuna.desktop \
     && test -f /usr/lib/systemd/user/tuna-session.target \
+    && for unit in $(sed -n 's/^Wants=//p' /usr/lib/systemd/user/tuna-session.target) gnome-session-monitor.service gnome-session-shutdown.target gnome-session-x11-services-ready.target org.gnome.SettingsDaemon.XSettings.service; do \
+        test -f "/usr/lib/systemd/user/$unit" || { echo "missing GNOME session unit $unit" >&2; exit 1; }; done \
+    && test -x /usr/lib/gnome-session-ctl \
     && test -f /etc/pam.d/tuna-lock \
     && test ! -L /etc/pam.d/tuna-lock \
     && for legacy in /usr/share/wayland-sessions/roost.desktop /etc/pam.d/roost-lock; do test -f "$legacy" && test ! -L "$legacy" && test "$(stat -c '%u:%g %a' "$legacy")" = '0:0 644' && test "$(pacman -Qqo "$legacy")" = tuna-desktop || exit 1; done && : 'tuna-rename: keep' \
