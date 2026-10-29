@@ -211,6 +211,14 @@ an explicit URI to the exported reference wallpaper and retains it in
 `lock-background-uri.txt`; the custom-color proof is separate from that
 GNOME visual comparison.
 
+Display power saving follows GNOME Settings Daemon 51's idle transitions
+(`gsd-power-manager.c` `idle_set_mode`). `G-POWER-SAVE-MODE` calls
+`org.gnome.Shell.Brightness` `SetDimming(true)` and sees the controlled
+backlight drop, writes DisplayConfig `PowerSaveMode` 3 and sees no frame
+rendered while the pointer moves, checks that -1 is ignored, writes 0 and
+sees a repaint, then `SetDimming(false)` restores the exact user baseline.
+The nested proof turns no CRTC off; see `docs/brightness-contract.md`.
+
 ## Workspace insertion comparison
 
 State `16b-workspace-insertion-placeholder` compares GNOME 51’s native

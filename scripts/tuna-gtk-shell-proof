@@ -8534,6 +8534,64 @@ fi
     --shell-executable "$privacy_expected_shell" >"$ARTIFACTS/brightness-controlled.log" 2>&1 ||
     fail G-BRIGHTNESS-CONTRACT "controlled policy/readback contract rejected; see retained JSON/log"
 pass G-BRIGHTNESS-CONTRACT "actual original shell wire schema and controlled associated dim/restore/auto/reset readbacks; synthetic sysfs/logind only"
+# GNOME Settings Daemon 51's idle transitions (gsd-power-manager.c
+# idle_set_mode): DIM calls org.gnome.Shell.Brightness SetDimming(true),
+# BLANK writes Mutter DisplayConfig PowerSaveMode 3 (disable_monitors) and
+# NORMAL writes 0 (enable_monitors) then SetDimming(false). Blanking stops
+# scanout even while the pointer moves; unblanking repaints, and undimming
+# restores the exact user baseline. Nested: no CRTC is switched off here.
+power_save_set() {
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method org.freedesktop.DBus.Properties.Set \
+        org.gnome.Mutter.DisplayConfig PowerSaveMode "<int32 $1>" >/dev/null
+}
+power_save_get() {
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method org.freedesktop.DBus.Properties.Get \
+        org.gnome.Mutter.DisplayConfig PowerSaveMode
+}
+shell_dimming() {
+    gdbus call --session --dest org.gnome.Shell.Brightness \
+        --object-path /org/gnome/Shell/Brightness \
+        --method org.gnome.Shell.Brightness.SetDimming "$1" >/dev/null
+}
+power_baseline="$(cat "$BACKLIGHT/brightness")"
+power_idle="$(gsettings get org.gnome.settings-daemon.plugins.power idle-brightness)"
+gsettings set org.gnome.settings-daemon.plugins.power idle-brightness 1
+[ "$(power_save_get)" = "(<0>,)" ] || fail G-POWER-SAVE-MODE "PowerSaveMode did not start on"
+shell_dimming true || fail G-POWER-SAVE-MODE "SetDimming(true) refused"
+end=$(($(date +%s) + 10))
+until [ "$(cat "$BACKLIGHT/brightness")" -lt "$power_baseline" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
+[ "$(cat "$BACKLIGHT/brightness")" -lt "$power_baseline" ] ||
+    fail G-POWER-SAVE-MODE "idle dim did not lower the backlight below $power_baseline"
+power_save_set 3 || fail G-POWER-SAVE-MODE "PowerSaveMode 3 refused"
+[ "$(power_save_get)" = "(<3>,)" ] || fail G-POWER-SAVE-MODE "PowerSaveMode did not read back 3"
+cstate '.power_save_mode == 3' "power save off" 5 || fail G-POWER-SAVE-MODE "compositor did not apply PowerSaveMode 3"
+sleep 1
+power_frames="$(jq .rendered_frames "$CSTATE")"
+for _ in 1 2 3 4 5; do
+    xdotool mousemove_relative -- 7 5
+    sleep 0.3
+done
+sleep 1
+[ "$(jq .rendered_frames "$CSTATE")" = "$power_frames" ] ||
+    fail G-POWER-SAVE-MODE "frames were scanned out while PowerSaveMode was 3"
+# Mutter ignores the unknown mode; the blank stays.
+power_save_set -1 || fail G-POWER-SAVE-MODE "PowerSaveMode -1 refused"
+[ "$(power_save_get)" = "(<3>,)" ] || fail G-POWER-SAVE-MODE "PowerSaveMode -1 was not ignored"
+power_save_set 0 || fail G-POWER-SAVE-MODE "PowerSaveMode 0 refused"
+[ "$(power_save_get)" = "(<0>,)" ] || fail G-POWER-SAVE-MODE "PowerSaveMode did not read back 0"
+cstate ".power_save_mode == 0 and .rendered_frames > $power_frames" "unblanked repaint" 5 ||
+    fail G-POWER-SAVE-MODE "unblanking did not repaint"
+shell_dimming false || fail G-POWER-SAVE-MODE "SetDimming(false) refused"
+end=$(($(date +%s) + 10))
+until [ "$(cat "$BACKLIGHT/brightness")" = "$power_baseline" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
+[ "$(cat "$BACKLIGHT/brightness")" = "$power_baseline" ] ||
+    fail G-POWER-SAVE-MODE "undimming did not restore the user baseline $power_baseline"
+gsettings set org.gnome.settings-daemon.plugins.power idle-brightness "$power_idle"
+pass G-POWER-SAVE-MODE "gsd idle sequence: Shell.Brightness dim, DisplayConfig PowerSaveMode 3 stops scanout (-1 ignored), 0 repaints, undim restores baseline; nested, no CRTC off"
 rm -rf "$ARTIFACTS/backlight/aaa-other"
 pass G-MONITOR-BRIGHTNESS-KEYS "bound monitor up/down/cycle change only the connector under the pointer; cycle wraps"
 # A rebound notification key focuses the active banner's real button.

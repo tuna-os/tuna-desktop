@@ -126,6 +126,10 @@ pub struct DrmBackend {
     /// Whether the session currently owns the VT.
     pub active: bool,
     sleep_reset_pending: bool,
+    /// DisplayConfig `PowerSaveMode` is not on (#355): nothing is submitted.
+    powered_off: bool,
+    /// Power saving turned every CRTC off; activation keeps them off.
+    outputs_disabled: bool,
     wake_scanout_blocked: bool,
     wake_event_traces: u8,
     pointer: Point<f64, Logical>,
@@ -446,6 +450,8 @@ impl DrmBackend {
                 libinput,
                 active: true,
                 sleep_reset_pending: false,
+                powered_off: false,
+                outputs_disabled: false,
                 wake_scanout_blocked: false,
                 wake_event_traces: 0,
                 pointer: (
@@ -497,7 +503,9 @@ impl DrmBackend {
                 if self.libinput.resume().is_err() {
                     eprintln!("tuna-compositor: drm: libinput resume failed");
                 }
-                if let Err(e) = self.drm.activate(false) {
+                // Display power saving (#355) keeps every CRTC off across
+                // a VT switch: the next owner may have lit them.
+                if let Err(e) = self.drm.activate(self.outputs_disabled) {
                     eprintln!("tuna-compositor: drm: activate failed: {e}");
                 }
                 for out in &mut self.outputs {
@@ -526,44 +534,13 @@ impl DrmBackend {
         eprintln!("tuna-compositor: drm: system wake scanout reset");
         let trace = std::env::var_os("TUNA_LOCK_TRACE").is_some();
         self.wake_event_traces = if trace { 2 } else { 0 };
-        // Pending and queued flips can be lost across S3. Drop both without
-        // submitting an old queued scene or claiming presentation. Ordinary
-        // frame_submitted() would submit queued_fb as a side effect.
-        for out in &mut self.outputs {
-            for mut feedback in out.surface.discard_pending_frames() {
-                feedback.discarded();
-            }
-            out.surface.reset_buffers();
-            out.pending = false;
-            out.last_frame = None;
-            out.damage_tracker = None;
-            out.wake_trace = trace;
-        }
-        // Reset actual connector/plane state too: an active VT does not imply
-        // that the kernel restored its framebuffer. The next locked frame
-        // commits the retained modes and surfaces again.
-        if let Err(error) = self.drm.reset_state() {
-            eprintln!("tuna-compositor: drm: wake KMS reset failed: {error}");
+        if let Err(error) = self.retire_scanout(trace) {
+            eprintln!("tuna-compositor: drm: wake {error}");
             // An unsuccessful reset cannot retire old kernel completions.
             // Stay masked without submitting a frame whose feedback could
             // be attached to an abandoned flip. VT activation can recover.
             self.sleep_reset_pending = true;
             return;
-        }
-        // The blocking disable commit has retired previous scanout. Drain
-        // its already queued completions before the first new submission.
-        // A valid modeset event can report the last vblank before submission,
-        // so its timestamp cannot identify an abandoned pre-sleep frame.
-        match drain_reset_events(|| self.drm.receive_events().map(|events| events.count())) {
-            Ok(count) if trace => {
-                eprintln!("tuna-compositor: drm: wake obsolete events drained={count}");
-            }
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!("tuna-compositor: drm: wake event drain failed: {error}");
-                self.sleep_reset_pending = true;
-                return;
-            }
         }
         self.wake_scanout_blocked = false;
         if trace {
@@ -579,9 +556,77 @@ impl DrmBackend {
         }
     }
 
-    /// A failed wake reset/drain must not submit until recovery succeeds.
+    /// Drop pending and queued flips, turn every CRTC off and drain the
+    /// completions the disable commit retired. The next frame commits the
+    /// retained modes and surfaces again.
+    fn retire_scanout(&mut self, trace: bool) -> Result<(), String> {
+        // Pending and queued flips can be lost across S3. Drop both without
+        // submitting an old queued scene or claiming presentation. Ordinary
+        // frame_submitted() would submit queued_fb as a side effect.
+        for out in &mut self.outputs {
+            for mut feedback in out.surface.discard_pending_frames() {
+                feedback.discarded();
+            }
+            out.surface.reset_buffers();
+            out.pending = false;
+            out.last_frame = None;
+            out.damage_tracker = None;
+            out.wake_trace = trace;
+        }
+        // Reset actual connector/plane state too: an active VT does not imply
+        // that the kernel restored its framebuffer.
+        self.drm
+            .reset_state()
+            .map_err(|error| format!("KMS reset failed: {error}"))?;
+        // The blocking disable commit has retired previous scanout. Drain
+        // its already queued completions before the first new submission.
+        // A valid modeset event can report the last vblank before submission,
+        // so its timestamp cannot identify an abandoned pre-sleep frame.
+        let count = drain_reset_events(|| self.drm.receive_events().map(|events| events.count()))
+            .map_err(|error| format!("event drain failed: {error}"))?;
+        if trace {
+            eprintln!("tuna-compositor: drm: wake obsolete events drained={count}");
+        }
+        Ok(())
+    }
+
+    /// DisplayConfig `PowerSaveMode` left on (#355): no frame is submitted
+    /// until [`power_on`](Self::power_on). With `disable_outputs` every
+    /// CRTC turns off, as Mutter's `meta_kms_device_disable`; off-seat the
+    /// next activation does it.
+    pub fn power_off(&mut self, disable_outputs: bool) {
+        self.powered_off = true;
+        if !disable_outputs || self.outputs_disabled {
+            return;
+        }
+        self.outputs_disabled = true;
+        if !self.active {
+            return;
+        }
+        if let Err(error) = self.retire_scanout(false) {
+            eprintln!("tuna-compositor: drm: power save {error}");
+            // Same recovery as an unsuccessful wake reset: never attach new
+            // feedback to a flip the disable may not have retired.
+            self.wake_scanout_blocked = true;
+            self.sleep_reset_pending = true;
+        }
+    }
+
+    /// DisplayConfig `PowerSaveMode` back on (#355): every output repaints
+    /// in full, and that frame modesets the CRTCs back on.
+    pub fn power_on(&mut self) {
+        self.powered_off = false;
+        self.outputs_disabled = false;
+        for out in &mut self.outputs {
+            out.last_frame = None;
+            out.damage_tracker = None;
+        }
+    }
+
+    /// A failed wake reset/drain must not submit until recovery succeeds;
+    /// display power saving submits nothing (#355).
     pub fn scanout_ready(&self) -> bool {
-        self.active && !self.wake_scanout_blocked
+        self.active && !self.wake_scanout_blocked && !self.powered_off
     }
 
     /// Page flip completion: the output may render again, and what its
