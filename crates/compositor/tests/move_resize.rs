@@ -9,8 +9,10 @@
 use std::os::unix::net::UnixStream;
 
 use smithay::utils::{Logical, Point};
+use tuna_compositor::focus_policy::FocusPolicy;
 use tuna_compositor::windows::{
-    ManagerInput, WindowLayout, WindowManager, MIN_WINDOW_SIZE, SUPER_LEFT_KEYCODE,
+    ManagerInput, WindowLayout, WindowManager, ALT_LEFT_KEYCODE, MIN_WINDOW_SIZE,
+    SUPER_LEFT_KEYCODE,
 };
 use tuna_compositor::TestCompositor;
 use wayland_client::{
@@ -461,6 +463,124 @@ fn super_drag_moves_without_a_client_request() {
     assert_eq!(geometry(&f).loc, start.loc + Point::from((-30, 70)));
     sync(&mut f);
     assert_eq!(f.client.releases, 0, "a swallowed press has no release");
+}
+
+fn key(f: &mut Fixture, keycode: u32, pressed: bool, time: u32) {
+    f.manager.on_input(
+        &mut f.comp.state,
+        ManagerInput::Key {
+            keycode,
+            pressed,
+            time,
+        },
+    );
+}
+
+const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
+
+#[test]
+fn mouse_button_modifier_moves_the_drag_to_its_key() {
+    // org.gnome.desktop.wm.preferences mouse-button-modifier '<Alt>'.
+    let mut f = fixture();
+    f.manager.set_focus_policy(FocusPolicy {
+        modifier: tuna_shell_control::MOD_ALT,
+        ..FocusPolicy::default()
+    });
+    let start = geometry(&f);
+    let at = (start.loc + Point::from((200, 200))).to_f64();
+    f.manager.pointer_motion(&mut f.comp.state, at, 1);
+    // Super is now an ordinary click: delivered, nothing moves.
+    key(&mut f, SUPER_LEFT_KEYCODE, true, 2);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, true, 3);
+    f.manager
+        .pointer_motion(&mut f.comp.state, at + Point::from((40.0, 0.0)), 4);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 5);
+    key(&mut f, SUPER_LEFT_KEYCODE, false, 6);
+    sync(&mut f);
+    assert_eq!(f.client.presses, 1, "Super+press reaches the client");
+    assert_eq!(geometry(&f).loc, start.loc);
+    // Alt+drag moves without a client request.
+    let at = at + Point::from((40.0, 0.0));
+    key(&mut f, ALT_LEFT_KEYCODE, true, 7);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, true, 8);
+    f.manager
+        .pointer_motion(&mut f.comp.state, at + Point::from((-30.0, 70.0)), 9);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 10);
+    key(&mut f, ALT_LEFT_KEYCODE, false, 11);
+    sync(&mut f);
+    assert_eq!(f.client.presses, 1, "Alt+press is the compositor's");
+    assert_eq!(geometry(&f).loc, start.loc + Point::from((-30, 70)));
+}
+
+#[test]
+fn modifier_resize_and_menu_buttons_follow_resize_with_right_button() {
+    let mut f = fixture();
+    let start = geometry(&f);
+    // The bottom-right third grabs the right and bottom edges.
+    let corner = (start.loc + Point::from((start.size.w - 20, start.size.h - 20))).to_f64();
+    f.manager.pointer_motion(&mut f.comp.state, corner, 1);
+    key(&mut f, SUPER_LEFT_KEYCODE, true, 2);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_MIDDLE, true, 3);
+    assert!(f.manager.grab_active(), "Super+middle resizes");
+    f.manager
+        .pointer_motion(&mut f.comp.state, corner + Point::from((40.0, 30.0)), 4);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_MIDDLE, false, 5);
+    let grown = geometry(&f);
+    assert_eq!(grown.loc, start.loc);
+    assert_eq!(
+        (grown.size.w, grown.size.h),
+        (start.size.w + 40, start.size.h + 30)
+    );
+    // Super+right shows GNOME's window menu at the pointer.
+    let corner = corner + Point::from((40.0, 30.0));
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_RIGHT, true, 6);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_RIGHT, false, 7);
+    assert_eq!(
+        f.manager.take_menu_requests(),
+        vec![(id(&f), corner.x as i32, corner.y as i32)]
+    );
+    // The centre third: the resize button is an ordinary press.
+    let centre = (grown.loc + Point::from((grown.size.w / 2, grown.size.h / 2))).to_f64();
+    f.manager.pointer_motion(&mut f.comp.state, centre, 8);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_MIDDLE, true, 9);
+    assert!(!f.manager.grab_active());
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_MIDDLE, false, 10);
+    // Swapped: right resizes, middle shows the menu.
+    f.manager.set_focus_policy(FocusPolicy {
+        resize_with_right_button: true,
+        ..FocusPolicy::default()
+    });
+    f.manager.pointer_motion(&mut f.comp.state, corner, 11);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_RIGHT, true, 12);
+    assert!(f.manager.grab_active(), "Super+right resizes when swapped");
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_RIGHT, false, 13);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_MIDDLE, true, 14);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_MIDDLE, false, 15);
+    assert_eq!(
+        f.manager.take_menu_requests(),
+        vec![(id(&f), corner.x as i32, corner.y as i32)]
+    );
+    key(&mut f, SUPER_LEFT_KEYCODE, false, 16);
+    sync(&mut f);
+    assert_eq!(
+        f.client.presses, 1,
+        "only the centre press reached the client"
+    );
 }
 
 #[test]

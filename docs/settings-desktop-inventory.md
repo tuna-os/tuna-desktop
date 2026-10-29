@@ -10,6 +10,8 @@ Orientation follow-up: w2-345 (#345). `orientation-lock` never lived under `org.
 
 Privacy follow-up: w3-356-privacy (#356). The three `org.gnome.desktop.privacy` device kill-switches move to Honored with the enforcing services identified per key; retention, diagnostics, and reporting rows stay Ignored as external-service responsibilities. Mechanism, GNOME 51 comparison, and proof matrix are in [privacy-enforcement.md](privacy-enforcement.md).
 
+Focus-policy follow-up: feat/focus-policy (#347, ledger P-WM-09). `focus-mode`, `auto-raise`, `auto-raise-delay`, `raise-on-click`, `mouse-button-modifier` and `resize-with-right-button` move to Honored: the compositor reads them live on an owned GIO thread (`crates/compositor/src/wm_preferences.rs`) with Mutter 51.0's semantics (`crates/compositor/src/focus_policy.rs`). The three `action-*-click-titlebar` keys stay Via GTK: titlebars are client-side and GTK runs those actions itself.
+
 Wellbeing renderer evidence: candidate `529f71648f3286092b55b93f59983a2882de3ec5` (2026-10-12). The GTK entry point starts [the wellbeing runtime](../crates/shell-gtk/src/wellbeing.rs), which watches the schemas, maintains `$XDG_DATA_HOME/gnome-shell/session-active-history.json`, registers notice actions and sends effects through the control client with correlated `Applied` responses. [Exact-source native renderer evidence](https://github.com/tuna-os/tuna-desktop/actions/runs/38320982358) was independently rechecked for 38 pixel comparisons from 44 original PNGs: entry/midpoint/endpoint, combined effects, immediate disable, reduced-motion/animations-off controls and cursor exclusion under nested winit/Xvfb/llvmpipe. This uses a supervised synthetic control peer; it does not qualify production GTK wellbeing policy, installed DRM/GPU sessions or the complete feature. The countdown stop hook now cancels only its owned OSD display and timer, preserving a newer volume/brightness display; the added actual GTK regression awaits exact-source CI execution. [#354](https://github.com/tuna-os/tuna-desktop/issues/354) remains open.
 
 Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.14.5/gdk/wayland/gdkdisplay-wayland.c). Related shell, Mutter and settings-daemon keys are in [settings-map.md](settings-map.md).
@@ -614,16 +616,16 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 | action-middle-click-titlebar | Via GTK | GTK Wayland settings translation; clients follow the portal or GSettings fallback |
 | action-right-click-titlebar | Via GTK | GTK Wayland settings translation; clients follow the portal or GSettings fallback |
 | audible-bell | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
-| auto-raise | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
-| auto-raise-delay | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
+| auto-raise | Honored (compositor) | Owned GIO reader, live; in sloppy/mouse focus the entered window rises after auto-raise-delay if still under the pointer and not on top (Mutter 51 display.c); never in click focus. Proof G-FOCUS-AUTORAISE |
+| auto-raise-delay | Honored (compositor) | Owned GIO reader, live; the auto-raise delay, clamped to the schema's 0–10000 ms. Proof G-FOCUS-AUTORAISE |
 | button-layout | Via GTK | GTK Wayland settings translation; clients follow the portal or GSettings fallback |
 | disable-workarounds | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
-| focus-mode | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
+| focus-mode | Honored (compositor) | Owned GIO reader, live; click, sloppy (focus on enter, kept over the desktop) and mouse (also unfocused over the desktop and shell chrome), with focus-change-on-pointer-rest and Mutter's sticky activation focus; the scrollable strip keeps click focus. Proofs G-FOCUS-SLOPPY, G-FOCUS-MOUSE |
 | focus-new-windows | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
-| mouse-button-modifier | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
+| mouse-button-modifier | Honored (compositor) | Owned GIO reader, live; parsed like Mutter's meta_parse_modifier (empty/disabled turns modifier clicks off); with it held button 1 moves, the resize button resizes from the pressed third, the menu button opens the window menu. Mod2/Mod3/Mod5 contribute nothing. Proof G-FOCUS-MODIFIER |
 | num-workspaces | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
-| raise-on-click | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
-| resize-with-right-button | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
+| raise-on-click | Honored (compositor) | Owned GIO reader, live; false focuses clicked windows and xdg-activation requests without raising, and only grabs under 8 px raise at release; shell activations still raise (Mutter's pager rule). Proof G-FOCUS-RAISE-ON-CLICK |
+| resize-with-right-button | Honored (compositor) | Owned GIO reader, live; true makes the right button resize and the middle button open the window menu with mouse-button-modifier. Proof G-FOCUS-MODIFIER |
 | theme | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
 | titlebar-font | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |
 | titlebar-uses-system-font | Ignored | Tuna Desktop uses click focus and dynamic workspaces; this WM policy has no consumer |

@@ -386,6 +386,40 @@ fn focused_client_can_hand_focus_with_a_token() {
 }
 
 #[test]
+fn token_activation_raises_only_with_raise_on_click() {
+    // Mutter activates xdg-activation requests as META_CLIENT_TYPE_APPLICATION:
+    // with raise-on-click off they focus without raising (window.c).
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    manager.set_focus_policy(tuna_compositor::focus_policy::FocusPolicy {
+        raise_on_click: false,
+        ..Default::default()
+    });
+    let mut peer = connect(&mut comp);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let first = window(&mut peer, "first");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let _second = window(&mut peer, "second");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let second_id = manager.model().focused().unwrap();
+    let _token = mint(&mut peer, true);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let token = peer.client.token.take().expect("token issued");
+    peer.client
+        .activation
+        .as_ref()
+        .unwrap()
+        .activate(token, &first);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(focused_title(&manager).as_deref(), Some("first"));
+    assert_eq!(
+        manager.stacking_order().last(),
+        Some(&second_id),
+        "focused beneath the window that was on top"
+    );
+}
+
+#[test]
 fn background_clients_and_serial_less_tokens_cannot_steal_focus() {
     let mut comp = TestCompositor::new();
     let mut manager = comp.window_manager();

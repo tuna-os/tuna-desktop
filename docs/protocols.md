@@ -89,7 +89,9 @@ and this page together.
 
 A token is valid only when the client that asks for it holds keyboard
 focus and attaches an input serial. It works once, within 10 seconds.
-A valid request focuses and raises the window. This is Mutter's
+A valid request focuses the window and raises it unless
+`org.gnome.desktop.wm.preferences raise-on-click` is off (Mutter activates
+these as `META_CLIENT_TYPE_APPLICATION`). This is Mutter's
 focus-stealing prevention in its simplest form: a background app cannot
 mint its way to the front.
 

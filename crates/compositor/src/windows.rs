@@ -275,6 +275,33 @@ struct HeldAccelerator {
     mode: u32,
 }
 
+/// Mutter's sticky mouse focus: an activation in sloppy or mouse mode
+/// keeps focus against stationary crossings until the pointer moves, and
+/// against every crossing until it has moved 50 px.
+#[derive(Debug, Clone, Copy)]
+struct StickyFocus {
+    /// Pointer travel since the activation.
+    distance: f64,
+}
+
+/// A crossing waiting for the pointer to rest (Mutter's 25 ms poll).
+#[derive(Debug, Clone, Copy)]
+struct PointerRest {
+    window: Option<u64>,
+    pos: (i32, i32),
+    due: std::time::Instant,
+}
+
+/// A grab started without raise-on-click: it raises at its end unless
+/// it travelled the threshold (meta-window-drag.c).
+#[derive(Debug, Clone, Copy)]
+struct GrabRaise {
+    id: u64,
+    start: Point<f64, Logical>,
+    /// Largest axis offset from `start` seen so far.
+    distance: f64,
+}
+
 pub struct WindowManager {
     /// Active interactive move/resize, if any (#58).
     grab: Option<PointerGrab>,
@@ -407,6 +434,16 @@ pub struct WindowManager {
     workspace_tracker: crate::workspace_tracker::WorkspaceTracker,
     modal_dim: crate::modal_dim::ModalDim,
     icon_geometries: HashMap<u64, Rectangle<i32, Logical>>,
+    /// GNOME's focus policy (`org.gnome.desktop.wm.preferences`), live.
+    focus_policy: crate::focus_policy::FocusPolicy,
+    /// Mutter's `pointer_window` at the last crossing (`Some(None)`: no
+    /// window, i.e. the desktop or shell chrome); `None` before the first.
+    pointer_window: Option<Option<u64>>,
+    sticky_focus: Option<StickyFocus>,
+    pointer_rest: Option<PointerRest>,
+    /// Pending auto-raise `(window, due)`.
+    auto_raise: Option<(u64, std::time::Instant)>,
+    grab_raise: Option<GrabRaise>,
 }
 
 impl WindowManager {
@@ -627,6 +664,12 @@ impl WindowManager {
             workspace_tracker: Default::default(),
             modal_dim: Default::default(),
             icon_geometries: Default::default(),
+            focus_policy: Default::default(),
+            pointer_window: None,
+            sticky_focus: None,
+            pointer_rest: None,
+            auto_raise: None,
+            grab_raise: None,
         }
     }
 
@@ -2001,6 +2044,21 @@ impl WindowManager {
         self.stacking.retain(|other| *other != id);
         self.focus_history.retain(|other| *other != id);
         self.icon_geometries.remove(&id);
+        // An unmanaged window drops its auto-raise and pointer-rest check,
+        // and stops being the pointer window: the next repick crosses into
+        // whatever lies beneath.
+        if self.auto_raise.is_some_and(|(pending, _)| pending == id) {
+            self.auto_raise = None;
+        }
+        if self
+            .pointer_rest
+            .is_some_and(|rest| rest.window == Some(id))
+        {
+            self.pointer_rest = None;
+        }
+        if self.pointer_window == Some(Some(id)) {
+            self.pointer_window = None;
+        }
         self.model.remove(id);
         if self
             .grab
@@ -2079,7 +2137,9 @@ impl WindowManager {
                     }
                 }
                 WindowRequest::Activate => {
-                    self.focus(state, Some(id));
+                    // xdg-activation is META_CLIENT_TYPE_APPLICATION:
+                    // Mutter raises it only with raise-on-click.
+                    self.activate(state, Some(id), self.focus_policy.raise_on_click);
                 }
                 WindowRequest::Minimize => {
                     self.minimize(state, id);
@@ -2115,8 +2175,16 @@ impl WindowManager {
 
     /// Focus a window: model focus, keyboard focus, pointer-adjacent
     /// activation flags, and configure round-trips. `None` unfocuses.
-    /// The window rises to the top of the stacking order.
+    /// The window rises to the top of the stacking order: this is the
+    /// shell's activation, which Mutter's `meta_window_activate` raises
+    /// as a pager whatever `raise-on-click` says.
     pub fn focus(&mut self, state: &mut State, id: Option<u64>) -> bool {
+        self.activate(state, id, true)
+    }
+
+    /// Activation (`meta_window_activate_full`): raised when `raise`, and
+    /// in sloppy or mouse mode the new focus turns sticky.
+    fn activate(&mut self, state: &mut State, id: Option<u64>, raise: bool) -> bool {
         if let Some(id) = id {
             if !self.windows.contains_key(&id) {
                 return false;
@@ -2128,9 +2196,14 @@ impl WindowManager {
         // window that was focused before it opened.
         if self.overview_held.is_some() {
             self.focus_parked(id);
-            return true;
+        } else {
+            self.apply_focus_raise(state, id, raise);
         }
-        self.apply_focus(state, id);
+        // meta_display_maybe_update_sticky_mouse_focus: the activated window
+        // survives the restack under a stationary pointer (an overview pick,
+        // Alt+Tab) until the pointer moves.
+        self.sticky_focus = (self.focus_policy.mode.follows_pointer() && id.is_some())
+            .then_some(StickyFocus { distance: 0.0 });
         true
     }
 
@@ -2197,11 +2270,24 @@ impl WindowManager {
     }
 
     fn apply_focus(&mut self, state: &mut State, id: Option<u64>) {
+        self.apply_focus_raise(state, id, true);
+    }
+
+    /// Focus, raising the floating stack only when `raise` (GNOME's
+    /// `raise-on-click` and pointer focus focus without raising).
+    fn apply_focus_raise(&mut self, state: &mut State, id: Option<u64>, raise: bool) {
         // GNOME attaches modal dialogs to their parent: the parent
         // cannot take focus from its dialog (xdg-dialog, #89).
         let id = id.map(|id| self.activation_target(id));
         let previous = self.model.focused();
         self.model.set_focused(id);
+        // meta_display_set_input_focus drops another window's auto-raise.
+        if self
+            .auto_raise
+            .is_some_and(|(pending, _)| Some(pending) != id)
+        {
+            self.auto_raise = None;
+        }
         if let Some(id) = id {
             self.remember_focus(id);
         }
@@ -2223,7 +2309,7 @@ impl WindowManager {
             // Floating stacks raise focus to the top; the strip keeps
             // column order independent of focus (niri shape), so focus
             // never reorders in scroll mode.
-            if self.mode == SessionMode::Gnome {
+            if raise && self.mode == SessionMode::Gnome {
                 self.raise_family(id);
             }
         }
@@ -2600,8 +2686,25 @@ impl WindowManager {
                 pointer_start: pointer,
                 loc_start: window.geometry.loc,
             });
+            self.note_grab_start(id);
         }
         let _ = state;
+    }
+
+    /// meta-window-drag.c: a grab raises its window as it starts with
+    /// `raise-on-click`; without, a grab that never travels the threshold
+    /// from where the pointer was when it began raises when it ends.
+    fn note_grab_start(&mut self, id: u64) {
+        self.grab_raise = None;
+        if self.focus_policy.grab_raises_at_start() {
+            self.raise_family(id);
+        } else {
+            self.grab_raise = Some(GrabRaise {
+                id,
+                start: self.pointer_pos,
+                distance: 0.0,
+            });
+        }
     }
 
     /// Start resizing `id` from `edges` with the pointer.
@@ -2616,13 +2719,24 @@ impl WindowManager {
         edges: u32,
         pointer: Point<f64, Logical>,
     ) {
+        let button = state
+            .seat
+            .get_pointer()
+            .and_then(|p| p.grab_start_data())
+            .map(|g| g.button);
+        self.begin_resize_owned(state, id, edges, pointer, button);
+    }
+
+    fn begin_resize_owned(
+        &mut self,
+        state: &mut State,
+        id: u64,
+        edges: u32,
+        pointer: Point<f64, Logical>,
+        button: Option<u32>,
+    ) {
         self.settle(id);
         if self.mode == SessionMode::Scroll {
-            let button = state
-                .seat
-                .get_pointer()
-                .and_then(|p| p.grab_start_data())
-                .map(|g| g.button);
             // This layout has one full-height window per column. Only
             // horizontal edges can change its width, including corners.
             if edges & (EDGE_LEFT | EDGE_RIGHT) == 0
@@ -2654,6 +2768,7 @@ impl WindowManager {
                 pointer_start: pointer,
                 geometry_start: window.geometry,
             });
+            self.note_grab_start(id);
         }
     }
 
@@ -2680,6 +2795,12 @@ impl WindowManager {
         let Some(grab) = self.grab else {
             return false;
         };
+        if let Some(raise) = self.grab_raise.as_mut() {
+            raise.distance = raise
+                .distance
+                .max((pos.x - raise.start.x).abs())
+                .max((pos.y - raise.start.y).abs());
+        }
         if let Some(owner) = Self::strip_grab_owner(grab) {
             if !self.strip_pointer_valid(state, owner) {
                 self.cancel_strip_pointer(state);
@@ -2757,6 +2878,13 @@ impl WindowManager {
         let Some(grab) = self.grab.take() else {
             return;
         };
+        if let Some(raise) = self.grab_raise.take() {
+            if self.focus_policy.grab_raises_at_end(raise.distance)
+                && self.windows.contains_key(&raise.id)
+            {
+                self.raise_family(raise.id);
+            }
+        }
         if let Some(owner) = Self::strip_grab_owner(grab) {
             self.reset_strip_edge();
             if !self.strip_pointer_valid(state, owner) {
@@ -2923,11 +3051,13 @@ impl WindowManager {
         let Some(pos) = self.constrain(state, pos) else {
             return;
         };
+        let travelled = (pos.x - self.pointer_pos.x).hypot(pos.y - self.pointer_pos.y);
         self.pointer_pos = pos;
         // An interactive move/resize owns the pointer until release.
         if self.grab_motion(state, pos) {
             return;
         }
+        self.sticky_motion(state, travelled);
         // Popups paint over everything they hang off: they win first.
         if let Some(popup) = self.popup_at(state, pos) {
             if let Some(pointer) = self.pointer.clone() {
@@ -2965,6 +3095,9 @@ impl WindowManager {
                 // frame boundary (GTK4 drops unframed clicks).
                 pointer.frame(state);
             }
+            // Shell chrome is no window: GNOME's stage actors (panel,
+            // banners) leave Mutter's pointer window NULL.
+            self.pointer_crossing(state, None);
             return;
         }
         // In the overview, windows are previews the compositor draws:
@@ -2985,13 +3118,13 @@ impl WindowManager {
             return;
         }
         // Pointer focus is the window under the pointer, or nothing over
-        // the bare desktop. Keyboard focus and stacking change only on a
-        // click (GNOME's default click-to-focus), never on motion.
+        // the bare desktop. Keyboard focus follows it only in GNOME's
+        // sloppy and mouse modes (pointer_crossing).
         let Some(pointer) = self.pointer.clone() else {
             return;
         };
-        let target = self
-            .window_at(pos)
+        let under = self.window_at(pos);
+        let target = under
             // An attached modal dialog blocks pointer input to its parent,
             // even where the parent's content is exposed beside the dialog.
             .filter(|id| self.modal_target(*id) == *id)
@@ -3017,6 +3150,208 @@ impl WindowManager {
         // wl_seat v5+: clients act on pointer events only at a frame
         // boundary (GTK4 drops unframed clicks).
         pointer.frame(state);
+        self.pointer_crossing(state, under);
+    }
+
+    /// GNOME's focus policy, as last read from its settings.
+    pub fn focus_policy(&self) -> crate::focus_policy::FocusPolicy {
+        self.focus_policy
+    }
+
+    /// Install a fresh focus policy (live `org.gnome.desktop.wm.preferences`).
+    pub fn set_focus_policy(&mut self, policy: crate::focus_policy::FocusPolicy) {
+        if policy == self.focus_policy {
+            return;
+        }
+        eprintln!(
+            "tuna-compositor: focus policy mode={} auto_raise={} delay_ms={} raise_on_click={} modifier={} resize_with_right_button={} pointer_rest={}",
+            policy.mode.as_str(),
+            policy.auto_raise,
+            policy.auto_raise_delay.as_millis(),
+            policy.raise_on_click,
+            policy.modifier,
+            policy.resize_with_right_button,
+            policy.focus_change_on_pointer_rest,
+        );
+        // display.c prefs_changed_callback: click focus clears sticky focus.
+        if !policy.mode.follows_pointer() {
+            self.sticky_focus = None;
+            self.pointer_rest = None;
+        }
+        if !policy.mode.follows_pointer() || !policy.auto_raise {
+            self.auto_raise = None;
+        }
+        self.focus_policy = policy;
+    }
+
+    /// Model ids bottom-to-top.
+    pub fn stacking_order(&self) -> &[u64] {
+        &self.stacking
+    }
+
+    /// Whether pointer crossings may move keyboard focus now: sloppy or
+    /// mouse mode on the floating desktop, with no grab, overview, modal
+    /// shell surface or popup holding input. The scrollable strip keeps
+    /// click focus (Tuna's own layout; focus there scrolls the view).
+    fn pointer_focus_active(&self, state: &State) -> bool {
+        self.focus_policy.mode.follows_pointer()
+            && self.mode == SessionMode::Gnome
+            && self.grab.is_none()
+            && !self.overview_open
+            && self.overview_held.is_none()
+            && self.exclusive_held.is_none()
+            && !self.lock_input_active
+            && !state.popup_grab_active()
+    }
+
+    /// Integer pointer position, as Mutter's pointer-rest poll compares it.
+    fn rest_pos(&self) -> (i32, i32) {
+        (self.pointer_pos.x as i32, self.pointer_pos.y as i32)
+    }
+
+    /// A crossing into `under` (`None`: no window), as Mutter's Wayland
+    /// pointer reports it to meta_display_handle_window_enter.
+    fn pointer_crossing(&mut self, state: &mut State, under: Option<u64>) {
+        if self.pointer_window == Some(under) {
+            return;
+        }
+        // Clutter's implicit grab holds crossings until the buttons rise;
+        // the next motion or repick then crosses.
+        if self
+            .pointer
+            .as_ref()
+            .is_some_and(|pointer| pointer.is_grabbed())
+        {
+            return;
+        }
+        self.pointer_window = Some(under);
+        if !self.pointer_focus_active(state) {
+            return;
+        }
+        // An activation's sticky focus ignores crossings until the pointer
+        // has moved at all.
+        if self
+            .sticky_focus
+            .is_some_and(|sticky| sticky.distance <= 0.0)
+        {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.focus_policy.focus_change_on_pointer_rest {
+            self.pointer_rest = Some(PointerRest {
+                window: under,
+                pos: self.rest_pos(),
+                due: now + crate::focus_policy::POINTER_REST_INTERVAL,
+            });
+        } else {
+            self.focus_mouse_mode(state, under, now);
+        }
+    }
+
+    /// display.c focus_mouse_mode: focus without raising, queue auto-raise,
+    /// or in mouse mode unfocus over no window.
+    fn focus_mouse_mode(
+        &mut self,
+        state: &mut State,
+        target: Option<u64>,
+        now: std::time::Instant,
+    ) {
+        let focused = self.model.focused();
+        match self.focus_policy.focus_mouse_mode(target, focused) {
+            crate::focus_policy::Enter::Focus { id, auto_raise } => {
+                if focused != Some(self.modal_target(id)) {
+                    self.apply_focus_raise(state, Some(id), false);
+                }
+                if let Some(delay) = auto_raise {
+                    self.auto_raise = Some((id, now + delay));
+                }
+            }
+            crate::focus_policy::Enter::Unfocus => self.apply_focus_raise(state, None, false),
+            crate::focus_policy::Enter::Nothing => {}
+        }
+    }
+
+    /// Accumulate pointer travel against sticky focus; past 50 px it lets
+    /// go and the window under the pointer takes focus
+    /// (invalidate_sticky_mouse_focus).
+    fn sticky_motion(&mut self, state: &mut State, travelled: f64) {
+        let Some(sticky) = self.sticky_focus.as_mut() else {
+            return;
+        };
+        sticky.distance += travelled;
+        if sticky.distance <= crate::focus_policy::STICKY_UNSTICK_DISTANCE {
+            return;
+        }
+        self.sticky_focus = None;
+        if let Some(under) = self.pointer_window {
+            if self.pointer_focus_active(state) {
+                self.focus_mouse_mode(state, under, std::time::Instant::now());
+            }
+        }
+    }
+
+    /// Clutter's repick after the scene changed under a stationary
+    /// pointer (a window mapped, closed, restacked or the workspace
+    /// switched): a crossing without motion. Only pointer focus needs it.
+    pub fn repick_pointer_window(&mut self, state: &mut State) {
+        if !self.pointer_focus_active(state) {
+            return;
+        }
+        let pos = self.pointer_pos;
+        if self.popup_at(state, pos).is_some() {
+            return;
+        }
+        let under =
+            if crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
+                .is_some()
+            {
+                None
+            } else {
+                self.window_at(pos)
+            };
+        self.pointer_crossing(state, under);
+    }
+
+    /// The next pointer-rest check or auto-raise.
+    pub fn focus_deadline(&self) -> Option<std::time::Instant> {
+        self.pointer_rest
+            .map(|rest| rest.due)
+            .into_iter()
+            .chain(self.auto_raise.map(|(_, due)| due))
+            .min()
+    }
+
+    /// Run the due pointer-rest check (focus_on_pointer_rest_callback) and
+    /// auto-raise (window_raise_with_delay_callback).
+    pub fn run_focus_timers(&mut self, state: &mut State, now: std::time::Instant) {
+        if let Some(mut rest) = self.pointer_rest.filter(|rest| now >= rest.due) {
+            self.pointer_rest = None;
+            let live = rest.window.is_none_or(|id| self.windows.contains_key(&id));
+            if live && self.pointer_focus_active(state) {
+                let pos = self.rest_pos();
+                if pos != rest.pos {
+                    // Still moving: poll again.
+                    rest.pos = pos;
+                    rest.due = now + crate::focus_policy::POINTER_REST_INTERVAL;
+                    self.pointer_rest = Some(rest);
+                } else if rest
+                    .window
+                    .is_none_or(|id| self.pointer_window == Some(Some(id)))
+                {
+                    self.focus_mouse_mode(state, rest.window, now);
+                }
+            }
+        }
+        if let Some((id, _)) = self.auto_raise.filter(|(_, due)| now >= *due) {
+            self.auto_raise = None;
+            // Raised only when not already on top and still under the pointer.
+            if self.mode == SessionMode::Gnome
+                && self.stacking.last() != Some(&id)
+                && self.pointer_window == Some(Some(id))
+            {
+                self.raise_family(id);
+            }
+        }
     }
 
     /// Pointer button: deliver to the focused window and focus the
@@ -3070,7 +3405,10 @@ impl WindowManager {
             eprintln!(
                 "tuna-compositor: pointer trace: manager button received popup_grab={} move_modifier={} pressed={pressed} pos=({:.1},{:.1}) layer={layer:?} popup={} window={:?} overview={} grab={:?} seat_grab={seat_grab} focused={focused} stack={stack:?}",
                 state.popup_grab_active(),
-                self.super_held,
+                {
+                    let modifier = self.focus_policy.modifier;
+                    modifier != 0 && self.held_mods() & modifier == modifier
+                },
                 pos.x,
                 pos.y,
                 self.popup_at(state, pos).is_some(),
@@ -3102,29 +3440,66 @@ impl WindowManager {
             {
                 if let Some(id) = self.window_at(pos) {
                     if self.modal_target(id) != id {
-                        self.apply_focus(state, Some(id));
+                        self.apply_focus_raise(state, Some(id), self.focus_policy.raise_on_click);
                         self.swallowed_button = Some(button);
                         return;
                     }
                 }
             }
         }
-        // Super+press on a window starts a move (GNOME's Super+drag).
-        if pressed && self.super_held && !self.overview_open && !strip_owned {
+        // GNOME's window clicks (window.c meta_window_handle_ungrabbed_event):
+        // with the whole mouse-button-modifier held, button 1 moves, the
+        // resize button resizes from the pressed third and the menu button
+        // shows the window menu; those presses stay with the compositor.
+        // Any other press focuses and is delivered, raising only when
+        // unmodified with raise-on-click.
+        let mut press_raise = self.focus_policy.raise_on_click;
+        if pressed && !self.overview_open && !strip_owned {
             let pos = self.pointer_pos;
             if crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
                 .is_none()
                 && self.popup_at(state, pos).is_none()
             {
-                if let Some(id) = self.window_at(pos) {
-                    self.apply_focus(state, Some(id));
-                    // The trigger machine already disarmed the Super tap on
-                    // this press, so releasing Super will not open the
-                    // overview.
-                    self.begin_move_owned(state, id, pos, Some(button));
-                    // The press is not delivered, so neither is its release.
-                    self.swallowed_button = Some(button);
-                    return;
+                if let Some((id, frame)) = self
+                    .window_at(pos)
+                    .and_then(|id| Some((id, self.shifted(id, self.windows.get(&id)?.geometry))))
+                {
+                    let decision = self.focus_policy.press(
+                        self.held_mods(),
+                        button,
+                        state.shortcuts_inhibited(),
+                        (frame.loc.x, frame.loc.y, frame.size.w, frame.size.h),
+                        (pos.x, pos.y),
+                    );
+                    // Every swallowed press: the trigger machine already
+                    // disarmed the Super tap on it, so releasing Super
+                    // will not open the overview, and the release is
+                    // swallowed with it.
+                    match decision {
+                        crate::focus_policy::Press::Focus { raise } => press_raise = raise,
+                        crate::focus_policy::Press::Move => {
+                            self.apply_focus_raise(state, Some(id), false);
+                            self.begin_move_owned(state, id, pos, Some(button));
+                            self.swallowed_button = Some(button);
+                            return;
+                        }
+                        crate::focus_policy::Press::Resize { edges } => {
+                            self.apply_focus_raise(state, Some(id), false);
+                            self.begin_resize_owned(state, id, edges, pos, Some(button));
+                            self.swallowed_button = Some(button);
+                            return;
+                        }
+                        crate::focus_policy::Press::Menu { raise } => {
+                            self.apply_focus_raise(state, Some(id), raise);
+                            self.menu_requests.push((
+                                id,
+                                pos.x.round() as i32,
+                                pos.y.round() as i32,
+                            ));
+                            self.swallowed_button = Some(button);
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -3172,7 +3547,11 @@ impl WindowManager {
                     .as_ref()
                     .is_none_or(|keyboard| keyboard.current_focus() == self.surface_of(id));
                 if self.model.focused() != Some(id) || !keyboard_matches {
-                    self.apply_focus(state, Some(id));
+                    self.apply_focus_raise(state, Some(id), press_raise);
+                } else if press_raise && self.mode == SessionMode::Gnome {
+                    // Pointer focus leaves windows focused beneath others:
+                    // every raise-on-click press raises, focused or not.
+                    self.raise_family(id);
                 }
             }
         }
