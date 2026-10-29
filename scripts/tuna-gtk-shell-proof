@@ -8557,15 +8557,39 @@ shell_dimming() {
         --object-path /org/gnome/Shell/Brightness \
         --method org.gnome.Shell.Brightness.SetDimming "$1" >/dev/null
 }
+# The monitor-key cycle above wrapped the primary to its hardware floor and
+# the slider kept its zero ratio (CI 40815468357: tuna-bl 10/1010), so only
+# the second output (aaa-other, ratio-scaled above its floor) can show a
+# dim. GNOME 51 clips each output to min(idle, level); expect exact values.
 power_baseline="$(cat "$BACKLIGHT/brightness")"
+power_other="$ARTIFACTS/backlight/aaa-other"
+power_other_baseline="$(cat "$power_other/brightness")"
 power_idle="$(gsettings get org.gnome.settings-daemon.plugins.power idle-brightness)"
 gsettings set org.gnome.settings-daemon.plugins.power idle-brightness 1
+power_dimmed="$("$PY" - "$BACKLIGHT" "$power_other" <<'PY_DIMMED'
+import pathlib
+import sys
+
+def dimmed(path):
+    maximum = int((path / "max_brightness").read_text().strip())
+    minimum = max(1, maximum // 100)
+    level = (int((path / "brightness").read_text().strip()) - minimum) / (maximum - minimum)
+    return minimum + int((maximum - minimum) * min(0.01, level) + 0.5)
+
+print(*(dimmed(pathlib.Path(arg)) for arg in sys.argv[1:]))
+PY_DIMMED
+)"
+power_dimmed_primary="${power_dimmed%% *}"
+power_dimmed_other="${power_dimmed##* }"
+[ "$power_dimmed_other" -lt "$power_other_baseline" ] ||
+    fail G-POWER-SAVE-MODE "no output above the 1% idle level to dim ($power_other_baseline)"
 [ "$(power_save_get)" = "(<0>,)" ] || fail G-POWER-SAVE-MODE "PowerSaveMode did not start on"
 shell_dimming true || fail G-POWER-SAVE-MODE "SetDimming(true) refused"
 end=$(($(date +%s) + 10))
-until [ "$(cat "$BACKLIGHT/brightness")" -lt "$power_baseline" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
-[ "$(cat "$BACKLIGHT/brightness")" -lt "$power_baseline" ] ||
-    fail G-POWER-SAVE-MODE "idle dim did not lower the backlight below $power_baseline"
+until [ "$(cat "$power_other/brightness")" = "$power_dimmed_other" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
+[ "$(cat "$power_other/brightness")" = "$power_dimmed_other" ] &&
+    [ "$(cat "$BACKLIGHT/brightness")" = "$power_dimmed_primary" ] ||
+    fail G-POWER-SAVE-MODE "idle dim did not clip to $power_dimmed_primary/$power_dimmed_other (from $power_baseline/$power_other_baseline)"
 power_save_set 3 || fail G-POWER-SAVE-MODE "PowerSaveMode 3 refused"
 [ "$(power_save_get)" = "(<3>,)" ] || fail G-POWER-SAVE-MODE "PowerSaveMode did not read back 3"
 cstate '.power_save_mode == 3' "power save off" 5 || fail G-POWER-SAVE-MODE "compositor did not apply PowerSaveMode 3"
@@ -8587,9 +8611,12 @@ cstate ".power_save_mode == 0 and .rendered_frames > $power_frames" "unblanked r
     fail G-POWER-SAVE-MODE "unblanking did not repaint"
 shell_dimming false || fail G-POWER-SAVE-MODE "SetDimming(false) refused"
 end=$(($(date +%s) + 10))
-until [ "$(cat "$BACKLIGHT/brightness")" = "$power_baseline" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
-[ "$(cat "$BACKLIGHT/brightness")" = "$power_baseline" ] ||
-    fail G-POWER-SAVE-MODE "undimming did not restore the user baseline $power_baseline"
+until [ "$(cat "$BACKLIGHT/brightness")" = "$power_baseline" ] &&
+    [ "$(cat "$power_other/brightness")" = "$power_other_baseline" ] ||
+    [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
+[ "$(cat "$BACKLIGHT/brightness")" = "$power_baseline" ] &&
+    [ "$(cat "$power_other/brightness")" = "$power_other_baseline" ] ||
+    fail G-POWER-SAVE-MODE "undimming did not restore the user baseline $power_baseline/$power_other_baseline"
 gsettings set org.gnome.settings-daemon.plugins.power idle-brightness "$power_idle"
 pass G-POWER-SAVE-MODE "gsd idle sequence: Shell.Brightness dim, DisplayConfig PowerSaveMode 3 stops scanout (-1 ignored), 0 repaints, undim restores baseline; nested, no CRTC off"
 rm -rf "$ARTIFACTS/backlight/aaa-other"
