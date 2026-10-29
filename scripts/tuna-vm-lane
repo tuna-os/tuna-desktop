@@ -92,14 +92,17 @@ OVMF = ("/usr/share/ovmf/OVMF.fd", "/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/q
 # session worker opens for gdm-wayland-session (GDM 51.1
 # daemon/gdm-session-worker.c: sd_journal_stream_fd (arguments[0], ...)).
 SESSION_RECORD_RE = re.compile(r"(?:tuna-vm-session|gdm-wayland-session)\[(\d+)\]: (.*)")
-# A library's own leveled stderr line from a session process: libinput's
-# default handler (`libinput error: `) or Mesa (`MESA-EGL: warning: `).
-# A sheared Tuna fragment never opens this way: lock receipts are
-# compact JSON, lock results carry no level word, and Tuna component
-# names are lowercase; a record split at one stays incomplete and still
-# fails the strict matchers closed.
+# A whole record a session process opens without a `tuna-` component
+# prefix: a library's own leveled stderr line, libinput's default handler
+# (`libinput error: `) or Mesa (`MESA-EGL: warning: `), or the compositor's
+# uppercase child diagnostic (`TUNA_ORCA_DIAGNOSTIC stage=`), each observed on
+# session PIDs in CI serial logs. A sheared Tuna fragment never opens this
+# way: lock receipts are compact JSON, lock results carry no level word, and
+# Tuna component names are lowercase; a record split at one stays incomplete
+# and still fails the strict matchers closed.
 FOREIGN_RECORD_RE = re.compile(
-    r"(?:[a-z][\w-]* (?:debug|info|warning|error)|[A-Z][\w-]*: (?:debug|info|warning|error)): ")
+    r"(?:[a-z][\w-]* (?:debug|info|warning|error)|[A-Z][\w-]*: (?:debug|info|warning|error)): "
+    r"|TUNA_[A-Z_]+ ")
 
 
 def session_records(text):
@@ -109,8 +112,8 @@ def session_records(text):
     console records (run 38855306157: `lock command result applied=`, then
     `false`, then ` request_id=` from the same PID). A fragment from a PID
     continues that PID's previous record unless it opens a new `tuna-`
-    component record or a foreign library record (run 40822024326: the
-    compositor's resume-time `libinput error: ` line must not extend its
+    component record or a foreign record (runs 40822024326, 40468688011:
+    the compositor's resume-time `libinput error: ` line must not extend its
     owned-retirement receipt). Returns whole records in serial order.
     """
     records, open_by_pid = [], {}
