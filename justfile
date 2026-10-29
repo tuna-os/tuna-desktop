@@ -71,6 +71,10 @@ proof name *args: _disk
     export HOME="$art/home" XDG_CONFIG_HOME="$art/home/.config" XDG_CACHE_HOME="$art/home/.cache" \
         XDG_DATA_HOME="$art/home/.local/share" XDG_STATE_HOME="$art/home/.local/state"
     mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
+    # Scripts that call `pkg-config` by name get the one PKG_CONFIG names (a
+    # Homebrew one earlier in PATH lacks the system's wayland-protocols),
+    # with Cargo's own bin directory still first.
+    export PATH="$CARGO_HOME/bin:$(dirname "$PKG_CONFIG"):$PATH"
     # A positional artifact contract is stated in the script's first lines.
     if head -n 30 "$script" | grep -qE '\$\{1:\?|sys\.argv\[1\]'; then
         set -- "$art"
