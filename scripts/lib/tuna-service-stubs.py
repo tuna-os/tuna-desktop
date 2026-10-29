@@ -27,8 +27,8 @@ starts), just enough of each daemon behind GNOME 51's quick settings:
 - power-profiles-daemon: ActiveProfile (rw), Profiles (power-saver,
   balanced, performance) and PerformanceDegraded, UPower name.
 - logind: session/auto SetBrightness, which writes BACKLIGHT_DIR's
-  brightness file the way the kernel would, and Terminate; the Manager's
-  Suspend, Reboot and PowerOff. Power calls are appended to POWER_LOG,
+  brightness file the way the kernel would; the Manager's Suspend,
+  Reboot and PowerOff. Power calls are appended to POWER_LOG,
   and Suspend emits PrepareForSleep(true) first, as logind does.
 
 - polkit: the Authority's RegisterAuthenticationAgent, recording the
@@ -155,7 +155,6 @@ XML = """
       <arg type="s" direction="in"/><arg type="s" direction="in"/>
       <arg type="u" direction="in"/>
     </method>
-    <method name="Terminate"/>
   </interface>
   <interface name="org.freedesktop.PolicyKit1.Authority">
     <method name="RegisterAuthenticationAgent">
@@ -464,7 +463,7 @@ def method_call(c, sender, path, iface, method, params, invocation):
         set_property(c, None, path, "org.bluez.Device1", "Connected",
                      GLib.Variant("b", method == "Connect"))
         invocation.return_value(None)
-    elif method in ("Suspend", "Reboot", "PowerOff", "Terminate"):
+    elif method in ("Suspend", "Reboot", "PowerOff"):
         if method == "Suspend":
             c.emit_signal(None, "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
                           "PrepareForSleep", GLib.Variant("(b)", (True,)))

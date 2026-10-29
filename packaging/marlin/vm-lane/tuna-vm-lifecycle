@@ -2375,7 +2375,8 @@ print(json.dumps(result))
             try:
                 stat = (path / "stat").read_text().rsplit(")", 1)[1].split()
                 name = (path / "comm").read_text().strip()
-                if name in {"chvt", "python3", COMPOSITOR_COMM, "systemd-logind", "qemu-ga"}:
+                if name in {"chvt", "python3", COMPOSITOR_COMM, "systemd-logind", "qemu-ga",
+                            "gdm", "gdm-session-wor", "gdm-wayland-ses", "gnome-shell"}:
                     processes.append({"pid": int(path.name), "name": name, "state": stat[0],
                                       "wait_site": (path / "wchan").read_text().strip()})
             except (FileNotFoundError, PermissionError, ProcessLookupError):
@@ -2596,8 +2597,22 @@ print(json.dumps(result))
         result = {"power-button-chassis": power_button_chassis, "power-button-action": power_button_action,
                   "power-button-block": power_button_block}[action](sys.argv[2])
     elif action == "logout":
-        call("loginctl", "terminate-session", inventory()["session"]["Id"])
-        result = {"requested": "terminate session"}
+        # The product's Log Out: the compositor's org.gnome.SessionManager
+        # Logout(1), no confirmation, which ends the compositor (the session
+        # leader) as gnome-session ends a GNOME session. A guest predating
+        # that manager logs out as its shell's Log Out did, through logind.
+        owned = call("gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
+                     "--object-path", "/org/freedesktop/DBus",
+                     "--method", "org.freedesktop.DBus.NameHasOwner", "org.gnome.SessionManager",
+                     user=True) == "(true,)"
+        if owned:
+            # The reply can race the compositor's exit; the lane judges the outcome.
+            call("gdbus", "call", "--session", "--dest", "org.gnome.SessionManager",
+                 "--object-path", "/org/gnome/SessionManager",
+                 "--method", "org.gnome.SessionManager.Logout", "1", user=True, check=False)
+        else:
+            call("loginctl", "terminate-session", inventory()["session"]["Id"])
+        result = {"requested": "session manager logout" if owned else "terminate session"}
     elif action == "login-session":
         # Before Tuna Desktop writes its state snapshot: which desktop the
         # login actually started, by fixed process name only.
