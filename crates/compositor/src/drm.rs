@@ -815,6 +815,9 @@ impl DrmBackend {
                     "natural_available": device.config_scroll_has_natural_scroll(),
                     "accel_speed": device.config_accel_speed(),
                     "accel_available": device.config_accel_is_available(),
+                    "accel_profile": device.config_accel_profile().map(accel_profile_name),
+                    "accel_profiles": device.config_accel_profiles().into_iter().map(accel_profile_name).collect::<Vec<_>>(),
+                    "accel_custom_supported_by_compositor": false,
                     "dwt_enabled": device.config_dwt_enabled(),
                     "dwt_available": device.config_dwt_is_available(),
                 })
@@ -976,6 +979,125 @@ fn apply_libinput(
         let _ = device.config_dwt_set_enabled(dwt);
     }
     let _ = device.config_accel_set_speed(policy.speed);
+    if is_mouse_for_accel(device) {
+        apply_mouse_accel_profile(device, settings.mouse_accel_profile);
+    }
+}
+
+fn accel_profile_name(profile: smithay::reexports::input::AccelProfile) -> &'static str {
+    use smithay::reexports::input::AccelProfile;
+    match profile {
+        AccelProfile::Flat => "flat",
+        AccelProfile::Adaptive => "adaptive",
+        _ => "unknown",
+    }
+}
+
+/// Mutter excludes touchpads, trackballs and pointing sticks from the mouse
+/// profile, consulting the udev device and its immediate parent for the latter.
+fn is_mouse_for_accel(device: &smithay::reexports::input::Device) -> bool {
+    if pointer_kind(device) != PointerKind::Pointer {
+        return false;
+    }
+    // This device was created by the libinput udev context used by this backend.
+    let udev = unsafe { device.udev_device() };
+    udev.as_ref().is_none_or(|dev| {
+        dev.property_value("ID_INPUT_TRACKBALL").is_none()
+            && dev.property_value("ID_INPUT_POINTINGSTICK").is_none()
+            && dev.parent().as_ref().is_none_or(|parent| {
+                parent.property_value("ID_INPUT_TRACKBALL").is_none()
+                    && parent.property_value("ID_INPUT_POINTINGSTICK").is_none()
+            })
+    })
+}
+
+fn resolve_mouse_accel_profile(
+    requested: tuna_shell_control::MouseAccelProfile,
+    available: &[smithay::reexports::input::AccelProfile],
+    default: Option<smithay::reexports::input::AccelProfile>,
+) -> Option<smithay::reexports::input::AccelProfile> {
+    use smithay::reexports::input::AccelProfile;
+    use tuna_shell_control::MouseAccelProfile;
+    let desired = match requested {
+        MouseAccelProfile::Flat => Some(AccelProfile::Flat),
+        MouseAccelProfile::Adaptive => Some(AccelProfile::Adaptive),
+        MouseAccelProfile::Default | MouseAccelProfile::Custom => None,
+    };
+    desired
+        .filter(|profile| available.contains(profile))
+        .or(default)
+}
+
+#[cfg(test)]
+mod mouse_accel_tests {
+    use super::resolve_mouse_accel_profile;
+    use smithay::reexports::input::AccelProfile::{Adaptive, Flat};
+    use tuna_shell_control::MouseAccelProfile;
+
+    #[test]
+    fn supported_profiles_and_unsupported_fallback_use_device_default() {
+        let available = [Flat, Adaptive];
+        assert_eq!(
+            resolve_mouse_accel_profile(MouseAccelProfile::Default, &available, Some(Adaptive)),
+            Some(Adaptive)
+        );
+        assert_eq!(
+            resolve_mouse_accel_profile(MouseAccelProfile::Flat, &available, Some(Adaptive)),
+            Some(Flat)
+        );
+        assert_eq!(
+            resolve_mouse_accel_profile(MouseAccelProfile::Adaptive, &available, Some(Flat)),
+            Some(Adaptive)
+        );
+        assert_eq!(
+            resolve_mouse_accel_profile(MouseAccelProfile::Flat, &[Adaptive], Some(Adaptive)),
+            Some(Adaptive)
+        );
+        assert_eq!(
+            resolve_mouse_accel_profile(MouseAccelProfile::Custom, &available, Some(Adaptive)),
+            Some(Adaptive)
+        );
+        assert_eq!(
+            resolve_mouse_accel_profile(MouseAccelProfile::Flat, &[], None),
+            None
+        );
+    }
+}
+
+fn apply_mouse_accel_profile(
+    device: &mut smithay::reexports::input::Device,
+    requested: tuna_shell_control::MouseAccelProfile,
+) {
+    let available = device.config_accel_profiles();
+    let selected =
+        resolve_mouse_accel_profile(requested, &available, device.config_accel_default_profile());
+    if requested == tuna_shell_control::MouseAccelProfile::Custom {
+        eprintln!("tuna-compositor: libinput: custom mouse acceleration is unsupported by the compositor for {}; using device default", device.name());
+    } else if matches!(
+        requested,
+        tuna_shell_control::MouseAccelProfile::Flat
+            | tuna_shell_control::MouseAccelProfile::Adaptive
+    ) && selected
+        != match requested {
+            tuna_shell_control::MouseAccelProfile::Flat => {
+                Some(smithay::reexports::input::AccelProfile::Flat)
+            }
+            tuna_shell_control::MouseAccelProfile::Adaptive => {
+                Some(smithay::reexports::input::AccelProfile::Adaptive)
+            }
+            _ => None,
+        }
+    {
+        eprintln!("tuna-compositor: libinput: requested mouse acceleration profile unsupported for {}; using device default", device.name());
+    }
+    if let Some(profile) = selected {
+        if let Err(error) = device.config_accel_set_profile(profile) {
+            eprintln!(
+                "tuna-compositor: libinput: mouse acceleration profile rejected for {}: {error:?}",
+                device.name()
+            );
+        }
+    }
 }
 
 fn apply_handedness(device: &smithay::reexports::input::Device, left_handed: bool) {

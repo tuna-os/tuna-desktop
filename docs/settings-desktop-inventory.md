@@ -303,7 +303,7 @@ Source: [GTK Wayland settings translations](https://github.com/GNOME/gtk/blob/4.
 
 | Key | Status | Reason |
 |---|---|---|
-| accel-profile | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
+| accel-profile | Honored | `default`, `flat` and `adaptive` reach libinput live and on hotplug for mice only (trackballs and pointing sticks excluded, as in Mutter); a profile the device lacks and `custom` fall back to the device default, since the compositor's libinput bindings cannot set custom curves. Native VM proof V-POINTER-LIVE checks flat then adaptive on the live device |
 | custom-accel-config | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly |
 | double-click | Via GTK | GTK Wayland settings translation; clients follow the portal or GSettings fallback |
 | drag-threshold | Via GTK | GTK Wayland settings translation; clients follow the portal or GSettings fallback |

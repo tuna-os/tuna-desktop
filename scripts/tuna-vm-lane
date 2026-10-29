@@ -793,32 +793,54 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                                "proven by the current-build marlin-vm lane")
     else:
         pointer_live = []
+        # Mouse acceleration profiles (protocol 0.39) are proven only where the
+        # compositor reports them: a published guest predating them has neither
+        # the snapshot key nor the guest action; a current build must have both.
+        profiles_reported = any("accel_profiles" in d for d in
+                                agent.run("inventory")["state"].get("input_devices") or [])
+        if not published and not profiles_reported:
+            raise RuntimeError("current build does not report libinput acceleration profiles")
         try:
-            def pointer_live_matches(speed, natural):
+            def pointer_live_matches(speed, natural, profile=None):
                 def matches(value):
                     devices = [d for d in value["state"].get("input_devices", [])
                                if d["kind"] == "pointer"]
                     accel = [d for d in devices if d["accel_available"]]
+                    profiled = [d for d in accel if profile in d.get("accel_profiles", ())]
                     return (bool(accel)
                             and all(abs(d["accel_speed"] - speed) < 0.05 for d in accel)
                             and all(d["natural_scroll"] is natural for d in devices
-                                    if d["natural_available"]))
+                                    if d["natural_available"])
+                            and (profile is None
+                                 or (bool(profiled)
+                                     and all(d["accel_profile"] == profile for d in profiled))))
                 return matches
+            applied_profile = "flat" if profiles_reported else None
+            restored_profile = "adaptive" if profiles_reported else None
             if not agent.run("mouse-speed", "0.5")["stored"]:
                 raise RuntimeError("GNOME mouse speed did not persist")
             if not agent.run("mouse-natural", "true")["stored"]:
                 raise RuntimeError("GNOME mouse natural scroll did not persist")
-            live = await_state(pointer_live_matches(0.5, True), label="pointer-live")
+            if applied_profile and not agent.run("mouse-accel", applied_profile)["stored"]:
+                raise RuntimeError("GNOME mouse acceleration profile did not persist")
+            live = await_state(pointer_live_matches(0.5, True, applied_profile), label="pointer-live")
             pointer_live.append({"applied": live["state"]["input_devices"]})
             agent.run("mouse-speed", "0.0")
             agent.run("mouse-natural", "false")
-            restored = await_state(pointer_live_matches(0.0, False), label="pointer-live-restored")
+            if restored_profile:
+                agent.run("mouse-accel", restored_profile)
+            restored = await_state(pointer_live_matches(0.0, False, restored_profile),
+                                   label="pointer-live-restored")
             pointer_live.append({"restored": restored["state"]["input_devices"]})
             record("V-POINTER-LIVE", True,
-                   "GNOME mouse speed/natural-scroll reach live libinput device state and restore; availability-gated per device")
+                   "GNOME mouse speed/natural-scroll/acceleration profile (flat then adaptive) reach live libinput device state and restore; availability-gated per device"
+                   if profiles_reported else
+                   "GNOME mouse speed/natural-scroll reach live libinput device state and restore; published guest predates acceleration-profile reporting")
         finally:
             agent.run("mouse-speed", "0.0")
             agent.run("mouse-natural", "false")
+            if profiles_reported:
+                agent.run("mouse-accel", "default")
             # Keep await_state's last observed pointer-live.json on failure.
             with open(os.path.join(evidence, "pointer-live-events.json"), "w") as stream:
                 json.dump(pointer_live, stream, indent=2)
