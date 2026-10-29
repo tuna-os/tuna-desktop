@@ -181,9 +181,11 @@ impl ProtocolVersion {
     /// scroll-wheel emulation and per-class acceleration).
     /// `MouseAccelProfile` becomes `PointerAccelProfile`; positional
     /// postcard peers must ship together.
+    /// `0.41` appends mutter's `center-new-windows` to InputSettings;
+    /// positional postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 40,
+        minor: 41,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -1007,6 +1009,10 @@ pub struct InputSettings {
     /// `org.gnome.desktop.peripherals.pointingstick`.
     #[serde(default)]
     pub pointing_stick: PointingStickSettings,
+    /// `org.gnome.mutter center-new-windows` (0.41): centered automatic
+    /// placement, else mutter's first-fit from the work area's corner.
+    #[serde(default = "default_center_new_windows")]
+    pub center_new_windows: bool,
 }
 
 /// GNOME's `GDesktopPointerAccelProfile`, shared by the mouse, touchpad,
@@ -1295,6 +1301,11 @@ fn default_attach_modal_dialogs() -> bool {
     true
 }
 
+/// Mutter 51's `center-new-windows` default.
+fn default_center_new_windows() -> bool {
+    true
+}
+
 impl Default for InputSettings {
     /// GNOME 51's defaults.
     fn default() -> Self {
@@ -1334,6 +1345,7 @@ impl Default for InputSettings {
             mouse: MouseSettings::default(),
             trackball: TrackballSettings::default(),
             pointing_stick: PointingStickSettings::default(),
+            center_new_windows: true,
         }
     }
 }
@@ -2045,6 +2057,22 @@ mod tests {
         }
         assert!(InputSettings::default().attach_modal_dialogs);
     }
+
+    #[test]
+    fn center_new_windows_survives_positional_control_wire() {
+        for enabled in [true, false] {
+            let settings = InputSettings {
+                center_new_windows: enabled,
+                ..Default::default()
+            };
+            let mut buffer = [0u8; 512];
+            let body = postcard::to_slice(&settings, &mut buffer).unwrap();
+            let decoded: InputSettings = postcard::from_bytes(body).unwrap();
+            assert_eq!(decoded.center_new_windows, enabled);
+            assert_eq!(decoded, settings);
+        }
+        assert!(InputSettings::default().center_new_windows);
+    }
     #[test]
     fn secrets_never_reach_debug_output() {
         let kind = CommandKind::Unlock {
@@ -2056,8 +2084,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_40() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 40));
+    fn current_version_is_0_41() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 41));
     }
 
     #[test]

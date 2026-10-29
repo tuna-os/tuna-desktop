@@ -1,9 +1,27 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- GNOME 51 org.gnome.mutter keys Tuna consumes; defaults are the GNOME
+     session's (gnome-shell 51.0 data/00_org.gnome.shell.gschema.override). -->
 <schemalist>
   <schema id="org.gnome.mutter" path="/org/gnome/mutter/">
     <key name="attach-modal-dialogs" type="b">
       <default>true</default>
       <summary>Attach modal dialogs to their parent window</summary>
+    </key>
+    <key name="edge-tiling" type="b">
+      <default>true</default>
+      <summary>Enable edge tiling when dropping windows on screen edges</summary>
+    </key>
+    <key name="dynamic-workspaces" type="b">
+      <default>true</default>
+      <summary>Workspaces are managed dynamically</summary>
+    </key>
+    <key name="workspaces-only-on-primary" type="b">
+      <default>true</default>
+      <summary>Workspaces only on primary</summary>
+    </key>
+    <key name="center-new-windows" type="b">
+      <default>true</default>
+      <summary>Place new windows in the center</summary>
     </key>
   </schema>
 </schemalist>
