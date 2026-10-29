@@ -63,6 +63,7 @@ use crate::xwayland::XWaylandSupervisor;
 use crate::{ClientState, State};
 
 mod aids;
+mod display;
 
 /// Display-rate loop pacing: while anything moves, dispatch blocks at
 /// most this long, so animations step near 60 Hz and the loop never
@@ -711,6 +712,13 @@ pub struct Runtime {
     /// Configured transform per connector (Settings/monitors.xml):
     /// the sensor overrides these live but never rewrites them.
     manual_transforms: std::collections::HashMap<String, u32>,
+    /// What org.gnome.Mutter.DisplayConfig reports (#340), shared with
+    /// the D-Bus thread, and the key it was last published at.
+    display_share: std::sync::Arc<crate::display_config::DisplayShare>,
+    display_published: Option<(i32, i32, u64)>,
+    /// Mutter's current configuration, its history and the pending
+    /// confirmation of a persistent change.
+    display_configs: crate::display_config::ConfigManager,
     capture_authority: crate::capture_security::Authority,
     cast_grants: std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     remote_held: std::collections::HashMap<u64, RemoteHeld>,
@@ -874,7 +882,10 @@ impl Runtime {
             BackendChoice::Drm => {
                 let (drm, sources) = crate::drm::DrmBackend::new()
                     .map_err(|e| RuntimeError::Backend(e.to_string()))?;
-                for out in &drm.outputs {
+                // One wl_output per logical monitor: mirror clones and
+                // switched-off connectors have none (#340; Mutter also
+                // advertises each mirror clone, a known difference).
+                for out in drm.outputs.iter().filter(|o| o.is_leader()) {
                     let global = out.output.create_global::<State>(&dh);
                     let (lw, lh) = out.logical_size();
                     state.add_output(&out.name, Some(out.output.clone()), lw, lh);
@@ -1117,6 +1128,7 @@ impl Runtime {
             Default::default();
         let power_save_share: std::sync::Arc<crate::power_save::PowerSaveShare> =
             Default::default();
+        let display_share: std::sync::Arc<crate::display_config::DisplayShare> = Default::default();
         // org.gnome.Shell.Introspect: the portal's window picker.
         let capture_authority = crate::capture_security::Authority::default();
         let introspect = crate::introspect::start(state.desktop_size(), capture_authority.clone());
@@ -1131,6 +1143,7 @@ impl Runtime {
                     orientation_share.clone(),
                     night_light_share.clone(),
                     power_save_share.clone(),
+                    display_share.clone(),
                 ),
                 |event, _, rt: &mut Runtime| {
                     if let calloop::channel::Event::Msg(request) = event {
@@ -1324,6 +1337,9 @@ impl Runtime {
             power_save_beat: None,
             night_light: crate::night_light::NightLightController::new(night_light_share.clone()),
             manual_transforms: Default::default(),
+            display_share,
+            display_published: None,
+            display_configs: Default::default(),
             capture_authority,
             cast_grants: Default::default(),
             remote_held: Default::default(),
@@ -2472,6 +2488,9 @@ impl Runtime {
             .workspace_slide()
             .snapshot(self.animation_clock.now());
         doc["transitions"] = self.transitions_diagnostics();
+        // GNOME Settings' display configuration (#340): modes, the
+        // kernel's CRTC modes on hardware, pending confirmation.
+        doc["display_config"] = self.display_config_diagnostics();
         let motion = self.input_settings.motion;
         doc["motion_policy"] = serde_json::json!(motion.level.as_str());
         doc["animation_slowdown"] = serde_json::json!(motion.slowdown());
@@ -3182,7 +3201,7 @@ impl Runtime {
                 let mut top = i32::MAX;
                 let mut right = i32::MIN;
                 let mut bottom = i32::MIN;
-                for out in &drm.outputs {
+                for out in drm.outputs.iter().filter(|o| o.enabled) {
                     let size = out.logical_size();
                     left = left.min(out.loc.0);
                     top = top.min(out.loc.1);
@@ -3723,20 +3742,10 @@ impl Runtime {
                 self.apply_orientation_policy();
             }
             crate::mutter::ToLoop::ApplyMonitors {
-                configs,
-                persistent,
-            } => {
-                self.apply_monitors(&configs);
-                if persistent {
-                    match crate::monitors::save(&configs) {
-                        Ok(path) => eprintln!(
-                            "tuna-compositor: display settings saved to {}",
-                            path.display()
-                        ),
-                        Err(e) => eprintln!("tuna-compositor: display settings not saved: {e}"),
-                    }
-                }
-            }
+                config,
+                method,
+                reply,
+            } => self.on_apply_monitors(config, method, reply),
             crate::mutter::ToLoop::PowerSave { mode, reply } => {
                 self.set_power_save_mode(mode);
                 let _ = reply.send(());
@@ -3931,25 +3940,6 @@ impl Runtime {
         }
     }
 
-    /// Apply a display arrangement live (GNOME Settings' Displays
-    /// panel): each named output's scale, logical position and rotation.
-    /// Layout, rendering and the per-window client scale follow on the
-    /// next frame. The sensor may immediately override a built-in
-    /// panel's rotation while orientation lock is off (#345).
-    fn apply_monitors(&mut self, configs: &[crate::monitors::MonitorConfig]) {
-        // GNOME's ScreenTransition: picture the old layout first.
-        let before = (self.state.hot_corner_outputs(), self.scale.to_bits());
-        let snapshots = if self.transitions.wants_screen_snapshot() {
-            self.screen_snapshots()
-        } else {
-            Vec::new()
-        };
-        self.arrange_monitors(configs);
-        if (self.state.hot_corner_outputs(), self.scale.to_bits()) != before {
-            self.transitions.screen_changed(snapshots);
-        }
-    }
-
     /// Each output's current picture (`None`: the nested window), for
     /// the monitor-change fade. Empty while locked.
     fn screen_snapshots(&mut self) -> Vec<(Option<String>, i32, i32, Vec<u8>)> {
@@ -3957,7 +3947,12 @@ impl Runtime {
         let names: Vec<Option<String>> = match &self.backend {
             Backend::Winit(_) => vec![None],
             #[cfg(feature = "drm")]
-            Backend::Drm(drm) => drm.outputs.iter().map(|o| Some(o.name.clone())).collect(),
+            Backend::Drm(drm) => drm
+                .outputs
+                .iter()
+                .filter(|o| o.enabled)
+                .map(|o| Some(o.name.clone()))
+                .collect(),
         };
         names
             .into_iter()
@@ -3966,71 +3961,6 @@ impl Runtime {
                 Some((name, w, h, pixels))
             })
             .collect()
-    }
-
-    fn arrange_monitors(&mut self, configs: &[crate::monitors::MonitorConfig]) {
-        let scale_of = |s: f64| {
-            if s == 1.0 {
-                Scale::Integer(1)
-            } else {
-                Scale::Fractional(s)
-            }
-        };
-        for config in configs {
-            self.manual_transforms
-                .insert(config.connector.clone(), config.transform);
-        }
-        match &mut self.backend {
-            Backend::Winit(backend) => {
-                // One nested output: take the first arrangement entry.
-                let Some(config) = configs.first() else {
-                    return;
-                };
-                self.scale = clamp_scale(config.scale);
-                if let Some(output) = self.state.primary_output() {
-                    output.change_current_state(None, None, Some(scale_of(self.scale)), None);
-                }
-                if config.transform != 0 {
-                    eprintln!(
-                        "tuna-compositor: nested output cannot rotate; ignoring transform {}",
-                        config.transform
-                    );
-                }
-                let size = backend.window_size();
-                let (lw, lh) = logical_size(size.w, size.h, self.scale);
-                self.state.set_output_size(lw, lh);
-            }
-            #[cfg(feature = "drm")]
-            Backend::Drm(drm) => {
-                for config in configs {
-                    let Some(out) = drm.outputs.iter_mut().find(|o| o.name == config.connector)
-                    else {
-                        continue;
-                    };
-                    out.scale = clamp_scale(config.scale);
-                    out.loc = (config.x, config.y);
-                    // The sensor wins on unlocked built-in panels; the
-                    // configured transform stays in manual_transforms.
-                    let transform = self.orientation.effective(&out.name, config.transform);
-                    out.transform = transform;
-                    out.output.change_current_state(
-                        None,
-                        Some(crate::orientation::smithay_transform(transform)),
-                        Some(scale_of(out.scale)),
-                        Some(out.loc.into()),
-                    );
-                    let (lw, lh) = out.logical_size();
-                    let output = out.output.clone();
-                    let name = out.name.clone();
-                    let loc = out.loc;
-                    self.state.add_output(&name, Some(output), lw, lh);
-                    self.state.set_output_location(&name, loc);
-                }
-            }
-        }
-        if let Some(first) = configs.first() {
-            self.state.set_preferred_scale(clamp_scale(first.scale));
-        }
     }
 
     /// Keep the D-Bus side's monitor list current (cheap when unchanged).
@@ -4347,6 +4277,10 @@ impl Runtime {
             if !self.is_locked() {
                 self.state.answer_shortcut_consent(request, allow);
             }
+        }
+        // GNOME Shell's "Keep these display settings?" answer (#340).
+        for keep in outcome.display_change {
+            self.complete_display_change(keep);
         }
         if let Some(request) = self.state.take_shortcut_consent_update() {
             self.control
@@ -4696,6 +4630,7 @@ impl Runtime {
         );
         self.publish_state();
         self.publish_cast_outputs();
+        self.publish_display_state();
         self.publish_overview_previews();
         let strip_was_animating = self.manager.strip_animating();
         self.render()?;
@@ -5222,9 +5157,17 @@ impl Runtime {
                 // feedback at its page flip (#89): a surface belongs to
                 // the output under its center, else the primary.
                 let drawn = crate::frame_timing::drawn_roots(&self.state, &self.manager, locked);
+                // Clones and switched-off outputs own no surface: what a
+                // mirrored logical monitor draws presents on its leader.
                 let rects: Vec<Rectangle<i32, Logical>> = outputs
                     .iter()
-                    .map(|o| Rectangle::new(o.loc.into(), o.logical_size().into()))
+                    .map(|o| {
+                        if o.is_leader() {
+                            Rectangle::new(o.loc.into(), o.logical_size().into())
+                        } else {
+                            Rectangle::default()
+                        }
+                    })
                     .collect();
                 let owner = |at: &smithay::utils::Point<i32, Logical>| {
                     rects.iter().position(|r| r.contains(*at)).unwrap_or(0)
@@ -5232,8 +5175,9 @@ impl Runtime {
                 let mut queued = false;
                 let mut cursor_presented = false;
                 for (index, out) in outputs.iter_mut().enumerate() {
-                    // Display-paced: one frame in flight per output.
-                    if out.pending {
+                    // Display-paced: one frame in flight per output; a
+                    // switched-off CRTC gets none (#340).
+                    if out.pending || !out.enabled {
                         continue;
                     }
                     let size = out.size;
@@ -5243,7 +5187,7 @@ impl Runtime {
                         scale: out.scale,
                     };
                     let lock_surface = locked
-                        .then(|| self.state.lock_surface_for(&out.name))
+                        .then(|| self.state.lock_surface_for(out.logical_name()))
                         .flatten();
                     // Rotation (#345): the tracker holds the output
                     // transform while Smithay renders inverted (see
@@ -5475,8 +5419,12 @@ impl Runtime {
                         // Never reuse history after an unsubmitted partial update.
                         out.last_frame = None;
                         out.damage_tracker = None;
+                        // A new mode the kernel tested but would not
+                        // commit: back to the previous one (#340).
+                        out.revert_failed_mode();
                         continue;
                     }
+                    out.mode_committed();
                     out.trace_wake_submission();
                     out.pending = true;
                     if index == 0 {

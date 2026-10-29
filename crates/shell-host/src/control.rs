@@ -91,6 +91,9 @@ pub enum Handled {
     PointerOutput,
     /// Show or dismiss the shortcut consent dialog.
     ShortcutConsent(Option<(u64, String)>),
+    /// Show GNOME's display-change confirmation with this countdown in
+    /// seconds; a newer one replaces an open dialog.
+    ConfirmDisplayChange(u32),
     /// The keyboard switched Sticky or Slow Keys: save and confirm.
     KeyboardAidToggled {
         aid: tuna_shell_control::KeyboardAid,
@@ -692,6 +695,17 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// Answer the display-change dialog: Keep Changes (`true`) or Revert
+    /// Settings (`false`).
+    pub fn complete_display_change(&mut self, keep: bool) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::CompleteDisplayChange { keep },
+        })?;
+        Ok(id)
+    }
+
     /// Carry out one of GNOME's window-menu actions. Returns the request id.
     pub fn window_action(
         &mut self,
@@ -1003,6 +1017,9 @@ impl ControlClient {
                 Ok(Handled::PointerOutput)
             }
             Message::ShortcutConsent { request } => Ok(Handled::ShortcutConsent(request)),
+            Message::ConfirmDisplayChange { timeout_secs } => {
+                Ok(Handled::ConfirmDisplayChange(timeout_secs))
+            }
             Message::KeyboardAidToggled { aid, enabled } => {
                 Ok(Handled::KeyboardAidToggled { aid, enabled })
             }
@@ -1279,6 +1296,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::ScreenReader { .. } => "ScreenReader",
         Message::PointerOutput { .. } => "PointerOutput",
         Message::ShortcutConsent { .. } => "ShortcutConsent",
+        Message::ConfirmDisplayChange { .. } => "ConfirmDisplayChange",
         Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
         Message::DwellClickType { .. } => "DwellClickType",
         Message::PointerTimeout { .. } => "PointerTimeout",

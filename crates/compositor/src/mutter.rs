@@ -172,11 +172,14 @@ pub enum ToLoop {
     StopCast {
         session_id: u64,
     },
-    /// GNOME Settings' Displays panel applied an arrangement; persist it
-    /// when asked (method 2).
+    /// GNOME Settings' Displays panel applied a verified configuration
+    /// (method temporary or persistent). The loop applies it and replies
+    /// `Err` with the reason when the hardware refused it (nothing
+    /// changed then).
     ApplyMonitors {
-        configs: Vec<crate::monitors::MonitorConfig>,
-        persistent: bool,
+        config: crate::monitors::MonitorsConfig,
+        method: crate::display_config::Method,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
     /// The accelerometer sample changed (iio-sensor-proxy, #345):
     /// whether a sensor is present and its current orientation.
@@ -291,6 +294,7 @@ impl ServiceChannel {
 
 // --- DisplayConfig -----------------------------------------------------
 
+/// `(ssss)a(siiddada{sv})a{sv}`: one connected monitor.
 #[derive(Serialize, Type)]
 struct Monitor {
     names: (String, String, String, String),
@@ -298,6 +302,7 @@ struct Monitor {
     properties: HashMap<String, OwnedValue>,
 }
 
+/// `(siiddada{sv})`: one of its modes.
 #[derive(Serialize, Type)]
 struct Mode {
     id: String,
@@ -309,6 +314,7 @@ struct Mode {
     properties: HashMap<String, OwnedValue>,
 }
 
+/// `(iiduba(ssss)a{sv})`: one logical monitor.
 #[derive(Serialize, Type)]
 struct LogicalMonitor {
     x: i32,
@@ -320,12 +326,7 @@ struct LogicalMonitor {
     properties: HashMap<String, OwnedValue>,
 }
 
-/// GNOME's built-in panel test (Mutter's), for "Built-in display".
-/// (Shared with the orientation policy: [`crate::orientation::is_builtin_panel`].)
-fn is_laptop_panel(connector: &str) -> bool {
-    crate::orientation::is_builtin_panel(connector)
-}
-
+/// `(iiduba(ssa{sv}))`: one requested logical monitor.
 #[derive(Deserialize, Type)]
 struct LogicalMonitorConfiguration {
     x: i32,
@@ -336,11 +337,176 @@ struct LogicalMonitorConfiguration {
     monitors: Vec<(String, String, HashMap<String, OwnedValue>)>,
 }
 
+impl LogicalMonitorConfiguration {
+    /// The request with GNOME Settings' per-monitor properties read
+    /// (`underscanning` b, `color-mode` u), as Mutter's
+    /// `create_monitor_config_from_variant` reads them.
+    fn request(&self) -> fdo::Result<crate::display_config::LogicalRequest> {
+        let monitors = self
+            .monitors
+            .iter()
+            .map(|(connector, mode_id, properties)| {
+                let underscanning = properties
+                    .get("underscanning")
+                    .map(bool::try_from)
+                    .transpose()
+                    .map_err(|_| fdo::Error::InvalidArgs("underscanning must be b".into()))?;
+                let color_mode = properties
+                    .get("color-mode")
+                    .map(u32::try_from)
+                    .transpose()
+                    .map_err(|_| fdo::Error::InvalidArgs("color-mode must be u".into()))?;
+                Ok(crate::display_config::MonitorRequest {
+                    connector: connector.clone(),
+                    mode_id: mode_id.clone(),
+                    underscanning,
+                    color_mode,
+                })
+            })
+            .collect::<fdo::Result<Vec<_>>>()?;
+        Ok(crate::display_config::LogicalRequest {
+            x: self.x,
+            y: self.y,
+            scale: self.scale,
+            transform: self.transform,
+            primary: self.is_primary,
+            monitors,
+        })
+    }
+}
+
 struct DisplayConfig {
-    outputs: Outputs,
+    display: Arc<crate::display_config::DisplayShare>,
     to_loop: calloop::channel::Sender<ToLoop>,
     orientation: std::sync::Arc<crate::orientation::OrientationShare>,
     power_save: std::sync::Arc<crate::power_save::PowerSaveShare>,
+}
+
+fn spec_names(spec: &crate::monitors::MonitorSpec) -> (String, String, String, String) {
+    (
+        spec.connector.clone(),
+        spec.vendor.clone(),
+        spec.product.clone(),
+        spec.serial.clone(),
+    )
+}
+
+/// Mutter's `handle_get_current_state` over the published state:
+/// every advertised mode with its supported and preferred scales and
+/// `is-current`/`is-preferred`/`is-interlaced` only when true; the
+/// monitor properties Mutter 51 always sends.
+#[allow(clippy::type_complexity)]
+fn current_state(
+    state: &crate::display_config::DisplayState,
+) -> (
+    u32,
+    Vec<Monitor>,
+    Vec<LogicalMonitor>,
+    HashMap<String, OwnedValue>,
+) {
+    use crate::display_config::{should_be_advertised, supported_scales};
+    let flag = |name: &str| (name.to_owned(), OwnedValue::from(true));
+    let monitors = state
+        .monitors
+        .iter()
+        .map(|monitor| {
+            let preferred = monitor.modes[monitor.preferred];
+            let modes = monitor
+                .modes
+                .iter()
+                .enumerate()
+                .filter(|(_, mode)| should_be_advertised(mode, &preferred))
+                .map(|(index, mode)| {
+                    let mut properties = HashMap::new();
+                    if monitor.current == Some(index) {
+                        properties.extend([flag("is-current")]);
+                    }
+                    if monitor.preferred == index {
+                        properties.extend([flag("is-preferred")]);
+                    }
+                    if mode.interlaced {
+                        properties.extend([flag("is-interlaced")]);
+                    }
+                    Mode {
+                        id: mode.id(),
+                        width: mode.width,
+                        height: mode.height,
+                        refresh_rate: f64::from(mode.refresh),
+                        preferred_scale: f64::from(state.preferred_scale(monitor, index)),
+                        supported_scales: supported_scales(mode.width, mode.height)
+                            .into_iter()
+                            .map(f64::from)
+                            .collect(),
+                        properties,
+                    }
+                })
+                .collect();
+            let properties = HashMap::from([
+                ("is-builtin".to_owned(), OwnedValue::from(monitor.builtin)),
+                (
+                    "display-name".to_owned(),
+                    OwnedValue::try_from(Value::from(monitor.display_name.clone()))
+                        .expect("string value"),
+                ),
+                ("is-for-lease".to_owned(), OwnedValue::from(false)),
+                // SDR only: HDR colour modes are P-DS-03.
+                ("color-mode".to_owned(), OwnedValue::from(0u32)),
+                (
+                    "supported-color-modes".to_owned(),
+                    OwnedValue::try_from(Value::from(vec![0u32])).expect("array value"),
+                ),
+            ]);
+            Monitor {
+                names: spec_names(&monitor.spec),
+                modes,
+                properties,
+            }
+        })
+        .collect();
+    let logical = state
+        .logical
+        .iter()
+        .map(|l| LogicalMonitor {
+            x: l.x,
+            y: l.y,
+            scale: l.scale,
+            transform: l.transform,
+            is_primary: l.primary,
+            monitors: l
+                .monitors
+                .iter()
+                .filter_map(|c| state.monitor(c).map(|m| spec_names(&m.spec)))
+                .collect(),
+            properties: HashMap::new(),
+        })
+        .collect();
+    let properties = HashMap::from([(
+        "layout-mode".to_owned(),
+        // 1: logical layout (Mutter 51's native default and only mode here).
+        OwnedValue::from(1u32),
+    )]);
+    (state.serial, monitors, logical, properties)
+}
+
+fn apply_error(error: crate::display_config::ApplyError) -> fdo::Error {
+    match error {
+        crate::display_config::ApplyError::AccessDenied(m) => fdo::Error::AccessDenied(m),
+        crate::display_config::ApplyError::InvalidArgs(m) => fdo::Error::InvalidArgs(m),
+    }
+}
+
+/// Emit `MonitorsChanged` for every state change the runtime publishes
+/// (an applied, reverted or kept configuration, a mode the kernel
+/// refused). Ends when the share drops its sender.
+fn spawn_monitors_changed(conn: zbus::Connection, changes: std::sync::mpsc::Receiver<()>) {
+    std::thread::spawn(move || {
+        let Ok(emitter) = SignalEmitter::new(&conn, "/org/gnome/Mutter/DisplayConfig") else {
+            return;
+        };
+        for () in changes {
+            let _ = zbus::block_on(DisplayConfig::monitors_changed(&emitter));
+        }
+    });
 }
 
 /// g-s-d's Night Light properties (#339), served from the compositor
@@ -582,95 +748,52 @@ impl DisplayConfig {
         Vec<LogicalMonitor>,
         HashMap<String, OwnedValue>,
     )> {
-        let outputs = self
-            .outputs
-            .lock()
-            .map_err(|_| fdo::Error::Failed("poisoned".into()))?;
-        let mut monitors = Vec::new();
-        let mut logical = Vec::new();
-        for o in outputs.iter() {
-            let names = (
-                o.connector.clone(),
-                o.make.clone(),
-                o.model.clone(),
-                // Mutter's serial; the connector keeps session restore stable.
-                o.connector.clone(),
-            );
-            let builtin = is_laptop_panel(&o.connector);
-            let display_name = if builtin {
-                "Built-in display".to_owned()
-            } else {
-                o.model.clone()
-            };
-            let refresh = f64::from(o.refresh_mhz) / 1000.0;
-            monitors.push(Monitor {
-                names: names.clone(),
-                modes: vec![Mode {
-                    id: mode_id(o),
-                    width: o.width,
-                    height: o.height,
-                    refresh_rate: refresh,
-                    preferred_scale: o.scale,
-                    supported_scales: vec![1.0, 1.25, 1.5, 1.75, 2.0],
-                    properties: HashMap::from([
-                        ("is-current".to_owned(), OwnedValue::from(true)),
-                        ("is-preferred".to_owned(), OwnedValue::from(true)),
-                    ]),
-                }],
-                properties: HashMap::from([
-                    (
-                        "display-name".to_owned(),
-                        OwnedValue::try_from(Value::from(display_name)).expect("string value"),
-                    ),
-                    ("is-builtin".to_owned(), OwnedValue::from(builtin)),
-                ]),
-            });
-            logical.push(LogicalMonitor {
-                x: o.x,
-                y: o.y,
-                scale: o.scale,
-                transform: o.transform,
-                is_primary: o.primary,
-                monitors: vec![names],
-                properties: HashMap::new(),
-            });
-        }
-        let properties = HashMap::from([(
-            "layout-mode".to_owned(),
-            // 1: logical layout (GNOME's default).
-            OwnedValue::from(1u32),
-        )]);
-        Ok((0, monitors, logical, properties))
+        Ok(current_state(&self.display.snapshot()))
     }
 
-    /// GNOME Settings' Displays panel: 0 verifies, 1 applies, 2 applies
-    /// and keeps (niri's checks: no mirroring, known connectors only).
+    /// GNOME Settings' Displays panel, as Mutter 51 handles it: 0
+    /// verifies, 1 applies, 2 applies and asks GNOME Shell to confirm
+    /// (reverting after 20 s unless kept). The loop applies the
+    /// configuration (testing new modes on the hardware first) and
+    /// answers before this call returns.
     async fn apply_monitors_config(
         &self,
-        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
-        _serial: u32,
+        serial: u32,
         method: u32,
         logical_monitor_configs: Vec<LogicalMonitorConfiguration>,
-        _properties: HashMap<String, OwnedValue>,
+        properties: HashMap<String, OwnedValue>,
     ) -> fdo::Result<()> {
-        let configs = {
-            let outputs = self
-                .outputs
-                .lock()
-                .map_err(|_| fdo::Error::Failed("poisoned".into()))?;
-            validate(&outputs, &logical_monitor_configs)?
-        };
-        if method == 0 {
+        let method = crate::display_config::Method::from_dbus(method).map_err(apply_error)?;
+        let layout_mode = properties
+            .get("layout-mode")
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| fdo::Error::InvalidArgs("layout-mode must be u".into()))?;
+        let requests = logical_monitor_configs
+            .iter()
+            .map(LogicalMonitorConfiguration::request)
+            .collect::<fdo::Result<Vec<_>>>()?;
+        let config =
+            crate::display_config::verify(&self.display.snapshot(), serial, layout_mode, &requests)
+                .map_err(apply_error)?;
+        if method == crate::display_config::Method::Verify {
             return Ok(());
         }
+        let (reply, applied) = std::sync::mpsc::channel();
         self.to_loop
             .send(ToLoop::ApplyMonitors {
-                configs,
-                persistent: method == 2,
+                config,
+                method,
+                reply,
             })
             .map_err(|_| fdo::Error::Failed("compositor gone".into()))?;
-        let _ = DisplayConfig::monitors_changed(&ctxt).await;
-        Ok(())
+        match applied.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(fdo::Error::InvalidArgs(message)),
+            Err(_) => Err(fdo::Error::Failed(
+                "the display configuration was not applied".into(),
+            )),
+        }
     }
 
     #[zbus(signal)]
@@ -717,83 +840,6 @@ impl DisplayConfig {
     fn night_light_supported(&self) -> bool {
         true
     }
-}
-
-/// The mode identifier advertised to GNOME Settings for this lit output.
-fn mode_id(output: &OutputSnapshot) -> String {
-    let refresh = f64::from(output.refresh_mhz) / 1000.0;
-    format!("{}x{}@{refresh:.3}", output.width, output.height)
-}
-
-/// Check a requested arrangement against the lit outputs.
-fn validate(
-    outputs: &[OutputSnapshot],
-    requested: &[LogicalMonitorConfiguration],
-) -> fdo::Result<Vec<crate::monitors::MonitorConfig>> {
-    let mut configs = Vec::new();
-    for logical in requested {
-        if logical.monitors.len() > 1 {
-            return Err(fdo::Error::Failed("mirroring is not supported yet".into()));
-        }
-        if !crate::orientation::transform_is_supported(logical.transform) {
-            return Err(fdo::Error::Failed(format!(
-                "transform {} is not a Mutter transform (0-7)",
-                logical.transform
-            )));
-        }
-        if !(1.0..=4.0).contains(&logical.scale) {
-            return Err(fdo::Error::Failed(format!(
-                "scale {} out of range",
-                logical.scale
-            )));
-        }
-        for (connector, requested_mode, _props) in &logical.monitors {
-            let output = outputs
-                .iter()
-                .find(|o| &o.connector == connector)
-                .ok_or_else(|| fdo::Error::Failed(format!("connector '{connector}' not found")))?;
-            // Mode changes are not implemented. Only accept the exact mode
-            // we advertised, rather than silently ignoring the requested one.
-            if requested_mode != &mode_id(output) {
-                return Err(fdo::Error::Failed(format!(
-                    "mode '{requested_mode}' is not supported on '{connector}'"
-                )));
-            }
-            if configs
-                .iter()
-                .any(|config: &crate::monitors::MonitorConfig| &config.connector == connector)
-            {
-                return Err(fdo::Error::Failed(format!(
-                    "connector '{connector}' configured more than once"
-                )));
-            }
-            configs.push(crate::monitors::MonitorConfig {
-                connector: connector.clone(),
-                scale: logical.scale,
-                x: logical.x,
-                y: logical.y,
-                primary: logical.is_primary,
-                transform: logical.transform,
-            });
-        }
-    }
-    if configs.is_empty() {
-        return Err(fdo::Error::Failed(
-            "at least one output must stay on".into(),
-        ));
-    }
-    // The runtime rearranges lit outputs but cannot disable one yet.
-    // GNOME expresses disabling by omitting the output from this list.
-    if outputs.iter().any(|output| {
-        !configs
-            .iter()
-            .any(|config| config.connector == output.connector)
-    }) {
-        return Err(fdo::Error::Failed(
-            "disabling outputs is not supported yet".into(),
-        ));
-    }
-    Ok(configs)
 }
 
 // --- ScreenCast ----------------------------------------------------------
@@ -1172,13 +1218,14 @@ pub fn start(
     orientation: std::sync::Arc<crate::orientation::OrientationShare>,
     night_light: std::sync::Arc<crate::night_light::NightLightShare>,
     power_save: std::sync::Arc<crate::power_save::PowerSaveShare>,
+    display_state: Arc<crate::display_config::DisplayShare>,
 ) -> calloop::channel::Channel<ToLoop> {
     let (to_loop, from_dbus) = calloop::channel::channel();
     let _ = std::thread::Builder::new()
         .name("tuna-mutter-dbus".into())
         .spawn(move || {
             let display_config = DisplayConfig {
-                outputs: outputs.clone(),
+                display: display_state.clone(),
                 to_loop: to_loop.clone(),
                 orientation: orientation.clone(),
                 power_save: power_save.clone(),
@@ -1245,6 +1292,9 @@ pub fn start(
                     }
                 }
             }
+            // Every published configuration change, as Mutter emits
+            // MonitorsChanged from its monitor manager.
+            spawn_monitors_changed(conn.inner().clone(), display_state.subscribe_changes());
             // Night Light properties (#339): independent of the
             // portal names above. When a real settings daemon owns
             // this name its temp-disable wins and ours stays
@@ -1404,6 +1454,8 @@ mod tests {
         }
     }
 
+    /// One monitor as GNOME Settings sends it (`color-mode` and
+    /// `underscanning` always present).
     fn logical(connector: &str, scale: f64) -> LogicalMonitorConfiguration {
         LogicalMonitorConfiguration {
             x: 0,
@@ -1411,60 +1463,302 @@ mod tests {
             scale,
             transform: 0,
             is_primary: true,
-            monitors: vec![(connector.into(), "1920x1080@60.000".into(), HashMap::new())],
+            monitors: vec![(
+                connector.into(),
+                "1920x1080@60.000".into(),
+                HashMap::from([
+                    ("color-mode".to_owned(), OwnedValue::from(0u32)),
+                    ("underscanning".to_owned(), OwnedValue::from(false)),
+                ]),
+            )],
         }
     }
 
+    fn spec(connector: &str) -> crate::monitors::MonitorSpec {
+        crate::monitors::MonitorSpec {
+            connector: connector.into(),
+            vendor: "Tuna Desktop".into(),
+            product: connector.into(),
+            serial: connector.into(),
+        }
+    }
+
+    fn mode(width: i32, height: i32, refresh: f32) -> crate::display_config::ModeSpec {
+        crate::display_config::ModeSpec {
+            width,
+            height,
+            refresh,
+            interlaced: false,
+        }
+    }
+
+    /// A panel (1080p at 60 and 59.94 Hz, 720p, 640x480) and an
+    /// external monitor, side by side.
+    fn display_state() -> crate::display_config::DisplayState {
+        use crate::display_config::{DisplayState, LogicalState, MonitorState};
+        let monitor = |connector: &str, modes, builtin| MonitorState {
+            spec: spec(connector),
+            display_name: if builtin {
+                "Built-in display".into()
+            } else {
+                connector.into()
+            },
+            builtin,
+            width_mm: 344,
+            height_mm: 194,
+            modes,
+            preferred: 0,
+            current: Some(0),
+        };
+        DisplayState {
+            serial: 3,
+            monitors: vec![
+                monitor(
+                    "eDP-1",
+                    vec![
+                        mode(1920, 1080, 60.0),
+                        mode(1920, 1080, 59.94),
+                        mode(1280, 720, 60.0),
+                        mode(640, 480, 59.94),
+                    ],
+                    true,
+                ),
+                monitor("HDMI-A-1", vec![mode(1920, 1080, 60.0)], false),
+            ],
+            logical: vec![
+                LogicalState {
+                    x: 0,
+                    y: 0,
+                    scale: 1.5,
+                    transform: 0,
+                    primary: true,
+                    monitors: vec!["eDP-1".into()],
+                },
+                LogicalState {
+                    x: 1280,
+                    y: 0,
+                    scale: 1.0,
+                    transform: 0,
+                    primary: false,
+                    monitors: vec!["HDMI-A-1".into()],
+                },
+            ],
+        }
+    }
+
+    /// What `ApplyMonitorsConfig` decides before anything changes.
+    fn check(
+        state: &crate::display_config::DisplayState,
+        requests: &[LogicalMonitorConfiguration],
+    ) -> fdo::Result<crate::monitors::MonitorsConfig> {
+        let requests = requests
+            .iter()
+            .map(LogicalMonitorConfiguration::request)
+            .collect::<fdo::Result<Vec<_>>>()?;
+        crate::display_config::verify(state, state.serial, None, &requests).map_err(apply_error)
+    }
+
     #[test]
-    fn display_settings_do_not_acknowledge_ignored_modes_or_disabled_outputs() {
-        let outputs = [snapshot("eDP-1"), snapshot("HDMI-A-1")];
-        let valid = || vec![logical("eDP-1", 1.5), logical("HDMI-A-1", 1.0)];
-        assert_eq!(validate(&outputs, &valid()).unwrap().len(), 2);
-        for mode in ["", "1920x1080@59.940", "1280x720@60.000"] {
+    fn display_settings_apply_requested_modes_and_disabled_outputs() {
+        let state = display_state();
+        let valid = || {
+            let mut external = logical("HDMI-A-1", 1.0);
+            external.x = 1280;
+            external.is_primary = false;
+            vec![logical("eDP-1", 1.5), external]
+        };
+        let config = check(&state, &valid()).unwrap();
+        assert_eq!(config.logical.len(), 2);
+        assert!(config.disabled.is_empty());
+        // Modes nobody advertised are refused, never ignored.
+        for id in ["", "1920x1080@50.000", "2560x1440@60.000"] {
             let mut requested = valid();
-            requested[0].monitors[0].1 = mode.into();
-            assert!(
-                validate(&outputs, &requested).is_err(),
-                "unsupported mode {mode:?}"
+            requested[0].monitors[0].1 = id.into();
+            assert_eq!(
+                check(&state, &requested),
+                Err(fdo::Error::InvalidArgs(format!(
+                    "Invalid mode '{id}' specified"
+                ))),
             );
         }
-        assert!(
-            validate(&outputs, &valid()[..1]).is_err(),
-            "omitting an output requests disabling it"
+        // An advertised fractional refresh rate and another resolution
+        // are applied as requested.
+        let mut requested = valid();
+        requested[0].monitors[0].1 = "1920x1080@59.940".into();
+        let config = check(&state, &requested).unwrap();
+        assert_eq!(
+            config.logical[0].monitors[0].mode,
+            Some(mode(1920, 1080, 59.94))
         );
+        let mut requested = valid();
+        requested[0].scale = 1.0;
+        requested[0].monitors[0].1 = "1280x720@60.000".into();
+        let config = check(&state, &requested).unwrap();
+        assert_eq!(
+            config.logical[0].monitors[0].mode,
+            Some(mode(1280, 720, 60.0))
+        );
+        // Omitting an output disables it.
+        let config = check(&state, &valid()[..1]).unwrap();
+        assert_eq!(config.disabled, vec![spec("HDMI-A-1")]);
         let mut duplicate = valid();
         duplicate.push(logical("eDP-1", 2.0));
-        assert!(validate(&outputs, &duplicate).is_err(), "duplicate output");
-
-        let mut fractional_refresh = snapshot("eDP-1");
-        fractional_refresh.refresh_mhz = 59_940;
-        let mut request = logical("eDP-1", 1.0);
-        request.monitors[0].1 = "1920x1080@59.940".into();
-        assert!(
-            validate(&[fractional_refresh], &[request]).is_ok(),
-            "advertised fractional refresh remains valid"
-        );
+        assert!(check(&state, &duplicate).is_err(), "duplicate output");
     }
 
     #[test]
     fn display_settings_requests_are_checked() {
-        let outputs = [snapshot("eDP-1")];
-        let ok = validate(&outputs, &[logical("eDP-1", 1.5)]).unwrap();
-        assert_eq!((ok[0].connector.as_str(), ok[0].scale), ("eDP-1", 1.5));
-        assert!(
-            validate(&outputs, &[logical("DP-9", 1.0)]).is_err(),
-            "unknown connector"
+        let state = display_state();
+        let ok = check(&state, &[logical("eDP-1", 1.5)]).unwrap();
+        let (laptop, monitor) = ok.find("eDP-1").unwrap();
+        assert_eq!(
+            (monitor.spec.connector.as_str(), laptop.scale),
+            ("eDP-1", 1.5)
         );
-        assert!(
-            validate(&outputs, &[logical("eDP-1", 0.5)]).is_err(),
-            "scale range"
+        assert_eq!(
+            check(&state, &[logical("DP-9", 1.0)]),
+            Err(fdo::Error::InvalidArgs(
+                "Invalid connector 'DP-9' specified".into()
+            ))
         );
-        assert!(validate(&outputs, &[]).is_err(), "all off");
+        assert_eq!(
+            check(&state, &[logical("eDP-1", 0.5)]),
+            Err(fdo::Error::InvalidArgs(
+                "Scale 0.5 not valid for resolution 1920x1080".into()
+            ))
+        );
+        assert_eq!(
+            check(&state, &[]),
+            Err(fdo::Error::InvalidArgs("Monitors config incomplete".into()))
+        );
+        // Mirroring needs a mode both monitors have.
         let mut mirrored = logical("eDP-1", 1.0);
         mirrored
             .monitors
-            .push(("HDMI-A-1".into(), String::new(), HashMap::new()));
-        assert!(validate(&outputs, &[mirrored]).is_err(), "mirroring");
+            .push(("HDMI-A-1".into(), "1920x1080@60.000".into(), HashMap::new()));
+        let config = check(&state, &[mirrored.clone()]).unwrap();
+        assert_eq!(config.logical[0].monitors.len(), 2);
+        mirrored.monitors[0].1 = "1280x720@60.000".into();
+        assert_eq!(
+            check(&state, &[mirrored]),
+            Err(fdo::Error::InvalidArgs(
+                "Monitors modes in logical monitor not equal".into()
+            ))
+        );
+        // Ill-typed properties and unsupported features are refused.
+        let mut typed = logical("eDP-1", 1.0);
+        typed.monitors[0].2.insert(
+            "color-mode".into(),
+            OwnedValue::try_from(Value::from("bt2100")).unwrap(),
+        );
+        assert_eq!(
+            check(&state, &[typed]),
+            Err(fdo::Error::InvalidArgs("color-mode must be u".into()))
+        );
+        let mut underscan = logical("eDP-1", 1.0);
+        underscan.monitors[0]
+            .2
+            .insert("underscanning".into(), OwnedValue::from(true));
+        assert_eq!(
+            check(&state, &[underscan]),
+            Err(fdo::Error::InvalidArgs(
+                "Underscanning requested but unsupported".into()
+            ))
+        );
+        // A stale serial is AccessDenied, as Mutter answers it.
+        let requests = [logical("eDP-1", 1.0).request().unwrap()];
+        assert_eq!(
+            crate::display_config::verify(&state, 2, None, &requests).map_err(apply_error),
+            Err(fdo::Error::AccessDenied(
+                "The requested configuration is based on stale information".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn display_config_signatures_match_mutter_xml() {
+        // org.gnome.Mutter.DisplayConfig.xml (mutter 51.0).
+        assert_eq!(
+            <Vec<Monitor> as Type>::SIGNATURE.to_string(),
+            "a((ssss)a(siiddada{sv})a{sv})"
+        );
+        assert_eq!(
+            <Vec<LogicalMonitor> as Type>::SIGNATURE.to_string(),
+            "a(iiduba(ssss)a{sv})"
+        );
+        assert_eq!(
+            <Vec<LogicalMonitorConfiguration> as Type>::SIGNATURE.to_string(),
+            "a(iiduba(ssa{sv}))"
+        );
+    }
+
+    #[test]
+    fn current_state_lists_every_mode_like_mutter() {
+        let mut state = display_state();
+        state.monitors[0].current = Some(1);
+        let (serial, monitors, logical, properties) = current_state(&state);
+        assert_eq!(serial, 3);
+        assert_eq!(monitors.len(), 2);
+        let panel = &monitors[0];
+        assert_eq!(
+            panel.names,
+            (
+                "eDP-1".into(),
+                "Tuna Desktop".into(),
+                "eDP-1".into(),
+                "eDP-1".into()
+            )
+        );
+        // 640x480 leaves less than 600x600 and is not the preferred
+        // size, so Mutter does not advertise it.
+        let ids: Vec<&str> = panel.modes.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["1920x1080@60.000", "1920x1080@59.940", "1280x720@60.000"]
+        );
+        let flags = |m: &Mode| {
+            let mut keys: Vec<&str> = m.properties.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            keys
+        };
+        assert_eq!(flags(&panel.modes[0]), ["is-preferred"]);
+        assert_eq!(flags(&panel.modes[1]), ["is-current"]);
+        assert!(flags(&panel.modes[2]).is_empty());
+        assert!((panel.modes[1].refresh_rate - 59.94).abs() < 1e-4);
+        assert_eq!(
+            panel.modes[0].supported_scales,
+            [
+                1.0,
+                1.25,
+                f64::from(4.0f32 / 3.0),
+                1.5,
+                f64::from(5.0f32 / 3.0),
+                2.0
+            ]
+        );
+        // The current mode prefers the scale in use; others follow DPI
+        // (a 15.6" 1080p panel: ~141 DPI, 1).
+        assert_eq!(panel.modes[1].preferred_scale, 1.5);
+        assert_eq!(panel.modes[0].preferred_scale, 1.0);
+        assert!(bool::try_from(&panel.properties["is-builtin"]).unwrap());
+        assert_eq!(
+            <&str>::try_from(&panel.properties["display-name"]).unwrap(),
+            "Built-in display"
+        );
+        assert_eq!(u32::try_from(&panel.properties["color-mode"]).unwrap(), 0);
+        assert_eq!(logical.len(), 2);
+        assert_eq!((logical[0].scale, logical[0].is_primary), (1.5, true));
+        assert_eq!(logical[1].monitors[0].0, "HDMI-A-1");
+        assert_eq!(u32::try_from(&properties["layout-mode"]).unwrap(), 1);
+        // A disabled monitor stays listed with no current mode.
+        state.monitors[1].current = None;
+        state.logical.truncate(1);
+        let (_, monitors, logical, _) = current_state(&state);
+        assert!(monitors[1]
+            .modes
+            .iter()
+            .all(|m| !m.properties.contains_key("is-current")));
+        assert_eq!(logical.len(), 1);
     }
 
     #[test]
@@ -1493,24 +1787,25 @@ mod tests {
 
     #[test]
     fn builtin_panels_follow_mutter() {
-        assert!(is_laptop_panel("eDP-1"));
-        assert!(is_laptop_panel("LVDS-1"));
-        assert!(!is_laptop_panel("HDMI-A-1"));
-        assert!(!is_laptop_panel("tuna-0"));
+        use crate::orientation::is_builtin_panel;
+        assert!(is_builtin_panel("eDP-1"));
+        assert!(is_builtin_panel("LVDS-1"));
+        assert!(!is_builtin_panel("HDMI-A-1"));
+        assert!(!is_builtin_panel("tuna-0"));
     }
 
     #[test]
     fn display_rotation_validates_mutter_transforms() {
-        let outputs = [snapshot("eDP-1")];
+        let state = display_state();
         for transform in 0..=7u32 {
             let mut request = logical("eDP-1", 1.0);
             request.transform = transform;
-            let ok = validate(&outputs, &[request]).unwrap();
-            assert_eq!(ok[0].transform, transform);
+            let ok = check(&state, &[request]).unwrap();
+            assert_eq!(ok.logical[0].transform, transform);
         }
         let mut request = logical("eDP-1", 1.0);
         request.transform = 8;
-        assert!(validate(&outputs, &[request]).is_err(), "transform range");
+        assert!(check(&state, &[request]).is_err(), "transform range");
     }
 
     #[test]
@@ -1625,7 +1920,7 @@ mod tests {
         });
 
         let display_config = DisplayConfig {
-            outputs: Default::default(),
+            display: Default::default(),
             to_loop,
             orientation: Default::default(),
             power_save: share.clone(),
@@ -1710,6 +2005,242 @@ mod tests {
                 },
                 Transition::PowerOn,
             ]
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        event_loop_thread.join().unwrap();
+    }
+
+    /// The bus surface GNOME Settings drives (#340): Mutter's argument
+    /// types, verification that never reaches the loop, a stale serial
+    /// refused as AccessDenied, and an apply the loop answers, announced
+    /// with MonitorsChanged under a new serial.
+    #[test]
+    fn display_config_applies_and_announces_over_a_private_bus() {
+        use crate::display_config::{DisplayShare, Method};
+        use std::io::{BufRead, BufReader};
+        use std::process::{Child, Command, Stdio};
+        use std::time::Duration;
+
+        struct Bus(Child);
+        impl Drop for Bus {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut daemon = Bus(Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("private test bus starts"));
+        let mut address = String::new();
+        BufReader::new(daemon.0.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
+        let connect = |builder: zbus::blocking::connection::Builder<'static>| {
+            builder
+                .method_timeout(Duration::from_secs(5))
+                .build()
+                .unwrap()
+        };
+        const DEST: &str = "org.gnome.Mutter.DisplayConfig";
+        const PATH: &str = "/org/gnome/Mutter/DisplayConfig";
+
+        let share = Arc::new(DisplayShare::default());
+        assert!(share.publish(display_state()));
+        // The loop side: show the requested mode and publish it.
+        let (to_loop, from_dbus) = calloop::channel::channel();
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let event_loop_thread = std::thread::spawn({
+            let share = share.clone();
+            let applied = applied.clone();
+            let stop = stop.clone();
+            move || {
+                let mut event_loop: calloop::EventLoop<()> = calloop::EventLoop::try_new().unwrap();
+                event_loop
+                    .handle()
+                    .insert_source(from_dbus, move |event, _, _: &mut ()| {
+                        if let calloop::channel::Event::Msg(ToLoop::ApplyMonitors {
+                            config,
+                            method,
+                            reply,
+                        }) = event
+                        {
+                            let mode = config.logical[0].monitors[0].mode.unwrap();
+                            let mut state = share.snapshot();
+                            state.monitors[0].current =
+                                state.monitors[0].modes.iter().position(|m| m.equals(&mode));
+                            share.publish(state);
+                            applied.lock().unwrap().push((mode.id(), method));
+                            reply.send(Ok(())).unwrap();
+                        }
+                    })
+                    .unwrap();
+                while !stop.load(Ordering::SeqCst) {
+                    event_loop
+                        .dispatch(Some(Duration::from_millis(20)), &mut ())
+                        .unwrap();
+                }
+            }
+        });
+
+        let display_config = DisplayConfig {
+            display: share.clone(),
+            to_loop,
+            orientation: Default::default(),
+            power_save: Default::default(),
+        };
+        let server = connect(
+            zbus::blocking::connection::Builder::address(address.trim())
+                .unwrap()
+                .serve_at(PATH, display_config)
+                .unwrap()
+                .name(DEST)
+                .unwrap(),
+        );
+        spawn_monitors_changed(server.inner().clone(), share.subscribe_changes());
+        let client = connect(zbus::blocking::connection::Builder::address(address.trim()).unwrap());
+
+        let xml: String = client
+            .call_method(
+                Some(DEST),
+                PATH,
+                Some("org.freedesktop.DBus.Introspectable"),
+                "Introspect",
+                &(),
+            )
+            .unwrap()
+            .body()
+            .deserialize()
+            .unwrap();
+        for signature in [
+            "a((ssss)a(siiddada{sv})a{sv})",
+            "a(iiduba(ssss)a{sv})",
+            "a(iiduba(ssa{sv}))",
+            "<signal name=\"MonitorsChanged\"",
+        ] {
+            assert!(xml.contains(signature), "{signature} missing from {xml}");
+        }
+
+        type ModeOut = (
+            String,
+            i32,
+            i32,
+            f64,
+            f64,
+            Vec<f64>,
+            HashMap<String, OwnedValue>,
+        );
+        type MonitorOut = (
+            (String, String, String, String),
+            Vec<ModeOut>,
+            HashMap<String, OwnedValue>,
+        );
+        type LogicalOut = (
+            i32,
+            i32,
+            f64,
+            u32,
+            bool,
+            Vec<(String, String, String, String)>,
+            HashMap<String, OwnedValue>,
+        );
+        type StateOut = (
+            u32,
+            Vec<MonitorOut>,
+            Vec<LogicalOut>,
+            HashMap<String, OwnedValue>,
+        );
+        let get_state = || -> StateOut {
+            client
+                .call_method(Some(DEST), PATH, Some(DEST), "GetCurrentState", &())
+                .unwrap()
+                .body()
+                .deserialize()
+                .unwrap()
+        };
+        let current = |state: &StateOut| -> Vec<String> {
+            state.1[0]
+                .1
+                .iter()
+                .filter(|m| m.6.contains_key("is-current"))
+                .map(|m| m.0.clone())
+                .collect()
+        };
+        let state = get_state();
+        assert_eq!(state.0, 1);
+        assert_eq!(state.1.len(), 2);
+        assert_eq!(state.2.len(), 2);
+        assert_eq!(current(&state), ["1920x1080@60.000"]);
+
+        let signals = zbus::blocking::Proxy::new(&client, DEST, PATH, DEST)
+            .unwrap()
+            .receive_signal("MonitorsChanged")
+            .unwrap();
+        let (changed_tx, changed) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in signals {
+                if changed_tx.send(()).is_err() {
+                    return;
+                }
+            }
+        });
+        let apply = |serial: u32, method: u32, mode_id: &str| {
+            let monitors = vec![(
+                "eDP-1".to_owned(),
+                mode_id.to_owned(),
+                HashMap::<String, OwnedValue>::new(),
+            )];
+            client.call_method(
+                Some(DEST),
+                PATH,
+                Some(DEST),
+                "ApplyMonitorsConfig",
+                &(
+                    serial,
+                    method,
+                    vec![(0i32, 0i32, 1.0f64, 0u32, true, monitors)],
+                    HashMap::<String, OwnedValue>::new(),
+                ),
+            )
+        };
+        let error_name = |result: zbus::Result<zbus::message::Message>| match result {
+            Err(zbus::Error::MethodError(name, _, _)) => name.to_string(),
+            other => panic!("expected a D-Bus error, got {other:?}"),
+        };
+        assert_eq!(
+            error_name(apply(0, 1, "1280x720@60.000")),
+            "org.freedesktop.DBus.Error.AccessDenied"
+        );
+        assert_eq!(
+            error_name(apply(1, 0, "640x400@60.000")),
+            "org.freedesktop.DBus.Error.InvalidArgs"
+        );
+        // Verify answers without reaching the loop or changing anything.
+        apply(1, 0, "1280x720@60.000").unwrap();
+        assert!(applied.lock().unwrap().is_empty());
+        assert!(changed.recv_timeout(Duration::from_millis(300)).is_err());
+        // Temporary: applied by the loop before the call returns, then
+        // announced; the serial moves on.
+        apply(1, 1, "1280x720@60.000").unwrap();
+        assert_eq!(
+            *applied.lock().unwrap(),
+            vec![("1280x720@60.000".to_owned(), Method::Temporary)]
+        );
+        changed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let state = get_state();
+        assert_eq!(state.0, 2);
+        assert_eq!(current(&state), ["1280x720@60.000"]);
+        assert_eq!(
+            error_name(apply(1, 2, "1920x1080@60.000")),
+            "org.freedesktop.DBus.Error.AccessDenied"
+        );
+        apply(2, 2, "1920x1080@59.940").unwrap();
+        assert_eq!(
+            applied.lock().unwrap().last(),
+            Some(&("1920x1080@59.940".to_owned(), Method::Persistent))
         );
 
         stop.store(true, Ordering::SeqCst);

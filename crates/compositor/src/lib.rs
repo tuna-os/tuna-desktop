@@ -63,6 +63,7 @@ mod control_readiness;
 pub mod corner_pressure;
 pub mod cursor;
 mod cursor_svg;
+pub mod display_config;
 #[cfg(feature = "drm")]
 pub mod drm;
 pub mod focus_policy;

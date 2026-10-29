@@ -1688,12 +1688,20 @@ st_system_unlock() {
     shot system-unlocked || state_fail "scrot failed"
     require_cstate '(.locked | not) and (.windows | length) > 0' "session unlocked with windows"
 }
+display_serial() {
+    bus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method org.gnome.Mutter.DisplayConfig.GetCurrentState | sed -n 's/^(uint32 \([0-9]*\),.*/\1/p'
+}
 st_system_scale() {
     cstate_wait '(.locked | not)' 5 || state_skip "session is locked; scale capture needs the desktop"
+    # Temporary (method 1): a persistent change would put GNOME Shell's
+    # "Keep these display settings?" dialog in the capture (#340).
+    serial="$(display_serial)"
     bus call --session --dest org.gnome.Mutter.DisplayConfig \
         --object-path /org/gnome/Mutter/DisplayConfig \
         --method org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig \
-        -- 0 2 "[(0, 0, 1.25, uint32 0, true, [('tuna-0', '${WIDTH}x${HEIGHT}@60.000', @a{sv} {})])]" \
+        -- "${serial:-0}" 1 "[(0, 0, 1.25, uint32 0, true, [('tuna-0', '${WIDTH}x${HEIGHT}@60.000', @a{sv} {})])]" \
         "@a{sv} {}" >>"$ARTIFACTS/display-config.log" 2>&1 || state_fail "ApplyMonitorsConfig failed"
     cstate_wait '.layers | any(.namespace == "tuna-panel" and .rect[2] == 1024)' 10 \
         || state_fail "layout did not follow scale 1.25"
@@ -1717,10 +1725,11 @@ EOF2
         "$ARTIFACTS/system-scale-frame-proof.json" >"$ARTIFACTS/system-scale-frame-proof.done.json" \
         || state_fail "scaled close receipt failed"
     mv "$ARTIFACTS/system-scale-frame-proof.done.json" "$ARTIFACTS/system-scale-frame-proof.json"
+    serial="$(display_serial)"
     bus call --session --dest org.gnome.Mutter.DisplayConfig \
         --object-path /org/gnome/Mutter/DisplayConfig \
         --method org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig \
-        -- 0 1 "[(0, 0, 1, uint32 0, true, [('tuna-0', '${WIDTH}x${HEIGHT}@60.000', @a{sv} {})])]" \
+        -- "${serial:-0}" 1 "[(0, 0, 1, uint32 0, true, [('tuna-0', '${WIDTH}x${HEIGHT}@60.000', @a{sv} {})])]" \
         "@a{sv} {}" >>"$ARTIFACTS/display-config.log" 2>&1 || true
     sleep 1
 }

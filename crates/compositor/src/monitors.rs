@@ -1,30 +1,98 @@
-//! GNOME's display configuration (`~/.config/monitors.xml`, #59).
+//! GNOME's display configuration (`~/.config/monitors.xml`, #59, #340).
 //!
-//! GNOME Settings writes each monitor arrangement the user has chosen:
-//! per connector, a logical position and a scale. Tuna Desktop reads the
-//! arrangement matching the connectors that are lit, so a laptop set to
-//! 150 percent in GNOME opens Tuna Desktop at 150 percent too. Logical layout
-//! mode (GNOME's default) is assumed: positions are logical pixels.
+//! Mutter keeps one configuration per set of connected monitors: its
+//! logical monitors (position, scale, rotation, primary, and the
+//! monitors showing each one with the mode they run) plus the monitors
+//! switched off. Tuna Desktop reads the configuration matching the
+//! connectors that are lit, so a laptop set to 150 percent in GNOME
+//! opens Tuna Desktop at 150 percent too, and writes what GNOME
+//! Settings keeps in Mutter 51's exact format
+//! (`meta-monitor-config-store.c`). Logical layout mode (GNOME's
+//! default) is assumed: positions are logical pixels.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// One monitor in one arrangement.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MonitorConfig {
+use crate::display_config::ModeSpec;
+
+/// Mutter's `MetaMonitorSpec`: the connector and the monitor's
+/// vendor, product and serial.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct MonitorSpec {
     /// Connector name as the kernel names it (`eDP-1`, `HDMI-A-1`).
     pub connector: String,
-    /// Output scale (1, 1.25, 1.5, 2, …).
-    pub scale: f64,
+    pub vendor: String,
+    pub product: String,
+    pub serial: String,
+}
+
+impl MonitorSpec {
+    /// A spec known only by its connector.
+    pub fn connector(connector: &str) -> Self {
+        Self {
+            connector: connector.to_owned(),
+            ..Self::default()
+        }
+    }
+}
+
+/// One monitor of a logical monitor and the mode it runs (`None` when
+/// the file names no mode: the monitor keeps its current one).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MonitorConfig {
+    pub spec: MonitorSpec,
+    pub mode: Option<ModeSpec>,
+}
+
+/// One logical monitor; several monitors mirror it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogicalMonitorConfig {
     /// Logical position.
     pub x: i32,
     pub y: i32,
-    /// GNOME's primary monitor (top bar).
-    pub primary: bool,
+    /// Output scale (1, 1.25, 1.5, 2, …).
+    pub scale: f64,
     /// Mutter DisplayConfig transform (0-7) from the `<transform>` block
     /// (#345): 0 normal, 1 left, 2 upside-down, 3 right, 4-7 flipped.
     /// Absent blocks stay 0, as mutter writes normal without a block.
     pub transform: u32,
+    /// GNOME's primary monitor (top bar).
+    pub primary: bool,
+    pub monitors: Vec<MonitorConfig>,
+}
+
+/// One configuration: what each monitor of one monitor set shows.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MonitorsConfig {
+    pub logical: Vec<LogicalMonitorConfig>,
+    /// Monitors switched off (`<disabled>`).
+    pub disabled: Vec<MonitorSpec>,
+}
+
+impl MonitorsConfig {
+    /// The connectors this configuration covers, sorted: the key it is
+    /// stored under (Mutter keys on the full monitor specs; Tuna Desktop
+    /// cannot read EDIDs, so the connector stands for the monitor).
+    pub fn connectors(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .logical
+            .iter()
+            .flat_map(|l| l.monitors.iter().map(|m| m.spec.connector.as_str()))
+            .chain(self.disabled.iter().map(|s| s.connector.as_str()))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// The logical monitor showing this connector, and its monitor.
+    pub fn find(&self, connector: &str) -> Option<(&LogicalMonitorConfig, &MonitorConfig)> {
+        self.logical.iter().find_map(|l| {
+            l.monitors
+                .iter()
+                .find(|m| m.spec.connector == connector)
+                .map(|m| (l, m))
+        })
+    }
 }
 
 /// Mutter 51.0 rotation names (`meta-monitor-config-store.c`):
@@ -77,84 +145,111 @@ fn transform_xml(transform: u32) -> String {
     )
 }
 
-/// Every arrangement in a monitors.xml, each as its monitors.
-pub fn parse(xml: &str) -> Vec<Vec<MonitorConfig>> {
+fn child_text(node: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
+    node.children()
+        .find(|c| c.has_tag_name(name))
+        .and_then(|c| c.text())
+        .map(|t| t.trim().to_owned())
+}
+
+fn parse_spec(spec: roxmltree::Node<'_, '_>) -> Option<MonitorSpec> {
+    Some(MonitorSpec {
+        connector: child_text(spec, "connector").filter(|c| !c.is_empty())?,
+        vendor: child_text(spec, "vendor").unwrap_or_default(),
+        product: child_text(spec, "product").unwrap_or_default(),
+        serial: child_text(spec, "serial").unwrap_or_default(),
+    })
+}
+
+/// A `<mode>` block: width, height, rate and the interlace flag.
+fn parse_mode(mode: roxmltree::Node<'_, '_>) -> Option<ModeSpec> {
+    let width: i32 = child_text(mode, "width")?.parse().ok()?;
+    let height: i32 = child_text(mode, "height")?.parse().ok()?;
+    let refresh: f64 = child_text(mode, "rate")?.parse().ok()?;
+    let interlaced = mode
+        .children()
+        .any(|c| c.has_tag_name("flag") && c.text().map(str::trim) == Some("interlace"));
+    (width > 0 && height > 0 && refresh.is_finite() && refresh > 0.0).then_some(ModeSpec {
+        width,
+        height,
+        refresh: refresh as f32,
+        interlaced,
+    })
+}
+
+/// Every configuration in a monitors.xml.
+pub fn parse(xml: &str) -> Vec<MonitorsConfig> {
     let Ok(doc) = roxmltree::Document::parse(xml) else {
         return Vec::new();
-    };
-    let child_text = |node: roxmltree::Node<'_, '_>, name: &str| -> Option<String> {
-        node.children()
-            .find(|c| c.has_tag_name(name))
-            .and_then(|c| c.text())
-            .map(|t| t.trim().to_owned())
     };
     doc.root_element()
         .children()
         .filter(|n| n.has_tag_name("configuration"))
         .map(|configuration| {
-            configuration
+            let logical = configuration
                 .children()
                 .filter(|n| n.has_tag_name("logicalmonitor"))
-                .flat_map(|logical| {
+                .filter_map(|logical| {
                     let scale = child_text(logical, "scale")
                         .and_then(|s| s.parse::<f64>().ok())
                         .filter(|s| s.is_finite() && *s > 0.0)
                         .unwrap_or(1.0);
-                    let x = child_text(logical, "x")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    let y = child_text(logical, "y")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    let primary = child_text(logical, "primary").is_some_and(|p| p == "yes");
-                    let transform = parse_transform(logical);
-                    // A logical monitor may mirror several connectors.
-                    logical
+                    let monitors: Vec<MonitorConfig> = logical
                         .children()
                         .filter(|n| n.has_tag_name("monitor"))
-                        .filter_map(move |monitor| {
-                            let spec =
-                                monitor.children().find(|c| c.has_tag_name("monitorspec"))?;
-                            Some(MonitorConfig {
-                                connector: child_text(spec, "connector")?,
-                                scale,
-                                x,
-                                y,
-                                primary,
-                                transform,
-                            })
+                        .filter_map(|monitor| {
+                            let spec = monitor
+                                .children()
+                                .find(|c| c.has_tag_name("monitorspec"))
+                                .and_then(parse_spec)?;
+                            let mode = monitor
+                                .children()
+                                .find(|c| c.has_tag_name("mode"))
+                                .and_then(parse_mode);
+                            Some(MonitorConfig { spec, mode })
                         })
-                        .collect::<Vec<_>>()
+                        .collect();
+                    (!monitors.is_empty()).then(|| LogicalMonitorConfig {
+                        x: child_text(logical, "x")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0),
+                        y: child_text(logical, "y")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0),
+                        scale,
+                        transform: parse_transform(logical),
+                        primary: child_text(logical, "primary").is_some_and(|p| p == "yes"),
+                        monitors,
+                    })
                 })
-                .collect()
+                .collect();
+            let disabled = configuration
+                .children()
+                .filter(|n| n.has_tag_name("disabled"))
+                .flat_map(|d| d.children().filter(|c| c.has_tag_name("monitorspec")))
+                .filter_map(parse_spec)
+                .collect();
+            MonitorsConfig { logical, disabled }
         })
+        .filter(|c| !c.logical.is_empty())
         .collect()
 }
 
-/// The arrangement for exactly these connectors, as GNOME picks it; else
-/// the first one that covers them all. Keyed by connector.
-pub fn choose(
-    configurations: &[Vec<MonitorConfig>],
-    connected: &[String],
-) -> HashMap<String, MonitorConfig> {
+/// The configuration for exactly these connectors, as GNOME picks it;
+/// else the first one that covers them all.
+pub fn choose(configurations: &[MonitorsConfig], connected: &[String]) -> Option<MonitorsConfig> {
     let mut wanted: Vec<&str> = connected.iter().map(String::as_str).collect();
     wanted.sort_unstable();
-    fn names(c: &[MonitorConfig]) -> Vec<&str> {
-        let mut n: Vec<&str> = c.iter().map(|m| m.connector.as_str()).collect();
-        n.sort_unstable();
-        n.dedup();
-        n
-    }
-    let exact = configurations.iter().find(|c| names(c) == wanted);
-    let covering = || {
-        configurations
-            .iter()
-            .find(|c| wanted.iter().all(|w| names(c).contains(w)))
-    };
-    exact
-        .or_else(covering)
-        .map(|c| c.iter().map(|m| (m.connector.clone(), m.clone())).collect())
-        .unwrap_or_default()
+    wanted.dedup();
+    configurations
+        .iter()
+        .find(|c| c.connectors() == wanted)
+        .or_else(|| {
+            configurations
+                .iter()
+                .find(|c| wanted.iter().all(|w| c.connectors().contains(w)))
+        })
+        .cloned()
 }
 
 /// `$XDG_CONFIG_HOME/monitors.xml` (default `~/.config/monitors.xml`).
@@ -166,59 +261,114 @@ pub fn path() -> Option<PathBuf> {
         .map(|dir| dir.join("monitors.xml"))
 }
 
-/// Tuna Desktop's own saved arrangements (`$XDG_CONFIG_HOME/tuna/monitors.xml`):
-/// what GNOME Settings applied in a Tuna Desktop session. Kept apart from
-/// GNOME's file, whose full monitor specs (EDID vendor, product, serial)
-/// Tuna Desktop cannot write yet, so a GNOME session's settings stay intact.
+/// Tuna Desktop's own saved configurations
+/// (`$XDG_CONFIG_HOME/tuna/monitors.xml`): what GNOME Settings kept in a
+/// Tuna Desktop session, in Mutter's format. Kept apart from GNOME's
+/// file because Tuna Desktop's monitor specs carry no EDID vendor,
+/// product or serial, so a GNOME session's configurations stay intact.
 pub fn tuna_path() -> Option<PathBuf> {
     path().and_then(|p| p.parent().map(|dir| dir.join("tuna").join("monitors.xml")))
 }
 
-/// The user's arrangement for these connectors: Tuna Desktop's own saved one
-/// first, then GNOME's (empty when there is none).
-pub fn load(connected: &[String]) -> HashMap<String, MonitorConfig> {
-    for file in [tuna_path(), path()].into_iter().flatten() {
-        if let Ok(xml) = std::fs::read_to_string(&file) {
-            let chosen = choose(&parse(&xml), connected);
-            if !chosen.is_empty() {
-                return chosen;
-            }
-        }
-    }
-    HashMap::new()
+/// The user's configuration for these connectors: Tuna Desktop's own
+/// saved one first, then GNOME's.
+pub fn load(connected: &[String]) -> Option<MonitorsConfig> {
+    [tuna_path(), path()]
+        .into_iter()
+        .flatten()
+        .filter_map(|file| std::fs::read_to_string(file).ok())
+        .find_map(|xml| choose(&parse(&xml), connected))
 }
 
-/// One arrangement as a monitors.xml document (GNOME's format).
-pub fn to_xml(configs: &[MonitorConfig]) -> String {
-    let escape = |s: &str| {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-    };
-    let mut out = String::from("<monitors version=\"2\">\n  <configuration>\n");
-    for c in configs {
-        out.push_str(&format!(
-            "    <logicalmonitor>\n      <x>{}</x>\n      <y>{}</y>\n      <scale>{}</scale>\n{}{}      <monitor>\n        <monitorspec>\n          <connector>{}</connector>\n        </monitorspec>\n      </monitor>\n    </logicalmonitor>\n",
-            c.x,
-            c.y,
-            c.scale,
-            if c.primary { "      <primary>yes</primary>\n" } else { "" },
-            transform_xml(c.transform),
-            escape(&c.connector),
-        ));
+fn escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Mutter's `append_monitor_spec`.
+fn spec_xml(spec: &MonitorSpec, indent: &str) -> String {
+    format!(
+        "{indent}<monitorspec>\n{indent}  <connector>{}</connector>\n{indent}  <vendor>{}</vendor>\n{indent}  <product>{}</product>\n{indent}  <serial>{}</serial>\n{indent}</monitorspec>\n",
+        escape(&spec.connector),
+        escape(&spec.vendor),
+        escape(&spec.product),
+        escape(&spec.serial),
+    )
+}
+
+/// Every configuration as a monitors.xml document, in the order and
+/// layout of Mutter's `generate_config_xml`.
+pub fn to_xml(configs: &[MonitorsConfig]) -> String {
+    let mut out = String::from("<monitors version=\"2\">\n");
+    for config in configs {
+        out.push_str("  <configuration>\n    <layoutmode>logical</layoutmode>\n");
+        for logical in &config.logical {
+            out.push_str(&format!(
+                "    <logicalmonitor>\n      <x>{}</x>\n      <y>{}</y>\n      <scale>{}</scale>\n",
+                logical.x, logical.y, logical.scale
+            ));
+            if logical.primary {
+                out.push_str("      <primary>yes</primary>\n");
+            }
+            out.push_str(&transform_xml(logical.transform));
+            for monitor in &logical.monitors {
+                out.push_str("      <monitor>\n");
+                out.push_str(&spec_xml(&monitor.spec, "        "));
+                if let Some(mode) = monitor.mode {
+                    out.push_str(&format!(
+                        "        <mode>\n          <width>{}</width>\n          <height>{}</height>\n          <rate>{:.3}</rate>\n{}        </mode>\n",
+                        mode.width,
+                        mode.height,
+                        mode.refresh,
+                        if mode.interlaced {
+                            "          <flag>interlace</flag>\n"
+                        } else {
+                            ""
+                        },
+                    ));
+                }
+                out.push_str("      </monitor>\n");
+            }
+            out.push_str("    </logicalmonitor>\n");
+        }
+        if !config.disabled.is_empty() {
+            out.push_str("    <disabled>\n");
+            for spec in &config.disabled {
+                out.push_str(&spec_xml(spec, "      "));
+            }
+            out.push_str("    </disabled>\n");
+        }
+        out.push_str("  </configuration>\n");
     }
-    out.push_str("  </configuration>\n</monitors>\n");
+    out.push_str("</monitors>\n");
     out
 }
 
-/// Save an arrangement as Tuna Desktop's own monitors.xml (atomic replace).
-pub fn save(configs: &[MonitorConfig]) -> std::io::Result<PathBuf> {
+/// Mutter's `meta_monitor_config_store_add`: the store with `config`
+/// replacing the configuration for the same monitors, else added.
+pub fn merge(store: &str, config: &MonitorsConfig) -> String {
+    let mut configs = parse(store);
+    let key = config.connectors();
+    match configs.iter().position(|c| c.connectors() == key) {
+        Some(index) => configs[index] = config.clone(),
+        None => configs.push(config.clone()),
+    }
+    to_xml(&configs)
+}
+
+/// Save a configuration into Tuna Desktop's own monitors.xml, keeping
+/// the other monitor sets' (atomic replace).
+pub fn save(config: &MonitorsConfig) -> std::io::Result<PathBuf> {
     let file = tuna_path().ok_or_else(|| std::io::Error::other("no config dir"))?;
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    let store = std::fs::read_to_string(&file).unwrap_or_default();
     let tmp = file.with_extension("xml.tmp");
-    std::fs::write(&tmp, to_xml(configs))?;
+    std::fs::write(&tmp, merge(&store, config))?;
     std::fs::rename(&tmp, &file)?;
     Ok(file)
 }
@@ -249,41 +399,122 @@ mod tests {
   </configuration>
 </monitors>"#;
 
+    fn spec(connector: &str) -> MonitorSpec {
+        MonitorSpec {
+            connector: connector.into(),
+            vendor: "Tuna Desktop".into(),
+            product: connector.into(),
+            serial: connector.into(),
+        }
+    }
+
+    fn mode(width: i32, height: i32, refresh: f32) -> Option<ModeSpec> {
+        Some(ModeSpec {
+            width,
+            height,
+            refresh,
+            interlaced: false,
+        })
+    }
+
+    fn logical(connector: &str, x: i32, scale: f64, primary: bool) -> LogicalMonitorConfig {
+        LogicalMonitorConfig {
+            x,
+            y: 0,
+            scale,
+            transform: 0,
+            primary,
+            monitors: vec![MonitorConfig {
+                spec: spec(connector),
+                mode: mode(1920, 1080, 60.0),
+            }],
+        }
+    }
+
     #[test]
     fn parses_gnome_monitors_xml() {
         let configs = parse(XML);
         assert_eq!(configs.len(), 2);
-        assert_eq!(configs[0].len(), 1);
-        assert_eq!(configs[0][0].connector, "eDP-1");
-        assert_eq!(configs[0][0].scale, 1.5);
-        assert!(configs[0][0].primary);
-        assert_eq!(configs[1][1].connector, "HDMI-A-1");
-        assert_eq!((configs[1][1].x, configs[1][1].scale), (1504, 1.0));
+        assert_eq!(configs[0].logical.len(), 1);
+        let (laptop, monitor) = configs[0].find("eDP-1").unwrap();
+        assert_eq!(laptop.scale, 1.5);
+        assert!(laptop.primary);
+        assert_eq!(monitor.spec.vendor, "BOE");
+        assert_eq!(monitor.mode, mode(2256, 1504, 59.999));
+        assert_eq!(monitor.mode.unwrap().id(), "2256x1504@59.999");
+        let (hdmi, monitor) = configs[1].find("HDMI-A-1").unwrap();
+        assert_eq!((hdmi.x, hdmi.scale), (1504, 1.0));
+        // A file without modes keeps the current ones.
+        assert_eq!(monitor.mode, None);
         assert!(parse("<not xml").is_empty());
     }
 
     #[test]
     fn saved_arrangements_read_back() {
-        let configs = vec![
-            MonitorConfig {
-                connector: "eDP-1".into(),
-                scale: 1.25,
-                x: 0,
-                y: 0,
-                primary: true,
-                transform: 0,
-            },
-            MonitorConfig {
-                connector: "HDMI-A-1".into(),
-                scale: 1.0,
-                x: 1536,
-                y: 0,
-                primary: false,
-                transform: 0,
-            },
-        ];
+        let configs = vec![MonitorsConfig {
+            logical: vec![
+                logical("eDP-1", 0, 1.25, true),
+                logical("HDMI-A-1", 1536, 1.0, false),
+            ],
+            disabled: Vec::new(),
+        }];
         let back = parse(&to_xml(&configs));
-        assert_eq!(back, vec![configs]);
+        assert_eq!(back, configs);
+    }
+
+    #[test]
+    fn modes_mirrors_and_disabled_monitors_round_trip_in_mutter_format() {
+        let mut mirrored = logical("eDP-1", 0, 1.0, true);
+        mirrored.monitors.push(MonitorConfig {
+            spec: spec("HDMI-A-1"),
+            mode: Some(ModeSpec {
+                width: 1920,
+                height: 1080,
+                refresh: 59.94,
+                interlaced: true,
+            }),
+        });
+        let config = MonitorsConfig {
+            logical: vec![mirrored],
+            disabled: vec![spec("DP-1")],
+        };
+        let xml = to_xml(std::slice::from_ref(&config));
+        // Mutter's layout, byte for byte.
+        assert!(xml.starts_with(
+            "<monitors version=\"2\">\n  <configuration>\n    <layoutmode>logical</layoutmode>\n    <logicalmonitor>\n      <x>0</x>\n      <y>0</y>\n      <scale>1</scale>\n      <primary>yes</primary>\n      <monitor>\n        <monitorspec>\n          <connector>eDP-1</connector>\n          <vendor>Tuna Desktop</vendor>\n          <product>eDP-1</product>\n          <serial>eDP-1</serial>\n        </monitorspec>\n        <mode>\n          <width>1920</width>\n          <height>1080</height>\n          <rate>60.000</rate>\n        </mode>\n      </monitor>\n"
+        ), "{xml}");
+        assert!(xml.contains("<rate>59.940</rate>\n          <flag>interlace</flag>\n"));
+        assert!(xml.contains(
+            "    <disabled>\n      <monitorspec>\n        <connector>DP-1</connector>\n"
+        ));
+        let back = parse(&xml);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].logical[0].monitors.len(), 2);
+        assert_eq!(back[0].disabled, vec![spec("DP-1")]);
+        assert_eq!(
+            back[0].logical[0].monitors[1].mode.unwrap().id(),
+            "1920x1080i@59.940"
+        );
+        assert_eq!(back[0].connectors(), ["DP-1", "HDMI-A-1", "eDP-1"]);
+    }
+
+    #[test]
+    fn saving_replaces_only_the_same_monitor_set() {
+        let laptop = MonitorsConfig {
+            logical: vec![logical("eDP-1", 0, 1.25, true)],
+            disabled: Vec::new(),
+        };
+        let docked = MonitorsConfig {
+            logical: vec![logical("HDMI-A-1", 0, 1.0, true)],
+            disabled: vec![spec("eDP-1")],
+        };
+        let store = merge("", &laptop);
+        let store = merge(&store, &docked);
+        assert_eq!(parse(&store), vec![laptop.clone(), docked.clone()]);
+        let mut laptop_150 = laptop.clone();
+        laptop_150.logical[0].scale = 1.5;
+        let store = merge(&store, &laptop_150);
+        assert_eq!(parse(&store), vec![laptop_150, docked]);
     }
 
     #[test]
@@ -311,8 +542,9 @@ mod tests {
         let configs = parse(xml);
         assert_eq!(configs.len(), 1);
         let transforms: Vec<(String, u32)> = configs[0]
+            .logical
             .iter()
-            .map(|c| (c.connector.clone(), c.transform))
+            .map(|l| (l.monitors[0].spec.connector.clone(), l.transform))
             .collect();
         assert_eq!(
             transforms,
@@ -323,31 +555,37 @@ mod tests {
             ]
         );
         // Rotation survives a save/load cycle; normal still omits the block.
-        let back = parse(&to_xml(&configs[0]));
+        let back = parse(&to_xml(&configs));
         assert_eq!(back, configs);
-        assert!(!to_xml(&configs[0][..0]).contains("transform"));
-        let normal = MonitorConfig {
-            connector: "eDP-1".into(),
-            scale: 1.0,
-            x: 0,
-            y: 0,
-            primary: true,
-            transform: 0,
+        assert!(!to_xml(&[]).contains("transform"));
+        let normal = MonitorsConfig {
+            logical: vec![logical("eDP-1", 0, 1.0, true)],
+            disabled: Vec::new(),
         };
         assert!(!to_xml(std::slice::from_ref(&normal)).contains("transform"));
         // Unknown rotations keep the arrangement readable at normal.
         let broken = xml.replace("<rotation>left</rotation>", "<rotation>diagonal</rotation>");
-        assert_eq!(parse(&broken)[0][0].transform, 0);
+        assert_eq!(parse(&broken)[0].logical[0].transform, 0);
     }
 
     #[test]
     fn picks_the_arrangement_for_the_lit_connectors() {
         let configs = parse(XML);
-        let laptop = choose(&configs, &["eDP-1".to_owned()]);
-        assert_eq!(laptop.len(), 1);
-        assert_eq!(laptop["eDP-1"].scale, 1.5);
-        let docked = choose(&configs, &["HDMI-A-1".to_owned(), "eDP-1".to_owned()]);
-        assert_eq!(docked["HDMI-A-1"].x, 1504);
-        assert!(choose(&configs, &["DP-3".to_owned()]).is_empty());
+        let laptop = choose(&configs, &["eDP-1".to_owned()]).unwrap();
+        assert_eq!(laptop.logical.len(), 1);
+        assert_eq!(laptop.find("eDP-1").unwrap().0.scale, 1.5);
+        let docked = choose(&configs, &["HDMI-A-1".to_owned(), "eDP-1".to_owned()]).unwrap();
+        assert_eq!(docked.find("HDMI-A-1").unwrap().0.x, 1504);
+        assert!(choose(&configs, &["DP-3".to_owned()]).is_none());
+        // A disabled monitor belongs to the configuration's monitor set.
+        let lid_closed = MonitorsConfig {
+            logical: vec![logical("HDMI-A-1", 0, 1.0, true)],
+            disabled: vec![spec("eDP-1")],
+        };
+        let configs = vec![lid_closed.clone()];
+        assert_eq!(
+            choose(&configs, &["eDP-1".to_owned(), "HDMI-A-1".to_owned()]),
+            Some(lid_closed)
+        );
     }
 }

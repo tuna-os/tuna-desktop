@@ -12,7 +12,11 @@ before decoding.
 ## Public API (`src/lib.rs`)
 
 - Framing: `encode_frame`, `decode_frame`, `DecodeError`, `MAX_FRAME_BYTES`.
-- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.41).
+- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.42).
+- Display-change confirmation (0.42): `Message::ConfirmDisplayChange
+  { timeout_secs }` (sent only to peers advertising minor >=42) asks the shell
+  for GNOME's "Keep these display settings?" dialog; the shell answers with
+  `CommandKind::CompleteDisplayChange { keep }`.
 - Dash targets: `WindowIconGeometry`, `MAX_WINDOW_ICON_GEOMETRIES`, and
   appended `CommandKind::SetWindowIconGeometries` full replacements. Unknown
   windows are ignored by the compositor; an empty list selects monitor fallback.
