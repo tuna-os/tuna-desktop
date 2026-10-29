@@ -13,6 +13,8 @@
 #[path = "../src/lockdown.rs"]
 mod lockdown;
 
+use std::sync::{mpsc, LazyLock, Mutex};
+
 use glib::object::Cast;
 use gtk4 as gtk;
 use gtk4::prelude::*;
@@ -98,12 +100,57 @@ fn policy_round_trips_through_memory_backend() {
     );
 }
 
+type GtkJob = (fn(), mpsc::Sender<Result<(), String>>);
+
+/// GTK refuses initialization from a second thread, while libtest runs
+/// every test on its own thread (even with `--test-threads=1`). Every
+/// display test therefore runs its body on one dedicated GTK thread,
+/// one body at a time, and re-raises the body's panic on the test's
+/// own thread.
+static GTK_THREAD: LazyLock<Mutex<mpsc::Sender<GtkJob>>> = LazyLock::new(|| {
+    let (jobs, inbox) = mpsc::channel::<GtkJob>();
+    std::thread::Builder::new()
+        .name("gtk".into())
+        .spawn(move || {
+            let display = gtk::init().map_err(|error| format!("GTK display: {error}"));
+            for (body, reply) in inbox {
+                let outcome = display.clone().and_then(|()| {
+                    std::panic::catch_unwind(body).map_err(|payload| {
+                        payload
+                            .downcast_ref::<&str>()
+                            .map(|message| (*message).to_owned())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "non-string panic".to_owned())
+                    })
+                });
+                let _ = reply.send(outcome);
+            }
+        })
+        .expect("spawn the GTK thread");
+    Mutex::new(jobs)
+});
+
+fn on_gtk_thread(body: fn()) {
+    let (reply, outcome) = mpsc::channel();
+    GTK_THREAD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .send((body, reply))
+        .expect("GTK thread accepts work");
+    if let Err(message) = outcome.recv().expect("GTK thread replies") {
+        panic!("on the GTK thread: {message}");
+    }
+}
+
 /// Real widgets flip visibility under the policy. Needs a display;
 /// run under `xvfb-run`.
 #[test]
 #[ignore = "requires a display (xvfb-run) for GTK widgets"]
 fn widgets_apply_entry_visibility() {
-    gtk::init().expect("GTK display");
+    on_gtk_thread(entry_visibility_on_display);
+}
+
+fn entry_visibility_on_display() {
     let lock = gtk::Button::with_label("Lock");
     let log_out = gtk::Button::with_label("Log Out…");
     let user_switch = gtk::Button::with_label("Switch User");
@@ -169,7 +216,10 @@ fn text_of(entry: &gtk::PasswordEntry) -> gtk::Text {
 #[test]
 #[ignore = "requires a display (xvfb-run) for GTK widgets"]
 fn password_peek_follows_disable_show_password_live() {
-    gtk::init().expect("GTK display");
+    on_gtk_thread(password_peek_on_display);
+}
+
+fn password_peek_on_display() {
     let Some(settings) = memory_lockdown() else {
         return;
     };
