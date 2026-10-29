@@ -3679,6 +3679,7 @@ impl WindowManager {
                 time,
             } => {
                 if let Some(pointer) = self.pointer.clone() {
+                    self.lock_pointer_enter(state, &pointer, surface, time);
                     pointer.button(
                         state,
                         &ButtonEvent {
@@ -3699,9 +3700,41 @@ impl WindowManager {
                 horizontal,
                 vertical,
                 time,
-            } => self.pointer_axis(state, horizontal, vertical, time),
+            } => {
+                if let Some(pointer) = self.pointer.clone() {
+                    self.lock_pointer_enter(state, &pointer, surface, time);
+                }
+                self.pointer_axis(state, horizontal, vertical, time)
+            }
             _ => {}
         }
+    }
+
+    /// A lock surface mapped under a still pointer has had no motion to
+    /// enter it, so a press or scroll would go to no surface (and a drag
+    /// begun there would stay focusless under the implicit grab). Enter
+    /// it where the pointer stands first, as Mutter repicks on a stage
+    /// change. Never during a grab: a held button keeps its surface.
+    fn lock_pointer_enter(
+        &mut self,
+        state: &mut State,
+        pointer: &smithay::input::pointer::PointerHandle<State>,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        time: u32,
+    ) {
+        if pointer.is_grabbed() || pointer.current_focus().as_ref() == Some(surface) {
+            return;
+        }
+        pointer.motion(
+            state,
+            Some((surface.clone(), (0.0, 0.0).into())),
+            &MotionEvent {
+                location: self.pointer_pos,
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+        pointer.frame(state);
     }
 
     /// Deliver a key event to the focused window. Returns false when no

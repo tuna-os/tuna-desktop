@@ -944,6 +944,11 @@ mod gtk_curtain_tests {
         assert!((a - b).abs() <= 1.5, "{what}: {a} vs {b}");
     }
 
+    /// GTK keeps a widget's opacity as an 8-bit alpha (`gtk_widget_set_opacity`).
+    fn alpha(opacity: f64, want: f64) -> bool {
+        (opacity - want).abs() <= 1.0 / 255.0
+    }
+
     /// Real GTK widgets: the pages are allocated at GNOME's frames about
     /// their own centres, the hidden page leaves focus and the tree, and
     /// Reduced Motion and animations off keep to GNOME's policy.
@@ -1008,8 +1013,8 @@ mod gtk_curtain_tests {
             clock_rest.x() + clock_rest.width() / 2.0,
             "pivot x",
         );
-        assert!((clock.opacity() - 0.5).abs() < 1e-6);
-        assert!((prompt.opacity() - 0.5).abs() < 1e-6);
+        assert!(alpha(clock.opacity(), 0.5), "clock {}", clock.opacity());
+        assert!(alpha(prompt.opacity(), 0.5), "prompt {}", prompt.opacity());
         let prompt_half = bounds(&prompt_widget, &curtain);
 
         // Released slowly past half: the prompt, ease-out cubic.
@@ -1060,7 +1065,7 @@ mod gtk_curtain_tests {
         let distance = curtain.swipe_begin("test");
         curtain.swipe_update(0.5 * distance, distance);
         assert!(pump_until(Duration::from_secs(2), || {
-            (clock.opacity() - 0.5).abs() < 1e-6
+            alpha(clock.opacity(), 0.5)
         }));
         // Let an allocation pass, then the clock is where it rests.
         let _ = pump_until(Duration::from_millis(200), || false);
