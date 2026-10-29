@@ -181,6 +181,18 @@ impl Notifications {
         vec!["actions".to_owned(), "persistence".to_owned()]
     }
 
+    /// Mandatory in the notification spec; libnotify asks for it before
+    /// every `Notify` (gnome-shell notificationDaemon.js
+    /// `GetServerInformation` answers spec version 1.2).
+    fn get_server_information(&self) -> (String, String, String, String) {
+        (
+            "tuna-shell".to_owned(),
+            "Tuna".to_owned(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+            "1.2".to_owned(),
+        )
+    }
+
     /// Banner press fired an action key (emitted by
     /// [`NotificationBus::invoke_action`]).
     #[zbus(signal)]
@@ -633,6 +645,11 @@ mod tests {
                 .call::<&str, _, Vec<String>>("GetCapabilities", &())
                 .expect("stub GetCapabilities reaches the intake");
             assert_eq!(caps, vec!["actions".to_owned(), "persistence".to_owned()]);
+
+            let info: (String, String, String, String) = proxy
+                .call("GetServerInformation", &())
+                .expect("libnotify's GetServerInformation reaches the intake");
+            assert_eq!(info.3, "1.2", "spec version as gnome-shell answers");
 
             let id = stub_notify(&proxy, vec!["default".to_owned(), "Open".to_owned()]);
             assert_ne!(id, 0, "intake returns a live notification id");
