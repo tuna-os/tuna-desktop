@@ -500,7 +500,7 @@ Consumers re-checked against gnome-shell 51.0, gnome-session 51.0 and gnome-sett
 | Key | Status | Reason |
 |---|---|---|
 | idle-delay | Honored | Live compositor idle policy; gsd-power dims at half the delay and blanks after the shield (V-GSD-POWER-IDLE) |
-| save-restore | Ignored | Tuna Desktop session does not consume this legacy session preference |
+| save-restore | Ignored | As in GNOME 51: gnome-session 51 turns its app save and restore off (`RestoreSupported` false, which the compositor's `org.gnome.SessionManager` also reports, so GNOME Settings hides "Reopen Windows After Login"); window restoration is the client opt-in of `xdg_session_manager_v1`, which Mutter 51 and Tuna Desktop apply without reading this key (P-SY-08) |
 | session-name | Ignored | Tuna Desktop session does not consume this legacy session preference |
 ## org.gnome.desktop.sound
 

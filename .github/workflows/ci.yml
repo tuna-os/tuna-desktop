@@ -911,6 +911,11 @@ jobs:
       # one already failed the job.
       - if: ${{ !cancelled() }}
         run: shellcheck scripts/tuna-magnifier-proof && scripts/tuna-magnifier-proof --artifacts gtk-shell-artifacts/magnifier
+      # Window session save and restore (P-SY-08, #338): an
+      # xdg-session-management client's windows come back, moved, resized,
+      # maximized and on their workspace, after the nested compositor
+      # restarts (G-SESSION-RESTORE*).
+      - run: scripts/tuna-session-restore-proof --artifacts gtk-shell-artifacts/session-restore
       # Keep runnable binaries even when a later live proof assertion fails.
       - if: always()
         run: |
@@ -1323,6 +1328,7 @@ jobs:
           --assertions ledger-in/gtk-shell/a11y/assertions.txt
           --assertions ledger-in/gtk-shell/scale/assertions.txt
           --assertions ledger-in/gtk-shell/magnifier/assertions.txt
+          --assertions ledger-in/gtk-shell/session-restore/assertions.txt
           --assertions ledger-in/drm-smoke/assertions.txt
           --assertions ledger-in/marlin-vm/assertions.txt
 

@@ -110,7 +110,7 @@ state records its state observation next to its stills and clips.
 | P-TR-01 | AppIndicator tray items | stage:panel `nested` | Observed subset | tray-menu still; icon-only and error variants open |
 | P-WM-08 | Multitasking preferences | `missing-product` | No adequate capture | no consumer for fixed count/primary-only/tiling preference; nothing truthful to capture |
 | P-WM-09 | Full WM shortcut list and focus policy | `unproven` | No adequate capture | working accelerators have no dedicated stills; unregistered keys unimplemented |
-| P-SY-08 | Session save and restore | `missing-product` | No adequate capture | no consumer and no session-management protocol; Corral after implementation |
+| P-SY-08 | Session save and restore | `unproven` | No adequate capture | xdg-session-management restores session windows across a nested compositor restart (G-SESSION-RESTORE checks geometry and workspace from compositor state, no stills); installed logout/reboot capture needs Corral |
 | P-SY-09 | Remaining Mutter protocols and versions | `nonvisual` | No adequate capture | no pixels; consumer output lives in CI logs |
 | P-SY-10 | Screenshot-UI keyboard selection | stage:system `partial` | No adequate capture | UI chrome captured; arrow/Alt/Shift/Ctrl/R selection visuals unproven |
 | P-DS-01 | Night Light | stage:quick-settings `partial` | No adequate capture | tile captured; no temperature transform exists to show (`missing-product` for the effect) |
@@ -215,7 +215,7 @@ their ledger rows above:
   (`unsupported-in-nested`), P-A11Y-03/P-A11Y-04 (`missing-product`).
 - privacy: P-ST-04 (`missing-product`), P-NT-03 (`missing-product`).
 - nightlight: P-DS-01 (tile `nested`, transform `missing-product`).
-- session restore: P-SY-08 (`missing-product`).
+- session restore: P-SY-08 (`unproven`).
 - rotation: P-DS-02 (rejected, `partial` for scale/position),
   P-DS-04 (`missing-product`).
 - print: P-ST-10 (`unsupported-in-nested`, printers panel on image).

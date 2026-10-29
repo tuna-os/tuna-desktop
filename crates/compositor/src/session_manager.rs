@@ -27,10 +27,15 @@
 //! `Active`; `PowerOff(true)`/`Reboot(true)`). gnome-session asks its
 //! registered clients before the dialog (QueryEndSession); Tuna has no
 //! client registration, so the logout inhibitors held here are the whole
-//! answer. Not provided: client registration, presence, the weak logind
-//! inhibitors gnome-session takes for the logout and suspend flags, and
-//! session restore (the restore facade in `session_restore.rs` is not
-//! wired; joining it means serving its methods on this object).
+//! answer. `RestoreSupported` is false, as gnome-session 51 sets it ("For
+//! GNOME 50, we've disabled the save/restore feature",
+//! `_gsm_manager_set_active_session`): GNOME Settings then hides its
+//! "Reopen Windows After Login" switch, and window restoration is what
+//! clients opt into through `xdg_session_manager_v1`
+//! ([`crate::xdg_session`]). Not provided: client registration, presence,
+//! the weak logind inhibitors gnome-session takes for the logout and
+//! suspend flags, and the `RegisterRestore` family that only a session
+//! supporting restore is asked.
 
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -374,6 +379,13 @@ impl Manager {
     #[zbus(property)]
     fn inhibited_actions(&self) -> u32 {
         self.share.inhibited.load(Ordering::Acquire)
+    }
+
+    /// gnome-session 51 reports no app save and restore; GNOME Settings
+    /// reads this before showing "Reopen Windows After Login".
+    #[zbus(property)]
+    fn restore_supported(&self) -> bool {
+        false
     }
 
     #[zbus(signal)]
@@ -1014,6 +1026,8 @@ mod tests {
         let manager = proxy(&observer, PATH, "org.gnome.SessionManager");
         assert!(manager.get_property::<bool>("SessionIsActive").unwrap());
         assert_eq!(manager.get_property::<u32>("InhibitedActions").unwrap(), 0);
+        // GNOME Settings hides "Reopen Windows After Login" on this.
+        assert!(!manager.get_property::<bool>("RestoreSupported").unwrap());
         let added = manager.receive_signal("InhibitorAdded").unwrap();
 
         // gsd-screensaver-proxy's call for a video player's

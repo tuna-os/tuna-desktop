@@ -73,6 +73,9 @@ plugins use (`InhibitedActions`, `SessionIsActive`, `Inhibit`, `Uninhibit`,
 `IsInhibited`, `GetInhibitors`, and `Shutdown`, `Reboot` and `Logout`, which
 open the shell's `org.gnome.SessionManager.EndSessionDialog`); idle inhibitors
 also hold off Tuna's idle lock.
+Its `RestoreSupported` is false, as gnome-session 51 reports it, so GNOME
+Settings hides "Reopen Windows After Login"; window restoration is the client
+opt-in of `xdg_session_manager_v1` (P-SY-08).
 Proof V-GSD-PLUGINS checks every started plugin's process, user, unit and bus name.
 
 | Plugin (bus name `org.gnome.SettingsDaemon.*`) | GNOME 51 target | Tuna session |

@@ -62,6 +62,7 @@ const EXPECTED: &[(&str, u32)] = &[
     ("wp_single_pixel_buffer_manager_v1", 1),
     ("wp_viewporter", 1),
     ("xdg_activation_v1", 1),
+    ("xdg_session_manager_v1", 1),
     ("xdg_system_bell_v1", 1),
     ("xdg_toplevel_icon_manager_v1", 1),
     ("xdg_toplevel_tag_manager_v1", 1),
