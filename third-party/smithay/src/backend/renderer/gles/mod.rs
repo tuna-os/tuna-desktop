@@ -305,6 +305,9 @@ pub struct GlesRenderer {
     vertices: Vec<f32>,
     non_opaque_damage: Vec<Rectangle<i32, Physical>>,
     opaque_damage: Vec<Rectangle<i32, Physical>>,
+    // textures the current frame read without a fence yet, and scratch space for the fence each
+    // one had; see `fence_frame_reads`
+    frame_reads: Vec<(GlesTexture, Option<Arc<ReadFence>>)>,
 
     // cleanup
     destruction_callback: Receiver<CleanupResource>,
@@ -635,6 +638,7 @@ impl GlesRenderer {
             vertices: Vec::with_capacity(6 * 16),
             non_opaque_damage: Vec::with_capacity(16),
             opaque_damage: Vec::with_capacity(16),
+            frame_reads: Vec::with_capacity(16),
 
             destruction_callback: rx,
             destruction_callback_sender: tx,
@@ -657,7 +661,7 @@ impl GlesRenderer {
             let mut sync_lock = texture.0.sync.write().unwrap();
             let mut fbo = 0;
             unsafe {
-                sync_lock.wait_for_all(&self.gl);
+                sync_lock.wait_for_all(&self.gl, &texture.0.read_sync);
                 self.gl.GenFramebuffers(1, &mut fbo as *mut _);
                 self.gl.BindFramebuffer(ffi::FRAMEBUFFER, fbo);
                 self.gl.FramebufferTexture2D(
@@ -752,6 +756,26 @@ impl GlesRenderer {
         }
     }
 
+    /// Fences every texture the current frame read through an unshared context, all with one
+    /// fence. The context must be current.
+    fn fence_frame_reads(&mut self) {
+        if self.frame_reads.is_empty() {
+            return;
+        }
+        // The new fence must also cover the reads behind each texture's previous fence, which
+        // another context may have issued while this one was shared.
+        for (texture, waited) in &mut self.frame_reads {
+            *waited = texture.0.read_sync.wait_to_replace(&self.gl);
+        }
+        let fence = ReadFence::new(&self.gl, self.destruction_callback_sender.clone());
+        for (texture, waited) in self.frame_reads.drain(..) {
+            texture
+                .0
+                .read_sync
+                .replace(&self.gl, waited, &fence, &self.destruction_callback_sender);
+        }
+    }
+
     /// Returns the supported [`Capabilities`](Capability) of this renderer.
     pub fn capabilities(&self) -> &[Capability] {
         &self.capabilities
@@ -836,6 +860,7 @@ impl ImportMemWl for GlesRenderer {
                         let new = Arc::new(GlesTextureInternal {
                             texture: tex,
                             sync: RwLock::default(),
+                            read_sync: ReadSync::default(),
                             format: Some(internal_format),
                             has_alpha,
                             is_external: false,
@@ -853,7 +878,7 @@ impl ImportMemWl for GlesRenderer {
 
             let mut sync_lock = texture.0.sync.write().unwrap();
             unsafe {
-                sync_lock.wait_for_all(&self.gl);
+                sync_lock.wait_for_all(&self.gl, &texture.0.read_sync);
                 self.gl.BindTexture(ffi::TEXTURE_2D, texture.0.texture);
                 self.gl
                     .TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
@@ -1005,6 +1030,7 @@ impl ImportMem for GlesRenderer {
             GlesTextureInternal {
                 texture: tex,
                 sync,
+                read_sync: ReadSync::default(),
                 format: Some(internal),
                 has_alpha,
                 is_external: false,
@@ -1045,7 +1071,7 @@ impl ImportMem for GlesRenderer {
         let mut sync_lock = texture.0.sync.write().unwrap();
         unsafe {
             self.egl.make_current()?;
-            sync_lock.wait_for_all(&self.gl);
+            sync_lock.wait_for_all(&self.gl, &texture.0.read_sync);
             self.gl.BindTexture(ffi::TEXTURE_2D, texture.0.texture);
             self.gl
                 .TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
@@ -1146,6 +1172,7 @@ impl ImportEgl for GlesRenderer {
         let texture = GlesTexture(Arc::new(GlesTextureInternal {
             texture: tex,
             sync: RwLock::default(),
+            read_sync: ReadSync::default(),
             format: match egl.format {
                 EGLFormat::RGB | EGLFormat::RGBA => Some(ffi::RGBA8),
                 EGLFormat::External => None,
@@ -1192,6 +1219,7 @@ impl ImportDma for GlesRenderer {
             let texture = GlesTexture(Arc::new(GlesTextureInternal {
                 texture: tex,
                 sync: RwLock::default(),
+                read_sync: ReadSync::default(),
                 format: Some(format),
                 has_alpha,
                 is_external,
@@ -2321,6 +2349,8 @@ impl GlesFrame<'_, '_> {
         if let GlesTargetInternal::Texture { sync_lock, .. } = &mut self.target.0 {
             sync_lock.update_write(&self.renderer.gl);
         }
+        // One read fence for the frame's textures; `Drop` gets here too for unfinished frames.
+        self.renderer.fence_frame_reads();
 
         // delayed destruction until the next frame rendering.
         self.renderer.cleanup();
@@ -2696,6 +2726,9 @@ impl GlesFrame<'_, '_> {
             &program_variant.debug
         };
 
+        let fencing = self.renderer.capabilities.contains(&Capability::Fencing);
+        let shared = self.renderer.egl.is_shared();
+
         // render
         let gl = &self.renderer.gl;
         let sync_lock = tex.0.sync.read().unwrap();
@@ -2781,11 +2814,28 @@ impl GlesFrame<'_, '_> {
             gl.DisableVertexAttribArray(program.attrib_vert as u32);
             gl.DisableVertexAttribArray(program.attrib_vert_position as u32);
 
-            if self.renderer.capabilities.contains(&Capability::Fencing) {
-                sync_lock.update_read(gl);
-            } else if self.renderer.egl.is_shared() {
+            if fencing && shared {
+                // Another context may take the write lock once this draw releases the read
+                // lock, so the read is fenced now.
+                tex.0
+                    .read_sync
+                    .update(gl, tex.0.destruction_callback_sender.clone());
+            } else if shared {
                 gl.Finish();
-            };
+            }
+        }
+        drop(sync_lock);
+
+        if fencing && shared {
+            // Reads deferred before the context was shared, through `GlesFrame::egl_context`.
+            self.renderer.fence_frame_reads();
+        } else if fencing {
+            // Fenced once for the whole frame: a fence per draw makes some drivers (llvmpipe)
+            // flush and rasterize the frame once per drawn texture.
+            let reads = &mut self.renderer.frame_reads;
+            if !reads.iter().any(|(read, _)| Arc::ptr_eq(&read.0, &tex.0)) {
+                reads.push((tex.clone(), None));
+            }
         }
 
         Ok(())
@@ -3237,5 +3287,178 @@ mod tests {
         assert_eq!(tex_mat * top_right, Vector3::new(1f32, 0f32, 1f32));
         assert_eq!(tex_mat * bottom_right, Vector3::new(0f32, 0f32, 1f32));
         assert_eq!(tex_mat * bottom_left, Vector3::new(0f32, 1f32, 1f32));
+    }
+}
+
+/// Read fences against a surfaceless Mesa EGL display (llvmpipe without a GPU).
+#[cfg(test)]
+mod per_frame_read_fence_tests {
+    use super::*;
+    use crate::backend::egl::{native::EGLSurfacelessDisplay, EGLDisplay};
+
+    const SIZE: i32 = 4;
+
+    fn renderer() -> GlesRenderer {
+        let display = unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }.expect("surfaceless EGL display");
+        let context = EGLContext::new(&display).expect("EGL context");
+        let renderer = unsafe { GlesRenderer::new(context) }.expect("GLES renderer");
+        assert!(renderer.capabilities().contains(&Capability::Fencing));
+        renderer
+    }
+
+    fn solid(renderer: &mut GlesRenderer, rgba: [u8; 4]) -> GlesTexture {
+        renderer
+            .import_memory(&rgba.repeat(4), Fourcc::Abgr8888, (2, 2).into(), false)
+            .expect("texture upload")
+    }
+
+    fn target(renderer: &mut GlesRenderer) -> GlesTexture {
+        renderer
+            .create_buffer(Fourcc::Abgr8888, (SIZE, SIZE).into())
+            .expect("render target")
+    }
+
+    fn draw(frame: &mut GlesFrame<'_, '_>, texture: &GlesTexture) {
+        let dst = Rectangle::from_size((SIZE, SIZE).into());
+        Frame::render_texture_from_to(
+            frame,
+            texture,
+            Rectangle::from_size((2.0, 2.0).into()),
+            dst,
+            &[dst],
+            &[],
+            Transform::Normal,
+            1.0,
+        )
+        .expect("draw");
+    }
+
+    fn first_pixel(renderer: &mut GlesRenderer, target: &mut GlesTexture) -> [u8; 4] {
+        let framebuffer = renderer.bind(target).expect("bind");
+        let mapping = renderer
+            .copy_framebuffer(
+                &framebuffer,
+                Rectangle::from_size((SIZE, SIZE).into()),
+                Fourcc::Abgr8888,
+            )
+            .expect("read back");
+        let pixels = renderer.map_texture(&mapping).expect("map");
+        pixels[..4].try_into().unwrap()
+    }
+
+    fn same(a: &Option<Arc<ReadFence>>, b: &Option<Arc<ReadFence>>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn per_frame_read_fence_covers_all_reads_with_one_fence() {
+        let mut renderer = renderer();
+        let textures: Vec<_> = (0..3).map(|i| solid(&mut renderer, [i, 0, 0, 255])).collect();
+        let mut target = target(&mut renderer);
+        let mut framebuffer = renderer.bind(&mut target).unwrap();
+        let mut previous: Option<Arc<ReadFence>> = None;
+        for _ in 0..2 {
+            let mut frame = renderer
+                .render(&mut framebuffer, (SIZE, SIZE).into(), Transform::Normal)
+                .unwrap();
+            for texture in textures.iter().chain(&textures) {
+                draw(&mut frame, texture);
+            }
+            // No fence per draw: each texture is recorded once and keeps the last frame's fence.
+            assert_eq!(frame.renderer.frame_reads.len(), textures.len());
+            for texture in &textures {
+                assert!(same(&texture.0.read_sync.current(), &previous));
+            }
+            frame.finish().unwrap().wait().unwrap();
+
+            let fence = textures[0].0.read_sync.current().expect("frame read fence");
+            for texture in &textures {
+                assert!(Arc::ptr_eq(&texture.0.read_sync.current().unwrap(), &fence));
+            }
+            assert!(!same(&Some(fence.clone()), &previous), "a new fence per frame");
+            assert!(renderer.frame_reads.is_empty());
+            previous = Some(fence);
+        }
+    }
+
+    #[test]
+    fn per_frame_read_fence_is_created_for_a_dropped_frame() {
+        let mut renderer = renderer();
+        let texture = solid(&mut renderer, [255, 0, 0, 255]);
+        let mut target = target(&mut renderer);
+        let mut framebuffer = renderer.bind(&mut target).unwrap();
+        let mut frame = renderer
+            .render(&mut framebuffer, (SIZE, SIZE).into(), Transform::Normal)
+            .unwrap();
+        draw(&mut frame, &texture);
+        drop(frame);
+        assert!(texture.0.read_sync.current().is_some());
+        assert!(renderer.frame_reads.is_empty());
+    }
+
+    #[test]
+    fn per_frame_read_fence_keeps_a_fence_per_draw_for_shared_contexts() {
+        let mut renderer = renderer();
+        let texture = solid(&mut renderer, [255, 0, 0, 255]);
+        let _other = EGLContext::new_shared(renderer.egl_context().display(), renderer.egl_context())
+            .expect("shared EGL context");
+        let mut target = target(&mut renderer);
+        let mut framebuffer = renderer.bind(&mut target).unwrap();
+        let mut frame = renderer
+            .render(&mut framebuffer, (SIZE, SIZE).into(), Transform::Normal)
+            .unwrap();
+        draw(&mut frame, &texture);
+        // Another context may write the texture as soon as the draw returns.
+        let first = texture.0.read_sync.current().expect("read fence after the draw");
+        draw(&mut frame, &texture);
+        let second = texture.0.read_sync.current().expect("read fence after the draw");
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(frame.renderer.frame_reads.is_empty());
+        frame.finish().unwrap().wait().unwrap();
+        assert!(Arc::ptr_eq(&texture.0.read_sync.current().unwrap(), &second));
+    }
+
+    #[test]
+    fn per_frame_read_fence_orders_a_later_upload_from_another_context() {
+        let mut renderer = renderer();
+        let texture = solid(&mut renderer, [255, 0, 0, 255]);
+        let mut target = target(&mut renderer);
+        {
+            let mut framebuffer = renderer.bind(&mut target).unwrap();
+            let mut frame = renderer
+                .render(&mut framebuffer, (SIZE, SIZE).into(), Transform::Normal)
+                .unwrap();
+            draw(&mut frame, &texture);
+            // Not awaited: the upload below must wait for the read fence instead.
+            let _ = frame.finish().unwrap();
+        }
+        assert!(texture.0.read_sync.current().is_some());
+
+        // A context created later shares the texture and overwrites it.
+        let other = EGLContext::new_shared(renderer.egl_context().display(), renderer.egl_context())
+            .expect("shared EGL context");
+        let mut writer = unsafe { GlesRenderer::new(other) }.expect("GLES renderer");
+        writer
+            .update_memory(
+                &texture,
+                &[0, 255, 0, 255].repeat(4),
+                Rectangle::from_size((2, 2).into()),
+            )
+            .expect("texture update");
+
+        assert_eq!(first_pixel(&mut renderer, &mut target), [255, 0, 0, 255]);
+        {
+            let mut framebuffer = renderer.bind(&mut target).unwrap();
+            let mut frame = renderer
+                .render(&mut framebuffer, (SIZE, SIZE).into(), Transform::Normal)
+                .unwrap();
+            draw(&mut frame, &texture);
+            frame.finish().unwrap().wait().unwrap();
+        }
+        assert_eq!(first_pixel(&mut renderer, &mut target), [0, 255, 0, 255]);
     }
 }
