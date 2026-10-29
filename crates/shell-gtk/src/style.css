@@ -1480,8 +1480,9 @@ window.tuna-folder-dialog button.folder-tile:hover {
 }
 
 /* GNOME's app grid pages (pageIndicators.js, .page-navigation-arrow):
-   10px white dots 12px apart, the inactive ones at 2/3 size and half
-   opacity; 60px round arrows on #222226 at the sides. */
+   10px white dots 12px apart (their scale and opacity follow the pages'
+   position, set by the shell, not CSS); 60px round arrows on #222226 at
+   the sides. */
 .page-indicators {
   margin-bottom: 12px;
 }
@@ -1499,14 +1500,6 @@ window.tuna-folder-dialog button.folder-tile:hover {
   min-height: 10px;
   border-radius: 999px;
   background-color: #fafafb;
-  opacity: 0.5;
-  transform: scale(0.6667);
-  transition: all 400ms;
-}
-
-.page-indicator.active .page-indicator-icon {
-  opacity: 1;
-  transform: none;
 }
 
 /* .page-navigation-hint: during a drag, a 5% white gradient fading

@@ -2,7 +2,8 @@
 //! view): a page switch eases out-cubic over 300 ms as GNOME's
 //! adjustment does, rather than adw::Carousel's spring. A discrete
 //! wheel step turns one page (at most every 150 ms), a touchpad or
-//! touch swipe follows the fingers and settles on release.
+//! touch swipe follows the fingers and settles as GNOME's SwipeTracker
+//! releases it (swipeTracker.js).
 //!
 //! The pages are allocated once at the page they settle on; while the
 //! position moves only the drawing slides, so a switch costs no
@@ -22,6 +23,16 @@ const SMOOTH_STEP_PX: f64 = 30.0;
 
 /// Hears the current page change.
 type PageChanged = Rc<dyn Fn(u32)>;
+/// Hears where the pages are drawn move.
+type PositionChanged = Rc<dyn Fn(f64)>;
+
+/// A swipe in progress: where it began (in pages) and whether a
+/// touchpad (rather than a touchscreen) drives it.
+#[derive(Clone, Copy, Debug)]
+pub struct Swipe {
+    initial: f64,
+    touchpad: bool,
+}
 
 mod imp {
     use super::*;
@@ -38,9 +49,12 @@ mod imp {
         /// `interactive`).
         pub interactive: Cell<bool>,
         pub smooth_dy: Cell<f64>,
-        /// A swipe in progress: the position it started from.
-        pub swipe: Cell<Option<f64>>,
+        /// A swipe in progress.
+        pub swipe: Cell<Option<Swipe>>,
+        /// The swipe's recent moves, for its velocity.
+        pub history: RefCell<anim::SwipeHistory>,
         pub page_changed: RefCell<Vec<PageChanged>>,
+        pub position_changed: RefCell<Vec<PositionChanged>>,
     }
 
     #[glib::object_subclass]
@@ -174,9 +188,20 @@ impl GridPager {
         self.imp().page.get()
     }
 
+    /// Where the pages are drawn, in pages: between two while switching.
+    pub fn position(&self) -> f64 {
+        self.imp().position.get()
+    }
+
     /// Hears the current page change (when a switch begins).
     pub fn connect_page_changed(&self, f: impl Fn(u32) + 'static) {
         self.imp().page_changed.borrow_mut().push(Rc::new(f));
+    }
+
+    /// Hears where the pages are drawn move, each frame of a switch or
+    /// swipe (AppDisplay's adjustment `notify::value`).
+    pub fn connect_position_changed(&self, f: impl Fn(f64) + 'static) {
+        self.imp().position_changed.borrow_mut().push(Rc::new(f));
     }
 
     /// One page forward or back, clamped.
@@ -187,34 +212,53 @@ impl GridPager {
     }
 
     /// Let the wheel, touchpad and touch turn pages, or not (as
-    /// adw::Carousel's `interactive`); turning it off settles a swipe.
+    /// adw::Carousel's `interactive`); turning it off interrupts a swipe,
+    /// which jumps to the page nearest where it began (SwipeTracker's
+    /// `_interrupt`).
     pub fn set_interactive(&self, interactive: bool) {
         let imp = self.imp();
         if imp.interactive.replace(interactive) && !interactive {
             imp.smooth_dy.set(0.0);
-            self.swipe_end();
+            if let Some(swipe) = imp.swipe.take() {
+                imp.history.borrow_mut().reset();
+                let last = f64::from(self.n_pages().saturating_sub(1));
+                let page = anim::swipe_cancel_page(swipe.initial).clamp(0.0, last);
+                self.ease_to(page as u32, 0.0);
+            }
         }
     }
 
-    /// Go to page `index`: GNOME's goToPage, eased unless unmapped.
+    /// Go to page `index`: GNOME's goToPage, eased over the whole
+    /// `PAGE_SWITCH_TIME` from wherever the pages are drawn, unless
+    /// unmapped or not `animate`.
     pub fn scroll_to(&self, index: u32, animate: bool) {
+        let duration_ms = if animate {
+            anim::PAGE_SWITCH.duration_ms
+        } else {
+            0.0
+        };
+        self.ease_to(index, duration_ms);
+    }
+
+    /// Ease the drawing out-cubic to page `index` over `duration_ms`
+    /// (before the slow-down factor; 0: at once). The page changes at
+    /// once.
+    fn ease_to(&self, index: u32, duration_ms: f64) {
         let imp = self.imp();
         let index = index.min(self.n_pages().saturating_sub(1));
         let from = imp.position.get();
+        let to = f64::from(index);
         let changed = imp.page.replace(index) != index;
         if changed {
             self.queue_allocate();
         }
         let motion = anim::motion();
-        let distance = f64::from(index) - from;
-        let total = if animate && self.is_mapped() && distance != 0.0 {
-            anim::PAGE_SWITCH
-                .lasting(anim::page_switch_ms(distance))
-                .end_ms(motion)
+        let timing = anim::PAGE_SWITCH.lasting(duration_ms);
+        let total = if self.is_mapped() && from != to {
+            timing.end_ms(motion)
         } else {
             0.0
         };
-        let timing = anim::PAGE_SWITCH.lasting(anim::page_switch_ms(distance));
         let weak = self.downgrade();
         imp.slot.start(
             self,
@@ -222,12 +266,19 @@ impl GridPager {
             total,
             move |elapsed| {
                 if let Some(pager) = weak.upgrade() {
-                    let to = f64::from(index);
-                    pager
-                        .imp()
-                        .position
-                        .set(anim::lerp(from, to, timing.at(elapsed, motion)));
-                    pager.queue_draw();
+                    let position = anim::lerp(from, to, timing.at(elapsed, motion));
+                    // Each animated frame, sampled on the frame clock,
+                    // for the proof to check against GNOME's curve.
+                    if total > 0.0 {
+                        anim::trace(
+                            "page-switch",
+                            format_args!(
+                                "frame elapsed={elapsed:.3} position={position:.6} from={from:.6} to={to:.6} ms={:.3}",
+                                timing.duration_ms
+                            ),
+                        );
+                    }
+                    pager.draw_at(position);
                 }
             },
             || {},
@@ -240,43 +291,79 @@ impl GridPager {
         }
     }
 
-    fn set_position(&self, position: f64) {
-        let last = f64::from(self.n_pages().saturating_sub(1));
-        self.imp().position.set(position.clamp(0.0, last));
-        self.queue_draw();
-    }
-
-    fn swipe_begin(&self) {
+    /// Draw the pages at `position` and tell who listens.
+    fn draw_at(&self, position: f64) {
         let imp = self.imp();
-        imp.slot.stop();
-        if imp.swipe.get().is_none() {
-            imp.swipe.set(Some(imp.position.get()));
+        if imp.position.replace(position) == position {
+            return;
+        }
+        self.queue_draw();
+        let callbacks = imp.position_changed.borrow().clone();
+        for f in callbacks {
+            f(position);
         }
     }
 
-    /// Follow the fingers by `pages`.
-    fn swipe_update(&self, pages: f64) {
-        self.swipe_begin();
-        self.set_position(self.imp().position.get() + pages);
+    /// A swipe begins at event `time` (ms), taking over from a switch
+    /// where it stands (AppDisplay._swipeBegin).
+    fn swipe_begin(&self, time: u32, touchpad: bool) {
+        let imp = self.imp();
+        if imp.swipe.get().is_some() {
+            return;
+        }
+        imp.slot.stop();
+        imp.swipe.set(Some(Swipe {
+            initial: imp.position.get(),
+            touchpad,
+        }));
+        let mut history = imp.history.borrow_mut();
+        history.reset();
+        history.append(time, 0.0);
     }
 
-    /// Settle on the nearest page, or the next one in the swipe's
-    /// direction once it went a quarter of the way.
-    fn swipe_end(&self) {
+    /// Follow the fingers `delta` pixels toward later pages, at most a
+    /// page past where the swipe began.
+    fn swipe_update(&self, time: u32, delta: f64, touchpad: bool) {
+        self.swipe_begin(time, touchpad);
         let imp = self.imp();
-        let Some(start) = imp.swipe.take() else {
+        let Some(swipe) = imp.swipe.get() else {
             return;
         };
-        let position = imp.position.get();
-        let moved = position - start;
-        let base = start.round();
-        let target = if moved.abs() >= 0.25 {
-            base + moved.signum()
-        } else {
-            base
+        imp.history.borrow_mut().append(time, delta);
+        let last = f64::from(self.n_pages().saturating_sub(1));
+        let (lower, upper) = anim::swipe_bounds(swipe.initial, last);
+        let width = f64::from(self.width().max(1));
+        self.draw_at((imp.position.get() + delta / width).clamp(lower, upper));
+    }
+
+    /// Released at event `time`: settle where GNOME's SwipeTracker
+    /// would, over its duration, out-cubic (AppDisplay._swipeEnd).
+    fn swipe_end(&self, time: u32) {
+        let imp = self.imp();
+        let Some(swipe) = imp.swipe.take() else {
+            return;
+        };
+        let velocity = {
+            let mut history = imp.history.borrow_mut();
+            history.trim(time);
+            let velocity = history.velocity();
+            history.reset();
+            velocity
         };
         let last = f64::from(self.n_pages().saturating_sub(1));
-        self.scroll_to(target.clamp(0.0, last) as u32, true);
+        let (page, duration_ms) = anim::swipe_end(
+            imp.position.get(),
+            swipe.initial,
+            velocity,
+            f64::from(self.width().max(1)),
+            swipe.touchpad,
+            last,
+        );
+        anim::trace(
+            "swipe",
+            format_args!("end velocity={velocity:.4} page={page:.0} ms={duration_ms:.1}"),
+        );
+        self.ease_to(page as u32, duration_ms);
     }
 
     fn add_scrolling(&self) {
@@ -292,11 +379,12 @@ impl GridPager {
             }
             let rtl = pager.direction() == gtk::TextDirection::Rtl;
             if controller.unit() == gtk::gdk::ScrollUnit::Surface {
-                // A touchpad: sideways follows the fingers, up and down
-                // turns a page per step as GNOME's discrete scrolling.
-                if dx.abs() > dy.abs() {
-                    let width = f64::from(pager.width().max(1));
-                    pager.swipe_update(if rtl { -dx } else { dx } / width);
+                // A touchpad: sideways follows the fingers (and a swipe
+                // under way keeps following them), up and down turns a
+                // page per step as GNOME's discrete scrolling.
+                if imp.swipe.get().is_some() || dx.abs() > dy.abs() {
+                    let time = controller.current_event_time();
+                    pager.swipe_update(time, if rtl { -dx } else { dx }, true);
                     return glib::Propagation::Stop;
                 }
                 let acc = imp.smooth_dy.get() + dy;
@@ -310,39 +398,43 @@ impl GridPager {
             pager.wheel(if rtl { -dx } else { dx }, dy)
         });
         let weak = self.downgrade();
-        scroll.connect_scroll_end(move |_| {
+        scroll.connect_scroll_end(move |controller| {
             if let Some(pager) = weak.upgrade() {
                 pager.imp().smooth_dy.set(0.0);
-                pager.swipe_end();
+                pager.swipe_end(controller.current_event_time());
             }
         });
         self.add_controller(scroll);
-        // A touch swipe.
+        // A touch swipe: the finger's moves, as pixels toward later
+        // pages.
         let drag = gtk::GestureDrag::new();
         drag.set_touch_only(true);
-        let origin = Rc::new(Cell::new(0.0));
+        let offset = Rc::new(Cell::new(0.0));
         {
-            let (weak, origin) = (self.downgrade(), origin.clone());
-            drag.connect_drag_begin(move |_, _, _| {
+            let (weak, offset) = (self.downgrade(), offset.clone());
+            drag.connect_drag_begin(move |gesture, _, _| {
                 if let Some(pager) = weak.upgrade().filter(|p| p.imp().interactive.get()) {
-                    pager.swipe_begin();
-                    origin.set(pager.imp().position.get());
+                    offset.set(0.0);
+                    pager.swipe_begin(gesture.current_event_time(), false);
                 }
             });
         }
         {
             let weak = self.downgrade();
-            drag.connect_drag_update(move |_, dx, _| {
-                if let Some(pager) = weak.upgrade().filter(|p| p.imp().interactive.get()) {
-                    let width = f64::from(pager.width().max(1));
-                    pager.set_position(origin.get() - dx / width);
+            drag.connect_drag_update(move |gesture, dx, _| {
+                if let Some(pager) = weak
+                    .upgrade()
+                    .filter(|p| p.imp().interactive.get() && p.imp().swipe.get().is_some())
+                {
+                    let delta = offset.replace(dx) - dx;
+                    pager.swipe_update(gesture.current_event_time(), delta, false);
                 }
             });
         }
         let weak = self.downgrade();
-        drag.connect_drag_end(move |_, _, _| {
+        drag.connect_drag_end(move |gesture, _, _| {
             if let Some(pager) = weak.upgrade() {
-                pager.swipe_end();
+                pager.swipe_end(gesture.current_event_time());
             }
         });
         self.add_controller(drag);

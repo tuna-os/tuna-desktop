@@ -146,7 +146,7 @@ state records its state observation next to its stills and clips.
 | P-AN-05 | Workspace slide, swipe, popup, dots | stage:transitions `clip` + stage:overview `nested` | Transition clip required | slide clip + popup stills; swipe/popup-fade/dots transitions unproven |
 | P-AN-06 | Modal dialog parent dim | `unproven` | Transition clip required | no modal-dialog capture state; intermediate frames unproven |
 | P-AN-07 | Overview transitions | stage:transitions `clip` | Transition clip required | open/close + grid-morph clips; gesture/hover/thumbnail/drag/search/dash/panel transitions unproven |
-| P-AN-08 | App grid animations | `missing-product` | Transition clip required | folder zoom, icon scale-in, launch zoom not wired; page-switch curve unproven |
+| P-AN-08 | App grid animations | `unproven` | Transition clip required | folder zoom, launch zoom, page switch, page dots and arrows implemented and trace-gated (G-FOLDER-ZOOM, G-LAUNCH-ZOOM, G-GRID-PAGE-ANIM); no capture state or transition clip yet |
 | P-AN-09 | Menu, OSD, banner, switcher transitions | stage:transitions `clip` + stage:notifications `nested` | Transition clip required | switcher-fade clip + banner stills; popover/submenu/OSD/banner/modal transitions unproven |
 | P-AN-10 | Lock, flash, wallpaper, ripple transitions | stage:system `partial` | Transition clip required | lock stills only; curtain/flash/crossfade/ripple/startup transitions unproven |
 
