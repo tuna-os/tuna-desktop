@@ -15,6 +15,7 @@
 
 mod accessibility;
 mod anim_clock;
+mod audio_selection;
 mod audio_state;
 mod background_settings;
 mod brightness;
@@ -1752,6 +1753,17 @@ fn build(app: &adw::Application) {
             }),
         )
     };
+    // gsd-media-keys asks which device an ambiguous jack plug is.
+    audio_selection::start(app.upcast_ref(), {
+        let shell = shell.clone();
+        Rc::new(move || {
+            if let Some(control) = shell.borrow_mut().control.as_mut() {
+                if control.model().is_overview_open() {
+                    let _ = control.toggle_overview();
+                }
+            }
+        })
+    });
     // GNOME's lock screen on ext-session-lock (the compositor decides
     // when, draws the blurred background, and checks the password).
     let lock_ui = {
@@ -2786,6 +2798,12 @@ fn build(app: &adw::Application) {
         let wm_settings = keybindings::wm_settings();
         let mutter_settings = keybindings::mutter_settings();
         let media_settings = keybindings::media_settings();
+        // gsd-media-keys owns the media-keys schema's bindings whenever it
+        // runs (every hardware session, tuna-session.target). Until the
+        // watch has answered the shell binds none of them, so a daemon
+        // that grabs first never meets a key the shell reserved; its
+        // NameOwnerChanged reaches the shell before its GrabAccelerators.
+        let gsd_media_keys: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
         let apply: Rc<dyn Fn()> = {
             let (settings, wm_settings, mutter_settings, media_settings, gnome_shell) = (
                 settings.clone(),
@@ -2795,6 +2813,7 @@ fn build(app: &adw::Application) {
                 gnome_shell.clone(),
             );
             let shell = shell.clone();
+            let gsd_media_keys = gsd_media_keys.clone();
             Rc::new(move || {
                 // The switcher's chords go to the compositor, which holds
                 // the popup open while their modifiers are held.
@@ -2812,6 +2831,7 @@ fn build(app: &adw::Application) {
                     wm_settings.as_ref(),
                     mutter_settings.as_ref(),
                     media_settings.as_ref(),
+                    gsd_media_keys.get().unwrap_or(true),
                 );
                 let accels: Vec<(String, u32, u32)> = list
                     .iter()
@@ -2843,6 +2863,36 @@ fn build(app: &adw::Application) {
             })
         };
         apply();
+        {
+            let owner_changed = {
+                let (gsd_media_keys, apply) = (gsd_media_keys.clone(), apply.clone());
+                move |running: bool| {
+                    if gsd_media_keys.replace(Some(running)) == Some(running) {
+                        return;
+                    }
+                    eprintln!(
+                        "tuna-shell-gtk: media keys: {}",
+                        if running {
+                            "gsd-media-keys owns the media-keys bindings"
+                        } else {
+                            "no gsd-media-keys, native volume and lock bindings"
+                        }
+                    );
+                    apply();
+                }
+            };
+            let vanished = owner_changed.clone();
+            // Watched for the whole session (a WatcherId unwatches
+            // nothing when it drops): a restarted daemon takes its keys
+            // back, a crashed one leaves the native subset.
+            let _ = gio::bus_watch_name(
+                gio::BusType::Session,
+                keybindings::MEDIA_KEYS_DAEMON,
+                gio::BusNameWatcherFlags::NONE,
+                move |_, _, _| owner_changed(true),
+                move |_, _| vanished(false),
+            );
+        }
         for settings in [settings, wm_settings, mutter_settings, media_settings]
             .into_iter()
             .flatten()

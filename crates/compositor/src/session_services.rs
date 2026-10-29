@@ -209,6 +209,12 @@ impl Drop for Leader {
 /// targets follow Xwayland only there).
 static HARDWARE_SESSION: AtomicBool = AtomicBool::new(false);
 
+/// Whether this compositor runs the hardware session (its logind
+/// session is its own, so session-ending calls may act on it).
+pub fn hardware_session() -> bool {
+    HARDWARE_SESSION.load(Ordering::Acquire)
+}
+
 /// GNOME Shell 51 starts gnome-session-x11-services-ready.target once
 /// Xwayland's display is set up, which brings gsd-xsettings up
 /// (`windowManager.js` `_startX11Services`, mode "fail"). Mutter has
@@ -662,6 +668,7 @@ mod tests {
             "Datetime",
             "Housekeeping",
             "Keyboard",
+            "MediaKeys",
             "Power",
             "PrintNotifications",
             "Rfkill",
@@ -676,9 +683,8 @@ mod tests {
             assert!(wanted.contains(&unit), "{unit} is not started: {wanted:?}");
         }
         // The compositor owns org.gnome.SettingsDaemon.Color (Night
-        // Light); the shell binds the media keys natively and the
-        // compositor runs Orca, which gsd-a11y-settings would start again.
-        for owned in ["Color", "MediaKeys", "A11ySettings"] {
+        // Light) and runs Orca, which gsd-a11y-settings would start again.
+        for owned in ["Color", "A11ySettings"] {
             let unit = format!("org.gnome.SettingsDaemon.{owned}.target");
             assert!(!wanted.contains(&unit), "{unit} conflicts with Tuna");
         }

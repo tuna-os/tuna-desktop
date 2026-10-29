@@ -894,14 +894,16 @@ window.tuna-switcher {
    GNOME's vignette,
    a #36363a card with 18px corners and 24px padding, a 20px heavy
    title, and 170x43 buttons at 10% white, the focused one ringed. */
-window.tuna-end-session {
+window.tuna-end-session,
+window.tuna-audio-device-selection {
   /* Measured off GNOME: brightness 0.5 at the center falling linearly
      to about 0.15 in the corners (lightbox.js vignette). */
   background-color: transparent;
   background-image: radial-gradient(ellipse farthest-corner at center, rgba(0, 0, 0, 0.5) 0%, rgba(0, 0, 0, 0.854) 100%);
 }
 
-.tuna-end-session .modal-dialog {
+.tuna-end-session .modal-dialog,
+.tuna-audio-device-selection .modal-dialog {
   background-color: #36363a;
   border-radius: 18px;
   padding: 24px;
@@ -911,20 +913,24 @@ window.tuna-end-session {
   font-size: 11pt;
 }
 
-.tuna-end-session .modal-dialog-content-box {
+.tuna-end-session .modal-dialog-content-box,
+.tuna-audio-device-selection .modal-dialog-content-box {
   padding-top: 12px;
 }
 
-.tuna-end-session .message-dialog-title {
+.tuna-end-session .message-dialog-title,
+.tuna-audio-device-selection .message-dialog-title {
   font-size: 15pt;
   font-weight: 800;
 }
 
-.tuna-end-session .modal-dialog-button-box {
+.tuna-end-session .modal-dialog-button-box,
+.tuna-audio-device-selection .modal-dialog-button-box {
   padding-top: 6px;
 }
 
-.tuna-end-session .modal-dialog-button {
+.tuna-end-session .modal-dialog-button,
+.tuna-audio-device-selection .modal-dialog-button {
   min-height: 25px;
   padding: 9px 12px;
   border-radius: 9px;
@@ -934,11 +940,13 @@ window.tuna-end-session {
   box-shadow: none;
 }
 
-.tuna-end-session .modal-dialog-button:hover {
+.tuna-end-session .modal-dialog-button:hover,
+.tuna-audio-device-selection .modal-dialog-button:hover {
   background-color: rgba(255, 255, 255, 0.13);
 }
 
-.tuna-end-session .modal-dialog-button:focus {
+.tuna-end-session .modal-dialog-button:focus,
+.tuna-audio-device-selection .modal-dialog-button:focus {
   outline: none;
   box-shadow: inset 0 0 0 2px rgb(121, 160, 208);
   background-color: rgba(121, 160, 208, 0.12);
@@ -965,6 +973,30 @@ window.tuna-end-session {
 .tuna-run-dialog .run-dialog-description {
   font-size: 9pt;
   color: #c4c4c7;
+}
+
+/* GNOME 51's audio device selection: a 24em ModalDialog whose device
+   tiles are styled like the switcher's (12px padding and spacing, 64px
+   icons). */
+.audio-device-selection-dialog {
+  min-width: 24em;
+}
+
+.audio-selection-device {
+  border-radius: 12px;
+  background-color: transparent;
+  color: #ffffff;
+  box-shadow: none;
+}
+
+.audio-selection-device:hover,
+.audio-selection-device:focus {
+  background-color: rgba(255, 255, 255, 0.1);
+  outline: none;
+}
+
+.audio-selection-device-box {
+  padding: 12px;
 }
 
 /* App-grid folders (GNOME 51): the 2x2 collage sits bare on the tile. */

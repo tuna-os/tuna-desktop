@@ -6,6 +6,16 @@
 //! countdown, Cancel, and the action; the countdown runs the action.
 //! Everything goes through logind on the system bus.
 //!
+//! The same dialog serves GNOME Shell 51's
+//! `org.gnome.SessionManager.EndSessionDialog` on the shell's bus
+//! connection (endSessionDialog.js), which the session manager opens for
+//! `Shutdown`, `Reboot` and `Logout`: gnome-settings-daemon's power key
+//! with `power-button-action` interactive, and its logout, reboot and
+//! shutdown keys. As in GNOME, Cancel emits `Canceled` then `Closed`,
+//! a confirmation emits `ConfirmedShutdown`, `ConfirmedReboot` or
+//! `ConfirmedLogout`, and `Close` emits `Closed`. The confirmed action
+//! runs here through logind, as the menu's does.
+//!
 //! In the nested preview (`TUNA_SESSION_KIND=nested`) logind's session
 //! is the host's: only Log Out is offered, and it ends this compositor
 //! (SIGTERM to its parent), never the host session.
@@ -29,6 +39,50 @@ const SESSION_PATH: &str = "/org/freedesktop/login1/session/auto";
 const SESSION_IFACE: &str = "org.freedesktop.login1.Session";
 /// GNOME's end-session countdown.
 pub const COUNTDOWN_S: u32 = 60;
+
+/// GNOME Shell's end-session dialog object on the shell's connection.
+pub const END_SESSION_DIALOG_PATH: &str = "/org/gnome/SessionManager/EndSessionDialog";
+const END_SESSION_DIALOG_IFACE: &str = "org.gnome.SessionManager.EndSessionDialog";
+const END_SESSION_DIALOG_XML: &str = r#"<node>
+  <interface name="org.gnome.SessionManager.EndSessionDialog">
+    <method name="Open">
+      <arg type="u" direction="in"/>
+      <arg type="u" direction="in"/>
+      <arg type="u" direction="in"/>
+      <arg type="ao" direction="in"/>
+    </method>
+    <method name="Close"/>
+    <signal name="ConfirmedLogout"/>
+    <signal name="ConfirmedReboot"/>
+    <signal name="ConfirmedShutdown"/>
+    <signal name="Canceled"/>
+    <signal name="Closed"/>
+  </interface>
+</node>"#;
+
+/// The action an `Open` dialog type asks for: gnome-session's
+/// `GsmShellEndSessionDialogType` (0 log out, 1 shutdown, 2 restart).
+/// GNOME Shell's type 3 is its own offline-update restart, which it
+/// derives from a restart when gnome-software has an update scheduled;
+/// Tuna has no offline updates, so it is an unknown type here.
+pub fn dialog_action(kind: u32) -> Option<Action> {
+    match kind {
+        0 => Some(Action::LogOut),
+        1 => Some(Action::PowerOff),
+        2 => Some(Action::Restart),
+        _ => None,
+    }
+}
+
+/// The signal a confirmed `action` emits (endSessionDialog.js `DialogContent`).
+pub fn confirmed_signal(action: Action) -> Option<&'static str> {
+    match action {
+        Action::LogOut => Some("ConfirmedLogout"),
+        Action::PowerOff => Some("ConfirmedShutdown"),
+        Action::Restart => Some("ConfirmedReboot"),
+        Action::Suspend => None,
+    }
+}
 
 /// One end-session action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +232,8 @@ pub struct PowerUi {
     pending: Cell<Option<Action>>,
     left: Cell<u32>,
     timer: RefCell<Option<glib::SourceId>>,
+    /// The session bus, where the dialog's D-Bus signals go.
+    bus: RefCell<Option<gio::DBusConnection>>,
 }
 
 impl PowerUi {
@@ -239,6 +295,7 @@ impl PowerUi {
             pending: Cell::new(None),
             left: Cell::new(0),
             timer: RefCell::new(None),
+            bus: RefCell::new(None),
         });
         {
             let me = ui.clone();
@@ -308,6 +365,7 @@ impl PowerUi {
             // Keep the settings object (and its signal) alive.
             std::mem::forget(lockdown);
         }
+        serve_end_session_dialog(&ui);
         ui
     }
 
@@ -336,15 +394,21 @@ impl PowerUi {
     /// Restart or Power Off request while `disable-log-out` denies never
     /// opens (live read per open, so no stale menu path can bypass it).
     pub fn ask(self: &Rc<Self>, action: Action) {
+        self.ask_for(action, COUNTDOWN_S);
+    }
+
+    /// [`Self::ask`] with the caller's countdown (`seconds`, as
+    /// `Open`'s `seconds_to_stay_open`); whether it opened.
+    fn ask_for(self: &Rc<Self>, action: Action, seconds: u32) -> bool {
         if !action_allowed(action, crate::lockdown::read().entry_visibility().log_out) {
-            return;
+            return false;
         }
         self.stop_timer();
         self.pending.set(Some(action));
-        self.left.set(COUNTDOWN_S);
+        self.left.set(seconds);
         self.title.set_text(action.title());
         self.confirm.set_label(action.title());
-        self.body.set_text(&action.countdown_text(COUNTDOWN_S));
+        self.body.set_text(&action.countdown_text(seconds));
         self.fade.present();
         // Cancel holds the focus when the dialog opens, as in GNOME.
         if let Some(cancel) = self.confirm.prev_sibling().and_downcast::<gtk::Button>() {
@@ -365,6 +429,7 @@ impl PowerUi {
             glib::ControlFlow::Continue
         });
         *self.timer.borrow_mut() = Some(id);
+        true
     }
 
     fn stop_timer(&self) {
@@ -373,10 +438,36 @@ impl PowerUi {
         }
     }
 
+    fn emit(&self, signal: &str) {
+        if let Some(bus) = self.bus.borrow().as_ref() {
+            let _ = bus.emit_signal(
+                None,
+                END_SESSION_DIALOG_PATH,
+                END_SESSION_DIALOG_IFACE,
+                signal,
+                None,
+            );
+        }
+    }
+
     fn cancel(&self) {
         self.stop_timer();
-        self.pending.set(None);
+        let open = self.pending.take().is_some();
         self.fade.hide();
+        if open {
+            self.emit("Canceled");
+            self.emit("Closed");
+        }
+    }
+
+    /// `Close`: dismiss without an answer.
+    fn close(&self) {
+        self.stop_timer();
+        let open = self.pending.take().is_some();
+        self.fade.hide();
+        if open {
+            self.emit("Closed");
+        }
     }
 
     /// Cancel a pending session-ending dialog while `disable-log-out`
@@ -397,11 +488,103 @@ impl PowerUi {
             // `end_phase` from Running while locked down).
             if !action_allowed(action, crate::lockdown::read().entry_visibility().log_out) {
                 eprintln!("tuna-shell-gtk: {action:?} refused by administrator policy");
+                self.emit("Canceled");
+                self.emit("Closed");
                 return;
+            }
+            if let Some(signal) = confirmed_signal(action) {
+                self.emit(signal);
             }
             self.perform(action);
         }
     }
+}
+
+/// Export the dialog as GNOME Shell does, on the shared session
+/// connection that also carries `org.gnome.Shell`.
+fn serve_end_session_dialog(ui: &Rc<PowerUi>) {
+    let info = gio::DBusNodeInfo::for_xml(END_SESSION_DIALOG_XML)
+        .ok()
+        .and_then(|node| node.lookup_interface(END_SESSION_DIALOG_IFACE));
+    let Some(info) = info else {
+        eprintln!("tuna-shell-gtk: end-session dialog interface did not parse");
+        return;
+    };
+    let weak = Rc::downgrade(ui);
+    gio::bus_get(
+        gio::BusType::Session,
+        None::<&gio::Cancellable>,
+        move |conn| {
+            let Ok(conn) = conn else {
+                return;
+            };
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            *ui.bus.borrow_mut() = Some(conn.clone());
+            let weak = Rc::downgrade(&ui);
+            let registered = conn
+                .register_object(END_SESSION_DIALOG_PATH, &info)
+                .method_call(move |_, _, _, _, method, params, invocation| {
+                    let Some(ui) = weak.upgrade() else {
+                        invocation.return_dbus_error(
+                            "org.freedesktop.DBus.Error.Failed",
+                            "the shell is shutting down",
+                        );
+                        return;
+                    };
+                    match method {
+                        "Open" => {
+                            let Some((kind, seconds)) = open_args(&params) else {
+                                invocation.return_dbus_error(
+                                    "org.freedesktop.DBus.Error.InvalidArgs",
+                                    "Open takes (uuuao)",
+                                );
+                                return;
+                            };
+                            let Some(action) = dialog_action(kind) else {
+                                // endSessionDialog.js ModalDialogError.UNKNOWN_TYPE.
+                                invocation.return_dbus_error(
+                                    "org.gnome.Shell.ModalDialog.Error.UnknownType",
+                                    "Unknown dialog type requested",
+                                );
+                                return;
+                            };
+                            if ui.ask_for(action, seconds) {
+                                eprintln!(
+                                    "tuna-shell-gtk: end-session dialog: {} opened over D-Bus",
+                                    action.title()
+                                );
+                                invocation.return_value(None);
+                            } else {
+                                invocation.return_dbus_error(
+                                    "org.freedesktop.DBus.Error.AccessDenied",
+                                    "Ending the session is disabled by the administrator",
+                                );
+                            }
+                        }
+                        "Close" => {
+                            ui.close();
+                            invocation.return_value(None);
+                        }
+                        _ => invocation
+                            .return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method),
+                    }
+                })
+                .build();
+            if let Err(e) = registered {
+                eprintln!("tuna-shell-gtk: end-session dialog object: {e}");
+            }
+        },
+    );
+}
+
+/// `Open`'s dialog type and seconds to stay open, when the call is `(uuuao)`.
+fn open_args(params: &glib::Variant) -> Option<(u32, u32)> {
+    if params.type_().as_str() != "(uuuao)" {
+        return None;
+    }
+    Some((params.child_value(0).get()?, params.child_value(2).get()?))
 }
 
 #[cfg(test)]
@@ -452,6 +635,55 @@ mod tests {
         }
         assert!(!should_cancel_pending(None, false));
         assert!(!should_cancel_pending(Some(Action::Suspend), false));
+    }
+
+    #[test]
+    fn end_session_dialog_types_and_signals_match_gnome_51() {
+        // gnome-session 51 GsmShellEndSessionDialogType.
+        assert_eq!(dialog_action(0), Some(Action::LogOut));
+        assert_eq!(dialog_action(1), Some(Action::PowerOff));
+        assert_eq!(dialog_action(2), Some(Action::Restart));
+        assert_eq!(dialog_action(3), None);
+        assert_eq!(dialog_action(u32::MAX), None);
+        // endSessionDialog.js confirm buttons' signals.
+        assert_eq!(
+            confirmed_signal(Action::PowerOff),
+            Some("ConfirmedShutdown")
+        );
+        assert_eq!(confirmed_signal(Action::Restart), Some("ConfirmedReboot"));
+        assert_eq!(confirmed_signal(Action::LogOut), Some("ConfirmedLogout"));
+        assert_eq!(confirmed_signal(Action::Suspend), None);
+        // The interface parses and declares exactly GNOME's members.
+        let node = gio::DBusNodeInfo::for_xml(END_SESSION_DIALOG_XML).unwrap();
+        let iface = node.lookup_interface(END_SESSION_DIALOG_IFACE).unwrap();
+        assert!(iface.lookup_method("Open").is_some());
+        assert!(iface.lookup_method("Close").is_some());
+        // gsm-shell.c sends `(uuu@ao)`: type, timestamp, seconds, inhibitors.
+        let inhibitors = glib::Variant::array_from_iter_with_type(
+            glib::VariantTy::OBJECT_PATH,
+            [
+                glib::variant::ObjectPath::try_from("/org/gnome/SessionManager/Inhibitor1")
+                    .unwrap()
+                    .to_variant(),
+            ],
+        );
+        let open = glib::Variant::tuple_from_iter([
+            1u32.to_variant(),
+            0u32.to_variant(),
+            60u32.to_variant(),
+            inhibitors,
+        ]);
+        assert_eq!(open_args(&open), Some((1, 60)));
+        assert_eq!(open_args(&(1u32, 0u32, 60u32).to_variant()), None);
+        for signal in [
+            "ConfirmedLogout",
+            "ConfirmedReboot",
+            "ConfirmedShutdown",
+            "Canceled",
+            "Closed",
+        ] {
+            assert!(iface.lookup_signal(signal).is_some(), "{signal}");
+        }
     }
 
     #[test]

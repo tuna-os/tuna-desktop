@@ -38,8 +38,9 @@ feature tour:
 | V-AUTH-FAIL-CLOSED | Real PAM service temporarily uses `pam_deny`; fresh submitted/refused milestones prove the correct test password was attempted and denied; original service restored afterward |
 | V-CAPTURE-INPUT-FAIL-CLOSED | Reachable real untrusted grim/wtype clients are denied capture/virtual-keyboard interfaces while locked; a successful Wayland connection is required and timeouts do not count as refusal; this does not assert that these interfaces are available while unlocked |
 | V-SHELL-FAIL-CLOSED | Stop the portal and kill the lock UI; original app/compositor identities survive and the supervised replacement stays locked |
-| V-GSD-PLUGINS | Each of the twelve gnome-settings-daemon plugins the session target wants is the packaged `gsd-*` binary, running as the session user as its unit's main PID and owning its bus name; `org.gnome.SettingsDaemon.Color` belongs to the compositor; MediaKeys and A11ySettings have no owner; the session targets are active and the compositor holds `gnome-session-leader-fifo` (lifecycle/gsd-plugins.json, #355) |
+| V-GSD-PLUGINS | Each of the thirteen gnome-settings-daemon plugins the session target wants, MediaKeys included, is the packaged `gsd-*` binary, running as the session user as its unit's main PID and owning its bus name; `org.gnome.SettingsDaemon.Color` belongs to the compositor; A11ySettings has no owner; the session targets are active and the compositor holds `gnome-session-leader-fifo` (lifecycle/gsd-plugins.json, #355, #589) |
 | V-GSD-POWER-IDLE | With `idle-delay` set to 20 s and no input, dbus-monitor records gsd-power's own `SetDimming(true)` before its `PowerSaveMode=3`; the compositor snapshot reports locked and `power_save_mode` 3; Return wakes it to 0 and gsd-power undims; the original delay is restored (lifecycle/gsd-power-idle.json, #355) |
+| V-POWER-BUTTON | gsd-media-keys (its unit's main PID, the session user) holds logind's `block` inhibitor on `handle-power-key:handle-suspend-key:handle-hibernate-key` with Why "GNOME handling keypresses". On a fixture desktop chassis, after each gsd restart a new gsd-media-keys must own its name, hold that inhibitor, have `XF86PowerOff` granted by `GrabAccelerators` and the shell must log that it yielded the bindings. QMP `system_powerdown` (ACPI power button) with `power-button-action` `interactive`: `AcceleratorActivated` reaches gsd, gsd calls `org.gnome.SessionManager.Shutdown`, the compositor calls `EndSessionDialog.Open(1, …)` and the `tuna-shell-end-session` layer shows within 15 s; 5 s after the press QEMU is `running` with the same compositor process and logind session and no logind power request; Escape (always sent, far inside the 60 s countdown) removes the layer, the shell emits `Canceled` and logs its D-Bus Power Off dialog. `nothing`: gsd receives the key, and for at least 8 s no Shutdown, dialog call, layer or logind request follows. On the image's `vm` chassis with a fixture `shutdown` block inhibitor held by root: gsd calls `PowerOffWithFlags(0)`, logind refuses it ("… due to active block inhibitor"), no dialog opens and the session is unchanged 5 s later. Setting, chassis and `/etc/machine-info` are restored (lifecycle/power-button.json, #353, #589) |
 | V-LOGOUT | Terminate the real logind session; the display manager's non-root greeter (gtkgreet under active greetd on the CI fixture; GDM's gnome-shell greeter in its active gdm-launch-environment session on the published flavor) repaints and no original compositor survives |
 
 The original tour's `V-LOCK` still requires exactly unlocked → locked →
@@ -48,6 +49,25 @@ lock transitions. A QEMU pause is never a substitute for guest suspend.
 The repaint comparison excludes the panel clock and tolerates up to 20%
 changed body pixels for applications such as System Monitor; it also
 requires exact window and process identity preservation.
+
+V-POWER-BUTTON runs on the unlocked desktop after V-SHELL-FAIL-CLOSED and
+before V-LOGOUT. gnome-settings-daemon 51 reads hostnamed's `Chassis` once
+at startup and, on `vm`, powers off for every `power-button-action` but
+`nothing`. QEMU guests report `vm`, so the fixture (root, through QGA)
+records `/etc/machine-info` and `Chassis`, calls hostnamed `SetChassis`
+with `desktop` and restarts `org.gnome.SettingsDaemon.MediaKeys.target`
+as the session user. The service refuses manual start and stop, but a
+restart of its `PartOf` target propagates; if refused, the fixture kills the
+main PID and `Restart=on-failure` brings it back. Afterwards the fixture
+restores the recorded chassis and file bytes and restarts gsd again, so the
+rest of the lane sees the image default. The `vm` case stays safe because
+gsd 51 sends `PowerOffWithFlags` without `SD_LOGIND_SKIP_INHIBITORS`, and
+since systemd 257 logind refuses that request outright under a `block`
+inhibitor. The fixture refuses to press the button on an older logind.
+`power-button-action` `suspend` is not exercised. It would add a second
+real S3 cycle, and the user-authorized single-S3 contract below forbids
+that. `hibernate`, the lock-screen mode, and an unrestrained VM power-off
+are not exercised either.
 
 The compositor also listens to the trusted logind system-bus sleep signal:
 preparation invalidates pending authentication generations and engages its own lock; wake restores KMS connector/plane
