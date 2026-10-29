@@ -615,6 +615,24 @@ def amplification_observation(value):
 # 65536: the ceiling gsd-media-keys 51 raises an amplified sink to
 # (do_sound_action caps at gvc_mixer_control_get_vol_max_amplified).
 GNOME_UI_MAX_PERCENT = 99957 / 65536 * 100
+# The shell's native volume keys write the amplified ceiling as wpctl's
+# four-decimal 1.5252 (crates/shell-gtk/src/logic.rs
+# wpctl_volume_arg_with_limit), short of PA_VOLUME_UI_MAX.
+SHELL_NATIVE_UI_MAX_PERCENT = 152.52
+
+
+def amplified_ceiling(media_keys, published):
+    """(handler, sink percent) one amplified volume-up press reaches. The
+    owner of org.gnome.SettingsDaemon.MediaKeys handles the volume keys: the
+    shell binds them natively only while that name is unowned. The current
+    build must run the packaged gsd-media-keys; only a published guest that
+    predates it keeps the shell's native keys."""
+    if media_keys["ok"]:
+        return "gsd-media-keys", GNOME_UI_MAX_PERCENT
+    if published and media_keys["owner"] is None:
+        return "shell-native", SHELL_NATIVE_UI_MAX_PERCENT
+    raise RuntimeError("volume keys have no packaged gsd-media-keys owner")
+
 
 
 def amplification_checks(actual, initial, mode, percent_ok):
@@ -1555,12 +1573,15 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                     raise RuntimeError("GNOME overamplification preference did not drive the real PipeWire sink")
                 amplified_observations.append(actual)
         else:
-            for mode, expected in (("off", 100.0), ("on", 104.0), ("high", GNOME_UI_MAX_PERCENT), ("off", 100.0)):
+            for mode, expected in (("off", 100.0), ("on", 104.0), ("high", None), ("off", 100.0)):
                 case = {"mode": mode, "expected_percent": expected, "initial": None,
                         "poll_count": 0, "samples": [], "passed": False}
                 amplified_cases.append(case)
                 initial = agent.run("audio-amplification-" + mode)
                 case["initial"] = amplification_observation(initial)
+                case["key_handler"], ceiling = amplified_ceiling(initial["media_keys"], published)
+                if expected is None:
+                    expected = case["expected_percent"] = ceiling
                 time.sleep(0.3)
                 qmp.keys("volumeup")
                 deadline = time.monotonic() + 10

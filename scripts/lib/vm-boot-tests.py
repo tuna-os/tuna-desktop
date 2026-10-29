@@ -45,9 +45,13 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
     # The amplified sink level V-AUDIO-AMPLIFICATION observed under gsd-media-keys
     # 51 (CI run 40825026740): gvc's PA_VOLUME_UI_MAX read back through wpctl.
     GSD_UI_MAX = 152.5222828677338
+    # The published shell's native keys (CI run 40871680704): wpctl 1.5252.
+    NATIVE_UI_MAX = 152.52074966249404
+    GSD = {"ok": True, "owner": [":1.40", 4242]}
+    UNOWNED = {"ok": False, "owner": None}
 
     def run_audio(self, *, change=None, older=False, dense=False, setup_error=False,
-                  write_error=False, high=GSD_UI_MAX):
+                  write_error=False, high=GSD_UI_MAX, media_keys=GSD, published=False):
         tree = ast.parse(self.SOURCE.read_text())
         lifecycle = next(node for node in tree.body
                          if isinstance(node, ast.FunctionDef) and node.name == "run_lifecycle")
@@ -92,10 +96,11 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
                 case_index += 1
                 if setup_error and case_index == 3:
                     raise RuntimeError("private-exception-text")
-                return value(150.0 if case_index == 2 else 98.0, case_index in (1, 2))
+                return {**value(150.0 if case_index == 2 else 98.0, case_index in (1, 2)),
+                        "media_keys": media_keys}
             scope = {**vars(lane), "agent": SimpleNamespace(run=run),
                      "qmp": SimpleNamespace(keys=lambda key: keys.append(key)),
-                     "evidence": directory, "older_guest": older,
+                     "evidence": directory, "older_guest": older, "published": published,
                      "record": lambda *args: records.append(args),
                      "time": SimpleNamespace(monotonic=monotonic, sleep=sleep)}
             if write_error:
@@ -150,6 +155,30 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
         self.assertIsNone(result.legacy)
         self.assertEqual([case["passed"] for case in result.diagnostic][:3], [True, True, False])
         self.assertEqual(result.diagnostic[2]["expected_percent"], lane.GNOME_UI_MAX_PERCENT)
+        self.assertEqual(result.diagnostic[2]["key_handler"], "gsd-media-keys")
+
+    def test_ceiling_follows_the_guests_media_keys_owner(self):
+        # A published guest whose shell predates gsd-media-keys binds the
+        # volume keys natively and writes wpctl's 1.5252.
+        native = self.run_audio(high=self.NATIVE_UI_MAX, media_keys=self.UNOWNED, published=True)
+        self.assertIsNone(native.error)
+        self.assertEqual(native.diagnostic[2]["expected_percent"], lane.SHELL_NATIVE_UI_MAX_PERCENT)
+        self.assertEqual({case["key_handler"] for case in native.diagnostic}, {"shell-native"})
+        # A published guest running gsd-media-keys gets GNOME's exact ceiling.
+        self.assertIsNone(self.run_audio(media_keys=self.GSD, published=True).error)
+        truncated = self.run_audio(high=self.NATIVE_UI_MAX, media_keys=self.GSD, published=True)
+        self.assertIsInstance(truncated.error, RuntimeError)
+        # The native ceiling never passes for gsd's, nor gsd's for the native.
+        self.assertIsInstance(self.run_audio(media_keys=self.UNOWNED, published=True).error, RuntimeError)
+        # The current build must run the packaged gsd-media-keys, and no guest
+        # passes with an owner that is not it.
+        for media_keys, published in ((self.UNOWNED, False), ({"ok": False, "owner": [":1.9", 7]}, True),
+                                      ({"ok": False, "owner": [":1.9", 7]}, False)):
+            with self.subTest(media_keys=media_keys, published=published):
+                result = self.run_audio(high=self.NATIVE_UI_MAX, media_keys=media_keys, published=published)
+                self.assertIsInstance(result.error, RuntimeError)
+                self.assertEqual(result.records, [])
+                self.assertEqual(result.actions[-1], "audio-amplification-reset")
 
     def test_success_preserves_legacy_receipt_actions_and_verdict(self):
         for older in (False, True):
