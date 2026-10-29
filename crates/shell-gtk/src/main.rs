@@ -1727,6 +1727,10 @@ fn build(app: &adw::Application) {
     // GNOME's calendar events through its calendar server.
     calendar_ui.set_event_source(events::EventSource::new());
     let clock = panel_menu_button(&clock_label, "Date and Time", &cal_popover);
+    {
+        let notify = notify.clone();
+        cal_popover.connect_visible_notify(move |p| notify.set_banner_blocked(p.is_visible()));
+    }
     clock.add_css_class("clock-display");
 
     // System indicators in GNOME's order (panel.js `_indicators`): each

@@ -326,6 +326,8 @@ pub struct NotifyUi {
     user_watch_signal: RefCell<Option<gio::SignalSubscription>>,
     /// Told when Do Not Disturb turns on or off.
     dnd_changed: RefCell<Vec<DndListener>>,
+    /// The date menu is open: banners hide (`MessageTray.bannerBlocked`).
+    banner_blocked: Cell<bool>,
 }
 
 /// Told when Do Not Disturb turns on or off.
@@ -552,6 +554,7 @@ impl NotifyUi {
             user_watch: Cell::new(UserWatch::Off),
             user_watch_signal: RefCell::new(None),
             dnd_changed: RefCell::new(Vec::new()),
+            banner_blocked: Cell::new(false),
         });
         {
             let weak = Rc::downgrade(&ui);
@@ -666,6 +669,14 @@ impl NotifyUi {
     /// The calendar popover's notification pane.
     pub fn pane(&self) -> &gtk::Box {
         &self.pane
+    }
+
+    /// GNOME 51 panel.js: the menu in the banners' box (the date menu)
+    /// blocks banners while open; they return, if still live, on close.
+    pub fn set_banner_blocked(self: &Rc<Self>, on: bool) {
+        if self.banner_blocked.replace(on) != on {
+            self.refresh();
+        }
     }
 
     /// Turn Do Not Disturb on or off (the quick-settings toggle and the
@@ -883,8 +894,15 @@ impl NotifyUi {
             .retain(|k| groups.iter().any(|(g, ids)| g == k && ids.len() > 1));
         let mut expanded: Vec<String> = self.expanded.borrow().iter().cloned().collect();
         expanded.sort();
+        // While the date menu is open the banners stay in its list only
+        // (messageTray.js `bannerBlocked`).
+        let blocked = self.banner_blocked.get();
         let now = Shown {
-            banners: center.banners().iter().map(|n| n.id).collect(),
+            banners: if blocked {
+                Vec::new()
+            } else {
+                center.banners().iter().map(|n| n.id).collect()
+            },
             history: center.history().iter().rev().map(|n| n.id).collect(),
             expanded,
             dnd: center.dnd(),
@@ -901,7 +919,7 @@ impl NotifyUi {
                 self.banner_box.remove(&child);
             }
         }
-        for n in center.banners() {
+        for n in center.banners().iter().filter(|_| !blocked) {
             let (c, close) = card(n);
             c.add_css_class("banner");
             let has_default = n.actions().iter().any(|a| a.id == "default");
