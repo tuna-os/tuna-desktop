@@ -584,6 +584,13 @@ impl WindowManager {
     }
 
     /// Whether the seat's Num Lock is on (Mouse Keys stand aside).
+    /// Num Lock, or `None` before the seat has a keyboard.
+    pub fn keyboard_num_lock(&self) -> Option<bool> {
+        self.keyboard
+            .as_ref()
+            .map(|keyboard| keyboard.modifier_state().num_lock)
+    }
+
     pub fn num_lock(&self) -> bool {
         self.keyboard
             .as_ref()
@@ -5784,7 +5791,10 @@ impl WindowManager {
             options: (!settings.xkb_options.is_empty()).then(|| settings.xkb_options.clone()),
             ..XkbConfig::default()
         };
-        if let Err(e) = keyboard.set_xkb_config(state, config) {
+        // Num Lock, Caps Lock and the active input source survive the new
+        // keymap, as mutter keeps them; the shell's input-source manager
+        // relies on the layout staying put (#346).
+        if let Err(e) = keyboard.set_xkb_config_keeping_locks(state, config) {
             eprintln!(
                 "tuna-compositor: keymap {}({}) refused: {e:?}",
                 settings.xkb_layout, settings.xkb_variant
@@ -5807,6 +5817,16 @@ impl WindowManager {
         };
         keyboard.change_repeat_info(rate, settings.repeat_delay_ms as i32);
         self.repeat = (rate, settings.repeat_delay_ms as i32);
+    }
+
+    /// Lock or unlock Num Lock, telling the focused client (mutter's
+    /// `meta_seat_impl_set_keyboard_numlock_in_impl`).
+    pub fn set_num_lock(&mut self, state: &mut State, on: bool) {
+        if let Some(keyboard) = self.keyboard.clone() {
+            keyboard.with_xkb_state(state, |mut context| {
+                context.set_modifier_locked(smithay::input::keyboard::xkb::MOD_NAME_NUM, on);
+            });
+        }
     }
 
     pub fn take_input_source_switches(&mut self) -> Vec<bool> {
@@ -5853,6 +5873,7 @@ impl WindowManager {
             "layouts": layouts,
             "repeat_rate": self.repeat.0,
             "repeat_delay": self.repeat.1,
+            "num_lock": keyboard.modifier_state().num_lock,
         })
     }
 

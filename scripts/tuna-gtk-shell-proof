@@ -103,6 +103,14 @@
 #                  per-class acceleration) reach the compositor live and
 #                  reset to GNOME 51's defaults (#343); the native VM lane
 #                  proves libinput device state
+#   G-INPUT-SOURCE-MRU Super+Space flips between the two most recent
+#                  sources, the held popup steps through the MRU list,
+#                  and mru-sources keeps the order (#346)
+#   G-INPUT-PER-WINDOW per-window: each window restores its own source on
+#                  focus, new windows start on the first (#346)
+#   G-NUMLOCK      Num Lock changes save numlock-state only while
+#                  remember-numlock-state is set; a keymap reload keeps
+#                  the lock and the active source (#346)
 #   G-A11Y-STICKY  Sticky Keys: a tapped Shift latches for one key, two
 #                  taps lock, two modifiers at once switch the aid off (#350)
 #   G-A11Y-SHORTCUTS Shift five times / held eight seconds switch Sticky /
@@ -4252,6 +4260,137 @@ cstate '.keyboard.layouts == ["English (US)", "German"]' "two sources" ||
 xdotool key super+space
 cstate '.keyboard.layout == "German"' "next source" ||
     fail G-SETTINGS-INPUT "Super+Space did not switch to the next input source"
+
+# GNOME's input-source policy (#346, keyboard.js InputSourceManager). The
+# quick tap above picked the second most recent source and saved the order.
+mru_wait() {
+    end=$(($(date +%s) + 10))
+    until [ "$(gsettings get org.gnome.desktop.input-sources mru-sources)" = "$1" ] ||
+        [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
+    [ "$(gsettings get org.gnome.desktop.input-sources mru-sources)" = "$1" ]
+}
+mru_wait "[('xkb', 'de'), ('xkb', 'us')]" ||
+    fail G-INPUT-SOURCE-MRU "the switch did not save mru-sources: $(gsettings get org.gnome.desktop.input-sources mru-sources)"
+# A third source joins after the remembered order; the front stays active.
+gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'us'), ('xkb', 'de'), ('xkb', 'fr')]"
+cstate '.keyboard.layouts == ["English (US)", "German", "French"] and .keyboard.layout == "German"' "three sources" ||
+    fail G-INPUT-SOURCE-MRU "a new source list did not keep the most recent source active"
+# Taps flip between the two most recent sources; position order would
+# have reached French.
+xdotool key super+space
+cstate '.keyboard.layout == "English (US)"' "tap to the previous source" ||
+    fail G-INPUT-SOURCE-MRU "Super+Space did not pick the second most recent source"
+xdotool key super+space
+cstate '.keyboard.layout == "German"' "tap back" ||
+    fail G-INPUT-SOURCE-MRU "a second tap did not flip back"
+# Held: the popup lists the sources most recent first; a second press
+# steps to the third, releasing Super picks it.
+xdotool keydown Super_L
+xdotool key space
+sleep 0.4
+xdotool key space
+sleep 0.4
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-input-source-popup.json" 20 ||
+    { xdotool keyup Super_L; fail G-INPUT-SOURCE-MRU "accessibility dump failed"; }
+scrot "$ARTIFACTS/input-source-popup.png" >/dev/null
+xdotool keyup Super_L
+for name in "German" "English (US)" "French"; do
+    showing "$ARTIFACTS/a11y-input-source-popup.json" "$name" ||
+        fail G-INPUT-SOURCE-MRU "the held switcher did not list $name"
+done
+cstate '.keyboard.layout == "French"' "held switch" ||
+    fail G-INPUT-SOURCE-MRU "releasing Super did not pick the stepped-to source"
+mru_wait "[('xkb', 'fr'), ('xkb', 'de'), ('xkb', 'us')]" ||
+    fail G-INPUT-SOURCE-MRU "the held switch did not save mru-sources"
+sleep 0.5
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-input-source-popup-closed.json" 20 ||
+    fail G-INPUT-SOURCE-MRU "accessibility dump failed"
+hidden "$ARTIFACTS/a11y-input-source-popup-closed.json" "French" ||
+    fail G-INPUT-SOURCE-MRU "the switcher stayed open after Super was released"
+pass G-INPUT-SOURCE-MRU "Super+Space flips between the two most recent sources, the held popup steps through the MRU list, and mru-sources keeps the order across source changes"
+
+# per-window: each window keeps its own source; a window seen for the
+# first time starts on the first one.
+gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'us'), ('xkb', 'de')]"
+cstate '.keyboard.layouts == ["English (US)", "German"]' "two sources again" ||
+    fail G-INPUT-PER-WINDOW "the source list did not return to two"
+[ "$(jq '.windows | length' "$CSTATE")" -ge 2 ] ||
+    fail G-INPUT-PER-WINDOW "the per-window check needs two windows"
+gsettings set org.gnome.desktop.input-sources per-window true
+sleep 1
+window_a="$(jq '.focused' "$CSTATE")"
+[ "$window_a" != null ] || fail G-INPUT-PER-WINDOW "no window has the focus"
+# A window remembers what is activated in it while per-window is on.
+cstate '.keyboard.layout == "German"' "German before per-window" ||
+    fail G-INPUT-PER-WINDOW "the two-source list did not keep German active"
+xdotool key super+space
+cstate '.keyboard.layout == "English (US)"' "window A tap" ||
+    fail G-INPUT-PER-WINDOW "Super+Space did not switch in window A"
+xdotool key super+space
+cstate '.keyboard.layout == "German"' "window A on German" ||
+    fail G-INPUT-PER-WINDOW "window A did not switch back to German"
+xdotool key alt+Tab
+cstate ".focused != $window_a and .focused != null" "window B focused" ||
+    fail G-INPUT-PER-WINDOW "Alt+Tab did not focus another window"
+window_b="$(jq '.focused' "$CSTATE")"
+cstate '.keyboard.layout == "English (US)"' "window B starts on the first source" ||
+    fail G-INPUT-PER-WINDOW "a newly focused window did not start on the first source"
+xdotool key alt+Tab
+cstate ".focused == $window_a and .keyboard.layout == \"German\"" "window A restored" ||
+    fail G-INPUT-PER-WINDOW "refocusing window A did not restore German"
+xdotool key alt+Tab
+cstate ".focused == $window_b and .keyboard.layout == \"English (US)\"" "window B restored" ||
+    fail G-INPUT-PER-WINDOW "refocusing window B did not restore English (US)"
+gsettings set org.gnome.desktop.input-sources per-window false
+xdotool key alt+Tab
+cstate ".focused == $window_a" "window A again" ||
+    fail G-INPUT-PER-WINDOW "Alt+Tab did not return to window A"
+sleep 1
+jq -e '.keyboard.layout == "English (US)"' "$CSTATE" >/dev/null ||
+    fail G-INPUT-PER-WINDOW "with per-window off the focus change still switched sources"
+pass G-INPUT-PER-WINDOW "with per-window each window restores its own source on focus, new windows start on the first, and turning it off stops following the focus"
+
+# Remembered Num Lock (mutter's maybe_save_numlock_state): every change is
+# saved while remember-numlock-state is set, nothing is saved without it,
+# and a keymap reload keeps the lock.
+numlock_wait() {
+    end=$(($(date +%s) + 10))
+    until [ "$(gsettings get org.gnome.desktop.peripherals.keyboard numlock-state)" = "$1" ] ||
+        [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
+    [ "$(gsettings get org.gnome.desktop.peripherals.keyboard numlock-state)" = "$1" ]
+}
+gsettings set org.gnome.desktop.peripherals.keyboard remember-numlock-state true
+numlock_before="$(jq '.keyboard.num_lock' "$CSTATE")"
+if [ "$numlock_before" = true ]; then
+    xdotool key Num_Lock
+    cstate '.keyboard.num_lock == false' "Num Lock off" || fail G-NUMLOCK "Num Lock did not turn off"
+fi
+xdotool key Num_Lock
+cstate '.keyboard.num_lock == true' "Num Lock on" || fail G-NUMLOCK "Num_Lock did not lock Num Lock"
+numlock_wait true || fail G-NUMLOCK "the compositor did not save numlock-state true"
+gsettings set org.gnome.desktop.input-sources xkb-options "['compose:ralt']"
+cstate '.keyboard.num_lock == true and .keyboard.layout == "English (US)"' "reload keeps Num Lock" ||
+    fail G-NUMLOCK "a keymap reload dropped Num Lock or the active source"
+gsettings reset org.gnome.desktop.input-sources xkb-options
+xdotool key Num_Lock
+cstate '.keyboard.num_lock == false' "Num Lock off again" || fail G-NUMLOCK "Num_Lock did not unlock Num Lock"
+numlock_wait false || fail G-NUMLOCK "the compositor did not save numlock-state false"
+gsettings set org.gnome.desktop.peripherals.keyboard remember-numlock-state false
+xdotool key Num_Lock
+cstate '.keyboard.num_lock == true' "Num Lock on unremembered" || fail G-NUMLOCK "Num_Lock did not lock Num Lock"
+sleep 2
+[ "$(gsettings get org.gnome.desktop.peripherals.keyboard numlock-state)" = false ] ||
+    fail G-NUMLOCK "numlock-state was saved with remember-numlock-state off"
+xdotool key Num_Lock
+cstate '.keyboard.num_lock == false' "Num Lock off unremembered" || fail G-NUMLOCK "Num_Lock did not unlock Num Lock"
+gsettings reset org.gnome.desktop.peripherals.keyboard remember-numlock-state
+gsettings reset org.gnome.desktop.peripherals.keyboard numlock-state
+pass G-NUMLOCK "Num Lock changes save numlock-state only while remember-numlock-state is set, and a keymap reload keeps the lock and the active source"
+
+# Back to the state G-SETTINGS-INPUT continues from: German active.
+xdotool key super+space
+cstate '.keyboard.layout == "German"' "German again" ||
+    fail G-SETTINGS-INPUT "Super+Space did not return to German"
 gsettings set org.gnome.desktop.peripherals.keyboard repeat-interval 50
 cstate '.keyboard.repeat_rate == 20' "repeat" ||
     fail G-SETTINGS-INPUT "repeat-interval 50 ms did not set 20 keys/s"

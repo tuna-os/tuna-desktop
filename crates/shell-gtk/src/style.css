@@ -856,6 +856,19 @@ window.tuna-switcher {
   background-color: rgba(255, 255, 255, 0.2);
 }
 
+/* GNOME 51's InputSourcePopup (_switcher-popup.scss): the switcher
+   list with square items, each source's short name 34pt in a 96px box
+   over its display name. */
+.tuna-switcher .input-source-switcher {
+  padding: 12px;
+}
+
+.tuna-switcher .input-source-switcher-symbol {
+  font-size: 34pt;
+  min-width: 96px;
+  min-height: 96px;
+}
+
 /* GNOME's ThumbnailSwitcher: the same list, 2px around each frame,
    6px to the title; frames 256px wide with 8px corners. */
 .tuna-switcher .thumbnail-switcher {

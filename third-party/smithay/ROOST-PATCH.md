@@ -63,3 +63,16 @@ crates/compositor/tests/data_device.rs cover pointer and touch drags, with
 and without an icon or a source, and a normal drop that can still Finish.
 The isolated diff is retained in DND-CANCEL-API-PATCH.diff; the pinned
 version stays 0.7.0.
+
+Issue #346 additionally changes src/input/keyboard/mod.rs for GNOME's input
+sources and remembered Num Lock. The additive
+KeyboardHandle::set_xkb_config_keeping_locks replaces the keymap as
+set_xkb_config does, but carries the latched and locked modifiers and the
+locked layout over to the new state (a layout past the new keymap's last
+falls back to the first), as mutter's meta_wayland_keyboard_update_xkb_state
+keeps them; clients receive the new keymap with those modifiers. The
+additive XkbContext::set_modifier_locked locks or unlocks one named modifier
+(Num Lock at startup), keeping the others and the layout, and reports the
+change through with_xkb_state's usual modifier and LED notification. The
+existing set_xkb_config is unchanged. The isolated diff is retained in
+KEYMAP-STATE-API-PATCH.diff; the pinned version stays 0.7.0.

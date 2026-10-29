@@ -3831,6 +3831,61 @@ fn consumed_modifier_release_updates_the_next_forwarded_key_without_focus_change
     assert_eq!(f.manager.model().focused(), Some(f.id_a));
 }
 
+/// GNOME's input sources and remembered Num Lock (#346): a keymap reload
+/// (new options, a changed source list) keeps Num Lock and the active
+/// layout as mutter does, falling back to the first layout only when the
+/// active one no longer exists; the focused client hears the kept state.
+#[test]
+fn keymap_reload_keeps_num_lock_and_the_active_layout() {
+    let mut f = two_windows();
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    let mut settings = tuna_shell_control::InputSettings {
+        xkb_layout: "us,de".into(),
+        ..Default::default()
+    };
+    f.manager
+        .apply_keyboard_settings(&mut f.comp.state, &settings);
+    f.manager.switch_input_source(&mut f.comp.state, false);
+    f.manager.set_num_lock(&mut f.comp.state, true);
+    assert_eq!(f.manager.keyboard_num_lock(), Some(true));
+    let summary = f.manager.keyboard_summary(&mut f.comp.state);
+    assert_eq!(summary["layout"], "German");
+    assert_eq!(summary["num_lock"], true);
+
+    // New options reload the keymap: German and Num Lock stay.
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    f.client_a.keyboard_modifiers.clear();
+    settings.xkb_options = "compose:ralt".into();
+    f.manager
+        .apply_keyboard_settings(&mut f.comp.state, &settings);
+    let summary = f.manager.keyboard_summary(&mut f.comp.state);
+    assert_eq!(
+        summary["layout"], "German",
+        "the active source survives a reload"
+    );
+    assert_eq!(summary["num_lock"], true, "Num Lock survives a reload");
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    let &(_, _, locked, group) = f
+        .client_a
+        .keyboard_modifiers
+        .last()
+        .expect("the new keymap arrives with its modifiers");
+    assert_ne!(locked, 0, "the client sees Num Lock still locked");
+    assert_eq!(group, 1, "the client sees the second layout");
+
+    // A shorter source list drops the active layout: the first one.
+    settings.xkb_layout = "fr".into();
+    f.manager
+        .apply_keyboard_settings(&mut f.comp.state, &settings);
+    let summary = f.manager.keyboard_summary(&mut f.comp.state);
+    assert_eq!(summary["layout"], "French");
+    assert_eq!(summary["num_lock"], true);
+
+    // Num Lock off again, through the same locked-modifier path.
+    f.manager.set_num_lock(&mut f.comp.state, false);
+    assert_eq!(f.manager.keyboard_num_lock(), Some(false));
+}
+
 wayland_client::delegate_noop!(Client: ignore XdgWmDialogV1);
 wayland_client::delegate_noop!(Client: ignore XdgDialogV1);
 

@@ -641,6 +641,8 @@ pub struct Runtime {
     wake: crate::wake::Wake,
     /// Last live lockdown refresh (see [`LOCKDOWN_REFRESH_INTERVAL`]).
     lockdown_refresh_at: Instant,
+    /// GNOME's remembered Num Lock (#346): restore once, save changes.
+    numlock: crate::numlock::NumlockMemory,
     /// On-demand XWayland server supervisor. Idle until the first X11
     /// need is recorded via [`Runtime::request_x11`]; the window-model
     /// join installs the real spawner, until then ticks are no-ops.
@@ -1257,6 +1259,12 @@ impl Runtime {
             // Mutter reads them in-process (prefs.c); changes wake the loop.
             wm_preferences: crate::wm_preferences::Reader::new(&wake),
             wm_preferences_status: None,
+            numlock: {
+                let wake = wake.clone();
+                crate::numlock::NumlockMemory::start(crate::numlock::CliStore, move || {
+                    wake.signal()
+                })
+            },
             wake,
             lockdown_refresh_at: Instant::now(),
             xwayland: XWaylandSupervisor::new(),
@@ -4423,6 +4431,11 @@ impl Runtime {
         if self.lockdown_refresh_at.elapsed() >= LOCKDOWN_REFRESH_INTERVAL {
             self.control.refresh_lockdown();
             self.lockdown_refresh_at = Instant::now();
+        }
+        // GNOME's remembered Num Lock (#346): apply the restore once it
+        // lands and save every change, as mutter does.
+        if let Some(on) = self.numlock.tick(self.manager.keyboard_num_lock()) {
+            self.manager.set_num_lock(&mut self.state, on);
         }
         // GNOME's idle and lock settings, from the shell (#63).
         if let Some(ms) = outcome.idle_timeout {
