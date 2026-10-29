@@ -28,6 +28,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gtk4 as gtk;
 use gtk4::glib;
@@ -138,18 +139,23 @@ impl Ease {
 pub struct Tween {
     pub from: f64,
     pub to: f64,
-    pub start_ms: f64,
+    /// When it began, on [`crate::anim_clock::now`].
+    pub start: Duration,
     pub duration_ms: f64,
     pub ease: Ease,
 }
 
 impl Tween {
-    /// The value at `now_ms`, and whether the ease is over.
-    pub fn at(&self, now_ms: f64) -> (f64, bool) {
+    /// The value at `now`, and whether the ease is over. Elapsed time is
+    /// the exact difference of two clock readings, in whole microseconds:
+    /// subtracting two large millisecond floats could leave a 300 ms ease
+    /// a hair short of its end forever on a frozen clock.
+    pub fn at(&self, now: Duration) -> (f64, bool) {
+        let elapsed_ms = now.saturating_sub(self.start).as_micros() as f64 / 1000.0;
         let t = if self.duration_ms <= 0.0 {
             1.0
         } else {
-            ((now_ms - self.start_ms) / self.duration_ms).clamp(0.0, 1.0)
+            (elapsed_ms / self.duration_ms).clamp(0.0, 1.0)
         };
         (lerp(self.from, self.to, self.ease.apply(t)), t >= 1.0)
     }
@@ -626,10 +632,10 @@ impl Curtain {
         let duration = policy.adjust_ms(duration_ms);
         let from = imp.progress.get();
         let instant = duration <= 0.0 || !self.is_mapped();
-        let start_ms = if instant {
-            0.0
+        let start = if instant {
+            Duration::ZERO
         } else {
-            crate::anim_clock::now_ms()
+            crate::anim_clock::now()
         };
         trace(format_args!(
             "ease to={} from={from:.4} duration={duration:.0} nominal={duration_ms:.0} mode={} motion={} clock={}",
@@ -654,7 +660,7 @@ impl Curtain {
         imp.tween.set(Some(Tween {
             from,
             to: target,
-            start_ms,
+            start,
             duration_ms: duration,
             ease,
         }));
@@ -671,7 +677,7 @@ impl Curtain {
             imp.ticking.set(false);
             return glib::ControlFlow::Break;
         };
-        let (value, done) = tween.at(crate::anim_clock::now_ms());
+        let (value, done) = tween.at(crate::anim_clock::now());
         self.set_progress(value);
         if !done {
             return glib::ControlFlow::Continue;
@@ -780,38 +786,62 @@ mod tests {
 
     #[test]
     fn crossfade_is_300_ms_ease_out_quad_from_the_current_value() {
+        let ms = Duration::from_millis;
         let show = Tween {
             from: 0.0,
             to: 1.0,
-            start_ms: 1000.0,
+            start: ms(1000),
             duration_ms: CROSSFADE_MS,
             ease: Ease::OutQuad,
         };
-        assert_eq!(show.at(1000.0), (0.0, false));
-        assert_eq!(show.at(1150.0), (0.75, false));
-        assert_eq!(show.at(1300.0), (1.0, true));
-        assert_eq!(show.at(5000.0), (1.0, true));
+        assert_eq!(show.at(ms(1000)), (0.0, false));
+        assert_eq!(show.at(ms(1150)), (0.75, false));
+        assert_eq!(show.at(ms(1300)), (1.0, true));
+        assert_eq!(show.at(ms(5000)), (1.0, true));
         // Escape half way back: from the drawn value, not from 1.
         let hide = Tween {
             from: 0.75,
             to: 0.0,
             ..show
         };
-        assert!(close(hide.at(1150.0).0, 0.1875));
+        assert!(close(hide.at(ms(1150)).0, 0.1875));
         let swipe = Tween {
             from: 0.4,
             to: 1.0,
-            start_ms: 0.0,
+            start: Duration::ZERO,
             duration_ms: 200.0,
             ease: Ease::OutCubic,
         };
-        assert!(close(swipe.at(100.0).0, 0.4 + 0.6 * 0.875));
+        assert!(close(swipe.at(ms(100)).0, 0.4 + 0.6 * 0.875));
         let instant = Tween {
             duration_ms: 0.0,
             ..swipe
         };
-        let (value, done) = instant.at(0.0);
+        let (value, done) = instant.at(Duration::ZERO);
         assert!(close(value, 1.0) && done);
+    }
+
+    /// A proof moves the frozen clock by exactly 300 ms; after a long
+    /// session the clock reads in the hundreds of thousands of seconds,
+    /// where millisecond floats no longer subtract exactly. The ease must
+    /// still end (and be at exactly half way at 150 ms).
+    #[test]
+    fn an_ease_ends_exactly_on_a_late_frozen_clock() {
+        for start in [
+            Duration::new(123_456, 789_123_457),
+            Duration::new(987_654_321, 999_999_999),
+            Duration::new(3_141, 592_653_589),
+        ] {
+            let show = Tween {
+                from: 0.0,
+                to: 1.0,
+                start,
+                duration_ms: CROSSFADE_MS,
+                ease: Ease::OutQuad,
+            };
+            assert_eq!(show.at(start + Duration::from_millis(150)), (0.75, false));
+            assert_eq!(show.at(start + Duration::from_millis(300)), (1.0, true));
+        }
     }
 
     #[test]

@@ -126,16 +126,19 @@ thread_local! {
     static CLOCK: RefCell<AnimationClock> = RefCell::new(AnimationClock::from_env());
 }
 
-/// Animation time in milliseconds, after following the clock file.
-pub fn now_ms() -> f64 {
+/// Animation time, after following the clock file. Kept as a `Duration`
+/// (whole nanoseconds): differences of it are exact, so a proof that
+/// moves the frozen clock by 300 ms ends a 300 ms ease exactly, however
+/// long the session has run.
+pub fn now() -> Duration {
     CLOCK.with(|clock| {
         let mut clock = clock.borrow_mut();
         clock.poll();
-        clock.now().as_secs_f64() * 1000.0
+        clock.now()
     })
 }
 
-/// Whether a proof holds animation time (as of the last [`now_ms`]).
+/// Whether a proof holds animation time (as of the last [`now`]).
 pub fn manual() -> bool {
     CLOCK.with(|clock| clock.borrow().is_manual())
 }
