@@ -430,6 +430,140 @@ impl NightLightColor {
     }
 }
 
+/// The single `PropertiesChanged` entry g-s-d's `emit_property_changed`
+/// sends for one change (`Temperature` as `roundf`'s `u`).
+fn color_change_property(
+    change: crate::night_light::ColorChange,
+) -> (&'static str, Value<'static>) {
+    use crate::night_light::ColorChange;
+    match change {
+        ColorChange::NightLightActive(value) => ("NightLightActive", Value::from(value)),
+        ColorChange::Temperature(kelvin) => ("Temperature", Value::from(kelvin)),
+        ColorChange::DisabledUntilTomorrow(value) => ("DisabledUntilTomorrow", Value::from(value)),
+        ColorChange::Sunrise(hours) => ("Sunrise", Value::from(hours)),
+        ColorChange::Sunset(hours) => ("Sunset", Value::from(hours)),
+    }
+}
+
+/// Emit one `org.freedesktop.DBus.Properties.PropertiesChanged` per
+/// change on `/org/gnome/SettingsDaemon/Color`, in order and with an
+/// empty invalidated list, as `gsd-color-manager.c` does. Ends when the
+/// share drops its sender.
+fn spawn_color_signals(
+    conn: zbus::Connection,
+    changes: std::sync::mpsc::Receiver<crate::night_light::ColorChange>,
+) {
+    std::thread::spawn(move || {
+        let Ok(emitter) = SignalEmitter::new(&conn, "/org/gnome/SettingsDaemon/Color") else {
+            return;
+        };
+        let interface =
+            zbus::names::InterfaceName::from_static_str_unchecked("org.gnome.SettingsDaemon.Color");
+        for change in changes {
+            let (name, value) = color_change_property(change);
+            let _ = zbus::block_on(fdo::Properties::properties_changed(
+                &emitter,
+                interface.clone(),
+                HashMap::from([(name, value)]),
+                std::borrow::Cow::Borrowed(&[]),
+            ));
+        }
+    });
+}
+
+#[cfg(test)]
+mod color_signal_tests {
+    use super::*;
+    use crate::night_light::{ColorChange, NightLightShare};
+
+    /// Over a real peer-to-peer D-Bus link: each share change arrives
+    /// as its own `PropertiesChanged` with g-s-d's shape, unchanged
+    /// writes and `Temperature` property writes send nothing.
+    #[test]
+    fn share_changes_reach_the_wire_as_gsd_properties_changed() {
+        let (server_end, client_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            zbus::blocking::connection::Builder::async_io_unix_stream(server_end)
+                .server(zbus::Guid::generate())
+                .unwrap()
+                .p2p()
+                .build()
+                .unwrap()
+        });
+        let client = zbus::blocking::connection::Builder::async_io_unix_stream(client_end)
+            .p2p()
+            .build()
+            .unwrap();
+        let server = server.join().unwrap();
+        let share = Arc::new(NightLightShare::default());
+        spawn_color_signals(server.inner().clone(), share.subscribe_changes());
+        let mut messages = zbus::blocking::MessageIterator::from(&client);
+
+        share.set_disabled_until_tmw(Some(1));
+        share.set_disabled_until_tmw(Some(2)); // still set: no signal
+        share.set_temperature_override(4000).unwrap(); // gsd: no signal
+        share.publish(true, 4000);
+        share.publish(true, 3900); // active unchanged: no signal
+        share.set_disabled_until_tmw(None);
+
+        let mut seen = Vec::new();
+        while seen.len() < 3 {
+            let message = messages.next().unwrap().unwrap();
+            let header = message.header();
+            assert_eq!(
+                header.interface().map(|i| i.as_str()),
+                Some("org.freedesktop.DBus.Properties")
+            );
+            assert_eq!(
+                header.member().map(|m| m.as_str()),
+                Some("PropertiesChanged")
+            );
+            assert_eq!(
+                header.path().map(|p| p.as_str()),
+                Some("/org/gnome/SettingsDaemon/Color")
+            );
+            let (interface, changed, invalidated): (
+                String,
+                HashMap<String, OwnedValue>,
+                Vec<String>,
+            ) = message.body().deserialize().unwrap();
+            assert_eq!(interface, "org.gnome.SettingsDaemon.Color");
+            assert!(invalidated.is_empty());
+            assert_eq!(changed.len(), 1);
+            let (name, value) = changed.into_iter().next().unwrap();
+            seen.push((name, bool::try_from(value).unwrap()));
+        }
+        assert_eq!(
+            seen,
+            [
+                ("DisabledUntilTomorrow".to_string(), true),
+                ("NightLightActive".to_string(), true),
+                ("DisabledUntilTomorrow".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_change_maps_to_its_gsd_property_and_type() {
+        assert_eq!(
+            color_change_property(ColorChange::Temperature(2700)),
+            ("Temperature", Value::U32(2700))
+        );
+        assert_eq!(
+            color_change_property(ColorChange::Sunrise(6.5)),
+            ("Sunrise", Value::F64(6.5))
+        );
+        assert_eq!(
+            color_change_property(ColorChange::Sunset(19.25)),
+            ("Sunset", Value::F64(19.25))
+        );
+        assert_eq!(
+            color_change_property(ColorChange::NightLightActive(false)),
+            ("NightLightActive", Value::Bool(false))
+        );
+    }
+}
+
 #[interface(name = "org.gnome.Mutter.DisplayConfig")]
 impl DisplayConfig {
     #[allow(clippy::type_complexity)]
@@ -1100,28 +1234,14 @@ pub fn start(
                         false
                     }
                 };
-            let mut last_disabled = night_light.disabled_until_tmw().is_some();
+            if color_owned {
+                spawn_color_signals(conn.inner().clone(), night_light.subscribe_changes());
+            }
             // Revoke on lock, unique-name disconnect or loss of the trusted
             // service identity. 100ms admission scan plus one compositor tick
             // bounds stream teardown; frames additionally fail closed on lock.
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(100));
-                let disabled = night_light.disabled_until_tmw().is_some();
-                if color_owned && disabled != last_disabled {
-                    if let Ok(interface) = conn
-                        .object_server()
-                        .interface::<_, NightLightColor>("/org/gnome/SettingsDaemon/Color")
-                    {
-                        let color = interface.get();
-                        if zbus::block_on(
-                            color.disabled_until_tomorrow_changed(interface.signal_emitter()),
-                        )
-                        .is_ok()
-                        {
-                            last_disabled = disabled;
-                        }
-                    }
-                }
                 let remote_snapshot = remote.lock().map(|s| s.clone()).unwrap_or_default();
                 for (remote_id, grant) in remote_snapshot {
                     let alive = zbus::block_on(authority.owner_alive(conn.inner(), &grant.owner));

@@ -3243,6 +3243,12 @@ done
 if color_call --method org.gnome.SettingsDaemon.Color.NightLightPreview 0 >/dev/null; then
     fail G-QS-NIGHT "NightLightPreview accepted a zero duration"
 fi
+# Watch the signals GNOME Settings' proxy reacts to, not only polling.
+NIGHT_SIGNALS="$ARTIFACTS/night-light-signals.txt"
+gdbus monitor --session --dest org.gnome.SettingsDaemon.Color \
+    --object-path /org/gnome/SettingsDaemon/Color >"$NIGHT_SIGNALS" 2>&1 &
+night_monitor=$!
+sleep 0.5
 color_call --method org.gnome.SettingsDaemon.Color.NightLightPreview 10 >/dev/null ||
     fail G-QS-NIGHT "NightLightPreview(10) failed"
 night_eased="" night_reached=""
@@ -3272,8 +3278,22 @@ done
 [ -n "$night_restored" ] || fail G-QS-NIGHT "the preview never expired back to 6500 K (Temperature $(color_temp))"
 color_prop NightLightActive | grep -q false ||
     fail G-QS-NIGHT "NightLightActive stayed true after the preview expired"
+kill "$night_monitor" 2>/dev/null || true
+wait "$night_monitor" 2>/dev/null || true
+night_signal() {
+    grep -F "org.freedesktop.DBus.Properties.PropertiesChanged ('org.gnome.SettingsDaemon.Color', {'$1': $2" \
+        "$NIGHT_SIGNALS" >/dev/null
+}
+night_signal NightLightActive '<true>' ||
+    fail G-QS-NIGHT "no PropertiesChanged NightLightActive=true during the preview ($(wc -l <"$NIGHT_SIGNALS") lines)"
+night_signal NightLightActive '<false>' ||
+    fail G-QS-NIGHT "no PropertiesChanged NightLightActive=false after the preview"
+night_signal Temperature '<uint32 3000>' ||
+    fail G-QS-NIGHT "no PropertiesChanged Temperature=3000 during the preview"
+night_signal Temperature '<uint32 6500>' ||
+    fail G-QS-NIGHT "no PropertiesChanged Temperature=6500 after the preview"
 gsettings reset org.gnome.settings-daemon.plugins.color night-light-temperature
-pass G-QS-NIGHT "the real tile toggles night-light-enabled; NightLightPreview eases Temperature to the key and back"
+pass G-QS-NIGHT "the real tile toggles night-light-enabled; NightLightPreview eases Temperature to the key and back, announced by PropertiesChanged"
 
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-qs-brightness.json" 20 \
     --set Brightness 30 || fail G-QS-BRIGHTNESS "could not set Brightness"
