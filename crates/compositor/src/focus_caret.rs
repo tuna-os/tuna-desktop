@@ -391,11 +391,11 @@ fn rect_of(reply: &zbus::Message) -> Option<(i32, i32, i32, i32)> {
     }
 }
 
+/// Window extents of an AT-SPI event's source, and the sender's pid.
+type Located = ((i32, i32, i32, i32), Option<u32>);
+
 /// `_updateFocus`: a focused (or selected) component's window extents.
-fn focus_extents(
-    conn: &zbus::blocking::Connection,
-    message: &zbus::Message,
-) -> Option<((i32, i32, i32, i32), Option<u32>)> {
+fn focus_extents(conn: &zbus::blocking::Connection, message: &zbus::Message) -> Option<Located> {
     let (kind, detail1) = kind_and_detail(message)?;
     if !matches!(kind.as_str(), "focused" | "selected") || detail1 != 1 {
         return None;
@@ -414,10 +414,7 @@ fn focus_extents(
 
 /// `_updateCaret`: the caret character's window extents; a 0x0 box
 /// (offset not translatable) is ignored, as in GNOME.
-fn caret_extents(
-    conn: &zbus::blocking::Connection,
-    message: &zbus::Message,
-) -> Option<((i32, i32, i32, i32), Option<u32>)> {
+fn caret_extents(conn: &zbus::blocking::Connection, message: &zbus::Message) -> Option<Located> {
     let (_, offset) = kind_and_detail(message)?;
     let object = source(conn, message)?;
     let reply = object.call(
@@ -450,11 +447,13 @@ mod tests {
 
     #[test]
     fn turning_tracking_off_drops_the_last_event() {
-        let mut tracker = FocusCaretTracker::default();
-        tracker.wanted = (true, true);
         // A stand-in worker: the sync below must not start a real one.
         let (control, _worker) = mpsc::channel();
-        tracker.control = Some(control);
+        let mut tracker = FocusCaretTracker {
+            wanted: (true, true),
+            control: Some(control),
+            ..FocusCaretTracker::default()
+        };
         {
             let mut latest = tracker.shared.latest.lock().unwrap();
             latest.focus = Some(Extents {
