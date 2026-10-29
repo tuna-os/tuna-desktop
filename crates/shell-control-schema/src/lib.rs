@@ -175,9 +175,15 @@ impl ProtocolVersion {
     /// (`SetAcceleratorGrabs`) and `AcceleratorDeactivated`.
     /// `0.39` appends the mouse acceleration profile to InputSettings.
     /// Positional postcard peers must ship together.
+    /// `0.40` appends GNOME's per-device-class touchpad, mouse, trackball
+    /// and pointing-stick settings to InputSettings (send-events, click
+    /// method, scroll methods, tap options, middle-click emulation,
+    /// scroll-wheel emulation and per-class acceleration).
+    /// `MouseAccelProfile` becomes `PointerAccelProfile`; positional
+    /// postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 39,
+        minor: 40,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -988,12 +994,25 @@ pub struct InputSettings {
     /// GNOME mouse acceleration profile; trackballs and pointing sticks have
     /// separate settings and must not inherit this value.
     #[serde(default)]
-    pub mouse_accel_profile: MouseAccelProfile,
+    pub mouse_accel_profile: PointerAccelProfile,
+    /// `org.gnome.desktop.peripherals.touchpad` beyond the keys above.
+    #[serde(default)]
+    pub touchpad: TouchpadSettings,
+    /// `org.gnome.desktop.peripherals.mouse` beyond the keys above.
+    #[serde(default)]
+    pub mouse: MouseSettings,
+    /// `org.gnome.desktop.peripherals.trackball`.
+    #[serde(default)]
+    pub trackball: TrackballSettings,
+    /// `org.gnome.desktop.peripherals.pointingstick`.
+    #[serde(default)]
+    pub pointing_stick: PointingStickSettings,
 }
 
-/// GNOME's mouse acceleration profile.
+/// GNOME's `GDesktopPointerAccelProfile`, shared by the mouse, touchpad,
+/// trackball and pointing-stick schemas.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MouseAccelProfile {
+pub enum PointerAccelProfile {
     #[default]
     Default,
     Flat,
@@ -1002,7 +1021,7 @@ pub enum MouseAccelProfile {
     Custom,
 }
 
-impl MouseAccelProfile {
+impl PointerAccelProfile {
     /// Decode the GSettings enum nick, falling back to the device default.
     pub fn from_gsettings(value: &str) -> Self {
         match value {
@@ -1012,6 +1031,162 @@ impl MouseAccelProfile {
             _ => Self::Default,
         }
     }
+}
+
+/// GNOME's `GDesktopDeviceSendEvents` (touchpad `send-events`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SendEvents {
+    #[default]
+    Enabled,
+    Disabled,
+    /// libinput suspends the touchpad while an external mouse is plugged.
+    DisabledOnExternalMouse,
+}
+
+impl SendEvents {
+    /// Decode the GSettings enum nick; unknown nicks keep GNOME's default.
+    pub fn from_gsettings(value: &str) -> Self {
+        match value {
+            "disabled" => Self::Disabled,
+            "disabled-on-external-mouse" => Self::DisabledOnExternalMouse,
+            _ => Self::Enabled,
+        }
+    }
+}
+
+/// GNOME's `GDesktopTouchpadClickMethod` (touchpad `click-method`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TouchpadClickMethod {
+    /// The device's own default method.
+    Default,
+    None,
+    /// Software button areas.
+    Areas,
+    /// Clickfinger: the finger count picks the button (GNOME's default).
+    #[default]
+    Fingers,
+}
+
+impl TouchpadClickMethod {
+    /// Decode the GSettings enum nick; unknown nicks keep GNOME's default.
+    pub fn from_gsettings(value: &str) -> Self {
+        match value {
+            "default" => Self::Default,
+            "none" => Self::None,
+            "areas" => Self::Areas,
+            _ => Self::Fingers,
+        }
+    }
+}
+
+/// GNOME's `GDesktopTouchpadTapButtonMap` (touchpad `tap-button-map`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TapButtonMap {
+    #[default]
+    Default,
+    /// One, two, three fingers: left, right, middle.
+    Lrm,
+    /// One, two, three fingers: left, middle, right.
+    Lmr,
+}
+
+impl TapButtonMap {
+    /// Decode the GSettings enum nick; unknown nicks keep GNOME's default.
+    pub fn from_gsettings(value: &str) -> Self {
+        match value {
+            "lrm" => Self::Lrm,
+            "lmr" => Self::Lmr,
+            _ => Self::Default,
+        }
+    }
+}
+
+/// GNOME's `GDesktopPointingStickScrollMethod` (pointing-stick
+/// `scroll-method`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PointingStickScrollMethod {
+    #[default]
+    Default,
+    None,
+    OnButtonDown,
+}
+
+impl PointingStickScrollMethod {
+    /// Decode the GSettings enum nick; unknown nicks keep GNOME's default.
+    pub fn from_gsettings(value: &str) -> Self {
+        match value {
+            "none" => Self::None,
+            "on-button-down" => Self::OnButtonDown,
+            _ => Self::Default,
+        }
+    }
+}
+
+/// GNOME's `scroll-wheel-emulation-button` and `-lock` (mouse and
+/// trackball schemas). `button` is GNOME's button number, 0 for off.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrollWheelEmulation {
+    pub button: u32,
+    pub lock: bool,
+}
+
+/// GNOME 51 `org.gnome.desktop.peripherals.touchpad` keys not carried by
+/// the flat touchpad fields of [`InputSettings`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TouchpadSettings {
+    pub send_events: SendEvents,
+    pub click_method: TouchpadClickMethod,
+    pub edge_scrolling: bool,
+    pub two_finger_scrolling: bool,
+    pub tap_and_drag: bool,
+    pub tap_and_drag_lock: bool,
+    pub tap_button_map: TapButtonMap,
+    pub middle_click_emulation: bool,
+    pub accel_profile: PointerAccelProfile,
+}
+
+impl Default for TouchpadSettings {
+    /// GNOME 51's defaults.
+    fn default() -> Self {
+        Self {
+            send_events: SendEvents::Enabled,
+            click_method: TouchpadClickMethod::Fingers,
+            edge_scrolling: false,
+            two_finger_scrolling: true,
+            tap_and_drag: true,
+            tap_and_drag_lock: false,
+            tap_button_map: TapButtonMap::Default,
+            middle_click_emulation: false,
+            accel_profile: PointerAccelProfile::Default,
+        }
+    }
+}
+
+/// GNOME 51 `org.gnome.desktop.peripherals.mouse` keys not carried by the
+/// flat mouse fields of [`InputSettings`]. Defaults are GNOME 51's.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MouseSettings {
+    pub middle_click_emulation: bool,
+    pub scroll_wheel_emulation: ScrollWheelEmulation,
+}
+
+/// GNOME 51 `org.gnome.desktop.peripherals.trackball`. Defaults are GNOME
+/// 51's.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackballSettings {
+    pub accel_profile: PointerAccelProfile,
+    pub middle_click_emulation: bool,
+    pub scroll_wheel_emulation: ScrollWheelEmulation,
+}
+
+/// GNOME 51 `org.gnome.desktop.peripherals.pointingstick`. Defaults are
+/// GNOME 51's.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointingStickSettings {
+    /// Pointer speed in thousandths, -1000..=1000 (GNOME's -1..1).
+    pub speed_milli: i32,
+    pub accel_profile: PointerAccelProfile,
+    pub scroll_method: PointingStickScrollMethod,
 }
 
 /// GNOME's `org.gnome.desktop.a11y.mouse`, flattened for the compositor.
@@ -1154,7 +1329,11 @@ impl Default for InputSettings {
             locate_pointer: false,
             locate_pointer_key: default_locate_pointer_key(),
             pointer_aids: PointerAids::default(),
-            mouse_accel_profile: MouseAccelProfile::Default,
+            mouse_accel_profile: PointerAccelProfile::Default,
+            touchpad: TouchpadSettings::default(),
+            mouse: MouseSettings::default(),
+            trackball: TrackballSettings::default(),
+            pointing_stick: PointingStickSettings::default(),
         }
     }
 }
@@ -1877,28 +2056,157 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_39() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 39));
+    fn current_version_is_0_40() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 40));
     }
 
     #[test]
-    fn mouse_acceleration_nicks_and_wire_roundtrip() {
+    fn pointer_acceleration_nicks_and_wire_roundtrip() {
         for (nick, profile) in [
-            ("default", MouseAccelProfile::Default),
-            ("flat", MouseAccelProfile::Flat),
-            ("adaptive", MouseAccelProfile::Adaptive),
-            ("custom", MouseAccelProfile::Custom),
-            ("unknown", MouseAccelProfile::Default),
+            ("default", PointerAccelProfile::Default),
+            ("flat", PointerAccelProfile::Flat),
+            ("adaptive", PointerAccelProfile::Adaptive),
+            ("custom", PointerAccelProfile::Custom),
+            ("unknown", PointerAccelProfile::Default),
         ] {
-            assert_eq!(MouseAccelProfile::from_gsettings(nick), profile);
+            assert_eq!(PointerAccelProfile::from_gsettings(nick), profile);
             roundtrip(&Message::Command {
                 id: 1,
                 kind: CommandKind::SetInputSettings(Box::new(InputSettings {
                     mouse_accel_profile: profile,
+                    touchpad: TouchpadSettings {
+                        accel_profile: profile,
+                        ..TouchpadSettings::default()
+                    },
+                    trackball: TrackballSettings {
+                        accel_profile: profile,
+                        ..TrackballSettings::default()
+                    },
+                    pointing_stick: PointingStickSettings {
+                        accel_profile: profile,
+                        ..PointingStickSettings::default()
+                    },
                     ..InputSettings::default()
                 })),
             });
         }
+    }
+
+    #[test]
+    fn device_setting_nicks_follow_gsettings_desktop_schemas_51() {
+        // gdesktop-enums.h 51.0 nicks; unknown values keep the schema default.
+        assert_eq!(SendEvents::from_gsettings("enabled"), SendEvents::Enabled);
+        assert_eq!(SendEvents::from_gsettings("disabled"), SendEvents::Disabled);
+        assert_eq!(
+            SendEvents::from_gsettings("disabled-on-external-mouse"),
+            SendEvents::DisabledOnExternalMouse
+        );
+        assert_eq!(SendEvents::from_gsettings("bogus"), SendEvents::Enabled);
+        for (nick, method) in [
+            ("default", TouchpadClickMethod::Default),
+            ("none", TouchpadClickMethod::None),
+            ("areas", TouchpadClickMethod::Areas),
+            ("fingers", TouchpadClickMethod::Fingers),
+            ("bogus", TouchpadClickMethod::Fingers),
+        ] {
+            assert_eq!(TouchpadClickMethod::from_gsettings(nick), method);
+        }
+        for (nick, map) in [
+            ("default", TapButtonMap::Default),
+            ("lrm", TapButtonMap::Lrm),
+            ("lmr", TapButtonMap::Lmr),
+            ("bogus", TapButtonMap::Default),
+        ] {
+            assert_eq!(TapButtonMap::from_gsettings(nick), map);
+        }
+        for (nick, method) in [
+            ("default", PointingStickScrollMethod::Default),
+            ("none", PointingStickScrollMethod::None),
+            ("on-button-down", PointingStickScrollMethod::OnButtonDown),
+            ("bogus", PointingStickScrollMethod::Default),
+        ] {
+            assert_eq!(PointingStickScrollMethod::from_gsettings(nick), method);
+        }
+    }
+
+    #[test]
+    fn device_settings_default_to_gnome_51_and_survive_the_positional_wire() {
+        let defaults = InputSettings::default();
+        assert_eq!(
+            defaults.touchpad,
+            TouchpadSettings {
+                send_events: SendEvents::Enabled,
+                click_method: TouchpadClickMethod::Fingers,
+                edge_scrolling: false,
+                two_finger_scrolling: true,
+                tap_and_drag: true,
+                tap_and_drag_lock: false,
+                tap_button_map: TapButtonMap::Default,
+                middle_click_emulation: false,
+                accel_profile: PointerAccelProfile::Default,
+            }
+        );
+        assert_eq!(
+            defaults.mouse,
+            MouseSettings {
+                middle_click_emulation: false,
+                scroll_wheel_emulation: ScrollWheelEmulation {
+                    button: 0,
+                    lock: false
+                },
+            }
+        );
+        assert_eq!(defaults.trackball, TrackballSettings::default());
+        assert_eq!(defaults.pointing_stick, PointingStickSettings::default());
+        roundtrip(&Message::Command {
+            id: 3,
+            kind: CommandKind::SetInputSettings(Box::new(InputSettings {
+                touchpad: TouchpadSettings {
+                    send_events: SendEvents::DisabledOnExternalMouse,
+                    click_method: TouchpadClickMethod::None,
+                    edge_scrolling: true,
+                    two_finger_scrolling: false,
+                    tap_and_drag: false,
+                    tap_and_drag_lock: true,
+                    tap_button_map: TapButtonMap::Lmr,
+                    middle_click_emulation: true,
+                    accel_profile: PointerAccelProfile::Flat,
+                },
+                mouse: MouseSettings {
+                    middle_click_emulation: true,
+                    scroll_wheel_emulation: ScrollWheelEmulation {
+                        button: 2,
+                        lock: true,
+                    },
+                },
+                trackball: TrackballSettings {
+                    accel_profile: PointerAccelProfile::Adaptive,
+                    middle_click_emulation: true,
+                    scroll_wheel_emulation: ScrollWheelEmulation {
+                        button: 8,
+                        lock: false,
+                    },
+                },
+                pointing_stick: PointingStickSettings {
+                    speed_milli: -750,
+                    accel_profile: PointerAccelProfile::Flat,
+                    scroll_method: PointingStickScrollMethod::None,
+                },
+                ..defaults.clone()
+            })),
+        });
+        // Positional: the four device classes append 19 bytes at their
+        // defaults after the 0.39 body, so a 0.39 peer's frame (which ends
+        // at `mouse_accel_profile`) is rejected instead of misread.
+        let current = encode_frame(&Message::Command {
+            id: 3,
+            kind: CommandKind::SetInputSettings(Box::new(defaults)),
+        });
+        let mut old = current[..current.len() - 19].to_vec();
+        let body = u32::try_from(old.len() - 4).unwrap();
+        old[..4].copy_from_slice(&body.to_le_bytes());
+        assert!(decode_frame(&old).is_err());
+        assert!(decode_frame(&current).is_ok());
     }
 
     #[test]

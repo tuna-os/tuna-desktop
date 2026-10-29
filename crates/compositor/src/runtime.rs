@@ -2272,6 +2272,17 @@ impl Runtime {
             "mouse_left_handed": self.input_settings.mouse_left_handed,
             "hot_corners": self.input_settings.hot_corners,
             "touchpad_left_handed": self.input_settings.touchpad_left_handed,
+            // GNOME's per-class pointer settings as the shell sent them
+            // (#343): the GSettings-to-compositor boundary nested proofs
+            // assert; hardware sessions also report applied libinput
+            // state per device in `input_devices`.
+            "pointer_device_settings": {
+                "mouse_accel_profile": self.input_settings.mouse_accel_profile,
+                "touchpad": self.input_settings.touchpad,
+                "mouse": self.input_settings.mouse,
+                "trackball": self.input_settings.trackball,
+                "pointing_stick": self.input_settings.pointing_stick,
+            },
             "locked": self.is_locked(),
             "active_workspace": model.active_workspace(),
             "focused": focused,

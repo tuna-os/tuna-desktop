@@ -1847,6 +1847,26 @@ print(json.dumps(result))
         call("gsettings", "set", "org.gnome.desktop.peripherals.mouse", "accel-profile", value, user=True)
         # gsettings prints enum values quoted.
         result = {"stored": call("gsettings", "get", "org.gnome.desktop.peripherals.mouse", "accel-profile", user=True) == f"'{value}'"}
+    elif action == "mouse-middle":
+        value = sys.argv[2]
+        if value not in ("true", "false"):
+            raise ValueError("mouse middle-click emulation must be true or false")
+        call("gsettings", "set", "org.gnome.desktop.peripherals.mouse", "middle-click-emulation", value, user=True)
+        result = {"stored": call("gsettings", "get", "org.gnome.desktop.peripherals.mouse", "middle-click-emulation", user=True) == value}
+    elif action == "mouse-wheel-emulation":
+        button, lock = sys.argv[2], sys.argv[3]
+        if not (button.isdigit() and 0 <= int(button) <= 24) or lock not in ("true", "false"):
+            raise ValueError("mouse wheel emulation needs a 0..24 button and true or false")
+        # The mouse schema gained these keys in gsettings-desktop-schemas 51.
+        keys = call("gsettings", "list-keys", "org.gnome.desktop.peripherals.mouse", user=True).split()
+        if not {"scroll-wheel-emulation-button", "scroll-wheel-emulation-button-lock"} <= set(keys):
+            result = {"available": False, "stored": False}
+        else:
+            call("gsettings", "set", "org.gnome.desktop.peripherals.mouse", "scroll-wheel-emulation-button", button, user=True)
+            call("gsettings", "set", "org.gnome.desktop.peripherals.mouse", "scroll-wheel-emulation-button-lock", lock, user=True)
+            result = {"available": True,
+                      "stored": call("gsettings", "get", "org.gnome.desktop.peripherals.mouse", "scroll-wheel-emulation-button", user=True) == button
+                      and call("gsettings", "get", "org.gnome.desktop.peripherals.mouse", "scroll-wheel-emulation-button-lock", user=True) == lock}
     elif action in ("input-count", "input-ready", "input-buttons"):
         result = json.loads(pathlib.Path(RUNTIME, "tuna-vm-input.json").read_text())
         if pathlib.Path(f"/proc/{result['pid']}").stat().st_uid != OWNER.pw_uid:
