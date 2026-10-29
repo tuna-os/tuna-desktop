@@ -22,9 +22,10 @@ use tuna_compositor::focus_policy::{FocusMode, FocusPolicy};
 use tuna_compositor::layer::OVERVIEW_NAMESPACE;
 use tuna_compositor::windows::{
     ManagerInput, SessionMode, TileSide, WindowLayout, WindowManager, ALT_LEFT_KEYCODE,
-    ARROW_DOWN_KEYCODE, ARROW_LEFT_KEYCODE, ARROW_RIGHT_KEYCODE, ARROW_UP_KEYCODE,
-    CTRL_LEFT_KEYCODE, ESCAPE_KEYCODE, F4_KEYCODE, GRAVE_KEYCODE, PAGE_DOWN_KEYCODE,
-    PAGE_UP_KEYCODE, R_KEYCODE, SHIFT_LEFT_KEYCODE, SUPER_LEFT_KEYCODE, TAB_KEYCODE, T_KEYCODE,
+    ARROW_DOWN_KEYCODE, ARROW_LEFT_KEYCODE, ARROW_RIGHT_KEYCODE, ARROW_UP_KEYCODE, COMMA_KEYCODE,
+    CTRL_LEFT_KEYCODE, DOT_KEYCODE, ESCAPE_KEYCODE, F4_KEYCODE, GRAVE_KEYCODE, LEFT_BRACE_KEYCODE,
+    PAGE_DOWN_KEYCODE, PAGE_UP_KEYCODE, RIGHT_BRACE_KEYCODE, R_KEYCODE, SHIFT_LEFT_KEYCODE,
+    SUPER_LEFT_KEYCODE, TAB_KEYCODE, T_KEYCODE,
 };
 use tuna_compositor::TestCompositor;
 use tuna_shell_control::SwitcherAction;
@@ -4242,7 +4243,9 @@ fn strip_pointer_move_presents_actor_keeps_slots_and_commits_only_own_button() {
     let before = [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap());
     let id_a = f.id_a;
     let pos = start_strip_drag(&mut f, id_a);
-    let next = (pos.x + 850.0, pos.y + 40.0).into();
+    // Mid-height and past B's middle: the gap after B is the nearest
+    // boundary (niri insert position), not B's top window edge.
+    let next = (pos.x + 1000.0, pos.y + 340.0).into();
     f.manager.pointer_motion(&mut f.comp.state, next, 12);
     assert_eq!(
         f.manager.geometry(f.id_a).unwrap(),
@@ -4252,7 +4255,7 @@ fn strip_pointer_move_presents_actor_keeps_slots_and_commits_only_own_button() {
     let drawn = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
     assert_eq!(
         drawn.loc,
-        (before[0].loc.x + 850, before[0].loc.y + 40).into()
+        (before[0].loc.x + 1000, before[0].loc.y + 340).into()
     );
     assert_eq!(
         f.manager
@@ -4668,8 +4671,9 @@ fn strip_drag_survives_unrelated_map_and_neighbor_close_without_resurrection() {
     let canonical_c = f.manager.geometry(f.id_c).unwrap();
     assert!(canonical_a.loc.x < canonical_new.loc.x);
     assert!(canonical_new.loc.x < canonical_c.loc.x);
+    // Mid-height, so the gap before C is nearer than any window edge.
     f.manager
-        .pointer_motion(&mut f.comp.state, (pos.x + 950.0, pos.y).into(), 13);
+        .pointer_motion(&mut f.comp.state, (pos.x + 950.0, pos.y + 340.0).into(), 13);
     let center = |rect: smithay::utils::Rectangle<i32, Logical>| {
         f64::from(rect.loc.x) + f64::from(rect.size.w) / 2.0
     };
@@ -4712,8 +4716,11 @@ fn strip_reorder_preserves_unrelated_workspace_geometry_and_identity() {
     let other = f.manager.geometry(f.id_c).unwrap();
     let id_a = f.id_a;
     let pos = start_strip_drag(&mut f, id_a);
-    f.manager
-        .pointer_motion(&mut f.comp.state, (pos.x + 750.0, pos.y).into(), 12);
+    f.manager.pointer_motion(
+        &mut f.comp.state,
+        (pos.x + 1000.0, pos.y + 340.0).into(),
+        12,
+    );
     f.manager
         .pointer_button(&mut f.comp.state, BTN_LEFT, false, 13);
     assert_eq!(f.manager.geometry(f.id_c).unwrap(), other);
@@ -4887,8 +4894,11 @@ fn strip_pointer_width_and_order_survive_layout_round_trip() {
     let before_drag = strip_column_order(&f);
     let id_a = f.id_a;
     let pos = start_strip_drag(&mut f, id_a);
-    f.manager
-        .pointer_motion(&mut f.comp.state, (pos.x + 750.0, pos.y).into(), 24);
+    f.manager.pointer_motion(
+        &mut f.comp.state,
+        (pos.x + 1000.0, pos.y + 340.0).into(),
+        24,
+    );
     f.manager
         .pointer_button(&mut f.comp.state, BTN_LEFT, false, 25);
     release(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
@@ -4914,6 +4924,478 @@ fn strip_pointer_width_and_order_survive_layout_round_trip() {
         resized,
         "re-entering keeps the pointer-set column width"
     );
+}
+
+/// Press `keys` in order, then release them in reverse: one chord.
+fn chord3(f: &mut ThreeFixture, keys: &[u32]) {
+    for key in keys {
+        press(&mut f.manager, &mut f.comp, *key);
+    }
+    for key in keys.iter().rev() {
+        release(&mut f.manager, &mut f.comp, *key);
+    }
+}
+
+fn rects3(f: &ThreeFixture) -> [smithay::utils::Rectangle<i32, Logical>; 3] {
+    [f.id_a, f.id_b, f.id_c].map(|id| f.manager.geometry(id).unwrap())
+}
+
+fn client_of(f: &mut ThreeFixture, id: u64) -> &mut Client {
+    if id == f.id_a {
+        &mut f.client_a
+    } else if id == f.id_b {
+        &mut f.client_b
+    } else {
+        &mut f.client_c
+    }
+}
+
+/// Press on `id`'s drawn window at `at` inside it, then ask its own client
+/// for an xdg resize from `edge` with that genuine press serial.
+fn client_resize(
+    f: &mut ThreeFixture,
+    id: u64,
+    at: (i32, i32),
+    edge: wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge,
+) -> Point<f64, Logical> {
+    f.manager.set_motion_allowed(false);
+    assert!(!f.manager.step_strip_view(0.0));
+    let g = strip_drawn_geometry(&f.manager, id).unwrap();
+    let pos: Point<f64, Logical> = (f64::from(g.loc.x + at.0), f64::from(g.loc.y + at.1)).into();
+    f.manager.pointer_motion(&mut f.comp.state, pos, 20);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, true, 21);
+    sync_three(f);
+    let client = client_of(f, id);
+    let serial = client
+        .pointer_press_serial
+        .expect("actual pointer press serial");
+    client
+        .toplevel
+        .as_ref()
+        .unwrap()
+        .resize(client.seat.as_ref().unwrap(), serial, edge);
+    sync_three(f);
+    f.manager.reconcile(&mut f.comp.state);
+    pos
+}
+
+/// Ask `id`'s client for new xdg min/max sizes and let the strip see them.
+fn set_size_limits(f: &mut ThreeFixture, id: u64, min: (i32, i32), max: (i32, i32)) {
+    let client = client_of(f, id);
+    let toplevel = client.toplevel.as_ref().unwrap();
+    toplevel.set_min_size(min.0, min.1);
+    toplevel.set_max_size(max.0, max.1);
+    client.surface.as_ref().unwrap().commit();
+    sync_three(f);
+    f.manager.reconcile(&mut f.comp.state);
+}
+
+#[test]
+fn strip_consume_and_expel_follow_niri_columns_and_keep_widths() {
+    let mut f = three_windows();
+    f.manager.set_motion_allowed(false);
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    // Super+[ on the first column and Super+] on the last do nothing.
+    let rest = rects3(&f);
+    chord3(&mut f, &[SUPER_LEFT_KEYCODE, LEFT_BRACE_KEYCODE]);
+    assert_eq!(rects3(&f), rest);
+    // The column, not the window, owns the width: widen A's first.
+    chord3(&mut f, &[SUPER_LEFT_KEYCODE, R_KEYCODE]);
+    assert_eq!(f.manager.geometry(f.id_a).unwrap().size.w, 826);
+    f.manager.focus(&mut f.comp.state, Some(f.id_b));
+    clear_three(&mut f);
+
+    // A lone B joins the bottom of the column on its left; the column's
+    // free height is shared evenly (two automatic heights).
+    chord3(&mut f, &[SUPER_LEFT_KEYCODE, LEFT_BRACE_KEYCODE]);
+    let [a, b, c] = rects3(&f);
+    assert_eq!((b.loc.x, b.size.w), (a.loc.x, 826));
+    assert_eq!((a.loc.y, a.size.h), (48, 360));
+    assert_eq!((b.loc.y, b.size.h), (48 + 360 + 16, 360));
+    assert_eq!(
+        c.loc.x,
+        a.loc.x + 826 + 16,
+        "C closes ranks behind the column"
+    );
+    assert_eq!(f.manager.model().focused(), Some(f.id_b));
+    pump(&mut f.comp, &mut f.queue_b, &mut f.client_b, |c| {
+        c.configure_sizes.last() == Some(&(826, 360))
+    });
+
+    // Up/Down move focus inside the shared column; Shift moves B up.
+    chord3(&mut f, &[SUPER_LEFT_KEYCODE, ARROW_UP_KEYCODE]);
+    assert_eq!(f.manager.model().focused(), Some(f.id_a));
+    chord3(&mut f, &[SUPER_LEFT_KEYCODE, ARROW_DOWN_KEYCODE]);
+    assert_eq!(f.manager.model().focused(), Some(f.id_b));
+    chord3(
+        &mut f,
+        &[SUPER_LEFT_KEYCODE, SHIFT_LEFT_KEYCODE, ARROW_UP_KEYCODE],
+    );
+    let [a, b, _] = rects3(&f);
+    assert_eq!((b.loc.y, a.loc.y), (48, 48 + 360 + 16));
+    assert_eq!(f.manager.model().focused(), Some(f.id_b));
+
+    // A shared B leaves for a new column on its right with the width of
+    // the column it left; A is alone and full height again.
+    chord3(&mut f, &[SUPER_LEFT_KEYCODE, RIGHT_BRACE_KEYCODE]);
+    let [a, b, c] = rects3(&f);
+    assert_eq!((a.loc.y, a.size.h), (48, 736));
+    assert_eq!((b.loc.x, b.size.w), (a.loc.x + 826 + 16, 826));
+    assert_eq!((b.loc.y, b.size.h), (48, 736));
+    assert_eq!(c.loc.x, b.loc.x + 826 + 16);
+    assert_eq!(f.manager.model().focused(), Some(f.id_b));
+
+    // Super+, from A takes the next column's top window; Super+. sends
+    // the bottom one back out, focus staying in the source column.
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    chord3(&mut f, &[SUPER_LEFT_KEYCODE, COMMA_KEYCODE]);
+    let [a, b, _] = rects3(&f);
+    assert_eq!((b.loc.x, b.loc.y), (a.loc.x, 48 + 360 + 16));
+    f.manager.focus(&mut f.comp.state, Some(f.id_b));
+    chord3(&mut f, &[SUPER_LEFT_KEYCODE, DOT_KEYCODE]);
+    let [a, b, _] = rects3(&f);
+    assert_eq!(a.size.h, 736);
+    assert_eq!(b.loc.x, a.loc.x + 826 + 16);
+    assert_eq!(
+        f.manager.model().focused(),
+        Some(f.id_a),
+        "expelling the focused bottom window keeps focus in its column"
+    );
+
+    sync_three(&mut f);
+    for client in [&f.client_a, &f.client_b, &f.client_c] {
+        assert!(
+            !client.keys.iter().any(|(key, pressed)| *pressed
+                && [
+                    LEFT_BRACE_KEYCODE,
+                    RIGHT_BRACE_KEYCODE,
+                    COMMA_KEYCODE,
+                    DOT_KEYCODE
+                ]
+                .contains(key)),
+            "column chords must be consumed: {:?}",
+            client.keys
+        );
+    }
+}
+
+#[test]
+fn gnome_mode_forwards_column_chords_untouched() {
+    let mut f = three_windows();
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    let before = rects3(&f);
+    clear_three(&mut f);
+    chord3(&mut f, &[SUPER_LEFT_KEYCODE, LEFT_BRACE_KEYCODE]);
+    sync_three(&mut f);
+    assert_eq!(rects3(&f), before);
+    assert!(f.client_a.keys.contains(&(LEFT_BRACE_KEYCODE, true)));
+}
+
+#[test]
+fn strip_columns_honour_client_min_and_max_sizes() {
+    let mut f = three_windows();
+    let id_a = f.id_a;
+    set_size_limits(&mut f, id_a, (0, 500), (0, 0));
+    f.manager.set_motion_allowed(false);
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_b));
+    chord3(&mut f, &[SUPER_LEFT_KEYCODE, LEFT_BRACE_KEYCODE]);
+    // A's 500px minimum beats an even split; B takes the rest.
+    let [a, b, _] = rects3(&f);
+    assert_eq!(a.size.h, 500);
+    assert_eq!((b.loc.y, b.size.h), (48 + 500 + 16, 736 - 500 - 16));
+
+    // A column never gets narrower than its client allows or wider than
+    // it asks for; a conflicting minimum wins.
+    let id_c = f.id_c;
+    set_size_limits(&mut f, id_c, (0, 0), (400, 0));
+    assert_eq!(f.manager.geometry(f.id_c).unwrap().size.w, 400);
+    set_size_limits(&mut f, id_c, (700, 0), (400, 0));
+    assert_eq!(f.manager.geometry(f.id_c).unwrap().size.w, 700);
+    set_size_limits(&mut f, id_c, (0, 0), (0, 0));
+    assert_eq!(f.manager.geometry(f.id_c).unwrap().size.w, 616);
+
+    // A lone window with an exact height keeps it (niri's fixed-size rule).
+    set_size_limits(&mut f, id_c, (0, 300), (0, 300));
+    assert_eq!(f.manager.geometry(f.id_c).unwrap().size.h, 300);
+}
+
+#[test]
+fn strip_window_height_resize_inside_column_commits_and_cancels() {
+    use wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge;
+    let mut f = three_windows();
+    f.manager.set_motion_allowed(false);
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_b));
+    chord3(&mut f, &[SUPER_LEFT_KEYCODE, LEFT_BRACE_KEYCODE]);
+    let even = rects3(&f);
+    assert_eq!((even[0].size.h, even[1].size.h), (360, 360));
+
+    // Dragging B's top edge up grows B and shrinks A, width untouched.
+    let id_b = f.id_b;
+    let pos = client_resize(&mut f, id_b, (100, 100), ResizeEdge::Top);
+    assert!(f.manager.grab_active());
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x + 30.0, pos.y - 100.0).into(), 22);
+    let [a, b, _] = rects3(&f);
+    assert_eq!((a.size.h, b.size.h), (260, 460));
+    assert_eq!(b.loc.y, 48 + 260 + 16);
+    assert_eq!(b.size.w, even[1].size.w, "a vertical edge leaves the width");
+    pump(&mut f.comp, &mut f.queue_b, &mut f.client_b, |c| {
+        c.configure_sizes.last() == Some(&(616, 460))
+    });
+    // Escape restores every height of the column.
+    press(&mut f.manager, &mut f.comp, ESCAPE_KEYCODE);
+    assert!(!f.manager.grab_active());
+    assert_eq!(rects3(&f), even);
+    release(&mut f.manager, &mut f.comp, ESCAPE_KEYCODE);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 23);
+
+    // The column's top edge is no window boundary: nothing to resize.
+    let id_a = f.id_a;
+    client_resize(&mut f, id_a, (100, 100), ResizeEdge::Top);
+    assert!(!f.manager.grab_active());
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 24);
+
+    // A's bottom edge commits on release and keeps B's automatic share.
+    let pos = client_resize(&mut f, id_a, (100, 300), ResizeEdge::Bottom);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x, pos.y + 80.0).into(), 25);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 26);
+    assert!(!f.manager.grab_active());
+    let [a, b, _] = rects3(&f);
+    assert_eq!((a.size.h, b.size.h), (440, 280));
+    // Pulling past what B's height minimum allows stops there.
+    set_size_limits(&mut f, id_b, (0, 200), (0, 0));
+    let pos = client_resize(&mut f, id_a, (100, 300), ResizeEdge::Bottom);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x, pos.y + 300.0).into(), 27);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 28);
+    let [a, b, _] = rects3(&f);
+    assert_eq!((a.size.h, b.size.h), (720 - 200, 200));
+
+    // Back alone, A is full height and its vertical edges stay inert.
+    f.manager.focus(&mut f.comp.state, Some(f.id_b));
+    chord3(&mut f, &[SUPER_LEFT_KEYCODE, RIGHT_BRACE_KEYCODE]);
+    assert_eq!(f.manager.geometry(f.id_a).unwrap().size.h, 736);
+    client_resize(&mut f, id_a, (100, 300), ResizeEdge::Bottom);
+    assert!(!f.manager.grab_active());
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 29);
+}
+
+#[test]
+fn strip_modifier_resize_button_resizes_from_window_thirds() {
+    const BTN_RIGHT: u32 = BTN_LEFT + 1;
+    const BTN_MIDDLE: u32 = BTN_LEFT + 2;
+    let mut f = three_windows();
+    f.manager.set_motion_allowed(false);
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    assert!(!f.manager.step_strip_view(0.0));
+    let a = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    clear_three(&mut f);
+    sync_three(&mut f);
+    f.client_a.pointer_buttons.clear();
+    let _ = f.manager.take_menu_requests();
+
+    // GNOME 51's defaults: Super with the middle button resizes. Right
+    // third: the column's right edge follows the pointer.
+    let right: Point<f64, Logical> = (
+        f64::from(a.loc.x + a.size.w - 40),
+        f64::from(a.loc.y + a.size.h / 2),
+    )
+        .into();
+    f.manager.pointer_motion(&mut f.comp.state, right, 30);
+    press(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_MIDDLE, true, 31);
+    assert!(f.manager.grab_active());
+    f.manager
+        .pointer_motion(&mut f.comp.state, (right.x + 50.0, right.y).into(), 32);
+    assert_eq!(f.manager.geometry(f.id_a).unwrap().size.w, a.size.w + 50);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_MIDDLE, false, 33);
+    assert!(!f.manager.grab_active());
+    assert_eq!(f.manager.geometry(f.id_a).unwrap().size.w, a.size.w + 50);
+
+    // Middle third: an ordinary click for the client, no grab; Super with
+    // the right button is GNOME's window menu.
+    let a = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    let middle: Point<f64, Logical> = (
+        f64::from(a.loc.x + a.size.w / 2),
+        f64::from(a.loc.y + a.size.h / 2),
+    )
+        .into();
+    f.manager.pointer_motion(&mut f.comp.state, middle, 34);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_MIDDLE, true, 35);
+    assert!(!f.manager.grab_active());
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_MIDDLE, false, 36);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_RIGHT, true, 37);
+    assert!(!f.manager.grab_active());
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_RIGHT, false, 38);
+    release(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
+    sync_three(&mut f);
+    assert_eq!(
+        f.client_a.pointer_buttons,
+        vec![(BTN_MIDDLE, true), (BTN_MIDDLE, false)],
+        "the resize and menu presses are swallowed, the middle click delivered"
+    );
+    assert_eq!(
+        f.manager.take_menu_requests(),
+        vec![(f.id_a, middle.x as i32, middle.y as i32)]
+    );
+
+    // An Alt modifier with resize-with-right-button: Alt with the right
+    // button on the bottom third of A sharing a column moves its bottom.
+    f.manager.focus(&mut f.comp.state, Some(f.id_b));
+    chord3(&mut f, &[SUPER_LEFT_KEYCODE, LEFT_BRACE_KEYCODE]);
+    assert!(!f.manager.step_strip_view(0.0));
+    f.manager.set_focus_policy(FocusPolicy {
+        modifier: tuna_shell_control::MOD_ALT,
+        resize_with_right_button: true,
+        ..FocusPolicy::default()
+    });
+    let a = strip_drawn_geometry(&f.manager, f.id_a).unwrap();
+    assert_eq!(a.size.h, 360);
+    let bottom: Point<f64, Logical> = (
+        f64::from(a.loc.x + a.size.w / 2),
+        f64::from(a.loc.y + a.size.h - 30),
+    )
+        .into();
+    f.manager.pointer_motion(&mut f.comp.state, bottom, 39);
+    press(&mut f.manager, &mut f.comp, ALT_LEFT_KEYCODE);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_RIGHT, true, 40);
+    assert!(f.manager.grab_active());
+    f.manager
+        .pointer_motion(&mut f.comp.state, (bottom.x, bottom.y + 60.0).into(), 41);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_RIGHT, false, 42);
+    release(&mut f.manager, &mut f.comp, ALT_LEFT_KEYCODE);
+    let [a, b, _] = rects3(&f);
+    assert_eq!((a.size.h, b.size.h), (420, 300));
+}
+
+#[test]
+fn strip_drop_joins_a_column_near_a_window_edge_and_a_gap_near_a_column_edge() {
+    let mut f = three_windows();
+    f.manager.set_motion_allowed(false);
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    assert!(!f.manager.step_strip_view(0.0));
+    let b = strip_drawn_geometry(&f.manager, f.id_b).unwrap();
+    let id_a = f.id_a;
+    start_strip_drag(&mut f, id_a);
+    // A third into B, 10px below its top: B's top edge (18px away, aiming
+    // at the gap's middle) is nearer than either column edge.
+    f.manager.pointer_motion(
+        &mut f.comp.state,
+        (f64::from(b.loc.x + b.size.w / 3), f64::from(b.loc.y + 10)).into(),
+        12,
+    );
+    let (owner, bar) = f.manager.tile_preview(&f.comp.state).unwrap();
+    assert_eq!(owner, f.id_a);
+    assert_eq!(
+        (bar.loc.x, bar.loc.y, bar.size.w, bar.size.h),
+        (b.loc.x, b.loc.y - 8 - 4, b.size.w, 8),
+        "a horizontal bar across B's column, in the gap above B"
+    );
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 13);
+    release(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
+    let [a, b, c] = rects3(&f);
+    assert_eq!((a.loc.x, a.size.w), (b.loc.x, b.size.w));
+    assert_eq!((a.loc.y, a.size.h), (48, 360));
+    assert_eq!(b.loc.y, 48 + 360 + 16);
+    assert_eq!(c.loc.x, a.loc.x + 616 + 16);
+
+    // Narrow the shared column, then drag A out past C's middle at
+    // mid-height: the gap after C is nearest, a new column lands there
+    // and takes the width of the column A left.
+    chord3(&mut f, &[SUPER_LEFT_KEYCODE, SHIFT_LEFT_KEYCODE, R_KEYCODE]);
+    assert!(!f.manager.step_strip_view(0.0));
+    let [a, _, _] = rects3(&f);
+    assert_eq!(a.size.w, 405);
+    let c = strip_drawn_geometry(&f.manager, f.id_c).unwrap();
+    start_strip_drag(&mut f, id_a);
+    f.manager.pointer_motion(
+        &mut f.comp.state,
+        (f64::from(c.loc.x + c.size.w * 3 / 4), 400.0).into(),
+        14,
+    );
+    let (_, bar) = f.manager.tile_preview(&f.comp.state).unwrap();
+    assert_eq!(
+        (bar.loc.x, bar.size.w),
+        (c.loc.x + c.size.w + 16 - 4, 8),
+        "an upright bar in the gap after C"
+    );
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 15);
+    release(&mut f.manager, &mut f.comp, SUPER_LEFT_KEYCODE);
+    let [a, b, c] = rects3(&f);
+    assert_eq!((b.loc.y, b.size.h), (48, 736), "B is alone again");
+    assert_eq!(c.loc.x, b.loc.x + 405 + 16);
+    assert_eq!((a.loc.x, a.size.w), (c.loc.x + 616 + 16, 405));
+    assert_eq!((a.loc.y, a.size.h), (48, 736));
+}
+
+#[test]
+fn strip_columns_and_heights_survive_mode_round_trip_close_and_workspace_move() {
+    use wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge;
+    let mut f = three_windows();
+    let floating = rects3(&f);
+    f.manager.set_motion_allowed(false);
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_b));
+    chord3(&mut f, &[SUPER_LEFT_KEYCODE, LEFT_BRACE_KEYCODE]);
+    let id_b = f.id_b;
+    let pos = client_resize(&mut f, id_b, (100, 100), ResizeEdge::Top);
+    f.manager
+        .pointer_motion(&mut f.comp.state, (pos.x, pos.y - 60.0).into(), 50);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 51);
+    let column = rects3(&f);
+    assert_eq!((column[0].size.h, column[1].size.h), (300, 420));
+
+    f.manager.set_scroll(&mut f.comp.state, false);
+    assert_eq!(rects3(&f), floating, "floating rectangles restore exactly");
+    f.manager.set_scroll(&mut f.comp.state, true);
+    f.manager.focus(&mut f.comp.state, Some(f.id_b));
+    assert_eq!(rects3(&f), column, "columns and heights come back");
+
+    // Moving B to another workspace takes it out of the column.
+    assert!(f.manager.move_to_workspace(&mut f.comp.state, f.id_b, 1));
+    f.manager.focus(&mut f.comp.state, Some(f.id_a));
+    let a = f.manager.geometry(f.id_a).unwrap();
+    assert_eq!((a.loc.y, a.size.h), (48, 736));
+    f.manager.switch_workspace(&mut f.comp.state, 1);
+    let b = f.manager.geometry(f.id_b).unwrap();
+    assert_eq!((b.loc.y, b.size.h), (48, 736));
+    f.manager.switch_workspace(&mut f.comp.state, 0);
+
+    // Closing one window of a shared column leaves the other full height.
+    f.manager.focus(&mut f.comp.state, Some(f.id_c));
+    chord3(&mut f, &[SUPER_LEFT_KEYCODE, LEFT_BRACE_KEYCODE]);
+    assert_eq!(f.manager.geometry(f.id_c).unwrap().size.h, 360);
+    f.client_c.toplevel.as_ref().unwrap().destroy();
+    f.client_c.xdg_surface.as_ref().unwrap().destroy();
+    f.client_c.surface.as_ref().unwrap().destroy();
+    sync_three(&mut f);
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(f.manager.geometry(f.id_c).is_none());
+    let a = f.manager.geometry(f.id_a).unwrap();
+    assert_eq!((a.loc.y, a.size.h), (48, 736));
 }
 
 #[test]

@@ -242,6 +242,60 @@ def gap_after_move(gap, step):
     return -gap if after == 0 else after
 
 
+STRIP_GAP = 16
+
+
+def remaining_columns(sample, found, mover):
+    """Actual strip columns of the mover's workspace without the mover.
+
+    Left to right, each column's rectangles top to bottom: what the
+    compositor's drop target reads while the mover is lifted."""
+    lifted = found[mover]
+    columns = {}
+    for window in sample['inventory']['state']['windows']:
+        if window.get('workspace') != lifted.get('workspace') or window['id'] == lifted['id']:
+            continue
+        columns.setdefault(window['rect'][0], []).append(window['rect'])
+    return [sorted(tiles, key=lambda rect: rect[1]) for _, tiles in sorted(columns.items())]
+
+
+def drop_slot(sample, found, mover, target):
+    """Index of `target`'s column among the mover's remaining columns."""
+    starts = [tiles[0][0] for tiles in remaining_columns(sample, found, mover)]
+    return starts.index(found[target]['rect'][0])
+
+
+def strip_insert(columns, x, y, *, gap=STRIP_GAP):
+    """niri 26.04 `insert_position`, as the compositor applies it to a strip drop.
+
+    Aiming at the middle of a gap, the nearest column boundary (a column's
+    left edge, or the gap past its right edge) names a new column slot,
+    unless the pointer is over a column and nearer one of its window
+    boundaries, which joins that column: ('column', slot) or
+    ('tile', column, index)."""
+    x, y = x + gap / 2, y + gap / 2
+    nearest = over = None
+    for index, tiles in enumerate(columns):
+        left = tiles[0][0]
+        right = left + tiles[0][2] + gap
+        for edge, slot in ((left, index), (right, index + 1)):
+            if nearest is None or abs(edge - x) < nearest[0]:
+                nearest = (abs(edge - x), slot)
+        if left <= x < right:
+            over = index
+    if nearest is None:
+        return ('column', 0)
+    if over is not None:
+        inside = None
+        for index, (_, top, _, height) in enumerate(columns[over]):
+            for edge, slot in ((top, index), (top + height + gap, index + 1)):
+                if inside is None or abs(edge - y) < inside[0]:
+                    inside = (abs(edge - y), slot)
+        if inside is not None and nearest[0] > inside[0]:
+            return ('tile', over, inside[1])
+    return ('column', nearest[1])
+
+
 def colored_frame(image, rect, color):
     """Strict actual viewport pixels; never accept a model rectangle alone."""
     width, height, pixels = image
@@ -567,17 +621,30 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         button(False)
         resized = ready('scroll', extra=lambda sample, found: found['alpha']['rect'][2] == rect[2] + delta)
         capture('05-pointer-width', resized)
-        # Reorder via actual custom titlebar Gdk begin_move. Select the
-        # current visible Beta center, using the real observed slot geometry.
+        # Reorder via actual custom titlebar Gdk begin_move. The compositor
+        # drops at the column boundary nearest the pointer (niri insert
+        # position), so carry the press to the middle height of Beta's right
+        # quarter: the gap after Beta, not Beta's top edge, is nearest.
         current = windows(resized, original, edge=edge)
         alpha, beta = current['alpha']['rect'], current['beta']['rect']
         origin_x, origin_y = alpha[0] + 24, alpha[1] + 20
-        target_x = min(1260, beta[0] + beta[2] // 2 + 30)
+        target_x = min(1260, beta[0] + 3 * beta[2] // 4)
+        target_y = alpha[1] + alpha[3] // 2
+        after = drop_slot(resized, current, 'alpha', 'beta') + 1
+        if strip_insert(remaining_columns(resized, current, 'alpha'), target_x, target_y) != ('column', after):
+            raise RuntimeError('actual reorder target is not the gap after Beta')
         move(origin_x, origin_y)
         button(True)
         move(origin_x + 12, origin_y)
         dragging = ready('scroll', extra=lambda sample, found: (sample['fixture']['windows']['alpha']['move_requests'] > resized['fixture']['windows']['alpha']['move_requests'] and (sample['inventory']['state']['tile_preview'] or {}).get('window') == found['alpha']['id']))
-        move(target_x, origin_y)
+        move(target_x, target_y)
+        def after_beta(sample, found):
+            preview = sample['inventory']['state']['tile_preview'] or {}
+            bar = preview.get('rect', [])
+            beta_now = found['beta']['rect']
+            return (preview.get('window') == found['alpha']['id'] and len(bar) == 4
+                    and bar[2] == 8 and bar[0] == beta_now[0] + beta_now[2] + STRIP_GAP - 4)
+        ready('scroll', extra=after_beta)
         # A real second button must not replace the initiating owner.
         button(True, 'right')
         button(False, 'right')
@@ -590,18 +657,21 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         before_cancel = windows(reordered, original, edge=edge)
         rect = before_cancel['alpha']['rect']
         beta_rect = before_cancel['beta']['rect']
-        # Grab near the visible right side, so an actual in-viewport motion
-        # can move the actor center left of Beta's center even for a wide A.
+        # Grab near the visible right side of the title; then carry the
+        # pointer to the middle height of Beta's left quarter, where the gap
+        # before Beta is the nearest boundary.
         grab_x = min(1250, rect[0] + rect[2] - 24)
         if not rect[0] < grab_x < rect[0] + rect[2]:
             raise RuntimeError('actual cancellation title target is not visible')
-        grab_offset = grab_x - rect[0]
-        target_x = max(20, min(1260, beta_rect[0] + beta_rect[2] // 2 - 48 - rect[2] // 2 + grab_offset))
+        target_x = max(20, beta_rect[0] + beta_rect[2] // 4)
+        target_y = rect[1] + rect[3] // 2
+        if strip_insert(remaining_columns(reordered, before_cancel, 'alpha'), target_x, target_y) != ('column', drop_slot(reordered, before_cancel, 'alpha', 'beta')):
+            raise RuntimeError('actual cancellation target is not the gap before Beta')
         move(grab_x, rect[1] + 20)
         button(True)
         move(grab_x - 12, rect[1] + 20)
         ready('scroll', extra=lambda sample, found: (sample['inventory']['state']['tile_preview'] or {}).get('window') == found['alpha']['id'])
-        move(target_x, rect[1] + 20)
+        move(target_x, target_y)
         def before_beta(sample, found):
             preview = sample['inventory']['state']['tile_preview'] or {}
             bar = preview.get('rect', [])
@@ -646,7 +716,9 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         grab_x = min(1250, rect[0] + rect[2] - 24)
         if not max(rect[0], 0) < grab_x < rect[0] + rect[2] - 16:
             raise RuntimeError('actual Super drag body target left the viewport')
-        target_x = max(20, min(1260, beta_rect[0] + beta_rect[2] // 2 - 48 - rect[2] // 2 + grab_x - rect[0]))
+        target_x = max(20, beta_rect[0] + beta_rect[2] // 4)
+        if strip_insert(remaining_columns(clicked, current, 'alpha'), target_x, grab_y) != ('column', drop_slot(clicked, current, 'alpha', 'beta')):
+            raise RuntimeError('actual Super drag target is not the gap before Beta')
         move(grab_x, grab_y)
         clicked_counts = clicked['fixture']['windows']['alpha']
         def unclaimed(sample):
@@ -693,6 +765,56 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         if {role: item['rect'][2:] for role, item in windows(returned, original, edge=edge).items()} != {role: item['rect'][2:] for role, item in current.items()}:
             raise RuntimeError('Super drag reorder changed actual column sizes')
         capture('08-super-drag-reorder', returned)
+        # niri's column chords on actual keys. Super+] puts the lone, focused
+        # Alpha at the bottom of Beta's column (Beta's width), the two
+        # sharing its height evenly.
+        lone = windows(returned, original, edge=edge)
+        full = lone['alpha']['rect'][3]
+        if (lone['alpha']['rect'][0] >= lone['beta']['rect'][0]
+                or returned['inventory']['state']['focused'] != lone['alpha']['id']):
+            raise RuntimeError('consume control is not a focused Alpha left of Beta')
+        chord('meta_l', 'bracket_right')
+        def shared(sample, found):
+            alpha, beta = found['alpha']['rect'], found['beta']['rect']
+            return (alpha[0] == beta[0] and alpha[2] == beta[2] == lone['beta']['rect'][2]
+                    and beta[1] == lone['beta']['rect'][1]
+                    and alpha[1] == beta[1] + beta[3] + STRIP_GAP
+                    and beta[3] + STRIP_GAP + alpha[3] == full and abs(alpha[3] - beta[3]) <= 1
+                    and sample['inventory']['state']['focused'] == found['alpha']['id'])
+        consumed = ready('scroll', returned, extra=shared)
+        capture('09-column-consume', consumed)
+        # Real GTK bottom-right grip of the top window (Beta): its bottom
+        # edge is the boundary inside the column, so dragging it up gives
+        # Beta a fixed height and Alpha the rest (niri set-window-height).
+        stacked = windows(consumed, original, edge=edge)
+        top, below = stacked['beta']['rect'], stacked['alpha']['rect']
+        x, y = top[0] + top[2] - 6, top[1] + top[3] - 6
+        move(x, y)
+        button(True)
+        grip = ready('scroll', extra=lambda sample, found: sample['fixture']['windows']['beta']['resize_requests'] > consumed['fixture']['windows']['beta']['resize_requests'])
+        move(x, y - 12)
+        move(x, y - 60)
+        def heights_moved(sample, found):
+            alpha, beta = found['alpha']['rect'], found['beta']['rect']
+            return (beta[3] == top[3] - 60 and beta[1] == top[1] and beta[2] == top[2]
+                    and alpha[1] == below[1] - 60 and alpha[3] == below[3] + 60
+                    and alpha[0] == beta[0] and alpha[2] == beta[2])
+        ready('scroll', grip, extra=heights_moved)
+        button(False)
+        heights = ready('scroll', extra=heights_moved)
+        capture('10-column-height', heights, 'beta')
+        # Super+] on the shared, focused Beta expels it into a new column on
+        # the right with the column's width; both are full height again.
+        if heights['inventory']['state']['focused'] != stacked['beta']['id']:
+            raise RuntimeError('expel control is not the focused Beta')
+        chord('meta_l', 'bracket_right')
+        def apart(sample, found):
+            alpha, beta = found['alpha']['rect'], found['beta']['rect']
+            return (alpha[1] == beta[1] == top[1] and alpha[3] == beta[3] == full
+                    and beta[0] == alpha[0] + alpha[2] + STRIP_GAP and alpha[2] == beta[2] == top[2]
+                    and sample['inventory']['state']['focused'] == found['beta']['id'])
+        returned = ready('scroll', heights, extra=apart)
+        capture('11-column-expel', returned, 'beta')
         if edge:
             before_edge = returned
             before_found = windows(before_edge, original, edge=True)
@@ -700,6 +822,15 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
             move(rect[0] + 24, rect[1] + 20)
             button(True)
             move(rect[0] + 36, rect[1] + 20)
+            # The virtual tablet reports position and buttons together: a
+            # motion queued behind a press the guest has not read yet carries
+            # the press along. Run 40891830621 pressed at x=1278.9, past every
+            # window, so no drag began. See Alpha's titlebar drag own the
+            # pointer before the edge motion.
+            ready('scroll', extra=lambda sample, found: (
+                sample['fixture']['windows']['alpha']['move_requests']
+                > before_edge['fixture']['windows']['alpha']['move_requests']
+                and (sample['inventory']['state']['tile_preview'] or {}).get('window') == found['alpha']['id']))
             # ONE movement into the band; the following observer has no input
             # capability and cannot repeatedly drive the viewport itself.
             move(1279, rect[1] + 20)
@@ -708,7 +839,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
             receipt['stationary_edge'] = {'observations': observations,
                 'stationary_input_verified': True, 'sampled_not_every_frame': True,
                 'presented_latency_qualified': False}
-            capture('09-stationary-delta-revealed', terminal, 'delta')
+            capture('12-stationary-delta-revealed', terminal, 'delta')
             final = windows(terminal, original, edge=True)
             bar = terminal['inventory']['state']['tile_preview']['rect']
             delta_rect = final['delta']['rect']
@@ -718,14 +849,14 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
             returned = ready('scroll', terminal, extra=lambda sample, found:
                 sample['inventory']['state']['tile_preview'] is None and
                 found['alpha']['rect'][0] > found['delta']['rect'][0])
-            capture('10-stationary-matching-release', returned)
+            capture('13-stationary-matching-release', returned)
         chord('meta_l', 'shift', 't')
         restored = ready('gnome', returned)
         if {w['id']: w['workspace'] for w in restored['inventory']['state']['windows']} != initial_ids:
             raise RuntimeError('mode restore changed actual native identities')
         if {w['id']: w['rect'] for w in restored['inventory']['state']['windows']} != initial_rects:
             raise RuntimeError('mode restore lost independent floating rectangles')
-        capture('11-floating-restored' if edge else '09-floating-restored', restored)
+        capture('14-floating-restored' if edge else '12-floating-restored', restored)
         if time.monotonic() >= deadline:
             raise TimeoutError('installed strip completion exceeded absolute deadline')
         receipt['completed'] = True

@@ -54,6 +54,13 @@ bridge yet.
 | Alt+F4 | Ask the focused window to close |
 | Super+Shift+T | Flip floating / strip session mode |
 | Super+R / Super+Shift+R | Step the focused column through width presets (strip mode) |
+| Super+Left / Super+Right | Strip mode: focus the column left / right (plus Shift: move the column) |
+| Super+Up / Super+Down | Strip mode, in a shared column: focus the window above / below (plus Shift: move it); a lone window keeps the gnome meaning above |
+| Super+[ / Super+] | Strip mode: a lone window joins the bottom of the column on that side; a window sharing a column leaves it for a new column on that side (niri `consume-or-expel-window-left/right`) |
+| Super+, / Super+. | Strip mode: take the next column's top window into the focused column / send its bottom window out to a new column on the right (niri `consume-window-into-column` / `expel-window-from-column`) |
+| Super+left-drag | Move a window; in strip mode drop it at the nearest column gap, or into a column at the nearest window edge. The modifier follows `mouse-button-modifier` |
+| Super+middle-drag | Resize from the edges of the window third under the pointer; its middle third is a plain click. Strip mode: the column width, or the window's height inside a shared column. Right instead of middle with `resize-with-right-button` |
+| Super+right-click | GNOME's window menu, in both modes. Middle instead of right with `resize-with-right-button` |
 
 ## GTK shell: top bar, menus, overview
 

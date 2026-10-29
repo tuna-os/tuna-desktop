@@ -98,11 +98,14 @@ struct ManagedWindow {
     /// on leaving floating, cleared by manual move/resize (a fresh
     /// start, GNOME shape).
     restore: Option<Rectangle<i32, Logical>>,
-    /// Strip width-preset slot (`STRIP_PRESETS` index) chosen with
-    /// Super+R; `None` means the default. Survives mode toggles.
-    preset: Option<usize>,
-    /// Pointer-resized logical width; preset cycling clears it.
-    strip_fixed_width: Option<i32>,
+    /// Strip column this window belongs to (niri `Column`). Columns
+    /// group same-workspace windows; a fresh window opens its own.
+    /// Survives mode toggles, so leaving and re-entering the strip
+    /// keeps every column.
+    strip_column: u64,
+    /// This window's height inside its strip column (niri
+    /// `WindowHeight`). A single-window column is always full height.
+    strip_height: TileHeight,
     /// Not placed yet: the client picks its own size from an empty
     /// configure and is placed at that size on its first commit, as
     /// Mutter does.
@@ -197,11 +200,13 @@ enum PointerGrab {
     },
     StripResize {
         owner: StripPointer,
+        /// Effective edges: horizontal only when one side moves, vertical
+        /// only where niri resizes a window height inside its column.
         edges: u32,
         pointer_start: Point<f64, Logical>,
         width_start: i32,
-        fixed_start: Option<i32>,
-        preset_start: Option<usize>,
+        width_before: ColumnWidth,
+        height_start: i32,
     },
     /// Move: the window follows the pointer from where the drag began.
     Move {
@@ -226,6 +231,50 @@ struct StripPointer {
     workspace: u32,
     work: Rectangle<i32, Logical>,
     offset: f64,
+}
+
+/// One strip column's width choice (niri `ColumnWidth`): a Super+R preset
+/// slot (`None` is the default) or a pointer-resized fixed width, which
+/// preset cycling clears.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct ColumnWidth {
+    preset: Option<usize>,
+    fixed: Option<i32>,
+}
+
+/// A client's minimum and maximum window size (zero: unconstrained).
+type SizeHints = (Size<i32, Logical>, Size<i32, Logical>);
+
+/// A window's height inside its strip column (niri `WindowHeight`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TileHeight {
+    /// Shares the column's free height in proportion to its weight.
+    Auto { weight: f64 },
+    /// A fixed logical window height, set by an interactive resize.
+    Fixed(i32),
+}
+
+impl TileHeight {
+    const AUTO: Self = Self::Auto { weight: 1.0 };
+}
+
+/// Where a dragged strip window lands (niri `InsertPosition`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StripInsert {
+    /// A new column at this index among the remaining columns.
+    Column(usize),
+    /// Into remaining column `column`, before its tile `tile`.
+    Tile { column: usize, tile: usize },
+}
+
+/// One laid-out strip column: its id, screen x (view offset applied),
+/// width, and each member's y and height.
+#[derive(Debug, Clone, PartialEq)]
+struct StripColumnLayout {
+    column: u64,
+    x: i32,
+    width: i32,
+    tiles: Vec<(u64, i32, i32)>,
 }
 
 /// xdg_toplevel ResizeEdge bits.
@@ -405,6 +454,18 @@ pub struct WindowManager {
     strip_edge_direction: i8,
     strip_edge_elapsed: f64,
     strip_edge_first_frame: bool,
+    /// Width choice per strip column ([`ManagedWindow::strip_column`]):
+    /// Super+R preset slot or a pointer-resized fixed width. Columns
+    /// with no member left drop their entry.
+    strip_widths: HashMap<u64, ColumnWidth>,
+    /// Last strip column id handed out.
+    next_strip_column: u64,
+    /// Tile heights of the column under a direct strip resize, for
+    /// cancellation (the grab itself stays `Copy`).
+    strip_resize_heights: Vec<(u64, TileHeight)>,
+    /// Client size limits the strip was last laid out with: a client
+    /// changing them re-sizes its column (niri `update_window`).
+    strip_hints: HashMap<u64, SizeHints>,
     /// GNOME's workspace switch motion, stepped by the runtime once a
     /// frame. Only render positions use it.
     workspace_slide: crate::workspace_slide::WorkspaceSlide,
@@ -664,6 +725,10 @@ impl WindowManager {
             strip_edge_direction: 0,
             strip_edge_elapsed: 0.0,
             strip_edge_first_frame: false,
+            strip_widths: HashMap::new(),
+            next_strip_column: 0,
+            strip_resize_heights: Vec::new(),
+            strip_hints: HashMap::new(),
             workspace_slide: Default::default(),
             super_held: false,
             // add_keyboard below: 200 ms delay, 200 keys/s.
@@ -1465,6 +1530,7 @@ impl WindowManager {
             window.surface.on_commit();
         }
         self.place_committed(state);
+        self.refresh_strip_hints(state);
         self.refresh_workspace_affinity(state);
         // Focus tracks the active workspace: a model-level switch (e.g.
         // shell FocusWorkspace) that strands focus on a hidden window
@@ -1613,6 +1679,7 @@ impl WindowManager {
         // With a real output the client chooses its size first (Mutter's
         // empty initial configure); headless tests keep the cascade.
         let unplaced = Self::work_area(state).size.w > 0;
+        let strip_column = self.alloc_strip_column();
         self.windows.insert(
             id,
             ManagedWindow {
@@ -1620,8 +1687,8 @@ impl WindowManager {
                 geometry,
                 layout: WindowLayout::Floating,
                 restore: None,
-                preset: None,
-                strip_fixed_width: None,
+                strip_column,
+                strip_height: TileHeight::AUTO,
                 unplaced,
                 minimized: false,
                 above: false,
@@ -1852,6 +1919,7 @@ impl WindowManager {
             Some(WmWindowType::Dialog | WmWindowType::Splash)
         );
         let geometry = self.placement_sized(state, wanted, always_centered);
+        let strip_column = self.alloc_strip_column();
         self.windows.insert(
             id,
             ManagedWindow {
@@ -1859,8 +1927,8 @@ impl WindowManager {
                 geometry,
                 layout: WindowLayout::Floating,
                 restore: None,
-                preset: None,
-                strip_fixed_width: None,
+                strip_column,
+                strip_height: TileHeight::AUTO,
                 unplaced: false,
                 minimized: false,
                 above: false,
@@ -2077,6 +2145,7 @@ impl WindowManager {
                         .get(parent)
                         .is_some_and(|window| window.surface.alive())
             });
+        let column = self.windows.get(&id).map(|window| window.strip_column);
         if let Some(window) = self.windows.remove(&id) {
             eprintln!("tuna-compositor: window {id} unmapped");
             match window.surface.underlying_surface() {
@@ -2091,6 +2160,9 @@ impl WindowManager {
             }
         }
         self.stacking.retain(|other| *other != id);
+        if let Some(column) = column {
+            self.settle_strip_column(column);
+        }
         self.focus_history.retain(|other| *other != id);
         self.icon_geometries.remove(&id);
         // An unmanaged window drops its auto-raise and pointer-rest check,
@@ -2567,66 +2639,124 @@ impl WindowManager {
         order
     }
 
-    fn strip_move_slot(
-        &self,
-        id: u64,
-        geometry_start: Rectangle<i32, Logical>,
-        pointer_start: Point<f64, Logical>,
-    ) -> (Vec<u64>, usize) {
-        let remaining: Vec<_> = self
-            .strip_order()
-            .into_iter()
-            .filter(|other| !self.strip_family_member(*other, id))
-            .collect();
-        let center = f64::from(geometry_start.loc.x)
-            + f64::from(geometry_start.size.w) / 2.0
-            + self.pointer_pos.x
-            - pointer_start.x;
-        let slot = remaining
+    /// Columns left when `root`'s family is lifted out of the active
+    /// strip, and where the pointer would drop it (niri
+    /// `insert_position`, aiming at the middle of a gap): the closest
+    /// column boundary — a column's left edge, or the gap past its
+    /// right edge — unless the pointer is over a column and nearer one
+    /// of its window boundaries, which inserts into that column. The
+    /// lifted slot stays reserved, so both sides of it name the slot the
+    /// window came from. A window with attached dialogs only lands as
+    /// new columns.
+    fn strip_insert_target(&self, root: u64) -> (Vec<(u64, Vec<u64>)>, StripInsert) {
+        let gap = f64::from(Self::STRIP_GAP);
+        let columns = self.strip_active_columns();
+        let lone = columns
             .iter()
-            .take_while(|other| {
-                self.geometry(**other).is_some_and(|g| {
-                    let g = self.strip_shifted(**other, g);
-                    center > f64::from(g.loc.x) + f64::from(g.size.w) / 2.0
-                })
+            .flat_map(|(_, members)| members.iter())
+            .filter(|id| self.strip_family_member(**id, root))
+            .count()
+            <= 1;
+        let remaining: Vec<(u64, Vec<u64>)> = columns
+            .into_iter()
+            .filter_map(|(column, members)| {
+                let members: Vec<u64> = members
+                    .into_iter()
+                    .filter(|id| !self.strip_family_member(*id, root))
+                    .collect();
+                (!members.is_empty()).then_some((column, members))
             })
-            .count();
-        (remaining, slot)
+            .collect();
+        let drawn = |id: u64| self.geometry(id).map(|g| self.strip_shifted(id, g));
+        let x = self.pointer_pos.x + gap / 2.0;
+        let y = self.pointer_pos.y + gap / 2.0;
+        let closest = |best: &mut Option<(f64, usize)>, edge: f64, at: f64, slot: usize| {
+            let distance = (edge - at).abs();
+            if best.is_none_or(|(nearest, _)| distance < nearest) {
+                *best = Some((distance, slot));
+            }
+        };
+        let mut gap_best = None;
+        let mut over = None;
+        for (index, (_, members)) in remaining.iter().enumerate() {
+            let Some(first) = members.first().and_then(|id| drawn(*id)) else {
+                continue;
+            };
+            let left = f64::from(first.loc.x);
+            let right = left + f64::from(first.size.w) + gap;
+            closest(&mut gap_best, left, x, index);
+            closest(&mut gap_best, right, x, index + 1);
+            if left <= x && x < right {
+                over = Some(index);
+            }
+        }
+        let Some((vertical, slot)) = gap_best else {
+            return (remaining, StripInsert::Column(0));
+        };
+        let into = over.filter(|_| lone).and_then(|column| {
+            let mut tile_best = None;
+            for (index, id) in remaining[column].1.iter().enumerate() {
+                let Some(g) = drawn(*id) else {
+                    continue;
+                };
+                let top = f64::from(g.loc.y);
+                closest(&mut tile_best, top, y, index);
+                closest(
+                    &mut tile_best,
+                    top + f64::from(g.size.h) + gap,
+                    y,
+                    index + 1,
+                );
+            }
+            tile_best
+                .filter(|(horizontal, _)| vertical > *horizontal)
+                .map(|(_, tile)| StripInsert::Tile { column, tile })
+        });
+        (remaining, into.unwrap_or(StripInsert::Column(slot)))
     }
 
-    fn commit_strip_move(
-        &mut self,
-        state: &mut State,
-        owner: StripPointer,
-        geometry_start: Rectangle<i32, Logical>,
-        pointer_start: Point<f64, Logical>,
-    ) {
-        let (mut order, slot) = self.strip_move_slot(owner.id, geometry_start, pointer_start);
-        let family: Vec<_> = self
-            .strip_order()
-            .into_iter()
+    /// Drop the dragged family where [`strip_insert_target`] points: as
+    /// new columns, each keeping its column (and width) unless it shared
+    /// one, whose width it then takes along; or as a window of an
+    /// existing column, which keeps that column's width.
+    fn commit_strip_move(&mut self, state: &mut State, owner: StripPointer) {
+        let (mut columns, insert) = self.strip_insert_target(owner.id);
+        let before = self.strip_columns_on(owner.workspace);
+        let family: Vec<u64> = before
+            .iter()
+            .flat_map(|(_, members)| members.iter().copied())
             .filter(|id| self.strip_family_member(*id, owner.id))
             .collect();
-        order.splice(slot..slot, family);
-        let positions: Vec<_> = self
-            .stacking
-            .iter()
-            .enumerate()
-            .filter(|(_, id)| {
-                self.model
-                    .window(**id)
-                    .is_some_and(|w| w.workspace == owner.workspace)
-            })
-            .map(|(i, _)| i)
-            .collect();
-        if positions.len() != order.len() {
-            return;
+        match insert {
+            StripInsert::Tile { column, tile } => {
+                let members = &mut columns[column].1;
+                members.insert(tile.min(members.len()), owner.id);
+                self.set_strip_height(owner.id, TileHeight::AUTO);
+            }
+            StripInsert::Column(slot) => {
+                let mut moved = Vec::with_capacity(family.len());
+                for id in family {
+                    let Some(own) = self.windows.get(&id).map(|w| w.strip_column) else {
+                        continue;
+                    };
+                    let alone = before
+                        .iter()
+                        .any(|(column, members)| *column == own && members.len() == 1);
+                    let column = if alone {
+                        own
+                    } else {
+                        self.split_strip_column(own)
+                    };
+                    moved.push((column, vec![id]));
+                }
+                let slot = slot.min(columns.len());
+                columns.splice(slot..slot, moved);
+            }
         }
-        for (position, id) in positions.into_iter().zip(order) {
-            self.stacking[position] = id;
+        if self.write_strip_columns(owner.workspace, columns) {
+            self.follow_focus(state);
+            self.relayout_strip(state);
         }
-        self.follow_focus(state);
-        self.relayout_strip(state);
     }
 
     fn snap_strip_columns(&mut self) {
@@ -2654,15 +2784,16 @@ impl WindowManager {
         };
         self.grab = None;
         self.reset_strip_edge();
-        if let PointerGrab::StripResize {
-            fixed_start,
-            preset_start,
-            ..
-        } = grab
-        {
-            if let Some(window) = self.windows.get_mut(&owner.id) {
-                window.strip_fixed_width = fixed_start;
-                window.preset = preset_start;
+        if let PointerGrab::StripResize { width_before, .. } = grab {
+            if let Some(column) = self.windows.get(&owner.id).map(|w| w.strip_column) {
+                if width_before == ColumnWidth::default() {
+                    self.strip_widths.remove(&column);
+                } else {
+                    self.strip_widths.insert(column, width_before);
+                }
+            }
+            for (id, height) in std::mem::take(&mut self.strip_resize_heights) {
+                self.set_strip_height(id, height);
             }
         }
         self.strip_offset = owner.offset;
@@ -2786,22 +2917,29 @@ impl WindowManager {
     ) {
         self.settle(id);
         if self.mode == SessionMode::Scroll {
-            // This layout has one full-height window per column. Only
-            // horizontal edges can change its width, including corners.
-            if edges & (EDGE_LEFT | EDGE_RIGHT) == 0
-                || edges & (EDGE_LEFT | EDGE_RIGHT) == (EDGE_LEFT | EDGE_RIGHT)
-            {
+            let Some(edges) = self.strip_resize_edges(id, edges) else {
                 return;
-            }
+            };
             if let Some(owner) = self.strip_pointer_owner(state, id, button) {
-                let window = &self.windows[&id];
+                let columns = self.strip_columns_on(owner.workspace);
+                let members = Self::strip_locate(&columns, id)
+                    .map(|(column, _)| columns[column].1.clone())
+                    .unwrap_or_else(|| vec![id]);
+                self.strip_resize_heights = members
+                    .iter()
+                    .filter_map(|member| {
+                        self.windows
+                            .get(member)
+                            .map(|window| (*member, window.strip_height))
+                    })
+                    .collect();
                 self.grab = Some(PointerGrab::StripResize {
                     owner,
                     edges,
                     pointer_start: pointer,
-                    width_start: self.strip_width_for(id, owner.work.size.w),
-                    fixed_start: window.strip_fixed_width,
-                    preset_start: window.preset,
+                    width_start: self.strip_column_pixels(&members, owner.work.size.w),
+                    width_before: self.strip_column_width(id),
+                    height_start: self.windows[&id].geometry.size.h,
                 });
                 self.snap_strip_columns();
             }
@@ -2819,6 +2957,94 @@ impl WindowManager {
             });
             self.note_grab_start(id);
         }
+    }
+
+    /// The edges a strip resize of `id` may move (niri
+    /// `interactive_resize_update`): one horizontal side changes the
+    /// column width; the top or bottom side changes the window's height
+    /// inside a column it shares, except the top of the topmost window.
+    /// A lone window stays full height. `None` when nothing would move.
+    fn strip_resize_edges(&self, id: u64, edges: u32) -> Option<u32> {
+        let mut effective = 0;
+        let horizontal = edges & (EDGE_LEFT | EDGE_RIGHT);
+        if horizontal != 0 && horizontal != EDGE_LEFT | EDGE_RIGHT {
+            effective |= horizontal;
+        }
+        let vertical = edges & (EDGE_TOP | EDGE_BOTTOM);
+        if vertical != 0 && vertical != EDGE_TOP | EDGE_BOTTOM {
+            let workspace = self.model.window(id)?.workspace;
+            let columns = self.strip_columns_on(workspace);
+            let (column, tile) = Self::strip_locate(&columns, id)?;
+            if columns[column].1.len() > 1 && !(vertical == EDGE_TOP && tile == 0) {
+                effective |= vertical;
+            }
+        }
+        (effective != 0).then_some(effective)
+    }
+
+    /// niri `set_window_height(SetFixed)`: give `id` a fixed height in its
+    /// shared column. The first fixed height turns the others' current
+    /// heights into automatic weights (relative to their median) so they
+    /// keep their proportions; the height is clamped to what the other
+    /// windows' minimums leave, to the client's limits and to the
+    /// interactive minimum. Whether anything changed.
+    fn set_strip_window_height(
+        &mut self,
+        workspace: u32,
+        work: Rectangle<i32, Logical>,
+        id: u64,
+        height: i32,
+    ) -> bool {
+        let columns = self.strip_columns_on(workspace);
+        let Some((column, _)) = Self::strip_locate(&columns, id) else {
+            return false;
+        };
+        let members = &columns[column].1;
+        if members.len() < 2 {
+            return false;
+        }
+        let mut changed = false;
+        if matches!(
+            self.windows.get(&id).map(|w| w.strip_height),
+            Some(TileHeight::Auto { .. })
+        ) {
+            let heights: Vec<i32> = members
+                .iter()
+                .map(|m| self.windows.get(m).map_or(1, |w| w.geometry.size.h.max(1)))
+                .collect();
+            let mut sorted = heights.clone();
+            sorted.sort_unstable();
+            let median = f64::from(sorted[sorted.len() / 2]);
+            for (member, h) in members.iter().zip(heights) {
+                self.set_strip_height(
+                    *member,
+                    TileHeight::Auto {
+                        weight: f64::from(h) / median,
+                    },
+                );
+            }
+            changed = true;
+        }
+        let taken: i32 = members
+            .iter()
+            .filter(|m| **m != id)
+            .map(|m| self.size_hints(*m).0.h.max(1) + Self::STRIP_GAP)
+            .sum();
+        let left = (work.size.h - 2 * Self::STRIP_GAP - taken).max(1);
+        let (min, max) = self.size_hints(id);
+        let mut h = height.min(left).max(MIN_WINDOW_SIZE.1.min(left));
+        if max.h > 0 {
+            h = h.min(max.h);
+        }
+        if min.h > 0 {
+            h = h.max(min.h);
+        }
+        let next = TileHeight::Fixed(h.clamp(1, 100_000));
+        if self.windows.get(&id).map(|w| w.strip_height) != Some(next) {
+            self.set_strip_height(id, next);
+            changed = true;
+        }
+        changed
     }
 
     /// Whether an interactive move/resize is in progress.
@@ -2863,25 +3089,54 @@ impl WindowManager {
                 edges,
                 pointer_start,
                 width_start,
+                height_start,
                 ..
             } => {
-                let delta = (pos.x - pointer_start.x).round() as i32;
-                let delta = if edges & EDGE_LEFT != 0 {
-                    delta.saturating_neg()
-                } else {
-                    delta
-                };
-                let width = width_start.saturating_add(delta).clamp(
-                    MIN_WINDOW_SIZE.0,
-                    owner.work.size.w.saturating_mul(4).max(MIN_WINDOW_SIZE.0),
-                );
-                if self.windows[&owner.id].strip_fixed_width != Some(width) {
-                    self.windows.get_mut(&owner.id).unwrap().strip_fixed_width = Some(width);
-                    self.strip_offset = if edges & EDGE_LEFT != 0 {
-                        owner.offset + f64::from(width - width_start)
+                let mut changed = false;
+                if edges & (EDGE_LEFT | EDGE_RIGHT) != 0 {
+                    let delta = (pos.x - pointer_start.x).round() as i32;
+                    let delta = if edges & EDGE_LEFT != 0 {
+                        delta.saturating_neg()
                     } else {
-                        owner.offset
+                        delta
                     };
+                    let width = width_start.saturating_add(delta).clamp(
+                        MIN_WINDOW_SIZE.0,
+                        owner.work.size.w.saturating_mul(4).max(MIN_WINDOW_SIZE.0),
+                    );
+                    let column = self.windows[&owner.id].strip_column;
+                    let current = self.strip_widths.get(&column).copied().unwrap_or_default();
+                    if current.fixed != Some(width) {
+                        self.strip_widths.insert(
+                            column,
+                            ColumnWidth {
+                                fixed: Some(width),
+                                ..current
+                            },
+                        );
+                        self.strip_offset = if edges & EDGE_LEFT != 0 {
+                            owner.offset + f64::from(width - width_start)
+                        } else {
+                            owner.offset
+                        };
+                        changed = true;
+                    }
+                }
+                if edges & (EDGE_TOP | EDGE_BOTTOM) != 0 {
+                    let delta = (pos.y - pointer_start.y).round() as i32;
+                    let delta = if edges & EDGE_TOP != 0 {
+                        delta.saturating_neg()
+                    } else {
+                        delta
+                    };
+                    changed |= self.set_strip_window_height(
+                        owner.workspace,
+                        owner.work,
+                        owner.id,
+                        height_start.saturating_add(delta),
+                    );
+                }
+                if changed {
                     self.relayout_strip(state);
                     self.snap_strip_columns();
                 }
@@ -2943,16 +3198,12 @@ impl WindowManager {
                 self.cancel_strip_pointer(state);
                 return;
             }
-            if let PointerGrab::StripMove {
-                geometry_start,
-                pointer_start,
-                ..
-            } = grab
-            {
-                self.commit_strip_move(state, owner, geometry_start, pointer_start);
+            if let PointerGrab::StripMove { .. } = grab {
+                self.commit_strip_move(state, owner);
             } else {
                 // Direct resize no longer owns the viewport. Re-enter the
                 // usual minimal focus-follow and configure path on release.
+                self.strip_resize_heights.clear();
                 self.follow_focus(state);
                 self.relayout_strip(state);
             }
@@ -2976,30 +3227,55 @@ impl WindowManager {
 
     /// GNOME's tile preview while a moved window is over a snap edge:
     /// the dragged window and the area it would fill on release (the
-    /// work area, or one half of it).
+    /// work area, or one half of it). A strip move shows a narrow bar
+    /// instead: upright in the gap a new column would take, or across a
+    /// column where the window would join it.
     pub fn tile_preview(&self, state: &State) -> Option<(u64, Rectangle<i32, Logical>)> {
         if let Some(PointerGrab::StripMove {
             owner,
             geometry_start,
-            pointer_start,
+            ..
         }) = self.grab
         {
             if !self.strip_pointer_valid(state, owner) {
                 return None;
             }
-            let (remaining, slot) = self.strip_move_slot(owner.id, geometry_start, pointer_start);
+            let (remaining, insert) = self.strip_insert_target(owner.id);
+            let drawn = |id: u64| self.geometry(id).map(|g| self.shifted(id, g));
+            let first = |column: &(u64, Vec<u64>)| column.1.first().and_then(|id| drawn(*id));
+            if let StripInsert::Tile { column, tile } = insert {
+                let members = &remaining[column].1;
+                let column_rect = first(&remaining[column])?;
+                let y = match members.get(tile) {
+                    Some(id) => drawn(*id)?.loc.y,
+                    None => {
+                        let last = drawn(*members.last()?)?;
+                        last.loc
+                            .y
+                            .saturating_add(last.size.h)
+                            .saturating_add(Self::STRIP_GAP)
+                    }
+                };
+                return Some((
+                    owner.id,
+                    Rectangle::new(
+                        (column_rect.loc.x, y.saturating_sub(Self::STRIP_GAP / 2 + 4)).into(),
+                        (column_rect.size.w, 8).into(),
+                    ),
+                ));
+            }
+            let StripInsert::Column(slot) = insert else {
+                return None;
+            };
             let x = remaining
                 .get(slot)
-                .and_then(|id| self.geometry(*id).map(|g| self.shifted(*id, g).loc.x))
+                .and_then(|column| first(column).map(|g| g.loc.x))
                 .or_else(|| {
-                    remaining.last().and_then(|id| {
-                        self.geometry(*id).map(|g| {
-                            let g = self.shifted(*id, g);
-                            g.loc
-                                .x
-                                .saturating_add(g.size.w)
-                                .saturating_add(Self::STRIP_GAP)
-                        })
+                    remaining.last().and_then(first).map(|g| {
+                        g.loc
+                            .x
+                            .saturating_add(g.size.w)
+                            .saturating_add(Self::STRIP_GAP)
                     })
                 })
                 .unwrap_or(geometry_start.loc.x);
@@ -3501,7 +3777,9 @@ impl WindowManager {
         // resize button resizes from the pressed third and the menu button
         // shows the window menu; those presses stay with the compositor.
         // Any other press focuses and is delivered, raising only when
-        // unmodified with raise-on-click.
+        // unmodified with raise-on-click. The strip uses the same modifier
+        // and buttons; its resize grab changes the column width, or a
+        // window's height inside a shared column (niri's Mod+drag resize).
         let mut press_raise = self.focus_policy.raise_on_click;
         if pressed && !self.overview_open && !strip_owned {
             let pos = self.pointer_pos;
@@ -4355,14 +4633,9 @@ impl WindowManager {
     /// default-column-width).
     const STRIP_DEFAULT_PRESET: usize = 1;
 
-    /// Work-area fraction for `id`'s strip column: its chosen preset
-    /// or the default.
-    fn strip_proportion(&self, id: u64) -> f64 {
-        let slot = self
-            .windows
-            .get(&id)
-            .and_then(|window| window.preset)
-            .unwrap_or(Self::STRIP_DEFAULT_PRESET);
+    /// Work-area fraction for a column's preset slot, or the default.
+    fn strip_proportion(width: ColumnWidth) -> f64 {
+        let slot = width.preset.unwrap_or(Self::STRIP_DEFAULT_PRESET);
         Self::STRIP_PRESETS[slot % Self::STRIP_PRESETS.len()]
     }
 
@@ -4372,17 +4645,174 @@ impl WindowManager {
         (((work_w - Self::STRIP_GAP) as f64 * proportion) as i32 - Self::STRIP_GAP).max(1)
     }
 
-    fn strip_width_for(&self, id: u64, work_w: i32) -> i32 {
+    /// A fresh strip column id.
+    fn alloc_strip_column(&mut self) -> u64 {
+        self.next_strip_column = self.next_strip_column.saturating_add(1);
+        self.next_strip_column
+    }
+
+    /// The width choice of `id`'s column.
+    fn strip_column_width(&self, id: u64) -> ColumnWidth {
         self.windows
             .get(&id)
-            .and_then(|w| w.strip_fixed_width)
+            .and_then(|window| self.strip_widths.get(&window.strip_column))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// A client's xdg (or ICCCM) minimum and maximum window size; zero
+    /// means unconstrained, as in xdg-shell.
+    fn size_hints(&self, id: u64) -> SizeHints {
+        let none = (Size::from((0, 0)), Size::from((0, 0)));
+        let Some(window) = self.windows.get(&id) else {
+            return none;
+        };
+        match window.surface.underlying_surface() {
+            WindowSurface::Wayland(toplevel) => with_states(toplevel.wl_surface(), |states| {
+                let mut cached = states
+                    .cached_state
+                    .get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
+                let current = cached.current();
+                (current.min_size, current.max_size)
+            }),
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(surface) => (
+                surface.min_size().unwrap_or(none.0),
+                surface.max_size().unwrap_or(none.1),
+            ),
+        }
+    }
+
+    /// The resolved width of the column holding `members` (niri
+    /// `update_tile_sizes`): its preset or fixed width, then clamped to
+    /// the largest member minimum and smallest member maximum, the
+    /// minimum winning a conflict.
+    fn strip_column_pixels(&self, members: &[u64], work_w: i32) -> i32 {
+        let width = members
+            .first()
+            .map(|id| self.strip_column_width(*id))
+            .unwrap_or_default();
+        let base = width
+            .fixed
             .map(|w| {
                 w.clamp(
                     MIN_WINDOW_SIZE.0,
                     work_w.saturating_mul(4).max(MIN_WINDOW_SIZE.0),
                 )
             })
-            .unwrap_or_else(|| Self::strip_width(work_w, self.strip_proportion(id)))
+            .unwrap_or_else(|| Self::strip_width(work_w, Self::strip_proportion(width)));
+        let mut min_w = 1;
+        let mut max_w = i32::MAX;
+        for id in members {
+            let (min, max) = self.size_hints(*id);
+            min_w = min_w.max(min.w);
+            if max.w > 0 {
+                max_w = max_w.min(max.w);
+            }
+        }
+        base.clamp(min_w, max_w.max(min_w))
+    }
+
+    /// Window heights for one column's members (niri
+    /// `update_tile_sizes`): fixed heights first, clamped to what the
+    /// other windows' minimums leave and to the client's own limits;
+    /// automatic heights then share the rest by weight, any whose
+    /// minimum is not met taking that minimum instead. A lone window
+    /// always fills the column (Tuna keeps single columns full height).
+    fn strip_tile_heights(&self, members: &[u64], work_h: i32) -> Vec<i32> {
+        let gap = f64::from(Self::STRIP_GAP);
+        let n = members.len();
+        let hints: Vec<_> = members.iter().map(|id| self.size_hints(*id)).collect();
+        let mins: Vec<f64> = hints
+            .iter()
+            .map(|(min, _)| f64::from(min.h.max(1)))
+            .collect();
+        let maxs: Vec<f64> = hints
+            .iter()
+            .map(|(_, max)| f64::from(max.h.max(0)))
+            .collect();
+        let specs: Vec<TileHeight> = if n == 1 {
+            vec![TileHeight::AUTO]
+        } else {
+            members
+                .iter()
+                .map(|id| {
+                    self.windows
+                        .get(id)
+                        .map_or(TileHeight::AUTO, |window| window.strip_height)
+                })
+                .collect()
+        };
+        let max_tile = (f64::from(work_h) - 2.0 * gap).max(1.0);
+        let max_fixed = specs
+            .iter()
+            .position(|spec| matches!(spec, TileHeight::Fixed(_)))
+            .filter(|_| n > 1)
+            .map(|fixed| {
+                let taken: f64 = (0..n).filter(|i| *i != fixed).map(|i| mins[i] + gap).sum();
+                (max_tile - taken).round().max(1.0)
+            })
+            .unwrap_or(max_tile);
+        let mut heights: Vec<Option<f64>> = specs
+            .iter()
+            .map(|spec| match spec {
+                TileHeight::Auto { .. } => None,
+                TileHeight::Fixed(h) => Some(f64::from((*h).max(1)).min(max_fixed)),
+            })
+            .collect();
+        let mut height_left = f64::from(work_h) - gap * (n as f64 + 1.0);
+        let mut auto_left = n;
+        for i in 0..n {
+            if mins[i] == maxs[i] {
+                heights[i] = Some(mins[i]);
+            }
+            if let Some(h) = heights[i].as_mut() {
+                if maxs[i] > 0.0 {
+                    *h = h.min(maxs[i]);
+                }
+                *h = h.max(mins[i]);
+                height_left -= *h;
+                auto_left -= 1;
+            }
+        }
+        let weight = |i: usize| match specs[i] {
+            TileHeight::Auto { weight } => weight.max(f64::MIN_POSITIVE),
+            TileHeight::Fixed(_) => 0.0,
+        };
+        let mut total_weight: f64 = (0..n).filter(|i| heights[*i].is_none()).map(weight).sum();
+        'outer: while auto_left > 0 {
+            let mut left = height_left;
+            let mut weights = total_weight;
+            for i in 0..n {
+                if heights[i].is_some() {
+                    continue;
+                }
+                let auto = left * weight(i) / weights;
+                if mins[i] > auto {
+                    heights[i] = Some(mins[i]);
+                    height_left -= mins[i];
+                    total_weight -= weight(i);
+                    auto_left -= 1;
+                    continue 'outer;
+                }
+                left -= auto.round().max(1.0);
+                weights -= weight(i);
+            }
+            for (i, height) in heights.iter_mut().enumerate() {
+                if height.is_some() {
+                    continue;
+                }
+                let auto = (height_left * weight(i) / total_weight).round().max(1.0);
+                *height = Some(auto);
+                height_left -= auto;
+                total_weight -= weight(i);
+                auto_left -= 1;
+            }
+        }
+        heights
+            .into_iter()
+            .map(|h| h.unwrap_or(1.0).round().clamp(1.0, f64::from(i32::MAX)) as i32)
+            .collect()
     }
 
     /// Current session mode (scrollable-tiling spec).
@@ -4390,38 +4820,61 @@ impl WindowManager {
         self.mode
     }
 
-    /// Same-workspace strip columns bottom-to-top with resolved
-    /// widths, for `id`'s workspace (falls back to active).
-    fn strip_columns(&self, state: &State, id: u64) -> Vec<(u64, i32)> {
-        let work = Self::work_area(state);
-        let workspace = self
-            .model
-            .window(id)
-            .map(|entry| entry.workspace)
-            .unwrap_or_else(|| self.model.active_workspace());
-        self.stacking
+    /// `workspace`'s strip columns left to right as (column id, members
+    /// top to bottom). Order is stacking order: a column sits where its
+    /// first member does, and members keep their stacking order inside
+    /// it, so a column never depends on its windows being adjacent.
+    fn strip_columns_on(&self, workspace: u32) -> Vec<(u64, Vec<u64>)> {
+        let mut columns: Vec<(u64, Vec<u64>)> = Vec::new();
+        let mut index: HashMap<u64, usize> = HashMap::new();
+        for id in &self.stacking {
+            if !self
+                .model
+                .window(*id)
+                .is_some_and(|entry| entry.workspace == workspace)
+            {
+                continue;
+            }
+            let Some(window) = self.windows.get(id) else {
+                continue;
+            };
+            match index.get(&window.strip_column) {
+                Some(slot) => columns[*slot].1.push(*id),
+                None => {
+                    index.insert(window.strip_column, columns.len());
+                    columns.push((window.strip_column, vec![*id]));
+                }
+            }
+        }
+        columns
+    }
+
+    /// The active workspace's columns.
+    fn strip_active_columns(&self) -> Vec<(u64, Vec<u64>)> {
+        self.strip_columns_on(self.model.active_workspace())
+    }
+
+    /// `id`'s column index and its index inside that column.
+    fn strip_locate(columns: &[(u64, Vec<u64>)], id: u64) -> Option<(usize, usize)> {
+        columns
             .iter()
-            .copied()
-            .filter(|other| {
-                self.model
-                    .window(*other)
-                    .is_some_and(|entry| entry.workspace == workspace)
+            .enumerate()
+            .find_map(|(column, (_, members))| {
+                members
+                    .iter()
+                    .position(|member| *member == id)
+                    .map(|tile| (column, tile))
             })
-            .map(|other| {
-                let width = self.strip_width_for(other, work.size.w);
-                (other, width)
-            })
-            .collect()
     }
 
     /// Total strip extent (columns plus inner gaps) for clamping.
-    fn strip_total(total_widths: &[(u64, i32)]) -> i32 {
-        if total_widths.is_empty() {
+    fn strip_total(&self, columns: &[(u64, Vec<u64>)], work_w: i32) -> i32 {
+        if columns.is_empty() {
             0
         } else {
-            total_widths
+            columns
                 .iter()
-                .map(|(_, w)| w + Self::STRIP_GAP)
+                .map(|(_, members)| self.strip_column_pixels(members, work_w) + Self::STRIP_GAP)
                 .sum::<i32>()
                 - Self::STRIP_GAP
         }
@@ -4446,25 +4899,67 @@ impl WindowManager {
         self.strip_offset as i32
     }
 
-    /// One strip column rectangle for `id`: the work area's height less
-    /// a gap above and below, preset-proportion width with gaps between
-    /// columns and at the strip's ends (niri gaps-twice formula).
-    /// Columns past the right edge overflow; the strip never squeezes.
+    /// Lay out `workspace`'s strip in screen coordinates: columns with
+    /// gaps between them and at the strip's ends (niri gaps-twice
+    /// formula), the view offset applied; each column's windows stacked
+    /// top to bottom with gaps, sharing the work area's height. Columns
+    /// past the right edge overflow; the strip never squeezes.
+    fn strip_layout(&self, state: &State, workspace: u32) -> Vec<StripColumnLayout> {
+        let work = Self::work_area(state);
+        let columns = self.strip_columns_on(workspace);
+        let Some(first) = columns.first().and_then(|(_, members)| members.first()) else {
+            return Vec::new();
+        };
+        let mut x = work.loc.x + Self::STRIP_GAP - self.strip_column_layout_offset(*first);
+        let mut out = Vec::with_capacity(columns.len());
+        for (column, members) in columns {
+            let width = self.strip_column_pixels(&members, work.size.w);
+            let heights = self.strip_tile_heights(&members, work.size.h);
+            let mut y = work.loc.y + Self::STRIP_GAP;
+            let tiles = members
+                .into_iter()
+                .zip(heights)
+                .map(|(id, h)| {
+                    let tile = (id, y, h);
+                    y = y.saturating_add(h).saturating_add(Self::STRIP_GAP);
+                    tile
+                })
+                .collect();
+            out.push(StripColumnLayout {
+                column,
+                x,
+                width,
+                tiles,
+            });
+            x = x.saturating_add(width).saturating_add(Self::STRIP_GAP);
+        }
+        out
+    }
+
+    /// One strip window's rectangle: its column's x and width, its own
+    /// y and height inside the column.
     fn strip_column_area(&self, state: &State, id: u64) -> Rectangle<i32, Logical> {
         let work = Self::work_area(state);
-        let columns = self.strip_columns(state, id);
-        let mut x = work.loc.x + Self::STRIP_GAP - self.strip_column_layout_offset(id);
-        let mut width = self.strip_width_for(id, work.size.w);
-        for (other, w) in &columns {
-            if *other == id {
-                width = *w;
-                break;
+        let workspace = self
+            .model
+            .window(id)
+            .map(|entry| entry.workspace)
+            .unwrap_or_else(|| self.model.active_workspace());
+        for column in self.strip_layout(state, workspace) {
+            if let Some((_, y, h)) = column.tiles.iter().find(|(tile, _, _)| *tile == id) {
+                return Rectangle {
+                    loc: (column.x, *y).into(),
+                    size: (column.width, (*h).max(1)).into(),
+                };
             }
-            x += w + Self::STRIP_GAP;
         }
         Rectangle {
-            loc: (x, work.loc.y + Self::STRIP_GAP).into(),
-            size: (width, (work.size.h - 2 * Self::STRIP_GAP).max(1)).into(),
+            loc: (work.loc.x + Self::STRIP_GAP, work.loc.y + Self::STRIP_GAP).into(),
+            size: (
+                Self::strip_width(work.size.w, Self::strip_proportion(ColumnWidth::default())),
+                (work.size.h - 2 * Self::STRIP_GAP).max(1),
+            )
+                .into(),
         }
     }
 
@@ -4472,12 +4967,8 @@ impl WindowManager {
     /// less the view.
     fn strip_max_offset(&self, state: &State) -> f64 {
         let work = Self::work_area(state);
-        let widths: Vec<(u64, i32)> = self
-            .strip_order()
-            .iter()
-            .map(|id| (*id, self.strip_width_for(*id, work.size.w)))
-            .collect();
-        let total = Self::strip_total(&widths) + 2 * Self::STRIP_GAP;
+        let total =
+            self.strip_total(&self.strip_active_columns(), work.size.w) + 2 * Self::STRIP_GAP;
         (total - work.size.w).max(0) as f64
     }
 
@@ -4499,9 +4990,9 @@ impl WindowManager {
         let work = Self::work_area(state);
         let mut start = 0;
         let mut width = None;
-        for id in self.strip_order() {
-            let w = self.strip_width_for(id, work.size.w);
-            if id == focused {
+        for (_, members) in self.strip_active_columns() {
+            let w = self.strip_column_pixels(&members, work.size.w);
+            if members.contains(&focused) {
                 width = Some(w);
                 break;
             }
@@ -4568,11 +5059,14 @@ impl WindowManager {
     }
 
     fn strip_edge_max(&self, work: Rectangle<i32, Logical>) -> f64 {
-        let extent = self.strip_order().into_iter().fold(0i64, |extent, id| {
-            extent
-                .saturating_add(i64::from(self.strip_width_for(id, work.size.w)))
-                .saturating_add(i64::from(Self::STRIP_GAP))
-        });
+        let extent = self
+            .strip_active_columns()
+            .into_iter()
+            .fold(0i64, |extent, (_, members)| {
+                extent
+                    .saturating_add(i64::from(self.strip_column_pixels(&members, work.size.w)))
+                    .saturating_add(i64::from(Self::STRIP_GAP))
+            });
         // One interior gap per column and one additional end gap.
         (extent
             .saturating_add(i64::from(Self::STRIP_GAP))
@@ -4766,13 +5260,6 @@ impl WindowManager {
         if self.mode != SessionMode::Scroll {
             return false;
         }
-        let work = Self::work_area(state);
-        let widths: Vec<(u64, i32)> = self
-            .strip_order()
-            .iter()
-            .map(|id| (*id, self.strip_width_for(*id, work.size.w)))
-            .collect();
-        let _ = (&widths, work);
         let max = self.strip_max_offset(state);
         let next = (self.strip_offset + horizontal + vertical).clamp(0.0, max);
         if next == self.strip_offset {
@@ -4800,117 +5287,333 @@ impl WindowManager {
         {
             return false;
         }
-        if self.windows[&focused].strip_fixed_width.is_some() {
-            let width = self.strip_width_for(focused, Self::work_area(state).size.w);
-            let presets =
-                Self::STRIP_PRESETS.map(|p| Self::strip_width(Self::work_area(state).size.w, p));
-            let next = if direction >= 0 {
+        let Some(column) = self.windows.get(&focused).map(|w| w.strip_column) else {
+            return false;
+        };
+        let current = self.strip_column_width(focused);
+        let next = if current.fixed.is_some() {
+            let work_w = Self::work_area(state).size.w;
+            let members = self
+                .strip_active_columns()
+                .into_iter()
+                .find(|(id, _)| *id == column)
+                .map(|(_, members)| members)
+                .unwrap_or_else(|| vec![focused]);
+            let width = self.strip_column_pixels(&members, work_w);
+            let presets = Self::STRIP_PRESETS.map(|p| Self::strip_width(work_w, p));
+            if direction >= 0 {
                 presets.iter().position(|w| *w > width).unwrap_or(0)
             } else {
                 presets
                     .iter()
                     .rposition(|w| *w < width)
                     .unwrap_or(presets.len() - 1)
-            };
-            let window = self.windows.get_mut(&focused).unwrap();
-            window.strip_fixed_width = None;
-            window.preset = Some(next);
-            self.follow_focus(state);
-            self.relayout_strip(state);
-            return true;
+            }
+        } else {
+            let count = Self::STRIP_PRESETS.len() as i32;
+            let slot = current.preset.unwrap_or(Self::STRIP_DEFAULT_PRESET) as i32;
+            (slot + direction).rem_euclid(count) as usize
+        };
+        self.strip_widths.insert(
+            column,
+            ColumnWidth {
+                preset: Some(next),
+                fixed: None,
+            },
+        );
+        self.follow_focus(state);
+        self.relayout_strip(state);
+        true
+    }
+
+    /// The focused strip window with its workspace, that workspace's
+    /// columns and its own column and tile index, when strip column
+    /// commands may act on it.
+    #[allow(clippy::type_complexity)]
+    fn strip_focus_columns(&self) -> Option<(u64, u32, Vec<(u64, Vec<u64>)>, usize, usize)> {
+        if self.mode != SessionMode::Scroll {
+            return None;
         }
-        let count = Self::STRIP_PRESETS.len() as i32;
-        let current = self
-            .windows
-            .get(&focused)
-            .and_then(|window| window.preset)
-            .unwrap_or(Self::STRIP_DEFAULT_PRESET) as i32;
-        let next = (current + direction).rem_euclid(count) as usize;
-        if let Some(window) = self.windows.get_mut(&focused) {
-            window.preset = Some(next);
+        let focused = self.model.focused()?;
+        if self.window_layout(focused) != Some(WindowLayout::Strip) {
+            return None;
+        }
+        let workspace = self.model.window(focused)?.workspace;
+        if workspace != self.model.active_workspace() {
+            return None;
+        }
+        let columns = self.strip_columns_on(workspace);
+        let (column, tile) = Self::strip_locate(&columns, focused)?;
+        Some((focused, workspace, columns, column, tile))
+    }
+
+    /// Rewrite `workspace`'s strip as `columns` (id, members top to
+    /// bottom): window membership plus the stacking slots that order the
+    /// columns. The windows must be exactly the strip's current ones.
+    /// A window left alone in its column goes back to full height.
+    fn write_strip_columns(&mut self, workspace: u32, columns: Vec<(u64, Vec<u64>)>) -> bool {
+        let positions: Vec<usize> = self
+            .stacking
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| {
+                self.windows.contains_key(id)
+                    && self
+                        .model
+                        .window(**id)
+                        .is_some_and(|entry| entry.workspace == workspace)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let flat: Vec<u64> = columns
+            .iter()
+            .flat_map(|(_, members)| members.iter().copied())
+            .collect();
+        let mut current: Vec<u64> = positions
+            .iter()
+            .map(|index| self.stacking[*index])
+            .collect();
+        let mut next = flat.clone();
+        current.sort_unstable();
+        next.sort_unstable();
+        if current != next {
+            return false;
+        }
+        for (index, id) in positions.into_iter().zip(flat) {
+            self.stacking[index] = id;
+        }
+        for (column, members) in &columns {
+            let single = members.len() == 1;
+            for id in members {
+                if let Some(window) = self.windows.get_mut(id) {
+                    window.strip_column = *column;
+                    if single {
+                        window.strip_height = TileHeight::AUTO;
+                    }
+                }
+            }
+        }
+        self.retain_strip_widths();
+        true
+    }
+
+    /// Drop width choices of columns no window belongs to any more.
+    fn retain_strip_widths(&mut self) {
+        let live: HashSet<u64> = self.windows.values().map(|w| w.strip_column).collect();
+        self.strip_widths.retain(|column, _| live.contains(column));
+    }
+
+    /// A new column for a window leaving column `source`, keeping that
+    /// column's width (niri `RemovedTile::width`).
+    fn split_strip_column(&mut self, source: u64) -> u64 {
+        let column = self.alloc_strip_column();
+        if let Some(width) = self.strip_widths.get(&source).copied() {
+            self.strip_widths.insert(column, width);
+        }
+        column
+    }
+
+    /// Commit a column rewrite and settle the view on the focused column.
+    fn finish_strip_change(
+        &mut self,
+        state: &mut State,
+        workspace: u32,
+        columns: Vec<(u64, Vec<u64>)>,
+    ) -> bool {
+        if !self.write_strip_columns(workspace, columns) {
+            return false;
         }
         self.follow_focus(state);
         self.relayout_strip(state);
         true
     }
 
-    /// Active-workspace windows bottom-to-top: the strip order focus
-    /// motion and slot moves operate on.
-    fn strip_order(&self) -> Vec<u64> {
-        let active = self.model.active_workspace();
-        self.stacking
-            .iter()
+    fn set_strip_height(&mut self, id: u64, height: TileHeight) {
+        if let Some(window) = self.windows.get_mut(&id) {
+            window.strip_height = height;
+        }
+    }
+
+    /// niri `consume-or-expel-window-left/right`: a window alone in its
+    /// column joins the bottom of the neighboring column on that side; a
+    /// window sharing its column leaves it for a new column on that side,
+    /// keeping the column's width. The window keeps focus. Nothing
+    /// happens at the strip's end.
+    fn consume_or_expel(&mut self, state: &mut State, right: bool) -> bool {
+        self.cancel_strip_pointer(state);
+        let Some((focused, workspace, mut columns, column, tile)) = self.strip_focus_columns()
+        else {
+            return false;
+        };
+        if columns[column].1.len() == 1 {
+            let target = if right {
+                column + 1
+            } else {
+                match column.checked_sub(1) {
+                    Some(target) => target,
+                    None => return true,
+                }
+            };
+            if target >= columns.len() {
+                return true;
+            }
+            columns.remove(column);
+            let target = if target > column { target - 1 } else { target };
+            columns[target].1.push(focused);
+            self.set_strip_height(focused, TileHeight::AUTO);
+        } else {
+            let source = columns[column].0;
+            columns[column].1.remove(tile);
+            let new = self.split_strip_column(source);
+            columns.insert(
+                if right { column + 1 } else { column },
+                (new, vec![focused]),
+            );
+        }
+        self.finish_strip_change(state, workspace, columns)
+    }
+
+    /// niri `consume-window-into-column`: the top window of the next
+    /// column joins the bottom of the focused one.
+    fn consume_into_column(&mut self, state: &mut State) -> bool {
+        self.cancel_strip_pointer(state);
+        let Some((_, workspace, mut columns, column, _)) = self.strip_focus_columns() else {
+            return false;
+        };
+        if column + 1 >= columns.len() {
+            return true;
+        }
+        let moved = columns[column + 1].1.remove(0);
+        if columns[column + 1].1.is_empty() {
+            columns.remove(column + 1);
+        }
+        columns[column].1.push(moved);
+        self.set_strip_height(moved, TileHeight::AUTO);
+        self.finish_strip_change(state, workspace, columns)
+    }
+
+    /// niri `expel-window-from-column`: the focused column's bottom window
+    /// becomes a new column to its right with the same width. Focus stays
+    /// in the source column, on its new bottom window if the expelled one
+    /// had it.
+    fn expel_from_column(&mut self, state: &mut State) -> bool {
+        self.cancel_strip_pointer(state);
+        let Some((focused, workspace, mut columns, column, _)) = self.strip_focus_columns() else {
+            return false;
+        };
+        if columns[column].1.len() == 1 {
+            return true;
+        }
+        let source = columns[column].0;
+        let Some(moved) = columns[column].1.pop() else {
+            return false;
+        };
+        let refocus = columns[column]
+            .1
+            .last()
             .copied()
-            .filter(|id| {
-                self.model
-                    .window(*id)
-                    .is_some_and(|entry| entry.workspace == active)
-            })
-            .collect()
+            .filter(|_| moved == focused);
+        let new = self.split_strip_column(source);
+        columns.insert(column + 1, (new, vec![moved]));
+        if !self.finish_strip_change(state, workspace, columns) {
+            return false;
+        }
+        if refocus.is_some() {
+            self.apply_focus(state, refocus);
+        }
+        true
+    }
+
+    /// niri `focus-window-up/down`: focus the window above or below in the
+    /// focused column; nothing past either end.
+    fn focus_in_column(&mut self, state: &mut State, delta: i32) -> bool {
+        let Some((_, _, columns, column, tile)) = self.strip_focus_columns() else {
+            return false;
+        };
+        let members = &columns[column].1;
+        let Some(next) = tile
+            .checked_add_signed(delta as isize)
+            .filter(|next| *next < members.len())
+        else {
+            return true;
+        };
+        let target = members[next];
+        self.apply_focus(state, Some(target));
+        true
+    }
+
+    /// niri `move-window-up/down`: swap the focused window with its
+    /// neighbor inside the column; nothing past either end.
+    fn move_in_column(&mut self, state: &mut State, delta: i32) -> bool {
+        self.cancel_strip_pointer(state);
+        let Some((_, workspace, mut columns, column, tile)) = self.strip_focus_columns() else {
+            return false;
+        };
+        let Some(next) = tile
+            .checked_add_signed(delta as isize)
+            .filter(|next| *next < columns[column].1.len())
+        else {
+            return true;
+        };
+        columns[column].1.swap(tile, next);
+        self.finish_strip_change(state, workspace, columns)
     }
 
     /// Move strip focus one column left/right (negative/positive
-    /// delta), clamped at the ends. Focus never reorders the strip:
-    /// column order is independent of focus. False with no windows.
+    /// delta), clamped at the ends, to the window of that column focused
+    /// last (niri's per-column active window). Focus never reorders the
+    /// strip: column order is independent of focus. False with no windows.
     fn focus_neighbor_in_strip(&mut self, state: &mut State, delta: i32) -> bool {
-        let order = self.strip_order();
-        if order.is_empty() {
+        let columns = self.strip_active_columns();
+        if columns.is_empty() {
             return false;
         }
         let pos = self
             .model
             .focused()
-            .and_then(|focused| order.iter().position(|id| *id == focused))
-            .unwrap_or(0) as i32;
-        let next = pos.saturating_add(delta).clamp(0, order.len() as i32 - 1) as usize;
-        self.apply_focus(state, Some(order[next]));
+            .and_then(|focused| Self::strip_locate(&columns, focused))
+            .map_or(0, |(column, _)| column) as i32;
+        let next = pos.saturating_add(delta).clamp(0, columns.len() as i32 - 1) as usize;
+        let members = &columns[next].1;
+        let target = self
+            .focus_history
+            .iter()
+            .copied()
+            .find(|id| members.contains(id))
+            .unwrap_or(members[0]);
+        self.apply_focus(state, Some(target));
         true
     }
 
-    /// Move the focused window one strip slot left/right, following it
-    /// with focus. Only the two swapped columns change geometry; the
-    /// rest of the strip is untouched. False with no movable window.
+    /// Move the focused column one strip slot left/right (niri
+    /// `move-column-left/right`), following it with focus. Only the two
+    /// swapped columns change geometry; the rest of the strip is
+    /// untouched. False with no movable window.
     fn move_focused_in_strip(&mut self, state: &mut State, delta: i32) -> bool {
         self.cancel_strip_pointer(state);
         let Some(focused) = self.model.focused() else {
             return false;
         };
         let active = self.model.active_workspace();
-        let off_workspace = self
+        if self
             .model
             .window(focused)
-            .map(|entry| entry.workspace != active)
-            .unwrap_or(true);
-        if off_workspace {
+            .is_none_or(|entry| entry.workspace != active)
+        {
             return false;
         }
-        let positions: Vec<usize> = self
-            .stacking
-            .iter()
-            .enumerate()
-            .filter(|(_, id)| {
-                self.model
-                    .window(**id)
-                    .is_some_and(|entry| entry.workspace == active)
-            })
-            .map(|(index, _)| index)
-            .collect();
-        let Some(slot) = positions
-            .iter()
-            .position(|index| self.stacking[*index] == focused)
-        else {
+        let mut columns = self.strip_columns_on(active);
+        let Some((column, _)) = Self::strip_locate(&columns, focused) else {
             return false;
         };
-        let other = slot
+        let other = column
             .saturating_add_signed(delta as isize)
-            .clamp(0, positions.len() - 1);
-        if other == slot {
+            .clamp(0, columns.len() - 1);
+        if other == column {
             return true;
         }
-        self.stacking.swap(positions[slot], positions[other]);
-        self.follow_focus(state);
-        self.relayout_strip(state);
-        true
+        columns.swap(column, other);
+        self.finish_strip_change(state, active, columns)
     }
 
     /// Re-resolve every strip column (after slot moves, preset
@@ -4918,19 +5621,38 @@ impl WindowManager {
     /// The view offset clamps to the new overflow first so a shrink
     /// never strands blank space at the strip end.
     fn relayout_strip(&mut self, state: &mut State) {
-        let work = Self::work_area(state);
-        let widths: Vec<(u64, i32)> = self
-            .strip_order()
-            .iter()
-            .map(|id| (*id, self.strip_width_for(*id, work.size.w)))
-            .collect();
-        let _ = (&widths, work);
         self.strip_offset = self.strip_offset.clamp(0.0, self.strip_max_offset(state));
         let ids: Vec<u64> = self.windows.keys().copied().collect();
         for id in ids {
             if self.window_layout(id) == Some(WindowLayout::Strip) {
                 self.apply_layout(state, id, WindowLayout::Strip);
             }
+        }
+        self.strip_hints = self.current_strip_hints();
+    }
+
+    fn current_strip_hints(&self) -> HashMap<u64, SizeHints> {
+        self.windows
+            .keys()
+            .copied()
+            .filter(|id| self.window_layout(*id) == Some(WindowLayout::Strip))
+            .map(|id| (id, self.size_hints(id)))
+            .collect()
+    }
+
+    /// Re-lay out the strip when a client changed the size limits its
+    /// column or height was resolved with.
+    fn refresh_strip_hints(&mut self, state: &mut State) {
+        let hints = self.current_strip_hints();
+        if hints == self.strip_hints {
+            return;
+        }
+        let changed = hints
+            .iter()
+            .any(|(id, now)| self.strip_hints.get(id).is_some_and(|old| old != now));
+        self.strip_hints = hints;
+        if changed && self.mode == SessionMode::Scroll {
+            self.relayout_strip(state);
         }
     }
 
@@ -4956,6 +5678,7 @@ impl WindowManager {
             for id in ids {
                 self.apply_layout(state, id, WindowLayout::Strip);
             }
+            self.strip_hints = self.current_strip_hints();
         } else {
             let ids: Vec<u64> = self.windows.keys().copied().collect();
             for id in ids {
@@ -5196,6 +5919,7 @@ impl WindowManager {
         if !self.windows.contains_key(&id) {
             return false;
         }
+        let from = self.model.window(id).map(|entry| entry.workspace);
         if !self.model.update(
             id,
             WindowUpdate {
@@ -5204,6 +5928,9 @@ impl WindowManager {
             },
         ) {
             return false;
+        }
+        if from != Some(workspace) {
+            self.detach_strip_column(id);
         }
         if Some(id) == self.model.focused()
             && !self.on_all_workspaces(id)
@@ -5222,8 +5949,45 @@ impl WindowManager {
         if !self.windows.contains_key(&id) || !self.model.insert_workspace_and_move(id, at) {
             return false;
         }
+        self.detach_strip_column(id);
         self.focus_topmost(state, self.model.active_workspace());
         true
+    }
+
+    /// A window leaving its workspace leaves its strip column too, as a
+    /// column of its own with the same width (niri moves the window, not
+    /// the column).
+    fn detach_strip_column(&mut self, id: u64) {
+        let Some(own) = self.windows.get(&id).map(|window| window.strip_column) else {
+            return;
+        };
+        if self
+            .windows
+            .iter()
+            .any(|(other, window)| *other != id && window.strip_column == own)
+        {
+            let column = self.split_strip_column(own);
+            if let Some(window) = self.windows.get_mut(&id) {
+                window.strip_column = column;
+                window.strip_height = TileHeight::AUTO;
+            }
+            self.settle_strip_column(own);
+        }
+    }
+
+    /// After a member left column `column`: a lone survivor is full height
+    /// again, and a column nobody belongs to forgets its width.
+    fn settle_strip_column(&mut self, column: u64) {
+        let members: Vec<u64> = self
+            .windows
+            .iter()
+            .filter(|(_, window)| window.strip_column == column)
+            .map(|(id, _)| *id)
+            .collect();
+        if let [only] = members.as_slice() {
+            self.set_strip_height(*only, TileHeight::AUTO);
+        }
+        self.retain_strip_widths();
     }
 
     /// Grace lease for a workspace the user just switched away from:
@@ -5650,6 +6414,16 @@ fn switcher_keysym(keycode: u32) -> Option<u32> {
 pub const R_KEYCODE: u32 = 19;
 /// evdev KEY_H: Super+H hides the focused window (GNOME's minimize).
 pub const H_KEYCODE: u32 = 35;
+/// evdev KEY_LEFTBRACE / KEY_RIGHTBRACE: in strip mode Super+[ and Super+]
+/// consume the focused window into the neighboring column on that side,
+/// or expel it from a shared column (niri `consume-or-expel-window-left/right`).
+pub const LEFT_BRACE_KEYCODE: u32 = 26;
+pub const RIGHT_BRACE_KEYCODE: u32 = 27;
+/// evdev KEY_COMMA / KEY_DOT: in strip mode Super+, consumes the next
+/// column's top window, Super+. expels the focused column's bottom one
+/// (niri `consume-window-into-column` / `expel-window-from-column`).
+pub const COMMA_KEYCODE: u32 = 51;
+pub const DOT_KEYCODE: u32 = 52;
 /// Top inset of the maximized/tiled work area: the shell panel strip.
 /// Derived from [`PANEL_HEIGHT`] (the compositor↔shell contract).
 pub const WORK_AREA_TOP: i32 = PANEL_HEIGHT as i32;
@@ -6467,6 +7241,24 @@ impl WindowManager {
             } else {
                 self.keyboard_key(state, keycode, pressed, time);
             }
+        } else if pressed
+            && self.super_held
+            && self.mode == SessionMode::Scroll
+            && matches!(
+                keycode,
+                LEFT_BRACE_KEYCODE | RIGHT_BRACE_KEYCODE | COMMA_KEYCODE | DOT_KEYCODE
+            )
+        {
+            // Strip column chords (niri's default binds, unbound in GNOME
+            // 51): Super+[ / Super+] consume into or expel from the column
+            // on that side, Super+, takes the next column's top window,
+            // Super+. expels the bottom one. Scroll-only like Super+R.
+            match keycode {
+                LEFT_BRACE_KEYCODE => self.consume_or_expel(state, false),
+                RIGHT_BRACE_KEYCODE => self.consume_or_expel(state, true),
+                COMMA_KEYCODE => self.consume_into_column(state),
+                _ => self.expel_from_column(state),
+            };
         } else if builtin
             && pressed
             && self.super_held
@@ -6501,14 +7293,24 @@ impl WindowManager {
             {
                 // Scroll-mode strip motion (niri shape): arrows move
                 // focus along the strip, Shift+arrows move the focused
-                // window one slot. Up/Down keep their gnome meaning;
-                // forced membership converts the result to columns.
-                // Consumed in all cases, like the gnome chords.
+                // column one slot. Consumed in all cases, like the gnome
+                // chords.
                 let delta = if keycode == ARROW_LEFT_KEYCODE { -1 } else { 1 };
                 if self.shift_held {
                     self.move_focused_in_strip(state, delta);
                 } else {
                     self.focus_neighbor_in_strip(state, delta);
+                }
+            } else if self.mode == SessionMode::Scroll && self.strip_column_shared() {
+                // Up/Down inside a shared column (niri `focus-window-up/down`,
+                // Shift: `move-window-up/down`). A lone window keeps their
+                // gnome meaning below, which forced membership turns back
+                // into its column.
+                let delta = if keycode == ARROW_UP_KEYCODE { -1 } else { 1 };
+                if self.shift_held {
+                    self.move_in_column(state, delta);
+                } else {
+                    self.focus_in_column(state, delta);
                 }
             } else if let Some(id) = self.model.focused() {
                 match keycode {
@@ -6544,6 +7346,12 @@ impl WindowManager {
             keycode,
             ARROW_UP_KEYCODE | ARROW_DOWN_KEYCODE | ARROW_LEFT_KEYCODE | ARROW_RIGHT_KEYCODE
         )
+    }
+
+    /// Whether the focused strip window shares its column.
+    fn strip_column_shared(&self) -> bool {
+        self.strip_focus_columns()
+            .is_some_and(|(_, _, columns, column, _)| columns[column].1.len() > 1)
     }
 
     /// Tile a side, toggling back to floating on repeat (GNOME shape).

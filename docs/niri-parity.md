@@ -94,6 +94,53 @@ explicit: wheel/touchpad scrolling is direct; maximize, fullscreen and edge
 tiling keep a window in the strip; there is one strip using the primary
 output area, rather than niri's independent layout on every output.
 
+## Columns, drops and resizing
+
+Columns hold several windows, following niri 26.04's
+[`src/layout/scrolling.rs`](https://github.com/YaLTeR/niri/blob/v26.04/src/layout/scrolling.rs)
+and its [default binds](https://github.com/YaLTeR/niri/blob/v26.04/resources/default-config.kdl):
+
+- Super+[ / Super+] (`consume-or-expel-window-left/right`): a lone window
+  joins the bottom of the neighboring column on that side; a window sharing a
+  column leaves it for a new column on that side with the column's width
+  (`RemovedTile::width`). Super+, / Super+. take the next column's top window
+  into the focused column and send the bottom one out to the right. Super+Up /
+  Super+Down move focus inside a shared column, with Shift moving the window
+  (niri binds these on Mod+Ctrl; Tuna Desktop keeps Shift for its existing
+  column moves). GNOME 51 binds none of `<Super>bracketleft`,
+  `<Super>bracketright`, `<Super>comma` or `<Super>period`
+  ([gsettings-desktop-schemas 51.0 wm keybindings](https://gitlab.gnome.org/GNOME/gsettings-desktop-schemas/-/blob/51.0/schemas/org.gnome.desktop.wm.keybindings.gschema.xml.in),
+  mutter and gnome-shell 51.0 schemas); its `<Super>Up` / `<Super>Down`
+  (maximize / unmaximize) and `<Super><Shift>Up` / `<Super><Shift>Down`
+  (move to monitor) are only replaced in strip mode, inside a shared column,
+  where forced strip membership already made them no-ops.
+- Heights follow `update_tile_sizes`: windows share the column's height by
+  weight, a window whose minimum is not met takes it, and one resized window
+  keeps a fixed height clamped to what the others' minimums leave. The first
+  fixed height turns the others into weights from their current heights over
+  the median (`convert_heights_to_auto`). Column widths clamp to the largest
+  member minimum and smallest member maximum, the minimum winning; a client
+  changing its limits re-sizes its column.
+- A drop lands at the boundary nearest the pointer, aiming at the middle of a
+  gap (`insert_position`): a column's edge makes a new column, a window's top
+  or bottom edge inside the column under the pointer joins that column.
+- An xdg resize, or the GNOME modifier resize (`mouse-button-modifier` with
+  the middle button, or the right one under `resize-with-right-button`) on
+  the pointer's outer third of a window (niri's Mod+right-drag,
+  `resize_edges_under`), changes the column width from one side and a
+  window's height from its top or bottom inside a shared column; the topmost
+  window's top edge does nothing (`interactive_resize_update`). The strip
+  keeps GNOME's modifier and buttons rather than niri's fixed Mod+RMB, so
+  the two modes agree.
+
+Remaining differences: a lone window stays full height (niri lets a vertical
+resize shorten it, and has no reset bind here); the dragged window keeps its
+slot until the drop instead of leaving the layout, so both sides of that slot
+name it; drop bars are 8px rather than niri's 300px hint areas; dialogs with
+attached children only drop as new columns; interactive sizes floor at
+120×80px; and there is no tabbed column display, window height presets or
+`Mod+Ctrl+R` height reset.
+
 To reproduce without compiling a local GTK shell:
 
 ```sh
