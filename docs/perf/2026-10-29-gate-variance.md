@@ -117,7 +117,12 @@ fails whenever one pair's p95 reaches 3%.
 about 14 KB/s for GNOME and about 10 KB/s for Tuna to the serial console. About
 a third of sessions lose one or two garbled records. This load runs as root,
 outside the measured user scope, so it is not counted. It is a residual
-asymmetric perturbation.
+asymmetric perturbation. The console drops runs of bytes inside a line: in 20
+sessions of runs 40887247970–40914419860, 18 of 5,430 records were damaged.
+One of them still parsed, with a process missing `cpu_ticks`, and crashed the
+session's summary (40914419860). Each record now carries a SHA-256 of its
+JSON, and `tuna-vm-perf` drops any record whose digest does not match, as it
+already dropped unparseable ones.
 
 **Not measured yet.** #820 (gsd plugins in the Tuna session) merged after every
 run analysed here. Its plugins count as `services`, so they affect the `total`

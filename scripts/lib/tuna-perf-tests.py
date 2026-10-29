@@ -1164,8 +1164,26 @@ class Accounting(unittest.TestCase):
             self.assertEqual(result["process_count"], 0)
 
     def test_journal_prefix_and_truncated_serial_do_not_corrupt_valid_samples(self):
-        result = host.raw_samples('prefix tuna-perf-sample: {"pss_kib":7}\ntuna-perf-sample: {bad\n')
-        self.assertEqual(result, [{"pss_kib":7}])
+        valid = guest.sample_line({"pss_kib": 7})
+        result = host.raw_samples(f'[ 1.0] python3[770]: {valid}\r\ntuna-perf-sample: {{bad\n')
+        self.assertEqual(result, [{"pss_kib": 7}])
+
+    def test_a_record_missing_bytes_is_dropped_even_when_it_still_parses(self):
+        # Run 40914419860: the serial console dropped '":47,...,"c' and left
+        # valid JSON whose process had no cpu_ticks.
+        row = {"processes": [{"pid": 965, "cpu_ticks": 47, "comm": "systemd"},
+                             {"pid": 1188, "cmd": "gsd-datetime"}]}
+        line = guest.sample_line(row)
+        lost = line.replace('":47,"comm":"systemd"},{"pid":1188,"c', '')
+        self.assertIn('"cpu_ticksmd":"gsd-datetime"', lost)
+        json.loads(lost.split('tuna-perf-sample: ', 1)[1].rpartition(' sha256=')[0])
+        self.assertEqual(host.raw_samples(lost), [])
+        # A missing or altered digest, or a pre-digest record, is never accepted.
+        payload, _, digest = line.rpartition(' sha256=')
+        for corrupt in (payload, payload + ' sha256=' + digest[:-1],
+                        payload + ' sha256=' + digest.upper(), line.replace('47', '4')):
+            self.assertEqual(host.raw_samples(corrupt), [])
+        self.assertEqual(host.raw_samples(line), [row])
 
     def test_small_sample_percentiles_keep_the_extreme_tail(self):
         result = host.distribution([1, 9, 2, 3])

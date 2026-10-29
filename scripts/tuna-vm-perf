@@ -339,13 +339,24 @@ def presentation_summary(trace):
 
 
 def raw_samples(serial):
+    """Only records whose digest matches what the observer printed.
+
+    The serial console drops runs of bytes inside lines; usually the JSON
+    then fails to parse, but run 40914419860 kept a valid record missing a
+    process's cpu_ticks. A record without a matching digest is dropped like
+    an unparseable one.
+    """
     result = []
     for line in serial.splitlines():
-        if "tuna-perf-sample: " in line:
-            try:
-                result.append(json.loads(line.split("tuna-perf-sample: ", 1)[1]))
-            except json.JSONDecodeError:
-                continue
+        if "tuna-perf-sample: " not in line:
+            continue
+        payload, separator, digest = line.split("tuna-perf-sample: ", 1)[1].rstrip().rpartition(" sha256=")
+        if not separator or hashlib.sha256(payload.encode()).hexdigest() != digest:
+            continue
+        try:
+            result.append(json.loads(payload))
+        except json.JSONDecodeError:
+            continue
     return result
 
 

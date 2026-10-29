@@ -376,6 +376,17 @@ def sample(uid, proc=Path("/proc"), observer=None, thread_diagnostics=False):
             "fds": sum(row["fds"] for row in rows), "process_count": len(rows)}
 
 
+def sample_line(row):
+    """One journal line carrying its own digest.
+
+    The serial console can drop a run of bytes inside a line and still leave
+    valid JSON (run 40914419860: '"cpu_ticks":47,…,"cmd"' became
+    '"cpu_ticksmd"'), so the host keeps only records whose digest matches.
+    """
+    payload = json.dumps(row, separators=(",", ":"))
+    return f"tuna-perf-sample: {payload} sha256={hashlib.sha256(payload.encode()).hexdigest()}"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--interval", type=float, default=1)
@@ -400,7 +411,7 @@ def main():
                                                   if previous_at is not None else None),
                    departed_processes=len(previous.keys() - current.keys()))
         row["cpu_interval_start_boottime_s"] = previous_boot_at
-        print("tuna-perf-sample: " + json.dumps(row, separators=(",", ":")), flush=True)
+        print(sample_line(row), flush=True)
         previous, previous_at, previous_boot_at = current, start, boot_start
         if not globals_captured:
             globals_captured = capture_globals(uid)
