@@ -549,14 +549,54 @@ def owned_compositor(processes):
 
 
 # GNOME 51 settings daemon plugins the Tuna session starts through GNOME's own
-# user units (share/systemd/user/tuna-session.target, #355), and the ones whose
-# service Tuna Desktop provides itself.
-GSD_STARTED = ("Datetime", "Housekeeping", "Keyboard", "Power", "PrintNotifications", "Rfkill",
-               "ScreensaverProxy", "Sharing", "Smartcard", "Sound", "UsbProtection", "Wwan")
-GSD_TUNA_OWNED = ("A11ySettings", "MediaKeys")
+# user units (share/systemd/user/tuna-session.target, #355, #589), and the
+# one whose service Tuna Desktop provides itself (A11ySettings: the
+# compositor runs Orca; Color is the compositor's own bus name).
+GSD_STARTED = ("Datetime", "Housekeeping", "Keyboard", "MediaKeys", "Power", "PrintNotifications",
+               "Rfkill", "ScreensaverProxy", "Sharing", "Smartcard", "Sound", "UsbProtection", "Wwan")
+GSD_TUNA_OWNED = ("A11ySettings",)
 LEADER_FIFO = f"{RUNTIME}/gnome-session-leader-fifo"
 GSD_POWER_MONITOR = pathlib.Path("/run/tuna-vm-gsd-power-monitor.log")
 GSD_POWER_STATE = pathlib.Path("/run/tuna-vm-gsd-power-state.json")
+POWER_BUTTON_STATE = pathlib.Path("/run/tuna-vm-power-button-state.json")
+POWER_BUTTON_SESSION_LOG = pathlib.Path("/run/tuna-vm-power-button-session.log")
+POWER_BUTTON_SYSTEM_LOG = pathlib.Path("/run/tuna-vm-power-button-system.log")
+POWER_BUTTON_LOG_BOUND = 64 << 20
+MEDIA_KEYS = "org.gnome.SettingsDaemon.MediaKeys"
+# gsd-media-keys' GrabAccelerators/AcceleratorActivated exchange with the
+# org.gnome.Shell key grabber, gnome-session's Shutdown entry point and the
+# shell's EndSessionDialog. Method returns are matched to their calls by
+# (destination, reply_serial) because the replier's unique name is not
+# known when the monitor starts.
+POWER_BUTTON_SESSION_RULES = (
+    "type='method_call',interface='org.gnome.Shell',member='GrabAccelerators'",
+    "type='method_return'",
+    "type='error'",
+    "type='signal',interface='org.gnome.Shell',member='AcceleratorActivated'",
+    "type='method_call',interface='org.gnome.SessionManager',member='Shutdown'",
+    "type='method_call',interface='org.gnome.SessionManager.EndSessionDialog'",
+    "type='signal',interface='org.gnome.SessionManager.EndSessionDialog'")
+# logind power requests, their error replies and logind's own announcement
+# that it is about to act (gsd-media-keys' logind_power_action:
+# PowerOffWithFlags/SuspendWithFlags/HibernateWithFlags). gsd passes no reply
+# callback, so GDBus sends these calls NO_REPLY_EXPECTED and logind answers
+# nothing, not even a refusal: a refused request shows as a call that
+# PrepareForShutdown/PrepareForSleep never follows while PreparingForShutdown
+# stays false.
+POWER_BUTTON_LOGIND_CALLS = ("PowerOff", "PowerOffWithFlags", "Suspend", "SuspendWithFlags",
+                             "Hibernate", "HibernateWithFlags")
+POWER_BUTTON_LOGIND_PREPARE = ("PrepareForShutdown", "PrepareForSleep")
+POWER_BUTTON_SYSTEM_RULES = tuple(
+    f"type='method_call',interface='org.freedesktop.login1.Manager',member='{member}'"
+    for member in POWER_BUTTON_LOGIND_CALLS) + tuple(
+    f"type='signal',interface='org.freedesktop.login1.Manager',member='{member}'"
+    for member in POWER_BUTTON_LOGIND_PREPARE) + ("type='error'",)
+POWER_BUTTON_ACTIONS = ("interactive", "nothing")
+# A block inhibitor on shutdown held by the fixture itself (root): since
+# systemd 257 a strong block inhibitor refuses PowerOffWithFlags without
+# SD_LOGIND_SKIP_INHIBITORS outright, which is how gsd 51 powers off a VM.
+POWER_BUTTON_BLOCK_WHO = "tuna-vm-lane"
+POWER_BUTTON_BLOCK_SYSTEMD = 257
 
 
 def gsd_executable(plugin):
@@ -587,26 +627,29 @@ def user_unit(unit):
     return dict(line.split("=", 1) for line in shown.splitlines() if "=" in line)
 
 
+def gsd_plugin_row(plugin):
+    """The plugin's unit, bus owner and owner process identity."""
+    name = f"org.gnome.SettingsDaemon.{plugin}"
+    row = {"unit": user_unit(name + ".service"), "owner": bus_owner(name)}
+    if row["owner"]:
+        proc = pathlib.Path(f"/proc/{row['owner'][1]}")
+        executable = os.readlink(proc / "exe")
+        row.update(uid=proc.stat().st_uid, executable=executable,
+                   package=call("pacman", "-Qqo", executable, check=False))
+    row["ok"] = (row["unit"].get("ActiveState") == "active" and row["owner"] is not None
+                 and row["unit"].get("MainPID") == str(row["owner"][1])
+                 and row.get("uid") == OWNER.pw_uid
+                 and pathlib.Path(row.get("executable", "")).name == gsd_executable(plugin)
+                 and row.get("package") == "gnome-settings-daemon")
+    return row
+
+
 def gsd_plugins():
     """Each started plugin is the packaged gsd binary, running as the session
     user under its own unit and owning its bus name; Tuna's own services keep
     theirs; the compositor holds the session leader FIFO."""
     compositor = owned_compositor(inventory()["processes"])
-    started = {}
-    for plugin in GSD_STARTED:
-        name = f"org.gnome.SettingsDaemon.{plugin}"
-        row = {"unit": user_unit(name + ".service"), "owner": bus_owner(name)}
-        if row["owner"]:
-            proc = pathlib.Path(f"/proc/{row['owner'][1]}")
-            executable = os.readlink(proc / "exe")
-            row.update(uid=proc.stat().st_uid, executable=executable,
-                       package=call("pacman", "-Qqo", executable, check=False))
-        row["ok"] = (row["unit"].get("ActiveState") == "active" and row["owner"] is not None
-                     and row["unit"].get("MainPID") == str(row["owner"][1])
-                     and row.get("uid") == OWNER.pw_uid
-                     and pathlib.Path(row.get("executable", "")).name == gsd_executable(plugin)
-                     and row.get("package") == "gnome-settings-daemon")
-        started[plugin] = row
+    started = {plugin: gsd_plugin_row(plugin) for plugin in GSD_STARTED}
     color = bus_owner("org.gnome.SettingsDaemon.Color")
     tuna = {"Color": {"owner": color, "ok": color is not None and color[1] == compositor["pid"]}}
     for plugin in GSD_TUNA_OWNED:
@@ -648,6 +691,295 @@ def gsd_power_calls(text):
                               "call": "PowerSaveMode", "value": int(args[2].split()[-1])})
         block = [line] if line else []
     return calls
+
+
+def dbus_monitor_messages(text):
+    """Every message in dbus-monitor's text output, in bus order: header
+    fields and stripped argument lines. Only complete lines count, so each
+    message keeps its index while the monitor appends."""
+    text = text[:text.rfind("\n") + 1]
+    messages, block = [], []
+    for line in text.splitlines() + [""]:
+        if line.startswith((" ", "\t")):
+            if block:
+                block.append(line.strip())
+            continue
+        if block:
+            kind = next((kind for kind in ("method call", "method return", "signal", "error")
+                         if block[0].startswith(kind + " ")), None)
+            if kind:
+                header = dict(part.split("=", 1) for part in block[0].replace(";", " ").split() if "=" in part)
+                # A broadcast prints "destination=(null destination)".
+                destination = header.get("destination")
+                messages.append({"index": len(messages), "type": kind, "sender": header.get("sender"),
+                                 "destination": None if destination in (None, "(null") else destination,
+                                 "serial": header.get("serial"), "reply_serial": header.get("reply_serial"),
+                                 "interface": header.get("interface"), "member": header.get("member"),
+                                 "error_name": header.get("error_name"), "args": block[1:]})
+        block = [line] if line else []
+    return messages
+
+
+def power_button_log(path):
+    with path.open("rb") as stream:
+        data = stream.read(POWER_BUTTON_LOG_BOUND + 1)
+    if len(data) > POWER_BUTTON_LOG_BOUND:
+        raise RuntimeError("power button monitor log exceeds its bound")
+    return dbus_monitor_messages(data.decode(errors="replace"))
+
+
+def logind_inhibitors():
+    listed = json.loads(call("busctl", "--system", "--json=short", "call", "org.freedesktop.login1",
+                             "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "ListInhibitors"))
+    return [dict(zip(("what", "who", "why", "mode", "uid", "pid"), row)) for row in listed["data"][0]]
+
+
+def logind_preparing_for_shutdown():
+    """logind's PreparingForShutdown: true once it has begun a power-off."""
+    return json.loads(call("busctl", "--system", "--json=short", "get-property", "org.freedesktop.login1",
+                           "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
+                           "PreparingForShutdown"))["data"]
+
+
+def hostname_chassis():
+    """hostnamed's Chassis property, which gsd reads once at startup."""
+    return json.loads(call("busctl", "--system", "--json=short", "get-property", "org.freedesktop.hostname1",
+                           "/org/freedesktop/hostname1", "org.freedesktop.hostname1", "Chassis"))["data"]
+
+
+def machine_info_chassis(text):
+    """The CHASSIS= value configured in /etc/machine-info, else None."""
+    for line in (text or "").splitlines():
+        if line.startswith("CHASSIS="):
+            value = shlex.split(line[len("CHASSIS="):])
+            return value[0] if value else ""
+    return None
+
+
+def system_bus_pid(name):
+    try:
+        reply = call("busctl", "--system", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                     "org.freedesktop.DBus", "GetConnectionUnixProcessID", "s", name).split()
+    except subprocess.CalledProcessError:
+        return None
+    return int(reply[1]) if len(reply) == 2 and reply[0] == "u" else None
+
+
+def power_button_observe():
+    """gsd-media-keys' identity and inhibitors, its key grabs and
+    activations, Shutdown and EndSessionDialog traffic on the session bus,
+    logind power requests on the system bus and the compositor's layers."""
+    session = power_button_log(POWER_BUTTON_SESSION_LOG)
+    system = power_button_log(POWER_BUTTON_SYSTEM_LOG)
+
+    def replies(messages):
+        return {(m["destination"], m["reply_serial"]): m for m in messages
+                if m["type"] in ("method return", "error") and m["reply_serial"]}
+    session_replies, system_replies = replies(session), replies(system)
+
+    def reply_of(table, message):
+        reply = table.get((message["sender"], message["serial"]))
+        if reply is None:
+            return None
+        text = next((arg[len('string "'):-1] for arg in reply["args"] if arg.startswith('string "')), None)
+        return {"index": reply["index"], "type": reply["type"], "error_name": reply["error_name"],
+                "message": text if reply["type"] == "error" else None}
+
+    grabs = []
+    for message in session:
+        if message["type"] != "method call" or message["member"] != "GrabAccelerators":
+            continue
+        accelerators = [arg[len('string "'):-1] for arg in message["args"] if arg.startswith('string "')]
+        reply = session_replies.get((message["sender"], message["serial"]))
+        actions = ([int(arg.split()[1]) for arg in reply["args"] if arg.startswith("uint32 ")]
+                   if reply is not None and reply["type"] == "method return" else None)
+        power = (actions[accelerators.index("XF86PowerOff")]
+                 if actions is not None and len(actions) == len(accelerators)
+                 and "XF86PowerOff" in accelerators else None)
+        grabs.append({"index": message["index"], "sender": message["sender"],
+                      "accelerators": len(accelerators), "power_key": "XF86PowerOff" in accelerators,
+                      "reply": reply["type"] if reply is not None else None, "power_action": power})
+    activations = [{"index": m["index"], "sender": m["sender"], "destination": m["destination"],
+                    "action": int(m["args"][0].split()[1])}
+                   for m in session if m["type"] == "signal" and m["member"] == "AcceleratorActivated"
+                   and m["args"][:1] and m["args"][0].startswith("uint32 ")]
+    shutdowns = [{"index": m["index"], "sender": m["sender"], "destination": m["destination"],
+                  "reply": reply_of(session_replies, m)}
+                 for m in session if m["type"] == "method call"
+                 and m["interface"] == "org.gnome.SessionManager" and m["member"] == "Shutdown"]
+    dialog = [{"index": m["index"], "type": m["type"], "sender": m["sender"], "destination": m["destination"],
+               "member": m["member"], "args": m["args"][:3]}
+              for m in session if m["interface"] == "org.gnome.SessionManager.EndSessionDialog"
+              and m["type"] in ("method call", "signal")]
+    power_calls = [{"index": m["index"], "member": m["member"], "sender": m["sender"],
+                    "sender_pid": system_bus_pid(m["sender"]), "args": m["args"][:1],
+                    "reply": reply_of(system_replies, m)}
+                   for m in system if m["type"] == "method call"
+                   and m["interface"] == "org.freedesktop.login1.Manager"
+                   and m["member"] in POWER_BUTTON_LOGIND_CALLS]
+    saved = json.loads(POWER_BUTTON_STATE.read_text())
+    layers = json.loads(STATE.read_text()).get("layers")
+    return {"session_count": len(session), "system_count": len(system), "grabs": grabs,
+            "activations": activations, "shutdowns": shutdowns, "dialog": dialog, "system": power_calls,
+            "media_keys": gsd_plugin_row("MediaKeys"), "inhibitors": logind_inhibitors(),
+            "prepare": [{"index": m["index"], "member": m["member"], "args": m["args"][:1]}
+                        for m in system if m["type"] == "signal"
+                        and m["member"] in POWER_BUTTON_LOGIND_PREPARE],
+            "preparing_for_shutdown": logind_preparing_for_shutdown(),
+            "session_user": OWNER.pw_name, "session_uid": OWNER.pw_uid,
+            "owners": {"shell": bus_owner("org.gnome.Shell"),
+                       "session_manager": bus_owner("org.gnome.SessionManager")},
+            "layers": None if layers is None else [layer.get("namespace") for layer in layers],
+            "monitors_alive": {name: pathlib.Path(f"/proc/{saved[name]}").exists()
+                               for name in ("session_monitor", "system_monitor")}}
+
+
+def power_button_start():
+    if POWER_BUTTON_STATE.exists():
+        raise RuntimeError("power button fixture already started")
+    machine_info = pathlib.Path("/etc/machine-info")
+    saved = {"action": call("gsettings", "get", "org.gnome.settings-daemon.plugins.power",
+                            "power-button-action", user=True),
+             "chassis": hostname_chassis(),
+             "machine_info": machine_info.read_text() if machine_info.exists() else None,
+             "systemd": int(call("systemctl", "--version").split()[1])}
+    with POWER_BUTTON_SESSION_LOG.open("w") as log:
+        session = subprocess.Popen(
+            ["runuser", "-u", OWNER.pw_name, "--", "env", f"XDG_RUNTIME_DIR={RUNTIME}",
+             f"DBUS_SESSION_BUS_ADDRESS=unix:path={RUNTIME}/bus", "dbus-monitor", "--session",
+             *POWER_BUTTON_SESSION_RULES],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.DEVNULL, start_new_session=True)
+    with POWER_BUTTON_SYSTEM_LOG.open("w") as log:
+        system = subprocess.Popen(["dbus-monitor", "--system", *POWER_BUTTON_SYSTEM_RULES],
+                                  stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+    saved.update(session_monitor=session.pid, system_monitor=system.pid)
+    POWER_BUTTON_STATE.write_text(json.dumps(saved))
+    time.sleep(1)
+    if session.poll() is not None or system.poll() is not None:
+        raise RuntimeError("dbus-monitor exited")
+    return {"original_action": saved["action"], "original_chassis": saved["chassis"],
+            "configured_chassis": machine_info_chassis(saved["machine_info"]),
+            "systemd": saved["systemd"], **power_button_observe()}
+
+
+def restart_media_keys():
+    """Restart gsd-media-keys so it rereads hostnamed's chassis. The unit
+    refuses manual start/stop, but restarting its PartOf target propagates."""
+    old = bus_owner(MEDIA_KEYS)
+    unit = user_unit(MEDIA_KEYS + ".service")
+    try:
+        call("systemctl", "--user", "restart", MEDIA_KEYS + ".target", user=True)
+        route = "target"
+    except subprocess.CalledProcessError:
+        # Restart=on-failure brings an unclean exit back.
+        pid = int(unit.get("MainPID", "0"))
+        if old is None or pid <= 0 or pid != old[1]:
+            raise
+        os.kill(pid, signal.SIGKILL)
+        route = "sigkill"
+    return {"old_owner": old, "route": route}
+
+
+def power_button_chassis(mode):
+    saved = json.loads(POWER_BUTTON_STATE.read_text())
+    machine_info = pathlib.Path("/etc/machine-info")
+    if mode == "desktop":
+        expected = "desktop"
+    elif mode == "restore":
+        expected = machine_info_chassis(saved["machine_info"]) or ""
+    else:
+        raise ValueError("unknown fixed chassis mode")
+    call("busctl", "--system", "call", "org.freedesktop.hostname1", "/org/freedesktop/hostname1",
+         "org.freedesktop.hostname1", "SetChassis", "sb", expected, "false")
+    if mode == "restore":
+        # hostnamed rewrites the whole file; put the image's bytes back.
+        current = machine_info.read_text() if machine_info.exists() else None
+        if current != saved["machine_info"]:
+            if saved["machine_info"] is None:
+                machine_info.unlink()
+            else:
+                machine_info.write_text(saved["machine_info"])
+    chassis = hostname_chassis()
+    if chassis != ("desktop" if mode == "desktop" else saved["chassis"]):
+        raise RuntimeError("hostnamed chassis did not take the fixture value")
+    current = machine_info.read_text() if machine_info.exists() else None
+    return {"chassis": chassis, "machine_info_restored": current == saved["machine_info"],
+            **restart_media_keys()}
+
+
+def power_button_action(value):
+    saved = json.loads(POWER_BUTTON_STATE.read_text())
+    if value == "restore":
+        target = saved["action"]
+    elif value in POWER_BUTTON_ACTIONS:
+        target = f"'{value}'"
+    else:
+        raise ValueError("unknown fixed power-button-action")
+    schema, key = "org.gnome.settings-daemon.plugins.power", "power-button-action"
+    call("gsettings", "set", schema, key, target, user=True)
+    stored = call("gsettings", "get", schema, key, user=True)
+    if stored != target:
+        raise RuntimeError("power-button-action did not persist")
+    return {"stored": stored}
+
+
+def power_button_block(mode):
+    saved = json.loads(POWER_BUTTON_STATE.read_text())
+    listed = lambda: [row for row in logind_inhibitors() if row["who"] == POWER_BUTTON_BLOCK_WHO]
+    if mode == "start":
+        if saved["systemd"] < POWER_BUTTON_BLOCK_SYSTEMD:
+            raise RuntimeError("logind predates strong block inhibitors; refusing to press a VM power-off")
+        block = subprocess.Popen(
+            ["systemd-inhibit", "--what=shutdown", f"--who={POWER_BUTTON_BLOCK_WHO}",
+             "--why=V-POWER-BUTTON keeps the VM up", "--mode=block", "sleep", "infinity"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        saved["block"] = block.pid
+        POWER_BUTTON_STATE.write_text(json.dumps(saved))
+        deadline = time.monotonic() + 5
+        while not any(row["pid"] == block.pid and row["mode"] == "block"
+                      and "shutdown" in row["what"].split(":") for row in listed()):
+            if block.poll() is not None or time.monotonic() >= deadline:
+                raise RuntimeError("fixture shutdown block inhibitor was not taken")
+            time.sleep(0.1)
+        return {"pid": block.pid, "systemd": saved["systemd"], "inhibitors": listed()}
+    if mode != "stop":
+        raise ValueError("unknown fixed block mode")
+    pid = saved.pop("block", None)
+    if pid is not None:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    POWER_BUTTON_STATE.write_text(json.dumps(saved))
+    deadline = time.monotonic() + 5
+    while listed():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("fixture shutdown block inhibitor was not released")
+        time.sleep(0.1)
+    return {"released": True}
+
+
+def power_button_stop():
+    saved = json.loads(POWER_BUTTON_STATE.read_text())
+    for name in ("session_monitor", "system_monitor", "block"):
+        if saved.get(name) is not None:
+            try:
+                os.killpg(saved[name], signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    POWER_BUTTON_STATE.unlink()
+    machine_info = pathlib.Path("/etc/machine-info")
+    action = call("gsettings", "get", "org.gnome.settings-daemon.plugins.power",
+                  "power-button-action", user=True)
+    chassis = hostname_chassis()
+    return {"action": action, "action_restored": action == saved["action"],
+            "chassis": chassis, "chassis_restored": chassis == saved["chassis"],
+            "machine_info_restored": (machine_info.read_text() if machine_info.exists() else None)
+                                     == saved["machine_info"],
+            "block_released": not any(row["who"] == POWER_BUTTON_BLOCK_WHO for row in logind_inhibitors())}
+
 
 
 def orca_read_error(error):
@@ -2024,6 +2356,10 @@ print(json.dumps(result))
                   "percent": float(props["channelVolumes"][0]) ** (1 / 3) * 100,
                   "muted": bool(props.get("mute", False)),
                   "amplified": call("gsettings", "get", schema, key, user=True) == "true"}
+        if action != "audio-amplification-read":
+            # Whoever owns MediaKeys handles the volume keys: the shell
+            # binds them natively only while the name has no owner.
+            result["media_keys"] = gsd_plugin_row("MediaKeys")
     elif action == "suspend":
         # Queue real logind suspend, so QGA can reply before the guest sleeps.
         policy = {name: pathlib.Path(f"/sys/power/{name}").read_text().strip()
@@ -2247,6 +2583,16 @@ print(json.dumps(result))
                   "calls": gsd_power_calls(text),
                   "restored_idle_delay": call("gsettings", "get", "org.gnome.desktop.session",
                                               "idle-delay", user=True)}
+    elif action in ("power-button-start", "power-button-observe", "power-button-stop"):
+        if len(sys.argv) != 2:
+            raise ValueError("power button action takes no argument")
+        result = {"power-button-start": power_button_start, "power-button-observe": power_button_observe,
+                  "power-button-stop": power_button_stop}[action]()
+    elif action in ("power-button-chassis", "power-button-action", "power-button-block"):
+        if len(sys.argv) != 3:
+            raise ValueError("power button action requires exactly one fixed argument")
+        result = {"power-button-chassis": power_button_chassis, "power-button-action": power_button_action,
+                  "power-button-block": power_button_block}[action](sys.argv[2])
     elif action == "logout":
         call("loginctl", "terminate-session", inventory()["session"]["Id"])
         result = {"requested": "terminate session"}

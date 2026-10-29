@@ -631,6 +631,30 @@ def amplification_observation(value):
                            and value["sink_name"].startswith("alsa_output")}
 
 
+# gvc's PA_VOLUME_UI_MAX, pa_sw_volume_from_dB(+11.0) = 99957 of PA_VOLUME_NORM
+# 65536: the ceiling gsd-media-keys 51 raises an amplified sink to
+# (do_sound_action caps at gvc_mixer_control_get_vol_max_amplified).
+GNOME_UI_MAX_PERCENT = 99957 / 65536 * 100
+# The shell's native volume keys write the amplified ceiling as wpctl's
+# four-decimal 1.5252 (crates/shell-gtk/src/logic.rs
+# wpctl_volume_arg_with_limit), short of PA_VOLUME_UI_MAX.
+SHELL_NATIVE_UI_MAX_PERCENT = 152.52
+
+
+def amplified_ceiling(media_keys, published):
+    """(handler, sink percent) one amplified volume-up press reaches. The
+    owner of org.gnome.SettingsDaemon.MediaKeys handles the volume keys: the
+    shell binds them natively only while that name is unowned. The current
+    build must run the packaged gsd-media-keys; only a published guest that
+    predates it keeps the shell's native keys."""
+    if media_keys["ok"]:
+        return "gsd-media-keys", GNOME_UI_MAX_PERCENT
+    if published and media_keys["owner"] is None:
+        return "shell-native", SHELL_NATIVE_UI_MAX_PERCENT
+    raise RuntimeError("volume keys have no packaged gsd-media-keys owner")
+
+
+
 def amplification_checks(actual, initial, mode, percent_ok):
     return {"percent": percent_ok, "unmuted": not actual["muted"],
             "amplified": actual["amplified"] == (mode != "off"),
@@ -1029,8 +1053,8 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         if not plugins.get("pass"):
             raise RuntimeError("settings daemon plugins are not the session's own bus owners")
         record("V-GSD-PLUGINS", True,
-               "12 packaged gsd plugins run as the session user under their GNOME units and own their bus names; "
-               "Color stays with the compositor, MediaKeys and A11ySettings stay off; the compositor holds the leader FIFO")
+               "13 packaged gsd plugins, MediaKeys included, run as the session user under their GNOME units and own "
+               "their bus names; Color stays with the compositor, A11ySettings stays off; the compositor holds the leader FIFO")
         power_idle = {"states": []}
         started = False
         try:
@@ -1569,12 +1593,15 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                     raise RuntimeError("GNOME overamplification preference did not drive the real PipeWire sink")
                 amplified_observations.append(actual)
         else:
-            for mode, expected in (("off", 100.0), ("on", 104.0), ("high", 152.52), ("off", 100.0)):
+            for mode, expected in (("off", 100.0), ("on", 104.0), ("high", None), ("off", 100.0)):
                 case = {"mode": mode, "expected_percent": expected, "initial": None,
                         "poll_count": 0, "samples": [], "passed": False}
                 amplified_cases.append(case)
                 initial = agent.run("audio-amplification-" + mode)
                 case["initial"] = amplification_observation(initial)
+                case["key_handler"], ceiling = amplified_ceiling(initial["media_keys"], published)
+                if expected is None:
+                    expected = case["expected_percent"] = ceiling
                 time.sleep(0.3)
                 qmp.keys("volumeup")
                 deadline = time.monotonic() + 10
@@ -2243,6 +2270,257 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     qmp.keys("ret")
     await_state(lambda state: not state["state"]["locked"])
     inventory("authenticated")
+    # GNOME 51's gsd-media-keys owns the power key (#353, #589): its logind
+    # handle-power-key block inhibitor keeps logind's HandlePowerKey away,
+    # and it follows power-button-action. gsd reads hostnamed's Chassis once
+    # at startup and powers a "vm" off for every action but nothing, so the
+    # interactive and nothing cases run on a desktop chassis; the image's
+    # vm chassis is restored and its power-off request held off by logind.
+    if published:
+        record("V-POWER-BUTTON", True,
+               "published guest predates the gsd-media-keys session; proven by the current-build marlin-vm lane")
+    else:
+        power_button = {"cases": {}}
+        end_session = "tuna-shell-end-session"
+        owns_line = "tuna-shell-gtk: media keys: gsd-media-keys owns the media-keys bindings"
+        dialog_line = "tuna-shell-gtk: end-session dialog: Power Off opened over D-Bus"
+        key_what = {"handle-power-key", "handle-suspend-key", "handle-hibernate-key"}
+
+        def key_inhibitor(observed, pid):
+            return next((row for row in observed["inhibitors"]
+                         if row["mode"] == "block" and row["pid"] == pid
+                         and key_what <= set(row["what"].split(":"))
+                         and row["who"] == observed["session_user"]
+                         and row["why"] == "GNOME handling keypresses"
+                         and row["uid"] == observed["session_uid"]), None)
+
+        def since(observed, mark, key, bus="session"):
+            return [item for item in observed[key] if item["index"] >= mark[f"{bus}_count"]]
+
+        def activated(observed, mark, action_id, gsd):
+            return any(item["action"] == action_id and item["destination"] in (gsd[0], None)
+                       for item in since(observed, mark, "activations"))
+
+        def identity(value):
+            return {"session": value["session"]["Id"],
+                    "compositor": [(p["pid"], p["start_ticks"]) for p in value["processes"]
+                                   if guest_role(p["executable"]) == "tuna-compositor"]}
+
+        def await_restart(label, restarted, serial_offset):
+            # A new packaged gsd-media-keys owns its name, holds the key
+            # inhibitor, has XF86PowerOff grabbed, and the shell yielded.
+            old = restarted["old_owner"]
+            deadline = time.monotonic() + 30
+            while True:
+                observed = agent.run("power-button-observe")
+                media = observed["media_keys"]
+                fresh = media["ok"] and old is not None and media["owner"][1] != old[1]
+                inhibitor = key_inhibitor(observed, media["owner"][1]) if fresh else None
+                grabbed = [grab["power_action"] for grab in observed["grabs"]
+                           if fresh and grab["sender"] == media["owner"][0] and grab["power_action"]]
+                yielded = owns_line in read_text(serial_path)[serial_offset:]
+                if not all(observed["monitors_alive"].values()):
+                    raise RuntimeError("power button bus monitors exited")
+                if inhibitor and grabbed and yielded:
+                    power_button[label] = {"restart": restarted, "media_keys": media,
+                                           "inhibitor": inhibitor, "power_action": grabbed[-1]}
+                    return observed, grabbed[-1]
+                if time.monotonic() >= deadline:
+                    power_button[label] = {"restart": restarted, "last": observed, "shell_yielded": yielded}
+                    raise RuntimeError(f"restarted gsd-media-keys did not take the power key ({label})")
+                time.sleep(0.3)
+
+        def press(label, gsd):
+            identity_before = identity(inventory(f"power-button-{label}-before"))
+            mark = agent.run("power-button-observe")
+            if (mark["media_keys"]["owner"] != gsd or mark["layers"] is None
+                    or end_session in mark["layers"] or qmp.cmd("query-status")["status"] != "running"):
+                raise RuntimeError(f"power button case {label} did not start from the plain running desktop")
+            offset = len(read_text(serial_path))
+            qmp.cmd("system_powerdown")  # ACPI power button: KEY_POWER through libinput.
+            return identity_before, mark, offset, time.monotonic()
+
+        def quiet(observed, mark):
+            return not (since(observed, mark, "shutdowns") or since(observed, mark, "dialog")
+                        or end_session in (observed["layers"] or []))
+
+        started = False
+        try:
+            fixture = agent.run("power-button-start")
+            started = True
+            power_button["start"] = fixture
+            gsd = fixture["media_keys"]["owner"]
+            power_button["inhibitor"] = key_inhibitor(fixture, gsd[1]) if fixture["media_keys"]["ok"] else None
+            if power_button["inhibitor"] is None:
+                raise RuntimeError("the session's gsd-media-keys holds no logind power key block inhibitor")
+            if fixture["original_chassis"] != "vm":
+                raise RuntimeError(f"image chassis is {fixture['original_chassis']!r}, not vm")
+            try:
+                offset = len(read_text(serial_path))
+                observed, action_id = await_restart(
+                    "desktop-chassis", agent.run("power-button-chassis", "desktop"), offset)
+                gsd = observed["media_keys"]["owner"]
+
+                agent.run("power-button-action", "interactive")
+                case = power_button["cases"]["interactive"] = {}
+                identity_before, mark, offset, pressed = press("interactive", gsd)
+                try:
+                    # Bounded far inside the dialog's 60 s countdown.
+                    deadline = pressed + 15
+                    while True:
+                        observed = agent.run("power-button-observe")
+                        manager = observed["owners"]["session_manager"]
+                        shutdown = [call for call in since(observed, mark, "shutdowns") if call["sender"] == gsd[0]]
+                        opened = [item for item in since(observed, mark, "dialog")
+                                  if item["type"] == "method call" and item["member"] == "Open"
+                                  and item["args"][:1] == ["uint32 1"]
+                                  and manager is not None and item["sender"] == manager[0]]
+                        showing = end_session in (observed["layers"] or [])
+                        if activated(observed, mark, action_id, gsd) and shutdown and opened and showing:
+                            break
+                        if time.monotonic() >= deadline:
+                            case["last"] = observed
+                            raise RuntimeError("power key did not open the Power Off end-session dialog")
+                        time.sleep(0.2)
+                    case.update(shown_after=round(time.monotonic() - pressed, 1), shutdown=shutdown, open=opened)
+                    frame("power-button-interactive-dialog")
+                    time.sleep(max(0.0, pressed + 5 - time.monotonic()))
+                    status = qmp.cmd("query-status")["status"]
+                    held = agent.run("power-button-observe")
+                    held_identity = identity(inventory("power-button-interactive-held"))
+                    case["held"] = {"after": round(time.monotonic() - pressed, 1), "status": status,
+                                    "showing": end_session in held["layers"],
+                                    "logind": since(held, mark, "system", "system")}
+                    if not (status == "running" and case["held"]["showing"] and held_identity == identity_before
+                            and not case["held"]["logind"]):
+                        raise RuntimeError("the Power Off dialog did not hold the running session")
+                finally:
+                    # Cancel well before the countdown powers off, on every path.
+                    qmp.keys("esc")
+                    case["escape_after"] = round(time.monotonic() - pressed, 1)
+                deadline = time.monotonic() + 10
+                while True:
+                    observed = agent.run("power-button-observe")
+                    shell = observed["owners"]["shell"]
+                    canceled = [item for item in since(observed, mark, "dialog")
+                                if item["type"] == "signal" and item["member"] == "Canceled"
+                                and shell is not None and item["sender"] == shell[0]]
+                    logged = dialog_line in read_text(serial_path)[offset:]
+                    if canceled and logged and end_session not in observed["layers"]:
+                        break
+                    if time.monotonic() >= deadline:
+                        case["last"] = observed
+                        raise RuntimeError("Escape did not cancel the Power Off dialog")
+                    time.sleep(0.2)
+                status = qmp.cmd("query-status")["status"]
+                case.update(canceled=canceled, status_after_cancel=status)
+                frame("power-button-interactive-canceled")
+                if (status != "running" or identity(inventory("power-button-interactive-canceled")) != identity_before
+                        or since(observed, mark, "system", "system")):
+                    raise RuntimeError("canceling the Power Off dialog disturbed the session")
+
+                agent.run("power-button-action", "nothing")
+                case = power_button["cases"]["nothing"] = {}
+                identity_before, mark, offset, pressed = press("nothing", gsd)
+                try:
+                    while True:
+                        observed = agent.run("power-button-observe")
+                        if not quiet(observed, mark) or since(observed, mark, "system", "system"):
+                            case["last"] = observed
+                            raise RuntimeError("power-button-action nothing still acted")
+                        reached = activated(observed, mark, action_id, gsd)
+                        if reached and time.monotonic() >= pressed + 8:
+                            break
+                        if time.monotonic() >= pressed + 15:
+                            case["last"] = observed
+                            raise RuntimeError("power key never reached gsd-media-keys")
+                        time.sleep(0.2)
+                except BaseException:
+                    qmp.keys("esc")  # Never leave a countdown running.
+                    raise
+                status = qmp.cmd("query-status")["status"]
+                case.update(window=round(time.monotonic() - pressed, 1), status=status)
+                if (status != "running" or identity(inventory("power-button-nothing-after")) != identity_before
+                        or observed["media_keys"]["owner"] != gsd):
+                    raise RuntimeError("power-button-action nothing disturbed the session")
+            finally:
+                agent.run("power-button-action", "restore")
+                offset = len(read_text(serial_path))
+                restored = agent.run("power-button-chassis", "restore")
+            observed, action_id = await_restart("restored-chassis", restored, offset)
+            gsd = observed["media_keys"]["owner"]
+
+            # gsd 51 on a vm chassis calls PowerOffWithFlags(0) without
+            # SD_LOGIND_SKIP_INHIBITORS; the fixture's own block inhibitor
+            # makes logind refuse it, so the VM stays up to record the gate.
+            # gsd passes no reply callback (logind_power_action), so GDBus
+            # marks the call NO_REPLY_EXPECTED and logind sends no refusal
+            # (CI run 40830470213 captured the call, never a reply): the
+            # refusal is that logind never announces PrepareForShutdown and
+            # PreparingForShutdown stays false with the inhibitor held.
+            case = power_button["cases"]["vm"] = {}
+            blocked = False
+            pressed = None
+            try:
+                case["block"] = agent.run("power-button-block", "start")
+                blocked = True
+                agent.run("power-button-action", "interactive")
+                identity_before, mark, offset, pressed = press("vm", gsd)
+                deadline = pressed + 10
+                while True:
+                    observed = agent.run("power-button-observe")
+                    requested = [call for call in since(observed, mark, "system", "system")
+                                 if call["member"] == "PowerOffWithFlags" and call["sender_pid"] == gsd[1]
+                                 and call["args"] == ["uint64 0"]]
+                    if not quiet(observed, mark):
+                        case["last"] = observed
+                        raise RuntimeError("vm chassis power key opened the end-session path")
+                    if activated(observed, mark, action_id, gsd) and requested:
+                        break
+                    if time.monotonic() >= deadline:
+                        case["last"] = observed
+                        raise RuntimeError("gsd-media-keys did not request logind power-off on the vm chassis")
+                    time.sleep(0.2)
+                case["requested"] = requested
+                time.sleep(max(0.0, pressed + 5 - time.monotonic()))
+                status = qmp.cmd("query-status")["status"]
+                observed = agent.run("power-button-observe")
+                calls = since(observed, mark, "system", "system")
+                prepare = since(observed, mark, "prepare", "system")
+                held = any(row["mode"] == "block" and row["who"] == "tuna-vm-lane"
+                           and "shutdown" in row["what"].split(":") for row in observed["inhibitors"])
+                case.update(status=status, logind=calls, prepare=prepare,
+                            preparing_for_shutdown=observed["preparing_for_shutdown"], block_held=held)
+                if (status != "running" or identity(inventory("power-button-vm-after")) != identity_before
+                        or not quiet(observed, mark) or prepare or observed["preparing_for_shutdown"] is not False
+                        or not held
+                        or any(call["member"] != "PowerOffWithFlags" or call["sender_pid"] != gsd[1]
+                               or (call["reply"] is not None and call["reply"]["type"] != "error")
+                               for call in calls)):
+                    raise RuntimeError("vm chassis power key disturbed the session beyond the refused power-off")
+            finally:
+                # logind answers inhibited requests at once; the 5 s window
+                # above already covers it. Never release the block earlier.
+                if pressed is not None:
+                    time.sleep(max(0.0, pressed + 5 - time.monotonic()))
+                if blocked:
+                    agent.run("power-button-block", "stop")
+                agent.run("power-button-action", "restore")
+        finally:
+            if started:
+                power_button["stop"] = agent.run("power-button-stop")
+            with open(os.path.join(evidence, "power-button.json"), "w") as stream:
+                json.dump(power_button, stream, indent=2)
+        restored_image = power_button["stop"]
+        if not all(restored_image[key] for key in ("action_restored", "chassis_restored", "machine_info_restored",
+                                         "block_released")):
+            raise RuntimeError(f"power button fixture did not restore the image: {restored_image}")
+        record("V-POWER-BUTTON", True,
+               f"gsd-media-keys holds logind's handle-power/suspend/hibernate-key block inhibitor as the session user; "
+               f"ACPI power button on a desktop chassis: interactive -> gsd Shutdown -> EndSessionDialog Open(1), "
+               f"dialog up after {power_button['cases']['interactive']['shown_after']} s, VM, compositor and session "
+               f"unchanged at 5 s, Escape -> Canceled; nothing -> AcceleratorActivated only; image vm chassis -> "
+               f"gsd PowerOffWithFlags(0) refused by a fixture block inhibitor; chassis and setting restored")
     if older_guest:
         departing_orca = None
         with open(os.path.join(evidence, "orca-before-logout.json"), "w") as stream:
@@ -2829,8 +3107,10 @@ def run_tour(qmp, out, serial_path, older_guest=False):
         wait(1)
         keys("esc")
         wait(2)
-        # Actual PipeWire sink on the virtual HDA device. Guest health
-        # samples each completed mutation; allow a sample between keys.
+        # Actual PipeWire sink on the virtual HDA device. In the hardware
+        # session gsd-media-keys handles these keys through the shell's
+        # GrabAccelerators (GNOME's 6% steps). Guest health samples each
+        # completed mutation; allow a sample between keys.
         for media_key in ("volumeup", "volumedown", "audiomute", "audiomute"):
             keys(media_key)
             wait(3)

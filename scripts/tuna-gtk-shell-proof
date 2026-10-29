@@ -219,6 +219,16 @@
 #                  key's shot on the clipboard and writes no file
 #   G-ACCEL        org.gnome.Shell: an allowlisted caller grabs a media key,
 #                  the key fires AcceleratorActivated, and ShowOSD shows
+#   G-GSD-MEDIA-OWNER the distribution's real gsd-media-keys owns
+#                  org.gnome.SettingsDaemon.MediaKeys, the shell stands its
+#                  native media bindings down and gsd's grabs succeed
+#   G-GSD-MIC-MUTE XF86AudioMicMute mutes and unmutes the default PipeWire
+#                  source through gsd, which shows the microphone OSD; the
+#                  native path stays silent
+#   G-GSD-VOLUME-ONCE one volume key moves the sink exactly one gsd step
+#   G-GSD-MPRIS    XF86AudioPlay reaches an MPRIS player as PlayPause
+#   G-GSD-LAUNCHER XF86WWW launches the default x-scheme-handler/http app
+#   G-GSD-NATIVE-RESUME with gsd-media-keys gone the native bindings return
 #   G-KEYBINDINGS  GNOME Shell's keys: Super+S quick settings, Super+V the
 #                  date menu, Super+A the app grid (and back)
 #   G-PANEL-FOCUS  Ctrl+Alt+Tab focuses the top bar (switch-panels):
@@ -508,6 +518,10 @@ OCCLUSION_PIDS=""
 A11Y_INPUT_PID=""
 CURSOR_PID=""
 IME_PIDS=""
+GSD_MEDIA_KEYS_PID=""
+GSD_BUS_PID=""
+MPRIS_PID=""
+PW_PULSE_PID=""
 cleanup() {
     if [ -n "$ICON_PID" ]; then kill "$ICON_PID" 2>/dev/null || true; fi
     if [ -n "$HINTS_PID" ]; then kill "$HINTS_PID" 2>/dev/null || true; fi
@@ -529,6 +543,9 @@ cleanup() {
     fi
     if [ -n "$SCREENSAVER_PID" ]; then kill "$SCREENSAVER_PID" 2>/dev/null || true; fi
     if [ -n "$CAL_PID" ]; then kill "$CAL_PID" 2>/dev/null || true; fi
+    for gsd_pid in $GSD_MEDIA_KEYS_PID $MPRIS_PID $GSD_BUS_PID $PW_PULSE_PID; do
+        kill "$gsd_pid" 2>/dev/null || true
+    done
     if [ -n "$ACCEL_PID" ]; then kill "$ACCEL_PID" 2>/dev/null || true; fi
     if [ -n "$COMPOSITOR_PID" ]; then
         kill "$COMPOSITOR_PID" 2>/dev/null || true
@@ -892,6 +909,9 @@ WPCTL
 # Only audio monitoring uses the event fixture. Capture revocation must inspect
 # actual PipeWire nodes with the installed one-shot tool, never the endless FIFO.
 PW_DUMP_REAL="$(command -v pw-dump || true)"
+# G-GSD-* drive a real PipeWire beside the shell's stand-ins.
+WPCTL_REAL="$(command -v wpctl || true)"
+PW_CLI_REAL="$(command -v pw-cli || true)"
 cat >"$ARTIFACTS/bin/pw-dump" <<PW_DUMP
 #!/bin/sh
 for arg do
@@ -7187,6 +7207,15 @@ grep -q "activated" "$ACCEL_MARKER" ||
 sleep 0.5
 scrot "$ARTIFACTS/24b-osd.png" >/dev/null
 pass G-ACCEL "gnome-settings-daemon's grab fires on its key and its ShowOSD shows the OSD"
+# The stand-in owns org.gnome.SettingsDaemon.MediaKeys, so while it runs the
+# shell leaves the media keys to it. End it: the native proofs below run on
+# the native bindings, as the nested preview (no gsd-media-keys) has them.
+accel_off="$(log_mark)"
+kill "$ACCEL_PID" 2>/dev/null || true
+wait "$ACCEL_PID" 2>/dev/null || true
+ACCEL_PID=""
+log_wait "$accel_off" "tuna-shell-gtk: media keys: no gsd-media-keys, native volume and lock bindings" 10 ||
+    fail G-MEDIA-VOLUME "the shell did not take the media keys back when the stand-in left"
 
 # Native media actions work even without gsd-media-keys. These assert
 # the actual asynchronous backend mutations, including GNOME's unmute rule.
@@ -7326,6 +7355,297 @@ media_baseline 0.4200
 scrot "$ARTIFACTS/media-volume-osd.png" >/dev/null
 rm -f "$TUNA_MEDIA_DIAGNOSTICS"
 pass G-MEDIA-VOLUME "native volume/precise/mute/microphone keys mutate PipeWire state; unmute preserves the level"
+
+# gnome-settings-daemon's real gsd-media-keys against this same shell
+# (G-GSD-*). A hardware session starts it (tuna-session.target); the nested
+# preview does not, which is why the native proofs above remain the
+# fallback. CI runs the distribution's build (Ubuntu's gnome-settings-daemon
+# is older than GNOME 51; gsd-media-keys/version.txt records which): its
+# media-keys plugin speaks the same org.gnome.Shell GrabAccelerators /
+# AcceleratorActivated / ShowOSD contract. gsd changes a real PipeWire
+# through pipewire-pulse (libgvc), while the native path only ever reaches
+# the wpctl stand-in, so a double-handled key shows on either side.
+GSD_DIR="$ARTIFACTS/gsd-media-keys"
+GSD_BIN=""
+for candidate in /usr/libexec/gsd-media-keys /usr/lib/gsd-media-keys; do
+    if [ -x "$candidate" ]; then GSD_BIN="$candidate"; break; fi
+done
+gsd_now() { "$PY" -c 'import time; print(time.monotonic_ns())'; }
+gsd_bus() { "$PY" "$ROOT/scripts/lib/gsd-media-keys-bus.py" "$@"; }
+# Run "$@" until it succeeds, for at most $1 seconds.
+gsd_until() {
+    gsd_end=$(($(date +%s) + $1))
+    shift
+    until "$@"; do
+        [ "$(date +%s)" -lt "$gsd_end" ] || return 1
+        sleep 0.2
+    done
+}
+# "0.40", or "0.40 [MUTED]", from the real wpctl (never the stand-in).
+real_volume() { "$WPCTL_REAL" get-volume "$1" 2>/dev/null | sed -n 's/^Volume: //p'; }
+real_volume_is() { [ "$(real_volume "$1")" = "$2" ]; }
+real_muted() { real_volume "$1" | grep -q '\[MUTED\]'; }
+real_unmuted() {
+    gsd_vol="$(real_volume "$1")"
+    [ -n "$gsd_vol" ] && [ "$gsd_vol" = "${gsd_vol%\[MUTED\]}" ]
+}
+real_moved() {
+    gsd_vol="$(real_volume "$1")"
+    [ -n "$gsd_vol" ] && [ "$gsd_vol" != "$2" ]
+}
+gsd_owner() {
+    gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.GetNameOwner org.gnome.SettingsDaemon.MediaKeys 2>/dev/null |
+        sed -n "s/^('\(:[0-9.]*\)',)\$/\1/p"
+}
+gsd_released() { [ -z "$(gsd_owner)" ]; }
+gsd_node_id() {
+    "$PW_DUMP_REAL" 2>/dev/null | jq -r --arg n "$1" \
+        '.[] | select(.type == "PipeWire:Interface:Node" and .info.props["node.name"] == $n) | .id' | head -1
+}
+gsd_node_ready() { [ -n "$(gsd_node_id "$1")" ]; }
+gsd_default_is() { "$WPCTL_REAL" inspect "$1" 2>/dev/null | grep -qF "node.name = \"$2\""; }
+# gsd's libgvc client has reached pipewire-pulse.
+gsd_audio_client() {
+    "$PW_DUMP_REAL" 2>/dev/null | jq -e --arg pid "$GSD_MEDIA_KEYS_PID" \
+        'any(.[]; .type == "PipeWire:Interface:Client" and
+            (((.info.props["application.process.id"] // "") | tostring) == $pid or
+             .info.props["application.process.binary"] == "gsd-media-keys"))' >/dev/null
+}
+gsd_fixture() { cat "$VOLUME_FILE" "$VOLUME_MUTED_FILE" "$MIC_FILE" "$MIC_MUTED_FILE" | tr '\n' ' '; }
+# The native path left the stand-in alone and logged no media action, and
+# the key fired gsd's grab exactly once ($1 gate, $2 log offset, $3 action,
+# $4 monotonic time of the press, $5 the stand-in's state before).
+gsd_once() {
+    sleep 0.5
+    [ "$(gsd_bus native "$LOG" "$2")" = 0 ] || fail "$1" "the shell's native media path ran while gsd-media-keys owned the keys"
+    [ "$(gsd_fixture)" = "$5" ] || fail "$1" "the native wpctl stand-in changed while gsd-media-keys owned the keys"
+    [ "$(gsd_bus activations "$GSD_DIR/bus.jsonl" "$3" "$4")" = 1 ] ||
+        fail "$1" "the key did not fire gsd's grab $3 exactly once"
+}
+gsd_media_keys_proof() {
+    mkdir -p "$GSD_DIR"
+    {
+        echo "binary: $GSD_BIN"
+        dpkg-query -W gnome-settings-daemon 2>/dev/null || pacman -Q gnome-settings-daemon 2>/dev/null ||
+            echo "package: unknown"
+        echo "parity target: GNOME 51 gnome-settings-daemon; this is the host distribution's build"
+    } >"$GSD_DIR/version.txt"
+    cat "$GSD_DIR/version.txt"
+    # libgvc speaks the PulseAudio protocol: pipewire-pulse on the proof's
+    # private PipeWire, with a null speaker and microphone as the defaults.
+    gsd_pulse="unix:$XDG_RUNTIME_DIR/pulse/native"
+    pipewire-pulse >"$GSD_DIR/pipewire-pulse.log" 2>&1 &
+    PW_PULSE_PID=$!
+    gsd_until 10 test -S "$XDG_RUNTIME_DIR/pulse/native" ||
+        fail G-GSD-MEDIA-OWNER "pipewire-pulse did not open its socket"
+    "$PW_CLI_REAL" create-node adapter '{ factory.name=support.null-audio-sink node.name=tuna-gsd-proof-sink node.description="Tuna Proof Speakers" media.class=Audio/Sink object.linger=true audio.position=[FL FR] }' \
+        >"$GSD_DIR/pw-cli-sink.txt" 2>&1 || fail G-GSD-MEDIA-OWNER "could not create the PipeWire sink"
+    "$PW_CLI_REAL" create-node adapter '{ factory.name=support.null-audio-sink node.name=tuna-gsd-proof-source node.description="Tuna Proof Microphone" media.class=Audio/Source object.linger=true audio.position=[FL FR] }' \
+        >"$GSD_DIR/pw-cli-source.txt" 2>&1 || fail G-GSD-MEDIA-OWNER "could not create the PipeWire source"
+    gsd_until 10 gsd_node_ready tuna-gsd-proof-sink || fail G-GSD-MEDIA-OWNER "the PipeWire sink never appeared"
+    gsd_until 10 gsd_node_ready tuna-gsd-proof-source || fail G-GSD-MEDIA-OWNER "the PipeWire source never appeared"
+    gsd_sink="$(gsd_node_id tuna-gsd-proof-sink)"
+    gsd_source="$(gsd_node_id tuna-gsd-proof-source)"
+    "$WPCTL_REAL" set-default "$gsd_sink"
+    "$WPCTL_REAL" set-default "$gsd_source"
+    gsd_until 10 gsd_default_is @DEFAULT_AUDIO_SINK@ tuna-gsd-proof-sink ||
+        fail G-GSD-MEDIA-OWNER "the proof sink did not become the default"
+    gsd_until 10 gsd_default_is @DEFAULT_AUDIO_SOURCE@ tuna-gsd-proof-source ||
+        fail G-GSD-MEDIA-OWNER "the proof source did not become the default"
+    "$WPCTL_REAL" set-volume @DEFAULT_AUDIO_SINK@ 0.40
+    "$WPCTL_REAL" set-mute @DEFAULT_AUDIO_SINK@ 0
+    "$WPCTL_REAL" set-mute @DEFAULT_AUDIO_SOURCE@ 0
+    gsd_until 5 real_volume_is @DEFAULT_AUDIO_SINK@ 0.40 || fail G-GSD-MEDIA-OWNER "could not set the sink baseline"
+    gsd_until 5 real_unmuted @DEFAULT_AUDIO_SOURCE@ || fail G-GSD-MEDIA-OWNER "could not unmute the source"
+    # XF86WWW's handler: a private default x-scheme-handler/http app whose
+    # Exec leaves a marker (gsd's do_url_action launches the default).
+    gsd_www_marker="$GSD_DIR/www-launched"
+    rm -f "$gsd_www_marker"
+    cat >"$ARTIFACTS/bin/tuna-gsd-www-probe" <<WWW_PROBE
+#!/bin/sh
+printf 'launched with %s arguments\n' "\$#" >>"$gsd_www_marker"
+WWW_PROBE
+    chmod +x "$ARTIFACTS/bin/tuna-gsd-www-probe"
+    cat >"$XDG_DATA_HOME/applications/tuna-gsd-www-probe.desktop" <<WWW_DESKTOP
+[Desktop Entry]
+Name=Tuna Proof Browser
+Exec=$ARTIFACTS/bin/tuna-gsd-www-probe %u
+Type=Application
+MimeType=x-scheme-handler/http;
+NoDisplay=true
+WWW_DESKTOP
+    cp "$XDG_CONFIG_HOME/mimeapps.list" "$GSD_DIR/mimeapps.list.before"
+    gio mime x-scheme-handler/http tuna-gsd-www-probe.desktop >"$GSD_DIR/gio-mime.txt" 2>&1 ||
+        fail G-GSD-LAUNCHER "could not make the probe the default http handler"
+    # The very lookup gsd's do_url_action makes.
+    "$PY" -c 'import sys; from gi.repository import Gio; a = Gio.AppInfo.get_default_for_uri_scheme("http"); sys.exit(not a or a.get_id() != sys.argv[1])' \
+        tuna-gsd-www-probe.desktop ||
+        fail G-GSD-LAUNCHER "the probe is not the default http handler"
+    # Witness every org.gnome.Shell call, reply and signal on the bus.
+    gsd_bus monitor "$GSD_DIR/bus.jsonl" "$GSD_DIR/bus-ready" 600 >"$GSD_DIR/bus-monitor.log" 2>&1 &
+    GSD_BUS_PID=$!
+    gsd_until 10 test -s "$GSD_DIR/bus-ready" || fail G-GSD-MEDIA-OWNER "the session bus monitor did not start"
+    "$PY" "$ROOT/scripts/lib/tuna-mpris-player-stub.py" "$GSD_DIR/mpris-calls" 600 >"$GSD_DIR/mpris.log" 2>&1 &
+    MPRIS_PID=$!
+    gsd_until 10 grep -qsx ready "$GSD_DIR/mpris-calls" || fail G-GSD-MPRIS "the MPRIS player did not own its name"
+    gsd_fixture_before="$(gsd_fixture)"
+    touch "$TUNA_MEDIA_DIAGNOSTICS"
+
+    gsd_off="$(log_mark)"
+    env -u DISPLAY GDK_BACKEND=wayland WAYLAND_DISPLAY="$SOCKET_NAME" PULSE_SERVER="$gsd_pulse" \
+        "$GSD_BIN" --verbose >"$GSD_DIR/gsd-media-keys.log" 2>&1 &
+    GSD_MEDIA_KEYS_PID=$!
+    GSD_OWNER=""
+    gsd_end=$(($(date +%s) + 20))
+    while [ -z "$GSD_OWNER" ]; do
+        kill -0 "$GSD_MEDIA_KEYS_PID" 2>/dev/null || fail G-GSD-MEDIA-OWNER "gsd-media-keys exited during startup"
+        [ "$(date +%s)" -le "$gsd_end" ] ||
+            fail G-GSD-MEDIA-OWNER "gsd-media-keys never owned org.gnome.SettingsDaemon.MediaKeys"
+        sleep 0.3
+        GSD_OWNER="$(gsd_owner)"
+    done
+    gsd_owner_pid="$(gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.GetConnectionUnixProcessID "$GSD_OWNER" | sed -n 's/^(uint32 \([0-9]*\),)$/\1/p')"
+    [ "$gsd_owner_pid" = "$GSD_MEDIA_KEYS_PID" ] ||
+        fail G-GSD-MEDIA-OWNER "org.gnome.SettingsDaemon.MediaKeys is owned by pid $gsd_owner_pid, not gsd-media-keys"
+    log_wait "$gsd_off" "tuna-shell-gtk: media keys: gsd-media-keys owns the media-keys bindings" 10 ||
+        fail G-GSD-MEDIA-OWNER "the shell did not hand the media keys to gsd-media-keys"
+    gsd_grabs="$(gsd_bus grabs "$GSD_DIR/bus.jsonl" "$GSD_OWNER" \
+        XF86AudioMicMute XF86AudioRaiseVolume XF86AudioPlay XF86WWW --timeout 20)" ||
+        fail G-GSD-MEDIA-OWNER "org.gnome.Shell refused gsd-media-keys' grabs"
+    printf '%s\n' "$gsd_grabs" >"$GSD_DIR/grabs.json"
+    gsd_mic="$(printf '%s' "$gsd_grabs" | jq -r .XF86AudioMicMute)"
+    gsd_raise="$(printf '%s' "$gsd_grabs" | jq -r .XF86AudioRaiseVolume)"
+    gsd_play="$(printf '%s' "$gsd_grabs" | jq -r .XF86AudioPlay)"
+    gsd_www="$(printf '%s' "$gsd_grabs" | jq -r .XF86WWW)"
+    # ... and the shell handed exactly those grabs to the compositor.
+    gsd_bus forwarded "$LOG" "$gsd_off" "$gsd_mic" 269025202 --timeout 10 ||
+        fail G-GSD-MEDIA-OWNER "the compositor never received gsd's XF86AudioMicMute grab"
+    gsd_bus forwarded "$LOG" "$gsd_off" "$gsd_raise" 269025043 --timeout 10 ||
+        fail G-GSD-MEDIA-OWNER "the compositor never received gsd's XF86AudioRaiseVolume grab"
+    pass G-GSD-MEDIA-OWNER "gsd-media-keys owns MediaKeys; the shell stands down and gsd's MicMute/RaiseVolume/Play/WWW grabs succeed"
+
+    gsd_until 15 gsd_audio_client || fail G-GSD-MIC-MUTE "gsd-media-keys never connected to pipewire-pulse"
+    # Its mixer learns the defaults, and the last OSD (if any) hides (1.5 s),
+    # so this one fades in.
+    sleep 2
+    gsd_off="$(log_mark)"
+    gsd_since="$(gsd_now)"
+    xdotool key XF86AudioMicMute
+    gsd_until 5 real_muted @DEFAULT_AUDIO_SOURCE@ || fail G-GSD-MIC-MUTE "XF86AudioMicMute did not mute the default source"
+    gsd_bus osd "$GSD_DIR/bus.jsonl" "$GSD_OWNER" "$gsd_since" microphone-sensitivity-muted-symbolic --timeout 5 ||
+        fail G-GSD-MIC-MUTE "gsd-media-keys showed no muted-microphone OSD"
+    log_wait "$gsd_off" "tuna-shell-gtk: transient osd " 5 || fail G-GSD-MIC-MUTE "the shell did not show gsd's OSD"
+    scrot "$GSD_DIR/mic-muted-osd.png" >/dev/null
+    [ "$(gsd_bus fired "$LOG" "$gsd_off" "$gsd_mic")" = 1 ] ||
+        fail G-GSD-MIC-MUTE "the compositor did not fire gsd's XF86AudioMicMute grab once"
+    gsd_once G-GSD-MIC-MUTE "$gsd_off" "$gsd_mic" "$gsd_since" "$gsd_fixture_before"
+    gsd_since="$(gsd_now)"
+    xdotool key XF86AudioMicMute
+    gsd_until 5 real_unmuted @DEFAULT_AUDIO_SOURCE@ || fail G-GSD-MIC-MUTE "a second XF86AudioMicMute did not unmute"
+    gsd_bus osd "$GSD_DIR/bus.jsonl" "$GSD_OWNER" "$gsd_since" microphone-sensitivity-low-symbolic \
+        microphone-sensitivity-medium-symbolic microphone-sensitivity-high-symbolic --timeout 5 ||
+        fail G-GSD-MIC-MUTE "gsd-media-keys showed no unmuted-microphone OSD"
+    gsd_once G-GSD-MIC-MUTE "$gsd_off" "$gsd_mic" "$gsd_since" "$gsd_fixture_before"
+    pass G-GSD-MIC-MUTE "gsd mutes and unmutes the default PipeWire source and shows its microphone OSD; native path silent"
+
+    gsd_off="$(log_mark)"
+    gsd_since="$(gsd_now)"
+    xdotool key XF86AudioRaiseVolume
+    gsd_until 5 real_moved @DEFAULT_AUDIO_SINK@ 0.40 || fail G-GSD-VOLUME-ONCE "XF86AudioRaiseVolume did not change the sink"
+    gsd_bus osd "$GSD_DIR/bus.jsonl" "$GSD_OWNER" "$gsd_since" audio-volume-low-symbolic \
+        audio-volume-medium-symbolic audio-volume-high-symbolic --timeout 5 ||
+        fail G-GSD-VOLUME-ONCE "gsd-media-keys showed no volume OSD"
+    # A second handler of the same press would have landed by now.
+    sleep 1.5
+    gsd_after="$(real_volume @DEFAULT_AUDIO_SINK@)"
+    echo "$gsd_after" >"$GSD_DIR/sink-after-raise.txt"
+    "$PY" -c 'import sys; sys.exit(abs(float(sys.argv[1]) - 0.40 - 0.06) > 0.011)' "$gsd_after" ||
+        fail G-GSD-VOLUME-ONCE "one press moved the sink from 0.40 to $gsd_after, not one 6% step"
+    [ "$(gsd_bus fired "$LOG" "$gsd_off" "$gsd_raise")" = 1 ] ||
+        fail G-GSD-VOLUME-ONCE "the compositor did not fire gsd's XF86AudioRaiseVolume grab once"
+    gsd_once G-GSD-VOLUME-ONCE "$gsd_off" "$gsd_raise" "$gsd_since" "$gsd_fixture_before"
+    pass G-GSD-VOLUME-ONCE "one XF86AudioRaiseVolume moves the sink one 6% gsd step (0.40 to $gsd_after), handled once"
+
+    gsd_until 10 grep -qsxF "properties $GSD_OWNER" "$GSD_DIR/mpris-calls" ||
+        fail G-GSD-MPRIS "gsd-media-keys never loaded the player's properties"
+    sleep 0.5
+    gsd_since="$(gsd_now)"
+    xdotool key XF86AudioPlay
+    gsd_until 5 grep -qsxF "call PlayPause $GSD_OWNER" "$GSD_DIR/mpris-calls" ||
+        fail G-GSD-MPRIS "XF86AudioPlay did not reach the player as PlayPause"
+    [ "$(gsd_bus activations "$GSD_DIR/bus.jsonl" "$gsd_play" "$gsd_since")" = 1 ] ||
+        fail G-GSD-MPRIS "XF86AudioPlay did not fire gsd's grab exactly once"
+    [ "$(grep -c '^call ' "$GSD_DIR/mpris-calls")" = 1 ] || fail G-GSD-MPRIS "the player received other calls"
+    pass G-GSD-MPRIS "XF86AudioPlay reaches the MPRIS player as PlayPause through gsd-media-keys"
+
+    gsd_since="$(gsd_now)"
+    xdotool key XF86WWW
+    gsd_until 10 test -s "$gsd_www_marker" || fail G-GSD-LAUNCHER "XF86WWW did not launch the default http handler"
+    [ "$(gsd_bus activations "$GSD_DIR/bus.jsonl" "$gsd_www" "$gsd_since")" = 1 ] ||
+        fail G-GSD-LAUNCHER "XF86WWW did not fire gsd's grab exactly once"
+    pass G-GSD-LAUNCHER "XF86WWW makes gsd-media-keys launch the default x-scheme-handler/http application"
+
+    gsd_sink_held="$(real_volume @DEFAULT_AUDIO_SINK@)"
+    gsd_off="$(log_mark)"
+    kill "$GSD_MEDIA_KEYS_PID"
+    (sleep 10; kill -9 "$GSD_MEDIA_KEYS_PID" 2>/dev/null) &
+    gsd_watchdog=$!
+    gsd_status=0
+    wait "$GSD_MEDIA_KEYS_PID" || gsd_status=$?
+    kill "$gsd_watchdog" 2>/dev/null || true
+    echo "gsd-media-keys exit status after SIGTERM: $gsd_status" >>"$GSD_DIR/version.txt"
+    GSD_MEDIA_KEYS_PID=""
+    gsd_until 10 gsd_released || fail G-GSD-NATIVE-RESUME "org.gnome.SettingsDaemon.MediaKeys outlived gsd-media-keys"
+    log_wait "$gsd_off" "tuna-shell-gtk: media keys: no gsd-media-keys, native volume and lock bindings" 10 ||
+        fail G-GSD-NATIVE-RESUME "the shell did not take the media keys back"
+    sleep 0.7
+    [ "$(cat "$VOLUME_FILE")" = 0.4200 ] || fail G-GSD-NATIVE-RESUME "unexpected stand-in baseline $(cat "$VOLUME_FILE")"
+    MEDIA_SINCE="$(gsd_now)"
+    MEDIA_KIND=key
+    xdotool key XF86AudioRaiseVolume
+    "$PY" "$ROOT/scripts/lib/media-completion-barrier.py" --log "$LOG" \
+        --pid "$MEDIA_SHELL_PID" --owner "$ARTIFACTS/media-completion-owner.json" \
+        --since "$MEDIA_SINCE" --kind "$MEDIA_KIND" \
+        --policy "$(gsettings get org.gnome.desktop.sound allow-volume-above-100-percent)" \
+        --receipt "$GSD_DIR/native-resume-completion.json" ||
+        fail G-GSD-NATIVE-RESUME "the native volume key's callbacks did not settle"
+    media_volume 0.4800 || fail G-GSD-NATIVE-RESUME "the native volume key did not apply the 6% step"
+    [ "$(gsd_bus native "$LOG" "$gsd_off")" -ge 1 ] || fail G-GSD-NATIVE-RESUME "no native media action ran"
+    [ "$(real_volume @DEFAULT_AUDIO_SINK@)" = "$gsd_sink_held" ] ||
+        fail G-GSD-NATIVE-RESUME "something still drove the PipeWire sink after gsd-media-keys left"
+    echo 0.4200 >"$VOLUME_FILE"
+    scrot "$GSD_DIR/native-resume.png" >/dev/null
+    pass G-GSD-NATIVE-RESUME "with gsd-media-keys gone the shell rebinds and handles the volume key natively"
+
+    rm -f "$TUNA_MEDIA_DIAGNOSTICS"
+    kill "$MPRIS_PID" "$GSD_BUS_PID" 2>/dev/null || true
+    wait "$MPRIS_PID" "$GSD_BUS_PID" 2>/dev/null || true
+    MPRIS_PID=""
+    GSD_BUS_PID=""
+    "$PW_CLI_REAL" destroy "$gsd_sink" >/dev/null 2>&1 || true
+    "$PW_CLI_REAL" destroy "$gsd_source" >/dev/null 2>&1 || true
+    kill "$PW_PULSE_PID" 2>/dev/null || true
+    wait "$PW_PULSE_PID" 2>/dev/null || true
+    PW_PULSE_PID=""
+    cp "$GSD_DIR/mimeapps.list.before" "$XDG_CONFIG_HOME/mimeapps.list"
+    rm -f "$XDG_DATA_HOME/applications/tuna-gsd-www-probe.desktop"
+}
+gsd_missing=""
+if [ -z "$GSD_BIN" ]; then gsd_missing="gsd-media-keys"; fi
+if ! command -v pipewire-pulse >/dev/null 2>&1; then gsd_missing="$gsd_missing pipewire-pulse"; fi
+if [ -z "$PW_PIDS" ]; then gsd_missing="$gsd_missing pipewire/wireplumber"; fi
+if [ -z "$WPCTL_REAL" ] || [ -z "$PW_CLI_REAL" ] || [ -z "$PW_DUMP_REAL" ]; then
+    gsd_missing="$gsd_missing wpctl/pw-cli/pw-dump"
+fi
+if [ -z "$gsd_missing" ]; then
+    gsd_media_keys_proof
+elif [ "${TUNA_REQUIRE_GSD_MEDIA_KEYS:-}" = 1 ]; then
+    fail G-GSD-MEDIA-OWNER "required but missing:$gsd_missing"
+else
+    echo "tuna-gtk-shell-proof: G-GSD-MEDIA-KEYS not run, missing:$gsd_missing" >&2
+fi
 
 # GNOME Shell's own keybindings (org.gnome.shell.keybindings defaults).
 sleep 2
@@ -8459,11 +8779,19 @@ sleep 1
 # Exercise the normal three-finger handler with nested synthetic phases.
 # Physical touchpad/libinput qualification remains a separate hardware gate.
 swipe_sequence=100
+# The input file is a single slot the compositor polls each tick: wait
+# until it has read a phase before writing the next one, so a slow tick
+# can never drop a begin (a lost begin leaves the whole swipe ignored).
+swipe_consumed() {
+    cstate ".proof_swipe_sequence == $1" "swipe phase $1 consumed" 5 ||
+        fail G-SWIPE-INPUT "the compositor never read synthetic swipe phase $1"
+}
 swipe_phase() {
     swipe_sequence=$((swipe_sequence + 1))
     printf '{"phase":"%s","dx":%s,"dy":%s,"sequence":%s}\n' \
         "$1" "$2" "$3" "$swipe_sequence" >"$TUNA_PROOF_SWIPE_INPUT.tmp"
     mv "$TUNA_PROOF_SWIPE_INPUT.tmp" "$TUNA_PROOF_SWIPE_INPUT"
+    swipe_consumed "$swipe_sequence"
     sleep 0.2
 }
 gesture_home="$(jq -r '.active_workspace' "$CSTATE")"
@@ -8490,6 +8818,7 @@ swipe_at() {
     printf '{"phase":"%s","dx":%s,"dy":0,"time":%s,"sequence":%s}\n' \
         "$1" "$2" "$3" "$swipe_sequence" >"$TUNA_PROOF_SWIPE_INPUT.tmp"
     mv "$TUNA_PROOF_SWIPE_INPUT.tmp" "$TUNA_PROOF_SWIPE_INPUT"
+    swipe_consumed "$swipe_sequence"
     sleep 0.2
 }
 held_at() {
@@ -8596,6 +8925,7 @@ swipe_timed() {
     printf '{"phase":"%s","dy":%s,"time":%s,"sequence":%s}\n' \
         "$1" "$2" "$3" "$swipe_sequence" >"$TUNA_PROOF_SWIPE_INPUT.tmp"
     mv "$TUNA_PROOF_SWIPE_INPUT.tmp" "$TUNA_PROOF_SWIPE_INPUT"
+    swipe_consumed "$swipe_sequence"
     sleep 0.2
 }
 swipe_timed begin 0 5000
@@ -8637,9 +8967,11 @@ sleep 1
 # compositor's normal gesture handler; the held frame lets CI sample it.
 printf '{"phase":"begin","sequence":1}\n' >"$TUNA_PROOF_SWIPE_INPUT.tmp"
 mv "$TUNA_PROOF_SWIPE_INPUT.tmp" "$TUNA_PROOF_SWIPE_INPUT"
+swipe_consumed 1
 sleep 0.2
 printf '{"phase":"update","dy":-150,"sequence":2}\n' >"$TUNA_PROOF_SWIPE_INPUT.tmp"
 mv "$TUNA_PROOF_SWIPE_INPUT.tmp" "$TUNA_PROOF_SWIPE_INPUT"
+swipe_consumed 2
 cstate '.overview_progress == 0.5 and (.thumbnails | length) == 3 and any(.workspace_cards[]; (.active | not) and .alpha > 0 and .alpha < 1)' "half swipe" ||
     fail G-SWIPE-PROGRESS "neighbour cards or thumbnails are missing mid-gesture"
 sleep 0.2
@@ -8648,6 +8980,7 @@ cp "$CSTATE" "$ARTIFACTS/mid-swipe-state.json"
 pass G-SWIPE-PROGRESS "neighbour workspaces and thumbnails slide and fade during a held three-finger swipe"
 printf '{"phase":"end","sequence":3}\n' >"$TUNA_PROOF_SWIPE_INPUT.tmp"
 mv "$TUNA_PROOF_SWIPE_INPUT.tmp" "$TUNA_PROOF_SWIPE_INPUT"
+swipe_consumed 3
 cstate '.overview_open and (.thumbnails | length) == 3' "strip" ||
     fail G-WS-THUMBS "the overview shows no three-thumbnail strip"
 sleep 1.5

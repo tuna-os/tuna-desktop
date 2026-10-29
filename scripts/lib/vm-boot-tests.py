@@ -42,8 +42,16 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
     """Synthetic host-proof regressions; no native audio qualification."""
     SOURCE = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
 
+    # The amplified sink level V-AUDIO-AMPLIFICATION observed under gsd-media-keys
+    # 51 (CI run 40825026740): gvc's PA_VOLUME_UI_MAX read back through wpctl.
+    GSD_UI_MAX = 152.5222828677338
+    # The published shell's native keys (CI run 40871680704): wpctl 1.5252.
+    NATIVE_UI_MAX = 152.52074966249404
+    GSD = {"ok": True, "owner": [":1.40", 4242]}
+    UNOWNED = {"ok": False, "owner": None}
+
     def run_audio(self, *, change=None, older=False, dense=False, setup_error=False,
-                  write_error=False):
+                  write_error=False, high=GSD_UI_MAX, media_keys=GSD, published=False):
         tree = ast.parse(self.SOURCE.read_text())
         lifecycle = next(node for node in tree.body
                          if isinstance(node, ast.FunctionDef) and node.name == "run_lifecycle")
@@ -80,7 +88,7 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
                     return {}
                 if action == "audio-amplification-read":
                     percent = ((98.0, 98.0, 150.0, 98.0) if older else
-                               (100.0, 104.0, 152.52, 100.0))[case_index]
+                               (100.0, 104.0, high, 100.0))[case_index]
                     actual = value(percent, case_index in (1, 2))
                     if case_index == 3 and change:
                         actual.update(change)
@@ -88,10 +96,11 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
                 case_index += 1
                 if setup_error and case_index == 3:
                     raise RuntimeError("private-exception-text")
-                return value(150.0 if case_index == 2 else 98.0, case_index in (1, 2))
+                return {**value(150.0 if case_index == 2 else 98.0, case_index in (1, 2)),
+                        "media_keys": media_keys}
             scope = {**vars(lane), "agent": SimpleNamespace(run=run),
                      "qmp": SimpleNamespace(keys=lambda key: keys.append(key)),
-                     "evidence": directory, "older_guest": older,
+                     "evidence": directory, "older_guest": older, "published": published,
                      "record": lambda *args: records.append(args),
                      "time": SimpleNamespace(monotonic=monotonic, sleep=sleep)}
             if write_error:
@@ -136,6 +145,41 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
                 self.assertNotIn("private", encoded)
                 self.assertNotIn("never-copy-this", encoded)
 
+    def test_amplified_ceiling_is_gnomes_pa_volume_ui_max_not_a_truncation(self):
+        # gvc's PA_VOLUME_UI_MAX = pa_sw_volume_from_dB(+11) = 99957/65536.
+        self.assertAlmostEqual(lane.GNOME_UI_MAX_PERCENT, 152.52227783203125, places=12)
+        self.assertLess(abs(self.GSD_UI_MAX - lane.GNOME_UI_MAX_PERCENT), 0.001)
+        # A ceiling written with four decimals (1.5252) is short of GNOME's.
+        result = self.run_audio(high=152.52)
+        self.assertIsInstance(result.error, RuntimeError)
+        self.assertIsNone(result.legacy)
+        self.assertEqual([case["passed"] for case in result.diagnostic][:3], [True, True, False])
+        self.assertEqual(result.diagnostic[2]["expected_percent"], lane.GNOME_UI_MAX_PERCENT)
+        self.assertEqual(result.diagnostic[2]["key_handler"], "gsd-media-keys")
+
+    def test_ceiling_follows_the_guests_media_keys_owner(self):
+        # A published guest whose shell predates gsd-media-keys binds the
+        # volume keys natively and writes wpctl's 1.5252.
+        native = self.run_audio(high=self.NATIVE_UI_MAX, media_keys=self.UNOWNED, published=True)
+        self.assertIsNone(native.error)
+        self.assertEqual(native.diagnostic[2]["expected_percent"], lane.SHELL_NATIVE_UI_MAX_PERCENT)
+        self.assertEqual({case["key_handler"] for case in native.diagnostic}, {"shell-native"})
+        # A published guest running gsd-media-keys gets GNOME's exact ceiling.
+        self.assertIsNone(self.run_audio(media_keys=self.GSD, published=True).error)
+        truncated = self.run_audio(high=self.NATIVE_UI_MAX, media_keys=self.GSD, published=True)
+        self.assertIsInstance(truncated.error, RuntimeError)
+        # The native ceiling never passes for gsd's, nor gsd's for the native.
+        self.assertIsInstance(self.run_audio(media_keys=self.UNOWNED, published=True).error, RuntimeError)
+        # The current build must run the packaged gsd-media-keys, and no guest
+        # passes with an owner that is not it.
+        for media_keys, published in ((self.UNOWNED, False), ({"ok": False, "owner": [":1.9", 7]}, True),
+                                      ({"ok": False, "owner": [":1.9", 7]}, False)):
+            with self.subTest(media_keys=media_keys, published=published):
+                result = self.run_audio(high=self.NATIVE_UI_MAX, media_keys=media_keys, published=published)
+                self.assertIsInstance(result.error, RuntimeError)
+                self.assertEqual(result.records, [])
+                self.assertEqual(result.actions[-1], "audio-amplification-reset")
+
     def test_success_preserves_legacy_receipt_actions_and_verdict(self):
         for older in (False, True):
             with self.subTest(older=older):
@@ -143,7 +187,7 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
                 self.assertIsNone(result.error)
                 self.assertEqual(len(result.legacy), 4)
                 self.assertEqual([v["percent"] for v in result.legacy],
-                                 [98.0, 98.0, 150.0, 98.0] if older else [100.0, 104.0, 152.52, 100.0])
+                                 [98.0, 98.0, 150.0, 98.0] if older else [100.0, 104.0, self.GSD_UI_MAX, 100.0])
                 self.assertEqual(result.keys, [] if older else ["volumeup"] * 4)
                 self.assertEqual(result.sleeps, [] if older else [0.3] * 4)
                 self.assertEqual(result.records[0][:2], ("V-AUDIO-AMPLIFICATION", True))

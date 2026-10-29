@@ -19,6 +19,9 @@ pub const WM_SCHEMA: &str = "org.gnome.desktop.wm.keybindings";
 /// Mutter's own keys (half tiling).
 pub const MUTTER_SCHEMA: &str = "org.gnome.mutter.keybindings";
 pub const MEDIA_SCHEMA: &str = "org.gnome.settings-daemon.plugins.media-keys";
+/// gnome-settings-daemon's media-keys plugin, which owns [`MEDIA_SCHEMA`]'s
+/// bindings in GNOME.
+pub const MEDIA_KEYS_DAEMON: &str = "org.gnome.SettingsDaemon.MediaKeys";
 
 /// What a binding does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,14 +554,21 @@ impl Action {
 
 /// The current bindings: each key's accelerators from its GNOME schema
 /// (`shell`, `wm` or `mutter`) when installed, else GNOME 51's defaults.
+/// The media-keys schema's keys (volume, mic-mute, screensaver, magnifier) are
+/// gnome-settings-daemon's in GNOME: while `gsd_media_keys` runs it grabs
+/// them through org.gnome.Shell, so the shell binds none of them and the
+/// grabs cannot collide. Without it (the nested preview, which starts no
+/// session services) the shell keeps its native subset.
 pub fn bindings(
     shell: Option<&gio::Settings>,
     wm: Option<&gio::Settings>,
     mutter: Option<&gio::Settings>,
     media: Option<&gio::Settings>,
+    gsd_media_keys: bool,
 ) -> Vec<Binding> {
     specs()
         .into_iter()
+        .filter(|spec| !(gsd_media_keys && spec.schema == Schema::Media))
         .flat_map(|spec| {
             let settings = match spec.schema {
                 Schema::Shell => shell,
@@ -768,7 +778,7 @@ mod tests {
 
     #[test]
     fn gnome_51_defaults_without_the_schema() {
-        let all = bindings(None, None, None, None);
+        let all = bindings(None, None, None, None, false);
         let find = |action| {
             all.iter()
                 .filter(|b| b.action == action)
@@ -885,6 +895,50 @@ mod tests {
                 "{}",
                 b.accelerator
             );
+        }
+    }
+
+    #[test]
+    fn gsd_media_keys_owns_every_media_schema_key_and_nothing_else() {
+        let native = bindings(None, None, None, None, false);
+        let standing_down = bindings(None, None, None, None, true);
+        let media = [
+            Action::LockScreen,
+            Action::VolumeUp { precise: false },
+            Action::VolumeUp { precise: true },
+            Action::VolumeDown { precise: false },
+            Action::VolumeDown { precise: true },
+            Action::VolumeMute,
+            Action::VolumeUpQuiet,
+            Action::VolumeDownQuiet,
+            Action::VolumeMuteQuiet,
+            Action::MicrophoneMute,
+            Action::ToggleMagnifier,
+            Action::MagnifierZoom { zoom_in: true },
+            Action::MagnifierZoom { zoom_in: false },
+        ];
+        for action in media {
+            assert!(native.iter().any(|b| b.action == action), "{action:?}");
+            assert!(
+                !standing_down.iter().any(|b| b.action == action),
+                "{action:?} still bound beside gsd-media-keys"
+            );
+        }
+        // GNOME Shell's own keys stay the shell's: brightness lives in
+        // org.gnome.shell.keybindings in GNOME 51, not in gsd.
+        let rest: Vec<_> = native
+            .iter()
+            .filter(|b| !media.contains(&b.action))
+            .cloned()
+            .collect();
+        assert_eq!(standing_down, rest);
+        assert!(standing_down
+            .iter()
+            .any(|b| b.action == Action::BrightnessUp && b.accelerator == "XF86MonBrightnessUp"));
+        // Nothing left in the shell's reserved set grabs a gsd key.
+        for b in &standing_down {
+            assert!(!b.accelerator.contains("XF86Audio"), "{b:?}");
+            assert_ne!(b.accelerator, "<Super>l");
         }
     }
 

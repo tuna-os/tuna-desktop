@@ -258,7 +258,7 @@ Consumers re-checked against gnome-shell 51.0, gnome-session 51.0 and gnome-sett
 | disable-application-handlers | Ignored | No GNOME 51 desktop consumer: gnome-shell, gnome-session and gnome-settings-daemon 51.0 never read it, so Tuna's shell no longer gates Settings or calendar launches on it (#357); applications that honor it read it themselves |
 | disable-command-line | Honored (GTK shell) | Alt+F2 opens GNOME's Run a Command dialog; `RunDialog.open()` refuses while set, re-read per open (runDialog.js); G-LOCKDOWN-COMMAND-LINE (#357) |
 | disable-lock-screen | Honored | As screenShield.js `lock()`/systemActions.js: Lock button hidden, keybinding, screensaver/D-Bus, sleep and idle locks refused by the shell, compositor backstop denies Lock and idle; never unlocks a locked session; G-LOCKDOWN-LOCK (#357) |
-| disable-log-out | Honored (GTK shell) | Log Out…, Restart… and Power Off… hidden and refused live, as gnome-session 51 answers CanShutdown/CanReboot unavailable and refuses Logout; Suspend stays; G-LOCKDOWN-LOG-OUT (#357) |
+| disable-log-out | Honored (GTK shell, compositor) | Log Out…, Restart… and Power Off… hidden and refused live, as gnome-session 51 answers CanShutdown/CanReboot unavailable and refuses Logout; Suspend stays; G-LOCKDOWN-LOG-OUT (#357). The compositor's `org.gnome.SessionManager` refuses `Shutdown`, `Reboot` and `Logout` (gsd-media-keys' power, shutdown, reboot and logout keys) with `LockedDown` before any dialog, as gnome-session 51 does, and the shell's `EndSessionDialog.Open` refuses them too |
 | disable-print-setup | Ignored | No GNOME 51 desktop consumer; applications' Print Setup dialogs read it themselves; the shell exposes no print path |
 | disable-printing | Ignored | No GNOME 51 desktop consumer; applications' Print dialogs read it themselves; the shell exposes no print path |
 | disable-save-to-disk | Honored (shell captures) | As screenshot.js/screencastService.js: shell screenshots stay on the clipboard, screencasts refuse to start, the portal's org.gnome.Shell.Screenshot calls are refused; applications' Save As dialogs stay app-owned; G-LOCKDOWN-SAVE-TO-DISK (#357) |
@@ -506,7 +506,7 @@ Consumers re-checked against gnome-shell 51.0, gnome-session 51.0 and gnome-sett
 
 | Key | Status | Reason |
 |---|---|---|
-| allow-volume-above-100-percent | Ignored | No verified Tuna Desktop audio preference consumer beyond toolkit translation |
+| allow-volume-above-100-percent | Honored | gsd-media-keys' volume keys stop at 100% or at GNOME's +11 dB ceiling; the shell's volume slider and its native key subset (sessions without gsd-media-keys) use the same live ceiling. Proofs V-AUDIO-AMPLIFICATION, G-MEDIA-AMPLIFICATION |
 | event-sounds | Via GTK | GTK Wayland settings translation; clients follow the portal or GSettings fallback |
 | input-feedback-sounds | Via GTK | GTK Wayland settings translation; clients follow the portal or GSettings fallback |
 | theme-name | Via GTK | GTK Wayland settings translation; clients follow the portal or GSettings fallback |
