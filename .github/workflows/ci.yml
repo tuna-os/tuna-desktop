@@ -722,12 +722,16 @@ jobs:
       # same clients and actions as tests/gnome-reference/motion.js, sampled
       # on the frozen clock at GNOME's capture delays and compared with
       # tests/gnome-reference/motion-reference.json. The modal-dim proof
-      # covers overlap, live settings and parent death.
+      # covers overlap, live settings and parent death; the window-lifecycle
+      # proof the retained close frame of a CSD GTK window; the X11 proof
+      # minimize toward _NET_WM_ICON_GEOMETRY on the session's XWayland.
       - name: Prove window motion against the paired GNOME 51 capture
         run: |
           dbus-run-session -- /usr/bin/python3 scripts/tuna-motion-pairing-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --artifacts "$RUNNER_TEMP/motion-pairing" --display :112 --require-clean
           dbus-run-session -- /usr/bin/python3 scripts/tuna-modal-dim-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --artifacts "$RUNNER_TEMP/modal-dim" --display :114
-          for proof in motion-pairing modal-dim; do
+          dbus-run-session -- /usr/bin/python3 scripts/tuna-window-lifecycle-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --artifacts "$RUNNER_TEMP/window-lifecycle" --display :115
+          dbus-run-session -- /usr/bin/python3 scripts/tuna-x11-icon-geometry-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --artifacts "$RUNNER_TEMP/x11-icon-geometry" --display :116
+          for proof in motion-pairing modal-dim window-lifecycle x11-icon-geometry; do
             mkdir -p "gtk-shell-artifacts/$proof"
             cp "$RUNNER_TEMP/$proof/assertions.txt" "$RUNNER_TEMP/$proof/manifest.json" "gtk-shell-artifacts/$proof/"
           done
@@ -739,6 +743,8 @@ jobs:
           path: |
             ${{ runner.temp }}/motion-pairing/
             ${{ runner.temp }}/modal-dim/
+            ${{ runner.temp }}/window-lifecycle/
+            ${{ runner.temp }}/x11-icon-geometry/
           retention-days: 14
       - name: Bound native privacy executor proof
         run: cargo test -p tuna-shell-gtk --bin tuna-shell-gtk privacy::tests::live_pw::live_native_executor_mutes_restores_and_refuses_wrong_identity -- --exact --nocapture
@@ -1391,6 +1397,8 @@ jobs:
           --assertions ledger-in/gtk-shell/session-restore/assertions.txt
           --assertions ledger-in/gtk-shell/motion-pairing/assertions.txt
           --assertions ledger-in/gtk-shell/modal-dim/assertions.txt
+          --assertions ledger-in/gtk-shell/window-lifecycle/assertions.txt
+          --assertions ledger-in/gtk-shell/x11-icon-geometry/assertions.txt
           --assertions ledger-in/gtk-shell/osk/assertions.txt
           --assertions ledger-in/gtk-shell/lock-auth/assertions.txt
           --assertions ledger-in/orca-speech/assertions.txt

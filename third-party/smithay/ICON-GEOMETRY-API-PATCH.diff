@@ -11,7 +11,7 @@ index e6bbf35f..ee5fe727 100644
              _NET_WM_WINDOW_TYPE_DESKTOP,
              _NET_WM_WINDOW_TYPE_DOCK,
 diff --git a/third-party/smithay/src/xwayland/xwm/surface.rs b/third-party/smithay/src/xwayland/xwm/surface.rs
-index 8cca78ee..7a73529a 100644
+index 9d82fafc..5189a717 100644
 --- a/third-party/smithay/src/xwayland/xwm/surface.rs
 +++ b/third-party/smithay/src/xwayland/xwm/surface.rs
 @@ -71,6 +71,7 @@ pub(crate) struct SharedSurfaceState {
@@ -64,7 +64,7 @@ index 8cca78ee..7a73529a 100644
      /// Returns if the window is considered to be a popup.
      ///
      /// Corresponds to the internal `_NET_WM_STATE_MODAL` state of the underlying X11 window.
-@@ -642,6 +664,7 @@ impl X11Surface {
+@@ -678,6 +700,7 @@ impl X11Surface {
          self.update_motif_hints()?;
          self.update_startup_id()?;
          self.update_pid()?;
@@ -72,7 +72,7 @@ index 8cca78ee..7a73529a 100644
          Ok(())
      }
  
-@@ -687,6 +710,10 @@ impl X11Surface {
+@@ -723,6 +746,10 @@ impl X11Surface {
                  self.update_pid()?;
                  Ok(Some(WmWindowProperty::Pid))
              }
@@ -83,7 +83,7 @@ index 8cca78ee..7a73529a 100644
  
              _ => Ok(None), // unknown
          }
-@@ -777,6 +804,40 @@ impl X11Surface {
+@@ -813,6 +840,40 @@ impl X11Surface {
          Ok(())
      }
  
