@@ -241,7 +241,9 @@ RUSTUP_HOME="${RUSTUP_HOME:-$ORIG_HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$ORIG
     sha256sum "$BIN_DIR/tuna-compositor" "$BIN_DIR/tuna-shell-gtk"
 } >"$ARTIFACTS/manifest.txt" 2>&1 || fail G-ORCA-SPEECH-TOGGLE "build identity failed"
 SOCKET="tuna-orca-$$"
-RUST_BACKTRACE=1 LD_PRELOAD="$PAM_WRAPPER_LIB" PAM_WRAPPER=1 \
+# TUNA_LOCK_TRACE: the shell logs the lock prompt's PAM steps (no
+# credentials), so the proof types only once the password is asked for.
+RUST_BACKTRACE=1 TUNA_LOCK_TRACE=1 LD_PRELOAD="$PAM_WRAPPER_LIB" PAM_WRAPPER=1 \
     PAM_WRAPPER_SERVICE_DIR="$ARTIFACTS/pam/services" \
     "$BIN_DIR/tuna-compositor" --backend winit --socket "$SOCKET" --screen-reader \
     --width "$WIDTH" --height "$HEIGHT" --shell-bin "$BIN_DIR/tuna-shell-gtk" >"$LOG" 2>&1 &
@@ -408,8 +410,16 @@ cstate '.locked == true' "locked" || fail G-ORCA-SPEECH-LOCK "Super+L did not lo
 sleep 2
 xdotool key Return
 said G-ORCA-SPEECH-LOCK lock "Lock Screen" "Password" "password text."
+# PAM's password question reaches the prompt before typing, so no key
+# lands while the entry is still starting its conversation.
+asked=0
+for _ in $(seq 1 100); do
+    grep -q "lock auth query service=password" "$LOG" && { asked=1; break; }
+    sleep 0.2
+done
+[ "$asked" = 1 ] || fail G-ORCA-SPEECH-LOCK "the unlock prompt never asked PAM's password question"
 mark lock-type
-xdotool type --delay 200 "$UNLOCK_PASSWORD"
+xdotool type --clearmodifiers --delay 200 "$UNLOCK_PASSWORD"
 bullets="$(printf '%s' "$UNLOCK_PASSWORD" | sed 's/./● /g')"
 # shellcheck disable=SC2086
 said G-ORCA-SPEECH-LOCK lock-type $bullets
@@ -430,8 +440,13 @@ sleep 3
 step toggle-off super+alt+s
 cstate '.screen_reader_state == "disabled" and .screen_reader_pid == null' "Orca stopped" 30 ||
     fail G-ORCA-SPEECH-TOGGLE "Super+Alt+S did not stop Orca"
-[ "$(gsettings get org.gnome.desktop.a11y.applications screen-reader-enabled)" = false ] ||
-    fail G-ORCA-SPEECH-TOGGLE "screen-reader-enabled is still set"
+# The shell's keyfile write can trail Orca's exit on a loaded runner.
+off=0
+for _ in $(seq 1 50); do
+    [ "$(gsettings get org.gnome.desktop.a11y.applications screen-reader-enabled)" = false ] && { off=1; break; }
+    sleep 0.2
+done
+[ "$off" = 1 ] || fail G-ORCA-SPEECH-TOGGLE "screen-reader-enabled is still set"
 if kill -0 "$READER_PID" 2>/dev/null; then
     fail G-ORCA-SPEECH-TOGGLE "Orca (pid $READER_PID) outlived Super+Alt+S"
 fi
