@@ -42,6 +42,9 @@
 #                  it jumps, and Reduced Motion keeps only the fades
 #   G-LAUNCH-ZOOM  launching from the grid zooms the icon and label out
 #                  over 250 ms
+#   G-GRID-ACTIVATE-RUNNING a running app's grid tile raises its window
+#                  without launching it again or zooming; Ctrl+click
+#                  opens a new window with the zoom (AppIcon.activate)
 #   G-GRID-FADE    Show Apps fades the grid in over 400 ms after 100 ms
 #   G-APP-FOLDERS  GNOME's app-folders settings group the app grid: the
 #                  folder replaces its apps and opens to show them
@@ -2903,6 +2906,87 @@ sleep 0.5
 cstate '.layers | all(.namespace != "tuna-shell-launch-zoom")' "launch zoom gone" ||
     fail G-LAUNCH-ZOOM "the launch zoom's surface outlived its animation"
 pass G-LAUNCH-ZOOM "a launch from the grid zooms its icon out over 250 ms and leaves nothing behind"
+
+# GNOME's AppIcon.activate (appDisplay.js:3053-3071): a running app's
+# grid tile raises its window and neither launches it again nor zooms;
+# Ctrl+click opens a new window (here, shell_app_open_new_window's
+# relaunch) with the zoom. A test app with an unfocused window gets a
+# visible desktop entry for the gate, then its hidden one back.
+running_app="$(jq -r '.focused as $f | [.windows[] | select((.app_id // "") | startswith("tuna-test-"))]
+    | group_by(.app_id) | map(select(all(.[]; .id != $f))) | (.[0] // []) | (.[0].app_id // empty)' "$CSTATE")"
+[ -n "$running_app" ] || fail G-GRID-ACTIVATE-RUNNING "no unfocused test app window to raise"
+running_raise="$(jq -r --arg a "$running_app" '[.windows[] | select(.app_id == $a) | .id] | min' "$CSTATE")"
+running_count="$(jq -r --arg a "$running_app" '[.windows[] | select(.app_id == $a)] | length' "$CSTATE")"
+running_desktop="$XDG_DATA_HOME/applications/$running_app.desktop"
+cp "$running_desktop" "$ARTIFACTS/running-app-hidden.desktop"
+RUNNING_MARKER="$ARTIFACTS/running-app-relaunched"
+rm -f "$RUNNING_MARKER"
+printf '[Desktop Entry]\nName=Tuna Running Probe\nExec=touch %s\nType=Application\n' "$RUNNING_MARKER" >"$running_desktop"
+sleep 1.5
+# The tile, on whichever grid page holds it: its centre on the output
+# from the App Grid window's own nodes (the dash lists the app too).
+running_tile() {
+    jq -er --arg name "Tuna Running Probe" --argjson ox "$grid_origin_x" --argjson oy "$grid_origin_y" --argjson width "$WIDTH" '
+        [foreach .[] as $n (null; if $n.role == "frame" then $n.name else . end; [., $n])]
+        | map(select(.[0] == "App Grid") | .[1]
+            | select(.showing and (.role == "push button" or .role == "button") and .name == $name
+                and .bounds[2] > 0 and .bounds[3] > 0
+                and .bounds[0] + $ox >= 0 and .bounds[0] + $ox + .bounds[2] <= $width))
+        | first | .bounds | "\((.[0] + $ox + .[2] / 2) | floor) \((.[1] + $oy + .[3] / 2) | floor)"' "$1"
+}
+running_open_grid() {
+    xdotool key super+a
+    cstate '.overview_open and .overview_app_grid' "app grid" || fail G-GRID-ACTIVATE-RUNNING "Super+A did not show the app grid"
+    sleep 1.5
+    grid_origin
+    running_point=""
+    for running_page in 2 3 4; do
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-running-grid.json" 20 ||
+            fail G-GRID-ACTIVATE-RUNNING "accessibility dump failed"
+        running_point="$(running_tile "$ARTIFACTS/a11y-running-grid.json")" && break
+        running_point=""
+        # Not on this page: turn to the next, if there is one.
+        showing "$ARTIFACTS/a11y-running-grid.json" "Page $running_page" || break
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-running-page.json" 20 \
+            --press "Page $running_page" >/dev/null || fail G-GRID-ACTIVATE-RUNNING "could not turn to page $running_page"
+        sleep 0.5
+    done
+    [ -n "$running_point" ] || fail G-GRID-ACTIVATE-RUNNING "the running app has no grid tile"
+}
+running_open_grid
+running_mark="$(log_mark)"
+# shellcheck disable=SC2086
+xdotool mousemove --window "$WID" $running_point click 1
+cstate ".focused == $running_raise and (.overview_open | not)" "running app raised" ||
+    fail G-GRID-ACTIVATE-RUNNING "clicking the running app's tile did not raise its window and close the overview"
+sleep 1.5
+cstate "[.windows[] | select(.app_id == \"$running_app\")] | length == $running_count" "no new window" ||
+    fail G-GRID-ACTIVATE-RUNNING "clicking the running app's tile opened another window"
+[ -e "$RUNNING_MARKER" ] && fail G-GRID-ACTIVATE-RUNNING "clicking the running app's tile launched it again"
+log_has "$running_mark" "grid-anim launch-zoom" &&
+    fail G-GRID-ACTIVATE-RUNNING "raising a running app drew the launch zoom"
+cstate '.layers | all(.namespace != "tuna-shell-launch-zoom")' "no launch zoom" ||
+    fail G-GRID-ACTIVATE-RUNNING "raising a running app mapped a launch zoom surface"
+# Ctrl+click: can_open_new_window (no SingleMainWindow, no action) and
+# open_new_window launches the app again, with the zoom.
+running_open_grid
+running_mark="$(log_mark)"
+xdotool keydown Control_L
+sleep 0.3
+# shellcheck disable=SC2086
+xdotool mousemove --window "$WID" $running_point click 1
+sleep 0.3
+xdotool keyup Control_L
+log_wait "$running_mark" "grid-anim launch-zoom settle" ||
+    fail G-GRID-ACTIVATE-RUNNING "Ctrl+click on the running app drew no launch zoom"
+anim_end=$(($(date +%s) + 10))
+until [ -e "$RUNNING_MARKER" ] || [ "$(date +%s)" -gt "$anim_end" ]; do sleep 0.3; done
+[ -e "$RUNNING_MARKER" ] || fail G-GRID-ACTIVATE-RUNNING "Ctrl+click on the running app did not open a new window"
+cstate '.overview_open | not' "closed after Ctrl+click" ||
+    fail G-GRID-ACTIVATE-RUNNING "the overview stayed open after Ctrl+click"
+cp "$ARTIFACTS/running-app-hidden.desktop" "$running_desktop"
+sleep 1.5
+pass G-GRID-ACTIVATE-RUNNING "a running app's grid tile raises its window without relaunching or zooming; Ctrl+click opens another with the zoom"
 
 # Notifications (#56). Close whatever the grid left open first (#97).
 xdotool key Escape

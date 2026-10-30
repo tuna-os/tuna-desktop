@@ -391,6 +391,7 @@ mod tests {
             argv: Vec::new(),
             icon: None,
             categories: Vec::new(),
+            new_window: Default::default(),
         };
         let apps = tuna_shell_host::apps::AppProvider::new(vec![entry]);
         // GNOME's favorite-apps and DesktopId keys carry ".desktop".
