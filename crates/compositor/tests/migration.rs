@@ -662,3 +662,57 @@ fn real_output_global_removal_reaches_clients() {
     );
 }
 
+/// A real hotplugged output: a protocol `Output` with its registry
+/// global, registered in the inventory as `Runtime` does.
+fn plug_real_output(comp: &mut TestCompositor, name: &str) {
+    let output = Output::new(
+        name.to_owned(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Tuna Desktop".to_owned(),
+            model: "Test".to_owned(),
+        },
+    );
+    let mode = Mode {
+        size: (1280, 800).into(),
+        refresh: 60_000,
+    };
+    output.change_current_state(Some(mode), None, Some(Scale::Integer(1)), None);
+    output.set_preferred(mode);
+    let global = output.create_global::<State>(&comp.display.handle());
+    comp.state.add_output(name, Some(output), 1280, 800);
+    comp.state.note_output_global(name, global);
+}
+
+/// A monitor unplugged right after it was plugged in: GTK binds every
+/// wl_output the moment it is announced, so the bind can reach the
+/// compositor after the output is gone. The client must survive it, as
+/// under Mutter (`wl_global_remove` now, `wl_global_destroy` later) and
+/// niri (the global is destroyed 10 s after it is disabled); destroying
+/// the global at once makes the bind a protocol error that kills the
+/// client (the hotplug storm's GTK clients and shell).
+#[test]
+fn unplug_racing_a_wl_output_bind_keeps_the_client() {
+    let mut comp = TestCompositor::new();
+    comp.state.add_output("left", None, 1280, 800);
+    let (conn, mut queue, mut client) = connect(&mut comp);
+    // Plugged in: the announcement reaches the client, which binds.
+    plug_real_output(&mut comp, "hot-0");
+    comp.display.flush_clients().unwrap();
+    while client.output_names.is_empty() {
+        queue.blocking_dispatch(&mut client).unwrap();
+    }
+    queue.flush().unwrap();
+    let advertised = client.output_names[0];
+    // Unplugged before the compositor reads the bind.
+    assert!(comp.state.remove_output("hot-0"));
+    // The bind is read now; the client stays connected and hears the
+    // removal.
+    sync_client(&mut comp, &conn, &mut queue, &mut client);
+    pump(&mut comp, &mut queue, &mut client, |c| {
+        c.removed_names.contains(&advertised)
+    });
+    // The disabled global waits for the runtime to destroy it later.
+    assert_eq!(comp.state.take_retired_output_globals().len(), 1);
+}

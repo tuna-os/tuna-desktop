@@ -321,6 +321,7 @@ impl Runtime {
         for name in &gone {
             self.state.remove_output(name);
         }
+        self.destroy_retired_output_globals_later();
         for (name, output, loc, (lw, lh)) in &leaders {
             let known = self.state.outputs.iter().any(|entry| &entry.name == name);
             self.state.add_output(name, Some(output.clone()), *lw, *lh);
@@ -345,6 +346,27 @@ impl Runtime {
         // Anchored layer surfaces (the panel) follow a new mode now,
         // not on their next commit.
         crate::layer::arrange_after_commit(&self.state);
+    }
+
+    /// Destroy the withdrawn wl_output globals of removed outputs once
+    /// clients have long seen the removal: 10 seconds, as niri does
+    /// (`Niri::remove_output`, GPL-3.0-or-later). A client binding one
+    /// meanwhile gets an inert wl_output instead of a protocol error.
+    #[cfg(feature = "drm")]
+    fn destroy_retired_output_globals_later(&mut self) {
+        let retired = self.state.take_retired_output_globals();
+        if retired.is_empty() {
+            return;
+        }
+        let timer = calloop::timer::Timer::from_duration(Duration::from_secs(10));
+        if let Err(error) = self.loop_handle.insert_source(timer, move |_, _, rt| {
+            for global in &retired {
+                rt.state.dh.remove_global::<State>(global.clone());
+            }
+            calloop::timer::TimeoutAction::Drop
+        }) {
+            eprintln!("tuna-compositor: output global removal timer: {error}");
+        }
     }
 
     /// The display configuration for the proof state file: the serial,

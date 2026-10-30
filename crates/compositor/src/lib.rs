@@ -254,6 +254,10 @@ pub struct State {
     /// test) registers the first entry; readers fall back to zero
     /// sizes, which configure zero sizes.
     pub(crate) outputs: Vec<OutputEntry>,
+    /// wl_output globals of removed outputs: withdrawn from the registry
+    /// but still bindable until the runtime destroys them
+    /// ([`take_retired_output_globals`](Self::take_retired_output_globals)).
+    retired_output_globals: Vec<GlobalId>,
     /// Target remembered when the first preferred scale is sent, before mapping.
     pub(crate) initial_outputs: std::collections::HashMap<wl_surface::WlSurface, String>,
     /// Client window-state requests awaiting the manager's next
@@ -1020,6 +1024,7 @@ impl State {
             window_origins: std::collections::HashMap::new(),
             initial_outputs: std::collections::HashMap::new(),
             outputs: Vec::new(),
+            retired_output_globals: Vec::new(),
             window_requests: Vec::new(),
             closed_toplevel_parents: std::collections::HashMap::new(),
             protocols: protocols::Protocols::new(dh),
@@ -1108,18 +1113,19 @@ impl State {
     /// [`WindowManager::relocate_for_monitors_changed`](crate::windows::WindowManager::relocate_for_monitors_changed)
     /// and [`WindowManager::reapply_derived_layouts`](crate::windows::WindowManager::reapply_derived_layouts)),
     /// so no window is stranded.
-    /// Real entries un-advertise their global, so clients see the
-    /// hotplug removal live; virtual entries just drop. Returns
-    /// whether an entry was removed.
+    /// Real entries withdraw their global, so clients see the hotplug
+    /// removal live; it stays bindable until the runtime destroys it
+    /// ([`take_retired_output_globals`](Self::take_retired_output_globals)),
+    /// so a client binding it as it goes is not disconnected. Virtual
+    /// entries just drop. Returns whether an entry was removed.
     pub fn remove_output(&mut self, name: &str) -> bool {
         let Some(index) = self.outputs.iter().position(|entry| entry.name == name) else {
             return false;
         };
         let was_primary = self.outputs[index].primary;
-        let global = self.outputs[index].global.take();
-        if let Some(id) = global {
+        if let Some(id) = self.outputs[index].global.take() {
             self.dh.disable_global::<State>(id.clone());
-            self.dh.remove_global::<State>(id);
+            self.retired_output_globals.push(id);
         }
         self.outputs.remove(index);
         if was_primary {
@@ -1128,6 +1134,13 @@ impl State {
             }
         }
         true
+    }
+
+    /// The withdrawn globals of removed outputs, for the runtime to
+    /// destroy once clients have seen the removal (Mutter destroys its
+    /// wl_output global after `wl_global_remove`; niri waits 10 s).
+    pub fn take_retired_output_globals(&mut self) -> Vec<GlobalId> {
+        std::mem::take(&mut self.retired_output_globals)
     }
 
     /// Move the dock anchor: mark `name` primary, clearing the flag
