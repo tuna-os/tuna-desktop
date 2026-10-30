@@ -151,6 +151,9 @@ struct Drained {
     /// The latest display-change confirmation countdown, in seconds.
     display_change: Option<u32>,
     popups: Vec<(u32, u32)>,
+    /// Overview swipe phases `(state, settle_us)`, wire fixed point, in
+    /// order: the app grid follows them.
+    overview_swipes: Vec<(u32, Option<u32>)>,
     aid_switches: Vec<(tuna_shell_control::KeyboardAid, bool)>,
     /// The click the next hover click makes, when the compositor changed it.
     dwell_click: Option<tuna_shell_control::DwellClick>,
@@ -272,6 +275,9 @@ fn drain(
                 .pointer_timeouts
                 .push((kind, duration_ms, clicked, x, y)),
             Handled::WorkspacePopup { index, count } => out.popups.push((index, count)),
+            Handled::OverviewSwipe { state, settle_us } => {
+                out.overview_swipes.push((state, settle_us));
+            }
             Handled::Accelerator { action, time, mode } => {
                 out.accelerators.push((action, time, mode, false));
             }
@@ -3620,6 +3626,7 @@ fn build(app: &adw::Application) {
                     consent,
                     display_change,
                     popups,
+                    overview_swipes,
                     aid_switches,
                     dwell_click,
                     pointer_timeouts,
@@ -3780,6 +3787,15 @@ fn build(app: &adw::Application) {
                     gtk::AccessibleTristate::False
                 })]);
                 overview::OverviewUi::set_open(&overview_ui, open);
+                // After the open state: a release that opened or closed the
+                // overview has already reached the grid.
+                for (state, settle_us) in overview_swipes {
+                    overview::OverviewUi::follow_swipe(
+                        &overview_ui,
+                        f64::from(state) / f64::from(tuna_shell_control::OVERVIEW_STATE_SCALE),
+                        settle_us.map(|us| f64::from(us) / 1000.0),
+                    );
+                }
                 if open != last_open.replace(open) {
                     // Panel focus follows the overview: opening hands the
                     // keyboard over; closing releases a hold that never won

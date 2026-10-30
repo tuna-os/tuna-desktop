@@ -2568,6 +2568,8 @@ impl Runtime {
                 "workspace": at, "rect": [r.loc.x, r.loc.y, r.size.w, r.size.h],
             })),
             "overview_progress": progress,
+            // GNOME's controls state: 0 desktop, 1 window picker, 2 app grid.
+            "overview_state": self.overview_motion.controls_state(self.overview_app_grid),
             "workspace_cards": workspace_cards,
 
             // The Alt+Tab switcher's window thumbnails being drawn.
@@ -2778,23 +2780,32 @@ impl Runtime {
     }
 
     /// The overview at rest on the primary output (#54): the window
-    /// picker or the app grid, before any animation.
+    /// picker or the app grid, before any animation, or between them and
+    /// between workspaces where a swipe draws it.
     fn overview_base(&self) -> crate::overview::OverviewLayout {
         let size = self.state.primary_size();
         let output = Rectangle::new((0, 0).into(), size);
         let model = self.manager.model();
-        let layout = if self.overview_app_grid {
-            crate::overview::app_grid_layout_with_policy
-        } else {
-            crate::overview::layout_with_policy
-        };
-        layout(
-            output,
-            crate::windows::WORK_AREA_TOP,
-            model.workspaces(),
+        let windows = self.manager.overview_windows();
+        let dynamic = model.fixed_workspace_count().is_none();
+        self.overview_motion.resting(
             model.active_workspace(),
-            &self.manager.overview_windows(),
-            model.fixed_workspace_count().is_none(),
+            self.overview_app_grid,
+            |workspace, app_grid| {
+                let layout = if app_grid {
+                    crate::overview::app_grid_layout_with_policy
+                } else {
+                    crate::overview::layout_with_policy
+                };
+                layout(
+                    output,
+                    crate::windows::WORK_AREA_TOP,
+                    model.workspaces(),
+                    workspace,
+                    &windows,
+                    dynamic,
+                )
+            },
         )
     }
 
@@ -3085,9 +3096,10 @@ impl Runtime {
                 ..
             } => {
                 let natural = self.input_settings.touchpad_natural_scroll;
+                let rtl = self.input_settings.right_to_left;
                 match self
                     .shell_swipe
-                    .update(delta_unaccel.x, delta_unaccel.y, natural)
+                    .update(delta_unaccel.x, delta_unaccel.y, natural, rtl)
                 {
                     None => false,
                     Some(Step::Pending) => true,
@@ -3126,30 +3138,37 @@ impl Runtime {
 
     /// The swipe committed to `orientation`: start the tracker GNOME
     /// has on that axis now. Vertical is always the overview's
-    /// (overview.js:226-233, normal and overview modes). Horizontal is
-    /// the desktop's workspace strip, or the overview's workspaces
-    /// while it is open or opening (workspaceAnimation.js:363-372); with
-    /// workspaces only on the primary monitor, a horizontal swipe over
-    /// another monitor moves nothing (workspaceAnimation.js:509-512,
-    /// workspacesView.js:961-962).
+    /// (overview.js:226-233, normal and overview modes), across the
+    /// desktop, the window picker and the app grid
+    /// (overviewControls.js:757-775). Horizontal is the desktop's
+    /// workspace strip, or the overview's workspaces while it is open or
+    /// opening (workspaceAnimation.js:363-372); with workspaces only on
+    /// the primary monitor, a horizontal swipe over another monitor moves
+    /// nothing (workspaceAnimation.js:509-512, workspacesView.js:961-962).
     fn begin_swipe_target(&mut self, orientation: crate::touchpad_swipe::Orientation, time: u32) {
         use crate::touchpad_swipe::Orientation;
         self.swipe_target = match orientation {
-            Orientation::Vertical => SwipeTarget::Overview { travel: 0.0 },
+            Orientation::Vertical => {
+                let app_grid = self.control.overview_open() && self.overview_app_grid;
+                self.overview_motion.swipe_begin(time, app_grid);
+                SwipeTarget::Overview { travel: 0.0 }
+            }
             Orientation::Horizontal if self.swipe_over_secondary() => SwipeTarget::None,
             Orientation::Horizontal if self.control.overview_open() => {
+                // The overview's strip: GNOME's dynamic workspaces end
+                // with an empty one, which a swipe can reach.
                 let model = self.manager.model();
-                let workspaces = model.workspaces().to_vec();
+                let workspaces = if model.fixed_workspace_count().is_none() {
+                    crate::overview::shown_workspaces(
+                        model.workspaces(),
+                        &self.manager.overview_windows(),
+                    )
+                } else {
+                    model.workspaces().to_vec()
+                };
                 let active = model.active_workspace();
-                let initial = workspaces.iter().position(|w| *w == active).unwrap_or(0) as f64;
-                let mut history = crate::workspace_slide::SwipeHistory::default();
-                history.append(time, 0.0);
-                SwipeTarget::OverviewWorkspaces {
-                    workspaces,
-                    initial,
-                    progress: initial,
-                    history,
-                }
+                self.overview_motion.scroll_begin(time, workspaces, active);
+                SwipeTarget::OverviewWorkspaces
             }
             Orientation::Horizontal => {
                 self.workspace_swipe_begin(time);
@@ -3170,19 +3189,11 @@ impl Runtime {
                     travel,
                     crate::touchpad_swipe::TOUCHPAD_BASE_HEIGHT,
                 );
+                let state = self.overview_motion.controls_state(self.overview_app_grid);
+                self.publish_overview_swipe(state, None);
             }
             SwipeTarget::Workspaces => self.workspace_swipe_update(-delta, time),
-            SwipeTarget::OverviewWorkspaces {
-                workspaces,
-                initial,
-                progress,
-                history,
-            } => {
-                history.append(time, delta);
-                let last = workspaces.len().saturating_sub(1) as f64;
-                *progress = (*progress + delta / crate::workspace_slide::TOUCHPAD_BASE_WIDTH)
-                    .clamp((*initial - 1.0).max(0.0), (*initial + 1.0).min(last));
-            }
+            SwipeTarget::OverviewWorkspaces => self.overview_motion.scroll_update(time, delta),
         }
     }
 
@@ -3192,37 +3203,63 @@ impl Runtime {
         match std::mem::replace(&mut self.swipe_target, SwipeTarget::None) {
             SwipeTarget::None => {}
             SwipeTarget::Overview { .. } => {
-                if let Some(open) = self.overview_motion.swipe_end(
+                if let Some((state, duration_ms)) = self.overview_motion.swipe_end(
                     time,
                     interrupted,
                     crate::touchpad_swipe::TOUCHPAD_BASE_HEIGHT,
                     self.input_settings.motion,
                 ) {
-                    self.control.set_overview(open);
+                    // `gestureEnd` checks Show Apps for the app grid
+                    // (overviewControls.js:781-786); the shell follows.
+                    self.overview_app_grid = state >= crate::overview::CONTROLS_APP_GRID;
+                    self.control
+                        .set_overview(state >= crate::overview::CONTROLS_WINDOW_PICKER);
+                    self.publish_overview_swipe(state, Some(duration_ms));
                 }
             }
             SwipeTarget::Workspaces => self.workspace_swipe_end(time, interrupted),
-            SwipeTarget::OverviewWorkspaces {
-                workspaces,
-                initial,
-                progress,
-                mut history,
-            } => {
-                let (end, _) = crate::workspace_slide::swipe_release(
-                    progress,
-                    initial,
-                    workspaces.len(),
-                    history.velocity(time),
-                    interrupted,
-                );
-                // The overview's own workspace scroll animates the change.
-                if let Some(&target) = workspaces.get(end as usize) {
-                    if target != self.manager.model().active_workspace() {
-                        self.manager.switch_to_workspace(&mut self.state, target);
+            SwipeTarget::OverviewWorkspaces => {
+                let motion = self.input_settings.motion;
+                let Some(target) = self.overview_motion.scroll_end(time, interrupted, motion)
+                else {
+                    return;
+                };
+                // The model switches now so focus never waits for the
+                // ease; the drawn strip keeps easing. A step past the last
+                // workspace creates GNOME's trailing empty one.
+                let model = self.manager.model();
+                let active = model.active_workspace();
+                let strip = self
+                    .overview_motion
+                    .workspace_scroll()
+                    .map(|(strip, _)| strip.to_vec())
+                    .unwrap_or_default();
+                let index = |workspace| strip.iter().position(|w| *w == workspace);
+                if let (Some(from), Some(to)) = (index(active), index(target)) {
+                    if from != to {
+                        self.manager
+                            .switch_relative(&mut self.state, to as i32 - from as i32);
                     }
                 }
             }
         }
+    }
+
+    /// Tell the shell where a swipe holds GNOME's overview controls state
+    /// (`settle_ms: None`) or settles it, so its app grid follows.
+    fn publish_overview_swipe(&mut self, state: f64, settle_ms: Option<f64>) {
+        let scale = f64::from(tuna_shell_control::OVERVIEW_STATE_SCALE);
+        self.control
+            .queue_message(tuna_shell_control::Message::OverviewSwipe {
+                state: (state.clamp(0.0, crate::overview::CONTROLS_APP_GRID) * scale).round()
+                    as u32,
+                settle_us: settle_ms.map(|ms| {
+                    (ms.max(0.0) * 1000.0)
+                        .round()
+                        .min(f64::from(tuna_shell_control::MAX_OVERVIEW_SETTLE_US))
+                        as u32
+                }),
+            });
     }
 
     /// Whether the pointer, where a swipe acts, is over a monitor other
@@ -6476,18 +6513,14 @@ impl Runtime {
 enum SwipeTarget {
     /// Nothing moves (no swipe, or one GNOME's trackers ignore).
     None,
-    /// The overview's transition, `travel` touchpad units toward open.
+    /// The overview's controls state (desktop, window picker, app grid),
+    /// `travel` touchpad units toward the app grid.
     Overview { travel: f64 },
     /// The desktop's workspace strip ([`crate::workspace_slide`]).
     Workspaces,
-    /// The open overview's workspaces (`WorkspacesView`): `progress`
-    /// along `workspaces` from slot `initial`, settled on release.
-    OverviewWorkspaces {
-        workspaces: Vec<u32>,
-        initial: f64,
-        progress: f64,
-        history: crate::workspace_slide::SwipeHistory,
-    },
+    /// The open overview's workspaces (`WorkspacesView`), scrolled by
+    /// [`crate::overview::OverviewMotion`].
+    OverviewWorkspaces,
 }
 
 /// Overview backdrop (GNOME 51's `#overviewGroup`, #222226).

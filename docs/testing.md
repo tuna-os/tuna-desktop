@@ -232,10 +232,16 @@ pointer motion, two-finger scrolling and `LIBINPUT_EVENT_GESTURE_SWIPE_*`.
 The phase then checks GNOME 51's swipe trackers against the compositor
 state: up and down open and close the overview, which follows the held
 fingers; left and right switch workspace; a slow half swipe settles
-back; a short fast flick completes; four fingers are the shell's too;
-scrolling, and no swipe, reaches a GTK 4 client; turning natural-scroll
-off reverses the gestures; and the swipe follows under reduced motion
-and with animations off. The emulator also runs on its own and reads
+back; a short fast flick completes; a long swipe from the desktop stops
+at the window picker, and from the picker the swipe follows into the app
+grid (the shell's grid surface maps and eases on release) and back; in
+the open overview, with four fixed workspaces (mutter's schema is
+compiled in when the host lacks it), a sideways swipe scrolls the
+workspaces under the fingers and a fast flick settles two or more on;
+four fingers are the shell's too; scrolling, and no swipe, reaches a GTK
+4 client; turning natural-scroll off reverses the gestures; and the
+swipe follows under reduced motion and with animations off. The emulator
+also runs on its own and reads
 commands (`down N`, `move DX DY MS`, `hold MS`, `up`, `swipe N DX DY MS
 [PAUSE]`, `scroll`, `tap`, `click`) on stdin, in millimetres and
 milliseconds. Other phases can import `create_touchpad()` from it.
@@ -356,9 +362,11 @@ live motion policy: animations off snaps everything, Reduced Motion
 (fade-only) snaps overview and strip motion but keeps the idle-shield fade.
 A held touchpad swipe is not an animation. As in GNOME 51 (overview.js:359-380,
 animationUtils.js:23-33), the overview follows the fingers under every
-policy. The release eases under full motion and Reduced Motion, with the
-slow-down factor applied, and lands at once with animations off
-(`G-SWIPE-REDUCED-MOTION`, `D-TOUCHPAD-SWIPE`).
+policy, across the desktop, the window picker and the app grid, and so do
+the overview's workspaces under a sideways swipe. The release eases under
+full motion and Reduced Motion, with the slow-down factor applied, and
+lands at once with animations off (`G-SWIPE-REDUCED-MOTION`,
+`G-SWIPE-APPGRID`, `G-SWIPE-OVERVIEW-SCROLL`, `D-TOUCHPAD-SWIPE`).
 
 ## Frame cost
 

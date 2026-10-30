@@ -40,10 +40,15 @@
 #              and close the overview following the fingers, left/right
 #              switch workspace, a slow half swipe stays, a short fast
 #              flick completes (swipeTracker.js velocity projection),
-#              four fingers are the shell's too, two-finger scrolling and
-#              no swipe reach a GTK 4 client, natural-scroll off reverses
-#              the gestures, and under reduced motion the held swipe
-#              follows and eases while with animations off it lands at once
+#              from the window picker the swipe follows into the app grid
+#              and back (a swipe from the desktop stops at the picker),
+#              in the open overview a sideways swipe scrolls the
+#              workspaces under the fingers and a flick settles several
+#              on, four fingers are the shell's too, two-finger scrolling
+#              and no swipe reach a GTK 4 client, natural-scroll off
+#              reverses the gestures, and under reduced motion the held
+#              swipe follows and eases while with animations off it lands
+#              at once
 # and captures a scanout screenshot with ffmpeg kmsgrab when possible.
 # Needs root (sudo) for modprobe, seatd and uinput. Exits nonzero on any failure.
 set -eu
@@ -55,7 +60,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --seconds) SECONDS_UP="$2"; shift 2 ;;
-        --help|-h) sed -n '2,48p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,53p' "$0"; exit 0 ;;
         *) echo "tuna-drm-smoke: unknown argument $1" >&2; exit 1 ;;
     esac
 done
@@ -974,9 +979,15 @@ for key in "org.gnome.desktop.peripherals.touchpad natural-scroll" "org.gnome.de
     gsettings range $key >/dev/null 2>&1 ||
         fail D-TOUCHPAD-SWIPE "no $key setting: install gsettings-desktop-schemas"
 done
-# Ubuntu's gsettings-desktop-schemas predates GNOME's reduced-motion key.
+# Ubuntu's gsettings-desktop-schemas predates GNOME's reduced-motion key,
+# and mutter's own schema (dynamic workspaces) is not installed.
 if ! gsettings range org.gnome.desktop.a11y.interface reduced-motion >/dev/null 2>&1; then
     cp "$ROOT/tests/settings/gnome51-a11y-interface.gschema.xml" "$ARTIFACTS/schemas-touchpad/"
+fi
+if ! gsettings range org.gnome.mutter dynamic-workspaces >/dev/null 2>&1; then
+    cp "$ROOT/tests/settings/gnome51-mutter.gschema.xml" "$ARTIFACTS/schemas-touchpad/"
+fi
+if [ -n "$(ls "$ARTIFACTS/schemas-touchpad")" ]; then
     glib-compile-schemas "$ARTIFACTS/schemas-touchpad"
     GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas-touchpad:$GSETTINGS_SCHEMA_DIR"
     export GSETTINGS_SCHEMA_DIR
@@ -990,7 +1001,7 @@ export DBUS_SESSION_BUS_ADDRESS
 LOG="$TOUCHPAD_LOG"
 env -u DISPLAY -u WAYLAND_DISPLAY \
     XDG_RUNTIME_DIR="$RUNTIME" XDG_STATE_HOME="$ARTIFACTS/state" XDG_DATA_HOME="$ARTIFACTS/data" \
-    LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD" TUNA_COMPOSITOR_STATE="$CSTATE" \
+    LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD" TUNA_COMPOSITOR_STATE="$CSTATE" TUNA_GRID_TRACE=1 \
     "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-touchpad \
     --shell-bin "$ROOT/target/debug/tuna-shell-gtk" >"$TOUCHPAD_LOG" 2>&1 &
 COMP_PID=$!
@@ -1122,6 +1133,99 @@ switched ".gesture and .to == $HOME_WS and .velocity == 0" ||
     fail D-TOUCHPAD-SWIPE "a slow half sideways swipe did not slide back: $(last_switch)"
 at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "a slow half sideways swipe switched workspace"
 pass D-TOUCHPAD-SWIPE "three fingers left/right slid to the next workspace and back; a slow half swipe stayed"
+
+# GNOME's overview gesture spans the desktop, the window picker and the
+# app grid (ControlsState 0-2, overviewControls.js:757-797). From the
+# desktop the tracker stops at the window picker however far the fingers
+# go (swipeTracker.js:547-565: no long swipes); from the window picker
+# three fingers up follow into the app grid, whose shell surface maps and
+# follows them, and the release lands there with the grid easing over the
+# swipe's settle time; down comes back to the window picker.
+prev_release="$(last_release)"
+tp swipe 3 0 -60 300
+released '.target == 1 and .from == 1' ||
+    fail D-TOUCHPAD-SWIPE "a long swipe up from the desktop did not stop at the window picker: $(last_release)"
+at_rest 1 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "the long swipe did not settle on the window picker"
+state '.overview_state == 1 and (.overview_app_grid | not)' 5 ||
+    fail D-TOUCHPAD-SWIPE "the long swipe from the desktop reached past the window picker"
+grid_mark="$(wc -c <"$TOUCHPAD_LOG")"
+prev_release="$(last_release)"
+tp down 3
+tp move 0 -15 300
+state '.touchpad_swipe.active and .touchpad_swipe.orientation == "vertical" and .overview_open
+       and .overview_progress == 1 and .overview_state > 1.1 and .overview_state < 1.9
+       and (.layers | any(.namespace == "tuna-shell-appgrid"))' 5 ||
+    fail D-TOUCHPAD-SWIPE "fingers held up from the window picker did not draw the app grid part way: $(jq -c '{touchpad_swipe, overview_state}' "$CSTATE")"
+grid_held="$(jq '.overview_state' "$CSTATE")"
+tp move 0 -10 200
+state ".touchpad_swipe.active and .overview_state > $grid_held" 5 ||
+    fail D-TOUCHPAD-SWIPE "the app grid stopped following the fingers at $grid_held"
+grid_held_more="$(jq '.overview_state' "$CSTATE")"
+tp up
+released '.target == 2 and .curve == "ease-out-cubic" and .duration_ms > 0' ||
+    fail D-TOUCHPAD-SWIPE "the release did not ease onto the app grid: $(last_release)"
+state '(.touchpad_swipe.active | not) and .overview_open and .overview_state == 2 and .overview_app_grid
+       and (.layers | any(.namespace == "tuna-shell-appgrid"))' 10 ||
+    fail D-TOUCHPAD-SWIPE "three fingers up from the window picker did not settle on the app grid"
+tail -c +"$((grid_mark + 1))" "$TOUCHPAD_LOG" | grep -q 'grid-anim grid-swipe-in' ||
+    fail D-TOUCHPAD-SWIPE "the shell's app grid did not ease in on the swipe's release"
+prev_release="$(last_release)"
+tp swipe 3 0 25 250
+released '.target == 1 and .from > 1' ||
+    fail D-TOUCHPAD-SWIPE "three fingers down from the app grid did not release toward the window picker: $(last_release)"
+state '(.touchpad_swipe.active | not) and .overview_open and .overview_state == 1 and (.overview_app_grid | not)
+       and ((.layers | any(.namespace == "tuna-shell-appgrid")) | not)' 10 ||
+    fail D-TOUCHPAD-SWIPE "three fingers down from the app grid did not come back to the window picker"
+tp swipe 3 0 25 250
+at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "could not close the overview after the app grid swipes"
+pass D-TOUCHPAD-SWIPE "a long swipe from the desktop stopped at the window picker; from it the app grid followed the fingers ($grid_held, $grid_held_more) and the release landed there; down came back"
+
+# In the open overview a sideways swipe scrolls its workspaces under the
+# fingers (WorkspacesView, workspacesView.js:960-1002), across as many as
+# they travel (long swipes, :876), and the release eases out-cubic on the
+# projected velocity. Four fixed workspaces give the strip room.
+gsettings set org.gnome.mutter dynamic-workspaces false
+gsettings set org.gnome.desktop.wm.preferences num-workspaces 4
+state '.workspaces | length == 4' 5 || fail D-TOUCHPAD-SWIPE "four fixed workspaces did not reach the compositor: $(jq -c .workspaces "$CSTATE")"
+FIRST_WS="$(jq -r '.workspaces[0]' "$CSTATE")"
+[ "$FIRST_WS" = "$HOME_WS" ] || fail D-TOUCHPAD-SWIPE "the session's workspace is not the first of four"
+tp swipe 3 0 -25 300
+at_rest 1 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "the overview did not open for the sideways swipes"
+tp down 3
+tp move -20 0 300
+state ".touchpad_swipe.active and .touchpad_swipe.orientation == \"horizontal\" and .overview_motion.scroll.held
+       and .overview_motion.scroll.position > 0.2 and .overview_motion.scroll.position < 1
+       and .active_workspace == $HOME_WS" 5 ||
+    fail D-TOUCHPAD-SWIPE "held fingers did not hold the overview's workspaces part way: $(jq -c '{touchpad_swipe, scroll: .overview_motion.scroll}' "$CSTATE")"
+strip_held="$(jq '.overview_motion.scroll.position' "$CSTATE")"
+tp move -25 0 300
+state ".touchpad_swipe.active and .overview_motion.scroll.position > 1 and .active_workspace == $HOME_WS" 5 ||
+    fail D-TOUCHPAD-SWIPE "the overview's workspaces stopped following the fingers at $strip_held"
+strip_held_more="$(jq '.overview_motion.scroll.position' "$CSTATE")"
+tp hold 400
+tp up
+state '.overview_motion.scroll == null and .overview_motion.scroll_release.velocity == 0' 10 ||
+    fail D-TOUCHPAD-SWIPE "the held sideways swipe did not settle: $(jq -c .overview_motion.scroll_release "$CSTATE")"
+strip_settled="$(jq '.overview_motion.scroll_release.target' "$CSTATE")"
+state ".overview_open and .active_workspace == (.workspaces[$strip_settled])" 5 ||
+    fail D-TOUCHPAD-SWIPE "the overview's workspaces settled at $strip_settled without switching there"
+tp swipe 3 60 0 250
+state ".overview_open and .active_workspace == $HOME_WS and .overview_motion.scroll == null" 10 ||
+    fail D-TOUCHPAD-SWIPE "a long swipe back did not return to the first workspace"
+tp swipe 3 -35 0 120
+state '.overview_motion.scroll == null and (.overview_motion.scroll_release | .target - .from > 1 and .curve == "ease-out-cubic" and .duration_ms > 0)' 10 ||
+    fail D-TOUCHPAD-SWIPE "a fast sideways flick did not carry the strip past the next workspace: $(jq -c .overview_motion.scroll_release "$CSTATE")"
+strip_flick="$(jq -c .overview_motion.scroll_release "$CSTATE")"
+state ".overview_open and .active_workspace != $HOME_WS and .active_workspace != (.workspaces[1])" 5 ||
+    fail D-TOUCHPAD-SWIPE "the flick did not settle two or more workspaces on"
+tp swipe 3 80 0 250
+state ".active_workspace == $HOME_WS and .overview_motion.scroll == null" 10 || fail D-TOUCHPAD-SWIPE "could not come back to the first workspace"
+tp swipe 3 0 25 250
+at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "could not close the overview after the sideways swipes"
+gsettings set org.gnome.mutter dynamic-workspaces true
+gsettings reset org.gnome.desktop.wm.preferences num-workspaces
+state '.workspaces | length <= 2' 5 || fail D-TOUCHPAD-SWIPE "dynamic workspaces did not come back"
+pass D-TOUCHPAD-SWIPE "the overview's workspaces followed held fingers ($strip_held, $strip_held_more) and settled on release at $strip_settled; a fast flick crossed several ($strip_flick)"
 
 # Four fingers are the shell's too (fingers >= GESTURE_FINGER_COUNT).
 prev_release="$(last_release)"

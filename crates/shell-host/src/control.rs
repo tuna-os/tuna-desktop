@@ -125,6 +125,14 @@ pub enum Handled {
     ClosePadOsd {
         pad: u32,
     },
+    /// A touchpad swipe holds (`settle_us: None`) or settles GNOME's
+    /// overview controls state: the app grid follows it.
+    OverviewSwipe {
+        /// `ControlsState` in `OVERVIEW_STATE_SCALE`ths.
+        state: u32,
+        /// The release's settle time, in microseconds.
+        settle_us: Option<u32>,
+    },
     /// The keyboard switched Sticky or Slow Keys: save and confirm.
     KeyboardAidToggled {
         aid: tuna_shell_control::KeyboardAid,
@@ -1193,6 +1201,9 @@ impl ControlClient {
             Message::PadOsdLabels { pad, labels } => Ok(Handled::PadOsdLabels { pad, labels }),
             Message::PadOsdInput { pad, event } => Ok(Handled::PadOsdInput { pad, event }),
             Message::ClosePadOsd { pad } => Ok(Handled::ClosePadOsd { pad }),
+            Message::OverviewSwipe { state, settle_us } => {
+                Ok(Handled::OverviewSwipe { state, settle_us })
+            }
             Message::KeyboardAidToggled { aid, enabled } => {
                 Ok(Handled::KeyboardAidToggled { aid, enabled })
             }
@@ -1489,6 +1500,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::PadOsdLabels { .. } => "PadOsdLabels",
         Message::PadOsdInput { .. } => "PadOsdInput",
         Message::ClosePadOsd { .. } => "ClosePadOsd",
+        Message::OverviewSwipe { .. } => "OverviewSwipe",
     }
 }
 
@@ -1992,6 +2004,26 @@ mod tests {
             (
                 Message::ClosePadOsd { pad: 3 },
                 Handled::ClosePadOsd { pad: 3 },
+            ),
+            (
+                Message::OverviewSwipe {
+                    state: 15_000,
+                    settle_us: None,
+                },
+                Handled::OverviewSwipe {
+                    state: 15_000,
+                    settle_us: None,
+                },
+            ),
+            (
+                Message::OverviewSwipe {
+                    state: 20_000,
+                    settle_us: Some(180_000),
+                },
+                Handled::OverviewSwipe {
+                    state: 20_000,
+                    settle_us: Some(180_000),
+                },
             ),
         ];
         for (message, expected) in cases {

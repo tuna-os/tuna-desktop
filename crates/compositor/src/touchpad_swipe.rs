@@ -12,8 +12,11 @@
 //! first update. Deltas come out with GNOME's sign, positive moving the
 //! tracker forward (overview open, next workspace): the fingers' motion
 //! negated with natural scrolling on, as it is (:188-189), so turning
-//! natural scrolling off reverses every gesture. A libinput cancel ends
-//! the gesture exactly as lifting the fingers does (:194-198).
+//! natural scrolling off reverses every gesture. With the shell's text
+//! direction right-to-left a horizontal delta is negated once more, as
+//! every horizontal tracker does (swipeTracker.js:593-595). A libinput
+//! cancel ends the gesture exactly as lifting the fingers does
+//! (:194-198).
 //!
 //! Tuna Desktop consumes the pending phase too: GNOME lets those first
 //! events propagate, but with a tracker for each axis every such swipe
@@ -103,8 +106,9 @@ impl TouchpadSwipe {
     }
 
     /// The fingers moved `(dx, dy)`, unaccelerated (right and down
-    /// positive). `None` when the swipe is not the shell's.
-    pub fn update(&mut self, dx: f64, dy: f64, natural_scroll: bool) -> Option<Step> {
+    /// positive), under the shell's text direction (`rtl`). `None` when
+    /// the swipe is not the shell's.
+    pub fn update(&mut self, dx: f64, dy: f64, natural_scroll: bool, rtl: bool) -> Option<Step> {
         let (orientation, begin) = match &mut self.state {
             State::Idle => return None,
             State::Handling(orientation) => (*orientation, false),
@@ -124,6 +128,7 @@ impl TouchpadSwipe {
             }
         };
         let motion = match orientation {
+            Orientation::Horizontal if rtl => -dx,
             Orientation::Horizontal => dx,
             Orientation::Vertical => dy,
         };
@@ -173,13 +178,13 @@ mod tests {
     fn three_or_more_fingers_are_the_shells_and_fewer_propagate() {
         let mut swipe = TouchpadSwipe::default();
         assert!(!swipe.begin(2));
-        assert_eq!(swipe.update(0.0, -40.0, true), None);
+        assert_eq!(swipe.update(0.0, -40.0, true, false), None);
         assert_eq!(swipe.end(), None);
         for fingers in [3, 4, 5] {
             assert!(swipe.begin(fingers), "{fingers} fingers");
             assert!(swipe.active());
             assert_eq!(
-                swipe.update(0.0, -40.0, true),
+                swipe.update(0.0, -40.0, true, false),
                 update(40.0, true, Orientation::Vertical),
                 "{fingers} fingers"
             );
@@ -192,22 +197,22 @@ mod tests {
     fn travel_under_the_drag_threshold_moves_nothing_and_is_dropped() {
         let mut swipe = TouchpadSwipe::default();
         swipe.begin(3);
-        assert_eq!(swipe.update(-6.0, -4.0, true), Some(Step::Pending));
-        assert_eq!(swipe.update(-6.0, 2.0, true), Some(Step::Pending));
+        assert_eq!(swipe.update(-6.0, -4.0, true, false), Some(Step::Pending));
+        assert_eq!(swipe.update(-6.0, 2.0, true, false), Some(Step::Pending));
         assert_eq!(swipe.orientation(), None);
         // 18.2 units of travel, mostly leftward: horizontal from here on,
         // the crossing event's own motion first, vertical motion ignored.
         assert_eq!(
-            swipe.update(-6.0, -1.0, true),
+            swipe.update(-6.0, -1.0, true, false),
             update(6.0, true, Orientation::Horizontal)
         );
         assert_eq!(
-            swipe.update(-3.0, -50.0, true),
+            swipe.update(-3.0, -50.0, true, false),
             update(3.0, false, Orientation::Horizontal)
         );
         // Lifted before the threshold: the shell's, but nothing to end.
         swipe.begin(3);
-        swipe.update(0.0, 10.0, true);
+        swipe.update(0.0, 10.0, true, false);
         assert_eq!(swipe.end(), Some(None));
     }
 
@@ -217,7 +222,7 @@ mod tests {
         let mut swipe = TouchpadSwipe::default();
         swipe.begin(3);
         assert_eq!(
-            swipe.update(12.0, 12.0, true),
+            swipe.update(12.0, 12.0, true, false),
             update(-12.0, true, Orientation::Vertical)
         );
     }
@@ -230,23 +235,56 @@ mod tests {
         traditional.begin(3);
         // Fingers up: forward (open) with natural scrolling, back without.
         assert_eq!(
-            natural.update(0.0, -20.0, true),
+            natural.update(0.0, -20.0, true, false),
             update(20.0, true, Orientation::Vertical)
         );
         assert_eq!(
-            traditional.update(0.0, -20.0, false),
+            traditional.update(0.0, -20.0, false, false),
             update(-20.0, true, Orientation::Vertical)
         );
         natural.begin(4);
         traditional.begin(4);
         // Fingers right: the previous workspace, or the next one.
         assert_eq!(
-            natural.update(20.0, 0.0, true),
+            natural.update(20.0, 0.0, true, false),
             update(-20.0, true, Orientation::Horizontal)
         );
         assert_eq!(
-            traditional.update(20.0, 0.0, false),
+            traditional.update(20.0, 0.0, false, false),
             update(20.0, true, Orientation::Horizontal)
         );
+    }
+
+    #[test]
+    fn right_to_left_reverses_only_the_horizontal_trackers() {
+        // swipeTracker.js:593-595: the horizontal delta is negated under
+        // an RTL text direction, after natural scrolling has applied.
+        for natural in [true, false] {
+            let mut ltr = TouchpadSwipe::default();
+            let mut rtl = TouchpadSwipe::default();
+            ltr.begin(3);
+            rtl.begin(3);
+            let Some(Step::Update { delta: forward, .. }) = ltr.update(20.0, 0.0, natural, false)
+            else {
+                panic!("no horizontal update");
+            };
+            assert_eq!(
+                rtl.update(20.0, 0.0, natural, true),
+                update(-forward, true, Orientation::Horizontal),
+                "natural {natural}"
+            );
+            assert_eq!(
+                rtl.update(-5.0, 0.0, natural, true),
+                update(forward / 4.0, false, Orientation::Horizontal),
+                "natural {natural}"
+            );
+            ltr.begin(3);
+            rtl.begin(3);
+            assert_eq!(
+                rtl.update(0.0, -20.0, natural, true),
+                ltr.update(0.0, -20.0, natural, false),
+                "vertical, natural {natural}"
+            );
+        }
     }
 }
