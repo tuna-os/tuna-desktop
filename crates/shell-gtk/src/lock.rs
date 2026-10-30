@@ -718,7 +718,10 @@ impl LockUi {
         });
         if let Some(keyboard) = &keyboard {
             overlay.add_overlay(keyboard.widget());
-            for widget in [entry.password.upcast_ref::<gtk::Widget>(), entry.text.upcast_ref()] {
+            for widget in [
+                entry.password.upcast_ref::<gtk::Widget>(),
+                entry.text.upcast_ref(),
+            ] {
                 let focus = gtk::EventControllerFocus::new();
                 {
                     let keyboard = Rc::downgrade(keyboard);
