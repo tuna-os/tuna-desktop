@@ -504,9 +504,16 @@ fn each_sequence_stays_on_the_surface_it_began_on_and_is_framed() {
     assert_eq!(f.client.count(&Seen::Motion { surface: b, id: 1 }), 1);
     assert_eq!(f.client.count(&Seen::Up { surface: a, id: 0 }), 1);
     assert_eq!(f.client.count(&Seen::Up { surface: b, id: 1 }), 1);
-    assert_eq!(f.client.count(&Seen::Frame), 4, "one frame per hardware frame");
+    assert_eq!(
+        f.client.count(&Seen::Frame),
+        4,
+        "one frame per hardware frame"
+    );
     assert_eq!(f.client.count(&Seen::Cancel), 0);
-    assert_eq!(f.client.pointer_buttons, 0, "touch is not pointer emulation");
+    assert_eq!(
+        f.client.pointer_buttons, 0,
+        "touch is not pointer emulation"
+    );
     // A touch begin focuses like a primary press.
     assert_eq!(f.manager.model().focused(), Some(f.ids[1]));
 }
@@ -562,8 +569,11 @@ fn touch_while_locked_reaches_only_the_lock_surface() {
     f.manager
         .lock_input(&mut f.comp.state, &lock, ManagerInput::TouchFrame { time });
     let time = f.tick();
-    f.manager
-        .lock_input(&mut f.comp.state, &lock, ManagerInput::TouchUp { slot: 0, time });
+    f.manager.lock_input(
+        &mut f.comp.state,
+        &lock,
+        ManagerInput::TouchUp { slot: 0, time },
+    );
     let time = f.tick();
     f.manager
         .lock_input(&mut f.comp.state, &lock, ManagerInput::TouchFrame { time });
@@ -593,9 +603,7 @@ fn any_fingers_serial_starts_a_drag_like_mutter() {
         .unwrap()
         .create_data_source(&qh, ());
     source.offer("text/plain".into());
-    source.set_actions(
-        wayland_client::protocol::wl_data_device_manager::DndAction::Copy,
-    );
+    source.set_actions(wayland_client::protocol::wl_data_device_manager::DndAction::Copy);
     f.client
         .data_device
         .as_ref()
@@ -675,7 +683,11 @@ fn the_keyboard_slides_a_covered_fields_window_up_and_back() {
     f.manager.step_osk_slide(ms(1150));
     assert_eq!(f.manager.geometry(alpha).unwrap().loc.y, -160);
     assert!(!f.manager.osk_slide_running());
-    assert_eq!(f.manager.geometry(f.ids[1]).unwrap().loc.y, 100, "beta stays");
+    assert_eq!(
+        f.manager.geometry(f.ids[1]).unwrap().loc.y,
+        100,
+        "beta stays"
+    );
     // The shifted field stays near the keyboard: nothing more moves.
     let shifted = f.manager.field_cursor(&surface, (10, 250, 2, 20));
     f.manager

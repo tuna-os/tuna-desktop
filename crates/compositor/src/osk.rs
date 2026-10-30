@@ -506,7 +506,9 @@ mod tests {
             vec![(1, 234)]
         );
         let settled_field = FieldCursor { y: 374, ..field };
-        assert!(slide.update(Some(settled), Some(settled_field), ys).is_empty());
+        assert!(slide
+            .update(Some(settled), Some(settled_field), ys)
+            .is_empty());
         assert_eq!(slide.update(None, None, ys), vec![(1, 500)]);
     }
 }
