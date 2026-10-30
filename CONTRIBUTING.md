@@ -152,9 +152,11 @@ above — just DCO sign-off on the commit. Use plain file edits for anything und
 See [docs/test-strategy.md](docs/test-strategy.md) for the full verification
 layers (unit/property, protocol probes, nested integration, VM/session,
 hardware qualification, human UX/accessibility, security, performance,
-upgrade/recovery) and the required cross-cutting journeys. Not all layers
-have tooling yet — the framework is currently in draft status with no
-implementation tests run in most layers beyond what CI already exercises.
+upgrade/recovery) and the required cross-cutting journeys. The unit,
+integration and nested proof layers are active and run in CI; parity,
+VM/session, hardware, accessibility, security, performance and
+upgrade/recovery qualification remain incomplete where the test strategy
+says so. This is not a claim of daily-driver or release readiness.
 
 ## Reporting issues
 

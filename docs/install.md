@@ -10,7 +10,14 @@
 
 ## Test-drive in a VM (one command)
 
-To evaluate Tuna Desktop without installing packages or compiling from source:
+On Linux or macOS, evaluate Tuna Desktop without building it or installing Tuna Desktop packages. The script needs these host tools first; it checks for them and stops with install hints if any is missing:
+
+- QEMU (`qemu-system-x86_64` or `qemu-system-aarch64`, matching the host architecture, plus `qemu-img`). On Linux, `/dev/kvm` is strongly recommended; without it QEMU falls back to very slow TCG emulation.
+- Podman with working rootless user namespaces (on macOS, an initialized and running `podman machine`).
+- cosign, to verify the image signature.
+- About 10 GiB free in `$HOME` and `/var/tmp`, and network access to GitHub, `ghcr.io` and the Sigstore verification services.
+
+The guest architecture follows the host (x86_64 or aarch64). Corral and its bootc plugin are the only components the script installs for you.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tuna-os/tuna-desktop/main/scripts/try-tuna-desktop | bash
@@ -49,12 +56,17 @@ preserving user data. See `docs/release.md` for the release process.
 
 ## From source
 
-Prerequisites mirror CI (`check` job plus the display libraries the nested
-backend dlopens): a stable Rust toolchain, `libxkbcommon-dev`,
-`libxkbcommon-x11-dev`, `libegl1`, `libgl1-mesa-dri`, `libgbm1`,
-`pkg-config`. The GTK shell also needs `libgtk-4-dev`, `libadwaita-1-dev`
-and gtk4-layer-shell (`scripts/ci-install-gtk4-layer-shell` builds it
-where the distribution has no package).
+Install the complete package list in
+[Prerequisites](development.md#prerequisites) first (Ubuntu and Arch lists,
+matching the CI `check` job). The compositor builds its DRM and PipeWire
+features by default, so it needs the libseat, libinput, libudev, GBM, libdrm,
+PipeWire, libclang and xkbcommon development packages
+(`crates/compositor/Cargo.toml`); the GTK shell and greeter need GTK 4,
+libadwaita and gtk4-layer-shell (`crates/shell-gtk/Cargo.toml`,
+`crates/greeter/Cargo.toml`). Where the distribution has no gtk4-layer-shell
+package, `scripts/ci-install-gtk4-layer-shell` builds it. At run time the
+nested backend additionally dlopens the EGL/Mesa display libraries
+(`libegl1`, `libgl1-mesa-dri`, `libgbm1` on Ubuntu).
 
 ```sh
 cargo build --release \

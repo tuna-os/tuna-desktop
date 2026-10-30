@@ -24,7 +24,14 @@ Never post account credentials or API keys in issues or pull requests.
 ## Quickstart
 
 - **Test-drive in a VM (one command):**
-  On Linux or macOS, evaluate Tuna Desktop without installing packages or building:
+  On Linux or macOS, evaluate Tuna Desktop without building it or installing Tuna Desktop packages. The script needs these host tools first; it checks for them and stops with install hints if any is missing:
+
+  - QEMU (`qemu-system-x86_64` or `qemu-system-aarch64`, matching the host architecture, plus `qemu-img`). On Linux, `/dev/kvm` is strongly recommended; without it QEMU falls back to very slow TCG emulation.
+  - Podman with working rootless user namespaces (on macOS, an initialized and running `podman machine`).
+  - cosign, to verify the image signature.
+  - About 10 GiB free in `$HOME` and `/var/tmp`, and network access to GitHub, `ghcr.io` and the Sigstore verification services.
+
+  The guest architecture follows the host (x86_64 or aarch64). Corral and its bootc plugin are the only components the script installs for you.
 
   ```sh
   curl -fsSL https://raw.githubusercontent.com/tuna-os/tuna-desktop/main/scripts/try-tuna-desktop | bash

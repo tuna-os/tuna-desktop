@@ -1,6 +1,6 @@
 # Program architecture
 
-**Status:** Proposed, for design review  
+**Status:** Tier 1 (nested developer preview) is implemented; tier 2 (daily-driver candidate) and release qualification remain open and are tracked in [the roadmap](roadmap.md). Open decisions and release gates below still apply; sections marked *target* describe design that is not yet shipped.  
 **Date:** 27 September 2026  
 **Name:** Tuna Desktop (Rust Wayland desktop session), formerly Roost. Crates, binaries, packages and environment variables were renamed in [#536](https://github.com/tuna-os/tuna-desktop/pull/536); [#505](https://github.com/tuna-os/tuna-desktop/issues/505) tracks the subsequent compatibility transition.
 
@@ -15,7 +15,8 @@ The parity target is a named, pinned GNOME release and configuration on the same
 - **Compositor:** Rust process built with Smithay. Owns seats, outputs, focus, stacking, workspace/window state, input routing, frame scheduling, capture authorization, and privileged protocol exposure. It remains authoritative when the shell is slow or disconnected.
 - **Shell host:** one supervised Wayland client initially, containing panel, overview, launcher, and quick settings. It draws its own surfaces and sends intent through a versioned control API. It never owns focus or window policy.
 - **Recovery and lock:** minimal recovery affordance is available when the shell is absent. Lock state remains in the compositor; unlock requires a reviewed authentication path. Production credential binding and lock implementation are release-gate decisions.
-- **Extensions:** separate, untrusted processes behind a capability broker. No privileged compositor Wayland socket, arbitrary native plugin ABI, raw input, clipboard, capture, filesystem, or network access by default. Wasmtime is a later optional worker implementation, not the security boundary by itself.
+- **Extensions (target):** separate, untrusted processes behind a capability broker. No privileged compositor Wayland socket, arbitrary native plugin ABI, raw input, clipboard, capture, filesystem, or network access by default. Wasmtime is a later optional worker implementation, not the security boundary by itself. Neither the separate-process isolation nor the capability broker is shipped; both remain release-gated work.
+- **Extensions (current):** `crates/shell-host/src/extensions.rs` runs Rhai scripts from the user extension directory *in-process* inside `tuna-shell-host`. The engine replaces the module resolver with a dummy (no `import` from disk), captures `print` as notices, aborts scripts past an operation budget (`MAX_OPS`), and registers only a small hand-built API (`bar_cell`, `dock_badge`, `on_press`, `notice`); errors disable the script. This is containment inside the shell process, not process isolation: a Rhai engine bug or resource exhaustion affects the shell host itself.
 - **System integration:** reuse system services and portals where appropriate. The portal backend mediates consent; compositor-enforced grants authorize capture and are revocable.
 
 Use Smithay/calloop's event model initially. Pointer/input/frame paths must not synchronously wait for shell, extensions, search, disk, or network work. The shell toolkit choice is GTK4/libadwaita ([ADR 0006](adr/0006-gtk4-libadwaita-shell.md)); accessibility and visual parity remain acceptance criteria.
