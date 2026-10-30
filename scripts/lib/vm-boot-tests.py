@@ -4459,6 +4459,46 @@ class VmSoak(unittest.TestCase):
         self.assertIn("**FAILED**", (soak / "summary.md").read_text())
 
 
+class HealthProbeWindow(unittest.TestCase):
+    """Run 41091885419: GDM login took 150 s (selection attempt 3), so the
+    probes' 120 s window, counted from boot, expired before the user bus
+    existed and V-CALENDAR and every V-PORTAL check failed spuriously."""
+    HEALTH = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-health"
+
+    def run_health(self, login_after_sleeps):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stubs, runtime = root / "bin", root / "runtime"
+            stubs.mkdir()
+            runtime.mkdir()
+            stub = {
+                # Each sleep is a step of guest time; login creates the user
+                # bus after the given number, and the final loop ends later.
+                "sleep": f"""n=$(( $(cat "$STATE/sleeps" 2>/dev/null || echo 0) + 1 ))
+echo $n > "$STATE/sleeps"
+if [ $n -eq {login_after_sleeps} ]; then
+    python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$XDG_RUNTIME_DIR/bus"
+fi
+[ $n -le {login_after_sleeps + 200} ]""",
+                "timeout": 'shift; exec "$@"',
+                "gdbus": '[ -S "$XDG_RUNTIME_DIR/bus" ]',
+                "wpctl": "exit 1",
+                # No real /run/user/<uid>/bus on the test host can answer.
+                "id": "echo 4242424",
+            }
+            for name, body in stub.items():
+                (stubs / name).write_text("#!/bin/bash\n" + body + "\n")
+                (stubs / name).chmod(0o755)
+            env = {"PATH": f"{stubs}:/usr/bin:/bin", "XDG_RUNTIME_DIR": str(runtime), "STATE": str(root)}
+            return subprocess.run(["bash", str(self.HEALTH)], env=env, capture_output=True,
+                                  text=True, timeout=120).stdout
+
+    def test_probe_window_starts_at_login_not_boot(self):
+        output = self.run_health(login_after_sleeps=150)
+        for name in ("calendar", "portal", "portal-gnome", "portal-screenshot", "portal-screencast"):
+            self.assertIn(f"tuna-vm-health: {name} ready", output)
+        self.assertNotIn("failed", output)
+
 
 if __name__ == "__main__":
     unittest.main()
