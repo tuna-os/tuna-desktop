@@ -4,7 +4,8 @@
 #
 #   .github/runners/build-image [NODE]          # default node: karnataka
 #
-# Prints the image references to put in values-*.yaml (template.spec image).
+# Points values-24.04.yaml / values-26.04.yaml at the new tags; roll them out
+# with .github/runners/deploy --sets-only.
 set -euo pipefail
 
 node=${1:-karnataka}
@@ -24,5 +25,6 @@ for ubuntu in 24.04 26.04; do
       --build-arg RUNNER_VERSION=$runner_version -t '$ref' '$remote_dir'
     sudo podman save '$ref' | sudo k3s ctr -n k8s.io images import -
     sudo podman rmi '$ref' >/dev/null"
+  sed -i "s|image: localhost/tuna-ci-runner:${ubuntu}-.*|image: ${ref}|" "$here/values-${ubuntu}.yaml"
   echo "$ref"
 done
