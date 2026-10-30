@@ -1370,8 +1370,8 @@ impl Runtime {
         // as mutter's meta-settings.c reads it in-process (#356); only
         // the hardware session has privacy screens.
         #[cfg(feature = "drm")]
-        let privacy_screen_settings = hardware
-            .then(|| crate::privacy_screen_settings::PrivacyScreenSettings::start(&wake));
+        let privacy_screen_settings =
+            hardware.then(|| crate::privacy_screen_settings::PrivacyScreenSettings::start(&wake));
         let loop_handle = event_loop.handle();
         let mut runtime = Runtime {
             display,
