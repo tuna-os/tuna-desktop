@@ -142,55 +142,124 @@ pub fn attempt_unlock(client: &mut impl UnlockClient, user: &str, password: &str
     UnlockOutcome::Denied
 }
 
-/// The fingerprint seam [`attempt_fprint_unlock`] drives.
-/// [`crate::fprintd::Fprintd`] is the production implementation; tests
-/// stub here (no reader on CI).
+/// Scans per fingerprint conversation: `pam_fprintd`'s `DEFAULT_MAX_TRIES`
+/// (fprintd `pam/pam_fprintd.c`), which GDM's `gdm-fingerprint` service
+/// runs for GNOME Shell 51's lock screen.
+pub const MAX_FINGERPRINT_TRIES: usize = 3;
+/// `pam_fprintd`'s message after a complete non-matching scan.
+pub const FINGERPRINT_NO_MATCH: &str = "Failed to match fingerprint";
+/// `pam_fprintd`'s message when a scan times out (it then returns
+/// `PAM_AUTHINFO_UNAVAIL`, which GDM reports as an unavailable service).
+pub const FINGERPRINT_TIMED_OUT: &str = "Verification timed out";
+/// GDM 51 `gdm-session-worker.c` `get_max_retries_error_message` for
+/// `gdm-fingerprint` after `PAM_MAXTRIES`.
+pub const FINGERPRINT_MAX_TRIES: &str =
+    "You reached the maximum fingerprint authentication attempts, please try another method";
+
+/// One step of a fingerprint conversation the lock screen shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FingerprintStep {
+    /// The reader waits for a finger (`swipe`: a swipe sensor).
+    Scan { swipe: bool },
+    /// `pam_fprintd`'s informational message.
+    Info(&'static str),
+    /// `pam_fprintd`'s (or GDM's) error message.
+    Problem(&'static str),
+}
+
+/// How a fingerprint conversation ended. Only [`Self::Matched`] may unlock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FingerprintEnd {
+    Matched,
+    /// Every scan failed to match (`PAM_MAXTRIES`): after the max-tries
+    /// problem, GDM's service-unavailable (TOO_MANY_RETRIES) as well.
+    Failed,
+    /// No daemon, reader or enrolled print, a timed-out scan or a daemon
+    /// error (`PAM_AUTHINFO_UNAVAIL`): GDM's service-unavailable.
+    Unavailable,
+    Cancelled,
+}
+
+/// The fingerprint seam [`run_fingerprint`] drives. [`crate::fprintd::Fprintd`]
+/// is the production implementation; tests stub here (no reader on CI).
 pub trait FprintVerifier {
-    /// One bounded verification for `user`.
-    fn verify(&mut self, user: &str) -> crate::fprintd::VerifyOutcome;
+    /// A reader is present and `user` enrolled a print (pam_fprintd's
+    /// `user_has_prints`; GNOME offers fingerprint only then).
+    fn offered(&mut self, user: &str) -> bool;
+    /// One bounded, cancellable scan.
+    fn verify(
+        &mut self,
+        user: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: crate::fprintd::ProgressSink,
+    ) -> crate::fprintd::VerifyOutcome;
 }
 
 impl FprintVerifier for crate::fprintd::Fprintd {
-    fn verify(&mut self, user: &str) -> crate::fprintd::VerifyOutcome {
-        crate::fprintd::Fprintd::verify_user(self, user)
+    fn offered(&mut self, user: &str) -> bool {
+        self.capability(user).offered()
+    }
+
+    fn verify(
+        &mut self,
+        user: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: crate::fprintd::ProgressSink,
+    ) -> crate::fprintd::VerifyOutcome {
+        // A cancelled previous attempt's reaper may still be retiring its
+        // claim; wait for it (bounded) rather than fail on contention.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !crate::fprintd::claim_idle() && std::time::Instant::now() < until {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return crate::fprintd::VerifyOutcome::Cancelled;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        self.verify_interactive(user, crate::fprintd::VERIFY_TIMEOUT, cancel, progress)
     }
 }
 
-/// One fingerprint attempt for `user`: only a daemon-reported match
-/// unlocks. No-match, no device, no enrolled prints, cancellation,
-/// timeout and errors all collapse to [`UnlockOutcome::Denied`] with no
-/// detail, exactly like the password path.
-pub fn attempt_fprint_unlock(verifier: &mut impl FprintVerifier, user: &str) -> UnlockOutcome {
-    match verifier.verify(user) {
-        crate::fprintd::VerifyOutcome::Matched => UnlockOutcome::Unlocked,
-        _ => UnlockOutcome::Denied,
+/// One fingerprint conversation for `user`, as `pam_fprintd`'s `do_verify`
+/// runs it: up to [`MAX_FINGERPRINT_TRIES`] scans, a no-match message after
+/// each failed one, the max-tries message at the end; a timed-out scan or
+/// any daemon failure ends it as unavailable. Only a daemon-reported match
+/// ends it [`FingerprintEnd::Matched`]. Blocking: runs on a worker thread.
+pub fn run_fingerprint(
+    verifier: &mut impl FprintVerifier,
+    user: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    step: std::sync::Arc<dyn Fn(FingerprintStep) + Send + Sync>,
+) -> FingerprintEnd {
+    use crate::fprintd::{VerifyOutcome, VerifyProgress};
+    if !verifier.offered(user) {
+        return FingerprintEnd::Unavailable;
     }
-}
-
-/// Truthful fingerprint capability for `user` (reader present plus
-/// enrollment), for the lock screen to decide whether to offer a
-/// fingerprint attempt. Unavailable on any failure, including no
-/// daemon. Blocking (D-Bus round trips), so the runtime calls it on a
-/// worker thread, like [`verify`].
-pub fn fprint_capability(user: &str) -> crate::fprintd::Capability {
-    crate::fprintd::Fprintd::connect()
-        .map(|client| client.capability(user))
-        .unwrap_or_else(crate::fprintd::Capability::unavailable)
-}
-
-/// One live fingerprint verification for `user` through fprintd,
-/// without touching any lock state. `false` on every non-match,
-/// including no daemon, no reader, and no enrolled prints. Blocking
-/// (the user may take the whole [`crate::fprintd::VERIFY_TIMEOUT`]),
-/// so the runtime calls it on a worker thread.
-pub fn verify_fingerprint(user: &str) -> bool {
-    let Some(client) = crate::fprintd::Fprintd::connect() else {
-        return false;
-    };
-    matches!(
-        client.verify_user(user),
-        crate::fprintd::VerifyOutcome::Matched
-    )
+    for _ in 0..MAX_FINGERPRINT_TRIES {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return FingerprintEnd::Cancelled;
+        }
+        let sink = step.clone();
+        let progress: crate::fprintd::ProgressSink = Box::new(move |progress| {
+            sink(match progress {
+                VerifyProgress::Armed { swipe } => FingerprintStep::Scan { swipe },
+                VerifyProgress::Retry(message) => FingerprintStep::Problem(message),
+            })
+        });
+        match verifier.verify(user, cancel, progress) {
+            VerifyOutcome::Matched => return FingerprintEnd::Matched,
+            VerifyOutcome::NoMatch => step(FingerprintStep::Problem(FINGERPRINT_NO_MATCH)),
+            VerifyOutcome::TimedOut => {
+                step(FingerprintStep::Info(FINGERPRINT_TIMED_OUT));
+                return FingerprintEnd::Unavailable;
+            }
+            VerifyOutcome::Cancelled => return FingerprintEnd::Cancelled,
+            VerifyOutcome::NoDevice | VerifyOutcome::NotEnrolled | VerifyOutcome::Error => {
+                return FingerprintEnd::Unavailable
+            }
+        }
+    }
+    step(FingerprintStep::Problem(FINGERPRINT_MAX_TRIES));
+    FingerprintEnd::Failed
 }
 
 /// Verify `password` for `user` the way [`unlock_session`] does, without
@@ -516,91 +585,164 @@ mod tests {
         assert_eq!(stub.answers, vec![None]);
     }
 
-    /// Scripted fingerprint stub: canned outcomes, recording the user.
+    /// Scripted fingerprint stub: canned scans, each optionally reporting
+    /// progress first, recording the user of every scan.
     struct FprintStub {
-        outcomes: VecDeque<crate::fprintd::VerifyOutcome>,
+        offered: bool,
+        scans: VecDeque<(
+            Vec<crate::fprintd::VerifyProgress>,
+            crate::fprintd::VerifyOutcome,
+        )>,
         users: Vec<String>,
     }
 
     impl FprintStub {
-        fn new(outcome: crate::fprintd::VerifyOutcome) -> Self {
-            Self::sequenced(vec![outcome])
-        }
-
         fn sequenced(outcomes: Vec<crate::fprintd::VerifyOutcome>) -> Self {
             Self {
-                outcomes: outcomes.into(),
+                offered: true,
+                scans: outcomes.into_iter().map(|o| (Vec::new(), o)).collect(),
                 users: Vec::new(),
             }
         }
     }
 
     impl FprintVerifier for FprintStub {
-        fn verify(&mut self, user: &str) -> crate::fprintd::VerifyOutcome {
+        fn offered(&mut self, _user: &str) -> bool {
+            self.offered
+        }
+        fn verify(
+            &mut self,
+            user: &str,
+            _cancel: &std::sync::atomic::AtomicBool,
+            progress: crate::fprintd::ProgressSink,
+        ) -> crate::fprintd::VerifyOutcome {
             self.users.push(user.to_string());
-            self.outcomes
+            let (steps, outcome) = self
+                .scans
                 .pop_front()
-                .unwrap_or(crate::fprintd::VerifyOutcome::Error)
+                .unwrap_or((Vec::new(), crate::fprintd::VerifyOutcome::Error));
+            for step in steps {
+                progress(step);
+            }
+            outcome
         }
     }
 
-    #[test]
-    fn fingerprint_match_unlocks_for_that_user() {
-        let mut stub = FprintStub::new(crate::fprintd::VerifyOutcome::Matched);
-        assert_eq!(
-            attempt_fprint_unlock(&mut stub, "ada"),
-            UnlockOutcome::Unlocked
+    fn run(stub: &mut FprintStub, cancel: bool) -> (FingerprintEnd, Vec<FingerprintStep>) {
+        let steps = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = steps.clone();
+        let end = run_fingerprint(
+            stub,
+            "ada",
+            &std::sync::atomic::AtomicBool::new(cancel),
+            std::sync::Arc::new(move |step| sink.lock().unwrap().push(step)),
         );
-        assert_eq!(stub.users, vec!["ada".to_string()]);
+        let steps = steps.lock().unwrap().clone();
+        (end, steps)
     }
 
     #[test]
-    fn every_fingerprint_non_match_denies_silently() {
-        use crate::fprintd::VerifyOutcome::*;
-        for outcome in [NoMatch, NoDevice, NotEnrolled, Cancelled, TimedOut, Error] {
-            let mut stub = FprintStub::new(outcome);
-            assert_eq!(
-                attempt_fprint_unlock(&mut stub, "ada"),
-                UnlockOutcome::Denied,
-                "unlocked on {outcome:?}"
-            );
-        }
+    fn fingerprint_match_ends_matched_for_that_user_with_the_scan_cue() {
+        use crate::fprintd::{VerifyOutcome::Matched, VerifyProgress::Armed};
+        let mut stub = FprintStub::sequenced(Vec::new());
+        stub.scans.push_back((vec![Armed { swipe: true }], Matched));
+        let (end, steps) = run(&mut stub, false);
+        assert_eq!(end, FingerprintEnd::Matched);
+        assert_eq!(steps, [FingerprintStep::Scan { swipe: true }]);
+        assert_eq!(stub.users, ["ada"]);
     }
 
     #[test]
-    fn late_worker_result_cannot_apply_to_a_newer_generation() {
-        // Each attempt resolves solely on its own verification: the first
-        // attempt times out and stays denied (its worker's late result has
-        // no attempt to apply to — the waiter is gone), and the newer
-        // generation decides solely on its own outcome. Generations never
-        // leak into each other in either direction.
+    fn three_failed_scans_end_failed_like_pam_fprintd_max_tries() {
+        use crate::fprintd::VerifyOutcome::{Matched, NoMatch};
+        let mut stub = FprintStub::sequenced(vec![NoMatch, NoMatch, NoMatch, Matched]);
+        let (end, steps) = run(&mut stub, false);
+        assert_eq!(end, FingerprintEnd::Failed);
+        assert_eq!(
+            steps,
+            [
+                FingerprintStep::Problem(FINGERPRINT_NO_MATCH),
+                FingerprintStep::Problem(FINGERPRINT_NO_MATCH),
+                FingerprintStep::Problem(FINGERPRINT_NO_MATCH),
+                FingerprintStep::Problem(FINGERPRINT_MAX_TRIES),
+            ]
+        );
+        // The fourth scripted match is never reached: three scans only.
+        assert_eq!(stub.users.len(), MAX_FINGERPRINT_TRIES);
+    }
+
+    #[test]
+    fn a_retry_then_match_reports_pam_fprintd_messages() {
+        use crate::fprintd::{VerifyOutcome::*, VerifyProgress::*};
+        let mut stub = FprintStub::sequenced(Vec::new());
+        stub.scans.push_back((
+            vec![
+                Armed { swipe: false },
+                Retry("Place your finger on the reader again"),
+            ],
+            NoMatch,
+        ));
+        stub.scans
+            .push_back((vec![Armed { swipe: false }], Matched));
+        let (end, steps) = run(&mut stub, false);
+        assert_eq!(end, FingerprintEnd::Matched);
+        assert_eq!(
+            steps,
+            [
+                FingerprintStep::Scan { swipe: false },
+                FingerprintStep::Problem("Place your finger on the reader again"),
+                FingerprintStep::Problem(FINGERPRINT_NO_MATCH),
+                FingerprintStep::Scan { swipe: false },
+            ]
+        );
+    }
+
+    #[test]
+    fn timeouts_and_daemon_failures_end_unavailable_never_matched() {
         use crate::fprintd::VerifyOutcome::*;
         let mut stub = FprintStub::sequenced(vec![TimedOut, Matched]);
-        assert_eq!(
-            attempt_fprint_unlock(&mut stub, "ada"),
-            UnlockOutcome::Denied
-        );
-        assert_eq!(
-            attempt_fprint_unlock(&mut stub, "ada"),
-            UnlockOutcome::Unlocked
-        );
-        assert_eq!(stub.users, vec!["ada".to_string(), "ada".to_string()]);
+        let (end, steps) = run(&mut stub, false);
+        assert_eq!(end, FingerprintEnd::Unavailable);
+        assert_eq!(steps, [FingerprintStep::Info(FINGERPRINT_TIMED_OUT)]);
+        assert_eq!(stub.users.len(), 1, "a timed-out conversation ends");
+        for outcome in [NoDevice, NotEnrolled, Error] {
+            let mut stub = FprintStub::sequenced(vec![outcome, Matched]);
+            let (end, steps) = run(&mut stub, false);
+            assert_eq!(end, FingerprintEnd::Unavailable, "{outcome:?}");
+            assert!(steps.is_empty());
+        }
+        let mut stub = FprintStub::sequenced(vec![Cancelled, Matched]);
+        assert_eq!(run(&mut stub, false).0, FingerprintEnd::Cancelled);
     }
 
     #[test]
-    fn fingerprint_capability_is_unavailable_when_disabled() {
-        let _guard = crate::fprintd::test_serialize_env().lock().unwrap();
-        let prior = std::env::var_os(crate::fprintd::DISABLE_ENV);
-        unsafe { std::env::set_var(crate::fprintd::DISABLE_ENV, "1") };
-        let capability = fprint_capability("ada");
-        assert!(!capability.offered());
-        assert!(!verify_fingerprint("ada"));
-        unsafe {
-            match prior {
-                Some(value) => std::env::set_var(crate::fprintd::DISABLE_ENV, value),
-                None => std::env::remove_var(crate::fprintd::DISABLE_ENV),
-            }
-        }
+    fn no_reader_or_prints_and_prior_cancel_never_scan() {
+        let mut stub = FprintStub::sequenced(vec![crate::fprintd::VerifyOutcome::Matched]);
+        stub.offered = false;
+        assert_eq!(run(&mut stub, false).0, FingerprintEnd::Unavailable);
+        assert!(stub.users.is_empty());
+        let mut stub = FprintStub::sequenced(vec![crate::fprintd::VerifyOutcome::Matched]);
+        assert_eq!(run(&mut stub, true).0, FingerprintEnd::Cancelled);
+        assert!(stub.users.is_empty());
+    }
+
+    #[test]
+    fn retry_statuses_use_pam_fprintd_wording_by_scan_type() {
+        use crate::fprintd::retry_message;
+        assert_eq!(
+            retry_message("verify-retry-scan", false),
+            Some("Place your finger on the reader again")
+        );
+        assert_eq!(
+            retry_message("verify-retry-scan", true),
+            Some("Swipe your finger again")
+        );
+        assert_eq!(
+            retry_message("verify-swipe-too-short", true),
+            Some("Swipe was too short, try again")
+        );
+        assert_eq!(retry_message("verify-match", false), None);
+        assert_eq!(retry_message("verify-no-match", false), None);
     }
 
     #[test]

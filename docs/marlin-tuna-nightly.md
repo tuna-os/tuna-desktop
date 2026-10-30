@@ -49,7 +49,10 @@ including lock/unlock, strict first-resume locked state, sleep
 authentication fail-closed, real PAM refusal, VT repaint and logout back to
 the GDM greeter. Every boot runs even after an earlier one fails, so one run
 reports every check. No pause substitute or fabricated greeter success is
-accepted.
+accepted. The current-build `marlin-vm` lanes run this same GDM login and
+logout code against the source-built image with tunaOS's tuna-flavor GDM
+configuration ([lifecycle](vm-lifecycle.md)); `--published` only lets this
+nightly qualify gaps of the released build that those lanes prove.
 
 | Area | Checks |
 |---|---|

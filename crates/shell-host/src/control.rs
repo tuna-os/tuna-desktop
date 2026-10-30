@@ -94,6 +94,13 @@ pub enum Handled {
     /// Show GNOME's display-change confirmation with this countdown in
     /// seconds; a newer one replaces an open dialog.
     ConfirmDisplayChange(u32),
+    /// A step of a lock-screen authentication conversation this client
+    /// started with [`ControlClient::begin_verification`] (request id).
+    AuthEvent {
+        request: u64,
+        service: tuna_shell_control::AuthService,
+        event: tuna_shell_control::AuthEvent,
+    },
     /// The keyboard switched Sticky or Slow Keys: save and confirm.
     KeyboardAidToggled {
         aid: tuna_shell_control::KeyboardAid,
@@ -101,6 +108,13 @@ pub enum Handled {
     },
     /// The click the next hover click makes.
     DwellClickType(tuna_shell_control::DwellClick),
+    /// What GNOME's on-screen keyboard follows: input-method focus, the
+    /// input-panel ON request and touch-mode auto-show (0.43).
+    OnScreenKeyboard {
+        focus: Option<tuna_shell_control::TextFieldFocus>,
+        show: bool,
+        touch_auto: bool,
+    },
     /// A pointer accessibility timeout started or stopped (pie timer).
     PointerTimeout {
         kind: tuna_shell_control::PointerTimeoutKind,
@@ -531,6 +545,16 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// Type one on-screen keyboard action into the focused client.
+    pub fn osk_input(&mut self, input: tuna_shell_control::OskInput) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::OskInput { input },
+        })?;
+        Ok(id)
+    }
+
     /// Move the cursor within the screenshot overlay after keyboard selection.
     pub fn move_screenshot_pointer(&mut self, x: f64, y: f64) -> Result<u64, ControlError> {
         let id = self.alloc_request_id();
@@ -800,6 +824,80 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// Start one lock-screen authentication conversation (GDM's
+    /// `BeginVerificationForUser`; the compositor picks the user). Its
+    /// steps arrive as [`Handled::AuthEvent`] with the returned id, and one
+    /// `CommandResult` for that id ends it (`Applied` unlocked). Like
+    /// [`unlock`](Self::unlock), never sent across a reconnect before the
+    /// fresh snapshot.
+    pub fn begin_verification(
+        &mut self,
+        service: tuna_shell_control::AuthService,
+    ) -> Result<u64, ControlError> {
+        if self.auth_needs_snapshot {
+            return Err(ControlError::Unexpected(
+                "authentication requires a fresh snapshot".into(),
+            ));
+        }
+        let id = self.alloc_request_id();
+        let frame = tuna_shell_control::encode_frame(&Message::Command {
+            id,
+            kind: CommandKind::BeginVerification { service },
+        });
+        self.write_auth_frame(&frame)?;
+        Ok(id)
+    }
+
+    /// Answer the outstanding query `sequence` of `service` (GDM's
+    /// `AnswerQuery`). Same dedicated, never-replayed writer and wiped
+    /// buffer as [`unlock`](Self::unlock); the answer is never logged.
+    pub fn answer_query(
+        &mut self,
+        service: tuna_shell_control::AuthService,
+        sequence: u32,
+        answer: String,
+    ) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        let frame = tuna_shell_control::encode_answer_frame(
+            id,
+            service,
+            sequence,
+            tuna_shell_control::Secret(answer),
+        )?;
+        if self.auth_needs_snapshot {
+            return Err(ControlError::Unexpected(
+                "authentication requires a fresh snapshot".into(),
+            ));
+        }
+        self.write_auth_frame(frame.as_bytes())?;
+        Ok(id)
+    }
+
+    /// Stop every conversation this client started (GDM's `Cancel`).
+    pub fn cancel_verification(&mut self) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        let frame = tuna_shell_control::encode_frame(&Message::Command {
+            id,
+            kind: CommandKind::CancelVerification,
+        });
+        self.write_auth_frame(&frame)?;
+        Ok(id)
+    }
+
+    /// Authentication frames are never resent: an uncertain write shuts the
+    /// stream down and requires a fresh snapshot, like [`unlock`](Self::unlock).
+    fn write_auth_frame(&mut self, frame: &[u8]) -> Result<(), ControlError> {
+        if let Err(error) = self.stream.write_all(frame) {
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            self.auth_needs_snapshot = true;
+            self.read_buf.clear();
+            self.revision = None;
+            self.needs_snapshot = true;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     /// Ask the compositor to close a window (dock quit). Like
     /// `toggle_overview` this carries no activation token: closing is
     /// not focus, and unknown ids come back `Denied`. Callers must
@@ -1020,10 +1118,28 @@ impl ControlClient {
             Message::ConfirmDisplayChange { timeout_secs } => {
                 Ok(Handled::ConfirmDisplayChange(timeout_secs))
             }
+            Message::AuthEvent {
+                request,
+                service,
+                event,
+            } => Ok(Handled::AuthEvent {
+                request,
+                service,
+                event,
+            }),
             Message::KeyboardAidToggled { aid, enabled } => {
                 Ok(Handled::KeyboardAidToggled { aid, enabled })
             }
             Message::DwellClickType { click } => Ok(Handled::DwellClickType(click)),
+            Message::OnScreenKeyboard {
+                focus,
+                show,
+                touch_auto,
+            } => Ok(Handled::OnScreenKeyboard {
+                focus,
+                show,
+                touch_auto,
+            }),
             Message::PointerTimeout {
                 kind,
                 duration_ms,
@@ -1134,7 +1250,7 @@ impl ControlClient {
         if matches!(
             msg,
             Message::Command {
-                kind: CommandKind::Unlock { .. },
+                kind: CommandKind::Unlock { .. } | CommandKind::AnswerQuery { .. },
                 ..
             }
         ) {
@@ -1297,8 +1413,10 @@ fn message_label(msg: &Message) -> &'static str {
         Message::PointerOutput { .. } => "PointerOutput",
         Message::ShortcutConsent { .. } => "ShortcutConsent",
         Message::ConfirmDisplayChange { .. } => "ConfirmDisplayChange",
+        Message::AuthEvent { .. } => "AuthEvent",
         Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
         Message::DwellClickType { .. } => "DwellClickType",
+        Message::OnScreenKeyboard { .. } => "OnScreenKeyboard",
         Message::PointerTimeout { .. } => "PointerTimeout",
     }
 }

@@ -1815,8 +1815,10 @@ impl MonoClock {
 // Live runtime: timers, settings watches and shell dispatch
 // ---------------------------------------------------------------------------
 
-/// Post a resident notice (title, body) to the shell's message list.
-pub type NoticeHook = Rc<dyn Fn(String, String)>;
+/// Post the screen-time notice (title, body) to the shell's message list,
+/// updating the resident one in place while it lives (`Some(id)`, GNOME's
+/// `_ensureNotification` + `addNotification`). Returns its id.
+pub type NoticeHook = Rc<dyn Fn(String, String, Option<u64>) -> Option<u64>>;
 /// Show the break countdown OSD (label, 0..1 progress as due approaches).
 pub type CountdownHook = Rc<dyn Fn(String, f64)>;
 /// Hide only the OSD display still owned by this countdown.
@@ -1932,30 +1934,32 @@ fn log_effect(effect: EffectState) {
 }
 
 /// Deliver screen-time events to the shell: limit notices go to the message
-/// list, grayscale updates the desired effect state.
+/// list, grayscale updates the desired effect state. Like GNOME's
+/// `TimeLimitsNotificationSource`, the upcoming and reached notices are one
+/// resident notification (`resident`, its center id) updated in place, so
+/// "Screen Time Limit Reached" takes over the warning's banner, even one
+/// still waiting on screen for an away user, instead of queuing behind it.
 pub fn dispatch_screen_time(
     hooks: &ShellHooks,
     effect: &mut EffectState,
+    resident: &mut Option<u64>,
     events: &[ScreenTimeEvent],
 ) {
     for event in events {
-        match event {
+        let notice = match event {
             ScreenTimeEvent::StateChanged(state) => {
                 eprintln!("tuna-shell-gtk: wellbeing: screen-time state {state:?}");
+                continue;
             }
-            ScreenTimeEvent::LimitUpcoming { .. } => {
-                let notice = limit_upcoming_notice();
-                (hooks.post_notice)(notice.title, notice.body);
-            }
-            ScreenTimeEvent::LimitReached => {
-                let notice = limit_reached_notice();
-                (hooks.post_notice)(notice.title, notice.body);
-            }
+            ScreenTimeEvent::LimitUpcoming { .. } => limit_upcoming_notice(),
+            ScreenTimeEvent::LimitReached => limit_reached_notice(),
             ScreenTimeEvent::GrayscaleChanged(on) => {
                 effect.grayscale = *on;
                 log_effect(*effect);
+                continue;
             }
-        }
+        };
+        *resident = (hooks.post_notice)(notice.title, notice.body, *resident);
     }
 }
 
@@ -2084,6 +2088,8 @@ struct Runtime {
     effect: EffectState,
     countdown: Option<BreakType>,
     resident: Option<u64>,
+    /// The screen-time notice's center id (see [`dispatch_screen_time`]).
+    limit_notice: Option<u64>,
     actions: Rc<RefCell<Vec<BreakActionKind>>>,
     sent_effect: Option<EffectState>,
     screen_timer: Option<glib::SourceId>,
@@ -2097,7 +2103,7 @@ fn screen_tick(rt: &Rc<RefCell<Runtime>>) {
     if rt.borrow().stopped {
         return;
     }
-    let (hooks, mut effect, events) = {
+    let (hooks, mut effect, mut limit_notice, events) = {
         let mut r = rt.borrow_mut();
         let now_wall = wall_now();
         let mono_now = r.mono.now();
@@ -2109,12 +2115,13 @@ fn screen_tick(rt: &Rc<RefCell<Runtime>>) {
         if let Some(Err(e)) = &poll.loaded {
             eprintln!("tuna-shell-gtk: wellbeing: {e}");
         }
-        (r.hooks.clone(), r.effect, poll.events)
+        (r.hooks.clone(), r.effect, r.limit_notice, poll.events)
     };
-    dispatch_screen_time(&hooks, &mut effect, &events);
+    dispatch_screen_time(&hooks, &mut effect, &mut limit_notice, &events);
     let mut r = rt.borrow_mut();
     maybe_send_effect(&hooks, &mut r.sent_effect, &effect);
     r.effect = effect;
+    r.limit_notice = limit_notice;
     drop(r);
     schedule_screen_tick(rt);
 }
@@ -2219,6 +2226,7 @@ pub fn start(
         effect: EffectState::default(),
         countdown: None,
         resident: None,
+        limit_notice: None,
         actions,
         sent_effect: None,
         screen_timer: None,
@@ -2871,9 +2879,11 @@ mod tests {
 
     type ActionPost = (String, String, Vec<(String, String)>, u64);
     type ActionCallbacks = HashMap<(u64, String), Rc<dyn Fn()>>;
+    /// A screen-time notice post: title, body and the id it replaced.
+    type NoticePost = (String, String, Option<u64>);
 
     struct Recorded {
-        posts: Rc<RefCell<Vec<(String, String)>>>,
+        posts: Rc<RefCell<Vec<NoticePost>>>,
         countdowns: Rc<RefCell<Vec<(String, f64)>>>,
         countdown_hides: Rc<Cell<u32>>,
         locks: Rc<Cell<u32>>,
@@ -2901,8 +2911,15 @@ mod tests {
         let queued = recorded.queued.clone();
         let effect_sends = recorded.effect_sends.clone();
         ShellHooks {
-            post_notice: Rc::new(move |title, body| {
-                posts.borrow_mut().push((title, body));
+            post_notice: Rc::new({
+                let next_id = next_id.clone();
+                move |title, body, replaces| {
+                    posts.borrow_mut().push((title, body, replaces));
+                    Some(replaces.unwrap_or_else(|| {
+                        next_id.set(next_id.get() + 1);
+                        next_id.get()
+                    }))
+                }
             }),
             show_countdown: Rc::new(move |label, progress| {
                 countdowns.borrow_mut().push((label, progress));
@@ -2973,9 +2990,11 @@ mod tests {
     fn dispatch_posts_limit_notices_with_gnome_strings_and_tracks_grayscale() {
         let (hooks, seen) = recorded();
         let mut effect = EffectState::default();
+        let mut resident = None;
         dispatch_screen_time(
             &hooks,
             &mut effect,
+            &mut resident,
             &[
                 ScreenTimeEvent::StateChanged(TimeLimitsState::Active),
                 ScreenTimeEvent::LimitUpcoming {
@@ -2988,28 +3007,37 @@ mod tests {
             &[(
                 "Screen Time Limit in 10 Minutes".to_string(),
                 "Your screen time limit is approaching".to_string(),
+                None,
             )]
         );
+        let warning = resident.expect("the warning is the resident notice");
         assert!(!effect.grayscale);
         dispatch_screen_time(
             &hooks,
             &mut effect,
+            &mut resident,
             &[
                 ScreenTimeEvent::LimitReached,
                 ScreenTimeEvent::GrayscaleChanged(true),
             ],
         );
+        // GNOME's TimeLimitsNotificationSource keeps one notification and
+        // updates it in place: "Reached" replaces the warning, banner and
+        // list entry both, rather than queuing a second one behind it.
         assert_eq!(
             seen.posts.borrow().as_slice()[1],
             (
                 "Screen Time Limit Reached".to_string(),
                 "It's time to stop using the device".to_string(),
+                Some(warning),
             )
         );
+        assert_eq!(resident, Some(warning));
         assert!(effect.grayscale);
         dispatch_screen_time(
             &hooks,
             &mut effect,
+            &mut resident,
             &[ScreenTimeEvent::GrayscaleChanged(false)],
         );
         assert!(!effect.grayscale);
@@ -3504,7 +3532,7 @@ mod tests {
         let poll = tracker.poll(T0, 1000, true);
         assert!(poll.stored.is_ok());
         assert_eq!(tracker.state(), TimeLimitsState::Disabled);
-        dispatch_screen_time(&hooks, &mut effect, &poll.events);
+        dispatch_screen_time(&hooks, &mut effect, &mut None, &poll.events);
         assert!(seen.posts.borrow().is_empty());
         assert!(!effect.grayscale);
         assert!(!dir.path().join("session-active-history.json").exists());

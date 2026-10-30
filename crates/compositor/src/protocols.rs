@@ -51,9 +51,9 @@ use smithay::{
     backend::allocator::{dmabuf::Dmabuf, Format},
     delegate_cursor_shape, delegate_dmabuf, delegate_fractional_scale, delegate_idle_inhibit,
     delegate_input_method_manager, delegate_pointer_constraints, delegate_pointer_gestures,
-    delegate_relative_pointer, delegate_single_pixel_buffer, delegate_text_input_manager,
-    delegate_viewporter, delegate_xdg_activation, delegate_xdg_dialog, delegate_xdg_foreign,
-    delegate_xdg_system_bell, delegate_xdg_toplevel_tag,
+    delegate_relative_pointer, delegate_single_pixel_buffer, delegate_viewporter,
+    delegate_xdg_activation, delegate_xdg_dialog, delegate_xdg_foreign, delegate_xdg_system_bell,
+    delegate_xdg_toplevel_tag,
     input::pointer::PointerHandle,
     reexports::{
         wayland_protocols::{
@@ -143,6 +143,8 @@ pub(crate) struct Protocols {
     pub(crate) inhibitors: Vec<WlSurface>,
     /// Scale fractional-scale clients are asked to render at (#59).
     pub(crate) preferred_scale: f64,
+    /// Every text input's committed state, for the on-screen keyboard.
+    pub(crate) text_inputs: crate::osk::TextInputs,
 }
 
 impl Protocols {
@@ -191,6 +193,7 @@ impl Protocols {
             bell: Bell::default(),
             inhibitors: Vec::new(),
             preferred_scale: 1.0,
+            text_inputs: crate::osk::TextInputs::default(),
         }
     }
 }
@@ -600,7 +603,51 @@ impl IdleInhibitHandler for State {
 }
 delegate_idle_inhibit!(State);
 
-delegate_text_input_manager!(State);
+// Keep Smithay's text-input state, but watch every request first: GNOME's
+// on-screen keyboard follows the focused field's enable, content type and
+// re-enable (input panel) whether or not an input method runs (#349).
+smithay::reexports::wayland_server::delegate_global_dispatch!(State: [
+    smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_manager_v3::ZwpTextInputManagerV3: ()
+] => TextInputManagerState);
+smithay::reexports::wayland_server::delegate_dispatch!(State: [
+    smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_manager_v3::ZwpTextInputManagerV3: ()
+] => TextInputManagerState);
+
+impl
+    Dispatch<
+        smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::ZwpTextInputV3,
+        smithay::wayland::text_input::TextInputUserData,
+    > for State
+{
+    fn request(
+        state: &mut State,
+        client: &Client,
+        resource: &smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::ZwpTextInputV3,
+        request: smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::Request,
+        data: &smithay::wayland::text_input::TextInputUserData,
+        handle: &DisplayHandle,
+        data_init: &mut DataInit<'_, State>,
+    ) {
+        let focus = state.seat.get_keyboard().and_then(|k| k.current_focus());
+        state
+            .protocols
+            .text_inputs
+            .request(resource, &request, focus.as_ref());
+        <TextInputManagerState as Dispatch<_, _, State>>::request(
+            state, client, resource, request, data, handle, data_init,
+        );
+    }
+
+    fn destroyed(
+        state: &mut State,
+        client: smithay::reexports::wayland_server::backend::ClientId,
+        resource: &smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::ZwpTextInputV3,
+        data: &smithay::wayland::text_input::TextInputUserData,
+    ) {
+        state.protocols.text_inputs.destroyed(resource);
+        <TextInputManagerState as Dispatch<_, _, State>>::destroyed(state, client, resource, data);
+    }
+}
 
 impl InputMethodHandler for State {
     fn new_popup(&mut self, surface: ImPopup) {

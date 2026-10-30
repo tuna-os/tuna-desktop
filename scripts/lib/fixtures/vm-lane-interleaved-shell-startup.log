@@ -1,7 +1,7 @@
-[   14.133886] tuna-vm-session[960]: tuna-compositor: switcher keys: 12 chords, cycle-group Some(SwitcherKey { keysym: 65475, mods: 8, kind:
-[   14.136927] tuna-vm-session[1100]: tuna-shell-gtk: keybindings:
-[   14.138951] tuna-vm-session[960]: CycleGroup
-[   14.140111] tuna-vm-session[1100]: 82
-[   14.141686] tuna-vm-session[960]:  }
-[   14.142668] tuna-vm-session[1100]:  grabs, maximize on
-[   14.143943] tuna-vm-session[960]: )
+[   14.133886] gdm-wayland-session[960]: tuna-compositor: switcher keys: 12 chords, cycle-group Some(SwitcherKey { keysym: 65475, mods: 8, kind:
+[   14.136927] gdm-wayland-session[1100]: tuna-shell-gtk: keybindings:
+[   14.138951] gdm-wayland-session[960]: CycleGroup
+[   14.140111] gdm-wayland-session[1100]: 82
+[   14.141686] gdm-wayland-session[960]:  }
+[   14.142668] gdm-wayland-session[1100]:  grabs, maximize on
+[   14.143943] gdm-wayland-session[960]: )

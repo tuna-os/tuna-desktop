@@ -18,6 +18,15 @@
 #              ApplyMonitorsConfig switches the CRTC to another mode (the
 #              kernel reports it, frames keep flipping) and an unconfirmed
 #              persistent change reverts after Mutter's 20 s (#340)
+#   D-COLORD   a real colord on a private system bus gets Mutter's device
+#              (id, metadata) and its generated sRGB profile as default
+#   D-GAMMA    the kernel's GAMMA_LUT, read back with KMS ioctls, is the
+#              assigned profile's ramp, Night Light's 3000 K blackbody, and
+#              an imported vcgt profile times 3000 K (P-DS-03, #341)
+#   D-CALIBRATE CalibrateMonitor/SetCrtcGammaLut program a raw ramp; Stop
+#              and a vanished caller both restore the white point
+#   D-COLOR-RESTART a restart unregisters the device and colord's mapping
+#              restores the calibrated profile to the next session
 # and captures a scanout screenshot with ffmpeg kmsgrab when possible.
 # Needs root (sudo) for modprobe and seatd. Exits nonzero on any failure.
 set -eu
@@ -29,7 +38,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --seconds) SECONDS_UP="$2"; shift 2 ;;
-        --help|-h) sed -n '2,21p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "tuna-drm-smoke: unknown argument $1" >&2; exit 1 ;;
     esac
 done
@@ -45,9 +54,15 @@ CSTATE="$ARTIFACTS/compositor-state.json"
 SEATD_PID=""
 COMP_PID=""
 DBUS_PID=""
+COLORD_PID=""
+SYSTEM_BUS_PID=""
+CALIBRATION_PID=""
 
 cleanup() {
     if [ -n "$COMP_PID" ]; then kill "$COMP_PID" 2>/dev/null || true; fi
+    if [ -n "$CALIBRATION_PID" ]; then kill "$CALIBRATION_PID" 2>/dev/null || true; fi
+    if [ -n "$COLORD_PID" ]; then sudo kill "$COLORD_PID" 2>/dev/null || true; fi
+    if [ -n "$SYSTEM_BUS_PID" ]; then kill "$SYSTEM_BUS_PID" 2>/dev/null || true; fi
     if [ -n "$DBUS_PID" ]; then kill "$DBUS_PID" 2>/dev/null || true; fi
     if [ -n "$SEATD_PID" ]; then sudo kill "$SEATD_PID" 2>/dev/null || true; fi
     # Put a stopped system seatd back exactly as we found it.
@@ -399,5 +414,222 @@ wait "$COMP_PID" || true
 COMP_PID=""
 if grep -q panicked "$MODES_LOG"; then fail D-NOPANIC "panic in the mode-change session"; fi
 pass D-MODES "$MODE_COUNT advertised modes on $CONNECTOR; CRTC $ORIGINAL_MODE -> $TARGET_MODE by ApplyMonitorsConfig with frames flipping, unconfirmed persistent $ORIGINAL_MODE reverted after ${elapsed}s"
+
+# Colour management (P-DS-03, #341): the real colord on a private system
+# bus, Mutter's device and profile registration, and the CRTC GAMMA_LUT
+# read back from the kernel (not from the compositor) for the assigned
+# profile, Night Light, an assigned VCGT calibration, a calibration
+# session (stopped, then abandoned) and a restart that keeps the
+# assignment through colord's mapping database.
+COLORD_BIN=""
+for candidate in /usr/libexec/colord /usr/lib/colord/colord; do
+    [ -x "$candidate" ] && COLORD_BIN="$candidate" && break
+done
+[ -n "$COLORD_BIN" ] || fail D-COLORD "colord is not installed"
+SYSTEM_BUS_SOCKET="$RUNTIME/system_bus_socket"
+cat >"$ARTIFACTS/system-bus.conf" <<XML
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>system</type>
+  <listen>unix:path=$SYSTEM_BUS_SOCKET</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow user="*"/>
+    <allow own="*"/>
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow receive_sender="*"/>
+  </policy>
+</busconfig>
+XML
+dbus-daemon --config-file="$ARTIFACTS/system-bus.conf" --fork --print-address=1 --print-pid=1 \
+    >"$ARTIFACTS/dbus-system.txt"
+SYSTEM_BUS="$(sed -n 1p "$ARTIFACTS/dbus-system.txt")"
+SYSTEM_BUS_PID="$(sed -n 2p "$ARTIFACTS/dbus-system.txt")"
+# colord keeps its databases in /var/lib/colord: a private tmpfs there,
+# and the daemon runs as this user, so it trusts our calls as its own
+# (cd_main_sender_authenticated) without the host's polkit.
+sudo mkdir -p /var/lib/colord
+# shellcheck disable=SC2016,SC2024
+sudo unshare --mount --propagation private sh -c \
+    'mount -t tmpfs tmpfs /var/lib/colord && exec setpriv --reuid="$1" --regid="$2" --clear-groups env DBUS_SYSTEM_BUS_ADDRESS="$3" "$4" -v' \
+    sh "$(id -u)" "$(id -g)" "$SYSTEM_BUS" "$COLORD_BIN" >"$ARTIFACTS/colord.log" 2>&1 &
+COLORD_PID=$!
+cd_call() {
+    gdbus call --address "$SYSTEM_BUS" --dest org.freedesktop.ColorManager "$@"
+}
+end=$(($(date +%s) + 30))
+until cd_call --object-path /org/freedesktop/ColorManager \
+    --method org.freedesktop.ColorManager.GetDevices >/dev/null 2>&1; do
+    kill -0 "$COLORD_PID" 2>/dev/null || fail D-COLORD "colord exited: $(tail -5 "$ARTIFACTS/colord.log")"
+    [ "$(date +%s)" -le "$end" ] || fail D-COLORD "colord never served the private system bus"
+    sleep 0.2
+done
+COLOR_LOG="$ARTIFACTS/compositor-color.log"
+CSTATE="$ARTIFACTS/compositor-state-color.json"
+COLOR_DATA="$ARTIFACTS/data-color"
+start_color_session() {
+    env -u DISPLAY -u WAYLAND_DISPLAY \
+        XDG_RUNTIME_DIR="$RUNTIME" XDG_CONFIG_HOME="$ARTIFACTS/config-modes" \
+        XDG_STATE_HOME="$ARTIFACTS/state" XDG_DATA_HOME="$COLOR_DATA" \
+        DBUS_SYSTEM_BUS_ADDRESS="$SYSTEM_BUS" \
+        LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD" TUNA_COMPOSITOR_STATE="$CSTATE" \
+        "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-color \
+        --shell-bin "$ROOT/target/debug/tuna-shell-host" >>"$COLOR_LOG" 2>&1 &
+    COMP_PID=$!
+    LOG="$COLOR_LOG"
+}
+readback() {
+    # The output file stays user-owned on purpose.
+    # shellcheck disable=SC2024
+    sudo python3 "$ROOT/scripts/lib/drm-gamma-readback.py" "$CARD" >"$ARTIFACTS/gamma-$1.json"
+}
+# wait_gamma NAME MODE ARGS...: the kernel's GAMMA_LUT becomes what MODE expects.
+wait_gamma() {
+    name="$1"
+    shift
+    end=$(($(date +%s) + 15))
+    until readback "$name" &&
+        python3 "$ROOT/scripts/lib/drm-gamma-expect.py" check "$ARTIFACTS/gamma-$name.json" "$@" \
+            >"$ARTIFACTS/gamma-$name.check" 2>&1; do
+        kill -0 "$COMP_PID" 2>/dev/null || return 1
+        [ "$(date +%s)" -le "$end" ] || return 1
+        sleep 0.2
+    done
+}
+color_set_temperature() {
+    gdbus call --session --dest org.gnome.SettingsDaemon.Color \
+        --object-path /org/gnome/SettingsDaemon/Color \
+        --method org.freedesktop.DBus.Properties.Set \
+        org.gnome.SettingsDaemon.Color Temperature "<uint32 $1>" >/dev/null
+}
+# The vkms connector has no EDID: Mutter names the device after the
+# connector and generates lcms2's sRGB profile for it (gamma LUT present).
+DEVICE_ID="xrandr-$CONNECTOR"
+start_color_session
+end=$(($(date +%s) + 30))
+until [ -s "$CSTATE" ] && jq -e '.color.devices[0].ready and .color.devices[0].assigned != null' \
+    "$CSTATE" >/dev/null 2>&1; do
+    kill -0 "$COMP_PID" 2>/dev/null || fail D-COLORD "compositor exited"
+    [ "$(date +%s)" -le "$end" ] || fail D-COLORD "no colord device was set up: $(jq -c .color "$CSTATE" 2>/dev/null)"
+    sleep 0.2
+done
+cp "$CSTATE" "$ARTIFACTS/color-registered.json"
+device_path="$(cd_call --object-path /org/freedesktop/ColorManager \
+    --method org.freedesktop.ColorManager.FindDeviceById "$DEVICE_ID" | sed -n "s/^(objectpath '\(.*\)',)$/\1/p")"
+[ -n "$device_path" ] || fail D-COLORD "colord has no device $DEVICE_ID"
+cd_prop() {
+    cd_call --object-path "$1" --method org.freedesktop.DBus.Properties.Get "$2" "$3"
+}
+cd_prop "$device_path" org.freedesktop.ColorManager.Device Kind | grep -q "'display'" ||
+    fail D-COLORD "device kind is not display"
+cd_prop "$device_path" org.freedesktop.ColorManager.Device Metadata >"$ARTIFACTS/colord-device-metadata.txt"
+grep -q "'XRANDR_name': '$CONNECTOR'" "$ARTIFACTS/colord-device-metadata.txt" ||
+    fail D-COLORD "device metadata lacks XRANDR_name: $(cat "$ARTIFACTS/colord-device-metadata.txt")"
+grep -q "'OutputPriority': 'primary'" "$ARTIFACTS/colord-device-metadata.txt" ||
+    fail D-COLORD "device metadata lacks OutputPriority primary"
+default_profile="$(cd_prop "$device_path" org.freedesktop.ColorManager.Device Profiles |
+    sed -n "s/^(<\[objectpath '\([^']*\)'.*/\1/p")"
+[ -n "$default_profile" ] || fail D-COLORD "colord assigned no profile to $DEVICE_ID"
+profile_file="$(cd_prop "$default_profile" org.freedesktop.ColorManager.Profile Filename |
+    sed -n "s/^(<'\(.*\)'>,)$/\1/p")"
+case "$profile_file" in
+    "$COLOR_DATA"/icc/device-*.icc) ;;
+    *) fail D-COLORD "the default profile is not Mutter's device profile: $profile_file" ;;
+esac
+cd_prop "$default_profile" org.freedesktop.ColorManager.Profile Title | grep -q "sRGB built-in" ||
+    fail D-COLORD "colord did not read the generated sRGB profile's description"
+cd_prop "$default_profile" org.freedesktop.ColorManager.Profile Metadata |
+    grep -q "'MAPPING_device_id': '$DEVICE_ID'" ||
+    fail D-COLORD "colord did not read the profile's MAPPING_device_id"
+pass D-COLORD "$DEVICE_ID registered in the real colord with Mutter's metadata; its generated sRGB profile $profile_file is the default"
+
+wait_gamma assigned ramp 6500 ||
+    fail D-GAMMA "the assigned profile did not program the identity ramp: $(cat "$ARTIFACTS/gamma-assigned.check")"
+color_set_temperature 3000 || fail D-GAMMA "could not set the Night Light Temperature"
+wait_gamma night-light ramp 3000 ||
+    fail D-GAMMA "Temperature 3000 K did not reach GAMMA_LUT: $(cat "$ARTIFACTS/gamma-night-light.check")"
+# GNOME Settings' import: the calibrated file lands in the ICC store and
+# becomes the default; Mutter applies its vcgt under Night Light.
+python3 "$ROOT/scripts/lib/drm-gamma-expect.py" vcgt-add "$profile_file" "$ARTIFACTS/calibrated.icc"
+cp "$ARTIFACTS/calibrated.icc" "$COLOR_DATA/icc/calibrated.icc"
+end=$(($(date +%s) + 15))
+until calibrated="$(cd_call --object-path /org/freedesktop/ColorManager \
+    --method org.freedesktop.ColorManager.FindProfileByFilename "$COLOR_DATA/icc/calibrated.icc" 2>/dev/null |
+    sed -n "s/^(objectpath '\(.*\)',)$/\1/p")" && [ -n "$calibrated" ]; do
+    [ "$(date +%s)" -le "$end" ] || fail D-GAMMA "the compositor did not register the imported profile with colord"
+    sleep 0.2
+done
+cd_call --object-path "$device_path" --method org.freedesktop.ColorManager.Device.AddProfile hard "$calibrated" \
+    >/dev/null 2>&1 || true
+cd_call --object-path "$device_path" --method org.freedesktop.ColorManager.Device.MakeProfileDefault "$calibrated" \
+    >/dev/null || fail D-GAMMA "colord refused MakeProfileDefault"
+wait_gamma vcgt-night-light vcgt "$ARTIFACTS/calibrated.icc.json" 3000 ||
+    fail D-GAMMA "the assigned vcgt did not reach GAMMA_LUT: $(cat "$ARTIFACTS/gamma-vcgt-night-light.check")"
+pass D-GAMMA "kernel GAMMA_LUT ($(jq '.[0].gamma_lut_size' "$ARTIFACTS/gamma-assigned.json") entries) read back: identity for the sRGB profile, the 3000 K blackbody ramp for Night Light, the imported profile's vcgt times 3000 K"
+
+# A calibration session as GNOME Settings opens it: the white point goes
+# to 6500 K and the raw ramp is programmed; Stop restores the profile.
+python3 "$ROOT/scripts/lib/drm-gamma-expect.py" ramp 256 1 >"$ARTIFACTS/calibration-ramp.json"
+calibrate() {
+    rm -f "$ARTIFACTS/calibration-$1.status"
+    mkfifo "$ARTIFACTS/calibration-$1.in"
+    python3 "$ROOT/scripts/lib/color-calibration-client.py" "$CONNECTOR" \
+        "$ARTIFACTS/calibration-ramp.json" "$ARTIFACTS/calibration-$1.status" \
+        <"$ARTIFACTS/calibration-$1.in" >"$ARTIFACTS/calibration-$1.log" 2>&1 &
+    CALIBRATION_PID=$!
+    exec 9>"$ARTIFACTS/calibration-$1.in"
+    end=$(($(date +%s) + 10))
+    until [ -s "$ARTIFACTS/calibration-$1.status" ]; do
+        kill -0 "$CALIBRATION_PID" 2>/dev/null ||
+            fail D-CALIBRATE "the calibration client failed: $(cat "$ARTIFACTS/calibration-$1.log")"
+        [ "$(date +%s)" -le "$end" ] || fail D-CALIBRATE "CalibrateMonitor never answered"
+        sleep 0.1
+    done
+}
+calibrate stop
+jq -e '.gamma_lut_size == 256' "$ARTIFACTS/calibration-stop.status" >/dev/null ||
+    fail D-CALIBRATE "GammaLutSize is not the CRTC's: $(cat "$ARTIFACTS/calibration-stop.status")"
+wait_gamma calibrating raw "$ARTIFACTS/calibration-ramp.json" ||
+    fail D-CALIBRATE "SetCrtcGammaLut did not reach GAMMA_LUT: $(cat "$ARTIFACTS/gamma-calibrating.check")"
+echo stop >&9
+exec 9>&-
+wait "$CALIBRATION_PID" || fail D-CALIBRATE "Stop failed: $(cat "$ARTIFACTS/calibration-stop.log")"
+wait_gamma stopped vcgt "$ARTIFACTS/calibrated.icc.json" 3000 ||
+    fail D-CALIBRATE "Stop did not restore the profile white point: $(cat "$ARTIFACTS/gamma-stopped.check")"
+# A caller that leaves the bus without Stop loses its session too.
+calibrate vanish
+wait_gamma abandoned-calibrating raw "$ARTIFACTS/calibration-ramp.json" ||
+    fail D-CALIBRATE "the second session's ramp did not apply"
+echo leave >&9
+exec 9>&-
+wait "$CALIBRATION_PID" || true
+wait_gamma abandoned vcgt "$ARTIFACTS/calibrated.icc.json" 3000 ||
+    fail D-CALIBRATE "a vanished caller's session kept its ramp: $(cat "$ARTIFACTS/gamma-abandoned.check")"
+pass D-CALIBRATE "CalibrateMonitor/SetCrtcGammaLut programmed the raw 256-entry ramp; Stop and a vanished caller both restored the vcgt white point"
+
+# Restart: the session's devices leave colord, and the next session's
+# device gets the calibrated profile back from colord's mapping database.
+kill -TERM "$COMP_PID"
+wait "$COMP_PID" || true
+COMP_PID=""
+if cd_call --object-path /org/freedesktop/ColorManager \
+    --method org.freedesktop.ColorManager.FindDeviceById "$DEVICE_ID" >/dev/null 2>&1; then
+    fail D-COLOR-RESTART "the stopped session left its colord device behind"
+fi
+start_color_session
+wait_gamma restarted vcgt "$ARTIFACTS/calibrated.icc.json" 6500 ||
+    fail D-COLOR-RESTART "the restarted session did not restore the calibrated profile: $(cat "$ARTIFACTS/gamma-restarted.check")"
+jq -e --arg f "$COLOR_DATA/icc/calibrated.icc" '.color.devices[0].assigned.filename == $f and .color.devices[0].has_vcgt' \
+    "$CSTATE" >/dev/null || fail D-COLOR-RESTART "the restarted session reports another assignment: $(jq -c .color.devices "$CSTATE")"
+kill -TERM "$COMP_PID"
+wait "$COMP_PID" || true
+COMP_PID=""
+if grep -q panicked "$COLOR_LOG"; then fail D-NOPANIC "panic in the colour sessions"; fi
+pass D-COLOR-RESTART "after a restart colord's mapping kept the calibrated profile and its vcgt reached GAMMA_LUT at 6500 K"
+sudo kill "$COLORD_PID" 2>/dev/null || true
+COLORD_PID=""
+kill "$SYSTEM_BUS_PID" 2>/dev/null || true
+SYSTEM_BUS_PID=""
 
 echo "tuna-drm-smoke: OK, artifacts in $ARTIFACTS"

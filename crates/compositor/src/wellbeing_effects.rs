@@ -103,7 +103,7 @@ impl Effects {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FrameColor {
     pub program: GlesTexProgram,
     pub gains: crate::night_light::ColorGains,

@@ -444,6 +444,167 @@ fn actual_runtime_epoch_invalidation_and_public_sync_unlock() {
     run_parent(&bin, "2", 3, "probe");
 }
 
+/// The next conversation step for `request`; its result may not come first.
+fn auth_event(conn: &mut ControlConn, request: u64) -> tuna_shell_control::AuthEvent {
+    match receive(conn, |m| {
+        matches!(m, Message::AuthEvent { request: got, .. } if *got == request)
+            || matches!(m, Message::CommandResult { id, .. } if *id == request)
+    }) {
+        Message::AuthEvent { event, .. } => event,
+        other => panic!("conversation {request} ended early: {other:?}"),
+    }
+}
+
+fn query(conn: &mut ControlConn, request: u64, sequence: u32, question: &str, secret: bool) {
+    assert_eq!(
+        auth_event(conn, request),
+        tuna_shell_control::AuthEvent::Query {
+            sequence,
+            question: question.into(),
+            secret
+        }
+    );
+}
+
+fn answer(conn: &mut ControlConn, id: u64, sequence: u32, text: &str) {
+    send(
+        conn,
+        id,
+        CommandKind::AnswerQuery {
+            service: tuna_shell_control::AuthService::Password,
+            sequence,
+            answer: Secret(text.into()),
+        },
+    );
+    result(conn, id, true);
+}
+
+fn begin(conn: &mut ControlConn, id: u64, service: tuna_shell_control::AuthService) {
+    send(conn, id, CommandKind::BeginVerification { service });
+}
+
+/// The interactive relay against the controlled multi-prompt PAM module:
+/// a visible question, a distinct secret, an info and an error message in
+/// one PAM batch, then a separate PIN; wrong answers, a stale sequence and
+/// a cancel keep the session locked; only fresh correct answers unlock.
+fn conversation_client() {
+    use tuna_shell_control::{AuthEvent, AuthService};
+    let root = PathBuf::from(std::env::var_os("TUNA_AUTH_OWNER_ROOT").unwrap());
+    wait(|| state(&root)["auth_owner"].is_object());
+    let mut a = connect();
+    send(&mut a, 10, CommandKind::Lock);
+    result(&mut a, 10, true);
+    wait(|| state(&root)["locked"] == true);
+    // No reader: GDM's service-unavailable, then the denied result.
+    begin(&mut a, 11, AuthService::Fingerprint);
+    assert_eq!(auth_event(&mut a, 11), AuthEvent::Unavailable);
+    result(&mut a, 11, false);
+    // First conversation: a wrong PIN after correct first answers.
+    begin(&mut a, 20, AuthService::Password);
+    query(&mut a, 20, 1, "Visible account challenge", false);
+    // A second password conversation on the same connection is refused.
+    begin(&mut a, 21, AuthService::Password);
+    result(&mut a, 21, false);
+    // A stale sequence is dropped, never applied to the open question.
+    answer(&mut a, 22, 2, "visible-answer");
+    answer(&mut a, 23, 1, "visible-answer");
+    query(&mut a, 20, 2, "First secret challenge", true);
+    answer(&mut a, 24, 2, "first-secret");
+    assert_eq!(
+        auth_event(&mut a, 20),
+        AuthEvent::Info {
+            text: "Information from controlled stack".into()
+        }
+    );
+    assert_eq!(
+        auth_event(&mut a, 20),
+        AuthEvent::Problem {
+            text: "Error notice from controlled stack".into()
+        }
+    );
+    query(&mut a, 20, 3, "Separate PIN challenge", true);
+    // The PIN is its own answer: the password is never reused for it.
+    answer(&mut a, 25, 3, "first-secret");
+    assert_eq!(
+        auth_event(&mut a, 20),
+        AuthEvent::Problem {
+            text: "Sorry, password authentication didn’t work. Please try again.".into()
+        }
+    );
+    result(&mut a, 20, false);
+    assert_eq!(state(&root)["locked"], true, "a wrong PIN cannot unlock");
+    wait(|| state(&root)["auth_owner"]["conversations"]["password"] == false);
+    // Second conversation: cancelled mid-way, silently denied.
+    begin(&mut a, 30, AuthService::Password);
+    query(&mut a, 30, 1, "Visible account challenge", false);
+    answer(&mut a, 31, 1, "visible-answer");
+    query(&mut a, 30, 2, "First secret challenge", true);
+    send(&mut a, 32, CommandKind::CancelVerification);
+    result(&mut a, 32, true);
+    match receive(&mut a, |m| {
+        matches!(m, Message::AuthEvent { request: 30, .. })
+            || matches!(m, Message::CommandResult { id: 30, .. })
+    }) {
+        Message::CommandResult {
+            status: CommandStatus::Denied { .. },
+            ..
+        } => {}
+        other => panic!("a cancelled conversation reports nothing else: {other:?}"),
+    }
+    assert_eq!(state(&root)["locked"], true, "cancel cannot unlock");
+    // A late answer to the cancelled conversation goes nowhere.
+    answer(&mut a, 33, 2, "first-secret");
+    // Third conversation: every fresh correct answer unlocks.
+    begin(&mut a, 40, AuthService::Password);
+    query(&mut a, 40, 1, "Visible account challenge", false);
+    answer(&mut a, 41, 1, "visible-answer");
+    query(&mut a, 40, 2, "First secret challenge", true);
+    answer(&mut a, 42, 2, "first-secret");
+    assert!(matches!(auth_event(&mut a, 40), AuthEvent::Info { .. }));
+    assert!(matches!(auth_event(&mut a, 40), AuthEvent::Problem { .. }));
+    query(&mut a, 40, 3, "Separate PIN challenge", true);
+    answer(&mut a, 43, 3, "pin-secret");
+    result(&mut a, 40, true);
+    wait(|| {
+        state(&root)["locked"] == false
+            && state(&root)["auth_owner"]["conversations"]["password"] == false
+    });
+    // Unlocked: nothing to verify, so a new conversation is denied.
+    begin(&mut a, 50, AuthService::Password);
+    result(&mut a, 50, false);
+    publish_json(
+        &root.join("success.json"),
+        &serde_json::json!({
+            "supervised_client_pid": std::process::id(),
+            "fingerprint_unavailable_denied": true,
+            "second_password_conversation_denied": true,
+            "stale_sequence_dropped": true,
+            "distinct_answers_per_question": true,
+            "info_and_error_relayed": true,
+            "wrong_pin_denied_with_problem": true,
+            "cancel_denied_silently": true,
+            "fresh_answers_unlock": true,
+            "scope": "actual nested Runtime + private PAM helper + controlled multi-prompt module; no GTK, reader or installed stack"
+        }),
+    );
+    std::thread::sleep(Duration::from_secs(2));
+}
+
+#[test]
+fn actual_main_runtime_pam_conversation_relay() {
+    match std::env::var(ROLE).ok().as_deref() {
+        Some("4") => return conversation_client(),
+        Some(_) => return,
+        None => {}
+    }
+    run_parent(
+        Path::new(env!("CARGO_BIN_EXE_tuna-compositor")),
+        "4",
+        0,
+        "conversation",
+    );
+}
+
 fn assert_pam_helper_image(root: &Path, attempt: u32) {
     use std::os::unix::fs::MetadataExt;
     let helper: u32 = std::fs::read_to_string(root.join(format!("started-{attempt}")))
@@ -509,7 +670,8 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
     };
     let end = Instant::now() + Duration::from_secs(30);
     let socket = root.path().join("greetd.sock");
-    let server = if role == "3" {
+    let pam = role == "3" || role == "4";
+    let server = if pam {
         None
     } else {
         let listener = UnixListener::bind(&socket).unwrap();
@@ -519,7 +681,7 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
         }))
     };
     let owned_bin = root.path().join("compositor-copy");
-    if role == "3" {
+    if pam {
         assert!(
             Path::new("/usr/lib/x86_64-linux-gnu/libpam_wrapper.so").exists(),
             "required actual PAM wrapper"
@@ -537,15 +699,23 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
             .unwrap()
             .success());
         std::fs::create_dir(root.path().join("services")).unwrap();
+        // Role 4 is the interactive relay: the module's multi-prompt mode.
+        let (service, mode) = if role == "3" {
+            ("runtime-delay", "runtime-delay")
+        } else {
+            ("runtime-conversation", "multi")
+        };
         std::fs::write(
-            root.path().join("services/runtime-delay"),
+            root.path().join("services").join(service),
             format!(
-                "auth required {} runtime-delay\naccount required {} runtime-delay\n",
+                "auth required {} {mode}\naccount required {} {mode}\n",
                 module.display(),
                 module.display()
             ),
         )
         .unwrap();
+    }
+    if role == "3" {
         std::fs::copy(bin, &owned_bin).unwrap();
     }
     let executable = if role == "3" {
@@ -564,13 +734,22 @@ fn run_parent(bin: &Path, role: &str, attempts: usize, kind: &str) {
     );
     let log = std::fs::File::create(root.path().join("compositor.log")).unwrap();
     let mut command = Command::new(executable);
-    if role == "3" {
+    if pam {
         command
             .env_remove("GREETD_SOCK")
-            .env("TUNA_PAM_SERVICE", "runtime-delay")
+            .env(
+                "TUNA_PAM_SERVICE",
+                if role == "3" {
+                    "runtime-delay"
+                } else {
+                    "runtime-conversation"
+                },
+            )
             .env("LD_PRELOAD", "/usr/lib/x86_64-linux-gnu/libpam_wrapper.so")
             .env("PAM_WRAPPER", "1")
-            .env("PAM_WRAPPER_SERVICE_DIR", root.path().join("services"));
+            .env("PAM_WRAPPER_SERVICE_DIR", root.path().join("services"))
+            // No reader here: the fingerprint service must say unavailable.
+            .env("TUNA_FPRINTD_OFF", "1");
     } else {
         command.env("GREETD_SOCK", &socket);
     }

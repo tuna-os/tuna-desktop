@@ -63,7 +63,10 @@ use crate::xwayland::XWaylandSupervisor;
 use crate::{ClientState, State};
 
 mod aids;
+mod auth;
+mod color;
 mod display;
+mod osk;
 
 /// Display-rate loop pacing: while anything moves, dispatch blocks at
 /// most this long, so animations step near 60 Hz and the loop never
@@ -689,6 +692,8 @@ pub struct Runtime {
     wellbeing_effects: crate::wellbeing_effects::Effects,
     /// GNOME's keyboard accessibility aids, ahead of everything else (#350).
     input_aids: aids::RuntimeAids,
+    /// Keys GNOME's on-screen keyboard holds down (#349).
+    osk: osk::RuntimeOsk,
     /// An Escape press cancelled a client drag; its repeats and release
     /// belong to that cancel, not to the overview or a client.
     dnd_escape_held: bool,
@@ -714,6 +719,11 @@ pub struct Runtime {
     /// The controller also owns the live state shared with the D-Bus
     /// thread (active, temperature, "disabled until tomorrow").
     night_light: crate::night_light::NightLightController,
+    /// colord devices, calibration sessions and the CRTC white point
+    /// (P-DS-03), shared with the colord and D-Bus threads.
+    color: std::sync::Arc<crate::color_manager::ColorShare>,
+    /// The colord client thread (hardware sessions only).
+    colord: Option<crate::color_manager::ColordClient>,
     /// `org.gnome.desktop.wm.preferences` focus keys (owned GIO reader).
     wm_preferences: crate::wm_preferences::Reader,
     /// Last reported reader status, so a change logs once.
@@ -800,6 +810,8 @@ pub struct Runtime {
     unlock_worker: Option<UnlockWorker>,
     unlock_quarantined: Option<crate::auth_owner::Attempt>,
     unlock_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The lock screen's password and fingerprint conversations (#366).
+    auth: auth::Conversations,
     /// org.gnome.Mutter.IdleMonitor.
     idle_monitor: crate::idle_monitor::IdleMonitor,
     /// org.gnome.SessionManager's inhibitors and session activity.
@@ -1166,6 +1178,22 @@ impl Runtime {
         let power_save_share: std::sync::Arc<crate::power_save::PowerSaveShare> =
             Default::default();
         let display_share: std::sync::Arc<crate::display_config::DisplayShare> = Default::default();
+        let color_share: std::sync::Arc<crate::color_manager::ColorShare> = Default::default();
+        // Mutter registers physical monitors with colord; nested outputs
+        // are virtual monitors and get no colord device.
+        let colord = match &backend {
+            Backend::Winit(_) => None,
+            #[cfg(feature = "drm")]
+            Backend::Drm(drm) => {
+                color_share.set_gamma_sizes(drm.gamma_sizes());
+                Some(crate::color_manager::ColordClient::start(
+                    color_share.clone(),
+                    drm.colord_monitors(),
+                    crate::color_manager::Bus::System,
+                    crate::color_manager::icc_directory(),
+                ))
+            }
+        };
         // org.gnome.Shell.Introspect: the portal's window picker.
         let capture_authority = crate::capture_security::Authority::default();
         let introspect = crate::introspect::start(state.desktop_size(), capture_authority.clone());
@@ -1181,6 +1209,7 @@ impl Runtime {
                     night_light_share.clone(),
                     power_save_share.clone(),
                     display_share.clone(),
+                    color_share.clone(),
                 ),
                 |event, _, rt: &mut Runtime| {
                     if let calloop::channel::Event::Msg(request) = event {
@@ -1361,6 +1390,7 @@ impl Runtime {
             input_settings: Default::default(),
             wellbeing_effects: Default::default(),
             input_aids: aids::RuntimeAids::default(),
+            osk: osk::RuntimeOsk::default(),
             dnd_escape_held: false,
             orca: crate::orca::Reader::new(&session.socket_name, a11y_keyboard.clone()),
             a11y_keyboard,
@@ -1373,6 +1403,8 @@ impl Runtime {
             power_save_share,
             power_save_beat: None,
             night_light: crate::night_light::NightLightController::new(night_light_share.clone()),
+            color: color_share.clone(),
+            colord,
             manual_transforms: Default::default(),
             display_share,
             display_published: None,
@@ -1387,6 +1419,7 @@ impl Runtime {
             unlock_worker: None,
             unlock_quarantined: None,
             unlock_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            auth: auth::Conversations::default(),
             idle_monitor: crate::idle_monitor::start(),
             session_manager: crate::session_manager::start(),
             magnifier: crate::magnifier::MagnifierState::new(),
@@ -1413,6 +1446,7 @@ impl Runtime {
         // them, so no second wake source or thread is needed.
         night_light_share.set_wake(&runtime.wake);
         night_light_share.start_reader(&runtime.wake);
+        color_share.set_wake(&runtime.wake);
         runtime.orca.set_wake(&runtime.wake);
         runtime.idle_monitor.set_wake(&runtime.wake);
         if let Some(ime) = &runtime.ime {
@@ -1602,6 +1636,8 @@ impl Runtime {
         #[cfg(feature = "drm")]
         self.performance_trace.cancel();
         self.reset_input_aid_ownership();
+        // Nothing the session's keyboard held stays down under the lock.
+        self.release_osk_keys();
         if let Some(monitor) = &self.a11y_keyboard {
             monitor.set_locked(true);
         }
@@ -1785,6 +1821,11 @@ impl Runtime {
         if !self.is_locked() || !self.unlock_slot.grant(&self.unlock_generation, epoch) {
             return false;
         }
+        self.release_lock();
+        true
+    }
+
+    fn release_lock(&mut self) {
         self.reset_input_aid_ownership();
         if let Some(monitor) = &self.a11y_keyboard {
             monitor.set_locked(false);
@@ -1793,7 +1834,37 @@ impl Runtime {
         self.control.set_locked(false);
         self.state.set_shortcut_inhibition_locked(false);
         self.overlay.hide();
-        true
+    }
+
+    /// logind's `Lock` signal (`loginctl lock-session`): `screenShield.js`
+    /// connects it to `lock()`, which the disable-lock-screen lockdown
+    /// refuses.
+    #[cfg(feature = "drm")]
+    fn lock_for_logind(&mut self) {
+        if self.is_locked() {
+            return;
+        }
+        if self.control.lock_screen_allowed() {
+            self.engage_lock();
+        } else {
+            eprintln!("tuna-compositor: logind lock refused by administrator policy");
+        }
+    }
+
+    /// logind's `Unlock` signal (`loginctl unlock-session`): `screenShield.js`
+    /// connects it to `deactivate()`, which ends the lock without a password.
+    /// logind only emits it for the session's owner or a polkit-authorized
+    /// caller. A password check or conversation in flight is denied, never
+    /// applied.
+    #[cfg(feature = "drm")]
+    fn unlock_for_logind(&mut self) {
+        if !self.is_locked() {
+            return;
+        }
+        self.unlock_slot.release_by_session(&self.unlock_generation);
+        self.release_lock();
+        self.cancel_invalid_unlock();
+        self.cancel_all_conversations();
     }
 
     /// Actual helper retirement is required in addition to the joined wrapper.
@@ -1933,6 +2004,12 @@ impl Runtime {
         self.active_at = Instant::now();
         if self.is_locked() {
             self.cursor.locate.reset_keys();
+            if matches!(
+                input,
+                ManagerInput::Key { .. } | ManagerInput::Button { .. }
+            ) {
+                self.auth.note_user_input();
+            }
         } else {
             // GNOME's locate-pointer: a lone Ctrl tap; the key still
             // reaches the client (#342).
@@ -2301,7 +2378,11 @@ impl Runtime {
         if self.state_path.is_none() {
             return;
         }
-        let keyboard = self.manager.keyboard_summary(&mut self.state);
+        let mut keyboard = self.manager.keyboard_summary(&mut self.state);
+        if let Some(keyboard) = keyboard.as_object_mut() {
+            let saving = self.numlock.saving(self.manager.keyboard_num_lock());
+            keyboard.insert("numlock_saving".into(), saving.into());
+        }
         let Some(path) = self.state_path.as_ref() else {
             return;
         };
@@ -2561,6 +2642,7 @@ impl Runtime {
         // GNOME Settings' display configuration (#340): modes, the
         // kernel's CRTC modes on hardware, pending confirmation.
         doc["display_config"] = self.display_config_diagnostics();
+        doc["color"] = self.color_diagnostics();
         let motion = self.input_settings.motion;
         doc["motion_policy"] = serde_json::json!(motion.level.as_str());
         doc["animation_slowdown"] = serde_json::json!(motion.slowdown());
@@ -2598,12 +2680,32 @@ impl Runtime {
             [pos.x, pos.y]
         }));
         doc["input_aids"] = self.input_aids_summary();
+        // What the on-screen keyboard follows (#349): the focused field's
+        // content type only, never text; nothing while locked.
+        doc["text_input"] = if self.is_locked() {
+            serde_json::Value::Null
+        } else {
+            let focus = self
+                .state
+                .seat
+                .get_keyboard()
+                .and_then(|k| k.current_focus());
+            self.state
+                .protocols
+                .text_inputs
+                .focus(focus.as_ref())
+                .map_or(
+                    serde_json::Value::Null,
+                    |field| serde_json::json!({ "purpose": field.purpose, "hints": field.hints }),
+                )
+        };
         // Owned proof diagnostics only: no credentials, prompts or typed input.
         doc["auth_owner"] = if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
             serde_json::json!({ "outer_pending": self.unlock_worker.is_some(),
+                "conversations": self.auth.diagnostics(),
                 "backend_unretired": self.unlock_quarantined.is_some(),
                 "epoch": self.unlock_generation.load(std::sync::atomic::Ordering::Acquire),
-                "attempt": self.unlock_worker.as_ref().map(|worker| worker.attempt).or(self.unlock_quarantined).map(|attempt| serde_json::json!({
+                "attempt": self.unlock_worker.as_ref().map(|worker| worker.attempt).or(self.unlock_quarantined).or(self.auth.password_attempt()).map(|attempt| serde_json::json!({
                     "serial": attempt.serial, "epoch": attempt.epoch,
                     "origin": attempt.origin.map(|origin| serde_json::json!({
                         "connection": origin.connection, "request": origin.request }))
@@ -4352,6 +4454,8 @@ impl Runtime {
             self.manager.focus_deadline(),
             // Window sessions are written 3 s after a change (Mutter).
             self.state.window_sessions().save_deadline(),
+            // The lock conversation's shared idle/total deadline.
+            self.auth.next_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -4470,6 +4574,7 @@ impl Runtime {
                 .zip(self.shell.child_generation())
                 .map(|(pid, generation)| crate::control::AuthOwner { pid, generation }),
         );
+        self.publish_on_screen_keyboard();
         let outcome = self.control.poll(self.manager.model_mut());
         for workspace in outcome.departed_workspaces.iter().copied() {
             self.manager.keep_departed_workspace_alive(workspace);
@@ -4559,6 +4664,9 @@ impl Runtime {
         }
         for backward in outcome.input_source_switches {
             self.switch_input_source_with_aid_reset(backward);
+        }
+        for input in outcome.osk_inputs {
+            self.osk_input(input);
         }
         // Header-bar right clicks: GNOME's window menu, drawn by the shell.
         for (window, x, y) in self.manager.take_menu_requests() {
@@ -4657,6 +4765,17 @@ impl Runtime {
                 self.control.finish_unlock(origin, false);
             }
         }
+        // The lock screen's conversations (GDM's UserVerifier role): begun,
+        // answered and cancelled here; advanced after the gates below.
+        for (origin, service) in outcome.auth_begin {
+            self.begin_verification(origin, service);
+        }
+        for (connection, service, sequence, answer) in outcome.auth_answers {
+            self.answer_query(connection, service, sequence, answer);
+        }
+        for connection in outcome.auth_cancel {
+            self.cancel_verification(connection);
+        }
         self.idle_monitor.tick();
         // Idle timeout from input timestamps: lock the untouched session.
         // A live idle inhibitor (video, presentation) counts as activity,
@@ -4749,6 +4868,7 @@ impl Runtime {
         if let Some(attempt) = completed {
             self.finish_unlock(attempt);
         }
+        self.poll_conversations();
 
         for event in self.shell.drain_events() {
             eprintln!("tuna-compositor: shell supervision: {event:?}");
@@ -5005,6 +5125,10 @@ impl Runtime {
             locked,
         );
         let wellbeing = self.wellbeing_effects.sample(self.animation_clock.now());
+        // Hardware outputs take Night Light and the assigned profile's
+        // calibration as the CRTC white point (P-DS-03); the renderer
+        // tints only outputs without one.
+        let tint_needed = self.update_white_points(self.night_light.applied_kelvin());
         let renderer = match &mut self.backend {
             Backend::Winit(backend) => backend.renderer(),
             #[cfg(feature = "drm")]
@@ -5034,8 +5158,17 @@ impl Runtime {
         );
         // The tint program is compiled once per renderer and cached;
         // a compile failure draws this frame untinted.
-        let night_tint =
-            crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, night_gains);
+        let night_tint = crate::wellbeing_effects::FrameColor::new(
+            renderer,
+            wellbeing,
+            night_gains.filter(|_| tint_needed),
+        );
+        // Outputs whose CRTC carries the white point draw untinted.
+        #[cfg(feature = "drm")]
+        let plain_tint = match night_gains {
+            Some(_) => crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, None),
+            None => night_tint.clone(),
+        };
         let overview = (show_content && !overlay_visible && drawn).then(|| self.overview_layout());
         // While search shows results, the workspace view steps aside.
         let cards = overview
@@ -5463,6 +5596,11 @@ impl Runtime {
                         continue;
                     }
                     let size = out.size;
+                    let output_tint = if out.tint_fallback {
+                        night_tint.as_ref()
+                    } else {
+                        plain_tint.as_ref()
+                    };
                     // Per-output scale from GNOME's monitors.xml (#59).
                     let view = View {
                         offset: out.loc,
@@ -5696,7 +5834,7 @@ impl Runtime {
                                         damage,
                                         scale: view.scale,
                                         blank_alpha,
-                                        tint: night_tint.as_ref(),
+                                        tint: output_tint,
                                     },
                                     &decor,
                                     &previews,
@@ -5741,7 +5879,7 @@ impl Runtime {
                                         damage: &damage,
                                         scale: view.scale,
                                         blank_alpha,
-                                        tint: night_tint.as_ref(),
+                                        tint: output_tint,
                                     },
                                     &decor,
                                     &previews,
@@ -7326,6 +7464,25 @@ fn run_loop(
     if let Some(monitor) = &sleep_monitor {
         monitor.set_wake(&runtime.wake);
     }
+    // The session's logind object, as GNOME's screen shield follows it:
+    // Lock/Unlock signals in, LockedHint out (#846). Nested runs share
+    // the host's session and leave it alone.
+    #[cfg(feature = "drm")]
+    let mut logind_session = if matches!(runtime.backend, Backend::Drm(_)) {
+        match crate::logind_session::Session::start() {
+            Ok(session) => Some(session),
+            Err(error) => {
+                eprintln!("tuna-compositor: logind session unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(feature = "drm")]
+    if let Some(session) = &logind_session {
+        session.set_wake(&runtime.wake);
+    }
     // Graceful shutdown on SIGTERM/SIGINT/SIGHUP: ending the loop drops the
     // runtime, whose supervisor kills the shell child (ADR 0003 kill
     // on exit). Without this a signal would bypass `Drop` and orphan
@@ -7362,6 +7519,7 @@ fn run_loop(
     let mut wait = Duration::ZERO;
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            runtime.shutdown_colord();
             restore_env(prev_env);
             return Ok(runtime.stats);
         }
@@ -7382,7 +7540,17 @@ fn run_loop(
                 }
             }
         }
+        #[cfg(feature = "drm")]
+        match logind_session.as_ref().and_then(|session| session.take()) {
+            Some(crate::logind_session::Request::Lock) => runtime.lock_for_logind(),
+            Some(crate::logind_session::Request::Unlock) => runtime.unlock_for_logind(),
+            None => {}
+        }
         let ticked = dispatched.and_then(|_| runtime.tick());
+        #[cfg(feature = "drm")]
+        if let Some(session) = &mut logind_session {
+            session.report_locked(runtime.is_locked());
+        }
         let probe_delay = probe(&mut AuthOwnerProbe {
             runtime: &mut runtime,
         });
@@ -7396,6 +7564,7 @@ fn run_loop(
                 continue;
             }
             done => {
+                runtime.shutdown_colord();
                 restore_env(prev_env);
                 return done.map(|_| runtime.stats);
             }

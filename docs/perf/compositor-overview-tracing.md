@@ -1,6 +1,6 @@
 # Tuna Desktop overview action-to-scanout tracing
 
-For an explicit performance fixture, set `TUNA_PERF_TRACE=1` before starting `tuna-compositor --backend drm`. Normal sessions leave tracing disabled. The CI-only greetd VM wrapper enables it and forwards stderr through its existing journal/serial route. No key symbols, text, window titles or client IDs enter these records.
+For an explicit performance fixture, set `TUNA_PERF_TRACE=1` before starting `tuna-compositor --backend drm`. Normal sessions leave tracing disabled. The CI-only current-build VM fixture enables it through the session's `environment.d`, and GDM's session journal stream reaches the existing serial route. No key symbols, text, window titles or client IDs enter these records.
 
 An accepted overview toggle records an anonymous ID and CLOCK_MONOTONIC handling timestamp. That action is associated with the first successfully queued primary-output scene whose expected workspace wallpaper cards are all renderable. A changed shell or dark overview background while cards are pending does not complete the action; its original handling timestamp stays pending. A frame already pending before the action cannot complete it. The corresponding actual primary kernel page flip records its timestamp and sequence; a missing or stale kernel timestamp produces a discarded record rather than a latency sample. Lock, inactive-seat and ambiguous replaced-frame paths discard pending associations. At most 64 actions are recorded during a compositor’s lifetime.
 

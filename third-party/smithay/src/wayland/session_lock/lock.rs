@@ -106,6 +106,14 @@ where
                         let attributes = states.data_map.get::<Mutex<LockSurfaceAttributes>>();
                         let attributes = attributes.unwrap().lock().unwrap();
 
+                        // Tuna: once the client destroyed the lock surface role
+                        // object, its wl_surface is no longer a lock surface; a
+                        // later unmap (GDK attaches NULL on hide) is legal and
+                        // must not be posted on the dead role object.
+                        if !attributes.surface.is_alive() {
+                            return;
+                        }
+
                         let Some(state) = attributes.last_acked else {
                             attributes.surface.post_error(
                                 ext_session_lock_surface_v1::Error::CommitBeforeFirstAck,

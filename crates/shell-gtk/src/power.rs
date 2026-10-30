@@ -4,7 +4,10 @@
 //! Restart…, Power Off…, Log Out. The "…" actions open GNOME's
 //! end-session dialog: a dimmed full-screen layer with a 60-second
 //! countdown, Cancel, and the action; the countdown runs the action.
-//! Everything goes through logind on the system bus.
+//! Suspend, restart and power off go through logind on the system bus.
+//! Log Out ends the compositor, the session leader, as gnome-session's
+//! exit ends a GNOME session; its orderly SIGTERM shutdown ends the display
+//! manager's session (see the compositor's `session_manager::perform`).
 //!
 //! The same dialog serves GNOME Shell 51's
 //! `org.gnome.SessionManager.EndSessionDialog` on the shell's bus
@@ -14,11 +17,11 @@
 //! shutdown keys. As in GNOME, Cancel emits `Canceled` then `Closed`,
 //! a confirmation emits `ConfirmedShutdown`, `ConfirmedReboot` or
 //! `ConfirmedLogout`, and `Close` emits `Closed`. The confirmed action
-//! runs here through logind, as the menu's does.
+//! runs here, as the menu's does.
 //!
 //! In the nested preview (`TUNA_SESSION_KIND=nested`) logind's session
-//! is the host's: only Log Out is offered, and it ends this compositor
-//! (SIGTERM to its parent), never the host session.
+//! is the host's: only Log Out is offered, and it ends this compositor,
+//! never the host session.
 //!
 //! Before sleep, logind's `PrepareForSleep(true)` locks the screen, so
 //! the session resumes locked from any suspend (menu, lid, idle).
@@ -35,8 +38,6 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 const LOGIND: &str = "org.freedesktop.login1";
 const MANAGER_PATH: &str = "/org/freedesktop/login1";
 const MANAGER_IFACE: &str = "org.freedesktop.login1.Manager";
-const SESSION_PATH: &str = "/org/freedesktop/login1/session/auto";
-const SESSION_IFACE: &str = "org.freedesktop.login1.Session";
 /// GNOME's end-session countdown.
 pub const COUNTDOWN_S: u32 = 60;
 
@@ -170,19 +171,14 @@ pub fn is_nested() -> bool {
     std::env::var("TUNA_SESSION_KIND").map_or(true, |kind| kind != "hardware")
 }
 
-fn system_call(
-    conn: &gio::DBusConnection,
-    path: &str,
-    iface: &str,
-    method: &str,
-    args: Option<glib::Variant>,
-) {
+/// An interactive logind manager call on the system bus.
+fn system_call(conn: &gio::DBusConnection, method: &str) {
     conn.call(
         Some(LOGIND),
-        path,
-        iface,
+        MANAGER_PATH,
+        MANAGER_IFACE,
         method,
-        args.as_ref(),
+        Some(&(true,).to_variant()),
         None,
         gio::DBusCallFlags::NONE,
         5000,
@@ -195,28 +191,34 @@ fn system_call(
     );
 }
 
+/// End the supervising compositor, this process's parent, which shuts
+/// down cleanly on SIGTERM. An adoptive parent is never signalled.
+fn end_compositor() {
+    let parent = unsafe { libc::getppid() };
+    let comm = std::fs::read_to_string(format!("/proc/{parent}/comm")).unwrap_or_default();
+    if parent > 1 && comm.trim_end() == "tuna-composito" {
+        unsafe {
+            libc::kill(parent, libc::SIGTERM);
+        }
+    } else {
+        eprintln!("tuna-shell-gtk: parent {parent} is not the compositor; Log Out not sent");
+    }
+}
+
 /// Carry out `action` now.
 fn perform(action: Action, nested: bool, conn: Option<&gio::DBusConnection>) {
-    if nested {
-        if action == Action::LogOut {
-            // End this compositor only: it shuts down cleanly on SIGTERM.
-            unsafe {
-                libc::kill(libc::getppid(), libc::SIGTERM);
-            }
-        }
-        return;
-    }
+    let method = match action {
+        Action::LogOut => return end_compositor(),
+        _ if nested => return,
+        Action::Suspend => "Suspend",
+        Action::Restart => "Reboot",
+        Action::PowerOff => "PowerOff",
+    };
     let Some(conn) = conn else {
         eprintln!("tuna-shell-gtk: no system bus for {action:?}");
         return;
     };
-    let interactive = Some((true,).to_variant());
-    match action {
-        Action::Suspend => system_call(conn, MANAGER_PATH, MANAGER_IFACE, "Suspend", interactive),
-        Action::Restart => system_call(conn, MANAGER_PATH, MANAGER_IFACE, "Reboot", interactive),
-        Action::PowerOff => system_call(conn, MANAGER_PATH, MANAGER_IFACE, "PowerOff", interactive),
-        Action::LogOut => system_call(conn, SESSION_PATH, SESSION_IFACE, "Terminate", None),
-    }
+    system_call(conn, method);
 }
 
 /// The power surfaces: the menu rows for quick settings, the dialog.

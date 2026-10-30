@@ -57,6 +57,7 @@ pub mod animation_clock;
 mod auth_owner;
 mod bell;
 pub mod capture_security;
+pub mod color_manager;
 mod constraint_motion;
 pub mod control;
 mod control_readiness;
@@ -66,10 +67,12 @@ mod cursor_svg;
 pub mod display_config;
 #[cfg(feature = "drm")]
 pub mod drm;
+pub mod edid;
 pub(crate) mod focus_caret;
 pub mod focus_policy;
 pub mod fprintd;
 pub mod frame_timing;
+pub mod icc;
 pub mod idle_monitor;
 pub mod ime;
 pub mod input_aids;
@@ -77,6 +80,7 @@ pub mod introspect;
 pub mod layer;
 pub mod lock;
 pub mod lockdown;
+mod logind_session;
 pub mod magnifier;
 pub mod menu_close;
 pub mod minimize;
@@ -92,6 +96,7 @@ pub mod numlock;
 mod occlusion;
 pub mod orca;
 pub mod orientation;
+pub mod osk;
 mod output_constraints;
 pub mod overlay;
 pub mod overview;
@@ -720,6 +725,8 @@ impl SeatHandler for State {
         if let Some(surface) = focused {
             self.reactivate_inhibitor(surface);
         }
+        // Text inputs must be enabled anew after `enter` (#349).
+        self.protocols.text_inputs.focus_changed();
     }
 
     /// A client set the cursor (wl_pointer.set_cursor or a

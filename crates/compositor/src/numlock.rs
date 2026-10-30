@@ -17,8 +17,12 @@
 //! startup reader thread and one save worker that coalesces to the
 //! newest state. Unreadable settings read as GNOME's defaults (nothing
 //! remembered), so a broken backend never turns Num Lock on or writes.
+//! The state file reports a save in flight (`keyboard.numlock_saving`):
+//! a keyfile-backed proof session must not write settings meanwhile,
+//! since the CLI rewrites the whole keyfile it loaded and would undo them.
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 
 use crate::lockdown::{read_bool_via_command, LOCKDOWN_READ_TIMEOUT};
 
@@ -83,16 +87,23 @@ pub struct NumlockMemory {
     last: Option<bool>,
     /// A change seen before the restore landed: the user's choice wins.
     changed_before_restore: bool,
-    save: mpsc::Sender<bool>,
+    /// Saves queued so far, each numbered, with the newest state.
+    save: mpsc::Sender<(u64, bool)>,
+    queued: u64,
+    /// The newest queued save the worker has finished (written, or
+    /// found unnecessary).
+    settled: Arc<AtomicU64>,
 }
 
 impl NumlockMemory {
     /// Start the restore read and the save worker against `store`;
-    /// `landed` runs once the restore read finishes (the runtime wakes
-    /// its loop so the result applies without waiting for input).
-    pub fn start(store: impl Store + Clone, landed: impl FnOnce() + Send + 'static) -> Self {
+    /// `wake` runs once the restore read finishes and after every save
+    /// (the runtime wakes its loop so the result applies, and the state
+    /// file reports it, without waiting for input).
+    pub fn start(store: impl Store + Clone, wake: impl Fn() + Clone + Send + 'static) -> Self {
         let (restore_tx, restore_rx) = mpsc::channel();
         let reader = store.clone();
+        let landed = wake.clone();
         let _ = std::thread::Builder::new()
             .name("tuna-numlock-restore".into())
             .spawn(move || {
@@ -105,22 +116,25 @@ impl NumlockMemory {
                 let _ = restore_tx.send(restored_state(remember, saved));
                 landed();
             });
-        let (save_tx, save_rx) = mpsc::channel::<bool>();
+        let (save_tx, save_rx) = mpsc::channel::<(u64, bool)>();
+        let settled = Arc::new(AtomicU64::new(0));
+        let done = settled.clone();
         let _ = std::thread::Builder::new()
             .name("tuna-numlock-save".into())
             .spawn(move || {
-                while let Ok(mut current) = save_rx.recv() {
+                while let Ok((mut newest, mut current)) = save_rx.recv() {
                     // Coalesce a burst of toggles to the newest state.
-                    while let Ok(newer) = save_rx.try_recv() {
-                        current = newer;
+                    while let Ok((number, newer)) = save_rx.try_recv() {
+                        (newest, current) = (number, newer);
                     }
                     let remember = store.get(KEY_REMEMBER);
-                    if remember != Some(true) {
-                        continue;
-                    }
-                    if needs_save(remember, store.get(KEY_STATE), current) {
+                    // The stored state is read only while remembering.
+                    if remember == Some(true) && needs_save(remember, store.get(KEY_STATE), current)
+                    {
                         store.set(KEY_STATE, current);
                     }
+                    done.store(newest, Ordering::Release);
+                    wake();
                 }
             });
         Self {
@@ -128,6 +142,8 @@ impl NumlockMemory {
             last: None,
             changed_before_restore: false,
             save: save_tx,
+            queued: 0,
+            settled,
         }
     }
 
@@ -145,7 +161,8 @@ impl NumlockMemory {
             if self.restore.is_some() {
                 self.changed_before_restore = true;
             }
-            let _ = self.save.send(current);
+            self.queued += 1;
+            let _ = self.save.send((self.queued, current));
         }
         let restore = self.restore.as_ref()?;
         let wanted = match restore.try_recv() {
@@ -155,6 +172,14 @@ impl NumlockMemory {
         };
         self.restore = None;
         (wanted && !current && !self.changed_before_restore).then_some(true)
+    }
+
+    /// Whether a save of `current` (the keyboard's Num Lock now) is still
+    /// to come: a change the next tick will queue, or a queued save the
+    /// worker has not finished.
+    pub fn saving(&self, current: Option<bool>) -> bool {
+        let unseen = matches!((self.last, current), (Some(last), Some(now)) if last != now);
+        unseen || self.settled.load(Ordering::Acquire) != self.queued
     }
 }
 
@@ -282,5 +307,31 @@ mod tests {
             memory.restore.is_none()
         }));
         assert!(!applied, "the user's toggle beats a late restore");
+    }
+
+    #[test]
+    fn a_save_is_reported_in_flight_until_it_settles() {
+        let store = Fake::default();
+        *store.0.lock().unwrap() = (Some(true), Some(false), Vec::new());
+        let mut memory = NumlockMemory::start(Slow(store.clone()), || {});
+        assert!(!memory.saving(None));
+        memory.tick(Some(false));
+        assert!(!memory.saving(Some(false)));
+        // The LED changed but no tick has seen it: its save is still to come.
+        assert!(memory.saving(Some(true)));
+        memory.tick(Some(true));
+        assert!(memory.saving(Some(true)), "queued behind the slow store");
+        assert!(until(|| !memory.saving(Some(true))));
+        assert_eq!(
+            store.0.lock().unwrap().2,
+            vec![true],
+            "settled only once written"
+        );
+        // A save found unnecessary settles too.
+        store.0.lock().unwrap().0 = Some(false);
+        memory.tick(Some(false));
+        assert!(memory.saving(Some(false)));
+        assert!(until(|| !memory.saving(Some(false))));
+        assert_eq!(store.0.lock().unwrap().2, vec![true]);
     }
 }

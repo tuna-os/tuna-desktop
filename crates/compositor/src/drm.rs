@@ -44,6 +44,7 @@ use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size};
 
 use crate::windows::ManagerInput;
 
+pub mod color;
 pub mod libinput;
 
 /// Scanout surface type: GBM buffers on the DRM device, each queued
@@ -108,6 +109,14 @@ pub struct DrmOutput {
     pub(crate) last_frame: Option<crate::native_repaint::FrameSignature>,
     pub(crate) damage_tracker: Option<smithay::backend::renderer::damage::OutputDamageTracker>,
     wake_trace: bool,
+    /// GAMMA_LUT/CTM of the CRTC (P-DS-03).
+    color: color::CrtcColor,
+    /// The connector's EDID blob, read at discovery.
+    edid: Option<Vec<u8>>,
+    /// The white point programmed on the CRTC.
+    white_point: crate::color_manager::WhitePoint,
+    /// The CRTC takes no white point: the renderer tints instead.
+    pub tint_fallback: bool,
 }
 
 /// Mutter's mode spec of a kernel mode: resolution, refresh rate as
@@ -276,6 +285,9 @@ pub struct DrmBackend {
     alt: bool,
     /// libinput devices, for GNOME's touchpad and mouse settings (#60).
     devices: Vec<smithay::reexports::input::Device>,
+    /// Mutter's seat touch-mode and the last pointing device, for the
+    /// on-screen keyboard's auto-show (#349).
+    touch_mode: crate::osk::TouchMode,
     input_settings: tuna_shell_control::InputSettings,
     /// Bumped by every applied layout or reverted mode (#340).
     layout_generation: u64,
@@ -486,6 +498,10 @@ impl DrmBackend {
                 }
             };
             used.push(crtc);
+            // A ramp or matrix a previous session left must not stay.
+            let mut color = color::CrtcColor::new(&drm, crtc);
+            color.reset(&drm);
+            let edid = color::connector_edid(&drm, *handle);
             let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
             let (w, h) = mode.size();
             let size: Size<i32, Physical> = (i32::from(w), i32::from(h)).into();
@@ -533,6 +549,10 @@ impl DrmBackend {
                 last_frame: None,
                 damage_tracker: None,
                 wake_trace: false,
+                color,
+                edid,
+                white_point: Default::default(),
+                tint_fallback: false,
             });
         }
         if outputs.is_empty() {
@@ -583,6 +603,7 @@ impl DrmBackend {
             ctrl: false,
             alt: false,
             devices: Vec::new(),
+            touch_mode: Default::default(),
             input_settings: Default::default(),
             corner_pressure: Default::default(),
             hot_corner_active: true,
@@ -851,6 +872,107 @@ impl DrmBackend {
         }
     }
 
+    /// The monitors Mutter's colour manager registers with colord: every
+    /// connector with its EDID identity and CRTC gamma size; the first
+    /// output is primary.
+    pub fn colord_monitors(&self) -> Vec<crate::color_manager::ColordMonitor> {
+        let atomic = self.drm.is_atomic();
+        self.outputs
+            .iter()
+            .enumerate()
+            .map(|(i, out)| crate::color_manager::ColordMonitor {
+                identity: crate::edid::MonitorIdentity::new(
+                    &out.name,
+                    out.edid.as_deref(),
+                    i == 0,
+                    out.size_mm,
+                    color::pnp_vendor_name,
+                ),
+                gamma_lut_size: out.color.caps(atomic).gamma_lut_size,
+            })
+            .collect()
+    }
+
+    /// Each connector's CRTC gamma size (calibration `GammaLutSize`).
+    pub fn gamma_sizes(&self) -> Vec<(String, usize)> {
+        let atomic = self.drm.is_atomic();
+        self.outputs
+            .iter()
+            .map(|out| (out.name.clone(), out.color.caps(atomic).gamma_lut_size))
+            .collect()
+    }
+
+    /// Program every lit output's white point (`update_white_point`):
+    /// calibration session ramps, else the assigned profile's vcgt
+    /// scaled by the Night Light `temperature`. Off-seat nothing is
+    /// programmed; activation programs again. Returns whether any
+    /// output fell back to the renderer tint.
+    pub fn update_white_points(
+        &mut self,
+        share: &crate::color_manager::ColorShare,
+        temperature: u32,
+    ) -> bool {
+        use crate::color_manager::WhitePointUpdate;
+        if !self.active || !self.drm.is_active() {
+            return self.outputs.iter().any(|o| o.tint_fallback);
+        }
+        let atomic = self.drm.is_atomic();
+        for out in &mut self.outputs {
+            // do_update: an inactive monitor is not updated.
+            if !out.enabled {
+                continue;
+            }
+            let device = share.device(&out.name);
+            let session = share.calibration_for(&out.name);
+            let update = out.white_point.update(
+                out.color.caps(atomic),
+                device.as_ref().is_some_and(|d| d.assigned.is_some()),
+                device.as_ref().and_then(|d| d.calibration.as_deref()),
+                session.as_ref().map(Option::as_ref),
+                temperature,
+            );
+            out.tint_fallback = update == WhitePointUpdate::Unsupported;
+            if let WhitePointUpdate::Program(programming) = update {
+                if let Err(error) = out.color.program(&self.drm, &programming) {
+                    eprintln!("tuna-compositor: drm: {} white point: {error}", out.name);
+                    out.white_point.invalidate();
+                }
+            }
+        }
+        self.outputs.iter().any(|o| o.enabled && o.tint_fallback)
+    }
+
+    /// Whether `output` takes Night Light in the renderer (no CRTC
+    /// white point).
+    pub fn tints(&self, output: &str) -> bool {
+        self.outputs
+            .iter()
+            .any(|o| o.name == output && o.tint_fallback)
+    }
+
+    /// The CRTC colour state as the kernel reports it, for the state
+    /// file the DRM smoke proof reads (GAMMA_LUT readback).
+    pub fn color_state(&self) -> Vec<serde_json::Value> {
+        let atomic = self.drm.is_atomic();
+        self.outputs
+            .iter()
+            .map(|out| {
+                let caps = out.color.caps(atomic);
+                let lut = out.color.read_gamma_lut(&self.drm);
+                serde_json::json!({
+                    "connector": out.name,
+                    "gamma_lut_size": caps.gamma_lut_size,
+                    "ctm": caps.ctm,
+                    "edid_md5": out.edid.as_deref().map(crate::edid::md5_hex),
+                    "tint_fallback": out.tint_fallback,
+                    "gamma_lut": lut.map(|l| serde_json::json!({
+                        "red": l.red, "green": l.green, "blue": l.blue,
+                    })),
+                })
+            })
+            .collect()
+    }
+
     /// The mode each CRTC is actually set to, as the kernel reports it
     /// (`drmModeGetCrtc`): what the DRM smoke proof compares against
     /// the mode GNOME Settings asked for.
@@ -908,6 +1030,9 @@ impl DrmBackend {
                     out.pending = false;
                     out.last_frame = None;
                     out.damage_tracker = None;
+                    // Another VT owner may have changed the ramp
+                    // (meta_onscreen_native_invalidate).
+                    out.white_point.invalidate();
                 }
                 self.active = true;
                 if self.sleep_reset_pending {
@@ -1082,6 +1207,7 @@ impl DrmBackend {
         event: InputEvent<LibinputInputBackend>,
         layout: &[(Rectangle<i32, Logical>, bool)],
     ) -> Vec<ManagerInput> {
+        self.note_touch_mode(&event);
         match event {
             InputEvent::PointerMotion { event } => {
                 self.relative_motion_events = self.relative_motion_events.saturating_add(1);
@@ -1123,6 +1249,7 @@ impl DrmBackend {
                 if let Some(device) = self.devices.last_mut() {
                     libinput::apply(&self.input_settings, device, two_finger);
                 }
+                self.recount_touch_devices();
                 Vec::new()
             }
             InputEvent::DeviceRemoved { device } => {
@@ -1135,6 +1262,7 @@ impl DrmBackend {
                     let settings = self.input_settings.clone();
                     self.apply_input_settings(&settings);
                 }
+                self.recount_touch_devices();
                 Vec::new()
             }
             // Touchpad swipes (#60): three fingers are the shell's.
@@ -1247,6 +1375,61 @@ impl DrmBackend {
     /// `two_finger_devices`), which makes edge scrolling yield.
     fn two_finger_available(&self) -> bool {
         self.devices.iter().any(libinput::has_two_finger_scroll)
+    }
+
+    /// The seat's touch-mode state (#349).
+    pub fn touch_mode(&self) -> crate::osk::TouchMode {
+        self.touch_mode
+    }
+
+    /// Follow mutter's tablet-mode switch and GNOME's
+    /// `last-device-changed`, which skips keyboards.
+    fn note_touch_mode(&mut self, event: &InputEvent<LibinputInputBackend>) {
+        use smithay::backend::input::{Switch, SwitchState, SwitchToggleEvent};
+        use smithay::reexports::input::DeviceCapability;
+        let device = match event {
+            InputEvent::SwitchToggle { event } => {
+                if SwitchToggleEvent::switch(event) == Some(Switch::TabletMode) {
+                    self.touch_mode.tablet_mode =
+                        SwitchToggleEvent::state(event) == SwitchState::On;
+                }
+                None
+            }
+            InputEvent::PointerMotion { event } => Some(Event::device(event)),
+            InputEvent::PointerMotionAbsolute { event } => Some(Event::device(event)),
+            InputEvent::PointerButton { event } => Some(Event::device(event)),
+            InputEvent::PointerAxis { event } => Some(Event::device(event)),
+            InputEvent::TouchDown { event } => Some(Event::device(event)),
+            InputEvent::TouchMotion { event } => Some(Event::device(event)),
+            InputEvent::GestureSwipeBegin { event } => Some(Event::device(event)),
+            InputEvent::GesturePinchBegin { event } => Some(Event::device(event)),
+            InputEvent::GestureHoldBegin { event } => Some(Event::device(event)),
+            InputEvent::TabletToolAxis { event } => Some(Event::device(event)),
+            InputEvent::TabletToolTip { event } => Some(Event::device(event)),
+            _ => None,
+        };
+        if let Some(device) = device {
+            self.touch_mode.last_touchscreen = device.has_capability(DeviceCapability::Touch);
+        }
+    }
+
+    /// Recount the device classes mutter's `update_touch_mode` reads.
+    fn recount_touch_devices(&mut self) {
+        use smithay::reexports::input::{
+            event::switch::Switch as LibinputSwitch, DeviceCapability,
+        };
+        self.touch_mode.has_touchscreen = self
+            .devices
+            .iter()
+            .any(|d| d.has_capability(DeviceCapability::Touch));
+        self.touch_mode.has_pointer = self
+            .devices
+            .iter()
+            .any(|d| d.has_capability(DeviceCapability::Pointer));
+        self.touch_mode.has_tablet_switch = self.devices.iter().any(|d| {
+            d.has_capability(DeviceCapability::Switch)
+                && d.switch_has_switch(LibinputSwitch::TabletMode) == Ok(true)
+        });
     }
 
     /// Live libinput state for every tracked device (#343), see

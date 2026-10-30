@@ -12,10 +12,10 @@
 //! All code here is original.
 //!
 //! Fingerprint lock-state application has no synchronous helper: the live
-//! path resolves on a runtime worker thread (see #366), so only the
-//! password half is exercised at this level. The fingerprint outcome seam
-//! itself is covered by unit tests at
-//! [`attempt_fprint_unlock`](tuna_compositor::unlock::attempt_fprint_unlock).
+//! path runs on a runtime worker thread (see #366), so only the password
+//! half is exercised at this level. The fingerprint conversation itself is
+//! covered by unit tests at
+//! [`run_fingerprint`](tuna_compositor::unlock::run_fingerprint).
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;

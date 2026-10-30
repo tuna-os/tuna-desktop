@@ -554,31 +554,36 @@ fn read_setting(schema: &str, key: &str) -> Option<bool> {
 }
 
 /// End the session without asking: `gsm-systemd.c` powers off and
-/// reboots through logind interactively; a logout ends this logind
-/// session, as the shell's Log Out does.
+/// reboots through logind interactively. A logout ends this compositor,
+/// the session leader, as gnome-session's exit ends a GNOME session: the
+/// SIGTERM path retires Orca, saves window sessions, stops the session
+/// targets and releases the seat, which hands the VT back, and the exit
+/// ends the display manager's session. logind's `Session.Terminate`
+/// instead signals GDM's session worker together with the compositor; the
+/// worker then switches to the login VT while logind restores the session
+/// VT, and when logind's restore cancelled that switch GDM never started
+/// its greeter (V-LOGOUT).
 fn perform(kind: EndSession) {
+    let power = match kind {
+        EndSession::Logout => {
+            if let Err(e) = signal_hook::low_level::raise(signal_hook::consts::SIGTERM) {
+                eprintln!("tuna-compositor: session manager: {kind:?} failed: {e}");
+            }
+            return;
+        }
+        EndSession::Shutdown => "PowerOff",
+        EndSession::Reboot => "Reboot",
+    };
     let result = zbus::blocking::Connection::system().and_then(|system| {
-        match kind {
-            EndSession::Shutdown | EndSession::Reboot => system.call_method(
+        system
+            .call_method(
                 Some("org.freedesktop.login1"),
                 "/org/freedesktop/login1",
                 Some("org.freedesktop.login1.Manager"),
-                if kind == EndSession::Shutdown {
-                    "PowerOff"
-                } else {
-                    "Reboot"
-                },
+                power,
                 &(true,),
-            ),
-            EndSession::Logout => system.call_method(
-                Some("org.freedesktop.login1"),
-                "/org/freedesktop/login1/session/auto",
-                Some("org.freedesktop.login1.Session"),
-                "Terminate",
-                &(),
-            ),
-        }
-        .map(|_| ())
+            )
+            .map(|_| ())
     });
     if let Err(e) = result {
         eprintln!("tuna-compositor: session manager: {kind:?} failed: {e}");
@@ -793,20 +798,7 @@ fn follow_logind_session(session: zbus::blocking::Connection) -> bool {
     let Ok(system) = zbus::blocking::Connection::system() else {
         return true;
     };
-    let Ok(manager) = zbus::blocking::Proxy::new(
-        &system,
-        "org.freedesktop.login1",
-        "/org/freedesktop/login1",
-        "org.freedesktop.login1.Manager",
-    ) else {
-        return true;
-    };
-    let path: zbus::Result<zbus::zvariant::OwnedObjectPath> = match std::env::var("XDG_SESSION_ID")
-    {
-        Ok(id) if !id.is_empty() => manager.call("GetSession", &(id.as_str(),)),
-        _ => manager.call("GetSessionByPID", &(std::process::id(),)),
-    };
-    let Ok(path) = path else {
+    let Ok(path) = crate::logind_session::current_session_path(&system) else {
         return true;
     };
     let Ok(logind_session) = zbus::blocking::Proxy::new(

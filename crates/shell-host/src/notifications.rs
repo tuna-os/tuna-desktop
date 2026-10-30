@@ -28,7 +28,9 @@ use std::sync::Arc;
 
 use crate::notification_policy::{self, LockSource, PolicyStore, SourcePolicy};
 
-/// How many banners may stack before older ones wait in history.
+/// GNOME's `MAX_NOTIFICATIONS_IN_QUEUE`: how many banners may wait,
+/// the one on screen included, before a new arrival goes to history
+/// only. Critical ones always queue.
 pub const MAX_BANNERS: usize = 3;
 /// How many notifications history retains (oldest drop first).
 pub const MAX_HISTORY: usize = 50;
@@ -365,6 +367,9 @@ pub struct NotificationCenter {
     policy: PolicySlot,
     /// Sounds due to play, oldest first (the shell drains them).
     sounds: Vec<Sound>,
+    /// In-place replacements so far: a view that keys its drawn list on
+    /// ids redraws when this moves.
+    replacements: u64,
 }
 
 impl NotificationCenter {
@@ -443,8 +448,9 @@ impl NotificationCenter {
                 }
             }
         }
+        // Admission keeps the earliest (the banner on screen first).
         while banners.len() > MAX_BANNERS {
-            banners.pop_front();
+            banners.pop_back();
         }
         center.banners = banners;
         center
@@ -563,6 +569,12 @@ impl NotificationCenter {
         self.banners.len()
     }
 
+    /// How many notifications were updated in place so far (see
+    /// [`NotificationCenter::notify`]): their ids stay, their text moves.
+    pub fn replacements(&self) -> u64 {
+        self.replacements
+    }
+
     /// File a notification (freedesktop `Notify` shape). Returns the
     /// store id. With `replaces_id` naming a live entry, that entry is
     /// updated in place and re-queued instead of allocating.
@@ -603,6 +615,7 @@ impl NotificationCenter {
                 entry.expanded = false;
                 entry.acknowledged = false;
                 entry.consumed.clear();
+                self.replacements += 1;
                 return replaces;
             }
         }
@@ -650,17 +663,20 @@ impl NotificationCenter {
         if self.dnd && urgency != Urgency::Critical {
             return;
         }
-        self.push_banner(id);
+        self.push_banner(id, urgency);
     }
 
-    /// Queue a banner (once), dropping the oldest past the cap.
-    fn push_banner(&mut self, id: u64) {
-        if !self.banners.contains(&id) {
-            self.banners.push_back(id);
+    /// Queue a banner once, as GNOME's message tray admits one: the
+    /// queue keeps what it took first (the banner on screen never makes
+    /// way), and while it is full a new arrival waits in history only,
+    /// unless it is critical. History pruning bounds it either way.
+    fn push_banner(&mut self, id: u64, urgency: Urgency) {
+        if self.banners.contains(&id)
+            || (self.banners.len() >= MAX_BANNERS && urgency != Urgency::Critical)
+        {
+            return;
         }
-        while self.banners.len() > MAX_BANNERS {
-            self.banners.pop_front();
-        }
+        self.banners.push_back(id);
     }
 
     /// Follow GNOME Settings' notification policy from `store`.
@@ -723,7 +739,7 @@ impl NotificationCenter {
             entry.expanded = delivery.expanded;
         }
         if delivery.banner {
-            self.push_banner(id);
+            self.push_banner(id, n.urgency);
         } else {
             self.banners.retain(|b| *b != id);
         }
@@ -1167,9 +1183,12 @@ mod tests {
         assert_eq!(c.history().len(), 1);
         assert_eq!(c.history()[0].title, "new");
         assert_eq!(c.banners().len(), 1);
+        // Same id, new text: views keyed on ids learn of it here.
+        assert_eq!(c.replacements(), 1);
         // Unknown replace ids allocate fresh.
         let fresh = c.notify("app", "t", "b", vec![], Urgency::Normal, Some(999));
         assert_ne!(fresh, 999);
+        assert_eq!(c.replacements(), 1);
     }
 
     #[test]
@@ -1384,8 +1403,8 @@ mod tests {
         let queued: Vec<u64> = c.banners().iter().map(|n| n.id).collect();
         assert_eq!(
             queued,
-            vec![9998, 9999, 10_000],
-            "newest kept on the banners"
+            vec![9951, 9952, 9953],
+            "the queue keeps the oldest live arrivals it admitted"
         );
         // A second flood changes nothing about the bounds: flat.
         for _ in 0..10_000 {
@@ -1395,6 +1414,28 @@ mod tests {
         assert_eq!(c.banners().len(), MAX_BANNERS);
         let ids: Vec<u64> = c.history().iter().map(|n| n.id).collect();
         assert_eq!(ids, (19951..=20_000).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn full_queue_leaves_new_arrivals_in_history_like_gnome() {
+        let mut c = center();
+        let first: Vec<u64> = (0..MAX_BANNERS)
+            .map(|_| c.notify("app", "t", "b", vec![], Urgency::Normal, None))
+            .collect();
+        // Full, the banner on screen included: the next waits in history.
+        let skipped = c.notify("app", "t", "b", vec![], Urgency::Normal, None);
+        let queued = |c: &NotificationCenter| c.banners().iter().map(|n| n.id).collect::<Vec<_>>();
+        assert_eq!(queued(&c), first, "the banner on screen never makes way");
+        assert_eq!(c.history().len(), MAX_BANNERS + 1);
+        // A critical one always queues.
+        let alarm = c.notify("app", "t", "b", vec![], Urgency::Critical, None);
+        assert_eq!(queued(&c).last(), Some(&alarm));
+        // Room again: the next arrival takes it, never the skipped one.
+        c.dismiss(first[0]).unwrap();
+        c.dismiss(first[1]).unwrap();
+        let next = c.notify("app", "t", "b", vec![], Urgency::Normal, None);
+        assert_eq!(queued(&c), vec![first[2], alarm, next]);
+        assert!(!queued(&c).contains(&skipped));
     }
 
     #[test]

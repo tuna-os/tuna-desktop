@@ -106,8 +106,11 @@ Cleanup is automatic where it is safe:
   your own home can't leak in. One proof runs at a time machine-wide
   (`/tmp/tuna-local-proof.lock`). Proofs that need another proof's
   prebuilt binaries (`--bin-dir`) are refused with the name of their
-  caller. A passing proof deletes its artifacts; a failing one keeps
-  them and prints the path;
+  caller. When the proof ends, pass or fail, any process it started is
+  stopped, including daemons that detached from it (`ibus-daemon
+  --daemonize`, `dbus-daemon --fork`): each carries a `TUNA_PROOF_RUN`
+  marker in its environment. A passing proof deletes its artifacts; a
+  failing one keeps them and prints the path;
 - `just gc` deletes the targets of worktrees whose pull request is merged
   or closed, removes those worktrees when they have no uncommitted
   changes, and expires `just ci-artifacts` downloads after six hours. It
@@ -337,6 +340,19 @@ or wholly culled, unless the overview, the switcher or a cast shows them.
 Proof `G-OCCLUSION-CULL` fullscreens an opaque window over another and
 requires the lower one to be culled and throttled, then drawn at full
 rate again once the upper window's translucent shadow returns.
+
+## Settings writes in proofs
+
+`scripts/tuna-gtk-shell-proof` keeps GSettings in a private keyfile
+(`GSETTINGS_BACKEND=keyfile`). Each writer rewrites the whole file from
+the copy it loaded, so two writers at once can lose a key. The
+compositor writes `numlock-state` through the `gsettings` CLI after
+every Num Lock change. Until its `keyboard.numlock_saving` state field
+is `false` again, any setting the proof writes can be undone. Wait for
+it after a Num Lock change and before the next `gsettings set`. The
+`keyboard.keymap_generation` field goes up each time a keymap is
+applied. Wait for it after changing the input sources or `xkb-options`
+and before typing.
 
 ## Parity ledger check
 

@@ -212,7 +212,7 @@ class Tests(unittest.TestCase):
         self.assertIn('"after-paint"', body)
         self.assertIn('gi.require_foreign("cairo")', body)
         container = (ROOT / 'packaging/marlin/vm-lane/Containerfile').read_text()
-        transaction = next(line for line in container.splitlines() if line.startswith('RUN pacman -Syu'))
+        transaction = next(line for line in container.splitlines() if 'pacman -Syu' in line)
         self.assertIn('python-cairo', transaction.split())
         self.assertIn('WaylandToplevel.set_application_id', body)
         self.assertIn('Gtk.Application(application_id="org.tuna.VmInput")', source)

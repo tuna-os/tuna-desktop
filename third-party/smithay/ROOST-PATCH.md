@@ -102,3 +102,29 @@ frames dropped without finish, per-draw fences for shared contexts, and an
 upload from a later shared context that must not change a finished frame.
 The isolated diff is retained in PER-FRAME-READ-FENCE-PATCH.diff; the
 pinned version stays 0.7.0.
+
+Issue #349 additionally changes src/wayland/seat/keyboard.rs and
+src/wayland/text_input/mod.rs for GNOME's on-screen keyboard. Upstream
+sends zwp_text_input_v3 enter and leave only while an input method
+instance exists, so without IBus a text field never learns it has focus
+and never enables its text input. Mutter announces text-input focus
+unconditionally (meta-wayland-text-input.c), and GNOME's on-screen
+keyboard follows that input-method focus; keyboard focus enter and leave
+now always send text-input enter and leave, and a text input created
+while its client already holds the keyboard (GTK binds it after its first
+keyboard enter) is sent enter at once, that instance alone, as
+meta_wayland_text_input_create_new_resource does. Input-method
+deactivation stays gated on an instance, and text-input requests without
+an input method are still discarded by Smithay (Roost tracks them itself
+before Smithay dispatches them). The isolated diff is retained in
+TEXT-INPUT-FOCUS-API-PATCH.diff; the pinned version stays 0.7.0.
+
+Issue #366 changes src/wayland/session_lock/lock.rs: the lock surface's
+pre-commit hook returns early once the client destroyed the
+ext_session_lock_surface_v1 role object. After unlock_and_destroy, GTK
+destroys the role object and then unmaps the wl_surface (attaches NULL); the
+protocol's NULL-buffer and dimension errors apply only while the surface has
+the lock-surface role, and posting them on the dead role object disconnected
+the shell. The GTK lock-screen proof (scripts/tuna-lock-auth-proof) relocks
+after each unlock and covers it. The isolated diff is retained in
+LOCK-SURFACE-UNMAP-PATCH.diff; the pinned version stays 0.7.0.

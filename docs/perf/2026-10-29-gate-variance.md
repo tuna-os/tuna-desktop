@@ -197,3 +197,49 @@ rebuilt every card of every notification group in the calendar's history list,
 even with the calendar closed. With the warm-up and measured rounds, one group
 holds up to 40 cards. The list is now built only while it is mapped, and it
 catches up when the calendar opens.
+
+### The banner churn (#503)
+
+In 40931135786 (EPYC 7763) Tuna's notifications phase used 27.5% compositor
+and 7.3% shell against 15.3% and 0.2% in its own settle; GNOME's gnome-shell
+used 9.3–9.4% against a 5.5–11.3% settle. The extra cost was Tuna's banner
+model, not drawing. The shell stacked up to three banners, and the store made
+room for each arrival by dropping its oldest banner. The first Notify comes
+about 1.2–1.4 s after the last Alt+Tab, so the user counts as away (GNOME's
+`IDLE_TIME`, 1 s) and no banner ever expired: every arrival, 1.25 s apart,
+rebuilt the stack and dropped the whole 521×346 surface in again.
+
+GNOME 51's message tray shows one banner at a time. Its queue holds at most
+three with the one on screen (`MAX_NOTIFICATIONS_IN_QUEUE`), and while it is
+full a new arrival goes to the list only. An away user's banner stays until
+they come back, so GNOME draws no banner in the measured rounds. The store
+now admits banners the same way, and the GTK shell runs GNOME's tray cycle
+(`tray_step` in `crates/shell-gtk/src/notify.rs`): the next banner drops in
+only after the last has gone, its four seconds start once it has dropped in,
+and only an expired banner slides out.
+
+Local replica: release `tuna-compositor` nested on Xvfb with llvmpipe and
+`tuna-shell-gtk`, one warm-up and three measured rounds of ten `Notify` calls
+1.25 s apart, per-process `/proc` CPU over the measured 37.5 s (percent of
+one core; frames and damage from temporary per-frame logging):
+
+| | main | this change |
+|---|---:|---:|
+| Compositor, away user (the lane's case) | 4.8 | 2.1 (idle 2.0) |
+| Shell, away user | 4.4 | 0.4 (idle 0.3) |
+| Banner commits / frames, away user | 253 / 254 | 0 / 0 |
+| Banner damage, away user | 45.8 Mpx | 0 |
+| Compositor, active user (pointer moved before each Notify) | 4.9 | 3.7 |
+| Shell, active user | 4.1 | 1.2 |
+| Banner frames and damage, active user | 338, 59.1 Mpx | 190, 10.9 Mpx |
+
+The active-user damage excludes the nested backend's full-output frames after
+an idle gap (EGL buffer age 0 on Xvfb), which the DRM backend does not have.
+`perf record` of main's shell attributed most of its samples to pixman inside
+`cairo_mask` (the blurred banner shadow under the moving transform) and to
+FreeType re-rasterizing glyphs at every animation scale.
+
+The frame-pacing p99 failures in the same runs are the observer's: every
+frame-pacer stall (173–307 ms) begins within 0.1–0.3 s of a 1 Hz observer
+record reaching the serial console, on both desktops (GNOME's p99 was
+200–213 ms in the same pairs).

@@ -408,6 +408,9 @@ pub struct InputSources {
     names: XkbNames,
     step: Rc<dyn Fn(bool)>,
     popup: Popup,
+    /// Told whenever the current source changes (the on-screen keyboard's
+    /// `current-source-changed`).
+    changed: RefCell<Vec<Rc<dyn Fn()>>>,
 }
 
 fn schema() -> Option<gio::Settings> {
@@ -462,6 +465,7 @@ impl InputSources {
                 delay: Rc::new(RefCell::new(None)),
                 no_mods: Rc::new(RefCell::new(None)),
             },
+            changed: RefCell::new(Vec::new()),
         });
         let keys = gtk::EventControllerKey::new();
         {
@@ -602,6 +606,46 @@ impl InputSources {
         if activation.interactive {
             self.save_mru();
         }
+        let changed: Vec<Rc<dyn Fn()>> = self.changed.borrow().clone();
+        for f in changed {
+            f();
+        }
+    }
+
+    /// The current source's XKB id (`currentSource.xkbId`), the group the
+    /// on-screen keyboard draws; `us` before any source is known.
+    pub fn current_id(&self) -> String {
+        let manager = self.manager.borrow();
+        manager
+            .current
+            .and_then(|index| manager.sources().get(index))
+            .map_or_else(|| "us".to_owned(), |source| source.id.clone())
+    }
+
+    /// Every source with its display name, and the current one's position
+    /// (the on-screen keyboard's `LanguageSelectionPopup`).
+    pub fn menu(&self) -> (Vec<String>, Option<usize>) {
+        let manager = self.manager.borrow();
+        let names = manager
+            .sources()
+            .iter()
+            .map(|source| self.names.lookup(&source.id).0)
+            .collect();
+        (names, manager.current)
+    }
+
+    /// `activateInputSource(is, true)`: the user picked source `index`.
+    pub fn choose(&self, index: usize) {
+        if index >= self.manager.borrow().sources().len() {
+            return;
+        }
+        let activation = self.manager.borrow_mut().activate(index, true);
+        self.apply(activation);
+    }
+
+    /// Call `f` after every change of the current source.
+    pub fn connect_changed(&self, f: Rc<dyn Fn()>) {
+        self.changed.borrow_mut().push(f);
     }
 
     /// `_updateMruSettings`.

@@ -6,7 +6,7 @@ mod protocol_version_tests {
 
     #[test]
     fn shipped_input_minor_accepts_current_and_rejects_future() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 42));
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 44));
         assert!(ProtocolVersion::new(0, 24).is_compatible_with(&CURRENT_VERSION));
         assert!(ProtocolVersion::new(0, 25).is_compatible_with(&CURRENT_VERSION));
         assert!(ProtocolVersion::new(0, 26).is_compatible_with(&CURRENT_VERSION));
@@ -25,6 +25,8 @@ mod protocol_version_tests {
         assert!(ProtocolVersion::new(0, 39).is_compatible_with(&CURRENT_VERSION));
         assert!(ProtocolVersion::new(0, 40).is_compatible_with(&CURRENT_VERSION));
         assert!(ProtocolVersion::new(0, 41).is_compatible_with(&CURRENT_VERSION));
+        assert!(ProtocolVersion::new(0, 42).is_compatible_with(&CURRENT_VERSION));
+        assert!(ProtocolVersion::new(0, 43).is_compatible_with(&CURRENT_VERSION));
         assert!(!ProtocolVersion::new(0, CURRENT_VERSION.minor + 1)
             .is_compatible_with(&CURRENT_VERSION));
     }
@@ -62,7 +64,7 @@ mod protocol_version_tests {
         let major = CURRENT_VERSION.major;
         let minor = CURRENT_VERSION.minor;
         assert!(major > 0 || minor > 0); // At least one should be non-zero
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 42));
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 44));
         assert!(!ProtocolVersion::new(0, CURRENT_VERSION.minor + 1)
             .is_compatible_with(&CURRENT_VERSION));
     }

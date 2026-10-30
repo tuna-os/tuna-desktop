@@ -38,7 +38,9 @@ mod keybindings;
 mod live_apps;
 mod location;
 mod lock;
+mod lock_auth;
 mod lock_curtain;
+mod lock_wiggle;
 mod lockdown;
 mod logic;
 mod magnifier_sync;
@@ -49,6 +51,9 @@ mod network_secrets;
 mod notify;
 mod orca;
 mod osd;
+mod osk;
+mod osk_layout;
+mod osk_model;
 mod overview;
 mod panel_focus;
 mod pointer_a11y;
@@ -131,6 +136,12 @@ fn is_would_block(e: &ControlError) -> bool {
 #[derive(Default)]
 struct Drained {
     results: Vec<(u64, bool)>,
+    /// Lock-screen authentication steps `(request, service, event)`, in order.
+    auth_events: Vec<(
+        u64,
+        tuna_shell_control::AuthService,
+        tuna_shell_control::AuthEvent,
+    )>,
     /// Grabbed accelerator presses and releases `(action, time, mode, released)`.
     accelerators: Vec<(u32, u32, u32, bool)>,
     menus: Vec<tuna_shell_host::control::WindowMenuRequest>,
@@ -143,6 +154,9 @@ struct Drained {
     dwell_click: Option<tuna_shell_control::DwellClick>,
     /// Pointer accessibility timeouts for the pie timer, in order.
     pointer_timeouts: Vec<PointerTimeout>,
+    /// The compositor's on-screen keyboard updates, in order: focus, the
+    /// input-panel request, touch-mode auto-show.
+    osk: Vec<(Option<tuna_shell_control::TextFieldFocus>, bool, bool)>,
 }
 
 /// One pointer accessibility timeout report: kind, duration when it
@@ -219,6 +233,11 @@ fn drain(
             }
             Handled::KeyboardAidToggled { aid, enabled } => out.aid_switches.push((aid, enabled)),
             Handled::DwellClickType(click) => out.dwell_click = Some(click),
+            Handled::OnScreenKeyboard {
+                focus,
+                show,
+                touch_auto,
+            } => out.osk.push((focus, show, touch_auto)),
             Handled::PointerTimeout {
                 kind,
                 duration_ms,
@@ -239,6 +258,11 @@ fn drain(
                 id,
                 matches!(status, tuna_shell_control::CommandStatus::Applied),
             )),
+            Handled::AuthEvent {
+                request,
+                service,
+                event,
+            } => out.auth_events.push((request, service, event)),
             _ => {}
         }
     }
@@ -1644,6 +1668,8 @@ fn build(app: &adw::Application) {
         gio::resources_register_include!("icons.gresource").ok();
         gtk::IconTheme::for_display(&display).add_resource_path("/org/tuna/Shell/icons");
     }
+    // GNOME Shell's on-screen keyboard layouts and emoji list.
+    gio::resources_register_include!("osk-layouts.gresource").ok();
     // GNOME's icon theme key, applied the way gnome-settings-daemon's
     // xsettings plugin applies it to GTK.
     if let (Some(gtk_settings), Some(iface)) =
@@ -1791,19 +1817,66 @@ fn build(app: &adw::Application) {
         })
     });
     // GNOME's lock screen on ext-session-lock (the compositor decides
-    // when, draws the blurred background, and checks the password).
+    // when, draws the blurred background, and runs the authentication
+    // conversations).
     let lock_ui = {
-        let shell = shell.clone();
         let interface = settings(INTERFACE_SCHEMA);
+        // GNOME's login-screen schema may be absent: fingerprint stays on,
+        // as its default.
+        let login_screen = settings("org.gnome.login-screen").filter(|s| {
+            s.settings_schema()
+                .is_some_and(|schema| schema.has_key("enable-fingerprint-authentication"))
+        });
+        let port = lock::AuthPort {
+            unlock: {
+                let shell = shell.clone();
+                Rc::new(move |password| {
+                    shell
+                        .borrow_mut()
+                        .control
+                        .as_mut()
+                        .and_then(|c| c.unlock(password).ok())
+                })
+            },
+            begin: {
+                let shell = shell.clone();
+                Rc::new(move |service| {
+                    shell
+                        .borrow_mut()
+                        .control
+                        .as_mut()
+                        .and_then(|c| c.begin_verification(service).ok())
+                })
+            },
+            answer: {
+                let shell = shell.clone();
+                Rc::new(move |service, sequence, answer| {
+                    shell
+                        .borrow_mut()
+                        .control
+                        .as_mut()
+                        .and_then(|c| c.answer_query(service, sequence, answer).ok())
+                })
+            },
+            cancel: {
+                let shell = shell.clone();
+                Rc::new(move || {
+                    shell
+                        .borrow_mut()
+                        .control
+                        .as_mut()
+                        .and_then(|c| c.cancel_verification().ok())
+                })
+            },
+            fingerprint_enabled: Rc::new(move || {
+                login_screen
+                    .as_ref()
+                    .is_none_or(|s| s.boolean("enable-fingerprint-authentication"))
+            }),
+        };
         lock::LockUi::new(
             app.upcast_ref(),
-            Rc::new(move |password| {
-                shell
-                    .borrow_mut()
-                    .control
-                    .as_mut()
-                    .and_then(|c| c.unlock(password).ok())
-            }),
+            port,
             Box::new(move || {
                 interface
                     .as_ref()
@@ -2357,8 +2430,8 @@ fn build(app: &adw::Application) {
         wellbeing::start(
             app.upcast_ref(),
             wellbeing::ShellHooks {
-                post_notice: Rc::new(move |title: String, body: String| {
-                    notices.post("Wellbeing", "alarm-symbolic", &title, &body);
+                post_notice: Rc::new(move |title: String, body: String, replaces: Option<u64>| {
+                    notices.post_replacing("Wellbeing", "alarm-symbolic", &title, &body, replaces)
                 }),
                 post_action_notice: Rc::new(
                     move |title: String, body: String, actions: Vec<(String, String)>| {
@@ -2463,6 +2536,22 @@ fn build(app: &adw::Application) {
             }),
         )
     };
+    // GNOME's on-screen keyboard (#349): typed through the compositor,
+    // following its input-method focus and the current input source.
+    let osk = {
+        let shell = shell.clone();
+        osk::Osk::new(
+            input_sources.clone(),
+            Rc::new(move |input| {
+                if let Some(control) = shell.borrow_mut().control.as_mut() {
+                    if let Err(e) = control.osk_input(input) {
+                        eprintln!("tuna-shell-gtk: on-screen keyboard input: {e}");
+                    }
+                }
+            }),
+        )
+    };
+    lock_ui.set_osk(osk.clone());
 
     // GNOME Shell's own keybindings (org.gnome.shell.keybindings).
     {
@@ -3402,6 +3491,7 @@ fn build(app: &adw::Application) {
             Rc::new(move |drained: Drained| {
                 let Drained {
                     results,
+                    auth_events,
                     accelerators,
                     menus,
                     consent,
@@ -3410,6 +3500,7 @@ fn build(app: &adw::Application) {
                     aid_switches,
                     dwell_click,
                     pointer_timeouts,
+                    osk: osk_updates,
                 } = drained;
                 let mut shell = shell.borrow_mut();
                 let locked = shell.control.as_ref().is_some_and(|c| c.locked());
@@ -3463,8 +3554,14 @@ fn build(app: &adw::Application) {
                 lock_ui.sync_connection_generation(auth_generation);
                 if let Some(locked) = authoritative_lock {
                     lock_ui.sync(locked);
+                    lock_ui.resume_verification();
                 }
                 screensaver.sync(locked);
+                // The session keyboard never shows over the lock screen.
+                osk.set_locked(locked);
+                for (focus, show, touch_auto) in osk_updates {
+                    osk.update(focus, show, touch_auto);
+                }
                 if locked {
                     shortcut_consent.dismiss();
                 } else if let Some(request) = consent {
@@ -3499,6 +3596,11 @@ fn build(app: &adw::Application) {
                 }
                 if locked {
                     kbd_a11y_dialog.dismiss();
+                }
+                // Conversation steps first: a step and the result ending its
+                // conversation can arrive in one drain, in that order.
+                for (request, service, event) in auth_events {
+                    lock_ui.auth_event(request, service, &event);
                 }
                 for (id, applied) in results {
                     // Receipt of Applied precedes the runtime manager replacement.
