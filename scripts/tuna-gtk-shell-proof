@@ -10218,8 +10218,9 @@ end_monitor() {
 END_MANAGER=$(bus_owner org.gnome.SessionManager)
 END_SHELL=$(bus_owner org.gnome.Shell)
 MANAGER_PID=$(bus_pid "$END_MANAGER")
-[ -n "$MANAGER_PID" ] && [ "$(cat "/proc/$MANAGER_PID/comm" 2>/dev/null)" = tuna-compositor ] ||
+if [ -z "$MANAGER_PID" ] || [ "$(cat "/proc/$MANAGER_PID/comm" 2>/dev/null)" != tuna-compositor ]; then
     fail G-END-SESSION-RESTART "org.gnome.SessionManager is not the compositor's (pid '${MANAGER_PID}')"
+fi
 [ "$MANAGER_PID" != "$(bus_pid "$END_SHELL")" ] ||
     fail G-END-SESSION-RESTART "the shell owns org.gnome.SessionManager"
 # An installed application holds a logout inhibitor (listed), a service a
