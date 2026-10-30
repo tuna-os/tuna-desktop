@@ -138,6 +138,20 @@ pub fn banner_leave(t: f64, height: f64) -> Frame {
     }
 }
 
+/// The banner shown again after an update (`_updateShowingNotification`
+/// on the notification already up): from wherever it stands, it fades
+/// back to full (ease-out quad) and returns to its place, jumping to 90%
+/// and growing back (ease-out back).
+pub fn banner_reshow(from: Frame, t: f64) -> Frame {
+    let back = ease_out_back(t);
+    Frame {
+        opacity: lerp(from.opacity, 1.0, ease_out_quad(t)),
+        dy: lerp(from.dy, 0.0, back),
+        scale: lerp(BANNER_SCALE, 1.0, back),
+        extent: 1.0,
+    }
+}
+
 /// A list item zooming in (`_addMessage`) or out (`_removeMessage`):
 /// GNOME scales the item, its layout share with it.
 pub fn message(t: f64, adding: bool) -> Frame {
@@ -353,6 +367,17 @@ impl MotionBin {
         let bin: Self = glib::Object::new();
         child.set_parent(&bin);
         bin
+    }
+
+    /// The frame the bin shows now.
+    pub fn frame(&self) -> Frame {
+        let imp = self.imp();
+        Frame {
+            opacity: self.opacity(),
+            dy: imp.dy.get(),
+            scale: imp.scale.get(),
+            extent: imp.extent.get(),
+        }
     }
 
     pub fn set_frame(&self, frame: Frame) {
@@ -732,6 +757,22 @@ mod tests {
             let t = f64::from(i) / 20.0;
             assert!((0.0..=1.0).contains(&banner_leave(t, 80.0).opacity));
         }
+    }
+
+    #[test]
+    fn an_updated_banner_pops_again_from_where_it_stands() {
+        // On screen: it stays put and opaque, jumps to 90% and grows back.
+        let start = banner_reshow(Frame::REST, 0.0);
+        assert_eq!((start.opacity, start.dy), (1.0, 0.0));
+        assert!(close(start.scale, 0.9));
+        assert!(banner_reshow(Frame::REST, 0.7).scale > 1.0);
+        assert_eq!(banner_reshow(Frame::REST, 1.0), Frame::REST);
+        // Caught sliding out: it comes back from there.
+        let leaving = banner_leave(0.5, 80.0);
+        let back = banner_reshow(leaving, 0.0);
+        assert!(close(back.opacity, leaving.opacity) && close(back.dy, leaving.dy));
+        let end = banner_reshow(leaving, 1.0);
+        assert!(close(end.opacity, 1.0) && close(end.dy, 0.0) && close(end.scale, 1.0));
     }
 
     #[test]

@@ -367,6 +367,9 @@ pub struct NotificationCenter {
     policy: PolicySlot,
     /// Sounds due to play, oldest first (the shell drains them).
     sounds: Vec<Sound>,
+    /// In-place replacements so far: a view that keys its drawn list on
+    /// ids redraws when this moves.
+    replacements: u64,
 }
 
 impl NotificationCenter {
@@ -566,6 +569,12 @@ impl NotificationCenter {
         self.banners.len()
     }
 
+    /// How many notifications were updated in place so far (see
+    /// [`NotificationCenter::notify`]): their ids stay, their text moves.
+    pub fn replacements(&self) -> u64 {
+        self.replacements
+    }
+
     /// File a notification (freedesktop `Notify` shape). Returns the
     /// store id. With `replaces_id` naming a live entry, that entry is
     /// updated in place and re-queued instead of allocating.
@@ -606,6 +615,7 @@ impl NotificationCenter {
                 entry.expanded = false;
                 entry.acknowledged = false;
                 entry.consumed.clear();
+                self.replacements += 1;
                 return replaces;
             }
         }
@@ -1173,9 +1183,12 @@ mod tests {
         assert_eq!(c.history().len(), 1);
         assert_eq!(c.history()[0].title, "new");
         assert_eq!(c.banners().len(), 1);
+        // Same id, new text: views keyed on ids learn of it here.
+        assert_eq!(c.replacements(), 1);
         // Unknown replace ids allocate fresh.
         let fresh = c.notify("app", "t", "b", vec![], Urgency::Normal, Some(999));
         assert_ne!(fresh, 999);
+        assert_eq!(c.replacements(), 1);
     }
 
     #[test]
