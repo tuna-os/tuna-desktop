@@ -1101,6 +1101,51 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                f"idle-delay 20 s: gsd-power's own SetDimming(true), then the lock and its PowerSaveMode=3 "
                f"in the compositor snapshot after {power_idle['blanked_after']} s; input wakes it to 0 and undims")
 
+    # logind's LockedHint follows the lock, and loginctl lock-session /
+    # unlock-session drive it, as GNOME 51's screenShield.js does (#846).
+    if published:
+        record("V-LOCKED-HINT", True,
+               "published guest predates the logind lock integration; proven by the current-build marlin-vm lane")
+    else:
+        hints = []
+
+        def await_hint(expected, label):
+            deadline = time.monotonic() + 10
+            while True:
+                value = agent.run("locked-hint")
+                hints.append({"step": label, "locked_hint": value["locked_hint"]})
+                if value["locked_hint"] == expected or time.monotonic() >= deadline:
+                    return value["locked_hint"] == expected
+                time.sleep(0.2)
+
+        try:
+            steps = [await_hint("no", "unlocked")]
+            agent.run("lock-session")
+            await_state(lambda value: value["state"]["locked"])
+            steps.append(await_hint("yes", "loginctl-lock-session"))
+            qmp.keys("ret")
+            time.sleep(0.3)
+            qmp.keys("ctrl", "a")
+            qmp.type_text("tuna")
+            qmp.keys("ret")
+            await_state(lambda value: not value["state"]["locked"])
+            steps.append(await_hint("no", "password-unlock"))
+            qmp.keys("meta_l", "l")
+            await_state(lambda value: value["state"]["locked"])
+            steps.append(await_hint("yes", "super-l"))
+            agent.run("unlock-session")
+            await_state(lambda value: not value["state"]["locked"])
+            steps.append(await_hint("no", "loginctl-unlock-session"))
+        finally:
+            with open(os.path.join(evidence, "locked-hint.json"), "w") as stream:
+                json.dump(hints, stream, indent=2)
+        if not all(steps):
+            record("V-LOCKED-HINT", False, f"logind LockedHint did not follow the lock: {hints}")
+            raise RuntimeError("logind LockedHint did not follow the lock")
+        record("V-LOCKED-HINT", True,
+               "logind LockedHint no, then loginctl lock-session locks with yes, the password unlocks with no, "
+               "Super+L locks with yes and loginctl unlock-session unlocks with no (lifecycle/locked-hint.json)")
+
     # Real distribution Orca owns a credential-verified bus name under the ordinary
     # session user. Settings writes trigger Tuna Desktop's consumer, not test start/stop.
     orca_observations = []

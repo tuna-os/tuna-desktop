@@ -77,6 +77,7 @@ pub mod introspect;
 pub mod layer;
 pub mod lock;
 pub mod lockdown;
+mod logind_session;
 pub mod magnifier;
 pub mod menu_close;
 pub mod minimize;

@@ -125,6 +125,13 @@ impl Slot {
         self.locked = false;
         true
     }
+    /// logind's `Unlock` ends the lock without a verification, as
+    /// `screenShield.js` `deactivate()` does. The epoch still advances, so
+    /// an attempt in flight belongs to the ended lock and can never grant.
+    pub fn release_by_session(&mut self, epoch: &AtomicU64) {
+        advance_epoch(epoch);
+        self.locked = false;
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -147,6 +154,22 @@ mod tests {
         assert!(slot.grant(&epoch, fresh.epoch));
         slot.note_lock(&epoch);
         assert_eq!(epoch.load(Ordering::Acquire), 4);
+    }
+    #[test]
+    fn logind_unlock_ends_the_lock_and_strands_the_attempt_in_flight() {
+        let epoch = AtomicU64::new(0);
+        let mut slot = Slot::default();
+        slot.note_lock(&epoch);
+        let pending = slot.begin(None, 1).unwrap();
+        slot.release_by_session(&epoch);
+        assert_eq!(epoch.load(Ordering::Acquire), 2);
+        assert!(slot.retire(pending));
+        assert!(
+            !slot.grant(&epoch, pending.epoch),
+            "a password checked under the ended lock grants nothing"
+        );
+        slot.note_lock(&epoch);
+        assert_eq!(epoch.load(Ordering::Acquire), 3, "the next lock is new");
     }
     #[test]
     fn stale_mismatched_duplicate_and_concurrent_results_preserve_ownership() {

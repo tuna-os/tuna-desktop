@@ -2404,6 +2404,17 @@ print(json.dumps(result))
              "--object-path", "/org/gnome/ScreenSaver", "--method", "org.gnome.ScreenSaver.Lock",
              user=True)
         result = {"requested": "lock"}
+    elif action == "locked-hint":
+        session = owner_login_session()["Id"]
+        result = {"session": session,
+                  "locked_hint": call("loginctl", "show-session", session, "--property=LockedHint",
+                                      "--value")}
+    elif action in ("lock-session", "unlock-session"):
+        # The session owner's own loginctl, as typed in a terminal: logind
+        # authorizes the owner and emits Lock/Unlock on the session object.
+        session = owner_login_session()["Id"]
+        call("loginctl", action, session, user=True)
+        result = {"session": session, "requested": action}
     elif action == "delay-unlock":
         service = pathlib.Path(LOCK_PAM)
         original = service.read_text()

@@ -1791,6 +1791,11 @@ impl Runtime {
         if !self.is_locked() || !self.unlock_slot.grant(&self.unlock_generation, epoch) {
             return false;
         }
+        self.release_lock();
+        true
+    }
+
+    fn release_lock(&mut self) {
         self.reset_input_aid_ownership();
         if let Some(monitor) = &self.a11y_keyboard {
             monitor.set_locked(false);
@@ -1799,7 +1804,35 @@ impl Runtime {
         self.control.set_locked(false);
         self.state.set_shortcut_inhibition_locked(false);
         self.overlay.hide();
-        true
+    }
+
+    /// logind's `Lock` signal (`loginctl lock-session`): `screenShield.js`
+    /// connects it to `lock()`, which the disable-lock-screen lockdown
+    /// refuses.
+    #[cfg(feature = "drm")]
+    fn lock_for_logind(&mut self) {
+        if self.is_locked() {
+            return;
+        }
+        if self.control.lock_screen_allowed() {
+            self.engage_lock();
+        } else {
+            eprintln!("tuna-compositor: logind lock refused by administrator policy");
+        }
+    }
+
+    /// logind's `Unlock` signal (`loginctl unlock-session`): `screenShield.js`
+    /// connects it to `deactivate()`, which ends the lock without a password.
+    /// logind only emits it for the session's owner or a polkit-authorized
+    /// caller. A password check in flight is denied, never applied.
+    #[cfg(feature = "drm")]
+    fn unlock_for_logind(&mut self) {
+        if !self.is_locked() {
+            return;
+        }
+        self.unlock_slot.release_by_session(&self.unlock_generation);
+        self.release_lock();
+        self.cancel_invalid_unlock();
     }
 
     /// Actual helper retirement is required in addition to the joined wrapper.
@@ -7359,6 +7392,25 @@ fn run_loop(
     if let Some(monitor) = &sleep_monitor {
         monitor.set_wake(&runtime.wake);
     }
+    // The session's logind object, as GNOME's screen shield follows it:
+    // Lock/Unlock signals in, LockedHint out (#846). Nested runs share
+    // the host's session and leave it alone.
+    #[cfg(feature = "drm")]
+    let mut logind_session = if matches!(runtime.backend, Backend::Drm(_)) {
+        match crate::logind_session::Session::start() {
+            Ok(session) => Some(session),
+            Err(error) => {
+                eprintln!("tuna-compositor: logind session unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(feature = "drm")]
+    if let Some(session) = &logind_session {
+        session.set_wake(&runtime.wake);
+    }
     // Graceful shutdown on SIGTERM/SIGINT/SIGHUP: ending the loop drops the
     // runtime, whose supervisor kills the shell child (ADR 0003 kill
     // on exit). Without this a signal would bypass `Drop` and orphan
@@ -7415,7 +7467,17 @@ fn run_loop(
                 }
             }
         }
+        #[cfg(feature = "drm")]
+        match logind_session.as_ref().and_then(|session| session.take()) {
+            Some(crate::logind_session::Request::Lock) => runtime.lock_for_logind(),
+            Some(crate::logind_session::Request::Unlock) => runtime.unlock_for_logind(),
+            None => {}
+        }
         let ticked = dispatched.and_then(|_| runtime.tick());
+        #[cfg(feature = "drm")]
+        if let Some(session) = &mut logind_session {
+            session.report_locked(runtime.is_locked());
+        }
         let probe_delay = probe(&mut AuthOwnerProbe {
             runtime: &mut runtime,
         });
