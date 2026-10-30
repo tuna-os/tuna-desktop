@@ -38,6 +38,7 @@ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::drm::control::{
     self, connector, crtc, Device as ControlDevice, ModeTypeFlags,
 };
+use smithay::reexports::input::event::TabletToolEvent;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size};
@@ -46,6 +47,8 @@ use crate::windows::ManagerInput;
 
 pub mod color;
 pub mod libinput;
+pub mod libwacom;
+pub mod tablet;
 
 /// Scanout surface type: GBM buffers on the DRM device, each queued
 /// frame carrying the presentation feedback of what it drew (#89).
@@ -289,6 +292,8 @@ pub struct DrmBackend {
     /// on-screen keyboard's auto-show (#349).
     touch_mode: crate::osk::TouchMode,
     input_settings: tuna_shell_control::InputSettings,
+    /// Drawing tablets and pads (P-IN-05).
+    tablets: tablet::Tablets,
     /// Bumped by every applied layout or reverted mode (#340).
     layout_generation: u64,
 }
@@ -605,6 +610,7 @@ impl DrmBackend {
             devices: Vec::new(),
             touch_mode: Default::default(),
             input_settings: Default::default(),
+            tablets: Default::default(),
             corner_pressure: Default::default(),
             hot_corner_active: true,
             relative_motion_events: 0,
@@ -1249,6 +1255,11 @@ impl DrmBackend {
                 if let Some(device) = self.devices.last_mut() {
                     libinput::apply(&self.input_settings, device, two_finger);
                 }
+                if let Some(device) = self.devices.last() {
+                    let monitors = self.tablet_monitors();
+                    self.tablets.set_monitors(monitors);
+                    self.tablets.device_added(device);
+                }
                 self.recount_touch_devices();
                 Vec::new()
             }
@@ -1256,6 +1267,7 @@ impl DrmBackend {
                 self.corner_pressure.reset();
                 let had_two_finger = self.two_finger_available();
                 self.devices.retain(|d| *d != device);
+                self.tablets.device_removed(&device);
                 // Mutter reapplies every setting once the last touchpad that
                 // scrolls with two fingers leaves (edge scrolling may return).
                 if had_two_finger && !self.two_finger_available() {
@@ -1286,6 +1298,30 @@ impl DrmBackend {
                     cancelled: event.cancelled(),
                     time: (event.time() / 1000) as u32,
                 }]
+            }
+            // Drawing tablets (P-IN-05): queued for the window manager.
+            // Wrap the event, never `into_tablet_tool_event`: input 0.9
+            // builds the enum from the raw pointer and then drops (and
+            // destroys) the event it came from.
+            InputEvent::TabletToolAxis { event } => {
+                self.tablet_tool(TabletToolEvent::Axis(event));
+                Vec::new()
+            }
+            InputEvent::TabletToolProximity { event } => {
+                self.tablet_tool(TabletToolEvent::Proximity(event));
+                Vec::new()
+            }
+            InputEvent::TabletToolTip { event } => {
+                self.tablet_tool(TabletToolEvent::Tip(event));
+                Vec::new()
+            }
+            InputEvent::TabletToolButton { event } => {
+                self.tablet_tool(TabletToolEvent::Button(event));
+                Vec::new()
+            }
+            InputEvent::Special(event) => {
+                self.tablets.pad_event(event);
+                Vec::new()
             }
             InputEvent::Keyboard { event } => {
                 let code = u32::from(event.key_code()).saturating_sub(XKB_OFFSET);
@@ -1436,6 +1472,66 @@ impl DrmBackend {
     /// [`libinput::device_state`].
     pub fn input_device_states(&self) -> Vec<serde_json::Value> {
         self.devices.iter().map(libinput::device_state).collect()
+    }
+
+    /// The lit logical monitors as the tablet mapper matches them: the
+    /// DisplayConfig identity (vendor, product, the connector as serial),
+    /// physical size, desktop rectangle, transform and mode size.
+    fn tablet_monitors(&self) -> Vec<crate::tablet::Monitor> {
+        self.outputs
+            .iter()
+            .filter(|out| out.is_leader())
+            .map(|out| {
+                let properties = out.output.physical_properties();
+                let (w, h) = out.logical_size();
+                crate::tablet::Monitor {
+                    connector: out.name.clone(),
+                    vendor: properties.make,
+                    product: properties.model,
+                    serial: out.name.clone(),
+                    width_mm: out.size_mm.0,
+                    height_mm: out.size_mm.1,
+                    rect: Rectangle::new(out.loc.into(), (w, h).into()),
+                    transform: out.transform,
+                    mode: (out.size.w, out.size.h),
+                }
+            })
+            .collect()
+    }
+
+    fn tablet_tool(&mut self, event: smithay::reexports::input::event::TabletToolEvent) {
+        let monitors = self.tablet_monitors();
+        self.tablets.set_monitors(monitors);
+        self.tablets.tool_event(event);
+    }
+
+    /// Tablet events the last libinput dispatch produced, in order.
+    pub fn take_tablet_events(&mut self) -> Vec<crate::tablet::TabletEvent> {
+        self.tablets.take_events()
+    }
+
+    /// The hardware tablets and pads (pad OSD requests and labels).
+    pub fn tablets(&mut self) -> &mut tablet::Tablets {
+        &mut self.tablets
+    }
+
+    /// The tablet and stylus settings paths to read.
+    pub(crate) fn tablet_settings_wanted(
+        &self,
+    ) -> std::collections::BTreeSet<(crate::tablet_settings::Kind, String)> {
+        self.tablets.wanted()
+    }
+
+    /// Apply a completed tablet settings read.
+    pub(crate) fn set_tablet_settings(&mut self, snapshot: crate::tablet_settings::Snapshot) {
+        let monitors = self.tablet_monitors();
+        self.tablets.set_monitors(monitors);
+        self.tablets.set_settings(snapshot);
+    }
+
+    /// Tablets and pads for the compositor state file.
+    pub fn tablets_introspect(&self) -> serde_json::Value {
+        self.tablets.introspect()
     }
 
     /// Move the drawn cursor to where the window manager put the pointer.

@@ -1206,6 +1206,26 @@ window.tuna-osd .level.after-label {
   margin-bottom: 4px;
 }
 
+/* GNOME 51's pad OSD (_osd.scss `.pad-osd-window`): 32px of padding on
+   80% black over the whole monitor; the bold title (padOsd.js's
+   "font-side: larger" typo leaves the size alone). */
+window.tuna-pad-osd {
+  background: none;
+  font-family: "Adwaita Sans", "Cantarell", sans-serif;
+  font-size: 11pt;
+}
+window.tuna-pad-osd .pad-osd-window {
+  padding: 32px;
+  background-color: rgba(0, 0, 0, 0.8);
+  color: #ffffff;
+}
+window.tuna-pad-osd .pad-osd-title {
+  font-weight: bold;
+}
+window.tuna-pad-osd .combo-box-label {
+  min-width: 15em;
+}
+
 /* GNOME's grid cells are exactly the 113px tiles: no flowbox padding. */
 .tuna-overview-grid flowboxchild {
   padding: 0;

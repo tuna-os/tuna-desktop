@@ -728,6 +728,9 @@ pub struct Runtime {
     wm_preferences: crate::wm_preferences::Reader,
     /// Last reported reader status, so a change logs once.
     wm_preferences_status: Option<crate::night_light_settings::CacheStatus>,
+    /// GNOME's per-device tablet and stylus settings (owned GIO reader).
+    tablet_settings: crate::tablet_settings::Reader,
+    tablet_settings_status: Option<crate::night_light_settings::CacheStatus>,
     /// Configured transform per connector (Settings/monitors.xml):
     /// the sensor overrides these live but never rewrites them.
     manual_transforms: std::collections::HashMap<String, u32>,
@@ -741,6 +744,10 @@ pub struct Runtime {
     capture_authority: crate::capture_security::Authority,
     cast_grants: std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     remote_held: std::collections::HashMap<u64, RemoteHeld>,
+    /// Keys the tablet action mappers' virtual keyboard holds (evdev).
+    tablet_virtual_keys: std::collections::BTreeSet<u32>,
+    /// The pad OSD labels the shell last received.
+    pad_osd_labels_sent: Option<tuna_shell_control::PadOsdLabels>,
     /// Window list org.gnome.Shell.Introspect serves (window sharing).
     introspect: crate::introspect::Handle,
     /// A three-finger swipe in progress: its travel so far (#60).
@@ -1015,6 +1022,21 @@ impl Runtime {
                             }
                             rt.on_backend_input(input);
                         }
+                        // Tablets (P-IN-05) after the dispatch's other input,
+                        // in their own order; their settings paths follow
+                        // hotplug and tool changes.
+                        let tablet_events = match &mut rt.backend {
+                            Backend::Drm(drm) => {
+                                rt.tablet_settings
+                                    .want(drm.tablet_settings_wanted(), Instant::now());
+                                drm.take_tablet_events()
+                            }
+                            Backend::Winit(_) => Vec::new(),
+                        };
+                        for event in tablet_events {
+                            rt.on_tablet_input(event);
+                        }
+                        rt.pad_osd_tick();
                         // The window manager has the final say (a locked
                         // pointer stays put): the drawn cursor follows it.
                         let pos = rt.manager.pointer_pos();
@@ -1338,6 +1360,10 @@ impl Runtime {
             // Mutter reads them in-process (prefs.c); changes wake the loop.
             wm_preferences: crate::wm_preferences::Reader::new(&wake),
             wm_preferences_status: None,
+            // Tablet and stylus settings, read on their own GIO thread as
+            // Mutter's meta-input-settings.c reads them in-process.
+            tablet_settings: crate::tablet_settings::Reader::new(&wake),
+            tablet_settings_status: None,
             numlock: {
                 let wake = wake.clone();
                 crate::numlock::NumlockMemory::start(crate::numlock::CliStore, move || {
@@ -1412,6 +1438,8 @@ impl Runtime {
             capture_authority,
             cast_grants: Default::default(),
             remote_held: Default::default(),
+            tablet_virtual_keys: Default::default(),
+            pad_osd_labels_sent: None,
             introspect,
             idle_since: Instant::now(),
             unlock_results,
@@ -2724,6 +2752,10 @@ impl Runtime {
         // Canonical view AND column spring state, outside the large scene macro.
         doc["strip_animating"] = serde_json::Value::Bool(self.manager.strip_animating());
         doc["input_devices"] = serde_json::Value::Array(self.input_device_states());
+        #[cfg(feature = "drm")]
+        if let Backend::Drm(drm) = &self.backend {
+            doc["tablets"] = drm.tablets_introspect();
+        }
         let doc = doc.to_string();
         if doc == self.state_last {
             return;
@@ -4451,6 +4483,8 @@ impl Runtime {
             // GNOME focus policy: the bounded settings re-read, the
             // pointer-rest poll and auto-raise.
             self.wm_preferences.next_deadline(now),
+            // Tablet and stylus settings: the bounded re-read.
+            self.tablet_settings.next_deadline(now),
             self.manager.focus_deadline(),
             // Window sessions are written 3 s after a change (Mutter).
             self.state.window_sessions().save_deadline(),
@@ -4523,6 +4557,7 @@ impl Runtime {
         self.manager.reconcile(&mut self.state);
         self.state.window_sessions_mut().save_if_due(Instant::now());
         self.focus_policy_tick();
+        self.tablet_settings_tick();
         self.poll_input_aids();
         #[cfg(feature = "xwayland")]
         // DISPLAY may be a reserved idle listener. An icon helper must not
@@ -4590,6 +4625,13 @@ impl Runtime {
         // GNOME Shell's "Keep these display settings?" answer (#340).
         for keep in outcome.display_change {
             self.complete_display_change(keep);
+        }
+        // The shell's pad OSD (P-IN-05): shown on request, closed by it.
+        for (pad, edition_mode) in outcome.pad_osd_requests {
+            self.request_pad_osd(pad, edition_mode);
+        }
+        for pad in outcome.pad_osd_closed {
+            self.pad_osd_closed(pad);
         }
         if let Some(request) = self.state.take_shortcut_consent_update() {
             self.control
@@ -5017,6 +5059,261 @@ impl Runtime {
         }
     }
 
+    /// GNOME's tablet and stylus settings (P-IN-05): hand a completed
+    /// read to the hardware tablets, which apply what changed.
+    fn tablet_settings_tick(&mut self) {
+        let now = Instant::now();
+        let snapshot = self.tablet_settings.poll(now);
+        let status = self.tablet_settings.status();
+        if self.tablet_settings_status != Some(status) {
+            if status == crate::night_light_settings::CacheStatus::Quarantined {
+                eprintln!(
+                    "tuna-compositor: tablet settings cache {status:?}; retaining the applied settings"
+                );
+            }
+            self.tablet_settings_status = Some(status);
+        }
+        #[cfg(feature = "drm")]
+        if let (Some(snapshot), Backend::Drm(drm)) = (snapshot, &mut self.backend) {
+            drm.set_tablet_settings(snapshot);
+            self.pad_osd_tick();
+        }
+    }
+
+    /// One tablet event (P-IN-05): activity like any input; the action
+    /// mappers' effects are the compositor's own; while locked only the
+    /// lock surface hears tools; a waking blank takes the event.
+    fn on_tablet_input(&mut self, event: crate::tablet::TabletEvent) {
+        use crate::tablet::TabletEvent;
+        let mut waking_blank = false;
+        if let Some(time) = event.time() {
+            waking_blank = self.blank_alpha() > 0.0;
+            self.lock.note_input(u64::from(time));
+            self.idle_since = Instant::now();
+            self.idle_monitor.activity();
+            self.active_at = Instant::now();
+        }
+        let event = match event {
+            TabletEvent::EmulateKeybinding {
+                accel,
+                pressed,
+                time,
+            } => {
+                self.emulate_keybinding(&accel, pressed, time);
+                return;
+            }
+            TabletEvent::SetOutput { path, output } => {
+                self.tablet_settings.set_output(path, output);
+                return;
+            }
+            TabletEvent::ShowOsd {
+                connector,
+                icon,
+                label,
+            } => {
+                self.control
+                    .queue_message(tuna_shell_control::Message::ShowOsd {
+                        connector,
+                        icon: icon.into(),
+                        label,
+                    });
+                return;
+            }
+            TabletEvent::RequestPadOsd { pad, .. } => {
+                self.request_pad_osd(pad, false);
+                return;
+            }
+            TabletEvent::PadOsdInput { pad, event, .. } => {
+                self.control
+                    .queue_message(tuna_shell_control::Message::PadOsdInput { pad, event });
+                return;
+            }
+            TabletEvent::ClosePadOsd { pad } => {
+                self.pad_osd_labels_sent = None;
+                self.control
+                    .queue_message(tuna_shell_control::Message::ClosePadOsd { pad });
+                return;
+            }
+            event => event,
+        };
+        if waking_blank && !matches!(event, TabletEvent::ProximityOut { .. }) {
+            return;
+        }
+        if self.is_locked() {
+            let surface = self
+                .state
+                .primary_output_name()
+                .and_then(|name| self.state.lock_surface_for(&name));
+            let hotplug = event.time().is_none();
+            match surface {
+                Some(surface) => self
+                    .manager
+                    .tablet_input(&mut self.state, event, Some(&surface)),
+                // No lock surface: devices still come and go, nothing else lands.
+                None if hotplug => self.manager.tablet_input(&mut self.state, event, None),
+                None => {}
+            }
+            return;
+        }
+        self.manager.tablet_input(&mut self.state, event, None);
+    }
+
+    /// `meta_tablet_action_mapper_emulate_keybinding`: the accelerator's
+    /// modifiers and key on the tablet's virtual keyboard, through the
+    /// same path as a physical key (shortcuts first, then the focus).
+    fn emulate_keybinding(&mut self, accel: &str, pressed: bool, time: u32) {
+        let Some(steps) = crate::tablet_actions::keybinding_steps(accel, pressed) else {
+            eprintln!("tuna-compositor: tablet: \"{accel}\" is not a valid accelerator");
+            return;
+        };
+        eprintln!(
+            "tuna-compositor: tablet: keybinding {accel} {}",
+            if pressed { "press" } else { "release" }
+        );
+        for step in steps {
+            self.notify_keyval(step.keysym, step.pressed, time);
+        }
+    }
+
+    /// `notify_keyval_in_impl`: the key typing `keysym` in the current
+    /// layout, with Shift or Level 3 held around it for a higher level;
+    /// a duplicate press or unmatched release is ignored.
+    fn notify_keyval(&mut self, keysym: u32, pressed: bool, time: u32) {
+        let Some((keycode, level)) = self.manager.keycode_for_keysym(&mut self.state, keysym)
+        else {
+            eprintln!(
+                "tuna-compositor: tablet: no keycode found for keyval {keysym:x} in current group"
+            );
+            return;
+        };
+        let admitted = if pressed {
+            self.tablet_virtual_keys.insert(keycode)
+        } else {
+            self.tablet_virtual_keys.remove(&keycode)
+        };
+        if !admitted {
+            eprintln!("tuna-compositor: tablet: ignoring repeated virtual key {keycode:#x}");
+            return;
+        }
+        let level_key = crate::tablet_actions::level_modifier(level)
+            .and_then(|modifier| self.manager.keycode_for_keysym(&mut self.state, modifier))
+            .map(|(keycode, _)| keycode);
+        let key = |rt: &mut Self, keycode: u32, pressed: bool| {
+            rt.on_manager_input(ManagerInput::Key {
+                keycode,
+                pressed,
+                time,
+            });
+        };
+        if let (true, Some(modifier)) = (pressed, level_key) {
+            key(self, modifier, true);
+        }
+        key(self, keycode, pressed);
+        if let (false, Some(modifier)) = (pressed, level_key) {
+            key(self, modifier, false);
+        }
+    }
+
+    /// `meta_display_request_pad_osd`: hand the shell the pad's OSD. Like
+    /// Mutter, nothing happens while one is shown or without a layout.
+    fn request_pad_osd(&mut self, pad: u32, edition_mode: bool) {
+        #[cfg(feature = "drm")]
+        {
+            if !self.control.pad_osd_capable() {
+                return;
+            }
+            let Backend::Drm(drm) = &mut self.backend else {
+                return;
+            };
+            let Some((desc, mut osd)) = drm.tablets().pad_osd(pad, edition_mode) else {
+                return;
+            };
+            drm.tablets().set_pad_osd_shown(Some(pad));
+            self.fill_pad_feedback(&desc, &mut osd.labels);
+            self.pad_osd_labels_sent = Some(osd.labels.clone());
+            eprintln!(
+                "tuna-compositor: tablet: pad OSD for {} ({}) edition={edition_mode}",
+                osd.name, osd.layout_path
+            );
+            self.control
+                .queue_message(tuna_shell_control::Message::ShowPadOsd(Box::new(osd)));
+        }
+        #[cfg(not(feature = "drm"))]
+        let _ = (pad, edition_mode);
+    }
+
+    /// The shell closed the pad OSD: pad events go back to clients.
+    fn pad_osd_closed(&mut self, pad: u32) {
+        #[cfg(feature = "drm")]
+        if let Backend::Drm(drm) = &mut self.backend {
+            if drm.tablets().pad_osd_shown() == Some(pad) {
+                drm.tablets().set_pad_osd_shown(None);
+                self.pad_osd_labels_sent = None;
+                eprintln!("tuna-compositor: tablet: pad OSD closed");
+            }
+        }
+        #[cfg(not(feature = "drm"))]
+        let _ = pad;
+    }
+
+    /// Labels no action gives come from the focused client's
+    /// `set_feedback` (`meta_display_get_pad_button_label`'s second half).
+    fn fill_pad_feedback(
+        &self,
+        desc: &smithay::wayland::tablet_manager::TabletPadDescriptor,
+        labels: &mut tuna_shell_control::PadOsdLabels,
+    ) {
+        use smithay::wayland::tablet_manager::TabletSeatTrait;
+        let Some(handle) = self.state.seat.tablet_seat().get_pad(desc) else {
+            return;
+        };
+        for (button, slot) in labels.buttons.iter_mut().enumerate() {
+            if slot.label.is_none() {
+                slot.label = handle.button_label(button as u32);
+            }
+        }
+        for (ring, pair) in labels.rings.iter_mut().enumerate() {
+            for label in pair.iter_mut().filter(|l| l.is_none()) {
+                *label = handle.ring_label(ring as u32);
+            }
+        }
+        for (strip, pair) in labels.strips.iter_mut().enumerate() {
+            for label in pair.iter_mut().filter(|l| l.is_none()) {
+                *label = handle.strip_label(strip as u32);
+            }
+        }
+    }
+
+    /// After each tablet dispatch and settings read: the shell's pad
+    /// targets, and the shown OSD's labels when a mode or setting changed
+    /// them. A shell that went away takes its OSD with it.
+    fn pad_osd_tick(&mut self) {
+        #[cfg(feature = "drm")]
+        {
+            let Backend::Drm(drm) = &mut self.backend else {
+                return;
+            };
+            self.control.set_pad_targets(drm.tablets().pad_targets());
+            let Some(pad) = drm.tablets().pad_osd_shown() else {
+                return;
+            };
+            if !self.control.pad_osd_capable() {
+                drm.tablets().set_pad_osd_shown(None);
+                self.pad_osd_labels_sent = None;
+                return;
+            }
+            let Some((desc, mut labels)) = drm.tablets().pad_osd_labels(pad) else {
+                return;
+            };
+            self.fill_pad_feedback(&desc, &mut labels);
+            if self.pad_osd_labels_sent.as_ref() != Some(&labels) {
+                self.pad_osd_labels_sent = Some(labels.clone());
+                self.control
+                    .queue_message(tuna_shell_control::Message::PadOsdLabels { pad, labels });
+            }
+        }
+    }
+
     /// GNOME's focus policy (P-WM-09): install a completed settings read,
     /// then repick the pointer window (a crossing without motion) and run
     /// the pointer-rest and auto-raise timers. Native reads stay on the
@@ -5212,7 +5509,26 @@ impl Runtime {
         // The pointer is the compositor's to draw (#342): hidden while
         // locked or blanked, as the software pointer always was.
         let cursor_shown = !locked && blank_alpha < 1.0;
-        let cursor_what = if cursor_shown {
+        // A tablet tool in proximity draws its own cursor where it is, and
+        // the pointer's is hidden meanwhile (Mutter's tool sprite).
+        let tablet_cursor = self
+            .state
+            .tablet_cursor
+            .as_ref()
+            .filter(|_| cursor_shown)
+            .map(|(tool, pos)| {
+                let image = self
+                    .state
+                    .tablet_cursor_images
+                    .get(tool)
+                    .cloned()
+                    .unwrap_or_else(smithay::input::pointer::CursorImageStatus::default_named);
+                (crate::cursor::Pointer::resolve(&image, None, true), *pos)
+            });
+        let cursor_pos_override = tablet_cursor.as_ref().map(|(_, pos)| *pos);
+        let cursor_what = if let Some((what, _)) = tablet_cursor {
+            what
+        } else if cursor_shown {
             crate::cursor::Pointer::resolve(
                 &self.state.cursor_image,
                 self.manager.grab_cursor(),
@@ -5323,7 +5639,7 @@ impl Runtime {
                     let cursor = self.cursor.elements(
                         renderer,
                         &cursor_what,
-                        self.manager.pointer_pos(),
+                        cursor_pos_override.unwrap_or_else(|| self.manager.pointer_pos()),
                         Rectangle::from_size(size.to_f64().to_logical(view.scale).to_i32_round()),
                         view.scale,
                         cursor_now,
@@ -5677,7 +5993,7 @@ impl Runtime {
                     let cursor = self.cursor.elements(
                         renderer,
                         &cursor_what,
-                        pointer,
+                        cursor_pos_override.unwrap_or(pointer),
                         Rectangle::new(out.loc.into(), out.logical_size().into()),
                         out.scale,
                         cursor_now,

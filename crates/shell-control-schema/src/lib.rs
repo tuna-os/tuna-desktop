@@ -32,8 +32,8 @@ pub use layer_namespaces::{
     BANNER_NAMESPACE, DISPLAY_CHANGE_NAMESPACE, DOCK_NAMESPACE, END_SESSION_NAMESPACE,
     FOLDER_DIALOG_NAMESPACE, GTK_BANNERS_NAMESPACE, GTK_PANEL_NAMESPACE, IBUS_CANDIDATES_NAMESPACE,
     KBD_A11Y_NAMESPACE, NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE, OSK_NAMESPACE, OVERVIEW_NAMESPACE,
-    PANEL_NAMESPACE, POINTER_A11Y_NAMESPACE, POLKIT_NAMESPACE, PREVIEW_CHROME_NAMESPACE,
-    SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE,
+    PAD_OSD_NAMESPACE, PANEL_NAMESPACE, POINTER_A11Y_NAMESPACE, POLKIT_NAMESPACE,
+    PREVIEW_CHROME_NAMESPACE, SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE,
     SWITCHER_THUMBNAILS_NAMESPACE, WINDOW_MENU_NAMESPACE, WORKSPACE_POPUP_NAMESPACE,
 };
 
@@ -194,9 +194,13 @@ impl ProtocolVersion {
     /// UserVerifier shape): shell-to-compositor `BeginVerification`,
     /// `AnswerQuery` and `CancelVerification`, and compositor-to-shell
     /// `AuthEvent`. Positional postcard peers must ship together.
+    /// `0.45` appends drawing-tablet shell UI (P-IN-05): compositor-to-shell
+    /// `ShowOsd`, `ShowPadOsd`, `PadOsdLabels`, `PadOsdInput`, `ClosePadOsd`
+    /// and shell-to-compositor `RequestPadOsd`, `PadOsdClosed`.
+    /// Positional postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 44,
+        minor: 45,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -471,6 +475,17 @@ pub enum CommandKind {
     /// Since 0.44: stop every conversation this connection started (GDM's
     /// `Cancel`); each pending `BeginVerification` is then `Denied`.
     CancelVerification,
+    /// Since 0.45: show the pad OSD (`meta_display_request_pad_osd`), from
+    /// `org.gnome.Shell.Wacom.PadOsd.Show` or the OSD's pad chooser. Denied
+    /// when no such pad exists, it has no libwacom layout, or an OSD is
+    /// already shown.
+    RequestPadOsd {
+        target: PadOsdTarget,
+        edition_mode: bool,
+    },
+    /// Since 0.45: the shown pad OSD closed; the compositor stops routing
+    /// pad events to the shell.
+    PadOsdClosed { pad: u32 },
 }
 
 /// One on-screen keyboard action (gnome-shell 51 `KeyboardController`).
@@ -541,6 +556,81 @@ pub enum AuthEvent {
     /// This service cannot run for this user (GDM `ServiceUnavailable`):
     /// no reader, no enrolled print, or no conversation backend.
     Unavailable,
+}
+
+/// Most buttons, rings, strips or grouped pads one pad OSD message carries.
+pub const MAX_PAD_FEATURES: usize = 64;
+
+/// Which pad a [`CommandKind::RequestPadOsd`] names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PadOsdTarget {
+    /// The pad's evdev node (`/dev/input/eventN`), as GNOME Settings passes it.
+    DeviceNode(String),
+    /// A compositor pad id from [`PadOsd::group_pads`].
+    Pad(u32),
+}
+
+/// One pad in a pad OSD's device group (gnome-shell's PadChooser).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadOsdPad {
+    pub pad: u32,
+    pub name: String,
+}
+
+/// One pad button as the OSD shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadOsdButton {
+    /// `meta_display_get_pad_button_label`; `None` shows GNOME's "None".
+    pub label: Option<String>,
+    /// The mode group this button switches, if it is a mode-switch button
+    /// (not editable; its release refreshes the labels).
+    pub mode_switch_group: Option<u32>,
+}
+
+/// Every label of one pad (`meta_display_get_pad_feature_label` for
+/// rings and strips, in the current mode).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PadOsdLabels {
+    /// Indexed by button number.
+    pub buttons: Vec<PadOsdButton>,
+    /// Indexed by ring: `[cw, ccw]`.
+    pub rings: Vec<[Option<String>; 2]>,
+    /// Indexed by strip: `[up, down]`.
+    pub strips: Vec<[Option<String>; 2]>,
+    /// Current mode of each ring (index = ring), for edition settings paths.
+    pub ring_modes: Vec<u32>,
+    /// Current mode of each strip (index = strip).
+    pub strip_modes: Vec<u32>,
+}
+
+/// gnome-shell's `show-pad-osd` arguments (`windowManager.js` `_showPadOsd`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadOsd {
+    /// Compositor pad id, echoed in [`CommandKind::PadOsdClosed`].
+    pub pad: u32,
+    /// `clutter_input_device_get_device_name`: the OSD title.
+    pub name: String,
+    /// The libwacom layout SVG (`libwacom_get_layout_filename`).
+    pub layout_path: String,
+    /// The pad's `org.gnome.desktop.peripherals.tablet` path; edition
+    /// writes `org.gnome.desktop.peripherals.tablet.pad-button` below it
+    /// (`buttonA/`, `ringA-ccw-mode-0/`, `stripA-up-mode-0/`).
+    pub settings_path: String,
+    pub left_handed: bool,
+    pub edition_mode: bool,
+    /// The connector of the tablet's monitor, else the current one.
+    pub connector: Option<String>,
+    /// Pads in this pad's device group, itself included.
+    pub group_pads: Vec<PadOsdPad>,
+    pub labels: PadOsdLabels,
+}
+
+/// A pad event the shown pad OSD captures (`vfunc_captured_event`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PadOsdEvent {
+    Button { button: u32, pressed: bool },
+    Ring { ring: u32, mode: u32 },
+    Strip { strip: u32, mode: u32 },
 }
 
 /// A running window's dash icon target; empty replacement selects monitor fallback.
@@ -962,6 +1052,24 @@ pub enum Message {
         service: AuthService,
         event: AuthEvent,
     },
+    /// Since 0.45: `meta_display_show_osd`, an icon and label OSD on a
+    /// monitor (the tablet mapping notification and pad mode switches).
+    /// `connector` `None` is the current monitor. Sent only to peers
+    /// advertising minor >=45.
+    ShowOsd {
+        connector: Option<String>,
+        icon: String,
+        label: String,
+    },
+    /// Since 0.45: show gnome-shell's pad OSD (`show-pad-osd`).
+    ShowPadOsd(Box<PadOsd>),
+    /// Since 0.45: the shown pad's labels changed (mode switch, settings).
+    PadOsdLabels { pad: u32, labels: PadOsdLabels },
+    /// Since 0.45: a pad event while the OSD is shown, from `pad` (the
+    /// shown pad or another pad of its group).
+    PadOsdInput { pad: u32, event: PadOsdEvent },
+    /// Since 0.45: the shown pad was unplugged; close its OSD.
+    ClosePadOsd { pad: u32 },
 }
 
 /// The click a hover (dwell) makes: GNOME's dwell click types.
@@ -1908,6 +2016,43 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Message, DecodeError> {
 
 /// Reject messages carrying titles over [`MAX_TITLE_LEN`] bytes.
 fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
+    fn check_len(len: usize) -> Result<(), DecodeError> {
+        if len > MAX_PAD_FEATURES {
+            return Err(DecodeError::CollectionTooLong {
+                len,
+                max: MAX_PAD_FEATURES,
+            });
+        }
+        Ok(())
+    }
+    fn check_pad_labels(labels: &PadOsdLabels) -> Result<(), DecodeError> {
+        for len in [
+            labels.buttons.len(),
+            labels.rings.len(),
+            labels.strips.len(),
+            labels.ring_modes.len(),
+            labels.strip_modes.len(),
+        ] {
+            check_len(len)?;
+        }
+        let texts = labels
+            .buttons
+            .iter()
+            .filter_map(|b| b.label.as_deref())
+            .chain(
+                labels
+                    .rings
+                    .iter()
+                    .chain(&labels.strips)
+                    .flatten()
+                    .flatten()
+                    .map(String::as_str),
+            );
+        for text in texts {
+            check_title(text)?;
+        }
+        Ok(())
+    }
     fn check_title(title: &str) -> Result<(), DecodeError> {
         if title.len() > MAX_TITLE_LEN {
             return Err(DecodeError::TitleTooLong {
@@ -2029,6 +2174,14 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
                 postcard::Error::DeserializeBadEncoding,
             ));
         }
+        Message::Command {
+            kind:
+                CommandKind::RequestPadOsd {
+                    target: PadOsdTarget::DeviceNode(node),
+                    ..
+                },
+            ..
+        } => check_title(node)?,
         Message::Hello { .. }
         | Message::AcceleratorActivated { .. }
         | Message::AcceleratorDeactivated { .. }
@@ -2069,6 +2222,32 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
                 check_title(value)?;
             }
         }
+        Message::ShowOsd {
+            connector,
+            icon,
+            label,
+        } => {
+            check_title(icon)?;
+            check_title(label)?;
+            if let Some(connector) = connector {
+                check_title(connector)?;
+            }
+        }
+        Message::ShowPadOsd(osd) => {
+            check_title(&osd.name)?;
+            check_title(&osd.layout_path)?;
+            check_title(&osd.settings_path)?;
+            if let Some(connector) = &osd.connector {
+                check_title(connector)?;
+            }
+            check_len(osd.group_pads.len())?;
+            for pad in &osd.group_pads {
+                check_title(&pad.name)?;
+            }
+            check_pad_labels(&osd.labels)?;
+        }
+        Message::PadOsdLabels { labels, .. } => check_pad_labels(labels)?,
+        Message::PadOsdInput { .. } | Message::ClosePadOsd { .. } => {}
     }
     Ok(())
 }
@@ -2287,8 +2466,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_44() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 44));
+    fn current_version_is_0_45() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 45));
     }
 
     #[test]
@@ -3585,5 +3764,51 @@ mod auth_conversation_wire_tests {
             event: AuthEvent::Problem { text: exact },
         };
         assert_eq!(decode_frame(&encode_frame(&fits)).unwrap(), fits);
+    }
+}
+
+#[cfg(test)]
+mod tablet_osd_wire_order_tests {
+    use super::*;
+
+    #[test]
+    fn tablet_osd_variants_follow_the_0_44_auth_conversation() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 256];
+        let cancel =
+            tag(postcard::to_slice(&CommandKind::CancelVerification, &mut buffer).unwrap());
+        let request = CommandKind::RequestPadOsd {
+            target: PadOsdTarget::Pad(1),
+            edition_mode: false,
+        };
+        assert_eq!(
+            tag(postcard::to_slice(&request, &mut buffer).unwrap()),
+            cancel + 1
+        );
+        let closed = CommandKind::PadOsdClosed { pad: 1 };
+        assert_eq!(
+            tag(postcard::to_slice(&closed, &mut buffer).unwrap()),
+            cancel + 2
+        );
+        let auth = Message::AuthEvent {
+            request: 1,
+            service: AuthService::Password,
+            event: AuthEvent::Unavailable,
+        };
+        let auth = tag(postcard::to_slice(&auth, &mut buffer).unwrap());
+        let show = Message::ShowOsd {
+            connector: None,
+            icon: String::new(),
+            label: String::new(),
+        };
+        assert_eq!(
+            tag(postcard::to_slice(&show, &mut buffer).unwrap()),
+            auth + 1
+        );
+        let close = Message::ClosePadOsd { pad: 1 };
+        assert_eq!(
+            tag(postcard::to_slice(&close, &mut buffer).unwrap()),
+            auth + 5
+        );
     }
 }

@@ -41,7 +41,8 @@ use std::time::{Duration, Instant};
 
 use tuna_shell_control::{
     ActivationToken, CommandKind, CommandStatus, DecodeError, ErrorKind, Message, OutputInfo,
-    SwitcherAction, WindowInfo, WorkspaceInfo, CURRENT_VERSION, MAX_FRAME_BYTES,
+    PadOsd, PadOsdEvent, PadOsdLabels, PadOsdTarget, SwitcherAction, WindowInfo, WorkspaceInfo,
+    CURRENT_VERSION, MAX_FRAME_BYTES,
 };
 
 /// Transport and protocol failures, shared with the compositor endpoint.
@@ -100,6 +101,29 @@ pub enum Handled {
         request: u64,
         service: tuna_shell_control::AuthService,
         event: tuna_shell_control::AuthEvent,
+    },
+    /// Show mutter's `meta_display_show_osd` icon-and-label OSD on the
+    /// monitor with this connector (`None` = the current monitor).
+    ShowOsd {
+        connector: Option<String>,
+        icon: String,
+        label: String,
+    },
+    /// Open gnome-shell's pad OSD (`show-pad-osd`), replacing an open one.
+    ShowPadOsd(Box<PadOsd>),
+    /// The shown pad's labels changed (padOsd.js `_updateActionLabels`).
+    PadOsdLabels {
+        pad: u32,
+        labels: PadOsdLabels,
+    },
+    /// A pad event the shown OSD captures (`vfunc_captured_event`).
+    PadOsdInput {
+        pad: u32,
+        event: PadOsdEvent,
+    },
+    /// The shown pad was unplugged: close its OSD.
+    ClosePadOsd {
+        pad: u32,
     },
     /// The keyboard switched Sticky or Slow Keys: save and confirm.
     KeyboardAidToggled {
@@ -730,6 +754,35 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// Ask the compositor to show the pad OSD for `target`
+    /// (`org.gnome.Shell.Wacom.PadOsd.Show` or the pad chooser). The
+    /// result is `Denied` when the pad is unknown or has no layout.
+    pub fn request_pad_osd(
+        &mut self,
+        target: PadOsdTarget,
+        edition_mode: bool,
+    ) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::RequestPadOsd {
+                target,
+                edition_mode,
+            },
+        })?;
+        Ok(id)
+    }
+
+    /// Tell the compositor the pad OSD for `pad` closed, for any reason.
+    pub fn pad_osd_closed(&mut self, pad: u32) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::PadOsdClosed { pad },
+        })?;
+        Ok(id)
+    }
+
     /// Carry out one of GNOME's window-menu actions. Returns the request id.
     pub fn window_action(
         &mut self,
@@ -1127,6 +1180,19 @@ impl ControlClient {
                 service,
                 event,
             }),
+            Message::ShowOsd {
+                connector,
+                icon,
+                label,
+            } => Ok(Handled::ShowOsd {
+                connector,
+                icon,
+                label,
+            }),
+            Message::ShowPadOsd(osd) => Ok(Handled::ShowPadOsd(osd)),
+            Message::PadOsdLabels { pad, labels } => Ok(Handled::PadOsdLabels { pad, labels }),
+            Message::PadOsdInput { pad, event } => Ok(Handled::PadOsdInput { pad, event }),
+            Message::ClosePadOsd { pad } => Ok(Handled::ClosePadOsd { pad }),
             Message::KeyboardAidToggled { aid, enabled } => {
                 Ok(Handled::KeyboardAidToggled { aid, enabled })
             }
@@ -1418,6 +1484,11 @@ fn message_label(msg: &Message) -> &'static str {
         Message::DwellClickType { .. } => "DwellClickType",
         Message::OnScreenKeyboard { .. } => "OnScreenKeyboard",
         Message::PointerTimeout { .. } => "PointerTimeout",
+        Message::ShowOsd { .. } => "ShowOsd",
+        Message::ShowPadOsd(..) => "ShowPadOsd",
+        Message::PadOsdLabels { .. } => "PadOsdLabels",
+        Message::PadOsdInput { .. } => "PadOsdInput",
+        Message::ClosePadOsd { .. } => "ClosePadOsd",
     }
 }
 
@@ -1841,6 +1912,120 @@ mod tests {
         ));
         assert!(!client.model().is_overview_open());
         assert_eq!(client.revision(), Some(7));
+    }
+
+    fn pad_labels() -> PadOsdLabels {
+        PadOsdLabels {
+            buttons: vec![
+                tuna_shell_control::PadOsdButton {
+                    label: Some("Undo".into()),
+                    mode_switch_group: None,
+                },
+                tuna_shell_control::PadOsdButton {
+                    label: None,
+                    mode_switch_group: Some(0),
+                },
+            ],
+            rings: vec![[Some("Zoom in".into()), None]],
+            strips: vec![],
+            ring_modes: vec![1],
+            strip_modes: vec![],
+        }
+    }
+
+    #[test]
+    fn tablet_osd_messages_decode_to_handled() {
+        let (mut client, mut peer) = handshook();
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().expect("snapshot");
+        let osd = PadOsd {
+            pad: 3,
+            name: "Wacom Intuos Pro M Pad".into(),
+            layout_path: "/usr/share/libwacom/layouts/intuos-pro-2-m.svg".into(),
+            settings_path: "/org/gnome/desktop/peripherals/tablets/056a:0357/".into(),
+            left_handed: true,
+            edition_mode: false,
+            connector: Some("DP-1".into()),
+            group_pads: vec![tuna_shell_control::PadOsdPad {
+                pad: 3,
+                name: "Pad".into(),
+            }],
+            labels: pad_labels(),
+        };
+        let cases = [
+            (
+                Message::ShowOsd {
+                    connector: None,
+                    icon: "input-tablet-symbolic".into(),
+                    label: "Mode 1\n\n●○".into(),
+                },
+                Handled::ShowOsd {
+                    connector: None,
+                    icon: "input-tablet-symbolic".into(),
+                    label: "Mode 1\n\n●○".into(),
+                },
+            ),
+            (
+                Message::ShowPadOsd(Box::new(osd.clone())),
+                Handled::ShowPadOsd(Box::new(osd)),
+            ),
+            (
+                Message::PadOsdLabels {
+                    pad: 3,
+                    labels: pad_labels(),
+                },
+                Handled::PadOsdLabels {
+                    pad: 3,
+                    labels: pad_labels(),
+                },
+            ),
+            (
+                Message::PadOsdInput {
+                    pad: 4,
+                    event: PadOsdEvent::Ring { ring: 0, mode: 2 },
+                },
+                Handled::PadOsdInput {
+                    pad: 4,
+                    event: PadOsdEvent::Ring { ring: 0, mode: 2 },
+                },
+            ),
+            (
+                Message::ClosePadOsd { pad: 3 },
+                Handled::ClosePadOsd { pad: 3 },
+            ),
+        ];
+        for (message, expected) in cases {
+            server_write(&mut peer, &message);
+            assert_eq!(client.poll().expect("poll"), expected);
+        }
+        assert_eq!(client.revision(), Some(7), "UI messages keep the revision");
+    }
+
+    #[test]
+    fn pad_osd_commands_carry_fresh_request_ids() {
+        let (mut client, mut peer) = handshook();
+        let first = client
+            .request_pad_osd(PadOsdTarget::DeviceNode("/dev/input/event7".into()), true)
+            .expect("request");
+        assert_eq!(
+            server_read(&mut peer),
+            Message::Command {
+                id: first,
+                kind: CommandKind::RequestPadOsd {
+                    target: PadOsdTarget::DeviceNode("/dev/input/event7".into()),
+                    edition_mode: true,
+                },
+            }
+        );
+        let second = client.pad_osd_closed(3).expect("closed");
+        assert_ne!(first, second);
+        assert_eq!(
+            server_read(&mut peer),
+            Message::Command {
+                id: second,
+                kind: CommandKind::PadOsdClosed { pad: 3 },
+            }
+        );
     }
 
     #[test]

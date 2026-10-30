@@ -277,12 +277,13 @@ impl TabletToolHandle {
 
         wl_tool._type(tool.tool_type.into());
 
-        let high: u32 = (tool.hardware_serial >> 16) as u32;
+        // Both are 64-bit values split into two 32-bit halves.
+        let high: u32 = (tool.hardware_serial >> 32) as u32;
         let low: u32 = tool.hardware_serial as u32;
 
         wl_tool.hardware_serial(high, low);
 
-        let high: u32 = (tool.hardware_id_wacom >> 16) as u32;
+        let high: u32 = (tool.hardware_id_wacom >> 32) as u32;
         let low: u32 = tool.hardware_id_wacom as u32;
         wl_tool.hardware_id_wacom(high, low);
 

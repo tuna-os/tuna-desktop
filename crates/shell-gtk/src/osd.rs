@@ -130,6 +130,22 @@ impl OsdUi {
     /// Show with cancellable ownership. A later accepted request, including a
     /// normal ShowOSD call, replaces this identity and invalidates its token.
     pub fn show_owned(self: &Rc<Self>, request: &OsdRequest) -> Option<OsdToken> {
+        self.show_at(request, None)
+    }
+
+    /// mutter's `meta_display_show_osd`: show on the monitor with
+    /// `connector`, or (`None`, or a connector GDK does not know) where
+    /// the compositor places the OSD, the current monitor.
+    pub fn show_on(self: &Rc<Self>, request: &OsdRequest, connector: Option<&str>) {
+        let monitor = connector.and_then(crate::pad_osd::monitor_for_connector);
+        let _ = self.show_at(request, monitor);
+    }
+
+    fn show_at(
+        self: &Rc<Self>,
+        request: &OsdRequest,
+        monitor: Option<gtk::gdk::Monitor>,
+    ) -> Option<OsdToken> {
         let icon = request
             .icon
             .as_deref()
@@ -158,6 +174,9 @@ impl OsdUi {
         // Shrink to the new content: a layer surface keeps its last size
         // unless asked for its natural one.
         self.window.set_default_size(1, 1);
+        if self.window.is_layer_window() {
+            self.window.set_monitor(monitor.as_ref());
+        }
         // `OsdWindow.show`: only a hidden OSD fades in. A visible one keeps
         // its opacity transition, so a fade-out under way still completes
         // and hides it (`_hide` → `_reset`) while the re-armed timeout
