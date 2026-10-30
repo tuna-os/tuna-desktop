@@ -46,5 +46,5 @@ wp_color_representation_manager_v1	1	capture	gap:#89
 ext_background_effect_manager_v1	1	capture	match
 wl_fixes	1	capture	match
 wp_drm_lease_device_v1	1	capture	cond:native-kms
-wp_linux_drm_syncobj_manager_v1	1	source	gap:#89
+wp_linux_drm_syncobj_manager_v1	1	source	cond:renderer device with timeline syncobj and eventfd
 zwp_xwayland_keyboard_grab_manager_v1	1	source	gap:#89

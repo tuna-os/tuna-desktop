@@ -11,8 +11,12 @@
 #   1 is a floor, not a reading.
 # zwp_linux_dmabuf_v1 is v3 headless; on the native backend Mutter adds
 #   dmabuf feedback (v4+), which this capture cannot show.
+# cond:<when> rows are capability-gated in Mutter and Tuna Desktop alike:
+#   wp_linux_drm_syncobj_manager_v1 needs a renderer whose DRM device has
+#   timeline syncobjs and syncobj eventfd (meta-wayland-linux-drm-syncobj.c);
+#   the CI proof session renders in software and has no such device.
 #
-# interface	GNOME version	source	tuna (match | min:<v> | gap:<ref> | absent:<why>)
+# interface	GNOME version	source	tuna (match | min:<v> | gap:<ref> | cond:<when> | absent:<why>)
 wl_compositor	6	capture	match
 wl_shm	2	capture	match
 wl_output	4	capture	match
@@ -54,5 +58,5 @@ wp_color_representation_manager_v1	1	capture	gap:#89
 ext_background_effect_manager_v1	1	capture	match
 wl_fixes	1	capture	match
 wp_drm_lease_device_v1	1	source	cond:native-kms
-wp_linux_drm_syncobj_manager_v1	1	source	gap:#89
+wp_linux_drm_syncobj_manager_v1	1	source	cond:renderer device with timeline syncobj and eventfd
 zwp_xwayland_keyboard_grab_manager_v1	1	source	gap:#89
