@@ -133,6 +133,7 @@ requirement traceability.
 - [Program roadmap and requirement traceability](docs/roadmap.md)
 - [Parent requirement register](docs/requirements.md)
 - [Verification and test strategy](docs/test-strategy.md)
+- [Performance profiling guide](docs/performance-profiling.md)
 - [Parity ledger](docs/parity-ledger.md)
 - [Research intake rules](docs/research/README.md)
 - [Architecture decisions](docs/adr/README.md)

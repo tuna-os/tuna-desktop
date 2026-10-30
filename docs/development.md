@@ -239,6 +239,12 @@ diagnostic, not a fix.
 - Shell-host logs: Printed to the same log file as the compositor
 - Nested shell interaction: Use `./scripts/tuna-nested shell-pid` to identify the shell process for attaching a debugger
 
+### Performance
+See the [performance profiling guide](performance-profiling.md). It covers
+local `perf` and Sysprof profiling, the compositor's `frame_cost` state,
+RSS/PSS memory measurement, the paired GNOME 51 comparison, and the CI
+regression gates.
+
 ## Reporting issues
 
 If you find a bug or have a feature request:
