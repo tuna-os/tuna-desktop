@@ -949,17 +949,61 @@ impl Runtime {
                     state.set_output_location(&out.name, out.loc);
                     state.note_output_global(&out.name, global);
                 }
+                // One lease device global per DRM device, native backend
+                // only (meta_wayland_drm_lease_manager_new).
+                match drm.lease_device(&dh) {
+                    Ok(device) => {
+                        eprintln!(
+                            "tuna-compositor: drm-lease: wp_drm_lease_device_v1 advertised ({} connector(s) for lease)",
+                            device.connector_count()
+                        );
+                        state.protocols.drm_lease = Some(device);
+                    }
+                    Err(e) => eprintln!("tuna-compositor: drm-lease: no lease device: {e}"),
+                }
                 let handle = event_loop.handle();
                 handle
                     .insert_source(sources.session, |event, _, rt: &mut Runtime| {
                         if matches!(event, smithay::backend::session::Event::PauseSession) {
                             rt.manager.cancel_strip_pointer(&mut rt.state);
                         }
+                        let active =
+                            matches!(event, smithay::backend::session::Event::ActivateSession);
                         if let Backend::Drm(drm) = &mut rt.backend {
                             drm.on_session_event(event);
                         }
+                        if let Some(lease) = rt.state.protocols.drm_lease.as_mut() {
+                            if active {
+                                lease.resume();
+                            } else {
+                                lease.pause();
+                            }
+                        }
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                // Hotplug and lessee changes (Mutter's resources-changed
+                // and lease-changed) reach the lease device through udev.
+                let device_id = drm.drm.device_id();
+                let seat = smithay::backend::session::Session::seat(&drm.session);
+                match smithay::backend::udev::UdevBackend::new(seat) {
+                    Ok(udev) => {
+                        handle
+                            .insert_source(udev, move |event, _, rt: &mut Runtime| {
+                                if let smithay::backend::udev::UdevEvent::Changed {
+                                    device_id: id,
+                                } = event
+                                {
+                                    if id == device_id {
+                                        if let Some(lease) = rt.state.protocols.drm_lease.as_mut() {
+                                            lease.device_changed();
+                                        }
+                                    }
+                                }
+                            })
+                            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                    }
+                    Err(e) => eprintln!("tuna-compositor: drm-lease: no udev monitor: {e}"),
+                }
                 handle
                     .insert_source(sources.drm, |event, metadata, rt: &mut Runtime| {
                         let flip = match &mut rt.backend {
