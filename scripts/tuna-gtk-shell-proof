@@ -3518,8 +3518,12 @@ qs_press "Wired (enp1s0)" wired-submenu || fail G-NM-WIRED "could not expand ada
 "$PY" - "$ARTIFACTS/a11y-wired-submenu.json" <<'WIREDTREE' || fail G-NM-WIRED "connection action not inside expanded adapter"
 import json, sys
 nodes = json.load(open(sys.argv[1]))
-start = next(i for i, n in enumerate(nodes) if n['name'] == 'Wired (enp1s0)' and n['role'] != 'label')
+# PopupSubMenuMenuItem and its submenu share one group: the rows sit in
+# the group of the adapter's item, not in the other adapter's.
+item = next(i for i, n in enumerate(nodes) if n['name'] == 'Wired (enp1s0)' and n['role'] != 'label')
+start = max(i for i in range(item) if nodes[i]['depth'] < nodes[item]['depth'])
 end = next((i for i in range(start + 1, len(nodes)) if nodes[i]['depth'] <= nodes[start]['depth']), len(nodes))
+assert not any(n['name'] == 'Wired (enp2s0)' for n in nodes[start + 1:end])
 assert any(n['showing'] and n['name'] == 'Disconnect Wired' for n in nodes[start + 1:end])
 WIREDTREE
 scrot "$ARTIFACTS/15g-wired-submenus.png" >/dev/null
