@@ -5,8 +5,9 @@
 //! kept until it ends — an implicit grab per sequence. Smithay's default
 //! grab instead sends every later finger to the first finger's surface, so
 //! the seat installs this pair: the default grab opens an implicit grab on
-//! the first down, as Smithay's does (its serial is what `start_drag` and a
-//! touch-driven move look up), but each down keeps its own focus.
+//! the first down, as Smithay's does, but each down keeps its own focus and
+//! every live sequence's serial can start a drag (`start_drag`, through the
+//! vendored Smithay's `TouchGrab::sequence_start_data`).
 
 use smithay::input::touch::{
     DownEvent, GrabStartData, MotionEvent, OrientationEvent, ShapeEvent, TouchGrab,
@@ -34,16 +35,18 @@ impl TouchGrab<State> for SequenceDefaultGrab {
         seq: Serial,
     ) {
         handle.down(data, focus.clone(), event, seq);
+        let start_data = GrabStartData {
+            focus,
+            slot: event.slot,
+            location: event.location,
+        };
         handle.set_grab(
             self,
             data,
             event.serial,
             SequenceGrab {
-                start_data: GrabStartData {
-                    focus,
-                    slot: event.slot,
-                    location: event.location,
-                },
+                sequences: vec![(event.serial, start_data.clone())],
+                start_data,
                 points: 1,
             },
         );
@@ -106,9 +109,13 @@ impl TouchGrab<State> for SequenceDefaultGrab {
 }
 
 /// Fingers down: each keeps the focus it began on; the grab ends with
-/// the last finger or a cancel.
+/// the last finger or a cancel. Every live sequence's down serial stays
+/// a grab serial (`meta_wayland_seat_get_grab_info` looks through all
+/// touch sequences), so any finger can start a drag-and-drop.
 pub struct SequenceGrab {
     start_data: GrabStartData<State>,
+    /// Each finger still down: its down serial and where it began.
+    sequences: Vec<(Serial, GrabStartData<State>)>,
     points: usize,
 }
 
@@ -121,8 +128,16 @@ impl TouchGrab<State> for SequenceGrab {
         event: &DownEvent,
         seq: Serial,
     ) {
-        handle.down(data, focus, event, seq);
+        handle.down(data, focus.clone(), event, seq);
         self.points += 1;
+        self.sequences.push((
+            event.serial,
+            GrabStartData {
+                focus,
+                slot: event.slot,
+                location: event.location,
+            },
+        ));
     }
 
     fn up(
@@ -134,6 +149,7 @@ impl TouchGrab<State> for SequenceGrab {
     ) {
         handle.up(data, event, seq);
         self.points = self.points.saturating_sub(1);
+        self.sequences.retain(|(_, start)| start.slot != event.slot);
         if self.points == 0 {
             handle.unset_grab(self, data);
         }
@@ -181,6 +197,13 @@ impl TouchGrab<State> for SequenceGrab {
 
     fn start_data(&self) -> &GrabStartData<State> {
         &self.start_data
+    }
+
+    fn sequence_start_data(&self, serial: Serial) -> Option<GrabStartData<State>> {
+        self.sequences
+            .iter()
+            .find(|(down, _)| *down == serial)
+            .map(|(_, start)| start.clone())
     }
 
     fn unset(&mut self, _data: &mut State) {}

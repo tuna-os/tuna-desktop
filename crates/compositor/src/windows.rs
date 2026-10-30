@@ -354,6 +354,16 @@ struct GrabRaise {
     distance: f64,
 }
 
+/// One eased window move of the keyboard's slide (`_animateWindow`).
+#[derive(Debug, Clone, Copy)]
+struct OskSlideMove {
+    id: u64,
+    from: i32,
+    to: i32,
+    start: std::time::Duration,
+    duration: std::time::Duration,
+}
+
 pub struct WindowManager {
     /// Active interactive move/resize, if any (#58).
     grab: Option<PointerGrab>,
@@ -370,6 +380,10 @@ pub struct WindowManager {
     touch_cancels: u64,
     /// Where each touch point the manager follows is now, by slot.
     touch_points: HashMap<u32, Point<f64, Logical>>,
+    /// GNOME Shell's keyboard window slide (#349): which window the
+    /// keyboard moved up, and its moves in flight.
+    osk_slide: crate::osk::WindowSlide,
+    osk_slide_moves: Vec<OskSlideMove>,
     /// Window focused before it had a surface to focus (an X11 window
     /// mapped before association): the seat follows once it does.
     focus_awaits_surface: Option<u64>,
@@ -755,6 +769,8 @@ impl WindowManager {
             touch_swallowed: Default::default(),
             touch_cancels: 0,
             touch_points: HashMap::new(),
+            osk_slide: crate::osk::WindowSlide::default(),
+            osk_slide_moves: Vec::new(),
             mode: SessionMode::Gnome,
             strip_offset: 0.0,
             strip_shown: 0.0,
@@ -3061,6 +3077,7 @@ impl WindowManager {
         button: Option<u32>,
     ) {
         self.settle(id);
+        self.let_go_osk_slide(id);
         if self.mode == SessionMode::Scroll {
             if let Some(owner) = self.strip_pointer_owner(state, id, button) {
                 let geometry_start = self.shifted(id, self.windows[&id].geometry);
@@ -3161,6 +3178,7 @@ impl WindowManager {
         button: Option<u32>,
     ) {
         self.settle(id);
+        self.let_go_osk_slide(id);
         if self.mode == SessionMode::Scroll {
             let Some(edges) = self.strip_resize_edges(id, edges) else {
                 return;
@@ -4404,9 +4422,13 @@ impl WindowManager {
             return;
         }
         if let Some(touch) = self.touch.clone() {
+            // The sequence stays with the surface it began on; the surface
+            // under the point is for a touch drag-and-drop, whose target
+            // follows the finger (`meta_wayland_drag_grab` on touch).
+            let under = self.touch_target(state, pos);
             touch.motion(
                 state,
-                None,
+                under,
                 &smithay::input::touch::MotionEvent {
                     slot: Some(slot).into(),
                     location: pos,
@@ -4490,6 +4512,112 @@ impl WindowManager {
             "client_cancels": self.touch_cancels,
             "grab": self.touch_grab.is_some(),
         })
+    }
+
+    /// gnome-shell 51 `Keyboard.setCursorLocation` and `_animateWindow`:
+    /// with the keyboard at `keyboard` and the focused field's cursor at
+    /// `cursor`, slide the field's window up out of the keyboard's way
+    /// or back where it started, easing over `duration`
+    /// (`KEYBOARD_ANIMATION_TIME`, EASE_OUT_QUAD) and ending in a real
+    /// move (`_windowSlideAnimationComplete`). Only a floating window
+    /// moves: Mutter's constraints hold maximized, tiled and fullscreen
+    /// frames in place.
+    pub fn osk_slide(
+        &mut self,
+        keyboard: Option<crate::osk::KeyboardBox>,
+        cursor: Option<crate::osk::FieldCursor>,
+        now: std::time::Duration,
+        duration: std::time::Duration,
+    ) {
+        if let Some(id) = self.osk_slide.window() {
+            if !self.windows.contains_key(&id) {
+                self.let_go_osk_slide(id);
+            }
+        }
+        let windows = &self.windows;
+        let moves = self.osk_slide.update(keyboard, cursor, |id| {
+            windows
+                .get(&id)
+                .filter(|window| window.layout == WindowLayout::Floating)
+                .map(|window| window.geometry.loc.y)
+        });
+        for (id, to) in moves {
+            let Some(window) = self.windows.get(&id) else {
+                continue;
+            };
+            self.osk_slide_moves.retain(|slide| slide.id != id);
+            let from = window.geometry.loc.y;
+            if duration.is_zero() {
+                self.osk_slide_set_y(id, to);
+            } else {
+                self.osk_slide_moves.push(OskSlideMove {
+                    id,
+                    from,
+                    to,
+                    start: now,
+                    duration,
+                });
+            }
+        }
+    }
+
+    /// Advance the keyboard's window slides to `now`.
+    pub fn step_osk_slide(&mut self, now: std::time::Duration) {
+        let moves = std::mem::take(&mut self.osk_slide_moves);
+        for slide in moves {
+            let t = now.saturating_sub(slide.start).as_secs_f64() / slide.duration.as_secs_f64();
+            let eased = crate::transitions::ease_out_quad(t);
+            let y = f64::from(slide.from) + f64::from(slide.to - slide.from) * eased;
+            if t >= 1.0 {
+                self.osk_slide_set_y(slide.id, slide.to);
+            } else {
+                self.osk_slide_set_y(slide.id, y.round() as i32);
+                self.osk_slide_moves.push(slide);
+            }
+        }
+    }
+
+    /// Whether a keyboard window slide is easing.
+    pub fn osk_slide_running(&self) -> bool {
+        !self.osk_slide_moves.is_empty()
+    }
+
+    /// The window the keyboard slid up, for the state file.
+    pub fn osk_slide_window(&self) -> Option<u64> {
+        self.osk_slide.window()
+    }
+
+    /// The focused field's cursor in global coordinates: `rect` is local
+    /// to `surface`, a window's toplevel surface (mutter's input focus
+    /// reports the cursor in stage coordinates).
+    pub fn field_cursor(
+        &self,
+        surface: &WlSurface,
+        rect: (i32, i32, i32, i32),
+    ) -> Option<crate::osk::FieldCursor> {
+        let (id, window) = self
+            .windows
+            .iter()
+            .find(|(_, window)| window.surface.wl_surface().as_deref() == Some(surface))?;
+        let origin = crate::popup::surface_origin(surface, window.geometry.loc);
+        Some(crate::osk::FieldCursor {
+            window: *id,
+            y: origin.y + rect.1,
+            height: rect.3,
+        })
+    }
+
+    fn osk_slide_set_y(&mut self, id: u64, y: i32) {
+        if let Some(window) = self.windows.get_mut(&id) {
+            window.geometry.loc.y = y;
+        }
+    }
+
+    /// `_onFocusWindowMoving`: a window the user grabs is let go where
+    /// it is, and its slide stops.
+    fn let_go_osk_slide(&mut self, id: u64) {
+        self.osk_slide.let_go(id);
+        self.osk_slide_moves.retain(|slide| slide.id != id);
     }
 
     /// Scroll the client under the pointer. Wheel notches arrive in v120

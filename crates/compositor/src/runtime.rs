@@ -2795,6 +2795,16 @@ impl Runtime {
                     |field| serde_json::json!({ "purpose": field.purpose, "hints": field.hints }),
                 )
         };
+        // gnome-shell's keyboard window slide (#349): which window the
+        // keyboard moved up, by id and frame, for the OSK proof.
+        doc["osk_window_slide"] = match self.manager.osk_slide_window() {
+            Some(id) if !self.is_locked() => serde_json::json!({
+                "window": id,
+                "y": self.manager.geometry(id).map(|g| g.loc.y),
+                "easing": self.manager.osk_slide_running(),
+            }),
+            _ => serde_json::Value::Null,
+        };
         // Owned proof diagnostics only: no credentials, prompts or typed input.
         doc["auth_owner"] = if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
             serde_json::json!({ "outer_pending": self.unlock_worker.is_some(),
@@ -4462,6 +4472,7 @@ impl Runtime {
             || self.manager.workspace_slide().running()
             || self.manager.strip_animating()
             || self.manager.size_changes().in_flight()
+            || self.manager.osk_slide_running()
             || self.manager.window_lifecycle().running()
             || self.manager.modal_dim().running()
             || self.cursor.animating(clock)
