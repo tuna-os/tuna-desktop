@@ -1,7 +1,7 @@
 frame: Top Bar
 toggle button: Activities
 push button: Date and Time
-toggle button: Date and Time
+menu: Date and Time
 push button: Clear
 push button: <date>
 push button: Previous month
@@ -50,4 +50,4 @@ push button: #
 push button: #
 push button: Open Calendar
 push button: System
-toggle button: System
+menu: System

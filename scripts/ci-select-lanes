@@ -33,7 +33,7 @@ import sys
 # Selectable ci.yml proof jobs, in workflow order.
 LANES = [
     "fprint-phase-proof", "journey", "app-content", "scroll-proof", "drm-smoke",
-    "grid-cancel-comparison", "gtk-shell",
+    "grid-cancel-comparison", "gtk-shell", "orca-speech",
     "portal-security", "remote-security", "niri-parity", "arch-package",
     "marlin-image", "marlin-vm", "parity-ledger", "docs-shots",
 ]
@@ -46,8 +46,9 @@ CORE = ["fprint-phase-proof", "grid-cancel-comparison", "gtk-shell"]
 
 # Interchangeable end-to-end coverage of the same build, rotated per run.
 ROTATION = [
-    "journey", "app-content", "scroll-proof", "drm-smoke", "portal-security",
-    "remote-security", "niri-parity", "marlin-image", "marlin-vm",
+    "journey", "app-content", "scroll-proof", "drm-smoke", "orca-speech",
+    "portal-security", "remote-security", "niri-parity", "marlin-image",
+    "marlin-vm",
 ]
 
 # Lanes that download other lanes' artifacts.
@@ -57,7 +58,7 @@ NEEDS = {
     "niri-parity": ["arch-package"],
     "marlin-image": ["arch-package"],
     "marlin-vm": ["arch-package"],
-    "parity-ledger": ["journey", "gtk-shell", "drm-smoke", "marlin-vm"],
+    "parity-ledger": ["journey", "gtk-shell", "orca-speech", "drm-smoke", "marlin-vm"],
     "docs-shots": ["journey", "app-content", "scroll-proof"],
 }
 
@@ -97,6 +98,8 @@ OWNED = [
     ("scripts/tuna-app-content", ["app-content"]),
     ("scripts/tuna-scroll-proof", ["scroll-proof"]),
     ("scripts/tuna-drm-smoke", ["drm-smoke"]),
+    ("scripts/tuna-orca-speech-proof", ["orca-speech"]),
+    ("scripts/lib/tuna-orca-speech.py", ["orca-speech"]),
     ("scripts/tuna-frame-pacer-build", ["drm-smoke"]),
     ("scripts/lib/tuna-frame-pacer.c", ["drm-smoke"]),
     ("scripts/tuna-portal-security", ["portal-security"]),

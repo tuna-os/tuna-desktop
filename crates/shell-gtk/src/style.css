@@ -526,8 +526,15 @@ window.tuna-overview-grid {
   font-weight: normal;
 }
 
-.tuna-overview-grid .grid-tile:hover {
+.tuna-overview-grid .grid-tile:hover,
+.tuna-overview-grid .grid-tile:focus-visible {
   background-color: rgba(255, 255, 255, 0.1);
+}
+
+/* .overview-tile:focus: GNOME's 2px focus ring inside the tile. */
+.tuna-overview-grid .grid-tile:focus-visible {
+  box-shadow: inset 0 0 0 2px rgba(121, 160, 208, 0.8);
+  outline: none;
 }
 
 /* A folder (.app-folder): the tile tinted st-mix(#fafafb, #222226, 9%);
@@ -1043,6 +1050,21 @@ window.tuna-overview-chrome {
 
 .tuna-overview-chrome .window-close:hover {
   background-color: rgba(80, 80, 89, 0.98);
+}
+
+/* A keyboard-focused window preview (windowPreview.js key focus): a
+   transparent target over the compositor's preview, ringed. */
+.tuna-overview-chrome button.window-preview-focus {
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  border-radius: 12px;
+  background: none;
+  box-shadow: none;
+  outline: none;
+}
+.tuna-overview-chrome button.window-preview-focus:focus-visible {
+  box-shadow: inset 0 0 0 3px rgba(121, 160, 208, 0.8);
 }
 
 /* Lock screen (GNOME 51 unlockDialog, states 11 and 11b): transparent

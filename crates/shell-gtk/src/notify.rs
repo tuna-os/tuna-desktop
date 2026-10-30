@@ -828,7 +828,9 @@ impl NotifyUi {
         self.dnd_changed.borrow_mut().push(Box::new(f));
     }
 
-    /// GNOME's Super+N gives the current banner keyboard focus.
+    /// GNOME's Super+N gives the current banner keyboard focus: the
+    /// banner itself (messageList.js's focusable message), not its first
+    /// button.
     pub fn focus_active(&self) {
         if !self.banner_window.is_visible() {
             return;
@@ -837,7 +839,9 @@ impl NotifyUi {
             .set_keyboard_mode(KeyboardMode::Exclusive);
         self.banner_window.present();
         self.banner_window.set_focus_visible(true);
-        self.banner_box.child_focus(gtk::DirectionType::TabForward);
+        if let Some(banner) = self.banner_box.first_child() {
+            banner.grab_focus();
+        }
     }
 
     /// A locked session must not keep the banner's exclusive keyboard grab.

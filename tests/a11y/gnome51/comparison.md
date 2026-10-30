@@ -13,9 +13,9 @@ GNOME: 41 visible nodes; 2 named controls. Tuna Desktop: 6 named nodes in the pr
 | toggle button: Activities | frame: Top Bar |
 | menu: System | toggle button: Activities |
 | — | push button: Date and Time |
-| — | toggle button: Date and Time |
+| — | menu: Date and Time |
 | — | push button: System |
-| — | toggle button: System |
+| — | menu: System |
 
 ## overview
 
@@ -26,9 +26,9 @@ GNOME: 136 visible nodes; 9 named controls. Tuna Desktop: 15 named nodes in the 
 | push button: Files | frame: Top Bar |
 | push button: Text Editor | toggle button: Activities |
 | push button: Calculator | push button: Date and Time |
-| push button: tuna-test-beta | toggle button: Date and Time |
+| push button: tuna-test-beta | menu: Date and Time |
 | push button: tuna-test-gamma | push button: System |
-| push button: tuna-test-alpha | toggle button: System |
+| push button: tuna-test-alpha | menu: System |
 | toggle button: Show Apps | frame: Search |
 | toggle button: Activities | entry: Search |
 | menu: System | frame: Dash |
@@ -48,12 +48,12 @@ GNOME: 93 visible nodes; 7 named controls. Tuna Desktop: 29 named nodes in the p
 | toggle button: Activities | frame: Top Bar |
 | menu: System | toggle button: Activities |
 | push button: Take Screenshot | push button: Date and Time |
-| push button: Settings | toggle button: Date and Time |
+| push button: Settings | menu: Date and Time |
 | push button: Lock Screen | push button: System |
-| push button: Power Off Menu | toggle button: System |
+| push button: Power Off Menu | menu: System |
 | push button: Open power profiles menu | push button: Take Screenshot |
 | — | push button: Settings |
-| — | push button: Lock |
+| — | push button: Lock Screen |
 | — | push button: Power Off Menu |
 | — | push button: Mute |
 | — | slider: Volume |
@@ -78,13 +78,13 @@ GNOME: 93 visible nodes; 7 named controls. Tuna Desktop: 29 named nodes in the p
 ## Intended differences
 
 - GNOME has one compositor stage with many `panel` containers. Tuna Desktop exposes the GTK layer windows as named frames: Top Bar, Search, Dash and Window Previews.
-- Activities is a native toggle button and a GTK push button in Tuna Desktop; both open the overview.
-- GNOME’s date control is an unnamed menu with a clock label child. Tuna Desktop names its menu controls Date and Time. GNOME’s System menu maps to Tuna Desktop’s named GTK menu button and its internal toggle.
+- Activities is a toggle button on both sides, pressed while the overview is open (panel.js).
+- GNOME’s date control is an unnamed menu with a clock label child; Tuna Desktop names it Date and Time. Each Tuna Desktop panel menu is a GTK menu button: an outer push button around the focusable control, which takes GNOME’s menu role (panelMenu.js).
 - GNOME’s search field is an unnamed text node. Tuna Desktop exposes a named Search entry. Both scenes retain their search field in the visible tree.
 - Dash app names depend on the installed favorites and window fixtures. Show Apps is a toggle button on both sides. GNOME’s preview buttons are unnamed in the native tree; Tuna Desktop’s hovered-preview golden names the Close action.
-- Lock Screen in GNOME maps to Lock in Tuna Desktop. Open power profiles menu maps to Power Mode Menu. The shared screenshot, settings and power menu actions remain named.
+- Open power profiles menu in GNOME maps to Power Mode Menu in Tuna Desktop. The shared screenshot, settings, lock screen and power menu actions keep GNOME’s names.
 - GNOME’s Power Mode, Dark Style and Do Not Disturb toggles use visible label children instead of a name on the toggle. Tuna Desktop names the toggles directly. The native fixture retains those label children.
 - Tuna Desktop’s network, Bluetooth, volume and brightness controls are present because its live proof supplies those services. The GNOME headless reference has no usable network adapter, audio server or hardware backlight.
 - Tuna Desktop adds a Printers tile and menu for the CUPS queue (#362); GNOME 51 has no quick-settings printers control.
 
-This comparison describes visible accessible structure and labels. The live Tuna Desktop proof checks actions, focus and slider operation; it does not claim a spoken Orca end-to-end test.
+This comparison describes visible accessible structure and labels. The live Tuna Desktop proof checks actions, focus and slider operation; what Orca speaks on these surfaces is checked by scripts/tuna-orca-speech-proof.

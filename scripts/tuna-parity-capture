@@ -444,7 +444,7 @@ sleep 1
 gsettings set org.gnome.desktop.screensaver picture-uri "$(gsettings get org.gnome.desktop.background picture-uri)"
 gsettings get org.gnome.desktop.screensaver picture-uri >"$OUT/lock-background-uri.txt"
 sleep 0.5
-press "Lock"
+press "Lock Screen"
 shot 11-lock-screen 3
 xdotool mousemove 640 650 click 1
 shot 11b-unlock-prompt 2

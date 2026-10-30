@@ -128,6 +128,8 @@ pub struct PropertyMenu {
 impl PropertyMenu {
     pub fn new(locked: Rc<dyn Fn() -> bool>) -> Rc<Self> {
         let button = gtk::MenuButton::new();
+        // keyboard.js's InputSourceIndicator is a PanelMenu.Button.
+        crate::panel_menu_role(&button);
         button.set_label("Input Method");
         button.set_tooltip_text(Some("Input method properties"));
         button.set_visible(false);

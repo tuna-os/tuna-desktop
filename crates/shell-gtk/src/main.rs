@@ -479,6 +479,16 @@ impl shell_dbus::ShellActions for GnomeShellDbus {
     }
 }
 
+/// GNOME's PanelMenu.Button is an ATK MENU named by its label
+/// (panelMenu.js), so Orca says "System menu". The focusable toggle inside
+/// GTK's menu button takes that role; call this before the button is
+/// realized, while the role can still change.
+pub(crate) fn panel_menu_role(button: &gtk::MenuButton) {
+    if let Some(toggle) = button.first_child() {
+        toggle.set_property("accessible-role", gtk::AccessibleRole::Menu);
+    }
+}
+
 fn panel_menu_button(
     child: &impl IsA<gtk::Widget>,
     label: &str,
@@ -491,6 +501,7 @@ fn panel_menu_button(
         .build();
     button.add_css_class("panel-button");
     button.update_property(&[gtk::accessible::Property::Label(label)]);
+    panel_menu_role(&button);
     // GNOME focuses a panel menu's first item only when the keyboard
     // opened it: a click shows no focus ring (keyboard opens set it
     // back, see the keybinding toggle).
@@ -911,7 +922,7 @@ fn quick_settings_popover(
     ))));
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
-    let lock = qs_round("system-lock-screen-symbolic", "Lock");
+    let lock = qs_round("system-lock-screen-symbolic", "Lock Screen");
     let power = qs_round("system-shutdown-symbolic", "Power Off Menu");
     top.append(&screenshot);
     top.append(&settings_btn);
@@ -3550,14 +3561,23 @@ fn build(app: &adw::Application) {
         let last_open = Cell::new(false);
         let chrome = {
             let shell = shell.clone();
-            preview_chrome::PreviewChrome::new(
+            let actions = ShellActions(shell.clone());
+            let chrome = preview_chrome::PreviewChrome::new(
                 app.upcast_ref(),
                 Rc::new(move |id| {
                     if let Some(control) = shell.borrow_mut().control.as_mut() {
                         let _ = control.close_window(id);
                     }
                 }),
-            )
+                // A preview activated by keyboard: its window, as a click
+                // on the compositor's preview picks it.
+                Rc::new(move |id| {
+                    overview::OverviewActions::activate_window(&actions, id);
+                    overview::OverviewActions::close_overview(&actions);
+                }),
+            );
+            overview::OverviewUi::set_previews(&overview_ui, chrome.clone());
+            chrome
         };
         let chrome_apps = apps.clone();
         let shell_rc = shell.clone();

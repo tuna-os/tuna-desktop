@@ -2,7 +2,7 @@
 
 The GTK shell consumes `org.gnome.desktop.a11y always-show-universal-access-status` live. Its accessibility indicator appears when requested or when any menu feature is enabled, matching [GNOME Shell 51's indicator](https://github.com/GNOME/gnome-shell/blob/51.0/js/ui/status/accessibility.js). The ten rows follow the reference order: High Contrast, Zoom, Large Text, Screen Reader, Screen Keyboard, Visual Alerts, Sticky Keys, Slow Keys, Bounce Keys, Mouse Keys. Boolean rows bind their GNOME settings bidirectionally; Large Text uses factor 1.25 when enabled and resets the schema default when disabled. Accessibility Settings launches `gnome-control-center universal-access`.
 
-This implements menu settings and visibility. It does not implement AccessX, or compositor visual alerts. Those remain separately recorded capability gaps; a toggle state alone proves no functional assistive feature. Screen Reader remains subject to the hardware-session consumer and genuine Orca qualification.
+This implements menu settings and visibility. It does not implement AccessX, or compositor visual alerts. Those remain separately recorded capability gaps; a toggle state alone proves no functional assistive feature. Screen Reader (also Super+Alt+S) starts the distribution Orca in a hardware session, or in a nested one started with `--screen-reader`; what Orca says on the shell is gated by `scripts/tuna-orca-speech-proof` (P-A11Y-06).
 
 ## Screen magnifier (#349)
 

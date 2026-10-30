@@ -78,9 +78,11 @@ through its settings key (`org.gnome.shell.keybindings`,
 | Escape, panel menu open | Close the menu; focus stays on its button |
 | Escape, bar focused, no menu | Return focus to the client |
 | Super+S / Super+V | Quick settings / date menu; Tab, arrows and Enter operate them, Escape closes |
-| Super+A | App grid: arrows and PgUp/PgDn move, Enter launches, Escape leaves |
+| Super+A | App grid: Tab or Down from the search entry focuses the first tile, arrows and Tab walk the tiles across pages, PgUp/PgDn turn pages, Enter launches, Escape leaves |
+| Tab / Down, overview entry, no search | Into the window previews (the app grid on Super+A), named by window title; arrows and Tab move between them, Enter activates the window, Up from the top row or Shift+Tab from the first returns to the entry, typing returns to it with the text (overviewControls.js focus chain) |
 | Super+1..9 / Super+Ctrl+1..9 | Dash app: switch-or-launch / open a new window |
-| Super+N | Focus the notification banner's buttons; Escape releases |
+| Super+N | Focus the notification banner itself (Enter activates it, Tab reaches its buttons); Escape releases |
+| Super+Alt+S | Screen reader on/off (gsd's `screenreader` key) |
 | Print / Shift+Print / Alt+Print | Screenshot UI / fullscreen shot / window shot (S/C/W pick, Enter captures, Escape closes) |
 
 While the bar holds keyboard focus, NORMAL/OVERVIEW chords pause
@@ -107,14 +109,14 @@ gnome-shell `2177bdf9` (`js/ui/ctrlAltTab.js`,
 | Quick-settings power rows (Suspend, Restart, Power Off, Log Out) | Same menu; each opens a confirm dialog with Cancel focused, Escape cancels | Verified (proof G-POWER-ESCAPE) |
 | Overview search result click | Type, then Enter (top hit) or Tab to the row + Enter | Verified in source (entry `activate` + native focus) |
 | Dash app click / Show Apps | Super+1..9; Super+A for the grid | Verified (proof G-KEYBINDINGS) |
-| App-grid icon click | Arrows / PgUp/PgDn + Enter (native grid navigation) | Verified in source |
+| App-grid icon click | Super+A, Tab from the search entry, arrows / Tab / PgUp/PgDn + Enter | Verified (proof G-ORCA-SPEECH-GRID) |
 | Folder open / rename / remove | Enter opens the dialog (Rename focused); Escape unwinds without saving | Verified in source |
 | Workspace thumbnail click | Super+PgUp/PgDn (compositor WM chord) | Implemented (WM-owned) |
-| Window preview click (focus) | Alt+Tab switcher (compositor WM chord) | Implemented (WM-owned) |
+| Window preview click (focus) | Super, Tab from the search entry, arrows + Enter; or the Alt+Tab switcher | Verified (proof G-ORCA-SPEECH-PREVIEWS, G-SWITCHER) |
 | Drag preview to workspace card | Move-to-workspace chords (compositor WM chord) | Implemented (WM-owned) |
-| Notification banner buttons | Super+N, then Tab + Enter; Escape releases | Implemented; proof open |
+| Notification banner and its buttons | Super+N focuses the banner (Enter activates it), Tab + Enter its buttons; Escape releases | Verified (proof G-NOTIFICATION-FOCUS-KEY, G-ORCA-SPEECH-NOTIFY) |
 | Lock-screen curtain click or drag; unlock typing | Any key but Shift or Caps Lock lifts the curtain (a printable key starts the password), Enter submits; Escape returns to the curtain | Implemented (WM/lock-owned; proof G-LOCK-CURTAIN-CLOCK, G-LOCK-FIRST-PRINTABLE) |
 | Screenshot/polkit/network/consent/end-session/folder dialogs | Exclusive keyboard, first control focused, Escape cancels | Verified (proof G-POWER-ESCAPE, G-POLKIT, G-SCREENSHOT-UI) |
 | Window menu rows (Alt+Space) | Tab + Enter work; Up/Down do not move between rows | Handoff to #347 (WM surface/focus policy) |
-| Ctrl+Alt+Tab group-switcher dialog | Tuna focuses its single bar directly; GNOME lists Windows/bar/tray groups | Open follow-up (shell-side) |
+| Ctrl+Alt+Tab group-switcher dialog | Tuna focuses the top bar at once. GNOME's ctrlAltTab.js does the same for a quick press in a session whose only group is the bar, but with Ctrl+Alt held it shows CtrlAltTabPopup, a switcher of the focus groups (Top Bar; in the overview also Search, Windows or Apps and Dash; dock-type windows), Tab stepping while held and release focusing the selection | Open: no held-modifier group popup and no overview groups |
 | Lock-screen panel/a11y access | None: the lock screen shows no panel (GNOME binds `switch-panels` there) | Open; overlaps #352 (Orca paths) |

@@ -46,8 +46,14 @@ pub const OSD_NAMESPACE: &str = "tuna-osd";
 pub const POLKIT_NAMESPACE: &str = "tuna-polkit";
 /// GTK end-session dialog surface.
 pub const END_SESSION_NAMESPACE: &str = "tuna-shell-end-session";
-/// GTK overview preview chrome surface.
+/// GTK overview preview chrome surface. Like the app grid, it takes the
+/// keyboard from the search surface while it asks for it exclusively
+/// (keyboard navigation of GNOME's window picker).
 pub const PREVIEW_CHROME_NAMESPACE: &str = "tuna-shell-preview-chrome";
+/// GTK overview app-grid surface. While the overview is open and it asks
+/// for the keyboard exclusively, the compositor moves the keyboard from
+/// the search surface to it (GNOME's keyboard navigation into the grid).
+pub const APP_GRID_NAMESPACE: &str = "tuna-shell-appgrid";
 /// GTK keyboard-accessibility confirmation surface (Sticky/Slow Keys).
 pub const KBD_A11Y_NAMESPACE: &str = "tuna-kbd-a11y";
 /// GTK pointer-accessibility pie timer surface (hover and secondary click).
