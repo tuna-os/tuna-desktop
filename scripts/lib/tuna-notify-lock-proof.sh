@@ -24,6 +24,10 @@
 #   G-NOTIFY-SOUND       a banner plays its sound-name (else sound-file)
 #                        through the event-sound player as it shows,
 #                        unless enable-sound-alerts or event-sounds is off
+#   G-NOTIFY-RESTORE     what a disabled app sent stays out of the date
+#                        menu's list; enabling the app brings it back
+#                        there at once, with no banner (messageTray.js
+#                        _onSourceEnableChanged hides, never drops)
 
 NL_SCHEMA=org.gnome.desktop.notifications
 NL_APP_SCHEMA=org.gnome.desktop.notifications.application
@@ -259,6 +263,25 @@ notify_lock_proof() {
         "event-sounds off still played a notification sound"
     gsettings set org.gnome.desktop.sound event-sounds true
     pass G-NOTIFY-SOUND "a banner plays its sound-name, else its sound-file, through the event-sound player as it shows; enable-sound-alerts or event-sounds off keeps it silent"
+
+    # The disabled app's notification, sent while locked, waits hidden.
+    xdotool mousemove --window "$WID" $((WIDTH / 2)) 16 click 1
+    sleep 2
+    nl_until restore-disabled 'any(.[]; .showing and .name == "Hidden Summary")' G-NOTIFY-RESTORE ||
+        fail G-NOTIFY-RESTORE "the date menu does not list the history"
+    nl_mentions "$nl_tree" "Off Summary" &&
+        fail G-NOTIFY-RESTORE "a disabled app's notification reached the list"
+    gsettings set "$(nl_app tuna-lock-off)" enable true
+    nl_until restored 'any(.[]; .showing and .name == "Off Summary")' G-NOTIFY-RESTORE ||
+        fail G-NOTIFY-RESTORE "enabling the app did not bring its notification back to the list"
+    nl_shot restored
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-notify-restore-cleared.json" 20 \
+        --press "Clear" || fail G-NOTIFY-RESTORE "could not press Clear"
+    xdotool key Escape
+    sleep 2
+    nl_dump restored-closed G-NOTIFY-RESTORE
+    showing "$nl_tree" "Off Summary" && fail G-NOTIFY-RESTORE "a restored notification showed a banner"
+    pass G-NOTIFY-RESTORE "a disabled app's notification stays out of the list; enabling the app brings it back at once, with no banner"
 
     # As found for the gates after.
     for nl_id in $NL_APPS; do

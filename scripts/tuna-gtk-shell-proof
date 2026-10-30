@@ -58,7 +58,7 @@
 #   G-NOTIFY-DND     with Do Not Disturb on, no banner, but listed
 #   G-NOTIFY-GROUP   two from one app group, collapsed; pressing expands
 #   G-NOTIFY-POLICY  per-app policy (#348): first notify registers the app,
-#                    disabling it drops banners and list entries
+#                    disabling it keeps banners and list entries away
 #   G-NOTIFY-LOCK    while locked, allowed apps show name and count on the
 #                    lock screen, details only with details-in-lock-screen;
 #                    other apps are absent from the accessible tree (#348)
@@ -69,6 +69,8 @@
 #                    once; unlocking brings the queued banners and sounds
 #   G-NOTIFY-SOUND   banners play sound-name / sound-file as they show,
 #                    silenced by enable-sound-alerts or event-sounds off
+#   G-NOTIFY-RESTORE re-enabling a disabled app brings what it sent while
+#                    disabled back to the list, with no banner
 #   G-QS-SERVICES    quick settings shows the tiles of the services on
 #                    the bus (stub daemons on a private system bus, #55)
 #   G-QS-WIFI-MENU   the Wi-Fi menu scans, lists NetworkManager's networks
@@ -3238,7 +3240,7 @@ gsettings get org.gnome.desktop.notifications application-children | grep -q "$P
     fail G-NOTIFY-POLICY "the first notification did not register the app in application-children"
 gsettings set "org.gnome.desktop.notifications.application:/org/gnome/desktop/notifications/application/$POLICY_APP/" enable false
 sleep 1
-notify_hinted "Policy Held" "Dropped while the app is disabled" || fail G-NOTIFY-POLICY "Notify call failed"
+notify_hinted "Policy Held" "Hidden while the app is disabled" || fail G-NOTIFY-POLICY "Notify call failed"
 sleep 1
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-policy-held.json" 20 ||
     fail G-NOTIFY-POLICY "accessibility dump failed"
@@ -3253,7 +3255,7 @@ showing "$ARTIFACTS/a11y-policy-list.json" "Policy First" ||
 if showing "$ARTIFACTS/a11y-policy-list.json" "Policy Held"; then
     fail G-NOTIFY-POLICY "the disabled app's notification reached the list"
 fi
-pass G-NOTIFY-POLICY "first notify registers the app; disabling it drops banners and list entries"
+pass G-NOTIFY-POLICY "first notify registers the app; disabling it keeps banners and list entries away"
 # Leave the list empty and the settings as found for the next gates.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-policy-cleared.json" 20 \
     --press "Clear" || fail G-NOTIFY-POLICY "could not press Clear"

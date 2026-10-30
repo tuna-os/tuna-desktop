@@ -292,10 +292,11 @@ TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --artifacts gtk-shell-ar
 ```
 
 `--notify-lock-only` stops after panel readiness and runs just the
-lock-screen notification and notification sound gates (G-NOTIFY-LOCK,
-G-NOTIFY-LOCK-PIXELS, G-NOTIFY-LOCK-LIVE, G-NOTIFY-SOUND); it needs
-pam_wrapper to unlock. The proof's `canberra-gtk-play` stand-in records
-every event sound the shell asks for in `canberra-calls`.
+lock-screen notification, notification sound and disabled-app restore
+gates (G-NOTIFY-LOCK, G-NOTIFY-LOCK-PIXELS, G-NOTIFY-LOCK-LIVE,
+G-NOTIFY-SOUND, G-NOTIFY-RESTORE); it needs pam_wrapper to unlock. The
+proof's `canberra-gtk-play` stand-in records every event sound the shell
+asks for in `canberra-calls`.
 
 `scripts/tuna-drm-smoke` loads a kernel module and starts seatd as root.
 Run it in a VM or a disposable machine rather than your desktop session.
