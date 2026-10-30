@@ -360,6 +360,12 @@ pub struct WindowManager {
     /// Window focused before it had a surface to focus (an X11 window
     /// mapped before association): the seat follows once it does.
     focus_awaits_surface: Option<u64>,
+    /// X11 window holding the X server's input focus. Keyboard focus is
+    /// Xwayland's wl_surface, which alone does not move X focus: without
+    /// SetInputFocus the X server stays PointerRoot and keys reach
+    /// whichever X11 window lies under the X pointer, not the focused one.
+    #[cfg_attr(not(feature = "xwayland"), allow(dead_code))]
+    x11_input_focus: Option<u64>,
     /// Button whose press dismissed a popup grab: its release is
     /// swallowed too, so the window beneath never sees half a click.
     swallowed_button: Option<u32>,
@@ -721,6 +727,7 @@ impl WindowManager {
             workspace_popups: Vec::new(),
             swallowed_button: None,
             focus_awaits_surface: None,
+            x11_input_focus: None,
             grab: None,
             mode: SessionMode::Gnome,
             strip_offset: 0.0,
@@ -2620,6 +2627,7 @@ impl WindowManager {
         } else if let Some(keyboard) = self.keyboard.clone() {
             keyboard.set_focus(state, None, serial);
         }
+        self.sync_x11_input_focus(id);
         // Clipboard offers follow keyboard focus, with or without a
         // keyboard capability attached.
         let surface = id.and_then(|id| {
@@ -2631,6 +2639,39 @@ impl WindowManager {
             })
         });
         state.sync_selection_focus(surface.as_ref());
+    }
+
+    /// Mutter's meta_x11_display_set_input_focus: the X server's input
+    /// focus follows the focused X11 window (SetInputFocus/WM_TAKE_FOCUS
+    /// by its ICCCM input mode), and focusing anything else moves it off
+    /// X11 windows. Seat focus on Xwayland's wl_surface does not change X
+    /// focus by itself, so without this keys went to the X11 window under
+    /// the X pointer (PointerRoot), e.g. not to a parent whose dialog
+    /// closed while the pointer rested elsewhere.
+    fn sync_x11_input_focus(&mut self, id: Option<u64>) {
+        #[cfg(feature = "xwayland")]
+        {
+            let x11 = |windows: &HashMap<u64, ManagedWindow>, id: u64| {
+                windows
+                    .get(&id)
+                    .and_then(|window| match window.surface.underlying_surface() {
+                        WindowSurface::X11(surface) => Some(surface.clone()),
+                        WindowSurface::Wayland(_) => None,
+                    })
+            };
+            if let Some(surface) = id.and_then(|id| x11(&self.windows, id)) {
+                if let Err(error) = surface.set_input_focus(true) {
+                    eprintln!("tuna-compositor: X11 input focus refused: {error}");
+                }
+                self.x11_input_focus = id;
+            } else if let Some(old) = self.x11_input_focus.take() {
+                if let Some(surface) = x11(&self.windows, old) {
+                    let _ = surface.set_input_focus(false);
+                }
+            }
+        }
+        #[cfg(not(feature = "xwayland"))]
+        let _ = id;
     }
 
     /// Send a configure advertising this window's geometry, activation
