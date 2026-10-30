@@ -2016,6 +2016,8 @@ mod tests {
             (
                 Message::SeatTouchMode { touch_mode: true },
                 Handled::SeatTouchMode(true),
+            ),
+            (
                 Message::OskGesture {
                     phase: tuna_shell_control::OskGesturePhase::Progress { distance: 12.0 },
                 },

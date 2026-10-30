@@ -2538,7 +2538,7 @@ mod tests {
         assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 47));
         // A 0.46 shell still negotiates; a newer minor does not.
         assert!(ProtocolVersion::new(0, 46).is_compatible_with(&CURRENT_VERSION));
-        assert!(!ProtocolVersion::new(0, 48).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 49).is_compatible_with(&CURRENT_VERSION));
     }
 
     #[test]
@@ -3667,7 +3667,7 @@ mod on_screen_keyboard_wire_tests {
             index(&Message::OskGesture {
                 phase: OskGesturePhase::Cancel,
             }),
-            index(&Message::ClosePadOsd { pad: 0 }) + 1
+            index(&Message::SeatTouchMode { touch_mode: false }) + 1
         );
     }
 
