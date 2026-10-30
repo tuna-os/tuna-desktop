@@ -288,6 +288,18 @@
 #   G-LOCK-CURTAIN-DRAG a real pointer drag moves the curtain; releases
 #                  settle on swipeTracker.js's projection and ease-out
 #                  cubic, a flick reaches the prompt, which unlocks
+#   G-LOCK-SWIPE-SECURITY a three-finger swipe under way when the lock
+#                  engages ends cancelled, and swipes while locked leave
+#                  the overview closed and the workspace unchanged
+#   G-LOCK-CURTAIN-HINT the clock's hint stays hidden until 4 s of idle
+#                  (HINT_TIMEOUT), then fades in over 300 ms ease-out
+#                  cubic on the frozen clock; a power-save change hides
+#                  it at once; Reduced Motion keeps the fade, animations
+#                  off show it at once (unlockDialog.js 51, #502)
+#   G-LOCK-CURTAIN-TOUCHPAD an injected three-finger swipe and a
+#                  two-finger scroll ended by the axis stop lift the
+#                  curtain and settle on swipeTracker.js's touchpad
+#                  projection; the lifted prompt unlocks
 #   G-TRANSIENT-OFF with animations off the OSD, banners and panel menus
 #                  show and close at once; Reduced Motion keeps the fades
 #                  and drops the panel menu's rise (#501)
@@ -10628,6 +10640,150 @@ if [ -n "$PAM_ON" ]; then
         fail G-LOCK-CURTAIN-DRAG "the prompt a drag lifted did not unlock through PAM"
     real_clock || fail G-LOCK-CURTAIN-DRAG "removing the clock file did not resume real time"
     pass G-LOCK-CURTAIN-DRAG "a real pointer drag moves the curtain with the pointer past 16 px; slow releases settle on the nearer page and a flick on its velocity, on swipeTracker.js's projection and ease-out cubic; the dragged prompt unlocks through PAM"
+
+    # GNOME's global swipe trackers are not allowed on the lock screen:
+    # a three-finger swipe under way when the lock engages ends cancelled
+    # (the overview falls back closed), and its tail goes nowhere.
+    cstate '(.locked | not) and .overview_open == false and .overview_progress == 0' "desktop before the locked swipe" 10 ||
+        fail G-LOCK-SWIPE-SECURITY "the session was not back on the desktop"
+    lock_ws=$(jq .active_workspace "$CSTATE")
+    swipe_phase begin 0 0
+    swipe_phase update 0 -60
+    cstate '.overview_progress > 0' "overview following the swipe" 5 ||
+        fail G-LOCK-SWIPE-SECURITY "a vertical three-finger swipe did not move the overview"
+    xdotool key super+l
+    cstate ".locked and .overview_open == false and .overview_progress == 0 and .active_workspace == $lock_ws" "lock cancelled the swipe" 10 ||
+        fail G-LOCK-SWIPE-SECURITY "the swipe under way at lock did not end cancelled"
+    swipe_phase update 0 -300
+    swipe_phase end 0 0
+    cstate ".locked and .overview_open == false and .overview_progress == 0 and .active_workspace == $lock_ws" "the swipe's tail went nowhere" 5 ||
+        fail G-LOCK-SWIPE-SECURITY "the tail of a pre-lock swipe moved the session"
+
+    # The clock's hint (unlockDialog.js 51 UnlockDialogClock): hidden
+    # until the idle monitor's HINT_TIMEOUT (4 s) watch fires, then eased
+    # in over CROSSFADE_TIME on Clutter's default ease-out cubic.
+    curtain_here
+    curtain_clock=0
+    anim_clock 0
+    cstate '.animation_clock_manual' "frozen hint clock" ||
+        fail G-LOCK-CURTAIN-HINT "the clock file did not freeze animation time"
+    curtain absent 2.5 "hint ease" ||
+        fail G-LOCK-CURTAIN-HINT "the hint showed before 4 s of idle"
+    curtain line "hint ease to=1 from=0.000 duration=300 nominal=300 mode=ease-out-cubic clock=manual" ||
+        fail G-LOCK-CURTAIN-HINT "4 s of idle did not start the hint's 300 ms fade"
+    curtain_after 150
+    curtain line "hint frame opacity=0.875" ||
+        fail G-LOCK-CURTAIN-HINT "150 ms in, the hint was not at ease-out cubic 87.5%"
+    curtain_after 150
+    curtain line "hint settled opacity=1.000" ||
+        fail G-LOCK-CURTAIN-HINT "the hint did not settle 300 ms after the watch"
+    # power-save-mode-changed hides it at once; it shows again only after
+    # the next input and another 4 s.
+    gsettings set org.gnome.desktop.a11y.interface reduced-motion 'reduce'
+    cstate '.motion_policy == "fade-only"' "reduced hint" ||
+        fail G-LOCK-CURTAIN-HINT "Reduced Motion did not reach the session"
+    curtain_here
+    power_save_set 3
+    power_save_set 0
+    curtain line "hint hidden" ||
+        fail G-LOCK-CURTAIN-HINT "a power-save change did not hide the hint"
+    curtain_here
+    xdotool key Shift_L
+    curtain line "hint ease to=1 from=0.000 duration=300 nominal=300 mode=ease-out-cubic clock=manual" ||
+        fail G-LOCK-CURTAIN-HINT "under Reduced Motion the hint did not keep its 300 ms fade"
+    curtain_after 150
+    curtain line "hint frame opacity=0.875" ||
+        fail G-LOCK-CURTAIN-HINT "under Reduced Motion the hint was off ease-out cubic"
+    curtain_after 150
+    curtain line "hint settled opacity=1.000" ||
+        fail G-LOCK-CURTAIN-HINT "under Reduced Motion the hint did not settle"
+    gsettings reset org.gnome.desktop.a11y.interface reduced-motion
+    gsettings set org.gnome.desktop.interface enable-animations false
+    cstate '(.animations_enabled | not)' "hint without animations" ||
+        fail G-LOCK-CURTAIN-HINT "enable-animations false did not reach the session"
+    curtain_here
+    power_save_set 3
+    power_save_set 0
+    curtain line "hint hidden" ||
+        fail G-LOCK-CURTAIN-HINT "a power-save change did not hide the hint"
+    curtain_here
+    xdotool key Shift_L
+    curtain line "hint ease to=1 from=0.000 duration=0 nominal=300 mode=ease-out-cubic clock=instant" ||
+        fail G-LOCK-CURTAIN-HINT "with animations off the hint did not show at once"
+    curtain line "hint settled opacity=1.000" ||
+        fail G-LOCK-CURTAIN-HINT "with animations off the hint did not settle at once"
+    gsettings set org.gnome.desktop.interface enable-animations true
+    cstate '.motion_policy == "full"' "hint motion restored" ||
+        fail G-LOCK-CURTAIN-HINT "the full motion policy did not return"
+    pass G-LOCK-CURTAIN-HINT "the hint stays hidden until 4 s of idle, then fades in over 300 ms ease-out cubic on the frozen clock; a power-save change hides it at once; Reduced Motion keeps the fade and animations off show it at once"
+
+    # swipeTracker.js's touchpad gestures on the unlock dialog: a
+    # three-finger swipe (natural scrolling: fingers up lift the curtain)
+    # and a two-finger scroll ended by the axis stop, over
+    # TOUCHPAD_BASE_HEIGHT, released on the touchpad thresholds.
+    gsettings set org.gnome.desktop.peripherals.touchpad natural-scroll true
+    scroll_phase() {
+        swipe_sequence=$((swipe_sequence + 1))
+        printf '{"phase":"scroll","dx":0,"dy":%s,"stop":%s,"sequence":%s}\n' \
+            "$1" "$2" "$swipe_sequence" >"$TUNA_PROOF_SWIPE_INPUT.tmp"
+        mv "$TUNA_PROOF_SWIPE_INPUT.tmp" "$TUNA_PROOF_SWIPE_INPUT"
+        swipe_consumed "$swipe_sequence"
+        sleep 0.2
+    }
+    curtain_here
+    swipe_phase begin 0 0
+    swipe_phase update 0 -20
+    swipe_phase update 0 -100
+    swipe_phase update 0 -100
+    curtain line "swipe begin source=swipe progress=0.0000 distance=300" ||
+        fail G-LOCK-CURTAIN-TOUCHPAD "a three-finger swipe did not take the curtain"
+    curtain frame 0.7333 true ||
+        fail G-LOCK-CURTAIN-TOUCHPAD "the curtain did not follow the swipe over 300 px"
+    swipe_phase end 0 0
+    curtain_result=$(curtain release) ||
+        fail G-LOCK-CURTAIN-TOUCHPAD "the swipe's release did not follow swipeTracker.js"
+    # shellcheck disable=SC2086 # END DURATION PROGRESS VELOCITY
+    set -- $curtain_result
+    [ "$1" = 1 ] || fail G-LOCK-CURTAIN-TOUCHPAD "a swipe two thirds up did not reach the prompt ($curtain_result)"
+    curtain_after $((${2%.*} + 1))
+    curtain line "settled page=prompt progress=1.0000" ||
+        fail G-LOCK-CURTAIN-TOUCHPAD "the swiped prompt did not settle"
+    cstate ".locked and .overview_open == false and .overview_progress == 0 and .active_workspace == $lock_ws" "locked swipe left the session alone" 5 ||
+        fail G-LOCK-SWIPE-SECURITY "a swipe while locked moved the overview or the workspace"
+    pass G-LOCK-SWIPE-SECURITY "a swipe under way at lock ends cancelled; swipes while locked reach only the lock screen, the overview stays closed and the workspace unchanged"
+    curtain_here
+    xdotool key Escape
+    curtain line "ease to=clock from=1.0000 duration=300 nominal=300 mode=ease-out-quad motion=true clock=manual" ||
+        fail G-LOCK-CURTAIN-TOUCHPAD "Escape did not start the clock back after the swipe"
+    curtain_after 300
+    curtain line "settled page=clock progress=0.0000" ||
+        fail G-LOCK-CURTAIN-TOUCHPAD "the clock did not come back after the swipe"
+    curtain_here
+    for _ in 1 2 3 4; do
+        scroll_phase 40 false
+    done
+    curtain line "swipe begin source=scroll progress=0.0000 distance=300" ||
+        fail G-LOCK-CURTAIN-TOUCHPAD "a two-finger scroll did not take the curtain"
+    curtain frame 0.5333 true ||
+        fail G-LOCK-CURTAIN-TOUCHPAD "the curtain did not follow the scroll"
+    curtain absent 0.5 "swipe end " ||
+        fail G-LOCK-CURTAIN-TOUCHPAD "the scroll ended before the axis stop"
+    scroll_phase 0 true
+    curtain_result=$(curtain release) ||
+        fail G-LOCK-CURTAIN-TOUCHPAD "the axis stop did not end the scroll on swipeTracker.js's release"
+    # shellcheck disable=SC2086 # END DURATION PROGRESS VELOCITY
+    set -- $curtain_result
+    [ "$1" = 1 ] || fail G-LOCK-CURTAIN-TOUCHPAD "a scroll past half way did not reach the prompt ($curtain_result)"
+    curtain_after $((${2%.*} + 1))
+    curtain line "settled page=prompt progress=1.0000" ||
+        fail G-LOCK-CURTAIN-TOUCHPAD "the scrolled prompt did not settle"
+    xdotool type --delay 30 "$UNLOCK_PASSWORD"
+    xdotool key Return
+    cstate '(.locked | not)' "touchpad-lifted prompt unlocked through PAM" 15 ||
+        fail G-LOCK-CURTAIN-TOUCHPAD "the prompt a touchpad scroll lifted did not unlock through PAM"
+    real_clock || fail G-LOCK-CURTAIN-TOUCHPAD "removing the clock file did not resume real time"
+    gsettings reset org.gnome.desktop.peripherals.touchpad natural-scroll
+    pass G-LOCK-CURTAIN-TOUCHPAD "an injected three-finger swipe and a two-finger scroll ended by the axis stop lift the curtain and settle on swipeTracker.js's touchpad projection; the lifted prompt unlocks through PAM"
 
     # A short idle policy must fade, cancel on activity, then latch only
     # after the configured lock delay. Waking the blank stage cannot unlock.
