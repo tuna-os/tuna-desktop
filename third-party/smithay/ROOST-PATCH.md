@@ -151,3 +151,11 @@ region unchanged for such a rectangle; the handler now ignores it the same
 way. The stress suite's `bad-region` adversary covers it. The isolated diff
 is retained in REGION-RECT-PATCH.diff; the pinned
 version stays 0.7.0.
+
+Issue #203 also changes src/wayland/shm/handlers.rs: wl_shm_pool.resize
+with a size of zero or less posted the invalid-size error and then went on
+to `NonZeroUsize::try_from(size).unwrap()`, which panicked and took the
+whole session down (found by the deeper, error-aware protocol fuzzer).
+The handler now returns after the error, as libwayland-server's
+shm_pool_resize does. The isolated diff is retained in
+SHM-RESIZE-PATCH.diff; the pinned version stays 0.7.0.
