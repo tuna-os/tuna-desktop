@@ -415,10 +415,10 @@ mod gtk_countdown_tests {
         let hooks = ShellHooks {
             show_countdown,
             hide_countdown,
-            post_notice: Rc::new(|_, _, _| None),
+            post_notice: Rc::new(|_, _, _, _| None),
+            remove_notice: Rc::new(|_| {}),
             lock: Rc::new(|| {}),
-            post_action_notice: Rc::new(|_, _, _| None),
-            dismiss_notice: Rc::new(|_| false),
+            post_action_notice: Rc::new(|_, _, _, _, _| None),
             on_notice_action: Rc::new(|_, _, _| {}),
             drop_notice_actions: Rc::new(|_| {}),
             break_action: Rc::new(|_| {}),

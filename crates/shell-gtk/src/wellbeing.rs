@@ -511,14 +511,27 @@ impl Default for ScreenTimeSettings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScreenTimeEvent {
     StateChanged(TimeLimitsState),
-    /// First poll at or below 10 min remaining (GNOME schedules exactly 600 s;
-    /// polling fires within one poll period after crossing).
+    /// The limit is exactly 10 min away (GNOME's
+    /// `Math.ceil(remainingSecs) === timeoutLimit`): its source schedules an
+    /// update for that instant and posts nothing at any other remaining
+    /// time, so a limit set at or below 10 min gets no warning.
     LimitUpcoming {
         remaining_secs: i64,
     },
     LimitReached,
+    /// Remove the resident limit notification (GNOME destroys it when the
+    /// limit is off, history is disabled, or over 10 min remain again, as
+    /// after the day rolls over or the limit is raised).
+    LimitNoticeCleared,
     /// Desired grayscale state; applying it needs the compositor effect hook.
     GrayscaleChanged(bool),
+}
+
+/// Which text the resident limit notification carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LimitNotice {
+    Upcoming,
+    Reached,
 }
 
 /// Outcome of one poll: shell events plus the history load/store results.
@@ -548,7 +561,9 @@ pub struct ScreenTimeTracker {
     last_state_change: i64,
     clock_offset: i64,
     last_poll: Option<(i64, i64)>,
-    upcoming_fired_for_day: Option<i64>,
+    /// The resident limit notification, while it lives
+    /// (`TimeLimitsNotificationSource._notification`).
+    limit_notice: Option<LimitNotice>,
     grayscale_on: bool,
     started: bool,
 }
@@ -563,7 +578,7 @@ impl ScreenTimeTracker {
             last_state_change: 0,
             clock_offset: 0,
             last_poll: None,
-            upcoming_fired_for_day: None,
+            limit_notice: None,
             grayscale_on: false,
             started: false,
         }
@@ -639,6 +654,8 @@ impl ScreenTimeTracker {
                 self.grayscale_on = false;
                 events.push(ScreenTimeEvent::GrayscaleChanged(false));
             }
+            // `TimeLimitsState.DISABLED` destroys the notification source.
+            self.clear_limit_notice(&mut events);
             let stored = self.store.delete();
             self.started = false;
             self.last_poll = None;
@@ -744,7 +761,7 @@ impl ScreenTimeTracker {
             let remaining = self.settings.daily_limit_secs.saturating_sub(used);
             seconds = seconds.min(remaining.max(1) as u64);
             let warning_in = remaining.saturating_sub(LIMIT_UPCOMING_NOTIFICATION_SECONDS);
-            if self.upcoming_fired_for_day != Some(today) && warning_in > 0 {
+            if warning_in > 0 {
                 seconds = seconds.min(warning_in as u64);
             }
         }
@@ -811,21 +828,42 @@ impl ScreenTimeTracker {
             self.last_state_change = now_wall;
             events.push(ScreenTimeEvent::StateChanged(new_state));
             if new_state == TimeLimitsState::LimitReached {
+                self.limit_notice = Some(LimitNotice::Reached);
                 events.push(ScreenTimeEvent::LimitReached);
             }
         }
-        if self.state == TimeLimitsState::Active && limit_on && self.user_state == UserState::Active
+        self.update_limit_notice(limit - active_today, events);
+    }
+
+    /// `TimeLimitsNotificationSource._updateState`, `ACTIVE` branch (the
+    /// `LIMIT_REACHED` branch is the transition handled above). GNOME's
+    /// `dailyLimitTime` is 0 for an inactive user, so nothing changes then.
+    fn update_limit_notice(&mut self, remaining: i64, events: &mut Vec<ScreenTimeEvent>) {
+        if self.state != TimeLimitsState::Active {
+            return;
+        }
+        if !self.settings.daily_limit_enabled {
+            self.clear_limit_notice(events);
+            return;
+        }
+        if self.user_state != UserState::Active {
+            return;
+        }
+        if remaining > LIMIT_UPCOMING_NOTIFICATION_SECONDS {
+            self.clear_limit_notice(events);
+        } else if remaining == LIMIT_UPCOMING_NOTIFICATION_SECONDS
+            && self.limit_notice != Some(LimitNotice::Upcoming)
         {
-            let remaining = limit - active_today;
-            if remaining > 0
-                && remaining <= LIMIT_UPCOMING_NOTIFICATION_SECONDS
-                && self.upcoming_fired_for_day != Some(start_today)
-            {
-                self.upcoming_fired_for_day = Some(start_today);
-                events.push(ScreenTimeEvent::LimitUpcoming {
-                    remaining_secs: remaining,
-                });
-            }
+            self.limit_notice = Some(LimitNotice::Upcoming);
+            events.push(ScreenTimeEvent::LimitUpcoming {
+                remaining_secs: remaining,
+            });
+        }
+    }
+
+    fn clear_limit_notice(&mut self, events: &mut Vec<ScreenTimeEvent>) {
+        if self.limit_notice.take().is_some() {
+            events.push(ScreenTimeEvent::LimitNoticeCleared);
         }
     }
 
@@ -1224,8 +1262,10 @@ pub struct Notice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BreakUiEvent {
     StateChanged(BreakState),
-    /// Show or replace the single resident break notification.
+    /// Show the single resident break notification, updating it in place.
     Notify(Notice),
+    /// Remove it (GNOME's `destroy(SOURCE_CLOSED)`: break complete, break
+    /// over, or reminders disabled).
     DismissNotice,
     /// Show the prominent "Break in N seconds" countdown until due.
     StartCountdown {
@@ -1815,21 +1855,25 @@ impl MonoClock {
 // Live runtime: timers, settings watches and shell dispatch
 // ---------------------------------------------------------------------------
 
-/// Post the screen-time notice (title, body) to the shell's message list,
-/// updating the resident one in place while it lives (`Some(id)`, GNOME's
-/// `_ensureNotification` + `addNotification`). Returns its id.
-pub type NoticeHook = Rc<dyn Fn(String, String, Option<u64>) -> Option<u64>>;
+/// Post the screen-time notice (title, body, urgent) to the shell's message
+/// list, updating the resident one in place while it lives (`Some(id)`,
+/// GNOME's `_ensureNotification` + `addNotification`). Returns its id.
+/// `urgent` is GNOME's `Urgency.HIGH`, otherwise `Urgency.LOW`.
+pub type NoticeHook = Rc<dyn Fn(String, String, bool, Option<u64>) -> Option<u64>>;
+/// Remove a resident notice from the list and its banner
+/// (GNOME's `notification.destroy()`).
+pub type RemoveHook = Rc<dyn Fn(u64)>;
 /// Show the break countdown OSD (label, 0..1 progress as due approaches).
 pub type CountdownHook = Rc<dyn Fn(String, f64)>;
 /// Hide only the OSD display still owned by this countdown.
 pub type CountdownHideHook = Rc<dyn Fn()>;
 /// Lock the session now.
 pub type LockHook = Rc<dyn Fn()>;
-/// Post a resident notice WITH invokable actions; returns the center id.
+/// Post a resident notice WITH invokable actions, updating `Some(id)` in
+/// place (text, urgency and actions) while it lives; returns the center id.
 /// Actions are (key, label) pairs; only allow-listed keys are posted.
-pub type ActionNoticeHook = Rc<dyn Fn(String, String, Vec<(String, String)>) -> Option<u64>>;
-/// Dismiss one banner by center id (history keeps the entry).
-pub type DismissHook = Rc<dyn Fn(u64) -> bool>;
+pub type ActionNoticeHook =
+    Rc<dyn Fn(String, String, Vec<(String, String)>, bool, Option<u64>) -> Option<u64>>;
 /// Register a local callback for one (notice id, action key).
 pub type ActionRegisterHook = Rc<dyn Fn(u64, String, Rc<dyn Fn()>)>;
 /// Forget one notice's local callbacks (replacement/removal).
@@ -1882,11 +1926,11 @@ pub fn notice_action_buttons(
 #[derive(Clone)]
 pub struct ShellHooks {
     pub post_notice: NoticeHook,
+    pub remove_notice: RemoveHook,
     pub show_countdown: CountdownHook,
     pub hide_countdown: CountdownHideHook,
     pub lock: LockHook,
     pub post_action_notice: ActionNoticeHook,
-    pub dismiss_notice: DismissHook,
     pub on_notice_action: ActionRegisterHook,
     pub drop_notice_actions: ActionDropHook,
     pub break_action: BreakActionHook,
@@ -1938,7 +1982,8 @@ fn log_effect(effect: EffectState) {
 /// `TimeLimitsNotificationSource`, the upcoming and reached notices are one
 /// resident notification (`resident`, its center id) updated in place, so
 /// "Screen Time Limit Reached" takes over the warning's banner, even one
-/// still waiting on screen for an away user, instead of queuing behind it.
+/// still waiting on screen for an away user, instead of queuing behind it;
+/// it is removed outright once the source would destroy it.
 pub fn dispatch_screen_time(
     hooks: &ShellHooks,
     effect: &mut EffectState,
@@ -1953,13 +1998,44 @@ pub fn dispatch_screen_time(
             }
             ScreenTimeEvent::LimitUpcoming { .. } => limit_upcoming_notice(),
             ScreenTimeEvent::LimitReached => limit_reached_notice(),
+            ScreenTimeEvent::LimitNoticeCleared => {
+                if let Some(id) = resident.take() {
+                    eprintln!("tuna-shell-gtk: wellbeing: limit notice {id} removed");
+                    (hooks.remove_notice)(id);
+                }
+                continue;
+            }
             ScreenTimeEvent::GrayscaleChanged(on) => {
                 effect.grayscale = *on;
                 log_effect(*effect);
                 continue;
             }
         };
-        *resident = (hooks.post_notice)(notice.title, notice.body, *resident);
+        let replaces = *resident;
+        *resident = (hooks.post_notice)(
+            notice.title.clone(),
+            notice.body.clone(),
+            notice.urgent,
+            replaces,
+        );
+        log_notice("limit", &notice, replaces, *resident);
+    }
+}
+
+/// Proof-gate diagnostics: which resident a notice landed on, and whether
+/// it updated the live one in place.
+fn log_notice(kind: &str, notice: &Notice, replaces: Option<u64>, posted: Option<u64>) {
+    let urgency = if notice.urgent { "high" } else { "low" };
+    let how = if replaces.is_some() && replaces == posted {
+        "updated"
+    } else {
+        "posted"
+    };
+    if let Some(id) = posted {
+        eprintln!(
+            "tuna-shell-gtk: wellbeing: {kind} notice {id} {how} urgency={urgency}: {}",
+            notice.title
+        );
     }
 }
 
@@ -1968,8 +2044,9 @@ pub fn dispatch_screen_time(
 /// OSD countdown so the tick can refresh its label from the manager's due
 /// time; the OSD hides itself 1.5 s after the last show, so stopping needs
 /// no call. `resident` tracks the single resident break notice's center
-/// id: replacing it dismisses the old banner and drops its action
-/// callbacks, and dismissal clears it (history keeps every entry).
+/// id: like GNOME's `BreakNotificationSource`, a new notice updates it in
+/// place (text, urgency and actions; old action callbacks are dropped),
+/// and dismissal removes it from the list, as GNOME destroys it.
 pub fn dispatch_break_ui(
     hooks: &ShellHooks,
     effect: &mut EffectState,
@@ -1983,8 +2060,8 @@ pub fn dispatch_break_ui(
                 eprintln!("tuna-shell-gtk: wellbeing: break state {state:?}");
             }
             BreakUiEvent::Notify(notice) => {
-                if let Some(old) = resident.take() {
-                    (hooks.dismiss_notice)(old);
+                let replaces = resident.take();
+                if let Some(old) = replaces {
                     (hooks.drop_notice_actions)(old);
                 }
                 let buttons = notice_action_buttons(notice);
@@ -1995,7 +2072,10 @@ pub fn dispatch_break_ui(
                         .iter()
                         .map(|(key, label, _)| (key.to_string(), label.to_string()))
                         .collect(),
+                    notice.urgent,
+                    replaces,
                 );
+                log_notice("break", notice, replaces, posted);
                 if let Some(id) = posted {
                     for (key, _, kind) in buttons {
                         let push = hooks.break_action.clone();
@@ -2006,8 +2086,9 @@ pub fn dispatch_break_ui(
             }
             BreakUiEvent::DismissNotice => {
                 if let Some(id) = resident.take() {
-                    (hooks.dismiss_notice)(id);
                     (hooks.drop_notice_actions)(id);
+                    eprintln!("tuna-shell-gtk: wellbeing: break notice {id} removed");
+                    (hooks.remove_notice)(id);
                 }
             }
             BreakUiEvent::StartCountdown {
@@ -2136,8 +2217,16 @@ fn schedule_screen_tick(rt: &Rc<RefCell<Runtime>>) {
         if r.stopped {
             return;
         }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let whole = r.tracker.next_check_delay(now.as_secs() as i64);
+        // Land 50 ms into the target wall second: the tracker counts whole
+        // seconds, and GNOME's warning fires only at exactly 600 s left, so
+        // a wake that slipped past the boundary must not read 599.
+        let into_second = Duration::from_nanos(u64::from(now.subsec_nanos()));
         (
-            r.tracker.next_check_delay(wall_now()),
+            (whole + Duration::from_millis(50)).saturating_sub(into_second),
             r.screen_timer.take(),
         )
     };
@@ -2558,51 +2647,116 @@ mod tests {
         assert_eq!(ts[1].wall_time_secs, T0 + 90);
     }
 
-    #[test]
-    fn limit_warns_then_reaches_then_resets_next_day() {
-        let dir = tempfile::tempdir().unwrap();
-        let (today, tomorrow) = start_of_today(T0);
-        let limit = T0 - today + 120; // 2 min of headroom from the open edge
-        let mut tracker = ScreenTimeTracker::new(
+    fn limit_tracker(dir: &std::path::Path, today: i64, limit: i64) -> ScreenTimeTracker {
+        // Seed history on disk: active since 03:00 today.
+        std::fs::write(
+            dir.join("session-active-history.json"),
+            render_history(&[tr(UserState::Inactive, UserState::Active, today)]),
+        )
+        .unwrap();
+        ScreenTimeTracker::new(
             ScreenTimeSettings {
                 history_enabled: true,
                 daily_limit_enabled: true,
                 daily_limit_secs: limit,
                 grayscale: true,
             },
-            HistoryStore::new(dir.path().join("session-active-history.json")),
-        );
-        // Seed yesterday-free history on disk: active since 03:00 today.
-        std::fs::write(
-            dir.path().join("session-active-history.json"),
-            render_history(&[tr(UserState::Inactive, UserState::Active, today)]),
+            HistoryStore::new(dir.join("session-active-history.json")),
         )
-        .unwrap();
-        let poll = tracker.poll(T0, 1000, true);
+    }
+
+    fn upcoming(events: &[ScreenTimeEvent]) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e, ScreenTimeEvent::LimitUpcoming { .. }))
+    }
+
+    #[test]
+    fn limit_warns_at_exactly_ten_minutes_then_reaches_then_clears_next_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let (today, tomorrow) = start_of_today(T0);
+        let mut tracker = limit_tracker(dir.path(), today, T0 - today + 900);
+        // 15 min left: GNOME schedules the warning, it posts nothing yet.
+        assert!(!upcoming(&tracker.poll(T0, 1000, true).events));
+        assert!(!upcoming(&tracker.poll(T0 + 299, 1299, true).events));
+        // Exactly 600 s left (`Math.ceil(remainingSecs) === timeoutLimit`).
+        let poll = tracker.poll(T0 + 300, 1300, true);
         assert!(
-            poll.events.iter().any(|e| matches!(
-                e,
-                ScreenTimeEvent::LimitUpcoming { remaining_secs } if *remaining_secs == 120
-            )),
+            poll.events.contains(&ScreenTimeEvent::LimitUpcoming {
+                remaining_secs: LIMIT_UPCOMING_NOTIFICATION_SECONDS
+            }),
             "{:?}",
             poll.events
         );
+        // Any other remaining time posts nothing, re-polls included.
+        assert!(!upcoming(&tracker.poll(T0 + 300, 1300, true).events));
+        assert!(!upcoming(&tracker.poll(T0 + 301, 1301, true).events));
         assert_eq!(tracker.state(), TimeLimitsState::Active);
-        let poll = tracker.poll(T0 + 120, 1120, true);
+        let poll = tracker.poll(T0 + 900, 1900, true);
         assert!(poll.events.contains(&ScreenTimeEvent::LimitReached));
         assert!(poll
             .events
             .contains(&ScreenTimeEvent::GrayscaleChanged(true)));
+        assert!(!poll.events.contains(&ScreenTimeEvent::LimitNoticeCleared));
         assert_eq!(tracker.state(), TimeLimitsState::LimitReached);
         // Reaching the limit twice must not re-fire the one-shot notices.
-        let poll = tracker.poll(T0 + 150, 1150, true);
+        let poll = tracker.poll(T0 + 950, 1950, true);
         assert!(!poll.events.contains(&ScreenTimeEvent::LimitReached));
-        // After 03:00 the next day the limit resets to Active.
-        let poll = tracker.poll(tomorrow + 10, 1150 + (tomorrow + 10 - (T0 + 150)), true);
+        // After 03:00 the next day the limit resets to Active and, with
+        // over 10 min left again, GNOME destroys the notification.
+        let poll = tracker.poll(tomorrow + 10, 1950 + (tomorrow + 10 - (T0 + 950)), true);
         assert_eq!(tracker.state(), TimeLimitsState::Active);
         assert!(poll
             .events
             .contains(&ScreenTimeEvent::GrayscaleChanged(false)));
+        assert!(poll.events.contains(&ScreenTimeEvent::LimitNoticeCleared));
+    }
+
+    #[test]
+    fn limit_at_or_under_ten_minutes_gets_no_warning() {
+        // GNOME only warns at exactly 600 s left, so a fresh 2 min (or
+        // 10 s) limit goes straight to "Reached".
+        let dir = tempfile::tempdir().unwrap();
+        let (today, _) = start_of_today(T0);
+        let mut tracker = limit_tracker(dir.path(), today, T0 - today + 120);
+        for (wall, mono) in [(T0, 1000), (T0 + 60, 1060), (T0 + 119, 1119)] {
+            assert!(!upcoming(&tracker.poll(wall, mono, true).events));
+        }
+        let poll = tracker.poll(T0 + 120, 1120, true);
+        assert!(poll.events.contains(&ScreenTimeEvent::LimitReached));
+        assert!(!upcoming(&poll.events));
+    }
+
+    #[test]
+    fn turning_the_limit_off_removes_the_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let (today, _) = start_of_today(T0);
+        let mut tracker = limit_tracker(dir.path(), today, T0 - today + 10);
+        tracker.poll(T0, 1000, true);
+        let poll = tracker.poll(T0 + 10, 1010, true);
+        assert!(poll.events.contains(&ScreenTimeEvent::LimitReached));
+        let mut settings = tracker.settings();
+        settings.daily_limit_enabled = false;
+        tracker.set_settings(settings);
+        let poll = tracker.poll(T0 + 11, 1011, true);
+        assert_eq!(tracker.state(), TimeLimitsState::Active);
+        assert!(poll.events.contains(&ScreenTimeEvent::LimitNoticeCleared));
+        // Removed once; nothing more to remove.
+        let poll = tracker.poll(T0 + 12, 1012, true);
+        assert!(!poll.events.contains(&ScreenTimeEvent::LimitNoticeCleared));
+        // Disabling history destroys the source too.
+        settings.daily_limit_enabled = true;
+        tracker.set_settings(settings);
+        assert!(tracker
+            .poll(T0 + 13, 1013, true)
+            .events
+            .contains(&ScreenTimeEvent::LimitReached));
+        settings.history_enabled = false;
+        tracker.set_settings(settings);
+        assert!(tracker
+            .poll(T0 + 14, 1014, true)
+            .events
+            .contains(&ScreenTimeEvent::LimitNoticeCleared));
     }
 
     #[test]
@@ -2877,10 +3031,18 @@ mod tests {
         let _ = session_idle_delay();
     }
 
-    type ActionPost = (String, String, Vec<(String, String)>, u64);
+    /// A break notice post: title, body, actions, urgent, replaced id, id.
+    type ActionPost = (
+        String,
+        String,
+        Vec<(String, String)>,
+        bool,
+        Option<u64>,
+        u64,
+    );
     type ActionCallbacks = HashMap<(u64, String), Rc<dyn Fn()>>;
-    /// A screen-time notice post: title, body and the id it replaced.
-    type NoticePost = (String, String, Option<u64>);
+    /// A screen-time notice post: title, body, urgent and the id it replaced.
+    type NoticePost = (String, String, bool, Option<u64>);
 
     struct Recorded {
         posts: Rc<RefCell<Vec<NoticePost>>>,
@@ -2889,12 +3051,12 @@ mod tests {
         locks: Rc<Cell<u32>>,
         action_posts: Rc<RefCell<Vec<ActionPost>>>,
         next_id: Rc<Cell<u64>>,
-        dismissals: Rc<RefCell<Vec<u64>>>,
         registered: Rc<RefCell<Vec<(u64, String)>>>,
         callbacks: Rc<RefCell<ActionCallbacks>>,
         dropped: Rc<RefCell<Vec<u64>>>,
         queued: Rc<RefCell<Vec<BreakActionKind>>>,
         effect_sends: Rc<RefCell<Vec<(bool, bool)>>>,
+        removals: Rc<RefCell<Vec<u64>>>,
     }
 
     fn recording_hooks(recorded: &Recorded) -> ShellHooks {
@@ -2904,23 +3066,24 @@ mod tests {
         let locks = recorded.locks.clone();
         let action_posts = recorded.action_posts.clone();
         let next_id = recorded.next_id.clone();
-        let dismissals = recorded.dismissals.clone();
         let registered = recorded.registered.clone();
         let callbacks = recorded.callbacks.clone();
         let dropped = recorded.dropped.clone();
         let queued = recorded.queued.clone();
         let effect_sends = recorded.effect_sends.clone();
+        let removals = recorded.removals.clone();
         ShellHooks {
             post_notice: Rc::new({
                 let next_id = next_id.clone();
-                move |title, body, replaces| {
-                    posts.borrow_mut().push((title, body, replaces));
+                move |title, body, urgent, replaces| {
+                    posts.borrow_mut().push((title, body, urgent, replaces));
                     Some(replaces.unwrap_or_else(|| {
                         next_id.set(next_id.get() + 1);
                         next_id.get()
                     }))
                 }
             }),
+            remove_notice: Rc::new(move |id| removals.borrow_mut().push(id)),
             show_countdown: Rc::new(move |label, progress| {
                 countdowns.borrow_mut().push((label, progress));
             }),
@@ -2930,15 +3093,15 @@ mod tests {
             lock: Rc::new(move || {
                 locks.set(locks.get() + 1);
             }),
-            post_action_notice: Rc::new(move |title, body, actions| {
-                let id = next_id.get() + 1;
-                next_id.set(id);
-                action_posts.borrow_mut().push((title, body, actions, id));
+            post_action_notice: Rc::new(move |title, body, actions, urgent, replaces| {
+                let id = replaces.unwrap_or_else(|| {
+                    next_id.set(next_id.get() + 1);
+                    next_id.get()
+                });
+                action_posts
+                    .borrow_mut()
+                    .push((title, body, actions, urgent, replaces, id));
                 Some(id)
-            }),
-            dismiss_notice: Rc::new(move |id| {
-                dismissals.borrow_mut().push(id);
-                true
             }),
             on_notice_action: Rc::new({
                 let callbacks = callbacks.clone();
@@ -2975,12 +3138,12 @@ mod tests {
             locks: Rc::new(Cell::new(0)),
             action_posts: Rc::new(RefCell::new(Vec::new())),
             next_id: Rc::new(Cell::new(40)),
-            dismissals: Rc::new(RefCell::new(Vec::new())),
             registered: Rc::new(RefCell::new(Vec::new())),
             callbacks: Rc::new(RefCell::new(HashMap::new())),
             dropped: Rc::new(RefCell::new(Vec::new())),
             queued: Rc::new(RefCell::new(Vec::new())),
             effect_sends: Rc::new(RefCell::new(Vec::new())),
+            removals: Rc::new(RefCell::new(Vec::new())),
         };
         let shell = recording_hooks(&hooks);
         (shell, hooks)
@@ -3007,6 +3170,7 @@ mod tests {
             &[(
                 "Screen Time Limit in 10 Minutes".to_string(),
                 "Your screen time limit is approaching".to_string(),
+                true,
                 None,
             )]
         );
@@ -3029,6 +3193,7 @@ mod tests {
             (
                 "Screen Time Limit Reached".to_string(),
                 "It's time to stop using the device".to_string(),
+                true,
                 Some(warning),
             )
         );
@@ -3043,6 +3208,18 @@ mod tests {
         assert!(!effect.grayscale);
         // State changes and grayscale post no notices of their own.
         assert_eq!(seen.posts.borrow().len(), 2);
+        // Limit off / next day: the resident is removed outright, once.
+        dispatch_screen_time(
+            &hooks,
+            &mut effect,
+            &mut resident,
+            &[
+                ScreenTimeEvent::LimitNoticeCleared,
+                ScreenTimeEvent::LimitNoticeCleared,
+            ],
+        );
+        assert_eq!(seen.removals.borrow().as_slice(), &[warning]);
+        assert_eq!(resident, None);
     }
 
     #[test]
@@ -3070,7 +3247,9 @@ mod tests {
         assert!(seen.posts.borrow().is_empty());
         let posted = seen.action_posts.borrow();
         assert_eq!(posted.len(), 1);
-        let (title, body, actions, id) = &posted[0];
+        let (title, body, actions, urgent, replaces, id) = &posted[0];
+        assert!(*urgent, "GNOME posts it as Urgency.HIGH");
+        assert_eq!(*replaces, None);
         assert_eq!(title, "Time for an Eyesight Break");
         assert_eq!(
             body,
@@ -3112,9 +3291,9 @@ mod tests {
         assert_eq!(countdown, None);
         assert_eq!(seen.locks.get(), 1);
         assert_eq!(seen.countdown_hides.get(), 1);
-        // Dismissal dismisses the resident banner, drops its callbacks and
-        // clears the resident; history keeps the entry, posts stay empty.
-        assert_eq!(seen.dismissals.borrow().as_slice(), &[41]);
+        // Dismissal removes the resident (GNOME destroys it), drops its
+        // callbacks and clears the resident; posts stay empty.
+        assert_eq!(seen.removals.borrow().as_slice(), &[41]);
         assert_eq!(seen.dropped.borrow().as_slice(), &[41]);
         assert_eq!(resident, None);
         assert!(seen.callbacks.borrow().is_empty());
@@ -3184,15 +3363,21 @@ mod tests {
                 true,
             ))],
         );
-        assert_eq!(resident, Some(42));
+        // Updated in place: same id, and only allowed keys re-registered.
+        assert_eq!(resident, Some(41));
+        assert_eq!(seen.dropped.borrow().as_slice(), &[41]);
         assert!(!seen
             .callbacks
             .borrow()
-            .contains_key(&(42, "take".to_string())));
+            .contains_key(&(41, "take".to_string())));
+        assert!(seen
+            .callbacks
+            .borrow()
+            .contains_key(&(41, "skip".to_string())));
     }
 
     #[test]
-    fn replacement_dismisses_and_forgets_the_old_resident() {
+    fn break_notices_update_the_resident_in_place() {
         let (hooks, seen) = recorded();
         let mut effect = EffectState::default();
         let mut countdown = None;
@@ -3214,23 +3399,22 @@ mod tests {
             &mut effect,
             &mut countdown,
             &mut resident,
-            &[BreakUiEvent::Notify(due_notice(
-                BreakType::Eyesight,
-                20,
-                true,
-            ))],
+            &[BreakUiEvent::Notify(overdue_notice(90, false))],
         );
-        // The old banner is dismissed and its callbacks forgotten; only
-        // the new resident can fire.
-        assert_eq!(seen.dismissals.borrow().as_slice(), &[41]);
+        // GNOME's BreakNotificationSource keeps one notification and
+        // `set()`s it: no removal, same id, new text and urgency; the
+        // old callbacks are forgotten and the new ones registered.
+        assert!(seen.removals.borrow().is_empty());
         assert_eq!(seen.dropped.borrow().as_slice(), &[41]);
-        assert_eq!(resident, Some(42));
-        assert!(!seen
-            .callbacks
-            .borrow()
-            .contains_key(&(41, "take".to_string())));
-        seen.callbacks.borrow()[&(42, "take".to_string())]();
-        assert_eq!(seen.queued.borrow().as_slice(), &[BreakActionKind::Take]);
+        assert_eq!(resident, Some(41));
+        let posts = seen.action_posts.borrow();
+        let (title, _, _, urgent, replaces, id) = &posts[1];
+        assert_eq!(title, "Break Overdue");
+        assert!(!*urgent, "notify off is Urgency.LOW");
+        assert_eq!((*replaces, *id), (Some(41), 41));
+        drop(posts);
+        seen.callbacks.borrow()[&(41, "delay".to_string())]();
+        assert_eq!(seen.queued.borrow().as_slice(), &[BreakActionKind::Delay]);
     }
 
     #[test]
@@ -3246,7 +3430,7 @@ mod tests {
             &mut resident,
             &[BreakUiEvent::DismissNotice],
         );
-        assert!(seen.dismissals.borrow().is_empty());
+        assert!(seen.removals.borrow().is_empty());
         assert!(seen.dropped.borrow().is_empty());
         assert_eq!(resident, None);
     }

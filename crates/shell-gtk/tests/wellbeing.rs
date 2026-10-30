@@ -104,25 +104,30 @@ fn scripted_day_warns_reaches_and_resets() {
         ScreenTimeSettings {
             history_enabled: true,
             daily_limit_enabled: true,
-            daily_limit_secs: T0 - today + 120,
+            daily_limit_secs: T0 - today + 720,
             grayscale: true,
         },
         HistoryStore::new(history_file(dir.path())),
     );
+    // 12 min left: GNOME schedules the warning for exactly 600 s left.
     let poll = tracker.poll(T0, 1000, true);
     assert!(poll.stored.is_ok());
+    let warned = |events: &[ScreenTimeEvent]| {
+        events
+            .iter()
+            .any(|e| matches!(e, ScreenTimeEvent::LimitUpcoming { .. }))
+    };
+    assert!(!warned(&poll.events), "{:?}", poll.events);
+    let poll = tracker.poll(T0 + 120, 1120, true);
     assert!(
-        poll.events.iter().any(|e| matches!(
-            e,
-            ScreenTimeEvent::LimitUpcoming {
-                remaining_secs: 120
-            }
-        )),
+        poll.events.contains(&ScreenTimeEvent::LimitUpcoming {
+            remaining_secs: 600
+        }),
         "{:?}",
         poll.events
     );
 
-    let poll = tracker.poll(T0 + 120, 1120, true);
+    let poll = tracker.poll(T0 + 720, 1720, true);
     assert_eq!(tracker.state(), TimeLimitsState::LimitReached);
     assert!(poll.events.contains(&ScreenTimeEvent::LimitReached));
     assert!(poll
@@ -131,7 +136,7 @@ fn scripted_day_warns_reaches_and_resets() {
 
     // Disabling history mid-day deletes the file and stops the machine.
     tracker.set_settings(ScreenTimeSettings::default());
-    let poll = tracker.poll(T0 + 150, 1150, true);
+    let poll = tracker.poll(T0 + 750, 1750, true);
     assert_eq!(tracker.state(), TimeLimitsState::Active);
     assert!(poll
         .events
@@ -140,7 +145,7 @@ fn scripted_day_warns_reaches_and_resets() {
         history_enabled: false,
         ..Default::default()
     });
-    tracker.poll(T0 + 180, 1180, true);
+    tracker.poll(T0 + 780, 1780, true);
     assert_eq!(tracker.state(), TimeLimitsState::Disabled);
     assert!(!history_file(dir.path()).exists());
 
@@ -154,7 +159,7 @@ fn scripted_day_warns_reaches_and_resets() {
         },
         HistoryStore::new(history_file(dir.path())),
     );
-    let mono = 1180 + (tomorrow + 10 - (T0 + 180));
+    let mono = 1780 + (tomorrow + 10 - (T0 + 780));
     tracker.poll(tomorrow + 10, mono, true);
     assert_eq!(tracker.state(), TimeLimitsState::Active);
     assert_eq!(
