@@ -3,15 +3,17 @@
 //!
 //! The shell owns `org.freedesktop.Notifications` through the existing
 //! toolkit-free daemon (`tuna_shell_host::intake::NotificationBus`) and
-//! store (`NotificationCenter`); this module only draws them. Banners
-//! stack top-center under the top bar and expire after
-//! [`BANNER_TIMEOUT`] unless critical; the list shows history newest
-//! first, one group per app (GNOME 51's NotificationMessageGroup: a
-//! collapsed stack that expands on click); Do Not Disturb keeps banners
-//! away (critical ones still show) while history keeps filling.
+//! store (`NotificationCenter`); this module only draws them. Like
+//! GNOME's message tray, one banner at a time drops in top-center under
+//! the top bar; the others wait in the store's queue (see
+//! [`tray_step`]). A banner goes [`BANNER_TIMEOUT`] after it has dropped
+//! in unless critical; the list shows history newest first, one group
+//! per app (GNOME 51's NotificationMessageGroup: a collapsed stack that
+//! expands on click); Do Not Disturb keeps banners away (critical ones
+//! still show) while history keeps filling.
 //!
 //! Nothing here runs on a period: wire arrivals wake the main loop
-//! through the bus's change callback, each banner's expiry is a one-shot
+//! through the bus's change callback, the banner's expiry is a one-shot
 //! timeout re-armed after every update, and a banner waiting for an away
 //! user wakes on the IdleMonitor's user-active watch.
 
@@ -120,6 +122,69 @@ pub fn due<'a>(
     due
 }
 
+/// Where the banner surface is in GNOME's message tray cycle
+/// (`messageTray.js` `State`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayState {
+    Hidden,
+    /// Dropping in.
+    Showing,
+    /// On screen, its timeout running.
+    Shown,
+    /// Sliding out.
+    Hiding,
+}
+
+/// What the banner surface does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayStep {
+    Stay,
+    /// Drop this queued banner in; when it is the one already on screen
+    /// (or sliding out), it was updated: show it again in place.
+    Show(u64),
+    /// The banner on screen left the queue: take it away.
+    Hide,
+}
+
+/// GNOME's `MessageTray._updateState` for the banner surface, given
+/// the store's banner queue as `(id, urgency, acknowledged)`: with none
+/// on screen the next one drops in, critical first and otherwise oldest
+/// first; the banner on screen stays until it leaves the queue (it
+/// expired, was dismissed or closed); one sliding out finishes before the
+/// next drops in. Showing a banner acknowledges it, so the one on screen
+/// unacknowledged again was updated in place (a replacement): like
+/// `_onNotificationRequestBanner` for the notification already showing,
+/// it shows again (`_updateShowingNotification`), never queued behind.
+pub fn tray_step(
+    state: TrayState,
+    showing: Option<u64>,
+    queue: &[(u64, Urgency, bool)],
+) -> TrayStep {
+    let entry = |id: u64| queue.iter().find(|(q, _, _)| *q == id);
+    match (state, showing) {
+        (TrayState::Hidden, _) => queue
+            .iter()
+            .min_by_key(|(_, urgency, _)| std::cmp::Reverse(urgency_rank(*urgency)))
+            .map_or(TrayStep::Stay, |(id, _, _)| TrayStep::Show(*id)),
+        (TrayState::Showing | TrayState::Shown, Some(id)) => match entry(id) {
+            None => TrayStep::Hide,
+            Some((_, _, false)) => TrayStep::Show(id),
+            Some(_) => TrayStep::Stay,
+        },
+        (TrayState::Hiding, Some(id)) if entry(id).is_some() => TrayStep::Show(id),
+        _ => TrayStep::Stay,
+    }
+}
+
+/// The message tray's queue order (`n2.urgency - n1.urgency`).
+fn urgency_rank(urgency: Urgency) -> u8 {
+    match urgency {
+        Urgency::Low => 0,
+        Urgency::Normal => 1,
+        Urgency::Critical => 2,
+    }
+}
+
 /// A one-shot timeout after `delay`, in whole milliseconds rounded up so
 /// it never fires before `delay` has passed.
 fn timeout_after(delay: Duration, func: impl FnOnce() + 'static) -> glib::SourceId {
@@ -219,11 +284,12 @@ fn group_key(n: &Notification) -> String {
     }
 }
 
-/// Snapshot of what the surfaces show, to rebuild only on change.
+/// Snapshot of what the list shows, to rebuild only on change.
 #[derive(Default, PartialEq)]
 struct Shown {
-    banners: Vec<u64>,
     history: Vec<u64>,
+    /// The store's in-place replacements: an id kept, its text changed.
+    replacements: u64,
     expanded: Vec<String>,
     dnd: bool,
 }
@@ -300,9 +366,15 @@ pub struct NotifyUi {
     bus: RefCell<NotificationBus>,
     banner_window: gtk::ApplicationWindow,
     banner_box: gtk::Box,
-    /// Drops banners in and slides them out (`messageTray.js`).
+    /// Drops the banner in and slides it out (`messageTray.js`).
     banner_bin: crate::transient::MotionBin,
     banner_motion: crate::transient::Player,
+    /// The tray's cycle, and the banner it holds.
+    tray: Cell<TrayState>,
+    showing: Cell<Option<u64>>,
+    /// The banner this shell just expired: it slides out, where one
+    /// dismissed or closed goes at once (`_notificationRemoved`).
+    expired: Cell<Option<u64>>,
     /// The calendar popover's left pane.
     pane: gtk::Box,
     list: gtk::Box,
@@ -312,14 +384,21 @@ pub struct NotifyUi {
     /// SYNC_CREATE, so Clear shows (insensitive) until the list first
     /// changes; after that it hides whenever the list is empty.
     clear_bound: std::cell::Cell<bool>,
-    first_seen: RefCell<HashMap<u64, BannerTimer>>,
+    /// The banner on screen's expiry, from when it has dropped in.
+    timer: RefCell<Option<BannerTimer>>,
+    /// GNOME's `_userActiveWhileNotificationShown`: the user was active
+    /// when the banner on screen dropped in, or has been since. It holds
+    /// across an in-place update, which then times out like any banner
+    /// shown to an active user.
+    user_active: Cell<bool>,
     /// The groups the user expanded, by source key.
     expanded: RefCell<HashSet<String>>,
     group_widgets: RefCell<HashMap<String, Rc<crate::group_animation::Group>>>,
     /// The history list's widgets lag the store: they are built only while
     /// the list is on screen, and when it next maps.
     history_stale: Cell<bool>,
-    shown: RefCell<Shown>,
+    /// What the list last showed; `None` until the first refresh.
+    shown: RefCell<Option<Shown>>,
     local_actions: RefCell<ActionDispatch>,
     /// The next banner expiry (a one-shot timeout).
     deadline: RefCell<Option<glib::SourceId>>,
@@ -539,19 +618,20 @@ impl NotifyUi {
             banner_box,
             banner_bin,
             banner_motion: crate::transient::Player::new("banner"),
+            tray: Cell::new(TrayState::Hidden),
+            showing: Cell::new(None),
+            expired: Cell::new(None),
             pane,
             list,
             empty,
             clear,
             clear_bound: std::cell::Cell::new(false),
-            first_seen: RefCell::new(HashMap::new()),
+            timer: RefCell::new(None),
+            user_active: Cell::new(false),
             expanded: RefCell::new(HashSet::new()),
             group_widgets: RefCell::new(HashMap::new()),
             history_stale: Cell::new(false),
-            shown: RefCell::new(Shown {
-                banners: vec![u64::MAX],
-                ..Default::default()
-            }),
+            shown: RefCell::new(None),
             local_actions: RefCell::new(ActionDispatch::default()),
             deadline: RefCell::new(None),
             bus_retry: RefCell::new(None),
@@ -597,11 +677,31 @@ impl NotifyUi {
     /// Post the shell's own notification under a GNOME source name and
     /// icon (screenshots: "Screenshot", `screenshot-recorded-symbolic`).
     pub fn post(self: &Rc<Self>, app: &str, icon: &str, summary: &str, body: &str) {
-        if let Ok(mut center) = self.center.lock() {
-            let id = center.notify(app, summary, body, Vec::new(), Urgency::Normal, None);
+        self.post_replacing(app, icon, summary, body, None);
+    }
+
+    /// Post, or with `replaces` naming a live notification update it in
+    /// place, as a shell source updates its resident notification
+    /// (`notification.set()` then `source.addNotification()`): the list
+    /// entry takes the new text, and its banner shows again, in place
+    /// when it is the one on screen. Returns the notification's id
+    /// (`None` when the store is unreachable).
+    pub fn post_replacing(
+        self: &Rc<Self>,
+        app: &str,
+        icon: &str,
+        summary: &str,
+        body: &str,
+        replaces: Option<u64>,
+    ) -> Option<u64> {
+        let id = {
+            let mut center = self.center.lock().ok()?;
+            let id = center.notify(app, summary, body, Vec::new(), Urgency::Normal, replaces);
             center.set_source(id, icon, "");
-        }
+            id
+        };
         self.update();
+        Some(id)
     }
 
     /// Post the shell's own notification WITH invokable actions, returning
@@ -741,45 +841,19 @@ impl NotifyUi {
     }
 
     /// Claim the bus (retrying every [`BUS_RETRY`] while it is not
-    /// ours), expire banners, redraw on change, and arm the next wake:
-    /// the earliest banner deadline, or an away user's return. Runs on
-    /// every change to the notifications, never on a period.
+    /// ours), expire the banner on screen, redraw on change, and arm the
+    /// next wake: its deadline, or an away user's return. Runs on every
+    /// change to the notifications, never on a period.
     fn update(self: &Rc<Self>) {
         self.ensure_bus();
-        // Expire non-critical banners.
-        let due = {
-            let Ok(center) = self.center.lock() else {
-                return;
-            };
-            let mut seen = self.first_seen.borrow_mut();
-            let now = Instant::now();
-            let live: Vec<(u64, Urgency)> =
-                center.banners().iter().map(|n| (n.id, n.urgency)).collect();
-            seen.retain(|id, _| live.iter().any(|(l, _)| l == id));
-            let timed: Vec<u64> = live
-                .iter()
-                .filter(|(_, u)| *u != Urgency::Critical)
-                .map(|(id, _)| *id)
-                .collect();
-            // Ask for idle time only while a banner is timing.
-            let idle = if timed.is_empty() { None } else { idle_time() };
-            for id in &timed {
-                seen.entry(*id)
-                    .or_insert_with(|| BannerTimer::new(now, idle));
-            }
-            due(
-                seen.iter_mut()
-                    .filter(|(id, _)| timed.contains(id))
-                    .map(|(id, timer)| (*id, timer)),
-                now,
-                idle,
-            )
-        };
-        for id in &due.expired {
-            let _ = self.bus.borrow().dismiss_banner(*id as u32, REASON_EXPIRED);
-            self.retire_local_actions(*id);
+        for id in self.banner_due().expired {
+            self.expired.set(Some(id));
+            let _ = self.bus.borrow().dismiss_banner(id as u32, REASON_EXPIRED);
+            self.retire_local_actions(id);
         }
         self.refresh();
+        // After the refresh, which can bring the next banner on.
+        let due = self.banner_due();
         let mut next = due.next;
         if due.away {
             if self.user_watch.get() == UserWatch::Unavailable {
@@ -790,6 +864,48 @@ impl NotifyUi {
             }
         }
         self.arm_deadline(next);
+    }
+
+    /// Advance the banner on screen's timer to now. GNOME starts its
+    /// four seconds once the banner has dropped in, and never times a
+    /// critical one.
+    fn banner_due(&self) -> Due {
+        let timed = match (self.tray.get(), self.showing.get()) {
+            (TrayState::Shown, Some(id)) => self
+                .center
+                .lock()
+                .is_ok_and(|center| {
+                    center
+                        .banners()
+                        .iter()
+                        .any(|n| n.id == id && n.urgency != Urgency::Critical)
+                })
+                .then_some(id),
+            _ => None,
+        };
+        let mut timer = self.timer.borrow_mut();
+        let Some(id) = timed else {
+            *timer = None;
+            return Due::default();
+        };
+        // Ask for the idle time only while it decides: when the banner
+        // has just dropped in to a user not yet seen active, or while it
+        // waits for an away user.
+        let idle =
+            if !self.user_active.get() && timer.as_ref().is_none_or(|t| t.deadline().is_none()) {
+                idle_time()
+            } else {
+                None
+            };
+        let now = Instant::now();
+        // A user already seen active (an updated banner shown again) has
+        // no idle time asked: the active user's four seconds.
+        let timer = timer.get_or_insert_with(|| BannerTimer::new(now, idle));
+        let due = due([(id, &mut *timer)], now, idle);
+        if timer.deadline().is_some() {
+            self.user_active.set(true);
+        }
+        due
     }
 
     /// Connect the bus unless it is ours or a retry is already pending;
@@ -893,6 +1009,12 @@ impl NotifyUi {
     }
 
     fn refresh(self: &Rc<Self>) {
+        self.refresh_list();
+        self.sync_banner();
+    }
+
+    /// Redraw the calendar's list and its placeholder on change.
+    fn refresh_list(self: &Rc<Self>) {
         let Ok(center) = self.center.lock() else {
             return;
         };
@@ -908,95 +1030,16 @@ impl NotifyUi {
             .retain(|k| groups.iter().any(|(g, ids)| g == k && ids.len() > 1));
         let mut expanded: Vec<String> = self.expanded.borrow().iter().cloned().collect();
         expanded.sort();
-        // While the date menu is open the banners stay in its list only
-        // (messageTray.js `bannerBlocked`).
-        let blocked = self.banner_blocked.get();
         let now = Shown {
-            banners: if blocked {
-                Vec::new()
-            } else {
-                center.banners().iter().map(|n| n.id).collect()
-            },
             history: center.history().iter().rev().map(|n| n.id).collect(),
+            replacements: center.replacements(),
             expanded,
             dnd: center.dnd(),
         };
-        if *self.shown.borrow() == now {
+        if self.shown.borrow().as_ref() == Some(&now) {
             return;
         }
-        let before = std::mem::take(&mut *self.shown.borrow_mut());
-        // Banners. The last ones stay up while they slide away (and are
-        // cleared once they have).
-        let leaving = now.banners.is_empty() && !before.banners.is_empty();
-        if !now.banners.is_empty() {
-            while let Some(child) = self.banner_box.first_child() {
-                self.banner_box.remove(&child);
-            }
-        }
-        for n in center.banners().iter().filter(|_| !blocked) {
-            let (c, close) = card(n);
-            c.add_css_class("banner");
-            let has_default = n.actions().iter().any(|a| a.id == "default");
-            if n.actions().iter().any(|a| a.id != "default") {
-                let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-                for action in n.actions().iter().filter(|a| a.id != "default") {
-                    let button = gtk::Button::with_label(&action.label);
-                    let (me, id, key) = (self.clone(), n.id, action.id.clone());
-                    button.connect_clicked(move |_| {
-                        // Bus first: its per-key replay guard rejects
-                        // unknown/replayed keys. Local dispatch then fires
-                        // only for admitted shell-own (id, key) pairs and
-                        // retires the whole resident on success, so no
-                        // sibling key captured before the press can fire
-                        // afterwards. Unregistered notices behave exactly
-                        // as before.
-                        if me.bus.borrow().invoke_action(id as u32, &key).is_ok() {
-                            me.dispatch_local_action(id, &key);
-                        }
-                        me.refresh();
-                    });
-                    row.append(&button);
-                }
-                c.append(&row);
-            }
-            {
-                let (me, id) = (self.clone(), n.id);
-                close.connect_clicked(move |_| {
-                    let _ = me.bus.borrow().dismiss_banner(id as u32, REASON_DISMISSED);
-                    me.retire_local_actions(id);
-                    me.refresh();
-                });
-            }
-            let click = gtk::GestureClick::new();
-            {
-                let (me, id) = (self.clone(), n.id);
-                click.connect_released(move |_, _, _, _| {
-                    let bus = me.bus.borrow();
-                    let _ = if has_default {
-                        bus.invoke_action(id as u32, "default")
-                    } else {
-                        bus.dismiss_banner(id as u32, REASON_DISMISSED)
-                    };
-                    drop(bus);
-                    me.retire_local_actions(id);
-                    me.refresh();
-                });
-            }
-            c.add_controller(click);
-            self.banner_box.append(&c);
-        }
-        if now.banners.is_empty() && self.banner_window.is_layer_window() {
-            self.banner_window.set_keyboard_mode(KeyboardMode::None);
-            if leaving {
-                self.leave_banners();
-            }
-        } else if now.banners.iter().any(|id| !before.banners.contains(id))
-            || !self.banner_bin.can_target()
-        {
-            // A new banner (or one returning mid-slide) drops in.
-            self.enter_banners();
-        }
-
+        let before = self.shown.take().unwrap_or_default();
         // History list. Like GNOME's message list it is only built for the
         // open calendar: rebuilding every card of every group on each
         // arrival and expiry while the list was off screen was most of the
@@ -1016,11 +1059,129 @@ impl NotifyUi {
         self.clear.set_visible(!self.clear_bound.get() || any);
         self.clear.set_sensitive(any);
         drop(center);
-        *self.shown.borrow_mut() = now;
+        *self.shown.borrow_mut() = Some(now);
         // Showing the list above maps it while the store was held.
         if self.list.is_mapped() {
             self.sync_history();
         }
+    }
+
+    /// Move the banner surface along GNOME's message tray cycle (see
+    /// [`tray_step`]): one banner on screen at a time, the next one
+    /// dropping in once the last has gone, the one on screen showing
+    /// again when it was updated.
+    fn sync_banner(self: &Rc<Self>) {
+        if self.banner_blocked.get() {
+            // `bannerBlocked`: the open date menu hides the tray at once;
+            // the banner keeps its place until the menu closes.
+            self.banner_window.set_visible(false);
+            return;
+        }
+        let (step, card) = {
+            let Ok(mut center) = self.center.lock() else {
+                return;
+            };
+            let queue: Vec<(u64, Urgency, bool)> = center
+                .banners()
+                .iter()
+                .map(|n| (n.id, n.urgency, n.acknowledged()))
+                .collect();
+            let step = tray_step(self.tray.get(), self.showing.get(), &queue);
+            let card = match step {
+                TrayStep::Show(id) => center
+                    .banners()
+                    .into_iter()
+                    .find(|n| n.id == id)
+                    .map(|n| self.banner_card(n)),
+                _ => None,
+            };
+            if let TrayStep::Show(id) = step {
+                // `_updateShowingNotification`: what shows is seen.
+                center.acknowledge(&[id]);
+            }
+            (step, card)
+        };
+        match (step, card) {
+            (TrayStep::Show(id), Some(card)) => {
+                while let Some(child) = self.banner_box.first_child() {
+                    self.banner_box.remove(&child);
+                }
+                self.banner_box.append(&card);
+                let again = self.showing.replace(Some(id)) == Some(id);
+                if !again {
+                    self.user_active.set(false);
+                }
+                *self.timer.borrow_mut() = None;
+                self.enter_banner(again);
+            }
+            (TrayStep::Hide, _) => {
+                // GNOME slides out only an expired banner; a dismissed
+                // or closed one goes at once.
+                let expired = self.expired.take() == self.showing.get();
+                self.leave_banner(expired && self.banner_window.is_visible());
+            }
+            _ => {
+                // The menu that blocked the banner closed: it shows again.
+                let on = matches!(self.tray.get(), TrayState::Showing | TrayState::Shown);
+                if on && !self.banner_window.is_visible() {
+                    self.banner_window.set_visible(true);
+                }
+            }
+        }
+    }
+
+    /// One banner card, its buttons wired to the bus.
+    fn banner_card(self: &Rc<Self>, n: &Notification) -> gtk::Box {
+        let (c, close) = card(n);
+        c.add_css_class("banner");
+        let has_default = n.actions().iter().any(|a| a.id == "default");
+        if n.actions().iter().any(|a| a.id != "default") {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            for action in n.actions().iter().filter(|a| a.id != "default") {
+                let button = gtk::Button::with_label(&action.label);
+                let (me, id, key) = (self.clone(), n.id, action.id.clone());
+                button.connect_clicked(move |_| {
+                    // Bus first: its per-key replay guard rejects
+                    // unknown/replayed keys. Local dispatch then fires
+                    // only for admitted shell-own (id, key) pairs and
+                    // retires the whole resident on success, so no
+                    // sibling key captured before the press can fire
+                    // afterwards. Unregistered notices behave exactly
+                    // as before.
+                    if me.bus.borrow().invoke_action(id as u32, &key).is_ok() {
+                        me.dispatch_local_action(id, &key);
+                    }
+                    me.refresh();
+                });
+                row.append(&button);
+            }
+            c.append(&row);
+        }
+        {
+            let (me, id) = (self.clone(), n.id);
+            close.connect_clicked(move |_| {
+                let _ = me.bus.borrow().dismiss_banner(id as u32, REASON_DISMISSED);
+                me.retire_local_actions(id);
+                me.refresh();
+            });
+        }
+        let click = gtk::GestureClick::new();
+        {
+            let (me, id) = (self.clone(), n.id);
+            click.connect_released(move |_, _, _, _| {
+                let bus = me.bus.borrow();
+                let _ = if has_default {
+                    bus.invoke_action(id as u32, "default")
+                } else {
+                    bus.dismiss_banner(id as u32, REASON_DISMISSED)
+                };
+                drop(bus);
+                me.retire_local_actions(id);
+                me.refresh();
+            });
+        }
+        c.add_controller(click);
+        c
     }
 
     /// Build the history list deferred while it was hidden. Its cards
@@ -1036,7 +1197,11 @@ impl NotifyUi {
         let groups = group_ids(center.history().iter().rev().map(|n| (n.id, group_key(n))));
         let (listed, expanded) = {
             let shown = self.shown.borrow();
-            (shown.history.clone(), shown.expanded.clone())
+            let shown = shown.as_ref();
+            (
+                shown.map(|s| s.history.clone()).unwrap_or_default(),
+                shown.map(|s| s.expanded.clone()).unwrap_or_default(),
+            )
         };
         self.build_history(&center, &groups, &listed, &expanded);
     }
@@ -1120,38 +1285,66 @@ impl NotifyUi {
         }
     }
 
-    /// Drop the banners in: fade, slide down and grow from 90%.
-    fn enter_banners(&self) {
+    /// Drop the banner in: fade, slide down and grow from 90%. `again`
+    /// shows the banner already on screen (or sliding out) again after
+    /// an update, from where it stands. Its four seconds start once it
+    /// has (`_showNotificationCompleted`).
+    fn enter_banner(self: &Rc<Self>, again: bool) {
+        self.tray.set(TrayState::Showing);
         self.banner_bin.set_can_target(true);
         self.banner_window.set_visible(true);
-        self.banner_bin.animate(
-            &self.banner_motion,
-            crate::transient::BANNER_MS,
-            |bin, t| crate::transient::banner_enter(t, f64::from(bin.height())),
-            || {},
-        );
-    }
-
-    /// Slide the last banners back up, then hide their surface.
-    fn leave_banners(self: &Rc<Self>) {
-        self.banner_bin.set_can_target(false);
+        let from = again.then(|| self.banner_bin.frame());
         let weak = Rc::downgrade(self);
         self.banner_bin.animate(
             &self.banner_motion,
             crate::transient::BANNER_MS,
-            |bin, t| crate::transient::banner_leave(t, f64::from(bin.height())),
+            move |bin, t| match from {
+                Some(from) => crate::transient::banner_reshow(from, t),
+                None => crate::transient::banner_enter(t, f64::from(bin.height())),
+            },
             move || {
-                let Some(me) = weak.upgrade() else {
-                    return;
-                };
-                me.banner_window.set_visible(false);
-                while let Some(child) = me.banner_box.first_child() {
-                    me.banner_box.remove(&child);
+                if let Some(me) = weak.upgrade() {
+                    me.tray.set(TrayState::Shown);
+                    me.update();
                 }
-                me.banner_bin.set_frame(crate::transient::Frame::REST);
-                me.banner_bin.set_can_target(true);
             },
         );
+    }
+
+    /// Take the banner away, sliding it back up when `slide`, then let
+    /// the next queued one drop in (`_hideNotification`).
+    fn leave_banner(self: &Rc<Self>, slide: bool) {
+        self.tray.set(TrayState::Hiding);
+        self.banner_bin.set_can_target(false);
+        if self.banner_window.is_layer_window() {
+            self.banner_window.set_keyboard_mode(KeyboardMode::None);
+        }
+        let weak = Rc::downgrade(self);
+        let done = move || {
+            let Some(me) = weak.upgrade() else {
+                return;
+            };
+            me.banner_window.set_visible(false);
+            while let Some(child) = me.banner_box.first_child() {
+                me.banner_box.remove(&child);
+            }
+            me.banner_bin.set_frame(crate::transient::Frame::REST);
+            me.banner_bin.set_can_target(true);
+            me.showing.set(None);
+            me.tray.set(TrayState::Hidden);
+            me.update();
+        };
+        if slide {
+            self.banner_bin.animate(
+                &self.banner_motion,
+                crate::transient::BANNER_MS,
+                |bin, t| crate::transient::banner_leave(t, f64::from(bin.height())),
+                done,
+            );
+        } else {
+            self.banner_motion.stop();
+            done();
+        }
     }
 
     /// Close notifications from the list (and any banner they hold).
@@ -1181,7 +1374,9 @@ impl NotifyUi {
             // Keep the next refresh from rebuilding the group mid-animation.
             let mut expanded: Vec<_> = self.expanded.borrow().iter().cloned().collect();
             expanded.sort();
-            self.shown.borrow_mut().expanded = expanded;
+            if let Some(shown) = self.shown.borrow_mut().as_mut() {
+                shown.expanded = expanded;
+            }
         } else {
             self.refresh();
         }
@@ -1544,6 +1739,68 @@ mod timer_tests {
         assert!(!back.away);
         assert_eq!(due(std::iter::empty(), t0, None), Due::default());
     }
+
+    #[test]
+    fn one_banner_at_a_time_like_the_message_tray() {
+        use TrayState::*;
+        let (n, c) = (Urgency::Normal, Urgency::Critical);
+        // (id, urgency, acknowledged): a banner is acknowledged once it
+        // has shown.
+        // Nothing queued: nothing shows.
+        assert_eq!(tray_step(Hidden, None, &[]), TrayStep::Stay);
+        // The oldest queued banner drops in, never two at once...
+        assert_eq!(
+            tray_step(Hidden, None, &[(1, n, false), (2, n, false)]),
+            TrayStep::Show(1)
+        );
+        // ...and a critical one goes first.
+        assert_eq!(
+            tray_step(Hidden, None, &[(1, n, false), (2, c, false), (3, c, false)]),
+            TrayStep::Show(2)
+        );
+        // Newer arrivals wait while one is dropping in or on screen,
+        // critical or not: the banner on screen is never replaced.
+        for state in [Showing, Shown] {
+            assert_eq!(
+                tray_step(
+                    state,
+                    Some(1),
+                    &[(1, n, true), (2, c, false), (3, n, false)]
+                ),
+                TrayStep::Stay
+            );
+            // It goes once it leaves the queue (expired, dismissed, closed).
+            assert_eq!(tray_step(state, Some(1), &[(2, n, false)]), TrayStep::Hide);
+        }
+        // The next waits for the last to slide out, unless the one
+        // sliding out was queued again.
+        assert_eq!(tray_step(Hiding, Some(1), &[(2, n, false)]), TrayStep::Stay);
+        assert_eq!(
+            tray_step(Hiding, Some(1), &[(2, n, false), (1, n, false)]),
+            TrayStep::Show(1)
+        );
+    }
+
+    #[test]
+    fn an_updated_banner_on_screen_shows_again_in_place() {
+        use TrayState::*;
+        let n = Urgency::Normal;
+        // The banner on screen was replaced (unacknowledged again): it
+        // shows again at once, ahead of the queue, as GNOME's
+        // `_updateShowingNotification` does for the notification already
+        // up (a screen-time warning turning into "Limit Reached").
+        for state in [Showing, Shown] {
+            assert_eq!(
+                tray_step(state, Some(1), &[(2, n, false), (1, n, false)]),
+                TrayStep::Show(1)
+            );
+        }
+        // Once shown again it is seen, and stays.
+        assert_eq!(
+            tray_step(Shown, Some(1), &[(2, n, false), (1, n, true)]),
+            TrayStep::Stay
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1572,7 +1829,35 @@ mod gtk_action_lifecycle_tests {
         found.pop().unwrap()
     }
 
+    /// Every label's text under `root`, in widget order.
+    fn labels(root: &impl IsA<gtk::Widget>) -> Vec<String> {
+        fn collect(widget: &gtk::Widget, found: &mut Vec<String>) {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                found.push(label.text().to_string());
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                collect(&widget, found);
+                child = widget.next_sibling();
+            }
+        }
+        let mut found = Vec::new();
+        collect(root.as_ref(), &mut found);
+        found
+    }
+
+    /// Let the banner finish dropping in or sliding out, as a running
+    /// session would: one banner at a time, so the next waits for it.
+    fn settle(ui: &Rc<NotifyUi>) {
+        let end = Instant::now() + Duration::from_secs(5);
+        while matches!(ui.tray.get(), TrayState::Showing | TrayState::Hiding) {
+            assert!(Instant::now() < end, "banner never settled");
+            glib::MainContext::default().iteration(true);
+        }
+    }
+
     fn post(ui: &Rc<NotifyUi>) -> (u64, gtk::Button, gtk::Button, Rc<Cell<u32>>) {
+        settle(ui);
         let id = ui
             .post_with_actions(
                 "Owned callback fixture",
@@ -1585,6 +1870,8 @@ mod gtk_action_lifecycle_tests {
                 ],
             )
             .unwrap();
+        settle(ui);
+        assert_eq!(ui.showing.get(), Some(id), "the new banner is on screen");
         let fired = Rc::new(Cell::new(0));
         for key in ["take", "delay"] {
             let count = fired.clone();
@@ -1650,13 +1937,10 @@ mod gtk_action_lifecycle_tests {
                     assert!(ui.dismiss_notification(id));
                 }
                 "timeout" => {
-                    ui.first_seen.borrow_mut().insert(
-                        id,
-                        BannerTimer {
-                            shown: Instant::now() - Duration::from_secs(10),
-                            deadline: Some(Instant::now() - Duration::from_secs(1)),
-                        },
-                    );
+                    *ui.timer.borrow_mut() = Some(BannerTimer {
+                        shown: Instant::now() - Duration::from_secs(10),
+                        deadline: Some(Instant::now() - Duration::from_secs(1)),
+                    });
                     ui.update(); // Real expiry and retirement path, no sleep/retry.
                     assert!(!center.lock().unwrap().banners().iter().any(|n| n.id == id));
                 }
@@ -1710,6 +1994,7 @@ mod gtk_action_lifecycle_tests {
         }
         // External notices have no local handler. Dismiss keeps each history
         // action invokable once, including a captured button after dismissal.
+        settle(&ui);
         let id = ui
             .post_with_actions(
                 "External fixture",
@@ -1730,6 +2015,58 @@ mod gtk_action_lifecycle_tests {
         assert!(ui.bus.borrow().invoke_action(id as u32, "take").is_err());
         assert!(ui.bus.borrow().invoke_action(id as u32, "delay").is_err());
         assert_eq!(center.lock().unwrap().history().len(), 1);
+        ui.clear.emit_clicked();
+        // A resident notice updated in place (GNOME's screen-time warning
+        // turning into "Limit Reached") shows again on the banner already
+        // up with its new text, never queued behind a later arrival.
+        settle(&ui);
+        let warning = ui
+            .post_replacing("Wellbeing", "", "Screen Time Limit in 10 Minutes", "", None)
+            .unwrap();
+        settle(&ui);
+        assert_eq!(ui.showing.get(), Some(warning));
+        let later = ui.post_replacing("Later", "", "Later", "", None).unwrap();
+        settle(&ui);
+        assert_eq!(ui.showing.get(), Some(warning), "the later one waits");
+        // The list as the open calendar would draw it, before the update.
+        ui.sync_history();
+        assert!(labels(&ui.list).iter().any(|l| l.contains("10 Minutes")));
+        let reached = ui.post_replacing(
+            "Wellbeing",
+            "",
+            "Screen Time Limit Reached",
+            "",
+            Some(warning),
+        );
+        assert_eq!(reached, Some(warning), "updated in place");
+        settle(&ui);
+        assert_eq!(ui.showing.get(), Some(warning), "shown again, not queued");
+        let text = labels(&ui.banner_box);
+        assert!(
+            text.iter().any(|l| l == "Screen Time Limit Reached"),
+            "{text:?}"
+        );
+        assert!(!text.iter().any(|l| l.contains("10 Minutes")), "{text:?}");
+        // The list entry takes the new text too (same id, new content).
+        ui.sync_history();
+        let listed = labels(&ui.list);
+        assert!(
+            listed.iter().any(|l| l == "Screen Time Limit Reached"),
+            "{listed:?}"
+        );
+        assert!(
+            !listed.iter().any(|l| l.contains("10 Minutes")),
+            "{listed:?}"
+        );
+        {
+            let center = center.lock().unwrap();
+            assert_eq!(center.history().len(), 2);
+            assert!(center
+                .history()
+                .iter()
+                .any(|n| n.id == warning && n.acknowledged()));
+            assert!(center.banners().iter().any(|n| n.id == later));
+        }
         ui.clear.emit_clicked();
         ui.banner_window.close();
         println!("G-NOTIFY-LOCAL-LIFECYCLE pass actual GTK clicked handlers and in-memory NotificationCenter; Xvfb source scope only");

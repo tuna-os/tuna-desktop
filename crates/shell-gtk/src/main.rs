@@ -2370,8 +2370,8 @@ fn build(app: &adw::Application) {
         wellbeing::start(
             app.upcast_ref(),
             wellbeing::ShellHooks {
-                post_notice: Rc::new(move |title: String, body: String| {
-                    notices.post("Wellbeing", "alarm-symbolic", &title, &body);
+                post_notice: Rc::new(move |title: String, body: String, replaces: Option<u64>| {
+                    notices.post_replacing("Wellbeing", "alarm-symbolic", &title, &body, replaces)
                 }),
                 post_action_notice: Rc::new(
                     move |title: String, body: String, actions: Vec<(String, String)>| {
