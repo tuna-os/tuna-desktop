@@ -1,0 +1,62 @@
+diff --git a/src/xwayland/xwm/mod.rs b/src/xwayland/xwm/mod.rs
+index e6bbf35f..5371ff4f 100644
+--- a/src/xwayland/xwm/mod.rs
++++ b/src/xwayland/xwm/mod.rs
+@@ -156,6 +156,7 @@ mod atoms {
+             // wayland-stuff
+             WL_SURFACE_ID,
+             WL_SURFACE_SERIAL,
++            _XWAYLAND_MAY_GRAB_KEYBOARD,
+ 
+             // private
+             _SMITHAY_CLOSE_CONNECTION,
+@@ -2332,6 +2333,14 @@ where
+                         }
+                     }
+                 }
++                x if x == xwm.atoms._XWAYLAND_MAY_GRAB_KEYBOARD => {
++                    // A client allowing its own keyboard grabs (Mutter's
++                    // events.c sets the window's xwayland-may-grab-keyboard).
++                    if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == msg.window) {
++                        surface.state.lock().unwrap().xwayland_may_grab_keyboard =
++                            msg.data.as_data32()[0] != 0;
++                    }
++                }
+                 x if x == xwm.atoms.WM_CHANGE_STATE => {
+                     let data = msg.data.as_data32();
+                     if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == msg.window).cloned() {
+diff --git a/src/xwayland/xwm/surface.rs b/src/xwayland/xwm/surface.rs
+index 8cca78ee..faaaf4a2 100644
+--- a/src/xwayland/xwm/surface.rs
++++ b/src/xwayland/xwm/surface.rs
+@@ -62,6 +62,8 @@ pub(crate) struct SharedSurfaceState {
+     pub(super) mapped_onto: Option<X11Window>,
+     pub(super) geometry: Rectangle<i32, Logical>,
+     pub(super) override_redirect: bool,
++    // Set by an _XWAYLAND_MAY_GRAB_KEYBOARD client message.
++    pub(super) xwayland_may_grab_keyboard: bool,
+ 
+     // The associated wl_surface.
+     pub(crate) wl_surface: Option<WlSurface>,
+@@ -197,6 +199,7 @@ impl X11Surface {
+                 net_state: HashSet::new(),
+                 motif_hints: vec![0; 5],
+                 window_type: Vec::new(),
++                xwayland_may_grab_keyboard: false,
+             })),
+             user_data: Arc::new(UserDataMap::new()),
+         }
+@@ -367,6 +370,13 @@ impl X11Surface {
+         self.state.lock().unwrap().instance.clone()
+     }
+ 
++    /// Whether the client allowed this window's keyboard grabs with an
++    /// `_XWAYLAND_MAY_GRAB_KEYBOARD` client message (data.l\[0\] non-zero),
++    /// as Mutter's `xwayland-may-grab-keyboard` window property.
++    pub fn xwayland_may_grab_keyboard(&self) -> bool {
++        self.state.lock().unwrap().xwayland_may_grab_keyboard
++    }
++
+     /// Returns the startup id of the underlying X11 window
+     pub fn startup_id(&self) -> Option<String> {
+         self.state.lock().unwrap().startup_id.clone()

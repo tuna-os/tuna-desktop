@@ -39,6 +39,9 @@
 //!   restore-shortcuts) hands the shortcuts back until the window is
 //!   focused again. A trusted shell consent response is required first;
 //!   unapproved requests remain inactive, even after refocusing.
+//! - Xwayland keyboard grab v1 (Xwayland only): a granted X11 keyboard
+//!   grab inhibits shortcuts the same way, without consent; see
+//!   [`crate::xwayland_grab`].
 //! - pointer-warp v1: a client may move the pointer within its own
 //!   surface while it has pointer focus (the enter serial must match).
 //! - presentation-time, fifo and commit-timing: see [`crate::frame_timing`].
@@ -116,6 +119,8 @@ pub const ACTIVATION_TOKEN_TTL: Duration = Duration::from_secs(10);
 pub(crate) struct Protocols {
     #[cfg(feature = "xwayland")]
     pub(crate) x11_interop: crate::x11_interop::Interop,
+    #[cfg(feature = "xwayland")]
+    pub(crate) xwayland_grabs: crate::xwayland_grab::XwaylandGrabs,
     pub(crate) dmabuf_state: DmabufState,
     pub(crate) dmabuf_global: Option<DmabufGlobal>,
     pub(crate) activation_state: XdgActivationState,
@@ -208,6 +213,8 @@ impl Protocols {
             shortcut_locked: false,
             #[cfg(feature = "xwayland")]
             x11_interop: crate::x11_interop::Interop::new(dh),
+            #[cfg(feature = "xwayland")]
+            xwayland_grabs: crate::xwayland_grab::XwaylandGrabs::new(dh),
             _pointer_warp: dh.create_global::<State, WpPointerWarpV1, ()>(1, ()),
             _fixes: dh.create_global::<State, WlFixes, ()>(1, ()),
             background_effects: crate::background_effect::BackgroundEffects::new(dh),
@@ -369,7 +376,8 @@ impl State {
     }
 
     /// Whether the surface holding keyboard focus inhibits the
-    /// compositor's shortcuts (keyboard-shortcuts-inhibit).
+    /// compositor's shortcuts (keyboard-shortcuts-inhibit, or a granted
+    /// Xwayland keyboard grab).
     pub fn shortcuts_inhibited(&self) -> bool {
         if self.protocols.shortcut_locked {
             return false;
@@ -377,14 +385,19 @@ impl State {
         let Some(focus) = self.seat.get_keyboard().and_then(|k| k.current_focus()) else {
             return false;
         };
+        #[cfg(feature = "xwayland")]
+        if self.protocols.xwayland_grabs.inhibits(&focus) {
+            return true;
+        }
         self.seat
             .keyboard_shortcuts_inhibitor_for_surface(&focus)
             .is_some_and(|inhibitor| inhibitor.is_active())
     }
 
     /// Mutter's restore-shortcuts (Super+Escape): the focused surface's
-    /// inhibitor goes inactive until it is focused again. Returns
-    /// whether one was active.
+    /// inhibitor goes inactive until it is focused again, and its
+    /// Xwayland grab ends (`shortcuts_restored_cb`). Returns whether
+    /// either was active.
     pub fn restore_shortcuts(&mut self) -> bool {
         if self.protocols.shortcut_locked {
             return false;
@@ -392,12 +405,16 @@ impl State {
         let Some(focus) = self.seat.get_keyboard().and_then(|k| k.current_focus()) else {
             return false;
         };
+        #[cfg(feature = "xwayland")]
+        let grab = self.protocols.xwayland_grabs.restore(&focus);
+        #[cfg(not(feature = "xwayland"))]
+        let grab = false;
         match self.seat.keyboard_shortcuts_inhibitor_for_surface(&focus) {
             Some(inhibitor) if inhibitor.is_active() => {
                 inhibitor.inactivate();
                 true
             }
-            _ => false,
+            _ => grab,
         }
     }
 

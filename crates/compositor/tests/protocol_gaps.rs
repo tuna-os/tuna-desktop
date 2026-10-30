@@ -930,6 +930,23 @@ fn the_system_bell_rings() {
     assert_eq!(comp.state.bell_rings(), 2);
 }
 
+/// Mutter's `xwayland_grab_keyboard_filter`: the Xwayland keyboard grab
+/// global is the Xwayland client's alone. An ordinary client never sees
+/// it (the Xwayland path is `xwayland_grab::xwayland_tests`).
+#[cfg(feature = "xwayland")]
+#[test]
+fn the_xwayland_keyboard_grab_global_is_hidden_from_ordinary_clients() {
+    let (mut comp, mut manager) = compositor();
+    let peer = connect(&mut comp, &mut manager);
+    assert!(peer.client.globals.contains_key("wl_seat"));
+    // Smithay's other Xwayland-only global uses the same filter.
+    assert!(!peer.client.globals.contains_key("xwayland_shell_v1"));
+    assert!(!peer
+        .client
+        .globals
+        .contains_key("zwp_xwayland_keyboard_grab_manager_v1"));
+}
+
 #[test]
 fn windows_keep_their_toplevel_tag() {
     let (mut comp, mut manager) = compositor();

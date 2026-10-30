@@ -45,8 +45,10 @@ is represented by a match, a version floor or a recorded deviation; a
 source-only floor is never described as a measured native version.
 
 **Golden test.** `crates/compositor/tests/protocols.rs` asserts the exact
-list and versions below. Adding or dropping a protocol updates the test
-and this page together.
+list and versions below, as an ordinary client sees them. Adding or
+dropping a protocol updates the test and this page together. The one
+Xwayland-only global is not in that list; its own tests assert that
+ordinary clients never see it.
 
 ## Advertised by Tuna Desktop
 
@@ -86,6 +88,7 @@ and this page together.
 | xdg_toplevel_tag_manager_v1 | 1 | each window keeps its tag and description |
 | xdg_session_manager_v1 | 1 | window session save and restore as in Mutter 51 (P-SY-08): a client that opens a session gets its windows back after logout or reboot (workspace, position and size, maximized, tiled, fullscreen, output; minimized is not restored, as in Mutter); store `$XDG_DATA_HOME/tuna/window-sessions.json`, written 3 s after a change and at exit (`crates/compositor/src/xdg_session.rs`) |
 | zwp_keyboard_shortcuts_inhibit_manager_v1 | 1 | after Allow, the focused window gets every key, the shell's grabs, Super and Alt+Tab included; Super+Escape (Mutter's restore-shortcuts) takes them back until the window is focused again |
+| zwp_xwayland_keyboard_grab_manager_v1 | 1 | Xwayland only, as Mutter (hidden from every other client, so `wayland-info` and the golden list never see it). Rootless Xwayland asks for a grab when an X11 client grabs the keyboard. Grants follow Mutter's `meta_xwayland_grab_is_granted`: see below |
 | wp_pointer_warp_v1 | 1 | honoured while the surface has pointer focus from the enter serial it names; nested, the host pointer stays where it is |
 | wl_fixes | 1 | `destroy_registry` destroys the registry as Mutter does: the client's id is freed and that registry hears no more globals |
 | ext_background_effect_manager_v1 | 1 | capabilities `blur` at bind; one effect object per surface (`background_effect_exists`), `set_blur_region` double-buffered on commit, NULL removes it, `surface_destroyed` once the surface is gone; destroying the object unsets the region on the next commit (meta-wayland-background-effect.c). Drawn as Mutter 51's meta-background-effect.c and clutter-blur.c: the scene beneath the surface, clipped to the surface and its region, blurred (separable gaussian, sigma = radius / 2, radius 24 logical px times the surface's scale, downscaled by powers of two while sigma > 6 and both sides > 256 px), saturation 1.25 and 0.015 grain, at the surface's opacity, under its content; a repaint touching the sample area (region + 2 × radius) repaints all of it, and windows beneath an opaque blurred window still draw there. Not applied to overview previews or Alt+Tab thumbnails (Mutter also blurs behind clones) |
@@ -131,9 +134,35 @@ opens the dialog. Background requests, stale responses, destroyed surfaces
 and requests outstanding at lock or a switch to another app fail closed.
 The non-GTK fallback shell has no consent UI and keeps requests inactive.
 Super+Escape always takes granted shortcuts back until the window is
-focused again. GNOME's configurable Xwayland exemption rules are not
-implemented. `scripts/tuna-shortcut-proof` exercises Allow, Deny, refocus,
+focused again. `scripts/tuna-shortcut-proof` exercises Allow, Deny, refocus,
 emergency restore, stale focus and lock through a real Wayland test client.
+
+### Xwayland keyboard grabs
+
+An X11 app that grabs the keyboard (`XGrabKeyboard`; virtual machine and
+remote desktop viewers do) gets the same shortcut inhibition, without the
+dialog, when Mutter 51 would grant it (`meta-xwayland-grab-keyboard.c`,
+`meta-settings.c`):
+
+- A rule is matched against the window's WM_CLASS class and instance as a
+  GLib glob (`*` and `?`, whole name). Rules starting with `!` deny.
+- The rules are Mutter's built-in list (`gnome-boxes`, `remote-viewer`,
+  `virt-viewer`, `virt-manager`, `vinagre`, `vncviewer`, `Xephyr`),
+  followed by `org.gnome.mutter.wayland xwayland-grab-access-rules`, read
+  live with the focus settings.
+- A deny match refuses. Otherwise the grab is granted when the client sent
+  `_XWAYLAND_MAY_GRAB_KEYBOARD` for the window, or when an allow rule matches.
+  Anything else is ignored.
+- While the granted window has keyboard focus it gets every key, the
+  shell's shortcuts included. Super+Escape ends the grab, until the app
+  grabs again. Releasing the X11 grab or closing the window also ends it.
+  The lock screen keeps its keys, as with the inhibit protocol.
+- A grab is decided once, with the rules then in force: at the request,
+  or when its X11 window is first known. Later rule changes do not affect it.
+
+As in Mutter, `xwayland-allow-grabs` only adds a focus lock for
+override-redirect windows. Tuna Desktop does not show override-redirect
+X11 windows, so it does not read that key.
 
 ## GNOME D-Bus interfaces
 
@@ -163,7 +192,6 @@ GNOME's version.
 | xdg_toplevel_drag_manager_v1 | 1 | missing | not in Smithay 0.7: a window attached to a drag-and-drop operation and moved with it (detachable browser tabs) (#89) |
 | wp_color_manager_v1 (v2), wp_color_representation_manager_v1 | 2, 1 | missing | not in Smithay 0.7: needs a colour-managed renderer (ICC/HDR, YUV conversion); the GLES path is sRGB only (#89) |
 | wp_linux_drm_syncobj_manager_v1 | source-derived floor 1; absent in this VM capture | missing | explicit sync needs the DRM backend's syncobj import; GPU-capable native acceptance remains open (#68, #89) |
-| zwp_xwayland_keyboard_grab_manager_v1 (Xwayland only; from source) | — | missing | only rootful Xwayland with `-host-grab` uses it, and Mutter allows grabs only per `xwayland-grab-access-rules`; Tuna Desktop runs rootless Xwayland (#89) |
 | zwp_linux_dmabuf_feedback_v1 scanout tranches | per-surface feedback adds a scanout tranche for a direct-scanout candidate (`meta_wayland_dma_buf_surface_feedback`) | default feedback only | Tuna Desktop has no direct scanout of client buffers: every surface is composited, so a scanout tranche would point clients at planes nothing uses; it comes with direct scanout (perf lane) |
 | gtk_shell1 | 7 | missing | not planned: GTK4 needs none of it on a GNOME session |
 
