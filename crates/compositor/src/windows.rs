@@ -122,6 +122,10 @@ struct ManagedWindow {
     sticky: bool,
     /// Trusted cross-backend modal parent, pinned to a managed generation.
     x11_parent: Option<u64>,
+    /// The output this window returns to when it is connected (Mutter's
+    /// `preferred_logical_monitor`): where it was placed or the user
+    /// last moved it, kept while it waits on another output.
+    preferred_output: Option<String>,
 }
 
 /// Compositor-side presentation layout (002 window actions).
@@ -1716,6 +1720,7 @@ impl WindowManager {
                 above: false,
                 sticky: false,
                 x11_parent: None,
+                preferred_output: None,
             },
         );
         self.place_transient(surface, id);
@@ -1907,6 +1912,7 @@ impl WindowManager {
                     window.geometry = geometry;
                     window.unplaced = false;
                 }
+                self.note_preferred_output(state, id);
                 let parent = self.transient_parent(id);
                 if let Some(parent) = parent {
                     self.place_above(parent, id);
@@ -2089,6 +2095,7 @@ impl WindowManager {
                 above: false,
                 sticky: false,
                 x11_parent: None,
+                preferred_output: None,
             },
         );
         if let Some(parent) = surface
@@ -2097,6 +2104,7 @@ impl WindowManager {
         {
             self.place_above(parent, id);
         }
+        self.note_preferred_output(state, id);
         self.finish_map(state, id);
         id
     }
@@ -3418,6 +3426,8 @@ impl WindowManager {
             return;
         }
         if let PointerGrab::Move { id, .. } = grab {
+            // A user move picks the output the window returns to.
+            self.note_preferred_output(state, id);
             if !self.workspace_policy.edge_tiling {
                 return;
             }
@@ -6071,100 +6081,98 @@ impl WindowManager {
         true
     }
 
-    /// Shift `geo` from the removed output's slice into the
-    /// survivor's, preserving size and clamping inside the survivor
-    /// bounds (an oversized window pins at the survivor origin).
-    fn shift_into_survivor(
+    /// The output a window is on in `outputs`: the one it overlaps
+    /// most, as Mutter's `meta_window_update_monitor` picks it
+    /// (`meta_monitor_manager_get_logical_monitor_from_rect`).
+    fn output_of(
         geo: Rectangle<i32, Logical>,
-        removed_loc: (i32, i32),
-        survivor_loc: (i32, i32),
-        survivor_size: Size<i32, Logical>,
-    ) -> Rectangle<i32, Logical> {
-        let x = (survivor_loc.0 + geo.loc.x - removed_loc.0).clamp(
-            survivor_loc.0,
-            (survivor_loc.0 + survivor_size.w - geo.size.w).max(survivor_loc.0),
-        );
-        let y = (survivor_loc.1 + geo.loc.y - removed_loc.1).clamp(
-            survivor_loc.1,
-            (survivor_loc.1 + survivor_size.h - geo.size.h).max(survivor_loc.1),
-        );
-        Rectangle {
-            loc: (x, y).into(),
-            size: geo.size,
+        outputs: &[(String, Rectangle<i32, Logical>)],
+    ) -> Option<&(String, Rectangle<i32, Logical>)> {
+        outputs
+            .iter()
+            .filter_map(|entry| {
+                let overlap = entry.1.intersection(geo)?;
+                Some((i64::from(overlap.size.w) * i64::from(overlap.size.h), entry))
+            })
+            .filter(|(area, _)| *area > 0)
+            .max_by_key(|(area, _)| *area)
+            .map(|(_, entry)| entry)
+    }
+
+    /// Remember the output a window is on as the one it prefers, as
+    /// Mutter does when it places a window and when the user moves it to
+    /// another monitor (`preferred_logical_monitor`).
+    fn note_preferred_output(&mut self, state: &State, id: u64) {
+        let outputs = state.output_slices();
+        let Some(window) = self.windows.get_mut(&id) else {
+            return;
+        };
+        if let Some((name, _)) = Self::output_of(window.geometry, &outputs) {
+            window.preferred_output = Some(name.clone());
         }
     }
 
-    /// Whether `geo`'s center sits inside the `(loc, size)` slice:
-    /// the test for "this window lives on that output".
-    fn center_in_slice(
-        geo: Rectangle<i32, Logical>,
-        loc: (i32, i32),
-        size: Size<i32, Logical>,
-    ) -> bool {
-        let (cx, cy) = (geo.loc.x + geo.size.w / 2, geo.loc.y + geo.size.h / 2);
-        cx >= loc.0 && cx < loc.0 + size.w && cy >= loc.1 && cy < loc.1 + size.h
+    /// The output a window last placed or moved by the user preferred
+    /// (`None` before its first placement).
+    pub fn preferred_output(&self, id: u64) -> Option<&str> {
+        self.windows.get(&id)?.preferred_output.as_deref()
     }
 
-    /// Migrate windows off a removed output onto a live one, before
-    /// its inventory entry drops: call this, then
-    /// [`State::remove_output`](crate::State::remove_output), then
-    /// [`reapply_derived_layouts`](Self::reapply_derived_layouts) when
-    /// the primary changed.
-    ///
-    /// Windows carry no output affinity (they live in workspaces),
-    /// so migration is geometric: floating windows centered on the
-    /// removed slice shift into the survivor slice (preferring the
-    /// primary) with size preserved. Derived layouts (maximized,
-    /// tiled, fullscreen, strip) are positional only through the
-    /// primary areas, so they move in the re-apply step after
-    /// failover — re-applying here would size them for the dying
-    /// primary. Stashed restore rects shift with their windows.
-    /// Focus and workspace membership never change, so no window is
-    /// lost — only positions move. Returns how many windows moved.
-    /// Unknown names and a missing survivor (removing the last
-    /// output) migrate nothing.
-    pub fn migrate_output_windows(&mut self, state: &mut State, removed: &str) -> usize {
-        let Some(gone) = state
-            .outputs
-            .iter()
-            .find(|entry| entry.name == removed)
-            .cloned()
-        else {
-            return 0;
+    /// After the outputs changed (hotplug, a new arrangement, mode or
+    /// scale), re-home the floating windows as Mutter's
+    /// `meta_window_update_for_monitors_changed` does: a window goes to
+    /// the output it prefers when that is connected (so it returns to a
+    /// monitor plugged back in), else stays on its output, else moves to
+    /// the primary; it keeps its relative place there
+    /// (`move_rect_between_rects`). `before` is each output's rectangle
+    /// before the change ([`State::output_slices`]). Restore rects
+    /// follow the same way. Derived layouts (maximized, tiled,
+    /// fullscreen, strip) are re-resolved by
+    /// [`reapply_derived_layouts`](Self::reapply_derived_layouts).
+    /// Focus and workspaces never change: no window is lost. Returns
+    /// how many windows moved.
+    pub fn relocate_for_monitors_changed(
+        &mut self,
+        state: &State,
+        before: &[(String, Rectangle<i32, Logical>)],
+    ) -> usize {
+        let after = state.output_slices();
+        let primary = state.primary_output_name();
+        let target = |preferred: Option<&str>, old: &str| {
+            let find = |name: &str| after.iter().find(|(n, _)| n == name).map(|(_, r)| *r);
+            preferred
+                .and_then(find)
+                .or_else(|| find(old))
+                .or_else(|| primary.as_deref().and_then(find))
         };
-        let Some(live) = state
-            .outputs
-            .iter()
-            .find(|entry| entry.primary && entry.name != removed)
-            .or_else(|| state.outputs.iter().find(|entry| entry.name != removed))
-            .cloned()
-        else {
-            return 0;
+        let relocate = |geo: Rectangle<i32, Logical>, preferred: Option<&str>| {
+            let (old_name, old_rect) = Self::output_of(geo, before)?;
+            let new_rect = target(preferred, old_name)?;
+            (new_rect != *old_rect).then(|| move_rect_between_rects(geo, *old_rect, new_rect))
         };
         let mut moved = 0;
         let mut ids: Vec<u64> = self.windows.keys().copied().collect();
         ids.sort_unstable();
         for id in ids {
-            let Some(layout) = self.windows.get(&id).map(|window| window.layout) else {
+            let Some(window) = self.windows.get_mut(&id) else {
                 continue;
             };
-            if layout != WindowLayout::Floating {
-                continue;
+            if window.preferred_output.is_none() {
+                window.preferred_output =
+                    Self::output_of(window.geometry, before).map(|(name, _)| name.clone());
             }
+            let preferred = window.preferred_output.clone();
             let mut shifted = false;
-            if let Some(window) = self.windows.get_mut(&id) {
-                if Self::center_in_slice(window.geometry, gone.loc, gone.size) {
-                    window.geometry =
-                        Self::shift_into_survivor(window.geometry, gone.loc, live.loc, live.size);
+            if window.layout == WindowLayout::Floating {
+                if let Some(geo) = relocate(window.geometry, preferred.as_deref()) {
+                    window.geometry = geo;
                     shifted = true;
                 }
-                if let Some(restore) = window.restore {
-                    if Self::center_in_slice(restore, gone.loc, gone.size) {
-                        window.restore = Some(Self::shift_into_survivor(
-                            restore, gone.loc, live.loc, live.size,
-                        ));
-                        shifted = true;
-                    }
+            }
+            if let Some(restore) = window.restore {
+                if let Some(geo) = relocate(restore, preferred.as_deref()) {
+                    window.restore = Some(geo);
+                    shifted = true;
                 }
             }
             moved += usize::from(shifted);
@@ -7868,6 +7876,39 @@ impl WindowManager {
         eprintln!("tuna-compositor: switcher {action:?}");
         self.switcher_queue.push(action);
     }
+}
+
+/// Mutter's `move_rect_between_rects` (window.c): a window that fits
+/// inside both monitors keeps its relative place in the free space
+/// around it; otherwise its centre keeps its relative place.
+fn move_rect_between_rects(
+    rect: Rectangle<i32, Logical>,
+    old: Rectangle<i32, Logical>,
+    new: Rectangle<i32, Logical>,
+) -> Rectangle<i32, Logical> {
+    let fits = old.contains_rect(rect)
+        && old.size.w > rect.size.w
+        && old.size.h > rect.size.h
+        && new.size.w >= rect.size.w
+        && new.size.h >= rect.size.h;
+    let (x, y) = if fits {
+        let rel_x = (rect.loc.x - old.loc.x) as f32 / (old.size.w - rect.size.w) as f32;
+        let rel_y = (rect.loc.y - old.loc.y) as f32 / (old.size.h - rect.size.h) as f32;
+        (
+            new.loc.x + (rel_x * (new.size.w - rect.size.w) as f32) as i32,
+            new.loc.y + (rel_y * (new.size.h - rect.size.h) as f32) as i32,
+        )
+    } else {
+        let rel_x = ((rect.loc.x - old.loc.x + rect.size.w / 2) as f32 / old.size.w as f32)
+            .clamp(f32::EPSILON, 1.0 - f32::EPSILON);
+        let rel_y = ((rect.loc.y - old.loc.y + rect.size.h / 2) as f32 / old.size.h as f32)
+            .clamp(f32::EPSILON, 1.0 - f32::EPSILON);
+        (
+            new.loc.x - rect.size.w / 2 + (rel_x * new.size.w as f32) as i32,
+            new.loc.y - rect.size.h / 2 + (rel_y * new.size.h as f32) as i32,
+        )
+    };
+    Rectangle::new((x, y).into(), rect.size)
 }
 
 /// Mutter's `find_next_cascade` (place.c): starting where the window

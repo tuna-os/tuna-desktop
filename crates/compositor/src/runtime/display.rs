@@ -317,14 +317,8 @@ impl Runtime {
             .filter(|name| !leaders.iter().any(|(leader, ..)| leader == name))
             .collect();
         let primary_before = self.state.primary_output_name();
-        let sizes_before: Vec<(String, (i32, i32))> = self
-            .state
-            .outputs
-            .iter()
-            .map(|entry| (entry.name.clone(), (entry.size.w, entry.size.h)))
-            .collect();
+        let before = self.state.output_slices();
         for name in &gone {
-            self.manager.migrate_output_windows(&mut self.state, name);
             self.state.remove_output(name);
         }
         for (name, output, loc, (lw, lh)) in &leaders {
@@ -339,12 +333,13 @@ impl Runtime {
         if let Some((primary, ..)) = leaders.first() {
             self.state.set_primary(primary);
         }
-        let resized = leaders.iter().any(|(name, _, _, logical)| {
-            sizes_before
-                .iter()
-                .any(|(known, size)| known == name && size != logical)
-        });
-        if resized || !gone.is_empty() || self.state.primary_output_name() != primary_before {
+        // Mutter re-homes every window when the monitors change
+        // (`meta_window_update_for_monitors_changed`).
+        if self.state.output_slices() != before
+            || self.state.primary_output_name() != primary_before
+        {
+            self.manager
+                .relocate_for_monitors_changed(&self.state, &before);
             self.manager.reapply_derived_layouts(&mut self.state);
         }
         // Anchored layer surfaces (the panel) follow a new mode now,

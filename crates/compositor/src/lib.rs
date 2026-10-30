@@ -1103,11 +1103,11 @@ impl State {
     }
 
     /// Drop an output from the inventory; a surviving first entry
-    /// takes over primary. Callers migrate windows first (see
-    /// [`WindowManager::migrate_output_windows`](crate::windows::WindowManager::migrate_output_windows)),
-    /// so no window is stranded, then re-apply derived layouts when
-    /// the primary changed (see
-    /// [`WindowManager::reapply_derived_layouts`](crate::windows::WindowManager::reapply_derived_layouts)).
+    /// takes over primary. Callers snapshot [`output_slices`](Self::output_slices)
+    /// first and re-home windows once the inventory is current (see
+    /// [`WindowManager::relocate_for_monitors_changed`](crate::windows::WindowManager::relocate_for_monitors_changed)
+    /// and [`WindowManager::reapply_derived_layouts`](crate::windows::WindowManager::reapply_derived_layouts)),
+    /// so no window is stranded.
     /// Real entries un-advertise their global, so clients see the
     /// hotplug removal live; virtual entries just drop. Returns
     /// whether an entry was removed.
@@ -1262,6 +1262,26 @@ impl State {
             .and_then(|entry| entry.output.as_ref())
             .map(|output| output.current_scale())
             .unwrap_or(smithay::output::Scale::Integer(1))
+    }
+
+    /// Every registered output's name and logical rectangle, in
+    /// registration order: the layout windows are re-homed against when
+    /// outputs change.
+    pub fn output_slices(
+        &self,
+    ) -> Vec<(
+        String,
+        smithay::utils::Rectangle<i32, smithay::utils::Logical>,
+    )> {
+        self.outputs
+            .iter()
+            .map(|e| {
+                (
+                    e.name.clone(),
+                    smithay::utils::Rectangle::new(e.loc.into(), e.size),
+                )
+            })
+            .collect()
     }
 
     /// Every registered output with its protocol object: name, output,
