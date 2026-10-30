@@ -83,6 +83,7 @@ pub mod idle_monitor;
 pub mod ime;
 pub mod input_aids;
 pub mod introspect;
+mod key_repeat;
 pub mod layer;
 pub mod lock;
 pub mod lockdown;
@@ -1382,6 +1383,15 @@ impl TestCompositor {
         self.display
             .handle()
             .insert_client(stream, Arc::new(ClientState::default()))
+            .unwrap()
+    }
+
+    /// Attach a client through `stream` as the compositor's IBus bridge
+    /// (the one client allowed a virtual keyboard).
+    pub fn add_ime_bridge_client(&mut self, stream: UnixStream) -> Client {
+        self.display
+            .handle()
+            .insert_client(stream, Arc::new(ClientState::ime_bridge()))
             .unwrap()
     }
 

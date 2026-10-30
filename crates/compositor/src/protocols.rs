@@ -864,7 +864,7 @@ impl Dispatch<
         use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_v1::Request;
         use smithay::wayland::input_method::InputMethodKeyboardGrab;
         match request {
-            Request::Key { time, key, state: pressed } => {
+            Request::Key { time, key, state: key_state } => {
                 let Some(keyboard) = state.seat.get_keyboard() else { return };
                 // The physical event has already updated XKB. Do not update
                 // it twice or send it back into the IM grab recursively.
@@ -872,9 +872,15 @@ impl Dispatch<
                     grab.downcast_ref::<InputMethodKeyboardGrab>().cloned().map(|grab| (serial, grab))
                 }).flatten();
                 if grab.is_some() { keyboard.unset_grab(state); }
-                keyboard.input_forward(state, key.saturating_add(8).into(),
-                    if pressed == 1 { smithay::backend::input::KeyState::Pressed } else { smithay::backend::input::KeyState::Released },
-                    smithay::utils::SERIAL_COUNTER.next_serial(), time, false);
+                let keycode = key.saturating_add(8).into();
+                let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                match key_state {
+                    // A compositor repeat IBus did not take (wl_keyboard's
+                    // `repeated`): version 10 keyboards hear it as one.
+                    2 => keyboard.input_repeat(state, keycode, serial, time),
+                    1 => keyboard.input_forward(state, keycode, smithay::backend::input::KeyState::Pressed, serial, time, false),
+                    _ => keyboard.input_forward(state, keycode, smithay::backend::input::KeyState::Released, serial, time, false),
+                }
                 if let Some((serial, grab)) = grab { keyboard.set_grab(state, grab, serial); }
             }
             // Preserve the bridge's event order: newer physical events may

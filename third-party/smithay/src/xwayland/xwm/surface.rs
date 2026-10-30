@@ -1117,6 +1117,16 @@ impl<D: SeatHandler + 'static> KeyboardTarget<D> for X11Surface {
         }
     }
 
+    fn repeat(&self, seat: &Seat<D>, data: &mut D, key: KeysymHandle<'_>, serial: Serial, time: u32) {
+        if self.input_mode() == InputMode::None {
+            return;
+        }
+
+        if let Some(surface) = self.state.lock().unwrap().wl_surface.as_ref() {
+            KeyboardTarget::repeat(surface, seat, data, key, serial, time)
+        }
+    }
+
     fn modifiers(&self, seat: &Seat<D>, data: &mut D, modifiers: ModifiersState, serial: Serial) {
         if self.input_mode() == InputMode::None {
             return;

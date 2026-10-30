@@ -55,7 +55,7 @@ and this page together.
 | wl_compositor | 6 | preferred buffer scale sent per surface, for the output it is on |
 | wl_subcompositor | 1 | |
 | wl_shm | 2 | |
-| wl_seat | 9 | |
+| wl_seat | 10 | as Mutter 51: version 10 keyboards get `repeat_info(0, 0)` and the compositor repeats keys for them (`key` with state `repeated`, fresh serial) from GNOME's keyboard `repeat`, `delay` and `repeat-interval`: the last pressed key the keymap repeats, until it is released or another repeating key is pressed; earlier versions get the settings and repeat themselves. A held shell accelerator hears the repeat unless it ignores autorepeat; the IBus bridge's keyboard grab hears it as `repeated` and returns what IBus passes; other input methods repeat themselves from their grab's repeat_info. Xwayland binds the seat below 10 and keeps its own autorepeat |
 | wl_output | 4 | one per connected output |
 | wl_data_device_manager | 3 | |
 | zwp_primary_selection_device_manager_v1 | 1 | |
@@ -158,7 +158,6 @@ GNOME's version.
 
 | Protocol | GNOME 51 | Tuna Desktop | Why, and where tracked |
 |---|---|---|---|
-| wl_seat | 10 | 9 | Smithay 0.7 creates the seat at 9 and implements nothing newer; bumps with Smithay (#89) |
 | zwp_text_input_manager_v3 | 2 | 1 | Smithay 0.7 implements v1 only; bumps with Smithay (#60) |
 | xdg_toplevel_drag_manager_v1 | 1 | missing | not in Smithay 0.7: a window attached to a drag-and-drop operation and moved with it (detachable browser tabs) (#89) |
 | wp_color_manager_v1 (v2), wp_color_representation_manager_v1 | 2, 1 | missing | not in Smithay 0.7: needs a colour-managed renderer (ICC/HDR, YUV conversion); the GLES path is sRGB only (#89) |

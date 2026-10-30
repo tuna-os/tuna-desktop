@@ -1738,6 +1738,7 @@ impl Runtime {
         // Pre-lock presses never report repeats or releases across the
         // lock boundary.
         self.manager.invalidate_held_accelerators();
+        self.manager.cancel_key_repeat();
         self.control.cancel_pending_accelerators();
         self.cursor.on_lock();
         self.control.set_locked(true);
@@ -2052,6 +2053,38 @@ impl Runtime {
             if let Some(origin) = attempt.origin {
                 self.control.finish_unlock(origin, applied);
             }
+        }
+    }
+
+    /// The compositor's key repeat (wl_seat 10), routed as the held key's
+    /// press was: to the lock surface while locked. With no lock surface,
+    /// or an idle shield or the recovery overlay holding the keyboard, the
+    /// repeat ends, as those consumers swallow the key.
+    fn key_repeat_tick(&mut self) {
+        let now = Instant::now();
+        if self
+            .manager
+            .key_repeat_deadline()
+            .is_none_or(|due| now < due)
+        {
+            return;
+        }
+        let locked = self.is_locked();
+        let routed = if locked {
+            self.state
+                .primary_output_name()
+                .and_then(|name| self.state.lock_surface_for(&name))
+                .is_some()
+        } else {
+            !self.overlay.visible && self.blank_alpha() == 0.0
+        };
+        if !routed {
+            self.manager.cancel_key_repeat();
+            return;
+        }
+        self.manager.run_key_repeat(&mut self.state, now, locked);
+        for (action, time, mode) in self.manager.take_accelerators_fired() {
+            self.control.queue_accelerator(action, time, mode);
         }
     }
 
@@ -4568,6 +4601,8 @@ impl Runtime {
             // Tablet and stylus settings: the bounded re-read.
             self.tablet_settings.next_deadline(now),
             self.manager.focus_deadline(),
+            // The compositor's key repeat (wl_seat 10).
+            self.manager.key_repeat_deadline(),
             // Window sessions are written 3 s after a change (Mutter).
             self.state.window_sessions().save_deadline(),
             // The lock conversation's shared idle/total deadline.
@@ -4641,6 +4676,7 @@ impl Runtime {
         self.focus_policy_tick();
         self.tablet_settings_tick();
         self.poll_input_aids();
+        self.key_repeat_tick();
         #[cfg(feature = "xwayland")]
         // DISPLAY may be a reserved idle listener. An icon helper must not
         // connect and accidentally activate XWayland before a real client.

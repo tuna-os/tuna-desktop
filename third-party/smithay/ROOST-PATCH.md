@@ -194,3 +194,29 @@ meta_x11_display_set_input_focus does; enter/leave are unchanged. The
 nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
 The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
 version stays 0.7.0.
+
+Issue #364 additionally changes src/wayland/seat/mod.rs, seat/keyboard.rs,
+src/input/keyboard/mod.rs, src/wayland/input_method/input_method_keyboard_grab.rs
+and src/xwayland/xwm/surface.rs: wl_seat is created at version 10
+(WL_SEAT_VERSION), as Mutter 51 advertises it (META_WL_SEAT_VERSION).
+Version 10 adds only wl_keyboard's `repeated` key state; as Mutter's
+notify_key_repeat_for_resource does, a version 10 keyboard is told
+`repeat_info(0, 0)` on creation and on change_repeat_info, older ones the
+configured rate and delay. The additive KeyboardHandle::input_repeat delivers
+a compositor-generated repeat through the active grab
+(KeyboardGrab::repeat, defaulting to the inner handle's new repeat) to the
+focus (KeyboardTarget::repeat, defaulting to nothing), with any modifier
+change still pending sent first; the wl_surface target sends `key(state =
+repeated)` to the focused client's version 10 keyboards only, and X11Surface
+forwards to its wl_surface, as Mutter's meta_wayland_keyboard_broadcast_key
+skips older resources. A repeat changes neither XKB state nor the pressed
+keys. Xkb::key_repeats exposes xkb_keymap_key_repeats. The input-method
+keyboard grab is told the configured repeat_info like a keyboard before
+version 10, so its repeat override forwards changed modifiers only; the
+additive InputMethodKeyboardGrab::client and send_repeat let Roost hand its
+own IBus bridge the repeat as `repeated`. Roost generates repeats as Mutter's
+native seat does (meta-seat-impl.c). Real-client tests in
+crates/compositor/tests/key_repeat.rs bind versions 10 and 9 and cover the
+repeat pace, release, another key, modifiers, disabled repeat, accelerators
+and input-method grabs. The isolated diff is retained in
+WL-SEAT-10-PATCH.diff; the pinned version stays 0.7.0.

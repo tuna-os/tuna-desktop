@@ -28,7 +28,7 @@ wp_fractional_scale_manager_v1	1	capture	match
 zwp_pointer_gestures_v1	3	capture	match
 zwp_tablet_manager_v2	2	capture	match
 wp_pointer_warp_v1	1	capture	match
-wl_seat	10	capture	min:9
+wl_seat	10	capture	match
 zwp_relative_pointer_manager_v1	1	capture	match
 zwp_pointer_constraints_v1	1	capture	match
 zxdg_exporter_v2	1	capture	match

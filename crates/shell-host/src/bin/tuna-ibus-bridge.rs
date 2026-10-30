@@ -42,6 +42,7 @@ use gio::prelude::*;
 use tuna_shell_host::ibus::{
     address as ibus_address, debug, text as ibus_text, text_variant as ibus_text_variant,
 };
+use wayland_client::protocol::wl_keyboard::KeyState;
 use wayland_client::protocol::{wl_compositor, wl_registry, wl_seat, wl_surface};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
 use wayland_protocols_misc::zwp_input_method_v2::client::{
@@ -492,8 +493,12 @@ impl Bridge {
         .fold(0, |bits, (_, bit)| bits | bit)
     }
 
-    /// One grabbed key: IBus first, then the app if IBus passes.
-    fn key(&mut self, time: u32, key: u32, pressed: bool) {
+    /// One grabbed key: IBus first, then the app if IBus passes. The
+    /// compositor's repeat (wl_keyboard's `repeated`, wl_seat 10) is
+    /// another press to IBus, as GNOME Shell hands IBus repeated events,
+    /// leaves the XKB state alone and returns as a repeat.
+    fn key(&mut self, time: u32, key: u32, key_state: KeyState) {
+        let pressed = key_state != KeyState::Released;
         let keyval = self.xkb.as_ref().map_or(0, |(_, state)| {
             state.key_get_one_sym((key + 8).into()).raw()
         });
@@ -512,7 +517,11 @@ impl Bridge {
                 started.elapsed()
             );
         }
-        if let Some((_, xkb_state)) = &mut self.xkb {
+        if let Some((_, xkb_state)) = self
+            .xkb
+            .as_mut()
+            .filter(|_| key_state != KeyState::Repeated)
+        {
             xkb_state.update_key(
                 (key + 8).into(),
                 if pressed {
@@ -525,13 +534,13 @@ impl Bridge {
         // The commit or preedit this key produced comes before later keys.
         self.apply_incoming();
         if !handled {
-            self.forward(time, key, pressed);
+            self.forward(time, key, key_state);
         }
     }
 
-    fn forward(&self, time: u32, key: u32, pressed: bool) {
+    fn forward(&self, time: u32, key: u32, key_state: KeyState) {
         if let (Some(vk), true) = (&self.vk, self.vk_keymap) {
-            vk.key(time, key, u32::from(pressed));
+            vk.key(time, key, key_state.into());
         }
     }
 
@@ -574,7 +583,12 @@ impl Bridge {
                 im.commit(self.serial);
             }
             FromIbus::Forward { keycode, state } => {
-                self.forward(0, keycode, state & RELEASE == 0);
+                let key_state = if state & RELEASE == 0 {
+                    KeyState::Pressed
+                } else {
+                    KeyState::Released
+                };
+                self.forward(0, keycode, key_state);
             }
             FromIbus::DeleteSurrounding { offset, nchars } => {
                 let lengths = self
@@ -807,11 +821,12 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for Bridge {
                 state: key_state,
                 ..
             } => {
-                let pressed = matches!(
-                    key_state,
-                    WEnum::Value(wayland_client::protocol::wl_keyboard::KeyState::Pressed)
-                );
-                state.key(time, key, pressed);
+                // An unknown state ends the press, as before version 10.
+                let key_state = match key_state {
+                    WEnum::Value(key_state) => key_state,
+                    WEnum::Unknown(_) => KeyState::Released,
+                };
+                state.key(time, key, key_state);
             }
             zwp_input_method_keyboard_grab_v2::Event::Modifiers {
                 mods_depressed,

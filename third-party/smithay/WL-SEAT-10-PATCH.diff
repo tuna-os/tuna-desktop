@@ -1,0 +1,320 @@
+diff --git a/src/input/keyboard/mod.rs b/src/input/keyboard/mod.rs
+index b14b2cc4..d75cced6 100644
+--- a/src/input/keyboard/mod.rs
++++ b/src/input/keyboard/mod.rs
+@@ -20,7 +20,7 @@ pub use xkbcommon::xkb::{self, keysyms, Keycode, Keysym};
+ use super::{GrabStatus, Seat, SeatHandler};
+ 
+ #[cfg(feature = "wayland_frontend")]
+-use wayland_server::{Resource, Weak};
++use wayland_server::Weak;
+ #[cfg(feature = "wayland_frontend")]
+ mod keymap_file;
+ #[cfg(feature = "wayland_frontend")]
+@@ -51,6 +51,12 @@ where
+         serial: Serial,
+         time: u32,
+     );
++    /// The compositor repeated the held `key` (wl_keyboard version 10's
++    /// `repeated` key state). A repeat changes neither the XKB state nor
++    /// the pressed keys. The default ignores it.
++    fn repeat(&self, seat: &Seat<D>, data: &mut D, key: KeysymHandle<'_>, serial: Serial, time: u32) {
++        let _ = (seat, data, key, serial, time);
++    }
+     /// Hold modifiers were changed on a keyboard from a given seat
+     fn modifiers(&self, seat: &Seat<D>, data: &mut D, modifiers: ModifiersState, serial: Serial);
+     /// Keyboard focus of a given seat moved from another handler to this handler
+@@ -187,6 +193,11 @@ impl Xkb {
+     pub fn raw_syms_for_key_in_layout(&self, keycode: Keycode, layout: Layout) -> &[Keysym] {
+         self.keymap.key_get_syms_by_level(keycode, layout.0, 0)
+     }
++
++    /// Whether the keymap lets `keycode` repeat (`xkb_keymap_key_repeats`).
++    pub fn key_repeats(&self, keycode: Keycode) -> bool {
++        self.keymap.key_repeats(keycode)
++    }
+ }
+ 
+ impl fmt::Debug for Xkb {
+@@ -643,6 +654,22 @@ pub trait KeyboardGrab<D: SeatHandler>: Downcast {
+         time: u32,
+     );
+ 
++    /// A compositor-generated repeat of a held key
++    /// ([`KeyboardHandle::input_repeat`]). `modifiers` are only passed
++    /// when they changed since the last forwarded event; they must be sent
++    /// before the repeat. The default delivers both to the current focus.
++    fn repeat(
++        &mut self,
++        data: &mut D,
++        handle: &mut KeyboardInnerHandle<'_, D>,
++        keycode: Keycode,
++        modifiers: Option<ModifiersState>,
++        serial: Serial,
++        time: u32,
++    ) {
++        handle.repeat(data, keycode, modifiers, serial, time)
++    }
++
+     /// A focus change was requested.
+     fn set_focus(
+         &mut self,
+@@ -1131,6 +1158,21 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
+         }
+     }
+ 
++    /// Deliver a compositor-generated repeat of the held `keycode`
++    /// through the current grab to the focus, as Mutter's native seat
++    /// repeats keys for wl_keyboard version 10. Neither the XKB state nor
++    /// the pressed keys change; older keyboards repeat by themselves and
++    /// receive nothing.
++    pub fn input_repeat(&self, data: &mut D, keycode: Keycode, serial: Serial, time: u32) {
++        let mut guard = self.arc.internal.lock().unwrap();
++        let seat = self.get_seat(data);
++        let modifiers = guard.pending_modifiers.then_some(guard.mods_state);
++        guard.pending_modifiers = false;
++        guard.with_grab(data, &seat, |data, handle, grab| {
++            grab.repeat(data, handle, keycode, modifiers, serial, time);
++        });
++    }
++
+     /// Set the current focus of this keyboard
+     ///
+     /// If the new focus is different from the previous one, any previous focus
+@@ -1229,6 +1271,10 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
+     }
+ 
+     /// Change the repeat info configured for this keyboard
++    ///
++    /// Keyboards before version 10 are told `rate` and `delay`; version 10
++    /// keyboards are told `(0, 0)`, the compositor repeating keys for them
++    /// through [`KeyboardHandle::input_repeat`].
+     #[instrument(parent = &self.arc.span, skip(self))]
+     pub fn change_repeat_info(&self, rate: i32, delay: i32) {
+         let mut guard = self.arc.internal.lock().unwrap();
+@@ -1239,9 +1285,7 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
+             let Ok(kbd) = kbd.upgrade() else {
+                 continue;
+             };
+-            if kbd.version() >= 4 {
+-                kbd.repeat_info(rate, delay);
+-            }
++            crate::wayland::seat::keyboard::send_repeat_info(&kbd, rate, delay);
+         }
+     }
+ 
+@@ -1297,6 +1341,31 @@ impl<D: SeatHandler> fmt::Debug for KeyboardInnerHandle<'_, D> {
+     }
+ }
+ 
++impl<D: SeatHandler> KeyboardInnerHandle<'_, D> {
++    /// Send a compositor-generated repeat to the focused keyboards, after
++    /// any changed `modifiers`.
++    pub fn repeat(
++        &mut self,
++        data: &mut D,
++        keycode: Keycode,
++        modifiers: Option<ModifiersState>,
++        serial: Serial,
++        time: u32,
++    ) {
++        let Some((focus, _)) = self.inner.focus.as_ref() else {
++            return;
++        };
++        if let Some(mods) = modifiers {
++            focus.modifiers(self.seat, data, mods, serial);
++        }
++        let key = KeysymHandle {
++            xkb: &self.inner.xkb,
++            keycode,
++        };
++        focus.repeat(self.seat, data, key, serial, time);
++    }
++}
++
+ impl<D: SeatHandler + 'static> KeyboardInnerHandle<'_, D> {
+     /// Change the current grab on this keyboard to the provided grab
+     ///
+diff --git a/src/wayland/input_method/input_method_keyboard_grab.rs b/src/wayland/input_method/input_method_keyboard_grab.rs
+index 24ac2a72..93e114d9 100644
+--- a/src/wayland/input_method/input_method_keyboard_grab.rs
++++ b/src/wayland/input_method/input_method_keyboard_grab.rs
+@@ -36,6 +36,37 @@ pub struct InputMethodKeyboardGrab {
+     pub(crate) inner: Arc<Mutex<InputMethodKeyboard>>,
+ }
+ 
++impl InputMethodKeyboardGrab {
++    /// The client holding this keyboard grab, while it holds it.
++    pub fn client(&self) -> Option<wayland_server::Client> {
++        let inner = self.inner.lock().unwrap();
++        inner.grab.as_ref().and_then(wayland_server::Resource::client)
++    }
++
++    /// Send a compositor-generated repeat of the held `keycode` as
++    /// `key(state = repeated)` (wl_keyboard version 10's key state).
++    ///
++    /// Only for an input method the compositor knows to understand that
++    /// state: the grab is told the configured repeat_info like a keyboard
++    /// before version 10, and [`KeyboardGrab::repeat`] sends it no repeats.
++    pub fn send_repeat(&self, keycode: Keycode, serial: Serial, time: u32) {
++        let inner = self.inner.lock().unwrap();
++        let Some(keyboard) = inner.grab.as_ref() else {
++            return;
++        };
++        inner
++            .text_input_handle
++            .active_text_input_serial_or_default(serial.0, |serial| {
++                keyboard.key(
++                    serial,
++                    time,
++                    keycode.raw() - 8,
++                    wayland_server::protocol::wl_keyboard::KeyState::Repeated,
++                );
++            });
++    }
++}
++
+ impl<D> KeyboardGrab<D> for InputMethodKeyboardGrab
+ where
+     D: SeatHandler + 'static,
+@@ -68,6 +99,38 @@ where
+             });
+     }
+ 
++    /// An input method repeats keys by itself from the grab's repeat_info,
++    /// as a keyboard before version 10 does: it only hears changed
++    /// modifiers.
++    fn repeat(
++        &mut self,
++        _data: &mut D,
++        _handle: &mut KeyboardInnerHandle<'_, D>,
++        _keycode: Keycode,
++        modifiers: Option<ModifiersState>,
++        serial: Serial,
++        _time: u32,
++    ) {
++        let Some(serialized) = modifiers.map(|m| m.serialized) else {
++            return;
++        };
++        let inner = self.inner.lock().unwrap();
++        let Some(keyboard) = inner.grab.as_ref() else {
++            return;
++        };
++        inner
++            .text_input_handle
++            .active_text_input_serial_or_default(serial.0, |serial| {
++                keyboard.modifiers(
++                    serial,
++                    serialized.depressed,
++                    serialized.latched,
++                    serialized.locked,
++                    serialized.layout_effective,
++                )
++            });
++    }
++
+     fn set_focus(
+         &mut self,
+         data: &mut D,
+diff --git a/src/wayland/seat/keyboard.rs b/src/wayland/seat/keyboard.rs
+index 00408fc7..e617fa51 100644
+--- a/src/wayland/seat/keyboard.rs
++++ b/src/wayland/seat/keyboard.rs
+@@ -67,9 +67,7 @@ where
+         };
+ 
+         let guard = self.arc.internal.lock().unwrap();
+-        if kbd.version() >= 4 {
+-            kbd.repeat_info(guard.repeat_rate, guard.repeat_delay);
+-        }
++        send_repeat_info(&kbd, guard.repeat_rate, guard.repeat_delay);
+         if let Some((focused, serial)) = guard.focus.as_ref() {
+             if focused.same_client_as(&kbd.id()) {
+                 let serialized = guard.mods_state.serialized;
+@@ -140,6 +138,20 @@ where
+     }
+ }
+ 
++/// wl_keyboard's `repeated` key state (wl_seat 10).
++pub(crate) const KEY_STATE_REPEATED_SINCE: u32 = 10;
++
++/// The repeat a keyboard is told, as Mutter's notify_key_repeat_for_resource:
++/// from version 10 the compositor repeats keys itself (`rate` 0, `delay` 0),
++/// before it the client repeats with the configured `rate` and `delay`.
++pub(crate) fn send_repeat_info(kbd: &WlKeyboard, rate: i32, delay: i32) {
++    if kbd.version() >= KEY_STATE_REPEATED_SINCE {
++        kbd.repeat_info(0, 0);
++    } else if kbd.version() >= 4 {
++        kbd.repeat_info(rate, delay);
++    }
++}
++
+ pub(crate) fn for_each_focused_kbds<D: SeatHandler + 'static>(
+     seat: &Seat<D>,
+     surface: &WlSurface,
+@@ -220,6 +232,15 @@ impl<D: SeatHandler + 'static> KeyboardTarget<D> for WlSurface {
+         })
+     }
+ 
++    fn repeat(&self, seat: &Seat<D>, _data: &mut D, key: KeysymHandle<'_>, serial: Serial, time: u32) {
++        // Older keyboards repeat by themselves from repeat_info.
++        for_each_focused_kbds(seat, self, |kbd| {
++            if kbd.version() >= KEY_STATE_REPEATED_SINCE {
++                kbd.key(serial.into(), time, key.raw_code().raw() - 8, WlKeyState::Repeated)
++            }
++        })
++    }
++
+     fn modifiers(&self, seat: &Seat<D>, _data: &mut D, modifiers: ModifiersState, serial: Serial) {
+         for_each_focused_kbds(seat, self, |kbd| {
+             let modifiers = modifiers.serialized;
+diff --git a/src/wayland/seat/mod.rs b/src/wayland/seat/mod.rs
+index 0e33ec0e..d551fb37 100644
+--- a/src/wayland/seat/mod.rs
++++ b/src/wayland/seat/mod.rs
+@@ -94,6 +94,12 @@ use wayland_server::{
+ 
+ use super::compositor::CompositorHandler;
+ 
++/// The wl_seat version this implementation advertises. Version 10 adds
++/// wl_keyboard's `repeated` key state: the compositor repeats keys for
++/// those keyboards ([`KeyboardHandle::input_repeat`](crate::input::keyboard::KeyboardHandle::input_repeat))
++/// and tells them `repeat_info(0, 0)`.
++pub const WL_SEAT_VERSION: u32 = 10;
++
+ /// Focused objects that *might* have an underlying wl_surface.
+ pub trait WaylandFocus {
+     /// Returns the underlying wl_surface, if any.
+@@ -173,7 +179,10 @@ impl<D: SeatHandler + 'static> SeatState<D> {
+     {
+         let Seat { arc } = self.new_seat(name);
+ 
+-        let global_id = display.create_global::<D, _, _>(9, SeatGlobalData { arc: arc.clone() });
++        let global_id = display.create_global::<D, _, _>(
++            WL_SEAT_VERSION,
++            SeatGlobalData { arc: arc.clone() },
++        );
+         arc.inner.lock().unwrap().global = Some(global_id);
+ 
+         Seat { arc }
+diff --git a/src/xwayland/xwm/surface.rs b/src/xwayland/xwm/surface.rs
+index 9d82fafc..d6e4b18b 100644
+--- a/src/xwayland/xwm/surface.rs
++++ b/src/xwayland/xwm/surface.rs
+@@ -1117,6 +1117,16 @@ impl<D: SeatHandler + 'static> KeyboardTarget<D> for X11Surface {
+         }
+     }
+ 
++    fn repeat(&self, seat: &Seat<D>, data: &mut D, key: KeysymHandle<'_>, serial: Serial, time: u32) {
++        if self.input_mode() == InputMode::None {
++            return;
++        }
++
++        if let Some(surface) = self.state.lock().unwrap().wl_surface.as_ref() {
++            KeyboardTarget::repeat(surface, seat, data, key, serial, time)
++        }
++    }
++
+     fn modifiers(&self, seat: &Seat<D>, data: &mut D, modifiers: ModifiersState, serial: Serial) {
+         if self.input_mode() == InputMode::None {
+             return;

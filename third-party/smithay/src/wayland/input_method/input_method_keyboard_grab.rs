@@ -36,6 +36,37 @@ pub struct InputMethodKeyboardGrab {
     pub(crate) inner: Arc<Mutex<InputMethodKeyboard>>,
 }
 
+impl InputMethodKeyboardGrab {
+    /// The client holding this keyboard grab, while it holds it.
+    pub fn client(&self) -> Option<wayland_server::Client> {
+        let inner = self.inner.lock().unwrap();
+        inner.grab.as_ref().and_then(wayland_server::Resource::client)
+    }
+
+    /// Send a compositor-generated repeat of the held `keycode` as
+    /// `key(state = repeated)` (wl_keyboard version 10's key state).
+    ///
+    /// Only for an input method the compositor knows to understand that
+    /// state: the grab is told the configured repeat_info like a keyboard
+    /// before version 10, and [`KeyboardGrab::repeat`] sends it no repeats.
+    pub fn send_repeat(&self, keycode: Keycode, serial: Serial, time: u32) {
+        let inner = self.inner.lock().unwrap();
+        let Some(keyboard) = inner.grab.as_ref() else {
+            return;
+        };
+        inner
+            .text_input_handle
+            .active_text_input_serial_or_default(serial.0, |serial| {
+                keyboard.key(
+                    serial,
+                    time,
+                    keycode.raw() - 8,
+                    wayland_server::protocol::wl_keyboard::KeyState::Repeated,
+                );
+            });
+    }
+}
+
 impl<D> KeyboardGrab<D> for InputMethodKeyboardGrab
 where
     D: SeatHandler + 'static,
@@ -65,6 +96,38 @@ where
                         serialized.layout_effective,
                     )
                 }
+            });
+    }
+
+    /// An input method repeats keys by itself from the grab's repeat_info,
+    /// as a keyboard before version 10 does: it only hears changed
+    /// modifiers.
+    fn repeat(
+        &mut self,
+        _data: &mut D,
+        _handle: &mut KeyboardInnerHandle<'_, D>,
+        _keycode: Keycode,
+        modifiers: Option<ModifiersState>,
+        serial: Serial,
+        _time: u32,
+    ) {
+        let Some(serialized) = modifiers.map(|m| m.serialized) else {
+            return;
+        };
+        let inner = self.inner.lock().unwrap();
+        let Some(keyboard) = inner.grab.as_ref() else {
+            return;
+        };
+        inner
+            .text_input_handle
+            .active_text_input_serial_or_default(serial.0, |serial| {
+                keyboard.modifiers(
+                    serial,
+                    serialized.depressed,
+                    serialized.latched,
+                    serialized.locked,
+                    serialized.layout_effective,
+                )
             });
     }
 

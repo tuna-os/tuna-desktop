@@ -67,9 +67,7 @@ where
         };
 
         let guard = self.arc.internal.lock().unwrap();
-        if kbd.version() >= 4 {
-            kbd.repeat_info(guard.repeat_rate, guard.repeat_delay);
-        }
+        send_repeat_info(&kbd, guard.repeat_rate, guard.repeat_delay);
         if let Some((focused, serial)) = guard.focus.as_ref() {
             if focused.same_client_as(&kbd.id()) {
                 let serialized = guard.mods_state.serialized;
@@ -137,6 +135,20 @@ where
                 .unwrap()
                 .retain(|k| k.id() != keyboard.id())
         }
+    }
+}
+
+/// wl_keyboard's `repeated` key state (wl_seat 10).
+pub(crate) const KEY_STATE_REPEATED_SINCE: u32 = 10;
+
+/// The repeat a keyboard is told, as Mutter's notify_key_repeat_for_resource:
+/// from version 10 the compositor repeats keys itself (`rate` 0, `delay` 0),
+/// before it the client repeats with the configured `rate` and `delay`.
+pub(crate) fn send_repeat_info(kbd: &WlKeyboard, rate: i32, delay: i32) {
+    if kbd.version() >= KEY_STATE_REPEATED_SINCE {
+        kbd.repeat_info(0, 0);
+    } else if kbd.version() >= 4 {
+        kbd.repeat_info(rate, delay);
     }
 }
 
@@ -217,6 +229,15 @@ impl<D: SeatHandler + 'static> KeyboardTarget<D> for WlSurface {
     ) {
         for_each_focused_kbds(seat, self, |kbd| {
             kbd.key(serial.into(), time, key.raw_code().raw() - 8, state.into())
+        })
+    }
+
+    fn repeat(&self, seat: &Seat<D>, _data: &mut D, key: KeysymHandle<'_>, serial: Serial, time: u32) {
+        // Older keyboards repeat by themselves from repeat_info.
+        for_each_focused_kbds(seat, self, |kbd| {
+            if kbd.version() >= KEY_STATE_REPEATED_SINCE {
+                kbd.key(serial.into(), time, key.raw_code().raw() - 8, WlKeyState::Repeated)
+            }
         })
     }
 

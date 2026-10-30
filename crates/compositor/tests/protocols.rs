@@ -56,7 +56,7 @@ const EXPECTED: &[(&str, u32)] = &[
     ("wl_compositor", 6),
     ("wl_data_device_manager", 3),
     ("wl_fixes", 1),
-    ("wl_seat", 9),
+    ("wl_seat", 10),
     ("wl_shm", 2),
     ("wl_subcompositor", 1),
     ("wp_commit_timing_manager_v1", 1),

@@ -20,7 +20,7 @@ pub use xkbcommon::xkb::{self, keysyms, Keycode, Keysym};
 use super::{GrabStatus, Seat, SeatHandler};
 
 #[cfg(feature = "wayland_frontend")]
-use wayland_server::{Resource, Weak};
+use wayland_server::Weak;
 #[cfg(feature = "wayland_frontend")]
 mod keymap_file;
 #[cfg(feature = "wayland_frontend")]
@@ -51,6 +51,12 @@ where
         serial: Serial,
         time: u32,
     );
+    /// The compositor repeated the held `key` (wl_keyboard version 10's
+    /// `repeated` key state). A repeat changes neither the XKB state nor
+    /// the pressed keys. The default ignores it.
+    fn repeat(&self, seat: &Seat<D>, data: &mut D, key: KeysymHandle<'_>, serial: Serial, time: u32) {
+        let _ = (seat, data, key, serial, time);
+    }
     /// Hold modifiers were changed on a keyboard from a given seat
     fn modifiers(&self, seat: &Seat<D>, data: &mut D, modifiers: ModifiersState, serial: Serial);
     /// Keyboard focus of a given seat moved from another handler to this handler
@@ -186,6 +192,11 @@ impl Xkb {
     /// state applied.
     pub fn raw_syms_for_key_in_layout(&self, keycode: Keycode, layout: Layout) -> &[Keysym] {
         self.keymap.key_get_syms_by_level(keycode, layout.0, 0)
+    }
+
+    /// Whether the keymap lets `keycode` repeat (`xkb_keymap_key_repeats`).
+    pub fn key_repeats(&self, keycode: Keycode) -> bool {
+        self.keymap.key_repeats(keycode)
     }
 }
 
@@ -642,6 +653,22 @@ pub trait KeyboardGrab<D: SeatHandler>: Downcast {
         serial: Serial,
         time: u32,
     );
+
+    /// A compositor-generated repeat of a held key
+    /// ([`KeyboardHandle::input_repeat`]). `modifiers` are only passed
+    /// when they changed since the last forwarded event; they must be sent
+    /// before the repeat. The default delivers both to the current focus.
+    fn repeat(
+        &mut self,
+        data: &mut D,
+        handle: &mut KeyboardInnerHandle<'_, D>,
+        keycode: Keycode,
+        modifiers: Option<ModifiersState>,
+        serial: Serial,
+        time: u32,
+    ) {
+        handle.repeat(data, keycode, modifiers, serial, time)
+    }
 
     /// A focus change was requested.
     fn set_focus(
@@ -1131,6 +1158,21 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
         }
     }
 
+    /// Deliver a compositor-generated repeat of the held `keycode`
+    /// through the current grab to the focus, as Mutter's native seat
+    /// repeats keys for wl_keyboard version 10. Neither the XKB state nor
+    /// the pressed keys change; older keyboards repeat by themselves and
+    /// receive nothing.
+    pub fn input_repeat(&self, data: &mut D, keycode: Keycode, serial: Serial, time: u32) {
+        let mut guard = self.arc.internal.lock().unwrap();
+        let seat = self.get_seat(data);
+        let modifiers = guard.pending_modifiers.then_some(guard.mods_state);
+        guard.pending_modifiers = false;
+        guard.with_grab(data, &seat, |data, handle, grab| {
+            grab.repeat(data, handle, keycode, modifiers, serial, time);
+        });
+    }
+
     /// Set the current focus of this keyboard
     ///
     /// If the new focus is different from the previous one, any previous focus
@@ -1229,6 +1271,10 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
     }
 
     /// Change the repeat info configured for this keyboard
+    ///
+    /// Keyboards before version 10 are told `rate` and `delay`; version 10
+    /// keyboards are told `(0, 0)`, the compositor repeating keys for them
+    /// through [`KeyboardHandle::input_repeat`].
     #[instrument(parent = &self.arc.span, skip(self))]
     pub fn change_repeat_info(&self, rate: i32, delay: i32) {
         let mut guard = self.arc.internal.lock().unwrap();
@@ -1239,9 +1285,7 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
             let Ok(kbd) = kbd.upgrade() else {
                 continue;
             };
-            if kbd.version() >= 4 {
-                kbd.repeat_info(rate, delay);
-            }
+            crate::wayland::seat::keyboard::send_repeat_info(&kbd, rate, delay);
         }
     }
 
@@ -1294,6 +1338,31 @@ impl<D: SeatHandler> fmt::Debug for KeyboardInnerHandle<'_, D> {
             .field("inner", &self.inner)
             .field("seat", &self.seat.arc.name)
             .finish()
+    }
+}
+
+impl<D: SeatHandler> KeyboardInnerHandle<'_, D> {
+    /// Send a compositor-generated repeat to the focused keyboards, after
+    /// any changed `modifiers`.
+    pub fn repeat(
+        &mut self,
+        data: &mut D,
+        keycode: Keycode,
+        modifiers: Option<ModifiersState>,
+        serial: Serial,
+        time: u32,
+    ) {
+        let Some((focus, _)) = self.inner.focus.as_ref() else {
+            return;
+        };
+        if let Some(mods) = modifiers {
+            focus.modifiers(self.seat, data, mods, serial);
+        }
+        let key = KeysymHandle {
+            xkb: &self.inner.xkb,
+            keycode,
+        };
+        focus.repeat(self.seat, data, key, serial, time);
     }
 }
 
