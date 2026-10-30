@@ -952,11 +952,18 @@ impl Runtime {
                 let handle = event_loop.handle();
                 handle
                     .insert_source(sources.session, |event, _, rt: &mut Runtime| {
+                        let activated =
+                            matches!(event, smithay::backend::session::Event::ActivateSession);
                         if matches!(event, smithay::backend::session::Event::PauseSession) {
                             rt.manager.cancel_strip_pointer(&mut rt.state);
                         }
                         if let Backend::Drm(drm) = &mut rt.backend {
                             drm.on_session_event(event);
+                        }
+                        // Monitors may have come or gone while another VT
+                        // owned the device.
+                        if activated {
+                            rt.on_drm_hotplug();
                         }
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
@@ -971,6 +978,20 @@ impl Runtime {
                         }
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                if let Some(udev) = sources.udev {
+                    handle
+                        .insert_source(udev, |event, _, rt: &mut Runtime| {
+                            let smithay::backend::udev::UdevEvent::Changed { device_id } = event
+                            else {
+                                return;
+                            };
+                            if matches!(&rt.backend, Backend::Drm(drm) if drm.is_device(device_id))
+                            {
+                                rt.on_drm_hotplug();
+                            }
+                        })
+                        .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                }
                 handle
                     .insert_source(sources.input, |event, _, rt: &mut Runtime| {
                         // A VT switch revokes the evdev fds before libseat's
@@ -2683,6 +2704,33 @@ impl Runtime {
         // GNOME Settings' display configuration (#340): modes, the
         // kernel's CRTC modes on hardware, pending confirmation.
         doc["display_config"] = self.display_config_diagnostics();
+        // The window manager's outputs (wl_outputs) and the output each
+        // window returns to, for the hotplug storm.
+        let primary_output = self.state.primary_output_name();
+        doc["outputs"] = self
+            .state
+            .output_slices()
+            .into_iter()
+            .map(|(name, r)| {
+                serde_json::json!({
+                    "primary": primary_output.as_deref() == Some(name.as_str()),
+                    "name": name,
+                    "rect": [r.loc.x, r.loc.y, r.size.w, r.size.h],
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+        doc["window_outputs"] = snapshot
+            .windows
+            .iter()
+            .map(|w| {
+                (
+                    w.id.to_string(),
+                    serde_json::json!(self.manager.preferred_output(w.id)),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into();
         doc["color"] = self.color_diagnostics();
         let motion = self.input_settings.motion;
         doc["motion_policy"] = serde_json::json!(motion.level.as_str());

@@ -187,6 +187,85 @@ impl Runtime {
         self.publish_display_state();
     }
 
+    /// A connector was plugged in or unplugged (Mutter's
+    /// `meta_monitor_manager_reload`): the backend lights or drops the
+    /// outputs, the new monitor set is configured as
+    /// `meta_monitor_manager_ensure_configured` does (stored, then the
+    /// current or previous configuration that covers it, then linear),
+    /// and wl_outputs, windows and DisplayConfig follow.
+    #[cfg(feature = "drm")]
+    pub(super) fn on_drm_hotplug(&mut self) {
+        let live = self.display_state().live_config();
+        let Backend::Drm(drm) = &mut self.backend else {
+            return;
+        };
+        let changes = drm.rescan_connectors();
+        if changes.is_empty() {
+            return;
+        }
+        eprintln!(
+            "tuna-compositor: drm: hotplug: connected [{}], disconnected [{}]",
+            changes.added.join(", "),
+            changes.removed.join(", ")
+        );
+        self.display_configs.ensure_current(live);
+        let connectors = drm.startup_connectors();
+        if !connectors.is_empty() {
+            let names: Vec<String> = connectors.iter().map(|c| c.name.clone()).collect();
+            let stored = crate::monitors::load_exact(&names);
+            let existing: Vec<&MonitorsConfig> = [
+                self.display_configs.current(),
+                self.display_configs.previous(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let primary = self.state.primary_output_name();
+            let fallback = crate::drm::fallback_scale();
+            let mut layouts = display_config::hotplug_layouts(
+                stored.as_ref(),
+                &existing,
+                &connectors,
+                primary.as_deref(),
+                fallback,
+            );
+            // The sensor wins on unlocked built-in panels; the
+            // configured transform stays in manual_transforms.
+            for layout in &mut layouts {
+                if let Some(enabled) = &mut layout.enabled {
+                    self.manual_transforms
+                        .insert(layout.connector.clone(), enabled.transform);
+                    enabled.transform = self
+                        .orientation
+                        .effective(&layout.connector, enabled.transform);
+                }
+            }
+            if let Err(error) = drm.apply_layout(&layouts) {
+                eprintln!("tuna-compositor: drm: hotplug configuration not applied: {error}");
+                let linear = display_config::hotplug_layouts(
+                    None,
+                    &[],
+                    &connectors,
+                    primary.as_deref(),
+                    fallback,
+                );
+                if let Err(error) = drm.apply_layout(&linear) {
+                    eprintln!("tuna-compositor: drm: linear configuration not applied: {error}");
+                }
+            }
+        }
+        drm.log_outputs();
+        self.color.set_gamma_sizes(drm.gamma_sizes());
+        let primary_scale = drm.outputs.first().map(|o| o.scale);
+        self.sync_drm_outputs();
+        if let Some(scale) = primary_scale {
+            self.state.set_preferred_scale(scale);
+        }
+        let live = self.display_state().live_config();
+        self.display_configs.configured(live);
+        self.publish_display_state();
+    }
+
     /// Apply a configuration live, with GNOME's ScreenTransition: the
     /// old layout is pictured first when the layout changes.
     fn apply_monitors(&mut self, config: &MonitorsConfig) -> Result<(), String> {
