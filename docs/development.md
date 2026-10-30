@@ -240,6 +240,9 @@ diagnostic, not a fix.
 - Compositor logs: Check the output of `./scripts/tuna-nested run` or tail the log file; [nested session troubleshooting](nested-session.md#troubleshooting) explains the common lines
 - Shell-host logs: Printed to the same log file as the compositor
 - Nested shell interaction: Use `./scripts/tuna-nested shell-pid` to identify the shell process for attaching a debugger
+- Build, install, login and CI problems: [troubleshooting](troubleshooting.md)
+- Logs in a GDM session, restarting the shell, the lock screen and debuggers: [session operations](session-operations.md)
+- Trace output and every other variable the code reads: [environment variables](environment.md)
 
 ### Performance
 See the [performance profiling guide](performance-profiling.md). It covers
@@ -256,7 +259,7 @@ If you find a bug or have a feature request:
    - Clear title and description
    - Steps to reproduce (for bugs)
    - Expected vs. actual behavior
-   - Environment (distro, GPU, Rust version, Tuna Desktop commit); for nested-session bugs, see [filing a bug](nested-session.md#filing-a-bug)
+   - Environment (distro, GPU, Rust version, Tuna Desktop commit); [filing a bug](troubleshooting.md#filing-a-bug) lists the details and the commands that print them
 3. Reference relevant specs in `.spektacular/specs/` if applicable
 
 ## Further reading
