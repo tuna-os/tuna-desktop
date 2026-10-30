@@ -12,7 +12,10 @@ before decoding.
 ## Public API (`src/lib.rs`)
 
 - Framing: `encode_frame`, `decode_frame`, `DecodeError`, `MAX_FRAME_BYTES`.
-- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.44; 0.43 is reserved for #839).
+- Versioning: `ProtocolVersion`, `CURRENT_VERSION`. The current number is
+  `ProtocolVersion::CURRENT` in `src/lib.rs`, whose doc comment lists every
+  minor; the wire-change rules are in the
+  [API stability policy](../../docs/api-stability.md#shell-control-protocol-tuna-shell-control).
 - Display-change confirmation (0.42): `Message::ConfirmDisplayChange
   { timeout_secs }` (sent only to peers advertising minor >=42) asks the shell
   for GNOME's "Keep these display settings?" dialog; the shell answers with
@@ -61,7 +64,9 @@ and `tuna-shell-gtk`.
 activation tokens),
 [ADR 0005](../../docs/adr/0005-control-socket-peer-authentication.md)
 (control-socket peer authentication),
-[architecture](../../docs/architecture.md).
+[architecture](../../docs/architecture.md),
+[API stability and wire versioning](../../docs/api-stability.md) (this crate
+is internal; its wire format is the cross-process contract).
 
 ## Wellbeing scene effects (0.35)
 

@@ -41,3 +41,6 @@ this shell; packaged sessions prefer `tuna-shell-gtk` when it is installed
 [extensions](../../docs/extensions.md),
 [settings map](../../docs/settings-map.md),
 [nested session](../../docs/nested-session.md).
+
+Stability: internal, not published, no SemVer promise — see the
+[API stability policy](../../docs/api-stability.md).

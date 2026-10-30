@@ -6,6 +6,9 @@
 //! backends, seats, and the shell control channel arrive in later steps;
 //! the [`TestCompositor`] helper drives the display manually so
 //! integration tests stay deterministic without an event loop or GPU.
+//!
+//! Stability: internal. This crate is not published and makes no SemVer
+//! promise; see `docs/api-stability.md` in the repository.
 
 // The compositor state snapshot is one large `serde_json::json!` object,
 // which outgrows the default macro recursion limit.

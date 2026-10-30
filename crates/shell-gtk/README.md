@@ -43,3 +43,6 @@ command or GIO launch context only; they never mutate the live shell.
 [pixel parity with GNOME 51](../../docs/gnome-parity.md),
 [keymap](../../docs/keymap.md),
 [running tests locally](../../docs/testing.md).
+
+Stability: internal binary crate — see the
+[API stability policy](../../docs/api-stability.md).

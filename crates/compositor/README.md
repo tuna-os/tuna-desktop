@@ -41,3 +41,7 @@ as a dev-dependency for its live tests. Integration tests are in `tests/`.
 [ADR 0005](../../docs/adr/0005-control-socket-peer-authentication.md),
 [nested session](../../docs/nested-session.md),
 [protocols](../../docs/protocols.md), [keymap](../../docs/keymap.md).
+
+Stability: internal, not published, no SemVer promise — see the
+[API stability policy](../../docs/api-stability.md). Security boundaries:
+[security model](../../docs/security-model.md).

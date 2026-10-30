@@ -1,8 +1,9 @@
 // Tuna Desktop sample extension: a greeting bar cell.
 //
 // Install: copy this file into the extension directory
-// (`~/.local/share/tuna/extensions/hello.rhai` by default).
-// The shell picks it up without a restart.
+// (`~/.local/share/tuna-shell/extensions/hello.rhai` by default).
+// The legacy shell (`tuna-shell-host`) picks it up without a restart;
+// the GTK shell loads no scripts.
 //
 // API used here:
 //   bar_cell(text, icon)  — contribute the strip cell.

@@ -44,6 +44,14 @@ Also read:
 - [docs/adr/README.md](docs/adr/README.md) — open and decided architecture
   decisions. A "blocking" decision must resolve before its dependent spek's
   work passes its gate.
+- [docs/security-model.md](docs/security-model.md) — threat model, trust
+  boundaries, security properties, known limitations and release gates.
+  Start here for any change touching the lock, capture, portals, D-Bus
+  caller checks or extensions.
+- [docs/portal-service-integration.md](docs/portal-service-integration.md)
+  — how portal and D-Bus services are wired and tested.
+- [docs/api-stability.md](docs/api-stability.md) — crate stability tiers,
+  shell-control wire versioning and the MSRV policy.
 
 ## The Spektacular workflow
 
