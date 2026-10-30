@@ -33,6 +33,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import resource
 import secrets
 import signal
@@ -186,7 +187,12 @@ def input_worker(state_path, app_id, width, height, grab):
     keys.connect("key-pressed", bump("keys"))
     window.add_controller(keys)
     motion = Gtk.EventControllerMotion()
-    motion.connect("motion", bump("motions"))
+    last_motion = [None]
+
+    def moved(_controller, x, y):
+        counts["motions"] += 1
+        last_motion[0] = [round(x, 2), round(y, 2)]
+    motion.connect("motion", moved)
     window.add_controller(motion)
     click = Gtk.GestureClick(button=0)
     click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
@@ -209,12 +215,14 @@ def input_worker(state_path, app_id, width, height, grab):
 
         def open_popup(*_):
             # A grabbing popup needs a fresh input serial: open it from the
-            # click that focused the window, as a menu button would.
+            # press that focused the window, as a menu button does. Not the
+            # release: the text field claims the press sequence, which
+            # cancels this window-level gesture before its release.
             nonlocal opened
             if not opened:
                 opened = True
                 popover.popup()
-        click.connect("released", open_popup)
+        click.connect("pressed", open_popup)
     window.connect("close-request", lambda *_: loop.quit() or False)
     window.present()
     last = None
@@ -228,7 +236,7 @@ def input_worker(state_path, app_id, width, height, grab):
         value = dict(counts, pid=os.getpid(), mapped=window.get_mapped(),
                      active=window.is_active(), text=len(text.get_text()),
                      popup=bool(popover is not None and popover.get_mapped()),
-                     popup_opened=opened)
+                     popup_opened=opened, last_motion=last_motion[0])
         if value != last:
             last = value
             tmp = state_path + ".tmp"
@@ -351,8 +359,8 @@ class Stress:
         self.processes.append(process)
         return process
 
-    def worker(self, kind, name, *extra):
-        return self.launch([sys.executable, SELF, "--worker", kind, *extra], name, self.client_env)
+    def worker(self, kind, name, *extra, env=None):
+        return self.launch([sys.executable, SELF, "--worker", kind, *extra], name, env or self.client_env)
 
     def pump(self):
         if self.glib is not None:
@@ -432,10 +440,10 @@ class Stress:
                 return window["rect"]
         return None
 
-    def input_client(self, app_id, width=480, height=320, grab=False):
+    def input_client(self, app_id, width=480, height=320, grab=False, env=None):
         path = str(self.private / f"{app_id}.json")
         extra = [path, app_id, str(width), str(height)] + (["--grab"] if grab else [])
-        process = self.worker("input", app_id, *extra)
+        process = self.worker("input", app_id, *extra, env=env)
 
         def read():
             try:
@@ -755,6 +763,8 @@ class Stress:
                 if action:
                     self.call(conn, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell",
                               "UngrabAccelerator", GLib.Variant("(u)", (action,)), "(b)")
+        activated = self.accelerator_activation(conn)
+        held = self.accelerator_table_full(conn)
         # A grab outlives the flood, then leaves with its owner.
         accelerator = "<Control><Alt>F11"
         action = self.call(conn, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell",
@@ -772,8 +782,63 @@ class Stress:
         replacement.close_sync(None)
         self.input_path()
         self.record("S-ACCELERATORS", True,
-                    f"{granted} grants and ungrabs over {3 * len(accelerators)} requests; a fresh grab granted; "
-                    f"a departed caller's grab was released; input recovered")
+                    f"{granted} grants and ungrabs over {3 * len(accelerators)} requests; {activated}; "
+                    f"{held} grabs held at once until the shell's bound refused more, and the shell's own "
+                    "Super+A still opened the app grid; a fresh grab granted; a departed caller's grab "
+                    "was released; input recovered")
+
+    def accelerator_activation(self, conn):
+        """The caller's own grab fires: AcceleratorActivated, unicast to it."""
+        GLib = self.glib
+        from gi.repository import Gio
+        # Super+Alt+F11 stays at F11's first level; Ctrl+Alt+F11 would be
+        # the X server's own VT switch and never reach the compositor.
+        accelerator = "<Super><Alt>F11"
+        seen = []
+        subscription = conn.signal_subscribe(
+            None, "org.gnome.Shell", "AcceleratorActivated", "/org/gnome/Shell", None,
+            Gio.DBusSignalFlags.NONE, lambda *args: seen.append(args[5].unpack()[0]))
+        action = self.call(conn, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell",
+                           "GrabAccelerator", GLib.Variant("(suu)", (accelerator, 1 | 2, 0)),
+                           "(u)").unpack()[0]
+        if not action:
+            raise Failure(f"{accelerator} was not granted")
+        # The shell hands the compositor its grab set once its loop is idle.
+        time.sleep(0.5)
+        self.key("super+alt+F11")
+        self.wait_for(lambda: action in seen, f"AcceleratorActivated for the caller's {accelerator}", 10)
+        conn.signal_unsubscribe(subscription)
+        self.call(conn, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell",
+                  "UngrabAccelerator", GLib.Variant("(u)", (action,)), "(b)")
+        return f"the caller's {accelerator} fired AcceleratorActivated to it"
+
+    def accelerator_table_full(self, conn):
+        """A caller grabbing all it can leaves the shell's own bindings
+        working: the shell refuses grabs before the compositor's bound."""
+        GLib = self.glib
+        mods = ["Shift", "Control", "Alt", "Super"]
+        keys = list("abcdefghijklmnopqrstuvwxyz0123456789") + [f"F{n}" for n in range(1, 13)]
+        prefixes = ["".join(f"<{m}>" for i, m in enumerate(mods) if bits & (1 << i))
+                    for bits in range(1, 16)]
+        candidates = [p + k for p in prefixes for k in keys]
+        actions = []
+        for start in range(0, len(candidates), 32):
+            batch = [(a, 1 | 2, 0) for a in candidates[start:start + 32]]
+            actions += [a for a in self.call(conn, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell",
+                                             "GrabAccelerators", GLib.Variant("(a(suu))", (batch,)),
+                                             "(au)").unpack()[0] if a]
+        if not 0 < len(actions) < 512 or len(actions) == len(candidates):
+            raise Failure(f"{len(actions)} of {len(candidates)} grabs granted: the shell's bound did not hold")
+        time.sleep(0.5)
+        self.key("super+a")
+        self.overview(True)
+        self.key("Escape")
+        self.key("Escape")
+        self.overview(False)
+        for action in actions:
+            self.call(conn, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell",
+                      "UngrabAccelerator", GLib.Variant("(u)", (action,)), "(b)")
+        return len(actions)
 
     def tray_churn(self):
         GLib = self.glib
@@ -1001,8 +1066,21 @@ class Stress:
         self.record("S-IBUS", True, f"ibus-daemon killed {rounds} times under a focused field: typing "
                     "continued without it and the bridge refocused each returned daemon")
 
+    def wire_motions(self, name):
+        """wl_pointer.motion events a WAYLAND_DEBUG client logged, with
+        their libwayland timestamps in ms."""
+        stamps = []
+        for line in (self.out / f"{name}.log").read_text(errors="replace").splitlines():
+            match = re.match(r"\[\s*(\d+\.\d+)\]\s+wl_pointer@\d+\.motion\(", line)
+            if match:
+                stamps.append(float(match.group(1)))
+        return stamps
+
     def phase_input(self):
-        process, path, read = self.input_client("tuna-stress-keys", 640, 400)
+        # The wire log measures what the compositor sends, before GTK's
+        # own per-frame motion compression.
+        env = dict(self.client_env, WAYLAND_DEBUG="client")
+        process, path, read = self.input_client("tuna-stress-keys", 640, 400, env=env)
         self.focus_client("tuna-stress-keys", read)
         text = "abcdefghij" * 100
         start = read()["text"]
@@ -1016,13 +1094,43 @@ class Stress:
                       str(rect[0] + 10 + (index * 37) % (rect[2] - 20)),
                       str(rect[1] + 10 + (index * 53) % (rect[3] - 20))]
         motions = read()["motions"]
+        wire_before = len(self.wire_motions("tuna-stress-keys"))
         for chunk in range(0, len(moves), 2000):
             self.xdotool(*moves[chunk:chunk + 2000])
         self.wait_for(lambda: read()["motions"] > motions, "pointer flood delivered", 30)
+
+        def settled():
+            seen = read()["motions"]
+            time.sleep(0.5)
+            return read()["motions"] == seen
+        self.wait_for(settled, "the pointer flood settled", 30)
+        flood_end = read()["last_motion"]
+        wire = self.wire_motions("tuna-stress-keys")[wire_before:]
+        # One more move from the flood's last target: the client must see
+        # exactly this step, so whatever folded the flood (GTK's frame
+        # clock compresses motion; Mutter's stage does too) ended where
+        # the pointer did: compressed, not lost.
+        last_x, last_y = int(moves[-2]), int(moves[-1])
+        seen = read()["motions"]
+        self.xdotool("mousemove", "--window", self.wid, str(last_x + 17), str(last_y + 11))
+        self.wait_for(lambda: read()["motions"] > seen, "the step after the flood", 10)
+        after = read()["last_motion"]
+        step = [round(after[0] - flood_end[0], 2), round(after[1] - flood_end[1], 2)]
+        span_s = (wire[-1] - wire[0]) / 1000 if len(wire) > 1 else 0.0
+        # Mutter's stage processes queued events before each frame and
+        # folds consecutive motions into one (clutter-stage.c,
+        # _clutter_stage_process_queued_events): at most about one
+        # wl_pointer.motion per 60 Hz frame of the span. Reported, not
+        # gated: this compositor forwards every motion.
+        mutter_bound = int(span_s * 60) + 1
+        delivered = 0 < len(wire) <= 2000 and step == [17, 11]
         self.wait_state(lambda s: s["seat_pressed_key_count"] == 0, "no key left pressed", 10)
-        self.record("S-INPUT-FLOOD", read()["text"] == start + len(text),
-                    f"{len(text)} typed keys arrived exactly once; {read()['motions'] - motions} motion "
-                    "events from 2000 pointer moves")
+        self.record("S-INPUT-FLOOD", read()["text"] == start + len(text) and delivered,
+                    f"{len(text)} typed keys arrived exactly once; 2000 pointer moves reached the client as "
+                    f"{len(wire)} wl_pointer.motion over {span_s:.3f} s (Mutter's per-frame folding would "
+                    f"send about {mutter_bound}) and {read()['motions'] - motions - 1} GTK motions after "
+                    f"GTK's frame compression; the step after the flood moved the client's pointer by "
+                    f"{step} (want [17, 11]): the flood's last position arrived")
         self.close_client(process, path)
         self.windows_gone()
 
@@ -1166,13 +1274,24 @@ class Stress:
                     f"locked under an active popup grab mid-swipe; input reaching the client while locked: {leaked}")
         self.unlock()
         self.settled("overview settled after a swipe ended under the lock")
-        popup_gone = not read()["popup"]
+        # GNOME Shell 51 locks with Main.pushModal (screenShield.js
+        # _becomeModal): a stage grab that revokes Mutter's Wayland popup
+        # grab (meta-wayland-input.c) without dismissing it, so the popup
+        # outlives the lock and has the keyboard again once it lifts.
+        popup_kept = read()["popup"]
+        popup_keys = read()["popup_keys"]
+        if popup_kept:
+            self.key("Shift_L")
+            self.wait_for(lambda: read()["popup_keys"] > popup_keys,
+                          "a key reaching the kept popup after unlock", 10)
         self.focus_client("tuna-stress-grab", read)
         start = read()["text"]
         self.xdotool("type", "--delay", "20", "ok")
         self.wait_for(lambda: read()["text"] == start + 2, "typing after unlock", 10)
-        self.record("S-LOCK-GRAB", True, f"typing reached the client after unlock; the popup "
-                    f"grab {'was dismissed' if popup_gone else 'outlived'} the lock")
+        self.record("S-LOCK-GRAB", popup_kept,
+                    "the popup grab outlived the lock and had the keyboard again after unlock, as GNOME's "
+                    "modal stage grab revokes rather than dismisses it; typing reached the client"
+                    if popup_kept else "the lock dismissed the client's popup grab; GNOME keeps it")
         self.close_client(process, path)
         self.windows_gone()
         self.input_path()
