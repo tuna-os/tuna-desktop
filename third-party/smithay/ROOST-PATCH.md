@@ -229,3 +229,16 @@ crates/compositor/src/explicit_sync.rs cover every case; real socketpair
 tests in crates/compositor/tests/protocol_gaps.rs cover surface_exists,
 invalid_timeline, unsupported_buffer and no_acquire_point. The isolated
 diff is retained in DRM-SYNCOBJ-PATCH.diff; the pinned version stays 0.7.0.
+
+Issues #364 and #89 change src/xwayland/xwm/mod.rs and surface.rs: the XWM
+interns `_XWAYLAND_MAY_GRAB_KEYBOARD` and records a client message of that
+type for a known window (data.l[0] non-zero allows, zero revokes), read with
+the additive `X11Surface::xwayland_may_grab_keyboard`. This is Mutter 51's
+`xwayland-may-grab-keyboard` window property, set from the same client
+message in src/x11/events.c; `meta_xwayland_grab_is_granted` grants a
+zwp_xwayland_keyboard_grab_v1 to such a window unless a deny rule matches.
+Smithay's xwayland_keyboard_grab module is used unchanged (its global is
+already visible to the Xwayland client only); Roost overrides its grab
+handler. The real Xwayland test in crates/compositor/src/xwayland_grab.rs
+sends the message from an X11 client. The isolated diff is retained in
+XWAYLAND-MAY-GRAB-PATCH.diff; the pinned version stays 0.7.0.
