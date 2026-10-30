@@ -2693,22 +2693,44 @@ print(json.dumps(result))
         result = {"power-button-chassis": power_button_chassis, "power-button-action": power_button_action,
                   "power-button-block": power_button_block}[action](sys.argv[2])
     elif action == "logout":
-        # The product's Log Out: the compositor's org.gnome.SessionManager
-        # Logout(1), no confirmation, which ends the compositor (the session
-        # leader) as gnome-session ends a GNOME session. A guest predating
-        # that manager logs out as its shell's Log Out did, through logind.
+        # The product's Log Out: the compositor's org.gnome.SessionManager,
+        # which ends the compositor (the session leader) as gnome-session
+        # ends a GNOME session. "dialog" is the power menu's Log Out… (GNOME
+        # Shell 51 systemActions.js): Logout(0) answers once the shell's
+        # end-session dialog is open, and the dialog's 60 s countdown
+        # confirms it (#589). "now" is Logout(1), no confirmation. A guest
+        # predating that manager logs out as its shell's Log Out did,
+        # through logind.
+        mode = sys.argv[2] if len(sys.argv) > 2 else "now"
+        if mode not in ("now", "dialog"):
+            raise ValueError("logout takes now or dialog")
         owned = call("gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
                      "--object-path", "/org/freedesktop/DBus",
                      "--method", "org.freedesktop.DBus.NameHasOwner", "org.gnome.SessionManager",
                      user=True) == "(true,)"
-        if owned:
+        result = {}
+        if owned and mode == "dialog":
+            requested_at = time.monotonic()
+            result["reply"] = call("gdbus", "call", "--session", "--dest", "org.gnome.SessionManager",
+                                   "--object-path", "/org/gnome/SessionManager",
+                                   "--method", "org.gnome.SessionManager.Logout", "0", user=True)
+            result["dialog_shown_after"] = None
+            while time.monotonic() - requested_at < 15:
+                layers = json.loads(STATE.read_text()).get("layers") or []
+                if any(layer.get("namespace") == "tuna-shell-end-session" for layer in layers):
+                    result["dialog_shown_after"] = round(time.monotonic() - requested_at, 1)
+                    break
+                time.sleep(0.25)
+            result["requested"] = "session manager logout dialog"
+        elif owned:
             # The reply can race the compositor's exit; the lane judges the outcome.
             call("gdbus", "call", "--session", "--dest", "org.gnome.SessionManager",
                  "--object-path", "/org/gnome/SessionManager",
                  "--method", "org.gnome.SessionManager.Logout", "1", user=True, check=False)
+            result["requested"] = "session manager logout"
         else:
             call("loginctl", "terminate-session", inventory()["session"]["Id"])
-        result = {"requested": "session manager logout" if owned else "terminate session"}
+            result["requested"] = "terminate session"
     elif action == "login-session":
         # Before Tuna Desktop writes its state snapshot: which desktop the
         # login actually started, by fixed process name only.

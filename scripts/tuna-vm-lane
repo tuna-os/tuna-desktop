@@ -2662,10 +2662,19 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
             json.dump(departing_orca, stream, indent=2)
     logout_offset, logout_started = len(read_text(serial_path)), time.monotonic()
     # The product's own Log Out; the published build predates the session
-    # manager and logs out through logind, as its shell did.
-    requested = agent.run("logout")["requested"]
-    product_logout = published or requested == "session manager logout"
-    deadline = time.monotonic() + 30
+    # manager and logs out through logind, as its shell did. The current
+    # build logs out as its power menu's Log Out… does (#589): Logout(0)
+    # opens the end-session dialog and its 60 s countdown confirms, so the
+    # session must outlive the countdown and then end.
+    dialog_logout = not published and not older_guest
+    logout = agent.run("logout", "dialog") if dialog_logout else agent.run("logout")
+    requested = logout["requested"]
+    if dialog_logout:
+        product_logout = (requested == "session manager logout dialog"
+                          and logout.get("dialog_shown_after") is not None)
+    else:
+        product_logout = published or requested == "session manager logout"
+    deadline = time.monotonic() + (90 if dialog_logout else 30)
     greeter = {}
     greeter_visible = False
     # Both lanes keep the GDM greeter frame that preceded login. tunaOS's
@@ -2689,10 +2698,20 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     if not greeter_visible:
         frame("logout-timeout")
     greeter["logout_request"] = requested
+    greeter["greeter_after"] = round(time.monotonic() - logout_started, 1)
+    if dialog_logout:
+        greeter["dialog_shown_after"] = logout.get("dialog_shown_after")
+        # GNOME's countdown, not the request, ended the session.
+        product_logout = product_logout and greeter["greeter_after"] >= 55
     with open(os.path.join(evidence, "greeter.json"), "w") as stream:
         json.dump(greeter, stream, indent=2)
+    if dialog_logout:
+        logout_how = (f"Logout(0), end-session dialog up after {logout.get('dialog_shown_after')} s, "
+                      f"its 60 s countdown confirmed, greeter after {greeter['greeter_after']} s")
+    else:
+        logout_how = requested
     record("V-LOGOUT", greeter_visible and product_logout,
-           f"product Log Out ({requested}) ends the session and returns to a painted GDM greeter surface "
+           f"product Log Out ({logout_how}) ends the session and returns to a painted GDM greeter surface "
            "under active GDM, with no original compositor")
     if older_guest:
         with open(os.path.join(evidence, "orca-after-logout.json"), "w") as stream:

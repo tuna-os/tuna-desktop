@@ -13,18 +13,24 @@
 //! gnome-session's presence (an idle inhibitor keeps the session from
 //! becoming idle). gsd-media-keys calls `Shutdown` for the power key under
 //! `power-button-action` interactive and for its shutdown key, `Reboot`
-//! and `Logout(0)` for its reboot and logout keys; they open the shell's
-//! `org.gnome.SessionManager.EndSessionDialog` as gnome-session does.
+//! and `Logout(0)` for its reboot and logout keys, and the shell's power
+//! menu calls `Suspend`, `Reboot`, `Shutdown` and `Logout(0)` as GNOME
+//! Shell 51's `systemActions.js` does; the end-of-session requests open
+//! the shell's `org.gnome.SessionManager.EndSessionDialog` as gnome-session
+//! does, and its confirmation is carried out here (`Confirmed*` ends the
+//! session through logind or this compositor's exit), never in the shell.
 //!
 //! Semantics follow gnome-session 51 `gsm-manager.c`
 //! (`gsm_manager_inhibit`, `_uninhibit`, `_is_inhibited`,
 //! `_get_inhibitors`, `update_inhibited_actions`, `_shutdown`, `_reboot`,
-//! `_logout`, `end_session_or_show_shell_dialog`), `gsm-shell.c` (the
+//! `_logout`, `_suspend`, `end_session_or_show_shell_dialog`,
+//! `handle_end_session_dialog_confirmation`), `gsm-shell.c` (the
 //! dialog's `Open(type, 0, 60, inhibitors)` and its answers),
 //! `gsm-inhibitor.c` (object paths
 //! `/org/gnome/SessionManager/Inhibitor<serial>`, removal when the
 //! caller's bus name vanishes) and `gsm-systemd.c` (the logind session's
-//! `Active`; `PowerOff(true)`/`Reboot(true)`). gnome-session asks its
+//! `Active`; `PowerOff(true)`/`Reboot(true)`;
+//! `SuspendWithFlags(SD_LOGIND_SKIP_INHIBITORS)`). gnome-session asks its
 //! registered clients before the dialog (QueryEndSession); Tuna has no
 //! client registration, so the logout inhibitors held here are the whole
 //! answer. `RestoreSupported` is false, as gnome-session 51 sets it ("For
@@ -38,7 +44,7 @@
 //! supporting restore is asked.
 
 use std::hash::{BuildHasher, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use zbus::object_server::SignalEmitter;
@@ -207,10 +213,27 @@ struct Manager {
     active: AtomicBool,
     /// `(disable-log-out, logout-prompt)`, read per request.
     policy: Policy,
+    /// Carries out a confirmed or unconfirmed end of the session and
+    /// `Suspend` (tests record instead).
+    perform: Performer,
+    /// Serial of the latest dialog opened: the shell shows one dialog,
+    /// so a newer `Open` supersedes an older request still waiting.
+    dialogs: Arc<AtomicU64>,
 }
 
 /// Reads the end-session policy: `(locked_down, logout_prompt)`.
 type Policy = Arc<dyn Fn() -> (bool, bool) + Send + Sync>;
+
+/// What the manager carries out once nothing (or the dialog) stands in
+/// the way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Act {
+    End(EndSession),
+    Suspend,
+}
+
+/// Carries out an [`Act`]; blocking, so it runs off the bus executor.
+type Performer = Arc<dyn Fn(Act) + Send + Sync>;
 
 /// The live policy: org.gnome.desktop.lockdown `disable-log-out` and
 /// org.gnome.SessionManager `logout-prompt`, GNOME's defaults when unread.
@@ -233,9 +256,9 @@ impl Manager {
 
     /// `Shutdown`, `Reboot` and `Logout`: gnome-session 51
     /// `gsm_manager_shutdown`, `_reboot`, `_logout` then
-    /// `end_session_or_show_shell_dialog`. The dialog's confirmation
-    /// carries the action out in the shell (through logind, as its power
-    /// menu does); without a dialog the manager does it here.
+    /// `end_session_or_show_shell_dialog`; the shell's confirmation is
+    /// `handle_end_session_dialog_confirmation`, which ends the session
+    /// the shell confirmed (a shutdown it promoted to a reboot reboots).
     async fn end_session(
         &self,
         conn: &zbus::Connection,
@@ -253,15 +276,47 @@ impl Manager {
             .unwrap_or((false, true));
         let route = route(mode, locked_down, prompt, logout_inhibited)?;
         eprintln!("tuna-compositor: session manager: {kind:?} (mode {mode}) -> {route:?}");
-        // The nested preview's logind session is the host's: only the
-        // shell's dialog, which ends just this compositor, may act there.
-        if route == Route::Now && crate::session_services::hardware_session() {
-            off_executor(move || perform(kind)).await;
+        // The nested preview's logind session is the host's: there the
+        // session only ends through the dialog.
+        if route == Route::Now && logind_session_is_ours() {
+            let perform = self.perform.clone();
+            off_executor(move || perform(Act::End(kind))).await;
             return Ok(());
         }
+        let serial = self.dialogs.fetch_add(1, Ordering::AcqRel) + 1;
+        let pending = open_dialog(conn, kind, inhibitors).await?;
+        let latest = self.dialogs.clone();
+        let perform = self.perform.clone();
+        let answered = async move {
+            let confirmed = pending.answer().await;
+            if latest.load(Ordering::Acquire) != serial {
+                eprintln!(
+                    "tuna-compositor: session manager: {kind:?} superseded by a newer dialog"
+                );
+                return Err(EndSessionError::Cancelled);
+            }
+            let Some(confirmed) = confirmed else {
+                eprintln!("tuna-compositor: session manager: {kind:?} cancelled");
+                return Err(EndSessionError::Cancelled);
+            };
+            eprintln!("tuna-compositor: session manager: {confirmed:?} confirmed");
+            off_executor(move || perform(Act::End(confirmed))).await;
+            Ok(())
+        };
         // gsm_manager_logout replies at once; Shutdown and Reboot answer
         // when the end of the session is confirmed or cancelled.
-        dialog(conn, kind, inhibitors, kind != EndSession::Logout).await
+        if kind == EndSession::Logout {
+            conn.executor()
+                .spawn(
+                    async move {
+                        let _ = answered.await;
+                    },
+                    "tuna-end-session-answer",
+                )
+                .detach();
+            return Ok(());
+        }
+        answered.await
     }
 }
 
@@ -369,6 +424,15 @@ impl Manager {
         #[zbus(connection)] conn: &zbus::Connection,
     ) -> Result<(), EndSessionError> {
         self.end_session(conn, EndSession::Logout, mode).await
+    }
+
+    /// gnome-session 51 `Suspend` (`gsm_manager_suspend`): logind's
+    /// `SuspendWithFlags(SD_LOGIND_SKIP_INHIBITORS)`, then the reply,
+    /// whatever logind answered. GNOME Shell 51's power menu suspends
+    /// through this, and its `PrepareForSleep` lock follows.
+    async fn suspend(&self) {
+        let perform = self.perform.clone();
+        off_executor(move || perform(Act::Suspend)).await;
     }
 
     #[zbus(property)]
@@ -553,64 +617,139 @@ fn read_setting(schema: &str, key: &str) -> Option<bool> {
     )
 }
 
-/// End the session without asking: `gsm-systemd.c` powers off and
-/// reboots through logind interactively. A logout ends this compositor,
-/// the session leader, as gnome-session's exit ends a GNOME session: the
-/// SIGTERM path retires Orca, saves window sessions, stops the session
-/// targets and releases the seat, which hands the VT back, and the exit
-/// ends the display manager's session. logind's `Session.Terminate`
-/// instead signals GDM's session worker together with the compositor; the
-/// worker then switches to the login VT while logind restores the session
-/// VT, and when logind's restore cancelled that switch GDM never started
-/// its greeter (V-LOGOUT).
-fn perform(kind: EndSession) {
-    let power = match kind {
-        EndSession::Logout => {
+/// Whether logind's session is this compositor's to end: the hardware
+/// session, or an explicit `TUNA_SESSION_KIND=hardware` (proofs against a
+/// stub logind on a private system bus), as the shell's power menu reads
+/// it. The nested preview's logind session is the host's.
+pub fn logind_session_is_ours() -> bool {
+    crate::session_services::hardware_session()
+        || std::env::var(crate::runtime::SESSION_KIND_ENV).is_ok_and(|kind| kind == "hardware")
+}
+
+/// `SD_LOGIND_SKIP_INHIBITORS`, gnome-session's suspend flag.
+const SD_LOGIND_SKIP_INHIBITORS: u64 = 1 << 4;
+
+/// Carry `act` out: `gsm-systemd.c` powers off and reboots through
+/// logind interactively and suspends with `SuspendWithFlags`. A logout
+/// ends this compositor, the session leader, as gnome-session's exit
+/// ends a GNOME session: the SIGTERM path retires Orca, saves window
+/// sessions, stops the session targets and releases the seat, which
+/// hands the VT back, and the exit ends the display manager's session.
+/// logind's `Session.Terminate` instead signals GDM's session worker
+/// together with the compositor; the worker then switches to the login
+/// VT while logind restores the session VT, and when logind's restore
+/// cancelled that switch GDM never started its greeter (V-LOGOUT). The
+/// nested preview ends only itself: a logout still ends this compositor,
+/// but the host's logind is never asked to power off, reboot or suspend.
+fn perform(act: Act) {
+    let (method, flags) = match act {
+        Act::End(EndSession::Logout) => {
+            eprintln!("tuna-compositor: session manager: ending the session");
             if let Err(e) = signal_hook::low_level::raise(signal_hook::consts::SIGTERM) {
-                eprintln!("tuna-compositor: session manager: {kind:?} failed: {e}");
+                eprintln!("tuna-compositor: session manager: {act:?} failed: {e}");
             }
             return;
         }
-        EndSession::Shutdown => "PowerOff",
-        EndSession::Reboot => "Reboot",
+        _ if !logind_session_is_ours() => {
+            eprintln!("tuna-compositor: session manager: {act:?} not sent to the host's logind (nested preview)");
+            return;
+        }
+        Act::End(EndSession::Shutdown) => ("PowerOff", None),
+        Act::End(EndSession::Reboot) => ("Reboot", None),
+        Act::Suspend => ("SuspendWithFlags", Some(SD_LOGIND_SKIP_INHIBITORS)),
     };
     let result = zbus::blocking::Connection::system().and_then(|system| {
-        system
-            .call_method(
-                Some("org.freedesktop.login1"),
-                "/org/freedesktop/login1",
-                Some("org.freedesktop.login1.Manager"),
-                power,
-                &(true,),
-            )
-            .map(|_| ())
+        let logind = zbus::blocking::Proxy::new(
+            &system,
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+        )?;
+        match flags {
+            // gsm_systemd_suspend: interactive authorization, no reply value.
+            Some(flags) => logind
+                .call_with_flags::<_, _, ()>(
+                    method,
+                    zbus::proxy::MethodFlags::AllowInteractiveAuth.into(),
+                    &(flags,),
+                )
+                .map(|_| ()),
+            None => logind.call::<_, _, ()>(method, &(true,)),
+        }
     });
-    if let Err(e) = result {
-        eprintln!("tuna-compositor: session manager: {kind:?} failed: {e}");
+    match result {
+        Ok(()) => eprintln!("tuna-compositor: session manager: logind {method} sent"),
+        Err(e) => eprintln!("tuna-compositor: session manager: {act:?} failed: {e}"),
     }
 }
 
-/// Whether the dialog's answer confirmed the end of the session.
-fn dialog_answer(member: &str) -> Option<bool> {
+/// The dialog's answer: `Some(Some(kind))` confirms ending `kind` (the
+/// shell may promote a shutdown to a reboot, which gnome-session
+/// follows), `Some(None)` cancels, `None` is no answer.
+fn dialog_answer(member: &str) -> Option<Option<EndSession>> {
     match member {
-        // gnome-session follows a shutdown the shell promoted to a reboot.
-        "ConfirmedLogout" | "ConfirmedReboot" | "ConfirmedShutdown" => Some(true),
+        "ConfirmedLogout" => Some(Some(EndSession::Logout)),
+        "ConfirmedShutdown" => Some(Some(EndSession::Shutdown)),
+        "ConfirmedReboot" => Some(Some(EndSession::Reboot)),
         // Tuna's dialog emits Closed alone only for `Close`; no end of
         // the session follows, so the request is answered as cancelled.
-        "Canceled" | "Closed" => Some(false),
+        "Canceled" | "Closed" => Some(None),
         _ => None,
     }
 }
 
-/// `gsm_shell_open_end_session_dialog`, then (when `wait`) the answer:
-/// a confirmation completes the request, a cancel, a failed `Open` or
-/// the shell leaving the bus fails it as cancelled.
-async fn dialog(
+/// An open end-session dialog awaiting the shell's answer.
+struct PendingDialog {
+    answers: zbus::MessageStream,
+    owners: zbus::fdo::NameOwnerChangedStream,
+    owner: String,
+}
+
+impl PendingDialog {
+    /// The confirmed end of the session, or `None` when the dialog was
+    /// cancelled or closed or the shell left the bus.
+    async fn answer(self) -> Option<EndSession> {
+        use futures_lite::StreamExt;
+        let Self {
+            mut answers,
+            mut owners,
+            owner,
+        } = self;
+        let answered = async {
+            while let Some(Ok(message)) = answers.next().await {
+                let header = message.header();
+                if header.sender().map(|s| s.as_str()) != Some(owner.as_str()) {
+                    continue;
+                }
+                if let Some(answer) = header.member().and_then(|m| dialog_answer(m.as_str())) {
+                    return answer;
+                }
+            }
+            None
+        };
+        let shell_left = async {
+            while let Some(change) = owners.next().await {
+                if change
+                    .args()
+                    .map(|a| a.new_owner().as_ref().map(|n| n.as_str()) != Some(owner.as_str()))
+                    .unwrap_or(false)
+                {
+                    return None;
+                }
+            }
+            None
+        };
+        futures_lite::future::or(answered, shell_left).await
+    }
+}
+
+/// `gsm_shell_open_end_session_dialog`: a failed `Open` or no shell
+/// fails the request as cancelled.
+async fn open_dialog(
     conn: &zbus::Connection,
     kind: EndSession,
     inhibitors: Vec<String>,
-    wait: bool,
-) -> Result<(), EndSessionError> {
+) -> Result<PendingDialog, EndSessionError> {
     let dbus = zbus::fdo::DBusProxy::new(conn)
         .await
         .map_err(|_| EndSessionError::Cancelled)?;
@@ -629,10 +768,10 @@ async fn dialog(
         .and_then(|b| b.path(END_SESSION_DIALOG_PATH))
         .map(|b| b.build())
         .map_err(|_| EndSessionError::Cancelled)?;
-    let mut answers = zbus::MessageStream::for_match_rule(answers, conn, Some(16))
+    let answers = zbus::MessageStream::for_match_rule(answers, conn, Some(16))
         .await
         .map_err(|_| EndSessionError::Cancelled)?;
-    let mut owners = dbus
+    let owners = dbus
         .receive_name_owner_changed_with_args(&[(0, SHELL_NAME)])
         .await
         .map_err(|_| EndSessionError::Cancelled)?;
@@ -653,39 +792,11 @@ async fn dialog(
         eprintln!("tuna-compositor: session manager: end-session dialog did not open: {e}");
         return Err(EndSessionError::Cancelled);
     }
-    if !wait {
-        return Ok(());
-    }
-    use futures_lite::StreamExt;
-    let answered = async {
-        while let Some(Ok(message)) = answers.next().await {
-            let header = message.header();
-            if header.sender().map(|s| s.as_str()) != Some(owner.as_str()) {
-                continue;
-            }
-            if let Some(answer) = header.member().and_then(|m| dialog_answer(m.as_str())) {
-                return answer;
-            }
-        }
-        false
-    };
-    let shell_left = async {
-        while let Some(change) = owners.next().await {
-            if change
-                .args()
-                .map(|a| a.new_owner().as_ref().map(|n| n.as_str()) != Some(owner.as_str()))
-                .unwrap_or(false)
-            {
-                return false;
-            }
-        }
-        false
-    };
-    if futures_lite::future::or(answered, shell_left).await {
-        Ok(())
-    } else {
-        Err(EndSessionError::Cancelled)
-    }
+    Ok(PendingDialog {
+        answers,
+        owners,
+        owner,
+    })
 }
 
 struct InhibitorNode(Inhibitor);
@@ -717,16 +828,25 @@ fn serve_on(
     share: Share,
     active: bool,
 ) -> zbus::Result<std::thread::JoinHandle<()>> {
-    serve_with(conn, registry, share, active, Arc::new(read_policy))
+    serve_with(
+        conn,
+        registry,
+        share,
+        active,
+        Arc::new(read_policy),
+        Arc::new(perform),
+    )
 }
 
-/// [`serve_on`] with the end-session policy reader (tests pin it).
+/// [`serve_on`] with the end-session policy reader and the performer
+/// (tests pin the one and record the other).
 fn serve_with(
     conn: &zbus::blocking::Connection,
     registry: Arc<Mutex<Registry>>,
     share: Share,
     active: bool,
     policy: Policy,
+    perform: Performer,
 ) -> zbus::Result<std::thread::JoinHandle<()>> {
     let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
@@ -743,6 +863,8 @@ fn serve_with(
             share: share.clone(),
             active: AtomicBool::new(active),
             policy,
+            perform,
+            dialogs: Arc::default(),
         },
     )?;
     let conn = conn.clone();
@@ -1136,11 +1258,20 @@ mod tests {
         assert_eq!(EndSession::Shutdown.dialog_type(), 1);
         assert_eq!(EndSession::Reboot.dialog_type(), 2);
         // The shell's answers (a shutdown promoted to a reboot counts).
-        for confirmed in ["ConfirmedShutdown", "ConfirmedReboot", "ConfirmedLogout"] {
-            assert_eq!(dialog_answer(confirmed), Some(true));
-        }
-        assert_eq!(dialog_answer("Canceled"), Some(false));
-        assert_eq!(dialog_answer("Closed"), Some(false));
+        assert_eq!(
+            dialog_answer("ConfirmedShutdown"),
+            Some(Some(EndSession::Shutdown))
+        );
+        assert_eq!(
+            dialog_answer("ConfirmedReboot"),
+            Some(Some(EndSession::Reboot))
+        );
+        assert_eq!(
+            dialog_answer("ConfirmedLogout"),
+            Some(Some(EndSession::Logout))
+        );
+        assert_eq!(dialog_answer("Canceled"), Some(None));
+        assert_eq!(dialog_answer("Closed"), Some(None));
         assert_eq!(dialog_answer("Open"), None);
     }
 
@@ -1222,6 +1353,110 @@ mod tests {
         }
     }
 
+    type Performed = Arc<Mutex<Vec<Act>>>;
+
+    /// A performer recording what the manager would carry out.
+    fn recorder() -> (Performer, Performed) {
+        let performed: Performed = Arc::default();
+        let log = performed.clone();
+        (
+            Arc::new(move |act| log.lock().unwrap().push(act)),
+            performed,
+        )
+    }
+
+    /// GNOME Shell on `bus`: its end-session dialog, recording `Open`.
+    fn fake_shell(bus: &TestBus) -> (zbus::blocking::Connection, Opened) {
+        let shell = bus.connect();
+        let opened: Opened = Arc::default();
+        shell
+            .object_server()
+            .at(END_SESSION_DIALOG_PATH, FakeDialog(opened.clone()))
+            .unwrap();
+        shell.request_name(SHELL_NAME).unwrap();
+        (shell, opened)
+    }
+
+    const CANCELLED: &str = "org.gtk.GDBus.UnmappedGError.Quark._g_2dio_2derror_2dquark.Code19";
+
+    #[test]
+    fn power_menu_requests_end_the_session_only_as_the_dialog_confirms() {
+        let bus = TestBus::spawn();
+        let service = bus.connect();
+        let (perform, performed) = recorder();
+        let policy: Policy = Arc::new(|| (false, true));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let _watcher =
+            serve_with(&service, registry, Share::default(), true, policy, perform).unwrap();
+        service.request_name(NAME).unwrap();
+        let (shell, opened) = fake_shell(&bus);
+
+        // systemActions.js activateSuspend: SuspendAsync, no dialog.
+        call_in_thread(&bus, "Suspend", None)
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(*performed.lock().unwrap(), [Act::Suspend]);
+        assert!(opened.lock().unwrap().is_empty());
+
+        // Restart…: Reboot opens the restart dialog; Cancel leaves the
+        // session and fails the call as cancelled.
+        let reboot = call_in_thread(&bus, "Reboot", None);
+        wait_until("Reboot's dialog", || opened.lock().unwrap().len() == 1);
+        assert_eq!(
+            opened.lock().unwrap()[0],
+            (2, 0, AUTOMATIC_ACTION_TIMEOUT, vec![])
+        );
+        answer(&shell, "Canceled");
+        answer(&shell, "Closed");
+        assert_eq!(error_name(reboot.join().unwrap()), CANCELLED);
+        assert_eq!(*performed.lock().unwrap(), [Act::Suspend]);
+
+        // A newer request supersedes a Log Out still waiting for its
+        // answer: the shell shows one dialog, and its confirmation ends
+        // the session once, as the newer request asked.
+        call_in_thread(&bus, "Logout", Some(LOGOUT_MODE_NORMAL))
+            .join()
+            .unwrap()
+            .unwrap();
+        let reboot = call_in_thread(&bus, "Reboot", None);
+        wait_until("the second Reboot dialog", || {
+            opened.lock().unwrap().len() == 3
+        });
+        assert_eq!(opened.lock().unwrap()[1].0, 0);
+        assert_eq!(opened.lock().unwrap()[2].0, 2);
+        answer(&shell, "ConfirmedReboot");
+        reboot.join().unwrap().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            *performed.lock().unwrap(),
+            [Act::Suspend, Act::End(EndSession::Reboot)]
+        );
+
+        // Power Off… the shell promotes to a restart (an offline update):
+        // the manager reboots, as handle_end_session_dialog_confirmation.
+        let shutdown = call_in_thread(&bus, "Shutdown", None);
+        wait_until("Shutdown's dialog", || opened.lock().unwrap().len() == 4);
+        assert_eq!(opened.lock().unwrap()[3].0, 1);
+        answer(&shell, "ConfirmedReboot");
+        shutdown.join().unwrap().unwrap();
+        assert_eq!(
+            performed.lock().unwrap()[2..],
+            [Act::End(EndSession::Reboot)]
+        );
+
+        // Log Out…: answered at once; the confirmation ends the session.
+        call_in_thread(&bus, "Logout", Some(LOGOUT_MODE_NORMAL))
+            .join()
+            .unwrap()
+            .unwrap();
+        wait_until("Logout's dialog", || opened.lock().unwrap().len() == 5);
+        assert_eq!(performed.lock().unwrap().len(), 3);
+        answer(&shell, "ConfirmedLogout");
+        wait_until("the logout", || performed.lock().unwrap().len() == 4);
+        assert_eq!(performed.lock().unwrap()[3], Act::End(EndSession::Logout));
+    }
+
     #[test]
     fn gsd_power_key_shutdown_opens_the_shells_dialog_and_follows_its_answer() {
         let bus = TestBus::spawn();
@@ -1238,16 +1473,12 @@ mod tests {
             })
         };
         let registry = Arc::new(Mutex::new(Registry::default()));
-        let _watcher = serve_with(&service, registry, Share::default(), true, policy).unwrap();
+        let (perform, performed) = recorder();
+        let _watcher =
+            serve_with(&service, registry, Share::default(), true, policy, perform).unwrap();
         service.request_name(NAME).unwrap();
 
-        let shell = bus.connect();
-        let opened: Opened = Arc::default();
-        shell
-            .object_server()
-            .at(END_SESSION_DIALOG_PATH, FakeDialog(opened.clone()))
-            .unwrap();
-        shell.request_name(SHELL_NAME).unwrap();
+        let (shell, opened) = fake_shell(&bus);
 
         // An application holds a logout inhibitor: its path reaches Open.
         let app = bus.connect();
@@ -1279,6 +1510,8 @@ mod tests {
         );
         answer(&shell, "ConfirmedShutdown");
         shutdown.join().unwrap().unwrap();
+        // gnome-session powers off once the shell confirms.
+        assert_eq!(*performed.lock().unwrap(), [Act::End(EndSession::Shutdown)]);
 
         // Reboot, cancelled: gnome-session fails the task as cancelled.
         let reboot = call_in_thread(&bus, "Reboot", None);
@@ -1286,10 +1519,7 @@ mod tests {
         assert_eq!(opened.lock().unwrap()[1].0, 2);
         answer(&shell, "Canceled");
         answer(&shell, "Closed");
-        assert_eq!(
-            error_name(reboot.join().unwrap()),
-            "org.gtk.GDBus.UnmappedGError.Quark._g_2dio_2derror_2dquark.Code19"
-        );
+        assert_eq!(error_name(reboot.join().unwrap()), CANCELLED);
 
         // Logout(0) answers once the dialog is open, as gsm_manager_logout.
         call_in_thread(&bus, "Logout", Some(LOGOUT_MODE_NORMAL))
@@ -1313,10 +1543,7 @@ mod tests {
         let pending = call_in_thread(&bus, "Shutdown", None);
         wait_until("the last dialog", || opened.lock().unwrap().len() == 5);
         shell.release_name(SHELL_NAME).unwrap();
-        assert_eq!(
-            error_name(pending.join().unwrap()),
-            "org.gtk.GDBus.UnmappedGError.Quark._g_2dio_2derror_2dquark.Code19"
-        );
+        assert_eq!(error_name(pending.join().unwrap()), CANCELLED);
 
         // disable-log-out refuses Shutdown before any dialog.
         locked_down.store(true, Ordering::Release);
@@ -1325,5 +1552,7 @@ mod tests {
             "org.gnome.SessionManager.LockedDown"
         );
         assert_eq!(opened.lock().unwrap().len(), 5);
+        // Nothing but the confirmed Shutdown was ever carried out.
+        assert_eq!(*performed.lock().unwrap(), [Act::End(EndSession::Shutdown)]);
     }
 }
