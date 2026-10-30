@@ -40,6 +40,10 @@ default all but gdm; gdm answers GNOME Shell's "can lock" probe, the
 display manager's Version, so a reference GNOME session can lock) limits which daemons are served, so a capture can match another
 session's services exactly.
 
+TUNA_STUB_CALL_LOG, when set, receives one line per served method call
+or property read ("TIME PID call|get SENDER INTERFACE.MEMBER"); the
+stress suite uses it to see the shell come back to a returned daemon.
+
 Writes emit PropertiesChanged, so the shell sees its own changes the
 way it sees the real daemons'. The proof reads state back with gdbus.
 """
@@ -538,9 +542,25 @@ def set_property(c, sender, path, iface, prop, value):
     return True
 
 
+def logged(handler, kind):
+    """Append each served call ("call") and property read ("get") to
+    $TUNA_STUB_CALL_LOG, so a stress run sees clients come back to a
+    returned daemon."""
+    path = os.environ.get("TUNA_STUB_CALL_LOG")
+    if not path:
+        return handler
+
+    def wrapper(c, sender, object_path, iface, member, *rest):
+        with open(path, "a") as fh:
+            fh.write(f"{time.time():.3f} {os.getpid()} {kind} {sender} {iface}.{member}\n")
+        return handler(c, sender, object_path, iface, member, *rest)
+    return wrapper
+
+
 def serve(path, iface):
     info = NODE.lookup_interface(iface)
-    conn.register_object(path, info, method_call, get_property, set_property)
+    conn.register_object(path, info, logged(method_call, "call"),
+                         logged(get_property, "get"), set_property)
 
 
 SERVICES = {

@@ -9,6 +9,7 @@ on:
       - 'scripts/tuna-stress'
       - 'scripts/tuna-wayland-adversary-build'
       - 'scripts/lib/tuna-wayland-adversary.c'
+      - 'scripts/lib/tuna-service-stubs.py'
       - '.github/workflows/stress.yml'
 
 permissions:
@@ -21,7 +22,7 @@ concurrency:
 jobs:
   churn:
     runs-on: ubuntu-26.04
-    timeout-minutes: 40
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
@@ -38,8 +39,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
       - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get install -y libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool scrot ffmpeg jq dbus libglib2.0-bin xwayland x11-apps pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good at-spi2-core python3-pyatspi fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev meson ninja-build libwayland-dev wayland-protocols libpam-wrapper ibus gir1.2-ibus-1.0 wayland-utils
       - run: scripts/ci-install-gtk4-layer-shell
-      - run: cargo build -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk
-      - name: Churn windows and notifications; gate input and growth
+      - run: cargo build -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host
+      - name: Churn, floods, protocol fuzz, service and shell faults, input and lock; gate input and growth
         env:
           ROUNDS: ${{ github.event_name == 'schedule' && '300' || '10' }}
         run: scripts/tuna-stress --rounds "$ROUNDS" --out stress-artifacts
