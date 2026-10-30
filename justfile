@@ -13,9 +13,10 @@ export CARGO_BUILD_JOBS := env("CARGO_BUILD_JOBS", "2")
 export CARGO_TARGET_DIR := env("TUNA_TARGET_DIR", justfile_directory() / "target")
 
 # Cargo builds from every worktree on the machine queue on one lock, so
-# concurrent builds don't exhaust memory.
-lock := "flock " + env("TUNA_BUILD_LOCK", "/tmp/tuna-local-build.lock")
-proof_lock := "flock " + env("TUNA_PROOF_LOCK", "/tmp/tuna-local-proof.lock")
+# concurrent builds don't exhaust memory. `-o` closes the lock before the
+# command runs, so a daemon it leaves behind can't keep holding the lock.
+lock := "flock -o " + env("TUNA_BUILD_LOCK", "/tmp/tuna-local-build.lock")
+proof_lock := "flock -o " + env("TUNA_PROOF_LOCK", "/tmp/tuna-local-proof.lock")
 # Below this much free disk (GiB), builds run `gc` first.
 min_free_gb := env("TUNA_MIN_FREE_GB", "20")
 # Downloaded CI artifacts live here and expire after `artifact_ttl_min`.
@@ -60,6 +61,9 @@ proof name *args: _disk
         grep -lE "tuna-{{name}}\b" scripts/tuna-* .github/workflows/*.yml 2>/dev/null | grep -v "^$script$" | sed 's/^/  /' >&2
         exit 2
     fi
+    # A CI runner's umask: under 002 the session's directories come out
+    # group-writable and the compositor's ownership checks refuse them.
+    umask 022
     art=$(mktemp -d "${TMPDIR:-/tmp}/tuna-proof-{{name}}.XXXXXX")
     # A fresh home like a CI runner's, so desktop state in yours can't leak in
     # (or block the session's settings upgrade); Cargo and rustup stay yours.
@@ -67,6 +71,10 @@ proof name *args: _disk
     export HOME="$art/home" XDG_CONFIG_HOME="$art/home/.config" XDG_CACHE_HOME="$art/home/.cache" \
         XDG_DATA_HOME="$art/home/.local/share" XDG_STATE_HOME="$art/home/.local/state"
     mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
+    # Scripts that call `pkg-config` by name get the one PKG_CONFIG names (a
+    # Homebrew one earlier in PATH lacks the system's wayland-protocols),
+    # with Cargo's own bin directory still first.
+    export PATH="$CARGO_HOME/bin:$(dirname "$PKG_CONFIG"):$PATH"
     # A positional artifact contract is stated in the script's first lines.
     if head -n 30 "$script" | grep -qE '\$\{1:\?|sys\.argv\[1\]'; then
         set -- "$art"
@@ -75,6 +83,27 @@ proof name *args: _disk
     else
         set --                         # the proof keeps no artifacts
     fi
+    # Every process the proof starts inherits this marker, including daemons
+    # that detach from it (ibus-daemon --daemonize, dbus-daemon --fork);
+    # whatever still carries it when the proof ends is stopped.
+    export TUNA_PROOF_RUN="$art"
+    leftovers() {
+        local p
+        for p in /proc/[0-9]*; do
+            if grep -qzx "TUNA_PROOF_RUN=$art" "$p/environ" 2>/dev/null; then echo "${p#/proc/}"; fi
+        done
+    }
+    reap() {
+        local pids
+        pids=$(leftovers)
+        [ -n "$pids" ] || return 0
+        echo "proof {{name}}: stopping leftover processes: $(echo $pids)" >&2
+        kill $pids 2>/dev/null || true
+        sleep 2
+        pids=$(leftovers)
+        [ -z "$pids" ] || kill -9 $pids 2>/dev/null || true
+    }
+    trap reap EXIT
     # One proof at a time machine-wide (Xvfb, CPU); builds keep their own lock.
     if {{proof_lock}} "$script" "$@" {{args}}; then
         rm -rf "$art"
