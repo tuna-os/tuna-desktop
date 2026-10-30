@@ -1129,6 +1129,24 @@ impl WindowManager {
     pub fn icon_geometry(&self, id: u64) -> Option<Rectangle<i32, Logical>> {
         self.icon_geometries.get(&id).copied()
     }
+    /// Published dash icon bounds as `[window, x, y, w, h]`, by window id.
+    pub fn icon_geometries_json(&self) -> serde_json::Value {
+        let mut rows: Vec<_> = self
+            .icon_geometries
+            .iter()
+            .map(|(id, r)| {
+                [
+                    *id as i64,
+                    r.loc.x.into(),
+                    r.loc.y.into(),
+                    r.size.w.into(),
+                    r.size.h.into(),
+                ]
+            })
+            .collect();
+        rows.sort_unstable();
+        serde_json::json!(rows)
+    }
     /// Replace trusted shell-published global logical dash icon bounds.
     pub fn set_icon_geometries(&mut self, geometries: Vec<(u64, Rectangle<i32, Logical>)>) {
         self.icon_geometries = geometries

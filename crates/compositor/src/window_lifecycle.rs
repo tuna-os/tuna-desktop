@@ -59,6 +59,9 @@ pub fn frame(kind: Kind, effect: Effect, progress: f64, policy: MotionPolicy) ->
         1.0 - (1.0 - p).powi(2)
     };
     let motion = policy.allows_motion();
+    // Clutter interpolates the actor's opacity as a byte and truncates it
+    // (GNOME 51 draws 94/255 ten milliseconds into a map).
+    let opacity = |a: f64| ((255.0 * a) as u8) as f32 / 255.0;
     match (kind, effect) {
         (Kind::Normal, Effect::Map) => Frame {
             scale: if motion {
@@ -66,7 +69,7 @@ pub fn frame(kind: Kind, effect: Effect, progress: f64, policy: MotionPolicy) ->
             } else {
                 (1.0, 1.0)
             },
-            alpha: ease as f32,
+            alpha: opacity(ease),
             pivot: (0.5, 1.0),
         },
         (Kind::Normal, Effect::Destroy) => Frame {
@@ -75,17 +78,17 @@ pub fn frame(kind: Kind, effect: Effect, progress: f64, policy: MotionPolicy) ->
             } else {
                 (1.0, 1.0)
             },
-            alpha: (1.0 - ease) as f32,
+            alpha: opacity(1.0 - ease),
             pivot: (0.5, 0.5),
         },
         (Kind::Dialog, Effect::Map) => Frame {
             scale: (1.0, if motion { ease } else { 1.0 }),
-            alpha: if motion { ease as f32 } else { 1.0 },
+            alpha: if motion { opacity(ease) } else { 1.0 },
             pivot: (0.5, 0.5),
         },
         (Kind::Dialog, Effect::Destroy) => Frame {
             scale: (1.0, if motion { 1.0 - ease } else { 1.0 }),
-            alpha: if motion { 1.0 } else { (1.0 - ease) as f32 },
+            alpha: if motion { 1.0 } else { opacity(1.0 - ease) },
             pivot: (0.5, 0.5),
         },
     }
@@ -384,6 +387,9 @@ impl Lifecycle {
                 "scale": f.scale, "alpha": f.alpha, "pivot": f.pivot,
             })
         };
+        // Where the whole buffer (shadows included) is drawn this frame.
+        let rf = |r: RectF| [r.loc.x, r.loc.y, r.size.w, r.size.h];
+        let drawn = |id: &u64| self.cache.get(id).map(|c| rf(c.presentation));
         let opening: Vec<_> = self
             .opening
             .iter()
@@ -393,6 +399,7 @@ impl Lifecycle {
                     "elapsed_ms": self.now.saturating_sub(run.start).as_millis(),
                     "duration_ms": duration(run.kind,self.policy).as_millis(),
                     "frame": self.opening_frame(*id).map(frame_json),
+                    "drawn": drawn(id),
                 })
             })
             .collect();
@@ -406,6 +413,7 @@ impl Lifecycle {
                     "elapsed_ms": self.now.saturating_sub(g.running.start).as_millis(),
                     "duration_ms": duration(g.running.kind,self.policy).as_millis(),
                     "frame": frame_json(self.destroy_frame(g)),
+                    "drawn": rf(rect_f(g.geometry, self.destroy_frame(g))),
                 })
             })
             .collect();
@@ -420,7 +428,7 @@ impl Lifecycle {
             let (rect, alpha) = self.minimizing_frame(*id, normal)?;
             Some(serde_json::json!({"window":id,"icon":[run.icon.loc.x,run.icon.loc.y,run.icon.size.w,run.icon.size.h],"rect":[rect.loc.x,rect.loc.y,rect.size.w,rect.size.h],"alpha":alpha,"monitor_sized":run.monitor_sized,"duration_ms":crate::minimize::duration(self.policy).as_millis(),"live":true}))
         }));
-        let restoring:Vec<_>=self.restoring.iter().map(|(id,r)|serde_json::json!({"window":id,"elapsed_ms":self.now.saturating_sub(r.start).as_millis(),"duration_ms":crate::minimize::duration(self.policy).as_millis(),"icon":[r.icon.loc.x,r.icon.loc.y,r.icon.size.w,r.icon.size.h],"monitor_sized":r.monitor_sized})).collect();
+        let restoring:Vec<_>=self.restoring.iter().map(|(id,r)|serde_json::json!({"window":id,"elapsed_ms":self.now.saturating_sub(r.start).as_millis(),"duration_ms":crate::minimize::duration(self.policy).as_millis(),"icon":[r.icon.loc.x,r.icon.loc.y,r.icon.size.w,r.icon.size.h],"monitor_sized":r.monitor_sized,"drawn":drawn(id)})).collect();
         serde_json::json!({
             "retained_destroy_bytes": self.ghosts.iter().map(|g|g.pixels*4).sum::<u64>(),
             "snapshot_budget_bytes": 64*1024*1024,
@@ -437,7 +445,7 @@ pub fn step_frame(
     now: Duration,
     policy: MotionPolicy,
     allowed: bool,
-    right_to_left: bool,
+    destination: crate::minimize::TargetContext,
 ) {
     use smithay::backend::renderer::element::{
         surface::render_elements_from_surface_tree, Kind as RenderKind,
@@ -465,10 +473,12 @@ pub fn step_frame(
         .filter_map(|id| {
             let geometry = manager.geometry(*id)?;
             let monitor = state.monitor_geometry(geometry);
-            let icon = manager
-                .icon_geometry(*id)
-                .map(|r| r.to_f64())
-                .unwrap_or_else(|| crate::minimize::fallback(monitor, right_to_left));
+            let icon = crate::minimize::target(
+                manager.icon_geometry(*id),
+                destination.dash_visible,
+                monitor,
+                destination.right_to_left,
+            );
             Some((
                 *id,
                 (
@@ -558,6 +568,13 @@ pub fn step_frame(
                 continue;
             }
             if let Some((icon, monitor_sized)) = targets.get(&id) {
+                let kind = map_candidates.iter().find(|e| e.0 == id).map(|e| e.1);
+                if !crate::minimize::restore_animates(policy, *monitor_sized) {
+                    if let Some(kind) = kind {
+                        life.record(id, "unminimize", kind, "instant");
+                    }
+                    continue;
+                }
                 life.restoring.insert(
                     id,
                     MinRun {
@@ -566,7 +583,7 @@ pub fn step_frame(
                         monitor_sized: *monitor_sized,
                     },
                 );
-                if let Some(kind) = map_candidates.iter().find(|e| e.0 == id).map(|e| e.1) {
+                if let Some(kind) = kind {
                     life.record(id, "unminimize", kind, "started");
                 }
             }
@@ -618,15 +635,9 @@ pub fn step_frame(
                 presentation = r;
                 fade = alpha;
             } else if let Some(f) = mapped {
-                let r = rect(*geometry, f);
-                presentation = Rectangle::new(
-                    (
-                        r.loc.x - f64::from(geo.x) * f.scale.0,
-                        r.loc.y - f64::from(geo.y) * f.scale.1,
-                    )
-                        .into(),
-                    (f64::from(size.w) * f.scale.0, f64::from(size.h) * f.scale.1).into(),
-                );
+                // GNOME scales the whole actor, client shadows included, so
+                // the pivot sits on the buffer rect (windowManager.js:1514).
+                presentation = rect(buffer_geometry, f);
                 fade = f.alpha;
             }
             let resizing = manager.size_changes().frame(*id);
@@ -1056,7 +1067,13 @@ mod tests {
         assert_eq!(start.alpha, 0.0);
         assert_eq!(start.pivot, (0.5, 1.0));
         let mid = frame(Kind::Normal, Effect::Map, 0.5, p);
-        assert_eq!(mid.alpha, 0.96875);
+        assert_eq!(mid.alpha, 247.0 / 255.0);
+        // GNOME 51 paired capture (tests/gnome-reference/motion-reference.json):
+        // ten milliseconds in, Clutter's byte opacity is 94.
+        assert_eq!(
+            frame(Kind::Normal, Effect::Map, 10.0 / 150.0, p).alpha,
+            94.0 / 255.0
+        );
         assert_eq!(frame(Kind::Normal, Effect::Map, 1.0, p).scale, (1.0, 1.0));
         assert_eq!(duration(Kind::Normal, p), Duration::from_millis(150));
     }
@@ -1065,7 +1082,7 @@ mod tests {
         let p = policy(MotionLevel::Full);
         let mid = frame(Kind::Normal, Effect::Destroy, 0.5, p);
         assert_eq!(mid.scale, (0.85, 0.85));
-        assert_eq!(mid.alpha, 0.25);
+        assert_eq!(mid.alpha, 63.0 / 255.0);
         let d = frame(Kind::Dialog, Effect::Destroy, 0.5, p);
         assert_eq!(d.scale, (1.0, 0.25));
         assert_eq!(d.alpha, 1.0);
@@ -1076,7 +1093,7 @@ mod tests {
         let p = policy(MotionLevel::FadeOnly);
         let f = frame(Kind::Normal, Effect::Destroy, 0.5, p);
         assert_eq!(f.scale, (1.0, 1.0));
-        assert_eq!(f.alpha, 0.25);
+        assert_eq!(f.alpha, 63.0 / 255.0);
         let d = frame(Kind::Dialog, Effect::Map, 0.0, p);
         assert_eq!(d.scale, (1.0, 1.0));
         assert_eq!(d.alpha, 1.0);
@@ -1103,5 +1120,29 @@ mod tests {
         assert_eq!(mapped.loc.x + mapped.size.w / 2.0, 300.0);
         let closed = rect(r, frame(Kind::Normal, Effect::Destroy, 1.0, p));
         assert_eq!(closed.loc.y + closed.size.h / 2.0, 350.0);
+    }
+    #[test]
+    fn map_pivot_is_the_buffer_bottom_like_gnome() {
+        // GNOME 51 scales the window actor, shadows included, about the
+        // bottom centre of its buffer: 10 ms into the paired capture the
+        // 528x379 buffer at (376, 229) is drawn at (540.6, 455.8) 198.7x152.2.
+        let buffer = Rect::new((376, 229).into(), (528, 379).into());
+        let drawn = rect(
+            buffer,
+            frame(
+                Kind::Normal,
+                Effect::Map,
+                10.0 / 150.0,
+                policy(MotionLevel::Full),
+            ),
+        );
+        for (got, want) in [
+            (drawn.loc.x, 540.6),
+            (drawn.loc.y, 455.8),
+            (drawn.size.w, 198.7),
+            (drawn.size.h, 152.2),
+        ] {
+            assert!((got - want).abs() < 0.5, "{drawn:?}");
+        }
     }
 }

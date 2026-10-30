@@ -208,11 +208,26 @@ try:
     window=ready["windows"][0];wid=window["id"]; normal_rect=window["rect"]
     normal=screenshot("01-normal")
     def keys(*args):subprocess.run(["xdotool",*args],env=env,check=True)
-    def restore():
+    def restore(instant=False):
         keys("keydown","Alt_L","key","Tab")
         time.sleep(.7)
         keys("keyup","Alt_L")
+        if instant:
+            # GNOME 51 eases this fade on a still-hidden actor, so Clutter
+            # skips it and the window shows at once (windowManager.js:1243-1251).
+            return wait(lambda d:wid not in d["minimized"] and not d["window_lifecycle"]["restoring"]
+                        and any(e["window"]==wid and e["effect"]=="unminimize" and e["outcome"]=="instant"
+                                for e in d["window_lifecycle"]["history"]),"restore-instant")
         return wait(lambda d:wid not in d["minimized"] and d["window_lifecycle"]["restoring"],"restore-start")
+    def check_shown(name,rect):
+        # The GTK switcher popup may still be fading over the probe on its
+        # own clock; the restored window is already fully shown beneath it.
+        end=time.monotonic()+10
+        while True:
+            try:
+                return check_pixel(screenshot(name),rect,1.0)
+            except AssertionError:
+                if time.monotonic()>=end: raise
     def check_pixel(image,rect,alpha,brightness=1.0,point=None):
         x,y,w,h=rect
         point=point or (round(x+w*.7),round(y+h*.8))
@@ -256,21 +271,27 @@ try:
     },indent=2))
     move(950)
     wait(lambda d:not d["window_lifecycle"]["restoring"],"restore-finished")
-    # Open the actual GTK overview once to publish the native window-backed dash icon.
+    # Open the actual GTK overview once so the dash publishes its window-backed
+    # icon, then hide it. GNOME Shell 51 never has icon geometry on Wayland
+    # (windowManager.js:1183-1201; Mutter reads only X11 _NET_WM_ICON_GEOMETRY,
+    # src/x11/window-props.c:295), so a minimize with the dash off screen goes
+    # to the leading corner, not to the hidden icon.
     keys("key","Super_L")
     wait(lambda d:d["overview_open"] and any(l["namespace"]=="tuna-shell-dash" for l in d["layers"]),"dash-visible")
     settle_extra(300)
     time.sleep(1)
     dash_source=screenshot("04-dash-target-source")
     keys("key","Escape")
-    wait(lambda d:not d["overview_open"],"dash-hidden")
+    hidden=wait(lambda d:not d["overview_open"] and any(t[0]==wid for t in d["dash_icon_targets"]),"dash-hidden")
+    published=next(t[1:] for t in hidden["dash_icon_targets"] if t[0]==wid)
+    assert published[2:]==[64,64] and published[1]>600,published
+    center=(published[0]+32,published[1]+32)
+    assert dash_source.getpixel(center)==(127,211,33),(published,center,dash_source.getpixel(center))
     settle_extra(300)
     time.sleep(.3)
     action("minimize",2)
     target=wait(lambda d:d["window_lifecycle"]["minimizing"],"dash-minimize-start")["window_lifecycle"]["minimizing"][0]["icon"]
-    assert target[2:]==[64,64] and target[1]>600,target
-    center=(target[0]+32,target[1]+32)
-    assert dash_source.getpixel(center)==(127,211,33),(target,center,dash_source.getpixel(center))
+    assert target==[1280 if a.rtl else 0,0,0,0],("hidden dash icon used as the minimize target",target)
     move(1050)
     quarter=wait(lambda d:minimize_quarter(d,wid,target),"dash-minimize-quarter")
     q=quarter["window_lifecycle"]["minimizing"][0]
@@ -295,8 +316,8 @@ try:
     check_pixel(screenshot("06-reduced-minimize-quarter"),normal_rect,q["alpha"])
     move(2150)
     wait(lambda d:not d["window_lifecycle"]["minimizing"],"reduced-minimize-finished")
-    restore();move(2250)
-    check_pixel(screenshot("07-reduced-restore-quarter"),normal_rect,209/255)
+    restore(instant=True)
+    check_shown("07-reduced-restore-instant",normal_rect)
     subprocess.run(["gsettings","set","org.gnome.desktop.interface","enable-animations","false"],env=env,check=True)
     wait(lambda d:d["motion_policy"]=="off" and not d["window_lifecycle"]["restoring"],"off-clears-running")
     action("minimize",4)
@@ -335,10 +356,8 @@ try:
     check_pixel(screenshot("09-fullscreen-minimize-quarter"),f["rect"],f["alpha"])
     move(2800)
     wait(lambda d:not d["window_lifecycle"]["minimizing"],"fullscreen-minimize-complete")
-    restore();move(2900)
-    check_pixel(screenshot("10-fullscreen-restore-quarter"),[0,0,1280,800],209/255)
-    move(3200)
-    wait(lambda d:not d["window_lifecycle"]["restoring"],"fullscreen-restore-complete")
+    restore(instant=True)
+    check_shown("10-fullscreen-restore-instant",[0,0,1280,800])
     action("close",7);client.wait(timeout=10)
     wait(lambda d:not d["windows"],"fullscreen-death")
     move(3350)
@@ -598,5 +617,5 @@ finally:
 
 require_owned_cleanup(manifest["owned_cleanup"])
 if success:
-    (art / "assertions.txt").write_text("MN-NATIVE pass real xdg minimize and GTK switcher activation\nMN-FALLBACK pass monitor corner transform plus fade\nMN-RESTORE pass opaque full-motion live restore\nMN-DASH pass actual GTK published 64px icon target\nMN-MOTION pass GTK reduced/Off consumers\nMN-FULLSCREEN pass monitor-sized actors only fade\nMN-INTERRUPTED-MAP pass prior effects reset before live minimize\nMN-LIVE-CONTENT pass native buffer update during minimize\nMN-DEAD-ACTOR pass independent retained texture continues original clock\nMN-FAMILY-DIM pass live parent brightness during minimize\nMN-FAMILY-DIM-HIDDEN pass independently minimized managed modal retains dim until actual unset-modal brightness control\nMN-DEADLINE pass surface death after deadline does not restart destroy\nMN-FAMILY pass real attached modal inherited hiding and ancestor restore\nMN-FAMILY-OWN pass independent child minimize survives parent restore\nMN-FAMILY-HIDDEN pass hidden child map/close cannot restore parent\nMN-RESTORE-CLOSE pass actual frozen restore presentation survives native surface death without full-size jump\nMN-CLEANUP pass private session owned process cleanup\n")
+    (art / "assertions.txt").write_text("MN-NATIVE pass real xdg minimize and GTK switcher activation\nMN-FALLBACK pass monitor corner transform plus fade\nMN-RESTORE pass opaque full-motion live restore\nMN-DASH pass hidden GTK dash icon ignored; minimize goes to GNOME 51's leading corner\nMN-MOTION pass GTK reduced/Off consumers; reduced restore shows at once as GNOME 51\nMN-FULLSCREEN pass monitor-sized actors only fade out and restore at once\nMN-INTERRUPTED-MAP pass prior effects reset before live minimize\nMN-LIVE-CONTENT pass native buffer update during minimize\nMN-DEAD-ACTOR pass independent retained texture continues original clock\nMN-FAMILY-DIM pass live parent brightness during minimize\nMN-FAMILY-DIM-HIDDEN pass independently minimized managed modal retains dim until actual unset-modal brightness control\nMN-DEADLINE pass surface death after deadline does not restart destroy\nMN-FAMILY pass real attached modal inherited hiding and ancestor restore\nMN-FAMILY-OWN pass independent child minimize survives parent restore\nMN-FAMILY-HIDDEN pass hidden child map/close cannot restore parent\nMN-RESTORE-CLOSE pass actual frozen restore presentation survives native surface death without full-size jump\nMN-CLEANUP pass private session owned process cleanup\n")
     print(f"native minimize proof passed: {art}")
