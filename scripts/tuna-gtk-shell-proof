@@ -152,10 +152,12 @@
 #                  and revert restores (#594)
 #   G-WELLBEING-HISTORY the shell records GNOME-compatible
 #                  session-active history, deleted while disabled (#354)
-#   G-WELLBEING-LIMIT a spent daily limit posts its notice and
-#                  requests grayscale, live (#354)
+#   G-WELLBEING-LIMIT a spent daily limit posts its high-urgency notice
+#                  (no 10 minute warning for a 10 s limit, as GNOME) and
+#                  requests grayscale, live; limit off removes it (#354)
 #   G-WELLBEING-BREAK a 10 s break shows the OSD countdown, the due
-#                  notice, and an idle take fades and sounds (#354)
+#                  notice updated in place at high urgency, an idle take
+#                  fades and sounds, completion removes it (#354)
 #   G-WELLBEING-PIXEL-GRAY gray-only framebuffer: 3s EASE_OUT_QUAD to
 #                  full desaturation, immediate disable (#354)
 #   G-WELLBEING-PIXEL-FADE fade-only framebuffer: 3s EASE_OUT_QUAD to
@@ -6002,28 +6004,39 @@ if [ "$(printf '%s\n' "$BREAK_POSTS" | wc -l)" -gt 1 ]; then
         fail G-WELLBEING-BREAK "a later break notice was reposted instead of updated in place"
 fi
 # Leave no trace for the later gates: deselect (Disabled), reset the keys,
-# clear the notices, let the banners expire, restore the journey's DND.
+# clear any other notices, let the banners expire, restore the journey's DND.
 gsettings reset org.gnome.desktop.break-reminders selected-breaks
 gsettings reset org.gnome.desktop.break-reminders.eyesight interval-seconds
 gsettings reset org.gnome.desktop.break-reminders.eyesight duration-seconds
 gsettings reset org.gnome.desktop.break-reminders.eyesight countdown
 gsettings reset org.gnome.desktop.break-reminders.eyesight notify
 open_calendar
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wellbeing-cleared.json" 20 --press "Clear" ||
-    fail G-WELLBEING-BREAK "could not press Clear"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wellbeing-list.json" 20 ||
+    fail G-WELLBEING-BREAK "message list dump failed"
+# The completed break's notice is destroyed, as in GNOME: not in the list.
+for title in "Time for an Eyesight Break" "Eyesight Break in Progress" "Break Overdue" "Break Interrupted"; do
+    if jq -e --arg n "$title" 'any(.[]; .name == $n)' "$ARTIFACTS/a11y-wellbeing-list.json" >/dev/null; then
+        fail G-WELLBEING-BREAK "\"$title\" outlived the completed break in the message list"
+    fi
+done
+# GNOME hides Clear with nothing to clear; press it only when shown.
+if showing "$ARTIFACTS/a11y-wellbeing-list.json" "Clear"; then
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wellbeing-cleared.json" 20 --press "Clear" ||
+        fail G-WELLBEING-BREAK "could not press Clear"
+fi
 xdotool key Escape
 xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2))
 sleep 3
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wellbeing-quiet.json" 20 ||
     fail G-WELLBEING-BREAK "quiet dump failed"
 if showing "$ARTIFACTS/a11y-wellbeing-quiet.json" "Time for an Eyesight Break"; then
-    fail G-WELLBEING-BREAK "the due banner outlived Clear"
+    fail G-WELLBEING-BREAK "the due banner outlived the break"
 fi
 if showing "$ARTIFACTS/a11y-wellbeing-quiet.json" "Screen Time Limit Reached"; then
-    fail G-WELLBEING-BREAK "the limit banner outlived Clear"
+    fail G-WELLBEING-BREAK "the limit banner outlived the limit"
 fi
 gsettings set org.gnome.desktop.notifications show-banners "$DND_BEFORE"
-pass G-WELLBEING-BREAK "the 10 s break counts down, notifies due, and an idle take fades and sounds"
+pass G-WELLBEING-BREAK "the 10 s break counts down, notifies due as one high-urgency notification updated in place, an idle take fades and sounds, and completion removes it"
 
 # Wellbeing pixel/action proofs (#354, w3 pixel lane, proof4f hardening):
 # framebuffer effects through the production path (settings ->
@@ -6527,8 +6540,14 @@ wb_break_cleanup() {
     gsettings reset org.gnome.desktop.break-reminders.eyesight lock-screen ||
         fail "$WB_GATE" "could not reset lock-screen"
     open_calendar
-    wb_a11y_dump "$ARTIFACTS/a11y-wb-$WB_GATE-cleared.json" 20 --press "Clear" ||
-        fail "$WB_GATE" "could not press Clear"
+    # Disabling reminders destroys the break notice (GNOME), so the list
+    # may be empty and Clear hidden; press it only when shown.
+    wb_a11y_dump "$ARTIFACTS/a11y-wb-$WB_GATE-list.json" 20 ||
+        fail "$WB_GATE" "message list dump failed"
+    if showing "$ARTIFACTS/a11y-wb-$WB_GATE-list.json" "Clear"; then
+        wb_a11y_dump "$ARTIFACTS/a11y-wb-$WB_GATE-cleared.json" 20 --press "Clear" ||
+            fail "$WB_GATE" "could not press Clear"
+    fi
     xdotool key Escape || fail "$WB_GATE" "could not close the calendar"
     xdotool mousemove --window "$WID" 20 $((HEIGHT - 20)) ||
         fail "$WB_GATE" "could not park the pointer"
