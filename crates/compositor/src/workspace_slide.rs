@@ -12,8 +12,13 @@
 //! The model switches workspace at once (focus and input follow without
 //! waiting); only the drawn position of each workspace's windows trails
 //! it. Nothing is reconfigured: the offset is applied at render time.
-//! Under a fade-only motion policy the workspaces stay in place and
-//! crossfade over the same timeline; with motion off nothing animates.
+//! Under a fade-only motion policy a key switch keeps the workspaces in
+//! place and crossfades over the same timeline (#523); with motion off it
+//! is instant. A swipe slides under every policy: GNOME's swipe paths
+//! never consult Reduced Motion, and with animations off only the release
+//! is instant (`animationUtils.js:23-33`). Swipe phases also publish the
+//! strip position for the shell's Activities dots
+//! ([`WorkspaceSlide::take_progress`]).
 //! Times are animation-clock time ([`crate::animation_clock`]).
 
 use std::collections::VecDeque;
@@ -39,6 +44,8 @@ const DECELERATION_PARABOLA_MULTIPLIER: f64 = 0.35;
 /// The derivative of ease-out-cubic at 0: a release keeps its speed.
 const DURATION_MULTIPLIER: f64 = 3.0;
 const ANIMATION_BASE_VELOCITY: f64 = 0.002;
+/// `EPSILON`: a swipe beginning this close to a workspace began on it.
+const SNAP_EPSILON: f64 = 0.005;
 /// Finished motions kept for the state snapshot.
 const HISTORY_LEN: usize = 8;
 
@@ -147,8 +154,41 @@ pub fn swipe_release_over(
     distance: f64,
 ) -> (f64, f64) {
     let last = slots.saturating_sub(1) as f64;
+    let bounds = ((initial - 1.0).max(0.0), (initial + 1.0).min(last));
+    release_within(
+        progress, initial, bounds, slots, velocity, cancelled, distance,
+    )
+}
+
+/// `_getBounds` for a swipe that began at `progress` on a strip of
+/// `slots`: one workspace either side of the closest one, or of the two
+/// it lay between when the fingers caught a switch mid-flight
+/// (swipeTracker.js:547-565).
+pub fn swipe_bounds(progress: f64, slots: usize) -> (f64, f64) {
+    let last = slots.saturating_sub(1) as f64;
+    let closest = progress.round().clamp(0.0, last);
+    let (prev, next) = if (closest - progress).abs() < SNAP_EPSILON {
+        (closest, closest)
+    } else {
+        (progress.floor(), progress.ceil())
+    };
+    ((prev - 1.0).max(0.0), (next + 1.0).min(last))
+}
+
+/// [`swipe_release_over`] within explicit `bounds` (`_getEndProgress`
+/// and `_endGesture`, swipeTracker.js:601-658).
+#[allow(clippy::too_many_arguments)]
+fn release_within(
+    progress: f64,
+    initial: f64,
+    (low, high): (f64, f64),
+    slots: usize,
+    velocity: f64,
+    cancelled: bool,
+    distance: f64,
+) -> (f64, f64) {
+    let last = slots.saturating_sub(1) as f64;
     let closest = |p: f64| p.round().clamp(0.0, last);
-    let (low, high) = ((initial - 1.0).max(0.0), (initial + 1.0).min(last));
     let end = if cancelled {
         initial
     } else if velocity.abs() < VELOCITY_THRESHOLD {
@@ -237,7 +277,10 @@ enum Phase {
     },
     Following {
         progress: f64,
+        /// The closest workspace slot when the fingers went down.
         initial: f64,
+        /// `_getBounds(initialProgress)`: how far the fingers may drag.
+        bounds: (f64, f64),
         history: SwipeHistory,
     },
 }
@@ -258,6 +301,13 @@ pub struct WorkspaceSlide {
     frame: Option<Duration>,
     record: Option<SlideRecord>,
     finished: VecDeque<SlideRecord>,
+    /// The motion began under the fingers: it slides under every motion
+    /// policy (GNOME's swipe paths never consult Reduced Motion, and with
+    /// animations off only the release is instant).
+    gesture: bool,
+    /// The strip position (fractional workspace id) and settle time (ms)
+    /// to tell the shell, from the latest swipe phase.
+    progress_out: Option<(f64, f64)>,
 }
 
 impl Default for WorkspaceSlide {
@@ -272,6 +322,8 @@ impl Default for WorkspaceSlide {
             frame: None,
             record: None,
             finished: VecDeque::new(),
+            gesture: false,
+            progress_out: None,
         }
     }
 }
@@ -284,9 +336,42 @@ pub struct Placement {
 }
 
 impl WorkspaceSlide {
+    /// How this motion draws: a finger-driven one always slides.
+    fn drawn(&self) -> Motion {
+        if self.gesture {
+            Motion::Slide
+        } else {
+            Motion::of(self.policy)
+        }
+    }
+
     /// Whether a motion is drawn (motion off draws nothing).
     pub fn running(&self) -> bool {
-        Motion::of(self.policy) != Motion::Off && !matches!(self.phase, Phase::Idle)
+        self.drawn() != Motion::Off && !matches!(self.phase, Phase::Idle)
+    }
+
+    /// The latest swipe position for the shell's Activities dots, once:
+    /// `(fractional workspace id, settle ms)`. GNOME 51 binds the primary
+    /// monitor's swipe progress to the workspaces adjustment the dots read
+    /// (workspaceAnimation.js:255-268, panel.js:144-145,178-195).
+    pub fn take_progress(&mut self) -> Option<(f64, f64)> {
+        self.progress_out.take()
+    }
+
+    /// Queue strip slot `slot` for the shell, as a workspace id
+    /// interpolated between its neighbours (workspaceAnimation.js:257-266).
+    fn publish(&mut self, slot: f64, duration_ms: f64) {
+        let last = self.strip.len().saturating_sub(1);
+        let (lo, hi) = (
+            (slot.floor().max(0.0) as usize).min(last),
+            (slot.ceil().max(0.0) as usize).min(last),
+        );
+        let (Some(a), Some(b)) = (self.strip.get(lo), self.strip.get(hi)) else {
+            return;
+        };
+        let t = slot - slot.floor();
+        let id = f64::from(*a) + (f64::from(*b) - f64::from(*a)) * t;
+        self.progress_out = Some((id, duration_ms));
     }
 
     /// Whether fingers hold the strip.
@@ -329,7 +414,7 @@ impl WorkspaceSlide {
         if d.abs() >= 1.0 {
             return None;
         }
-        Some(match Motion::of(self.policy) {
+        Some(match self.drawn() {
             Motion::Fade => Placement {
                 dx: 0,
                 alpha: (1.0 - d.abs()) as f32,
@@ -369,10 +454,15 @@ impl WorkspaceSlide {
                 remap(to);
             }
             Phase::Following {
-                progress, initial, ..
+                progress,
+                initial,
+                bounds,
+                ..
             } => {
                 remap(progress);
                 remap(initial);
+                remap(&mut bounds.0);
+                remap(&mut bounds.1);
             }
             Phase::Idle => {}
         }
@@ -390,7 +480,15 @@ impl WorkspaceSlide {
             }
             self.finished.push_back(record);
         }
+        // Fingers cut off (the overview opened, animations went off): the
+        // dots return to the active workspace at once.
+        if self.following() {
+            if let Some(active) = self.seen {
+                self.progress_out = Some((f64::from(active), 0.0));
+            }
+        }
         self.phase = Phase::Idle;
+        self.gesture = false;
         self.last_value = None;
         self.strip.clear();
     }
@@ -453,12 +551,13 @@ impl WorkspaceSlide {
             _ => self.slot(previous).unwrap_or(to),
         };
         let duration = scaled(policy, SWITCH_MS);
+        let drawn = self.drawn();
         match &mut self.record {
             Some(record) => {
                 record.to = active;
                 record.retargets += 1;
                 record.duration_ms = duration.as_secs_f64() * 1000.0;
-                record.motion = Motion::of(policy);
+                record.motion = drawn;
             }
             None => {
                 self.record = Some(SlideRecord {
@@ -507,7 +606,7 @@ impl WorkspaceSlide {
                 }
             }
             self.last_value = Some(value);
-            if done || Motion::of(self.policy) == Motion::Off {
+            if done || self.drawn() == Motion::Off {
                 self.archive(now);
                 return false;
             }
@@ -518,40 +617,40 @@ impl WorkspaceSlide {
     }
 
     /// Fingers went down: hold the strip where it is drawn (catching a
-    /// switch still in flight) on the active workspace's strip.
+    /// switch still in flight) on the active workspace's strip. The snap
+    /// points are the workspaces there are, GNOME's trailing empty one
+    /// included: nothing past the last one exists to drag onto
+    /// (workspaceAnimation.js:524-549 `_switchWorkspaceBegin`).
+    /// `time` is the gesture's begin event time: GNOME seeds the velocity
+    /// history with a zero sample then (swipeTracker.js:509-513).
+    #[allow(clippy::too_many_arguments)]
     pub fn begin_swipe(
         &mut self,
         active: u32,
         workspaces: &[u32],
         output_width: i32,
         policy: MotionPolicy,
+        time: u32,
         now: Duration,
     ) {
         self.policy = policy;
         self.distance = f64::from(output_width + WORKSPACE_SPACING);
         self.last_value = self.value(now);
-        // GNOME keeps an empty workspace after the last: swiping onto it
-        // creates it.
-        let trailing = workspaces
-            .iter()
-            .chain([&active])
-            .max()
-            .copied()
-            .unwrap_or(0)
-            + 1;
-        self.merge_strip(workspaces, &[active, trailing]);
+        self.merge_strip(workspaces, &[active]);
         let progress = match self.last_value {
             Some(shown) => shown,
             None => self.slot(active).unwrap_or(0.0),
         };
         let last = self.strip.len().saturating_sub(1) as f64;
         let initial = progress.round().clamp(0.0, last);
+        let bounds = swipe_bounds(progress, self.strip.len());
         let from = self.strip.get(initial as usize).copied().unwrap_or(active);
+        self.gesture = true;
         if self.record.is_none() {
             self.record = Some(SlideRecord {
                 from,
                 to: from,
-                motion: Motion::of(policy),
+                motion: Motion::Slide,
                 gesture: true,
                 duration_ms: 0.0,
                 elapsed_ms: 0.0,
@@ -563,30 +662,36 @@ impl WorkspaceSlide {
             });
         } else if let Some(record) = self.record.as_mut() {
             record.gesture = true;
+            record.motion = Motion::Slide;
             record.retargets += 1;
         }
         self.last_value = Some(progress);
+        let mut history = SwipeHistory::default();
+        history.append(time, 0.0);
         self.phase = Phase::Following {
             progress,
             initial,
-            history: SwipeHistory::default(),
+            bounds,
+            history,
         };
+        self.publish(progress, 0.0);
     }
 
     /// Fingers moved `dx` px (left is towards the next workspace).
     pub fn update_swipe(&mut self, dx: f64, time: u32) {
-        let last = self.strip.len().saturating_sub(1) as f64;
         if let Phase::Following {
             progress,
-            initial,
+            bounds: (low, high),
             history,
+            ..
         } = &mut self.phase
         {
             let delta = -dx;
             history.append(time, delta);
-            let (low, high) = ((*initial - 1.0).max(0.0), (*initial + 1.0).min(last));
-            *progress = (*progress + delta / TOUCHPAD_BASE_WIDTH).clamp(low, high);
-            self.last_value = Some(*progress);
+            *progress = (*progress + delta / TOUCHPAD_BASE_WIDTH).clamp(*low, *high);
+            let progress = *progress;
+            self.last_value = Some(progress);
+            self.publish(progress, 0.0);
         }
     }
 
@@ -596,21 +701,31 @@ impl WorkspaceSlide {
         let Phase::Following {
             progress,
             initial,
+            bounds,
             history,
         } = &mut self.phase
         else {
             return None;
         };
         let velocity = history.velocity(time);
-        let (progress, initial) = (*progress, *initial);
-        let (end, ms) = swipe_release(progress, initial, self.strip.len(), velocity, cancelled);
+        let (progress, initial, bounds) = (*progress, *initial, *bounds);
+        let (end, ms) = release_within(
+            progress,
+            initial,
+            bounds,
+            self.strip.len(),
+            velocity,
+            cancelled,
+            TOUCHPAD_BASE_WIDTH,
+        );
         let target = self.strip.get(end as usize).copied();
         let duration = scaled(self.policy, ms);
+        let duration_ms = duration.as_secs_f64() * 1000.0;
         if let Some(record) = self.record.as_mut() {
             record.to = target.unwrap_or(record.to);
-            record.duration_ms = duration.as_secs_f64() * 1000.0;
+            record.duration_ms = duration_ms;
             record.velocity = velocity;
-            record.motion = Motion::of(self.policy);
+            record.motion = Motion::Slide;
         }
         self.phase = Phase::Easing {
             from: progress,
@@ -618,7 +733,9 @@ impl WorkspaceSlide {
             start: now,
             duration,
         };
-        if Motion::of(self.policy) == Motion::Off || duration.is_zero() {
+        self.publish(end, duration_ms);
+        // Animations off: GNOME eases the release over 0 ms.
+        if duration.is_zero() {
             self.archive(now);
         }
         target
@@ -816,22 +933,129 @@ mod tests {
         let t0 = Duration::from_secs(10);
         let mut slide = WorkspaceSlide::default();
         let on = MotionPolicy::default();
-        slide.observe(0, &[0], 1000, on, false, t0);
-        slide.begin_swipe(0, &[0], 1000, on, t0);
+        // Dynamic workspaces: the occupied one and GNOME's trailing empty one.
+        slide.observe(0, &[0, 1], 1000, on, false, t0);
+        slide.begin_swipe(0, &[0, 1], 1000, on, 990, t0);
         slide.update_swipe(-100.0, 1000);
         assert_eq!(slide.value(t0), Some(0.25));
         assert_eq!(slide.placement(1, t0).unwrap().dx, 825);
         slide.update_swipe(-40.0, 1010);
         slide.update_swipe(-40.0, 1020);
         let target = slide.end_swipe(false, 1020, t0);
-        // Two workspaces and the trailing empty one: the flick creates it.
         assert_eq!(target, Some(1));
         // The model follows; the observed switch keeps the swipe's timing.
         slide.observe(1, &[0, 1], 1000, on, false, t0);
         let record = slide.snapshot(t0)["in_flight"]["record"].clone();
         assert_eq!(record["gesture"], true);
+        // 180px over 30 ms from the begin sample: 6 px/ms.
+        assert_eq!(record["velocity"], 6.0);
         assert!(record["duration_ms"].as_f64().unwrap() < 250.0);
         assert!(!slide.step(t0 + ms(400)));
+    }
+
+    #[test]
+    fn the_begin_sample_counts_the_first_movement_towards_the_velocity() {
+        let t0 = Duration::from_secs(10);
+        let on = MotionPolicy::default();
+        let mut slide = WorkspaceSlide::default();
+        slide.observe(0, &[0, 1], 1000, on, false, t0);
+        // swipeTracker.js:509-513: (begin, 0), then 40px 8 ms later.
+        slide.begin_swipe(0, &[0, 1], 1000, on, 1000, t0);
+        slide.update_swipe(-40.0, 1008);
+        assert_eq!(slide.end_swipe(false, 1008, t0), Some(1));
+        assert_eq!(slide.snapshot(t0)["in_flight"]["record"]["velocity"], 5.0);
+    }
+
+    #[test]
+    fn a_swipe_cannot_drag_past_the_last_workspace() {
+        let t0 = Duration::from_secs(10);
+        let on = MotionPolicy::default();
+        // On GNOME's trailing empty workspace (dynamic) or the last fixed
+        // one, the strip holds at the edge: there is nothing to drag onto.
+        for workspaces in [&[0, 1][..], &[0, 1, 2][..]] {
+            let last = *workspaces.last().unwrap();
+            let mut slide = WorkspaceSlide::default();
+            slide.observe(last, workspaces, 1000, on, false, t0);
+            slide.begin_swipe(last, workspaces, 1000, on, 1000, t0);
+            slide.update_swipe(-300.0, 1010);
+            slide.update_swipe(-300.0, 1020);
+            assert_eq!(slide.value(t0), Some(f64::from(last)));
+            assert_eq!(slide.end_swipe(false, 1020, t0), Some(last));
+        }
+    }
+
+    #[test]
+    fn swipe_bounds_follow_gnomes_get_bounds() {
+        // On a workspace: one either side.
+        assert_eq!(swipe_bounds(1.0, 4), (0.0, 2.0));
+        assert_eq!(swipe_bounds(1.004, 4), (0.0, 2.0));
+        assert_eq!(swipe_bounds(0.0, 4), (0.0, 1.0));
+        assert_eq!(swipe_bounds(3.0, 4), (2.0, 3.0));
+        // Caught between two: one past either of them.
+        assert_eq!(swipe_bounds(1.5, 4), (0.0, 3.0));
+        assert_eq!(swipe_bounds(2.4, 5), (1.0, 4.0));
+    }
+
+    #[test]
+    fn a_held_swipe_slides_under_every_motion_policy() {
+        let t0 = Duration::from_secs(10);
+        for level in [MotionLevel::Full, MotionLevel::FadeOnly, MotionLevel::Off] {
+            let p = policy(level, 1.0);
+            let mut slide = WorkspaceSlide::default();
+            slide.observe(0, &[0, 1], 1000, p, false, t0);
+            slide.begin_swipe(0, &[0, 1], 1000, p, 1000, t0);
+            slide.update_swipe(-100.0, 1010);
+            assert!(slide.running(), "{level:?}");
+            assert_eq!(
+                slide.placement(1, t0),
+                Some(Placement {
+                    dx: 825,
+                    alpha: 1.0
+                }),
+                "{level:?}"
+            );
+            // A slow release under half way goes back: it slides back
+            // unless animations are off, which settles it at once.
+            assert_eq!(slide.end_swipe(false, 1500, t0), Some(0));
+            assert_eq!(slide.running(), level != MotionLevel::Off, "{level:?}");
+            if level == MotionLevel::FadeOnly {
+                let mid = slide.placement(0, t0 + ms(10)).unwrap();
+                assert!(mid.dx < 0 && mid.alpha == 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn swipe_phases_tell_the_dots_where_the_strip_is() {
+        let t0 = Duration::from_secs(10);
+        let on = MotionPolicy::default();
+        let mut slide = WorkspaceSlide::default();
+        slide.observe(1, &[0, 1, 2], 1000, on, false, t0);
+        assert_eq!(slide.take_progress(), None);
+        slide.begin_swipe(1, &[0, 1, 2], 1000, on, 1000, t0);
+        assert_eq!(slide.take_progress(), Some((1.0, 0.0)));
+        slide.update_swipe(-100.0, 1010);
+        assert_eq!(slide.take_progress(), Some((1.25, 0.0)));
+        assert_eq!(slide.take_progress(), None);
+        slide.update_swipe(-100.0, 1020);
+        let target = slide.end_swipe(false, 1020, t0);
+        assert_eq!(target, Some(2));
+        let (position, duration) = slide.take_progress().unwrap();
+        assert_eq!(position, 2.0);
+        let record = slide.snapshot(t0)["in_flight"]["record"].clone();
+        assert_eq!(duration.round(), record["duration_ms"].as_f64().unwrap());
+        // Ordinary frames and key switches never publish.
+        slide.observe(2, &[0, 1, 2], 1000, on, false, t0);
+        slide.step(t0 + ms(50));
+        assert_eq!(slide.take_progress(), None);
+        // The overview cutting a held swipe off returns the dots home.
+        slide.step(t0 + ms(1000));
+        slide.begin_swipe(2, &[0, 1, 2], 1000, on, 3000, t0 + ms(1000));
+        slide.update_swipe(150.0, 3010);
+        assert_eq!(slide.take_progress(), Some((1.625, 0.0)));
+        slide.observe(2, &[0, 1, 2], 1000, on, true, t0 + ms(1010));
+        assert_eq!(slide.take_progress(), Some((2.0, 0.0)));
+        assert!(!slide.running());
     }
 
     #[test]
@@ -844,7 +1068,7 @@ mod tests {
         let mid = t0 + ms(50);
         slide.step(mid);
         let shown = slide.value(mid).unwrap();
-        slide.begin_swipe(1, &[0, 1], 1000, on, mid);
+        slide.begin_swipe(1, &[0, 1], 1000, on, 1000, mid);
         assert!((slide.value(mid).unwrap() - shown).abs() < 1e-9);
         assert!(slide.following());
     }
@@ -872,7 +1096,7 @@ mod tests {
         let mid = t0 + ms(60);
         slide.observe(1, &[0, 1], 1000, on, false, mid);
         slide.step(mid);
-        slide.begin_swipe(1, &[0, 1], 1000, on, mid);
+        slide.begin_swipe(1, &[0, 1], 1000, on, 990, mid);
         slide.update_swipe(-100.0, 1000);
         let dragged = slide.value(mid).unwrap();
         slide.observe(1, &[0, 1], 1000, on, false, mid);

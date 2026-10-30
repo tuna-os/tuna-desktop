@@ -272,6 +272,20 @@
 #                  stretching new content; fade-only under Reduced Motion,
 #                  instant with animations off
 #   G-WS-POPUP     a workspace key shows the workspace switcher popup
+#   G-WS-POPUP-CLOCK the popup fades in 100 ms ease-out-quad (0/50/100 ms),
+#                  holds 600 ms and fades out, sampled on the frozen clock;
+#                  a key on the first workspace redisplays it opaque at
+#                  once and restarts the hold (workspaceSwitcherPopup.js 51)
+#   G-WS-POPUP-POLICY Reduced Motion keeps the popup's fade; animations
+#                  off show and hide it at once
+#   G-WS-DOTS-CLOCK the Activities dots match panel.js 51 at 0/125/250 ms
+#                  of a key switch each way on the frozen clock
+#   G-WS-DOTS-POLICY Reduced Motion and animations off move the dots at once
+#   G-WS-DOTS-SWIPE the dots follow a held three-finger swipe and settle
+#                  with the strip's release time and ease-out cubic (#596)
+#   G-WS-DOTS-SWIPE-POLICY a held swipe slides the strip and moves the
+#                  dots under Reduced Motion and animations off too; the
+#                  release snaps the dots
 #   G-WS-THUMBS    three workspaces put GNOME's thumbnails strip in the
 #                  overview, and a thumbnail click switches workspace
 #   G-OV-DND       dragging a window's preview onto the next workspace's
@@ -8820,6 +8834,144 @@ fi
 pass G-WS-POPUP "a workspace key shows GNOME's workspace switcher popup"
 sleep 1
 
+# The popup and the Activities dots on the frozen animation clock (#596).
+# workspaceSwitcherPopup.js:10-11,93-121: only a hidden popup fades in
+# (ANIMATION_TIME 100 ms ease-out-quad); a key while it shows is opaque at
+# once and restarts DISPLAY_TIMEOUT (600 ms); then it fades out over 100 ms.
+# panel.js:178-195: the dots' expansion follows the workspace animation's
+# 250 ms ease-out-cubic. The shell traces each frame (TUNA_TRANSIENT_TRACE);
+# scripts/lib/ws-anim-proof.py recomputes GNOME's values independently.
+ws_here() { ws_from=$(($(wc -l <"$LOG") + 1)); }
+ws_check() {
+    ws_command=$1
+    shift
+    "$PY" "$ROOT/scripts/lib/ws-anim-proof.py" "$ws_command" "$LOG" "$ws_from" "$@"
+}
+# The pill body's pixel ("r g b") in a fresh capture named $1. Windows
+# slide behind the pill on the same clock, so only the opaque pill is
+# compared with a threshold; the other captures are evidence.
+ws_pixel() {
+    sleep 0.3
+    scrot -o "$ARTIFACTS/$1.png" >/dev/null 2>&1 || true
+    px "$ARTIFACTS/$1.png" $((WIDTH / 2)) $((HEIGHT - 59 - 28))
+}
+ws_home="$(jq -r '.active_workspace' "$CSTATE")"
+[ "$ws_home" = 0 ] || fail G-WS-POPUP-CLOCK "expected to start on the first workspace, not $ws_home"
+anim_clock 0
+cstate '.animation_clock_manual and .motion_policy == "full"' "popup clock frozen" ||
+    fail G-WS-POPUP-CLOCK "the animation clock did not freeze"
+ws_here
+xdotool key super+Page_Down
+ws_check line "ws-popup display index=1 count=2 visible=false clock=manual" ||
+    fail G-WS-POPUP-CLOCK "Super+Page_Down did not display the hidden popup for workspace 2 of 2"
+ws_check line "ws-popup fade to=1 from=0.0000 duration=100 clock=manual" ||
+    fail G-WS-POPUP-CLOCK "the hidden popup did not start a 100 ms fade-in on the frozen clock"
+ws_check popup 0 || fail G-WS-POPUP-CLOCK "the popup was not transparent 0 ms in"
+ws_check line "ws-dots set count=2 active=1 from=0.0000 motion=true clock=manual" ||
+    fail G-WS-DOTS-CLOCK "the dots did not start moving to workspace 2 on the frozen clock"
+ws_check dots 0 || fail G-WS-DOTS-CLOCK "the dots moved while the clock was frozen"
+anim_clock 50
+ws_check popup 0.75 || fail G-WS-POPUP-CLOCK "the popup was not 75% opaque 50 ms in (ease-out-quad)"
+ws_half="$(ws_pixel 24f2-workspace-popup-50ms)"
+anim_clock 100
+ws_check popup 1 || fail G-WS-POPUP-CLOCK "the popup was not opaque 100 ms in"
+# shellcheck disable=SC2046
+set -- $(ws_pixel 24f3-workspace-popup-100ms)
+if [ "${1:-0}" -ge 70 ] || [ "${2:-0}" -ge 70 ] || [ "${3:-0}" -ge 75 ]; then
+    fail G-WS-POPUP-CLOCK "no opaque switcher pill drawn 100 ms in (pixel ${1:-?} ${2:-?} ${3:-?}; 50 ms: $ws_half)"
+fi
+anim_clock 125
+# Ease-out-cubic is 87.5% of the way at half time.
+ws_check dots 0.875 || fail G-WS-DOTS-CLOCK "the dots were not 87.5% of the way to workspace 2 at 125 ms"
+scrot -o "$ARTIFACTS/24f4-workspace-dots-125ms.png" >/dev/null 2>&1 || true
+anim_clock 250
+ws_check dots 1 || fail G-WS-DOTS-CLOCK "the dots had not settled on workspace 2 at 250 ms"
+anim_clock 599
+ws_check absent "ws-popup fade to=0" --timeout 1.5 ||
+    fail G-WS-POPUP-CLOCK "the popup began fading out before DISPLAY_TIMEOUT (600 ms)"
+anim_clock 650
+ws_check line "ws-popup fade to=0 from=1.0000 duration=100 clock=manual" ||
+    fail G-WS-POPUP-CLOCK "the popup did not fade out 600 ms after the key"
+ws_check popup 0.25 || fail G-WS-POPUP-CLOCK "the popup was not 25% opaque 50 ms into its fade-out"
+scrot -o "$ARTIFACTS/24f5-workspace-popup-650ms.png" >/dev/null 2>&1 || true
+anim_clock 700
+ws_check line "ws-popup hidden" || fail G-WS-POPUP-CLOCK "the popup was not hidden 100 ms into its fade-out"
+# Back, then a key on the first workspace while the popup fades in: GNOME
+# goes nowhere but redisplays it opaque at once and restarts the timeout.
+ws_here
+xdotool key super+Page_Up
+ws_check line "ws-popup fade to=1 from=0.0000 duration=100 clock=manual" ||
+    fail G-WS-POPUP-CLOCK "Super+Page_Up did not fade the hidden popup in"
+ws_check line "ws-dots set count=2 active=0 from=1.0000 motion=true clock=manual" ||
+    fail G-WS-DOTS-CLOCK "the dots did not start back to workspace 1"
+anim_clock 750
+ws_check popup 0.75 || fail G-WS-POPUP-CLOCK "the popup was not 75% opaque 50 ms into the second fade-in"
+ws_here
+xdotool key super+Page_Up
+ws_check line "ws-popup display index=0 count=2 visible=true clock=manual" ||
+    fail G-WS-POPUP-CLOCK "Super+Page_Up on the first workspace did not redisplay the popup"
+ws_check popup 1 || fail G-WS-POPUP-CLOCK "a key while the popup faded in did not make it opaque at once"
+cstate '.active_workspace == 0' "first workspace kept" ||
+    fail G-WS-POPUP-CLOCK "Super+Page_Up left the first workspace"
+anim_clock 825
+ws_check dots 0.125 || fail G-WS-DOTS-CLOCK "the dots were not 87.5% of the way back 125 ms in"
+anim_clock 950
+ws_check dots 0 || fail G-WS-DOTS-CLOCK "the dots had not settled back 250 ms in"
+anim_clock 1349
+ws_check absent "ws-popup fade to=0" --timeout 1.5 ||
+    fail G-WS-POPUP-CLOCK "the repeated key did not restart the 600 ms timeout"
+anim_clock 1400
+ws_check popup 0.25 || fail G-WS-POPUP-CLOCK "the popup was not 25% opaque 650 ms after the repeated key"
+anim_clock 1450
+ws_check line "ws-popup hidden" || fail G-WS-POPUP-CLOCK "the popup did not hide after the repeated key"
+pass G-WS-POPUP-CLOCK "the switcher popup fades in over 100 ms ease-out-quad (0/0.75/1 at 0/50/100 ms, drawn pill darkening), holds 600 ms, fades out (0.25 at 650 ms, hidden at 700 ms); a key on the first workspace redisplays it opaque at once and restarts the timeout"
+pass G-WS-DOTS-CLOCK "the Activities dots match panel.js 51 at 0/125/250 ms of a key switch each way (ease-out-cubic, 87.5% half way)"
+# Reduced Motion keeps the popup's fade and snaps the dots; animations off
+# snap both.
+ws_clock=2000
+for ws_policy in reduce off; do
+    if [ "$ws_policy" = reduce ]; then
+        gsettings set org.gnome.desktop.a11y.interface reduced-motion 'reduce'
+        cstate '.motion_policy == "fade-only"' "reduced popup" ||
+            fail G-WS-POPUP-POLICY "Reduced Motion did not reach the session"
+        ws_fade=100
+    else
+        gsettings reset org.gnome.desktop.a11y.interface reduced-motion
+        gsettings set org.gnome.desktop.interface enable-animations false
+        cstate '.motion_policy == "off"' "popup animations off" ||
+            fail G-WS-POPUP-POLICY "enable-animations false did not reach the session"
+        ws_fade=0
+    fi
+    anim_clock "$ws_clock"
+    ws_here
+    xdotool key super+Page_Down
+    ws_check line "ws-popup fade to=1 from=0.0000 duration=$ws_fade clock=manual" ||
+        fail G-WS-POPUP-POLICY "$ws_policy: the popup's fade-in was not ${ws_fade} ms"
+    ws_check line "ws-dots set count=2 active=1 from=0.0000 motion=false clock=manual" ||
+        fail G-WS-DOTS-POLICY "$ws_policy: the dots did not take the switch without motion"
+    ws_check dots 1 || fail G-WS-DOTS-POLICY "$ws_policy: the dots did not land on workspace 2 at once"
+    if [ "$ws_policy" = reduce ]; then
+        anim_clock $((ws_clock + 50))
+        ws_check popup 0.75 || fail G-WS-POPUP-POLICY "Reduced Motion dropped the popup's fade"
+    else
+        ws_check popup 1 || fail G-WS-POPUP-POLICY "animations off did not show the popup at once"
+    fi
+    anim_clock $((ws_clock + 600 + ws_fade))
+    ws_check line "ws-popup hidden" || fail G-WS-POPUP-POLICY "$ws_policy: the popup did not hide"
+    ws_here
+    xdotool key super+Page_Up
+    cstate '.active_workspace == 0' "$ws_policy home" || fail G-WS-POPUP-POLICY "$ws_policy: could not return"
+    ws_clock=$((ws_clock + 2000))
+    anim_clock "$ws_clock"
+    ws_check line "ws-popup hidden" || fail G-WS-POPUP-POLICY "$ws_policy: the second popup did not hide"
+done
+gsettings set org.gnome.desktop.interface enable-animations true
+cstate '.motion_policy == "full"' "popup motion restored" || fail G-WS-POPUP-POLICY "could not restore motion"
+real_clock || fail G-WS-POPUP-CLOCK "removing the clock file did not resume real time"
+pass G-WS-POPUP-POLICY "Reduced Motion keeps the popup's 100 ms fade, animations off show and hide it at once"
+pass G-WS-DOTS-POLICY "Reduced Motion and animations off move the dots to the new workspace at once"
+sleep 1
+
 # GNOME's keyboard workspace switch (workspaceAnimation.js): both
 # workspaces slide 250 ms ease-out-cubic as a render offset, a second
 # press retargets from where the strip is drawn, fade-only motion
@@ -9036,6 +9188,102 @@ if ! jq -e '.gesture and .velocity >= 0.6 and .duration_ms >= 100 and .duration_
     fail G-SWIPE-VELOCITY "release durations ignore velocity (flick ${flick_ms}ms, drag ${drag_ms}ms)"
 fi
 pass G-SWIPE-VELOCITY "a fast flick lands in ${flick_ms}ms, a slow drag in ${drag_ms}ms"
+
+# The Activities dots follow a held three-finger swipe and settle on its
+# release (#596): GNOME binds the primary monitor's swipe progress to the
+# workspaces adjustment the dots read (workspaceAnimation.js:255-268,
+# panel.js:144-145,178-195), so they track the fingers and then ease
+# (out-cubic) over the swipe tracker's release time. The compositor sends
+# each phase (WorkspaceProgress); the frozen clock samples the release.
+# The held strip slides under every motion policy: GNOME's swipe paths
+# never consult Reduced Motion, and animations off only zero the release
+# (animationUtils.js:23-33).
+slide_settled "$gesture_home" "dots swipe start" || fail G-WS-DOTS-SWIPE "the previous swipe did not settle"
+[ "$gesture_home" = 0 ] || fail G-WS-DOTS-SWIPE "expected to start on the first workspace, not $gesture_home"
+ws_clock=0
+anim_clock "$ws_clock"
+cstate '.animation_clock_manual and .motion_policy == "full"' "swipe dots clock frozen" ||
+    fail G-WS-DOTS-SWIPE "the animation clock did not freeze"
+# One release: $1 the expected landing position, $2 the swipe's start time.
+ws_release() {
+    # shellcheck disable=SC2046
+    set -- "$1" $(ws_check release)
+    [ "$2" = "$1" ] || fail G-WS-DOTS-SWIPE "the release sent the dots to $2, not $1"
+    ws_ms="$3"
+    cstate "(.workspace_slide.in_flight.record.duration_ms - $ws_ms) | fabs <= 0.5" "strip release $ws_ms ms" 5 ||
+        fail G-WS-DOTS-SWIPE "the dots' release time ${ws_ms} ms is not the strip's: $(jq -c '.workspace_slide.in_flight' "$CSTATE")"
+    ws_whole=${ws_ms%.*}
+    anim_clock $((ws_clock + ws_whole / 2))
+    ws_check eased $((ws_whole / 2)) >/dev/null ||
+        fail G-WS-DOTS-SWIPE "half way through the ${ws_ms} ms release the dots were not on GNOME's ease-out-cubic"
+    scrot -o "$ARTIFACTS/24p-workspace-dots-release-$1.png" >/dev/null 2>&1 || true
+    ws_clock=$((ws_clock + ws_whole + 1))
+    anim_clock "$ws_clock"
+    ws_check dots "$1" || fail G-WS-DOTS-SWIPE "the dots did not settle at $1 when the release ended"
+}
+ws_here
+swipe_at begin 0 60000
+swipe_at update -100 60010
+held_at 0.25 "dots: a quarter over" || fail G-WS-DOTS-SWIPE "the strip was not held a quarter over"
+ws_check line "ws-dots follow position=0.2500 duration=0.000 motion=true clock=manual" ||
+    fail G-WS-DOTS-SWIPE "100px of travel did not tell the shell the strip is a quarter over"
+ws_check dots 0.25 || fail G-WS-DOTS-SWIPE "the dots did not follow the fingers a quarter over"
+scrot -o "$ARTIFACTS/24o-workspace-dots-swipe-quarter.png" >/dev/null 2>&1 || true
+swipe_at update -60 60020
+ws_check dots 0.4 || fail G-WS-DOTS-SWIPE "the dots did not keep following the fingers to 0.4"
+# Lifted 400 ms after the last movement: no velocity, back to the start.
+swipe_at end 0 60420
+ws_release 0.0000
+slide_settled "$gesture_home" "dots swipe back" || fail G-WS-DOTS-SWIPE "the slow release did not settle back"
+# A fast short flick lands one workspace over, sooner.
+ws_here
+swipe_at begin 0 70000
+swipe_at update -40 70008
+swipe_at update -40 70016
+swipe_at end 0 70024
+ws_release 1.0000
+ws_check absent "ws-popup display" --timeout 0 ||
+    fail G-WS-DOTS-SWIPE "a swipe showed the switcher popup (GNOME's swipes never do)"
+slide_settled $((gesture_home + 1)) "dots flick" || fail G-WS-DOTS-SWIPE "the flick did not switch"
+xdotool key super+Page_Up
+cstate ".active_workspace == $gesture_home" "dots swipe home" || fail G-WS-DOTS-SWIPE "could not return"
+ws_clock=$((ws_clock + 1000))
+anim_clock "$ws_clock"
+pass G-WS-DOTS-SWIPE "the Activities dots follow a held swipe (0.25, 0.4 of a workspace) and settle on its release with the strip's own ease-out-cubic time, back on a slow lift and over on a flick"
+for ws_policy in reduce off; do
+    if [ "$ws_policy" = reduce ]; then
+        gsettings set org.gnome.desktop.a11y.interface reduced-motion 'reduce'
+        cstate '.motion_policy == "fade-only"' "reduced swipe dots" ||
+            fail G-WS-DOTS-SWIPE-POLICY "Reduced Motion did not reach the session"
+    else
+        gsettings reset org.gnome.desktop.a11y.interface reduced-motion
+        gsettings set org.gnome.desktop.interface enable-animations false
+        cstate '.motion_policy == "off"' "swipe dots animations off" ||
+            fail G-WS-DOTS-SWIPE-POLICY "enable-animations false did not reach the session"
+    fi
+    ws_here
+    swipe_at begin 0 $((80000 + ws_clock))
+    swipe_at update -100 $((80010 + ws_clock))
+    held_at 0.25 "$ws_policy: held" || fail G-WS-DOTS-SWIPE-POLICY "$ws_policy: the strip did not follow the fingers"
+    cstate '.workspace_slide.in_flight.record.motion == "slide"' "$ws_policy: held slide" ||
+        fail G-WS-DOTS-SWIPE-POLICY "$ws_policy: the held strip did not slide with the fingers"
+    ws_check dots 0.25 || fail G-WS-DOTS-SWIPE-POLICY "$ws_policy: the dots did not follow the fingers"
+    swipe_at end 0 $((80500 + ws_clock))
+    ws_check line "ws-dots follow position=0.0000 " || fail G-WS-DOTS-SWIPE-POLICY "$ws_policy: no release reached the dots"
+    # Without motion the dots land at once, on the frozen clock.
+    ws_check dots 0 || fail G-WS-DOTS-SWIPE-POLICY "$ws_policy: the dots did not snap home on release"
+    if [ "$ws_policy" = off ]; then
+        cstate '.workspace_slide.in_flight == null' "off: released at once" ||
+            fail G-WS-DOTS-SWIPE-POLICY "animations off: the release still animated"
+    fi
+    ws_clock=$((ws_clock + 1000))
+    anim_clock "$ws_clock"
+    slide_settled "$gesture_home" "$ws_policy: settled" || fail G-WS-DOTS-SWIPE-POLICY "$ws_policy: the swipe did not settle"
+done
+gsettings set org.gnome.desktop.interface enable-animations true
+cstate '.motion_policy == "full"' "swipe dots motion restored" || fail G-WS-DOTS-SWIPE-POLICY "could not restore motion"
+real_clock || fail G-WS-DOTS-SWIPE "removing the clock file did not resume real time"
+pass G-WS-DOTS-SWIPE-POLICY "under Reduced Motion and animations off a held swipe still slides the strip and moves the dots with the fingers; the release snaps the dots (and, with animations off, the strip)"
 
 gsettings set org.gnome.desktop.interface enable-animations false
 cstate '(.animations_enabled | not) and .overview_progress == 0' "reduced-motion swipe ready" ||

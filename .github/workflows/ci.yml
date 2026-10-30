@@ -864,6 +864,7 @@ jobs:
       - run: /usr/bin/python3 scripts/lib/wellbeing-pixels-tests.py
       - run: /usr/bin/python3 scripts/lib/gtk-folder-watch-proof-tests.py
       - run: /usr/bin/python3 scripts/lib/lock-curtain-proof-tests.py
+      - run: /usr/bin/python3 scripts/lib/ws-anim-proof-tests.py
       - run: /usr/bin/python3 scripts/lib/gsd-media-keys-bus-tests.py
       - run: scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts
         env:

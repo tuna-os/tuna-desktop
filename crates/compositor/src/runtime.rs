@@ -2129,6 +2129,7 @@ impl Runtime {
         // Three-finger swipes are the shell's (GNOME 51): consumed here,
         // acted on at the end. Other swipes reach the client.
         if self.shell_swipe_input(&input) {
+            self.publish_workspace_progress();
             return;
         }
         if !self.overlay.visible {
@@ -2928,6 +2929,26 @@ impl Runtime {
         let slide = self.manager.workspace_slide_mut();
         slide.observe(active, &workspaces, width, policy, suspended, now);
         slide.step(now);
+        self.publish_workspace_progress();
+    }
+
+    /// Tell the shell where a workspace swipe holds the strip, so the
+    /// Activities dots follow it; only swipe phases queue anything.
+    fn publish_workspace_progress(&mut self) {
+        if let Some((position, duration_ms)) = self.manager.workspace_slide_mut().take_progress() {
+            let scale = f64::from(tuna_shell_control::WORKSPACE_PROGRESS_SCALE);
+            self.control
+                .queue_message(tuna_shell_control::Message::WorkspaceProgress {
+                    position: (position.max(0.0) * scale)
+                        .round()
+                        .min(f64::from(tuna_shell_control::MAX_WORKSPACE_PROGRESS))
+                        as u32,
+                    duration_us: (duration_ms.max(0.0) * 1000.0)
+                        .round()
+                        .min(f64::from(tuna_shell_control::MAX_WORKSPACE_PROGRESS_US))
+                        as u32,
+                });
+        }
     }
 
     /// A press while the overview is open that no shell surface took:
@@ -3087,7 +3108,7 @@ impl Runtime {
                         let active = model.active_workspace();
                         let workspaces = model.workspaces().to_vec();
                         let slide = self.manager.workspace_slide_mut();
-                        slide.begin_swipe(active, &workspaces, width, policy, now);
+                        slide.begin_swipe(active, &workspaces, width, policy, time, now);
                         slide.update_swipe(travel.x, time);
                     }
                     // GNOME's overview follows the fingers: a vertical
@@ -3120,11 +3141,8 @@ impl Runtime {
                         .workspace_slide_mut()
                         .end_swipe(cancelled, time, now);
                     if let Some(target) = target {
-                        if target != self.manager.model().active_workspace()
-                            && !self.manager.switch_to_workspace(&mut self.state, target)
-                        {
-                            // GNOME's trailing empty workspace: create it.
-                            self.manager.switch_relative(&mut self.state, 1);
+                        if target != self.manager.model().active_workspace() {
+                            self.manager.switch_to_workspace(&mut self.state, target);
                         }
                     }
                     return true;
