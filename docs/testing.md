@@ -127,9 +127,10 @@ Cleanup is automatic where it is safe:
   `scripts/lib/tuna-xvfb`, which locks the first free display from `:120`
   up (plain `Xvfb -displayfd` takes no lock and lands on the low numbers
   every nested compositor's XWayland claims by lock file, which breaks
-  it), with per-run Wayland sockets, buses and runtime directories, so up
-  to a quarter of the CPUs' worth of them run at once
-  (`/tmp/tuna-local-proof.slot.N`, `TUNA_PROOF_SLOTS`). Proofs that touch
+  it), with per-run Wayland sockets, buses and runtime directories. One
+  runs at a time by default; `TUNA_PROOF_SLOTS=N` lets N run at once
+  (`/tmp/tuna-local-proof.slot.N`), but under that load the gtk-shell
+  proof's timing-sensitive stages fail intermittently. Proofs that touch
   machine-wide state (vkms, seatd, uinput, `sudo` or apt, like
   `drm-smoke`), and scripts that don't start an Xvfb, run one at a time
   (`/tmp/tuna-local-proof.lock`). A proof's own `cargo build` waits for a

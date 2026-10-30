@@ -32,11 +32,13 @@ semaphore := justfile_directory() / "scripts/lib/tuna-semaphore"
 build_slot_base := env("TUNA_BUILD_SLOT_BASE", "/tmp/tuna-local-build.slot")
 build_slots := env("TUNA_BUILD_SLOTS", `m=$(awk '/^MemTotal:/ { print int($2 / 1048576 / 8) }' /proc/meminfo); echo $((m < 1 ? 1 : m > 2 ? 2 : m))`)
 lock := semaphore + " " + build_slot_base + " " + build_slots
-# Nested proofs (each on its own Xvfb, Wayland socket, buses and runtime
-# directory) share a quarter of the CPUs' worth of slots; proofs that touch
-# machine-wide state (vkms, seatd, uinput, sudo) run one at a time.
+# Nested proofs each get their own Xvfb, Wayland socket, buses and runtime
+# directory, but under concurrent load the gtk-shell proof's fixed waits
+# still flake (3-way runs: 1/3 and 2/3 passed), so one runs at a time unless
+# TUNA_PROOF_SLOTS opts in. Proofs that touch machine-wide state (vkms,
+# seatd, uinput, sudo) always run one at a time.
 proof_slot_base := env("TUNA_PROOF_SLOT_BASE", "/tmp/tuna-local-proof.slot")
-proof_slots := env("TUNA_PROOF_SLOTS", `n=$(($(nproc) / 4)); echo $((n > 0 ? n : 1))`)
+proof_slots := env("TUNA_PROOF_SLOTS", "1")
 proof_lock := env("TUNA_PROOF_LOCK", "/tmp/tuna-local-proof.lock")
 # A proof still running after this many minutes is stopped.
 proof_timeout_min := env("TUNA_PROOF_TIMEOUT", "45")

@@ -180,7 +180,7 @@ The script's header documents its options; they all start with `TRY_TUNA_`:
 | `TUNA_TARGET_DIR` | `target/` in the checkout | Cargo target directory for every recipe. An inherited `CARGO_TARGET_DIR` is ignored. |
 | `TUNA_BUILD_SLOTS` | one per 8 GiB of RAM, at most 2 | Cargo builds that may run at once across worktrees (and proofs' own builds). |
 | `TUNA_BUILD_SLOT_BASE` | `/tmp/tuna-local-build.slot` | Prefix of the build slots' lock files (`.0`, `.1`, …). |
-| `TUNA_PROOF_SLOTS` | a quarter of the CPUs, at least 1 | Nested (private Xvfb) proofs that may run at once. |
+| `TUNA_PROOF_SLOTS` | `1` | Nested (private Xvfb) proofs that may run at once; above 1 is opt-in, as timing-sensitive proof stages flake under the load. |
 | `TUNA_PROOF_SLOT_BASE` | `/tmp/tuna-local-proof.slot` | Prefix of the nested proofs' slot lock files. |
 | `TUNA_PROOF_LOCK` | `/tmp/tuna-local-proof.lock` | Lock file that serializes proofs of machine-wide state (vkms, seatd, uinput, sudo). |
 | `TUNA_PROOF_TIMEOUT` | `45` | Minutes before `just proof` stops a proof and everything it started. |
