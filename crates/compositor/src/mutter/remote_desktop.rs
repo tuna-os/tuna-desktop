@@ -438,7 +438,9 @@ impl RemoteSession {
         options: HashMap<String, OwnedValue>,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> fdo::Result<zbus::zvariant::OwnedFd> {
-        self.admitted(&header, true)?;
+        // Mutter's handle_connect_to_eis has no started check: grd
+        // connects before Start; input waits for it (remote_eis.rs).
+        self.admitted(&header, false)?;
         let types = device_types(options.get("device-types"))?;
         if self.grant.eis_opened.swap(true, Ordering::SeqCst) {
             return Err(fdo::Error::LimitsExceeded(

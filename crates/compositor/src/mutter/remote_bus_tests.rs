@@ -403,6 +403,12 @@ fn session_clipboard_and_keysyms_are_owned_bounded_and_revocable() {
     }
     assert_eq!(owned.lock().unwrap().last(), Some(&None));
 
+    // EIS may be requested before Start (as grd does), never by another
+    // caller.
+    assert_error(
+        session(&foreign, "ConnectToEIS", &(no_options(),)),
+        "AccessDenied",
+    );
     // Keysyms need a started session and its owner.
     assert_error(
         session(&owner, "NotifyKeyboardKeysym", &(0x61u32, true)),

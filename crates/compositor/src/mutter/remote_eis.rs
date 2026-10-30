@@ -184,7 +184,9 @@ impl Worker {
                     }
                     _ => None,
                 };
-                if let Some(input) = input {
+                // Mutter accepts ConnectToEIS before Start (grd connects
+                // first) and input reaches nothing until the session runs.
+                if let Some(input) = input.filter(|_| self.grant.started.load(Ordering::SeqCst)) {
                     if remote_desktop::queue_input(&self.grant, &self.to_loop, input).is_err() {
                         self.disconnected = true;
                         return calloop::PostAction::Remove;
