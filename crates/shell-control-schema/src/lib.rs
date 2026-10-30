@@ -31,9 +31,9 @@ pub mod layer_namespaces;
 pub use layer_namespaces::{
     BANNER_NAMESPACE, DISPLAY_CHANGE_NAMESPACE, DOCK_NAMESPACE, END_SESSION_NAMESPACE,
     FOLDER_DIALOG_NAMESPACE, GTK_BANNERS_NAMESPACE, GTK_PANEL_NAMESPACE, IBUS_CANDIDATES_NAMESPACE,
-    KBD_A11Y_NAMESPACE, NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE, OSK_NAMESPACE, OVERVIEW_NAMESPACE, PAD_OSD_NAMESPACE,
-    PANEL_NAMESPACE, POINTER_A11Y_NAMESPACE, POLKIT_NAMESPACE, PREVIEW_CHROME_NAMESPACE,
-    SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE,
+    KBD_A11Y_NAMESPACE, NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE, OSK_NAMESPACE, OVERVIEW_NAMESPACE,
+    PAD_OSD_NAMESPACE, PANEL_NAMESPACE, POINTER_A11Y_NAMESPACE, POLKIT_NAMESPACE,
+    PREVIEW_CHROME_NAMESPACE, SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE,
     SWITCHER_THUMBNAILS_NAMESPACE, WINDOW_MENU_NAMESPACE, WORKSPACE_POPUP_NAMESPACE,
 };
 
@@ -479,7 +479,10 @@ pub enum CommandKind {
     /// `org.gnome.Shell.Wacom.PadOsd.Show` or the OSD's pad chooser. Denied
     /// when no such pad exists, it has no libwacom layout, or an OSD is
     /// already shown.
-    RequestPadOsd { target: PadOsdTarget, edition_mode: bool },
+    RequestPadOsd {
+        target: PadOsdTarget,
+        edition_mode: bool,
+    },
     /// Since 0.45: the shown pad OSD closed; the compositor stops routing
     /// pad events to the shell.
     PadOsdClosed { pad: u32 },
@@ -553,7 +556,6 @@ pub enum AuthEvent {
     /// This service cannot run for this user (GDM `ServiceUnavailable`):
     /// no reader, no enrolled print, or no conversation backend.
     Unavailable,
-}
 }
 
 /// Most buttons, rings, strips or grouped pads one pad OSD message carries.
@@ -2037,7 +2039,15 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
             .buttons
             .iter()
             .filter_map(|b| b.label.as_deref())
-            .chain(labels.rings.iter().chain(&labels.strips).flatten().flatten().map(String::as_str));
+            .chain(
+                labels
+                    .rings
+                    .iter()
+                    .chain(&labels.strips)
+                    .flatten()
+                    .flatten()
+                    .map(String::as_str),
+            );
         for text in texts {
             check_title(text)?;
         }
@@ -3765,14 +3775,21 @@ mod tablet_osd_wire_order_tests {
     fn tablet_osd_variants_follow_the_0_44_auth_conversation() {
         let tag = |bytes: &[u8]| bytes[0];
         let mut buffer = [0_u8; 256];
-        let cancel = tag(postcard::to_slice(&CommandKind::CancelVerification, &mut buffer).unwrap());
+        let cancel =
+            tag(postcard::to_slice(&CommandKind::CancelVerification, &mut buffer).unwrap());
         let request = CommandKind::RequestPadOsd {
             target: PadOsdTarget::Pad(1),
             edition_mode: false,
         };
-        assert_eq!(tag(postcard::to_slice(&request, &mut buffer).unwrap()), cancel + 1);
+        assert_eq!(
+            tag(postcard::to_slice(&request, &mut buffer).unwrap()),
+            cancel + 1
+        );
         let closed = CommandKind::PadOsdClosed { pad: 1 };
-        assert_eq!(tag(postcard::to_slice(&closed, &mut buffer).unwrap()), cancel + 2);
+        assert_eq!(
+            tag(postcard::to_slice(&closed, &mut buffer).unwrap()),
+            cancel + 2
+        );
         let auth = Message::AuthEvent {
             request: 1,
             service: AuthService::Password,
@@ -3784,8 +3801,14 @@ mod tablet_osd_wire_order_tests {
             icon: String::new(),
             label: String::new(),
         };
-        assert_eq!(tag(postcard::to_slice(&show, &mut buffer).unwrap()), auth + 1);
+        assert_eq!(
+            tag(postcard::to_slice(&show, &mut buffer).unwrap()),
+            auth + 1
+        );
         let close = Message::ClosePadOsd { pad: 1 };
-        assert_eq!(tag(postcard::to_slice(&close, &mut buffer).unwrap()), auth + 5);
+        assert_eq!(
+            tag(postcard::to_slice(&close, &mut buffer).unwrap()),
+            auth + 5
+        );
     }
 }
