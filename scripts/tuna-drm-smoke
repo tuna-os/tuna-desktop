@@ -288,8 +288,9 @@ for _ in $(seq 1 20); do
     fi
     sleep 0.25
 done
-grab -vf 'hwdownload,format=bgra' "$ARTIFACTS/color-pixel.png" &&
-    sudo chown "$(id -u):$(id -g)" "$ARTIFACTS/color-pixel.png" || true
+if grab -vf 'hwdownload,format=bgra' "$ARTIFACTS/color-pixel.png"; then
+    sudo chown "$(id -u):$(id -g)" "$ARTIFACTS/color-pixel.png"
+fi
 kill "$COLOR_PID" 2>/dev/null || true
 wait "$COLOR_PID" 2>/dev/null || true
 COLOR_PID=""
