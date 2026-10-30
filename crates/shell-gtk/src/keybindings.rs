@@ -868,6 +868,8 @@ mod tests {
         assert_eq!(find(Action::Maximize), ["<Super>Up"]);
         assert_eq!(find(Action::Unmaximize), ["<Super>Down", "<Alt>F5"]);
         assert_eq!(find(Action::Minimize), ["<Super>h"]);
+        assert_eq!(find(Action::BeginMove), ["<Alt>F7"]);
+        assert_eq!(find(Action::BeginResize), ["<Alt>F8"]);
         assert_eq!(find(Action::Close), ["<Alt>F4"]);
         assert_eq!(find(Action::TileLeft), ["<Super>Left"]);
         assert_eq!(find(Action::TileRight), ["<Super>Right"]);
