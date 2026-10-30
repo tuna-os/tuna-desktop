@@ -18,6 +18,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
 # The GTK shell is preferred; shell-host is the alternative legacy renderer.
 CRITICAL = ('tuna-compositor', 'tuna-shell-gtk')
 BINARIES = CRITICAL + ('tuna-shell-host', 'tuna-session', 'tuna-ibus-bridge')
+QUALIFICATION_S = 86400
+# The native workload is installed beside the observer, wherever that is.
+FRAME_PACER = Path(__file__).resolve().parent / 'tuna-frame-pacer'
+
+
+def scope(seconds):
+    """Only a full 24-hour request is a qualification candidate."""
+    if seconds == QUALIFICATION_S:
+        return '24-hour qualification candidate'
+    return f'bounded {seconds} s rehearsal; not the 24-hour qualification run'
 
 
 def identity(proc):
@@ -121,6 +131,7 @@ def main(args):
                                   for card in Path('/sys/class/drm').glob('card[0-9]')},
                   'bootc_status': json.loads(call(['bootc', 'status', '--json'], 30)),
                   'started_unix_s': time.time(), 'requested_duration_s': args.seconds,
+                  'scope': scope(args.seconds),
                   'interval_s': args.interval, 'warmup_s': args.warmup,
                   'limits': {'pss': 'baseline * 1.5 + 16384 KiB',
                              'fds': 'baseline * 1.5 + 32',
@@ -133,7 +144,7 @@ def main(args):
         from endurance_presentation import Reader
         socket = Path(f'/run/user/{uid}', args.wayland_display)
         metadata = socket.stat()
-        executable = Path('/usr/local/libexec/tuna-frame-pacer')
+        executable = FRAME_PACER
         binary = executable.stat()
         if (metadata.st_uid != uid or not stat.S_ISSOCK(metadata.st_mode)
                 or binary.st_uid != 0 or binary.st_mode & 0o022
@@ -164,7 +175,7 @@ def main(args):
             probe_output.close()
             raise
     original = baseline = None
-    report = {'complete': False, 'samples': 0, 'limitations': [
+    report = {'complete': False, 'samples': 0, 'scope': scope(args.seconds), 'limitations': [
         ('Frame pacing is real native client feedback; no GPU memory or input latency measurement.'
          if args.presentation else 'No frame pacing, GPU memory or input latency measurement.'),
         'PSS scope is the session UID; root services and kernel memory are excluded.',
@@ -263,7 +274,7 @@ if __name__ == '__main__':
         parser.error('source revision must be the exact 40-digit hexadecimal commit')
     if args.seconds <= args.warmup or args.interval <= 0 or args.warmup < 0:
         parser.error('duration must exceed nonnegative warmup; interval must be positive')
-    if args.presentation and (args.seconds > 86400 or not args.wayland_display
+    if args.presentation and (args.seconds > QUALIFICATION_S or not args.wayland_display
                              or not re.fullmatch(r'(?:wayland-|tuna-)[A-Za-z0-9_.-]+', args.wayland_display)):
         parser.error('presentation requires a session socket basename and duration at most 86400')
     main(args)
