@@ -120,10 +120,12 @@ mint its way to the front.
   handle 0 fails with `ENOENT`). The first missing piece is logged as
   `tuna-compositor: explicit sync disabled: <Mutter's reason>`; success as
   `tuna-compositor: explicit sync (linux-drm-syncobj v1) on <node>`.
-  Software rendering and KMS-only devices have no timeline syncobjs: vkms
-  and bochs report `DRM_CAP_SYNCOBJ_TIMELINE` 0 and `drmSyncobjEventfd`
-  `EOPNOTSUPP` (checked locally; the drm-smoke stage D-SYNCOBJ asserts the
-  global stays absent on vkms).
+  Software rendering and KMS-only devices have no timeline syncobjs: vkms,
+  bochs and vgem report `DRM_CAP_SYNCOBJ_TIMELINE` 0 and
+  `drmSyncobjEventfd` `EOPNOTSUPP` (checked locally). The drm-smoke stage
+  D-SYNCOBJ asserts the global stays absent on vkms, where Mesa's software
+  renderer already fails the first check (no
+  `EGL_ANDROID_native_fence_sync`).
 - **Errors.** `surface_exists` for a second syncobj surface,
   `invalid_timeline` for a syncobj fd the device cannot import, `no_surface`
   after the `wl_surface` is gone. At commit, in Mutter's order: a buffer
