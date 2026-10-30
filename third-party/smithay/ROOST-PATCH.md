@@ -173,7 +173,13 @@ connector of another lease device posts wrong_device and a repeated one
 duplicate_connector when it is requested (upstream checked only at submit
 and posted wrong_device for a withdrawn connector); an empty submit posts
 empty_lease and stops (upstream went on to call the handler); a connector
-withdrawn since it was requested fails the lease with finished. drm-smoke's
-D-LEASE leases the vkms connector through it with a real client. The
-isolated diff is retained in DRM-LEASE-PATCH.diff; the pinned version stays
-0.7.0.
+withdrawn since it was requested fails the lease with finished. A binding
+that cannot open a non-master DRM fd stays pending without events, as
+Mutter's lease_device_bind keeps it, until
+DrmLeaseState::retry_pending_binds (session activation); upstream sent the
+released destructor from inside the bind, which made wayland-backend panic
+on the destroyed object, and refused to create the global when the
+compositor could not open the node, where Mutter advertises it anyway.
+drm-smoke's D-LEASE leases the vkms connector through it with a real
+client. The isolated diff is retained in DRM-LEASE-PATCH.diff; the pinned
+version stays 0.7.0.

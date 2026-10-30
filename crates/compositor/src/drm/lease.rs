@@ -288,6 +288,9 @@ impl LeaseDevice {
     pub fn resume(&mut self) {
         self.paused = false;
         self.update_connectors();
+        // Bindings that could not open the card get their DRM fd now
+        // (Mutter's on_active_session_changed).
+        self.state.retry_pending_binds::<State>();
     }
 
     fn end_lease(&mut self, id: u32) {

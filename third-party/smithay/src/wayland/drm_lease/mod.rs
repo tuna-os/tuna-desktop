@@ -102,6 +102,10 @@ pub struct DrmLeaseState {
     global: Option<GlobalId>,
     connectors: Vec<DrmLeaseConnector>,
     known_lease_devices: Vec<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1>,
+    /// Bindings whose DRM fd could not be opened yet (Mutter's
+    /// pending_resources): no events until [`Self::retry_pending_binds`].
+    pending_lease_devices: Vec<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1>,
+    path: PathBuf,
     active_leases: Vec<DrmLeaseRef>,
 }
 
@@ -430,12 +434,11 @@ impl DrmLeaseState {
             .dev_path_with_type(NodeType::Primary)
             .ok_or(Error::UnableToGetPath)?;
 
-        // test once if we can get a non-master fd before initializing the global
-        let _ = get_non_master_fd(&path)?;
-
+        // Mutter advertises the global without trying the node: a binding
+        // that cannot get a DRM fd yet waits (`retry_pending_binds`).
         let data = DrmLeaseDeviceGlobalData {
             filter: Box::new(filter),
-            path,
+            path: path.clone(),
             node: *drm_node,
         };
 
@@ -447,6 +450,8 @@ impl DrmLeaseState {
             global: Some(global),
             connectors: Vec::new(),
             known_lease_devices: Vec::new(),
+            pending_lease_devices: Vec::new(),
+            path,
             active_leases: Vec::new(),
         })
     }
@@ -654,6 +659,66 @@ impl DrmLeaseState {
         self.remove_lease::<D>(lease_id).is_some()
     }
 
+    /// Mutter's send_pending_on_device_bind_events: give bindings that could
+    /// not get a DRM fd when they bound (no access to the device) their
+    /// fd, connectors and `done` now, for instance once the session is
+    /// active again. Those that still fail stay pending.
+    pub fn retry_pending_binds<D>(&mut self)
+    where
+        D: DrmLeaseHandler
+            + GlobalDispatch<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1, DrmLeaseDeviceGlobalData>
+            + Dispatch<wp_drm_lease_connector_v1::WpDrmLeaseConnectorV1, DrmNode, D>
+            + Dispatch<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1, DrmNode, D>
+            + Dispatch<wp_drm_lease_request_v1::WpDrmLeaseRequestV1, DrmLeaseRequestData, D>
+            + Dispatch<wp_drm_lease_v1::WpDrmLeaseV1, DrmLeaseData, D>
+            + 'static,
+    {
+        for device in std::mem::take(&mut self.pending_lease_devices) {
+            let Some(client) = device.client() else {
+                continue;
+            };
+            if self.send_bind_events::<D>(&device, &client) {
+                self.known_lease_devices.push(device);
+            } else {
+                self.pending_lease_devices.push(device);
+            }
+        }
+    }
+
+    /// Mutter's send_on_device_bind_events: a non-master DRM fd, the
+    /// connectors for lease, then `done`. Sends nothing without the fd.
+    fn send_bind_events<D>(
+        &mut self,
+        device: &wp_drm_lease_device_v1::WpDrmLeaseDeviceV1,
+        client: &Client,
+    ) -> bool
+    where
+        D: DrmLeaseHandler
+            + GlobalDispatch<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1, DrmLeaseDeviceGlobalData>
+            + Dispatch<wp_drm_lease_connector_v1::WpDrmLeaseConnectorV1, DrmNode, D>
+            + Dispatch<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1, DrmNode, D>
+            + Dispatch<wp_drm_lease_request_v1::WpDrmLeaseRequestV1, DrmLeaseRequestData, D>
+            + Dispatch<wp_drm_lease_v1::WpDrmLeaseV1, DrmLeaseData, D>
+            + 'static,
+    {
+        let fd = match get_non_master_fd(&self.path) {
+            Ok(fd) => fd,
+            Err(err) => {
+                tracing::warn!(?err, "No DRM fd for a lease device binding yet");
+                return false;
+            }
+        };
+        device.drm_fd(fd.as_fd());
+        for connector in self.connectors.iter_mut().filter(|c| c.enabled) {
+            if let Some(id) = connector.new_instance::<D>(&self.dh, client) {
+                device.connector(&id);
+                connector.send_info(&id);
+            }
+        }
+        device.done();
+        true
+    }
+
     /// [`DrmNode`] belonging to this DRM lease global
     pub fn node(&self) -> DrmNode {
         self.node
@@ -742,7 +807,7 @@ where
 {
     fn bind(
         state: &mut D,
-        dh: &DisplayHandle,
+        _dh: &DisplayHandle,
         client: &Client,
         resource: New<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1>,
         global_data: &DrmLeaseDeviceGlobalData,
@@ -751,22 +816,14 @@ where
         let drm_lease_state = state.drm_lease_state(global_data.node);
         let wp_drm_lease_device = data_init.init(resource, global_data.node);
 
-        let Ok(fd) = get_non_master_fd(&global_data.path) else {
-            // nothing we can do
-            wp_drm_lease_device.released();
-            return;
-        };
-
-        wp_drm_lease_device.drm_fd(fd.as_fd());
-        for connector in drm_lease_state.connectors.iter_mut().filter(|c| c.enabled) {
-            if let Some(id) = connector.new_instance::<D>(dh, client) {
-                wp_drm_lease_device.connector(&id);
-                connector.send_info(&id);
-            }
+        // Mutter's lease_device_bind: without a DRM fd the binding stays
+        // pending, silent. (Sending the `released` destructor from inside
+        // the bind destroyed the object before the bind returned.)
+        if drm_lease_state.send_bind_events::<D>(&wp_drm_lease_device, client) {
+            drm_lease_state.known_lease_devices.push(wp_drm_lease_device);
+        } else {
+            drm_lease_state.pending_lease_devices.push(wp_drm_lease_device);
         }
-        wp_drm_lease_device.done();
-
-        drm_lease_state.known_lease_devices.push(wp_drm_lease_device);
     }
 
     fn can_view(client: Client, global_data: &DrmLeaseDeviceGlobalData) -> bool {
@@ -807,6 +864,9 @@ where
                 let drm_lease_state = state.drm_lease_state(*data);
                 drm_lease_state
                     .known_lease_devices
+                    .retain(|device| device != resource);
+                drm_lease_state
+                    .pending_lease_devices
                     .retain(|device| device != resource);
                 resource.released();
             }

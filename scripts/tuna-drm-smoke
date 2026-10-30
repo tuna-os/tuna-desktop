@@ -75,6 +75,7 @@ CALIBRATION_PID=""
 EMU_PID=""
 CLIENT_PID=""
 CARD_ACL=""
+CARD_RULE=""
 
 cleanup() {
     if [ -n "$CLIENT_PID" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
@@ -89,7 +90,11 @@ cleanup() {
     if [ -n "$SEATD_PID" ]; then sudo kill "$SEATD_PID" 2>/dev/null || true; fi
     # Put a stopped system seatd back exactly as we found it.
     if [ -n "$SYSTEM_SEATD" ]; then sudo systemctl start seatd 2>/dev/null || true; fi
-    if [ -n "$CARD_ACL" ]; then sudo setfacl -x "u:$(id -un)" "$CARD_ACL" 2>/dev/null || true; fi
+    if [ -n "$CARD_ACL" ]; then
+        sudo rm -f "$CARD_RULE"
+        sudo udevadm control --reload 2>/dev/null || true
+        sudo setfacl -x "u:$(id -un)" "$CARD_ACL" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT INT TERM
 
@@ -167,8 +172,15 @@ echo "tuna-drm-smoke: vkms at $CARD"
 # uaccess ACL; seatd only hands the compositor its master fd. The lease
 # device opens its own non-master fd for clients, as Mutter does
 # (meta_kms_impl_device_open_non_privileged_fd), so grant the same ACL.
-sudo setfacl -m "u:$(id -un):rw" "$CARD"
+# udev's uaccess builtin flushes foreign ACL entries on every change event
+# (each lease is one), so a runtime rule re-applies it after the builtin.
+CARD_RULE="/run/udev/rules.d/99-tuna-drm-smoke-$(basename "$CARD").rules"
 CARD_ACL="$CARD"
+sudo mkdir -p /run/udev/rules.d
+echo "SUBSYSTEM==\"drm\", KERNEL==\"$(basename "$CARD")\", RUN+=\"/usr/bin/setfacl -m u:$(id -un):rw \$devnode\"" |
+    sudo tee "$CARD_RULE" >/dev/null
+sudo udevadm control --reload 2>/dev/null || true
+sudo setfacl -m "u:$(id -un):rw" "$CARD"
 
 echo "tuna-drm-smoke: building"
 cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-host -p tuna-shell-gtk
