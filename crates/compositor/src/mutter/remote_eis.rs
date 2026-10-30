@@ -79,11 +79,23 @@ impl Worker {
                         capabilities,
                         |device| {
                             if let Some(keyboard) = device.interface::<eis::Keyboard>() {
-                                keyboard.keymap(
-                                    eis::keyboard::KeymapType::Xkb,
-                                    self.keymap_len,
-                                    self.keymap.as_fd(),
-                                );
+                                // A fresh read-only description at offset 0 for
+                                // every send: grd read()s the keymap
+                                // (grd-session.c setup_xkb_keymap) instead of
+                                // mapping it, and the writer left our offset at
+                                // the end.
+                                use std::os::fd::AsRawFd;
+                                let fresh = std::fs::File::open(format!(
+                                    "/proc/self/fd/{}",
+                                    self.keymap.as_raw_fd()
+                                ));
+                                if let Ok(fresh) = fresh {
+                                    keyboard.keymap(
+                                        eis::keyboard::KeymapType::Xkb,
+                                        self.keymap_len,
+                                        fresh.as_fd(),
+                                    );
+                                }
                             }
                             if device.has_capability(DeviceCapability::PointerAbsolute) {
                                 for output in &self.outputs {
