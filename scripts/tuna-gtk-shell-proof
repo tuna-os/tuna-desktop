@@ -65,6 +65,8 @@
 #   G-NOTIFY-LOCK-PIXELS a redacted source's pixels do not depend on its
 #                    text; details change them and taking them back
 #                    restores the frame
+#   G-NOTIFY-LOCK-PUSH a list taller than the room under the clock raises
+#                    the clock, at most to a tenth of the height from the top
 #   G-NOTIFY-LOCK-LIVE arrivals and policy keys reach the locked screen at
 #                    once; unlocking brings the queued banners and sounds
 #   G-NOTIFY-SOUND   banners play sound-name / sound-file as they show,
