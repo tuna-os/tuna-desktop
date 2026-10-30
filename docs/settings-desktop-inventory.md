@@ -280,20 +280,20 @@ Consumers re-checked against gnome-shell 51.0, gnome-session 51.0 and gnome-sett
 
 | Key | Status | Reason |
 |---|---|---|
-| application-children | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
+| application-children | Honored | The first notification from an installed app appends its canonical id, as messageTray.js `NotificationApplicationPolicy.store()` does, so GNOME Settings lists it (`crates/shell-host/src/notification_policy.rs`). Proof G-NOTIFY-POLICY |
 | show-banners | Honored | Live Do Not Disturb policy |
-| show-in-lock-screen | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
+| show-in-lock-screen | Honored | Combined with each app's own key; with either off a source is absent from the lock screen's notification list, applied live while locked (unlockDialog.js `NotificationsBox`). Proof G-NOTIFY-LOCK-LIVE |
 ## org.gnome.desktop.notifications.application
 
 | Key | Status | Reason |
 |---|---|---|
-| application-id | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
-| details-in-lock-screen | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
-| enable | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
-| enable-sound-alerts | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
-| force-expanded | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
-| show-banners | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
-| show-in-lock-screen | Ignored | Tuna Desktop uses global banners and its notification model; per-application/lock-screen preference is not consumed |
+| application-id | Honored | Written with the app's desktop id on its first notification (`store()`). Proof G-NOTIFY-POLICY |
+| details-in-lock-screen | Honored | Lock-screen titles and bodies only with it (or for an all-`x-gnome-privacy-scope=system` source); otherwise name and count only, absent from pixels and the accessible tree; live while locked. Proofs G-NOTIFY-LOCK, G-NOTIFY-LOCK-PIXELS |
+| enable | Honored | Off drops the app's arrivals, critical included, and live (or at startup) what it already filed. GNOME hides the source and shows it again if re-enabled in the same session; Tuna Desktop does not keep them. Proof G-NOTIFY-POLICY |
+| enable-sound-alerts | Honored | Read as each banner shows; off keeps its `sound-name`/`sound-file` silent (messageTray.js `playSound`). Proof G-NOTIFY-SOUND |
+| force-expanded | Ignored | Read per arrival into the store's expanded flag, but the GTK banner always shows the whole body: it has no collapsed state to expand from |
+| show-banners | Honored | Combined with the global key at arrival; critical notifications break through. Proof G-NOTIFY-POLICY (enable) and the store's unit tests |
+| show-in-lock-screen | Honored | See the global key above. Proofs G-NOTIFY-LOCK, G-NOTIFY-LOCK-LIVE |
 ## org.gnome.desktop.peripherals.keyboard
 
 | Key | Status | Reason |

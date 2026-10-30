@@ -125,6 +125,14 @@ pub struct Notification {
     pub expanded: bool,
     /// Action keys already invoked (replay guard).
     consumed: HashSet<String>,
+    /// The sound its banner plays (`sound-name`, `sound-file`). Not
+    /// kept across restarts: GNOME's notifications do not outlive the
+    /// shell, so a restored banner comes back silent.
+    sound: Sound,
+    /// Sent with `x-gnome-privacy-scope` `system` (GNOME's
+    /// `PrivacyScope.SYSTEM`): a source of only these shows its details
+    /// on the lock screen.
+    system_scope: bool,
 }
 
 impl Notification {
@@ -190,6 +198,16 @@ impl Notification {
             .map(|action| action.id.as_str())
             .filter(|id| !self.consumed.contains(*id))
             .collect()
+    }
+
+    /// The sound its banner plays (empty for none).
+    pub fn sound(&self) -> &Sound {
+        &self.sound
+    }
+
+    /// Whether it is system-scoped (`x-gnome-privacy-scope` `system`).
+    pub fn system_scope(&self) -> bool {
+        self.system_scope
     }
 }
 
@@ -302,6 +320,11 @@ fn decode_notification(item: &serde_json::Value) -> Option<Notification> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
         consumed,
+        sound: Sound::default(),
+        system_scope: item
+            .get("privacy_scope")
+            .and_then(serde_json::Value::as_str)
+            == Some("system"),
     })
 }
 
@@ -341,6 +364,8 @@ pub struct Incoming {
     /// The `desktop-entry` hint.
     pub desktop_entry: String,
     pub sound: Sound,
+    /// `x-gnome-privacy-scope` is `system`.
+    pub system_scope: bool,
 }
 
 /// The policy store behind a center (none: everything generic with the
@@ -374,8 +399,6 @@ pub struct NotificationCenter {
     queue_path: Option<PathBuf>,
     /// GNOME Settings' notification policy.
     policy: PolicySlot,
-    /// Sounds due to play, oldest first (the shell drains them).
-    sounds: Vec<Sound>,
     /// In-place replacements so far: a view that keys its drawn list on
     /// ids redraws when this moves.
     replacements: u64,
@@ -493,6 +516,7 @@ impl NotificationCenter {
                     "urgency": n.urgency.as_str(),
                     "expanded": n.expanded,
                     "consumed": n.consumed.iter().collect::<Vec<_>>(),
+                    "privacy_scope": if n.system_scope { "system" } else { "user" },
                 })
             })
             .collect();
@@ -624,6 +648,8 @@ impl NotificationCenter {
                 entry.expanded = false;
                 entry.acknowledged = false;
                 entry.consumed.clear();
+                entry.sound = Sound::default();
+                entry.system_scope = false;
                 self.replacements += 1;
                 return replaces;
             }
@@ -656,6 +682,8 @@ impl NotificationCenter {
             urgency,
             expanded: false,
             consumed: HashSet::new(),
+            sound: Sound::default(),
+            system_scope: false,
         });
         while self.history.len() > MAX_HISTORY {
             let dropped = self.history.pop_front().map(|n| n.id);
@@ -748,14 +776,13 @@ impl NotificationCenter {
             entry.desktop_entry = n.desktop_entry.trim_end_matches(".desktop").to_owned();
             entry.app_id = app_id.unwrap_or_default();
             entry.expanded = delivery.expanded;
+            entry.sound = n.sound;
+            entry.system_scope = n.system_scope;
         }
         if delivery.banner {
             self.push_banner(id, n.urgency);
         } else {
             self.banners.retain(|b| *b != id);
-        }
-        if delivery.sound && !n.sound.is_empty() {
-            self.sounds.push(n.sound);
         }
         self.persist();
         id
@@ -780,9 +807,13 @@ impl NotificationCenter {
         disabled
     }
 
-    /// Sounds due to play since the last call.
-    pub fn take_sounds(&mut self) -> Vec<Sound> {
-        std::mem::take(&mut self.sounds)
+    /// The sound to play as `id`'s banner comes on screen, by the
+    /// source's policy at that moment (see
+    /// [`notification_policy::plays_sound`]); `None` for silence.
+    pub fn banner_sound(&self, id: u64) -> Option<Sound> {
+        let n = self.history.iter().find(|n| n.id == id)?;
+        let policy = self.policy_for((!n.app_id.is_empty()).then_some(n.app_id.as_str()));
+        notification_policy::plays_sound(&policy, &n.sound).then(|| n.sound.clone())
     }
 
     /// Mark notifications seen (a banner shown, the list opened).
@@ -800,7 +831,7 @@ impl NotificationCenter {
     /// source with unseen notifications that may show while locked
     /// (see [`notification_policy::lock_screen`]).
     pub fn lock_screen(&self) -> Vec<LockSource> {
-        notification_policy::lock_screen(self.history.iter().rev(), |n| {
+        notification_policy::lock_screen(self.history.iter(), |n| {
             self.policy_for((!n.app_id.is_empty()).then_some(n.app_id.as_str()))
         })
     }
@@ -976,23 +1007,38 @@ mod tests {
             c.banners().iter().map(|n| n.id).collect::<Vec<_>>(),
             [mail, generic]
         );
-        // Mail is muted, chat had no banner: only the generic one sounds.
-        assert_eq!(c.take_sounds().len(), 1);
-        assert!(c.take_sounds().is_empty());
+        // Sounds play as banners show: chat has none to show, mail is
+        // muted, the generic one sounds.
+        let named = Some(Sound {
+            name: "message-new-instant".to_owned(),
+            file: String::new(),
+        });
+        assert_eq!(c.banner_sound(mail), None);
+        assert_eq!(c.banner_sound(generic), named);
         let _ = chat;
-        // Do Not Disturb holds every banner and sound but critical ones,
-        // which also break through the per-app banner switch.
+        // enable-sound-alerts is read when the banner shows, so turning
+        // it back on reaches a banner still waiting in the queue.
+        store.set("org.example.Mail", |a| a.enable_sound = true);
+        assert_eq!(c.banner_sound(mail), named);
+        // Do Not Disturb holds every banner but critical ones, which
+        // also break through the per-app banner switch, and sound.
         c.set_dnd(true);
         c.deliver(incoming("org.example.Mail", "Quiet", Urgency::Normal));
         let crit = c.deliver(incoming("org.example.Chat", "Alarm", Urgency::Critical));
         assert_eq!(c.banners().last().map(|n| n.id), Some(crit));
         assert!(c.banners().last().unwrap().expanded);
-        assert_eq!(c.take_sounds().len(), 1);
-        // suppress-sound (an empty Sound) plays nothing.
+        assert_eq!(c.banner_sound(crit), named);
+        // No sound hint: nothing to play.
         let mut quiet = incoming("org.example.Chat", "Alarm 2", Urgency::Critical);
         quiet.sound = Sound::default();
-        c.deliver(quiet);
-        assert!(c.take_sounds().is_empty());
+        let quiet = c.deliver(quiet);
+        assert_eq!(c.banner_sound(quiet), None);
+        // A replacement carries its own sound (notification.set()).
+        let mut update = incoming("org.example.Chat", "Alarm 3", Urgency::Critical);
+        update.replaces_id = Some(quiet);
+        assert_eq!(c.deliver(update), quiet);
+        assert_eq!(c.banner_sound(quiet), named);
+        assert_eq!(c.banner_sound(9999), None);
     }
 
     #[test]
@@ -1051,12 +1097,18 @@ mod tests {
         let (mut c, _store) = policed();
         c.set_queue_path(path.clone());
         let a = c.deliver(incoming("org.example.Mail", "A", Urgency::Normal));
-        let b = c.deliver(incoming("org.example.Mail", "B", Urgency::Normal));
+        let mut system = incoming("org.example.Mail", "B", Urgency::Normal);
+        system.system_scope = true;
+        let b = c.deliver(system);
         c.acknowledge(&[a]);
         let back = NotificationCenter::load(&path);
         let by = |id| back.history().iter().find(|n| n.id == id).unwrap();
         assert_eq!(by(b).app_id(), "org.example.Mail");
         assert!(by(a).acknowledged() && !by(b).acknowledged());
+        // The privacy scope survives; the sound does not (a restored
+        // banner comes back silent).
+        assert!(by(b).system_scope() && !by(a).system_scope());
+        assert!(by(b).sound().is_empty());
     }
 
     #[test]

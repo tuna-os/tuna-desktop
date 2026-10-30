@@ -26,8 +26,12 @@ use tuna_shell_control::{AuthEvent, AuthService};
 
 use crate::lock_auth::{AuthMachine, Effect, Host, MessageKind, View};
 use crate::lock_curtain::{self, Curtain, Page};
+use crate::lock_notifications::{LockEntry, NotificationsBox};
 use crate::lock_wiggle::Wiggle;
 use crate::logic;
+
+/// What the lock screen's notifications show now.
+pub type LockNotifications = Rc<dyn Fn() -> Vec<LockEntry>>;
 
 /// Sends a password with the single-password `Unlock`; returns the
 /// request id.
@@ -208,6 +212,8 @@ struct Screen {
     /// GNOME's on-screen keyboard for this prompt (#349), when enabled.
     _keyboard: Option<Rc<crate::osk::LockKeyboard>>,
     message_wiggle: Wiggle,
+    /// The unseen notifications (unlockDialog.js `NotificationsBox`).
+    notifications: NotificationsBox,
 }
 
 impl Screen {
@@ -284,6 +290,8 @@ pub struct LockUi {
     /// GNOME's on-screen keyboard, whose lock-screen keys edit only the
     /// unlock prompt (#349).
     osk: RefCell<Option<Rc<crate::osk::Osk>>>,
+    /// Where the notifications box reads what to show (#348).
+    notifications: RefCell<Option<LockNotifications>>,
 }
 
 impl LockUi {
@@ -307,6 +315,7 @@ impl LockUi {
             clock_format,
             wall_clock: RefCell::new(None),
             osk: RefCell::new(None),
+            notifications: RefCell::new(None),
         });
         {
             let weak = Rc::downgrade(&ui);
@@ -332,6 +341,28 @@ impl LockUi {
     /// Give each lock window GNOME's on-screen keyboard for its prompt.
     pub fn set_osk(&self, osk: Rc<crate::osk::Osk>) {
         *self.osk.borrow_mut() = Some(osk);
+    }
+
+    /// Read the lock screen's notifications from `source`.
+    pub fn set_notifications(&self, source: LockNotifications) {
+        *self.notifications.borrow_mut() = Some(source);
+    }
+
+    /// Bring every lock screen's notifications up to date: an arrival, a
+    /// banner seen, or a notification policy key (GNOME's
+    /// `NotificationsBox` follows its sources' counts and policies live).
+    pub fn refresh_notifications(&self) {
+        let screens = self.screens.borrow();
+        if screens.is_empty() {
+            return;
+        }
+        let Some(source) = self.notifications.borrow().clone() else {
+            return;
+        };
+        let entries = source();
+        for screen in screens.iter() {
+            screen.notifications.show(&entries);
+        }
     }
 
     /// Drop every lock window. Their entries are wiped at once, which is
@@ -381,6 +412,7 @@ impl LockUi {
                 window.present();
             }
             self.refresh_clock();
+            self.refresh_notifications();
             let weak = Rc::downgrade(self);
             *self.wall_clock.borrow_mut() =
                 Some(crate::wall_clock::WallClock::new(false, move || {
@@ -709,6 +741,10 @@ impl LockUi {
         overlay.set_child(Some(&curtain));
         bar.set_valign(gtk::Align::Start);
         overlay.add_overlay(&bar);
+        // GNOME's NotificationsBox: the bottom of the column under the
+        // clock and the prompt.
+        let notifications = NotificationsBox::new();
+        overlay.add_overlay(notifications.widget());
         // GNOME's keyboard box sits over the lock screen too: it opens
         // when the prompt takes the focus and types into that prompt
         // alone (`_onKeyFocusChanged`).
@@ -746,17 +782,27 @@ impl LockUi {
 
         // Vertical placement: GNOME puts the stack a third of the way
         // down (UnlockDialogLayout), which lands the 1280x800 clock at
-        // y 275 and the prompt at y 205.
+        // y 275 and the prompt at y 205. The notifications take the
+        // bottom, never reaching up into the clock.
         {
             let (clock_box, prompt) = (clock_box.clone(), prompt.clone());
+            let scroller = notifications.widget().clone();
             let last = Cell::new(-1);
             window.add_tick_callback(move |w, _| {
                 let height = w.height();
+                let (clock_top, prompt_top) = logic::lock_offsets(height);
                 if height != last.get() {
                     last.set(height);
-                    let (clock_top, prompt_top) = logic::lock_offsets(height);
                     clock_box.set_margin_top(clock_top);
                     prompt.set_margin_top(prompt_top);
+                }
+                // The measure includes margins, and may still hold the old
+                // ones for a frame: take the clock's own height.
+                let (_, natural, _, _) = clock_box.measure(gtk::Orientation::Vertical, -1);
+                let clock = natural - clock_box.margin_top() - clock_box.margin_bottom();
+                let room = (height - clock_top - clock).max(0);
+                if scroller.max_content_height() != room {
+                    scroller.set_max_content_height(room);
                 }
                 glib::ControlFlow::Continue
             });
@@ -1043,6 +1089,7 @@ impl LockUi {
             message,
             _keyboard: keyboard,
             message_wiggle,
+            notifications,
         };
         screen.apply(&self.auth.borrow().view());
         self.screens.borrow_mut().push(screen);

@@ -4,6 +4,8 @@
 # Usage:
 #   scripts/tuna-gtk-shell-proof [--display :N] [--artifacts DIR]
 #   --screenshot-keys-only runs panel readiness and actual keyboard captures only.
+#   --notify-lock-only runs panel readiness and the lock-screen notification
+#   and notification sound gates only (needs pam_wrapper).
 #   --grid-cancel-only --grid-cancel-admission FILE is an exact CI comparison slice.
 #   --expect-grid-cancel-old-negative is permitted only in that admitted slice.
 #
@@ -55,6 +57,16 @@
 #   G-NOTIFY-GROUP   two from one app group, collapsed; pressing expands
 #   G-NOTIFY-POLICY  per-app policy (#348): first notify registers the app,
 #                    disabling it drops banners and list entries
+#   G-NOTIFY-LOCK    while locked, allowed apps show name and count on the
+#                    lock screen, details only with details-in-lock-screen;
+#                    other apps are absent from the accessible tree (#348)
+#   G-NOTIFY-LOCK-PIXELS a redacted source's pixels do not depend on its
+#                    text; details change them and taking them back
+#                    restores the frame
+#   G-NOTIFY-LOCK-LIVE arrivals and policy keys reach the locked screen at
+#                    once; unlocking brings the queued banners and sounds
+#   G-NOTIFY-SOUND   banners play sound-name / sound-file as they show,
+#                    silenced by enable-sound-alerts or event-sounds off
 #   G-QS-SERVICES    quick settings shows the tiles of the services on
 #                    the bus (stub daemons on a private system bus, #55)
 #   G-QS-WIFI-MENU   the Wi-Fi menu scans, lists NetworkManager's networks
@@ -350,6 +362,7 @@ WIDTH=1280
 HEIGHT=800
 INSTALLED_PACKAGE=0
 SCREENSHOT_KEYS_ONLY=0
+NOTIFY_LOCK_ONLY=0
 GRID_CANCEL_ONLY=0
 GRID_CANCEL_OLD_NEGATIVE=0
 GRID_CANCEL_ADMISSION=""
@@ -361,9 +374,10 @@ while [ $# -gt 0 ]; do
         --expect-grid-cancel-old-negative) GRID_CANCEL_OLD_NEGATIVE=1; shift ;;
         --grid-cancel-admission) GRID_CANCEL_ADMISSION="$2"; shift 2 ;;
         --screenshot-keys-only) SCREENSHOT_KEYS_ONLY=1; shift ;;
+        --notify-lock-only) NOTIFY_LOCK_ONLY=1; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
-        --help|-h) sed -n '2,17p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,19p' "$0"; exit 0 ;;
         *) echo "tuna-gtk-shell-proof: unknown argument $1" >&2; exit 1 ;;
     esac
 done
@@ -649,6 +663,7 @@ cstate() {
 }
 
 . "$ROOT/scripts/lib/tuna-screenshot-keys-proof.sh"
+. "$ROOT/scripts/lib/tuna-notify-lock-proof.sh"
 
 # Compositor-side state (overview, focus, previews) for app stages.
 CSTATE="$ARTIFACTS/compositor-state.json"
@@ -944,6 +959,13 @@ case "\$*" in
 esac
 "$PY" "$ROOT/scripts/lib/tuna-audio-fixture.py" "$ARTIFACTS" --event
 PW_CLI
+# libcanberra's player stand-in: every event sound the shell or compositor
+# plays (volume feedback, bell, notifications) is one line here.
+cat >"$ARTIFACTS/bin/canberra-gtk-play" <<CANBERRA
+#!/bin/sh
+printf '%s %s\n' "\$(date +%s%N)" "\$*" >>"$ARTIFACTS/canberra-calls"
+CANBERRA
+chmod +x "$ARTIFACTS/bin/canberra-gtk-play"
 chmod +x "$ARTIFACTS/bin/wpctl" "$ARTIFACTS/bin/pw-dump" "$ARTIFACTS/bin/pw-cli"
 PATH="$ARTIFACTS/bin:$PATH"
 export PATH
@@ -1135,6 +1157,13 @@ fi
 # controls; that also proves the accessible tree.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel.json" 60 ||
     fail A11Y-PANEL "shell never registered on the accessibility bus"
+if [ "$NOTIFY_LOCK_ONLY" = 1 ]; then
+    [ -n "$PAM_ON" ] || fail G-NOTIFY-LOCK "--notify-lock-only needs pam_wrapper to unlock"
+    cstate '.active_workspace != null and .locked == false' "notification desktop ready" ||
+        fail G-NOTIFY-LOCK "desktop never became ready"
+    notify_lock_proof
+    exit 0
+fi
 if [ "$SCREENSHOT_KEYS_ONLY" = 1 ]; then
     cstate '.active_workspace != null and .locked == false' "screenshot desktop ready" ||
         fail G-SCREENSHOT-KEYS "desktop never became ready"
@@ -10665,6 +10694,9 @@ if [ -n "$PAM_ON" ]; then
         fail G-LOCK-FOCUS "password entry lost focus without clearing its cursor blink callback"
     fi
     pass G-LOCK-FOCUS "password rejection and acceptance leave no GtkText focus-out warning"
+
+    # GNOME's lock-screen notifications and notification sounds (#348).
+    notify_lock_proof
 
 else
     echo "tuna-gtk-shell-proof: G-UNLOCK skipped (no pam_wrapper)"

@@ -1,10 +1,13 @@
-//! Serialized, bounded volume feedback. Playback state comes from the native
+//! Event sounds through libcanberra's player, as mutter's
+//! `MetaSoundPlayer` plays them for GNOME Shell: serialized, bounded volume
+//! feedback, and notification sounds. Playback state comes from the native
 //! PipeWire event stream, so changing volume does not interrupt existing audio.
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gio::prelude::*;
 use gtk4::{gio, glib};
+use tuna_shell_host::notifications::Sound;
 
 thread_local! {
     static RUNNING: Cell<Option<bool>> = const { Cell::new(None) };
@@ -103,30 +106,15 @@ pub fn volume(quiet: bool, changed: bool, muted: bool) {
                     }
                 });
                 OWN_PLAYING.set(false);
-                let theme = format!("canberra.xdg-theme.name={}", settings.string("theme-name"));
-                let launcher = gio::SubprocessLauncher::new(
-                    gio::SubprocessFlags::STDOUT_SILENCE | gio::SubprocessFlags::STDERR_SILENCE,
-                );
-                let parent = std::process::id() as libc::pid_t;
-                launcher.set_child_setup(move || unsafe {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
-                        || libc::getppid() != parent
-                    {
-                        libc::_exit(127);
-                    }
-                    // The deadline survives exec and is independent of GTK's loop.
-                    libc::signal(libc::SIGALRM, libc::SIG_DFL);
-                    libc::alarm(5);
-                });
-                let Ok(process) = launcher.spawn(&[
-                    "canberra-gtk-play".as_ref(),
-                    "--id".as_ref(),
-                    "audio-volume-change".as_ref(),
-                    "--description".as_ref(),
-                    "Volume changed".as_ref(),
-                    "--property".as_ref(),
-                    theme.as_ref(),
-                ]) else {
+                let Some(process) = spawn_player(
+                    &settings,
+                    &[
+                        "--id",
+                        "audio-volume-change",
+                        "--description",
+                        "Volume changed",
+                    ],
+                ) else {
                     return;
                 };
                 PLAYER.with_borrow_mut(|old| *old = Some(process.clone()));
@@ -157,6 +145,63 @@ pub fn volume(quiet: bool, changed: bool, muted: bool) {
     });
 }
 
+/// One `canberra-gtk-play` run in `org.gnome.desktop.sound`'s
+/// `theme-name`, killed with the shell and after five seconds at most.
+fn spawn_player(settings: &gio::Settings, args: &[&str]) -> Option<gio::Subprocess> {
+    let theme = format!("canberra.xdg-theme.name={}", settings.string("theme-name"));
+    let launcher = gio::SubprocessLauncher::new(
+        gio::SubprocessFlags::STDOUT_SILENCE | gio::SubprocessFlags::STDERR_SILENCE,
+    );
+    let parent = std::process::id() as libc::pid_t;
+    launcher.set_child_setup(move || unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
+            || libc::getppid() != parent
+        {
+            libc::_exit(127);
+        }
+        // The deadline survives exec and is independent of GTK's loop.
+        libc::signal(libc::SIGALRM, libc::SIG_DFL);
+        libc::alarm(5);
+    });
+    let mut argv: Vec<&std::ffi::OsStr> = vec![std::ffi::OsStr::new("canberra-gtk-play")];
+    argv.extend(args.iter().map(std::ffi::OsStr::new));
+    argv.extend([
+        std::ffi::OsStr::new("--property"),
+        std::ffi::OsStr::new(&theme),
+    ]);
+    launcher.spawn(&argv).ok()
+}
+
+/// The player arguments for a notification's sound (messageTray.js 51
+/// `Sound.play`): its theme name if it has one (`play_from_theme`),
+/// else its file (`play_from_file`), described as "Notification sound".
+fn notification_args(sound: &Sound) -> Option<[&str; 4]> {
+    let (kind, what) = if !sound.name.is_empty() {
+        ("--id", sound.name.as_str())
+    } else if !sound.file.is_empty() {
+        ("--file", sound.file.as_str())
+    } else {
+        return None;
+    };
+    Some([kind, what, "--description", "Notification sound"])
+}
+
+/// Play a notification's sound as its banner shows. Like
+/// `MetaSoundPlayer`, `event-sounds` off plays nothing; sounds overlap
+/// rather than replace one another or the volume feedback.
+pub fn notification(sound: &Sound) {
+    let Some(args) = notification_args(sound) else {
+        return;
+    };
+    let Some(settings) = SETTINGS.with(Clone::clone) else {
+        return;
+    };
+    if settings.boolean("event-sounds") {
+        // The child reaps itself through GSubprocess's own child watch.
+        let _ = spawn_player(&settings, &args);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +217,32 @@ mod tests {
         assert!(!allowed(true, true, true, false, Some(true), true));
         assert!(!allowed(true, false, true, false, Some(true), false));
         assert!(!allowed(true, false, true, false, None, false));
+    }
+
+    #[test]
+    fn notification_sounds_prefer_the_theme_name_like_gnome() {
+        let sound = |name: &str, file: &str| Sound {
+            name: name.into(),
+            file: file.into(),
+        };
+        assert_eq!(
+            notification_args(&sound("message-new-instant", "/tmp/a.oga")),
+            Some([
+                "--id",
+                "message-new-instant",
+                "--description",
+                "Notification sound"
+            ])
+        );
+        assert_eq!(
+            notification_args(&sound("", "/tmp/a.oga")),
+            Some([
+                "--file",
+                "/tmp/a.oga",
+                "--description",
+                "Notification sound"
+            ])
+        );
+        assert_eq!(notification_args(&Sound::default()), None);
     }
 }
