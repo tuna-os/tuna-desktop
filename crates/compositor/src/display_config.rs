@@ -855,6 +855,40 @@ pub fn startup_layouts(
     layouts
 }
 
+/// The layout after a connector hotplug, as Mutter's
+/// `meta_monitor_manager_ensure_configured` picks it: the stored
+/// configuration for the connected monitors, else the first of the
+/// `existing` configurations (current, then previous) that covers
+/// exactly them (`meta_monitor_manager_is_config_complete`), else the
+/// linear one (`meta_monitor_config_manager_create_linear`) with the
+/// primary monitor kept first, each monitor at `fallback_scale`.
+/// Stored and existing configurations are fitted to the connectors as
+/// at startup ([`startup_layouts`]).
+pub fn hotplug_layouts(
+    stored: Option<&MonitorsConfig>,
+    existing: &[&MonitorsConfig],
+    connectors: &[StartupConnector],
+    primary: Option<&str>,
+    fallback_scale: f64,
+) -> Vec<OutputLayout> {
+    if stored.is_some() {
+        return startup_layouts(stored, connectors, fallback_scale);
+    }
+    let mut connected: Vec<&str> = connectors.iter().map(|c| c.name.as_str()).collect();
+    connected.sort_unstable();
+    if let Some(complete) = existing.iter().find(|c| c.connectors() == connected) {
+        return startup_layouts(Some(complete), connectors, fallback_scale);
+    }
+    let mut linear: Vec<StartupConnector> = connectors.to_vec();
+    if let Some(index) = primary.and_then(|p| linear.iter().position(|c| c.name == p)) {
+        let primary = linear.remove(index);
+        linear.insert(0, primary);
+    }
+    let mut layouts = startup_layouts(None, &linear, fallback_scale);
+    layouts.sort_by_key(|l| connectors.iter().position(|c| c.name == l.connector));
+    layouts
+}
+
 /// Mutter's current configuration and its history
 /// (`MetaMonitorConfigManager`), plus the pending confirmation of a
 /// persistent change (`persistent_timeout_id`).
@@ -954,6 +988,18 @@ impl ConfigManager {
     /// `meta_monitor_config_manager_pop_previous`.
     pub fn pop_previous(&mut self) -> Option<MonitorsConfig> {
         self.history.pop_front()
+    }
+
+    /// `meta_monitor_config_manager_get_previous`: the configuration
+    /// before the current one.
+    pub fn previous(&self) -> Option<&MonitorsConfig> {
+        self.history.front()
+    }
+
+    /// A hotplug configured the monitors: `ensure_configured` makes the
+    /// configuration current without asking for confirmation.
+    pub fn configured(&mut self, config: MonitorsConfig) {
+        self.set_current(config);
     }
 }
 
@@ -1728,5 +1774,72 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// Mutter's `ensure_configured` after a hotplug: stored, then the
+    /// current or previous configuration that covers exactly the
+    /// connected monitors, then linear with the primary kept first.
+    #[test]
+    fn hotplug_prefers_stored_then_complete_existing_then_linear() {
+        let all = startup_connectors();
+        let lit = |id: &str, x: i32, primary: bool| Some((id.to_owned(), (x, 0), primary, None));
+        // HDMI-A-1 at 1.5, left of the laptop: the configuration in use
+        // before HDMI-A-1 was unplugged.
+        let mut two = stored(
+            vec![
+                stored_logical(1280, true, &[("eDP-1", Some(mode(1920, 1080, 60.0)))]),
+                stored_logical(0, false, &[("HDMI-A-1", Some(mode(1920, 1080, 60.0)))]),
+            ],
+            &[],
+        );
+        two.logical[1].scale = 1.5;
+        let laptop = stored(vec![stored_logical(0, true, &[("eDP-1", None)])], &[]);
+        let back = &all[..2];
+        // Plugged back in: the current (laptop alone) is incomplete,
+        // the previous one returns with its scale and arrangement.
+        let layouts = hotplug_layouts(None, &[&laptop, &two], back, Some("eDP-1"), 1.0);
+        assert_eq!(
+            summary(&layouts),
+            [
+                ("eDP-1".to_owned(), lit("1920x1080@60.000", 1280, true)),
+                ("HDMI-A-1".to_owned(), lit("1920x1080@60.000", 0, false)),
+            ]
+        );
+        assert_eq!(layouts[1].enabled.as_ref().unwrap().scale, 1.5);
+        // A stored configuration for the set wins over both.
+        let kept = stored(
+            vec![
+                stored_logical(0, false, &[("eDP-1", None)]),
+                stored_logical(1920, true, &[("HDMI-A-1", None)]),
+            ],
+            &[],
+        );
+        assert_eq!(
+            summary(&hotplug_layouts(
+                Some(&kept),
+                &[&laptop, &two],
+                back,
+                Some("eDP-1"),
+                1.0
+            )),
+            [
+                ("eDP-1".to_owned(), lit("1920x1080@60.000", 0, false)),
+                ("HDMI-A-1".to_owned(), lit("1920x1080@60.000", 1920, true)),
+            ]
+        );
+        // Nothing covers the three: linear, the primary (HDMI-A-1)
+        // first, at the fallback scale.
+        let linear = hotplug_layouts(None, &[&laptop, &two], &all, Some("HDMI-A-1"), 1.0);
+        assert_eq!(
+            summary(&linear),
+            [
+                ("eDP-1".to_owned(), lit("1920x1080@60.000", 1920, false)),
+                ("HDMI-A-1".to_owned(), lit("1920x1080@60.000", 0, true)),
+                ("DP-1".to_owned(), lit("2560x1440@60.000", 3840, false)),
+            ]
+        );
+        assert!(linear
+            .iter()
+            .all(|l| l.enabled.as_ref().unwrap().scale == 1.0));
     }
 }
