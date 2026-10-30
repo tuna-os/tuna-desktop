@@ -156,3 +156,30 @@ no error enum. Real socketpair tests in
 crates/compositor/tests/protocol_gaps.rs cover v1 export with v2 import, v2
 export with v1 import, revocation and unknown handles. The isolated diff is
 retained in XDG-FOREIGN-V1-PATCH.diff; the pinned version stays 0.7.0.
+
+Issues #364 and #588 change src/wayland/drm_lease/mod.rs, with a crate-private
+accessor in src/backend/drm/device/mod.rs and a crate-private re-export in
+src/backend/drm/mod.rs, for wp_drm_lease_device_v1 as Mutter 51 offers it
+(meta-wayland-drm-lease.c, meta-drm-lease.c). DrmLeaseBuilder is now Clone
+and shares its device's plane claims: a compositor keeps an empty builder and
+claims planes on a clone (DrmLeaseBuilder::claim_plane) when a request
+arrives, as the lease handler has no access to the DrmDevice. The additive
+DrmLeaseState::revoke_lease ends a lease from the compositor's side (finished,
+connectors offered again), for Mutter's update_leases (a lessee the kernel
+destroyed because its client closed the lease fd) and update_connectors (a
+leased connector unplugged). Request validation follows
+wp_drm_lease_request_request_connector and wp_drm_lease_request_submit: a
+connector of another lease device posts wrong_device and a repeated one
+duplicate_connector when it is requested (upstream checked only at submit
+and posted wrong_device for a withdrawn connector); an empty submit posts
+empty_lease and stops (upstream went on to call the handler); a connector
+withdrawn since it was requested fails the lease with finished. A binding
+that cannot open a non-master DRM fd stays pending without events, as
+Mutter's lease_device_bind keeps it, until
+DrmLeaseState::retry_pending_binds (session activation); upstream sent the
+released destructor from inside the bind, which made wayland-backend panic
+on the destroyed object, and refused to create the global when the
+compositor could not open the node, where Mutter advertises it anyway.
+drm-smoke's D-LEASE leases the vkms connector through it with a real
+client. The isolated diff is retained in DRM-LEASE-PATCH.diff; the pinned
+version stays 0.7.0.

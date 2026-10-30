@@ -12,7 +12,8 @@
 //! - **Outputs**: every connected connector with its preferred mode and
 //!   a free CRTC, tiled left to right in the same order the output
 //!   inventory uses. Each output renders when its previous page flip
-//!   completed (vblank), so frames are paced by the display.
+//!   completed (vblank), so frames are paced by the display. Connectors
+//!   for lease (non-desktop ones, [`lease`]) stay off the desktop.
 //! - **Input**: libinput on the session's seat. Relative pointer motion
 //!   is accumulated here and clamped to the output union, so the window
 //!   manager keeps receiving absolute positions like the nested backend.
@@ -46,6 +47,7 @@ use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size};
 use crate::windows::ManagerInput;
 
 pub mod color;
+pub mod lease;
 pub mod libinput;
 pub mod libwacom;
 pub mod tablet;
@@ -389,6 +391,22 @@ impl DrmBackend {
             .collect()
     }
 
+    /// The `wp_drm_lease_device_v1` global for this device (Mutter's
+    /// native backend only); it never leases the desktop's CRTCs and
+    /// primary planes.
+    pub fn lease_device(
+        &self,
+        dh: &smithay::reexports::wayland_server::DisplayHandle,
+    ) -> Result<lease::LeaseDevice, String> {
+        lease::LeaseDevice::new(
+            dh,
+            &self.drm,
+            self.outputs.iter().map(|o| o.crtc).collect(),
+            self.outputs.iter().map(|o| o.surface.plane()).collect(),
+            lease::debug_lease_connectors(),
+        )
+    }
+
     /// Open the seat, the primary GPU, every connected output, and
     /// libinput. Fails with a readable reason (no seat daemon, no GPU,
     /// nothing connected) so the launcher can report it.
@@ -437,11 +455,21 @@ impl DrmBackend {
             .filter(|device| *device == drm.device_id());
         let mut used: Vec<crtc::Handle> = Vec::new();
         let mut outputs = Vec::new();
+        let lease_names = lease::debug_lease_connectors();
+        let mut for_lease = 0usize;
         for handle in resources.connectors() {
             let Ok(info) = drm.get_connector(*handle, false) else {
                 continue;
             };
             if info.state() != connector::State::Connected {
+                continue;
+            }
+            let name = lease::connector_name(&info);
+            // Connectors for lease never join the desktop (Mutter's
+            // meta_gpu_kms_read_current skips non-desktop ones).
+            if lease::is_for_lease(&name, lease::non_desktop(&drm, *handle), &lease_names) {
+                eprintln!("tuna-compositor: drm: connector {name} is for lease, not the desktop");
+                for_lease += 1;
                 continue;
             }
             // Mutter's monitor modes (#340): every connector mode,
@@ -507,7 +535,6 @@ impl DrmBackend {
             let mut color = color::CrtcColor::new(&drm, crtc);
             color.reset(&drm);
             let edid = color::connector_edid(&drm, *handle);
-            let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
             let (w, h) = mode.size();
             let size: Size<i32, Physical> = (i32::from(w), i32::from(h)).into();
             let (mm_w, mm_h) = info.size().unwrap_or((0, 0));
@@ -560,7 +587,10 @@ impl DrmBackend {
                 tint_fallback: false,
             });
         }
-        if outputs.is_empty() {
+        // Mutter runs with no monitor at all; a device whose connected
+        // connectors are all for lease (a headset alone) still starts, so
+        // the lease device can offer them. Nothing connected stays an error.
+        if outputs.is_empty() && for_lease == 0 {
             return Err(DrmInitError(format!(
                 "no connected output on {}",
                 path.display()
@@ -616,7 +646,10 @@ impl DrmBackend {
             relative_motion_events: 0,
             layout_generation: 0,
         };
-        if let Err(error) = backend.apply_layout(&layouts) {
+        // With every connector for lease there is no layout to apply.
+        if backend.outputs.is_empty() {
+            eprintln!("tuna-compositor: drm: no desktop output; every connector is for lease");
+        } else if let Err(error) = backend.apply_layout(&layouts) {
             // A stored mode the kernel refused: Mutter falls back to its
             // default configuration the same way.
             eprintln!("tuna-compositor: drm: stored display configuration not applied: {error}");
@@ -645,13 +678,14 @@ impl DrmBackend {
                     .unwrap_or_default(),
             );
         }
-        let (first_w, first_h) = backend.outputs[0].logical_size();
-        let first_loc = backend.outputs[0].loc;
-        backend.pointer = (
-            f64::from(first_loc.0) + f64::from(first_w) / 2.0,
-            f64::from(first_loc.1) + f64::from(first_h) / 2.0,
-        )
-            .into();
+        if let Some(first) = backend.outputs.first() {
+            let (first_w, first_h) = first.logical_size();
+            backend.pointer = (
+                f64::from(first.loc.0) + f64::from(first_w) / 2.0,
+                f64::from(first.loc.1) + f64::from(first_h) / 2.0,
+            )
+                .into();
+        }
         Ok((
             backend,
             DrmSources {
