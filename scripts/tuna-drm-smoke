@@ -162,7 +162,9 @@ done
 echo "tuna-drm-smoke: vkms at $CARD"
 
 echo "tuna-drm-smoke: building"
-cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-host -p tuna-shell-gtk \
+cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-host -p tuna-shell-gtk
+# `--example` alone would build only the example, so it is a second build.
+cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor \
     --example tuna-color-pixel-client
 "$ROOT/scripts/tuna-frame-pacer-build" "$ARTIFACTS/frame-pacer"
 
