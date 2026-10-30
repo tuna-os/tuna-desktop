@@ -33,6 +33,11 @@ before decoding.
 - Dash targets: `WindowIconGeometry`, `MAX_WINDOW_ICON_GEOMETRIES`, and
   appended `CommandKind::SetWindowIconGeometries` full replacements. Unknown
   windows are ignored by the compositor; an empty list selects monitor fallback.
+- Overview swipe (0.46): `Message::OverviewSwipe { state, settle_us }`
+  (peers >=46 only) carries GNOME's overview controls state while a
+  touchpad swipe holds it (`settle_us: None`) and where and how fast its
+  release settles, in `OVERVIEW_STATE_SCALE`ths up to `MAX_OVERVIEW_STATE`
+  (the app grid); the shell's app grid follows it above the window picker.
 - Messages: `Message`, `StateOp`, `CommandKind`, `CommandStatus`,
   `ErrorKind`.
 - State types: `WindowInfo`, `WorkspaceInfo`, `OutputInfo`, `PreviewInfo`,

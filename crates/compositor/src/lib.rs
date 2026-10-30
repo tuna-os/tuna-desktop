@@ -134,6 +134,7 @@ pub mod supervise;
 pub mod tablet;
 pub mod tablet_actions;
 pub(crate) mod tablet_settings;
+pub mod touchpad_swipe;
 mod transient_family;
 pub mod transitions;
 pub mod unlock;

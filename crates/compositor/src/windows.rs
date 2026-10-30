@@ -6454,58 +6454,25 @@ pub enum ManagerInput {
         /// Microseconds, the protocol's precision.
         utime: u64,
     },
-    /// Touchpad swipe gesture phases (#60). Three-finger swipes are
-    /// the shell's (overview, workspaces); others reach the client.
+    /// Touchpad swipe gesture phases (#60). Swipes of three or more
+    /// fingers are the shell's (overview, workspaces; see
+    /// [`crate::touchpad_swipe`]); others reach the client.
     SwipeBegin {
         fingers: u32,
         time: u32,
     },
     SwipeUpdate {
+        /// Accelerated, as clients receive it (pointer-gestures).
         delta: Point<f64, Logical>,
+        /// Unaccelerated, as GNOME's swipe trackers read it
+        /// (swipeTracker.js:142).
+        delta_unaccel: Point<f64, Logical>,
         time: u32,
     },
     SwipeEnd {
         cancelled: bool,
         time: u32,
     },
-}
-
-/// What a finished three-finger touchpad swipe does (GNOME 51).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SwipeAction {
-    /// Swipe up: open the overview.
-    OpenOverview,
-    /// Swipe down: close it.
-    CloseOverview,
-    /// Fingers move left: the next workspace slides in (content follows
-    /// the fingers, as on GNOME).
-    NextWorkspace,
-    /// Fingers move right: the previous workspace.
-    PreviousWorkspace,
-}
-
-/// Fingers GNOME reserves for its own swipes.
-pub const SHELL_SWIPE_FINGERS: u32 = 3;
-/// Distance a swipe must travel to act (logical pixels).
-pub const SWIPE_THRESHOLD: f64 = 100.0;
-
-/// Classify a finished swipe by its dominant axis; short swipes do
-/// nothing.
-pub fn swipe_action(dx: f64, dy: f64) -> Option<SwipeAction> {
-    if dx.abs().max(dy.abs()) < SWIPE_THRESHOLD {
-        return None;
-    }
-    Some(if dy.abs() >= dx.abs() {
-        if dy < 0.0 {
-            SwipeAction::OpenOverview
-        } else {
-            SwipeAction::CloseOverview
-        }
-    } else if dx < 0.0 {
-        SwipeAction::NextWorkspace
-    } else {
-        SwipeAction::PreviousWorkspace
-    })
 }
 
 /// X11 keycodes are kernel evdev numbers plus 8; the winit backend
@@ -7100,7 +7067,7 @@ impl WindowManager {
                     pointer.frame(state);
                 }
             }
-            ManagerInput::SwipeUpdate { delta, time } => {
+            ManagerInput::SwipeUpdate { delta, time, .. } => {
                 if let Some(pointer) = self.pointer.clone() {
                     pointer.gesture_swipe_update(
                         state,

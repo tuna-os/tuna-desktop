@@ -9037,29 +9037,32 @@ if ! jq -e '.gesture and .velocity >= 0.6 and .duration_ms >= 100 and .duration_
 fi
 pass G-SWIPE-VELOCITY "a fast flick lands in ${flick_ms}ms, a slow drag in ${drag_ms}ms"
 
+# GNOME sets the overview's state adjustment straight from a held swipe
+# (overview.js:359-380), so it follows the fingers with animations off
+# too; only the release's ease drops to 0 ms (animationUtils.js:23-33).
 gsettings set org.gnome.desktop.interface enable-animations false
-cstate '(.animations_enabled | not) and .overview_progress == 0' "reduced-motion swipe ready" ||
-    fail G-SWIPE-REDUCED-MOTION "live reduced-motion setting did not arrive"
+cstate '(.animations_enabled | not) and .overview_progress == 0' "animations-off swipe ready" ||
+    fail G-SWIPE-REDUCED-MOTION "live animations setting did not arrive"
 swipe_phase begin 0 0
 swipe_phase update 0 -180
-cstate '.overview_progress == 1 and (.overview_open | not)' "reduced-motion held up" ||
-    fail G-SWIPE-REDUCED-MOTION "held upward swipe retained an intermediate transition"
+cstate '.overview_progress > 0.55 and .overview_progress < 0.65 and (.overview_open | not)' "animations-off held up" ||
+    fail G-SWIPE-REDUCED-MOTION "held upward swipe did not follow the fingers"
 cp "$CSTATE" "$ARTIFACTS/swipe-reduced-motion-held-up.json"
 swipe_phase end 0 0
-cstate '.overview_open and .overview_progress == 1' "reduced-motion up released" ||
-    fail G-SWIPE-REDUCED-MOTION "upward release did not open the overview"
+cstate '.overview_open and .overview_progress == 1 and .overview_motion.release.duration_ms == 0' "animations-off up released" ||
+    fail G-SWIPE-REDUCED-MOTION "upward release did not open the overview at once"
 swipe_phase begin 0 0
 swipe_phase update 0 180
-cstate '.overview_progress == 0 and .overview_open' "reduced-motion held down" ||
-    fail G-SWIPE-REDUCED-MOTION "held downward swipe retained an intermediate transition"
+cstate '.overview_progress > 0.35 and .overview_progress < 0.45 and .overview_open' "animations-off held down" ||
+    fail G-SWIPE-REDUCED-MOTION "held downward swipe did not follow the fingers"
 cp "$CSTATE" "$ARTIFACTS/swipe-reduced-motion-held-down.json"
 swipe_phase end 0 0
-cstate '(.overview_open | not) and .overview_progress == 0' "reduced-motion down released" ||
-    fail G-SWIPE-REDUCED-MOTION "downward release did not close the overview"
+cstate '(.overview_open | not) and .overview_progress == 0 and .overview_motion.release.duration_ms == 0' "animations-off down released" ||
+    fail G-SWIPE-REDUCED-MOTION "downward release did not close the overview at once"
 gsettings set org.gnome.desktop.interface enable-animations true
 cstate '.animations_enabled' "gesture animations restored" ||
     fail G-SWIPE-REDUCED-MOTION "could not restore animation setting"
-pass G-SWIPE-REDUCED-MOTION "up/down gestures snap while held and settle correctly with reduced motion"
+pass G-SWIPE-REDUCED-MOTION "with animations off up/down gestures follow the fingers while held and land at once"
 
 # GNOME 51 eases the overview open with EASE_OUT_SINE and closed with
 # EASE_OUT_QUAD over 250 ms (#499). The compositor records the progress
@@ -9093,8 +9096,10 @@ jq -e '
 pass G-OVERVIEW-EASING "opening follows EASE_OUT_SINE and closing EASE_OUT_QUAD over 250 ms, sampled mid-transition"
 
 # A quick upward flick opens the overview from a quarter of the way,
-# as GNOME's swipe tracker projects it, and the fingers' 3 px/ms set
-# an out-cubic finish of 225 ms rather than a fixed rate.
+# as GNOME's swipe tracker projects it, and the fingers' 3.75 px/ms (75
+# px over the 20 ms after the still sample the tracker starts with,
+# swipeTracker.js:509-513) set an out-cubic finish of 180 ms rather than
+# a fixed rate. The first update crosses the 16 px drag threshold.
 swipe_timed() {
     swipe_sequence=$((swipe_sequence + 1))
     printf '{"phase":"%s","dy":%s,"time":%s,"sequence":%s}\n' \
@@ -9104,11 +9109,11 @@ swipe_timed() {
     sleep 0.2
 }
 swipe_timed begin 0 5000
-swipe_timed update -15 5010
+swipe_timed update -30 5010
 swipe_timed update -30 5020
-swipe_timed update -30 5030
+swipe_timed update -15 5030
 swipe_timed end 0 5040
-cstate '.overview_open and .overview_motion.release.target == 1 and .overview_motion.release.from == 0.25 and .overview_motion.release.curve == "ease-out-cubic" and (.overview_motion.release.duration_ms - 225 | if . < 0 then -. else . end) < 0.01' "flick release" ||
+cstate '.overview_open and .overview_motion.release.target == 1 and .overview_motion.release.from == 0.25 and .overview_motion.release.curve == "ease-out-cubic" and (.overview_motion.release.duration_ms - 180 | if . < 0 then -. else . end) < 0.01' "flick release" ||
     fail G-SWIPE-MOMENTUM "a quarter-way flick did not carry its velocity into the finish"
 cstate '.overview_progress == 1' "flick settled" ||
     fail G-SWIPE-MOMENTUM "the flick did not settle open"
@@ -9117,6 +9122,58 @@ xdotool key Escape
 cstate '(.overview_open | not) and .overview_progress == 0' "flick closed" ||
     fail G-SWIPE-MOMENTUM "the overview did not close after the flick"
 pass G-SWIPE-MOMENTUM "a released swipe keeps its momentum: projected target and velocity-derived out-cubic duration"
+
+# GNOME 51's overview swipe spans the desktop, the window picker and the
+# app grid (ControlsState 0-2, overviewControls.js:757-797). From the
+# window picker fingers held up draw the app grid part way (the shell's
+# grid surface maps and follows, `_updateAppDisplayVisibility`), and the
+# release lands on the app grid with Show Apps checked (`gestureEnd`),
+# the grid easing over the swipe's own settle time; down comes back to
+# the window picker. A swipe from the desktop stops at the window picker
+# (swipeTracker.js:547-565: the overview tracker has no long swipes).
+swipe_timed begin 0 39000
+swipe_timed update -300 39010
+swipe_timed update -300 39020
+swipe_timed end 0 39400
+cstate '.overview_open and .overview_state == 1 and (.overview_app_grid | not) and .overview_motion.release.from == 1 and .overview_motion.release.target == 1' "desktop swipe stops at the picker" ||
+    fail G-SWIPE-APPGRID "a long swipe from the desktop did not stop at the window picker"
+grid_swipe_mark="$(log_mark)"
+swipe_timed begin 0 40000
+swipe_timed update -90 40010
+cstate '.touchpad_swipe.active and .overview_open and .overview_progress == 1 and .overview_state > 1.299 and .overview_state < 1.301 and (.layers | any(.namespace == "tuna-shell-appgrid"))' "app grid held part way" ||
+    fail G-SWIPE-APPGRID "a held swipe up from the window picker did not draw the app grid part way"
+cp "$CSTATE" "$ARTIFACTS/swipe-appgrid-held.json"
+swipe_timed update -60 40020
+cstate '.touchpad_swipe.active and .overview_state > 1.499 and .overview_state < 1.501' "app grid follows" ||
+    fail G-SWIPE-APPGRID "the app grid stopped following the fingers"
+scrot "$ARTIFACTS/24-appgrid-swipe-held.png" >/dev/null
+swipe_timed end 0 40030
+cstate '.overview_motion.release.from > 1.499 and .overview_motion.release.from < 1.501 and .overview_motion.release.target == 2 and .overview_motion.release.duration_ms > 0' "app grid release" ||
+    fail G-SWIPE-APPGRID "the release did not project onto the app grid"
+cstate '.overview_open and .overview_state == 2 and .overview_app_grid and (.layers | any(.namespace == "tuna-shell-appgrid"))' "app grid settled" ||
+    fail G-SWIPE-APPGRID "the swipe did not settle on the app grid"
+log_wait "$grid_swipe_mark" "grid-anim grid-swipe-in settle" ||
+    fail G-SWIPE-APPGRID "the shell's grid did not ease in on the swipe's release"
+cp "$CSTATE" "$ARTIFACTS/swipe-appgrid-settled.json"
+grid_swipe_mark="$(log_mark)"
+swipe_timed begin 0 41000
+swipe_timed update 90 41010
+cstate '.touchpad_swipe.active and .overview_state > 1.699 and .overview_state < 1.701' "app grid held down" ||
+    fail G-SWIPE-APPGRID "a held swipe down from the app grid did not follow"
+swipe_timed update 600 41020
+cstate '.touchpad_swipe.active and .overview_state == 1 and .overview_open' "app grid bound" ||
+    fail G-SWIPE-APPGRID "a swipe down from the app grid went past the window picker"
+swipe_timed end 0 41030
+cstate '.overview_open and .overview_state == 1 and (.overview_app_grid | not)' "back to the picker" ||
+    fail G-SWIPE-APPGRID "the swipe down did not come back to the window picker"
+log_wait "$grid_swipe_mark" "grid-anim grid-swipe-out" ||
+    fail G-SWIPE-APPGRID "the shell's grid did not leave on the swipe's release"
+cstate '(.layers | any(.namespace == "tuna-shell-appgrid")) | not' "grid hidden" ||
+    fail G-SWIPE-APPGRID "the app grid surface stayed mapped on the window picker"
+xdotool key Escape
+cstate '(.overview_open | not) and .overview_progress == 0' "appgrid swipe closed" ||
+    fail G-SWIPE-APPGRID "the overview did not close after the app grid swipes"
+pass G-SWIPE-APPGRID "the overview swipe stops at the picker from the desktop, follows into the app grid from it and lands there, and comes back"
 
 # GNOME's workspace thumbnails: a window moved one workspace right makes
 # three (the trailing empty one included), so the overview shows the
@@ -9172,6 +9229,34 @@ ring_vivid="$(awk -v r="$1" -v g="$2" -v b="$3" 'BEGIN {
 if [ "$ring_vivid" != yes ]; then
     fail G-WS-THUMBS "no accent indicator around the active thumbnail (pixel ${1:-?} ${2:-?} ${3:-?})"
 fi
+# GNOME's overview workspaces follow a sideways swipe (WorkspacesView's
+# scroll adjustment, workspacesView.js:960-1002): held, the strip sits
+# between workspaces and the active one stays; the overview tracker allows
+# long swipes (workspacesView.js:876), so one release can settle two
+# workspaces on, easing out-cubic over the projected duration.
+ov_scrolled() { echo "(.overview_motion.scroll | .position - (.workspaces | index($home_ws)))"; }
+swipe_at begin 0 50000
+swipe_at update -200 50010
+cstate ".overview_open and .overview_motion.scroll.held and ($(ov_scrolled) | . > 0.499 and . < 0.501) and .active_workspace == $home_ws" "overview strip held" ||
+    fail G-SWIPE-OVERVIEW-SCROLL "a held sideways swipe did not hold the overview's workspaces half way"
+cp "$CSTATE" "$ARTIFACTS/swipe-overview-scroll-held.json"
+swipe_at update -500 50020
+cstate ".overview_motion.scroll.held and ($(ov_scrolled) | . > 1.749 and . < 1.751) and .active_workspace == $home_ws" "overview strip follows" ||
+    fail G-SWIPE-OVERVIEW-SCROLL "the overview's workspaces stopped following past the next one"
+scrot "$ARTIFACTS/24g-overview-scroll-held.png" >/dev/null
+swipe_at end 0 50030
+cstate '.overview_motion.scroll_release | .target - .from > 0 and .curve == "ease-out-cubic" and .duration_ms > 0' "overview strip release" ||
+    fail G-SWIPE-OVERVIEW-SCROLL "the release did not ease on toward the last workspace"
+cstate ".overview_open and .active_workspace == $home_ws + 2 and .overview_motion.scroll == null" "two workspaces on" ||
+    fail G-SWIPE-OVERVIEW-SCROLL "the release did not settle two workspaces on"
+cp "$CSTATE" "$ARTIFACTS/swipe-overview-scroll-settled.json"
+swipe_at begin 0 51000
+swipe_at update 500 51010
+swipe_at update 300 51020
+swipe_at end 0 51030
+cstate ".overview_open and .active_workspace == $home_ws and .overview_motion.scroll == null" "overview strip home" ||
+    fail G-SWIPE-OVERVIEW-SCROLL "a long swipe back did not return two workspaces"
+pass G-SWIPE-OVERVIEW-SCROLL "the overview's workspaces follow a held sideways swipe across workspaces and a release settles two on and back"
 target="$(jq -r ".thumbnails[] | select(.workspace == $home_ws + 1) | .rect | \"\(.[0] + .[2] / 2) \(.[1] + .[3] / 2)\"" "$CSTATE")"
 # shellcheck disable=SC2086
 xdotool mousemove --window "$WID" $target click 1

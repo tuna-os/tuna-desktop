@@ -39,6 +39,8 @@ const DECELERATION_PARABOLA_MULTIPLIER: f64 = 0.35;
 /// The derivative of ease-out-cubic at 0: a release keeps its speed.
 const DURATION_MULTIPLIER: f64 = 3.0;
 const ANIMATION_BASE_VELOCITY: f64 = 0.002;
+/// `EPSILON`: a swipe beginning this close to a workspace began on it.
+const SNAP_EPSILON: f64 = 0.005;
 /// Finished motions kept for the state snapshot.
 const HISTORY_LEN: usize = 8;
 
@@ -147,8 +149,41 @@ pub fn swipe_release_over(
     distance: f64,
 ) -> (f64, f64) {
     let last = slots.saturating_sub(1) as f64;
+    let bounds = ((initial - 1.0).max(0.0), (initial + 1.0).min(last));
+    release_within(
+        progress, initial, bounds, slots, velocity, cancelled, distance,
+    )
+}
+
+/// `_getBounds` for a swipe that began at `progress` on a strip of
+/// `slots`: one workspace either side of the closest one, or of the two
+/// it lay between when the fingers caught a switch mid-flight
+/// (swipeTracker.js:547-565).
+pub fn swipe_bounds(progress: f64, slots: usize) -> (f64, f64) {
+    let last = slots.saturating_sub(1) as f64;
+    let closest = progress.round().clamp(0.0, last);
+    let (prev, next) = if (closest - progress).abs() < SNAP_EPSILON {
+        (closest, closest)
+    } else {
+        (progress.floor(), progress.ceil())
+    };
+    ((prev - 1.0).max(0.0), (next + 1.0).min(last))
+}
+
+/// [`swipe_release_over`] within explicit `bounds` (`_getEndProgress`
+/// and `_endGesture`, swipeTracker.js:601-658).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn release_within(
+    progress: f64,
+    initial: f64,
+    (low, high): (f64, f64),
+    slots: usize,
+    velocity: f64,
+    cancelled: bool,
+    distance: f64,
+) -> (f64, f64) {
+    let last = slots.saturating_sub(1) as f64;
     let closest = |p: f64| p.round().clamp(0.0, last);
-    let (low, high) = ((initial - 1.0).max(0.0), (initial + 1.0).min(last));
     let end = if cancelled {
         initial
     } else if velocity.abs() < VELOCITY_THRESHOLD {

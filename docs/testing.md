@@ -192,7 +192,7 @@ cannot satisfy the gate.
 | `gtk-shell` | `TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts` | gtk4-layer-shell (`scripts/ci-install-gtk4-layer-shell`), `xwayland pipewire wireplumber at-spi2-core python3-pyatspi fonts-cantarell ffmpeg libpam-wrapper` and the GStreamer PipeWire plugins; see the job for the full list | GTK shell panel, calendar, quick settings, overview, notifications, lock and unlock, AT-SPI trees; writes `assertions.txt` |
 | `gtk-shell` | `scripts/tuna-scale-proof --artifacts gtk-shell-artifacts/scale` | as above | The same session at 150 percent scale; writes `assertions.txt` |
 | `gtk-shell` | `scripts/tuna-slow-portal-proof --artifacts gtk-shell-artifacts/slow-portal` | as above | On a dbus-daemon bus whose portal activation hangs, the shell owns `org.gnome.Shell` within 15 s (40 s on GTK before 4.17, whose GtkApplication always waits on the inhibit portal) and makes no GDK portal call; writes `assertions.txt` |
-| `drm-smoke` | `scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts` | `seatd jq ffmpeg kmod`; run `scripts/ci-install-vkms` after `apt-get update` to ensure vkms for the running kernel | Hardware backend on the vkms virtual KMS device; needs `sudo` for `modprobe` and seatd |
+| `drm-smoke` | `scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts` | `seatd jq ffmpeg kmod python3-evdev python3-gi gir1.2-gtk-4.0 gsettings-desktop-schemas`; run `scripts/ci-install-vkms` after `apt-get update` to ensure vkms for the running kernel | Hardware backend on the vkms virtual KMS device; needs `sudo` for `modprobe`, seatd and uinput |
 
 `app-content` and `scroll-proof` download Playwright and Chromium into a
 temporary venv on every run, so they need network access.
@@ -219,6 +219,32 @@ includes vkms without a separate extra-modules package. No usable candidate
 or a still-missing module fails setup, and package installation errors are
 fatal. Module loading and the real vkms device and presentation assertions
 remain mandatory in the smoke test.
+
+The smoke test also drives real libinput with uinput devices (ADR 0008),
+so it needs `python3-evdev` and the GTK 4 PyGObject client packages the
+CI job installs. `D-TABLET` emulates a Wacom Cintiq 22HD
+(`scripts/lib/tuna-uinput-tablet.py`). `D-TOUCHPAD-SWIPE` (P-IN-02)
+emulates a Synaptics TM3053-004 clickpad as the kernel's rmi4 driver
+creates it (`scripts/lib/tuna-uinput-touchpad.py`, the capabilities of
+libinput's `litest-device-synaptics-rmi4.c`). The kernel timestamps its
+finger motion and libinput classifies it as a touchpad and turns it into
+pointer motion, two-finger scrolling and `LIBINPUT_EVENT_GESTURE_SWIPE_*`.
+The phase then checks GNOME 51's swipe trackers against the compositor
+state: up and down open and close the overview, which follows the held
+fingers; left and right switch workspace; a slow half swipe settles
+back; a short fast flick completes; a long swipe from the desktop stops
+at the window picker, and from the picker the swipe follows into the app
+grid (the shell's grid surface maps and eases on release) and back; in
+the open overview, with four fixed workspaces (mutter's schema is
+compiled in when the host lacks it), a sideways swipe scrolls the
+workspaces under the fingers and a fast flick settles two or more on;
+four fingers are the shell's too; scrolling, and no swipe, reaches a GTK
+4 client; turning natural-scroll off reverses the gestures; and the
+swipe follows under reduced motion and with animations off. The emulator
+also runs on its own and reads
+commands (`down N`, `move DX DY MS`, `hold MS`, `up`, `swipe N DX DY MS
+[PAUSE]`, `scroll`, `tap`, `click`) on stdin, in millimetres and
+milliseconds. Other phases can import `create_touchpad()` from it.
 
 ## Marlin VM lane
 
@@ -334,6 +360,13 @@ Proof `G-ANIMATION-CLOCK` samples the overview this way at 125 and 250 ms
 in both directions. `G-ANIMATIONS-OFF` and `G-INTROSPECT-MOTION` check the
 live motion policy: animations off snaps everything, Reduced Motion
 (fade-only) snaps overview and strip motion but keeps the idle-shield fade.
+A held touchpad swipe is not an animation. As in GNOME 51 (overview.js:359-380,
+animationUtils.js:23-33), the overview follows the fingers under every
+policy, across the desktop, the window picker and the app grid, and so do
+the overview's workspaces under a sideways swipe. The release eases under
+full motion and Reduced Motion, with the slow-down factor applied, and
+lands at once with animations off (`G-SWIPE-REDUCED-MOTION`,
+`G-SWIPE-APPGRID`, `G-SWIPE-OVERVIEW-SCROLL`, `D-TOUCHPAD-SWIPE`).
 
 ## Frame cost
 
