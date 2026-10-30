@@ -126,6 +126,12 @@ struct ManagedWindow {
     /// `preferred_logical_monitor`): where it was placed or the user
     /// last moved it, kept while it waits on another output.
     preferred_output: Option<String>,
+    /// Where the last output change put the window before the workarea
+    /// constraint moved it, and where the constraint put it (Mutter's
+    /// `unconstrained_rect`): the next output change starts from the
+    /// former while the window still sits at the latter, so a monitor
+    /// round trip returns it exactly.
+    unconstrained: Option<(Rectangle<i32, Logical>, Rectangle<i32, Logical>)>,
 }
 
 /// Compositor-side presentation layout (002 window actions).
@@ -548,6 +554,11 @@ impl WindowManager {
 
     /// Output scale/mode changes alter logical workareas independently of client
     /// requests. Preserve fitting windows that were fully visible, once per change.
+    /// Output changes the runtime reports to
+    /// [`relocate_for_monitors_changed`](Self::relocate_for_monitors_changed)
+    /// are handled there, which takes over this baseline: this pass catches
+    /// the workarea changes nothing re-homed (the nested output's size and
+    /// scale, a sensor rotation).
     fn reconcile_floating_workareas(&mut self, state: &State) {
         if self.grab.is_some() {
             return;
@@ -559,46 +570,19 @@ impl WindowManager {
                 .iter()
                 .zip(&self.floating_workareas)
                 .all(|(output, (name, area))| {
-                    output.name == *name
-                        && *area
-                            == (
-                                output.loc.0,
-                                output.loc.1.saturating_add(WORK_AREA_TOP),
-                                output.size.w,
-                                output.size.h.saturating_sub(WORK_AREA_TOP),
-                            )
+                    output.name == *name && *area == floating_workarea(output.loc, output.size)
                 })
         {
             return;
         }
-        let current: Vec<_> = state
-            .outputs
-            .iter()
-            .map(|output| {
-                (
-                    output.name.clone(),
-                    (
-                        output.loc.0,
-                        output.loc.1.saturating_add(WORK_AREA_TOP),
-                        output.size.w,
-                        output.size.h.saturating_sub(WORK_AREA_TOP),
-                    ),
-                )
-            })
-            .collect();
+        let current = output_workareas(state);
         let mut moved = Vec::new();
         for (&id, window) in &mut self.windows {
             if window.layout != WindowLayout::Floating || window.unplaced {
                 continue;
             }
-            let rect = (
-                window.geometry.loc.x,
-                window.geometry.loc.y,
-                window.geometry.size.w,
-                window.geometry.size.h,
-            );
             if let Some((x, y, _, _)) = crate::output_constraints::reposition_on_output(
-                rect,
+                rect_tuple(window.geometry),
                 &self.floating_workareas,
                 &current,
             ) {
@@ -1721,6 +1705,7 @@ impl WindowManager {
                 sticky: false,
                 x11_parent: None,
                 preferred_output: None,
+                unconstrained: None,
             },
         );
         self.place_transient(surface, id);
@@ -2096,6 +2081,7 @@ impl WindowManager {
                 sticky: false,
                 x11_parent: None,
                 preferred_output: None,
+                unconstrained: None,
             },
         );
         if let Some(parent) = surface
@@ -6124,10 +6110,12 @@ impl WindowManager {
     /// the output it prefers when that is connected (so it returns to a
     /// monitor plugged back in), else stays on its output, else moves to
     /// the primary; it keeps its relative place there
-    /// (`move_rect_between_rects`). `before` is each output's rectangle
-    /// before the change ([`State::output_slices`]). Restore rects
-    /// follow the same way. Derived layouts (maximized, tiled,
-    /// fullscreen, strip) are re-resolved by
+    /// (`move_rect_between_rects`) and, wholly visible before, stays
+    /// wholly inside that output's workarea (`constrain_fully_onscreen`).
+    /// `before` is each output's rectangle before the change
+    /// ([`State::output_slices`]). Restore rects follow the same way.
+    /// Derived layouts (maximized, tiled, fullscreen, strip) are
+    /// re-resolved by
     /// [`reapply_derived_layouts`](Self::reapply_derived_layouts).
     /// Focus and workspaces never change: no window is lost. Returns
     /// how many windows moved.
@@ -6138,19 +6126,40 @@ impl WindowManager {
     ) -> usize {
         let after = state.output_slices();
         let primary = state.primary_output_name();
+        let find = |name: &str| after.iter().find(|(n, _)| n == name);
+        // meta_window_find_monitor_from_id: the preferred output, else
+        // the window's own, else the primary.
         let target = |preferred: Option<&str>, old: &str| {
-            let find = |name: &str| after.iter().find(|(n, _)| n == name).map(|(_, r)| *r);
             preferred
                 .and_then(find)
                 .or_else(|| find(old))
                 .or_else(|| primary.as_deref().and_then(find))
         };
-        let relocate = |geo: Rectangle<i32, Logical>, preferred: Option<&str>| {
-            let (old_name, old_rect) = Self::output_of(geo, before)?;
-            let new_rect = target(preferred, old_name)?;
-            (new_rect != *old_rect).then(|| move_rect_between_rects(geo, *old_rect, new_rect))
+        // meta_window_move_between_rects: move_rect_between_rects on the
+        // unconstrained rect `free` of the window shown at `shown`, then
+        // the constraints (META_MOVE_RESIZE_CONSTRAIN) on the new layout.
+        let relocate = |shown: Rectangle<i32, Logical>,
+                        free: Rectangle<i32, Logical>,
+                        preferred: Option<&str>| {
+            let (old_name, old_rect) = Self::output_of(shown, before)?;
+            let (new_name, new_rect) = target(preferred, old_name)?;
+            if new_rect == old_rect {
+                return None;
+            }
+            let moved = move_rect_between_rects(free, *old_rect, *new_rect);
+            let constrained = crate::output_constraints::keep_fully_visible(
+                rect_tuple(shown),
+                floating_workarea((old_rect.loc.x, old_rect.loc.y), old_rect.size),
+                rect_tuple(moved),
+                floating_workarea((new_rect.loc.x, new_rect.loc.y), new_rect.size),
+            )
+            .map_or(moved, |(x, y, _, _)| {
+                Rectangle::new((x, y).into(), moved.size)
+            });
+            Some((new_name, moved, constrained))
         };
         let mut moved = 0;
+        let mut configure = Vec::new();
         let mut ids: Vec<u64> = self.windows.keys().copied().collect();
         ids.sort_unstable();
         for id in ids {
@@ -6164,24 +6173,38 @@ impl WindowManager {
             let preferred = window.preferred_output.clone();
             let mut shifted = false;
             if window.layout == WindowLayout::Floating {
-                if let Some(geo) = relocate(window.geometry, preferred.as_deref()) {
+                let free = match window.unconstrained {
+                    Some((free, shown)) if shown == window.geometry => free,
+                    _ => window.geometry,
+                };
+                if let Some((output, free, geo)) =
+                    relocate(window.geometry, free, preferred.as_deref())
+                {
                     eprintln!(
-                        "tuna-compositor: window {id} re-homed to {} from {:?} to {:?}",
-                        preferred.as_deref().unwrap_or("-"),
-                        window.geometry,
-                        geo
+                        "tuna-compositor: window {id} re-homed to {output} from {:?} to {:?}",
+                        window.geometry, geo
                     );
+                    window.unconstrained = (free != geo).then_some((free, geo));
                     window.geometry = geo;
+                    configure.push(id);
                     shifted = true;
                 }
             }
             if let Some(restore) = window.restore {
-                if let Some(geo) = relocate(restore, preferred.as_deref()) {
+                if let Some((_, _, geo)) = relocate(restore, restore, preferred.as_deref()) {
                     window.restore = Some(geo);
                     shifted = true;
                 }
             }
             moved += usize::from(shifted);
+        }
+        // This change is handled: the tick's workarea pass must not take
+        // it for a fresh one and clamp the re-homed windows into whichever
+        // output held their new place in the old layout (Mutter re-queues
+        // the constraints, which only see the new layout).
+        self.floating_workareas = output_workareas(state);
+        for id in configure {
+            self.configure(id, self.model.focused() == Some(id));
         }
         moved
     }
@@ -7882,6 +7905,36 @@ impl WindowManager {
         eprintln!("tuna-compositor: switcher {action:?}");
         self.switcher_queue.push(action);
     }
+}
+
+/// The workarea floating windows are kept wholly inside on an output at
+/// `loc` of `size`: the output minus the shell panel strip
+/// ([`WORK_AREA_TOP`]).
+fn floating_workarea(loc: (i32, i32), size: Size<i32, Logical>) -> crate::output_constraints::Rect {
+    (
+        loc.0,
+        loc.1.saturating_add(WORK_AREA_TOP),
+        size.w,
+        size.h.saturating_sub(WORK_AREA_TOP),
+    )
+}
+
+/// Every output's [`floating_workarea`], in registration order.
+fn output_workareas(state: &State) -> Vec<(String, crate::output_constraints::Rect)> {
+    state
+        .outputs
+        .iter()
+        .map(|output| {
+            (
+                output.name.clone(),
+                floating_workarea(output.loc, output.size),
+            )
+        })
+        .collect()
+}
+
+fn rect_tuple(rect: Rectangle<i32, Logical>) -> crate::output_constraints::Rect {
+    (rect.loc.x, rect.loc.y, rect.size.w, rect.size.h)
 }
 
 /// Mutter's `move_rect_between_rects` (window.c): a window that fits

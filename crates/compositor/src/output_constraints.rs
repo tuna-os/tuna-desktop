@@ -17,26 +17,38 @@ fn contains(area: Rect, window: Rect) -> bool {
         && i64::from(y) + i64::from(h) <= i64::from(ay) + i64::from(ah)
 }
 
-/// Move only when the old rectangle was wholly visible on the same named
-/// output. Never resize a client, migrate a removed output, or undo a user move.
-pub(crate) fn reposition(window: Rect, old: Rect, new: Rect) -> Option<Rect> {
-    if old == new || !contains(old, window) || window.2 > new.2 || window.3 > new.3 {
+/// Mutter 51's `constrain_fully_onscreen` for a window an output change
+/// moved from `before` to `moved`: one wholly inside the old workarea `old`
+/// that fits the new workarea `new` ends wholly inside `new`. `None` when it
+/// was not wholly visible, does not fit, or already sits inside. Never
+/// resizes a client.
+pub(crate) fn keep_fully_visible(before: Rect, old: Rect, moved: Rect, new: Rect) -> Option<Rect> {
+    if !contains(old, before) || moved.2 > new.2 || moved.3 > new.3 {
         return None;
     }
-    let max_x = i64::from(new.0) + i64::from(new.2) - i64::from(window.2);
-    let max_y = i64::from(new.1) + i64::from(new.3) - i64::from(window.3);
+    let max_x = i64::from(new.0) + i64::from(new.2) - i64::from(moved.2);
+    let max_y = i64::from(new.1) + i64::from(new.3) - i64::from(moved.3);
     if max_x < i64::from(new.0) || max_y < i64::from(new.1) {
         return None;
     }
-    let x = i64::from(window.0).clamp(i64::from(new.0), max_x);
-    let y = i64::from(window.1).clamp(i64::from(new.1), max_y);
+    let x = i64::from(moved.0).clamp(i64::from(new.0), max_x);
+    let y = i64::from(moved.1).clamp(i64::from(new.1), max_y);
     let result = (
         i32::try_from(x).ok()?,
         i32::try_from(y).ok()?,
-        window.2,
-        window.3,
+        moved.2,
+        moved.3,
     );
-    (result != window).then_some(result)
+    (result != moved).then_some(result)
+}
+
+/// Move only when the old rectangle was wholly visible on the same named
+/// output. Never resize a client, migrate a removed output, or undo a user move.
+pub(crate) fn reposition(window: Rect, old: Rect, new: Rect) -> Option<Rect> {
+    if old == new {
+        return None;
+    }
+    keep_fully_visible(window, old, window, new)
 }
 
 /// Output identity is stable across scale changes; output removal has its own
@@ -136,6 +148,51 @@ mod tests {
                 (2000, 32, 1024, 608)
             ),
             Some((2000, 100, 640, 420))
+        );
+    }
+    #[test]
+    fn rehomed_window_stays_below_the_panel_only_when_it_was_wholly_visible() {
+        // Re-homed from (0,40) on a 1024x768 output to 768x576 scaled: the
+        // relative place lands at y=22, under the panel strip, so the
+        // workarea constraint takes it back to the strip's edge.
+        assert_eq!(
+            keep_fully_visible(
+                (0, 40, 480, 320),
+                (0, 32, 1024, 736),
+                (0, 22, 480, 320),
+                (0, 32, 768, 544)
+            ),
+            Some((0, 32, 480, 320))
+        );
+        // Already wholly inside: nothing to do.
+        assert_eq!(
+            keep_fully_visible(
+                (1296, 240, 480, 320),
+                (1024, 32, 1024, 736),
+                (2192, 137, 480, 320),
+                (2048, 32, 768, 544)
+            ),
+            None
+        );
+        // Partly under the panel before the change: left where it landed.
+        assert_eq!(
+            keep_fully_visible(
+                (0, 10, 480, 320),
+                (0, 32, 1024, 736),
+                (0, 5, 480, 320),
+                (0, 32, 768, 544)
+            ),
+            None
+        );
+        // Larger than the new workarea: never resized or forced.
+        assert_eq!(
+            keep_fully_visible(
+                (0, 40, 900, 320),
+                (0, 32, 1024, 736),
+                (-66, 22, 900, 320),
+                (0, 32, 768, 544)
+            ),
+            None
         );
     }
 }

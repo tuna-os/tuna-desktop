@@ -7,9 +7,10 @@ on:
   pull_request:
     paths:
       - 'scripts/tuna-stress'
+      - 'scripts/tuna-hotplug-stress'
       - 'scripts/tuna-wayland-adversary-build'
       - 'scripts/lib/tuna-wayland-adversary.c'
-      - 'scripts/tuna-hotplug-stress'
+      - 'scripts/lib/tuna-service-stubs.py'
       - '.github/workflows/stress.yml'
 
 permissions:
