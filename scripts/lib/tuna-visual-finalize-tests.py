@@ -26,7 +26,7 @@ class FinalizeCase(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(FINALIZE), str(directory), stage, "P-X-01", "",
              "2026-10-12T11:00:00Z", "2026-10-12T11:01:00Z"],
-            capture_output=True, text=True)
+            capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads((directory / "stage.json").read_text())
 

@@ -137,7 +137,7 @@ class FinalizationTests(unittest.TestCase):
             tail = wrapper[start:wrapper.index('fi\n', start)]
             for proof, cleanup, expected in ((23, 1, 23), (0, 1, 1), (0, 0, 0)):
                 code = f'status={proof}\npython3() {{ return {cleanup}; }}\n' + tail
-                result = subprocess.run(['bash', '-c', code], capture_output=True)
+                result = subprocess.run(['bash', '-c', code], capture_output=True, timeout=60)
                 self.assertEqual(result.returncode, expected, (name, proof, cleanup, result.stderr))
 
     def test_root_symlink_refused(self):
@@ -271,7 +271,7 @@ if (root/'x-retired').exists(): raise RuntimeError('X server retired before comp
             for proof in (0, 23):
                 code = (f'status={proof}\njq() {{ return 1; }}\n'
                         'python3() { echo FINALIZER_RAN; return 0; }\n' + wrapper[start:end])
-                result = subprocess.run(['bash', '-c', code], capture_output=True, text=True)
+                result = subprocess.run(['bash', '-c', code], capture_output=True, text=True, timeout=60)
                 self.assertEqual(result.returncode, proof or 1, (name, proof))
                 self.assertNotIn('FINALIZER_RAN', result.stdout)
 
@@ -285,7 +285,7 @@ if (root/'x-retired').exists(): raise RuntimeError('X server retired before comp
                 for proof in (0, 23):
                     code = ('python3() { return 1; }\n' + cleanup +
                             f'\ntrap cleanup EXIT\nexit {proof}\n')
-                    result = subprocess.run(['bash', '-c', code], capture_output=True, text=True)
+                    result = subprocess.run(['bash', '-c', code], capture_output=True, text=True, timeout=60)
                     self.assertEqual(result.returncode, proof or 1, (name, proof, result.stderr))
 
 

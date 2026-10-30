@@ -27,7 +27,7 @@ class SecurityAuditTests(unittest.TestCase):
             for status in (0, 1, 2, 101):
                 with self.subTest(status=status):
                     result = subprocess.run(["bash", str(ROOT / "scripts/ci-security-audit")],
-                                            cwd=tmp, env=dict(env, AUDIT_STATUS=str(status)))
+                                            cwd=tmp, env=dict(env, AUDIT_STATUS=str(status)), timeout=60)
                     self.assertEqual(result.returncode, status)
                     self.assertEqual(args.read_text().splitlines(),
                                      ["audit", "--file", str(ROOT / "Cargo.lock")])
@@ -50,7 +50,7 @@ class SecurityAuditTests(unittest.TestCase):
             for status in (0, 1, 2, 101):
                 with self.subTest(status=status):
                     result = subprocess.run(["bash", "-euo", "pipefail", "-c", command], cwd=tmp,
-                                            env=dict(env, AUDIT_STATUS=str(status)))
+                                            env=dict(env, AUDIT_STATUS=str(status)), timeout=60)
                     self.assertEqual(result.returncode, status)
                     self.assertEqual(args.read_text().splitlines(),
                                      ["audit", "--file", str(candidate / "Cargo.lock")])
@@ -61,7 +61,7 @@ class SecurityAuditTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             candidate = pathlib.Path(tmp)
             argv = ["bash", "-euo", "pipefail", "-c", command]
-            absent = subprocess.run(argv, cwd=tmp, text=True, capture_output=True)
+            absent = subprocess.run(argv, cwd=tmp, text=True, capture_output=True, timeout=60)
             self.assertEqual(absent.returncode, 0)
             self.assertIn("locked dependency audit remains required", absent.stdout)
             tests = candidate / "scripts/tests"
@@ -69,7 +69,7 @@ class SecurityAuditTests(unittest.TestCase):
             for status in (0, 1, 2):
                 with self.subTest(status=status):
                     (tests / "test_ci_security_audit.py").write_text(f"raise SystemExit({status})\n")
-                    result = subprocess.run(argv, cwd=tmp, text=True, capture_output=True)
+                    result = subprocess.run(argv, cwd=tmp, text=True, capture_output=True, timeout=60)
                     self.assertEqual(result.returncode, status)
                     self.assertNotIn("::notice::", result.stdout)
 

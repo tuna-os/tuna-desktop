@@ -322,7 +322,7 @@ class FailureTransport(unittest.TestCase):
         parsed=ast.parse((ROOT/'scripts/tuna-vm-perf').read_text())
         context=Context('stop');context.stage='stop-call'
         payload=encode(context.failure(RuntimeError('PRIVATE')),'stop').decode()
-        child=subprocess.run([sys.executable,'-c','import sys;print(sys.argv[1]);sys.exit(9)',payload],capture_output=True)
+        child=subprocess.run([sys.executable,'-c','import sys;print(sys.argv[1]);sys.exit(9)',payload],capture_output=True, timeout=60)
         self.assertEqual(child.returncode,9)
         raw=b'controlled-unqualified-trace'*100
         capture_identity={'device':1,'inode':2,'uid':1000}

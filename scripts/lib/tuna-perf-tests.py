@@ -1352,7 +1352,7 @@ class PinnedBaselinePackageGuards(unittest.TestCase):
                                        TEST_PACKAGE_MUTATION=str(marker),
                                        TUNA_PKG_SHA256=hashlib.sha256(package.read_bytes()).hexdigest())
                     result = subprocess.run(["bash", "-e", "-c", script], env=environment,
-                                            capture_output=True, text=True)
+                                            capture_output=True, text=True, timeout=60)
                     self.assertEqual(result.returncode == 0, accepted, result.stderr)
                     self.assertEqual(marker.exists(), accepted)
 
@@ -1390,7 +1390,7 @@ class PinnedBaselinePackageGuards(unittest.TestCase):
                     environment = dict(os.environ, PATH=f"{root / 'bin'}:{os.environ['PATH']}",
                                        PERF_PINNED_BASELINE="true", TEST_PACKAGE_INVENTORY=str(inventory))
                     result = subprocess.run(["bash", "-e", "-c", script], env=environment,
-                                            capture_output=True, text=True)
+                                            capture_output=True, text=True, timeout=60)
                     self.assertEqual(result.returncode == 0, accepted, result.stderr)
 
     def test_all_baseline_containerfile_run_blocks_have_valid_shell_syntax(self):
@@ -1405,7 +1405,7 @@ class PinnedBaselinePackageGuards(unittest.TestCase):
                         body = re.sub(r"^RUN\s+(?:--[^\s]+\s+)*", "", line, count=1)
                         self.assertTrue(body, "RUN instruction has a shell body")
                         result = subprocess.run(["bash", "-n"], input=body, text=True,
-                                                capture_output=True)
+                                                capture_output=True, timeout=60)
                         self.assertEqual(result.returncode, 0, result.stderr)
 
 class KernelTraceDispatch(unittest.TestCase):

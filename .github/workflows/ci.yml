@@ -180,6 +180,8 @@ jobs:
           command -v glib-compile-schemas
           command -v timeout
       - run: /usr/bin/python3 scripts/tests/test_stock_slideshow_proof.py
+      - name: Test polkit helper stub protocol
+        run: python3 scripts/tests/test_tuna_polkit_helper_stub.py
       - run: cargo fmt --all -- --check
       - name: Check bounded EIS transport regression tests
         run: |
@@ -217,6 +219,7 @@ jobs:
           # The lockdown round trip (#357) needs the installed schema.
           TUNA_REQUIRE_LOCKDOWN_SCHEMA: "1"
       - name: Prove private PAM helper conversations and retirement
+        id: private-pam-helper-proof
         run: |
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/private-pam-helper-proof"
@@ -227,23 +230,27 @@ jobs:
           grep -Eq '^private PAM helper executable sha256: [a-f0-9]{64}$' "$RUNNER_TEMP/private-pam-helper-proof/test.log"
         env:
           TUNA_REQUIRE_PAM_WRAPPER: "1"
+      # Upload whenever the proof ran (pass or fail); a proof skipped by an
+      # earlier failure produced nothing, so uploading would only add a
+      # misleading "No files were found" annotation (#720).
       - name: Retain private PAM helper proof
-        if: always()
+        if: ${{ !cancelled() && steps.private-pam-helper-proof.outcome != 'skipped' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: private-pam-helper-proof
           path: ${{ runner.temp }}/private-pam-helper-proof/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
       - name: Shortcut inhibition consent proof
         run: scripts/tuna-shortcut-proof
       # Every listed test just passed: the parity-ledger job resolves
       # the ledger's cargo:<name> references against this list.
       - run: cargo test --workspace -q -- --list --format terse > test-list.txt
-      - run: scripts/tuna-test-strategy --test-list test-list.txt --report test-strategy-report.md
+      - id: test-strategy
+        run: scripts/tuna-test-strategy --test-list test-list.txt --report test-strategy-report.md
       - run: python3 scripts/lib/victory-signal-tests.py
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        if: always()
+        if: ${{ !cancelled() && steps.test-strategy.outcome != 'skipped' }}
         with:
           name: executed-test-strategy-report
           path: test-strategy-report.md

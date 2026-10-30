@@ -159,7 +159,7 @@ class PinnedBaseline(unittest.TestCase):
         result = subprocess.run(['bash', '-c', 'set -e; '+body+'\n'],
                                 env={**self.env, 'CURRENT_PACKAGES': self.packages,
                                      'TUNA_PKG_SHA256': hashlib.sha256(package.read_bytes()).hexdigest(),
-                                     'PERF_PINNED_BASELINE': 'true'}, capture_output=True)
+                                     'PERF_PINNED_BASELINE': 'true'}, capture_output=True, timeout=60)
         self.assertNotEqual(result.returncode, 0)
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
         self.assertEqual(calls, [['pacman', '-Q']])

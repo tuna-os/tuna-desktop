@@ -38,7 +38,7 @@ gdbus() {
                 ]:
                     with self.subTest(present=present, pid=pid, artifacts=artifacts):
                         env = {**os.environ, 'OWNER_PRESENT': present, 'OWNER_PID': pid, 'ARTIFACTS': artifacts}
-                        result = subprocess.run(['bash', '-c', mock + guard + '\nkeyring_owns_secrets'], env=env, capture_output=True, text=True)
+                        result = subprocess.run(['bash', '-c', mock + guard + '\nkeyring_owns_secrets'], env=env, capture_output=True, text=True, timeout=60)
                         self.assertEqual(result.returncode == 0, accepted, result.stderr)
             finally:
                 peer.terminate()

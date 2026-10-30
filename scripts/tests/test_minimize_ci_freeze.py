@@ -22,12 +22,12 @@ class MinimizeFreezeTests(unittest.TestCase):
         self.root = self.base / "source"
         self.root.mkdir()
         (self.root / "Cargo.lock").write_text("fixture lock bytes\n")
-        subprocess.run(["git", "init", "--quiet", str(self.root)], check=True)
-        subprocess.run(["git", "add", "Cargo.lock"], cwd=self.root, check=True)
+        subprocess.run(["git", "init", "--quiet", str(self.root)], check=True, timeout=60)
+        subprocess.run(["git", "add", "Cargo.lock"], cwd=self.root, check=True, timeout=60)
         subprocess.run([
             "git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
             "commit", "--quiet", "-m", "fixture",
-        ], cwd=self.root, check=True)
+        ], cwd=self.root, check=True, timeout=60)
         self.art = self.base / "artifacts"
         self.art.mkdir()
         self.messages = []
@@ -45,7 +45,7 @@ class MinimizeFreezeTests(unittest.TestCase):
         )
         return subprocess.run([
             "/usr/bin/python3", "-c", FREEZE, str(self.root), str(self.art),
-        ], capture_output=True, text=True)
+        ], capture_output=True, text=True, timeout=60)
 
     def test_exact_source_lock_and_member_bytes_are_bound(self):
         result = self.run_freeze()
@@ -54,7 +54,7 @@ class MinimizeFreezeTests(unittest.TestCase):
         manifest = json.loads((frozen / "manifest.json").read_text())
         revision = subprocess.check_output([
             "git", "rev-parse", "HEAD",
-        ], cwd=self.root, text=True).strip()
+        ], cwd=self.root, text=True, timeout=60).strip()
         self.assertEqual(manifest["source_commit"], revision)
         self.assertEqual((frozen / "SOURCE_COMMIT").read_text().strip(), revision)
         self.assertEqual(manifest["cargo_lock_sha256"], hashlib.sha256(

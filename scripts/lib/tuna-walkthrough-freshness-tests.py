@@ -94,13 +94,13 @@ class FreshnessCase(unittest.TestCase):
         return subprocess.run(
             [str(SCRIPT), "refresh", str(bundle), "--dest", str(dest),
              "--run-id", RUN_ID, "--merge-sha", EVENT_SHA, *extra],
-            capture_output=True, text=True)
+            capture_output=True, text=True, timeout=60)
 
     def freshness(self, dest, *extra):
         return subprocess.run(
             [str(SCRIPT), "freshness", "--dest", str(dest),
              "--expect-head", HEAD_SHA, "--expect-tree", TREE_SHA, *extra],
-            capture_output=True, text=True)
+            capture_output=True, text=True, timeout=60)
 
     def test_visual_map_covers_every_walkthrough_id(self):
         want = tsv_ids(MANIFEST_TSV)
@@ -268,7 +268,7 @@ class FreshnessCase(unittest.TestCase):
             result = subprocess.run(
                 [str(SCRIPT), "refresh", str(bundle), "--dest", str(dest),
                  "--run-id", RUN_ID, "--merge-sha", "0" * 40],
-                capture_output=True, text=True)
+                capture_output=True, text=True, timeout=60)
             self.assertEqual(result.returncode, 1)
             self.assertIn("does not match the recorded event SHA", result.stderr)
 
@@ -288,7 +288,7 @@ class FreshnessCase(unittest.TestCase):
             result = subprocess.run(
                 [str(SCRIPT), "freshness", "--dest", str(dest),
                  "--expect-head", HEAD_SHA, "--expect-tree", "2" * 40],
-                capture_output=True, text=True)
+                capture_output=True, text=True, timeout=60)
             self.assertEqual(result.returncode, 1)
             self.assertIn("recorded tree", result.stdout)
             self.assertIn("!= expected", result.stdout)
@@ -308,29 +308,29 @@ class FreshnessCase(unittest.TestCase):
         repo.mkdir()
         env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
-        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, timeout=60)
         (repo / "product.txt").write_text("v1")
         (repo / "docs" / "walkthrough").mkdir(parents=True)
         (repo / "docs" / "walkthrough" / "panel.png").write_bytes(b"old")
-        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True, timeout=60)
         subprocess.run(["git", "-C", str(repo), "commit", "-qm", "a"], check=True,
-                       env={**dict(os.environ), **env})
+                       env={**dict(os.environ), **env}, timeout=60)
         head_a = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
-                                capture_output=True, text=True).stdout.strip()
+                                capture_output=True, text=True, timeout=60).stdout.strip()
         tree_a = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
-                                capture_output=True, text=True).stdout.strip()
+                                capture_output=True, text=True, timeout=60).stdout.strip()
         (repo / "docs" / "walkthrough" / "panel.png").write_bytes(b"new")
         subprocess.run(["git", "-C", str(repo), "commit", "-qam", "adopt"], check=True,
-                       env={**dict(os.environ), **env})
+                       env={**dict(os.environ), **env}, timeout=60)
         head_b = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
-                                capture_output=True, text=True).stdout.strip()
+                                capture_output=True, text=True, timeout=60).stdout.strip()
         tree_b = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
-                                capture_output=True, text=True).stdout.strip()
+                                capture_output=True, text=True, timeout=60).stdout.strip()
         (repo / "product.txt").write_text("v2")
         subprocess.run(["git", "-C", str(repo), "commit", "-qam", "product"], check=True,
-                       env={**dict(os.environ), **env})
+                       env={**dict(os.environ), **env}, timeout=60)
         tree_c = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
-                                capture_output=True, text=True).stdout.strip()
+                                capture_output=True, text=True, timeout=60).stdout.strip()
         return repo, head_a, tree_a, head_b, tree_b, tree_c
 
     def test_freshness_accepts_walkthrough_only_drift(self):
@@ -345,7 +345,7 @@ class FreshnessCase(unittest.TestCase):
             result = subprocess.run(
                 [str(SCRIPT), "freshness", "--dest", str(dest),
                  "--expect-head", head_b, "--expect-tree", tree_b],
-                capture_output=True, text=True, env={**dict(os.environ), **env})
+                capture_output=True, text=True, env={**dict(os.environ), **env}, timeout=60)
             self.assertEqual(result.returncode, 0, result.stdout)
             self.assertIn("adopt drift", result.stdout)
 
@@ -361,7 +361,7 @@ class FreshnessCase(unittest.TestCase):
             result = subprocess.run(
                 [str(SCRIPT), "freshness", "--dest", str(dest),
                  "--expect-tree", tree_c],
-                capture_output=True, text=True, env={**dict(os.environ), **env})
+                capture_output=True, text=True, env={**dict(os.environ), **env}, timeout=60)
             self.assertEqual(result.returncode, 1)
             self.assertIn("recorded tree", result.stdout)
             self.assertNotIn("CURRENT", result.stdout)
@@ -416,7 +416,7 @@ class FreshnessCase(unittest.TestCase):
         try:
             manifest_path.write_bytes(b"not json")
             check = subprocess.run(
-                [str(SCRIPT), "check"], capture_output=True, text=True)
+                [str(SCRIPT), "check"], capture_output=True, text=True, timeout=60)
             self.assertEqual(check.returncode, 0, check.stderr)
         finally:
             if saved is None:
