@@ -10,8 +10,23 @@ remote grants.
 
 The GNOME portal owns the user consent picker. A linked ScreenCast session uses
 `remote-desktop-session-id`, must have the same caller, and shares the remote
-grant's permanent revocation flag. RemoteDesktop.Start starts its linked streams.
-An unrelated caller cannot attach a stream or inject input.
+grant's permanent revocation flag; a grant takes one linked session
+(`meta_remote_desktop_session_register_screen_cast`). An unrelated caller
+cannot attach a stream or inject input.
+
+ScreenCast follows mutter 51 (`meta-screen-cast-session.c`,
+`meta-screen-cast-stream.c`). Record* is accepted before and after Start.
+Session Start makes the session active and starts every stream recorded so
+far; a linked session is started only by RemoteDesktop.Start, and its own
+Start and Stop fail with mutter's "Must be started/stopped from remote desktop
+session". A stream recorded on an active session starts with its own
+`Stream.Start` ("session not started" before, "Stream already started" twice).
+`Stream.Stop` ("Stream not started" before Start) ends that stream and removes
+its object; on a plain session it closes the session (`on_stream_closed`),
+while a linked session lives on until its RemoteDesktop session ends.
+PipeWireStreamAdded goes to the session's owner only, as mutter's
+`on_stream_ready` sends it. Every Start, Stop and Record call checks the
+owner, lock and revocation.
 
 Advertised devices are keyboard and pointer (bitmask 3). Legacy evdev keycodes,
 keysyms, relative/stream-relative absolute motion, buttons and scroll are
@@ -67,9 +82,20 @@ bus names (`org.gnome.RemoteDesktop.User`, `.Handover`, `.Headless`). A
 process that merely takes those names, or a user-owned copy of the binary, is
 refused; grd gets no Screenshot, Introspect or unlinked ScreenCast access.
 Settings' configured credentials are the consent, as in GNOME. The grant is
-revoked when that identity or name is lost, on Stop and on lock. GNOME keeps
-an RDP session across the lock screen; Tuna Desktop ends it, as for every
-remote grant (#61).
+revoked when that identity or name is lost, on Stop, on EIS disconnect and on
+lock; grd's own Stop after its EIS client left succeeds and does nothing.
+
+Lock matches GNOME for the shared desktop. gnome-shell 51 `main.js`
+`_sessionUpdated` calls `inhibit_remote_access()` whenever the session mode
+disallows screencast and the backend is not headless; the `unlock-dialog`
+mode the screen shield pushes (`screenShield.js` `activate`) inherits
+`allowScreencast: false` from `restrictive` (`sessionMode.js`). mutter's
+`meta_dbus_session_manager_inhibit` then closes every RemoteDesktop and
+ScreenCast session, and `CreateSession` fails with "Session creation
+inhibited" until unlock. So a GNOME RDP client is disconnected on lock and
+cannot reconnect or unlock remotely; only headless remote-login sessions keep
+running behind the lock. Tuna Desktop ends every grant on lock and refuses
+CreateSession while locked ("session locked").
 
 Linked monitor streams carry `mapping-id` `tuna-monitor-<connector>`, and the
 EIS pointer regions carry the same ids (ei_device v2). Each keymap send is a
@@ -87,15 +113,24 @@ writes per session, and cut off on Stop, owner loss, lock or Disable. Mime
 lists are limited to 64 names of 255 bytes. These bounds are Tuna Desktop's;
 mutter has none. Signals go only to the session's owner.
 
-Not covered: grd records its monitor after RemoteDesktop.Start and then calls
-ScreenCast.Stream.Start; Tuna Desktop's ScreenCast sessions still accept
-streams only before Start and serve no Stream.Start/Stop, so grd's RecordMonitor
-fails with "capture session already started" and the RDP client disconnects
-before the first frame (Corral VM, 2026-10-30). Also not covered: RecordVirtual (so grd's extend mode and remote login through
-GDM's headless sessions), cursor metadata (`cursor-mode` is ignored, so the
-RDP client draws its own pointer), `disable-animations`, touch, smartcard and
-Kerberos redirection, and physical hardware. The published Marlin image does
-not ship gnome-remote-desktop, so Settings shows no Remote Desktop row there.
+Corral VM 2026-10-30 (candidate sideloaded on
+marlin@sha256:ae6363c1…, grd 51.0, a real FreeRDP 3 client; evidence in
+`docs/marlin/2026-10-30-rdp/`): the client shows the desktop frame; with
+Remote Control off, its clicks and keys reach nothing (a remote click on the
+Remote Control switch leaves it off), including after switching control off
+during a session; with it on, pointer and keyboard drive Settings; clipboard
+text crosses both ways; disconnect and reconnect work; lock disconnects the
+client and refuses a new connection until unlock; turning Desktop Sharing off
+in Settings and restarting grd end the session, and a new connection works
+afterwards.
+
+Not covered: RecordVirtual (so grd's extend mode and remote login through
+GDM's headless sessions), cursor metadata (`cursor-mode` is ignored; frames
+carry no pointer, grd sends no pointer updates and the RDP client keeps its
+local pointer, so pointer shapes are not mirrored), `disable-animations`,
+touch, smartcard and Kerberos redirection, and physical hardware. The
+published Marlin image does not ship gnome-remote-desktop, so Settings shows
+no Remote Desktop row there.
 
 `scripts/tuna-remote-security --candidate DIR --out DIR` tests a packaged
 compositor and GTK shell with the installed Fedora GNOME 51 portal backend,
