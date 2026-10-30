@@ -19,6 +19,11 @@ on:
       - packaging/marlin/vm-lane/tuna-vm-constraints-build
       - packaging/marlin/vm-lane/tuna-vm-gdm.tmpfiles
       - scripts/tuna-vm-lane
+      - scripts/tuna-vm-soak
+      - scripts/tuna-frame-pacer-build
+      - scripts/lib/tuna-frame-pacer.c
+      - scripts/lib/endurance_presentation.py
+      - scripts/lib/soak_report.py
 
 permissions:
   contents: read
@@ -30,7 +35,9 @@ concurrency:
 jobs:
   published-flavor:
     runs-on: ubuntu-26.04
-    timeout-minutes: 90
+    # The qualification boots take about 20 minutes; the bounded soak below
+    # adds its 50 minutes plus one boot and the file transfer.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Prepare the existing KVM profile
@@ -72,6 +79,7 @@ jobs:
             /usr/share/tuna-vm/shipped-package.txt | tee /mnt/vm/shipped-package
           sudo podman image inspect localhost/marlin-tuna-published-fixtures:ci --format '{{.Id}}' | tee /mnt/vm/fixture-image-id
       - name: Install published flavor fixture to the existing raw-disk profile
+        id: disk
         run: |
           probe='
             if ls /usr/lib/bootupd/updates/EFI/*/grub*.efi >/dev/null 2>&1; then :
@@ -96,6 +104,37 @@ jobs:
           --meta "shipped_tuna_package=$(cat /mnt/vm/shipped-package)"
           --meta "run_id=${{ github.run_id }}"
           --meta "harness_commit=${{ github.sha }}"
+      - name: Bounded soak on a fresh pristine boot (memory and frame pacing; not the 24-hour qualification)
+        id: soak
+        if: ${{ !cancelled() && steps.disk.outcome == 'success' }}
+        env:
+          # Nightly and dispatch: 50 minutes, 40 of them after the observer's
+          # ten-minute warmup. A pull request touching this lane rehearses the
+          # same wiring for 15 minutes. Neither is the 24-hour qualification
+          # run (docs/soak.md).
+          SOAK_SECONDS: ${{ github.event_name == 'pull_request' && '900' || '3000' }}
+          SOAK_WARMUP: ${{ github.event_name == 'pull_request' && '300' || '600' }}
+        run: |
+          # The deployment record: packaging/arch/PKGBUILD release builds fetch
+          # tag v${_semver}, and pkgver drops the semver's first '-'
+          # (1.0.0-beta.2 -> 1.0.0beta.2).
+          package=$(cat /mnt/vm/shipped-package)
+          version=${package#tuna-desktop }
+          version=${version%-*}
+          [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)([a-z].*)?$ ]] || { echo "unrecognised package: $package" >&2; exit 1; }
+          tag="v${BASH_REMATCH[1]}${BASH_REMATCH[2]:+-${BASH_REMATCH[2]}}"
+          refs=$(git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}")
+          revision=$(awk -v ref="refs/tags/$tag^{}" '$2 == ref { print $1 }' <<< "$refs")
+          [ -n "$revision" ] || revision=$(awk -v ref="refs/tags/$tag" '$2 == ref { print $1 }' <<< "$refs")
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || { echo "no release tag $tag for $package" >&2; exit 1; }
+          scripts/tuna-vm-lane --disk /mnt/vm/disk.raw --out published-vm-soak --published --require-kvm \
+            --soak "$SOAK_SECONDS" --soak-warmup "$SOAK_WARMUP" --soak-revision "$revision" \
+            --meta "published_image=ghcr.io/tuna-os/marlin@$(cat /mnt/vm/published-digest)" \
+            --meta "fixture_image_id=$(cat /mnt/vm/fixture-image-id)" \
+            --meta "shipped_tuna_package=$package" \
+            --meta "soak_source_tag=$tag" \
+            --meta "run_id=${{ github.run_id }}" \
+            --meta "harness_commit=${{ github.sha }}"
       - name: Publish per-check results for the digest under test
         if: always()
         env:
@@ -126,11 +165,24 @@ jobs:
                   if any(marker in line for marker in ('tuna-vm-health:', 'tuna-compositor: drm:',
                                                         'shell supervision: BudgetExhausted')):
                       excerpt.append(line)
+          # The bounded soak boot is reported beside the qualification checks
+          # (docs/soak.md); it is not 24-hour evidence.
+          soak = None
+          soak_dir = pathlib.Path('published-vm-soak')
+          if (soak_dir / 'assertions.txt').exists():
+              soak = {'artifact': f"published-marlin-tuna-soak-{os.environ['RUN_ID']}", 'checks': {}}
+              for line in (soak_dir / 'assertions.txt').read_text().splitlines():
+                  name, verdict, detail = (line.split(' ', 2) + ['', ''])[:3]
+                  soak['checks'][name] = {'pass': verdict == 'pass', 'detail': detail}
+              if (soak_dir / 'soak/summary.json').exists():
+                  summary_json = json.loads((soak_dir / 'soak/summary.json').read_text())
+                  soak['summary'] = {key: value for key, value in summary_json.items() if key != 'over_time'}
           results = {
               'run_id': os.environ['RUN_ID'], 'run_url': os.environ['RUN_URL'],
               'published_image': f'ghcr.io/tuna-os/marlin@{digest}' if digest else None,
               'published_image_digest': digest,
               'checks': checks,
+              'soak': soak,
           }
           (out / 'qualification.json').write_text(json.dumps(results, indent=2))
           if not checks or not all(c['pass'] for c in checks.values()):
@@ -141,11 +193,25 @@ jobs:
               for name, check in checks.items():
                   detail = check['detail'].replace('|', '\\|')
                   summary.write(f"| {name} | {'pass' if check['pass'] else '**FAIL**'} | {detail} |\n")
+              if soak:
+                  summary.write('\n## Bounded VM soak\n\n| Soak boot check | Result | Detail |\n|---|---|---|\n')
+                  for name, check in soak['checks'].items():
+                      detail = check['detail'].replace('|', '\\|')
+                      summary.write(f"| {name} | {'pass' if check['pass'] else '**FAIL**'} | {detail} |\n")
+                  if (soak_dir / 'soak/summary.md').exists():
+                      summary.write('\n' + (soak_dir / 'soak/summary.md').read_text())
           PY
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: published-marlin-tuna-vm-${{ github.run_id }}
           path: published-vm-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: ${{ !cancelled() && steps.soak.outcome != 'skipped' }}
+        with:
+          name: published-marlin-tuna-soak-${{ github.run_id }}
+          path: published-vm-soak/
           if-no-files-found: error
           retention-days: 30

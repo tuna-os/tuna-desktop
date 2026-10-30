@@ -17,6 +17,7 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 soak = importlib.util.module_from_spec(spec)
 loader.exec_module(soak)
 from endurance_presentation import Reader
+import soak_report
 
 
 class PresentationFailures(unittest.TestCase):
@@ -171,6 +172,86 @@ class HelperFailures(unittest.TestCase):
                 time.sleep(0.02)
             else:
                 self.fail('helper descendant survived the deadline')
+
+
+class Scope(unittest.TestCase):
+    def test_only_the_full_day_is_a_qualification_candidate(self):
+        self.assertEqual(soak.scope(86400), '24-hour qualification candidate')
+        for seconds in (3000, 86399, 86401):
+            with self.subTest(seconds=seconds):
+                self.assertIn('not the 24-hour qualification run', soak.scope(seconds))
+
+
+class Summary(unittest.TestCase):
+    """The retained-directory report the nightly VM lane publishes."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        fixture = Path(__file__).parent / 'fixtures/endurance-control.jsonl'
+        (self.root / 'presentation.jsonl').write_bytes(fixture.read_bytes())
+        self.provenance = {'requested_duration_s': 3, 'warmup_s': 1, 'interval_s': 1,
+                           'scope': soak.scope(3), 'source_revision': '0' * 40, 'boot_id': 'boot',
+                           'presentation_workload': {'size': [320, 180]}}
+        interval = {'count': 2, 'p50': 16.6, 'p95': 17.0, 'p99': 33.3, 'min': 16.0, 'max': 33.3, 'mean': 20.0}
+        self.samples = [{'elapsed_s': float(t), 'pss_kib': 100 * 1024 + 512 * t, 'rss_kib': 200 * 1024,
+                         'fds': 40 + t, 'processes': 10,
+                         'presentation': {'frames': 18, 'interval_ms': interval}} for t in range(4)]
+        self.report = {'complete': True, 'samples': 4, 'scope': soak.scope(3), 'elapsed_s': 3.01,
+                       'baseline': self.samples[1]}
+        self.store()
+
+    def store(self):
+        (self.root / 'provenance.json').write_text(json.dumps(self.provenance))
+        (self.root / 'report.json').write_text(json.dumps(self.report))
+        (self.root / 'samples.jsonl').write_text(''.join(json.dumps(s) + '\n' for s in self.samples))
+
+    def test_complete_bounded_run_reports_memory_and_pacing_over_time(self):
+        summary, text = soak_report.write(self.root)
+        self.assertTrue(summary['complete'], summary['problems'])
+        self.assertFalse(summary['qualifies_24h'])
+        memory = summary['memory']
+        self.assertEqual(memory['baseline']['pss_kib'], 100 * 1024 + 512)
+        self.assertEqual(memory['final']['fds'], 43)
+        self.assertEqual(memory['samples_after_warmup'], 3)
+        self.assertAlmostEqual(memory['pss_slope_kib_per_h'], 512 * 3600)
+        # The whole retained capture is re-read, not only the last poll.
+        self.assertEqual(summary['presentation']['total_frames'], 54)
+        self.assertEqual(summary['presentation']['interval_ms']['count'], 53)
+        self.assertEqual(len(summary['over_time']), 4)
+        self.assertIn('not the 24-hour qualification run', text)
+        self.assertIn('| 0.1 | 101.5 | 200.0 | 43 | 10 | 18 | 16.60 | 17.00 | 33.30 |', text)
+        self.assertEqual(json.loads((self.root / 'summary.json').read_text())['samples'], 4)
+
+    def test_incomplete_or_inconsistent_runs_fail(self):
+        for fault in ('failure', 'short', 'count', 'scope', 'truncated', 'missing-report'):
+            with self.subTest(fault=fault):
+                self.setUp()
+                if fault == 'failure':
+                    self.report = {'complete': False, 'samples': 4, 'scope': soak.scope(3),
+                                   'failure': 'critical process exited or restarted'}
+                elif fault == 'short':
+                    self.report['elapsed_s'] = 2.5
+                elif fault == 'count':
+                    self.samples.pop()
+                elif fault == 'scope':
+                    self.report['scope'] = soak.scope(86400)
+                self.store()
+                if fault == 'truncated':
+                    raw = (self.root / 'presentation.jsonl').read_bytes()
+                    (self.root / 'presentation.jsonl').write_bytes(raw[:-1])
+                elif fault == 'missing-report':
+                    (self.root / 'report.json').unlink()
+                summary, text = soak_report.write(self.root)
+                self.assertFalse(summary['complete'])
+                self.assertIn('**FAILED**', text)
+
+    def test_long_runs_show_bounded_evenly_spaced_rows(self):
+        samples = list(range(1000))
+        picked = soak_report.rows(samples)
+        self.assertEqual(len(picked), soak_report.MAX_ROWS)
+        self.assertEqual((picked[0], picked[-1]), (0, 999))
 
 
 if __name__ == '__main__':

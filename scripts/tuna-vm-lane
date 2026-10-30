@@ -31,14 +31,24 @@ at a nominal two frames/second plus synchronous stills, splices title cards from
 vm-tour-cards rendered from source in scratch, and writes tour/tuna-tour.webm, tour/preview.webp and a
 T-<section>.png still per section (needs ffmpeg with libvpx and libwebp).
 
+With --soak SECONDS (published fixture only, not with --tour), once the
+assertions pass it starts the fixture's scripts/tuna-vm-soak as a root
+transient service with the native frame workload on the session's own
+socket, polls it over the guest agent, retrieves its files into soak/
+(digest-checked) and asserts V-SOAK from scripts/lib/soak_report.py, which
+writes soak/summary.md and soak/summary.json (docs/soak.md).
+
 Usage:
   scripts/tuna-vm-lane --disk DISK.raw [--out DIR] [--timeout S] [--tour]
                         [--published] [--meta KEY=VALUE ...]
+                        [--soak S --soak-revision COMMIT [--soak-warmup S] [--soak-interval S]]
 
 Needs qemu-system-x86_64 and OVMF; KVM strongly recommended. Reuses the
 QMP client from scripts/tuna-baseline.
 """
 import argparse
+import base64
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -63,6 +73,7 @@ _guest_loader = importlib.machinery.SourceFileLoader("vm_guest_agent", os.path.j
 _guest_spec = importlib.util.spec_from_loader("vm_guest_agent", _guest_loader)
 guest_agent = importlib.util.module_from_spec(_guest_spec)
 _guest_loader.exec_module(guest_agent)
+import soak_report  # noqa: E402  (scripts/lib, on sys.path above)
 
 WIDTH, HEIGHT = baseline.WIDTH, baseline.HEIGHT
 DRM_RE = re.compile(r"tuna-compositor: drm: output (\S+) (\d+)x(\d+)")
@@ -3459,6 +3470,126 @@ def finish_constraint_proof(agent, qmp, original_mouse, evidence, report):
         raise RuntimeError("actual constraint cleanup failed: " + json.dumps(cleanup_errors))
 
 
+SOAK_POLL_S = 60
+# Beyond the requested duration: provenance, the final sample and the
+# workload's 20 s completion wait.
+SOAK_GRACE_S = 300
+SOAK_AGENT_FAILURES = 5
+
+
+def soak_call(agent_path, action, *arguments, timeout=60):
+    """One fixed lifecycle action on a fresh transport (a timeout poisons it)."""
+    agent = guest_agent.GuestAgent(agent_path)
+    try:
+        return agent.run(action, *arguments, timeout=timeout)
+    finally:
+        agent.close()
+
+
+def fetch_soak(agent_path, directory, status):
+    """Copy each retained observer file in bounded reads; check size and digest."""
+    problems = []
+    for name, size in status["files"].items():
+        path = os.path.join(directory, name)
+        digest = hashlib.sha256()
+        offset = 0
+        with open(path, "wb") as stream:
+            while offset < size:
+                chunk = soak_call(agent_path, "soak-read", name, offset)
+                data = base64.b64decode(chunk["data"], validate=True)
+                if chunk["offset"] != offset or chunk["size"] != size or not data:
+                    break
+                stream.write(data)
+                digest.update(data)
+                offset += len(data)
+        if offset != size or digest.hexdigest() != status["sha256"].get(name):
+            problems.append(f"{name} transfer differs from the guest copy")
+    return problems
+
+
+def soak_detail(summary):
+    memory = summary["memory"] or {}
+    pacing = summary["presentation"] or {}
+    base, final = memory.get("baseline", {}), memory.get("final", {})
+    interval = pacing.get("interval_ms", {})
+    text = f"{summary['scope']}: {summary['samples']} samples"
+    if base:
+        text += (f"; session PSS {base['pss_kib'] / 1024:.1f} MiB at warmup, "
+                 f"{final['pss_kib'] / 1024:.1f} MiB final; fds {base['fds']}->{final['fds']}")
+    if interval.get("count"):
+        text += (f"; {pacing['total_frames']} native frames, interval p50 {interval['p50']:.1f} ms, "
+                 f"p99 {interval['p99']:.1f} ms")
+    return text
+
+
+def run_soak(qmp, vm, agent_path, out, record, seconds, warmup, interval, revision):
+    directory = os.path.join(out, "soak")
+    os.makedirs(directory, exist_ok=True)
+    try:
+        started = soak_call(agent_path, "soak-start", seconds, warmup, interval, revision)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        record("V-SOAK", False, f"soak observer did not start: {error}")
+        return
+    with open(os.path.join(directory, "start.json"), "w") as stream:
+        json.dump(started, stream, indent=2)
+    log(f"soak observer started for {seconds}s on {started['wayland_display']}")
+    deadline = time.monotonic() + seconds + SOAK_GRACE_S
+    status, failures, framed = None, 0, False
+    while vm.poll() is None and time.monotonic() < deadline:
+        time.sleep(SOAK_POLL_S)
+        if not framed:
+            # The mapped native workload, once it is presenting.
+            qmp.frame(os.path.join(directory, "soak-start.png"))
+            framed = True
+        try:
+            status = soak_call(agent_path, "soak-status")
+            failures = 0
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            failures += 1
+            log(f"soak status unavailable ({failures}/{SOAK_AGENT_FAILURES}): {error}")
+            if failures >= SOAK_AGENT_FAILURES:
+                break
+            continue
+        last = status["last"] or {}
+        if last:
+            log(f"soak {last['elapsed_s']:.0f}/{seconds}s: PSS {last['pss_kib'] / 1024:.1f} MiB, "
+                f"fds {last['fds']}, processes {last['processes']}, frames {last['frames']}, "
+                f"p99 {last['p99_ms']} ms")
+        if not status["running"]:
+            break
+    problems = []
+    if vm.poll() is None:
+        qmp.frame(os.path.join(directory, "soak-end.png"))
+    if status is None or status["running"]:
+        problems.append("observer still running or unreachable at the host deadline")
+    else:
+        with open(os.path.join(directory, "status.json"), "w") as stream:
+            json.dump(status, stream, indent=2)
+        with open(os.path.join(directory, "observer-journal.txt"), "w") as stream:
+            stream.write(status["journal"] + "\n")
+        unit = status["unit"]
+        if unit.get("Result") != "success" or unit.get("ExecMainStatus") != "0":
+            lines = status["journal"].strip().splitlines()
+            problems.append(f"observer unit {unit.get('Result')} (status {unit.get('ExecMainStatus')})"
+                            + (f": {lines[-1]}" if lines else ""))
+        try:
+            problems += fetch_soak(agent_path, directory, status)
+        except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as error:
+            problems.append(f"soak files not retrieved: {error}")
+    detail = "no observer provenance retrieved"
+    if os.path.exists(os.path.join(directory, "provenance.json")):
+        try:
+            summary, _ = soak_report.write(directory)
+            problems += [p for p in summary["problems"] if p not in problems]
+            if summary["requested_duration_s"] != seconds:
+                problems.append("observer provenance differs from the requested duration")
+            detail = soak_detail(summary)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            problems.append(f"soak report unreadable: {error}")
+    record("V-SOAK", not problems, "; ".join([detail, *problems]))
+
+
+
 def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, native_relative_mouse=False,
          observer_records=None):
     ovmf = next((p for p in OVMF if os.path.exists(p)), None)
@@ -3589,7 +3720,21 @@ def main():
                     help="required reader qualification variant; upstream51 requires genuine packaged 51 principal/speech proof")
     ap.add_argument("--boots", type=int, default=1,
                     help="repeat pristine snapshot boots; tour only on the last boot")
+    ap.add_argument("--soak", type=int, default=0, metavar="SECONDS",
+                    help="run the fixture's tuna-vm-soak with its native frame workload for SECONDS "
+                         "(86400 is the 24-hour qualification; shorter runs are bounded rehearsals)")
+    ap.add_argument("--soak-warmup", type=int, default=600, metavar="SECONDS")
+    ap.add_argument("--soak-interval", type=int, default=60, metavar="SECONDS")
+    ap.add_argument("--soak-revision", metavar="COMMIT",
+                    help="the shipped payload's exact 40-digit source commit (deployment record)")
     a = ap.parse_args()
+    if a.soak:
+        if a.tour or a.boots != 1:
+            ap.error("--soak is its own single pristine boot, without --tour")
+        if not (0 <= a.soak_warmup < a.soak <= 86400 and a.soak_interval > 0):
+            ap.error("--soak must exceed a nonnegative warmup, at most 86400, with a positive interval")
+        if not re.fullmatch("[0-9a-f]{40}", a.soak_revision or ""):
+            ap.error("--soak needs --soak-revision, the exact 40-digit source commit")
     strip_image = None
     if a.strip_edge and not a.strip_image:
         ap.error("--strip-edge requires exact installed image admission")
@@ -3715,6 +3860,9 @@ def main():
             finally:
                 if agent is not None:
                     agent.close()
+            if a.soak and manager_ready:
+                run_soak(qmp, vm, agent_path, out, record, a.soak, a.soak_warmup, a.soak_interval,
+                         a.soak_revision)
             if a.tour:
                 try:
                     older_guest = bool(owner and owner.get("state")) and predates_newer_snapshot(owner["state"])
@@ -3761,6 +3909,8 @@ def main():
            "tuna-shell-gtk started under supervision" if shell
            else "no tuna-shell-gtk: keybindings line")
     results.setdefault("V-PANEL", (False, "session never came up, no screendump checked"))
+    if a.soak:
+        results.setdefault("V-SOAK", (False, "the session never became ready, so the soak did not run"))
     # GDM starting its greeter on the login VT takes DRM master from the
     # running session; say so instead of leaving a bare pixel failure.
     paused = "tuna-compositor: drm: session paused" in text
