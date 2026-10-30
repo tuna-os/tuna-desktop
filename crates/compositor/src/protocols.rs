@@ -46,6 +46,7 @@
 //!   core protocol gives no destructor (Mutter's meta-wayland-fixes.c).
 //! - ext-background-effect v1: the blur behind a surface's blur region
 //!   (`background_effect.rs`, drawn by `background_blur.rs`).
+//! - wp_drm_lease_device_v1 (native backend only): see `crate::drm::lease`.
 //!
 //! Deliberately absent, matching Mutter: xdg-decoration (GNOME is
 //! client-side decorations only).
@@ -159,6 +160,10 @@ pub(crate) struct Protocols {
     pub(crate) preferred_scale: f64,
     /// Every text input's committed state, for the on-screen keyboard.
     pub(crate) text_inputs: crate::osk::TextInputs,
+    /// wp_drm_lease_device_v1 on the native backend (Mutter advertises it
+    /// nowhere else); see [`crate::drm::lease`].
+    #[cfg(feature = "drm")]
+    pub(crate) drm_lease: Option<crate::drm::lease::LeaseDevice>,
 }
 
 impl Protocols {
@@ -211,6 +216,8 @@ impl Protocols {
             inhibitors: Vec::new(),
             preferred_scale: 1.0,
             text_inputs: crate::osk::TextInputs::default(),
+            #[cfg(feature = "drm")]
+            drm_lease: None,
         }
     }
 }
