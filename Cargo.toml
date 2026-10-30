@@ -41,7 +41,7 @@ xkbcommon = "=0.9.0"
 zbus = "5"
 image = "0.25"
 jxl-oxide = { version = "0.12", default-features = false, features = ["rayon"] }
-resvg = { version = "0.48", default-features = false, features = ["raster-images"] }
+resvg = { version = "0.49", default-features = false, features = ["raster-images"] }
 rhai = "1.26"
 
 # Wallpaper decoding runs in debug builds too (proofs, nested sessions):
