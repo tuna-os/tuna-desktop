@@ -1,0 +1,8 @@
+systemd 262.1-1
+polkit 128-1
+geoclue 2.8.2-2
+gnome-settings-daemon 51.1-1
+gnome-control-center 51.1-1
+gnome-desktop-4 1:51.0-1
+tuna-desktop 1.0.0beta.1-1
+7.2.11-arch1-1

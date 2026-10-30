@@ -433,7 +433,7 @@ impl LockUi {
     /// Clock and date, as GNOME's UnlockDialogClock shows them (on each
     /// minute while locked, and when the clock format changes).
     pub fn refresh_clock(&self) {
-        let now = jiff::Zoned::now().datetime();
+        let now = crate::wall_clock::now().datetime();
         let time = logic::lock_clock_text(&now, (self.clock_format)());
         let date = logic::lock_date_text(now.date());
         for screen in self.screens.borrow().iter() {

@@ -1,0 +1,12 @@
+SERVICE_START pid=1 uid=0 auid=4294967295 ses=4294967295 msg='unit=geoclue comm="systemd" exe="/usr/lib/systemd/systemd" hostname=? addr=? terminal=? res=success'
+geoclue.service: Deactivated successfully.
+SERVICE_STOP pid=1 uid=0 auid=4294967295 ses=4294967295 msg='unit=geoclue comm="systemd" exe="/usr/lib/systemd/systemd" hostname=? addr=? terminal=? res=success'
+Timezone monitor enabled, starting geoclue
+SERVICE_START pid=1 uid=0 auid=4294967295 ses=4294967295 msg='unit=geoclue comm="systemd" exe="/usr/lib/systemd/systemd" hostname=? addr=? terminal=? res=success'
+Failed to connect to GeoClue2 service: Timeout was reached
+Timezone monitor disabled, stopping geoclue
+geoclue.service: Deactivated successfully.
+SERVICE_STOP pid=1 uid=0 auid=4294967295 ses=4294967295 msg='unit=geoclue comm="systemd" exe="/usr/lib/systemd/systemd" hostname=? addr=? terminal=? res=success'
+.AvailableAccuracyLevel             property  u         0            emits-change
+.InUse                              property  b         false        emits-change
+u 0

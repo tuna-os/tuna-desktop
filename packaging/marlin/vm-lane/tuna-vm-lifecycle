@@ -2556,6 +2556,22 @@ print(json.dumps(result))
         result["original_session_inventory"]=original
     elif action == "gsd-plugins":
         result = gsd_plugins()
+    elif action == "datetime":
+        # Date & Time gates (#359, docs/datetime-proof.md): every write
+        # probe restores what it changed; the desktop user is the
+        # polkit subject and the panel the clock gates read.
+        evidence = os.path.join("/run", "tuna-vm-datetime.json")
+        proof = [sys.executable, "/usr/libexec/tuna-datetime-proof"]
+        collected = subprocess.run([*proof, "collect", "--out", evidence,
+                                    "--desktop-user", OWNER.pw_name],
+                                   capture_output=True, text=True, timeout=240)
+        if collected.returncode != 0:
+            raise RuntimeError(f"datetime collect failed: {collected.stderr.strip()[-400:]}")
+        checked = subprocess.run([*proof, "check", evidence],
+                                 capture_output=True, text=True, timeout=30)
+        with open(evidence, encoding="utf-8") as stream:
+            result = {"evidence": json.load(stream),
+                      "assertions": checked.stdout.splitlines()}
     elif action == "gsd-power-idle-start":
         # Watch gsd-power's own calls, then shorten GNOME's idle delay. The
         # harness's last input preceded this; nothing touches input until wake.

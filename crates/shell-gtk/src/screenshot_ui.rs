@@ -1074,7 +1074,7 @@ fn save(texture: &gdk::Texture, crop: Rect, w: f64, h: f64, to_disk: bool) -> Op
         .unwrap_or_else(|| glib::home_dir().join("Pictures"));
     let dir = pictures.join("Screenshots");
     std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(file_name(&jiff::Zoned::now().datetime()));
+    let path = dir.join(file_name(&crate::wall_clock::now().datetime()));
     cropped.save_to_png(&path).ok()?;
     Some(cropped)
 }
