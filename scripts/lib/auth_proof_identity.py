@@ -4,7 +4,10 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import urllib.request
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import github_api  # noqa: E402
 
 REPO = "tuna-os/tuna-desktop"
 WORKFLOW = ".github/workflows/ci.yml"
@@ -32,14 +35,7 @@ def source_tuple(root):
 
 
 def api(path):
-    request = urllib.request.Request(f"https://api.github.com/repos/{REPO}/{path}", headers={
-        "Authorization": f"Bearer {os.environ['GH_TOKEN']}", "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28"})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        data = response.read(4 * 1024 * 1024 + 1)
-    if len(data) > 4 * 1024 * 1024:
-        raise ValueError("GitHub API response exceeds bounded admission size")
-    return json.loads(data)
+    return github_api.repo_json(REPO, path)
 
 
 def validate_identity(run, jobs, commit, expected_sha, run_id, attempt, event):
