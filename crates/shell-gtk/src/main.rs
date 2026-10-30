@@ -517,7 +517,67 @@ fn panel_menu_button(
             window.set_focus_visible(false);
         }
     });
+    // Down on the focused button opens its menu and moves into it, as
+    // PopupMenu's source key handler does for a menu below its source
+    // (popupMenu.js `_onKeyPress`, navKey Down for St.Side.TOP).
+    let keys = gtk::EventControllerKey::new();
+    {
+        let button = button.downgrade();
+        keys.connect_key_pressed(move |_, key, _, state| {
+            use gtk::gdk::{Key, ModifierType};
+            let plain = !state.intersects(
+                ModifierType::SHIFT_MASK
+                    | ModifierType::CONTROL_MASK
+                    | ModifierType::ALT_MASK
+                    | ModifierType::SUPER_MASK,
+            );
+            match (key, button.upgrade()) {
+                (Key::Down | Key::KP_Down, Some(button)) if plain => {
+                    open_menu_from_keyboard(&button);
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+    }
+    button.add_controller(keys);
     button
+}
+
+/// Open a panel menu from the keyboard with its first item focused
+/// (`menu.actor.navigate_focus(null, TAB_FORWARD)`), the ring shown.
+fn open_menu_from_keyboard(button: &gtk::MenuButton) {
+    if !button.is_active() {
+        button.popup();
+    }
+    let Some(popover) = button.popover() else {
+        return;
+    };
+    if popover.focus_child().is_none() {
+        popover.child_focus(gtk::DirectionType::TabForward);
+    }
+    if let Some(window) = popover.root().and_downcast::<gtk::Window>() {
+        window.set_focus_visible(true);
+    }
+}
+
+/// St's `popup-menu` keys (st-widget.c `st_widget_key_press_event`:
+/// Menu, or Shift+F10) while `widget` or a widget inside it has the
+/// keyboard focus. `open` returns whether a menu opened.
+fn on_popup_menu_key(widget: &impl IsA<gtk::Widget>, open: impl Fn() -> bool + 'static) {
+    let Some(trigger) = gtk::ShortcutTrigger::parse_string("<Shift>F10|Menu") else {
+        return;
+    };
+    let action = gtk::CallbackAction::new(move |_, _| {
+        if open() {
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    let controller = gtk::ShortcutController::new();
+    controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+    widget.add_controller(controller);
 }
 
 /// The panel's live tray menu buttons, in strip order.
@@ -714,6 +774,18 @@ fn qs_menu_tile(icon: &str, title: &str, subtitle: Option<&str>, menu: &QsMenu) 
     arrow.add_css_class("qs-menu-button");
     arrow.update_property(&[gtk::accessible::Property::Label(&format!("{title} Menu"))]);
     outer.append(&arrow);
+    // QuickMenuToggle: `popup-menu` on the toggle or its arrow opens the
+    // menu while it is enabled (quickSettings.js).
+    {
+        let arrow = arrow.downgrade();
+        on_popup_menu_key(&outer, move || {
+            arrow
+                .upgrade()
+                .filter(|arrow| arrow.is_visible())
+                .map(|arrow| arrow.set_active(true))
+                .is_some()
+        });
+    }
     {
         let motion = menu.motion.clone();
         arrow.connect_toggled(move |a| motion.set_open(a.is_active()));
@@ -1008,6 +1080,12 @@ fn quick_settings_popover(
     {
         let motion = power_menu_box.motion.clone();
         power.connect_clicked(move |_| motion.set_open(!motion.is_open()));
+        // ShutdownItem opens its menu on `popup-menu` (status/system.js).
+        let motion = power_menu_box.motion.clone();
+        on_popup_menu_key(&power, move || {
+            motion.set_open(true);
+            true
+        });
     }
     {
         let popover = popover.clone();
@@ -1087,6 +1165,18 @@ fn quick_settings_popover(
         });
     }
     volume_row.append(&sound_arrow);
+    // QuickSlider: `popup-menu` on the slider opens its menu when it has
+    // one (quickSettings.js, `menuEnabled`).
+    {
+        let arrow = sound_arrow.downgrade();
+        on_popup_menu_key(&slider, move || {
+            arrow
+                .upgrade()
+                .filter(|arrow| arrow.is_visible())
+                .map(|arrow| arrow.set_active(true))
+                .is_some()
+        });
+    }
 
     // GNOME's microphone slider (volume.js `InputStreamSlider`): shown
     // only while an app records; the icon button mutes.
@@ -2123,6 +2213,22 @@ fn build(app: &adw::Application) {
                 input.clone(),
                 tray_box.clone(),
             );
+            // The date menu's message list takes Escape first while a
+            // group is expanded (calendar.js `_keyController`).
+            let collapse_e = (*button == clock).then(|| notify.clone());
+            let (bar_m, window_m, held_m, guard_m) = (
+                bar.clone(),
+                window.clone(),
+                panel_held.clone(),
+                panel_escape_guard.clone(),
+            );
+            let (clock_m, system_m, a11y_m, input_m, tray_box_m) = (
+                clock.clone(),
+                system.clone(),
+                a11y.clone(),
+                input.clone(),
+                tray_box.clone(),
+            );
             let guard = panel_escape_guard.clone();
             popover.connect_show(move |_| {
                 let mut state = guard.get();
@@ -2151,7 +2257,16 @@ fn build(app: &adw::Application) {
             escape_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
             escape_keys.connect_key_pressed(move |_, key, _, _| {
                 use gtk::gdk::Key;
-                if key != Key::Escape || !held_e.get() {
+                if key != Key::Escape {
+                    return glib::Propagation::Proceed;
+                }
+                if collapse_e
+                    .as_ref()
+                    .is_some_and(|notify| notify.collapse_expanded())
+                {
+                    return glib::Propagation::Stop;
+                }
+                if !held_e.get() {
                     return glib::Propagation::Proceed;
                 }
                 close_panel_menus(
@@ -2166,6 +2281,57 @@ fn build(app: &adw::Application) {
                 glib::Propagation::Stop
             });
             popover.add_controller(escape_keys);
+            // Left/Right that move nowhere inside the open menu go to the
+            // neighbouring panel control and open its menu (panelMenu.js
+            // `_onMenuKeyPress`, then PopupMenuManager's key-focus
+            // `_changeMenu`). GTK's own arrow binding moves inside first.
+            let focus_before: Rc<RefCell<Option<gtk::Widget>>> = Rc::new(RefCell::new(None));
+            {
+                let focus_before = focus_before.clone();
+                popover.connect_move_focus(move |popover, _| {
+                    *focus_before.borrow_mut() = popover.root().and_then(|root| root.focus());
+                });
+            }
+            popover.connect_local("move-focus", true, move |args| {
+                let popover = args[0].get::<gtk::Popover>().ok()?;
+                let direction = args[1].get::<gtk::DirectionType>().ok()?;
+                let forward = match direction {
+                    gtk::DirectionType::Left => false,
+                    gtk::DirectionType::Right => true,
+                    _ => return None,
+                };
+                let now = popover.root().and_then(|root| root.focus());
+                if !popover.is_visible() || *focus_before.borrow() != now {
+                    return None;
+                }
+                close_panel_menus(
+                    &clock_m,
+                    &system_m,
+                    &a11y_m,
+                    &input_m,
+                    &tray_box_m,
+                    &guard_m,
+                );
+                if held_m.get() {
+                    assert_panel_hold(&window_m, &held_m);
+                }
+                bar_m.child_focus(if forward {
+                    gtk::DirectionType::TabForward
+                } else {
+                    gtk::DirectionType::TabBackward
+                });
+                let mut buttons = vec![
+                    clock_m.clone(),
+                    system_m.clone(),
+                    a11y_m.clone(),
+                    input_m.clone(),
+                ];
+                buttons.extend(tray_menu_buttons(&tray_box_m));
+                if let Some(next) = buttons.into_iter().find(|b| b.focus_child().is_some()) {
+                    next.popup();
+                }
+                None
+            });
         }
     }
     // Panel-focus keys: Escape unwinds the open panel menu, then
