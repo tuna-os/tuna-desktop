@@ -2531,6 +2531,8 @@ impl Runtime {
             // Never emit key identities that could expose credential input.
             "seat_pressed_key_count": self.state.pressed_key_count(),
             "x11_ready": x11_ready,
+            "bell_rings": self.state.bell_rings(),
+            "bell_policy": self.state.protocols.bell.policy(),
             "idle_timeout_ms": self.lock.timeout_ms(),
             "idle_blank_alpha": self.blank_alpha(),
             "power_save_mode": self.power_save.mode(),

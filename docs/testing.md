@@ -302,6 +302,20 @@ rm -rf gtk-shell-artifacts
 TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts
 ```
 
+`--sound-alerts-only` runs just the bell and sound-feedback gates after the
+session starts (`just proof gtk-shell-proof --sound-alerts-only`):
+G-VISUAL-BELL (a real xdg-system-bell client; host pixels of the frame and
+whole-output flashes, none with `visual-bell` off, the original pixels after
+every case; `bell-window-system` only with `audible-bell` and
+`event-sounds`), G-X11-BELL (an X11 client's `XkbBell` through Xwayland, the
+same policy, Mutter's 100 ms repeat drop), G-XSETTINGS-SOUNDS (the
+distribution gsd-xsettings owns XSETTINGS and publishes
+`input-feedback-sounds` as `Net/EnableInputFeedbackSounds`) and
+G-QS-VOLUME-FEEDBACK (a real drag of the quick-settings volume slider sounds
+once at its end, a scroll once, a playing sink or `event-sounds` off never).
+A `canberra-gtk-play` stand-in logs every event sound to `canberra-calls`;
+none of these gates plays or captures audio.
+
 `scripts/tuna-drm-smoke` loads a kernel module and starts seatd as root.
 Run it in a VM or a disposable machine rather than your desktop session.
 The Ubuntu setup helper first checks whether vkms is already installed for

@@ -398,6 +398,13 @@ pub trait XwmHandler {
 
     /// WM has lost connection to X server
     fn disconnected(&mut self, _xwm: XwmId) {}
+
+    /// An X11 client rang the XKB bell (`XkbBellNotify`), after
+    /// [`X11Wm::select_bell_events`]. `window` is the X window the bell was
+    /// rung for, if the client named one; `time` is the X server timestamp.
+    fn bell(&mut self, xwm: XwmId, window: Option<X11Window>, time: u32) {
+        let _ = (xwm, window, time);
+    }
 }
 
 /// The runtime state of an reparenting XWayland window manager.
@@ -1315,6 +1322,80 @@ impl X11Wm {
 
         self.xsettings.update(&self.conn)?;
 
+        Ok(())
+    }
+
+    /// Handle X11 bells like Mutter: select `XkbBellNotify` on the core
+    /// keyboard and turn off the server's own `AudibleBell` control, so
+    /// every bell reaches [`XwmHandler::bell`] and none sounds twice.
+    pub fn select_bell_events(&mut self) -> Result<(), ReplyError> {
+        use x11rb::protocol::xkb::{
+            self, BoolCtrl, ConnectionExt as _, Control, EventType, MapPart, SelectEventsAux,
+        };
+        let device = u16::from(xkb::ID::USE_CORE_KBD);
+        if !self.conn.xkb_use_extension(1, 0)?.reply()?.supported {
+            return Err(ConnectionError::UnsupportedExtension.into());
+        }
+        self.conn.xkb_select_events(
+            device,
+            EventType::from(0u16),
+            EventType::BELL_NOTIFY,
+            MapPart::from(0u16),
+            MapPart::from(0u16),
+            &SelectEventsAux::new(),
+        )?;
+        // XkbChangeEnabledControls(dpy, XkbUseCoreKbd, XkbAudibleBellMask, 0).
+        self.conn.xkb_set_controls(
+            device,
+            0u16.into(),
+            0u16.into(),
+            0u16.into(),
+            0u16.into(),
+            0u16.into(),
+            0u16.into(),
+            0u16.into(),
+            0u16.into(),
+            0,
+            0,
+            0u16.into(),
+            BoolCtrl::AUDIBLE_BELL_MASK,
+            0u32.into(),
+            Control::CONTROLS_ENABLED,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0u32.into(),
+            0u32.into(),
+            0u16.into(),
+            0u16.into(),
+            &[0; 32],
+        )?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Give up the `_XSETTINGS_S0` selection [`X11Wm::start_wm`] takes, for
+    /// a session whose XSETTINGS manager is a separate client
+    /// (gnome-settings-daemon's xsettings plugin refuses to start while
+    /// another manager owns it).
+    pub fn release_xsettings_selection(&mut self) -> Result<(), ReplyError> {
+        let owner = self
+            .conn
+            .get_selection_owner(self.atoms._XSETTINGS_S0)?
+            .reply()?
+            .owner;
+        if owner == self.xsettings.window {
+            self.conn
+                .set_selection_owner(x11rb::NONE, self.atoms._XSETTINGS_S0, x11rb::CURRENT_TIME)?;
+            self.conn.flush()?;
+        }
         Ok(())
     }
 
@@ -2455,6 +2536,10 @@ where
                     state.randr_primary_output_change(xwm_id, primary_name);
                 }
             }
+        }
+        Event::XkbBellNotify(n) => {
+            drop(_guard);
+            state.bell(xwm_id, (n.window != x11rb::NONE).then_some(n.window), n.time);
         }
         Event::Error(err) => {
             info!(?err, "Got X11 Error");

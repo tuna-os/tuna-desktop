@@ -1,4 +1,4 @@
-//! Native xdg bell consumers with live policy and bounded player lifetime.
+//! Native xdg and X11 bell consumers with live policy and bounded player lifetime.
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
@@ -14,6 +14,8 @@ pub(crate) struct Bell {
     last_visual: Option<Instant>,
     visual: Option<(Instant, u8, Option<WlSurface>)>,
     player: Option<(std::process::Child, Instant)>,
+    /// X server time of the last admitted X11 bell (Mutter's `last_bell_time`).
+    last_x11_time: u32,
 }
 
 fn flashes(last: Option<Instant>, now: Instant) -> u8 {
@@ -22,6 +24,15 @@ fn flashes(last: Option<Instant>, now: Instant) -> u8 {
         Some(gap) if gap < Duration::from_secs(3) => 1,
         _ => 2,
     }
+}
+
+/// Mutter's `XSERVER_TIME_IS_BEFORE`: wrapping X server timestamps, where 0
+/// is "never".
+fn xserver_time_is_before(time1: u32, time2: u32) -> bool {
+    time1 == 0
+        || (time2 != 0
+            && ((time1 < time2 && time2 - time1 < u32::MAX / 2)
+                || (time1 > time2 && time1 - time2 > u32::MAX / 2)))
 }
 
 /// A 50 ms quad-in leg followed by `repeats` alternating legs.
@@ -140,6 +151,19 @@ impl Bell {
             surface.as_ref(),
         ))
     }
+    /// The live policy, once the shell has sent it.
+    pub fn policy(&self) -> Option<&BellPolicy> {
+        self.policy_ready.then_some(&self.policy)
+    }
+    /// Mutter 51 `handle_other_xevent`: an X11 bell within 100 ms of the
+    /// last one it handled is dropped (X server time).
+    pub fn admit_x11(&mut self, time: u32) -> bool {
+        if !xserver_time_is_before(self.last_x11_time, time.wrapping_sub(100)) {
+            return false;
+        }
+        self.last_x11_time = time;
+        true
+    }
     pub fn clear_visual(&mut self) {
         self.visual = None;
     }
@@ -226,5 +250,21 @@ mod tests {
         });
         assert!(bell.visual(Instant::now()).is_none());
         assert_eq!(bell.rings, 1);
+    }
+    #[test]
+    fn x11_bells_within_100ms_of_the_last_handled_one_are_dropped() {
+        let mut bell = Bell::default();
+        assert!(bell.admit_x11(5_000));
+        assert!(!bell.admit_x11(5_050));
+        assert!(!bell.admit_x11(5_100));
+        assert!(bell.admit_x11(5_101));
+        // Dropped bells do not extend the window, as in Mutter.
+        assert!(!bell.admit_x11(5_150));
+        assert!(bell.admit_x11(5_202));
+        // The server clock wraps.
+        let mut bell = Bell::default();
+        assert!(bell.admit_x11(u32::MAX - 20));
+        assert!(!bell.admit_x11(30));
+        assert!(bell.admit_x11(120));
     }
 }
