@@ -529,9 +529,10 @@ fn hotplug_remove_and_readd_returns_windows_to_their_output() {
     assert_eq!(f.manager.geometry(f.id_a).unwrap(), geo_a);
     // move_rect_between_rects: (1312, 32) is 32/1120 and 32/480 into the
     // free space of the 1920x1080 output, so 13 and 13 of the 480x200
-    // left over on the 1280x800 one.
+    // left over on the 1280x800 one. Beta was wholly below the 32px panel,
+    // so the constraints keep it there (constrain_fully_onscreen): y 32.
     let waiting = f.manager.geometry(f.id_b).unwrap();
-    assert_eq!((waiting.loc.x, waiting.loc.y), (13, 13));
+    assert_eq!((waiting.loc.x, waiting.loc.y), (13, 32));
     assert_eq!((waiting.size.w, waiting.size.h), (800, 600));
     assert_eq!(f.manager.preferred_output(f.id_b), Some("right"));
 
@@ -548,9 +549,11 @@ fn hotplug_remove_and_readd_returns_windows_to_their_output() {
     assert_eq!(f.manager.geometry(f.id_a).unwrap(), geo_a);
     let home = f.manager.geometry(f.id_b).unwrap();
     assert_inside_right(home);
+    // From where the unplug would have put it unconstrained, (13, 13):
     // 13/480 and 13/200 of the free space again, truncated as Mutter's
-    // integer conversion does.
-    assert_eq!((home.loc.x, home.loc.y), (1280 + 30, 31));
+    // integer conversion does, is (1310, 31), and the panel constraint
+    // takes it to y 32. From (13, 32) it would land at y 76.
+    assert_eq!((home.loc.x, home.loc.y), (1280 + 30, 32));
 }
 
 /// An output moving in the layout (GNOME Settings' arrangement or a
@@ -576,6 +579,98 @@ fn moved_output_carries_its_windows() {
         geo_b.loc - smithay::utils::Point::from((3200, 0))
     );
     assert_eq!(moved.size, geo_b.size);
+}
+
+/// The hotplug storm's arrangement step (#203): three 1024x768 outputs in
+/// a row, then GNOME Settings scales the middle one to 768x576 and moves
+/// it to the end, its neighbour taking its place. Each window follows its
+/// own output (`move_rect_between_rects`) and the next tick's workarea
+/// pass leaves it there: it must not clamp a re-homed window into
+/// whichever output held its new place in the old layout.
+#[test]
+fn rearranged_and_scaled_outputs_carry_their_windows_past_the_next_tick() {
+    let mut comp = TestCompositor::new();
+    for name in ["Virtual-2", "Virtual-3", "Virtual-4"] {
+        comp.state.add_output(name, None, 1024, 768);
+    }
+    let mut manager = comp.window_manager();
+    let (conn_b, mut queue_b, mut client_b) = connect(&mut comp);
+    map_toplevel(&mut comp, &conn_b, &mut queue_b, &mut client_b, "B");
+    let (conn_c, mut queue_c, mut client_c) = connect(&mut comp);
+    map_toplevel(&mut comp, &conn_c, &mut queue_c, &mut client_c, "C");
+    manager.reconcile(&mut comp.state);
+    sync_client(&mut comp, &conn_b, &mut queue_b, &mut client_b);
+    sync_client(&mut comp, &conn_c, &mut queue_c, &mut client_c);
+    let id = |manager: &WindowManager, title: &str| {
+        manager
+            .model()
+            .windows()
+            .find(|w| w.title == title)
+            .unwrap()
+            .id
+    };
+    let (id_b, id_c) = (id(&manager, "B"), id(&manager, "C"));
+    // B centred-ish on Virtual-3 and C on Virtual-4, as the storm's GTK
+    // clients are placed: 272 of 544 and 240 of 448 free pixels in.
+    for (window, x) in [(id_b, 1024 + 272), (id_c, 2048 + 272)] {
+        assert!(manager.resize_window(window, 480, 320));
+        let geo = manager.geometry(window).unwrap();
+        assert!(manager.move_window(window, x - geo.loc.x, 240 - geo.loc.y));
+    }
+    manager.reconcile(&mut comp.state);
+    assert_eq!(
+        manager.geometry(id_b).unwrap(),
+        smithay::utils::Rectangle::new((1296, 240).into(), (480, 320).into())
+    );
+
+    // ApplyMonitorsConfig: Virtual-2, then Virtual-4, then Virtual-3 at
+    // scale 4/3.
+    let before = comp.state.output_slices();
+    comp.state.add_output("Virtual-3", None, 768, 576);
+    comp.state.set_output_location("Virtual-3", (2048, 0));
+    comp.state.set_output_location("Virtual-4", (1024, 0));
+    assert_eq!(
+        manager.relocate_for_monitors_changed(&comp.state, &before),
+        2
+    );
+    // B: 272/544 and 240/448 of the free space of 768x576 at (2048,0);
+    // C: the same place on Virtual-4, now at (1024,0).
+    let b = smithay::utils::Rectangle::new((2048 + 144, 137).into(), (480, 320).into());
+    let c = smithay::utils::Rectangle::new((1024 + 272, 240).into(), (480, 320).into());
+    assert_eq!(manager.geometry(id_b).unwrap(), b);
+    assert_eq!(manager.geometry(id_c).unwrap(), c);
+    assert_eq!(manager.preferred_output(id_b), Some("Virtual-3"));
+    assert_eq!(manager.preferred_output(id_c), Some("Virtual-4"));
+
+    // The next tick sees the new workareas and keeps both where they are.
+    manager.reconcile(&mut comp.state);
+    assert_eq!(manager.geometry(id_b).unwrap(), b, "B stays on Virtual-3");
+    assert_eq!(manager.geometry(id_c).unwrap(), c, "C stays on Virtual-4");
+}
+
+/// A window just below the panel on an output that shrinks keeps its
+/// relative place, but never ends under the panel strip: Mutter's move
+/// between monitors runs the constraints (`constrain_fully_onscreen`).
+#[test]
+fn scaled_output_keeps_a_rehomed_window_below_the_panel() {
+    let mut f = two_windows_dual();
+    let geo = f.manager.geometry(f.id_a).unwrap();
+    // 800x600 at (0, 40) on the 1280x800 "left": 40 of the 200 free
+    // pixels down, wholly inside the workarea below the 32px panel.
+    assert!(f.manager.move_window(f.id_a, -geo.loc.x, 40 - geo.loc.y));
+    assert!(f.manager.move_window(f.id_b, 1280, 0));
+    let before = f.comp.state.output_slices();
+    // Scale 1.25: "left" is 1024x640 logical, "right" follows it.
+    f.comp.state.add_output("left", None, 1024, 640);
+    f.comp.state.set_output_location("right", (1024, 0));
+    f.manager
+        .relocate_for_monitors_changed(&f.comp.state, &before);
+    // move_rect_between_rects alone: 40/200 of 40 free pixels, y=8.
+    let alpha = f.manager.geometry(f.id_a).unwrap();
+    assert_eq!((alpha.loc.x, alpha.loc.y), (0, 32));
+    assert_eq!((alpha.size.w, alpha.size.h), (800, 600));
+    f.manager.reconcile(&mut f.comp.state);
+    assert_eq!(f.manager.geometry(f.id_a).unwrap(), alpha);
 }
 
 /// A window larger than the output it lands on keeps its centre's

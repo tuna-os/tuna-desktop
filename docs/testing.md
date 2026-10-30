@@ -410,43 +410,6 @@ refreshed from it. The docs show the GTK shell through the
 `scripts/lib/tuna-parity-compare.py`. CI does not run it. The workflow and
 the states are in [pixel parity with GNOME 51](gnome-parity.md).
 
-## When a run fails
-
-Read `nested.log` in the artifacts directory first (`compositor.log` for
-`tuna-drm-smoke`); see
-[nested session troubleshooting](nested-session.md#troubleshooting). Do not
-retry a deterministic test until it passes: the timing rule in the
-[development guide](development.md#writing-a-test) applies.
-
-## Bounded nested stress
-
-`nested stress` runs four concurrent Wayland GTK clients. Each round maps
-and destroys 400 windows; three warmup rounds settle renderer caches.
-After every measured round, Escape and Super must still change the
-compositor's overview state, and every destroyed window must disappear.
-The lane then sends 1,000 notifications and closes each over D-Bus.
-
-The per-change smoke uses ten measured rounds; nightly uses 300. The
-report retains PSS/RSS, file descriptors and descendant process counts
-for the compositor and supervised shell after each round. Final PSS must
-stay within warmup PSS × 1.25 + 64 MiB, and fd count within warmup + 32.
-These diagnostic bounds catch unbounded growth in this workload; they
-are separate from the GNOME performance targets in #73. A panic, lost
-input response, orphaned window or hung worker fails the lane. Logs,
-metrics, final state, assertions and the exact source revision are kept.
-
-Run it on a development host after building the compositor and GTK shell:
-
-```sh
-scripts/tuna-stress --rounds 10 --out /tmp/tuna-stress-fresh
-```
-
-Use a fresh empty artifact directory for each run. The harness starts its
-own Xvfb, session bus and private user state. It covers client churn and
-notification flood portions of #203; malformed Wayland requests, service
-faults, locked-input adversaries and a measured 24-hour VM soak remain
-open. Output hotplug has its own lane, below.
-
 ## Output hotplug storm
 
 The nested backend has one fixed output, so hotplug runs on real DRM: the
@@ -502,6 +465,41 @@ kept first. Unlike Mutter, which reads `monitors.xml` once at startup,
 the stored configuration is read from the file at each hotplug. Real
 panels, EDIDs, colord device registration on hotplug and multiple GPUs
 are not covered.
+
+## When a run fails
+
+Read `nested.log` in the artifacts directory first (`compositor.log` for
+`tuna-drm-smoke`); see
+[nested session troubleshooting](nested-session.md#troubleshooting). Do not
+retry a deterministic test until it passes: the timing rule in the
+[development guide](development.md#writing-a-test) applies.
+
+## Bounded nested stress
+
+`nested stress` runs four concurrent Wayland GTK clients. Each round maps
+and destroys 400 windows; three warmup rounds settle renderer caches.
+After every measured round, Escape and Super must still change the
+compositor's overview state, and every destroyed window must disappear.
+The lane then sends 1,000 notifications and closes each over D-Bus.
+
+The per-change smoke uses ten measured rounds; nightly uses 300. The
+report retains PSS/RSS, file descriptors and descendant process counts
+for the compositor and supervised shell after each round. Final PSS must
+stay within warmup PSS × 1.25 + 64 MiB, and fd count within warmup + 32.
+These diagnostic bounds catch unbounded growth in this workload; they
+are separate from the GNOME performance targets in #73. A panic, lost
+input response, orphaned window or hung worker fails the lane. Logs,
+metrics, final state, assertions and the exact source revision are kept.
+
+Run it on a development host after building the compositor and GTK shell:
+
+```sh
+scripts/tuna-stress --rounds 10 --out /tmp/tuna-stress-fresh
+```
+
+Use a fresh empty artifact directory for each run. Real output hotplug and
+the VM endurance soak (`scripts/tuna-vm-soak`, [soak.md](soak.md)) are
+separate lanes.
 
 ## Control decoder fuzzing
 
