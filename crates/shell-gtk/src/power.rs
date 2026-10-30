@@ -605,7 +605,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tuna-comm-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("tuna-compositor");
-        std::fs::copy("/bin/sleep", &exe).unwrap();
+        // A symlink, not a copy: the kernel names the process after the
+        // path it executes, and a freshly written executable can fail with
+        // ETXTBSY when another test thread forks while it is still open.
+        std::os::unix::fs::symlink("/bin/sleep", &exe).unwrap();
         let mut child = std::process::Command::new(&exe).arg("5").spawn().unwrap();
         let comm = std::fs::read_to_string(format!("/proc/{}/comm", child.id())).unwrap();
         child.kill().unwrap();
