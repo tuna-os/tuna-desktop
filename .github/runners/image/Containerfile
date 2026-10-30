@@ -1,0 +1,69 @@
+# Self-hosted GitHub Actions runner for tuna-desktop CI on karnataka.
+#
+# Mirrors what our jobs assume from GitHub's ubuntu-24.04/ubuntu-26.04
+# images: passwordless sudo, git, jq, python3, rustup with stable, podman,
+# shellcheck, xvfb and the usual build tools. Jobs still apt-get install
+# their own dependencies. Build with .github/runners/build-image.
+ARG UBUNTU=24.04
+FROM docker.io/library/ubuntu:${UBUNTU}
+
+ARG RUNNER_VERSION
+ARG RUNNER_UID=1001
+ARG IMAGE_OS=ubuntu24
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    ImageOS=${IMAGE_OS} \
+    RUNNER_TOOL_CACHE=/opt/hostedtoolcache \
+    AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
+
+# Subset of actions/runner-images' ubuntu toolset apt_packages plus the
+# tools that image installs separately (git, gh, podman, pipx, rustup).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      acl aria2 autoconf automake binutils bison brotli bzip2 ca-certificates \
+      coreutils curl dbus dnsutils dpkg-dev fakeroot file findutils flex \
+      g++ gcc git git-lfs gnupg imagemagick iproute2 iputils-ping jq \
+      libssl-dev libtool libyaml-dev locales lsb-release lz4 m4 make \
+      net-tools netcat-openbsd openssh-client p7zip-full parallel patchelf \
+      pigz pkg-config podman buildah skopeo fuse-overlayfs uidmap \
+      python-is-python3 python3 python3-pip python3-venv pipx rsync \
+      shellcheck sqlite3 sudo tar time tree tzdata unzip wget xvfb \
+      xz-utils zip zstd \
+ && curl -fsSLo /usr/share/keyrings/githubcli-archive-keyring.gpg \
+      https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update && apt-get install -y --no-install-recommends gh \
+ && rm -rf /var/lib/apt/lists/*
+
+# The ubuntu base image ships an `ubuntu` user at uid 1000; GitHub's
+# images run jobs as `runner` (uid 1001) with passwordless sudo.
+RUN useradd -m -u "${RUNNER_UID}" -s /bin/bash runner \
+ && usermod -aG sudo runner \
+ && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner \
+ && chmod 0440 /etc/sudoers.d/runner \
+ && echo 'Defaults env_keep += "DEBIAN_FRONTEND"' > /etc/sudoers.d/env_keep \
+ && mkdir -p /opt/hostedtoolcache && chown runner:runner /opt/hostedtoolcache
+
+WORKDIR /home/runner
+RUN curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \
+      | tar -xz \
+ && ./bin/installdependencies.sh \
+ && rm -rf /var/lib/apt/lists/* \
+ && chown -R runner:runner /home/runner
+
+# Refuses jobs from forks and foreign repositories, whatever runs-on says.
+COPY --chmod=0755 job-started /opt/tuna-ci/job-started
+ENV ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/tuna-ci/job-started
+
+USER runner
+ENV PATH=/home/runner/.cargo/bin:/home/runner/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    CARGO_HOME=/home/runner/.cargo \
+    RUSTUP_HOME=/home/runner/.rustup
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal \
+      --default-toolchain stable --component rustfmt,clippy --no-modify-path \
+ && rustc --version && cargo --version
+
+ENTRYPOINT []
+CMD ["/home/runner/run.sh"]

@@ -54,7 +54,10 @@ jobs:
           fi
 
   check:
-    runs-on: ubuntu-latest
+    # Self-hosted on karnataka (docs/ci-runners.md) for this repository's own
+    # branches; fork pull requests, and every job when the CI_RUNNERS
+    # repository variable is `hosted`, use GitHub-hosted runners.
+    runs-on: ${{ vars.CI_RUNNERS != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'tuna-ci-24.04' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

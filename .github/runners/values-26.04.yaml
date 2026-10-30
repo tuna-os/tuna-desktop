@@ -1,0 +1,49 @@
+# gha-runner-scale-set values: tuna-desktop jobs that run on ubuntu-26.04
+# (Ubuntu 26.04 userland). Install/upgrade: see docs/ci-runners.md.
+githubConfigUrl: https://github.com/tuna-os
+githubConfigSecret: tuna-ci-github
+# Org runner group whose only selected repository is tuna-os/tuna-desktop.
+runnerGroup: tuna-desktop-karnataka
+runnerScaleSetName: tuna-ci-26.04
+minRunners: 0
+maxRunners: 2
+
+controllerServiceAccount:
+  namespace: arc-systems
+  name: arc-gha-rs-controller
+
+listenerTemplate:
+  spec:
+    containers:
+      - name: listener
+        resources:
+          requests: {cpu: 50m, memory: 64Mi}
+          limits: {memory: 256Mi}
+
+template:
+  spec:
+    # One job per pod: ARC registers each pod as an ephemeral JIT runner
+    # and deletes it when the job ends; nothing survives the pod.
+    restartPolicy: Never
+    # Root in the pod (sudo apt-get) is an unprivileged uid on the node.
+    hostUsers: false
+    priorityClassName: tuna-ci-runner
+    automountServiceAccountToken: false
+    enableServiceLinks: false
+    containers:
+      - name: runner
+        image: localhost/tuna-ci-runner:26.04-2.338.2-202610301959
+        imagePullPolicy: Never
+        command: ["/home/runner/run.sh"]
+        resources:
+          requests: {cpu: "2", memory: 6Gi, ephemeral-storage: 20Gi}
+          limits: {cpu: "4", memory: 14Gi, ephemeral-storage: 45Gi}
+        volumeMounts:
+          - name: dshm
+            mountPath: /dev/shm
+    volumes:
+      # Chromium and GTK need more than the 64 MiB container default.
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi

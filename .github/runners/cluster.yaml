@@ -1,0 +1,87 @@
+# Cluster-side guard rails for tuna-desktop self-hosted runners on karnataka.
+# Apply with: kubectl --context karnataka-k3s apply -f .github/runners/cluster.yaml
+# See docs/ci-runners.md.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tuna-ci
+  labels:
+    # Runner pods are unprivileged; nothing in this namespace may be
+    # privileged, use host namespaces or mount host paths.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+---
+# Runner pods get no API credentials: the default service account never
+# mounts a token and has no RoleBindings.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: tuna-ci
+automountServiceAccountToken: false
+---
+# Deny all ingress. Egress: cluster DNS plus the public internet only. The
+# private ranges cover the pod and service CIDRs (10.42/16, 10.43/16, so the
+# Kubernetes API Service and every other namespace), the node's LAN and
+# tailnet addresses (the API server on :6443, kubelet on :10250), podman's
+# 10.88/16 bridge, and link-local metadata.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: runners-internet-only
+  namespace: tuna-ci
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+---
+# Hard ceiling for all runner pods together, whatever the scale sets ask
+# for: 8 runners x 4 CPU / 14 GiB, leaving punjab and KubeVirt their room.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: runner-ceiling
+  namespace: tuna-ci
+spec:
+  hard:
+    pods: "8"
+    requests.cpu: "16"
+    limits.cpu: "32"
+    requests.memory: 48Gi
+    limits.memory: 112Gi
+    requests.ephemeral-storage: 160Gi
+    limits.ephemeral-storage: 360Gi
+---
+# Runner pods yield to everything else: new KubeVirt VMs (punjab) and
+# cluster services preempt them; they never preempt anything.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: tuna-ci-runner
+value: -100
+preemptionPolicy: Never
+globalDefault: false
+description: tuna-desktop CI runners; lowest priority on karnataka.
