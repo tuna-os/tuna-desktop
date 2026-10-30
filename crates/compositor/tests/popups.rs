@@ -58,6 +58,8 @@ struct Client {
     /// Pointer button presses delivered (any surface).
     presses: u32,
     releases: u32,
+    /// Serial of the latest press delivered.
+    press_serial: Option<u32>,
     /// Surface ids keyboard focus entered, in order.
     keyboard_entered: Vec<u32>,
     layer_shell: Option<ZwlrLayerShellV1>,
@@ -199,11 +201,13 @@ impl Dispatch<WlPointer, ()> for Client {
                 state.pointer_entered.push(surface.id().protocol_id())
             }
             PointerEvent::Button {
+                serial,
                 state: wayland_client::WEnum::Value(s),
                 ..
             } => {
                 if s == wayland_client::protocol::wl_pointer::ButtonState::Pressed {
                     state.presses += 1;
+                    state.press_serial = Some(serial);
                 } else {
                     state.releases += 1;
                 }
@@ -278,6 +282,7 @@ struct Fixture {
     client: Client,
     toplevel_surface: WlSurface,
     toplevel_xdg: XdgSurface,
+    toplevel: XdgToplevel,
     window_origin: Point<i32, Logical>,
 }
 
@@ -344,6 +349,7 @@ fn fixture() -> Fixture {
         client,
         toplevel_surface: surface,
         toplevel_xdg: xdg,
+        toplevel,
         window_origin: (0, 0).into(),
     };
     sync(&mut f);
@@ -651,4 +657,241 @@ fn keyboard_focus_returns_to_the_exclusive_layer_after_the_grab() {
         Some(layer.id().protocol_id()),
         "grab hand-back restores the exclusive layer, not the window"
     );
+}
+
+/// Abort the test binary if the test it guards is still running after a
+/// minute: the regressions below hung the compositor in a loop, which would
+/// otherwise stall the whole test run without a verdict.
+struct Watchdog(#[allow(dead_code)] std::sync::mpsc::Sender<()>);
+
+fn watchdog(what: &'static str) -> Watchdog {
+    let (done, wait) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            wait.recv_timeout(std::time::Duration::from_secs(60))
+        {
+            eprintln!("{what}: the compositor was still busy after 60 s");
+            std::process::abort();
+        }
+    });
+    Watchdog(done)
+}
+
+/// Pump until the client's connection carries a protocol error.
+fn protocol_error(f: &mut Fixture) -> wayland_client::backend::protocol::ProtocolError {
+    for _ in 0..PUMP_ROUNDS {
+        let _ = f.queue.flush();
+        f.comp.pump();
+        if let Some(guard) = f.queue.prepare_read() {
+            let _ = guard.read();
+        }
+        let _ = f.queue.dispatch_pending(&mut f.client);
+        if let Some(error) = f.conn.protocol_error() {
+            return error;
+        }
+    }
+    panic!("no protocol error within the pump budget");
+}
+
+/// A client connected after the offender still gets its roundtrip answered.
+fn another_client_is_served(f: &mut Fixture) {
+    let (server, stream) = UnixStream::pair().unwrap();
+    f.comp.add_client(server);
+    let conn = Connection::from_socket(stream).unwrap();
+    let mut queue = conn.new_event_queue();
+    let mut client = Client::default();
+    conn.display().sync(&queue.handle(), ());
+    for _ in 0..PUMP_ROUNDS {
+        queue.flush().unwrap();
+        f.comp.pump();
+        if let Some(guard) = queue.prepare_read() {
+            guard.read().unwrap();
+        }
+        queue.dispatch_pending(&mut client).unwrap();
+        if client.synced {
+            return;
+        }
+    }
+    panic!("a new client went unanswered");
+}
+
+fn positioner(f: &Fixture) -> XdgPositioner {
+    let positioner = f
+        .client
+        .xdg_base
+        .as_ref()
+        .unwrap()
+        .create_positioner(&f.queue.handle(), ());
+    positioner.set_size(100, 50);
+    positioner.set_anchor_rect(10, 10, 1, 1);
+    positioner
+}
+
+fn xdg_surface_for(f: &Fixture, surface: &WlSurface) -> XdgSurface {
+    f.client
+        .xdg_base
+        .as_ref()
+        .unwrap()
+        .get_xdg_surface(surface, &f.queue.handle(), surface.clone())
+}
+
+fn assert_invalid_parent(f: &mut Fixture) {
+    let error = protocol_error(f);
+    assert_eq!(error.object_interface, "xdg_wm_base", "{error:?}");
+    assert_eq!(
+        error.code,
+        wayland_protocols::xdg::shell::client::xdg_wm_base::Error::InvalidPopupParent as u32,
+        "{error:?}"
+    );
+    another_client_is_served(f);
+}
+
+/// #203: the protocol fuzzer parented a popup to its own xdg_surface. The
+/// popup became its own ancestor and the walk to its root
+/// (find_popup_root_surface) never ended, hanging the session.
+#[test]
+fn a_popup_parented_to_itself_is_refused_and_the_compositor_keeps_serving() {
+    let _watchdog = watchdog("self-parented popup");
+    let mut f = fixture();
+    let qh = f.queue.handle();
+    let positioner = positioner(&f);
+    let surface = f
+        .client
+        .compositor
+        .as_ref()
+        .unwrap()
+        .create_surface(&qh, ());
+    let xdg = xdg_surface_for(&f, &surface);
+    let _popup = xdg.get_popup(Some(&xdg), &positioner, &qh, ());
+    surface.commit();
+    assert_invalid_parent(&mut f);
+}
+
+/// The same cycle through a second xdg_surface on a surface that already
+/// is a popup: its new popup would descend from itself.
+#[test]
+fn a_popup_descending_from_itself_is_refused() {
+    let _watchdog = watchdog("popup cycle");
+    let mut f = fixture();
+    let qh = f.queue.handle();
+    let positioner = positioner(&f);
+    let surface = f
+        .client
+        .compositor
+        .as_ref()
+        .unwrap()
+        .create_surface(&qh, ());
+    let first = xdg_surface_for(&f, &surface);
+    let _menu = first.get_popup(Some(&f.toplevel_xdg), &positioner, &qh, ());
+    surface.commit();
+    sync(&mut f);
+    let second = xdg_surface_for(&f, &surface);
+    let _cycle = second.get_popup(Some(&first), &positioner, &qh, ());
+    surface.commit();
+    assert_invalid_parent(&mut f);
+}
+
+/// Mutter refuses a parent without an xdg role
+/// (xdg_surface_constructor_get_popup, "Invalid popup parent role").
+#[test]
+fn a_popup_parent_without_a_role_is_refused() {
+    let _watchdog = watchdog("roleless popup parent");
+    let mut f = fixture();
+    let qh = f.queue.handle();
+    let positioner = positioner(&f);
+    let compositor = f.client.compositor.clone().unwrap();
+    let parent_surface = compositor.create_surface(&qh, ());
+    let parent = xdg_surface_for(&f, &parent_surface);
+    let surface = compositor.create_surface(&qh, ());
+    let _popup = xdg_surface_for(&f, &surface).get_popup(Some(&parent), &positioner, &qh, ());
+    surface.commit();
+    assert_invalid_parent(&mut f);
+}
+
+/// #203: a negative minimum or maximum size panicked in `Size::new`.
+/// Mutter posts invalid_size (xdg_toplevel_set_max_size).
+#[test]
+fn a_negative_toplevel_size_limit_is_refused() {
+    for max in [true, false] {
+        let mut f = fixture();
+        let qh = f.queue.handle();
+        let surface = f
+            .client
+            .compositor
+            .as_ref()
+            .unwrap()
+            .create_surface(&qh, ());
+        let toplevel = xdg_surface_for(&f, &surface).get_toplevel(&qh, ());
+        if max {
+            toplevel.set_max_size(-1, 200);
+        } else {
+            toplevel.set_min_size(200, i32::MIN);
+        }
+        let error = protocol_error(&mut f);
+        assert_eq!(error.object_interface, "xdg_toplevel", "{error:?}");
+        assert_eq!(
+            error.code,
+            wayland_protocols::xdg::shell::client::xdg_toplevel::Error::InvalidSize as u32,
+            "{error:?}"
+        );
+        another_client_is_served(&mut f);
+    }
+}
+
+/// #203: a negative parent size on a positioner panicked in `Size::new`.
+/// Mutter accepts any parent size; the popup still opens.
+#[test]
+fn a_negative_positioner_parent_size_is_ignored() {
+    let mut f = fixture();
+    let qh = f.queue.handle();
+    let positioner = positioner(&f);
+    positioner.set_parent_size(-5, i32::MIN);
+    positioner.set_anchor(Anchor::TopLeft);
+    positioner.set_gravity(Gravity::BottomRight);
+    let surface = f
+        .client
+        .compositor
+        .as_ref()
+        .unwrap()
+        .create_surface(&qh, ());
+    let _popup =
+        xdg_surface_for(&f, &surface).get_popup(Some(&f.toplevel_xdg), &positioner, &qh, ());
+    surface.commit();
+    pump(&mut f, |c| c.popup_configure.is_some());
+    assert_eq!(f.client.popup_configure, Some((10, 10, 100, 50)));
+    assert!(f.conn.protocol_error().is_none());
+}
+
+/// Mutter shows the window menu only for the serial of the latest press on
+/// the window (xdg_toplevel_show_window_menu): the fuzzer's request with no
+/// input at all opened the shell's modal menu and left it over the session.
+#[test]
+fn the_window_menu_needs_the_latest_press_on_the_window() {
+    let mut f = fixture();
+    let seat = f.client.seat.clone().unwrap();
+    f.toplevel.show_window_menu(&seat, 1, 20, 10);
+    sync(&mut f);
+    assert!(
+        f.manager.take_menu_requests().is_empty(),
+        "no press, no menu"
+    );
+    let inside = (f.window_origin + Point::from((300, 200))).to_f64();
+    f.manager.pointer_motion(&mut f.comp.state, inside, 2);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, true, 3);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 4);
+    sync(&mut f);
+    let serial = f.client.press_serial.expect("the press reached the window");
+    f.toplevel
+        .show_window_menu(&seat, serial.wrapping_add(1), 20, 10);
+    sync(&mut f);
+    assert!(
+        f.manager.take_menu_requests().is_empty(),
+        "another serial, no menu"
+    );
+    // After the release, as when GTK asks on press and the release is in.
+    f.toplevel.show_window_menu(&seat, serial, 20, 10);
+    sync(&mut f);
+    assert_eq!(f.manager.take_menu_requests().len(), 1);
 }

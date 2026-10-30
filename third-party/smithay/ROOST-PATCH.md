@@ -159,3 +159,26 @@ whole session down (found by the deeper, error-aware protocol fuzzer).
 The handler now returns after the error, as libwayland-server's
 shm_pool_resize does. The isolated diff is retained in
 SHM-RESIZE-PATCH.diff; the pinned version stays 0.7.0.
+
+Issue #203 also changes src/wayland/shell/xdg/handlers/surface.rs,
+surface/toplevel.rs and positioner.rs, all found by the deeper protocol
+fuzzer:
+
+- xdg_surface.get_popup accepted any parent, including the popup's own
+  xdg_surface or a second xdg_surface on a surface that already was a
+  popup. The popup then descended from itself and
+  `find_popup_root_surface` (and every other walk up the popup chain)
+  looped forever, hanging the whole session. As Mutter's
+  xdg_surface_constructor_get_popup (meta-wayland-xdg-shell.c), a parent
+  without an xdg role is refused with `invalid_popup_parent`; so is one
+  that descends from the new popup.
+- xdg_toplevel.set_min_size and set_max_size with a negative size panicked
+  in `Size::new`. They now post `invalid_size`, as Mutter's
+  xdg_toplevel_set_min_size and xdg_toplevel_set_max_size do.
+- xdg_positioner.set_parent_size with a negative size panicked the same
+  way. Mutter stores any parent size without an error; a negative one
+  cannot be a `Size`, so it is ignored.
+
+crates/compositor/tests/popups.rs covers the popup parent checks. The
+isolated diff is retained in XDG-SHELL-FUZZ-PATCH.diff; the pinned version
+stays 0.7.0.
