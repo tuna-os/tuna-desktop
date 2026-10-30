@@ -265,6 +265,9 @@ pub struct MonitorState {
     pub preferred: usize,
     /// The mode it shows; `None` while it is off.
     pub current: Option<usize>,
+    /// Its privacy screen (#356); `None` without one, and then
+    /// GetCurrentState omits `privacy-screen-state`.
+    pub privacy_screen: Option<crate::privacy_screen::ScreenState>,
 }
 
 /// One logical monitor: a region of the desktop and the monitors
@@ -982,6 +985,7 @@ mod tests {
             modes,
             preferred: 0,
             current,
+            privacy_screen: None,
         }
     }
 

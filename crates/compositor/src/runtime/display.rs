@@ -52,6 +52,7 @@ impl Runtime {
                         }],
                         preferred: 0,
                         current: Some(0),
+                        privacy_screen: None,
                     }],
                     logical: vec![LogicalState {
                         x: 0,
@@ -100,6 +101,26 @@ impl Runtime {
         }
         self.display_published = Some(key);
         self.display_share.publish(self.display_state());
+    }
+
+    /// GNOME's privacy screen setting (#356): a new read of
+    /// `privacy-screen` switches the privacy screens; a hotkey's change
+    /// writes it back. Neither waits on GSettings; a changed privacy
+    /// screen bumps the layout generation, so the publish that follows
+    /// announces MonitorsChanged.
+    #[cfg(feature = "drm")]
+    pub(super) fn privacy_screen_tick(&mut self) {
+        let (Some(settings), Backend::Drm(drm)) =
+            (&self.privacy_screen_settings, &mut self.backend)
+        else {
+            return;
+        };
+        if let Some(value) = settings.poll() {
+            drm.privacy_setting_read(value);
+        }
+        if let Some(value) = drm.take_privacy_setting_write() {
+            settings.write(value);
+        }
     }
 
     /// `ApplyMonitorsConfig` with a verified configuration (method

@@ -180,7 +180,9 @@ lookup).
 
 - Capture/recording (webcam overlay, mic recording): v2/proposed
   extension; this lane denies, never captures.
-- Privacy screen, USB protection: follow-up slice (hardware-gated).
+- Privacy screen: implemented in the compositor, see below. USB
+  protection: gnome-settings-daemon's usb-protection plugin, which needs
+  USBGuard (not shipped on Marlin, see below).
 - Retention (`old-files-age`, `remove-old-temp-files`,
   `remove-old-trash-files`): external-service responsibility
   (GNOME: settings-daemon housekeeping); no desktop consumer.
@@ -202,6 +204,59 @@ lookup).
 - A prompting Access UI (production uses the desktop backend's).
 - Mutter full-tree consumer check for the two audio keys.
 - Installed-image qualification on hardware with a real camera.
+
+## Privacy screen (compositor)
+
+`org.gnome.desktop.privacy` `privacy-screen` is consumed by the
+compositor's DRM backend as mutter 51.0 consumes it
+(`crates/compositor/src/privacy_screen.rs`, `drm/privacy.rs`,
+`privacy_screen_settings.rs`):
+
+- A connector has a privacy screen when it exposes the KMS enum
+  `privacy-screen hw-state`; it is switchable when it also exposes
+  `privacy-screen sw-state`, locked otherwise or when hw-state reads
+  `*-locked` (mutter `meta-kms-connector.c`).
+- A settings read that differs from the active monitors' global state
+  (disabled if any is disabled) writes sw-state on every unlocked
+  privacy screen; every applied monitor configuration and session
+  activation switches them to the setting again
+  (`meta-monitor-manager.c` `apply_privacy_screen_settings`,
+  `ensure_privacy_screen_settings`, `meta_monitor_manager_rebuild`).
+- A hw-state change the compositor did not request (the firmware
+  hotkey, announced as a DRM udev `change` event) writes the setting
+  back, so Settings follows the hardware
+  (`meta-monitor-manager-native.c` `on_kms_resources_changed`).
+- `GetCurrentState` reports `privacy-screen-state` `(bb)` (enabled,
+  locked) per monitor that has one and omits it otherwise;
+  `MonitorsChanged` follows each change. GNOME Settings' Screen Lock page
+  shows its Privacy Screen row only then (`cc-screen-page.c`).
+
+The key is read and written on an owned GIO thread; the frame loop never
+waits on GSettings. Tests: `privacy_screen::tests::*` (a fake KMS
+connector: discovery, enum mapping, locked/absent screens, refused
+writes, settings, hotkey write-back, rebuild),
+`privacy_screen_settings::tests::*` (real compiled schema, memory
+backend), `mutter::tests::current_state_reports_privacy_screens_as_mutter_does`;
+`D-MODES` in `scripts/tuna-drm-smoke` checks a vkms connector reports no
+`privacy-screen-state`. Hardware privacy screens (ThinkPad ePrivacy,
+Chromebook panels) are unmeasured: vkms, bochs-drm and virtio have no
+such property.
+
+## Installed image (2026-10-30)
+
+Corral evidence on the published `marlin:tuna` image and with main
+sideloaded: [docs/marlin/2026-10-30-privacy-devices](marlin/2026-10-30-privacy-devices/README.md).
+In short: the published image ships `tuna-desktop 1.0.0beta.1`, which
+predates this enforcement; camera denial there comes from
+xdg-desktop-portal-gnome's Lockdown (switch clicked in Settings: portal
+`Camera access disabled`, restored on re-enable); microphone and sound
+output are not enforced; no gnome-settings-daemon plugin runs, so
+Settings' Empty Trash does nothing. USBGuard is not installed
+(`pacman -Q usbguard`: not found), so USB protection cannot apply and
+Settings hides its row. With main sideloaded, Tuna's Lockdown backend
+serves the portal and the shell mutes and unmutes on the keys; the
+camera destroy path was not qualified (the simulated node could not be
+destroyed even by `pw-cli`).
 
 Native execution verifies Core cookie and object serial, binds the Node resource, and sends mutations through that proxy. Numeric CLI execution remains only an independent legacy test driver. The GTK CI job requires an isolated real PipeWire mute/restore and wrong-identity refusal proof; unit tests alone do not qualify native execution.
 

@@ -441,7 +441,7 @@ fn current_state(
                     }
                 })
                 .collect();
-            let properties = HashMap::from([
+            let mut properties = HashMap::from([
                 ("is-builtin".to_owned(), OwnedValue::from(monitor.builtin)),
                 (
                     "display-name".to_owned(),
@@ -456,6 +456,18 @@ fn current_state(
                     OwnedValue::try_from(Value::from(vec![0u32])).expect("array value"),
                 ),
             ]);
+            // Mutter's `(bb)`: enabled, hardware-locked; absent without
+            // a privacy screen (#356).
+            if let Some(privacy) = monitor.privacy_screen {
+                properties.insert(
+                    "privacy-screen-state".to_owned(),
+                    OwnedValue::try_from(Value::from(zbus::zvariant::Structure::from((
+                        privacy.enabled,
+                        privacy.locked,
+                    ))))
+                    .expect("structure value"),
+                );
+            }
             Monitor {
                 names: spec_names(&monitor.spec),
                 modes,
@@ -1529,6 +1541,7 @@ mod tests {
             modes,
             preferred: 0,
             current: Some(0),
+            privacy_screen: None,
         };
         DisplayState {
             serial: 3,
@@ -1769,6 +1782,9 @@ mod tests {
             "Built-in display"
         );
         assert_eq!(u32::try_from(&panel.properties["color-mode"]).unwrap(), 0);
+        // No privacy screen: no `privacy-screen-state` (GNOME Settings
+        // hides its row).
+        assert!(!panel.properties.contains_key("privacy-screen-state"));
         assert_eq!(logical.len(), 2);
         assert_eq!((logical[0].scale, logical[0].is_primary), (1.5, true));
         assert_eq!(logical[1].monitors[0].0, "HDMI-A-1");
@@ -1782,6 +1798,35 @@ mod tests {
             .iter()
             .all(|m| !m.properties.contains_key("is-current")));
         assert_eq!(logical.len(), 1);
+    }
+
+    #[test]
+    fn current_state_reports_privacy_screens_as_mutter_does() {
+        use crate::privacy_screen::ScreenState;
+        let mut state = display_state();
+        state.monitors[0].privacy_screen = Some(ScreenState {
+            enabled: true,
+            locked: false,
+        });
+        state.monitors[1].privacy_screen = Some(ScreenState {
+            enabled: false,
+            locked: true,
+        });
+        let (_, monitors, _, _) = current_state(&state);
+        // gnome-control-center 51 `cc-display-config.c` reads `(bb)`.
+        let read = |m: &Monitor| {
+            let value = &m.properties["privacy-screen-state"];
+            assert_eq!(value.value_signature().to_string(), "(bb)");
+            let Value::Structure(fields) = &**value else {
+                panic!("privacy-screen-state is not a structure");
+            };
+            let [Value::Bool(enabled), Value::Bool(locked)] = fields.fields() else {
+                panic!("privacy-screen-state is not (bb)");
+            };
+            (*enabled, *locked)
+        };
+        assert_eq!(read(&monitors[0]), (true, false));
+        assert_eq!(read(&monitors[1]), (false, true));
     }
 
     #[test]

@@ -113,6 +113,9 @@ mod performance_trace;
 pub mod pointer_aids;
 pub mod popup;
 pub mod power_save;
+pub mod privacy_screen;
+#[cfg(feature = "drm")]
+pub(crate) mod privacy_screen_settings;
 pub mod protocols;
 pub mod runtime;
 mod runtime_signal;
