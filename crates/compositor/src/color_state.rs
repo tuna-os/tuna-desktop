@@ -107,10 +107,12 @@ impl Primaries {
 
     /// `clutter_primaries_equal`: every chromaticity within 0.0001.
     pub fn approx_eq(&self, other: &Self) -> bool {
-        let near = |a: [f32; 2], b: [f32; 2]| {
-            approx(a[0], b[0], 0.0001) && approx(a[1], b[1], 0.0001)
-        };
-        near(self.r, other.r) && near(self.g, other.g) && near(self.b, other.b) && near(self.w, other.w)
+        let near =
+            |a: [f32; 2], b: [f32; 2]| approx(a[0], b[0], 0.0001) && approx(a[1], b[1], 0.0001);
+        near(self.r, other.r)
+            && near(self.g, other.g)
+            && near(self.b, other.b)
+            && near(self.w, other.w)
     }
 }
 
@@ -286,7 +288,8 @@ impl Params {
 
     /// `clutter_color_state_params_get_luminance`.
     pub fn luminance(&self) -> Luminance {
-        self.explicit.unwrap_or_else(|| self.eotf.default_luminance())
+        self.explicit
+            .unwrap_or_else(|| self.eotf.default_luminance())
     }
 
     fn approx_eq(&self, other: &Self) -> bool {
@@ -402,7 +405,11 @@ fn lut3d_model(bytes: &[u8]) -> Result<Vec<[f32; 3]>, String> {
     use moxcms::{ColorProfile, Layout, RenderingIntent, ToneReprCurve, TransformOptions};
     let source = ColorProfile::new_from_slice(bytes).map_err(|e| e.to_string())?;
     let mut linear = ColorProfile::new_bt2020();
-    for trc in [&mut linear.red_trc, &mut linear.green_trc, &mut linear.blue_trc] {
+    for trc in [
+        &mut linear.red_trc,
+        &mut linear.green_trc,
+        &mut linear.blue_trc,
+    ] {
         *trc = Some(ToneReprCurve::Lut(Vec::new()));
     }
     let transform = source
@@ -509,7 +516,10 @@ fn to_f32(m: &icc::Mat3) -> Mat3 {
 }
 
 fn xy_to_xyz(xy: [f32; 2]) -> [f64; 3] {
-    let (x, y) = (f64::from(xy[0]), f64::from(xy[1]).max(f64::from(f32::EPSILON)));
+    let (x, y) = (
+        f64::from(xy[0]),
+        f64::from(xy[1]).max(f64::from(f32::EPSILON)),
+    );
     [x / y, 1.0, (1.0 - x - y) / y]
 }
 
@@ -882,7 +892,8 @@ mod tests {
     fn bt2020_matrix_matches_the_reference_conversion() {
         // BT.2020 linear → sRGB linear (ITU-R BT.2087), Clutter's D65
         // rounding leaving it within 1e-3.
-        let source = ColorState::params(Params::named(Colorspace::Bt2020, TransferFunction::Linear));
+        let source =
+            ColorState::params(Params::named(Colorspace::Bt2020, TransferFunction::Linear));
         let target = ColorState::params(Params::named(Colorspace::Srgb, TransferFunction::Linear));
         let t = transform(&source, &target).unwrap();
         let expected = [
@@ -924,12 +935,17 @@ mod tests {
         let out = t.apply([0.214, 0.5, 1.0, 1.0]);
         assert!(near(out[0], 0.214f32.powf(1.0 / 2.2), 2e-3), "{out:?}");
         assert!(near(out[2], 1.0, 2e-3));
-        let piecewise =
-            ColorState::params(Params::named(Colorspace::Srgb, TransferFunction::SrgbPiecewise));
+        let piecewise = ColorState::params(Params::named(
+            Colorspace::Srgb,
+            TransferFunction::SrgbPiecewise,
+        ));
         let t = transform(&piecewise, &output()).unwrap();
         assert_eq!(t.decode, Decode::Srgb);
         let out = t.apply([0.5, 0.5, 0.5, 1.0]);
-        assert!(near(out[0], srgb_eotf(0.5).powf(1.0 / 2.2), 2e-3), "{out:?}");
+        assert!(
+            near(out[0], srgb_eotf(0.5).powf(1.0 / 2.2), 2e-3),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -951,8 +967,10 @@ mod tests {
         ));
         let again = ColorState::new(Kind::Icc(Icc::parse(&bytes).unwrap()));
         assert!(icc_state.equals(&again), "same checksum");
-        let params =
-            ColorState::params(Params::named(Colorspace::Srgb, TransferFunction::SrgbPiecewise));
+        let params = ColorState::params(Params::named(
+            Colorspace::Srgb,
+            TransferFunction::SrgbPiecewise,
+        ));
         let via_icc = transform(&icc_state, &output()).unwrap();
         let via_params = transform(&params, &output()).unwrap();
         for c in [[0.2, 0.4, 0.8, 1.0], [0.9, 0.1, 0.5, 1.0]] {
@@ -983,7 +1001,12 @@ mod tests {
                 }
             }
         }
-        for c in [[0.3, 0.7, 0.1], [0.9, 0.2, 0.55], [0.5, 0.5, 0.5], [0.1, 0.4, 0.9]] {
+        for c in [
+            [0.3, 0.7, 0.1],
+            [0.9, 0.2, 0.55],
+            [0.5, 0.5, 0.5],
+            [0.1, 0.4, 0.9],
+        ] {
             let out = lut3d(&lut, c);
             for k in 0..3 {
                 assert!(near(out[k], c[k], 1e-5), "{c:?} → {out:?}");

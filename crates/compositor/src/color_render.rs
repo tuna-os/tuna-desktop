@@ -29,8 +29,10 @@ use std::sync::{Arc, Weak};
 
 use smithay::backend::renderer::{
     element::{Id, RenderElement},
-    gles::{ffi, GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform, UniformName,
-        UniformType, UniformValue},
+    gles::{
+        ffi, GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform, UniformName, UniformType,
+        UniformValue,
+    },
     utils::with_renderer_surface_state,
     Color32F,
 };
@@ -79,7 +81,11 @@ fn effect_uniforms(tint: Option<&FrameColor>, brightness: f32) -> Vec<Uniform<'s
 impl ColorFrame {
     /// Resolve every colour-managed surface against output `output`'s
     /// colour state (the primary's when `None`).
-    pub(crate) fn new(renderer: &mut GlesRenderer, state: &mut State, output: Option<&str>) -> Self {
+    pub(crate) fn new(
+        renderer: &mut GlesRenderer,
+        state: &mut State,
+        output: Option<&str>,
+    ) -> Self {
         let surfaces: Vec<WlSurface> = state.protocols.color.tracked_surfaces().collect();
         if surfaces.is_empty() {
             return Self::default();
@@ -99,8 +105,8 @@ impl ColorFrame {
                 .as_ref()
                 .and_then(|image| color_state::transform(image, &target));
             let straight = color.alpha_mode == AlphaMode::Straight;
-            let limited = color.coefficients == Coefficients::IdentityLimited
-                && !surface_is_ycbcr(&surface);
+            let limited =
+                color.coefficients == Coefficients::IdentityLimited && !surface_is_ycbcr(&surface);
             if transform.is_none() && !straight && !limited {
                 continue;
             }
@@ -169,13 +175,12 @@ impl ColorFrame {
 /// Whether a surface's current buffer is a YCbCr dmabuf.
 fn surface_is_ycbcr(surface: &WlSurface) -> bool {
     with_renderer_surface_state(surface, |s| {
-        s.buffer()
-            .and_then(|b| {
-                use smithay::backend::allocator::Buffer;
-                smithay::wayland::dmabuf::get_dmabuf(b)
-                    .ok()
-                    .map(|d| d.format().code)
-            })
+        s.buffer().and_then(|b| {
+            use smithay::backend::allocator::Buffer;
+            smithay::wayland::dmabuf::get_dmabuf(b)
+                .ok()
+                .map(|d| d.format().code)
+        })
     })
     .flatten()
     .is_some_and(color_management::is_ycbcr)
@@ -214,7 +219,9 @@ fn uniforms(transform: Option<&Transform>, straight: bool, limited: bool) -> Vec
         Some(Encode::Srgb) => (2.0, 1.0),
         Some(Encode::Pq) => (3.0, 1.0),
     };
-    let m = transform.map_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], |t| t.matrix);
+    let m = transform.map_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], |t| {
+        t.matrix
+    });
     // GLSL matrices are column major.
     let columns = [
         m[0][0], m[1][0], m[2][0], m[0][1], m[1][1], m[2][1], m[0][2], m[1][2], m[2][2],
@@ -353,10 +360,26 @@ impl LutCache {
             let mut tex = 0;
             gl.GenTextures(1, &mut tex);
             gl.BindTexture(ffi::TEXTURE_2D, tex);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_MIN_FILTER,
+                ffi::NEAREST as i32,
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_MAG_FILTER,
+                ffi::NEAREST as i32,
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_S,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_T,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
             while gl.GetError() != ffi::NO_ERROR {}
             gl.TexImage2D(
                 ffi::TEXTURE_2D,
@@ -444,7 +467,8 @@ where
     };
     base(frame);
     if colors.is_empty() {
-        let result = crate::occlusion::draw_planned::<GlesRenderer, _>(frame, scale, elements, plan);
+        let result =
+            crate::occlusion::draw_planned::<GlesRenderer, _>(frame, scale, elements, plan);
         frame.clear_tex_program_override();
         return result;
     }
@@ -702,3 +726,240 @@ void main() {
     gl_FragColor = color;
 }
 "#;
+
+#[cfg(all(test, feature = "drm"))]
+mod tests {
+    use super::*;
+    use crate::color_state::{
+        ColorState, Colorimetry, Colorspace, Eotf, Kind, Luminance, Params, TransferFunction,
+    };
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::{Bind, ExportMem, Frame, ImportMem, Offscreen, Renderer};
+    use smithay::utils::{Buffer, Size};
+
+    const SIDE: i32 = 8;
+
+    /// Surfaceless EGL, or `None` on a machine without EGL (the test
+    /// skips, as the night-light GL test does).
+    fn headless_renderer() -> Option<GlesRenderer> {
+        use smithay::backend::egl::native::EGLSurfacelessDisplay;
+        use smithay::backend::egl::{EGLContext, EGLDisplay};
+        let display = unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }.ok()?;
+        let context = EGLContext::new(&display).ok()?;
+        unsafe { GlesRenderer::new(context) }.ok()
+    }
+
+    /// 64 premultiplied RGBA8 texels covering the range, a quarter of
+    /// them half transparent.
+    fn texels() -> Vec<[u8; 4]> {
+        (0..SIDE * SIDE)
+            .map(|i| {
+                let a: u8 = if i % 4 == 3 { 128 } else { 255 };
+                let channel = |mul: i32, add: i32| ((i * mul + add) % 256).min(i32::from(a)) as u8;
+                [channel(37, 0), channel(91, 13), channel(53, 200), a]
+            })
+            .collect()
+    }
+
+    /// Draw the texels through the colour program and read them back.
+    fn draw(
+        renderer: &mut GlesRenderer,
+        texels: &[[u8; 4]],
+        transform: Option<&Transform>,
+        straight: bool,
+        limited: bool,
+    ) -> Vec<[u8; 4]> {
+        let program = program(renderer).expect("colour shader compiles");
+        let lut = {
+            let cache = LutCache::of(renderer);
+            let mut luts = cache.borrow_mut();
+            match transform.map(|t| &t.decode) {
+                Some(Decode::Curve(curves)) => {
+                    Some(luts.curve(renderer, curves).expect("float textures"))
+                }
+                Some(Decode::Lut3d(lut)) => {
+                    Some(luts.lut3d(renderer, lut).expect("float textures"))
+                }
+                _ => None,
+            }
+        };
+        let size: Size<i32, Buffer> = (SIDE, SIDE).into();
+        let bytes: Vec<u8> = texels.iter().flatten().copied().collect();
+        let texture = renderer
+            .import_memory(&bytes, Fourcc::Abgr8888, size, false)
+            .unwrap();
+        let mut target: smithay::backend::renderer::gles::GlesTexture =
+            renderer.create_buffer(Fourcc::Abgr8888, size).unwrap();
+        let mut bound = renderer.bind(&mut target).unwrap();
+        let out = Rectangle::<i32, Physical>::from_size((SIDE, SIDE).into());
+        {
+            let mut frame = renderer
+                .render(&mut bound, out.size, smithay::utils::Transform::Normal)
+                .unwrap();
+            frame.clear(Color32F::TRANSPARENT, &[out]).unwrap();
+            let mut all = uniforms(transform, straight, limited);
+            all.extend(effect_uniforms(None, 1.0));
+            frame.override_default_tex_program(program, all);
+            if let Some(lut) = lut {
+                frame
+                    .with_context(|gl| unsafe {
+                        gl.ActiveTexture(ffi::TEXTURE1);
+                        gl.BindTexture(ffi::TEXTURE_2D, lut);
+                        gl.ActiveTexture(ffi::TEXTURE0);
+                    })
+                    .unwrap();
+            }
+            frame
+                .render_texture_from_to(
+                    &texture,
+                    Rectangle::<f64, Buffer>::from_size((f64::from(SIDE), f64::from(SIDE)).into()),
+                    out,
+                    &[out],
+                    &[],
+                    smithay::utils::Transform::Normal,
+                    1.0,
+                    None,
+                    &[],
+                )
+                .unwrap();
+            frame.clear_tex_program_override();
+            let _ = frame.finish().unwrap();
+        }
+        let mapping = renderer
+            .copy_framebuffer(&bound, Rectangle::from_size(size), Fourcc::Abgr8888)
+            .unwrap();
+        let read = renderer.map_texture(&mapping).unwrap();
+        read.chunks_exact(4)
+            .map(|p| [p[0], p[1], p[2], p[3]])
+            .collect()
+    }
+
+    /// The CPU reference: the same steps on each texel, in f32.
+    fn reference(
+        texel: [u8; 4],
+        transform: Option<&Transform>,
+        straight: bool,
+        limited: bool,
+    ) -> [f32; 4] {
+        let mut c = texel.map(|v| f32::from(v) / 255.0);
+        if limited {
+            for v in &mut c[..3] {
+                *v = 255.0 / 219.0 * (*v - 16.0 / 255.0);
+            }
+        }
+        if straight {
+            c = [c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3]];
+        }
+        if let Some(t) = transform {
+            c = t.apply(c);
+        }
+        c.map(|v| v.clamp(0.0, 1.0) * 255.0)
+    }
+
+    fn check(
+        renderer: &mut GlesRenderer,
+        name: &str,
+        transform: Option<&Transform>,
+        straight: bool,
+        limited: bool,
+    ) {
+        let texels = texels();
+        let drawn = draw(renderer, &texels, transform, straight, limited);
+        for (texel, got) in texels.iter().zip(&drawn) {
+            let want = reference(*texel, transform, straight, limited);
+            for k in 0..4 {
+                assert!(
+                    (f32::from(got[k]) - want[k]).abs() <= 2.0,
+                    "{name}: texel {texel:?} drew {got:?}, CPU reference {want:?}"
+                );
+            }
+        }
+    }
+
+    fn to_output(source: Params) -> Transform {
+        let output = ColorState::params(color_state::output_params());
+        color_state::transform(&ColorState::params(source), &output).expect("a transform")
+    }
+
+    /// Every decode and encode stage of the shader, against
+    /// [`Transform::apply`] (which single-pixel buffers use).
+    #[test]
+    fn shader_matches_the_cpu_reference() {
+        let Some(mut renderer) = headless_renderer() else {
+            eprintln!("colour GL test skipped: no surfaceless EGL");
+            return;
+        };
+        let pq = to_output(Params::named(Colorspace::Bt2020, TransferFunction::Pq));
+        assert_eq!(pq.decode, Decode::Pq);
+        check(&mut renderer, "BT.2020 PQ", Some(&pq), false, false);
+        check(
+            &mut renderer,
+            "BT.2020 PQ, straight, limited",
+            Some(&pq),
+            true,
+            true,
+        );
+        check(
+            &mut renderer,
+            "no transform, straight, limited",
+            None,
+            true,
+            true,
+        );
+
+        let srgb = to_output(Params::named(
+            Colorspace::P3,
+            TransferFunction::SrgbPiecewise,
+        ));
+        assert_eq!(srgb.decode, Decode::Srgb);
+        check(&mut renderer, "Display P3 sRGB", Some(&srgb), false, false);
+
+        let power = to_output(Params::new(
+            Colorimetry::Colorspace(Colorspace::Ntsc),
+            Eotf::Gamma(2.8),
+            Some(Luminance {
+                min: 0.1,
+                max: 200.0,
+                reference: 100.0,
+                mastering_max: 200.0,
+            }),
+        ));
+        assert!(matches!(power.decode, Decode::Power(_)));
+        check(&mut renderer, "NTSC gamma 2.8", Some(&power), false, false);
+
+        let icc =
+            color_state::Icc::parse(&crate::icc::DisplayProfile::srgb().encode().unwrap()).unwrap();
+        let output = ColorState::params(color_state::output_params());
+        let curve = color_state::transform(&ColorState::new(Kind::Icc(icc)), &output).unwrap();
+        assert!(
+            matches!(curve.decode, Decode::Curve(_)),
+            "{:?}",
+            curve.decode
+        );
+        check(&mut renderer, "sRGB ICC TRC", Some(&curve), false, false);
+
+        // A cross-talking 3D LUT, as a LUT-based ICC profile samples.
+        let n = color_state::LUT_3D_SIZE;
+        let step = 1.0 / (n - 1) as f32;
+        let mut cube = Vec::with_capacity(n * n * n);
+        for k in 0..n {
+            for j in 0..n {
+                for i in 0..n {
+                    let (r, g, b) = (i as f32 * step, j as f32 * step, k as f32 * step);
+                    cube.push([
+                        (0.8 * r * r + 0.2 * g).min(1.0),
+                        (0.7 * g.powf(2.2) + 0.3 * b).min(1.0),
+                        (0.9 * b.powf(1.8) + 0.1 * r).min(1.0),
+                    ]);
+                }
+            }
+        }
+        let lut = Transform {
+            decode: Decode::Lut3d(Arc::new(cube)),
+            matrix: [[0.9, 0.1, 0.0], [0.05, 0.9, 0.05], [0.0, 0.1, 0.9]],
+            encode: Encode::Power(1.0 / 2.2),
+        };
+        check(&mut renderer, "3D LUT", Some(&lut), false, false);
+        drop(renderer);
+    }
+}
