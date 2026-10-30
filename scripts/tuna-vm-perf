@@ -300,16 +300,21 @@ def retain_gnome_trace(agent, out, metadata):
             "limitation": (evidence["limitation"] if diagnostic else frames["limitation"])}
 
 
+# The guest helper's PRESENTED_FRAMES (tuna-perf-phase); >= 3 whole 1 s
+# observer intervals for the frames-phase CPU metric at 75 Hz.
+PRESENTED_FRAMES = 480
+
+
 def presentation_summary(trace):
     """Validate actual feedback; retain unknown refresh and absent hardware flags."""
     rows = trace.get("frames")
-    if not isinstance(rows, list) or len(rows) != 240:
-        raise ValueError("expected 240 presented frames")
+    if not isinstance(rows, list) or len(rows) != PRESENTED_FRAMES:
+        raise ValueError(f"expected {PRESENTED_FRAMES} presented frames")
     for name in ("clock_id", "commits", "discarded", "pending"):
         value = trace.get(name)
         if type(value) is not int or value < 0:
             raise ValueError(f"invalid presentation {name}")
-    if (trace["clock_id"] > 0xffffffff or not 240 <= trace["commits"] <= 1200
+    if (trace["clock_id"] > 0xffffffff or not PRESENTED_FRAMES <= trace["commits"] <= 1200
             or trace["commits"] != len(rows) + trace["discarded"] + trace["pending"]):
         raise ValueError("incomplete presentation accounting")
     commits = set()

@@ -81,7 +81,7 @@ Metric names are `cpu.<phase>.<role>.<stat>`, `overview.response_ms.<stat>` and 
 | Phase | Workload |
 |---|---|
 | `idle` | 30 s without input, 30 s after the panel first renders |
-| `frames` | Native frame-pacer client presenting 240 frames |
+| `frames` | Native frame-pacer client presenting 480 frames (about 6.4 s at 75 Hz; 240 frames fit only two whole 1 s CPU intervals once observer records left the serial console) |
 | `typing` | Typing three app names into the search and launching them |
 | `overview` | Ten overview open/close cycles |
 | `workspaces` | Ten workspace switches each way (animations) |

@@ -20,6 +20,8 @@
 #define HEIGHT 180
 #define BYTES (WIDTH * HEIGHT * 4)
 #define TARGET 240
+/* --frames: at most ten seconds at 60 Hz, inside the 15 s deadline. */
+#define MAX_FRAMES 600
 #define MAX_COMMITS 1200
 struct sample { uint64_t commit, timestamp, sequence; uint32_t refresh, flags; };
 struct state;
@@ -39,7 +41,8 @@ struct state {
     struct wl_callback *callback;
     struct buffer buffers[2];
     struct feedback *feedbacks;
-    struct sample samples[TARGET];
+    struct sample samples[MAX_FRAMES];
+    unsigned target;
     uint32_t clock_id;
     bool clock_known, configured, frame_ready, closed;
     unsigned presented, discarded, commits;
@@ -77,13 +80,13 @@ static void presented(void *data, struct wp_presentation_feedback *proxy,
     struct feedback *f = data;
     struct state *s = f->state;
     if (ns >= 1000000000) { fprintf(stderr, "invalid presentation nanoseconds\n"); s->closed = true; }
-    else if (s->presented < TARGET) {
+    else if (s->presented < s->target) {
         s->samples[s->presented++] = (struct sample){f->commit,
             (((uint64_t)sec_hi << 32) | sec_lo) * UINT64_C(1000000000) + ns,
             ((uint64_t)seq_hi << 32) | seq_lo, refresh, flags};
         s->total_presented++;
         s->last_presented = monotonic_s();
-        if (s->endurance && s->presented == TARGET) {
+        if (s->endurance && s->presented == s->target) {
             print_samples(s);
             s->presented = 0; s->batch++; s->batch_commit_start = s->commits;
         }
@@ -176,17 +179,20 @@ static void print_samples(struct state *s) {
     puts("]}"); fflush(stdout);
 }
 int main(int argc, char **argv) {
-    struct state s = { .frame_ready = true };
+    struct state s = { .frame_ready = true, .target = TARGET };
     unsigned seconds = 15;
     if (argc != 1) {
         char *end = NULL;
         errno = 0;
         long value = argc == 3 ? strtol(argv[2], &end, 10) : 0;
-        if (argc != 3 || strcmp(argv[1], "--endurance-seconds") || errno ||
-            !end || end == argv[2] || *end || value < 1 || value > 86400) {
-            fprintf(stderr, "usage: tuna-frame-pacer [--endurance-seconds 1..86400]\n"); return 2;
+        bool endurance = argc == 3 && !strcmp(argv[1], "--endurance-seconds");
+        bool frames = argc == 3 && !strcmp(argv[1], "--frames");
+        if ((!endurance && !frames) || errno || !end || end == argv[2] || *end ||
+            value < (endurance ? 1 : TARGET) || value > (endurance ? 86400 : MAX_FRAMES)) {
+            fprintf(stderr, "usage: tuna-frame-pacer [--endurance-seconds 1..86400 | --frames 240..600]\n"); return 2;
         }
-        s.endurance = true; seconds = (unsigned)value;
+        if (endurance) { s.endurance = true; seconds = (unsigned)value; }
+        else s.target = (unsigned)value;
     }
     s.started = monotonic_s();
     double deadline = s.started + seconds;
@@ -214,7 +220,7 @@ int main(int argc, char **argv) {
     xdg_toplevel_set_max_size(s.toplevel, WIDTH, HEIGHT);
     wl_surface_commit(s.surface);
     bool io_failed = false;
-    while (!s.closed && (s.endurance || s.presented < TARGET) && monotonic_s() < deadline) {
+    while (!s.closed && (s.endurance || s.presented < s.target) && monotonic_s() < deadline) {
         if (wl_display_dispatch_pending(s.display) < 0) { io_failed = true; break; }
         if (s.endurance && ((s.last_presented && monotonic_s() - s.last_presented > 2) ||
             (!s.last_presented && monotonic_s() - s.started > 15))) {
@@ -230,11 +236,11 @@ int main(int argc, char **argv) {
         if (ready > 0 && (fd.revents & POLLIN) && wl_display_dispatch(s.display) < 0) { io_failed = true; break; }
     }
     int result = 1;
-    if (!s.closed && !io_failed && (s.endurance ? (monotonic_s() >= deadline && s.total_presented > 1) : s.presented == TARGET)) {
+    if (!s.closed && !io_failed && (s.endurance ? (monotonic_s() >= deadline && s.total_presented > 1) : s.presented == s.target)) {
         if (s.presented) print_samples(&s);
         if (s.endurance) printf("{\"kind\":\"complete\",\"elapsed_s\":%.6f,\"requested_s\":%u,\"presented_total\":%u,\"commits\":%u,\"discarded\":%u,\"pending\":%u}\n", monotonic_s() - s.started, seconds, s.total_presented, s.commits, s.discarded, s.commits - s.total_presented - s.discarded);
         result = 0;
-    } else fprintf(stderr, "presentation incomplete: %u/%u, commits %u, discarded %u\n", s.presented, TARGET, s.commits, s.discarded);
+    } else fprintf(stderr, "presentation incomplete: %u/%u, commits %u, discarded %u\n", s.presented, s.target, s.commits, s.discarded);
     while (s.feedbacks) feedback_remove(s.feedbacks);
     if (s.callback) wl_callback_destroy(s.callback);
     if (s.inhibitor) zwp_idle_inhibitor_v1_destroy(s.inhibitor);
