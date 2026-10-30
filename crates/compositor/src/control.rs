@@ -384,6 +384,8 @@ pub struct Session<'a> {
     pad_osd_requests: Vec<(u32, bool)>,
     /// `PadOsdClosed`s, drained by the hub.
     pad_osd_closed: Vec<u32>,
+    /// A `CloseMenuUnanimated` arrived, drained by the hub.
+    close_menu_unanimated: bool,
 }
 
 impl std::fmt::Debug for Session<'_> {
@@ -484,6 +486,7 @@ impl<'a> Session<'a> {
             pad_targets: std::rc::Rc::default(),
             pad_osd_requests: Vec::new(),
             pad_osd_closed: Vec::new(),
+            close_menu_unanimated: false,
         };
         let msg = match session.conn.read_frame() {
             Ok(msg) => msg,
@@ -1132,6 +1135,17 @@ impl<'a> Session<'a> {
             }
             Message::Command {
                 id,
+                kind: CommandKind::CloseMenuUnanimated,
+            } => {
+                self.close_menu_unanimated = true;
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
                 kind: CommandKind::WindowAction { window, action },
             } => {
                 // The window manager carries it out (drained by the hub);
@@ -1511,6 +1525,7 @@ fn apply_command(
         | CommandKind::CancelVerification
         | CommandKind::RequestPadOsd { .. }
         | CommandKind::PadOsdClosed { .. }
+        | CommandKind::CloseMenuUnanimated
         | CommandKind::SwitchInputSource { .. }
         | CommandKind::SetWindowIconGeometries { .. }
         | CommandKind::SetWellbeingEffects { .. }
@@ -1588,6 +1603,8 @@ pub struct PollOutcome {
     pub pad_osd_requests: Vec<(u32, bool)>,
     /// Pad OSDs the shell closed, in order.
     pub pad_osd_closed: Vec<u32>,
+    /// The shell closed a panel menu unanimated (its button was hidden).
+    pub close_menu_unanimated: bool,
     /// Input-source switches to make (`true` backward), in order.
     pub input_source_switches: Vec<bool>,
     /// New switcher thumbnail frames, if the shell sent any.
@@ -2398,6 +2415,8 @@ impl ControlHub {
                     outcome
                         .pad_osd_closed
                         .extend(std::mem::take(&mut session.pad_osd_closed));
+                    outcome.close_menu_unanimated |=
+                        std::mem::take(&mut session.close_menu_unanimated);
                     outcome
                         .input_source_switches
                         .extend(std::mem::take(&mut session.input_source_switches));

@@ -2575,6 +2575,11 @@ impl Runtime {
 
             // The Alt+Tab switcher's window thumbnails being drawn.
             "switcher_thumbnails": self.switcher_thumbnails.len(),
+            // ... and how opaque each window image is drawn (#501).
+            "switcher_thumbnail_alphas": switcher_previews(&self.manager, &self.switcher_thumbnails)
+                .iter()
+                .map(|p| p.alpha)
+                .collect::<Vec<_>>(),
             // GNOME's tile preview while a dragged window is over a
             // snap edge: the window and the area it would fill.
             "tile_preview": self.manager.tile_preview(&self.state).map(|(id, r)| {
@@ -4668,6 +4673,11 @@ impl Runtime {
         for pad in outcome.pad_osd_closed {
             self.pad_osd_closed(pad);
         }
+        // PanelMenu.Button.vfunc_hide: the hidden button's menu closes
+        // without BoxPointer's close.
+        if outcome.close_menu_unanimated {
+            self.menu_close.close_unanimated(std::time::Instant::now());
+        }
         if let Some(request) = self.state.take_shortcut_consent_update() {
             self.control
                 .queue_message(tuna_shell_control::Message::ShortcutConsent { request });
@@ -6533,25 +6543,33 @@ fn switcher_previews(
 ) -> Vec<crate::overview::Preview> {
     thumbnails
         .iter()
-        .filter_map(|t| {
-            let geo = manager.geometry(t.window)?;
-            let (w, h) = (f64::from(geo.size.w.max(1)), f64::from(geo.size.h.max(1)));
-            let scale = (f64::from(t.width) / w)
-                .min(f64::from(t.height) / h)
-                .min(1.0);
-            let (sw, sh) = ((w * scale).round() as i32, (h * scale).round() as i32);
-            Some(crate::overview::Preview {
-                id: t.window,
-                rect: Rectangle::new(
-                    (t.x + (t.width - sw) / 2, t.y + (t.height - sh) / 2).into(),
-                    (sw, sh).into(),
-                ),
-                scale,
-                active: false,
-                alpha: 1.0,
-            })
-        })
+        .filter_map(|t| Some(switcher_preview(t, manager.geometry(t.window)?.size)))
         .collect()
+}
+
+/// One thumbnail's window (of `size`) fitted into its frame, drawn at the
+/// frame's opacity: the clone sits inside the thumbnail list, so it fades
+/// with it (altTab.js THUMBNAIL_FADE_TIME) and with the whole popup
+/// (switcherPopup.js POPUP_FADE_OUT_TIME).
+fn switcher_preview(
+    t: &tuna_shell_control::SwitcherThumbnail,
+    size: smithay::utils::Size<i32, Logical>,
+) -> crate::overview::Preview {
+    let (w, h) = (f64::from(size.w.max(1)), f64::from(size.h.max(1)));
+    let scale = (f64::from(t.width) / w)
+        .min(f64::from(t.height) / h)
+        .min(1.0);
+    let (sw, sh) = ((w * scale).round() as i32, (h * scale).round() as i32);
+    crate::overview::Preview {
+        id: t.window,
+        rect: Rectangle::new(
+            (t.x + (t.width - sw) / 2, t.y + (t.height - sh) / 2).into(),
+            (sw, sh).into(),
+        ),
+        scale,
+        active: false,
+        alpha: f32::from(t.opacity) / 255.0,
+    }
 }
 
 use crate::wellbeing_effects::FrameColor;
@@ -7957,6 +7975,31 @@ mod tests {
         // Superseded epoch: the worker succeeded, but a denied attempt never applies.
         assert_eq!(unlock_outcome(true, true), (true, false));
         assert_eq!(unlock_outcome(true, false), (true, true));
+    }
+
+    #[test]
+    fn switcher_thumbnails_draw_their_window_at_the_frames_opacity() {
+        let thumbnail = |opacity| tuna_shell_control::SwitcherThumbnail {
+            window: 3,
+            x: 100,
+            y: 50,
+            width: 256,
+            height: 160,
+            opacity,
+        };
+        let size = (1280, 800).into();
+        // Half way through a fade (Clutter's 0-255 opacity): half alpha.
+        let half = switcher_preview(&thumbnail(128), size);
+        assert_eq!(half.alpha, 128.0 / 255.0);
+        assert!((half.alpha - 0.5).abs() <= 1.0 / 255.0);
+        assert_eq!(switcher_preview(&thumbnail(255), size).alpha, 1.0);
+        assert_eq!(switcher_preview(&thumbnail(0), size).alpha, 0.0);
+        // The fit is unchanged: scaled down to the frame, centred in it.
+        assert_eq!(half.scale, 0.2);
+        assert_eq!(
+            half.rect,
+            Rectangle::new((100, 50).into(), (256, 160).into())
+        );
     }
 
     /// A preview record must ping an idle loop through the share's

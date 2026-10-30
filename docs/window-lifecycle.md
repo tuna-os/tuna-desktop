@@ -24,6 +24,11 @@ the popup goes, and draws it fading out over 150 ms ease-out quad while it
 rises 6 px and shrinks to 96% about its top centre (fade-only under Reduced
 Motion or when another bar menu takes the grab). The ghost takes no input,
 and the same menu opening again drops it (`crates/compositor/src/menu_close.rs`).
+A panel button hidden under its open menu closes it unanimated, as
+`PanelMenu.Button.vfunc_hide` does (`panelMenu.js:149-154`): the shell sends
+`CloseMenuUnanimated` before GTK drops the popup, and the compositor draws no
+close for the panel popup that goes within 500 ms of it (or drops the one it
+just started), recording `unanimated` in `menu_close.history`.
 
 ## Client lifetime and cost
 

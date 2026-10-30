@@ -156,9 +156,8 @@ pub fn menu() -> gtk::MenuButton {
                         .filter_map(|i| i.upgrade())
                         .map(|i| i.is_active()),
                 );
-                if !visible {
-                    button.popdown();
-                }
+                // Hiding the button closes an open menu unanimated
+                // (PanelMenu.Button.vfunc_hide, transient::MenuPopover).
                 button.set_visible(visible);
             }
         })

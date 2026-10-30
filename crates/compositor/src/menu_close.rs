@@ -19,13 +19,22 @@
 //! gesture, slide, lock) draws nothing, and the slow-down factor stretches
 //! the duration. A menu that opens again drops its ghost, as GNOME's
 //! `open` replaces the close transition.
+//!
+//! A panel button hidden under its open menu closes it without animation
+//! (`PanelMenu.Button.vfunc_hide`, `js/ui/panelMenu.js:149-154`:
+//! `menu.close({animate: false})`, so `_getPopupAnimationFromParams`
+//! picks `PopupAnimation.NONE`, `popupMenu.js:1103-1110`). The shell says
+//! so (`CloseMenuUnanimated`) before GTK drops the popup; the two arrive
+//! on different sockets, so the panel popup that goes within
+//! [`UNANIMATED_PAIRING`] of the request gets no ghost, whichever came
+//! first.
 use crate::size_change::{RectF, Snapshot};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tuna_shell_control::motion::MotionPolicy;
 
 /// `boxpointer.js` POPUP_ANIMATION_TIME.
@@ -36,6 +45,17 @@ pub const RISE: f64 = 6.0;
 pub const SCALE: f64 = 0.96;
 /// Retained copies are bounded like window destroy effects.
 const MAX_GHOSTS: usize = 8;
+/// How far apart (real time) a `CloseMenuUnanimated` and the popup going
+/// may arrive and still be one close: the shell sends the request in the
+/// same main-loop turn GTK destroys the popup.
+pub const UNANIMATED_PAIRING: Duration = Duration::from_millis(500);
+
+/// Whether a menu close at `close` is the one the shell asked to go
+/// unanimated at `request` (either may arrive first).
+pub fn pairs_with_unanimated(request: Instant, close: Instant) -> bool {
+    close.saturating_duration_since(request) <= UNANIMATED_PAIRING
+        && request.saturating_duration_since(close) <= UNANIMATED_PAIRING
+}
 
 pub fn duration(policy: MotionPolicy) -> Duration {
     Duration::from_secs_f64(policy.adjust_ms(MENU_MS) / 1000.0)
@@ -98,6 +118,8 @@ pub struct Ghost {
     motion: bool,
     fade_only: bool,
     start: Duration,
+    /// When the popup went, in real time (pairs an unanimated close).
+    went: Instant,
 }
 
 #[derive(Default)]
@@ -107,6 +129,8 @@ pub struct MenuClose {
     history: VecDeque<serde_json::Value>,
     now: Duration,
     policy: MotionPolicy,
+    /// A `CloseMenuUnanimated` waiting for its popup to go.
+    unanimated: Option<Instant>,
 }
 
 impl MenuClose {
@@ -186,7 +210,26 @@ impl MenuClose {
                 })
             })
             .collect();
-        serde_json::json!({"closing": ghosts, "retained": self.retained.len(), "history": self.history})
+        serde_json::json!({
+            "closing": ghosts,
+            "retained": self.retained.len(),
+            "unanimated_pending": self.unanimated.is_some(),
+            "history": self.history,
+        })
+    }
+
+    /// `menu.close({animate: false})` from a hidden panel button, asked at
+    /// `at`: drop the ghost of a popup that already went, else let the
+    /// next one to go close unanimated.
+    pub fn close_unanimated(&mut self, at: Instant) {
+        let before = self.ghosts.len();
+        self.ghosts.retain(|g| !pairs_with_unanimated(at, g.went));
+        if self.ghosts.len() < before {
+            self.record("unanimated", false);
+            self.unanimated = None;
+        } else {
+            self.unanimated = Some(at);
+        }
     }
 
     /// Retain this frame's panel menus and start a ghost for each one that
@@ -207,7 +250,16 @@ impl MenuClose {
         if !allowed || !policy.allows_fades() {
             self.retained.clear();
             self.ghosts.clear();
+            self.unanimated = None;
             return;
+        }
+        let went = Instant::now();
+        if self
+            .unanimated
+            .is_some_and(|at| went.saturating_duration_since(at) > UNANIMATED_PAIRING)
+        {
+            // Its popup never went (the menu was already closed).
+            self.unanimated = None;
         }
         let mut previous = std::mem::take(&mut self.retained);
         let mut present = HashSet::new();
@@ -301,6 +353,14 @@ impl MenuClose {
                 continue;
             }
             let fade_only = fade_only(grabbed_parents.contains(&old.parent));
+            if self
+                .unanimated
+                .take_if(|at| pairs_with_unanimated(*at, went))
+                .is_some()
+            {
+                self.record("unanimated", fade_only);
+                continue;
+            }
             if self.ghosts.len() >= MAX_GHOSTS {
                 self.record("snapshot-budget", fade_only);
                 continue;
@@ -322,6 +382,7 @@ impl MenuClose {
                 motion: policy.allows_motion() && !fade_only,
                 fade_only,
                 start: now,
+                went,
             });
         }
         let d = duration(policy);
@@ -412,5 +473,36 @@ mod tests {
         assert!(near(end.loc.y, 24.0) && near(end.size.h, 96.0));
         // The centre stays put horizontally.
         assert!(near(end.loc.x + end.size.w / 2.0, 200.0));
+    }
+
+    #[test]
+    fn a_hidden_buttons_close_pairs_whichever_arrives_first() {
+        // panelMenu.js:149-154: the request and the popup going are one
+        // close when they arrive within the pairing window, either order.
+        let at = Instant::now();
+        assert!(pairs_with_unanimated(at, at));
+        assert!(pairs_with_unanimated(at, at + Duration::from_millis(30)));
+        assert!(pairs_with_unanimated(at + Duration::from_millis(30), at));
+        assert!(pairs_with_unanimated(at, at + UNANIMATED_PAIRING));
+        // A later, ordinary close still animates.
+        assert!(!pairs_with_unanimated(
+            at,
+            at + UNANIMATED_PAIRING + Duration::from_millis(1)
+        ));
+        assert!(!pairs_with_unanimated(
+            at + UNANIMATED_PAIRING + Duration::from_millis(1),
+            at
+        ));
+    }
+
+    #[test]
+    fn an_unanimated_request_waits_for_its_popup_and_is_recorded() {
+        let mut close = MenuClose::default();
+        let at = Instant::now();
+        // No popup went yet: the request waits for the next one.
+        close.close_unanimated(at);
+        assert_eq!(close.unanimated, Some(at));
+        assert_eq!(close.to_json()["unanimated_pending"], true);
+        assert!(!close.running());
     }
 }

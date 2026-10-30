@@ -3469,6 +3469,29 @@ fn build(app: &adw::Application) {
         }
     }
 
+    // PanelMenu.Button.vfunc_hide: a panel button hidden under its open
+    // menu closes it without BoxPointer's close, which the compositor
+    // draws, so it hears first (CloseMenuUnanimated).
+    {
+        let shell = shell.clone();
+        transient::on_unanimated_menu_close(move || {
+            let send = |shell: &mut Shell| {
+                if let Some(control) = shell.control.as_mut() {
+                    let _ = control.close_menu_unanimated();
+                }
+            };
+            match shell.try_borrow_mut() {
+                Ok(mut shell) => send(&mut shell),
+                // Hidden while the shell state is borrowed: send it next;
+                // the compositor pairs it with the popup either way.
+                Err(_) => {
+                    let shell = shell.clone();
+                    glib::idle_add_local_once(move || send(&mut shell.borrow_mut()));
+                }
+            }
+        });
+    }
+
     // GNOME's window menu (header-bar right click).
     let window_menu = {
         let (shell, notify) = (shell.clone(), notify.clone());

@@ -307,11 +307,13 @@
 #                  show and close at once; Reduced Motion keeps the fades
 #                  and drops the panel menu's rise (#501)
 #   G-TRANSIENT-SETTLE the transient animations ran over GNOME 51's
-#                  durations and settled; panel menus rose and grew (#501)
+#                  durations and settled; panel menus rose and grew; the
+#                  window menu faded in and closed over 150 ms (#501)
 #   G-TRANSIENT-CLOSE-CLOCK a panel menu leaves the accessible tree at
 #                  once (Escape, one outside click) while the compositor
 #                  draws BoxPointer's close, sampled on the proof clock;
-#                  reopening replaces the close (#501)
+#                  reopening replaces the close; a button hidden under
+#                  its menu closes it unanimated (#501)
 #   A11Y-GOLDEN    the panel, calendar, quick settings and overview
 #                  accessible trees match tests/a11y/ (#71)
 #   G-FOCUS-RING   real Ctrl+Alt+Tab and Tab light GNOME 51's focus fill
@@ -345,7 +347,9 @@
 #               inside the output and steps through them; W closes the
 #               focused one
 #   G-SWITCHER-FADE the thumbnails fade in and the popup fades out over
-#               GNOME's 100 ms, animated and settled
+#               GNOME's 100 ms, animated and settled; the compositor draws
+#               the window images at their frames' opacity, sampled on
+#               the proof clock (#501)
 #   G-IME            IBus composes pinyin into hanzi in a GTK app
 #   G-SCROLL         niri's scrollable tiling: gaps, view follows focus, ring
 #   G-IME-SURROUNDING the engine sees the field's text around the
@@ -2067,7 +2071,44 @@ for fade in thumbnails-in popup-out; do
     printf '%s\n' "$fade_seg" | "$ROOT/scripts/lib/tuna-fade-match" "$fade" settled ||
         fail G-SWITCHER-FADE "the $fade fade did not settle"
 done
-pass G-SWITCHER-FADE "the switcher's thumbnails fade in and its popup fades out, animated and settled"
+# The window images fade with their frames (#501): GNOME's clones sit in
+# the thumbnail list inside the popup, so on the frozen proof clock the
+# compositor draws them at the strip's opacity, 100 ms ease-out quad in
+# (THUMBNAIL_FADE_TIME) and out with the popup (POPUP_FADE_OUT_TIME).
+# Escape cancels, keeping the focus the next steps expect.
+thumb_alphas() {
+    printf '.switcher_thumbnails == 2 and (.switcher_thumbnail_alphas | length) == 2 and all(.switcher_thumbnail_alphas[]; %s)' "$1"
+}
+anim_clock 0
+xdotool keydown Alt_L key grave
+cstate "$(thumb_alphas '. == 0')" "frozen transparent thumbnails" 5 ||
+    { xdotool keyup Alt_L; real_clock; fail G-SWITCHER-FADE "the thumbnails' windows did not start transparent with their frames"; }
+anim_clock 50
+cstate "$(thumb_alphas '((. - 191 / 255) | fabs) < 1e-6')" "thumbnails 50 ms in" ||
+    { xdotool keyup Alt_L; real_clock; fail G-SWITCHER-FADE "the thumbnails' windows were not three quarters opaque 50 ms in"; }
+cp "$CSTATE" "$ARTIFACTS/switcher-thumbnails-50ms.json"
+anim_clock 100
+cstate "$(thumb_alphas '. == 1')" "thumbnails 100 ms in" ||
+    { xdotool keyup Alt_L; real_clock; fail G-SWITCHER-FADE "the thumbnails' windows were not opaque 100 ms in"; }
+out_mark="$(wc -c <"$LOG")"
+xdotool key Escape
+xdotool keyup Alt_L
+out_started() {
+    tail -c +"$((out_mark + 1))" "$LOG" | "$ROOT/scripts/lib/tuna-fade-match" thumbnails-out start true
+}
+for _ in $(seq 1 25); do out_started && break; sleep 0.2; done
+out_started || { real_clock; fail G-SWITCHER-FADE "Escape did not start the thumbnails' fade-out"; }
+cstate "$(thumb_alphas '. == 1')" "frozen closing thumbnails" 5 ||
+    { real_clock; fail G-SWITCHER-FADE "the windows stopped drawing before their frames faded out"; }
+anim_clock 150
+cstate "$(thumb_alphas '((. - 64 / 255) | fabs) < 1e-6')" "thumbnails 50 ms into the fade-out" ||
+    { real_clock; fail G-SWITCHER-FADE "the thumbnails' windows were not a quarter opaque 50 ms into the fade-out"; }
+cp "$CSTATE" "$ARTIFACTS/switcher-thumbnails-out-50ms.json"
+anim_clock 200
+cstate '.switcher_thumbnails == 0' "thumbnails faded out" ||
+    { real_clock; fail G-SWITCHER-FADE "the thumbnails' windows were still drawn after the fade-out"; }
+real_clock || fail G-SWITCHER-FADE "removing the clock file did not resume real time"
+pass G-SWITCHER-FADE "the switcher's thumbnails fade in and its popup fades out, animated and settled; the compositor draws the window images at their frames' opacity (0, 191/255, 1 in; 1, 64/255, gone out) on the proof clock"
 sleep 0.5
 xdotool keydown Alt_L key grave
 sleep 1
@@ -5924,8 +5965,26 @@ hidden "$ARTIFACTS/a11y-menu-close-click.json" "Previous month" ||
 anim_clock 300
 cstate '(.menu_close.closing | length) == 0' "outside-click close done" ||
     fail G-TRANSIENT-CLOSE-CLOCK "the outside-click close never finished"
+# PanelMenu.Button.vfunc_hide (panelMenu.js:149-154): a panel button
+# hidden under its open menu closes it with animate: false, so the
+# compositor draws no BoxPointer close. The Accessibility button shows
+# while always-show-universal-access-status is on.
+gsettings set org.gnome.desktop.a11y always-show-universal-access-status true
+sleep 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-menu-hide-button.json" 20 ||
+    fail G-TRANSIENT-CLOSE-CLOCK "a11y dump failed"
+a11y_button="$(jq -er '[.[] | select(.showing and .name == "Accessibility" and ((.bounds[2] // 0) > 0) and ((.bounds[3] // 0) > 0))][0].bounds | "\(.[0] + .[2] / 2 | floor) \(.[1] + .[3] / 2 | floor)"' "$ARTIFACTS/a11y-menu-hide-button.json")" ||
+    fail G-TRANSIENT-CLOSE-CLOCK "always-show-universal-access-status showed no Accessibility button"
+# shellcheck disable=SC2086
+xdotool mousemove --window "$WID" $a11y_button click 1
+cstate '.menu_close.retained == 1 and (.menu_close.closing | length) == 0' "accessibility menu open" 5 ||
+    fail G-TRANSIENT-CLOSE-CLOCK "the Accessibility menu did not open"
+gsettings set org.gnome.desktop.a11y always-show-universal-access-status false
+cstate '.menu_close.retained == 0 and (.menu_close.closing | length) == 0 and .menu_close.history[-1].outcome == "unanimated" and (.menu_close.unanimated_pending | not)' "unanimated close" 5 ||
+    fail G-TRANSIENT-CLOSE-CLOCK "hiding the Accessibility button under its menu drew BoxPointer's close (GNOME closes it unanimated)"
+gsettings reset org.gnome.desktop.a11y always-show-universal-access-status
 real_clock
-pass G-TRANSIENT-CLOSE-CLOCK "panel menus close logically at once (accessible tree, one outside click) while the compositor draws BoxPointer's 150 ms out-quad fade, 6px rise and 96% shrink, sampled at 0/75/150 ms; reopening replaces the close"
+pass G-TRANSIENT-CLOSE-CLOCK "panel menus close logically at once (accessible tree, one outside click) while the compositor draws BoxPointer's 150 ms out-quad fade, 6px rise and 96% shrink, sampled at 0/75/150 ms; reopening replaces the close; a button hidden under its menu closes it unanimated"
 
 # GNOME settings (#63): the idle lock follows idle-delay and
 # lock-enabled as they change.
@@ -10984,8 +11043,9 @@ pass G-SHORTCUT-CONSENT "live requests require Allow, Deny stays inactive, known
 
 # Every transient animation (#501) that ran with animations on played
 # for its full GNOME duration and settled: the OSD and its level, the
-# banners, the panel menus, the quick-settings submenus and the modals.
-for spec in osd:100 osd-level:100 banner:200 menu:150 submenu:400 modal:100; do
+# banners, the panel menus, the quick-settings submenus, the modals and
+# the window menu (BoxPointer fade in, full close; windowMenu.js:239).
+for spec in osd:100 osd-level:100 banner:200 menu:150 submenu:400 modal:100 window-menu:150; do
     name="${spec%%:*}"
     grep -q "tuna-shell-gtk: transient $name settled after [0-9]* ms of ${spec#*:} ms" "$LOG" ||
         fail G-TRANSIENT-SETTLE "no $name animation settled over ${spec#*:} ms"
@@ -10993,7 +11053,7 @@ done
 # Panel menus open as BoxPointer does: rising 6px and growing from 96%.
 grep -q "tuna-shell-gtk: transient menu open motion=true rise=6 scale=0.96" "$LOG" ||
     fail G-TRANSIENT-SETTLE "no panel menu opened with BoxPointer's 6px rise and 96% growth"
-pass G-TRANSIENT-SETTLE "OSD, banners, panel menus (fade, rise and growth), quick-settings submenus and modals animate over GNOME's durations and settle"
+pass G-TRANSIENT-SETTLE "OSD, banners, panel menus (fade, rise and growth), quick-settings submenus, modals and the window menu animate over GNOME's durations and settle"
 
 "$ROOT/scripts/tuna-a11y-golden" check "$ARTIFACTS" ||
     fail A11Y-GOLDEN "accessible trees differ from tests/a11y/ (see above)"
