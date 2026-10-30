@@ -251,30 +251,62 @@ static int buffer_churn(struct client *c, const char *mode, struct wl_surface *s
     return 0;
 }
 /* Fuzz: seeded random requests on every bound global and the objects
- * they create, with arguments shaped by each request's signature (edge
- * integers, wrong-typed and stale objects, null, arrays, fds). Protocol
- * errors and disconnects are expected outcomes; a session the server stops
- * answering is a failure. */
-enum { FUZZ_LIVE = 256, FUZZ_ARGS = 20, FUZZ_SESSIONS = 100, FUZZ_STEPS = 48 };
+ * they create, with arguments shaped by each request's signature.
+ *
+ * Generation is per-object and error-aware so a session gets deep before
+ * it dies: a destroyed object is not named again, a surface that took a
+ * role (or an extension object) is not offered for another, object
+ * arguments are of the declared type, integers stay small. One request in
+ * FUZZ_HOSTILE breaks those rules on purpose (wrong-typed, stale or null
+ * objects, edge integers). A request that ended a session (a protocol
+ * error, or a disconnect without one: wayland-rs closes a client that
+ * names an unknown object without posting an error) is blamed, and later
+ * sessions of the same run pick it less often,
+ * so the run spends its budget past the first error instead of on it.
+ * Protocol errors and disconnects are expected outcomes; a session the
+ * server stops answering is a failure. */
+enum { FUZZ_LIVE = 256, FUZZ_ARGS = 20, FUZZ_SESSIONS = 100, FUZZ_STEPS = 256,
+       FUZZ_HOSTILE = 32, FUZZ_BLAME = 512 };
 struct fuzz {
     struct wl_display *display;
     uint64_t rng;
     struct wl_proxy *live[FUZZ_LIVE];
     const struct wl_interface *iface[FUZZ_LIVE];
-    unsigned count;
+    unsigned char dead[FUZZ_LIVE], used[FUZZ_LIVE];
+    int last_opcode[FUZZ_LIVE];
+    unsigned count, last;
 };
+/* Requests that ended a session, across the run's sessions. */
+static struct { const struct wl_interface *iface; uint32_t opcode, count; } blame[FUZZ_BLAME];
+static unsigned blamed;
+static uint32_t blame_count(const struct wl_interface *iface, uint32_t opcode) {
+    for (unsigned k = 0; k < blamed; k++)
+        if (blame[k].iface == iface && blame[k].opcode == opcode) return blame[k].count;
+    return 0;
+}
+static void blame_add(const struct wl_interface *iface, uint32_t opcode) {
+    for (unsigned k = 0; k < blamed; k++)
+        if (blame[k].iface == iface && blame[k].opcode == opcode) { blame[k].count++; return; }
+    if (blamed < FUZZ_BLAME) { blame[blamed].iface = iface; blame[blamed].opcode = opcode; blame[blamed++].count = 1; }
+}
+/* Distinct requests sent over the run. */
+static struct { const struct wl_interface *iface; uint32_t opcode; } kinds[FUZZ_BLAME];
+static unsigned kinds_seen;
+static void kind_note(const struct wl_interface *iface, uint32_t opcode) {
+    for (unsigned k = 0; k < kinds_seen; k++)
+        if (kinds[k].iface == iface && kinds[k].opcode == opcode) return;
+    if (kinds_seen < FUZZ_BLAME) { kinds[kinds_seen].iface = iface; kinds[kinds_seen++].opcode = opcode; }
+}
 static uint64_t fuzz_next(struct fuzz *f) {
     f->rng ^= f->rng << 13; f->rng ^= f->rng >> 7; f->rng ^= f->rng << 17;
     return f->rng;
 }
 static uint32_t fuzz_pick(struct fuzz *f, uint32_t n) { return n ? (uint32_t)(fuzz_next(f) % n) : 0; }
-/* Mostly small values (enums, counts), then edges, then anything. */
-static int32_t fuzz_int(struct fuzz *f) {
+/* Small values (enums, counts, sizes); hostile: edges and anything. */
+static int32_t fuzz_int(struct fuzz *f, int hostile) {
     static const int32_t edges[] = { -1, 7, 16, 64, 256, 4096, 65535, INT32_MAX, INT32_MIN };
-    uint32_t kind = fuzz_pick(f, 10);
-    if (kind < 5) return (int32_t)fuzz_pick(f, 5);
-    if (kind < 8) return edges[fuzz_pick(f, sizeof edges / sizeof *edges)];
-    return (int32_t)fuzz_next(f);
+    if (!hostile) return (int32_t)(fuzz_pick(f, 4) ? fuzz_pick(f, 5) : 1u << fuzz_pick(f, 9));
+    return fuzz_pick(f, 2) ? edges[fuzz_pick(f, sizeof edges / sizeof *edges)] : (int32_t)fuzz_next(f);
 }
 static void fuzz_global(void *data, struct wl_registry *registry, uint32_t id,
                         const char *name, uint32_t version) {
@@ -283,31 +315,53 @@ static void fuzz_global(void *data, struct wl_registry *registry, uint32_t id,
         if (strcmp((*i)->name, name)) continue;
         uint32_t bound = version < (uint32_t)(*i)->version ? version : (uint32_t)(*i)->version;
         f->live[f->count] = wl_registry_bind(registry, id, *i, bound);
+        f->last_opcode[f->count] = -1;
         f->iface[f->count++] = *i;
         return;
     }
 }
 static const struct wl_registry_listener fuzz_registry = { .global = fuzz_global, .global_remove = removed };
+static int is_destructor(const struct wl_message *message) {
+    return !strcmp(message->name, "destroy") || !strcmp(message->name, "release");
+}
+/* A live object of `type` not yet used up, from a random start; -1 if none. */
+static int fuzz_object(struct fuzz *f, const struct wl_interface *type, int consume) {
+    unsigned start = fuzz_pick(f, f->count);
+    for (unsigned k = 0; k < f->count; k++) {
+        unsigned j = (start + k) % f->count;
+        if (f->dead[j] || (type && f->iface[j] != type) || (consume && f->used[j])) continue;
+        return (int)j;
+    }
+    return -1;
+}
 /* One random request on a random live object; 1 when one was sent. */
 static int fuzz_request(struct fuzz *f) {
+    int hostile = !fuzz_pick(f, FUZZ_HOSTILE);
     unsigned index = fuzz_pick(f, f->count);
+    if (f->dead[index] && !hostile) return 0;
     struct wl_proxy *proxy = f->live[index];
     const struct wl_interface *iface = f->iface[index];
     if (!iface->method_count) return 0;
     uint32_t opcode = fuzz_pick(f, (uint32_t)iface->method_count);
+    /* A request blamed n times is sent 1 time in n + 1. */
+    uint32_t blames = blame_count(iface, opcode);
+    if (!hostile && blames && fuzz_pick(f, blames + 1)) return 0;
     const struct wl_message *message = &iface->methods[opcode];
     const char *sig = message->signature;
     uint32_t since = 0;
     while (*sig >= '0' && *sig <= '9') since = since * 10 + (uint32_t)(*sig++ - '0');
     uint32_t version = wl_proxy_get_version(proxy);
     if (since > version) return 0;
+    const char *args_sig = sig;
+    int creates = strchr(args_sig, 'n') != NULL;
     union wl_argument args[FUZZ_ARGS];
     struct wl_array arrays[FUZZ_ARGS];
     char strings[FUZZ_ARGS][24];
     unsigned char payload[FUZZ_ARGS][64];
     int fds[FUZZ_ARGS];
-    unsigned n = 0, nfds = 0;
-    int nullable = 0;
+    int consumed[FUZZ_ARGS];
+    unsigned n = 0, nfds = 0, nconsumed = 0;
+    int nullable = 0, surface_taken = 0;
     const struct wl_interface *created = NULL;
     memset(args, 0, sizeof args);
     for (; *sig; sig++) {
@@ -315,9 +369,9 @@ static int fuzz_request(struct fuzz *f) {
         if (n >= FUZZ_ARGS) goto skip;
         const struct wl_interface *type = message->types[n];
         switch (*sig) {
-        case 'i': args[n].i = fuzz_int(f); break;
-        case 'u': args[n].u = (uint32_t)fuzz_int(f); break;
-        case 'f': args[n].f = wl_fixed_from_int(fuzz_int(f) % 5000); break;
+        case 'i': args[n].i = fuzz_int(f, hostile); break;
+        case 'u': args[n].u = (uint32_t)fuzz_int(f, hostile); break;
+        case 'f': args[n].f = wl_fixed_from_int(fuzz_int(f, hostile) % 5000); break;
         case 's':
             if (nullable && !fuzz_pick(f, 4)) { args[n].s = NULL; break; }
             for (unsigned k = 0, len = fuzz_pick(f, 23); k <= len; k++)
@@ -325,20 +379,19 @@ static int fuzz_request(struct fuzz *f) {
             args[n].s = strings[n];
             break;
         case 'o': {
-            struct wl_proxy *target = NULL;
-            if (!nullable || fuzz_pick(f, 4)) {
-                /* An object of the declared type; rarely any object. */
-                unsigned start = fuzz_pick(f, f->count);
-                for (unsigned k = 0; k < f->count && !target; k++) {
-                    unsigned j = (start + k) % f->count;
-                    if (!type || f->iface[j] == type) target = f->live[j];
-                }
-                if (!fuzz_pick(f, 16)) target = f->live[start];
-                /* Without one, usually try another request instead. */
-                if (!target && fuzz_pick(f, 16)) goto skip;
-                if (!target) target = f->live[start];
+            if (nullable && !fuzz_pick(f, hostile ? 2 : 8)) { args[n].o = NULL; break; }
+            if (hostile) {
+                /* Anything: wrong-typed, destroyed or used up. */
+                args[n].o = (struct wl_object *)f->live[fuzz_pick(f, f->count)];
+                break;
             }
-            args[n].o = (struct wl_object *)target;
+            /* The first surface of a request that creates an object takes
+             * a role or an extension object: each surface gets one. */
+            int consume = creates && type == &wl_surface_interface && !surface_taken;
+            int j = fuzz_object(f, type, consume);
+            if (j < 0) goto skip;
+            if (consume) { surface_taken = 1; consumed[nconsumed++] = j; }
+            args[n].o = (struct wl_object *)f->live[j];
             break;
         }
         case 'n':
@@ -347,7 +400,7 @@ static int fuzz_request(struct fuzz *f) {
             args[n].n = 0;
             break;
         case 'a': {
-            unsigned len = fuzz_pick(f, 64);
+            unsigned len = fuzz_pick(f, hostile ? 64 : 16);
             for (unsigned k = 0; k < len; k++) payload[n][k] = (unsigned char)fuzz_next(f);
             arrays[n] = (struct wl_array){ .size = len, .alloc = len, .data = payload[n] };
             args[n].a = &arrays[n];
@@ -365,12 +418,18 @@ static int fuzz_request(struct fuzz *f) {
         nullable = 0;
         n++;
     }
-    /* Destructors are sent without destroying the proxy: later requests
-     * then name objects the server already destroyed. */
+    /* Destructors are sent without destroying the proxy: a hostile request
+     * may name the destroyed object later. */
     struct wl_proxy *made = wl_proxy_marshal_array_flags(proxy, opcode, created, version, 0, args);
     for (unsigned k = 0; k < nfds; k++) close(fds[k]);
+    for (unsigned k = 0; k < nconsumed; k++) f->used[consumed[k]] = 1;
+    if (is_destructor(message)) f->dead[index] = 1;
+    f->last_opcode[index] = (int)opcode;
+    f->last = index;
+    kind_note(iface, opcode);
     if (made && f->count < FUZZ_LIVE) {
         f->live[f->count] = made;
+        f->last_opcode[f->count] = -1;
         f->iface[f->count++] = created;
     }
     return 1;
@@ -378,8 +437,14 @@ skip:
     for (unsigned k = 0; k < nfds; k++) close(fds[k]);
     return 0;
 }
+/* Blame the request that ended a session. Every request is followed by a
+ * roundtrip, so it is the last one sent, whichever object the error names. */
+static void fuzz_blame(struct fuzz *f) {
+    if (f->count && f->last_opcode[f->last] >= 0)
+        blame_add(f->iface[f->last], (uint32_t)f->last_opcode[f->last]);
+}
 static int fuzz(const char *mode, uint64_t seed) {
-    unsigned requests = 0, rejected = 0, dropped = 0, survived = 0;
+    unsigned requests = 0, rejected = 0, dropped = 0, survived = 0, deepest = 0;
     for (unsigned session = 0; session < FUZZ_SESSIONS; session++) {
         struct fuzz f = { .display = wl_display_connect(NULL),
                           .rng = (seed * FUZZ_SESSIONS + session) * 2654435761u | 1 };
@@ -389,19 +454,31 @@ static int fuzz(const char *mode, uint64_t seed) {
             fprintf(stderr, "%s: session %u got no globals\n", mode, session); return 1;
         }
         /* errno says why a session ended: ETIMEDOUT only when the server
-         * stopped answering; a closed socket (EPIPE without a display
-         * error) is a disconnect. */
+         * stopped answering. Each request is followed by a roundtrip, so
+         * the server has read everything sent when it posts an error and
+         * closes: the client then reads the error instead of losing it to
+         * a reset connection (ECONNRESET, or EPIPE on the next send), and
+         * the blame lands on the request that caused it. Any protocol
+         * error counts, wl_display's own too (libwayland reports those as
+         * EINVAL, ENOMEM or EFAULT rather than EPROTO); a closed socket
+         * without one is a disconnect. */
         int lost = 0;
+        unsigned depth = 0;
         errno = 0;
         for (unsigned step = 0; step < FUZZ_STEPS && !lost; step++) {
-            requests += (unsigned)fuzz_request(&f);
-            lost = step % 8 == 7 && drain(f.display) < 0;
+            int sent = fuzz_request(&f);
+            depth += (unsigned)sent;
+            if (sent) lost = bounded_roundtrip(f.display, 5000) < 0;
         }
+        requests += depth;
+        if (depth > deepest) deepest = depth;
         int outcome = lost ? -1 : bounded_roundtrip(f.display, 5000);
         int why = errno;
+        const struct wl_interface *failed = NULL;
+        if (outcome != 0) wl_display_get_protocol_error(f.display, &failed, NULL);
         if (outcome == 0) survived++;
-        else if (wl_display_get_error(f.display) == EPROTO) rejected++;
-        else if (why != ETIMEDOUT) dropped++;
+        else if (failed) { rejected++; fuzz_blame(&f); }
+        else if (why != ETIMEDOUT) { dropped++; fuzz_blame(&f); }
         else {
             fprintf(stderr, "%s: seed %llu session %u: the server stopped answering\n", mode,
                     (unsigned long long)seed, session);
@@ -410,8 +487,9 @@ static int fuzz(const char *mode, uint64_t seed) {
         wl_display_disconnect(f.display);
     }
     printf("{\"mode\":\"%s\",\"result\":\"fuzz-served\",\"seed\":%llu,\"sessions\":%u,\"requests\":%u,"
-           "\"protocol_errors\":%u,\"disconnected\":%u,\"survived\":%u}\n", mode, (unsigned long long)seed,
-           (unsigned)FUZZ_SESSIONS, requests, rejected, dropped, survived);
+           "\"protocol_errors\":%u,\"disconnected\":%u,\"survived\":%u,\"deepest\":%u,\"kinds\":%u,"
+           "\"blamed\":%u}\n", mode, (unsigned long long)seed, (unsigned)FUZZ_SESSIONS, requests, rejected,
+           dropped, survived, deepest, kinds_seen, blamed);
     return 0;
 }
 int main(int argc, char **argv) {

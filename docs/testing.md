@@ -462,8 +462,12 @@ Phases, in order (`--phases` runs a subset):
   out-of-order destruction, invalid and never-acknowledged configures,
   death mid-transaction, 5,000 unthrottled commits each, 300 freshly
   written 2 MiB SHM buffers each, 1,000 connections held open at once, and
-  a seeded fuzzer sending random requests shaped by each request's
-  signature to every bound global (the day's seeds are in the report).
+  a seeded fuzzer: per attacker 100 sessions of up to 256 random requests
+  to every bound global and the objects they create, shaped by each
+  request's signature and kept valid in type and lifetime except one
+  request in 32 (wrong-typed, destroyed or null objects, edge integers);
+  requests that ended earlier sessions are picked less often, and every
+  request must be answered within 5 s (the day's seeds are in the report).
 - `dbus`: 1,000 notifications, 2,000 `ShowOSD` calls, accelerator grab and
   ungrab floods (then a live grab fires and a departed caller's grab is
   released), 300 tray items registered from their own connections and
