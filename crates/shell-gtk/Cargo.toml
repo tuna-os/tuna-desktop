@@ -12,7 +12,9 @@ path = "src/main.rs"
 [dependencies]
 async-channel = "2"
 xkbcommon.workspace = true
-gtk4 = { workspace = true, features = ["v4_12"] }
+# v4_14: `Accessible::announce` for the lock prompt's messages (Ubuntu
+# 24.04 ships GTK 4.14.2; Arch and the Tuna images ship newer).
+gtk4 = { workspace = true, features = ["v4_14"] }
 libadwaita.workspace = true
 gtk4-layer-shell.workspace = true
 gtk4-session-lock.workspace = true

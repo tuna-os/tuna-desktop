@@ -35,8 +35,8 @@ class Contract(unittest.TestCase):
   self.assertLess(text.index('CommandKind::Unlock'),text.index('encode_frame'))
  def test_actual_consumer_clears_fields_and_waits_for_authoritative_lock(self):
   lock=(ROOT/'crates/shell-gtk/src/lock.rs').read_text()
-  self.assertIn('None => reset_prompt(entry, message)',lock)
-  self.assertIn('entry.set_text("")',lock)
+  self.assertIn('self.password.set_text("")',lock)
+  self.assertIn('self.text.set_text("")',lock)
   main=(ROOT/'crates/shell-gtk/src/main.rs').read_text()
   self.assertIn('sync_connection_generation(auth_generation)',main)
   self.assertIn('filter(|c| !c.needs_snapshot())',main)

@@ -1157,13 +1157,17 @@ impl Osk {
         session.window.set_default_size(geometry.width(), height);
     }
 
-    /// A lock window's keyboard for its unlock `prompt`.
-    pub fn lock_keyboard(self: &Rc<Self>, prompt: &gtk::PasswordEntry) -> Rc<LockKeyboard> {
+    /// A lock window's keyboard for its unlock prompt: `prompt` yields the
+    /// entry currently asking (hidden or visible, authPrompt.js
+    /// `updateEntry`), or `None` once the prompt is gone.
+    pub fn lock_keyboard(
+        self: &Rc<Self>,
+        prompt: Rc<dyn Fn() -> Option<gtk::Editable>>,
+    ) -> Rc<LockKeyboard> {
         let model = Keyboard::new(&self.group(), Purpose::Password, PASSWORD_HINTS)
             .or_else(|| Keyboard::new("us", Purpose::Password, PASSWORD_HINTS));
-        let prompt = prompt.downgrade();
         let typing: Typing = Rc::new(move |effect| {
-            let Some(prompt) = prompt.upgrade() else {
+            let Some(prompt) = prompt() else {
                 return;
             };
             match prompt_edit(&effect) {

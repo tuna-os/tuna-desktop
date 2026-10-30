@@ -40,5 +40,7 @@ reader, installed PAM stack, suspend/resume, or issue #366.
 
 The d371 successor changes the APIs for cancellation and wake. This
 patch changes no cancellation API. The guard for message admission must run
-before answer construction in that successor too. The frozen fingerprint
-facades remain separate from runtime consumers; they do not grant unlock.
+before answer construction in that successor too. These guards apply to the
+single-password adapters only; the interactive conversation relays every
+prompt to the user and fingerprint runs as its own service
+([lock-conversations.md](lock-conversations.md)).

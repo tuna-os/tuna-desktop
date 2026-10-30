@@ -28,9 +28,12 @@ slot. An active method blocks a grant and admission of another method. The
 legacy wrapper release applies only to Password. Release of a PAM method needs a result that allows retirement,
 the exact `Attempt`, and the exact method.
 
-The Fingerprint tag has no retirement consumer in this change. Neither a PAM result nor a match from hardware can release that tag. A later fingerprint consumer must
-provide its own owned retirement path. Parallel methods must retain all their
-children through retirement. This change does not add fallback.
+A PAM result cannot release the Fingerprint tag. Its owned retirement path is
+`Slot::retire_fingerprint`, which accepts only the joined result of that
+attempt's own worker thread; the lock screen runs it on a separate Slot beside
+the password conversation and grants through the common Slot only after the
+other method has been cancelled and retired
+([lock-conversations.md](lock-conversations.md)).
 
 ## Shell ownership
 

@@ -1171,6 +1171,15 @@ window.tuna-lock .login-dialog-message {
   min-height: 40px;
   margin-top: 27px;
 }
+/* _login-lock.scss: inside .unlock-dialog a problem
+   (.login-dialog-message-warning) is the full foreground, a hint
+   (.login-dialog-message-hint) the message's darkened one. */
+window.tuna-lock .login-dialog-message.login-dialog-message-warning {
+  color: #fafafb;
+}
+window.tuna-lock .login-dialog-message.login-dialog-message-hint {
+  color: #dedee4;
+}
 
 /* GNOME 51's OSD (.osd-window): a #2e2e33 pill, 12px by 18px of
    padding, a 32px icon, bold label, and a 160px level bar. */

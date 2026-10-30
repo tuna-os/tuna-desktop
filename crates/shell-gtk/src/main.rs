@@ -38,7 +38,9 @@ mod keybindings;
 mod live_apps;
 mod location;
 mod lock;
+mod lock_auth;
 mod lock_curtain;
+mod lock_wiggle;
 mod lockdown;
 mod logic;
 mod magnifier_sync;
@@ -134,6 +136,12 @@ fn is_would_block(e: &ControlError) -> bool {
 #[derive(Default)]
 struct Drained {
     results: Vec<(u64, bool)>,
+    /// Lock-screen authentication steps `(request, service, event)`, in order.
+    auth_events: Vec<(
+        u64,
+        tuna_shell_control::AuthService,
+        tuna_shell_control::AuthEvent,
+    )>,
     /// Grabbed accelerator presses and releases `(action, time, mode, released)`.
     accelerators: Vec<(u32, u32, u32, bool)>,
     menus: Vec<tuna_shell_host::control::WindowMenuRequest>,
@@ -250,6 +258,11 @@ fn drain(
                 id,
                 matches!(status, tuna_shell_control::CommandStatus::Applied),
             )),
+            Handled::AuthEvent {
+                request,
+                service,
+                event,
+            } => out.auth_events.push((request, service, event)),
             _ => {}
         }
     }
@@ -1804,19 +1817,66 @@ fn build(app: &adw::Application) {
         })
     });
     // GNOME's lock screen on ext-session-lock (the compositor decides
-    // when, draws the blurred background, and checks the password).
+    // when, draws the blurred background, and runs the authentication
+    // conversations).
     let lock_ui = {
-        let shell = shell.clone();
         let interface = settings(INTERFACE_SCHEMA);
+        // GNOME's login-screen schema may be absent: fingerprint stays on,
+        // as its default.
+        let login_screen = settings("org.gnome.login-screen").filter(|s| {
+            s.settings_schema()
+                .is_some_and(|schema| schema.has_key("enable-fingerprint-authentication"))
+        });
+        let port = lock::AuthPort {
+            unlock: {
+                let shell = shell.clone();
+                Rc::new(move |password| {
+                    shell
+                        .borrow_mut()
+                        .control
+                        .as_mut()
+                        .and_then(|c| c.unlock(password).ok())
+                })
+            },
+            begin: {
+                let shell = shell.clone();
+                Rc::new(move |service| {
+                    shell
+                        .borrow_mut()
+                        .control
+                        .as_mut()
+                        .and_then(|c| c.begin_verification(service).ok())
+                })
+            },
+            answer: {
+                let shell = shell.clone();
+                Rc::new(move |service, sequence, answer| {
+                    shell
+                        .borrow_mut()
+                        .control
+                        .as_mut()
+                        .and_then(|c| c.answer_query(service, sequence, answer).ok())
+                })
+            },
+            cancel: {
+                let shell = shell.clone();
+                Rc::new(move || {
+                    shell
+                        .borrow_mut()
+                        .control
+                        .as_mut()
+                        .and_then(|c| c.cancel_verification().ok())
+                })
+            },
+            fingerprint_enabled: Rc::new(move || {
+                login_screen
+                    .as_ref()
+                    .is_none_or(|s| s.boolean("enable-fingerprint-authentication"))
+            }),
+        };
         lock::LockUi::new(
             app.upcast_ref(),
-            Rc::new(move |password| {
-                shell
-                    .borrow_mut()
-                    .control
-                    .as_mut()
-                    .and_then(|c| c.unlock(password).ok())
-            }),
+            port,
             Box::new(move || {
                 interface
                     .as_ref()
@@ -3431,6 +3491,7 @@ fn build(app: &adw::Application) {
             Rc::new(move |drained: Drained| {
                 let Drained {
                     results,
+                    auth_events,
                     accelerators,
                     menus,
                     consent,
@@ -3493,6 +3554,7 @@ fn build(app: &adw::Application) {
                 lock_ui.sync_connection_generation(auth_generation);
                 if let Some(locked) = authoritative_lock {
                     lock_ui.sync(locked);
+                    lock_ui.resume_verification();
                 }
                 screensaver.sync(locked);
                 // The session keyboard never shows over the lock screen.
@@ -3534,6 +3596,11 @@ fn build(app: &adw::Application) {
                 }
                 if locked {
                     kbd_a11y_dialog.dismiss();
+                }
+                // Conversation steps first: a step and the result ending its
+                // conversation can arrive in one drain, in that order.
+                for (request, service, event) in auth_events {
+                    lock_ui.auth_event(request, service, &event);
                 }
                 for (id, applied) in results {
                     // Receipt of Applied precedes the runtime manager replacement.

@@ -327,7 +327,11 @@ def delayed_auth_state(pid, start_ticks):
         owner_text = STATE.read_text()
         stage = "owner-parse"
         owner = json.loads(owner_text).get("auth_owner")
-        pending = type(owner) is dict and owner.get("outer_pending") is True
+        # The legacy password worker or the lock conversation (#366) owns it.
+        pending = type(owner) is dict and (
+            owner.get("outer_pending") is True
+            or (type(owner.get("conversations")) is dict
+                and owner["conversations"].get("password") is True))
         stage = "serialization"
         return {"real_pam_delay_running": pending and len(helpers) == 1 and len(delays) == 1,
                 "auth_owner": owner,

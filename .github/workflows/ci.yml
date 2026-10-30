@@ -786,6 +786,18 @@ jobs:
         run: python3 scripts/tuna-auth-no-replay-gtk-proof
         env:
           GH_TOKEN: ${{ github.token }}
+      # Multi-step and fingerprint lock authentication (#366, P-LK-02): the
+      # nested session with a pam_wrapper password + OTP stack and a mock
+      # fprintd on a private system bus, driven through real X11 input.
+      # Uploaded with gtk-shell-artifacts; the parity ledger reads its
+      # assertions.txt.
+      - name: Prove multi-step and fingerprint lock authentication
+        run: |
+          shellcheck scripts/tuna-lock-auth-proof
+          /usr/bin/python3 scripts/tests/test_tuna_lock_auth_fixtures.py
+          scripts/tuna-lock-auth-proof --artifacts gtk-shell-artifacts/lock-auth
+        env:
+          TUNA_REQUIRE_PAM_WRAPPER: "1"
       - name: Prove real GTK notification action retirement
         run: |
           /usr/bin/python3 scripts/tests/test_notify_callback_contract.py
@@ -1338,6 +1350,7 @@ jobs:
           --assertions ledger-in/gtk-shell/magnifier/assertions.txt
           --assertions ledger-in/gtk-shell/session-restore/assertions.txt
           --assertions ledger-in/gtk-shell/osk/assertions.txt
+          --assertions ledger-in/gtk-shell/lock-auth/assertions.txt
           --assertions ledger-in/drm-smoke/assertions.txt
           --assertions ledger-in/marlin-vm/assertions.txt
 

@@ -12,6 +12,8 @@ SCRIPT = (ROOT / 'scripts/tuna-auth-owner-ci-proof').read_text()
 BLOCKS = [part.split('\nPY\n', 1)[0] for part in SCRIPT.split("<<'PY'\n")[1:]]
 
 
+CONVERSATION_KEYS = ['fingerprint_unavailable_denied', 'second_password_conversation_denied', 'stale_sequence_dropped', 'distinct_answers_per_question', 'info_and_error_relayed', 'wrong_pin_denied_with_problem', 'cancel_denied_silently', 'fresh_answers_unlock']
+
 class Admission(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -66,6 +68,9 @@ class Admission(unittest.TestCase):
             'closed_origin_canceled_retired': True, 'origin_loss_wakes_private_pam_without_fixture_release': True, 'fresh_origin_success': True,
             'held_self_path_replaced': True, 'compositor_sha256': r['executables'][str(self.bin)]}))
         (self.out/'test-pam.log').write_text('auth owner pam sha256: '+r['executables'][str(self.bin)]+'\n')
+        (self.out/'runtime-conversation').mkdir(exist_ok=True)
+        (self.out/'runtime-conversation/success.json').write_text(json.dumps({
+            **{k: True for k in CONVERSATION_KEYS}, 'compositor_sha256': r['executables'][str(self.bin)]}))
         return r
 
     def test_exact_roles_and_unchanged_files_admitted(self):
@@ -155,6 +160,17 @@ class Admission(unittest.TestCase):
             receipt = json.loads(path.read_text()); receipt[field] = wrong
             path.write_text(json.dumps(receipt))
             with self.subTest(field=field), self.assertRaises(AssertionError): self.execute(BLOCKS[1])
+
+    def test_conversation_receipt_false_missing_or_wrong_image_refused(self):
+        for field, wrong in [*((key, False) for key in CONVERSATION_KEYS), ('compositor_sha256', '0'*64)]:
+            self.admit()
+            path = self.out/'runtime-conversation/success.json'
+            receipt = json.loads(path.read_text()); receipt[field] = wrong
+            path.write_text(json.dumps(receipt))
+            with self.subTest(field=field), self.assertRaises(AssertionError): self.execute(BLOCKS[1])
+        self.admit()
+        (self.out/'runtime-conversation/success.json').unlink()
+        with self.assertRaises(FileNotFoundError): self.execute(BLOCKS[1])
 
     def test_actual_pam_receipt_missing_or_duplicate_source_refused(self):
         self.admit()

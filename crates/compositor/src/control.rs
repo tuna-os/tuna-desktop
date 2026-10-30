@@ -342,8 +342,21 @@ pub struct Session<'a> {
     /// A lock-screen password awaiting verification, with its request
     /// id: the reply waits for the result (see `ControlHub::finish_unlock`).
     unlock_request: Option<(u64, tuna_shell_control::Secret)>,
-    /// The request id whose `CommandResult` is still owed.
+    /// The request id whose `CommandResult` is still owed: a legacy
+    /// `Unlock` or a password `BeginVerification` (never both at once).
     unlock_pending: Option<u64>,
+    /// The fingerprint `BeginVerification` whose result is still owed.
+    fingerprint_pending: Option<u64>,
+    /// Conversations the shell started this round, drained by the hub.
+    auth_begin: Vec<(u64, tuna_shell_control::AuthService)>,
+    /// Query answers the shell sent this round, drained by the hub.
+    auth_answers: Vec<(
+        tuna_shell_control::AuthService,
+        u32,
+        tuna_shell_control::Secret,
+    )>,
+    /// The shell asked to stop its conversations.
+    auth_cancel: bool,
     /// Latest `SetInputSettings` from the shell, drained by the hub.
     input_settings: Option<tuna_shell_control::InputSettings>,
     wellbeing_effects: Option<(bool, bool)>,
@@ -447,6 +460,10 @@ impl<'a> Session<'a> {
             overview_app_grid: None,
             unlock_request: None,
             unlock_pending: None,
+            fingerprint_pending: None,
+            auth_begin: Vec::new(),
+            auth_answers: Vec::new(),
+            auth_cancel: false,
             input_settings: None,
             wellbeing_effects: None,
             icon_geometries: None,
@@ -568,6 +585,11 @@ impl<'a> Session<'a> {
     /// This session's lockdown policy.
     pub fn lockdown_policy(&self) -> LockdownPolicy {
         self.lockdown
+    }
+
+    /// Whether this connection is still owed the result of `request`.
+    fn owes_auth(&self, request: u64) -> bool {
+        self.unlock_pending == Some(request) || self.fingerprint_pending == Some(request)
     }
 
     /// Window-menu actions the shell sent since the last call.
@@ -924,6 +946,69 @@ impl<'a> Session<'a> {
             }
             Message::Command {
                 id,
+                kind: CommandKind::BeginVerification { service },
+            } => {
+                // Like `Unlock`, the runtime answers when the conversation
+                // ends. One owed result per service; the password service
+                // shares the legacy unlock slot, so the two exclude each other.
+                let pending = match service {
+                    tuna_shell_control::AuthService::Password => &mut self.unlock_pending,
+                    tuna_shell_control::AuthService::Fingerprint => &mut self.fingerprint_pending,
+                };
+                if pending.is_some() || self.peer_minor < 44 {
+                    self.conn.write_frame(&Message::CommandResult {
+                        id,
+                        status: CommandStatus::Denied {
+                            reason: "authentication failed".into(),
+                        },
+                    })?;
+                    return Ok(Handled::CommandResult { id, applied: false });
+                }
+                *pending = Some(id);
+                self.auth_begin.push((id, service));
+                Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
+                kind:
+                    CommandKind::AnswerQuery {
+                        service,
+                        sequence,
+                        answer,
+                    },
+            } => {
+                // Queued for the runtime, which applies it only to the exact
+                // outstanding query; a stale or unmatched answer is dropped.
+                // Bounded: one answer per outstanding query is all it needs.
+                let applied = self.auth_answers.len() < 4;
+                if applied {
+                    self.auth_answers.push((service, sequence, answer));
+                }
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: if applied {
+                        CommandStatus::Applied
+                    } else {
+                        CommandStatus::Denied {
+                            reason: "authentication failed".into(),
+                        }
+                    },
+                })?;
+                Ok(Handled::CommandResult { id, applied })
+            }
+            Message::Command {
+                id,
+                kind: CommandKind::CancelVerification,
+            } => {
+                self.auth_cancel = true;
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
                 kind: CommandKind::SetOverviewAppGrid { active },
             } => {
                 // UI state for the runtime's overview drawing.
@@ -1111,6 +1196,7 @@ impl<'a> Session<'a> {
             | Message::PointerTimeout { .. }
             | Message::ShortcutConsent { .. }
             | Message::ConfirmDisplayChange { .. }
+            | Message::AuthEvent { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
                     kind: ErrorKind::UnknownCommand,
@@ -1158,6 +1244,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::PointerOutput { .. } => "PointerOutput",
         Message::ShortcutConsent { .. } => "ShortcutConsent",
         Message::ConfirmDisplayChange { .. } => "ConfirmDisplayChange",
+        Message::AuthEvent { .. } => "AuthEvent",
         Message::ScreenReader { .. } => "ScreenReader",
         Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
         Message::DwellClickType { .. } => "DwellClickType",
@@ -1334,6 +1421,9 @@ fn apply_command(
         | CommandKind::WindowAction { .. }
         | CommandKind::ShortcutConsent { .. }
         | CommandKind::CompleteDisplayChange { .. }
+        | CommandKind::BeginVerification { .. }
+        | CommandKind::AnswerQuery { .. }
+        | CommandKind::CancelVerification
         | CommandKind::SwitchInputSource { .. }
         | CommandKind::SetWindowIconGeometries { .. }
         | CommandKind::SetWellbeingEffects { .. }
@@ -1379,6 +1469,18 @@ pub struct PollOutcome {
     pub overview_app_grid: Option<bool>,
     /// A lock-screen password to verify, with its request id.
     pub unlock: Option<(crate::auth_owner::Origin, tuna_shell_control::Secret)>,
+    /// Authentication conversations the shell started: the origin is the
+    /// `BeginVerification` request whose result is owed.
+    pub auth_begin: Vec<(crate::auth_owner::Origin, tuna_shell_control::AuthService)>,
+    /// Query answers, by the connection that sent them.
+    pub auth_answers: Vec<(
+        u64,
+        tuna_shell_control::AuthService,
+        u32,
+        tuna_shell_control::Secret,
+    )>,
+    /// Connections that asked to stop their conversations.
+    pub auth_cancel: Vec<u64>,
     /// GNOME input settings the shell sent, if any.
     pub input_settings: Option<tuna_shell_control::InputSettings>,
     pub wellbeing_effects: Option<(bool, bool)>,
@@ -1880,12 +1982,12 @@ impl ControlHub {
         self.previews = (previews, hovered);
     }
 
-    /// Answer a lock-screen password: `Applied` when it unlocked the
-    /// session, `Denied` when it did not.
+    /// Whether `origin`'s authentication result is still owed to a live,
+    /// admitted, authenticated shell connection.
     pub fn origin_pending_live(&self, origin: crate::auth_owner::Origin) -> bool {
         self.sessions.iter().enumerate().any(|(i, session)| {
             session.connection_id == origin.connection
-                && session.unlock_pending == Some(origin.request)
+                && session.owes_auth(origin.request)
                 && self.gate.admits(self.session_peers[i], our_uid())
                 && (!self.auth_owner_configured
                     || self.auth_owner.is_some_and(|owner| {
@@ -1895,14 +1997,23 @@ impl ControlHub {
                 && session.conn.peer_live()
         })
     }
+    /// Answer a lock-screen authentication request (`Unlock` or
+    /// `BeginVerification`): `Applied` when it unlocked the session,
+    /// `Denied` when it did not.
     pub fn finish_unlock(&mut self, origin: crate::auth_owner::Origin, unlocked: bool) {
-        let Some(index) = self.sessions.iter().position(|s| {
-            s.connection_id == origin.connection && s.unlock_pending == Some(origin.request)
-        }) else {
+        let Some(index) = self
+            .sessions
+            .iter()
+            .position(|s| s.connection_id == origin.connection && s.owes_auth(origin.request))
+        else {
             return;
         };
         let session = &mut self.sessions[index];
-        session.unlock_pending = None;
+        if session.unlock_pending == Some(origin.request) {
+            session.unlock_pending = None;
+        } else {
+            session.fingerprint_pending = None;
+        }
         let sent = session.conn.write_frame(&Message::CommandResult {
             id: origin.request,
             status: if unlocked {
@@ -1917,6 +2028,38 @@ impl ControlHub {
             self.sessions.swap_remove(index);
             self.session_peers.swap_remove(index);
         }
+    }
+
+    /// Relay one conversation step to the connection that owns `origin`,
+    /// only while that request is still owed to a live admitted shell.
+    /// A write failure drops that connection, which ends its conversation.
+    pub fn send_auth_event(
+        &mut self,
+        origin: crate::auth_owner::Origin,
+        service: tuna_shell_control::AuthService,
+        event: tuna_shell_control::AuthEvent,
+    ) -> bool {
+        if !self.origin_pending_live(origin) {
+            return false;
+        }
+        let Some(index) = self
+            .sessions
+            .iter()
+            .position(|s| s.connection_id == origin.connection)
+        else {
+            return false;
+        };
+        let sent = self.sessions[index].conn.write_frame(&Message::AuthEvent {
+            request: origin.request,
+            service,
+            event,
+        });
+        if sent.is_err() {
+            self.sessions.swap_remove(index);
+            self.session_peers.swap_remove(index);
+            return false;
+        }
+        true
     }
 
     pub fn set_environment(&mut self, mut vars: Vec<(String, String)>) {
@@ -2163,6 +2306,26 @@ impl ControlHub {
                                 })
                                 .is_ok();
                         }
+                    }
+                    for (request, service) in std::mem::take(&mut session.auth_begin) {
+                        outcome.auth_begin.push((
+                            crate::auth_owner::Origin {
+                                connection: session.connection_id,
+                                request,
+                            },
+                            service,
+                        ));
+                    }
+                    for (service, sequence, answer) in std::mem::take(&mut session.auth_answers) {
+                        outcome.auth_answers.push((
+                            session.connection_id,
+                            service,
+                            sequence,
+                            answer,
+                        ));
+                    }
+                    if std::mem::take(&mut session.auth_cancel) {
+                        outcome.auth_cancel.push(session.connection_id);
                     }
                     if let Some(geometries) = session.icon_geometries.take() {
                         outcome.icon_geometries = Some(geometries);

@@ -89,6 +89,23 @@ impl Slot {
         }
         self.retire_exact(attempt)
     }
+    /// Fingerprint retirement: only the joined result of the attempt's own
+    /// worker thread is accepted (`joined` exists only after the join), so
+    /// no later callback can produce a result for this attempt.
+    pub fn retire_fingerprint(
+        &mut self,
+        attempt: Attempt,
+        _joined: &crate::unlock::FingerprintEnd,
+    ) -> bool {
+        if self.method != Some(MethodKind::Fingerprint) {
+            return false;
+        }
+        self.retire_exact(attempt)
+    }
+    /// Some method owns this slot (its attempt has not retired).
+    pub fn active(&self) -> bool {
+        self.active.is_some()
+    }
     fn retire_exact(&mut self, attempt: Attempt) -> bool {
         if self.active != Some(attempt) {
             return false;

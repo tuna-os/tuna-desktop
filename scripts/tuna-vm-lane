@@ -141,7 +141,12 @@ def sleep_auth_attempt(snapshot):
     """Bind a pending original password attempt before real S3; no secret data."""
     state = snapshot.get('state', {})
     owner = state.get('auth_owner')
-    if state.get('locked') is not True or type(owner) is not dict or owner.get('outer_pending') is not True:
+    # The single-password worker or the lock conversation (#366) owns it.
+    conversations = owner.get('conversations') if type(owner) is dict else None
+    pending = type(owner) is dict and (
+        owner.get('outer_pending') is True
+        or (type(conversations) is dict and conversations.get('password') is True))
+    if state.get('locked') is not True or not pending:
         raise ValueError('pre-sleep owned authentication not pending')
     attempt = owner.get('attempt')
     if type(attempt) is not dict or set(attempt) != {'serial', 'epoch', 'origin'}:
@@ -291,10 +296,47 @@ def cancelled_sleep_auth_retirement(trace, expected, current_epoch, original, ph
             and event['locked_after'] and not event['authenticated'] and not event['reported_ok'] and not event['applied']
             and event['current_epoch'] == current_epoch):
         return None
-    denial = re.compile(r'tuna-shell-gtk: lock command result applied=false request_id=([0-9]+)(?:\s|$)')
-    if not any(int(match.group(1)) == expected['origin']['request'] for match in denial.finditer(trace)):
+    if expected['origin']['request'] not in shell_denied_requests(trace):
         return None
     return event
+
+
+# The shell's denied result for a request: the single-password `Unlock`
+# command, or the lock conversation's password begin (#366).
+SHELL_DENIAL_RE = re.compile(
+    r'tuna-shell-gtk: lock (?:command result applied=false request_id=([0-9]+)'
+    r'|auth result service=password request=([0-9]+) applied=false)(?:\s|$)')
+
+
+def shell_denied_requests(text):
+    return {int(match.group(1) or match.group(2)) for match in SHELL_DENIAL_RE.finditer(text)}
+
+
+def pam_refusal_observed(records):
+    """A fresh PAM refusal reached the shell as a denial.
+
+    Single-password `Unlock`: the shell submitted and the command was
+    refused. Lock conversation: the compositor retired a password
+    conversation unauthenticated and uncancelled (PAM itself refused) and
+    the shell received that same request's denied result.
+    """
+    if (any("tuna-shell-gtk: lock password submitted" in line for line in records)
+            and any("tuna-shell-gtk: lock command result applied=false" in line for line in records)):
+        return True
+    prefix = 'tuna-compositor: lock conversation '
+    refused = set()
+    for line in records:
+        if prefix not in line:
+            continue
+        try:
+            event = json.loads(line.split(prefix, 1)[1])
+        except (ValueError, TypeError):
+            return False
+        if (type(event) is dict and event.get('event') == 'retired' and event.get('service') == 'password'
+                and event.get('retired') is True and event.get('authenticated') is False
+                and event.get('canceled') is False and auth_uint(event.get('request'))):
+            refused.add(event['request'])
+    return bool(refused & shell_denied_requests('\n'.join(records)))
 
 
 ORCA_RETIREMENT_RE = re.compile(
@@ -2300,8 +2342,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         time.sleep(12)
         denied = inventory("pam-denied")
         auth_records = session_records(read_text(serial_path)[auth_offset:])
-        attempted = (any("tuna-shell-gtk: lock password submitted" in line for line in auth_records)
-                     and any("tuna-shell-gtk: lock command result applied=false" in line for line in auth_records))
+        attempted = pam_refusal_observed(auth_records)
         record("V-AUTH-FAIL-CLOSED", attempted and denied["state"]["locked"] and same_apps(before, denied),
                "fresh submitted/refused milestones: real pam_deny service rejects the correct fixture password; apps remain inaccessible")
     finally:

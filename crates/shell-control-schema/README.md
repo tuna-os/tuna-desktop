@@ -12,11 +12,21 @@ before decoding.
 ## Public API (`src/lib.rs`)
 
 - Framing: `encode_frame`, `decode_frame`, `DecodeError`, `MAX_FRAME_BYTES`.
-- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.42).
+- Versioning: `ProtocolVersion`, `CURRENT_VERSION` (currently 0.44; 0.43 is reserved for #839).
 - Display-change confirmation (0.42): `Message::ConfirmDisplayChange
   { timeout_secs }` (sent only to peers advertising minor >=42) asks the shell
   for GNOME's "Keep these display settings?" dialog; the shell answers with
   `CommandKind::CompleteDisplayChange { keep }`.
+- Lock-screen authentication conversation (0.44), GDM's UserVerifier shape:
+  `CommandKind::BeginVerification { service }` (`AuthService::Password` or
+  `Fingerprint`) starts one conversation for the session's own user and is
+  answered once (`Applied` = unlocked, `Denied` = stopped);
+  `Message::AuthEvent { request, service, event }` (peers >=44 only) carries
+  its `Info`, `Problem`, `Query { sequence, question, secret }`,
+  `FingerprintScan { swipe }` and `Unavailable` steps;
+  `CommandKind::AnswerQuery { service, sequence, answer }` answers one query
+  (`encode_answer_frame` wipes its single buffer); `CancelVerification`
+  stops them all. Texts are bounded by `MAX_AUTH_TEXT_LEN`.
 - Dash targets: `WindowIconGeometry`, `MAX_WINDOW_ICON_GEOMETRIES`, and
   appended `CommandKind::SetWindowIconGeometries` full replacements. Unknown
   windows are ignored by the compositor; an empty list selects monitor fallback.

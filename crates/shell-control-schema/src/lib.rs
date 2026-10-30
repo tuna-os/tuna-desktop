@@ -190,9 +190,13 @@ impl ProtocolVersion {
     /// client) and the compositor-to-shell `OnScreenKeyboard` message
     /// (input-method focus, the input-panel request and touch-mode
     /// auto-show); positional postcard peers must ship together.
+    /// `0.44` appends the lock screen's authentication conversation (GDM's
+    /// UserVerifier shape): shell-to-compositor `BeginVerification`,
+    /// `AnswerQuery` and `CancelVerification`, and compositor-to-shell
+    /// `AuthEvent`. Positional postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 43,
+        minor: 44,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -447,6 +451,26 @@ pub enum CommandKind {
     /// session is locked: the lock screen's keyboard edits only its own
     /// prompt and never reaches the compositor.
     OskInput { input: OskInput },
+    /// Since 0.44: start one lock-screen authentication conversation for the
+    /// session's own user (GDM's `BeginVerificationForUser`; the user is
+    /// never taken from the shell). Its prompts and messages arrive as
+    /// [`Message::AuthEvent`]s carrying this command's id. Exactly one
+    /// `CommandResult` ends it: `Applied` once this service verified the
+    /// user and the session is unlocked, `Denied` when the conversation
+    /// stopped without unlocking (failure, cancellation, timeout, an
+    /// unavailable service, or the other service winning).
+    BeginVerification { service: AuthService },
+    /// Since 0.44: the answer to the outstanding [`AuthEvent::Query`] with
+    /// this `sequence` (GDM's `AnswerQuery`). Never replayed; `Debug` is
+    /// redacted. `Denied` when no such query is outstanding.
+    AnswerQuery {
+        service: AuthService,
+        sequence: u32,
+        answer: Secret,
+    },
+    /// Since 0.44: stop every conversation this connection started (GDM's
+    /// `Cancel`); each pending `BeginVerification` is then `Denied`.
+    CancelVerification,
 }
 
 /// One on-screen keyboard action (gnome-shell 51 `KeyboardController`).
@@ -477,6 +501,46 @@ pub const MAX_OSK_MODIFIERS: usize = 8;
 pub struct TextFieldFocus {
     pub purpose: u32,
     pub hints: u32,
+}
+
+/// Since 0.44: a lock-screen authentication service, GDM's conversation
+/// services (`gdm-password`, `gdm-fingerprint`) as GNOME Shell 51's
+/// `authServicesLegacy.js` runs them side by side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AuthService {
+    /// The PAM conversation of the lock service: password, then whatever
+    /// else the installed stack asks (a code, a PIN).
+    Password,
+    /// fprintd verification of an enrolled print.
+    Fingerprint,
+}
+
+/// Longest PAM prompt, message or answer text on the wire.
+pub const MAX_AUTH_TEXT_LEN: usize = 4096;
+
+/// Since 0.44: one step of an authentication conversation (GDM's
+/// UserVerifier signals).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthEvent {
+    /// An informational message (`PAM_TEXT_INFO`, GDM `Info`).
+    Info { text: String },
+    /// An error message (`PAM_ERROR_MSG`, or the verifier's own failure
+    /// text; GDM `Problem`).
+    Problem { text: String },
+    /// A question to answer with [`CommandKind::AnswerQuery`]: hidden input
+    /// when `secret` (`PAM_PROMPT_ECHO_OFF`, GDM `SecretInfoQuery`), else
+    /// visible (`PAM_PROMPT_ECHO_ON`, GDM `InfoQuery`).
+    Query {
+        sequence: u32,
+        question: String,
+        secret: bool,
+    },
+    /// The fingerprint reader is waiting for a finger: `swipe` when it is a
+    /// swipe sensor (fprintd's `scan-type`).
+    FingerprintScan { swipe: bool },
+    /// This service cannot run for this user (GDM `ServiceUnavailable`):
+    /// no reader, no enrolled print, or no conversation backend.
+    Unavailable,
 }
 
 /// A running window's dash icon target; empty replacement selects monitor fallback.
@@ -889,6 +953,14 @@ pub enum Message {
         focus: Option<TextFieldFocus>,
         show: bool,
         touch_auto: bool,
+    },
+    /// Since 0.44: a step of the conversation the shell started with the
+    /// `BeginVerification` command `request`. Sent only to peers advertising
+    /// minor >=44.
+    AuthEvent {
+        request: u64,
+        service: AuthService,
+        event: AuthEvent,
     },
 }
 
@@ -1696,7 +1768,11 @@ struct OwnedUnlock(Message);
 impl OwnedUnlock {
     fn wipe(&mut self) {
         if let Message::Command {
-            kind: CommandKind::Unlock { password },
+            kind:
+                CommandKind::Unlock { password }
+                | CommandKind::AnswerQuery {
+                    answer: password, ..
+                },
             ..
         } = &mut self.0
         {
@@ -1705,6 +1781,22 @@ impl OwnedUnlock {
                 wipe_auth_bytes(password.0.as_mut_vec());
             }
         }
+    }
+    /// One wiped buffer sized from the secret: no growth scratch or copy.
+    fn encode(&self, secret: &Secret) -> Result<SensitiveFrame, ControlError> {
+        if secret.0.len() > MAX_FRAME_BYTES {
+            return Err(ControlError::Unexpected(
+                "authentication frame exceeds bound".into(),
+            ));
+        }
+        let cap = secret.0.len().saturating_add(64).min(MAX_FRAME_BYTES);
+        let mut frame = SensitiveFrame(vec![0u8; cap + 4]);
+        let used = postcard::to_slice(&self.0, &mut frame.0[4..])
+            .map_err(|_| ControlError::Unexpected("authentication frame encoding refused".into()))?
+            .len();
+        frame.0[..4].copy_from_slice(&(used as u32).to_le_bytes());
+        frame.0.truncate(used + 4);
+        Ok(frame)
     }
 }
 impl Drop for OwnedUnlock {
@@ -1733,19 +1825,33 @@ pub fn encode_unlock_frame(id: u64, password: Secret) -> Result<SensitiveFrame, 
     else {
         unreachable!()
     };
-    if password.0.len() > MAX_FRAME_BYTES {
-        return Err(ControlError::Unexpected(
-            "authentication frame exceeds bound".into(),
-        ));
-    }
-    let cap = password.0.len().saturating_add(64).min(MAX_FRAME_BYTES);
-    let mut frame = SensitiveFrame(vec![0u8; cap + 4]);
-    let used = postcard::to_slice(&message.0, &mut frame.0[4..])
-        .map_err(|_| ControlError::Unexpected("authentication frame encoding refused".into()))?
-        .len();
-    frame.0[..4].copy_from_slice(&(used as u32).to_le_bytes());
-    frame.0.truncate(used + 4);
-    Ok(frame)
+    message.encode(password)
+}
+
+/// Encode an `AnswerQuery` with the same single wiped buffer as
+/// [`encode_unlock_frame`]; the owned answer is wiped on every path.
+pub fn encode_answer_frame(
+    id: u64,
+    service: AuthService,
+    sequence: u32,
+    answer: Secret,
+) -> Result<SensitiveFrame, ControlError> {
+    let message = OwnedUnlock(Message::Command {
+        id,
+        kind: CommandKind::AnswerQuery {
+            service,
+            sequence,
+            answer,
+        },
+    });
+    let Message::Command {
+        kind: CommandKind::AnswerQuery { answer, .. },
+        ..
+    } = &message.0
+    else {
+        unreachable!()
+    };
+    message.encode(answer)
 }
 
 /// Decode one length-prefixed frame into a message.
@@ -1890,6 +1996,28 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
             return Err(DecodeError::Malformed(
                 postcard::Error::DeserializeBadEncoding,
             ));
+        }
+        Message::Command {
+            kind: CommandKind::AnswerQuery { answer, .. },
+            ..
+        } if answer.0.len() > MAX_AUTH_TEXT_LEN => {
+            return Err(DecodeError::TitleTooLong {
+                len: answer.0.len(),
+                max: MAX_AUTH_TEXT_LEN,
+            });
+        }
+        Message::AuthEvent { event, .. } => {
+            let text = match event {
+                AuthEvent::Info { text } | AuthEvent::Problem { text } => text.as_str(),
+                AuthEvent::Query { question, .. } => question.as_str(),
+                AuthEvent::FingerprintScan { .. } | AuthEvent::Unavailable => "",
+            };
+            if text.len() > MAX_AUTH_TEXT_LEN {
+                return Err(DecodeError::TitleTooLong {
+                    len: text.len(),
+                    max: MAX_AUTH_TEXT_LEN,
+                });
+            }
         }
         Message::Command {
             kind: CommandKind::SetAcceleratorGrabs { grabs },
@@ -2159,8 +2287,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_43() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 43));
+    fn current_version_is_0_44() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 44));
     }
 
     #[test]
@@ -3295,5 +3423,167 @@ mod on_screen_keyboard_wire_tests {
             },
         };
         assert_eq!(decode_frame(&encode_frame(&at_cap)).unwrap(), at_cap);
+    }
+}
+
+#[cfg(test)]
+mod auth_conversation_wire_tests {
+    use super::*;
+
+    #[test]
+    fn auth_conversation_is_appended_and_round_trips() {
+        let command = |kind: &CommandKind| {
+            let mut buffer = [0_u8; 256];
+            postcard::to_slice(kind, &mut buffer).unwrap()[0]
+        };
+        // 0.44 sits after 0.43's on-screen keyboard.
+        let osk = command(&CommandKind::OskInput {
+            input: OskInput::Keyval {
+                keysym: 0,
+                pressed: false,
+            },
+        });
+        let begin = CommandKind::BeginVerification {
+            service: AuthService::Password,
+        };
+        let answer = CommandKind::AnswerQuery {
+            service: AuthService::Password,
+            sequence: 2,
+            answer: Secret("one-time-code".into()),
+        };
+        assert_eq!(command(&begin), osk + 1);
+        assert_eq!(command(&answer), osk + 2);
+        assert_eq!(command(&CommandKind::CancelVerification), osk + 3);
+        let message_index = |message: &Message| {
+            let mut buffer = [0_u8; 256];
+            postcard::to_slice(message, &mut buffer).unwrap()[0]
+        };
+        let event = Message::AuthEvent {
+            request: 9,
+            service: AuthService::Fingerprint,
+            event: AuthEvent::FingerprintScan { swipe: true },
+        };
+        assert_eq!(
+            message_index(&event),
+            message_index(&Message::OnScreenKeyboard {
+                focus: None,
+                show: false,
+                touch_auto: false,
+            }) + 1
+        );
+        for message in [
+            event,
+            Message::AuthEvent {
+                request: 9,
+                service: AuthService::Password,
+                event: AuthEvent::Query {
+                    sequence: 1,
+                    question: "Verification code:".into(),
+                    secret: false,
+                },
+            },
+            Message::AuthEvent {
+                request: 9,
+                service: AuthService::Password,
+                event: AuthEvent::Info {
+                    text: "A code was sent".into(),
+                },
+            },
+            Message::AuthEvent {
+                request: 9,
+                service: AuthService::Password,
+                event: AuthEvent::Problem {
+                    text: "Failed".into(),
+                },
+            },
+            Message::AuthEvent {
+                request: 9,
+                service: AuthService::Fingerprint,
+                event: AuthEvent::Unavailable,
+            },
+            Message::Command { id: 3, kind: begin },
+            Message::Command {
+                id: 4,
+                kind: answer,
+            },
+            Message::Command {
+                id: 5,
+                kind: CommandKind::CancelVerification,
+            },
+        ] {
+            assert_eq!(decode_frame(&encode_frame(&message)).unwrap(), message);
+        }
+    }
+
+    #[test]
+    fn answer_frames_match_the_generic_encoding_and_never_debug_the_answer() {
+        let expected = encode_frame(&Message::Command {
+            id: 77,
+            kind: CommandKind::AnswerQuery {
+                service: AuthService::Password,
+                sequence: 3,
+                answer: Secret("owned-code".into()),
+            },
+        });
+        let frame =
+            encode_answer_frame(77, AuthService::Password, 3, Secret("owned-code".into())).unwrap();
+        assert_eq!(frame.as_bytes(), expected);
+        let kind = CommandKind::AnswerQuery {
+            service: AuthService::Password,
+            sequence: 3,
+            answer: Secret("owned-code".into()),
+        };
+        assert!(!format!("{kind:?}").contains("owned-code"));
+        let mut owned = OwnedUnlock(Message::Command { id: 1, kind });
+        owned.wipe();
+        let Message::Command {
+            kind: CommandKind::AnswerQuery { answer, .. },
+            ..
+        } = &owned.0
+        else {
+            unreachable!()
+        };
+        assert!(answer.0.bytes().all(|byte| byte == 0));
+    }
+
+    #[test]
+    fn oversized_auth_texts_are_refused_on_decode() {
+        let long = "x".repeat(MAX_AUTH_TEXT_LEN + 1);
+        for message in [
+            Message::AuthEvent {
+                request: 1,
+                service: AuthService::Password,
+                event: AuthEvent::Info { text: long.clone() },
+            },
+            Message::AuthEvent {
+                request: 1,
+                service: AuthService::Password,
+                event: AuthEvent::Query {
+                    sequence: 1,
+                    question: long.clone(),
+                    secret: true,
+                },
+            },
+            Message::Command {
+                id: 1,
+                kind: CommandKind::AnswerQuery {
+                    service: AuthService::Password,
+                    sequence: 1,
+                    answer: Secret(long.clone()),
+                },
+            },
+        ] {
+            assert!(matches!(
+                decode_frame(&encode_frame(&message)),
+                Err(DecodeError::TitleTooLong { .. })
+            ));
+        }
+        let exact = "x".repeat(MAX_AUTH_TEXT_LEN);
+        let fits = Message::AuthEvent {
+            request: 1,
+            service: AuthService::Password,
+            event: AuthEvent::Problem { text: exact },
+        };
+        assert_eq!(decode_frame(&encode_frame(&fits)).unwrap(), fits);
     }
 }
