@@ -2,13 +2,15 @@
 """Walk the Tuna Desktop daily-driver journey on a published image through Corral.
 
 Installs one digest-pinned bootc image into a KubeVirt VM with `corral bootc
-create`, adds a local test account at runtime (the image is not modified),
-opens the VM's noVNC console in `corral web` with Playwright and drives the
-real GDM login and the session by keyboard and pointer: overview, app grid,
-search and launch, Alt+Tab, GNOME Settings, quick settings, a notification,
-lock and unlock, and logging out to GDM. Every step saves the console frame
-and the guest-side checks it ran into manifest.json. Frames are evidence for
-a human review; the script does not judge pixels.
+create`, which also creates the test account in the installed system (the
+image is not modified). `corral wait` holds the run until GDM is up and the
+screen is painted. `corral console` serves the VM's own noVNC page, which
+Playwright opens to drive the real GDM login and the session by keyboard and
+pointer: overview, app grid, search and launch, Alt+Tab, GNOME Settings,
+quick settings, a notification, lock and unlock, and logging out to GDM.
+Every step saves the console frame and the guest-side checks it ran into
+manifest.json. Frames are evidence for a human review; the script does not
+judge pixels.
 
 The pointer coordinates assume the 1280x800 output of the desktop VM lane
 profile (KubeVirt bochs-drm) and the Tuna Desktop 1.0.0 beta layout; the run
@@ -23,7 +25,6 @@ import json
 from pathlib import Path
 import re
 import shlex
-import socket
 import subprocess
 import sys
 import time
@@ -44,6 +45,9 @@ POINTS = {
     'gdm-user': (640, 349),             # GDM user list, the only row
 }
 CROSSCHECK = {'greeter-user-list', 'session-is-tuna', 'lock'}
+# Ready means: boot finished, GDM active, its greeter session on seat0, and
+# something painted on the console.
+GREETER = 'loginctl list-sessions --no-legend | awk \'$6=="greeter" && $4=="seat0"\' | grep -q .'
 
 
 class NotExercised(Exception):
@@ -54,11 +58,17 @@ def now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
 
 
-def run(cmd, timeout=120, check=True):
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+def run(cmd, timeout=120, check=True, input=None):
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input)
     if check and r.returncode:
         raise RuntimeError(f'{shlex.join(cmd)} exited {r.returncode}: {r.stderr.strip()[-800:]}')
     return r
+
+
+def corral_json(argv, timeout=120, check=True, input=None):
+    """Run `corral --json ARGV` and parse what it prints on stdout."""
+    r = run(['corral', '--json', *argv], timeout=timeout, check=check, input=input)
+    return json.loads(r.stdout) if r.stdout.strip() else None
 
 
 class Guest:
@@ -107,31 +117,32 @@ class Guest:
 
 
 class Console:
-    """The VM's noVNC console in `corral web`, driven by Playwright."""
+    """The VM's own console page from `corral console`, driven by Playwright.
 
-    def __init__(self, playwright, web, vm):
+    The page shows only the VM's noVNC canvas at 1:1, so page pixels map onto
+    guest pixels, and it reconnects by itself after the VNC session drops."""
+
+    def __init__(self, playwright, url):
         self.browser = playwright.chromium.launch()
-        self.page = self.browser.new_page(viewport={'width': WIDTH + 520, 'height': HEIGHT + 450})
-        self.web, self.vm = web, vm
+        self.page = self.browser.new_page(viewport={'width': WIDTH + 40, 'height': HEIGHT + 40})
+        self.url = url
 
     def open(self):
-        page = self.page
-        page.goto(self.web)
-        page.wait_for_selector('#tree .tree-item', timeout=30000)
-        page.locator('#tree .tree-item').filter(has_text=self.vm).first.click()
-        page.click('#content .tab[data-tab="console"]')
-        page.wait_for_selector('#vnc-screen[data-connected=true] canvas', timeout=60000)
-        page.check('#vnc-one')  # 1:1 so page pixels map onto guest pixels
-        page.wait_for_timeout(1500)
+        self.page.goto(self.url)
+        self.connected()
+
+    def connected(self, timeout=60000):
+        self.page.wait_for_selector('body[data-connected="true"] #vnc-canvas', timeout=timeout)
+        self.page.wait_for_timeout(1500)
         # noVNC only forwards keys while its canvas has focus.
-        page.locator('#vnc-screen canvas').focus()
+        self.page.locator('#vnc-canvas').focus()
 
     def size(self):
-        return self.page.evaluate("(() => { const c = document.querySelector('#vnc-screen canvas');"
+        return self.page.evaluate("(() => { const c = document.getElementById('vnc-canvas');"
                                   " return [c.width, c.height]; })()")
 
     def png(self):
-        data = self.page.evaluate("document.querySelector('#vnc-screen canvas').toDataURL('image/png')")
+        data = self.page.evaluate("document.getElementById('vnc-canvas').toDataURL('image/png')")
         return base64.b64decode(data.split(',', 1)[1])
 
     def grab(self, path):
@@ -145,7 +156,7 @@ class Console:
 
     def click(self, name):
         x, y = POINTS[name]
-        box = self.page.locator('#vnc-screen canvas').bounding_box()
+        box = self.page.locator('#vnc-canvas').bounding_box()
         self.page.mouse.click(box['x'] + x * box['width'] / WIDTH, box['y'] + y * box['height'] / HEIGHT)
 
     def key(self, chord, wait=1500):
@@ -163,44 +174,17 @@ class Console:
         self.browser.close()
 
 
-def free_port():
-    with socket.socket() as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
+def start_console(vm):
+    """`corral console` serves the VM's console page on a port the OS picks.
 
-
-def start_web():
-    port = free_port()
-    proc = subprocess.Popen(['corral', 'web', '--addr', f'127.0.0.1:{port}'],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(120):
-        try:
-            socket.create_connection(('127.0.0.1', port), timeout=1).close()
-            return proc, f'http://127.0.0.1:{port}/'
-        except OSError:
-            time.sleep(0.5)
-    proc.terminate()
-    raise RuntimeError('corral web did not listen')
-
-
-def kube_vm(args):
-    return json.loads(run(['kubectl', 'get', 'vm', args.vm, '-n', args.namespace, '-o', 'json']).stdout)
-
-
-def ensure_tablet(args):
-    """An absolute pointer, so console clicks land where they are aimed.
-
-    `corral bootc create` gives KubeVirt guests only QEMU's relative PS/2
-    mouse; noVNC clicks then drift. Adds the usb tablet Corral's generic
-    manifests already carry. Returns True when this run had to add it.
-    """
-    devices = kube_vm(args)['spec']['template']['spec']['domain']['devices']
-    if any(i.get('type') == 'tablet' for i in devices.get('inputs', [])):
-        return False
-    patch = [{'op': 'add', 'path': '/spec/template/spec/domain/devices/inputs',
-              'value': [{'type': 'tablet', 'bus': 'usb', 'name': 'tablet'}]}]
-    run(['kubectl', 'patch', 'vm', args.vm, '-n', args.namespace, '--type=json', '-p', json.dumps(patch)])
-    return True
+    Its first stdout line is JSON that names the page's URL."""
+    proc = subprocess.Popen(['corral', '--json', 'console', vm], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True)
+    line = proc.stdout.readline()
+    if not line:
+        proc.wait(timeout=30)
+        raise RuntimeError(f'corral console exited {proc.returncode} before it printed a URL')
+    return proc, json.loads(line)
 
 
 def wait_for(predicate, timeout, what, interval=5):
@@ -218,24 +202,31 @@ def wait_for(predicate, timeout, what, interval=5):
 
 def provision(args, guest, receipt):
     if not args.reuse:
+        # The account is created in the installed system at build time; the
+        # password goes in on stdin, never in argv.
         run(['corral', 'bootc', 'create', args.vm, '--image', args.image, '--cpu', str(args.cpu),
-             '--mem', args.mem, '--disk', args.disk, '-n', args.namespace]
-            + (['--node', args.node] if args.node else []), timeout=3600)
-    receipt['vm']['tablet_added_by_run'] = ensure_tablet(args)
-    spec = kube_vm(args)
-    if spec.get('status', {}).get('printableStatus') == 'Running':
+             '--mem', args.mem, '--disk', args.disk, '-n', args.namespace,
+             '--user', USER, '--password-stdin', '--tag', 'purpose=tuna-corral-journey']
+            + (['--node', args.node] if args.node else []), timeout=3600, input=PASSWORD + '\n')
+    info = corral_json(['info', args.vm])
+    wait = ['wait', args.vm, '--boot-complete', '--unit', 'gdm.service', '--exec', GREETER, '--paint',
+            '--timeout', '15m']
+    if info.get('status') == 'Running':
+        # `corral restart` returns before the guest reboots; wait for a boot
+        # other than this one.
+        wait += ['--boot-id', guest.out('cat /proc/sys/kernel/random/boot_id')]
         run(['corral', 'restart', args.vm], timeout=300)
     else:
         run(['corral', 'start', args.vm], timeout=300)
-    wait_for(lambda: guest.sh('systemctl is-active gdm')[1] == 'active', 900, 'SSH and GDM')
-    domain = spec['spec']['template']['spec']['domain']
-    receipt['vm'].update({
-        'cpu': domain.get('cpu'), 'memory': domain.get('memory'), 'machine': domain.get('machine'),
-        'firmware': domain.get('firmware', {}).get('bootloader'),
-        'inputs': kube_vm(args)['spec']['template']['spec']['domain']['devices'].get('inputs'),
-        'node': json.loads(run(['kubectl', 'get', 'vmi', args.vm, '-n', args.namespace, '-o', 'json']).stdout)
-                ['status'].get('nodeName'),
-    })
+    ready = corral_json(wait, timeout=1000, check=False)
+    receipt['ready'] = ready
+    if not (ready or {}).get('ready'):
+        raise RuntimeError(f'corral wait: VM not ready: {json.dumps(ready)[-800:]}')
+    info = corral_json(['info', args.vm])
+    receipt['vm'].update({k: info.get(k) for k in ('node', 'cpu', 'memory', 'firmware', 'inputs', 'disks',
+                                                   'tagValues', 'image')})
+    if not any(i.get('type') == 'tablet' for i in info.get('inputs') or []):
+        raise RuntimeError(f"no absolute pointer on the VM (inputs: {info.get('inputs')})")
     booted = json.loads(guest.out('bootc status --format json'))['status']['booted']['image']
     receipt['image']['booted'] = booted['image']['image']
     receipt['image']['booted_manifest_digest'] = booted.get('imageDigest')
@@ -250,17 +241,10 @@ def provision(args, guest, receipt):
                                       ' | xargs -r grep -h "^Name="').splitlines(),
         'gdm_custom_conf': guest.out('grep -E "^[A-Za-z]" /etc/gdm/custom.conf || true').splitlines(),
         'boot_id': guest.out('cat /proc/sys/kernel/random/boot_id'),
+        'account': guest.out(f'getent passwd {USER}'),
     }
-    # Runtime account in /var, as the VM lane fixture provisions it in an
-    # image layer: listed by AccountsService, no session named, so the shipped
-    # image alone decides which session GDM starts.
-    guest.out(f'id {USER} >/dev/null 2>&1 || useradd -m -d /var/home/{USER} -s /bin/bash -U {USER}; '
-              f'echo {USER}:{PASSWORD} | chpasswd; install -d -m 0700 /var/lib/AccountsService/users; '
-              f'printf "[User]\\nSystemAccount=false\\n" > /var/lib/AccountsService/users/{USER}; '
-              f'chmod 0600 /var/lib/AccountsService/users/{USER}; systemctl restart accounts-daemon gdm')
-    wait_for(guest.greeter_session, 180, 'GDM greeter session')
     receipt['account'] = {'user': USER, 'password': 'public fixture password (packaging/marlin/vm-lane)',
-                          'provisioned': 'runtime useradd + AccountsService record, image unchanged'}
+                          'provisioned': 'corral bootc create --user --password-stdin; image unchanged'}
 
 
 class Journey:
@@ -303,20 +287,22 @@ class Journey:
         (self.out / 'manifest.json').write_text(json.dumps(self.receipt, indent=2) + '\n')
 
     def crosscheck(self, frame):
-        """Same frame through KubeVirt's VNC screenshot, independent of noVNC.
+        """Same frame through `corral screenshot`, independent of noVNC.
 
         The capture is kept only when its pixels differ from the frame."""
-        other = self.out / 'crosscheck' / f'{frame.stem}-virtctl.png'
+        other = self.out / 'crosscheck' / f'{frame.stem}-corral.png'
         other.parent.mkdir(exist_ok=True)
-        r = run(['virtctl', 'vnc', 'screenshot', self.args.vm, '-n', self.args.namespace, '-f', str(other)],
-                check=False)
+        r = run(['corral', 'screenshot', self.args.vm, '-o', str(other)], check=False)
+        # KubeVirt keeps one VNC session; the screenshot's session ends the
+        # page's, and the page reconnects by itself.
+        self.console.connected()
         if r.returncode:
             return {'identical': False, 'observed': r.stderr.strip()[-300:]}
         digest = hashlib.sha256(other.read_bytes()).hexdigest()
         box = ImageChops.difference(Image.open(frame).convert('RGB'), Image.open(other).convert('RGB')).getbbox()
         if box is None:
             other.unlink()
-            return {'identical': True, 'virtctl_png_sha256': digest}
+            return {'identical': True, 'corral_png_sha256': digest}
         return {'identical': False, 'diff_bbox': box, 'file': f'crosscheck/{other.name}'}
 
     def gsetting(self, schema, key):
@@ -533,8 +519,7 @@ class Journey:
             wait_for(lambda: g.seat_session() is None, 90, 'user session to end')
             greeter = wait_for(g.greeter_session, 90, 'GDM greeter')
             c.wait(5000)
-            if not c.page.locator('#vnc-screen[data-connected=true] canvas').count():
-                c.open()
+            c.connected()
             check('user seat session ended', True, 'no seat0 session for the user')
             check('GDM greeter back on seat0', greeter, greeter)
         self.step('logout', 'Logging out returns to GDM', logout)
@@ -550,7 +535,6 @@ def main():
     p.add_argument('--cpu', type=int, default=4)
     p.add_argument('--mem', default='6G')
     p.add_argument('--disk', default='40Gi')
-    p.add_argument('--web', help='existing corral web URL (default: start one on a free port)')
     p.add_argument('--reuse', action='store_true', help='VM already built from --image; restart it instead')
     p.add_argument('--keep', action='store_true', help='leave the VM and its disk in place')
     args = p.parse_args()
@@ -562,35 +546,38 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     from playwright.sync_api import sync_playwright
 
-    receipt = {'schema': 1, 'started': now(), 'runner': 'scripts/tuna-corral-journey',
+    receipt = {'schema': 2, 'started': now(), 'runner': 'scripts/tuna-corral-journey',
                'runner_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                'corral': run(['corral', 'version']).stdout.strip(),
                'image': {'ref': args.image},
                'vm': {'name': args.vm, 'namespace': args.namespace, 'backend': 'kubevirt',
                       'requested': {'cpu': args.cpu, 'mem': args.mem, 'disk': args.disk, 'node': args.node}},
-               'console': 'corral web noVNC, Playwright Chromium, 1:1 scale; frames are the canvas pixels',
+               'console': 'corral console page (noVNC), Playwright Chromium, 1:1; frames are the canvas pixels',
                'steps': []}
-    guest, web_proc, console = Guest(args.vm), None, None
+    guest, console_proc = Guest(args.vm), None
     try:
         provision(args, guest, receipt)
-        if args.web:
-            web = args.web
-        else:
-            web_proc, web = start_web()
+        console_proc, endpoint = start_console(args.vm)
+        receipt['console_endpoint'] = endpoint
         with sync_playwright() as pw:
-            console = Console(pw, web, args.vm)
+            console = Console(pw, endpoint['url'])
             console.open()
             Journey(args, guest, console, receipt, out).run()
             console.close()
     finally:
-        if web_proc:
-            web_proc.terminate()
+        if console_proc:
+            console_proc.terminate()
+            console_proc.wait(timeout=30)
         if not args.keep:
             try:
-                r = run(['corral', 'delete', args.vm, '-f'], timeout=600, check=False)
-                receipt['cleanup'] = {'deleted': r.returncode == 0, 'output': (r.stdout + r.stderr).strip()[-400:]}
-            except subprocess.TimeoutExpired:
-                receipt['cleanup'] = {'deleted': False, 'output': 'corral delete timed out; delete the VM by hand'}
+                r = run(['corral', '--json', 'delete', args.vm, '-f', '--wait', '--timeout', '10m'],
+                        timeout=900, check=False)
+                result = json.loads(r.stdout) if r.stdout.strip() else []
+                left = [v['name'] for v in corral_json(['list', '--prefix', args.vm]) or [] if v['name'] == args.vm]
+                receipt['cleanup'] = {'deleted': r.returncode == 0 and not left, 'result': result,
+                                      'still_listed': left, 'stderr': r.stderr.strip()[-400:]}
+            except (subprocess.TimeoutExpired, RuntimeError, ValueError) as e:
+                receipt['cleanup'] = {'deleted': False, 'output': f'{type(e).__name__}: {e}'}
         receipt['finished'] = now()
         (out / 'manifest.json').write_text(json.dumps(receipt, indent=2) + '\n')
     failed = [s['id'] for s in receipt['steps'] if s['result'] == 'fail']
