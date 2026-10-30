@@ -294,6 +294,10 @@ You need `/dev/kvm`, about 30 GB of free disk, and the podman and
 `bootc install` commands from the job to run this locally. Do not use your
 desktop session for it.
 
+To drive the published image through GDM in a KubeVirt VM with keyboard
+and pointer input and save a console frame for every step, see
+[Published-image journey through Corral](corral-journey.md).
+
 ## Animation clock and motion policy
 
 Compositor animations (the overview transition, the scroll-strip springs and
