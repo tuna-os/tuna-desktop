@@ -672,6 +672,17 @@ impl<'a> Session<'a> {
         })
     }
 
+    /// Send mutter's seat touch-mode (#502), which picks the unlock
+    /// dialog's hint. Peers older than 0.46 cannot decode it and
+    /// receive nothing.
+    pub fn send_seat_touch_mode(&mut self, touch_mode: bool) -> Result<(), ControlError> {
+        if self.peer_minor < 46 {
+            return Ok(());
+        }
+        self.conn
+            .write_frame(&Message::SeatTouchMode { touch_mode })
+    }
+
     /// Send where the overview's window previews sit.
     pub fn send_overview_previews(
         &mut self,
@@ -1264,6 +1275,7 @@ impl<'a> Session<'a> {
             | Message::PadOsdLabels { .. }
             | Message::PadOsdInput { .. }
             | Message::ClosePadOsd { .. }
+            | Message::SeatTouchMode { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
                     kind: ErrorKind::UnknownCommand,
@@ -1322,6 +1334,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::PadOsdLabels { .. } => "PadOsdLabels",
         Message::PadOsdInput { .. } => "PadOsdInput",
         Message::ClosePadOsd { .. } => "ClosePadOsd",
+        Message::SeatTouchMode { .. } => "SeatTouchMode",
     }
 }
 
@@ -1739,6 +1752,10 @@ pub struct ControlHub {
     /// and the value every live session holds (#349).
     osk: OskBroadcast,
     osk_sent: Option<OskBroadcast>,
+    /// Mutter's seat touch-mode as last set by the runtime, and the
+    /// value every live session holds (#502).
+    touch_mode: bool,
+    touch_mode_sent: Option<bool>,
     /// Output inventory last handed to [`set_outputs`](Self::set_outputs)
     /// (multi-monitor): the runtime refreshes this every tick from the
     /// compositor's tracking, and [`poll`](Self::poll) broadcasts it
@@ -1838,6 +1855,9 @@ impl ControlHub {
             // No focus and no auto-show is what a shell assumes before
             // any message: only a change is owed.
             osk_sent: Some(OskBroadcast::default()),
+            // No touch-mode is what a shell assumes before any message.
+            touch_mode: false,
+            touch_mode_sent: Some(false),
             outputs: Vec::new(),
             native_outputs: Vec::new(),
             pointer_output: None,
@@ -1985,6 +2005,7 @@ impl ControlHub {
             || self.outputs != self.outputs_sent
             || !self.switcher_queue.is_empty()
             || self.osk_sent != Some(self.osk)
+            || self.touch_mode_sent != Some(self.touch_mode)
             || !self.accelerator_queue.is_empty()
             || !self.menu_queue.is_empty()
             || self.sessions.iter().any(|s| s.owes_deltas(model));
@@ -2048,6 +2069,12 @@ impl ControlHub {
         self.osk.focus = focus;
         self.osk.touch_auto = touch_auto;
         self.osk.show = (self.osk.show || show) && focus.is_some();
+    }
+
+    /// Refresh mutter's seat touch-mode (#502); the next
+    /// [`poll`](Self::poll) broadcasts a change.
+    pub fn set_seat_touch_mode(&mut self, touch_mode: bool) {
+        self.touch_mode = touch_mode;
     }
 
     /// Set the session environment (#59); the next [`poll`](Self::poll)
@@ -2553,6 +2580,17 @@ impl ControlHub {
                 self.osk_sent = Some(self.osk);
             }
         }
+        if self.touch_mode_sent != Some(self.touch_mode) {
+            let mut all_sent = true;
+            for session in &mut self.sessions {
+                if session.send_seat_touch_mode(self.touch_mode).is_err() {
+                    all_sent = false;
+                }
+            }
+            if all_sent {
+                self.touch_mode_sent = Some(self.touch_mode);
+            }
+        }
         if self.outputs != self.outputs_sent {
             let mut all_sent = true;
             for session in &mut self.sessions {
@@ -2662,6 +2700,9 @@ impl ControlHub {
                 };
                 if osk != OskBroadcast::default() {
                     let _ = session.send_on_screen_keyboard(osk);
+                }
+                if self.touch_mode {
+                    let _ = session.send_seat_touch_mode(true);
                 }
                 if self.pointer_output.is_some() {
                     let _ = session.send_window_menu(&Message::PointerOutput {

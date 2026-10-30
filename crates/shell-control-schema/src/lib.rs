@@ -204,9 +204,12 @@ impl ProtocolVersion {
     /// `ShowOsd`, `ShowPadOsd`, `PadOsdLabels`, `PadOsdInput`, `ClosePadOsd`
     /// and shell-to-compositor `RequestPadOsd`, `PadOsdClosed`.
     /// Positional postcard peers must ship together.
+    /// `0.46` appends compositor-to-shell `SeatTouchMode` (the seat's
+    /// touch-mode, which picks the unlock dialog's hint text, #502).
+    /// Positional postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 45,
+        minor: 46,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -1076,6 +1079,12 @@ pub enum Message {
     PadOsdInput { pad: u32, event: PadOsdEvent },
     /// Since 0.45: the shown pad was unplugged; close its OSD.
     ClosePadOsd { pad: u32 },
+    /// Since 0.46: mutter's seat `touch-mode` (a touchscreen and no
+    /// laptop switch, or one folded into a tablet), which the unlock
+    /// dialog's hint follows (`unlockDialog.js:388-440`). Sent on change
+    /// and in each handshake snapshot, only to peers advertising
+    /// minor >= 46.
+    SeatTouchMode { touch_mode: bool },
 }
 
 /// The click a hover (dwell) makes: GNOME's dwell click types.
@@ -2253,7 +2262,9 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
             check_pad_labels(&osd.labels)?;
         }
         Message::PadOsdLabels { labels, .. } => check_pad_labels(labels)?,
-        Message::PadOsdInput { .. } | Message::ClosePadOsd { .. } => {}
+        Message::PadOsdInput { .. }
+        | Message::ClosePadOsd { .. }
+        | Message::SeatTouchMode { .. } => {}
     }
     Ok(())
 }
@@ -2472,8 +2483,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_45() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 45));
+    fn current_version_is_0_46() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 46));
     }
 
     #[test]
@@ -3816,5 +3827,13 @@ mod tablet_osd_wire_order_tests {
             tag(postcard::to_slice(&close, &mut buffer).unwrap()),
             auth + 5
         );
+        // 0.46 appends the seat's touch-mode after them.
+        let touch = Message::SeatTouchMode { touch_mode: true };
+        assert_eq!(
+            tag(postcard::to_slice(&touch, &mut buffer).unwrap()),
+            auth + 6
+        );
+        let bytes = postcard::to_slice(&touch, &mut buffer).unwrap();
+        assert_eq!(postcard::from_bytes::<Message>(bytes).unwrap(), touch);
     }
 }

@@ -125,6 +125,8 @@ pub enum Handled {
     ClosePadOsd {
         pad: u32,
     },
+    /// Mutter's seat touch-mode changed (the unlock dialog's hint).
+    SeatTouchMode(bool),
     /// The keyboard switched Sticky or Slow Keys: save and confirm.
     KeyboardAidToggled {
         aid: tuna_shell_control::KeyboardAid,
@@ -1193,6 +1195,7 @@ impl ControlClient {
             Message::PadOsdLabels { pad, labels } => Ok(Handled::PadOsdLabels { pad, labels }),
             Message::PadOsdInput { pad, event } => Ok(Handled::PadOsdInput { pad, event }),
             Message::ClosePadOsd { pad } => Ok(Handled::ClosePadOsd { pad }),
+            Message::SeatTouchMode { touch_mode } => Ok(Handled::SeatTouchMode(touch_mode)),
             Message::KeyboardAidToggled { aid, enabled } => {
                 Ok(Handled::KeyboardAidToggled { aid, enabled })
             }
@@ -1489,6 +1492,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::PadOsdLabels { .. } => "PadOsdLabels",
         Message::PadOsdInput { .. } => "PadOsdInput",
         Message::ClosePadOsd { .. } => "ClosePadOsd",
+        Message::SeatTouchMode { .. } => "SeatTouchMode",
     }
 }
 
@@ -1992,6 +1996,10 @@ mod tests {
             (
                 Message::ClosePadOsd { pad: 3 },
                 Handled::ClosePadOsd { pad: 3 },
+            ),
+            (
+                Message::SeatTouchMode { touch_mode: true },
+                Handled::SeatTouchMode(true),
             ),
         ];
         for (message, expected) in cases {

@@ -3,9 +3,10 @@
 //! The compositor owns the lock: it decides when the session is locked,
 //! draws the blurred, dimmed wallpaper underneath, and runs the
 //! authentication conversations (GDM's part). This module draws GNOME's
-//! unlock dialog: the clock curtain (clock, date and "Click or press a
-//! key") and the unlock prompt, moved between on GNOME's transition
-//! (`lock_curtain.rs`), and drives GNOME's `AuthPrompt` flow over the
+//! unlock dialog: the clock curtain (clock, date and the hint that fades
+//! in once the session is idle) and the unlock prompt, moved between on
+//! GNOME's transition by keys, clicks, drags and touchpad swipes and
+//! scrolls (`lock_curtain.rs`), and drives GNOME's `AuthPrompt` flow over the
 //! control protocol (`lock_auth.rs`): password and fingerprint side by
 //! side, each PAM question in turn, GNOME's messages and Back. When the
 //! password conversation is unavailable it falls back to one redacted
@@ -25,9 +26,18 @@ use gtk4_session_lock as session_lock;
 use tuna_shell_control::{AuthEvent, AuthService};
 
 use crate::lock_auth::{AuthMachine, Effect, Host, MessageKind, View};
-use crate::lock_curtain::{self, Curtain, Page};
+use crate::lock_curtain::{self, Curtain, Page, Source};
 use crate::lock_wiggle::Wiggle;
 use crate::logic;
+
+/// GNOME's touchpad settings, whose `natural-scroll` turns a swipe's
+/// deltas round (swipeTracker.js `TouchpadSwipeGesture`); `None` without
+/// the schema, where GNOME's default (natural) holds.
+fn touchpad_settings() -> Option<gio::Settings> {
+    const SCHEMA: &str = "org.gnome.desktop.peripherals.touchpad";
+    gio::SettingsSchemaSource::default()?.lookup(SCHEMA, true)?;
+    Some(gio::Settings::new(SCHEMA))
+}
 
 /// Sends a password with the single-password `Unlock`; returns the
 /// request id.
@@ -208,6 +218,8 @@ struct Screen {
     /// GNOME's on-screen keyboard for this prompt (#349), when enabled.
     _keyboard: Option<Rc<crate::osk::LockKeyboard>>,
     message_wiggle: Wiggle,
+    /// The clock's hint; the [`lock_curtain::HintWatch`] holds it weakly.
+    _hint: Rc<lock_curtain::Hint>,
 }
 
 impl Screen {
@@ -284,6 +296,8 @@ pub struct LockUi {
     /// GNOME's on-screen keyboard, whose lock-screen keys edit only the
     /// unlock prompt (#349).
     osk: RefCell<Option<Rc<crate::osk::Osk>>>,
+    /// What the clocks' hints follow (idle time, power save, touch-mode).
+    hints: Rc<lock_curtain::HintWatch>,
 }
 
 impl LockUi {
@@ -307,6 +321,7 @@ impl LockUi {
             clock_format,
             wall_clock: RefCell::new(None),
             osk: RefCell::new(None),
+            hints: lock_curtain::HintWatch::new(),
         });
         {
             let weak = Rc::downgrade(&ui);
@@ -329,6 +344,11 @@ impl LockUi {
         ui
     }
 
+    /// Mutter's seat touch-mode changed: the hints say what it asks.
+    pub fn set_touch_mode(&self, touch_mode: bool) {
+        self.hints.set_touch_mode(touch_mode);
+    }
+
     /// Give each lock window GNOME's on-screen keyboard for its prompt.
     pub fn set_osk(&self, osk: Rc<crate::osk::Osk>) {
         *self.osk.borrow_mut() = Some(osk);
@@ -347,6 +367,7 @@ impl LockUi {
         drop(screens);
         self.applying.set(was_applying);
         self.wall_clock.take();
+        self.hints.disarm();
         glib::idle_add_local_once(move || {
             for window in windows {
                 window.destroy();
@@ -381,6 +402,7 @@ impl LockUi {
                 window.present();
             }
             self.refresh_clock();
+            self.hints.arm();
             let weak = Rc::downgrade(self);
             *self.wall_clock.borrow_mut() =
                 Some(crate::wall_clock::WallClock::new(false, move || {
@@ -575,9 +597,13 @@ impl LockUi {
         clock.add_css_class("unlock-dialog-clock-time");
         let date = gtk::Label::new(None);
         date.add_css_class("unlock-dialog-clock-date");
-        let hint = gtk::Label::new(Some("Click or press a key"));
+        // GNOME's hint: transparent until the session has been idle for
+        // HINT_TIMEOUT, then faded in (`UnlockDialogClock`).
+        let hint = gtk::Label::new(None);
         hint.add_css_class("unlock-dialog-clock-hint");
         hint.set_halign(gtk::Align::Center);
+        let hint_fade = lock_curtain::Hint::new(&hint, false);
+        self.hints.add(&hint_fade);
         let clock_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         clock_box.add_css_class("unlock-dialog-clock");
         clock_box.set_halign(gtk::Align::Center);
@@ -767,7 +793,8 @@ impl LockUi {
         // a printable key starting the answer with it; Escape on the
         // prompt cancels (`cancel`), a wheel step up brings the clock
         // back. A vertical drag (pointer, or touch, which the session
-        // delivers as the primary button) moves the curtain.
+        // delivers as the primary button), a three-finger touchpad swipe
+        // or a two-finger touchpad scroll moves the curtain.
         let show_prompt = {
             let (weak, curtain, entry) = (Rc::downgrade(self), curtain.clone(), entry.clone());
             move |preemptive: Option<char>| {
@@ -843,6 +870,8 @@ impl LockUi {
         {
             let pan: Rc<RefCell<Option<lock_curtain::Pan>>> = Rc::default();
             let distance = Rc::new(Cell::new(1.0));
+            // This drag began the swipe under way.
+            let dragging = Rc::new(Cell::new(false));
             {
                 let pan = pan.clone();
                 let keys = keyboard.as_ref().map(|k| k.keys().downgrade());
@@ -865,7 +894,12 @@ impl LockUi {
                 });
             }
             {
-                let (pan, distance, curtain) = (pan.clone(), distance.clone(), curtain.clone());
+                let (pan, distance, dragging, curtain) = (
+                    pan.clone(),
+                    distance.clone(),
+                    dragging.clone(),
+                    curtain.clone(),
+                );
                 let weak = Rc::downgrade(self);
                 drag.connect_drag_update(move |gesture, _, offset_y| {
                     let time = gesture.current_event_time();
@@ -876,9 +910,14 @@ impl LockUi {
                     else {
                         return;
                     };
-                    if !curtain.swiping() {
+                    if !dragging.get() {
+                        let Some(page) = curtain.swipe_begin(Source::Drag) else {
+                            // A touchpad swipe has the curtain.
+                            return;
+                        };
                         gesture.set_state(gtk::EventSequenceState::Claimed);
-                        distance.set(curtain.swipe_begin("drag"));
+                        dragging.set(true);
+                        distance.set(page);
                         // `_swipeBegin` → `_ensureAuthPrompt`.
                         if let Some(ui) = weak.upgrade() {
                             ui.drive(|auth, port| auth.show_prompt(port, false));
@@ -889,9 +928,10 @@ impl LockUi {
                 });
             }
             {
-                let (pan, distance, curtain, entry) = (
+                let (pan, distance, dragging, curtain, entry) = (
                     pan.clone(),
                     distance.clone(),
+                    dragging.clone(),
                     curtain.clone(),
                     entry.clone(),
                 );
@@ -900,13 +940,11 @@ impl LockUi {
                     let Some(pan) = pan.borrow_mut().take() else {
                         return;
                     };
-                    if !pan.recognized() {
+                    if !dragging.replace(false) {
                         return;
                     }
                     let velocity = -pan.velocity(time);
-                    if curtain.swipe_end("drag", velocity, distance.get(), false)
-                        == Some(Page::Prompt)
-                    {
+                    if curtain.swipe_end(velocity, distance.get(), false) == Some(Page::Prompt) {
                         entry.focus();
                     }
                 });
@@ -914,40 +952,117 @@ impl LockUi {
             {
                 let curtain = curtain.clone();
                 drag.connect_cancel(move |_, _| {
-                    let Some(pan) = pan.borrow_mut().take() else {
-                        return;
-                    };
-                    if pan.recognized() {
-                        curtain.swipe_end("drag", 0.0, distance.get(), true);
+                    if pan.borrow_mut().take().is_some() && dragging.replace(false) {
+                        curtain.swipe_end(0.0, distance.get(), true);
                     }
                 });
             }
         }
         window.add_controller(drag);
-        // Wheel steps switch pages, GNOME's discrete `ScrollController`
-        // (down the prompt, up the clock). Touchpad scrolls stay still:
-        // GNOME's `ScrollGesture` follows them and settles when the
-        // fingers lift, and the session forwards no axis stop to say so.
-        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        // `SwipeTracker`'s touchpad gestures: each step moves the curtain
+        // over TOUCHPAD_BASE_HEIGHT, a begin brings the prompt in
+        // (`_ensureAuthPrompt`) and an end settles on the touchpad
+        // projection.
+        let touchpad_step = {
+            let (weak, curtain, entry) = (Rc::downgrade(self), curtain.clone(), entry.clone());
+            move |source: Source, step: lock_curtain::Step| {
+                let begin = || {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.drive(|auth, port| auth.show_prompt(port, false));
+                    }
+                };
+                if curtain.touchpad(source, step, begin) == Some(Page::Prompt) {
+                    entry.focus();
+                }
+            }
+        };
+        // `TouchpadSwipeGesture`: three fingers, vertical, the deltas
+        // turned round under natural scrolling (read as it goes, as
+        // GNOME does).
+        let swipe = gtk::EventControllerLegacy::new();
         {
-            let wheel = Rc::new(Cell::new(0.0));
-            let (curtain, show_prompt) = (curtain.clone(), show_prompt.clone());
-            scroll.connect_scroll(move |controller, _, dy| {
-                if controller.unit() != gtk::gdk::ScrollUnit::Wheel {
+            let pad = RefCell::new(lock_curtain::TouchpadSwipe::default());
+            let touchpad_step = touchpad_step.clone();
+            let settings = touchpad_settings();
+            swipe.connect_event(move |_, event| {
+                let Some(swipe) = event.downcast_ref::<gtk::gdk::TouchpadEvent>() else {
+                    return glib::Propagation::Proceed;
+                };
+                if event.event_type() != gtk::gdk::EventType::TouchpadSwipe {
                     return glib::Propagation::Proceed;
                 }
-                let steps = wheel.get() + dy;
-                if steps.abs() < 1.0 {
-                    wheel.set(steps);
-                    return glib::Propagation::Stop;
+                let phase = match swipe.gesture_phase() {
+                    gtk::gdk::TouchpadGesturePhase::Begin => lock_curtain::SwipePhase::Begin,
+                    gtk::gdk::TouchpadGesturePhase::Update => lock_curtain::SwipePhase::Update,
+                    _ => lock_curtain::SwipePhase::End,
+                };
+                let natural = settings
+                    .as_ref()
+                    .is_none_or(|s| s.boolean("natural-scroll"));
+                let (step, handled) = pad.borrow_mut().event(
+                    phase,
+                    swipe.n_fingers(),
+                    swipe.deltas(),
+                    event.time(),
+                    natural,
+                );
+                if let Some(step) = step {
+                    touchpad_step(Source::Swipe, step);
                 }
-                wheel.set(0.0);
-                if steps > 0.0 {
-                    show_prompt(None);
+                if handled {
+                    glib::Propagation::Stop
                 } else {
-                    curtain.show_page(Page::Clock);
+                    glib::Propagation::Proceed
                 }
-                glib::Propagation::Stop
+            });
+        }
+        window.add_controller(swipe);
+        // Wheel steps switch pages, GNOME's discrete `ScrollController`
+        // (down the prompt, up the clock). A touchpad scroll is GNOME's
+        // `ScrollGesture`: it follows the fingers and settles on the axis
+        // stop, which ends GTK's scroll (`scroll-end`).
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        {
+            let wheel = Rc::new(Cell::new(0.0));
+            let gesture = Rc::new(RefCell::new(lock_curtain::ScrollGesture::default()));
+            {
+                let (curtain, show_prompt, gesture, touchpad_step) = (
+                    curtain.clone(),
+                    show_prompt.clone(),
+                    gesture.clone(),
+                    touchpad_step.clone(),
+                );
+                scroll.connect_scroll(move |controller, dx, dy| {
+                    if controller.unit() != gtk::gdk::ScrollUnit::Wheel {
+                        // `canHandleEvent`: finger scrolls only.
+                        if !controller
+                            .current_event_device()
+                            .is_some_and(|d| d.source() == gtk::gdk::InputSource::Touchpad)
+                        {
+                            return glib::Propagation::Proceed;
+                        }
+                        let time = controller.current_event_time();
+                        let step = gesture.borrow_mut().scroll(dx, dy, time);
+                        touchpad_step(Source::Scroll, step);
+                        return glib::Propagation::Stop;
+                    }
+                    let steps = wheel.get() + dy;
+                    if steps.abs() < 1.0 {
+                        wheel.set(steps);
+                        return glib::Propagation::Stop;
+                    }
+                    wheel.set(0.0);
+                    if steps > 0.0 {
+                        show_prompt(None);
+                    } else {
+                        curtain.show_page(Page::Clock);
+                    }
+                    glib::Propagation::Stop
+                });
+            }
+            scroll.connect_scroll_end(move |controller| {
+                let step = gesture.borrow_mut().stop(controller.current_event_time());
+                touchpad_step(Source::Scroll, step);
             });
         }
         window.add_controller(scroll);
@@ -1043,6 +1158,7 @@ impl LockUi {
             message,
             _keyboard: keyboard,
             message_wiggle,
+            _hint: hint_fade,
         };
         screen.apply(&self.auth.borrow().view());
         self.screens.borrow_mut().push(screen);

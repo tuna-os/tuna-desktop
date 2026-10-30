@@ -21,7 +21,7 @@ use smithay::wayland::seat::WaylandFocus;
 use tuna_compositor::focus_policy::{FocusMode, FocusPolicy};
 use tuna_compositor::layer::OVERVIEW_NAMESPACE;
 use tuna_compositor::windows::{
-    ManagerInput, SessionMode, TileSide, WindowLayout, WindowManager, ALT_LEFT_KEYCODE,
+    AxisStop, ManagerInput, SessionMode, TileSide, WindowLayout, WindowManager, ALT_LEFT_KEYCODE,
     ARROW_DOWN_KEYCODE, ARROW_LEFT_KEYCODE, ARROW_RIGHT_KEYCODE, ARROW_UP_KEYCODE, COMMA_KEYCODE,
     CTRL_LEFT_KEYCODE, DOT_KEYCODE, ESCAPE_KEYCODE, F4_KEYCODE, GRAVE_KEYCODE, LEFT_BRACE_KEYCODE,
     PAGE_DOWN_KEYCODE, PAGE_UP_KEYCODE, RIGHT_BRACE_KEYCODE, R_KEYCODE, SHIFT_LEFT_KEYCODE,
@@ -41,6 +41,10 @@ use wayland_client::{
         wl_surface::WlSurface,
     },
     Connection, Dispatch, EventQueue, QueueHandle, WEnum,
+};
+use wayland_protocols::wp::pointer_gestures::zv1::client::{
+    zwp_pointer_gesture_swipe_v1::{Event as SwipeEvent, ZwpPointerGestureSwipeV1},
+    zwp_pointer_gestures_v1::ZwpPointerGesturesV1,
 };
 use wayland_protocols::xdg::dialog::v1::client::{
     xdg_dialog_v1::XdgDialogV1, xdg_wm_dialog_v1::XdgWmDialogV1,
@@ -105,6 +109,15 @@ struct Client {
     configure_states: Vec<Vec<u8>>,
     /// Whether the server asked this client to close.
     close_requested: bool,
+    gestures: Option<ZwpPointerGesturesV1>,
+    swipe: Option<ZwpPointerGestureSwipeV1>,
+    /// Touchpad swipe events in arrival order: 'b' begin (with its
+    /// finger count in `swipe_fingers`), 'u' update, 'e' end, 'c' a
+    /// cancelled end.
+    swipe_events: Vec<char>,
+    swipe_fingers: Vec<u32>,
+    /// The axis of every wl_pointer.axis_stop, vertical = 0.
+    axis_stops: Vec<u32>,
 }
 
 /// Whether a raw xdg-toplevel state array carries `want` (native-endian
@@ -124,6 +137,16 @@ impl Client {
             && self.xdg_base.is_some()
             && self.keyboard.is_some()
             && self.pointer.is_some()
+    }
+
+    /// One swipe gesture object per pointer, once both are bound.
+    fn ensure_swipe(&mut self, qh: &QueueHandle<Self>) {
+        if self.swipe.is_some() {
+            return;
+        }
+        if let (Some(gestures), Some(pointer)) = (&self.gestures, &self.pointer) {
+            self.swipe = Some(gestures.get_swipe_gesture(pointer, qh, ()));
+        }
     }
 }
 
@@ -154,6 +177,16 @@ impl Dispatch<WlRegistry, ()> for Client {
                     state.keyboard = Some(seat.get_keyboard(qh, ()));
                     state.pointer = Some(seat.get_pointer(qh, ()));
                     state.seat = Some(seat);
+                    state.ensure_swipe(qh);
+                }
+                "zwp_pointer_gestures_v1" => {
+                    state.gestures = Some(registry.bind::<ZwpPointerGesturesV1, _, _>(
+                        name,
+                        version.min(3),
+                        qh,
+                        (),
+                    ));
+                    state.ensure_swipe(qh);
                 }
                 "xdg_wm_base" => {
                     state.xdg_base =
@@ -312,6 +345,10 @@ impl Dispatch<WlPointer, ()> for Client {
         _: &QueueHandle<Self>,
     ) {
         match event {
+            PointerEvent::AxisStop { axis, .. } => state.axis_stops.push(match axis {
+                WEnum::Value(a) => a as u32,
+                WEnum::Unknown(a) => a,
+            }),
             PointerEvent::Enter { .. } => {
                 state.pointer_enters += 1;
                 state.pointer_order.push('e');
@@ -360,6 +397,32 @@ empty_dispatch!(WlCompositor);
 empty_dispatch!(WlSurface);
 empty_dispatch!(WlSeat);
 empty_dispatch!(ZwlrLayerShellV1);
+empty_dispatch!(ZwpPointerGesturesV1);
+
+impl Dispatch<ZwpPointerGestureSwipeV1, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &ZwpPointerGestureSwipeV1,
+        event: SwipeEvent,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            SwipeEvent::Begin { fingers, .. } => {
+                state.swipe_events.push('b');
+                state.swipe_fingers.push(fingers);
+            }
+            SwipeEvent::Update { .. } => state.swipe_events.push('u'),
+            SwipeEvent::End { cancelled, .. } => {
+                state
+                    .swipe_events
+                    .push(if cancelled == 0 { 'e' } else { 'c' })
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for Client {
     fn event(
@@ -2519,6 +2582,7 @@ fn axis(manager: &mut WindowManager, comp: &mut TestCompositor, horizontal: f64,
         ManagerInput::Axis {
             horizontal,
             vertical,
+            stop: AxisStop::NONE,
             time: 6000,
         },
     );
@@ -3937,6 +4001,7 @@ fn stationary_pointer_press_enters_the_lock_surface_before_delivery() {
         ManagerInput::Axis {
             horizontal: 0.0,
             vertical: 120.0,
+            stop: AxisStop::NONE,
             time: 5003,
         },
     );
@@ -3993,6 +4058,7 @@ fn lock_pointer_enter_never_steals_a_held_grab() {
         ManagerInput::Axis {
             horizontal: 0.0,
             vertical: 120.0,
+            stop: AxisStop::NONE,
             time: 5002,
         },
     );
@@ -4002,6 +4068,74 @@ fn lock_pointer_enter_never_steals_a_held_grab() {
         "no enter while a button is held elsewhere"
     );
     assert_eq!(f.client_b.pointer_buttons.len(), buttons_b);
+}
+
+/// GNOME's unlock dialog lifts its curtain with a three-finger touchpad
+/// swipe and a two-finger scroll that ends on the axis stop
+/// (unlockDialog.js:584-592, swipeTracker.js `TouchpadSwipeGesture` and
+/// `ScrollGesture`). While locked the swipe and the stop reach the lock
+/// surface, as pointer gestures and `axis_stop`, and nothing else: no
+/// window behind the lock hears them (#502).
+#[test]
+fn lock_surface_alone_hears_touchpad_swipes_and_the_scroll_stop() {
+    let mut f = two_windows();
+    f.manager
+        .pointer_motion(&mut f.comp.state, alpha_only(), 5000);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+    assert!(f.client_a.swipe.is_some() && f.client_b.swipe.is_some());
+    let lock_surface = f.manager.surface_of(f.id_b).unwrap();
+    let inputs = [
+        // The tail of a swipe begun before the lock goes nowhere.
+        ManagerInput::SwipeUpdate {
+            delta: (0.0, -10.0).into(),
+            time: 5001,
+        },
+        ManagerInput::SwipeEnd {
+            cancelled: false,
+            time: 5002,
+        },
+        ManagerInput::SwipeBegin {
+            fingers: 3,
+            time: 5003,
+        },
+        ManagerInput::SwipeUpdate {
+            delta: (0.0, -20.0).into(),
+            time: 5004,
+        },
+        ManagerInput::SwipeUpdate {
+            delta: (0.0, -20.0).into(),
+            time: 5005,
+        },
+        ManagerInput::SwipeEnd {
+            cancelled: false,
+            time: 5006,
+        },
+        ManagerInput::Axis {
+            horizontal: 0.0,
+            vertical: 0.0,
+            stop: AxisStop {
+                horizontal: false,
+                vertical: true,
+            },
+            time: 5007,
+        },
+    ];
+    for input in inputs {
+        f.manager
+            .lock_input(&mut f.comp.state, &lock_surface, input);
+    }
+    pump(&mut f.comp, &mut f.queue_b, &mut f.client_b, |c| {
+        c.swipe_events.len() >= 4 && !c.axis_stops.is_empty()
+    });
+    assert_eq!(f.client_b.swipe_events, vec!['b', 'u', 'u', 'e']);
+    assert_eq!(f.client_b.swipe_fingers, vec![3]);
+    assert_eq!(f.client_b.axis_stops, vec![0], "the scroll stop reaches it");
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    assert!(
+        f.client_a.swipe_events.is_empty() && f.client_a.axis_stops.is_empty(),
+        "nothing behind the lock hears the swipe or the stop"
+    );
 }
 
 #[test]
@@ -4204,7 +4338,8 @@ fn modal_parent_blocks_pointer_clicks_scroll_and_super_drag_until_unset() {
     // The exposed right edge belongs to the parent, outside its smaller dialog.
     f.manager
         .pointer_motion(&mut f.comp.state, beta_only(), 6000);
-    f.manager.pointer_axis(&mut f.comp.state, 0.0, 120.0, 6000);
+    f.manager
+        .pointer_axis(&mut f.comp.state, 0.0, 120.0, AxisStop::NONE, 6000);
     f.manager
         .pointer_button(&mut f.comp.state, BTN_LEFT, true, 6001);
     f.manager
@@ -4232,7 +4367,8 @@ fn modal_parent_blocks_pointer_clicks_scroll_and_super_drag_until_unset() {
     f.manager.reconcile(&mut f.comp.state);
     f.manager
         .pointer_motion(&mut f.comp.state, beta_only(), 6006);
-    f.manager.pointer_axis(&mut f.comp.state, 0.0, 120.0, 6006);
+    f.manager
+        .pointer_axis(&mut f.comp.state, 0.0, 120.0, AxisStop::NONE, 6006);
     f.manager
         .pointer_button(&mut f.comp.state, BTN_LEFT, true, 6007);
     f.manager
