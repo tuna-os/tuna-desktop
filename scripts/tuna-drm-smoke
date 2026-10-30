@@ -1289,10 +1289,15 @@ state "$TS | .path == \"$TS_PATH\" and .output == \"$CONNECTOR\"" 15 ||
     fail D-TOUCH "replugging did not bring the touchscreen back on $CONNECTOR: $(jq -c .touchscreens "$CSTATE")"
 pass D-TOUCH "unplugged and replugged, mapped to $CONNECTOR again"
 
+# The compositor, shell and AT-SPI inherited the pipes' write ends, so
+# closing ours is no EOF while they live: tell the emulator to quit and
+# stop the mock directly.
+echo quit >&8
 exec 8>&-
 wait "$EMU_PID" 2>/dev/null || true
 EMU_PID=""
 exec 9>&-
+kill "$SENSOR_PID" 2>/dev/null || true
 wait "$SENSOR_PID" 2>/dev/null || true
 SENSOR_PID=""
 kill -TERM "$COMP_PID"
