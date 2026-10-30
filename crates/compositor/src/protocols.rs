@@ -6,6 +6,8 @@
 //!   GL renderer stop falling back to software. The runtime creates the
 //!   global once its renderer exists ([`State::enable_dmabuf`]); buffers
 //!   import lazily at draw time.
+//! - linux-drm-syncobj v1 (explicit sync): only when the renderer's
+//!   device has timeline syncobjs, as Mutter; see [`crate::explicit_sync`].
 //! - xdg-activation v1: an app may hand focus to another only with a
 //!   token minted while the requesting client held keyboard focus,
 //!   used within [`ACTIVATION_TOKEN_TTL`] (Mutter's focus-stealing
@@ -118,6 +120,16 @@ pub(crate) struct Protocols {
     pub(crate) x11_interop: crate::x11_interop::Interop,
     pub(crate) dmabuf_state: DmabufState,
     pub(crate) dmabuf_global: Option<DmabufGlobal>,
+    /// wp_linux_drm_syncobj_manager_v1, once the renderer passes Mutter's
+    /// checks ([`crate::explicit_sync`]).
+    #[cfg(feature = "drm")]
+    pub(crate) syncobj: Option<smithay::wayland::drm_syncobj::DrmSyncobjState>,
+    /// Acquire points held commits wait on, until the event loop watches them.
+    #[cfg(feature = "drm")]
+    pub(crate) acquire_waits: Vec<(
+        smithay::wayland::drm_syncobj::DrmSyncPointSource,
+        smithay::reexports::wayland_server::Weak<WlSurface>,
+    )>,
     pub(crate) activation_state: XdgActivationState,
     _viewporter: ViewporterState,
     _fractional_scale: FractionalScaleManagerState,
@@ -171,6 +183,10 @@ impl Protocols {
         Self {
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
+            #[cfg(feature = "drm")]
+            syncobj: None,
+            #[cfg(feature = "drm")]
+            acquire_waits: Vec::new(),
             activation_state: XdgActivationState::new::<State>(dh),
             _viewporter: ViewporterState::new::<State>(dh),
             _fractional_scale: FractionalScaleManagerState::new::<State>(dh),

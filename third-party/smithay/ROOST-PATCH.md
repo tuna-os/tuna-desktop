@@ -194,3 +194,20 @@ meta_x11_display_set_input_focus does; enter/leave are unchanged. The
 nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
 The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
 version stays 0.7.0.
+
+Issues #364 and #588 change src/wayland/drm_syncobj/mod.rs: a commit on a
+surface with a wp_linux_drm_syncobj_surface_v1 is checked as Mutter 51's
+meta_wayland_surface_explicit_sync_validate (meta-wayland-linux-drm-syncobj.c)
+does, and as the protocol's "if and only if" requires: a non-dmabuf buffer
+is unsupported_buffer whether or not points are set; a dmabuf without an
+acquire point is no_acquire_point (upstream let it through), then
+no_release_point; on one timeline acquire must be below release
+(conflicting_points); a point without a buffer is no_buffer (upstream
+called a lone release point no_acquire_point). Only the first error is
+posted. The check is the public pure function commit_error, with
+pending_commit_error reading it from a surface's pending state, so Roost's
+acquire-point pre-commit hook skips commits the check refuses. Unit tests in
+crates/compositor/src/explicit_sync.rs cover every case; real socketpair
+tests in crates/compositor/tests/protocol_gaps.rs cover surface_exists,
+invalid_timeline, unsupported_buffer and no_acquire_point. The isolated
+diff is retained in DRM-SYNCOBJ-PATCH.diff; the pinned version stays 0.7.0.

@@ -364,6 +364,69 @@ fn dmabuf_is_advertised_only_with_renderer_formats() {
     );
 }
 
+/// A stand-in import device: the gate only needs one to exist (timeline
+/// imports on it fail).
+#[cfg(feature = "drm")]
+fn stand_in_drm_device() -> smithay::backend::drm::DrmDeviceFd {
+    let file = std::fs::File::open("/dev/null").unwrap();
+    smithay::backend::drm::DrmDeviceFd::new(smithay::utils::DeviceFd::from(
+        std::os::fd::OwnedFd::from(file),
+    ))
+}
+
+/// Mutter creates wp_linux_drm_syncobj_manager_v1 only when every check of
+/// `meta_wayland_drm_syncobj_manager_new` passes; one missing capability
+/// keeps it away, all of them give version 1.
+#[cfg(feature = "drm")]
+#[test]
+fn explicit_sync_is_advertised_only_with_timeline_syncobj() {
+    use tuna_compositor::explicit_sync::SyncobjSupport;
+    let capable = || SyncobjSupport {
+        native_fence_sync: true,
+        device_path: Some("/dev/dri/renderD128".into()),
+        device: Some(stand_in_drm_device()),
+        timeline: true,
+        eventfd: true,
+    };
+    type Without = fn(&mut SyncobjSupport);
+    let lacking: [(&str, Without); 5] = [
+        ("native fence sync", |s| s.native_fence_sync = false),
+        ("EGL device node", |s| s.device_path = None),
+        ("opened device", |s| s.device = None),
+        ("timeline syncobj", |s| s.timeline = false),
+        ("syncobj eventfd", |s| s.eventfd = false),
+    ];
+    for (missing, without) in lacking {
+        let mut comp = TestCompositor::new();
+        let mut manager = comp.window_manager();
+        let mut support = capable();
+        without(&mut support);
+        assert!(!comp.state.enable_explicit_sync(support), "{missing}");
+        let mut peer = connect(&mut comp);
+        pump(&mut comp, &mut manager, &mut [&mut peer]);
+        assert!(
+            !peer
+                .client
+                .globals
+                .contains_key("wp_linux_drm_syncobj_manager_v1"),
+            "advertised without {missing}"
+        );
+    }
+
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    assert!(comp.state.enable_explicit_sync(capable()));
+    let mut peer = connect(&mut comp);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(
+        peer.client
+            .globals
+            .get("wp_linux_drm_syncobj_manager_v1")
+            .map(|g| g.1),
+        Some(1)
+    );
+}
+
 /// renderD128's device number (major 226, minor 128).
 const RENDER_NODE: u64 = (226 << 8) | 128;
 

@@ -74,6 +74,8 @@ pub mod display_config;
 #[cfg(feature = "drm")]
 pub mod drm;
 pub mod edid;
+#[cfg(feature = "drm")]
+pub mod explicit_sync;
 pub(crate) mod focus_caret;
 pub mod focus_policy;
 pub mod fprintd;
@@ -643,6 +645,9 @@ impl CompositorHandler for State {
     /// is created, so it runs before Smithay's: for a surface whose layer
     /// role is gone it marks the meaningless pending state as anchored on
     /// every edge, which the validator accepts.
+    ///
+    /// The same hook holds a commit until its explicit-sync acquire point
+    /// signals ([`explicit_sync`]).
     fn new_surface(&mut self, surface: &wl_surface::WlSurface) {
         smithay::wayland::compositor::add_pre_commit_hook::<State, _>(
             surface,
@@ -655,6 +660,8 @@ impl CompositorHandler for State {
                         cached.pending().anchor = smithay::wayland::shell::wlr_layer::Anchor::all();
                     });
                 }
+                #[cfg(feature = "drm")]
+                explicit_sync::hold_until_acquired(state, surface);
             },
         );
     }
