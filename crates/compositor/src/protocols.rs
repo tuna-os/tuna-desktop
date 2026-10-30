@@ -41,6 +41,8 @@
 //! - pointer-warp v1: a client may move the pointer within its own
 //!   surface while it has pointer focus (the enter serial must match).
 //! - presentation-time, fifo and commit-timing: see [`crate::frame_timing`].
+//! - ext-background-effect v1: the blur behind a surface's blur region
+//!   (`background_effect.rs`, drawn by `background_blur.rs`).
 //!
 //! Deliberately absent, matching Mutter: xdg-decoration (GNOME is
 //! client-side decorations only).
@@ -136,6 +138,8 @@ pub(crate) struct Protocols {
     shortcut_changed: bool,
     pub(crate) shortcut_locked: bool,
     _pointer_warp: GlobalId,
+    /// ext_background_effect_manager_v1 (blur behind surfaces).
+    pub(crate) background_effects: crate::background_effect::BackgroundEffects,
     /// Pointer warps clients asked for, drained by the window manager:
     /// surface, surface-local position, enter serial.
     pub(crate) pointer_warps: Vec<(WlSurface, Point<f64, Logical>, u32)>,
@@ -195,6 +199,7 @@ impl Protocols {
             #[cfg(feature = "xwayland")]
             x11_interop: crate::x11_interop::Interop::new(dh),
             _pointer_warp: dh.create_global::<State, WpPointerWarpV1, ()>(1, ()),
+            background_effects: crate::background_effect::BackgroundEffects::new(dh),
             pointer_warps: Vec::new(),
             bell: Bell::default(),
             inhibitors: Vec::new(),

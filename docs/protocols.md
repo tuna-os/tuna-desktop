@@ -88,6 +88,7 @@ and this page together.
 | xdg_session_manager_v1 | 1 | window session save and restore as in Mutter 51 (P-SY-08): a client that opens a session gets its windows back after logout or reboot (workspace, position and size, maximized, tiled, fullscreen, output; minimized is not restored, as in Mutter); store `$XDG_DATA_HOME/tuna/window-sessions.json`, written 3 s after a change and at exit (`crates/compositor/src/xdg_session.rs`) |
 | zwp_keyboard_shortcuts_inhibit_manager_v1 | 1 | after Allow, the focused window gets every key, the shell's grabs, Super and Alt+Tab included; Super+Escape (Mutter's restore-shortcuts) takes them back until the window is focused again |
 | wp_pointer_warp_v1 | 1 | honoured while the surface has pointer focus from the enter serial it names; nested, the host pointer stays where it is |
+| ext_background_effect_manager_v1 | 1 | capabilities `blur` at bind; one effect object per surface (`background_effect_exists`), `set_blur_region` double-buffered on commit, NULL removes it, `surface_destroyed` once the surface is gone; destroying the object unsets the region on the next commit (meta-wayland-background-effect.c). Drawn as Mutter 51's meta-background-effect.c and clutter-blur.c: the scene beneath the surface, clipped to the surface and its region, blurred (separable gaussian, sigma = radius / 2, radius 24 logical px times the surface's scale, downscaled by powers of two while sigma > 6 and both sides > 256 px), saturation 1.25 and 0.015 grain, at the surface's opacity, under its content; a repaint touching the sample area (region + 2 × radius) repaints all of it, and windows beneath an opaque blurred window still draw there. Not applied to overview previews or Alt+Tab thumbnails (Mutter also blurs behind clones) |
 
 ### Colour reference and source notices
 
@@ -289,7 +290,6 @@ GNOME's version.
 | zwp_text_input_manager_v3 | 2 | 1 | Smithay 0.7 implements v1 only; bumps with Smithay (#60) |
 | zxdg_exporter_v1, zxdg_importer_v1 | 1 | missing | GTK3 exports with v1; Smithay 0.7 implements v2 only and keeps its handle table private, so a v1 handle could not be imported by the portal's v2 (#61) |
 | xdg_toplevel_drag_manager_v1 | 1 | missing | not in Smithay 0.7: a window attached to a drag-and-drop operation and moved with it (detachable browser tabs) (#89) |
-| ext_background_effect_manager_v1 | 1 | missing | not in Smithay 0.7: needs a blur pass in the renderer (#89) |
 | wl_fixes | 1 | missing | not in wayland-server 0.31; its `destroy_registry` frees a registry object, which wayland-backend owns (#89) |
 | wp_drm_lease_device_v1 | 1 (native Marlin capture) | missing | lease needs connectors to hand out for VR headsets; recorded deviation, not exercised by the nested session (#68, #89) |
 | wp_linux_drm_syncobj_manager_v1 | source-derived floor 1; absent in this VM capture | missing | explicit sync needs the DRM backend's syncobj import; GPU-capable native acceptance remains open (#68, #89) |
