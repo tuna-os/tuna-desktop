@@ -59,10 +59,10 @@ and this page together.
 | wl_output | 4 | one per connected output |
 | wl_data_device_manager | 3 | |
 | zwp_primary_selection_device_manager_v1 | 1 | |
-| xdg_wm_base | 6 | popups with positioner constraints and grabs |
+| xdg_wm_base | 7 | popups with positioner constraints and grabs; edge states from Mutter's edge constraints: maximized is tiled and constrained on every edge, a half tile on its top, bottom and outer edge (Tuna Desktop pairs no tiles, so the inner edge stays free); constrained states only to version 7 binds |
 | zxdg_output_manager_v1 | 3 | |
 | zwlr_layer_shell_v1 | 4 | Tuna Desktop's own shell draws through it |
-| zwp_linux_dmabuf_v1 | 3 | only when the renderer reports formats |
+| zwp_linux_dmabuf_v1 | 5 | only when the renderer reports formats; as Mutter, version 5 when the renderer's EGL device names a render node (else its DRM node), with default feedback naming that device and one tranche of the renderer's formats, and version 3 without one; no scanout tranche, since every surface is composited |
 | xdg_activation_v1 | 1 | focus policy below |
 | wp_viewporter | 1 | |
 | wp_fractional_scale_manager_v1 | 1 | preferred scale 1 until #59 |
@@ -81,11 +81,13 @@ and this page together.
 | wp_commit_timing_manager_v1 | 1 | a timed update applies on the refresh cycle whose next presentation reaches its time |
 | xdg_wm_dialog_v1 | 1 | a modal dialog is attached to its parent: focusing the parent focuses the dialog (GNOME's attach-modal-dialogs) |
 | zxdg_exporter_v2, zxdg_importer_v2 | 1 | xdg-foreign: the portal parents its dialogs to the app's window, which centres and attaches them like the app's own |
+| zxdg_exporter_v1, zxdg_importer_v1 | 1 | GTK 3's xdg-foreign: one handle table with v2, as Mutter, so the portal's v2 import parents its dialogs to a GTK 3 window; revoking an export destroys its imports and clears their parents (`third-party/smithay/XDG-FOREIGN-V1-PATCH.diff`) |
 | xdg_system_bell_v1 | 1 | plays GNOME's `bell-window-system` sound through `canberra-gtk-play` when installed (Mutter's audible bell); a burst of rings is one sound |
 | xdg_toplevel_tag_manager_v1 | 1 | each window keeps its tag and description |
 | xdg_session_manager_v1 | 1 | window session save and restore as in Mutter 51 (P-SY-08): a client that opens a session gets its windows back after logout or reboot (workspace, position and size, maximized, tiled, fullscreen, output; minimized is not restored, as in Mutter); store `$XDG_DATA_HOME/tuna/window-sessions.json`, written 3 s after a change and at exit (`crates/compositor/src/xdg_session.rs`) |
 | zwp_keyboard_shortcuts_inhibit_manager_v1 | 1 | after Allow, the focused window gets every key, the shell's grabs, Super and Alt+Tab included; Super+Escape (Mutter's restore-shortcuts) takes them back until the window is focused again |
 | wp_pointer_warp_v1 | 1 | honoured while the surface has pointer focus from the enter serial it names; nested, the host pointer stays where it is |
+| wl_fixes | 1 | `destroy_registry` destroys the registry as Mutter does: the client's id is freed and that registry hears no more globals |
 
 ### xdg-activation policy
 
@@ -154,19 +156,16 @@ GNOME's version.
 
 | Protocol | GNOME 51 | Tuna Desktop | Why, and where tracked |
 |---|---|---|---|
-| xdg_wm_base | 7 | 6 | Smithay 0.7 creates the global at 6 and implements nothing newer; bumps with Smithay (#89) |
 | wl_seat | 10 | 9 | Smithay 0.7 creates the seat at 9 and implements nothing newer; bumps with Smithay (#89) |
 | zwp_text_input_manager_v3 | 2 | 1 | Smithay 0.7 implements v1 only; bumps with Smithay (#60) |
-| zxdg_exporter_v1, zxdg_importer_v1 | 1 | missing | GTK3 exports with v1; Smithay 0.7 implements v2 only and keeps its handle table private, so a v1 handle could not be imported by the portal's v2 (#61) |
 | xdg_toplevel_drag_manager_v1 | 1 | missing | not in Smithay 0.7: a window attached to a drag-and-drop operation and moved with it (detachable browser tabs) (#89) |
 | wp_color_manager_v1 (v2), wp_color_representation_manager_v1 | 2, 1 | missing | not in Smithay 0.7: needs a colour-managed renderer (ICC/HDR, YUV conversion); the GLES path is sRGB only (#89) |
 | ext_background_effect_manager_v1 | 1 | missing | not in Smithay 0.7: needs a blur pass in the renderer (#89) |
-| wl_fixes | 1 | missing | not in wayland-server 0.31; its `destroy_registry` frees a registry object, which wayland-backend owns (#89) |
 | wp_drm_lease_device_v1 | 1 (native Marlin capture) | missing | lease needs connectors to hand out for VR headsets; recorded deviation, not exercised by the nested session (#68, #89) |
 | wp_linux_drm_syncobj_manager_v1 | source-derived floor 1; absent in this VM capture | missing | explicit sync needs the DRM backend's syncobj import; GPU-capable native acceptance remains open (#68, #89) |
 | zwp_xwayland_keyboard_grab_manager_v1 (Xwayland only; from source) | — | missing | only rootful Xwayland with `-host-grab` uses it, and Mutter allows grabs only per `xwayland-grab-access-rules`; Tuna Desktop runs rootless Xwayland (#89) |
+| zwp_linux_dmabuf_feedback_v1 scanout tranches | per-surface feedback adds a scanout tranche for a direct-scanout candidate (`meta_wayland_dma_buf_surface_feedback`) | default feedback only | Tuna Desktop has no direct scanout of client buffers: every surface is composited, so a scanout tranche would point clients at planes nothing uses; it comes with direct scanout (perf lane) |
 | gtk_shell1 | 7 | missing | not planned: GTK4 needs none of it on a GNOME session |
-| zwp_linux_dmabuf_v1 feedback (v4+) | native backend only | version 3 | #89 |
 
 ## Deliberate differences
 

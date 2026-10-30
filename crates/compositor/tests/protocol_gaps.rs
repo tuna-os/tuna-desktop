@@ -35,10 +35,16 @@ use wayland_protocols::wp::presentation_time::client::{
 use wayland_protocols::xdg::dialog::v1::client::{
     xdg_dialog_v1::XdgDialogV1, xdg_wm_dialog_v1::XdgWmDialogV1,
 };
+use wayland_protocols::xdg::foreign::zv1::client::{
+    zxdg_exported_v1::{self, ZxdgExportedV1},
+    zxdg_exporter_v1::ZxdgExporterV1,
+    zxdg_imported_v1::{self, ZxdgImportedV1},
+    zxdg_importer_v1::ZxdgImporterV1,
+};
 use wayland_protocols::xdg::foreign::zv2::client::{
     zxdg_exported_v2::{self, ZxdgExportedV2},
     zxdg_exporter_v2::ZxdgExporterV2,
-    zxdg_imported_v2::ZxdgImportedV2,
+    zxdg_imported_v2::{self, ZxdgImportedV2},
     zxdg_importer_v2::ZxdgImporterV2,
 };
 use wayland_protocols::xdg::shell::client::{
@@ -66,6 +72,8 @@ struct Client {
     fates: HashMap<u32, Fate>,
     inhibitor_active: Option<bool>,
     handle: Option<String>,
+    /// xdg_imported destroyed events received (either version).
+    imports_destroyed: usize,
 }
 
 impl Dispatch<WlCallback, ()> for Client {
@@ -222,6 +230,51 @@ impl Dispatch<ZxdgExportedV2, ()> for Client {
     }
 }
 
+impl Dispatch<ZxdgExportedV1, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &ZxdgExportedV1,
+        event: zxdg_exported_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zxdg_exported_v1::Event::Handle { handle } = event {
+            state.handle = Some(handle);
+        }
+    }
+}
+
+impl Dispatch<ZxdgImportedV2, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &ZxdgImportedV2,
+        event: zxdg_imported_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zxdg_imported_v2::Event::Destroyed = event {
+            state.imports_destroyed += 1;
+        }
+    }
+}
+
+impl Dispatch<ZxdgImportedV1, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &ZxdgImportedV1,
+        event: zxdg_imported_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zxdg_imported_v1::Event::Destroyed = event {
+            state.imports_destroyed += 1;
+        }
+    }
+}
+
 wayland_client::delegate_noop!(Client: ignore WlCompositor);
 wayland_client::delegate_noop!(Client: ignore WlSurface);
 wayland_client::delegate_noop!(Client: ignore WlSeat);
@@ -235,7 +288,8 @@ wayland_client::delegate_noop!(Client: ignore XdgDialogV1);
 wayland_client::delegate_noop!(Client: ignore XdgToplevelTagManagerV1);
 wayland_client::delegate_noop!(Client: ignore ZxdgExporterV2);
 wayland_client::delegate_noop!(Client: ignore ZxdgImporterV2);
-wayland_client::delegate_noop!(Client: ignore ZxdgImportedV2);
+wayland_client::delegate_noop!(Client: ignore ZxdgExporterV1);
+wayland_client::delegate_noop!(Client: ignore ZxdgImporterV1);
 
 struct Peer {
     _conn: Connection,
@@ -675,6 +729,91 @@ fn exported_windows_parent_another_clients_dialog() {
             .is_some_and(|parent| toplevels.iter().any(|t| *t.wl_surface() == parent))),
         "the portal's dialog is parented to the app's window"
     );
+}
+
+/// The window titled `child` has the window titled `parent` as its
+/// parent.
+fn parented(comp: &TestCompositor, child: &str, parent: &str) -> bool {
+    use smithay::wayland::{compositor::with_states, shell::xdg::XdgToplevelSurfaceData};
+    let toplevels = comp.state.toplevels();
+    let titled = |title: &str| {
+        toplevels
+            .iter()
+            .find(|t| {
+                with_states(t.wl_surface(), |states| {
+                    states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()
+                        .is_some_and(|data| data.lock().unwrap().title.as_deref() == Some(title))
+                })
+            })
+            .cloned()
+    };
+    let (Some(child), Some(parent)) = (titled(child), titled(parent)) else {
+        return false;
+    };
+    child.parent().as_ref() == Some(parent.wl_surface())
+}
+
+#[test]
+fn gtk3_v1_exports_import_through_either_version_and_revoke() {
+    // Mutter keeps one handle table for zxdg_foreign v1 and v2
+    // (meta-wayland-legacy-xdg-foreign.c calls the v2 export/import
+    // functions): GTK 3 exports with v1 and the portal imports with v2.
+    let (mut comp, mut manager) = compositor();
+    let mut gtk3 = connect(&mut comp, &mut manager);
+    let mut portal = connect(&mut comp, &mut manager);
+    assert_eq!(gtk3.client.globals["zxdg_exporter_v1"].1, 1);
+    assert_eq!(gtk3.client.globals["zxdg_importer_v1"].1, 1);
+    let exporter_v1: ZxdgExporterV1 = gtk3.bind(1);
+    let importer_v1: ZxdgImporterV1 = gtk3.bind(1);
+    let exporter_v2: ZxdgExporterV2 = portal.bind(1);
+    let importer_v2: ZxdgImporterV2 = portal.bind(1);
+    let (app_surface, _app) = window(&mut gtk3, "gtk3 app");
+    let (dialog_surface, _dialog) = window(&mut portal, "portal chooser");
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+
+    // v1 export, v2 import.
+    let exported = exporter_v1.export(&app_surface, &gtk3.qh(), ());
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    let handle = gtk3.client.handle.take().expect("v1 export handle");
+    let imported = importer_v2.import_toplevel(handle.clone(), &portal.qh(), ());
+    imported.set_parent_of(&dialog_surface);
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    assert!(parented(&comp, "portal chooser", "gtk3 app"));
+    assert_eq!(portal.client.imports_destroyed, 0);
+
+    // Revoking the v1 export destroys the v2 import and frees the dialog
+    // (Mutter's meta_wayland_xdg_exported_destroy).
+    exported.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    assert_eq!(portal.client.imports_destroyed, 1);
+    assert!(!parented(&comp, "portal chooser", "gtk3 app"));
+    // The revoked handle no longer imports, through either version.
+    let stale = importer_v2.import_toplevel(handle, &portal.qh(), ());
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    assert_eq!(portal.client.imports_destroyed, 2);
+    stale.set_parent_of(&dialog_surface);
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    assert!(!parented(&comp, "portal chooser", "gtk3 app"));
+
+    // v2 export, v1 import, and the import's own destruction unparents.
+    let _exported = exporter_v2.export_toplevel(&dialog_surface, &portal.qh(), ());
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    let handle = portal.client.handle.take().expect("v2 export handle");
+    let imported = importer_v1.import(handle, &gtk3.qh(), ());
+    imported.set_parent_of(&app_surface);
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    assert!(parented(&comp, "gtk3 app", "portal chooser"));
+    imported.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    assert!(!parented(&comp, "gtk3 app", "portal chooser"));
+    assert_eq!(gtk3.client.imports_destroyed, 0);
+
+    // An unknown v1 handle is destroyed at once.
+    let _unknown = importer_v1.import("not-a-handle".into(), &gtk3.qh(), ());
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    assert_eq!(gtk3.client.imports_destroyed, 1);
 }
 
 #[test]
