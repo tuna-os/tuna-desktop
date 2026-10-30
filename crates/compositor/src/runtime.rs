@@ -4788,23 +4788,27 @@ impl Runtime {
         // flag. Anyone else's locker is dropped, which tells it the
         // lock failed.
         if let Some((locker, pid)) = self.state.take_lock_request() {
-            let ours = matches!(
-                (pid, self.shell.child_pid()),
-                (Some(pid), Some(child)) if u32::try_from(pid).ok() == Some(child)
+            use crate::session_lock::{lock_request_verdict, LockVerdict};
+            let verdict = lock_request_verdict(
+                pid,
+                self.shell.child_pid(),
+                self.control.lock_screen_allowed(),
             );
-            // Administrative lockdown (#357): a disabled lock screen
-            // refuses even our own shell's locker (no Wayland bypass).
-            let approved = ours && self.control.lock_screen_allowed();
-            if approved {
-                if !self.is_locked() {
-                    self.engage_lock();
+            match verdict {
+                LockVerdict::Approved => {
+                    if !self.is_locked() {
+                        self.engage_lock();
+                    }
                 }
-            } else if ours {
-                eprintln!("tuna-compositor: session lock refused by administrator policy");
-            } else {
-                eprintln!("tuna-compositor: session lock refused for pid {pid:?}");
+                LockVerdict::RefusedByPolicy => {
+                    eprintln!("tuna-compositor: session lock refused by administrator policy");
+                }
+                LockVerdict::RefusedForeign => {
+                    eprintln!("tuna-compositor: session lock refused for pid {pid:?}");
+                }
             }
-            self.state.resolve_lock_request(locker, approved);
+            self.state
+                .resolve_lock_request(locker, verdict == LockVerdict::Approved);
         }
         // A lock client's unlock_and_destroy never unlocks by itself:
         // only a verified password clears the flag.
@@ -5063,20 +5067,9 @@ impl Runtime {
     /// primary output advance fifo barriers and commit timers (#89).
     #[cfg(feature = "drm")]
     fn page_flipped(&mut self, flip: crate::drm::PageFlip) {
-        use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
-        use smithay::utils::{Monotonic, Time};
-        // Mutter's KMS flags: vsync'd, kernel-timestamped, completion
-        // reported by the hardware.
-        let (time, flags): (Time<Monotonic>, Kind) = match flip.time {
-            Some(time) => (
-                Time::from(time),
-                Kind::Vsync | Kind::HwClock | Kind::HwCompletion,
-            ),
-            None => (
-                self.state.presentation_now(),
-                Kind::Vsync | Kind::HwCompletion,
-            ),
-        };
+        use smithay::utils::Monotonic;
+        let (time, flags) =
+            crate::frame_timing::flip_presentation(flip.time, self.state.presentation_now());
         if let Some(mut feedback) = flip.feedback {
             feedback.presented::<_, Monotonic>(
                 time,
