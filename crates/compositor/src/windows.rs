@@ -175,6 +175,64 @@ pub enum TileSide {
     Right,
 }
 
+const TILED_STATES: [xdg_toplevel::State; 4] = [
+    xdg_toplevel::State::TiledTop,
+    xdg_toplevel::State::TiledRight,
+    xdg_toplevel::State::TiledBottom,
+    xdg_toplevel::State::TiledLeft,
+];
+
+const CONSTRAINED_STATES: [xdg_toplevel::State; 4] = [
+    xdg_toplevel::State::ConstrainedTop,
+    xdg_toplevel::State::ConstrainedRight,
+    xdg_toplevel::State::ConstrainedBottom,
+    xdg_toplevel::State::ConstrainedLeft,
+];
+
+/// The xdg_toplevel edge states a layout configures, in Mutter 51's
+/// order (`fill_states` in src/wayland/meta-wayland-xdg-shell.c).
+///
+/// Mutter derives them from the window's edge constraints
+/// (`update_edge_constraints` in src/core/window.c): maximized
+/// constrains every edge to the monitor; a half tile constrains its
+/// top, bottom and outer edge, leaving the inner edge free. Each
+/// constrained edge is also tiled (version 2 states); the constrained
+/// states (version 7) tell the client it cannot resize that edge.
+/// Smithay drops what an older client's bind cannot carry.
+///
+/// Mutter also marks a half tile's inner edge tiled, not constrained,
+/// while a window tiles the other half beside it (its "tile match");
+/// Tuna Desktop does not pair tiles, so that edge stays free.
+///
+/// The scroll-mode strip is Tuna Desktop's own: its columns are tiled
+/// on every edge, as niri tells its columns, so client decorations drop
+/// their shadows; nothing constrains them to the monitor.
+pub fn edge_states(layout: &WindowLayout) -> Vec<xdg_toplevel::State> {
+    use xdg_toplevel::State;
+    let constrained: &[State] = match layout {
+        WindowLayout::Floating | WindowLayout::Fullscreen => &[],
+        WindowLayout::Strip => return TILED_STATES.to_vec(),
+        WindowLayout::Maximized => &CONSTRAINED_STATES,
+        WindowLayout::Tiled(TileSide::Left) => &[
+            State::ConstrainedTop,
+            State::ConstrainedBottom,
+            State::ConstrainedLeft,
+        ],
+        WindowLayout::Tiled(TileSide::Right) => &[
+            State::ConstrainedTop,
+            State::ConstrainedRight,
+            State::ConstrainedBottom,
+        ],
+    };
+    let tiled = constrained.iter().map(|state| match state {
+        State::ConstrainedTop => State::TiledTop,
+        State::ConstrainedRight => State::TiledRight,
+        State::ConstrainedBottom => State::TiledBottom,
+        _ => State::TiledLeft,
+    });
+    tiled.chain(constrained.iter().copied()).collect()
+}
+
 /// Session-wide window-management mode (scrollable-tiling spec).
 /// Manager-local like [`WindowLayout`]: the shell never sees it, it
 /// only sees resulting geometry through rendering.
@@ -2672,45 +2730,29 @@ impl WindowManager {
                 pending.states.unset(xdg_toplevel::State::Activated);
             }
             // Exactly one presentation state: managed layouts advertise
-            // theirs, floating advertises none.
+            // theirs, floating advertises none. Edge states follow
+            // after it (see `edge_states`).
             for state in [
                 xdg_toplevel::State::Maximized,
                 xdg_toplevel::State::Fullscreen,
-                xdg_toplevel::State::TiledLeft,
-                xdg_toplevel::State::TiledRight,
-                xdg_toplevel::State::TiledTop,
-                xdg_toplevel::State::TiledBottom,
-            ] {
+            ]
+            .into_iter()
+            .chain(TILED_STATES)
+            .chain(CONSTRAINED_STATES)
+            {
                 pending.states.unset(state);
             }
             match layout {
-                WindowLayout::Floating => {}
-                // niri tells its columns they are tiled on every edge:
-                // client-side decorations drop their shadow and rounded
-                // corners, so columns meet the gaps (and the focus ring)
-                // square.
-                WindowLayout::Strip => {
-                    for state in [
-                        xdg_toplevel::State::TiledLeft,
-                        xdg_toplevel::State::TiledRight,
-                        xdg_toplevel::State::TiledTop,
-                        xdg_toplevel::State::TiledBottom,
-                    ] {
-                        pending.states.set(state);
-                    }
-                }
                 WindowLayout::Maximized => {
                     pending.states.set(xdg_toplevel::State::Maximized);
                 }
                 WindowLayout::Fullscreen => {
                     pending.states.set(xdg_toplevel::State::Fullscreen);
                 }
-                WindowLayout::Tiled(TileSide::Left) => {
-                    pending.states.set(xdg_toplevel::State::TiledLeft);
-                }
-                WindowLayout::Tiled(TileSide::Right) => {
-                    pending.states.set(xdg_toplevel::State::TiledRight);
-                }
+                WindowLayout::Floating | WindowLayout::Strip | WindowLayout::Tiled(_) => {}
+            }
+            for state in edge_states(layout) {
+                pending.states.set(state);
             }
         });
         surface.send_configure();
