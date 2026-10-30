@@ -7,7 +7,7 @@ Keyboard adjustment relocates the pointer to the selected edge, or to the area c
 ## Focused runtime proof
 
 ```sh
-scripts/tuna-gtk-shell-proof --screenshot-keys-only --display :97 \
+scripts/tuna-gtk-shell-proof --screenshot-keys-only \
   --artifacts /tmp/tuna-screenshot-keys
 ```
 

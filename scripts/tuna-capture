@@ -232,11 +232,25 @@ if [ -n "$DISPLAY_ARG" ]; then
     export DISPLAY
 fi
 if ! display_works; then
-    DISPLAY=":97"
-    export DISPLAY
-    echo "tuna-capture: starting Xvfb on $DISPLAY"
-    Xvfb "$DISPLAY" -screen 0 "${WIDTH}x${HEIGHT}x24" >"$ARTIFACTS/xvfb.log" 2>&1 &
-    OWNED_XVFB=$!
+    if [ -n "$DISPLAY_ARG" ]; then
+        echo "tuna-capture: starting Xvfb on $DISPLAY"
+        Xvfb "$DISPLAY" -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp >"$ARTIFACTS/xvfb.log" 2>&1 &
+        OWNED_XVFB=$!
+    else
+        # Xvfb picks a free display itself, so concurrent runs never collide.
+        rm -f "$ARTIFACTS/xvfb-display"
+        Xvfb -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp \
+            3>"$ARTIFACTS/xvfb-display" >"$ARTIFACTS/xvfb.log" 2>&1 &
+        OWNED_XVFB=$!
+        for _ in $(seq 1 30); do [ -s "$ARTIFACTS/xvfb-display" ] && break; sleep 1; done
+        [ -s "$ARTIFACTS/xvfb-display" ] || {
+            echo "tuna-capture: Xvfb did not allocate a display" >&2
+            exit 1
+        }
+        DISPLAY=":$(cat "$ARTIFACTS/xvfb-display")"
+        export DISPLAY
+        echo "tuna-capture: started Xvfb on $DISPLAY"
+    fi
     for _ in $(seq 1 30); do
         if display_works; then
             break
