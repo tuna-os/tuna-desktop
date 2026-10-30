@@ -164,8 +164,9 @@ fn clock_name(policy: Motion) -> &'static str {
 }
 
 /// The hover label: GNOME's `dash-label` chrome, a click-through popup
-/// above its item that screen readers skip (the item's own accessible
-/// name carries the text, as `setLabelText` sets it).
+/// above its item. Like GNOME's chrome St.Label it is a plain label to
+/// assistive technology; the item's button keeps the accessible name
+/// (`setLabelText` sets `accessible_name`, dash.js:129-132).
 struct HoverLabel {
     popover: gtk::Popover,
     text: gtk::Label,
@@ -179,7 +180,6 @@ impl HoverLabel {
         let label = gtk::Label::new(Some(text));
         label.add_css_class("dash-label");
         label.set_opacity(0.0);
-        label.update_state(&[gtk::accessible::State::Hidden(true)]);
         let ticking = Rc::new(Cell::new(false));
         {
             let ticking = ticking.clone();
@@ -193,7 +193,6 @@ impl HoverLabel {
         popover.set_can_target(false);
         popover.set_position(gtk::PositionType::Top);
         popover.set_offset(0, -LABEL_Y_OFFSET);
-        popover.update_state(&[gtk::accessible::State::Hidden(true)]);
         popover.set_child(Some(&label));
         popover.connect_realize(|popover| {
             if let Some(surface) = popover.surface() {

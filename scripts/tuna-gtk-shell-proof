@@ -3076,8 +3076,13 @@ log_wait "$dash_mark" "dash label $delta_key settle opacity=1.0000" ||
     fail G-DASH-MOTION "the label did not settle 150 ms in"
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-dash-label.json" 20 ||
     fail G-DASH-MOTION "accessibility dump failed"
-[ "$(jq '[.[] | select(.showing and .name == "tuna-test-delta")] | length' "$ARTIFACTS/a11y-dash-label.json")" = 1 ] ||
-    fail G-DASH-MOTION "the label repeated the item's name to assistive technology"
+# The label shows as a plain label (GNOME's chrome St.Label); the item's
+# button stays the one control carrying the name.
+jq -e 'any(.[]; .showing and .role == "label" and .name == "tuna-test-delta")' \
+    "$ARTIFACTS/a11y-dash-label.json" >/dev/null ||
+    fail G-DASH-MOTION "the hovered item's label did not show"
+[ "$(jq '[.[] | select(.showing and .role != "label" and .name == "tuna-test-delta")] | length' "$ARTIFACTS/a11y-dash-label.json")" = 1 ] ||
+    fail G-DASH-MOTION "the label added a second control named like the item"
 dash_mark="$(log_mark)"
 xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 3))
 log_wait "$dash_mark" "dash label $delta_key hide start from=1.0000 ms=100 motion=full clock=manual" ||
