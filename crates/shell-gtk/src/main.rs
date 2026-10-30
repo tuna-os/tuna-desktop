@@ -50,6 +50,7 @@ mod magnifier_sync;
 mod media_keys;
 mod motion;
 mod mount_operation;
+mod mpris;
 mod network_agent;
 mod network_secrets;
 mod notify;
@@ -1958,6 +1959,22 @@ fn build(app: &adw::Application) {
         notify.connect_lock_changed(move || {
             if let Some(lock_ui) = lock_ui.upgrade() {
                 lock_ui.refresh_notifications();
+            }
+        });
+    }
+    // GNOME's lock screen lists media players above the notifications
+    // (js/ui/mpris.js, unlockDialog.js `_addPlayer`, #348).
+    {
+        let mpris = mpris::Mpris::start();
+        let (source, act) = (mpris.clone(), mpris.clone());
+        lock_ui.set_media(
+            Rc::new(move || source.lock_entries()),
+            Rc::new(move |bus_name, action| act.act(bus_name, action)),
+        );
+        let lock_ui = Rc::downgrade(&lock_ui);
+        mpris.connect_changed(move || {
+            if let Some(lock_ui) = lock_ui.upgrade() {
+                lock_ui.refresh_media();
             }
         });
     }

@@ -27,7 +27,7 @@ use tuna_shell_control::{AuthEvent, AuthService};
 
 use crate::lock_auth::{AuthMachine, Effect, Host, MessageKind, View};
 use crate::lock_curtain::{self, Curtain, Page, Source};
-use crate::lock_notifications::{LockEntry, NotificationsBox};
+use crate::lock_notifications::{LockEntry, MediaActions, MediaEntry, NotificationsBox};
 use crate::lock_wiggle::Wiggle;
 use crate::logic;
 
@@ -41,6 +41,8 @@ fn touchpad_settings() -> Option<gio::Settings> {
 }
 /// What the lock screen's notifications show now.
 pub type LockNotifications = Rc<dyn Fn() -> Vec<LockEntry>>;
+/// The media players the lock screen shows now.
+pub type LockMedia = Rc<dyn Fn() -> Vec<MediaEntry>>;
 
 /// Sends a password with the single-password `Unlock`; returns the
 /// request id.
@@ -305,6 +307,9 @@ pub struct LockUi {
     hints: Rc<lock_curtain::HintWatch>,
     /// Where the notifications box reads what to show (#348).
     notifications: RefCell<Option<LockNotifications>>,
+    /// Where the notifications box reads its media players, and how its
+    /// controls reach them (#348).
+    media: RefCell<Option<(LockMedia, MediaActions)>>,
 }
 
 impl LockUi {
@@ -330,6 +335,7 @@ impl LockUi {
             osk: RefCell::new(None),
             hints: lock_curtain::HintWatch::new(),
             notifications: RefCell::new(None),
+            media: RefCell::new(None),
         });
         {
             let weak = Rc::downgrade(&ui);
@@ -384,6 +390,28 @@ impl LockUi {
         }
     }
 
+    /// Read the lock screen's media players from `source`; `act` drives
+    /// one by its bus name.
+    pub fn set_media(&self, source: LockMedia, act: MediaActions) {
+        *self.media.borrow_mut() = Some((source, act));
+    }
+
+    /// Bring every lock screen's media players up to date (GNOME's
+    /// `MediaMessage` follows its player and its policy live).
+    pub fn refresh_media(&self) {
+        let screens = self.screens.borrow();
+        if screens.is_empty() {
+            return;
+        }
+        let Some((source, act)) = self.media.borrow().clone() else {
+            return;
+        };
+        let players = source();
+        for screen in screens.iter() {
+            screen.notifications.show_media(&players, &act);
+        }
+    }
+
     /// Drop every lock window. Their entries are wiped at once, which is
     /// no input; the windows are destroyed from the main loop afterwards.
     /// gtk4-session-lock emits `::unlocked` (and `::failed`) before it
@@ -434,6 +462,7 @@ impl LockUi {
             self.refresh_clock();
             self.hints.arm();
             self.refresh_notifications();
+            self.refresh_media();
             let weak = Rc::downgrade(self);
             *self.wall_clock.borrow_mut() =
                 Some(crate::wall_clock::WallClock::new(false, move || {
