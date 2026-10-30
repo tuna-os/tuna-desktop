@@ -264,15 +264,22 @@ notify_lock_proof() {
     gsettings set org.gnome.desktop.sound event-sounds true
     pass G-NOTIFY-SOUND "a banner plays its sound-name, else its sound-file, through the event-sound player as it shows; enable-sound-alerts or event-sounds off keeps it silent"
 
-    # The disabled app's notification, sent while locked, waits hidden.
+    # A disabled app's notification waits hidden; the earlier ones were
+    # closed above (CloseNotification drops them for good), so send fresh
+    # ones: one listed as usual, one from the app still switched off.
+    nl_listed=$(nl_notify tuna-lock-private "Listed Summary" "listed body" 1) ||
+        fail G-NOTIFY-RESTORE "Notify failed"
+    nl_off_again=$(nl_notify tuna-lock-off "Off Again" "OFF-AGAIN-BODY" 1) ||
+        fail G-NOTIFY-RESTORE "Notify failed"
+    sleep 1
     xdotool mousemove --window "$WID" $((WIDTH / 2)) 16 click 1
     sleep 2
-    nl_until restore-disabled 'any(.[]; .showing and .name == "Hidden Summary")' G-NOTIFY-RESTORE ||
+    nl_until restore-disabled 'any(.[]; .showing and .name == "Listed Summary")' G-NOTIFY-RESTORE ||
         fail G-NOTIFY-RESTORE "the date menu does not list the history"
-    nl_mentions "$nl_tree" "Off Summary" &&
+    nl_mentions "$nl_tree" "Off Again" &&
         fail G-NOTIFY-RESTORE "a disabled app's notification reached the list"
     gsettings set "$(nl_app tuna-lock-off)" enable true
-    nl_until restored 'any(.[]; .showing and .name == "Off Summary")' G-NOTIFY-RESTORE ||
+    nl_until restored 'any(.[]; .showing and .name == "Off Again")' G-NOTIFY-RESTORE ||
         fail G-NOTIFY-RESTORE "enabling the app did not bring its notification back to the list"
     nl_shot restored
     "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-notify-restore-cleared.json" 20 \
@@ -280,7 +287,9 @@ notify_lock_proof() {
     xdotool key Escape
     sleep 2
     nl_dump restored-closed G-NOTIFY-RESTORE
-    showing "$nl_tree" "Off Summary" && fail G-NOTIFY-RESTORE "a restored notification showed a banner"
+    showing "$nl_tree" "Off Again" && fail G-NOTIFY-RESTORE "a restored notification showed a banner"
+    nl_close "$nl_listed"
+    nl_close "$nl_off_again"
     pass G-NOTIFY-RESTORE "a disabled app's notification stays out of the list; enabling the app brings it back at once, with no banner"
 
     # As found for the gates after.
