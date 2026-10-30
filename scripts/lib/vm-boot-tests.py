@@ -3699,6 +3699,24 @@ class GdmGreeterReadiness(unittest.TestCase):
         self.assertEqual(lane.session_records(text), ["tuna-shell-gtk: lock password submitted",
                                                       "tuna-shell-gtk: lock command result applied=false"])
 
+    def test_warning_coloured_gdm_stream_reads_as_plain_records(self):
+        # Run 40969124480: journald colours GDM's warning-priority stderr
+        # stream on the console; the colour must not glue records together.
+        colour = "\x1b[0;1;33m\x1b[0;1;38:5:185m"
+        serial = ("[ 465.7] /usr/lib/gdm-wayland-session[2059]: " + colour
+                  + "tuna-shell-gtk: lock command result applied=false request_id=93\x1b[0m\n"
+                  "[ 469.5] /usr/lib/gdm-wayland-session[1947]: " + colour
+                  + 'tuna-compositor: lock authentication owned retirement {"pid":1947}\x1b[0m\n'
+                  "[ 469.6] /usr/lib/gdm-wayland-session[2059]: " + colour + "false\x1b[0m\n")
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root, "serial.log")
+            path.write_bytes(serial.encode())
+            text = lane.read_text(str(path))
+        self.assertNotIn("\x1b", text)
+        self.assertEqual(lane.session_records(text), [
+            "tuna-shell-gtk: lock command result applied=false request_id=93false",
+            'tuna-compositor: lock authentication owned retirement {"pid":1947}'])
+
 
 class DelayedAuthFailureDiagnostics(unittest.TestCase):
     """Pure fixtures and fake QGA responses; never invoke guest or host PAM."""
