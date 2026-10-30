@@ -110,6 +110,11 @@ def area_point(area, event):
 
 
 def on_raw(controller, event):
+    # PyGObject may hand the signal's GdkEvent over as None (a fundamental
+    # type it cannot always marshal); the controller still has it.
+    event = event if event is not None else controller.get_current_event()
+    if event is None:
+        return False
     area = controller.get_widget()
     kind = event.get_event_type()
     sequence = event.get_event_sequence()
