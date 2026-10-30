@@ -113,7 +113,10 @@ spec:
               - 192.168.0.0/16
 ---
 # Hard ceiling for all runner pods together, whatever the scale sets ask
-# for: 8 runners x 4 CPU / 14 GiB, leaving punjab and KubeVirt their room.
+# for. karnataka has 28 CPU / 125 GiB allocatable; punjab is sized at
+# 12 cores / 24 GiB. Requests stop at 12 runners x 2 CPU / 6 GiB (24 CPU),
+# so the 14 pods the scale sets may ask for (10 + 4) never all schedule and
+# punjab and KubeVirt keep their room; they also preempt runners (below).
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -121,13 +124,13 @@ metadata:
   namespace: tuna-ci
 spec:
   hard:
-    pods: "8"
-    requests.cpu: "16"
-    limits.cpu: "32"
-    requests.memory: 48Gi
-    limits.memory: 112Gi
-    requests.ephemeral-storage: 160Gi
-    limits.ephemeral-storage: 360Gi
+    pods: "14"
+    requests.cpu: "24"
+    limits.cpu: "48"
+    requests.memory: 72Gi
+    limits.memory: 168Gi
+    requests.ephemeral-storage: 240Gi
+    limits.ephemeral-storage: 540Gi
 ---
 # Runner pods yield to everything else: new KubeVirt VMs (punjab) and
 # cluster services preempt them; they never preempt anything.
