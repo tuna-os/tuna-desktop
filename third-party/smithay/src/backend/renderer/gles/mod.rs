@@ -301,6 +301,8 @@ pub struct GlesRenderer {
     // caches
     buffers: Vec<GlesBuffer>,
     dmabuf_cache: HashMap<WeakDmabuf, GlesTexture>,
+    /// The YCbCr conversion each cached dmabuf was imported with, when set.
+    dmabuf_conversions: HashMap<WeakDmabuf, crate::backend::egl::YuvConversion>,
     vbos: [ffi::types::GLuint; 2],
     vertices: Vec<f32>,
     non_opaque_damage: Vec<Rectangle<i32, Physical>>,
@@ -635,6 +637,7 @@ impl GlesRenderer {
 
             buffers: Vec::new(),
             dmabuf_cache: std::collections::HashMap::new(),
+            dmabuf_conversions: std::collections::HashMap::new(),
             vertices: Vec::with_capacity(6 * 16),
             non_opaque_damage: Vec::with_capacity(16),
             opaque_damage: Vec::with_capacity(16),
@@ -709,6 +712,7 @@ impl GlesRenderer {
     #[profiling::function]
     fn cleanup(&mut self) {
         self.dmabuf_cache.retain(|entry, _tex| !entry.is_gone());
+        self.dmabuf_conversions.retain(|entry, _| !entry.is_gone());
         // Free outdated buffer resources
         // TODO: Replace with `drain_filter` once it lands
         let mut i = 0;
@@ -1198,6 +1202,45 @@ impl ImportDma for GlesRenderer {
         buffer: &Dmabuf,
         _damage: Option<&[Rectangle<i32, BufferCoord>]>,
     ) -> Result<GlesTexture, GlesError> {
+        self.import_dmabuf_converted(buffer, None)
+    }
+
+    fn dmabuf_formats(&self) -> FormatSet {
+        self.egl.dmabuf_texture_formats().clone()
+    }
+
+    fn has_dmabuf_format(&self, format: Format) -> bool {
+        self.egl.dmabuf_texture_formats().contains(&format)
+    }
+}
+
+impl GlesRenderer {
+    /// Import a dmabuf as [`ImportDma::import_dmabuf`] does, sampling
+    /// external (YCbCr) formats with `conversion`. A buffer imported
+    /// before with another conversion is imported anew.
+    #[instrument(level = "trace", parent = &self.span, skip(self))]
+    #[profiling::function]
+    pub fn import_dmabuf_with_conversion(
+        &mut self,
+        buffer: &Dmabuf,
+        conversion: Option<crate::backend::egl::YuvConversion>,
+    ) -> Result<GlesTexture, GlesError> {
+        let weak = buffer.weak();
+        if self.dmabuf_conversions.get(&weak).copied() != conversion {
+            self.dmabuf_cache.remove(&weak);
+            match conversion {
+                Some(conversion) => self.dmabuf_conversions.insert(weak, conversion),
+                None => self.dmabuf_conversions.remove(&weak),
+            };
+        }
+        self.import_dmabuf_converted(buffer, conversion)
+    }
+
+    fn import_dmabuf_converted(
+        &mut self,
+        buffer: &Dmabuf,
+        conversion: Option<crate::backend::egl::YuvConversion>,
+    ) -> Result<GlesTexture, GlesError> {
         use crate::backend::allocator::Buffer;
         if !self.extensions.iter().any(|ext| ext == "GL_OES_EGL_image") {
             return Err(GlesError::GLExtensionNotSupported(&["GL_OES_EGL_image"]));
@@ -1208,7 +1251,7 @@ impl ImportDma for GlesRenderer {
             let image = self
                 .egl
                 .display()
-                .create_image_from_dmabuf(buffer)
+                .create_image_from_dmabuf_with_conversion(buffer, conversion.filter(|_| is_external))
                 .map_err(GlesError::BindBufferEGLError)?;
 
             let tex = self.import_egl_image(image, is_external, None)?;
@@ -1232,18 +1275,24 @@ impl ImportDma for GlesRenderer {
             Ok(texture)
         })
     }
-
-    fn dmabuf_formats(&self) -> FormatSet {
-        self.egl.dmabuf_texture_formats().clone()
-    }
-
-    fn has_dmabuf_format(&self, format: Format) -> bool {
-        self.egl.dmabuf_texture_formats().contains(&format)
-    }
 }
 
 #[cfg(feature = "wayland_frontend")]
-impl ImportDmaWl for GlesRenderer {}
+impl ImportDmaWl for GlesRenderer {
+    fn import_dma_buffer(
+        &mut self,
+        buffer: &wayland_server::protocol::wl_buffer::WlBuffer,
+        surface: Option<&crate::wayland::compositor::SurfaceData>,
+        _damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Result<GlesTexture, GlesError> {
+        let dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
+            .expect("import_dma_buffer without checking buffer type?");
+        let conversion = surface
+            .and_then(|states| states.data_map.get::<crate::backend::egl::YuvConversionHint>())
+            .and_then(|hint| *hint.0.lock().unwrap());
+        self.import_dmabuf_with_conversion(dmabuf, conversion)
+    }
+}
 
 impl GlesRenderer {
     #[profiling::function]
