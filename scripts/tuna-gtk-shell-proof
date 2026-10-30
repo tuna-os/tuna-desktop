@@ -8847,6 +8847,14 @@ ws_check() {
     shift
     "$PY" "$ROOT/scripts/lib/ws-anim-proof.py" "$ws_command" "$LOG" "$ws_from" "$@"
 }
+# Before freezing the clock, the dots must have finished any scale-in or
+# scale-out on the real clock (panel.js:101-127, 500 ms): a removal that
+# is still running when time jumps to the frozen base never completes,
+# and its dot stays drawn beside the live ones.
+ws_settle() {
+    ws_from=1
+    ws_check settled || fail "$1" "the Activities dots were still scaling in or out before the clock froze"
+}
 # The pill body's pixel ("r g b") in a fresh capture named $1. Windows
 # slide behind the pill on the same clock, so only the opaque pill is
 # compared with a threshold; the other captures are evidence.
@@ -8857,6 +8865,7 @@ ws_pixel() {
 }
 ws_home="$(jq -r '.active_workspace' "$CSTATE")"
 [ "$ws_home" = 0 ] || fail G-WS-POPUP-CLOCK "expected to start on the first workspace, not $ws_home"
+ws_settle G-WS-DOTS-CLOCK
 anim_clock 0
 cstate '.animation_clock_manual and .motion_policy == "full"' "popup clock frozen" ||
     fail G-WS-POPUP-CLOCK "the animation clock did not freeze"
@@ -9200,6 +9209,7 @@ pass G-SWIPE-VELOCITY "a fast flick lands in ${flick_ms}ms, a slow drag in ${dra
 # (animationUtils.js:23-33).
 slide_settled "$gesture_home" "dots swipe start" || fail G-WS-DOTS-SWIPE "the previous swipe did not settle"
 [ "$gesture_home" = 0 ] || fail G-WS-DOTS-SWIPE "expected to start on the first workspace, not $gesture_home"
+ws_settle G-WS-DOTS-SWIPE
 ws_clock=0
 anim_clock "$ws_clock"
 cstate '.animation_clock_manual and .motion_policy == "full"' "swipe dots clock frozen" ||

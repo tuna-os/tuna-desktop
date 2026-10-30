@@ -65,6 +65,19 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(self.run_cmd(lines, "eased", "80"), f"{0.2 + 0.8 * 0.875:.4f}")
         self.assertEqual(self.run_cmd(lines, "release"), "1.0000 160.000 0.2")
 
+    def test_settled_needs_exactly_the_set_count_at_rest(self):
+        set_two = f"{P}ws-dots set count=2 active=0 from=0.0000 motion=true clock=real"
+        # A third dot still scaling out beside the two live ones.
+        leaving = frame(0.0, n=3).replace("slots=26.000", "slots=29.000")
+        with self.assertRaises(SystemExit):
+            self.run_cmd([set_two, leaving], "settled")
+        # The removal ended: two dots, GNOME's at the active index.
+        self.run_cmd([set_two, leaving, frame(0.0)], "settled")
+        # A dot still scaling in (smaller than GNOME's) is not settled.
+        growing = frame(0.0).replace("widths=29.000,6.000", "widths=29.000,5.985")
+        with self.assertRaises(SystemExit):
+            self.run_cmd([set_two, growing], "settled")
+
     def test_popup_reads_the_latest_frame(self):
         lines = [f"{P}ws-popup frame opacity=0.0000", f"{P}ws-popup frame opacity=0.7500"]
         self.run_cmd(lines, "popup", "0.75")

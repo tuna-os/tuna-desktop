@@ -23,6 +23,10 @@ and compares.
   ws-anim-proof.py eased LOG START ELAPSED the dots' latest frame is
                                            ELAPSED ms into that release
                                            (ease-out cubic)
+  ws-anim-proof.py settled LOG START       the dots' latest frame shows
+                                           exactly the last set's count,
+                                           GNOME's at its active index
+                                           (nothing scaling in or out)
 
 START is a 1-based log line; only lines from it on count. Commands wait
 up to --timeout seconds for the shell to log what they check.
@@ -45,6 +49,7 @@ DOTS_FRAME = re.compile(
     r"opacities=(?P<opacities>[-\d.,]+)$")
 POPUP_FRAME = re.compile(r"ws-popup frame opacity=(?P<opacity>[-\d.]+)$")
 FOLLOW = re.compile(r"ws-dots follow position=(?P<position>[-\d.]+) duration=(?P<duration>[-\d.]+) ")
+SET = re.compile(r"ws-dots set count=(?P<count>\d+) active=(?P<active>\d+) ")
 
 
 def lerp(a, b, t):
@@ -114,8 +119,12 @@ def dots_frame(match):
     }
 
 
-def dots_mismatch(frame, position):
-    """Why `frame` is not GNOME's dots at `position`, or None."""
+def dots_mismatch(frame, position, count=None):
+    """Why `frame` is not GNOME's dots at `position`, or None. With
+    `count`, the frame must hold exactly that many dots: none still
+    scaling in or out (`scaleIn`/`scaleOutAndDestroy`, panel.js:101-127)."""
+    if count is not None and len(frame["dots"]) != count:
+        return f"{len(frame['dots'])} dots drawn, not the {count} workspaces"
     if abs(frame["position"] - position) > TOLERANCE["position"]:
         return f"position {frame['position']} != {position:.4f}"
     want = gnome_dots(len(frame["dots"]), position)
@@ -141,7 +150,8 @@ def releases(entries):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["line", "absent", "popup", "dots", "release", "eased"])
+    ap.add_argument("command",
+                    choices=["line", "absent", "popup", "dots", "release", "eased", "settled"])
     ap.add_argument("log")
     ap.add_argument("start", type=int)
     ap.add_argument("args", nargs="*")
@@ -194,6 +204,27 @@ def main(argv=None):
             why = dots_mismatch(dots_frame(match), position) if match else "no frame"
             raise SystemExit(f"dots are not GNOME 51's at {position:.4f}: {why}")
         print(f"{position:.4f}")
+        return 0
+    if a.command == "settled":
+        def settled():
+            entries_now = entries()
+            last_set = last_match(entries_now, SET)
+            match = last_match(entries_now, DOTS_FRAME)
+            if last_set is None or match is None:
+                return None
+            count, active = int(last_set["count"]), float(last_set["active"])
+            if dots_mismatch(dots_frame(match), active, count) is None:
+                return True
+            return None
+        if wait(a.timeout, settled) is None:
+            entries_now = entries()
+            last_set = last_match(entries_now, SET)
+            match = last_match(entries_now, DOTS_FRAME)
+            if last_set is None or match is None:
+                raise SystemExit("no dots set or frame traced")
+            why = dots_mismatch(dots_frame(match), float(last_set["active"]),
+                                int(last_set["count"]))
+            raise SystemExit(f"the dots never settled: {why}")
         return 0
     if a.command == "release":
         release = wait(a.timeout, lambda: releases(entries()))
