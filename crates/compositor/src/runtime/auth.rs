@@ -446,6 +446,21 @@ impl Runtime {
         }
     }
 
+    /// The lock ended without a verification (logind `Unlock`): every
+    /// conversation is cancelled like the single-password attempt it
+    /// strands; their helpers still retire before the Slot is free, and a
+    /// pending winner of the ended lock fails the epoch check and grants
+    /// nothing.
+    #[cfg(feature = "drm")]
+    pub(super) fn cancel_all_conversations(&mut self) {
+        if let Some(conversation) = self.auth.password.as_mut() {
+            conversation.cancel();
+        }
+        if let Some(conversation) = self.auth.fingerprint.as_mut() {
+            conversation.cancel();
+        }
+    }
+
     /// Whether `attempt` may still show prompts and apply a result: the
     /// session is locked in the same epoch and its origin is live.
     fn conversation_live(&self, attempt: Attempt, origin: Origin) -> bool {

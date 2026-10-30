@@ -1854,7 +1854,8 @@ impl Runtime {
     /// logind's `Unlock` signal (`loginctl unlock-session`): `screenShield.js`
     /// connects it to `deactivate()`, which ends the lock without a password.
     /// logind only emits it for the session's owner or a polkit-authorized
-    /// caller. A password check in flight is denied, never applied.
+    /// caller. A password check or conversation in flight is denied, never
+    /// applied.
     #[cfg(feature = "drm")]
     fn unlock_for_logind(&mut self) {
         if !self.is_locked() {
@@ -1863,6 +1864,7 @@ impl Runtime {
         self.unlock_slot.release_by_session(&self.unlock_generation);
         self.release_lock();
         self.cancel_invalid_unlock();
+        self.cancel_all_conversations();
     }
 
     /// Actual helper retirement is required in addition to the joined wrapper.
