@@ -34,7 +34,7 @@ use smithay::{
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::wayland_server::Display,
     utils::{Logical, Point, Rectangle, Transform},
-    wayland::{seat::WaylandFocus, socket::ListeningSocketSource},
+    wayland::seat::WaylandFocus,
 };
 
 use crate::control::{ControlHub, PeerGate};
@@ -1174,11 +1174,12 @@ impl Runtime {
                 )
                 .map_err(|e| RuntimeError::Loop(e.to_string()))?;
         }
-        let socket = ListeningSocketSource::with_name(&session.socket_name)
-            .map_err(|e| RuntimeError::Socket(e.to_string()))?;
-        event_loop
-            .handle()
-            .insert_source(socket, |stream, _, runtime: &mut Runtime| {
+        // A failed accept (descriptors exhausted by a client flood) rests
+        // the socket instead of ending the session (#203).
+        crate::client_listener::listen(
+            &event_loop.handle(),
+            &session.socket_name,
+            |stream, runtime: &mut Runtime| {
                 let client_data = ClientState::native_connection(&stream);
                 if let Ok(client) = runtime
                     .display
