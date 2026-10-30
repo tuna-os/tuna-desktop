@@ -36,6 +36,8 @@ struct Screen {
     date: gtk::Label,
     entry: gtk::PasswordEntry,
     message: gtk::Label,
+    /// GNOME's on-screen keyboard for this prompt (#349), when enabled.
+    _keyboard: Option<Rc<crate::osk::LockKeyboard>>,
 }
 
 pub struct LockUi {
@@ -51,6 +53,9 @@ pub struct LockUi {
     clock_format: Box<dyn Fn() -> logic::ClockFormat>,
     /// Wakes the clock on the minute while the lock screens are up.
     wall_clock: RefCell<Option<crate::wall_clock::WallClock>>,
+    /// GNOME's on-screen keyboard, whose lock-screen keys edit only the
+    /// unlock prompt (#349).
+    osk: RefCell<Option<Rc<crate::osk::Osk>>>,
 }
 
 impl LockUi {
@@ -69,6 +74,7 @@ impl LockUi {
             connection_generation: Cell::new(None),
             clock_format,
             wall_clock: RefCell::new(None),
+            osk: RefCell::new(None),
         });
         {
             let weak = Rc::downgrade(&ui);
@@ -91,6 +97,11 @@ impl LockUi {
             });
         }
         ui
+    }
+
+    /// Give each lock window GNOME's on-screen keyboard for its prompt.
+    pub fn set_osk(&self, osk: Rc<crate::osk::Osk>) {
+        *self.osk.borrow_mut() = Some(osk);
     }
 
     /// Follow the compositor's lock flag: lock when it says locked,
@@ -312,6 +323,35 @@ impl LockUi {
         overlay.set_child(Some(&curtain));
         bar.set_valign(gtk::Align::Start);
         overlay.add_overlay(&bar);
+        // GNOME's keyboard box sits over the lock screen too: it opens
+        // when the prompt takes the focus and types into that prompt
+        // alone (`_onKeyFocusChanged`).
+        let keyboard = self
+            .osk
+            .borrow()
+            .as_ref()
+            .map(|osk| osk.lock_keyboard(&entry));
+        if let Some(keyboard) = &keyboard {
+            overlay.add_overlay(keyboard.widget());
+            let focus = gtk::EventControllerFocus::new();
+            {
+                let keyboard = Rc::downgrade(keyboard);
+                focus.connect_enter(move |_| {
+                    if let Some(keyboard) = keyboard.upgrade() {
+                        keyboard.prompt_focus(true);
+                    }
+                });
+            }
+            {
+                let keyboard = Rc::downgrade(keyboard);
+                focus.connect_leave(move |_| {
+                    if let Some(keyboard) = keyboard.upgrade() {
+                        keyboard.prompt_focus(false);
+                    }
+                });
+            }
+            entry.add_controller(focus);
+        }
         window.set_child(Some(&overlay));
 
         // Vertical placement: GNOME puts the stack a third of the way
@@ -418,7 +458,22 @@ impl LockUi {
             let distance = Rc::new(Cell::new(1.0));
             {
                 let pan = pan.clone();
-                drag.connect_drag_begin(move |gesture, _, _| {
+                let keys = keyboard.as_ref().map(|k| k.keys().downgrade());
+                drag.connect_drag_begin(move |gesture, x, y| {
+                    // The keyboard's keys are not the curtain.
+                    let on_keys = keys.as_ref().and_then(|k| k.upgrade()).is_some_and(|keys| {
+                        gesture
+                            .widget()
+                            .and_then(|w| w.pick(x, y, gtk::PickFlags::DEFAULT))
+                            .is_some_and(|picked| {
+                                picked == *keys.upcast_ref::<gtk::Widget>()
+                                    || picked.is_ancestor(&keys)
+                            })
+                    });
+                    if on_keys {
+                        gesture.set_state(gtk::EventSequenceState::Denied);
+                        return;
+                    }
                     *pan.borrow_mut() = Some(lock_curtain::Pan::new(gesture.current_event_time()));
                 });
             }
@@ -508,9 +563,14 @@ impl LockUi {
             // GNOME destroys the prompt once the clock is back
             // (`_maybeDestroyAuthPrompt`): nothing typed outlives it.
             let (entry, message) = (entry.downgrade(), message.downgrade());
+            let lock_keyboard = keyboard.as_ref().map(Rc::downgrade);
             curtain.connect_settled(move |page| {
                 if page != Page::Clock {
                     return;
+                }
+                // The prompt is gone: so is its keyboard.
+                if let Some(keyboard) = lock_keyboard.as_ref().and_then(|k| k.upgrade()) {
+                    keyboard.prompt_focus(false);
                 }
                 if let Some(entry) = entry.upgrade() {
                     entry.set_text("");
@@ -559,6 +619,7 @@ impl LockUi {
             date,
             entry,
             message,
+            _keyboard: keyboard,
         });
         window
     }

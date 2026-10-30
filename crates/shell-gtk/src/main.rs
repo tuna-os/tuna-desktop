@@ -49,6 +49,9 @@ mod network_secrets;
 mod notify;
 mod orca;
 mod osd;
+mod osk;
+mod osk_layout;
+mod osk_model;
 mod overview;
 mod panel_focus;
 mod pointer_a11y;
@@ -143,6 +146,9 @@ struct Drained {
     dwell_click: Option<tuna_shell_control::DwellClick>,
     /// Pointer accessibility timeouts for the pie timer, in order.
     pointer_timeouts: Vec<PointerTimeout>,
+    /// The compositor's on-screen keyboard updates, in order: focus, the
+    /// input-panel request, touch-mode auto-show.
+    osk: Vec<(Option<tuna_shell_control::TextFieldFocus>, bool, bool)>,
 }
 
 /// One pointer accessibility timeout report: kind, duration when it
@@ -219,6 +225,11 @@ fn drain(
             }
             Handled::KeyboardAidToggled { aid, enabled } => out.aid_switches.push((aid, enabled)),
             Handled::DwellClickType(click) => out.dwell_click = Some(click),
+            Handled::OnScreenKeyboard {
+                focus,
+                show,
+                touch_auto,
+            } => out.osk.push((focus, show, touch_auto)),
             Handled::PointerTimeout {
                 kind,
                 duration_ms,
@@ -1644,6 +1655,8 @@ fn build(app: &adw::Application) {
         gio::resources_register_include!("icons.gresource").ok();
         gtk::IconTheme::for_display(&display).add_resource_path("/org/tuna/Shell/icons");
     }
+    // GNOME Shell's on-screen keyboard layouts and emoji list.
+    gio::resources_register_include!("osk-layouts.gresource").ok();
     // GNOME's icon theme key, applied the way gnome-settings-daemon's
     // xsettings plugin applies it to GTK.
     if let (Some(gtk_settings), Some(iface)) =
@@ -2463,6 +2476,22 @@ fn build(app: &adw::Application) {
             }),
         )
     };
+    // GNOME's on-screen keyboard (#349): typed through the compositor,
+    // following its input-method focus and the current input source.
+    let osk = {
+        let shell = shell.clone();
+        osk::Osk::new(
+            input_sources.clone(),
+            Rc::new(move |input| {
+                if let Some(control) = shell.borrow_mut().control.as_mut() {
+                    if let Err(e) = control.osk_input(input) {
+                        eprintln!("tuna-shell-gtk: on-screen keyboard input: {e}");
+                    }
+                }
+            }),
+        )
+    };
+    lock_ui.set_osk(osk.clone());
 
     // GNOME Shell's own keybindings (org.gnome.shell.keybindings).
     {
@@ -3410,6 +3439,7 @@ fn build(app: &adw::Application) {
                     aid_switches,
                     dwell_click,
                     pointer_timeouts,
+                    osk: osk_updates,
                 } = drained;
                 let mut shell = shell.borrow_mut();
                 let locked = shell.control.as_ref().is_some_and(|c| c.locked());
@@ -3465,6 +3495,11 @@ fn build(app: &adw::Application) {
                     lock_ui.sync(locked);
                 }
                 screensaver.sync(locked);
+                // The session keyboard never shows over the lock screen.
+                osk.set_locked(locked);
+                for (focus, show, touch_auto) in osk_updates {
+                    osk.update(focus, show, touch_auto);
+                }
                 if locked {
                     shortcut_consent.dismiss();
                 } else if let Some(request) = consent {

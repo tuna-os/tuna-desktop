@@ -101,6 +101,13 @@ pub enum Handled {
     },
     /// The click the next hover click makes.
     DwellClickType(tuna_shell_control::DwellClick),
+    /// What GNOME's on-screen keyboard follows: input-method focus, the
+    /// input-panel ON request and touch-mode auto-show (0.43).
+    OnScreenKeyboard {
+        focus: Option<tuna_shell_control::TextFieldFocus>,
+        show: bool,
+        touch_auto: bool,
+    },
     /// A pointer accessibility timeout started or stopped (pie timer).
     PointerTimeout {
         kind: tuna_shell_control::PointerTimeoutKind,
@@ -527,6 +534,16 @@ impl ControlClient {
         self.write_message(&Message::Command {
             id,
             kind: CommandKind::SetScreenReader { enabled },
+        })?;
+        Ok(id)
+    }
+
+    /// Type one on-screen keyboard action into the focused client.
+    pub fn osk_input(&mut self, input: tuna_shell_control::OskInput) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::OskInput { input },
         })?;
         Ok(id)
     }
@@ -1024,6 +1041,15 @@ impl ControlClient {
                 Ok(Handled::KeyboardAidToggled { aid, enabled })
             }
             Message::DwellClickType { click } => Ok(Handled::DwellClickType(click)),
+            Message::OnScreenKeyboard {
+                focus,
+                show,
+                touch_auto,
+            } => Ok(Handled::OnScreenKeyboard {
+                focus,
+                show,
+                touch_auto,
+            }),
             Message::PointerTimeout {
                 kind,
                 duration_ms,
@@ -1299,6 +1325,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::ConfirmDisplayChange { .. } => "ConfirmDisplayChange",
         Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
         Message::DwellClickType { .. } => "DwellClickType",
+        Message::OnScreenKeyboard { .. } => "OnScreenKeyboard",
         Message::PointerTimeout { .. } => "PointerTimeout",
     }
 }

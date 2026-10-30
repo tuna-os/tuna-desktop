@@ -29,7 +29,9 @@ Never touched (the keep list):
   dated initial coverage baseline. (tests/a11y/gnome51/ is renamed: its
   comparison.md is generated from those trees by tuna-a11y-baseline,
   which CI checks, and nothing records their hashes);
-- third-party/ (vendored patches) and .spektacular/;
+- third-party/ (vendored patches), crates/shell-gtk/osk-layouts/ (GNOME's
+  osk-layouts copied byte-for-byte; emoji.json names the rooster emoji)
+  and .spektacular/;
 - links to historical GitHub Actions runs, and identifiers that live in
   third-party code (`roost_transport_bounds`, `ROOST-PATCH.md`);
 - any file carrying the marker `tuna-rename: keep-file` in its first
@@ -57,6 +59,7 @@ KEEP_PREFIXES = (
     ".git/",
     ".spektacular/",
     "third-party/",
+    "crates/shell-gtk/osk-layouts/",
     "docs/niri-parity/",
     "docs/marlin/",
     "scripts/rename-to-tuna",

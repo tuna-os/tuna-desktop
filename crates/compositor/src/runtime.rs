@@ -64,6 +64,7 @@ use crate::{ClientState, State};
 
 mod aids;
 mod display;
+mod osk;
 
 /// Display-rate loop pacing: while anything moves, dispatch blocks at
 /// most this long, so animations step near 60 Hz and the loop never
@@ -689,6 +690,8 @@ pub struct Runtime {
     wellbeing_effects: crate::wellbeing_effects::Effects,
     /// GNOME's keyboard accessibility aids, ahead of everything else (#350).
     input_aids: aids::RuntimeAids,
+    /// Keys GNOME's on-screen keyboard holds down (#349).
+    osk: osk::RuntimeOsk,
     /// An Escape press cancelled a client drag; its repeats and release
     /// belong to that cancel, not to the overview or a client.
     dnd_escape_held: bool,
@@ -1361,6 +1364,7 @@ impl Runtime {
             input_settings: Default::default(),
             wellbeing_effects: Default::default(),
             input_aids: aids::RuntimeAids::default(),
+            osk: osk::RuntimeOsk::default(),
             dnd_escape_held: false,
             orca: crate::orca::Reader::new(&session.socket_name, a11y_keyboard.clone()),
             a11y_keyboard,
@@ -1602,6 +1606,8 @@ impl Runtime {
         #[cfg(feature = "drm")]
         self.performance_trace.cancel();
         self.reset_input_aid_ownership();
+        // Nothing the session's keyboard held stays down under the lock.
+        self.release_osk_keys();
         if let Some(monitor) = &self.a11y_keyboard {
             monitor.set_locked(true);
         }
@@ -2602,6 +2608,25 @@ impl Runtime {
             [pos.x, pos.y]
         }));
         doc["input_aids"] = self.input_aids_summary();
+        // What the on-screen keyboard follows (#349): the focused field's
+        // content type only, never text; nothing while locked.
+        doc["text_input"] = if self.is_locked() {
+            serde_json::Value::Null
+        } else {
+            let focus = self
+                .state
+                .seat
+                .get_keyboard()
+                .and_then(|k| k.current_focus());
+            self.state
+                .protocols
+                .text_inputs
+                .focus(focus.as_ref())
+                .map_or(
+                    serde_json::Value::Null,
+                    |field| serde_json::json!({ "purpose": field.purpose, "hints": field.hints }),
+                )
+        };
         // Owned proof diagnostics only: no credentials, prompts or typed input.
         doc["auth_owner"] = if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
             serde_json::json!({ "outer_pending": self.unlock_worker.is_some(),
@@ -4474,6 +4499,7 @@ impl Runtime {
                 .zip(self.shell.child_generation())
                 .map(|(pid, generation)| crate::control::AuthOwner { pid, generation }),
         );
+        self.publish_on_screen_keyboard();
         let outcome = self.control.poll(self.manager.model_mut());
         for workspace in outcome.departed_workspaces.iter().copied() {
             self.manager.keep_departed_workspace_alive(workspace);
@@ -4563,6 +4589,9 @@ impl Runtime {
         }
         for backward in outcome.input_source_switches {
             self.switch_input_source_with_aid_reset(backward);
+        }
+        for input in outcome.osk_inputs {
+            self.osk_input(input);
         }
         // Header-bar right clicks: GNOME's window menu, drawn by the shell.
         for (window, x, y) in self.manager.take_menu_requests() {

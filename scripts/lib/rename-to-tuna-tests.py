@@ -94,7 +94,7 @@ class Rules(unittest.TestCase):
         self.assertEqual(R.rename_path("scripts/lib/roost-test-window.py"), "scripts/lib/tuna-test-window.py")
         self.assertEqual(R.rename_path("share/wayland-sessions/roost.desktop"), "share/wayland-sessions/tuna.desktop")
         for kept in ("docs/perf/2026-10-04-x/roost-report.json", "third-party/smithay/ROOST-PATCH.md",
-                     ".spektacular/x/roost.md",
+                     ".spektacular/x/roost.md", "crates/shell-gtk/osk-layouts/emoji.json",
                      "tests/protocols/marlin-roost-wayland-info.txt", "scripts/rename-to-tuna"):
             self.assertTrue(R.kept_path(kept), kept)
         self.assertFalse(R.kept_path("docs/perfect.md"))

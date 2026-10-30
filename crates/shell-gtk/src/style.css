@@ -1676,3 +1676,88 @@ window.tuna-ibus-candidates button.candidate-page-button-next {
 window.tuna-launch-zoom {
   background: none;
 }
+
+/* GNOME 51's on-screen keyboard (gnome-shell 51.0
+   data/theme/gnome-shell-sass/widgets/_keyboard.scss, dark variant, #349):
+   #keyboard on $osd_bg_color (#2e2e33) with a 1px inset top edge;
+   .key-container 4px padding; .keyboard-key 16pt bold (11pt + 5pt), 8px
+   corners and a 1px shadow on darken($osd_fg_color, 70%) (#4d4d4d);
+   .default-key (actions and keysyms) on #333333, :latched in the accent;
+   24px key icons; the long-press popup on the OSD colour with 18px
+   corners. */
+window.tuna-osk {
+  background: none;
+}
+.tuna-osk #keyboard,
+#keyboard.osk-keyboard {
+  font-family: "Adwaita Sans", "Cantarell", sans-serif;
+  color: #ffffff;
+  background-color: #2e2e33;
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.02);
+}
+#keyboard .key-container {
+  padding: 4px;
+}
+#keyboard .keyboard-key,
+popover.keyboard-subkeys .keyboard-key {
+  font-size: 16pt;
+  font-weight: bold;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  color: #ffffff;
+  background-color: #4d4d4d;
+  background-image: none;
+  box-shadow: 0 1px 0 0 rgba(0, 0, 0, 0.2);
+}
+#keyboard .keyboard-key:hover,
+popover.keyboard-subkeys .keyboard-key:hover {
+  background-color: #585858;
+}
+#keyboard .keyboard-key:active,
+popover.keyboard-subkeys .keyboard-key:active {
+  background-color: #636363;
+}
+#keyboard .keyboard-key.default-key {
+  background-color: #333333;
+}
+#keyboard .keyboard-key.default-key:hover {
+  background-color: #3e3e3e;
+}
+#keyboard .keyboard-key.default-key:active {
+  background-color: #494949;
+}
+#keyboard .keyboard-key.default-key.latched,
+#keyboard .emoji-panel .keyboard-key.latched {
+  color: @accent_fg_color;
+  background-color: @accent_bg_color;
+}
+#keyboard .emoji-page .keyboard-key {
+  background-color: transparent;
+  box-shadow: none;
+}
+#keyboard .page-indicator {
+  padding: 6px;
+}
+#keyboard .page-indicator-icon {
+  min-width: 8px;
+  min-height: 8px;
+  -gtk-icon-size: 8px;
+}
+popover.keyboard-subkeys > contents,
+popover.osk-language-popup > contents {
+  color: #ffffff;
+  background-color: #2e2e33;
+  border: 1px solid #44444a;
+  border-radius: 18px;
+  box-shadow: 0 0 12px 0 rgba(0, 0, 0, 0.1);
+}
+popover.keyboard-subkeys .key-container {
+  padding: 12px;
+  border-spacing: 8px;
+}
+popover.keyboard-subkeys .keyboard-key {
+  margin: 0 4px;
+}

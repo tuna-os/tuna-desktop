@@ -54,3 +54,5 @@ pub const KBD_A11Y_NAMESPACE: &str = "tuna-kbd-a11y";
 pub const POINTER_A11Y_NAMESPACE: &str = "tuna-pointer-a11y";
 /// GTK display-change confirmation surface ("Keep these display settings?").
 pub const DISPLAY_CHANGE_NAMESPACE: &str = "tuna-display-change";
+/// GTK on-screen keyboard surface (#349); never takes keyboard focus.
+pub const OSK_NAMESPACE: &str = "tuna-osk";
