@@ -12,13 +12,29 @@ present, Mutter's seat touch-mode follows the switch rather than the
 pointer devices, which a CI host may have.
 
 Runs as root (uinput) and reads one command per line on stdin, replying
-"ok" or "error ..." per line, so the shell driver stays in lockstep:
+"ok" or "error ..." per line, so the shell driver stays in lockstep.
+Touches, in normalized panel coordinates; every touch command is one
+evdev frame (closed by SYN_REPORT) that writes only its own slot's
+ABS_MT_* values plus the single-touch emulation the kernel's type-B
+helpers add (ABS_X/Y follow the touch just written, BTN_TOUCH is on
+while any slot is down):
 
-  down NX NY        one finger (slot 0) down at the normalized panel point
-  move NX NY        the finger moves
-  up                the finger lifts
-  tabletmode 1|0    the tablet-mode switch on / off
-  unplug / plug     remove / recreate the touchscreen (the switch stays)
+  down NX NY              finger 0 down at the point (slot 0)
+  move NX NY              finger 0 moves
+  up                      finger 0 lifts
+  down SLOT NX NY         finger SLOT (0-9) down at the point
+  move SLOT NX NY         finger SLOT moves
+  up SLOT                 finger SLOT lifts
+  frame ACTION...         several of the slot forms above in ONE frame,
+                          e.g. "frame move 0 0.3 0.5 move 1 0.7 0.5"
+                          (fingers move together) or
+                          "frame up 0 up 1 up 2"
+  CMD ; CMD ; ...         several commands (touch forms or frames) in
+                          order on one line, 20 ms apart, answered by a
+                          single ok: a gesture under a time limit, e.g.
+                          "down 0 0.5 0.995 ; move 0 0.5 0.9 ; move 0 0.5 0.8"
+  tabletmode 1|0          the tablet-mode switch on / off
+  unplug / plug           remove / recreate the touchscreen (the switch stays)
   quit
 """
 
@@ -78,17 +94,16 @@ class Touchscreen:
     def __init__(self):
         self.switch = switch_device()
         self.tracking_id = 0
-        self.down = False
         self.plug()
 
     def plug(self):
         self.touch = touchscreen_device()
-        self.down = False
+        self.slots = set()
 
     def unplug(self):
         self.touch.close()
         self.touch = None
-        self.down = False
+        self.slots = set()
 
     def frame(self, events):
         if self.touch is None:
@@ -97,41 +112,79 @@ class Touchscreen:
             self.touch.write(etype, code, value)
         self.touch.syn()
 
-    def position(self, nx, ny):
+    def action(self, cmd, args):
+        """The events of one slot's down / move / up, updating the slots
+        that are down; args are [SLOT] NX NY (or [SLOT] for up)."""
+        if cmd in ("down", "move"):
+            if len(args) not in (2, 3):
+                raise ValueError(f"{cmd} takes [SLOT] NX NY")
+            slot = int(args[0]) if len(args) == 3 else 0
+            nx, ny = args[-2:]
+        elif cmd == "up":
+            if len(args) > 1:
+                raise ValueError("up takes [SLOT]")
+            slot = int(args[0]) if args else 0
+        else:
+            raise ValueError(f"unknown touch action {cmd}")
+        if not 0 <= slot < SLOTS:
+            raise ValueError(f"slot {slot} out of range")
+        events = [(e.EV_ABS, e.ABS_MT_SLOT, slot)]
+        if cmd == "down":
+            if slot in self.slots:
+                raise ValueError(f"slot {slot} already down")
+            self.tracking_id = (self.tracking_id + 1) % 65536
+            events.append((e.EV_ABS, e.ABS_MT_TRACKING_ID, self.tracking_id))
+            self.slots.add(slot)
+        elif slot not in self.slots:
+            raise ValueError(f"slot {slot} not down")
+        if cmd == "up":
+            events.append((e.EV_ABS, e.ABS_MT_TRACKING_ID, -1))
+            self.slots.discard(slot)
+            return events
         x, y = units(nx), units(ny)
-        return [
-            (e.EV_ABS, e.ABS_MT_SLOT, 0),
+        return events + [
             (e.EV_ABS, e.ABS_MT_POSITION_X, x),
             (e.EV_ABS, e.ABS_MT_POSITION_Y, y),
             (e.EV_ABS, e.ABS_X, x),
             (e.EV_ABS, e.ABS_Y, y),
         ]
 
+    def touch_frame(self, actions):
+        """One evdev frame of (cmd, args) slot actions."""
+        if self.touch is None:
+            raise ValueError("unplugged")
+        was_down = bool(self.slots)
+        before = set(self.slots)
+        events = []
+        try:
+            for cmd, args in actions:
+                events += self.action(cmd, args)
+        except Exception:
+            self.slots = before
+            raise
+        if bool(self.slots) != was_down:
+            events.append((e.EV_KEY, e.BTN_TOUCH, int(bool(self.slots))))
+        self.frame(events)
+
     def run(self, words):
         cmd = words[0]
-        if cmd == "down":
-            if self.down:
-                raise ValueError("already down")
-            self.tracking_id = (self.tracking_id + 1) % 65536
-            events = self.position(*words[1:3])
-            events.insert(1, (e.EV_ABS, e.ABS_MT_TRACKING_ID, self.tracking_id))
-            self.frame(events + [(e.EV_KEY, e.BTN_TOUCH, 1)])
-            self.down = True
-        elif cmd == "move":
-            if not self.down:
-                raise ValueError("not down")
-            self.frame(self.position(*words[1:3]))
-        elif cmd == "up":
-            if not self.down:
-                raise ValueError("not down")
-            self.frame(
-                [
-                    (e.EV_ABS, e.ABS_MT_SLOT, 0),
-                    (e.EV_ABS, e.ABS_MT_TRACKING_ID, -1),
-                    (e.EV_KEY, e.BTN_TOUCH, 0),
-                ]
-            )
-            self.down = False
+        if cmd in ("down", "move", "up"):
+            self.touch_frame([(cmd, words[1:])])
+        elif cmd == "frame":
+            actions = []
+            rest = words[1:]
+            while rest:
+                name = rest[0]
+                take = {"down": 3, "move": 3, "up": 1}.get(name)
+                if take is None:
+                    raise ValueError(f"frame: unknown action {name}")
+                if len(rest) < take + 1:
+                    raise ValueError(f"frame: {name} takes {'SLOT' if take == 1 else 'SLOT NX NY'}")
+                actions.append((name, rest[1:take + 1]))
+                rest = rest[take + 1:]
+            if not actions:
+                raise ValueError("frame: no actions")
+            self.touch_frame(actions)
         elif cmd == "tabletmode":
             self.switch.write(e.EV_SW, e.SW_TABLET_MODE, int(words[1]))
             self.switch.syn()
@@ -146,18 +199,23 @@ class Touchscreen:
         # Leave libinput a frame interval before the next event.
         time.sleep(0.02)
 
+    def run_line(self, line):
+        for command in line.split(";"):
+            words = command.split()
+            if words:
+                self.run(words)
+
 
 def main():
     screen = Touchscreen()
     print("ready", flush=True)
     for line in sys.stdin:
-        words = line.split()
-        if not words:
+        if not line.split():
             continue
-        if words[0] == "quit":
+        if line.split() == ["quit"]:
             break
         try:
-            screen.run(words)
+            screen.run_line(line)
             print("ok", flush=True)
         except Exception as error:  # reported to the driver, never fatal
             print(f"error {error}", flush=True)

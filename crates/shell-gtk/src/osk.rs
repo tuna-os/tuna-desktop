@@ -25,7 +25,7 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4::{gio, glib};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use tuna_shell_control::{OskInput, TextFieldFocus};
+use tuna_shell_control::{OskGesturePhase, OskInput, TextFieldFocus};
 
 use crate::input_sources::InputSources;
 use crate::osk_layout::{self, Action, EmojiSection, Key, Purpose};
@@ -108,6 +108,34 @@ pub fn keyboard_height(width: i32, height: i32, min: i32) -> i32 {
         height / 4
     };
     base.max(min).min(height / 2)
+}
+
+/// `Keyboard.gestureProgress`: how far a bottom-edge drag of `distance`
+/// pixels reveals a keyboard `height` pixels tall, `min(delta, height) /
+/// height` (never negative).
+pub fn gesture_fraction(distance: f64, height: i32) -> f64 {
+    if height <= 0 {
+        return 0.0;
+    }
+    let height = f64::from(height);
+    distance.clamp(0.0, height) / height
+}
+
+/// Whether a bottom-edge drag drives the session keyboard: only while
+/// `KeyboardManager._keyboard` exists (enabled, and not under the lock
+/// screen) and it is hidden (`_bottomDragGesture.enabled = !visible`).
+pub fn gesture_allowed(enabled: bool, locked: bool, visible: bool) -> bool {
+    enabled && !locked && !visible
+}
+
+/// The style of a keyboard partly revealed by the drag: `translation_y`
+/// from a full `height` below its resting place, and `opacity`.
+fn gesture_css(fraction: f64, height: i32) -> String {
+    format!(
+        ".tuna-osk-gesture {{ transform: translateY({:.1}px); opacity: {:.3}; }}",
+        f64::from(height.max(0)) * (1.0 - fraction),
+        fraction
+    )
 }
 
 /// A key's accessible name: its label, its string, or what its icon means.
@@ -877,6 +905,27 @@ struct Session {
     view: KeyboardView,
     presence: RefCell<Presence>,
     timer: RefCell<Option<glib::SourceId>>,
+    /// `this.height` after the last `_relayout`.
+    height: Cell<i32>,
+    /// `_gestureInProgress`.
+    gesture: Cell<bool>,
+    /// Translates and fades the keyboard while a drag reveals it.
+    gesture_style: gtk::CssProvider,
+}
+
+impl Session {
+    /// Show the drag's partial reveal, or (`None`) drop it.
+    fn set_gesture_style(&self, fraction: Option<f64>) {
+        let widget = self.view.widget();
+        match fraction {
+            Some(fraction) => {
+                self.gesture_style
+                    .load_from_string(&gesture_css(fraction, self.height.get()));
+                widget.add_css_class("tuna-osk-gesture");
+            }
+            None => widget.remove_css_class("tuna-osk-gesture"),
+        }
+    }
 }
 
 /// A lock window's keyboard: opened by the unlock prompt's focus, and
@@ -968,6 +1017,9 @@ impl Osk {
         let now = self.now();
         let session = self.session.borrow().clone();
         if let Some(session) = session {
+            if !(enabled && !self.locked.get()) && session.gesture.replace(false) {
+                session.set_gesture_style(None);
+            }
             session
                 .presence
                 .borrow_mut()
@@ -1030,6 +1082,60 @@ impl Osk {
         }
     }
 
+    /// The compositor's `OskGesture`: `KeyboardManager`'s bottom drag
+    /// gesture handlers (`gestureProgress`, `gestureActivate`,
+    /// `gestureCancel`); nothing while the keyboard is disabled.
+    pub fn gesture(self: &Rc<Self>, phase: OskGesturePhase) {
+        let Some(session) = self.session.borrow().clone() else {
+            return;
+        };
+        let visible = session.presence.borrow().visible();
+        match phase {
+            OskGesturePhase::Progress { distance } => {
+                if !gesture_allowed(self.enabled(), self.locked.get(), visible) {
+                    return;
+                }
+                if !session.gesture.replace(true) {
+                    // `keyboardBox.show()`: at once, the drag moves it.
+                    self.relayout(&session);
+                    session.window.set_visible(true);
+                    session.revealer.set_transition_duration(0);
+                    session.revealer.set_reveal_child(true);
+                    session
+                        .revealer
+                        .set_transition_duration(KEYBOARD_ANIMATION_TIME_MS);
+                }
+                session.set_gesture_style(Some(gesture_fraction(distance, session.height.get())));
+            }
+            OskGesturePhase::Activate => {
+                if !self.enabled() || self.locked.get() {
+                    return;
+                }
+                let dragged = session.gesture.replace(false);
+                session.set_gesture_style(None);
+                // `open(true)`, shown without a focused text field.
+                session.presence.borrow_mut().open_now(self.now());
+                if dragged && !visible && session.revealer.reveals_child() {
+                    session.view.opened();
+                }
+                self.session_changed(&session);
+            }
+            OskGesturePhase::Cancel => {
+                if !session.gesture.replace(false) {
+                    return;
+                }
+                session.set_gesture_style(None);
+                // `_animateHide`, unless the keyboard opened meanwhile.
+                if !visible {
+                    session.revealer.set_reveal_child(false);
+                    if !crate::motion::current().animations_enabled() {
+                        session.window.set_visible(false);
+                    }
+                }
+            }
+        }
+    }
+
     fn ensure_session(self: &Rc<Self>) {
         if self.session.borrow().is_some() {
             return;
@@ -1070,12 +1176,23 @@ impl Osk {
         revealer.set_valign(gtk::Align::End);
         revealer.set_child(Some(view.widget()));
         window.set_child(Some(&revealer));
+        let gesture_style = gtk::CssProvider::new();
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &gesture_style,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+            );
+        }
         let session = Rc::new(Session {
             window,
             revealer,
             view,
             presence: RefCell::new(Presence::new()),
             timer: RefCell::new(None),
+            height: Cell::new(0),
+            gesture: Cell::new(false),
+            gesture_style,
         });
         {
             // `_animateHideComplete`: the box goes once the slide ends.
@@ -1110,7 +1227,7 @@ impl Osk {
             session.view.opened();
             session.window.set_visible(true);
             session.revealer.set_reveal_child(true);
-        } else if !visible && session.revealer.reveals_child() {
+        } else if !visible && session.revealer.reveals_child() && !session.gesture.get() {
             session.view.closed();
             session.revealer.set_reveal_child(false);
             if !crate::motion::current().animations_enabled() {
@@ -1154,6 +1271,7 @@ impl Osk {
             .0;
         let height = keyboard_height(geometry.width(), geometry.height(), min);
         session.view.widget().set_size_request(-1, height);
+        session.height.set(height);
         session.window.set_default_size(geometry.width(), height);
     }
 
@@ -1305,6 +1423,27 @@ impl Drop for LockKeyboard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gesture_reveals_by_clamped_fraction_of_height() {
+        assert_eq!(gesture_fraction(0.0, 300), 0.0);
+        assert_eq!(gesture_fraction(150.0, 300), 0.5);
+        assert_eq!(gesture_fraction(450.0, 300), 1.0);
+        assert_eq!(gesture_fraction(-20.0, 300), 0.0);
+        assert_eq!(gesture_fraction(80.0, 0), 0.0);
+        assert_eq!(
+            gesture_css(0.25, 200),
+            ".tuna-osk-gesture { transform: translateY(150.0px); opacity: 0.250; }"
+        );
+    }
+
+    #[test]
+    fn gesture_only_drives_an_enabled_hidden_unlocked_keyboard() {
+        assert!(gesture_allowed(true, false, false));
+        assert!(!gesture_allowed(false, false, false));
+        assert!(!gesture_allowed(true, true, false));
+        assert!(!gesture_allowed(true, false, true));
+    }
 
     #[test]
     fn effects_become_compositor_input_like_keyboard_controller() {

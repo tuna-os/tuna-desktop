@@ -139,6 +139,8 @@ pub mod supervise;
 pub mod tablet;
 pub mod tablet_actions;
 pub(crate) mod tablet_settings;
+pub mod touch_gesture;
+mod touch_grab;
 mod transient_family;
 pub mod transitions;
 pub mod unlock;
@@ -243,6 +245,11 @@ pub struct State {
     /// Set when the last grabbed popup went away, so the manager hands
     /// keyboard focus back to the focused window on its next reconcile.
     pub(crate) popup_refocus: bool,
+    /// Touch points delivered to a client and still down, by slot: the
+    /// `wl_touch.down` serial, its surface and where it touched, so a
+    /// header-bar drag begun by touch can start a move (Mutter's
+    /// `meta_wayland_seat_get_grab_info` takes touch sequences too).
+    pub(crate) touch_presses: std::collections::HashMap<u32, TouchPress>,
     /// Global origin of each mapped toplevel's surface, published by the
     /// window manager every reconcile, so popups can be constrained to
     /// the output under their parent before their first configure.
@@ -417,9 +424,11 @@ impl State {
         self.authenticated_client_pid(surface)
     }
 
-    /// A CSD move/resize must use this seat's live press on this surface.
-    /// Preserve its coordinates through the request queue: client dispatch
-    /// can happen after later pointer motion (GNOME 51 grab semantics).
+    /// A CSD move/resize must use this seat's live press on this surface:
+    /// the pointer's implicit grab, or a touch point still down on it
+    /// (`meta_wayland_seat_get_grab_info`). Preserve its coordinates
+    /// through the request queue: client dispatch can happen after later
+    /// motion (GNOME 51 grab semantics).
     fn interactive_press(
         &self,
         surface: &wl_surface::WlSurface,
@@ -429,6 +438,9 @@ impl State {
         if !self.seat.owns(seat) {
             return None;
         }
+        if let Some(press) = self.touch_press(serial) {
+            return (press.surface == *surface).then_some(press.location);
+        }
         let pointer = self.seat.get_pointer()?;
         if !pointer.has_grab(serial) {
             return None;
@@ -437,6 +449,23 @@ impl State {
         let (focus, _) = start.focus?;
         (focus == *surface).then_some(start.location)
     }
+
+    /// The touch point still down whose `wl_touch.down` carried `serial`.
+    pub(crate) fn touch_press(&self, serial: Serial) -> Option<&TouchPress> {
+        self.touch_presses
+            .values()
+            .find(|press| press.serial == serial)
+    }
+}
+
+/// A touch point delivered to a client, while it is down.
+#[derive(Debug, Clone)]
+pub(crate) struct TouchPress {
+    pub slot: u32,
+    pub serial: Serial,
+    pub surface: wl_surface::WlSurface,
+    /// Where it touched down, in global logical coordinates.
+    pub location: smithay::utils::Point<f64, smithay::utils::Logical>,
 }
 
 impl XdgShellHandler for State {
@@ -1018,6 +1047,7 @@ impl State {
             popups: smithay::desktop::PopupManager::default(),
             popup_grab: Vec::new(),
             popup_refocus: false,
+            touch_presses: std::collections::HashMap::new(),
             window_origins: std::collections::HashMap::new(),
             initial_outputs: std::collections::HashMap::new(),
             outputs: Vec::new(),

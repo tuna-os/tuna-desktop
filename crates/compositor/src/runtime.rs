@@ -69,6 +69,7 @@ mod display;
 mod motion;
 mod orientation;
 mod osk;
+mod touch;
 
 /// Display-rate loop pacing: while anything moves, dispatch blocks at
 /// most this long, so animations step near 60 Hz and the loop never
@@ -706,6 +707,7 @@ pub struct Runtime {
     motion_queue: crate::motion_coalesce::MotionCoalescer,
     /// Keys GNOME's on-screen keyboard holds down (#349).
     osk: osk::RuntimeOsk,
+    touch: touch::RuntimeTouch,
     /// An Escape press cancelled a client drag; its repeats and release
     /// belong to that cancel, not to the overview or a client.
     dnd_escape_held: bool,
@@ -1001,11 +1003,6 @@ impl Runtime {
                             && crate::layer::exclusive_popup_keyboard_layer(&rt.state).is_none();
                         let corner_layout = rt.state.hot_corner_outputs();
                         rt.triggers.set_pressure_only(true);
-                        let touch = matches!(
-                            event,
-                            smithay::backend::input::InputEvent::TouchDown { .. }
-                                | smithay::backend::input::InputEvent::TouchMotion { .. }
-                        );
                         let inputs = match &mut rt.backend {
                             Backend::Drm(drm) => {
                                 drm.set_hot_corner_active(corners_active);
@@ -1014,7 +1011,7 @@ impl Runtime {
                             Backend::Winit(_) => Vec::new(),
                         };
                         for input in inputs {
-                            let input = if touch { rt.unzoom_touch(input) } else { input };
+                            let input = rt.unzoom_touch(input);
                             if let ManagerInput::Button {
                                 button,
                                 pressed: false,
@@ -1460,6 +1457,7 @@ impl Runtime {
             input_aids: aids::RuntimeAids::default(),
             motion_queue: crate::motion_coalesce::MotionCoalescer::new(),
             osk: osk::RuntimeOsk::default(),
+            touch: touch::RuntimeTouch::default(),
             dnd_escape_held: false,
             orca: crate::orca::Reader::new(&session.socket_name, a11y_keyboard.clone()),
             a11y_keyboard,
@@ -1614,17 +1612,12 @@ impl Runtime {
                     #[cfg(feature = "drm")]
                     Backend::Drm(_) => return,
                 };
-                let touch = matches!(
-                    event,
-                    smithay::backend::input::InputEvent::TouchDown { .. }
-                        | smithay::backend::input::InputEvent::TouchMotion { .. }
-                );
                 for input in translate_input(event, area) {
-                    let input = if touch {
-                        self.unzoom_touch(input)
-                    } else {
-                        input
-                    };
+                    if matches!(input, ManagerInput::TouchDown { .. }) {
+                        // winit cannot list devices: a touch proves one.
+                        self.manager.set_touch_capability(&mut self.state, true);
+                    }
+                    let input = self.unzoom_touch(input);
                     self.on_backend_input(input);
                 }
             }
@@ -1633,20 +1626,28 @@ impl Runtime {
     }
 
     /// A touch point lands on what the screen magnifier shows under the
-    /// finger (#349), and the zoom holds still under it rather than
-    /// chasing the pointer the touch moves. Pointer devices stay in
-    /// unmagnified coordinates, as in GNOME: their sprite is drawn
-    /// where the position maps, so clicks already hit what it shows.
-    fn unzoom_touch(&mut self, input: ManagerInput) -> ManagerInput {
+    /// finger (#349). Pointer devices stay in unmagnified coordinates, as
+    /// in GNOME: their sprite is drawn where the position maps, so clicks
+    /// already hit what it shows.
+    fn unzoom_touch(&self, input: ManagerInput) -> ManagerInput {
+        if !self.magnifier.config().active() {
+            return input;
+        }
+        let unzoom = |magnifier: &crate::magnifier::MagnifierState, pos: Point<f64, Logical>| {
+            let (x, y) = magnifier.unzoom((pos.x, pos.y));
+            Point::from((x, y))
+        };
         match input {
-            ManagerInput::Motion { pos, time } if self.magnifier.config().active() => {
-                let (x, y) = self.magnifier.unzoom((pos.x, pos.y));
-                self.magnifier.hold_pointer((x, y));
-                ManagerInput::Motion {
-                    pos: (x, y).into(),
-                    time,
-                }
-            }
+            ManagerInput::TouchDown { slot, pos, time } => ManagerInput::TouchDown {
+                slot,
+                pos: unzoom(&self.magnifier, pos),
+                time,
+            },
+            ManagerInput::TouchMotion { slot, pos, time } => ManagerInput::TouchMotion {
+                slot,
+                pos: unzoom(&self.magnifier, pos),
+                time,
+            },
             other => other,
         }
     }
@@ -1708,6 +1709,7 @@ impl Runtime {
         #[cfg(feature = "drm")]
         self.performance_trace.cancel();
         self.reset_input_aid_ownership();
+        self.reset_touch_ownership();
         // Nothing the session's keyboard held stays down under the lock.
         self.release_osk_keys();
         if let Some(monitor) = &self.a11y_keyboard {
@@ -1905,6 +1907,7 @@ impl Runtime {
     fn release_lock(&mut self) {
         self.flush_motion();
         self.reset_input_aid_ownership();
+        self.reset_touch_ownership();
         if let Some(monitor) = &self.a11y_keyboard {
             monitor.set_locked(false);
         }
@@ -2119,6 +2122,11 @@ impl Runtime {
                 .locate
                 .feed_matched(&input, matches_key, self.manager.pointer_pos(), now);
         }
+        // GNOME Shell's stage gestures see every touch first (capture
+        // phase); one that recognizes owns the fingers until they lift.
+        if self.touch_gesture_input(&input) {
+            return;
+        }
         if self.is_locked() {
             // The lock takes the keyboard: a held Escape's release
             // never comes back to the drag cancel below.
@@ -2180,6 +2188,11 @@ impl Runtime {
             return;
         }
         if !self.overlay.visible {
+            // Compositor-drawn overview previews take touch as Shell
+            // actors do.
+            if self.touch_overview_input(&input) {
+                return;
+            }
             if let ManagerInput::Key {
                 keycode: ESCAPE_KEYCODE,
                 pressed: true,
@@ -2724,6 +2737,7 @@ impl Runtime {
         // kernel's CRTC modes on hardware, pending confirmation.
         doc["display_config"] = self.display_config_diagnostics();
         doc["orientation"] = self.orientation_diagnostics();
+        doc["touch"] = self.touch_diagnostics();
         doc["color"] = self.color_diagnostics();
         let motion = self.input_settings.motion;
         doc["motion_policy"] = serde_json::json!(motion.level.as_str());
@@ -7965,7 +7979,12 @@ fn input_time(input: &ManagerInput) -> u64 {
         | ManagerInput::Axis { time, .. }
         | ManagerInput::SwipeBegin { time, .. }
         | ManagerInput::SwipeUpdate { time, .. }
-        | ManagerInput::SwipeEnd { time, .. } => u64::from(time),
+        | ManagerInput::SwipeEnd { time, .. }
+        | ManagerInput::TouchDown { time, .. }
+        | ManagerInput::TouchMotion { time, .. }
+        | ManagerInput::TouchUp { time, .. }
+        | ManagerInput::TouchFrame { time }
+        | ManagerInput::TouchCancel { time } => u64::from(time),
         ManagerInput::RelativeMotion { utime, .. } => utime / 1000,
     }
 }

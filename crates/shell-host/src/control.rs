@@ -141,6 +141,9 @@ pub enum Handled {
         show: bool,
         touch_auto: bool,
     },
+    /// The touchscreen bottom-edge OSK drag (0.47): gnome-shell's
+    /// `KeyboardManager` bottom drag gesture progress, end or cancel.
+    OskGesture(tuna_shell_control::OskGesturePhase),
     /// A pointer accessibility timeout started or stopped (pie timer).
     PointerTimeout {
         kind: tuna_shell_control::PointerTimeoutKind,
@@ -1207,6 +1210,7 @@ impl ControlClient {
             Message::PadOsdInput { pad, event } => Ok(Handled::PadOsdInput { pad, event }),
             Message::ClosePadOsd { pad } => Ok(Handled::ClosePadOsd { pad }),
             Message::SeatTouchMode { touch_mode } => Ok(Handled::SeatTouchMode(touch_mode)),
+            Message::OskGesture { phase } => Ok(Handled::OskGesture(phase)),
             Message::KeyboardAidToggled { aid, enabled } => {
                 Ok(Handled::KeyboardAidToggled { aid, enabled })
             }
@@ -1504,6 +1508,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::PadOsdInput { .. } => "PadOsdInput",
         Message::ClosePadOsd { .. } => "ClosePadOsd",
         Message::SeatTouchMode { .. } => "SeatTouchMode",
+        Message::OskGesture { .. } => "OskGesture",
     }
 }
 
@@ -2011,6 +2016,12 @@ mod tests {
             (
                 Message::SeatTouchMode { touch_mode: true },
                 Handled::SeatTouchMode(true),
+                Message::OskGesture {
+                    phase: tuna_shell_control::OskGesturePhase::Progress { distance: 12.0 },
+                },
+                Handled::OskGesture(tuna_shell_control::OskGesturePhase::Progress {
+                    distance: 12.0,
+                }),
             ),
         ];
         for (message, expected) in cases {

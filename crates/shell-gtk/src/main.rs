@@ -164,6 +164,8 @@ struct Drained {
     /// The compositor's on-screen keyboard updates, in order: focus, the
     /// input-panel request, touch-mode auto-show.
     osk: Vec<(Option<tuna_shell_control::TextFieldFocus>, bool, bool)>,
+    /// The compositor's bottom-edge OSK drag phases, in order (wire 0.47).
+    osk_gestures: Vec<tuna_shell_control::OskGesturePhase>,
     /// Drawing-tablet OSD messages, in arrival order.
     tablet: Vec<TabletUi>,
     /// Mutter's seat touch-mode, when the compositor changed it.
@@ -269,6 +271,7 @@ fn drain(
                 show,
                 touch_auto,
             } => out.osk.push((focus, show, touch_auto)),
+            Handled::OskGesture(phase) => out.osk_gestures.push(phase),
             Handled::PointerTimeout {
                 kind,
                 duration_ms,
@@ -3736,6 +3739,7 @@ fn build(app: &adw::Application) {
                     tablet,
                     osk: osk_updates,
                     touch_mode,
+                    osk_gestures,
                 } = drained;
                 let mut shell = shell.borrow_mut();
                 let locked = shell.control.as_ref().is_some_and(|c| c.locked());
@@ -3804,6 +3808,9 @@ fn build(app: &adw::Application) {
                 osk.set_locked(locked);
                 for (focus, show, touch_auto) in osk_updates {
                     osk.update(focus, show, touch_auto);
+                }
+                for phase in osk_gestures {
+                    osk.gesture(phase);
                 }
                 if locked {
                     shortcut_consent.dismiss();

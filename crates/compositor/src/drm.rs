@@ -38,6 +38,7 @@ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::drm::control::{
     self, connector, crtc, Device as ControlDevice, ModeTypeFlags,
 };
+use smithay::reexports::input::event::touch::TouchEventSlot;
 use smithay::reexports::input::event::TabletToolEvent;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
@@ -1474,19 +1475,37 @@ impl DrmBackend {
                 )
             }
             // Touchscreens (#345): each contact through its device's
-            // monitor mapping (meta-seat-impl.c TOUCH_DOWN/TOUCH_MOTION).
+            // monitor mapping (meta-seat-impl.c TOUCH_DOWN/TOUCH_MOTION),
+            // as touch: Mutter moves no pointer for a touch. The seat
+            // slot is unique across touchscreens, as Clutter's sequence.
             InputEvent::TouchDown { event } => {
                 let time = (event.time() / 1000) as u32;
                 let pos = self.touch_position(&event);
-                self.observe_motion(pos);
-                crate::windows::touch_press((pos.x, pos.y), time).into()
+                vec![ManagerInput::TouchDown {
+                    slot: TouchEventSlot::seat_slot(&event),
+                    pos,
+                    time,
+                }]
             }
             InputEvent::TouchMotion { event } => {
                 let time = (event.time() / 1000) as u32;
                 let pos = self.touch_position(&event);
-                self.observe_motion(pos);
-                vec![ManagerInput::Motion { pos, time }]
+                vec![ManagerInput::TouchMotion {
+                    slot: TouchEventSlot::seat_slot(&event),
+                    pos,
+                    time,
+                }]
             }
+            InputEvent::TouchUp { event } => vec![ManagerInput::TouchUp {
+                slot: TouchEventSlot::seat_slot(&event),
+                time: (event.time() / 1000) as u32,
+            }],
+            InputEvent::TouchFrame { event } => vec![ManagerInput::TouchFrame {
+                time: (event.time() / 1000) as u32,
+            }],
+            InputEvent::TouchCancel { event } => vec![ManagerInput::TouchCancel {
+                time: (event.time() / 1000) as u32,
+            }],
             // Absolute pointers span the whole desktop, unrotated: Mutter
             // maps no pointer device to a monitor (meta-seat-impl.c
             // POINTER_MOTION_ABSOLUTE).

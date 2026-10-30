@@ -214,6 +214,8 @@ impl ProtocolVersion {
     /// the shell-to-compositor `CloseMenuUnanimated` command (panelMenu.js
     /// 51 `vfunc_hide`: a hidden panel button's menu closes without
     /// BoxPointer's close). Positional postcard peers must ship together.
+    /// `0.48` appends GNOME's bottom-edge OSK drag: compositor-to-shell
+    /// `OskGesture` (`ShellEdgeDragGesture` progress, activate, cancel).
     pub const CURRENT: Self = Self {
         major: 0,
         minor: 47,
@@ -1109,7 +1111,26 @@ pub enum Message {
     /// and in each handshake snapshot, only to peers advertising
     /// minor >= 46.
     SeatTouchMode { touch_mode: bool },
+    /// Since 0.47: the touchscreen bottom-edge drag (gnome-shell's
+    /// `KeyboardManager` bottom drag gesture) progressed, completed or
+    /// was cancelled. Sent only to peers advertising minor >= 47.
+    OskGesture { phase: OskGesturePhase },
 }
+
+/// A phase of the bottom-edge OSK drag (`ShellEdgeDragGesture`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum OskGesturePhase {
+    /// `progress`: vertical distance in logical pixels from the begin point.
+    Progress { distance: f64 },
+    /// `end`: dragged past the threshold; open the keyboard.
+    Activate,
+    /// `cancel`: the drag ended early.
+    Cancel,
+}
+
+// `Message` is `Eq`; decoding rejects a non-finite `distance` as
+// malformed, so reflexivity holds for every decoded message.
+impl Eq for OskGesturePhase {}
 
 /// The click a hover (dwell) makes: GNOME's dwell click types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2289,6 +2310,12 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
         Message::PadOsdInput { .. }
         | Message::ClosePadOsd { .. }
         | Message::SeatTouchMode { .. } => {}
+        Message::OskGesture {
+            phase: OskGesturePhase::Progress { distance },
+        } if !distance.is_finite() => {
+            return Err(DecodeError::Malformed(postcard::Error::SerdeDeCustom));
+        }
+        Message::OskGesture { .. } => {}
     }
     Ok(())
 }
@@ -3615,6 +3642,32 @@ mod on_screen_keyboard_wire_tests {
                 },
             }),
             command(CommandKind::CompleteDisplayChange { keep: false }) + 1
+        );
+    }
+
+    #[test]
+    fn osk_gesture_roundtrips_and_sits_last() {
+        for phase in [
+            OskGesturePhase::Progress { distance: 42.5 },
+            OskGesturePhase::Activate,
+            OskGesturePhase::Cancel,
+        ] {
+            let message = Message::OskGesture { phase };
+            assert_eq!(decode_frame(&encode_frame(&message)).unwrap(), message);
+        }
+        let nan = Message::OskGesture {
+            phase: OskGesturePhase::Progress { distance: f64::NAN },
+        };
+        assert!(matches!(
+            decode_frame(&encode_frame(&nan)),
+            Err(DecodeError::Malformed(_))
+        ));
+        let index = |message: &Message| encode_frame(message)[4];
+        assert_eq!(
+            index(&Message::OskGesture {
+                phase: OskGesturePhase::Cancel,
+            }),
+            index(&Message::ClosePadOsd { pad: 0 }) + 1
         );
     }
 

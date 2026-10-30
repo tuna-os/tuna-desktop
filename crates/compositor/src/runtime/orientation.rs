@@ -33,12 +33,15 @@ impl Runtime {
     }
 
     /// The seat's touch mode moved (a touchscreen, pointer or tablet-mode
-    /// switch came or went): Mutter recomputes the managed state.
+    /// switch came or went): Mutter recomputes the managed state, and the
+    /// seat advertises touch while a touchscreen is present.
     pub(super) fn sync_orientation_seat(&mut self) {
         #[cfg(feature = "drm")]
         if let super::Backend::Drm(drm) = &self.backend {
             let mode = drm.touch_mode();
             let (touch_mode, has_touchscreen) = (mode.touch_mode(), mode.has_touchscreen);
+            self.manager
+                .set_touch_capability(&mut self.state, has_touchscreen);
             if (
                 self.orientation.touch_mode,
                 self.orientation.has_touchscreen,
