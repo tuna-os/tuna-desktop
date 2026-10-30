@@ -171,12 +171,19 @@ pub enum ToLoop {
     RemoteClipboard(remote_clipboard::Request),
     StartCast {
         session_id: u64,
+        stream_id: u64,
         grant: Arc<AtomicBool>,
         target: CastTarget,
         signal: CastSignals,
     },
+    /// Every stream of a session ends.
     StopCast {
         session_id: u64,
+    },
+    /// One stream ends (`ScreenCast.Stream.Stop`).
+    StopStream {
+        session_id: u64,
+        stream_id: u64,
     },
     /// GNOME Settings' Displays panel applied a verified configuration
     /// (method temporary or persistent). The loop applies it and replies
@@ -877,7 +884,8 @@ struct ScreenCast {
 }
 
 /// A session's streams with their D-Bus interface handles.
-type SessionStreams = Arc<Mutex<Vec<(Stream, InterfaceRef<Stream>)>>>;
+type StreamList = Mutex<Vec<(Stream, InterfaceRef<Stream>)>>;
+type SessionStreams = Arc<StreamList>;
 
 #[derive(Clone)]
 struct Session {
@@ -891,13 +899,16 @@ struct Session {
     next_id: Arc<AtomicU64>,
     streams: SessionStreams,
     stopped: Arc<AtomicBool>,
+    /// Mutter's `is_active`: set by Start, or for a linked session by
+    /// the RemoteDesktop session's Start.
     started: Arc<AtomicBool>,
     /// Linked to a RemoteDesktop grant (`remote-desktop-session-id`).
     linked: bool,
 }
 
+/// What a stream shows.
 #[derive(Clone)]
-enum Stream {
+enum StreamSource {
     /// The monitor, and the mapping id pairing it with the remote
     /// session's EIS region when the session is linked.
     Monitor(OutputSnapshot, Option<String>),
@@ -906,15 +917,58 @@ enum Stream {
     Area(OutputSnapshot, (i32, i32, i32, i32), (i32, i32, i32, i32)),
 }
 
-impl Stream {
+impl StreamSource {
     fn target(&self) -> CastTarget {
         match self {
-            Stream::Monitor(output, _) => CastTarget::Monitor(output.connector.clone()),
-            Stream::Window(window) => CastTarget::Window(window.id),
-            Stream::Area(output, _, physical) => {
+            StreamSource::Monitor(output, _) => CastTarget::Monitor(output.connector.clone()),
+            StreamSource::Window(window) => CastTarget::Window(window.id),
+            StreamSource::Area(output, _, physical) => {
                 CastTarget::Area(output.connector.clone(), *physical)
             }
         }
+    }
+}
+
+/// One `org.gnome.Mutter.ScreenCast.Stream` object (mutter's
+/// meta-screen-cast-stream.c): its source, whether it runs, and the
+/// session state its Start and Stop answer to.
+#[derive(Clone)]
+struct Stream {
+    id: u64,
+    source: StreamSource,
+    /// Mutter's `meta_stream_is_started`.
+    started: Arc<AtomicBool>,
+    owner: String,
+    authority: crate::capture_security::Authority,
+    session_id: u64,
+    to_loop: calloop::channel::Sender<ToLoop>,
+    /// The mutter thread's signal queue the loop emits through (#657).
+    signals: crate::dbus_signals::SignalQueue,
+    /// The session's revocation flag (the grant's when linked).
+    stopped: Arc<AtomicBool>,
+    /// The session's `started` (`meta_screen_cast_session_is_active`).
+    session_active: Arc<AtomicBool>,
+    linked: bool,
+    /// The session's list, which a stopped stream leaves.
+    streams: std::sync::Weak<StreamList>,
+}
+
+/// Mutter's `check_permission`: the session's peer, here also unrevoked.
+fn session_owner(
+    owner: &str,
+    stopped: &AtomicBool,
+    header: &zbus::message::Header<'_>,
+) -> fdo::Result<()> {
+    if crate::capture_security::owns_session(
+        owner,
+        header.sender().map(|sender| sender.as_str()),
+        stopped.load(Ordering::SeqCst),
+    ) {
+        Ok(())
+    } else {
+        Err(crate::capture_security::denied(
+            "session belongs to another caller or was revoked",
+        ))
     }
 }
 
@@ -983,22 +1037,7 @@ impl ScreenCast {
         let linked = if let Some(value) = properties.get("remote-desktop-session-id") {
             let remote_id = <&str>::try_from(value)
                 .map_err(|_| fdo::Error::InvalidArgs("invalid remote session id".into()))?;
-            let remote = self
-                .remote
-                .lock()
-                .map_err(|_| fdo::Error::Failed("remote registry unavailable".into()))?;
-            let grant = remote
-                .get(remote_id)
-                .ok_or_else(|| crate::capture_security::denied("unknown remote session"))?;
-            if grant.owner != owner
-                || grant.stopped.load(Ordering::SeqCst)
-                || grant.started.load(Ordering::SeqCst)
-            {
-                return Err(crate::capture_security::denied(
-                    "remote grant cannot accept this stream",
-                ));
-            }
-            Some(grant.stopped.clone())
+            Some(self.linked_grant(&owner, remote_id)?)
         } else {
             None
         };
@@ -1034,7 +1073,44 @@ impl ScreenCast {
     }
 }
 
+impl ScreenCast {
+    /// The revocation flag of `owner`'s own unstarted RemoteDesktop grant
+    /// `remote_id`, which a new ScreenCast session links to. As mutter's
+    /// `meta_remote_desktop_session_register_screen_cast`, a grant takes
+    /// one ScreenCast session.
+    fn linked_grant(&self, owner: &str, remote_id: &str) -> fdo::Result<Arc<AtomicBool>> {
+        let remote = self
+            .remote
+            .lock()
+            .map_err(|_| fdo::Error::Failed("remote registry unavailable".into()))?;
+        let grant = remote
+            .get(remote_id)
+            .ok_or_else(|| crate::capture_security::denied("unknown remote session"))?;
+        if grant.owner != owner
+            || grant.stopped.load(Ordering::SeqCst)
+            || grant.started.load(Ordering::SeqCst)
+        {
+            return Err(crate::capture_security::denied(
+                "remote grant cannot accept this stream",
+            ));
+        }
+        if self.sessions.lock().map_or(true, |sessions| {
+            sessions
+                .iter()
+                .any(|(session, _)| Arc::ptr_eq(&session.stopped, &grant.stopped))
+        }) {
+            return Err(fdo::Error::Failed(
+                "Remote desktop session already have an associated screen cast session".into(),
+            ));
+        }
+        Ok(grant.stopped.clone())
+    }
+}
+
 impl Session {
+    /// Mutter's `meta_screen_cast_session_start`: the session becomes
+    /// active and every stream recorded so far starts. Streams recorded
+    /// later start with their own `Stream.Start`.
     fn start_streams(&self) -> fdo::Result<()> {
         self.authority.unlocked()?;
         if self.stopped.load(Ordering::SeqCst) {
@@ -1045,15 +1121,7 @@ impl Session {
         }
         let streams = self.streams.lock().map(|s| s.clone()).unwrap_or_default();
         for (stream, iface) in streams {
-            let _ = self.to_loop.send(ToLoop::StartCast {
-                session_id: self.id,
-                grant: self.stopped.clone(),
-                target: stream.target(),
-                signal: CastSignals {
-                    stream: iface.signal_emitter().to_owned(),
-                    queue: self.signals.clone(),
-                },
-            });
+            stream.begin(iface.signal_emitter())?;
         }
         Ok(())
     }
@@ -1076,8 +1144,15 @@ fn record_monitor_target(outputs: &[OutputSnapshot], connector: &str) -> Option<
 
 #[interface(name = "org.gnome.Mutter.ScreenCast.Session")]
 impl Session {
+    /// Mutter's `handle_start`: a session linked to a RemoteDesktop
+    /// session starts with that session's Start, never on its own.
     async fn start(&self, #[zbus(header)] header: zbus::message::Header<'_>) -> fdo::Result<()> {
         self.check_owner(&header)?;
+        if self.linked {
+            return Err(fdo::Error::Failed(
+                "Must be started from remote desktop session".into(),
+            ));
+        }
         self.start_streams()
     }
 
@@ -1088,6 +1163,11 @@ impl Session {
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> fdo::Result<()> {
         self.check_owner(&header)?;
+        if self.linked {
+            return Err(fdo::Error::Failed(
+                "Must be stopped from remote desktop session".into(),
+            ));
+        }
         if self.stopped.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
@@ -1125,7 +1205,7 @@ impl Session {
             .and_then(|o| record_monitor_target(&o, connector))
             .ok_or_else(|| fdo::Error::Failed("Unknown monitor".into()))?;
         let mapping_id = self.linked.then(|| output_mapping_id(&output.connector));
-        self.add_stream(server, Stream::Monitor(output, mapping_id))
+        self.add_stream(server, StreamSource::Monitor(output, mapping_id))
             .await
     }
 
@@ -1150,7 +1230,7 @@ impl Session {
             .ok_or_else(|| fdo::Error::Failed("the area is on no monitor".into()))?;
         self.add_stream(
             server,
-            Stream::Area(output, (x, y, width, height), physical),
+            StreamSource::Area(output, (x, y, width, height), physical),
         )
         .await
     }
@@ -1174,7 +1254,7 @@ impl Session {
             .ok()
             .and_then(|w| w.iter().find(|w| w.id == id).cloned())
             .ok_or_else(|| fdo::Error::Failed("no such window".into()))?;
-        self.add_stream(server, Stream::Window(window)).await
+        self.add_stream(server, StreamSource::Window(window)).await
     }
 
     #[zbus(signal)]
@@ -1183,26 +1263,16 @@ impl Session {
 
 impl Session {
     fn check_owner(&self, header: &zbus::message::Header<'_>) -> fdo::Result<()> {
-        if crate::capture_security::owns_session(
-            &self.owner,
-            header.sender().map(|sender| sender.as_str()),
-            self.stopped.load(Ordering::SeqCst),
-        ) {
-            Ok(())
-        } else {
-            Err(crate::capture_security::denied(
-                "session belongs to another caller or was revoked",
-            ))
-        }
+        session_owner(&self.owner, &self.stopped, header)
     }
+    /// Mutter's `add_stream`: allowed before and after Start; a stream
+    /// recorded on an active session waits for its own `Stream.Start`
+    /// (gnome-remote-desktop records after RemoteDesktop.Start).
     async fn add_stream(
         &self,
         server: &ObjectServer,
-        stream: Stream,
+        source: StreamSource,
     ) -> fdo::Result<OwnedObjectPath> {
-        if self.started.load(Ordering::SeqCst) {
-            return Err(fdo::Error::Failed("capture session already started".into()));
-        }
         if self
             .streams
             .lock()
@@ -1216,6 +1286,20 @@ impl Session {
         let path = format!("/org/gnome/Mutter/ScreenCast/Stream/u{id}");
         let path =
             OwnedObjectPath::try_from(path).map_err(|e| fdo::Error::Failed(e.to_string()))?;
+        let stream = Stream {
+            id,
+            source,
+            started: Arc::new(AtomicBool::new(false)),
+            owner: self.owner.clone(),
+            authority: self.authority.clone(),
+            session_id: self.id,
+            to_loop: self.to_loop.clone(),
+            signals: self.signals.clone(),
+            stopped: self.stopped.clone(),
+            session_active: self.started.clone(),
+            linked: self.linked,
+            streams: Arc::downgrade(&self.streams),
+        };
         server.at(&path, stream.clone()).await?;
         let iface = server.interface::<_, Stream>(&path).await?;
         if let Ok(mut streams) = self.streams.lock() {
@@ -1227,6 +1311,54 @@ impl Session {
 
 #[interface(name = "org.gnome.Mutter.ScreenCast.Stream")]
 impl Stream {
+    /// Mutter's `handle_start` (meta-screen-cast-stream.c): the owner
+    /// starts a stream recorded after its session became active.
+    async fn start(
+        &self,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<()> {
+        session_owner(&self.owner, &self.stopped, &header)?;
+        self.authority.unlocked()?;
+        if !self.session_active.load(Ordering::SeqCst) {
+            return Err(fdo::Error::Failed(
+                "Failed to start stream: session not started".into(),
+            ));
+        }
+        self.begin(&ctxt)
+    }
+
+    /// Mutter's `handle_stop`: the stream ends and leaves its session.
+    /// A stream of a plain session ends the session with it
+    /// (`on_stream_closed` in meta-screen-cast-session.c); a linked
+    /// session lives on until its RemoteDesktop session stops.
+    async fn stop(
+        &self,
+        #[zbus(object_server)] server: &ObjectServer,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<()> {
+        session_owner(&self.owner, &self.stopped, &header)?;
+        if !self.started.load(Ordering::SeqCst) {
+            return Err(fdo::Error::AccessDenied("Stream not started".into()));
+        }
+        let _ = self.to_loop.send(ToLoop::StopStream {
+            session_id: self.session_id,
+            stream_id: self.id,
+        });
+        if let Some(streams) = self.streams.upgrade() {
+            if let Ok(mut streams) = streams.lock() {
+                streams.retain(|(stream, _)| stream.id != self.id);
+            }
+        }
+        let _ = server.remove::<Stream, _>(ctxt.path()).await;
+        if !self.linked {
+            // The revocation scan closes the session and tells its owner.
+            self.stopped.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
     #[zbus(signal)]
     pub async fn pipe_wire_stream_added(ctxt: &SignalEmitter<'_>, node_id: u32)
         -> zbus::Result<()>;
@@ -1235,6 +1367,43 @@ impl Stream {
     /// streams of a session linked to a RemoteDesktop grant.
     #[zbus(property)]
     fn parameters(&self) -> HashMap<String, OwnedValue> {
+        self.source.parameters()
+    }
+}
+
+impl Stream {
+    /// Hand the stream to the event loop once (mutter's
+    /// `meta_screen_cast_stream_start`). Its PipeWireStreamAdded goes to
+    /// the session's peer only, as mutter's `on_stream_ready` sends it.
+    fn begin(&self, emitter: &SignalEmitter<'_>) -> fdo::Result<()> {
+        let owner = zbus::names::BusName::try_from(self.owner.clone())
+            .map_err(|_| fdo::Error::Failed("invalid session owner".into()))?;
+        if self.started.swap(true, Ordering::SeqCst) {
+            return Err(fdo::Error::Failed(
+                "Failed to start stream: Stream already started".into(),
+            ));
+        }
+        self.to_loop
+            .send(ToLoop::StartCast {
+                session_id: self.session_id,
+                stream_id: self.id,
+                grant: self.stopped.clone(),
+                target: self.source.target(),
+                signal: CastSignals {
+                    stream: emitter.to_owned().set_destination(owner),
+                    queue: self.signals.clone(),
+                },
+            })
+            .map_err(|_| fdo::Error::Failed("compositor gone".into()))
+    }
+
+    fn geometry(&self) -> StreamParameters {
+        self.source.geometry()
+    }
+}
+
+impl StreamSource {
+    fn parameters(&self) -> HashMap<String, OwnedValue> {
         let geometry = self.geometry();
         let mut parameters = HashMap::new();
         for (key, value) in [("position", geometry.position), ("size", geometry.size)] {
@@ -1242,19 +1411,17 @@ impl Stream {
                 parameters.insert(key.to_owned(), value);
             }
         }
-        if let Stream::Monitor(_, Some(mapping_id)) = self {
+        if let StreamSource::Monitor(_, Some(mapping_id)) = self {
             if let Ok(value) = OwnedValue::try_from(Value::from(mapping_id.as_str())) {
                 parameters.insert("mapping-id".to_owned(), value);
             }
         }
         parameters
     }
-}
 
-impl Stream {
     fn geometry(&self) -> StreamParameters {
         match self {
-            Stream::Monitor(o, _) => StreamParameters {
+            StreamSource::Monitor(o, _) => StreamParameters {
                 position: (o.x, o.y),
                 size: (
                     (f64::from(o.width) / o.scale).round() as i32,
@@ -1262,11 +1429,11 @@ impl Stream {
                 ),
             },
             // A window has no place on a monitor layout.
-            Stream::Window(w) => StreamParameters {
+            StreamSource::Window(w) => StreamParameters {
                 position: (0, 0),
                 size: (w.width.max(1), w.height.max(1)),
             },
-            Stream::Area(_, (x, y, w, h), _) => StreamParameters {
+            StreamSource::Area(_, (x, y, w, h), _) => StreamParameters {
                 position: (*x, *y),
                 size: (*w, *h),
             },

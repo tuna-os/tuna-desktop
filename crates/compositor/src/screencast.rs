@@ -71,10 +71,12 @@ impl PipeWire {
     }
 
     /// Start a stream of `width` x `height` physical pixels for one
-    /// session. The node id goes to the client once PipeWire assigns it.
+    /// session's stream. The node id goes to the client once PipeWire
+    /// assigns it.
     pub fn start_cast(
         &self,
         session_id: u64,
+        stream_id: u64,
         target: CastTarget,
         width: i32,
         height: i32,
@@ -194,6 +196,7 @@ impl PipeWire {
             .ok()?;
         Some(Cast {
             session_id,
+            stream_id,
             target,
             offered: (width, height),
             signal: session_signal,
@@ -218,6 +221,8 @@ struct Inner {
 /// One running stream.
 pub struct Cast {
     pub session_id: u64,
+    /// The `ScreenCast.Stream` object this cast serves.
+    pub stream_id: u64,
     /// Monitor or window this stream shows.
     pub target: CastTarget,
     /// Size last offered to the consumer (window casts follow resizes).

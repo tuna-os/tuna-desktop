@@ -4165,6 +4165,7 @@ impl Runtime {
             }
             crate::mutter::ToLoop::StartCast {
                 session_id,
+                stream_id,
                 grant,
                 target,
                 signal,
@@ -4202,7 +4203,7 @@ impl Runtime {
                 let Some(pw) = self.pipewire.as_ref() else {
                     return;
                 };
-                match pw.start_cast(session_id, target, width, height, signal) {
+                match pw.start_cast(session_id, stream_id, target, width, height, signal) {
                     Some(cast) => self.casts.push(cast),
                     None => eprintln!("tuna-compositor: screen cast: stream failed to start"),
                 }
@@ -4210,6 +4211,13 @@ impl Runtime {
             crate::mutter::ToLoop::StopCast { session_id } => {
                 self.casts.retain(|cast| cast.session_id != session_id);
                 self.cast_grants.remove(&session_id);
+            }
+            crate::mutter::ToLoop::StopStream {
+                session_id,
+                stream_id,
+            } => {
+                self.casts
+                    .retain(|cast| cast.session_id != session_id || cast.stream_id != stream_id);
             }
             crate::mutter::ToLoop::SensorSample {
                 present,
