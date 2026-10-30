@@ -40,3 +40,7 @@ focus untracked) and the remaining evidence are in
 [accessibility behavior](../../docs/accessibility-shell.md),
 [the settings inventory](../../docs/settings-desktop-inventory.md) and
 [the source/tests](src/lib.rs).
+
+Stability: internal, not published, no SemVer promise; the session JSON
+file is a cross-process contract — see the
+[API stability policy](../../docs/api-stability.md).

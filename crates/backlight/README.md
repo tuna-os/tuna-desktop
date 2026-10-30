@@ -30,3 +30,6 @@ Tests are inline in `src/lib.rs`.
 ## Docs
 
 [Brightness contract](../../docs/brightness-contract.md).
+
+Stability: internal, not published, no SemVer promise — see the
+[API stability policy](../../docs/api-stability.md).

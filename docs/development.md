@@ -9,7 +9,9 @@ Welcome to Tuna Desktop. This guide covers everything you need to set up your de
 - **Rust stable** with `rustfmt` and `clippy`, from [rustup.rs](https://rustup.rs):
   `rustup component add rustfmt clippy`. CI builds with the current stable
   toolchain. No crate declares a `rust-version` (MSRV); all crates use
-  edition 2021, and some dependencies need a recent stable compiler.
+  edition 2021, and some dependencies need a recent stable compiler. The
+  [API stability policy](api-stability.md#minimum-supported-rust-version)
+  explains why and what would change it.
 - **Git**.
 
 ### System packages

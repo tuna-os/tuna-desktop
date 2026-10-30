@@ -10,6 +10,10 @@
 //! Reference: `org.gnome.desktop.a11y.magnifier` at
 //! gsettings-desktop-schemas 51.0 (`schemas/org.gnome.desktop.a11y.magnifier.gschema.xml.in`)
 //! and gnome-shell 51.0 `js/ui/magnifier.js`. Defaults below match 51.0.
+//!
+//! Stability: internal. This crate is not published and makes no SemVer
+//! promise; its session JSON file is a cross-process contract between
+//! components built from one commit. See `docs/api-stability.md`.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

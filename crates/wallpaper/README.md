@@ -26,3 +26,6 @@ seconds to decode, which would stall nested sessions and proofs.
 
 [Settings map](../../docs/settings-map.md) for the GNOME background keys,
 [architecture](../../docs/architecture.md).
+
+Stability: internal, not published, no SemVer promise — see the
+[API stability policy](../../docs/api-stability.md).

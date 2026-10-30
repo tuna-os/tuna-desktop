@@ -8,6 +8,11 @@
 //! Wire format per ADR 0002: each frame is a u32 little-endian length prefix
 //! followed by a postcard body. Frames larger than [`MAX_FRAME_BYTES`] are
 //! rejected before any postcard decoding happens.
+//!
+//! Stability: internal. This crate is not published and makes no SemVer
+//! promise for its Rust API. The wire format is versioned by
+//! [`ProtocolVersion`]; the rules for changing it are in
+//! `docs/api-stability.md` in the repository.
 
 pub mod background;
 pub mod motion;

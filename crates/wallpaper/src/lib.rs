@@ -5,6 +5,9 @@
 //! decoders and the resize are generic, so they would otherwise be
 //! instantiated, unoptimised, inside the compositor. GNOME 51's default
 //! wallpapers are 4096x4096 JPEG XL files.
+//!
+//! Stability: internal. This crate is not published and makes no SemVer
+//! promise; see `docs/api-stability.md` in the repository.
 
 pub mod background;
 pub mod svg;

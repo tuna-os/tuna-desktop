@@ -50,6 +50,8 @@ Each spek has its own draft `plan.md`, `context.md`, and `research.md`; plans re
 - Same-hardware GNOME comparison reports startup, idle CPU, whole-session PSS, input latency, frame pacing and soak growth. Targets are based on a pinned baseline and reproducible traces. GPU and total-power comparisons are follow-up work under ADR 0008, not v1 comparison gates.
 - Recovery from a failed shell/config/package upgrade reaches a login-capable session without deleting user data.
 
+The [security model](security-model.md) consolidates the threat model, trust boundaries, current-versus-target state and known limitations behind these gates.
+
 ## Decisions still open
 
 The historical baseline decision in [ADR 0007](adr/0007-gnome51-marlin-baseline.md) selects **GNOME 51 on the Marlin image family** as the parity/performance comparator. [ADR 0008](adr/0008-v1-beta-track-and-release-scope.md) broadens the v1 target to **every TunaOS variant**, each qualified from its own image digest or explicitly unsupported with a recorded reason. The published Marlin GNOME image measured on October 4 contained GNOME Shell 50.5; a GNOME 51 comparison must identify its separately upgraded reference payload. See [the current roadmap](roadmap.md) for actual qualification and release limits.

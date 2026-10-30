@@ -1,5 +1,8 @@
 //! Original bounded raw-backlight/connector observations shared by shell and compositor.
 //! These reads confer no backend generation, provider policy or restoration authority.
+//!
+//! Stability: internal. This crate is not published and makes no SemVer
+//! promise; see `docs/api-stability.md` in the repository.
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::Read;

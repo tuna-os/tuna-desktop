@@ -10,6 +10,9 @@
 //!   panel surface.
 //! - [`control`] — shell-side control-protocol client (Hello, snapshot,
 //!   ordered changes with gap resnapshot, token activation commands).
+//!
+//! Stability: internal. This crate is not published and makes no SemVer
+//! promise; see `docs/api-stability.md` in the repository.
 
 pub mod apps;
 pub mod control;

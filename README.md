@@ -101,7 +101,8 @@ requirement traceability.
 ## Prerequisites
 
 - **Rust stable** with `rustfmt` and `clippy` (CI uses the current stable
-  toolchain; no MSRV is declared, crates use edition 2021).
+  toolchain; no MSRV is declared, crates use edition 2021; see the
+  [API stability and MSRV policy](docs/api-stability.md)).
 - **System libraries**: libseat, libinput, libudev, GBM, libdrm,
   libxkbcommon, GTK 4, libadwaita, PipeWire, Wayland and gtk4-layer-shell
   development files, plus EGL (Mesa llvmpipe is enough) to run a nested
@@ -129,6 +130,10 @@ requirement traceability.
 - [Parity ledger](docs/parity-ledger.md)
 - [Research intake rules](docs/research/README.md)
 - [Architecture decisions](docs/adr/README.md)
+- [Security model and threat model](docs/security-model.md)
+- [Portal and D-Bus service integration](docs/portal-service-integration.md)
+- [Extensions: current Rhai host and target architecture](docs/extensions.md)
+- [Crate API stability, wire versioning and MSRV](docs/api-stability.md)
 - [Contributing](CONTRIBUTING.md)
 
 ## License
