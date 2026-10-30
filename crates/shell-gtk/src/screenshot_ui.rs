@@ -213,8 +213,8 @@ enum Binding {
 /// Meta is left out of the comparison: GTK can report it for Alt.
 fn binding(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<Binding> {
     use gdk::ModifierType as M;
-    let held = modifiers
-        & (M::SHIFT_MASK | M::CONTROL_MASK | M::ALT_MASK | M::SUPER_MASK | M::HYPER_MASK);
+    let held =
+        modifiers & (M::SHIFT_MASK | M::CONTROL_MASK | M::ALT_MASK | M::SUPER_MASK | M::HYPER_MASK);
     let plain = held.is_empty();
     let direction = match key {
         gdk::Key::Left => Some(Direction::Left),
@@ -1164,12 +1164,24 @@ mod tests {
     fn keys_match_gnome_bindings_exactly() {
         use gdk::ModifierType as M;
         let none = M::empty();
-        assert_eq!(binding(gdk::Key::c, M::CONTROL_MASK), Some(Binding::Capture));
-        assert_eq!(binding(gdk::Key::c, none), Some(Binding::Mode(Mode::Screen)));
+        assert_eq!(
+            binding(gdk::Key::c, M::CONTROL_MASK),
+            Some(Binding::Capture)
+        );
+        assert_eq!(
+            binding(gdk::Key::c, none),
+            Some(Binding::Mode(Mode::Screen))
+        );
         assert_eq!(binding(gdk::Key::Return, none), Some(Binding::Capture));
         assert_eq!(binding(gdk::Key::space, none), Some(Binding::Capture));
-        assert_eq!(binding(gdk::Key::s, none), Some(Binding::Mode(Mode::Selection)));
-        assert_eq!(binding(gdk::Key::w, none), Some(Binding::Mode(Mode::Window)));
+        assert_eq!(
+            binding(gdk::Key::s, none),
+            Some(Binding::Mode(Mode::Selection))
+        );
+        assert_eq!(
+            binding(gdk::Key::w, none),
+            Some(Binding::Mode(Mode::Window))
+        );
         assert_eq!(binding(gdk::Key::v, none), Some(Binding::ToggleCast));
         assert_eq!(binding(gdk::Key::p, none), Some(Binding::TogglePointer));
         assert_eq!(binding(gdk::Key::r, none), Some(Binding::Reset));
@@ -1193,7 +1205,10 @@ mod tests {
             assert_eq!(binding(key, modifiers), None, "{key:?} {modifiers:?}");
         }
         // Escape closes whatever is held.
-        assert_eq!(binding(gdk::Key::Escape, M::SHIFT_MASK), Some(Binding::Close));
+        assert_eq!(
+            binding(gdk::Key::Escape, M::SHIFT_MASK),
+            Some(Binding::Close)
+        );
     }
 
     #[test]
@@ -1207,10 +1222,22 @@ mod tests {
                 shift,
             })
         };
-        assert_eq!(binding(gdk::Key::Left, M::empty()), arrow(false, false, false));
-        assert_eq!(binding(gdk::Key::Left, M::CONTROL_MASK), arrow(false, true, false));
-        assert_eq!(binding(gdk::Key::Left, M::SHIFT_MASK), arrow(false, false, true));
-        assert_eq!(binding(gdk::Key::Left, M::ALT_MASK), arrow(true, false, false));
+        assert_eq!(
+            binding(gdk::Key::Left, M::empty()),
+            arrow(false, false, false)
+        );
+        assert_eq!(
+            binding(gdk::Key::Left, M::CONTROL_MASK),
+            arrow(false, true, false)
+        );
+        assert_eq!(
+            binding(gdk::Key::Left, M::SHIFT_MASK),
+            arrow(false, false, true)
+        );
+        assert_eq!(
+            binding(gdk::Key::Left, M::ALT_MASK),
+            arrow(true, false, false)
+        );
         assert_eq!(
             binding(gdk::Key::Left, M::ALT_MASK | M::CONTROL_MASK),
             arrow(true, true, false)
