@@ -23,10 +23,11 @@ The pure failure fixtures in `scripts/lib/tuna-soak-tests.py` verify zombie reje
 ## Native frame pacing during endurance
 
 For a memory-and-frame-pacing run, build the small fixture with
-`scripts/tuna-frame-pacer-build`, install its binary as the root-owned
-`/usr/local/libexec/tuna-frame-pacer`, and copy
-`scripts/lib/endurance_presentation.py` to
-`/usr/local/libexec/lib/endurance_presentation.py` alongside the observer.
+`scripts/tuna-frame-pacer-build` and install its binary as the root-owned
+`tuna-frame-pacer` beside the observer (here
+`/usr/local/libexec/tuna-frame-pacer`); the observer runs the workload from
+its own directory. Copy `scripts/lib/endurance_presentation.py` to
+`lib/endurance_presentation.py` beside the observer as well.
 Use the running user's actual ordinary Wayland socket, for example:
 
 ```sh
@@ -60,3 +61,54 @@ when comparing with a memory-only idle soak. These intervals describe this
 native client workload, not input latency or all compositor animation frames.
 No GNOME-relative release threshold is introduced. A short DRM control
 exercises batch rollover and completion in CI; it is not 24-hour evidence.
+
+## Bounded nightly VM soak
+
+The [published-flavor nightly](marlin-tuna-nightly.md) runs this observer
+with the native workload on every scheduled or dispatched run. It is a
+bounded run, **not the 24-hour qualification run**: GitHub-hosted jobs stop
+at six hours and the same job runs the qualification boots. The
+qualification rule above is unchanged. `provenance.json` and `report.json`
+record `scope`, which reads `24-hour qualification candidate` only for
+`requested_duration_s: 86400` and otherwise
+`bounded N s rehearsal; not the 24-hour qualification run`.
+
+After the five qualification boots, the job boots the same installed digest
+once more from a pristine snapshot, logs in through GDM as those boots do and
+records the same startup checks. `scripts/tuna-vm-lane --soak 3000
+--soak-warmup 600` then starts the fixture's copy of the observer
+(`/usr/libexec/tuna-soak/`, installed by `Containerfile.published`, whose
+build stage compiles the native workload) as the root transient unit
+`tuna-vm-soak`. The workload uses the session's own
+`tuna-nested-<compositor pid>` socket. With the default 60 s interval that is
+50 minutes and 50 samples, 40 minutes of them after the ten-minute warmup.
+Pull requests that change the lane, fixture or soak scripts rehearse the
+same wiring for 900 s with a 300 s warmup.
+
+The lane polls the unit through the guest agent, then copies
+`provenance.json`, `samples.jsonl`, `report.json`, `presentation.jsonl` and
+`presentation.stderr` in bounded reads, checked against the guest's sizes
+and SHA-256 digests. `scripts/lib/soak_report.py` re-reads the whole native
+capture and writes `summary.json` and `summary.md`: session PSS, RSS, fds and
+processes at the warmup baseline, at the end and at their post-warmup peak
+against the observer's limits; the post-warmup PSS trend in MiB/h; whole-run
+frame interval p50/p95/p99/max; and one row per sample (at most 60, evenly
+spaced) of memory, descriptors, processes, frames and interval percentiles.
+`V-SOAK` passes only when the unit exits successfully, every file transfers
+intact, the report is complete for the requested duration and the capture
+validates. A failure names the observer's own reason from its journal.
+
+The `published-marlin-tuna-soak-<run id>` artifact holds the boot's serial
+log, assertions and manifest, and `soak/` with the observer files, the
+summary, the observer journal and the first and last soak frames. The job
+summary and `qualification.json` (`soak`) repeat the result beside, not
+inside, the digest's qualification checks; a soak failure still fails the
+nightly. The source revision comes from the deployment record: the shipped
+`tuna-desktop` package version maps to its release tag, as
+`packaging/arch/PKGBUILD` builds tag `v${_semver}`, resolved to a commit when
+the job runs. `provenance.json` keeps the measured binary hashes.
+
+These runs measure one idle desktop with one controlled native client on
+virtio-gpu under KVM. They show growth and pacing trends between nightlies;
+they are not GNOME-relative thresholds, hardware evidence or a substitute for
+the 24-hour run that #203 and #73 still require.
