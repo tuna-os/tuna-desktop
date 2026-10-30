@@ -1,0 +1,22 @@
+{
+  "issue": 358,
+  "date": "2026-10-30",
+  "vm": "tuna-q-rdp (Corral, KubeVirt, 4 vCPU, 6G, bochs-drm 1280x800)",
+  "image": "ghcr.io/tuna-os/marlin@sha256:ae6363c185015849701328fc38694f5ddcc0b4c804034a1d8d05577f1c70cf7d (booted manifest sha256:a182a20b732b6f8954be4afd7c0b47fa67306143100b5377d0b015a873415beb, version cbb3569)",
+  "published_compositor_sha256": "9d8de57edf1b43fd6ff9933ae53568d5cc04e8e15aae381309e10b2e372fcbd3",
+  "sideloaded": {
+    "method": "bootc usroverlay (transient /usr)",
+    "gnome-remote-desktop": "51.0-2 (pacman), /usr/lib/gnome-remote-desktop-daemon sha256 dc748c8aec8f69baca0b19bd089d6e657b6a178475866a8ca90f01dedf973a73",
+    "freerdp": "2:3.32.2-1 (guest, unused); client: FreeRDP 3 xfreerdp3 in an Arch container on the Corral host over the VM network (10.42.0.165:3389)",
+    "candidate_compositor": "branch rdp-e2e-358 commit 5a43bb29, release build sha256 821fab9363be1b471bcf8311b7acb688543f61037122c1c7e5942e32aadb442a",
+    "tuna-session.target": "main e730d9e2 share/systemd/user/tuna-session.target sha256 22b3bc87...; the published one (39c3a99c...) does not pull gnome-session.target, so grd (WantedBy=gnome-session.target) does not autostart there"
+  },
+  "steps": [
+    {"id": "published-settings", "result": "fail", "observed": "Settings > System has no Remote Desktop row: gnome-remote-desktop is not installed (cc-system-panel.c hides the row when the service is not-found)", "frame": "01-system-published-no-grd.png"},
+    {"id": "settings-enable", "result": "pass", "observed": "with grd sideloaded, Settings > System > Remote Desktop: Desktop Sharing and Remote Control switched on by pointer clicks; grd user unit active, org.gnome.RemoteDesktop.User owned, :3389 listening, rdp enable=true view-only=false", "frames": ["02-remote-desktop-page-grd-sideloaded.png", "03-sharing-and-control-enabled.png"]},
+    {"id": "published-rdp-connect", "result": "fail", "observed": "grd: Failed to start remote desktop session: AccessDenied: capture requires the supervised shell or installed portal", "log": "published-connect-client.log"},
+    {"id": "candidate-rdp-connect", "result": "fail", "observed": "CreateSession, ConnectToEIS and the EIS keymap pass; grd: Failed to record monitor: Failed: capture session already started (grd records after RemoteDesktop.Start and calls Stream.Start, not served), client disconnected before a frame", "log": "candidate-control3-client.log"},
+    {"id": "control-clipboard-viewonly-lock-revocation", "result": "not-exercised", "reason": "blocked by candidate-rdp-connect"},
+    {"id": "remote-login", "result": "not-exercised", "reason": "needs RecordVirtual and a GDM headless Tuna session; neither exists"}
+  ]
+}

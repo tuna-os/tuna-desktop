@@ -750,10 +750,7 @@ mod tests {
         let options = owner_changed_options(Some((&types, true)));
         let value = options.get("mime-types").unwrap();
         assert_eq!(value.value_signature().to_string(), "(as)");
-        assert_eq!(
-            bool::try_from(options.get("session-is-owner").unwrap()).unwrap(),
-            true
-        );
+        assert!(bool::try_from(options.get("session-is-owner").unwrap()).unwrap());
         assert!(owner_changed_options(None).is_empty());
     }
 
