@@ -15,7 +15,12 @@ base, and picks the proof lanes the change can affect:
 
 - `ci.yml`, `scripts/ci-*`, `Cargo.toml`, `Cargo.lock`, `third-party/` or
   `scripts/tuna-nested`: every lane.
-- docs, other workflows, `fuzz/` and the script self-tests: no proof lanes.
+- most documentation, other workflows, `fuzz/` and the script self-tests: no
+  proof lanes. The selector-owned documentation exceptions are
+  `docs/nested-session.md` (`arch-package`), `docs/walkthrough*`
+  (`gtk-shell`) and `docs/parity-ledger.md` (`parity-ledger`), each plus the
+  lanes whose artifacts it needs. `scripts/ci-select-lanes` (`OWNED` and
+  `NO_LANE`) is the authoritative, ordered mapping.
 - a lane's own proof script, reference fixtures or packaging: that lane
   (plus the lanes whose artifacts it needs).
 - anything else (crates, `share/`, other scripts): `gtk-shell` plus a
