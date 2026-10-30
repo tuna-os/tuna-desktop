@@ -194,14 +194,7 @@ impl WiredMenu {
             if shown.len() > 1 {
                 // NMSectionItem's use-submenu: each adapter has its own
                 // expandable connection menu, rather than flattening rows.
-                let label = if dev.interface.is_empty() {
-                    format!(
-                        "{DEVICE_NAME} ({})",
-                        dev.path.rsplit('/').next().unwrap_or_default()
-                    )
-                } else {
-                    format!("{DEVICE_NAME} ({})", dev.interface)
-                };
+                let label = submenu_label(dev);
                 let rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
                 for row in dev.menu(DEVICE_NAME) {
                     rows.append(&self.row(dev, &row, connectivity));
@@ -374,36 +367,14 @@ fn read_device(
 ) {
     let conn2 = conn.clone();
     get_all(conn, &path.clone(), DEVICE, move |props| {
-        let Some(props) = props else {
+        let Some((device, profiles, active)) = props
+            .as_ref()
+            .and_then(|props| ethernet_device(path, props, primary.as_deref()))
+        else {
             done.tick();
             return;
         };
-        let u = |k: &str| {
-            props
-                .lookup_value(k, None)
-                .and_then(|v| v.get::<u32>())
-                .unwrap_or(0)
-        };
-        if u("DeviceType") != ETHERNET {
-            done.tick();
-            return;
-        }
-        let profiles: Vec<String> = props
-            .lookup_value("AvailableConnections", None)
-            .and_then(|v| v.get::<Vec<glib::variant::ObjectPath>>())
-            .map(|p| p.into_iter().map(|p| p.as_str().to_owned()).collect())
-            .unwrap_or_default();
-        let active = object_path(&props, "ActiveConnection");
-        let device = Rc::new(RefCell::new(WiredDevice {
-            primary: active.is_some() && active == primary,
-            path,
-            interface: props
-                .lookup_value("Interface", None)
-                .and_then(|v| v.get::<String>())
-                .unwrap_or_default(),
-            state: u("State"),
-            ..WiredDevice::default()
-        }));
+        let device = Rc::new(RefCell::new(device));
         let finish = Countdown::new(profiles.len() + 2, {
             let device = device.clone();
             move || {
@@ -425,28 +396,8 @@ fn read_device(
                 5000,
                 None::<&gio::Cancellable>,
                 move |reply| {
-                    // a{sa{sv}}: the "connection" section's id and
-                    // timestamp.
-                    let section = reply.ok().and_then(|v| {
-                        v.child_value(0).iter().find_map(|entry| {
-                            (entry.child_value(0).str() == Some("connection"))
-                                .then(|| glib::VariantDict::new(Some(&entry.child_value(1))))
-                        })
-                    });
-                    if let Some(section) = section {
-                        let name = section
-                            .lookup_value("id", None)
-                            .and_then(|v| v.get::<String>());
-                        if let Some(name) = name {
-                            device.borrow_mut().connections.push(WiredConnection {
-                                path: p,
-                                name,
-                                timestamp: section
-                                    .lookup_value("timestamp", None)
-                                    .and_then(|v| v.get::<u64>())
-                                    .unwrap_or(0),
-                            });
-                        }
+                    if let Some(profile) = reply.ok().and_then(|v| saved_profile(p, &v)) {
+                        device.borrow_mut().connections.push(profile);
                     }
                     finish.tick();
                 },
@@ -457,12 +408,7 @@ fn read_device(
                 let (device, finish) = (device.clone(), finish.clone());
                 get_all(&conn2, &active, ACTIVE, move |props| {
                     if let Some(props) = props {
-                        let profile = object_path(&props, "Connection").unwrap_or_default();
-                        let state = props
-                            .lookup_value("State", None)
-                            .and_then(|v| v.get::<u32>())
-                            .unwrap_or(0);
-                        device.borrow_mut().active = Some((profile, state));
+                        device.borrow_mut().active = Some(active_connection(&props));
                     }
                     finish.tick();
                 });
@@ -471,6 +417,87 @@ fn read_device(
         }
         finish.tick();
     });
+}
+
+/// A listed adapter's submenu title when there are several: libnm's
+/// generic name plus the interface (the object path's tail without one).
+fn submenu_label(dev: &WiredDevice) -> String {
+    if dev.interface.is_empty() {
+        format!(
+            "{DEVICE_NAME} ({})",
+            dev.path.rsplit('/').next().unwrap_or_default()
+        )
+    } else {
+        format!("{DEVICE_NAME} ({})", dev.interface)
+    }
+}
+
+/// An ethernet device from its `Device` properties, with its usable
+/// profiles and active connection; `None` for any other device type.
+fn ethernet_device(
+    path: String,
+    props: &glib::VariantDict,
+    primary: Option<&str>,
+) -> Option<(WiredDevice, Vec<String>, Option<String>)> {
+    let u = |k: &str| {
+        props
+            .lookup_value(k, None)
+            .and_then(|v| v.get::<u32>())
+            .unwrap_or(0)
+    };
+    if u("DeviceType") != ETHERNET {
+        return None;
+    }
+    let profiles: Vec<String> = props
+        .lookup_value("AvailableConnections", None)
+        .and_then(|v| v.get::<Vec<glib::variant::ObjectPath>>())
+        .map(|p| p.into_iter().map(|p| p.as_str().to_owned()).collect())
+        .unwrap_or_default();
+    let active = object_path(props, "ActiveConnection");
+    let device = WiredDevice {
+        primary: active.is_some() && active.as_deref() == primary,
+        path,
+        interface: props
+            .lookup_value("Interface", None)
+            .and_then(|v| v.get::<String>())
+            .unwrap_or_default(),
+        state: u("State"),
+        ..WiredDevice::default()
+    };
+    Some((device, profiles, active))
+}
+
+/// A saved profile from `GetSettings`' `(a{sa{sv}})`: the "connection"
+/// section's id (required) and timestamp (0 when never up).
+fn saved_profile(path: String, reply: &glib::Variant) -> Option<WiredConnection> {
+    let settings = reply
+        .try_child_value(0)
+        .filter(|v| v.type_().as_str() == "a{sa{sv}}")?;
+    let section = settings.iter().find_map(|entry| {
+        (entry.child_value(0).str() == Some("connection"))
+            .then(|| glib::VariantDict::new(Some(&entry.child_value(1))))
+    })?;
+    let name = section
+        .lookup_value("id", None)
+        .and_then(|v| v.get::<String>())?;
+    Some(WiredConnection {
+        path,
+        name,
+        timestamp: section
+            .lookup_value("timestamp", None)
+            .and_then(|v| v.get::<u64>())
+            .unwrap_or(0),
+    })
+}
+
+/// An active connection's profile and `NMActiveConnectionState`.
+fn active_connection(props: &glib::VariantDict) -> (String, u32) {
+    let profile = object_path(props, "Connection").unwrap_or_default();
+    let state = props
+        .lookup_value("State", None)
+        .and_then(|v| v.get::<u32>())
+        .unwrap_or(0);
+    (profile, state)
 }
 
 /// Runs its closure once `n` ticks have come in.
@@ -531,4 +558,290 @@ fn get_all(
             )
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opath(p: &str) -> glib::Variant {
+        glib::variant::ObjectPath::try_from(p).unwrap().to_variant()
+    }
+
+    fn device_props(
+        kind: u32,
+        state: u32,
+        iface: &str,
+        profiles: &[&str],
+        active: &str,
+    ) -> glib::VariantDict {
+        let props = glib::VariantDict::new(None);
+        props.insert_value("DeviceType", &kind.to_variant());
+        props.insert_value("State", &state.to_variant());
+        props.insert_value("Interface", &iface.to_variant());
+        let paths: Vec<glib::variant::ObjectPath> = profiles
+            .iter()
+            .map(|p| glib::variant::ObjectPath::try_from(*p).unwrap())
+            .collect();
+        props.insert_value("AvailableConnections", &paths.to_variant());
+        props.insert_value("ActiveConnection", &opath(active));
+        props
+    }
+
+    fn settings(sections: &[(&str, &[(&str, glib::Variant)])]) -> glib::Variant {
+        let map: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, glib::Variant>,
+        > = sections
+            .iter()
+            .map(|(name, keys)| {
+                (
+                    (*name).to_owned(),
+                    keys.iter()
+                        .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+        (map,).to_variant()
+    }
+
+    fn conn(path: &str, name: &str, timestamp: u64) -> WiredConnection {
+        WiredConnection {
+            path: path.into(),
+            name: name.into(),
+            timestamp,
+        }
+    }
+
+    #[test]
+    fn only_ethernet_devices_are_read_with_profiles_and_primary() {
+        let props = device_props(ETHERNET, 100, "enp3s0", &["/s/1", "/s/2"], "/ac/1");
+        let (dev, profiles, active) =
+            ethernet_device("/d/2".into(), &props, Some("/ac/1")).unwrap();
+        assert_eq!(dev.path, "/d/2");
+        assert_eq!(dev.interface, "enp3s0");
+        assert_eq!(dev.state, 100);
+        assert!(dev.primary);
+        assert_eq!(profiles, ["/s/1", "/s/2"]);
+        assert_eq!(active.as_deref(), Some("/ac/1"));
+        // Another device's primary connection is not this one's.
+        let (dev, ..) = ethernet_device("/d/2".into(), &props, Some("/ac/9")).unwrap();
+        assert!(!dev.primary);
+        // Not connected ("/"): no active connection, never primary, even
+        // when NetworkManager has no primary connection either.
+        let idle = device_props(ETHERNET, 30, "enp3s0", &[], "/");
+        let (dev, profiles, active) = ethernet_device("/d/2".into(), &idle, None).unwrap();
+        assert!(!dev.primary && active.is_none() && profiles.is_empty());
+        // Wi-Fi (2), bridges (13), and devices without a type are not wired.
+        for kind in [2, 13, 0] {
+            let other = device_props(kind, 100, "wlan0", &[], "/");
+            assert!(
+                ethernet_device("/d/3".into(), &other, None).is_none(),
+                "{kind}"
+            );
+        }
+        let untyped = glib::VariantDict::new(None);
+        untyped.insert_value("DeviceType", &"ethernet".to_variant());
+        assert!(ethernet_device("/d/4".into(), &untyped, None).is_none());
+    }
+
+    #[test]
+    fn profiles_need_a_connection_id_and_default_to_never_used() {
+        let reply = settings(&[
+            (
+                "connection",
+                &[
+                    ("id", "Office".to_variant()),
+                    ("timestamp", 1_700_000_000u64.to_variant()),
+                ],
+            ),
+            ("802-3-ethernet", &[]),
+        ]);
+        assert_eq!(
+            saved_profile("/s/1".into(), &reply),
+            Some(conn("/s/1", "Office", 1_700_000_000))
+        );
+        let never = settings(&[("connection", &[("id", "Fresh".to_variant())])]);
+        assert_eq!(
+            saved_profile("/s/2".into(), &never),
+            Some(conn("/s/2", "Fresh", 0))
+        );
+        let odd_stamp = settings(&[(
+            "connection",
+            &[
+                ("id", "Odd".to_variant()),
+                ("timestamp", "yesterday".to_variant()),
+            ],
+        )]);
+        assert_eq!(
+            saved_profile("/s/3".into(), &odd_stamp).unwrap().timestamp,
+            0
+        );
+        // No id, no connection section, or the wrong shape: not a row.
+        let unnamed = settings(&[("connection", &[("uuid", "x".to_variant())])]);
+        let bare = settings(&[("802-3-ethernet", &[])]);
+        for reply in [unnamed, bare, ("x",).to_variant(), 3u32.to_variant()] {
+            assert_eq!(saved_profile("/s/4".into(), &reply), None, "{reply}");
+        }
+    }
+
+    #[test]
+    fn active_connection_reads_profile_and_state() {
+        let props = glib::VariantDict::new(None);
+        props.insert_value("Connection", &opath("/s/1"));
+        props.insert_value("State", &1u32.to_variant());
+        assert_eq!(active_connection(&props), ("/s/1".into(), 1));
+    }
+
+    #[test]
+    fn nm_device_states_decide_visibility_like_gnome() {
+        // NMDeviceState: unmanaged and unavailable (no cable) are hidden,
+        // every state from disconnected to failed is listed.
+        let shown = |state| {
+            WiredDevice {
+                state,
+                ..WiredDevice::default()
+            }
+            .shown()
+        };
+        for state in [0, 10, 20, 25, 130] {
+            assert!(!shown(state), "{state}");
+        }
+        for state in [30, 40, 50, 60, 70, 80, 90, 100, 110, 120] {
+            assert!(shown(state), "{state}");
+        }
+    }
+
+    #[test]
+    fn active_connection_states_drive_icon_and_click() {
+        let mut dev = WiredDevice {
+            path: "/d/1".into(),
+            state: 100,
+            connections: vec![conn("/s/1", "Wired connection 1", 5)],
+            active: Some(("/s/1".into(), 1)),
+            primary: true,
+            ..WiredDevice::default()
+        };
+        assert_eq!(dev.icon(4), "network-wired-acquiring-symbolic");
+        assert!(dev.is_active());
+        dev.active = Some(("/s/1".into(), 2));
+        assert_eq!(dev.icon(4), "network-wired-symbolic");
+        assert_eq!(
+            dev.icon(2),
+            "network-wired-no-route-symbolic",
+            "portal/limited"
+        );
+        dev.primary = false;
+        assert_eq!(
+            dev.icon(2),
+            "network-wired-symbolic",
+            "not the default route"
+        );
+        // Deactivating (3) and deactivated (4) read as off, but a click
+        // still disconnects what NetworkManager holds.
+        for state in [3, 4] {
+            dev.active = Some(("/s/1".into(), state));
+            assert!(!dev.is_active());
+            assert_eq!(dev.icon(4), "network-wired-disconnected-symbolic");
+            assert_eq!(dev.click(), WiredAction::Disconnect);
+        }
+    }
+
+    #[test]
+    fn profile_selection_prefers_the_most_recent_then_the_first_by_name() {
+        let mut dev = WiredDevice {
+            path: "/d/1".into(),
+            state: 30,
+            connections: vec![
+                conn("/s/1", "Zulu", 0),
+                conn("/s/2", "Home", 10),
+                conn("/s/3", "Office", 20),
+            ],
+            ..WiredDevice::default()
+        };
+        assert_eq!(dev.click(), WiredAction::Activate("/s/3".into()));
+        // None ever used: the first by name.
+        for c in &mut dev.connections {
+            c.timestamp = 0;
+        }
+        assert_eq!(dev.click(), WiredAction::Activate("/s/2".into()));
+        dev.connections.clear();
+        assert_eq!(dev.click(), WiredAction::AutoConnect);
+    }
+
+    #[test]
+    fn several_adapters_are_told_apart_and_the_toggle_acts_on_all() {
+        let usb = WiredDevice {
+            path: "/org/freedesktop/NetworkManager/Devices/7".into(),
+            state: 100,
+            connections: vec![conn("/s/2", "Dock", 50)],
+            active: Some(("/s/2".into(), 2)),
+            ..WiredDevice::default()
+        };
+        let builtin = WiredDevice {
+            path: "/org/freedesktop/NetworkManager/Devices/3".into(),
+            interface: "enp3s0".into(),
+            state: 100,
+            connections: vec![conn("/s/1", "Office", 90)],
+            active: Some(("/s/1".into(), 2)),
+            primary: true,
+            ..WiredDevice::default()
+        };
+        assert_eq!(submenu_label(&builtin), "Wired (enp3s0)");
+        assert_eq!(
+            submenu_label(&usb),
+            "Wired (7)",
+            "no interface: the path's tail"
+        );
+        let devices = [usb.clone(), builtin.clone()];
+        let toggle = logic::wired_toggle(&devices, 4);
+        assert!(toggle.visible && toggle.checked);
+        assert_eq!(toggle.subtitle.as_deref(), Some("2 connected"));
+        // The toggle turns every active adapter off.
+        assert_eq!(
+            logic::wired_click(&devices),
+            [
+                (usb.path.clone(), WiredAction::Disconnect),
+                (builtin.path.clone(), WiredAction::Disconnect)
+            ]
+        );
+        // Both down: the most recently used adapter comes up.
+        let down: Vec<WiredDevice> = devices
+            .iter()
+            .cloned()
+            .map(|mut d| {
+                d.active = None;
+                d.state = 30;
+                d
+            })
+            .collect();
+        assert_eq!(
+            logic::wired_click(&down),
+            [(builtin.path.clone(), WiredAction::Activate("/s/1".into()))]
+        );
+        // An unplugged adapter is not counted or toggled.
+        let mut unplugged = down.clone();
+        unplugged[1].state = 20;
+        assert_eq!(
+            logic::wired_click(&unplugged),
+            [(usb.path.clone(), WiredAction::Activate("/s/2".into()))]
+        );
+    }
+
+    #[test]
+    fn countdown_fires_once_after_every_tick() {
+        let fired = Rc::new(Cell::new(0));
+        let counter = fired.clone();
+        let done = Countdown::new(3, move || counter.set(counter.get() + 1));
+        done.tick();
+        done.tick();
+        assert_eq!(fired.get(), 0, "not before every reply is in");
+        done.tick();
+        assert_eq!(fired.get(), 1);
+        // Late or duplicate replies do not rebuild twice.
+        done.tick();
+        done.tick();
+        assert_eq!(fired.get(), 1);
+    }
 }

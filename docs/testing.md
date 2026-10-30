@@ -472,6 +472,18 @@ it after a Num Lock change and before the next `gsettings set`. The
 applied. Wait for it after changing the input sources or `xkb-options`
 and before typing.
 
+## Settings bindings in unit tests
+
+Shell unit tests that read GSettings use
+`crates/shell-gtk/src/test_settings.rs`. `SettingsFixture::new(xml)`
+compiles a `<schemalist>` with `glib-compile-schemas --strict` into a
+temporary directory, and `settings(id)` opens it on a private memory
+backend, so no dconf, session bus or host schema is involved and
+parallel tests cannot see each other's writes. Create the fixture inside
+`glib::MainContext::with_thread_default` and use `dispatch_until` when a
+test needs `changed` signals. `background_settings.rs` binds GNOME's
+background, interface and screensaver keys this way.
+
 ## Parity ledger check
 
 The `parity-ledger` job runs `scripts/tuna-ledger` against the test list
