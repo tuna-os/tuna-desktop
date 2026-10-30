@@ -270,7 +270,7 @@ jobs:
 
   fprint-phase-proof:
     # Required measured transport phases; not a live UI/hardware qualification.
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'fprint-phase-proof')
     timeout-minutes: 45
@@ -442,7 +442,7 @@ jobs:
           retention-days: 90
 
   app-content:
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'app-content')
     timeout-minutes: 25
@@ -478,7 +478,7 @@ jobs:
           retention-days: 14
 
   scroll-proof:
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'scroll-proof')
     timeout-minutes: 25
@@ -568,7 +568,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
     # Source-only real headed old/fixed comparison; the full GTK journey stays required.
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'grid-cancel-comparison')
     permissions:
@@ -637,7 +637,7 @@ jobs:
     # GTK4/libadwaita shell (ADR 0006) in the nested session: panel,
     # calendar and quick-settings popovers (xdg popups on a layer
     # surface), and the AT-SPI tree a screen reader sees (#71).
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     # Authentication callback admission requires this run's successful check.
     needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'gtk-shell')
@@ -1327,7 +1327,7 @@ jobs:
     # GNOME 51 parity ledger gate (#66): every row marked pass must cite
     # tests, and every cited cargo test / journey assertion must have
     # passed in this run.
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     needs: [select-lanes, check, journey, gtk-shell, orca-speech, drm-smoke, marlin-vm]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'parity-ledger')
     steps:
@@ -1377,7 +1377,7 @@ jobs:
           --assertions ledger-in/marlin-vm/assertions.txt
 
   docs-shots:
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     needs: [select-lanes, journey, app-content, scroll-proof]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'docs-shots')
     steps:

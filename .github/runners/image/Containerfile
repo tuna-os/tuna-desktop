@@ -46,6 +46,12 @@ RUN useradd -m -u "${RUNNER_UID}" -s /bin/bash runner \
  && echo 'Defaults env_keep += "DEBIAN_FRONTEND"' > /etc/sudoers.d/env_keep \
  && mkdir -p /opt/hostedtoolcache && chown runner:runner /opt/hostedtoolcache
 
+# What systemd-tmpfiles creates at boot on GitHub's VMs (X servers and
+# XWayland bind their sockets there), and the hosted work directory, so job
+# paths, and with them actions/cache versions, match GitHub-hosted runs.
+RUN install -d -m 1777 /tmp/.X11-unix /tmp/.ICE-unix \
+ && install -d -o runner -g runner /home/runner/work
+
 # Nested containers (podman, and `docker` via podman-docker) inside the
 # pod's user namespace, which spans uids 0-65535: root maps the whole
 # range, runner every id but its own. The pod's cgroupfs is read-only, so

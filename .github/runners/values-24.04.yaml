@@ -32,9 +32,12 @@ template:
     enableServiceLinks: false
     containers:
       - name: runner
-        image: localhost/tuna-ci-runner:24.04-2.338.2-202610302016
+        image: localhost/tuna-ci-runner:24.04-2.338.2-202610302030
         imagePullPolicy: Never
         command: ["/home/runner/run.sh"]
+        # ARC uses this as the runner's work folder: /home/runner/work, as on
+        # GitHub-hosted runners, so cached paths (and cache hits) match.
+        workingDir: /home/runner/work
         securityContext:
           # Rootless podman needs both to set up its nested user namespace;
           # they hold only inside the pod's own user namespace
