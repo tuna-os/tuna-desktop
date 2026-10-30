@@ -17,11 +17,15 @@ source: advertised only in setups the capture cannot reproduce).
   match        present at the GNOME version or newer
   min:<v>      present at version <v> or newer (a known version gap)
   gap:<ref>    absent today, a known gap tracked in <ref>
+  cond:<when>  offered only <when>, where Mutter offers it too (a device
+               capability); absence is fine, but when offered it must be
+               at the GNOME version or newer
   absent:<why> deliberately absent (GNOME parity choice or not planned)
 
 Fails (exit 1) when a `match` or `min:` global is missing or older than
-required. Known gaps that Tuna Desktop now offers are reported so the list can
-be tightened. Globals Tuna Desktop offers beyond GNOME's are listed.
+required, or a `cond:` global is offered older than GNOME's. Known gaps
+that Tuna Desktop now offers are reported so the list can be tightened.
+Globals Tuna Desktop offers beyond GNOME's are listed.
 """
 import argparse
 import os
@@ -55,7 +59,7 @@ def parse_reference(path):
             name, version, source, tuna = cells
             if source not in ("capture", "source"):
                 sys.exit(f"{path}:{n}: source must be capture or source, got {source}")
-            if not (tuna == "match" or tuna.split(":", 1)[0] in ("min", "gap", "absent")):
+            if not (tuna == "match" or tuna.split(":", 1)[0] in ("min", "gap", "cond", "absent")):
                 sys.exit(f"{path}:{n}: unknown tuna expectation {tuna}")
             rows.append((name, int(version), source, tuna))
     return rows
@@ -77,6 +81,14 @@ def compare(tuna, reference):
                 failures.append(f"{name}: v{have}, need v{need} (GNOME 51 has v{gnome})")
             elif have < gnome:
                 verdict = f"ok (known gap: GNOME v{gnome})"
+            else:
+                verdict = "ok"
+        elif kind == "cond":
+            if have is None:
+                verdict = f"ok (not offered here; cond {arg})"
+            elif have < gnome:
+                verdict = f"FAIL v{have} < v{gnome}"
+                failures.append(f"{name}: v{have}, need v{gnome} when offered ({arg})")
             else:
                 verdict = "ok"
         else:

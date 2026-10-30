@@ -102,6 +102,7 @@ OWNED = [
     ("scripts/lib/tuna-orca-speech.py", ["orca-speech"]),
     ("scripts/tuna-frame-pacer-build", ["drm-smoke"]),
     ("scripts/lib/tuna-frame-pacer.c", ["drm-smoke"]),
+    ("scripts/lib/tuna-drm-lease-probe.c", ["drm-smoke"]),
     ("scripts/tuna-portal-security", ["portal-security"]),
     ("scripts/lib/tuna-portal-artifact*", ["portal-security"]),
     ("tests/portal-reference/*", ["portal-security"]),

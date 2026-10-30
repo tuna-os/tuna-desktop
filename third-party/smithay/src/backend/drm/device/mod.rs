@@ -287,6 +287,11 @@ impl DrmDevice {
         self.plane_claim_storage.claim(plane, crtc)
     }
 
+    /// The device's plane claims, shared with lease builders.
+    pub(crate) fn plane_claim_storage(&self) -> &PlaneClaimStorage {
+        &self.plane_claim_storage
+    }
+
     /// Returns the size of the hardware cursor
     ///
     /// Note: In case of universal planes this is the
