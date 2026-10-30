@@ -36,8 +36,8 @@ schedule, dispatch or a pull request whose head repository is
 | --- | --- |
 | `tuna-ci-24.04` | select-lanes, check, fprint-phase-proof, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, parity-ledger, docs-shots, ci-gate |
 | `tuna-ci-26.04` | orca-speech |
-| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (both matrix legs), journey |
-| GitHub-hosted, not yet proven self-hosted | portal-security, remote-security, niri-parity, marlin-image |
+| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (both matrix legs) |
+| GitHub-hosted, not yet proven self-hosted | journey, portal-security, remote-security, niri-parity, marlin-image |
 
 Why the always-hosted lanes stay hosted:
 
@@ -52,15 +52,13 @@ Why the always-hosted lanes stay hosted:
   --via-loopback`, i.e. loop devices and a privileged container, which is
   root on the node. KVM through KubeVirt's device plugin would work, the
   disk build would not.
-- **journey**'s "Qualify disposable Debian lifecycle" step (`docker run …
-  legacy-upgrade-evidence.py`) fails under the runners' rootless podman
-  (`podman-docker`): two to five dpkg conffile lifecycle cases error
-  (`end of file on stdin at conffile prompt`), reproduced with a
-  GitHub-hosted-built candidate package, while every hosted run passes.
-  Until that difference is understood the lane stays hosted.
 
-The podman lanes (portal-security, remote-security, niri-parity,
-marlin-image) wait on hosted `arch-package`; rootless podman, `podman
+journey's self-hosted attempt failed in "Qualify disposable Debian lifecycle"
+(`end of file on stdin at conffile prompt`), but that failure came from #899
+changing a tuna-lock conffile, not from the runners; #930 restores it.
+
+The podman lanes (journey, and portal-security, remote-security, niri-parity
+and marlin-image, which also wait on hosted `arch-package`); rootless podman, `podman
 build` and `docker run` work in the runner pods, but these lanes have not
 passed self-hosted yet. Move one by switching its `runs-on` to the alias
 and proving it green on a pull request.

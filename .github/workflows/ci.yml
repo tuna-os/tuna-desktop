@@ -316,8 +316,7 @@ jobs:
           retention-days: 14
 
   journey:
-    # GitHub-hosted: its legacy-upgrade dpkg lifecycle fails under the
-    # self-hosted runners' rootless podman (docs/ci-runners.md).
+    # GitHub-hosted until proven self-hosted (docs/ci-runners.md).
     runs-on: ubuntu-26.04
     needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'journey')
