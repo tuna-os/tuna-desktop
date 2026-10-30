@@ -29,7 +29,7 @@ compositor-issued activation tokens behave versus Wayland serials.
   revision gaps trigger resnapshot.
 - fd-passing deferred (no current need; viable later via rustix
   SCM_RIGHTS, already in the smithay tree).
-- Activation tokens: compositor mints 32-char random Bearer [REDACTED] via
+- Activation tokens: compositor mints 32-char random tokens via
   `TokenStore` with purpose/seat/app_id attached. Policy: 30 s expiry,
   one-use (remove after first successful activation), seat binding
   plus `app_id` match required, log-and-deny on mismatch. Binding to

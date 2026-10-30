@@ -582,6 +582,67 @@ fn hub_newcomer_handshake_receives_non_empty_inventory() {
     assert_eq!(outputs, inventory);
 }
 
+/// Mutter's seat touch-mode picks the unlock dialog's hint (#502): the
+/// hub sends a change once, stays quiet while it holds, gives a newcomer
+/// the current value with its handshake, and never sends it to a peer
+/// older than 0.46.
+#[test]
+fn hub_broadcasts_seat_touch_mode_changes_and_hands_newcomers_the_value() {
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub =
+        ControlHub::bind(path.clone(), std::rc::Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let mut model = StateModel::new();
+    let mut client = hub_client(&path);
+    hub_handshake(&mut hub, &mut model, &mut client);
+
+    hub.set_seat_touch_mode(true);
+    hub.poll(&mut model);
+    assert_eq!(
+        client_read(&mut client),
+        Message::SeatTouchMode { touch_mode: true }
+    );
+    hub.set_seat_touch_mode(true);
+    hub.poll(&mut model);
+    client.set_nonblocking(true).unwrap();
+    let mut prefix = [0u8; 4];
+    match client.read_exact(&mut prefix) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("an unchanged touch-mode must stay quiet, got {other:?}"),
+    }
+    client.set_nonblocking(false).unwrap();
+
+    let mut newcomer = hub_client(&path);
+    hub_handshake(&mut hub, &mut model, &mut newcomer);
+    assert_eq!(
+        client_read(&mut newcomer),
+        Message::SeatTouchMode { touch_mode: true }
+    );
+
+    hub.set_seat_touch_mode(false);
+    hub.poll(&mut model);
+    for client in [&mut client, &mut newcomer] {
+        assert_eq!(
+            client_read(client),
+            Message::SeatTouchMode { touch_mode: false }
+        );
+    }
+
+    let (conn, mut old) = pair();
+    client_write(
+        &mut old,
+        &Message::Hello {
+            version: ProtocolVersion::new(CURRENT_VERSION.major, 45),
+        },
+    );
+    let mut session = Session::handshake(conn, &StateModel::new()).unwrap();
+    assert!(matches!(client_read(&mut old), Message::Hello { .. }));
+    assert!(matches!(client_read(&mut old), Message::Snapshot { .. }));
+    session.send_seat_touch_mode(true).unwrap();
+    session.send_overview(true).unwrap();
+    assert_eq!(client_read(&mut old), Message::Overview { open: true });
+}
+
 /// Temp dir with owner-only permissions: the control socket refuses to
 /// bind anywhere less private (#30).
 fn private_tempdir() -> tempfile::TempDir {

@@ -69,6 +69,7 @@ mod control_readiness;
 pub mod corner_pressure;
 pub mod cursor;
 mod cursor_svg;
+mod dbus_signals;
 pub mod display_config;
 #[cfg(feature = "drm")]
 pub mod drm;

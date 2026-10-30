@@ -456,6 +456,9 @@ pub struct WindowManager {
     accel_fired: Vec<(u32, u32, u32)>,
     /// Input is going to the session-lock surface.
     lock_input_active: bool,
+    /// A touchpad swipe began on the session-lock surface and has not
+    /// ended: only its updates and end follow it there.
+    lock_swipe: bool,
     /// Tablet tools in proximity (P-IN-05).
     tablet: tablet_input::TabletFocus,
     /// Window-menu requests `(window, x, y)` in global logical pixels,
@@ -770,6 +773,7 @@ impl WindowManager {
             accel_released: Vec::new(),
             accel_fired: Vec::new(),
             lock_input_active: false,
+            lock_swipe: false,
             tablet: tablet_input::TabletFocus::default(),
             menu_requests: Vec::new(),
             last_active_workspace: None,
@@ -4122,15 +4126,32 @@ impl WindowManager {
     /// Scroll the client under the pointer. Wheel notches arrive in v120
     /// units (multiples of 120): sent as discrete steps of 15 px each,
     /// Mutter's wheel distance. Anything else is a continuous (touchpad)
-    /// distance in pixels. Always closed by a pointer frame.
-    pub fn pointer_axis(&mut self, state: &mut State, horizontal: f64, vertical: f64, time: u32) {
+    /// distance in pixels, and a finished axis sends `axis_stop` as
+    /// Mutter does (`meta-wayland-pointer.c:927-967`). Always closed by
+    /// a pointer frame.
+    pub fn pointer_axis(
+        &mut self,
+        state: &mut State,
+        horizontal: f64,
+        vertical: f64,
+        stop: AxisStop,
+        time: u32,
+    ) {
         let Some(pointer) = self.pointer.clone() else {
             return;
         };
         let mut frame = AxisFrame::new(time);
         let mut wheel = false;
         let mut any = false;
-        for (axis, amount) in [(Axis::Horizontal, horizontal), (Axis::Vertical, vertical)] {
+        for (axis, amount, stopped) in [
+            (Axis::Horizontal, horizontal, stop.horizontal),
+            (Axis::Vertical, vertical, stop.vertical),
+        ] {
+            if stopped {
+                any = true;
+                frame = frame.stop(axis);
+                continue;
+            }
             if amount == 0.0 {
                 continue;
             }
@@ -4159,8 +4180,12 @@ impl WindowManager {
     /// Route one input event to the session-lock surface and nothing
     /// else (ext-session-lock-v1): keys go to it with keyboard focus
     /// held there, the pointer acts on it at the output origin, and no
-    /// compositor shortcut fires. Gestures and relative motion are
-    /// dropped: nothing behind the lock may hear them.
+    /// compositor shortcut fires. Touchpad swipes go to it too, as
+    /// pointer gestures: GNOME's unlock dialog lifts its curtain with a
+    /// three-finger swipe (`unlockDialog.js:584-592`, `swipeTracker.js`
+    /// `TouchpadSwipeGesture` under `UNLOCK_SCREEN`), while the global
+    /// overview and workspace trackers are not allowed in that mode.
+    /// Relative motion is dropped: nothing behind the lock may hear it.
     pub fn lock_input(
         &mut self,
         state: &mut State,
@@ -4224,12 +4249,65 @@ impl WindowManager {
             ManagerInput::Axis {
                 horizontal,
                 vertical,
+                stop,
                 time,
             } => {
                 if let Some(pointer) = self.pointer.clone() {
                     self.lock_pointer_enter(state, &pointer, surface, time);
                 }
-                self.pointer_axis(state, horizontal, vertical, time)
+                self.pointer_axis(state, horizontal, vertical, stop, time)
+            }
+            ManagerInput::SwipeBegin { fingers, time } => {
+                let Some(pointer) = self.pointer.clone() else {
+                    return;
+                };
+                self.lock_pointer_enter(state, &pointer, surface, time);
+                if pointer.current_focus().as_ref() != Some(surface) {
+                    // A button held elsewhere since before the lock:
+                    // the swipe would reach that surface, so it goes
+                    // nowhere.
+                    return;
+                }
+                self.lock_swipe = true;
+                pointer.gesture_swipe_begin(
+                    state,
+                    &smithay::input::pointer::GestureSwipeBeginEvent {
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time,
+                        fingers,
+                    },
+                );
+                pointer.frame(state);
+            }
+            ManagerInput::SwipeUpdate { delta, time, .. } => {
+                // Only a swipe that began on the lock surface goes on:
+                // one begun before the lock was the session's.
+                if !self.lock_swipe {
+                    return;
+                }
+                if let Some(pointer) = self.pointer.clone() {
+                    pointer.gesture_swipe_update(
+                        state,
+                        &smithay::input::pointer::GestureSwipeUpdateEvent { time, delta },
+                    );
+                    pointer.frame(state);
+                }
+            }
+            ManagerInput::SwipeEnd { cancelled, time } => {
+                if !std::mem::take(&mut self.lock_swipe) {
+                    return;
+                }
+                if let Some(pointer) = self.pointer.clone() {
+                    pointer.gesture_swipe_end(
+                        state,
+                        &smithay::input::pointer::GestureSwipeEndEvent {
+                            serial: SERIAL_COUNTER.next_serial(),
+                            time,
+                            cancelled,
+                        },
+                    );
+                    pointer.frame(state);
+                }
             }
             _ => {}
         }
@@ -6457,6 +6535,30 @@ fn contains(geometry: Rectangle<i32, Logical>, pos: Point<f64, Logical>) -> bool
         && pos.y < y + geometry.size.h as f64
 }
 
+/// The axes a finger or continuous scroll reported finished: libinput's
+/// terminating zero, which Mutter turns into `ClutterScrollFinishFlags`
+/// (`meta-seat-impl.c:2254-2277` `notify_continuous_axis`) and sends as
+/// `wl_pointer.axis_stop` (`meta-wayland-pointer.c:927-967`). Clients
+/// such as GTK end their scroll there (kinetic scrolling, the unlock
+/// dialog's `ScrollGesture`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AxisStop {
+    pub horizontal: bool,
+    pub vertical: bool,
+}
+
+impl AxisStop {
+    /// No axis stopped.
+    pub const NONE: Self = Self {
+        horizontal: false,
+        vertical: false,
+    };
+
+    pub fn any(self) -> bool {
+        self.horizontal || self.vertical
+    }
+}
+
 /// Backend input event kinds this manager consumes from the runtime.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ManagerInput {
@@ -6481,11 +6583,12 @@ pub enum ManagerInput {
         time: u32,
     },
     /// Pointer axis (wheel / scroll) motion, in backend units (v120
-    /// for wheels, pixels for continuous devices). Only scroll mode
-    /// consumes it; everywhere else it is dropped as before.
+    /// for wheels, pixels for continuous devices), and the axes a
+    /// finger scroll finished on (`stop`).
     Axis {
         horizontal: f64,
         vertical: f64,
+        stop: AxisStop,
         time: u32,
     },
     /// Raw pointer motion for relative-pointer clients (games, remote
@@ -7114,13 +7217,14 @@ impl WindowManager {
             ManagerInput::Axis {
                 horizontal,
                 vertical,
+                stop,
                 time,
             } => {
                 // Wheel scrolls the strip in scroll mode (focus stays
                 // on the same window); everywhere else it scrolls the
                 // client under the pointer, as in GNOME.
                 if !self.scroll_strip(state, horizontal, vertical) {
-                    self.pointer_axis(state, horizontal, vertical, time);
+                    self.pointer_axis(state, horizontal, vertical, stop, time);
                 }
             }
             ManagerInput::CornerPressure { .. } => {}
@@ -8015,9 +8119,26 @@ pub fn translate_input<B: InputBackend>(
                     .or_else(|| event.amount(axis))
                     .unwrap_or(0.0)
             };
+            // `notify_continuous_axis` (meta-seat-impl.c:2254-2277): a
+            // finger or continuous axis reporting zero has finished.
+            let continuous = matches!(
+                event.source(),
+                smithay::backend::input::AxisSource::Finger
+                    | smithay::backend::input::AxisSource::Continuous
+            );
+            let finished = |axis: Axis| {
+                continuous
+                    && event
+                        .amount(axis)
+                        .is_some_and(|value| value.abs() < f64::EPSILON)
+            };
             vec![ManagerInput::Axis {
                 horizontal: axis_amount(Axis::Horizontal),
                 vertical: axis_amount(Axis::Vertical),
+                stop: AxisStop {
+                    horizontal: finished(Axis::Horizontal),
+                    vertical: finished(Axis::Vertical),
+                },
                 time: (event.time() / 1000) as u32,
             }]
         }

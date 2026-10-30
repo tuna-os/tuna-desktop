@@ -1703,6 +1703,16 @@ impl Runtime {
         }
         self.capture_authority.publish(true, self.shell.child_pid());
         self.state.set_shortcut_inhibition_locked(true);
+        // A three-finger swipe under way is the unlocked session's: end
+        // it cancelled, so its overview or workspace slide never resumes
+        // (GNOME's trackers interrupt outside their allowed action modes,
+        // swipeTracker.js `_updateTouchpadGesture`/`_endTouchpadGesture`).
+        if self.shell_swipe.is_some() {
+            self.shell_swipe_input(&ManagerInput::SwipeEnd {
+                cancelled: true,
+                time: crate::state::system_millis() as u32,
+            });
+        }
         self.control.set_overview(false);
         self.overlay.show(Vec::new());
     }
@@ -3045,7 +3055,10 @@ impl Runtime {
             .as_u64()
             .map_or(crate::state::system_millis() as u32, |t| t as u32);
         let input = match value["phase"].as_str() {
-            Some("begin") => ManagerInput::SwipeBegin { fingers: 3, time },
+            Some("begin") => ManagerInput::SwipeBegin {
+                fingers: value["fingers"].as_u64().map_or(3, |f| f as u32),
+                time,
+            },
             Some("update") => ManagerInput::SwipeUpdate {
                 delta: (
                     value["dx"].as_f64().unwrap_or(0.0),
@@ -3056,6 +3069,17 @@ impl Runtime {
             },
             Some("end") => ManagerInput::SwipeEnd {
                 cancelled: value["cancelled"].as_bool().unwrap_or(false),
+                time,
+            },
+            // A two-finger touchpad scroll step (pixels), or with
+            // `stop` libinput's terminating zero for the vertical axis.
+            Some("scroll") => ManagerInput::Axis {
+                horizontal: value["dx"].as_f64().unwrap_or(0.0),
+                vertical: value["dy"].as_f64().unwrap_or(0.0),
+                stop: crate::windows::AxisStop {
+                    horizontal: false,
+                    vertical: value["stop"].as_bool().unwrap_or(false),
+                },
                 time,
             },
             _ => return,
@@ -3999,6 +4023,7 @@ impl Runtime {
             RemoteInput::Axis { dx, dy } => ManagerInput::Axis {
                 horizontal: dx,
                 vertical: dy,
+                stop: crate::windows::AxisStop::NONE,
                 time,
             },
         };
@@ -4040,7 +4065,7 @@ impl Runtime {
             } => {
                 if self.is_locked() || grant.load(std::sync::atomic::Ordering::SeqCst) {
                     grant.store(true, std::sync::atomic::Ordering::SeqCst);
-                    crate::mutter::session_closed(&signal, session_id);
+                    signal.session_closed(session_id);
                     return;
                 }
                 self.cast_grants.insert(session_id, grant);
@@ -4048,7 +4073,7 @@ impl Runtime {
                     self.pipewire = crate::screencast::PipeWire::new(&self.loop_handle);
                     if self.pipewire.is_none() {
                         eprintln!("tuna-compositor: screen cast: PipeWire is not running");
-                        crate::mutter::session_closed(&signal, session_id);
+                        signal.session_closed(session_id);
                         return;
                     }
                 }
@@ -4065,7 +4090,7 @@ impl Runtime {
                     crate::mutter::CastTarget::Area(_, (_, _, w, h)) => Some((*w, *h)),
                 };
                 let Some((width, height)) = size else {
-                    crate::mutter::session_closed(&signal, session_id);
+                    signal.session_closed(session_id);
                     return;
                 };
                 let Some(pw) = self.pipewire.as_ref() else {
@@ -4623,6 +4648,13 @@ impl Runtime {
                 .map(|(pid, generation)| crate::control::AuthOwner { pid, generation }),
         );
         self.publish_on_screen_keyboard();
+        // Mutter's seat touch-mode picks the unlock dialog's hint
+        // (unlockDialog.js:388-440, #502); nested sessions have none.
+        #[cfg(feature = "drm")]
+        if let Backend::Drm(drm) = &self.backend {
+            self.control
+                .set_seat_touch_mode(drm.touch_mode().touch_mode());
+        }
         let outcome = self.control.poll(self.manager.model_mut());
         for workspace in outcome.departed_workspaces.iter().copied() {
             self.manager.keep_departed_workspace_alive(workspace);

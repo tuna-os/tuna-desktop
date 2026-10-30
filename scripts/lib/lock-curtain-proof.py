@@ -21,6 +21,12 @@ js/ui/swipeTracker.js `_getEndProgress`/`_endGesture`) and compares.
                                                 ELAPSED ms after that
                                                 release, the frame is on
                                                 ease-out cubic
+  lock-curtain-proof.py absent LOG START SECONDS TEXT
+                                                no trace line holds TEXT
+                                                for SECONDS
+
+A release from a touchpad swipe or scroll (`source=swipe|scroll`) uses
+swipeTracker.js's touchpad thresholds (`isTouchpad`).
 
 START is a 1-based log line; only lines from it on count. Commands wait
 up to --timeout seconds for the shell to log what they check.
@@ -39,6 +45,8 @@ MIN_ANIMATION_DURATION = 100
 MAX_ANIMATION_DURATION = 400
 VELOCITY_THRESHOLD_TOUCH = 0.3
 DECELERATION_TOUCH = 0.998
+VELOCITY_THRESHOLD_TOUCHPAD = 0.6
+DECELERATION_TOUCHPAD = 0.997
 VELOCITY_CURVE_THRESHOLD = 2
 DECELERATION_PARABOLA_MULTIPLIER = 0.35
 DURATION_MULTIPLIER = 3
@@ -78,17 +86,19 @@ def closest(pos):
     return 1 if abs(1 - pos) < abs(pos) else 0
 
 
-def release(progress, initial, cancel, velocity, distance, cancelled):
-    """swipeTracker.js `_getEndProgress` and `_endGesture` for a pan
-    (isTouchpad false) over snap points [0, 1]: (end progress, duration
-    in ms)."""
+def release(progress, initial, cancel, velocity, distance, cancelled, touchpad=False):
+    """swipeTracker.js `_getEndProgress` and `_endGesture` over snap
+    points [0, 1], with the touch or (`touchpad`) touchpad thresholds:
+    (end progress, duration in ms)."""
+    threshold = VELOCITY_THRESHOLD_TOUCHPAD if touchpad else VELOCITY_THRESHOLD_TOUCH
+    decel = DECELERATION_TOUCHPAD if touchpad else DECELERATION_TOUCH
     if cancelled:
         end = cancel
     else:
-        if abs(velocity) < VELOCITY_THRESHOLD_TOUCH:
+        if abs(velocity) < threshold:
             end = closest(progress)
         else:
-            slope = DECELERATION_TOUCH / (1.0 - DECELERATION_TOUCH) / 1000.0
+            slope = decel / (1.0 - decel) / 1000.0
             if abs(velocity) > VELOCITY_CURVE_THRESHOLD:
                 c = slope / 2 / DECELERATION_PARABOLA_MULTIPLIER
                 x = abs(velocity) - VELOCITY_CURVE_THRESHOLD + c
@@ -173,6 +183,7 @@ def swipe_end(entries):
         "velocity": float(f["velocity"]),
         "distance": float(f["distance"]),
         "cancelled": f["cancelled"] == "true",
+        "touchpad": f.get("source") in ("swipe", "scroll"),
         "end": int(f["end"]),
         "duration": float(f["duration"]),
     }
@@ -182,7 +193,7 @@ def check_release(entry):
     # `Math.round` (half up), not Python's half-to-even.
     cancel = math.floor(entry["initial"] + 0.5)
     end, duration = release(entry["progress"], entry["initial"], cancel, entry["velocity"],
-                            entry["distance"], entry["cancelled"])
+                            entry["distance"], entry["cancelled"], entry["touchpad"])
     if end != entry["end"] or abs(duration - entry["duration"]) > 0.5:
         raise SystemExit(f"release {entry} differs from GNOME 51: end={end} duration={duration:.3f}")
     return end, duration
@@ -190,7 +201,8 @@ def check_release(entry):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["line", "frame", "distance", "follow", "release", "eased"])
+    ap.add_argument("command",
+                    choices=["line", "frame", "distance", "follow", "release", "eased", "absent"])
     ap.add_argument("log")
     ap.add_argument("start", type=int)
     ap.add_argument("args", nargs="*")
@@ -202,6 +214,15 @@ def main(argv=None):
         text = " ".join(a.args)
         if wait(a.timeout, lambda: True if any(text in e for e in entries()) else None) is None:
             raise SystemExit(f"no unlock-dialog line '{text}' (last: {entries()[-3:]})")
+        return 0
+
+    if a.command == "absent":
+        seconds, text = float(a.args[0]), " ".join(a.args[1:])
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if any(text in e for e in entries()):
+                raise SystemExit(f"unlock-dialog line '{text}' within {seconds} s")
+            time.sleep(0.1)
         return 0
 
     if a.command == "frame":
