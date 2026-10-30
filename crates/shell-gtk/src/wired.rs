@@ -786,7 +786,6 @@ mod tests {
             connections: vec![conn("/s/1", "Office", 90)],
             active: Some(("/s/1".into(), 2)),
             primary: true,
-            ..WiredDevice::default()
         };
         assert_eq!(submenu_label(&builtin), "Wired (enp3s0)");
         assert_eq!(
