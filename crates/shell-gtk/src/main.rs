@@ -2421,30 +2421,54 @@ fn build(app: &adw::Application) {
         let lock_shell = shell.clone();
         let effect_shell = shell.clone();
         let action_notices = notify.clone();
-        let dismiss_notices = notify.clone();
         let register_notices = notify.clone();
         let drop_notices = notify.clone();
+        let remove_notices = notify.clone();
+        // GNOME's wellbeing sources post `Urgency.HIGH`, or `LOW` for a
+        // break type whose `notify` toggle is off.
+        let notice_urgency = |urgent: bool| {
+            if urgent {
+                tuna_shell_host::notifications::Urgency::High
+            } else {
+                tuna_shell_host::notifications::Urgency::Low
+            }
+        };
         let break_queue: Rc<RefCell<Vec<wellbeing::BreakActionKind>>> =
             Rc::new(RefCell::new(Vec::new()));
         let break_push = break_queue.clone();
         wellbeing::start(
             app.upcast_ref(),
             wellbeing::ShellHooks {
-                post_notice: Rc::new(move |title: String, body: String, replaces: Option<u64>| {
-                    notices.post_replacing("Wellbeing", "alarm-symbolic", &title, &body, replaces)
-                }),
+                post_notice: Rc::new(
+                    move |title: String, body: String, urgent: bool, replaces: Option<u64>| {
+                        notices.post_replacing(
+                            "Wellbeing",
+                            "alarm-symbolic",
+                            &title,
+                            &body,
+                            notice_urgency(urgent),
+                            replaces,
+                        )
+                    },
+                ),
+                remove_notice: Rc::new(move |id: u64| remove_notices.remove_notification(id)),
                 post_action_notice: Rc::new(
-                    move |title: String, body: String, actions: Vec<(String, String)>| {
+                    move |title: String,
+                          body: String,
+                          actions: Vec<(String, String)>,
+                          urgent: bool,
+                          replaces: Option<u64>| {
                         action_notices.post_with_actions(
                             "Wellbeing",
                             "alarm-symbolic",
                             &title,
                             &body,
                             &actions,
+                            notice_urgency(urgent),
+                            replaces,
                         )
                     },
                 ),
-                dismiss_notice: Rc::new(move |id: u64| dismiss_notices.dismiss_notification(id)),
                 on_notice_action: Rc::new(move |id: u64, key: String, handler: Rc<dyn Fn()>| {
                     register_notices.on_notification_action(id, &key, handler);
                 }),

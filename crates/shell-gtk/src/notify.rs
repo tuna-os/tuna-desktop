@@ -181,7 +181,8 @@ fn urgency_rank(urgency: Urgency) -> u8 {
     match urgency {
         Urgency::Low => 0,
         Urgency::Normal => 1,
-        Urgency::Critical => 2,
+        Urgency::High => 2,
+        Urgency::Critical => 3,
     }
 }
 
@@ -677,7 +678,7 @@ impl NotifyUi {
     /// Post the shell's own notification under a GNOME source name and
     /// icon (screenshots: "Screenshot", `screenshot-recorded-symbolic`).
     pub fn post(self: &Rc<Self>, app: &str, icon: &str, summary: &str, body: &str) {
-        self.post_replacing(app, icon, summary, body, None);
+        self.post_replacing(app, icon, summary, body, Urgency::Normal, None);
     }
 
     /// Post, or with `replaces` naming a live notification update it in
@@ -692,23 +693,20 @@ impl NotifyUi {
         icon: &str,
         summary: &str,
         body: &str,
+        urgency: Urgency,
         replaces: Option<u64>,
     ) -> Option<u64> {
-        let id = {
-            let mut center = self.center.lock().ok()?;
-            let id = center.notify(app, summary, body, Vec::new(), Urgency::Normal, replaces);
-            center.set_source(id, icon, "");
-            id
-        };
-        self.update();
-        Some(id)
+        self.post_with_actions(app, icon, summary, body, &[], urgency, replaces)
     }
 
     /// Post the shell's own notification WITH invokable actions, returning
-    /// the center id (None when the store is unreachable). The banner
-    /// renders one button per action; a press runs the bus invoke first
-    /// (per-key replay guard + banner dismiss + signal) and then the
-    /// local handler, retiring all sibling keys on success.
+    /// the center id (None when the store is unreachable). `replaces`
+    /// updates a live one in place as [`Self::post_replacing`] does; its
+    /// actions are replaced too. The banner renders one button per
+    /// action; a press runs the bus invoke first (per-key replay guard +
+    /// banner dismiss + signal) and then the local handler, retiring all
+    /// sibling keys on success.
+    #[allow(clippy::too_many_arguments)]
     pub fn post_with_actions(
         self: &Rc<Self>,
         app: &str,
@@ -716,6 +714,8 @@ impl NotifyUi {
         summary: &str,
         body: &str,
         actions: &[(String, String)],
+        urgency: Urgency,
+        replaces: Option<u64>,
     ) -> Option<u64> {
         let id = {
             let mut center = self.center.lock().ok()?;
@@ -726,13 +726,19 @@ impl NotifyUi {
                     label: label.clone(),
                 })
                 .collect();
-            let id = center.notify(app, summary, body, listed, Urgency::Normal, None);
+            let id = center.notify(app, summary, body, listed, urgency, replaces);
             center.set_source(id, icon, "");
             id
         };
         // Arms the new banner's expiry, as for any other arrival.
         self.update();
         Some(id)
+    }
+
+    /// Remove a shell-own notification from the list and any banner it
+    /// holds (GNOME's `notification.destroy()`).
+    pub fn remove_notification(self: &Rc<Self>, id: u64) {
+        self.remove(&[id]);
     }
 
     /// Register a local callback for one shell-own (notice, action key).
@@ -745,23 +751,6 @@ impl NotifyUi {
     /// Forget one notice's local callbacks (replacement/removal).
     pub fn drop_notification_actions(self: &Rc<Self>, id: u64) {
         self.local_actions.borrow_mut().drop_notice(id);
-    }
-
-    /// Dismiss one banner by id (history keeps the entry); false when the
-    /// center no longer knows it. Retires the resident's local callbacks:
-    /// history keeps unconsumed keys invokable, so without this an old
-    /// key could still dispatch after the user dismissed the banner.
-    pub fn dismiss_notification(self: &Rc<Self>, id: u64) -> bool {
-        let dismissed = self
-            .center
-            .lock()
-            .map(|mut center| center.dismiss(id))
-            .is_ok_and(|r| r.is_ok());
-        if dismissed {
-            self.retire_local_actions(id);
-            self.refresh();
-        }
-        dismissed
     }
 
     /// Run one registered local callback; false when unadmitted. Only
@@ -1758,6 +1747,16 @@ mod timer_tests {
             tray_step(Hidden, None, &[(1, n, false), (2, c, false), (3, c, false)]),
             TrayStep::Show(2)
         );
+        // GNOME's HIGH ranks between normal and critical.
+        let h = Urgency::High;
+        assert_eq!(
+            tray_step(Hidden, None, &[(1, n, false), (2, h, false)]),
+            TrayStep::Show(2)
+        );
+        assert_eq!(
+            tray_step(Hidden, None, &[(1, h, false), (2, c, false)]),
+            TrayStep::Show(2)
+        );
         // Newer arrivals wait while one is dropping in or on screen,
         // critical or not: the banner on screen is never replaced.
         for state in [Showing, Shown] {
@@ -1868,6 +1867,8 @@ mod gtk_action_lifecycle_tests {
                     ("take".into(), "Take".into()),
                     ("delay".into(), "Delay".into()),
                 ],
+                Urgency::Normal,
+                None,
             )
             .unwrap();
         settle(ui);
@@ -1916,7 +1917,7 @@ mod gtk_action_lifecycle_tests {
 
         for terminal in [
             "user-close",
-            "dismiss",
+            "remove",
             "replacement",
             "timeout",
             "history-close",
@@ -1929,12 +1930,21 @@ mod gtk_action_lifecycle_tests {
             assert!(ui.local_actions.borrow().live.contains(&id));
             match terminal {
                 "user-close" => button(&ui.banner_box, "close").emit_clicked(),
-                "dismiss" => assert!(ui.dismiss_notification(id)),
+                "remove" => ui.remove_notification(id),
                 "replacement" => {
-                    // Production wellbeing replaces through these public APIs;
-                    // retain old buttons and ensure a new resident remains usable.
+                    // Production wellbeing updates its resident in place
+                    // through these public APIs: old callbacks retire.
                     ui.drop_notification_actions(id);
-                    assert!(ui.dismiss_notification(id));
+                    let same = ui.post_with_actions(
+                        "Owned callback fixture",
+                        "",
+                        "Break 2",
+                        "",
+                        &[],
+                        Urgency::High,
+                        Some(id),
+                    );
+                    assert_eq!(same, Some(id));
                 }
                 "timeout" => {
                     *ui.timer.borrow_mut() = Some(BannerTimer {
@@ -1977,7 +1987,10 @@ mod gtk_action_lifecycle_tests {
                 0,
                 "captured old callbacks fired after {terminal}"
             );
-            if matches!(terminal, "clear" | "history-close" | "center-remove") {
+            if matches!(
+                terminal,
+                "clear" | "history-close" | "center-remove" | "remove"
+            ) {
                 assert!(ui.bus.borrow().invoke_action(id as u32, "take").is_err());
             } else {
                 assert!(center.lock().unwrap().history().iter().any(|n| n.id == id));
@@ -2005,6 +2018,8 @@ mod gtk_action_lifecycle_tests {
                     ("take".into(), "Take".into()),
                     ("delay".into(), "Delay".into()),
                 ],
+                Urgency::Normal,
+                None,
             )
             .unwrap();
         let take = button(&ui.banner_box, "Take");
@@ -2021,11 +2036,20 @@ mod gtk_action_lifecycle_tests {
         // up with its new text, never queued behind a later arrival.
         settle(&ui);
         let warning = ui
-            .post_replacing("Wellbeing", "", "Screen Time Limit in 10 Minutes", "", None)
+            .post_replacing(
+                "Wellbeing",
+                "",
+                "Screen Time Limit in 10 Minutes",
+                "",
+                Urgency::High,
+                None,
+            )
             .unwrap();
         settle(&ui);
         assert_eq!(ui.showing.get(), Some(warning));
-        let later = ui.post_replacing("Later", "", "Later", "", None).unwrap();
+        let later = ui
+            .post_replacing("Later", "", "Later", "", Urgency::Normal, None)
+            .unwrap();
         settle(&ui);
         assert_eq!(ui.showing.get(), Some(warning), "the later one waits");
         // The list as the open calendar would draw it, before the update.
@@ -2036,6 +2060,7 @@ mod gtk_action_lifecycle_tests {
             "",
             "Screen Time Limit Reached",
             "",
+            Urgency::High,
             Some(warning),
         );
         assert_eq!(reached, Some(warning), "updated in place");

@@ -41,7 +41,8 @@ pub const QUEUE_FILE: &str = "notifications.json";
 /// Queue file schema version (a mismatch loads as empty).
 const QUEUE_VERSION: u64 = 1;
 
-/// Freedesktop-style urgency.
+/// Notification urgency: the freedesktop levels plus GNOME's shell-only
+/// `MessageTray.Urgency.HIGH`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Urgency {
     /// Background information.
@@ -49,6 +50,12 @@ pub enum Urgency {
     /// Normal notification (the default).
     #[default]
     Normal,
+    /// GNOME's `Urgency.HIGH`, used by shell sources (screen-time limits,
+    /// break reminders): it queues ahead of normal banners but, unlike
+    /// critical, is still held back by Do Not Disturb, the per-app banner
+    /// switch and the full banner queue, and it expires like any banner.
+    /// D-Bus clients cannot ask for it (freedesktop has no such level).
+    High,
     /// Breaks through Do Not Disturb onto the banner queue.
     Critical,
 }
@@ -59,6 +66,7 @@ impl Urgency {
         match self {
             Self::Low => "low",
             Self::Normal => "normal",
+            Self::High => "high",
             Self::Critical => "critical",
         }
     }
@@ -67,6 +75,7 @@ impl Urgency {
     fn from_str(text: &str) -> Self {
         match text {
             "low" => Self::Low,
+            "high" => Self::High,
             "critical" => Self::Critical,
             _ => Self::Normal,
         }
@@ -666,12 +675,14 @@ impl NotificationCenter {
         self.push_banner(id, urgency);
     }
 
-    /// Queue a banner once, as GNOME's message tray admits one: the
-    /// queue keeps what it took first (the banner on screen never makes
-    /// way), and while it is full a new arrival waits in history only,
-    /// unless it is critical. History pruning bounds it either way.
+    /// Queue a banner once, as GNOME's message tray admits one: low
+    /// urgency never banners (`_onNotificationRequestBanner`), the queue
+    /// keeps what it took first (the banner on screen never makes way),
+    /// and while it is full a new arrival waits in history only, unless
+    /// it is critical. History pruning bounds it either way.
     fn push_banner(&mut self, id: u64, urgency: Urgency) {
-        if self.banners.contains(&id)
+        if urgency == Urgency::Low
+            || self.banners.contains(&id)
             || (self.banners.len() >= MAX_BANNERS && urgency != Urgency::Critical)
         {
             return;
@@ -1055,9 +1066,10 @@ mod tests {
         let b = c.notify("app", "t2", "b2", vec![], Urgency::Low, None);
         assert_eq!((a, b), (1, 2));
         assert_eq!(c.history().len(), 2);
+        // GNOME never banners a low-urgency notification; history keeps it.
         assert_eq!(
             c.banners().iter().map(|n| n.id).collect::<Vec<_>>(),
-            vec![a, b]
+            vec![a]
         );
     }
 
@@ -1095,12 +1107,33 @@ mod tests {
     }
 
     #[test]
+    fn high_urgency_is_held_by_dnd_and_persists() {
+        // GNOME's Urgency.HIGH: only CRITICAL breaks through a busy tray.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(QUEUE_FILE);
+        let mut c = center();
+        c.set_queue_path(path.clone());
+        c.set_dnd(true);
+        let high = c.notify("Wellbeing", "t", "b", vec![], Urgency::High, None);
+        assert!(c.banners().is_empty());
+        c.set_dnd(false);
+        c.notify("Wellbeing", "t2", "b", vec![], Urgency::High, Some(high));
+        assert_eq!(
+            c.banners().iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![high]
+        );
+        let again = NotificationCenter::load(&path);
+        let entry = again.history().iter().find(|n| n.id == high).unwrap();
+        assert_eq!(entry.urgency, Urgency::High);
+    }
+
+    #[test]
     fn unread_count_tracks_the_banner_queue() {
         let mut c = center();
         assert_eq!(c.unread_count(), 0);
         let a = c.notify("app", "t", "b", vec![], Urgency::Normal, None);
         assert_eq!(c.unread_count(), 1);
-        c.notify("app", "t", "b", vec![], Urgency::Low, None);
+        c.notify("app", "t", "b", vec![], Urgency::Normal, None);
         assert_eq!(c.unread_count(), 2);
         // Dismissing reads the banner; history keeps the entry.
         c.dismiss(a).unwrap();
@@ -1176,7 +1209,7 @@ mod tests {
             "new",
             "b2",
             vec![action("x")],
-            Urgency::Low,
+            Urgency::Normal,
             Some(id),
         );
         assert_eq!(same, id);

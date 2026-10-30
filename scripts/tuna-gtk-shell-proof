@@ -5898,6 +5898,7 @@ pass G-WELLBEING-HISTORY "the shell records GNOME-compatible session-active hist
 DND_BEFORE="$(gsettings get org.gnome.desktop.notifications show-banners)"
 gsettings set org.gnome.desktop.notifications show-banners true
 sleep 2
+limit_post_mark="$(wc -c <"$LOG")"
 gsettings set org.gnome.desktop.screen-time-limits daily-limit-seconds 10
 gsettings set org.gnome.desktop.screen-time-limits daily-limit-enabled true
 LIMIT_BANNER=""
@@ -5910,6 +5911,14 @@ done
 [ -n "$LIMIT_BANNER" ] || fail G-WELLBEING-LIMIT "no Screen Time Limit Reached banner"
 scrot "$ARTIFACTS/25-wellbeing-limit.png" >/dev/null
 grep -q "wellbeing: effect grayscale=true" "$LOG" || fail G-WELLBEING-LIMIT "no grayscale request in the shell log"
+# GNOME parity: a 10 s limit is never exactly 600 s away, so it gets no
+# "10 Minutes" warning; "Reached" is posted at Urgency.HIGH.
+LIMIT_LOG="$(tail -c +"$((limit_post_mark + 1))" "$LOG")"
+if printf '%s\n' "$LIMIT_LOG" | grep -q "Screen Time Limit in"; then
+    fail G-WELLBEING-LIMIT "a 10 s limit posted the 10 minute warning (GNOME posts it only at exactly 600 s left)"
+fi
+LIMIT_ID="$(printf '%s\n' "$LIMIT_LOG" | sed -n 's/.*wellbeing: limit notice \([0-9]*\) posted urgency=high: Screen Time Limit Reached$/\1/p' | head -n1)"
+[ -n "$LIMIT_ID" ] || fail G-WELLBEING-LIMIT "the limit notice was not posted at high urgency"
 # Negative controls: grayscale off clears the request; the limit off
 # returns the tracker to Active without a second notice.
 gsettings set org.gnome.desktop.screen-time-limits grayscale false
@@ -5923,7 +5932,18 @@ gsettings reset org.gnome.desktop.screen-time-limits grayscale
 end=$(($(date +%s) + 15))
 until tail -c +"$((limit_mark + 1))" "$LOG" | grep -q "wellbeing: screen-time state Active" || [ "$(date +%s)" -gt "$end" ]; do sleep 1; done
 tail -c +"$((limit_mark + 1))" "$LOG" | grep -q "wellbeing: screen-time state Active" || fail G-WELLBEING-LIMIT "the tracker did not return to Active"
-pass G-WELLBEING-LIMIT "the spent daily limit posts its notice and requests grayscale live"
+# GNOME destroys the notification once the limit is off: gone from the
+# message list too, not just the banner.
+tail -c +"$((limit_mark + 1))" "$LOG" | grep -q "wellbeing: limit notice $LIMIT_ID removed" ||
+    fail G-WELLBEING-LIMIT "turning the limit off did not remove the limit notice"
+open_calendar
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wellbeing-limit-off.json" 20 ||
+    fail G-WELLBEING-LIMIT "message list dump failed"
+xdotool key Escape
+if jq -e 'any(.[]; .name == "Screen Time Limit Reached")' "$ARTIFACTS/a11y-wellbeing-limit-off.json" >/dev/null; then
+    fail G-WELLBEING-LIMIT "the limit notice outlived the limit in the message list"
+fi
+pass G-WELLBEING-LIMIT "the spent daily limit posts its high-urgency notice without a 10 minute warning, requests grayscale live, and is removed when the limit is off"
 
 # Break reminders with correct timing: a 10 s eyesight interval shows the
 # OSD countdown, then the due notice; an idle user takes the break (fade
@@ -5933,6 +5953,7 @@ xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2))
 gsettings set org.gnome.desktop.break-reminders.eyesight interval-seconds 10
 gsettings set org.gnome.desktop.break-reminders.eyesight duration-seconds 10
 gsettings set org.gnome.desktop.break-reminders.eyesight countdown true
+gsettings set org.gnome.desktop.break-reminders.eyesight notify true
 gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']"
 # Three keep-alives over 6 s: the user stays in the Active phase (idle
 # under 10 s) while the countdown shows and the break comes due. Due is
@@ -5963,12 +5984,30 @@ until tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=
 tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=true" || fail G-WELLBEING-BREAK "no fade request while the break was taken"
 tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: break complete sound" || fail G-WELLBEING-BREAK "no complete sound when the break finished"
 tail -c +"$((wb_mark + 1))" "$LOG" | grep -q "wellbeing: effect grayscale=false fade=false" || fail G-WELLBEING-BREAK "no unfade after the break finished"
+# GNOME parity: within one break cycle the resident break notification is
+# updated in place at Urgency.HIGH (notify on), never closed and reposted,
+# and completing the break destroys it (removed from the list).
+BREAK_LOG="$(tail -c +"$((wb_mark + 1))" "$LOG" | grep "wellbeing: break notice " | awk '{print} / removed$/{exit}' || true)"
+printf '%s\n' "$BREAK_LOG" | grep -q " removed$" ||
+    fail G-WELLBEING-BREAK "the completed break did not remove its notice"
+BREAK_POSTS="$(printf '%s\n' "$BREAK_LOG" | grep " urgency=" || true)"
+[ -n "$BREAK_POSTS" ] || fail G-WELLBEING-BREAK "no break notice posts in the shell log"
+if printf '%s\n' "$BREAK_POSTS" | grep -vq " urgency=high: "; then
+    fail G-WELLBEING-BREAK "a break notice with notify on was not high urgency"
+fi
+BREAK_IDS="$(printf '%s\n' "$BREAK_LOG" | sed -n 's/.*wellbeing: break notice \([0-9]*\) .*/\1/p' | sort -u | wc -l)"
+[ "$BREAK_IDS" -eq 1 ] || fail G-WELLBEING-BREAK "one break cycle used $BREAK_IDS notifications, not one updated in place"
+if [ "$(printf '%s\n' "$BREAK_POSTS" | wc -l)" -gt 1 ]; then
+    printf '%s\n' "$BREAK_POSTS" | sed -n '2,$p' | grep -vq " updated urgency=" &&
+        fail G-WELLBEING-BREAK "a later break notice was reposted instead of updated in place"
+fi
 # Leave no trace for the later gates: deselect (Disabled), reset the keys,
 # clear the notices, let the banners expire, restore the journey's DND.
 gsettings reset org.gnome.desktop.break-reminders selected-breaks
 gsettings reset org.gnome.desktop.break-reminders.eyesight interval-seconds
 gsettings reset org.gnome.desktop.break-reminders.eyesight duration-seconds
 gsettings reset org.gnome.desktop.break-reminders.eyesight countdown
+gsettings reset org.gnome.desktop.break-reminders.eyesight notify
 open_calendar
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wellbeing-cleared.json" 20 --press "Clear" ||
     fail G-WELLBEING-BREAK "could not press Clear"
