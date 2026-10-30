@@ -829,9 +829,7 @@ mod tests {
             .copy_framebuffer(&bound, Rectangle::from_size(size), Fourcc::Abgr8888)
             .unwrap();
         let read = renderer.map_texture(&mapping).unwrap();
-        read.chunks_exact(4)
-            .map(|p| [p[0], p[1], p[2], p[3]])
-            .collect()
+        read.as_chunks::<4>().0.to_vec()
     }
 
     /// The CPU reference: the same steps on each texel, in f32.

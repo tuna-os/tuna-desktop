@@ -691,7 +691,7 @@ fn srgb_inv_eotf(v: f32) -> f32 {
 }
 
 const PQ_C1: f32 = 0.8359375;
-const PQ_C2: f32 = 18.8515625;
+const PQ_C2: f32 = 2413.0 / 128.0;
 const PQ_C3: f32 = 18.6875;
 const PQ_M1: f32 = 0.1593017;
 const PQ_M2: f32 = 78.84375;
