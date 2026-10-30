@@ -21,12 +21,17 @@ Runs as root (uinput) and reads one command per line on stdin, replying
 
   add KIND        create the device (KIND as above)
   remove KIND     destroy it
+  move KIND DX DY COUNT INTERVAL_MS
+                  COUNT relative motion events of (DX, DY) device units,
+                  each its own frame, INTERVAL_MS apart (the kernel stamps
+                  each event, so libinput sees the real spacing)
   quit
 """
 
 import importlib.util
 import pathlib
 import sys
+import time
 
 from evdev import UInput, ecodes as e
 
@@ -71,15 +76,28 @@ def main():
                 continue
             if words == ["quit"]:
                 break
-            if len(words) != 2 or words[1] not in NAMES:
+            if len(words) < 2 or words[1] not in NAMES:
                 raise ValueError(f"unknown command {line.strip()!r}")
-            command, kind = words
-            if command == "add":
+            command, kind = words[:2]
+            if command == "add" and len(words) == 2:
                 if kind in devices:
                     raise ValueError(f"{kind} already present")
                 devices[kind] = device(kind)
-            elif command == "remove":
+            elif command == "remove" and len(words) == 2:
                 devices.pop(kind).close()
+            elif command == "move" and len(words) == 6 and kind != "touchpad":
+                dx, dy, count, interval = (int(w) for w in words[2:])
+                if count < 1 or interval < 0:
+                    raise ValueError(f"bad motion {line.strip()!r}")
+                dev = devices[kind]
+                for index in range(count):
+                    if index and interval:
+                        time.sleep(interval / 1000)
+                    if dx:
+                        dev.write(e.EV_REL, e.REL_X, dx)
+                    if dy:
+                        dev.write(e.EV_REL, e.REL_Y, dy)
+                    dev.syn()
             else:
                 raise ValueError(f"unknown command {line.strip()!r}")
             print("ok", flush=True)

@@ -34,6 +34,14 @@
 #              each device's own libinput configuration with Mutter 51's
 #              per-class rules, on arrival, live and on hotplug, and
 #              reset to GNOME's defaults
+#   D-HOT-CORNER GNOME Shell 51's hot-corner pressure barrier (layout.js
+#              HotCorner, PressureBarrier; #336) at fractional scale 1.25
+#              with an emulated relative mouse: 100 px of pressure within
+#              1000 ms toggles the overview, slower pushes and sliding
+#              along the edge never do, the held barrier rearms only once
+#              left, and a fullscreen window blocks it
+#   D-HOT-CORNER-RTL the same in a Hebrew (right-to-left) session: the
+#              barrier is at the top-right corner, none at the top-left
 #   D-TABLET   an emulated (uinput, ADR 0008) Wacom Cintiq 22HD pen and pad
 #              (P-IN-05): libwacom identity and pen/pad pairing, a GTK 4
 #              GtkGestureStylus client's position, pressure, tilt and tool
@@ -53,7 +61,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --seconds) SECONDS_UP="$2"; shift 2 ;;
-        --help|-h) sed -n '2,30p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,53p' "$0"; exit 0 ;;
         *) echo "tuna-drm-smoke: unknown argument $1" >&2; exit 1 ;;
     esac
 done
@@ -861,6 +869,17 @@ pointer_applied 15 ||
     fail D-POINTER-SETTINGS "replugged devices did not arrive with the current keys: $(jq -c '.input_devices' "$CSTATE")"
 pass D-POINTER-SETTINGS "a replugged mouse and touchpad arrive with the current keys"
 
+# Restart: a new native session enumerates the devices already plugged
+# (libinput's udev seat scan, not hotplug events) and applies the stored
+# keys to each as it arrives, as Mutter does at startup.
+kill -TERM "$COMP_PID"
+wait "$COMP_PID" || true
+COMP_PID=""
+start_pointer_session
+pointer_applied 20 ||
+    fail D-POINTER-SETTINGS "after a restart the plugged devices did not carry the current keys: $(jq -c '.input_devices' "$CSTATE"); seatd: $(tail -5 "$ARTIFACTS/seatd.log" | tr '\n' ' ')"
+pass D-POINTER-SETTINGS "a restarted native session finds the plugged mouse, trackball, pointing stick and touchpad and re-applies the current keys"
+
 for key in speed natural-scroll left-handed accel-profile middle-click-emulation \
     scroll-wheel-emulation-button scroll-wheel-emulation-button-lock; do
     gsettings reset $MOUSE_KEYS "$key"
@@ -886,6 +905,166 @@ kill -TERM "$COMP_PID"
 wait "$COMP_PID" || true
 COMP_PID=""
 if grep -q panicked "$POINTER_LOG"; then fail D-NOPANIC "panic in the pointer sessions"; fi
+if [ -n "$POINTER_SCHEMA_DIR_BEFORE" ]; then
+    GSETTINGS_SCHEMA_DIR="$POINTER_SCHEMA_DIR_BEFORE"
+else
+    unset GSETTINGS_SCHEMA_DIR
+fi
+
+# GNOME Shell 51's hot corner (#336): layout.js HotCorner's pressure
+# barriers (HOT_CORNER_PRESSURE_THRESHOLD 100 px within
+# HOT_CORNER_PRESSURE_TIMEOUT 1000 ms, PressureBarrier's 15 px cap per
+# event and its sliding filter) at fractional scale, pushed by an emulated
+# relative mouse through libinput. Flat acceleration at speed 0 passes
+# each motion through unchanged, so positions are exact logical pixels.
+# Once left-to-right (corner top-left), once in Hebrew (top-right).
+CORNER_LOG="$ARTIFACTS/compositor-corner.log"
+CORNER_CLIENT_LOG="$ARTIFACTS/corner-client.jsonl"
+mkdir -p "$ARTIFACTS/config-corner"
+GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas-pointer${GSETTINGS_SCHEMA_DIR:+:$GSETTINGS_SCHEMA_DIR}"
+XDG_CONFIG_HOME="$ARTIFACTS/config-corner"
+export GSETTINGS_SCHEMA_DIR XDG_CONFIG_HOME
+gsettings set org.gnome.desktop.peripherals.mouse accel-profile flat
+gsettings set org.gnome.desktop.peripherals.mouse speed 0
+gsettings set org.gnome.desktop.interface enable-hot-corners true
+LOG="$CORNER_LOG"
+# corner_run DIRECTION PHASE [LOCALE]
+corner_run() {
+    corner_dir=$1 phase=$2
+    CSTATE="$ARTIFACTS/compositor-state-corner-$corner_dir.json"
+    rm -f "$CSTATE"
+    env -u DISPLAY -u WAYLAND_DISPLAY ${3:+LANG="$3" LANGUAGE="${3%%_*}" LC_ALL="$3"} \
+        XDG_RUNTIME_DIR="$RUNTIME" XDG_STATE_HOME="$ARTIFACTS/state-corner" XDG_DATA_HOME="$ARTIFACTS/data" \
+        LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD" TUNA_COMPOSITOR_STATE="$CSTATE" TUNA_SCALE=1.25 \
+        "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-corner \
+        --shell-bin "$ROOT/target/debug/tuna-shell-gtk" >>"$CORNER_LOG" 2>&1 &
+    COMP_PID=$!
+    state '.display_config.monitors[0].scale == 1.25 and (.layers | any(.namespace == "tuna-panel"))' 30 ||
+        fail "$phase" "the session never mapped its panel at scale 1.25"
+    W="$(jq '.layers[] | select(.namespace == "tuna-panel") | .rect[2]' "$CSTATE")"
+    [ "$W" = "$(((MODE_W * 4 + 2) / 5))" ] ||
+        fail "$phase" "the panel is ${W} logical px wide, not ${MODE_W}/1.25"
+    if [ "$corner_dir" = rtl ]; then
+        state '.right_to_left' 10 || fail "$phase" "GTK did not take the Hebrew locale's right-to-left direction"
+        SIGN=-1
+    else
+        state '(.right_to_left | not) and .hot_corners' 10 || fail "$phase" "the left-to-right session did not take the corner policy"
+        SIGN=1
+    fi
+    POINTER_EMU_OUT="$ARTIFACTS/corner-emulator-$corner_dir.log"
+    rm -f "$ARTIFACTS/corner-emulator.fifo"
+    mkfifo "$ARTIFACTS/corner-emulator.fifo"
+    # shellcheck disable=SC2024
+    sudo python3 "$ROOT/scripts/lib/tuna-uinput-pointers.py" <"$ARTIFACTS/corner-emulator.fifo" >"$POINTER_EMU_OUT" 2>&1 &
+    POINTER_EMU_PID=$!
+    exec 7>"$ARTIFACTS/corner-emulator.fifo"
+    pointer_sent=0
+    pemu add mouse
+    state 'any(.input_devices[]?; .name == "Tuna D-POINTER Mouse" and .accel_profile == "flat")' 15 ||
+        fail "$phase" "the emulated mouse did not arrive with flat acceleration: $(jq -c '.input_devices' "$CSTATE")"
+    # cm DX DY COUNT INTERVAL_MS: motion, mirrored in right-to-left.
+    cm() { pemu move mouse $((SIGN * $1)) "$2" "$3" "$4"; }
+    # at X Y: the pointer at logical (X, Y) from the corner's side.
+    at() {
+        if [ "$SIGN" = 1 ]; then x=$1; else x=$((W - 1 - $1)); fi
+        state ".pointer_position == [$x, $2]" 5
+    }
+    ripples() { jq '.transitions.hot_corner_ripples.started' "$CSTATE"; }
+    # quiet WHAT [SECONDS]: nothing toggled the overview.
+    quiet() {
+        sleep "${2:-0.5}"
+        jq -e ".overview_open == $overview and .transitions.hot_corner_ripples.started == $r0" "$CSTATE" >/dev/null ||
+            fail "$phase" "$1 toggled the overview: $(jq -c '{overview_open, pointer_position}' "$CSTATE")"
+    }
+    # Park at (60, 60) without ever touching the barrier: down away from
+    # the edge, out sideways, along to the side edge below the corner, in
+    # 60 px, up to the top edge outside the corner, then down.
+    cm 0 400 1 0; cm 400 0 1 0; cm -3000 0 1 0; cm 60 0 1 0; cm 0 -3000 1 0; cm 0 60 1 0
+    overview=false r0=$(ripples)
+    at 60 60 || fail "$phase" "the pointer did not park at (60, 60): $(jq -c .pointer_position "$CSTATE")"
+    quiet "parking"
+    # approach: to (10, 5), 5 px below the top barrier inside the corner.
+    approach() { cm -50 0 1 0; cm 0 -55 1 0; at 10 5 || fail "$phase" "the pointer did not reach (10, 5)"; }
+    leave() { cm 40 40 1 0; cm 10 20 1 0; at 60 60 || fail "$phase" "the pointer did not leave the corner"; }
+
+    # Too slow: 10 px every 150 ms is at most 70 px in any 1000 ms.
+    approach
+    cm 0 -10 15 150
+    at 10 0 || fail "$phase" "the barrier did not hold the pointer at the top edge"
+    quiet "70 px per second of pressure"
+    # Sliding along the edge: each hit moves 6 px along it for 1 px into
+    # it, which PressureBarrier discards.
+    for _ in $(seq 1 20); do cm 6 -1 1 0; cm -6 -1 1 0; done
+    at 10 0 || fail "$phase" "sliding left the barrier"
+    quiet "sliding along the barrier"
+    leave
+
+    # 90 px within the window is short of the threshold; the tenth push,
+    # still within 1000 ms of the first, opens it.
+    approach
+    cm 0 -10 9 20
+    quiet "90 px of pressure" 0.15
+    cm 0 -10 1 0
+    state ".overview_open and .transitions.hot_corner_ripples.started == $((r0 + 1))" 5 ||
+        fail "$phase" "100 px of pressure within 1000 ms did not open the overview"
+    at 10 0 || fail "$phase" "the barrier did not hold the pointer at the corner"
+    overview=true r0=$((r0 + 1))
+    cp "$CSTATE" "$ARTIFACTS/corner-opened-$corner_dir.json"
+    # A held barrier stays triggered: more pressure does nothing.
+    cm 0 -10 15 20
+    quiet "pressure on the held barrier"
+    # Leaving both barriers rearms it; pressure again closes the overview.
+    leave
+    approach
+    cm 0 -10 12 20
+    state "(.overview_open | not) and .transitions.hot_corner_ripples.started == $((r0 + 1))" 5 ||
+        fail "$phase" "pressure after leaving the barriers did not close the overview"
+    overview=false r0=$((r0 + 1))
+    leave
+    if [ "$corner_dir" = rtl ]; then
+        # No barrier at the top-left: a push there never opens it.
+        cm 3000 0 1 0; cm -60 0 1 0; cm 0 -3000 1 0; cm 0 5 1 0; cm 50 0 1 0
+        at $((W - 11)) 5 || fail "$phase" "the pointer did not reach the top-left"
+        cm 0 -10 12 20
+        quiet "pressure at the top-left in right-to-left"
+        cm -50 0 1 0; cm 0 55 1 0; cm 3000 0 1 0; cm -3000 0 1 0; cm 60 0 1 0
+        at 60 60 || fail "$phase" "the pointer did not return to the corner side"
+    fi
+
+    # A fullscreen window blocks the corner (HotCorner._toggleOverview).
+    windows="$(jq '.windows | length' "$CSTATE")"
+    env -u DISPLAY XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY=tuna-drm-corner GDK_BACKEND=wayland \
+        python3 "$ROOT/scripts/lib/tuna-tablet-client.py" >"$CORNER_CLIENT_LOG" 2>"$ARTIFACTS/corner-client.stderr" &
+    CLIENT_PID=$!
+    state ".windows | length == $((windows + 1))" 20 || fail "$phase" "the fullscreen client never mapped"
+    approach
+    state '.pointer_fullscreen_blocked' 5 || fail "$phase" "the client is not fullscreen under the pointer"
+    cm 0 -10 12 20
+    quiet "pressure over a fullscreen window"
+    leave
+    kill "$CLIENT_PID" 2>/dev/null || true
+    wait "$CLIENT_PID" 2>/dev/null || true
+    CLIENT_PID=""
+    state ".windows | length == $windows" 10 || fail "$phase" "the fullscreen client did not close"
+    approach
+    cm 0 -10 12 20
+    state ".overview_open and .transitions.hot_corner_ripples.started == $((r0 + 1))" 5 ||
+        fail "$phase" "the corner did not open once the fullscreen window closed"
+
+    exec 7>&-
+    wait "$POINTER_EMU_PID" 2>/dev/null || true
+    POINTER_EMU_PID=""
+    kill -TERM "$COMP_PID"
+    wait "$COMP_PID" || true
+    COMP_PID=""
+}
+corner_run ltr D-HOT-CORNER
+pass D-HOT-CORNER "at scale 1.25 an emulated mouse's 100 px of pressure within 1000 ms at the top-left toggles the overview; 70 px/s, sliding and a held barrier do not; a fullscreen window blocks it"
+locale -a | grep -qix 'he_IL.utf-\?8' ||
+    fail D-HOT-CORNER-RTL "no he_IL.UTF-8 locale (install language-pack-he-base and language-pack-gnome-he-base)"
+corner_run rtl D-HOT-CORNER-RTL he_IL.UTF-8
+pass D-HOT-CORNER-RTL "in a Hebrew session GTK is right-to-left and the barrier is at the top-right with the same threshold, timeout, sliding filter and fullscreen guard; the top-left has none"
+if grep -q panicked "$CORNER_LOG"; then fail D-NOPANIC "panic in the hot-corner sessions"; fi
 if [ -n "$POINTER_SCHEMA_DIR_BEFORE" ]; then
     GSETTINGS_SCHEMA_DIR="$POINTER_SCHEMA_DIR_BEFORE"
 else

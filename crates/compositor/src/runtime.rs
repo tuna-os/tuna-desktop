@@ -2799,6 +2799,9 @@ impl Runtime {
         doc["pointer_fullscreen_blocked"] = serde_json::json!(
             (!self.is_locked()).then(|| self.manager.fullscreen_at(self.manager.pointer_pos()))
         );
+        // GTK's default text direction as the shell reports it: the side
+        // GNOME's hot corner and pressure barrier take (#336).
+        doc["right_to_left"] = serde_json::Value::Bool(self.input_settings.right_to_left);
         // Live libinput device configuration (#343): beside the macro,
         // which is already at its recursion limit.
         // Keep this unlocked drag observation outside the large scene macro.

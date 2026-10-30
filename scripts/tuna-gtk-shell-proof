@@ -138,6 +138,14 @@
 #                  cursor surface draws at its own size
 #   G-LOCATE-POINTER with locate-pointer on, a lone Ctrl tap draws GNOME's
 #                  ripples at the pointer; off, it draws nothing
+#   G-LOCATE-RIPPLE-PIXELS the ripples' actual pixels on the frozen clock
+#                  (locatePointer.js, ripples.js): the first ring's 1.375x
+#                  radius at 415 ms, towards the lightened accent, at 100%
+#                  and 125%, and no residue once they end
+#   G-CURSOR-SCALE at 125% (a temporary DisplayConfig change) a size-24
+#                  cursor loads the theme's 48px legacy or SVG image (the
+#                  ceiled scale, Mutter 51's cursor renderer) and draws 30
+#                  physical px at the scaled hotspot
 #   G-A11Y-DWELL   hover click: a resting pointer clicks once with GNOME's
 #                  pie timer; gesture mode picks the click by direction
 #   G-A11Y-SECONDARY a held primary button makes a secondary click
@@ -5173,6 +5181,90 @@ jq -e ".cursor.locate_pointer.at == [$((WIDTH / 2)), $((HEIGHT / 2))]" "$CSTATE"
     fail G-LOCATE-POINTER "the ripples did not center on the pointer: $(jq -c '.cursor.locate_pointer' "$CSTATE")"
 cstate '.cursor.locate_pointer.active | not' "ripples finished" 5 ||
     fail G-LOCATE-POINTER "the ripples did not finish"
+
+# Actual ripple pixels (gnome-shell 51 locatePointer.js, ripples.js) on
+# the frozen animation clock: 415 ms after the tap the first ring is at
+# out-quad scale 1.375 of its 54 px (disc plus glow), i.e. a radius of
+# 37.125 logical px; at 1400 ms all three rings are gone without residue.
+# ripple_pixels SCALE RADIUS: at the output centre, RADIUS physical px.
+ripple_pixels() {
+    xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
+    locate_count="$(jq '.cursor.locate_pointer.count' "$CSTATE")"
+    anim_clock 0
+    cstate '.animation_clock_manual and (.cursor.locate_pointer.active | not)' "ripple clock $1" ||
+        fail G-LOCATE-RIPPLE-PIXELS "the clock file did not freeze animation time at scale $1"
+    sleep 0.5
+    scrot -o "$ARTIFACTS/ripple-$1-before.png" >/dev/null
+    xdotool key Control_L
+    cstate ".cursor.locate_pointer.count == $((locate_count + 1)) and .cursor.locate_pointer.active" "ripple at scale $1" 3 ||
+        fail G-LOCATE-RIPPLE-PIXELS "a Ctrl tap did not start the ripples at scale $1"
+    ripple_frames="$(jq '.cursor.locate_pointer.frames' "$CSTATE")"
+    anim_clock 415
+    cstate ".animation_clock_ms == 415 and .cursor.locate_pointer.frames > $ripple_frames" "ripple at 415 ms, scale $1" 5 ||
+        fail G-LOCATE-RIPPLE-PIXELS "no ripple frame drew at 415 ms at scale $1"
+    sleep 0.5
+    scrot -o "$ARTIFACTS/ripple-$1-415ms.png" >/dev/null
+    anim_clock 1400
+    cstate '.cursor.locate_pointer.active | not' "ripples ended at scale $1" 5 ||
+        fail G-LOCATE-RIPPLE-PIXELS "the ripples did not end by 1400 ms at scale $1"
+    sleep 0.5
+    scrot -o "$ARTIFACTS/ripple-$1-settled.png" >/dev/null
+    "$PY" "$ROOT/scripts/lib/ripple-pixels.py" "$ARTIFACTS/ripple-$1-before.png" "$ARTIFACTS/ripple-$1-415ms.png" \
+        $((WIDTH / 2)) $((HEIGHT / 2)) "$2" 3 --settled "$ARTIFACTS/ripple-$1-settled.png" \
+        >"$ARTIFACTS/ripple-$1.log" 2>&1 ||
+        fail G-LOCATE-RIPPLE-PIXELS "the drawn ripples at scale $1 are not GNOME's: $(tail -1 "$ARTIFACTS/ripple-$1.log")"
+    real_clock || fail G-LOCATE-RIPPLE-PIXELS "removing the clock file did not resume real time"
+}
+# cursor_scale SCALE LOGICAL_WIDTH: a temporary DisplayConfig change, as
+# GNOME Settings' Displays panel sends one (no confirmation, not saved).
+cursor_scale() {
+    scale_serial="$(gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method org.gnome.Mutter.DisplayConfig.GetCurrentState | sed -n 's/^(uint32 \([0-9]*\),.*/\1/p')"
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig \
+        "$scale_serial" 1 "[(0, 0, $1, uint32 0, true, [('tuna-0', '${WIDTH}x${HEIGHT}@60.000', {'color-mode': <uint32 0>, 'underscanning': <false>})])]" \
+        "@a{sv} {}" >>"$ARTIFACTS/cursor-scale.log" 2>&1 ||
+        fail G-CURSOR-SCALE "ApplyMonitorsConfig scale $1 failed: $(tail -2 "$ARTIFACTS/cursor-scale.log")"
+    cstate ".layers | any(.namespace == \"tuna-panel\" and .rect[2] == $2)" "scale $1" ||
+        fail G-CURSOR-SCALE "the layout did not follow scale $1"
+    # GNOME's screen transition (250 ms hold, 500 ms fade) settles first.
+    sleep 1.5
+}
+ripple_pixels 1 37.125
+
+# Mutter 51's cursor renderer at 125%: the sprite loads at the ceiled
+# scale (the theme's 48px image for size 24) and draws at the theme size,
+# 24 logical = 30 physical px, the hotspot scaled with it.
+gsettings set org.gnome.desktop.interface cursor-theme 'TunaProof'
+gsettings set org.gnome.desktop.interface cursor-size 24
+cursor_probe shape default G-CURSOR-SCALE
+cursor_scale 1.25 1024
+probe_center="$(jq -r '.windows[] | select(.app_id == "tuna-cursor-probe") | .rect | "\(((.[0] + .[2] / 2) * 5 / 4) | floor) \(((.[1] + .[3] / 2) * 5 / 4) | floor)"' "$CSTATE")"
+# shellcheck disable=SC2086 # two physical coordinates
+xdotool mousemove --window "$WID" $probe_center
+cstate '.cursor.name == "default" and .cursor.source == "client" and .cursor.scale == 1.25 and .cursor.image_theme == "TunaProofBase" and .cursor.image == [48, 48] and .cursor.logical == [24, 24]' "48px image at 125%" ||
+    fail G-CURSOR-SCALE "at 125% size 24 did not load the theme's 48px image drawn at 24 logical px: $(jq -c .cursor "$CSTATE")"
+cp "$CSTATE" "$ARTIFACTS/cursor-scale-125.json"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-scale-125.png" 30 0.625 0.625 25,173,125 --tolerance 1 ||
+    fail G-CURSOR-SCALE "the 48px legacy image is not drawn as 30 physical px at its scaled hotspot"
+gsettings set org.gnome.desktop.interface cursor-theme TunaProofSvg
+cstate '.cursor.image_theme == "TunaProofSvg" and .cursor.image == [48, 48] and .cursor.logical == [24, 24]' "scalable cursor at 125%" ||
+    fail G-CURSOR-SCALE "at 125% the scalable theme did not rasterize at the ceiled scale: $(jq -c .cursor "$CSTATE")"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-scale-125-svg.png" 30 5 7.5 49,95,199 --tolerance 1 ||
+    fail G-CURSOR-SCALE "the SVG cursor is not drawn as 30 physical px at its scaled hotspot"
+kill "$CURSOR_PID" 2>/dev/null || true
+wait "$CURSOR_PID" 2>/dev/null || true
+CURSOR_PID=""
+cstate ".windows | length == $cursor_windows" "scale cursor probe closed" ||
+    fail G-CURSOR-SCALE "the cursor probe did not close"
+gsettings set org.gnome.desktop.interface cursor-theme "$cursor_theme_before"
+gsettings set org.gnome.desktop.interface cursor-size "$cursor_size_before"
+pass G-CURSOR-SCALE "at 125% a size-24 cursor loads the theme's 48px legacy or SVG image and draws 30 physical px at the scaled hotspot"
+ripple_pixels 1.25 46.40625
+cursor_scale 1 "$WIDTH"
+pass G-LOCATE-RIPPLE-PIXELS "locate-pointer ripples draw GNOME's 1.375x first ring at 415 ms (37 px at 100%, 46 px at 125%) towards the lightened accent and leave no residue"
 gsettings set org.gnome.desktop.interface locate-pointer false
 pass G-LOCATE-POINTER "a Ctrl tap ripples at the pointer with locate-pointer on, nothing with it off"
 
