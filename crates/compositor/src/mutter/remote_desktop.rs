@@ -12,16 +12,38 @@ pub(crate) struct RemoteGrant {
     pub started: Arc<AtomicBool>,
     pub pending: Arc<AtomicU32>,
     eis_opened: Arc<AtomicBool>,
+    pub clipboard: Arc<super::remote_clipboard::Shared>,
 }
 
 /// Input is queued with its revocable grant, never with caller-provided identity.
 #[derive(Debug)]
 pub enum Input {
-    Key { evdev: u32, pressed: bool },
-    Relative { dx: f64, dy: f64 },
-    Absolute { x: f64, y: f64 },
-    Button { button: u32, pressed: bool },
-    Axis { dx: f64, dy: f64 },
+    Key {
+        evdev: u32,
+        pressed: bool,
+    },
+    /// mutter's `notify_keyval`: resolved against the current layout on
+    /// the loop, with Shift/AltGr around it for its level.
+    Keysym {
+        keysym: u32,
+        pressed: bool,
+    },
+    Relative {
+        dx: f64,
+        dy: f64,
+    },
+    Absolute {
+        x: f64,
+        y: f64,
+    },
+    Button {
+        button: u32,
+        pressed: bool,
+    },
+    Axis {
+        dx: f64,
+        dy: f64,
+    },
 }
 
 pub(crate) struct RemoteDesktop {
@@ -62,6 +84,20 @@ impl RemoteSession {
     fn send(&self, input: Input) -> fdo::Result<()> {
         queue_input(&self.grant, &self.to_loop, input)
     }
+    /// Clipboard calls: the owner, unlocked and unrevoked (as mutter's
+    /// `check_permission`), on an enabled clipboard.
+    fn clipboard_admitted(&self, header: &zbus::message::Header<'_>) -> fdo::Result<()> {
+        self.admitted(header, false)?;
+        if !self.grant.clipboard.enabled() {
+            return Err(fdo::Error::Failed("Clipboard not enabled".into()));
+        }
+        Ok(())
+    }
+    fn clipboard_request(&self, request: super::remote_clipboard::Request) -> fdo::Result<()> {
+        self.to_loop
+            .send(ToLoop::RemoteClipboard(request))
+            .map_err(|_| fdo::Error::Failed("compositor gone".into()))
+    }
     fn unsupported(&self, header: &zbus::message::Header<'_>) -> fdo::Result<()> {
         self.admitted(header, true)?;
         Err(fdo::Error::NotSupported(
@@ -86,7 +122,7 @@ impl RemoteSession {
                 if iface.signal_emitter().path().as_str() != stream_path {
                     continue;
                 }
-                let parameters = stream.parameters();
+                let parameters = stream.geometry();
                 if x < 0.0
                     || y < 0.0
                     || x >= f64::from(parameters.size.0)
@@ -180,6 +216,21 @@ pub(crate) fn valid_button(button: i32) -> fdo::Result<u32> {
     Ok(button as u32)
 }
 
+impl RemoteGrant {
+    /// A fresh, unstarted grant for the unique bus name `owner`.
+    pub(crate) fn new(id: u64, owner: String) -> Self {
+        Self {
+            id,
+            owner,
+            stopped: Arc::new(AtomicBool::new(false)),
+            started: Arc::new(AtomicBool::new(false)),
+            pending: Arc::new(AtomicU32::new(0)),
+            eis_opened: Arc::new(AtomicBool::new(false)),
+            clipboard: Default::default(),
+        }
+    }
+}
+
 #[interface(name = "org.gnome.Mutter.RemoteDesktop")]
 impl RemoteDesktop {
     async fn create_session(
@@ -188,7 +239,7 @@ impl RemoteDesktop {
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> fdo::Result<OwnedObjectPath> {
-        let owner = self.authority.admit(conn, &header).await?;
+        let owner = self.authority.admit_remote(conn, &header).await?;
         if self
             .remote
             .lock()
@@ -199,14 +250,7 @@ impl RemoteDesktop {
             ));
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let grant = RemoteGrant {
-            id,
-            owner,
-            stopped: Arc::new(AtomicBool::new(false)),
-            started: Arc::new(AtomicBool::new(false)),
-            pending: Arc::new(AtomicU32::new(0)),
-            eis_opened: Arc::new(AtomicBool::new(false)),
-        };
+        let grant = RemoteGrant::new(id, owner);
         let session_id = format!("tuna-remote-{id}");
         let path =
             OwnedObjectPath::try_from(format!("/org/gnome/Mutter/RemoteDesktop/Session/u{id}"))
@@ -289,11 +333,15 @@ impl RemoteSession {
     }
     async fn notify_keyboard_keysym(
         &self,
-        _keysym: u32,
-        _state: bool,
+        keysym: u32,
+        state: bool,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> fdo::Result<()> {
-        self.unsupported(&header)
+        self.admitted(&header, true)?;
+        self.send(Input::Keysym {
+            keysym,
+            pressed: state,
+        })
     }
     async fn notify_pointer_button(
         &self,
@@ -424,6 +472,119 @@ impl RemoteSession {
         }
         result
     }
+    #[zbus(signal)]
+    pub async fn selection_owner_changed(
+        ctxt: &SignalEmitter<'_>,
+        options: HashMap<String, OwnedValue>,
+    ) -> zbus::Result<()>;
+    #[zbus(signal)]
+    pub async fn selection_transfer(
+        ctxt: &SignalEmitter<'_>,
+        mime_type: &str,
+        serial: u32,
+    ) -> zbus::Result<()>;
+    /// mutter's `meta_clipboard_session_enable`: optionally take the
+    /// selection at once, otherwise hear about the current owner.
+    async fn enable_clipboard(
+        &self,
+        options: HashMap<String, OwnedValue>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+    ) -> fdo::Result<()> {
+        self.admitted(&header, false)?;
+        let mime_types = super::remote_clipboard::mime_types(&options)?;
+        if !self.grant.clipboard.enable() {
+            return Err(fdo::Error::Failed("Already enabled".into()));
+        }
+        // Signals go to the session's owner only, as mutter emits them.
+        let destination = zbus::names::BusName::try_from(self.grant.owner.clone())
+            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+        let request = super::remote_clipboard::Request::Enable {
+            session_id: self.grant.id,
+            stopped: self.grant.stopped.clone(),
+            shared: self.grant.clipboard.clone(),
+            signal: ctxt.to_owned().set_destination(destination),
+            mime_types,
+        };
+        if self.to_loop.send(ToLoop::RemoteClipboard(request)).is_err() {
+            self.grant.clipboard.disable();
+            return Err(fdo::Error::Failed("compositor gone".into()));
+        }
+        Ok(())
+    }
+    async fn disable_clipboard(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<()> {
+        self.admitted(&header, false)?;
+        if !self.grant.clipboard.disable() {
+            return Err(fdo::Error::Failed("Was not enabled".into()));
+        }
+        self.clipboard_request(super::remote_clipboard::Request::Disable {
+            session_id: self.grant.id,
+        })
+    }
+    async fn set_selection(
+        &self,
+        options: HashMap<String, OwnedValue>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<()> {
+        self.clipboard_admitted(&header)?;
+        let mime_types = super::remote_clipboard::mime_types(&options)
+            .map_err(|e| fdo::Error::InvalidArgs(format!("Invalid format list: {e}")))?;
+        self.clipboard_request(super::remote_clipboard::Request::SetSelection {
+            session_id: self.grant.id,
+            mime_types,
+        })
+    }
+    /// A pipe for the data a local client asked for with `serial`.
+    async fn selection_write(
+        &self,
+        serial: u32,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<zbus::zvariant::OwnedFd> {
+        self.clipboard_admitted(&header)?;
+        super::remote_clipboard::selection_write(&self.grant.clipboard, &self.grant.stopped, serial)
+            .map(Into::into)
+    }
+    async fn selection_write_done(
+        &self,
+        _serial: u32,
+        _success: bool,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<()> {
+        self.clipboard_admitted(&header)
+    }
+    /// A pipe carrying the local selection in `mime_type`.
+    async fn selection_read(
+        &self,
+        mime_type: String,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<zbus::zvariant::OwnedFd> {
+        self.clipboard_admitted(&header)?;
+        super::remote_clipboard::valid_mime_type(&mime_type)?;
+        let shared = &self.grant.clipboard;
+        let (local, source) = super::remote_clipboard::begin_read(shared)?.split();
+        let (reply, answer) = std::sync::mpsc::channel();
+        let request = super::remote_clipboard::Request::Read {
+            session_id: self.grant.id,
+            mime_type,
+            fd: local,
+            reply,
+        };
+        let accepted = if self.to_loop.send(ToLoop::RemoteClipboard(request)).is_err() {
+            Err(fdo::Error::Failed("compositor gone".into()))
+        } else {
+            answer
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap_or_else(|_| Err(fdo::Error::Failed("selection unavailable".into())))
+        };
+        if let Err(error) = accepted {
+            super::remote_clipboard::abort_read(shared);
+            return Err(error);
+        }
+        super::remote_clipboard::finish_read(shared, &self.grant.stopped, source).map(Into::into)
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -439,6 +600,7 @@ mod tests {
                 started: Arc::new(AtomicBool::new(false)),
                 pending: Arc::new(AtomicU32::new(0)),
                 eis_opened: Arc::new(AtomicBool::new(false)),
+                clipboard: Default::default(),
             },
             authority: Default::default(),
             captures: Default::default(),
@@ -473,6 +635,7 @@ mod tests {
             started: Arc::new(AtomicBool::new(true)),
             pending: Arc::new(AtomicU32::new(0)),
             eis_opened: Arc::new(AtomicBool::new(false)),
+            clipboard: Default::default(),
         };
         let (sender, receiver) = calloop::channel::channel();
         for _ in 0..256 {

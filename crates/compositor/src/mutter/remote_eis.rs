@@ -93,6 +93,13 @@ impl Worker {
                                     let height =
                                         (f64::from(output.height) / output.scale).round().max(1.0)
                                             as u32;
+                                    // ei_device v2: the mapping id pairing this
+                                    // region with the linked monitor stream.
+                                    if device.device().version() >= 2 {
+                                        device.device().region_mapping_id(
+                                            &super::output_mapping_id(&output.connector),
+                                        );
+                                    }
                                     device.device().region(
                                         (output.x - self.origin.0) as u32,
                                         (output.y - self.origin.1) as u32,

@@ -19,9 +19,12 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use zbus::object_server::{InterfaceRef, SignalEmitter};
-use zbus::zvariant::{DeserializeDict, OwnedObjectPath, OwnedValue, SerializeDict, Type, Value};
+use zbus::zvariant::{DeserializeDict, OwnedObjectPath, OwnedValue, Type, Value};
 use zbus::{fdo, interface, ObjectServer};
 
+#[cfg(test)]
+mod remote_bus_tests;
+pub mod remote_clipboard;
 pub(crate) mod remote_desktop;
 mod remote_eis;
 #[cfg(test)]
@@ -163,6 +166,9 @@ pub enum ToLoop {
     RemoteKeymap {
         reply: std::sync::mpsc::Sender<String>,
     },
+    /// A RemoteDesktop session's clipboard request (mutter's
+    /// MetaClipboardSession); the loop owns the seat's selection.
+    RemoteClipboard(remote_clipboard::Request),
     StartCast {
         session_id: u64,
         grant: Arc<AtomicBool>,
@@ -886,11 +892,15 @@ struct Session {
     streams: SessionStreams,
     stopped: Arc<AtomicBool>,
     started: Arc<AtomicBool>,
+    /// Linked to a RemoteDesktop grant (`remote-desktop-session-id`).
+    linked: bool,
 }
 
 #[derive(Clone)]
 enum Stream {
-    Monitor(OutputSnapshot),
+    /// The monitor, and the mapping id pairing it with the remote
+    /// session's EIS region when the session is linked.
+    Monitor(OutputSnapshot, Option<String>),
     Window(WindowSnapshot),
     /// The output, the requested logical area, and its physical pixels.
     Area(OutputSnapshot, (i32, i32, i32, i32), (i32, i32, i32, i32)),
@@ -899,7 +909,7 @@ enum Stream {
 impl Stream {
     fn target(&self) -> CastTarget {
         match self {
-            Stream::Monitor(output) => CastTarget::Monitor(output.connector.clone()),
+            Stream::Monitor(output, _) => CastTarget::Monitor(output.connector.clone()),
             Stream::Window(window) => CastTarget::Window(window.id),
             Stream::Area(output, _, physical) => {
                 CastTarget::Area(output.connector.clone(), *physical)
@@ -928,13 +938,21 @@ struct RecordMonitorProperties {
     _is_recording: Option<bool>,
 }
 
-#[derive(Debug, SerializeDict, Type, Value)]
-#[zvariant(signature = "dict")]
+/// A stream's place in the logical layout.
+#[derive(Debug)]
 struct StreamParameters {
     /// Position in logical coordinates.
     position: (i32, i32),
     /// Size in logical coordinates.
     size: (i32, i32),
+}
+
+/// The EIS region and stream mapping id of a monitor: mutter's
+/// `meta_stream_map_input` pairs a linked stream with its viewport, and
+/// gnome-remote-desktop (`grd-stream.c`) refuses a stream without one
+/// and maps absolute pointer motion through the region carrying it.
+pub(crate) fn output_mapping_id(connector: &str) -> String {
+    format!("tuna-monitor-{connector}")
 }
 
 #[interface(name = "org.gnome.Mutter.ScreenCast")]
@@ -946,7 +964,13 @@ impl ScreenCast {
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> fdo::Result<OwnedObjectPath> {
-        let owner = self.authority.admit(conn, &header).await?;
+        // gnome-remote-desktop may only capture through a ScreenCast
+        // session linked to its own RemoteDesktop grant.
+        let owner = if properties.contains_key("remote-desktop-session-id") {
+            self.authority.admit_remote(conn, &header).await?
+        } else {
+            self.authority.admit(conn, &header).await?
+        };
         if self
             .sessions
             .lock()
@@ -992,6 +1016,7 @@ impl ScreenCast {
             signals: self.signals.clone(),
             next_id: self.next_id.clone(),
             streams: Arc::new(Mutex::new(Vec::new())),
+            linked: linked.is_some(),
             stopped: linked.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
             started: Arc::new(AtomicBool::new(false)),
         };
@@ -1032,6 +1057,21 @@ impl Session {
         }
         Ok(())
     }
+}
+
+/// Mutter's `handle_record_monitor` (meta-screen-cast-session.c): an
+/// empty connector means the primary monitor, which is how
+/// gnome-remote-desktop mirrors the desktop (`grd-session-rdp.c` asks for
+/// connector "").
+fn record_monitor_target(outputs: &[OutputSnapshot], connector: &str) -> Option<OutputSnapshot> {
+    if connector.is_empty() {
+        return outputs
+            .iter()
+            .find(|o| o.primary)
+            .or_else(|| outputs.first())
+            .cloned();
+    }
+    outputs.iter().find(|o| o.connector == connector).cloned()
 }
 
 #[interface(name = "org.gnome.Mutter.ScreenCast.Session")]
@@ -1082,9 +1122,11 @@ impl Session {
             .outputs
             .lock()
             .ok()
-            .and_then(|o| o.iter().find(|o| o.connector == connector).cloned())
-            .ok_or_else(|| fdo::Error::Failed("no such monitor".into()))?;
-        self.add_stream(server, Stream::Monitor(output)).await
+            .and_then(|o| record_monitor_target(&o, connector))
+            .ok_or_else(|| fdo::Error::Failed("Unknown monitor".into()))?;
+        let mapping_id = self.linked.then(|| output_mapping_id(&output.connector));
+        self.add_stream(server, Stream::Monitor(output, mapping_id))
+            .await
     }
 
     /// Part of the screen, in global logical pixels: what GNOME's screen
@@ -1189,10 +1231,30 @@ impl Stream {
     pub async fn pipe_wire_stream_added(ctxt: &SignalEmitter<'_>, node_id: u32)
         -> zbus::Result<()>;
 
+    /// Mutter's `Parameters`: position and size, plus `mapping-id` on
+    /// streams of a session linked to a RemoteDesktop grant.
     #[zbus(property)]
-    fn parameters(&self) -> StreamParameters {
+    fn parameters(&self) -> HashMap<String, OwnedValue> {
+        let geometry = self.geometry();
+        let mut parameters = HashMap::new();
+        for (key, value) in [("position", geometry.position), ("size", geometry.size)] {
+            if let Ok(value) = OwnedValue::try_from(Value::from(value)) {
+                parameters.insert(key.to_owned(), value);
+            }
+        }
+        if let Stream::Monitor(_, Some(mapping_id)) = self {
+            if let Ok(value) = OwnedValue::try_from(Value::from(mapping_id.as_str())) {
+                parameters.insert("mapping-id".to_owned(), value);
+            }
+        }
+        parameters
+    }
+}
+
+impl Stream {
+    fn geometry(&self) -> StreamParameters {
         match self {
-            Stream::Monitor(o) => StreamParameters {
+            Stream::Monitor(o, _) => StreamParameters {
                 position: (o.x, o.y),
                 size: (
                     (f64::from(o.width) / o.scale).round() as i32,
