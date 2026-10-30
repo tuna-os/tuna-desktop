@@ -80,10 +80,18 @@ def main():
         if darkest is None or count > darkest[0]:
             darkest = (count, image)
     settled_bbox = changed(settled).getbbox()
-    area = width * (height - top)
+    # The flash is black: a pixel already near black (another window's dark
+    # content) cannot change by THRESHOLD, so coverage counts only pixels
+    # bright enough to show half their level going.
+    darkenable = baseline.convert('L').point(lambda v: 255 if v > 2 * THRESHOLD else 0)
     # The window's rectangle in grabbed coordinates (rows above top cut).
     win = (rx, max(ry, top) - top, rx + rw, ry + rh - top)
-    win_area = max(0, win[2] - win[0]) * max(0, win[3] - win[1])
+
+    def bright(region=None):
+        mask = darkenable.crop(region) if region else darkenable
+        return sum(mask.histogram()[255:])
+    area = bright()
+    win_area = bright(win) if win[2] > win[0] and win[3] > win[1] else 0
     peak = darkest[0] if darkest else 0
     flashed = sum(1 for f in report_frames if f['changed'])
     failures = []
