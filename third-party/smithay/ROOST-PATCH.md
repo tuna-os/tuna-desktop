@@ -139,3 +139,22 @@ meta_x11_display_set_input_focus does; enter/leave are unchanged. The
 nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
 The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
 version stays 0.7.0.
+
+Issue #341 (wp_color_management_v1 / wp_color_representation_v1) adds two
+small APIs. RendererSurfaceState::invalidate_buffer
+(src/backend/renderer/utils/wayland.rs) drops the cached textures and marks
+the whole buffer damaged, so a surface whose image description or colour
+representation changed on commit repaints without new client damage, as
+Mutter redraws an actor whose colour state changed. The isolated diff is
+retained in COLOR-DAMAGE-API-PATCH.diff.
+
+The same issue adds EGL YCbCr conversion hints at dmabuf import
+(src/backend/egl, src/backend/renderer/gles). EGLDisplay::create_image_from_dmabuf
+takes an optional YuvConversion (EGL_YUV_COLOR_SPACE_HINT_EXT and
+EGL_SAMPLE_RANGE_HINT_EXT, BT.601/709/2020 at full or narrow range), a
+YuvConversionHint in a surface's data_map selects it for that surface's
+buffers, and the GLES renderer's dmabuf cache re-imports a buffer when its
+conversion changes. Without a hint the driver default applies, as before.
+EGL has no identity hint, so identity coefficients on a YCbCr buffer keep the
+driver default. The isolated diff is retained in YUV-CONVERSION-API-PATCH.diff;
+the pinned version stays 0.7.0.

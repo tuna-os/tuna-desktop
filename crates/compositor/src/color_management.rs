@@ -54,7 +54,9 @@ use wayland_protocols::wp::{
         },
         wp_color_management_surface_v1::{self as cm_surface, WpColorManagementSurfaceV1},
         wp_color_manager_v1::{self as manager, WpColorManagerV1},
-        wp_image_description_creator_icc_v1::{self as creator_icc, WpImageDescriptionCreatorIccV1},
+        wp_image_description_creator_icc_v1::{
+            self as creator_icc, WpImageDescriptionCreatorIccV1,
+        },
         wp_image_description_creator_params_v1::{
             self as creator_params, WpImageDescriptionCreatorParamsV1,
         },
@@ -62,7 +64,9 @@ use wayland_protocols::wp::{
         wp_image_description_v1::{self as image_desc, WpImageDescriptionV1},
     },
     color_representation::v1::server::{
-        wp_color_representation_manager_v1::{self as repr_manager, WpColorRepresentationManagerV1},
+        wp_color_representation_manager_v1::{
+            self as repr_manager, WpColorRepresentationManagerV1,
+        },
         wp_color_representation_surface_v1::{self as repr, WpColorRepresentationSurfaceV1},
     },
 };
@@ -110,14 +114,46 @@ pub enum Coefficients {
 
 /// Mutter's `supported_coeffs` table.
 const SUPPORTED_COEFFICIENTS: [(repr::Coefficients, repr::Range, Coefficients); 8] = [
-    (repr::Coefficients::Identity, repr::Range::Full, Coefficients::IdentityFull),
-    (repr::Coefficients::Identity, repr::Range::Limited, Coefficients::IdentityLimited),
-    (repr::Coefficients::Bt709, repr::Range::Full, Coefficients::Bt709Full),
-    (repr::Coefficients::Bt709, repr::Range::Limited, Coefficients::Bt709Limited),
-    (repr::Coefficients::Bt601, repr::Range::Full, Coefficients::Bt601Full),
-    (repr::Coefficients::Bt601, repr::Range::Limited, Coefficients::Bt601Limited),
-    (repr::Coefficients::Bt2020, repr::Range::Full, Coefficients::Bt2020Full),
-    (repr::Coefficients::Bt2020, repr::Range::Limited, Coefficients::Bt2020Limited),
+    (
+        repr::Coefficients::Identity,
+        repr::Range::Full,
+        Coefficients::IdentityFull,
+    ),
+    (
+        repr::Coefficients::Identity,
+        repr::Range::Limited,
+        Coefficients::IdentityLimited,
+    ),
+    (
+        repr::Coefficients::Bt709,
+        repr::Range::Full,
+        Coefficients::Bt709Full,
+    ),
+    (
+        repr::Coefficients::Bt709,
+        repr::Range::Limited,
+        Coefficients::Bt709Limited,
+    ),
+    (
+        repr::Coefficients::Bt601,
+        repr::Range::Full,
+        Coefficients::Bt601Full,
+    ),
+    (
+        repr::Coefficients::Bt601,
+        repr::Range::Limited,
+        Coefficients::Bt601Limited,
+    ),
+    (
+        repr::Coefficients::Bt2020,
+        repr::Range::Full,
+        Coefficients::Bt2020Full,
+    ),
+    (
+        repr::Coefficients::Bt2020,
+        repr::Range::Limited,
+        Coefficients::Bt2020Limited,
+    ),
 ];
 
 /// A surface's double-buffered colour state: image description and
@@ -186,13 +222,25 @@ pub(crate) fn damage_changed(surface: &WlSurface) {
         (),
         |_, _, _| compositor::TraversalAction::DoChildren(()),
         |_, states, _| {
-            let changed = std::mem::take(
-                &mut states.cached_state.get::<SurfaceColor>().current().changed,
-            );
+            let (changed, coefficients) = {
+                let mut guard = states.cached_state.get::<SurfaceColor>();
+                let current = guard.current();
+                (std::mem::take(&mut current.changed), current.coefficients)
+            };
+            states
+                .data_map
+                .insert_if_missing_threadsafe(smithay::backend::egl::YuvConversionHint::default);
+            if let Some(hint) = states
+                .data_map
+                .get::<smithay::backend::egl::YuvConversionHint>()
+            {
+                *hint.0.lock().unwrap() = yuv_conversion(coefficients);
+            }
             if changed {
-                if let Some(renderer) = states
-                    .data_map
-                    .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+                if let Some(renderer) =
+                    states
+                        .data_map
+                        .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
                 {
                     renderer.lock().unwrap().invalidate_buffer();
                 }
@@ -202,8 +250,27 @@ pub(crate) fn damage_changed(surface: &WlSurface) {
     );
 }
 
+/// The EGL import conversion for a surface's YCbCr buffers. Unset
+/// coefficients are BT.709 limited, Mutter's default. Identity has no
+/// EGL hint, so it falls back to the driver default (a divergence).
+fn yuv_conversion(coefficients: Coefficients) -> Option<smithay::backend::egl::YuvConversion> {
+    use smithay::backend::egl::{YuvColorSpace as S, YuvConversion, YuvRange as R};
+    let (color_space, range) = match coefficients {
+        Coefficients::Unset | Coefficients::Bt709Limited => (S::Rec709, R::Narrow),
+        Coefficients::Bt709Full => (S::Rec709, R::Full),
+        Coefficients::Bt601Full => (S::Rec601, R::Full),
+        Coefficients::Bt601Limited => (S::Rec601, R::Narrow),
+        Coefficients::Bt2020Full => (S::Rec2020, R::Full),
+        Coefficients::Bt2020Limited => (S::Rec2020, R::Narrow),
+        Coefficients::IdentityFull | Coefficients::IdentityLimited => return None,
+    };
+    Some(YuvConversion { color_space, range })
+}
+
 fn with_pending(surface: &WlSurface, f: impl FnOnce(&mut SurfaceColor)) {
-    with_states(surface, |states| f(states.cached_state.get::<SurfaceColor>().pending()));
+    with_states(surface, |states| {
+        f(states.cached_state.get::<SurfaceColor>().pending())
+    });
 }
 
 /// The colour state and representation a surface was last committed
@@ -253,13 +320,14 @@ pub(crate) struct ColorManagement {
     v1_ids: Vec<(ArcWeak<ColorState>, u32)>,
     v1_free: BTreeSet<u32>,
     v1_next: u32,
+    /// `get_information` replies waiting for the end of dispatch.
+    information: Vec<(WpImageDescriptionInfoV1, Arc<ColorState>)>,
 }
 
 impl ColorManagement {
     pub(crate) fn new(dh: &DisplayHandle) -> Self {
         Self {
-            _manager: dh
-                .create_global::<State, WpColorManagerV1, ()>(COLOR_MANAGEMENT_VERSION, ()),
+            _manager: dh.create_global::<State, WpColorManagerV1, ()>(COLOR_MANAGEMENT_VERSION, ()),
             _representation: dh.create_global::<State, WpColorRepresentationManagerV1, ()>(
                 COLOR_REPRESENTATION_VERSION,
                 (),
@@ -270,6 +338,7 @@ impl ColorManagement {
             v1_ids: Vec::new(),
             v1_free: BTreeSet::new(),
             v1_next: 0,
+            information: Vec::new(),
         }
     }
 
@@ -382,7 +451,12 @@ fn set_ready(
         let id = state.protocols.color.v1_id(&color);
         resource.ready(id);
     }
-    *resource.data::<ImageDescription>().unwrap().0.lock().unwrap() = Description::Ready {
+    *resource
+        .data::<ImageDescription>()
+        .unwrap()
+        .0
+        .lock()
+        .unwrap() = Description::Ready {
         state: color,
         has_info,
     };
@@ -390,7 +464,12 @@ fn set_ready(
 
 /// `meta_wayland_image_description_set_failed`.
 fn set_failed(resource: &WpImageDescriptionV1, cause: image_desc::Cause, message: &str) {
-    *resource.data::<ImageDescription>().unwrap().0.lock().unwrap() = Description::Failed;
+    *resource
+        .data::<ImageDescription>()
+        .unwrap()
+        .0
+        .lock()
+        .unwrap() = Description::Failed;
     resource.failed(cause, message.to_owned());
 }
 
@@ -532,6 +611,17 @@ fn send_supported(resource: &WpColorManagerV1) {
 }
 
 impl State {
+    /// Answer the `get_information` requests of the last dispatch; call
+    /// after `Display::dispatch_clients`, before flushing.
+    pub fn send_color_information(&mut self) {
+        for (info, color) in std::mem::take(&mut self.protocols.color.information) {
+            if info.is_alive() {
+                send_information(&info, &color);
+                info.done();
+            }
+        }
+    }
+
     /// The output whose colour state a surface prefers (Mutter's main
     /// monitor): its layer's output, its window's, its parent's, the one
     /// a new window would open on, or the primary output.
@@ -553,9 +643,7 @@ impl State {
                 return self
                     .outputs
                     .iter()
-                    .find(|e| {
-                        smithay::utils::Rectangle::new(e.loc.into(), e.size).overlaps(rect)
-                    })
+                    .find(|e| smithay::utils::Rectangle::new(e.loc.into(), e.size).overlaps(rect))
                     .map(|e| e.name.clone())
                     .or_else(|| self.primary_output_name());
             }
@@ -652,7 +740,8 @@ fn buffer_format(surface: &WlSurface) -> Option<Fourcc> {
         use smithay::backend::allocator::Buffer;
         return Some(dmabuf.format().code);
     }
-    if let Ok(format) = smithay::wayland::shm::with_buffer_contents(&buffer, |_, _, data| data.format)
+    if let Ok(format) =
+        smithay::wayland::shm::with_buffer_contents(&buffer, |_, _, data| data.format)
     {
         return smithay::wayland::shm::shm_format_to_fourcc(format);
     }
@@ -704,8 +793,17 @@ fn is_420(format: Fourcc) -> bool {
     use Fourcc::*;
     matches!(
         format,
-        Nv12 | Nv21 | Nv15 | P010 | P012 | P016 | Yuv420 | Yvu420 | Yuv420_8bit
-            | Yuv420_10bit | Y0l0 | X0l0
+        Nv12 | Nv21
+            | Nv15
+            | P010
+            | P012
+            | P016
+            | Yuv420
+            | Yvu420
+            | Yuv420_8bit
+            | Yuv420_10bit
+            | Y0l0
+            | X0l0
     )
 }
 
@@ -974,7 +1072,9 @@ impl Dispatch<WpColorManagementSurfaceFeedbackV1, SurfaceData> for State {
         data: &SurfaceData,
     ) {
         if let Some(surface) = data.surface() {
-            with_objects(&surface, |objects| objects.feedback.retain(|f| f != resource));
+            with_objects(&surface, |objects| {
+                objects.feedback.retain(|f| f != resource)
+            });
         }
     }
 }
@@ -1046,13 +1146,22 @@ fn check_icc_file(
         ));
     }
     if length == 0 || length > MAX_ICC_SIZE {
-        return Err((creator_icc::Error::BadSize, "The size is 0 or bigger than 32 MB"));
+        return Err((
+            creator_icc::Error::BadSize,
+            "The size is 0 or bigger than 32 MB",
+        ));
     }
     let Ok(stat) = fstat(fd) else {
-        return Err((creator_icc::Error::BadFd, "Couldn't fstat the ICC profile fd"));
+        return Err((
+            creator_icc::Error::BadFd,
+            "Couldn't fstat the ICC profile fd",
+        ));
     };
     if stat.st_size < i64::from(offset) + i64::from(length) {
-        return Err((creator_icc::Error::OutOfFile, "ICC file shorter than expected"));
+        return Err((
+            creator_icc::Error::OutOfFile,
+            "ICC file shorter than expected",
+        ));
     }
     Ok(())
 }
@@ -1062,7 +1171,11 @@ fn read_icc(fd: &OwnedFd, offset: u32, length: u32) -> Result<Vec<u8>, String> {
     let mut bytes = vec![0u8; length as usize];
     let mut done = 0;
     while done < bytes.len() {
-        match rustix::io::pread(fd.as_fd(), &mut bytes[done..], u64::from(offset) + done as u64) {
+        match rustix::io::pread(
+            fd.as_fd(),
+            &mut bytes[done..],
+            u64::from(offset) + done as u64,
+        ) {
             Ok(0) => return Err("Unexpected end of ICC file".to_owned()),
             Ok(n) => done += n,
             Err(rustix::io::Errno::INTR) => {}
@@ -1108,7 +1221,8 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsCreator> for State {
                     WEnum::Unknown(_) => None,
                 };
                 let Some(eotf) = eotf else {
-                    resource.post_error(E::InvalidTf, "The named transfer function is not supported");
+                    resource
+                        .post_error(E::InvalidTf, "The named transfer function is not supported");
                     return;
                 };
                 settings.eotf = Some(eotf);
@@ -1187,8 +1301,11 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsCreator> for State {
                     resource.post_error(E::AlreadySet, "The luminance was already set");
                     return;
                 }
-                let (min, max, reference) =
-                    (min_lum as f32 * 0.0001, max_lum as f32, reference_lum as f32);
+                let (min, max, reference) = (
+                    min_lum as f32 * 0.0001,
+                    max_lum as f32,
+                    reference_lum as f32,
+                );
                 if max <= min {
                     resource.post_error(
                         E::InvalidLuminance,
@@ -1240,7 +1357,7 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsCreator> for State {
 
 impl Dispatch<WpImageDescriptionV1, ImageDescription> for State {
     fn request(
-        _: &mut Self,
+        state: &mut Self,
         _: &Client,
         resource: &WpImageDescriptionV1,
         request: image_desc::Request,
@@ -1263,10 +1380,10 @@ impl Dispatch<WpImageDescriptionV1, ImageDescription> for State {
                     image_desc::Error::NoInformation,
                     "The image description has no information",
                 ),
-                Some((color, true)) => {
-                    send_information(&info, &color);
-                    info.done();
-                }
+                // `done` destroys the info object, which wayland-backend
+                // must still find when this request returns: send after
+                // dispatch ([`State::send_color_information`]).
+                Some((color, true)) => state.protocols.color.information.push((info, color)),
             }
         }
     }
@@ -1317,7 +1434,11 @@ impl Dispatch<WpColorRepresentationManagerV1, ()> for State {
         if let repr_manager::Request::GetSurface { id, surface } = request {
             let object = init.init(id, SurfaceData(surface.downgrade()));
             let exists = with_objects(&surface, |objects| {
-                if objects.representation.as_ref().is_some_and(Resource::is_alive) {
+                if objects
+                    .representation
+                    .as_ref()
+                    .is_some_and(Resource::is_alive)
+                {
                     return true;
                 }
                 objects.representation = Some(object);
@@ -1349,7 +1470,10 @@ impl Dispatch<WpColorRepresentationSurfaceV1, SurfaceData> for State {
             return;
         }
         let Some(surface) = data.surface() else {
-            resource.post_error(repr::Error::Inert, "Underlying surface object has been destroyed");
+            resource.post_error(
+                repr::Error::Inert,
+                "Underlying surface object has been destroyed",
+            );
             return;
         };
         match request {

@@ -4637,6 +4637,7 @@ impl Runtime {
         self.display
             .dispatch_clients(&mut self.state)
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        self.state.send_color_information();
         self.display
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
@@ -7422,8 +7423,17 @@ fn draw_scene(
     }
     // Surfaces carry logical sizes: draw them at the output scale. The
     // wallpaper above is already sized in physical pixels.
-    crate::color_render::draw_planned(frame, scale, previews, &previews_plan, colors, tint, 1.0, None)
-        .map_err(error)?;
+    crate::color_render::draw_planned(
+        frame,
+        scale,
+        previews,
+        &previews_plan,
+        colors,
+        tint,
+        1.0,
+        None,
+    )
+    .map_err(error)?;
     draw_slots(frame, scale, scene, &under, &under_plan, tint, colors).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, tile, &tile_plan).map_err(error)?;
     draw_slots(frame, scale, scene, &over, &over_plan, tint, colors).map_err(error)?;

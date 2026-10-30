@@ -60,8 +60,8 @@ pub mod animation_clock;
 mod auth_owner;
 mod bell;
 pub mod capture_security;
-pub mod color_manager;
 pub mod color_management;
+pub mod color_manager;
 pub(crate) mod color_render;
 pub mod color_state;
 mod constraint_motion;
@@ -1405,6 +1405,7 @@ impl TestCompositor {
     /// actions instead of blocking on either side.
     pub fn pump(&mut self) {
         self.display.dispatch_clients(&mut self.state).unwrap();
+        self.state.send_color_information();
         self.display.flush_clients().unwrap();
     }
 
