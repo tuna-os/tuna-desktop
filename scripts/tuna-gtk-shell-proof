@@ -3158,12 +3158,25 @@ fi
 open_calendar
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-policy-list.json" 20 ||
     fail G-NOTIFY-POLICY "accessibility dump failed"
-showing "$ARTIFACTS/a11y-policy-list.json" "Policy First" ||
-    fail G-NOTIFY-POLICY "the enabled notification is missing from the list"
-if showing "$ARTIFACTS/a11y-policy-list.json" "Policy Held"; then
-    fail G-NOTIFY-POLICY "the disabled app's notification reached the list"
-fi
-pass G-NOTIFY-POLICY "first notify registers the app; disabling it keeps banners and list entries away"
+# GNOME takes the disabled app's whole source out of the tray
+# (`_onSourceEnableChanged`): what it filed while enabled hides too.
+for policy_title in "Policy First" "Policy Held"; do
+    if showing "$ARTIFACTS/a11y-policy-list.json" "$policy_title"; then
+        fail G-NOTIFY-POLICY "the disabled app's \"$policy_title\" is in the list"
+    fi
+done
+# Enabled again, its source comes back with both notifications.
+gsettings set "org.gnome.desktop.notifications.application:/org/gnome/desktop/notifications/application/$POLICY_APP/" enable true
+sleep 1.5
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-policy-restored.json" 20 ||
+    fail G-NOTIFY-POLICY "accessibility dump failed"
+# The two group: the newest card shows, the older one is in the group.
+showing "$ARTIFACTS/a11y-policy-restored.json" "Policy Held" ||
+    fail G-NOTIFY-POLICY "re-enabling the app did not bring \"Policy Held\" back to the list"
+jq -e 'any(.[]; ((.name // "") + " " + (.description // "")) | contains("Policy First"))' \
+    "$ARTIFACTS/a11y-policy-restored.json" >/dev/null ||
+    fail G-NOTIFY-POLICY "re-enabling the app did not bring \"Policy First\" back to the list"
+pass G-NOTIFY-POLICY "first notify registers the app; disabling it hides its banners and list entries, re-enabling brings them back"
 # Leave the list empty and the settings as found for the next gates.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-policy-cleared.json" 20 \
     --press "Clear" || fail G-NOTIFY-POLICY "could not press Clear"
@@ -3171,7 +3184,6 @@ showing "$ARTIFACTS/a11y-policy-cleared.json" "No Notifications" ||
     fail G-NOTIFY-POLICY "Clear did not empty the policy list"
 xdotool key Escape
 sleep 1
-gsettings set "org.gnome.desktop.notifications.application:/org/gnome/desktop/notifications/application/$POLICY_APP/" enable true
 gsettings set org.gnome.desktop.notifications application-children "$POLICY_CHILDREN_BEFORE"
 gsettings set org.gnome.desktop.notifications show-banners "$POLICY_BANNERS_BEFORE"
 rm -f "$POLICY_DESKTOP_FILE"
