@@ -90,6 +90,7 @@ pub mod menu_close;
 pub mod minimize;
 pub mod modal_dim;
 pub mod monitors;
+pub mod motion_coalesce;
 pub mod mutter;
 pub mod native_output;
 #[cfg(feature = "drm")]

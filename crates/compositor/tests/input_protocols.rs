@@ -5,6 +5,7 @@
 use std::os::unix::net::UnixStream;
 
 use smithay::utils::{Logical, Point};
+use tuna_compositor::motion_coalesce::MotionCoalescer;
 use tuna_compositor::windows::{swipe_action, ManagerInput, SwipeAction, WindowManager};
 use tuna_compositor::TestCompositor;
 use wayland_client::{
@@ -485,6 +486,88 @@ fn a_locked_pointer_stays_put_while_relative_motion_flows() {
         "the locked pointer did not move"
     );
     assert_eq!(game.client.relative, [(12.0, -5.0)]);
+}
+
+/// Mutter folds a frame's motions and sums their relative deltas
+/// (clutter-stage.c, clutter_stage_compress_motion): a locked pointer's
+/// client gets one relative event carrying every delta exactly, with
+/// the newest timestamp, and the pointer still stays put.
+#[test]
+fn coalesced_relative_motion_sums_every_delta_for_a_locked_pointer() {
+    let mut comp = TestCompositor::new();
+    comp.state.set_output_size(1280, 800);
+    let mut manager = comp.window_manager();
+    let mut game = connect(&mut comp);
+    pump(&mut comp, &mut manager, &mut [&mut game]);
+    let surface = window(&mut game);
+    pump(&mut comp, &mut manager, &mut [&mut game]);
+    let (_, geometry) = manager.visible_windows()[0].clone();
+    let inside: Point<f64, Logical> = (geometry.loc + Point::from((50, 50))).to_f64();
+    manager.on_input(
+        &mut comp.state,
+        ManagerInput::Motion {
+            pos: inside,
+            time: 1,
+        },
+    );
+    pump(&mut comp, &mut manager, &mut [&mut game]);
+    let qh = game.queue.handle();
+    let pointer = game.client.pointer.clone().unwrap();
+    let _relative = game
+        .client
+        .relative_manager
+        .as_ref()
+        .expect("relative-pointer advertised")
+        .get_relative_pointer(&pointer, &qh, ());
+    let _lock = game
+        .client
+        .constraints
+        .as_ref()
+        .expect("pointer-constraints advertised")
+        .lock_pointer(&surface, &pointer, None, Lifetime::Persistent, &qh, ());
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut game]);
+
+    // Each backend event is an absolute position plus its raw delta,
+    // as the libinput backend reports them.
+    let deltas = [
+        (1.5, -2.25, 1.25, -2.0),
+        (0.125, 0.5, 0.0, 0.375),
+        (-3.0, 4.75, -2.5, 4.0),
+        (7.0, 0.0, 6.5, -0.125),
+    ];
+    let mut queue = MotionCoalescer::new();
+    let mut target = inside;
+    for (i, (dx, dy, ux, uy)) in deltas.into_iter().enumerate() {
+        target += Point::from((dx, dy));
+        for input in [
+            ManagerInput::Motion {
+                pos: target,
+                time: 2 + i as u32,
+            },
+            ManagerInput::RelativeMotion {
+                delta: (dx, dy).into(),
+                delta_unaccel: (ux, uy).into(),
+                utime: 3_000 + 1_000 * i as u64,
+            },
+        ] {
+            assert_eq!(queue.absorb(input), None, "motion waits for the frame");
+        }
+    }
+    for input in queue.take(std::time::Instant::now()).into_iter().flatten() {
+        manager.on_input(&mut comp.state, input);
+    }
+    pump(&mut comp, &mut manager, &mut [&mut game]);
+    assert_eq!(
+        manager.pointer_pos(),
+        inside,
+        "the locked pointer did not move"
+    );
+    assert_eq!(
+        game.client.relative_raw,
+        [(5.625, 3.0, 5.25, 2.25, 6_000)],
+        "one relative event, every delta summed exactly"
+    );
 }
 
 #[test]

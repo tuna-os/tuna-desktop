@@ -66,6 +66,7 @@ mod aids;
 mod auth;
 mod color;
 mod display;
+mod motion;
 mod osk;
 
 /// Display-rate loop pacing: while anything moves, dispatch blocks at
@@ -699,6 +700,9 @@ pub struct Runtime {
     wellbeing_effects: crate::wellbeing_effects::Effects,
     /// GNOME's keyboard accessibility aids, ahead of everything else (#350).
     input_aids: aids::RuntimeAids,
+    /// Pointer motion waiting for its output frame (Mutter's stage
+    /// event queue); see [`crate::motion_coalesce`].
+    motion_queue: crate::motion_coalesce::MotionCoalescer,
     /// Keys GNOME's on-screen keyboard holds down (#349).
     osk: osk::RuntimeOsk,
     /// An Escape press cancelled a client drag; its repeats and release
@@ -1427,6 +1431,7 @@ impl Runtime {
             input_settings: Default::default(),
             wellbeing_effects: Default::default(),
             input_aids: aids::RuntimeAids::default(),
+            motion_queue: crate::motion_coalesce::MotionCoalescer::new(),
             osk: osk::RuntimeOsk::default(),
             dnd_escape_held: false,
             orca: crate::orca::Reader::new(&session.socket_name, a11y_keyboard.clone()),
@@ -1670,6 +1675,8 @@ impl Runtime {
     /// snapshots), overview dismissed, and the exclusive lock surface
     /// up with an empty list — no window titles while locked.
     fn engage_lock(&mut self) {
+        // Motion that came before the lock is the session's, not the shield's.
+        self.flush_motion();
         // Track lifecycle separately: idle check_timeout has already locked its flag.
         self.unlock_slot.note_lock(&self.unlock_generation);
         #[cfg(feature = "drm")]
@@ -1867,6 +1874,7 @@ impl Runtime {
     }
 
     fn release_lock(&mut self) {
+        self.flush_motion();
         self.reset_input_aid_ownership();
         if let Some(monitor) = &self.a11y_keyboard {
             monitor.set_locked(false);
@@ -2001,14 +2009,15 @@ impl Runtime {
         }
     }
 
-    /// Route one backend input event: consumed by the lock surface while
+    /// Route one backend input event, after [`Self::on_manager_input`]
+    /// coalesced motion: consumed by the lock surface while
     /// locked (credential entry submits through [`try_unlock`](Self::try_unlock);
     /// windows hear nothing), else to the recovery overlay while it is visible,
     /// else through the overview triggers to the window manager.
     /// Trigger events still reach clients (tap toggles without
     /// breaking Super-combos); only Escape-closes is consumed, so a
     /// closing keypress never double-acts on client UI.
-    fn on_manager_input(&mut self, input: ManagerInput) {
+    fn dispatch_manager_input(&mut self, input: ManagerInput) {
         if let Some(monitor) = &self.a11y_keyboard {
             monitor.set_locked(self.is_locked());
             if self
@@ -3902,6 +3911,7 @@ impl Runtime {
         let Some(held) = self.remote_held.remove(&session_id) else {
             return;
         };
+        self.flush_motion();
         held.grant.store(true, std::sync::atomic::Ordering::SeqCst);
         let time = self.lock_now_ms() as u32;
         // Cleanup must reach the seat even while the lock shield has no
@@ -4153,6 +4163,7 @@ impl Runtime {
         if self.is_locked() || x < 0 || y < 0 {
             return;
         }
+        self.flush_motion();
         let Some(surface) = crate::layer::exclusive_keyboard_layer(&self.state) else {
             return;
         };
@@ -4433,8 +4444,15 @@ impl Runtime {
     /// How long the loop may sleep before the next [`tick`](Self::tick)
     /// (#503). Wayland clients, input, page flips, the control socket,
     /// signals, runtime files and worker threads wake it earlier through
-    /// their event sources; this covers what only time moves.
+    /// their event sources; this covers what only time moves, and
+    /// coalesced motion falling due.
     fn next_wake(&self) -> Duration {
+        let wake = self.producer_wake();
+        self.motion_wake().map_or(wake, |due| wake.min(due))
+    }
+
+    /// The timed producers' earliest wake.
+    fn producer_wake(&self) -> Duration {
         #[cfg(feature = "drm")]
         let native = matches!(self.backend, Backend::Drm(_));
         #[cfg(not(feature = "drm"))]
@@ -4576,6 +4594,9 @@ impl Runtime {
                 self.blank = crate::lock::IdleBlank::parse(&text);
             }
         }
+        // Motion folded since the last frame reaches the window manager
+        // now, before client requests and this tick's frame.
+        self.flush_motion_if_due();
         self.display
             .dispatch_clients(&mut self.state)
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
@@ -4602,9 +4623,13 @@ impl Runtime {
         }
         // A client's pointer warp moved the manager's pointer: the
         // drawn cursor follows (#89).
+        // Not while coalesced motion is pending: the backend's pointer
+        // is ahead of the manager's until the frame delivers it.
         #[cfg(feature = "drm")]
         if let Backend::Drm(drm) = &mut self.backend {
-            drm.set_pointer(self.manager.pointer_pos());
+            if !self.motion_queue.pending() {
+                drm.set_pointer(self.manager.pointer_pos());
+            }
         }
         // Publish the output inventory every tick (multi-monitor): the
         // hub broadcasts on change only, so the steady state costs one
@@ -5119,6 +5144,7 @@ impl Runtime {
     fn on_tablet_input(&mut self, event: crate::tablet::TabletEvent) {
         use crate::tablet::TabletEvent;
         let mut waking_blank = false;
+        self.flush_motion();
         if let Some(time) = event.time() {
             waking_blank = self.blank_alpha() > 0.0;
             self.lock.note_input(u64::from(time));
