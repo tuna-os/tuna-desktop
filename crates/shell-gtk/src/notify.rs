@@ -1189,13 +1189,18 @@ impl NotifyUi {
             let (me, id) = (self.clone(), n.id);
             Rc::new(move || {
                 let bus = me.bus.borrow();
-                let _ = if has_default {
-                    bus.invoke_action(id as u32, "default")
+                let invoked = if has_default {
+                    bus.invoke_action(id as u32, "default").is_ok()
                 } else {
-                    bus.dismiss_banner(id as u32, REASON_DISMISSED)
+                    let _ = bus.dismiss_banner(id as u32, REASON_DISMISSED);
+                    false
                 };
                 drop(bus);
-                me.retire_local_actions(id);
+                // A shell-own notice's activation runs like its buttons:
+                // only after the bus admitted the key.
+                if !(invoked && me.dispatch_local_action(id, "default")) {
+                    me.retire_local_actions(id);
+                }
                 me.refresh();
             })
         };
@@ -1889,6 +1894,26 @@ mod gtk_action_lifecycle_tests {
         found.pop().unwrap()
     }
 
+    /// The banner card's own click gesture (its body, not a button).
+    fn banner_body(root: &impl IsA<gtk::Widget>) -> gtk::GestureClick {
+        fn find(widget: &gtk::Widget) -> Option<gtk::GestureClick> {
+            if widget.has_css_class("banner") {
+                let controllers = widget.observe_controllers();
+                return (0..controllers.n_items())
+                    .find_map(|i| controllers.item(i).and_downcast::<gtk::GestureClick>());
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(found) = find(&widget) {
+                    return Some(found);
+                }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        find(root.as_ref()).expect("a banner card with a body gesture")
+    }
+
     /// Every label's text under `root`, in widget order.
     fn labels(root: &impl IsA<gtk::Widget>) -> Vec<String> {
         fn collect(widget: &gtk::Widget, found: &mut Vec<String>) {
@@ -2091,6 +2116,39 @@ mod gtk_action_lifecycle_tests {
         assert!(ui.bus.borrow().invoke_action(id as u32, "take").is_err());
         assert!(ui.bus.borrow().invoke_action(id as u32, "delay").is_err());
         assert_eq!(center.lock().unwrap().history().len(), 1);
+        ui.clear.emit_clicked();
+        // Activating a shell-own notice by its body (GNOME's `activated`:
+        // the removable-media notice opens the file manager) runs its
+        // "default" handler once; its buttons are spent with it.
+        settle(&ui);
+        let id = ui
+            .post_with_actions(
+                "Owned default fixture",
+                "",
+                "“STICK” connected",
+                "",
+                &[
+                    ("open-0".into(), "Open with Files".into()),
+                    ("default".into(), String::new()),
+                ],
+                Urgency::Normal,
+                None,
+            )
+            .unwrap();
+        settle(&ui);
+        let opened = Rc::new(Cell::new(0));
+        for key in ["open-0", "default"] {
+            let count = opened.clone();
+            ui.on_notification_action(id, key, Rc::new(move || count.set(count.get() + 1)));
+        }
+        let open_with = button(&ui.banner_box, "Open with Files");
+        let body = banner_body(&ui.banner_box);
+        body.emit_by_name::<()>("released", &[&1i32, &0f64, &0f64]);
+        body.emit_by_name::<()>("released", &[&1i32, &0f64, &0f64]);
+        open_with.emit_clicked();
+        assert_eq!(opened.get(), 1, "the body activates exactly once");
+        assert!(ui.local_actions.borrow().handlers.is_empty());
+        assert!(ui.local_actions.borrow().live.is_empty());
         ui.clear.emit_clicked();
         // A resident notice updated in place (GNOME's screen-time warning
         // turning into "Limit Reached") shows again on the banner already
