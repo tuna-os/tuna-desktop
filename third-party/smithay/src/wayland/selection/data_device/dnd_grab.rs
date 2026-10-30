@@ -258,6 +258,20 @@ where
         if !self.origin.alive() || self.data_source.as_ref().is_some_and(|s| !s.alive()) {
             self.prepare_cancel_offer();
         }
+        // A drag the handler says always performs its drop (a toplevel moved with it)
+        // reports dnd_drop_performed first, whatever the target does.
+        let drop_performed_first = !self.cancelled.get()
+            && self.data_source.as_ref().is_some_and(|source| {
+                source.alive()
+                    && ClientDndGrabHandler::drop_performed_without_target(data, source, self.seat.clone())
+            });
+        if drop_performed_first {
+            if let Some(source) = self.data_source.as_ref() {
+                if source.version() >= wl_data_source::EVT_DND_DROP_PERFORMED_SINCE {
+                    source.dnd_drop_performed();
+                }
+            }
+        }
         // the user dropped, proceed to the drop
         let seat_data = self
             .seat
@@ -291,7 +305,9 @@ where
         if let Some(source) = self.data_source.as_ref().filter(|s| s.alive()) {
             if !validated {
                 source.cancelled();
-            } else if source.version() >= wl_data_source::EVT_DND_DROP_PERFORMED_SINCE {
+            } else if !drop_performed_first
+                && source.version() >= wl_data_source::EVT_DND_DROP_PERFORMED_SINCE
+            {
                 source.dnd_drop_performed();
             }
         }

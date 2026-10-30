@@ -194,3 +194,21 @@ meta_x11_display_set_input_focus does; enter/leave are unchanged. The
 nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
 The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
 version stays 0.7.0.
+
+Issues #364 and #588 additionally change
+src/wayland/selection/data_device/mod.rs and dnd_grab.rs for
+xdg_toplevel_drag_v1, which Roost implements outside Smithay
+(crates/compositor/src/toplevel_drag.rs). Mutter's drag_grab_release
+(meta-wayland-data-device.c) reports dnd_drop_performed to the source of a
+drag that moves a toplevel before it resolves the drop, then cancels the
+source as usual when no target accepted; upstream reports dnd_drop_performed
+only after an accepted drop. The additive
+ClientDndGrabHandler::drop_performed_without_target hook, asked once on a
+release that was not cancelled while the source lives, lets the handler opt a
+drag in: the source then hears dnd_drop_performed before the target's drop,
+exactly once, and cancelled afterwards if nothing accepted. The default
+returns false, keeping upstream behaviour for every other drag; Escape
+cancellation never reports a drop. Real socketpair tests in
+crates/compositor/tests/protocol_gaps.rs cover an unaccepted and an accepted
+toplevel drag drop. The isolated diff is retained in
+XDG-TOPLEVEL-DRAG-PATCH.diff; the pinned version stays 0.7.0.

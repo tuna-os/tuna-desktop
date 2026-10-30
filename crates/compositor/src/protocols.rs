@@ -47,6 +47,8 @@
 //! - ext-background-effect v1: the blur behind a surface's blur region
 //!   (`background_effect.rs`, drawn by `background_blur.rs`).
 //! - wp_drm_lease_device_v1 (native backend only): see `crate::drm::lease`.
+//! - xdg-toplevel-drag v1: a window attached to a drag-and-drop follows
+//!   the pointer (detachable tabs); see [`crate::toplevel_drag`].
 //!
 //! Deliberately absent, matching Mutter: xdg-decoration (GNOME is
 //! client-side decorations only).
@@ -149,6 +151,8 @@ pub(crate) struct Protocols {
     _fixes: GlobalId,
     /// ext_background_effect_manager_v1 (blur behind surfaces).
     pub(crate) background_effects: crate::background_effect::BackgroundEffects,
+    /// xdg_toplevel_drag_manager_v1 and its toplevel drags.
+    pub(crate) toplevel_drag: crate::toplevel_drag::ToplevelDrags,
     /// Pointer warps clients asked for, drained by the window manager:
     /// surface, surface-local position, enter serial.
     pub(crate) pointer_warps: Vec<(WlSurface, Point<f64, Logical>, u32)>,
@@ -211,6 +215,7 @@ impl Protocols {
             _pointer_warp: dh.create_global::<State, WpPointerWarpV1, ()>(1, ()),
             _fixes: dh.create_global::<State, WlFixes, ()>(1, ()),
             background_effects: crate::background_effect::BackgroundEffects::new(dh),
+            toplevel_drag: crate::toplevel_drag::ToplevelDrags::new(dh),
             pointer_warps: Vec::new(),
             bell: Bell::default(),
             inhibitors: Vec::new(),

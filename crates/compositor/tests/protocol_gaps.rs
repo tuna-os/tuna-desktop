@@ -1,7 +1,8 @@
 //! The GNOME 51 protocols Tuna Desktop added to close P-SY-06's gaps (#89):
 //! presentation-time, fifo, keyboard-shortcuts-inhibit, xdg-dialog,
-//! xdg-foreign, xdg-system-bell, xdg-toplevel-tag and ext-background-effect,
-//! driven by a real client against the headless compositor.
+//! xdg-foreign, xdg-system-bell, xdg-toplevel-tag, ext-background-effect
+//! and xdg-toplevel-drag, driven by a real client against the headless
+//! compositor.
 
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
@@ -80,6 +81,8 @@ struct Client {
     imports_destroyed: usize,
     /// ext_background_effect_manager_v1 capabilities, as sent.
     background_effects: Option<u32>,
+    /// What the drag-and-drop objects heard (xdg-toplevel-drag tests).
+    drag: DragLog,
 }
 
 impl Dispatch<WlCallback, ()> for Client {
@@ -1255,4 +1258,507 @@ fn a_blur_region_for_a_destroyed_surface_is_a_protocol_error() {
         error.code,
         ext_background_effect_surface_v1::Error::SurfaceDestroyed as u32
     );
+}
+
+// xdg_toplevel_drag_v1 (#364, #588): Mutter 51's meta-wayland-toplevel-drag.c.
+
+use wayland_client::protocol::{
+    wl_buffer::WlBuffer,
+    wl_data_device::{self, WlDataDevice},
+    wl_data_device_manager::{DndAction, WlDataDeviceManager},
+    wl_data_offer::WlDataOffer,
+    wl_data_source::{self, WlDataSource},
+    wl_pointer::{self, WlPointer},
+    wl_shm::{self, WlShm},
+    wl_shm_pool::WlShmPool,
+};
+use wayland_protocols::xdg::toplevel_drag::v1::client::{
+    xdg_toplevel_drag_manager_v1::{self, XdgToplevelDragManagerV1},
+    xdg_toplevel_drag_v1::{self, XdgToplevelDragV1},
+};
+
+const BUTTON_LEFT: u32 = 0x110;
+
+#[derive(Default)]
+struct DragLog {
+    /// Serials of wl_pointer button presses.
+    presses: Vec<u32>,
+    /// wl_data_source terminal events, in order.
+    source: Vec<&'static str>,
+    /// wl_data_device enters: surface, serial and offer.
+    enters: Vec<(WlSurface, u32, Option<WlDataOffer>)>,
+    drops: usize,
+}
+
+impl Dispatch<WlPointer, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_pointer::Event::Button {
+            serial,
+            state: wayland_client::WEnum::Value(wl_pointer::ButtonState::Pressed),
+            ..
+        } = event
+        {
+            state.drag.presses.push(serial);
+        }
+    }
+}
+
+impl Dispatch<WlDataDevice, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &WlDataDevice,
+        event: wl_data_device::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_data_device::Event::Enter {
+                serial,
+                surface,
+                id,
+                ..
+            } => state.drag.enters.push((surface, serial, id)),
+            wl_data_device::Event::Drop => state.drag.drops += 1,
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(Client, WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (WlDataOffer, ()),
+    ]);
+}
+
+impl Dispatch<WlDataSource, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &WlDataSource,
+        event: wl_data_source::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_data_source::Event::Cancelled => state.drag.source.push("cancelled"),
+            wl_data_source::Event::DndDropPerformed => state.drag.source.push("dnd_drop_performed"),
+            wl_data_source::Event::DndFinished => state.drag.source.push("dnd_finished"),
+            _ => {}
+        }
+    }
+}
+
+wayland_client::delegate_noop!(Client: ignore WlDataDeviceManager);
+wayland_client::delegate_noop!(Client: ignore WlDataOffer);
+wayland_client::delegate_noop!(Client: ignore WlShm);
+wayland_client::delegate_noop!(Client: ignore WlShmPool);
+wayland_client::delegate_noop!(Client: ignore WlBuffer);
+wayland_client::delegate_noop!(Client: ignore XdgToplevelDragManagerV1);
+wayland_client::delegate_noop!(Client: ignore XdgToplevelDragV1);
+
+/// A client with a pointer, a data device and the toplevel-drag global.
+struct Dragger {
+    peer: Peer,
+    device: WlDataDevice,
+    data: WlDataDeviceManager,
+    drags: XdgToplevelDragManagerV1,
+    shm: WlShm,
+}
+
+fn dragger(comp: &mut TestCompositor, manager: &mut WindowManager) -> Dragger {
+    let mut peer = connect(comp, manager);
+    let qh = peer.qh();
+    let seat: WlSeat = peer.bind(5);
+    let data: WlDataDeviceManager = peer.bind(3);
+    let drags: XdgToplevelDragManagerV1 = peer.bind(1);
+    let shm: WlShm = peer.bind(1);
+    let device = data.get_data_device(&seat, &qh, ());
+    let _pointer = seat.get_pointer(&qh, ());
+    pump(comp, manager, &mut [&mut peer]);
+    Dragger {
+        peer,
+        device,
+        data,
+        drags,
+        shm,
+    }
+}
+
+/// Give `surface` a `w`×`h` buffer, which shows (places) its window.
+fn show(d: &mut Dragger, surface: &WlSurface, w: i32, h: i32) {
+    use std::os::fd::AsFd;
+    let qh = d.peer.qh();
+    let stride = w * 4;
+    let file = tempfile::tempfile().unwrap();
+    file.set_len((stride * h) as u64).unwrap();
+    let pool = d.shm.create_pool(file.as_fd(), stride * h, &qh, ());
+    let buffer = pool.create_buffer(0, w, h, stride, wl_shm::Format::Argb8888, &qh, ());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage_buffer(0, 0, w, h);
+    surface.commit();
+    pool.destroy();
+}
+
+/// Map a toplevel and show it at 400×300; returns surface, role and id.
+fn shown_window(
+    comp: &mut TestCompositor,
+    manager: &mut WindowManager,
+    d: &mut Dragger,
+    title: &str,
+) -> (WlSurface, XdgToplevel, u64) {
+    let (surface, toplevel) = window(&mut d.peer, title);
+    pump(comp, manager, &mut [&mut d.peer]);
+    show(d, &surface, 400, 300);
+    pump(comp, manager, &mut [&mut d.peer]);
+    (surface, toplevel, id_of(manager, title))
+}
+
+fn motion(manager: &mut WindowManager, comp: &mut TestCompositor, x: f64, y: f64) {
+    manager.on_input(
+        &mut comp.state,
+        ManagerInput::Motion {
+            pos: (x, y).into(),
+            time: 20,
+        },
+    );
+}
+
+fn button(manager: &mut WindowManager, comp: &mut TestCompositor, pressed: bool) {
+    manager.on_input(
+        &mut comp.state,
+        ManagerInput::Button {
+            button: BUTTON_LEFT,
+            pressed,
+            time: 21,
+        },
+    );
+}
+
+fn loc_of(manager: &WindowManager, id: u64) -> (i32, i32) {
+    let loc = manager.geometry(id).expect("window managed").loc;
+    (loc.x, loc.y)
+}
+
+/// Press on `origin` at (x, y) and start a drag from it with a fresh
+/// source and its toplevel drag (made before start_drag, as the
+/// protocol asks).
+fn start_drag(
+    comp: &mut TestCompositor,
+    manager: &mut WindowManager,
+    d: &mut Dragger,
+    origin: &WlSurface,
+    x: f64,
+    y: f64,
+) -> (WlDataSource, XdgToplevelDragV1) {
+    motion(manager, comp, x, y);
+    button(manager, comp, true);
+    pump(comp, manager, &mut [&mut d.peer]);
+    let serial = *d.peer.client.drag.presses.last().expect("press delivered");
+    let qh = d.peer.qh();
+    let source = d.data.create_data_source(&qh, ());
+    source.offer("text/plain".into());
+    source.set_actions(DndAction::Move);
+    let drag = d.drags.get_xdg_toplevel_drag(&source, &qh, ());
+    d.device.start_drag(Some(&source), origin, None, serial);
+    pump(comp, manager, &mut [&mut d.peer]);
+    assert!(comp.client_dnd_active(), "start_drag must be accepted");
+    (source, drag)
+}
+
+/// Pump a client that may have been disconnected for a protocol error,
+/// then report that error as (interface, code).
+fn protocol_error(
+    comp: &mut TestCompositor,
+    manager: &mut WindowManager,
+    peer: &mut Peer,
+) -> Option<(String, u32)> {
+    for _ in 0..ROUNDS {
+        let _ = peer.queue.flush();
+        comp.pump();
+        manager.reconcile(&mut comp.state);
+        comp.pump();
+        if let Some(guard) = peer.queue.prepare_read() {
+            let _ = guard.read();
+        }
+        let _ = peer.queue.dispatch_pending(&mut peer.client);
+    }
+    peer._conn
+        .protocol_error()
+        .map(|e| (e.object_interface, e.code))
+}
+
+/// Chromium's detached tab: a new toplevel attached to the drag before it
+/// is shown appears under the pointer at its offset and follows it; it
+/// takes no part in choosing the drop target, and the drop leaves it
+/// where it is. The source hears dnd_drop_performed first either way,
+/// then cancelled if nothing accepted (drag_grab_release).
+fn detached_tab_case(accept: bool) {
+    let (mut comp, mut manager) = compositor();
+    let mut d = dragger(&mut comp, &mut manager);
+    let (tabs, _tabs_role, tabs_id) = shown_window(&mut comp, &mut manager, &mut d, "tabs");
+    let (x, y) = loc_of(&manager, tabs_id);
+    let (source, drag) = start_drag(
+        &mut comp,
+        &mut manager,
+        &mut d,
+        &tabs,
+        f64::from(x + 100),
+        f64::from(y + 20),
+    );
+
+    // The new window: attached, then mapped, then shown.
+    let qh = d.peer.qh();
+    let compositor: WlCompositor = d.peer.bind(6);
+    let wm: XdgWmBase = d.peer.bind(6);
+    let detached = compositor.create_surface(&qh, ());
+    let xdg = wm.get_xdg_surface(&detached, &qh, ());
+    let role = xdg.get_toplevel(&qh, ());
+    role.set_title("detached".into());
+    drag.attach(&role, 40, 10);
+    detached.commit();
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    motion(&mut manager, &mut comp, 300.6, 500.4);
+    show(&mut d, &detached, 200, 150);
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    let id = id_of(&manager, "detached");
+    assert_eq!(
+        loc_of(&manager, id),
+        (260, 490),
+        "shown under the pointer at its offset"
+    );
+    assert_eq!(
+        manager.model().focused(),
+        Some(id),
+        "the window drag focuses it"
+    );
+
+    // Over both windows: the dragged one is not the target, tabs is.
+    motion(
+        &mut manager,
+        &mut comp,
+        f64::from(x + 260),
+        f64::from(y + 184),
+    );
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    assert_eq!(
+        loc_of(&manager, id),
+        (x + 220, y + 174),
+        "follows the pointer"
+    );
+    let (target, serial, offer) = d
+        .peer
+        .client
+        .drag
+        .enters
+        .last()
+        .cloned()
+        .expect("the drag entered a target");
+    assert_eq!(
+        target, tabs,
+        "the dragged window takes no part in the hit test"
+    );
+    if accept {
+        let offer = offer.expect("an offer for the source");
+        offer.accept(serial, Some("text/plain".into()));
+        offer.set_actions(DndAction::Move, DndAction::Move);
+        pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    }
+
+    button(&mut manager, &mut comp, false);
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    assert!(!comp.client_dnd_active());
+    let expected: &[&str] = if accept {
+        &["dnd_drop_performed"]
+    } else {
+        &["dnd_drop_performed", "cancelled"]
+    };
+    assert_eq!(d.peer.client.drag.source, expected);
+    assert_eq!(d.peer.client.drag.drops, usize::from(accept));
+    assert_eq!(loc_of(&manager, id), (x + 220, y + 174), "dropped in place");
+
+    // After the drop the window stays put and the toplevel drag is inert.
+    motion(&mut manager, &mut comp, 900.0, 600.0);
+    drag.attach(&role, 0, 0);
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    assert_eq!(loc_of(&manager, id), (x + 220, y + 174));
+    if accept {
+        let (_, _, offer) = d.peer.client.drag.enters.last().cloned().unwrap();
+        offer.unwrap().finish();
+        pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+        assert_eq!(
+            d.peer.client.drag.source,
+            ["dnd_drop_performed", "dnd_finished"]
+        );
+    }
+    drag.destroy();
+    source.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    assert!(d.peer._conn.protocol_error().is_none());
+    std::mem::forget((compositor, wm, xdg));
+}
+
+#[test]
+fn toplevel_drag_places_a_detached_window_under_the_pointer_and_drops_it_in_place() {
+    detached_tab_case(false);
+}
+
+#[test]
+fn toplevel_drag_accepted_drop_reports_drop_performed_once() {
+    detached_tab_case(true);
+}
+
+/// A shown window attached during the drag moves with the pointer at
+/// once; Escape cancels the drag and returns it to where it started.
+#[test]
+fn toplevel_drag_escape_returns_the_window_to_its_start() {
+    let (mut comp, mut manager) = compositor();
+    let mut d = dragger(&mut comp, &mut manager);
+    let (tabs, tabs_role, id) = shown_window(&mut comp, &mut manager, &mut d, "tabs");
+    let start = loc_of(&manager, id);
+    let (_source, drag) = start_drag(
+        &mut comp,
+        &mut manager,
+        &mut d,
+        &tabs,
+        f64::from(start.0 + 100),
+        f64::from(start.1 + 20),
+    );
+    drag.attach(&tabs_role, 100, 20);
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    motion(&mut manager, &mut comp, 800.0, 500.0);
+    assert_eq!(loc_of(&manager, id), (700, 480));
+    motion(&mut manager, &mut comp, 650.5, 420.9);
+    assert_eq!(loc_of(&manager, id), (550, 400));
+
+    // The runtime's Escape path.
+    assert!(comp.cancel_client_dnd(30));
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    assert_eq!(d.peer.client.drag.source, ["cancelled"]);
+    assert_eq!(loc_of(&manager, id), start, "Escape restores the start");
+    motion(&mut manager, &mut comp, 700.0, 300.0);
+    assert_eq!(loc_of(&manager, id), start, "no longer attached");
+    button(&mut manager, &mut comp, false);
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    assert!(d.peer._conn.protocol_error().is_none());
+}
+
+/// Destroying the attached toplevel detaches it (another may attach);
+/// destroying the toplevel drag or the source mid-drag ends the
+/// attachment where the window is, without an error.
+#[test]
+fn toplevel_drag_ends_cleanly_when_its_toplevel_drag_or_source_goes() {
+    let (mut comp, mut manager) = compositor();
+    let mut d = dragger(&mut comp, &mut manager);
+    let (first, first_role, _) = shown_window(&mut comp, &mut manager, &mut d, "first");
+    let (_second, second_role, second_id) = shown_window(&mut comp, &mut manager, &mut d, "second");
+    // The drag origin is shown last, on top, so the press lands on it.
+    let (tabs, _tabs_role, tabs_id) = shown_window(&mut comp, &mut manager, &mut d, "tabs");
+    let (x, y) = loc_of(&manager, tabs_id);
+    let (source, drag) = start_drag(
+        &mut comp,
+        &mut manager,
+        &mut d,
+        &tabs,
+        f64::from(x + 10),
+        f64::from(y + 10),
+    );
+    drag.attach(&first_role, 5, 5);
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    first_role.destroy();
+    first.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    drag.attach(&second_role, 50, 60);
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    motion(&mut manager, &mut comp, 600.0, 400.0);
+    assert_eq!(
+        loc_of(&manager, second_id),
+        (550, 340),
+        "the reattached window moves"
+    );
+
+    drag.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    motion(&mut manager, &mut comp, 700.0, 450.0);
+    assert_eq!(loc_of(&manager, second_id), (550, 340), "stops where it is");
+    button(&mut manager, &mut comp, false);
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    assert_eq!(d.peer.client.drag.source, ["cancelled"], "an ordinary drop");
+    assert!(d.peer._conn.protocol_error().is_none());
+
+    // A second drag whose source goes away mid-drag.
+    d.peer.client.drag.source.clear();
+    let _ = source;
+    let (x, y) = loc_of(&manager, tabs_id);
+    let (source, drag) = start_drag(
+        &mut comp,
+        &mut manager,
+        &mut d,
+        &tabs,
+        f64::from(x + 10),
+        f64::from(y + 10),
+    );
+    drag.attach(&second_role, 50, 60);
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    motion(&mut manager, &mut comp, 640.0, 420.0);
+    assert_eq!(loc_of(&manager, second_id), (590, 360));
+    source.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    motion(&mut manager, &mut comp, 500.0, 300.0);
+    assert_eq!(
+        loc_of(&manager, second_id),
+        (590, 360),
+        "stops with its source"
+    );
+    drag.attach(&second_role, 0, 0);
+    button(&mut manager, &mut comp, false);
+    pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+    assert!(!comp.client_dnd_active());
+    assert!(d.peer._conn.protocol_error().is_none());
+}
+
+/// Mutter's two errors: a source takes one toplevel drag, and a toplevel
+/// drag one live toplevel.
+#[test]
+fn toplevel_drag_protocol_errors_match_mutter() {
+    let (mut comp, mut manager) = compositor();
+    let mut d = dragger(&mut comp, &mut manager);
+    let qh = d.peer.qh();
+    let source = d.data.create_data_source(&qh, ());
+    let _first = d.drags.get_xdg_toplevel_drag(&source, &qh, ());
+    let _second = d.drags.get_xdg_toplevel_drag(&source, &qh, ());
+    assert_eq!(
+        protocol_error(&mut comp, &mut manager, &mut d.peer),
+        Some((
+            "xdg_toplevel_drag_manager_v1".to_owned(),
+            xdg_toplevel_drag_manager_v1::Error::InvalidSource as u32
+        ))
+    );
+
+    for same in [false, true] {
+        let (mut comp, mut manager) = compositor();
+        let mut d = dragger(&mut comp, &mut manager);
+        let (_, one) = window(&mut d.peer, "one");
+        let (_, two) = window(&mut d.peer, "two");
+        pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+        let qh = d.peer.qh();
+        let source = d.data.create_data_source(&qh, ());
+        let drag = d.drags.get_xdg_toplevel_drag(&source, &qh, ());
+        drag.attach(&one, 0, 0);
+        pump(&mut comp, &mut manager, &mut [&mut d.peer]);
+        assert!(d.peer._conn.protocol_error().is_none());
+        drag.attach(if same { &one } else { &two }, 0, 0);
+        assert_eq!(
+            protocol_error(&mut comp, &mut manager, &mut d.peer),
+            Some((
+                "xdg_toplevel_drag_v1".to_owned(),
+                xdg_toplevel_drag_v1::Error::ToplevelAttached as u32
+            ))
+        );
+    }
 }
