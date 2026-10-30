@@ -5198,9 +5198,11 @@ ripple_pixels() {
     xdotool key Control_L
     cstate ".cursor.locate_pointer.count == $((locate_count + 1)) and .cursor.locate_pointer.active" "ripple at scale $1" 3 ||
         fail G-LOCATE-RIPPLE-PIXELS "a Ctrl tap did not start the ripples at scale $1"
+    # The state reports the frozen clock against its own base.
     ripple_frames="$(jq '.cursor.locate_pointer.frames' "$CSTATE")"
+    ripple_clock="$(jq '.animation_clock_ms' "$CSTATE")"
     anim_clock 415
-    cstate ".animation_clock_ms == 415 and .cursor.locate_pointer.frames > $ripple_frames" "ripple at 415 ms, scale $1" 5 ||
+    cstate ".animation_clock_ms == $((ripple_clock + 415)) and .cursor.locate_pointer.frames > $ripple_frames" "ripple at 415 ms, scale $1" 5 ||
         fail G-LOCATE-RIPPLE-PIXELS "no ripple frame drew at 415 ms at scale $1"
     sleep 0.5
     scrot -o "$ARTIFACTS/ripple-$1-415ms.png" >/dev/null
