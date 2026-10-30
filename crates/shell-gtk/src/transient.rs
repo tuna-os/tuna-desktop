@@ -920,7 +920,12 @@ glib::wrapper! {
 impl PopupSubmenu {
     /// An item labelled `label` whose submenu is `content`, closed.
     pub fn new(label: &str, content: &impl IsA<gtk::Widget>) -> Self {
-        let menu: Self = glib::Object::new();
+        // A labelled group holding the item and its submenu, so assistive
+        // technology finds the submenu's rows under the item's name.
+        let menu: Self = glib::Object::builder()
+            .property("accessible-role", gtk::AccessibleRole::Group)
+            .build();
+        menu.update_property(&[gtk::accessible::Property::Label(label)]);
         let imp = menu.imp();
         imp.label.set_text(label);
         imp.header

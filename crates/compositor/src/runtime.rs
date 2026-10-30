@@ -2240,14 +2240,10 @@ impl Runtime {
             // the hub broadcast; the next hub poll delivers it to the
             // shell, which owns MRU order and rendering.
             for action in self.manager.take_switcher_queue() {
-                // A closing switcher takes its thumbnails with it.
-                if matches!(
-                    action,
-                    tuna_shell_control::SwitcherAction::Commit
-                        | tuna_shell_control::SwitcherAction::Cancel
-                ) {
-                    self.switcher_thumbnails.clear();
-                }
+                // A closing switcher's window images fade out with its
+                // popup (switcherPopup.js fadeAndDestroy): the shell keeps
+                // sending their frames at the fading opacity and clears
+                // them once the fade ends.
                 self.control.queue_switcher(action);
             }
             for (action, time, mode) in self.manager.take_accelerators_fired() {
