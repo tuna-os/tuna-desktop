@@ -128,3 +128,31 @@ the lock-surface role, and posting them on the dead role object disconnected
 the shell. The GTK lock-screen proof (scripts/tuna-lock-auth-proof) relocks
 after each unlock and covers it. The isolated diff is retained in
 LOCK-SURFACE-UNMAP-PATCH.diff; the pinned version stays 0.7.0.
+
+Issue #364 changes src/wayland/shell/xdg/mod.rs: xdg_wm_base is created at
+version 7, as Mutter 51 advertises it (META_XDG_WM_BASE_VERSION). Version 7
+adds only the four xdg_toplevel constrained_* states. A configure keeps
+every state a client's bind can name and drops the rest: tiled states below
+version 2, suspended below 6 and constrained below 7, the same version
+gates as Mutter's fill_states (meta-wayland-xdg-shell.c). Roost sets the
+states from Mutter's edge constraints. Real-client tests in
+crates/compositor/tests/windows.rs bind versions 7 and 6 and read the
+configure states. The isolated diff is retained in
+XDG-WM-BASE-7-PATCH.diff; the pinned version stays 0.7.0.
+
+Issue #364 additionally changes src/wayland/xdg_foreign/mod.rs and
+handlers.rs: zxdg_exporter_v1 and zxdg_importer_v1 join the v2 globals,
+sharing one handle table, as Mutter's meta-wayland-legacy-xdg-foreign.c
+calls the same export and import functions as v2. GTK 3 exports with v1 and
+the portal imports with v2, so each version imports the other's handles.
+Each import now parents at most one child (Mutter's imported->parent_of;
+upstream kept one child per export, so a second importer replaced the
+first's relationship), and revoking an export sends destroyed to every
+import and clears the parents they set, as meta_wayland_xdg_exported_destroy
+does; upstream only cleared the parent. An import of an unknown handle is
+destroyed at once, as before. An invalid v1 parent posts error 0 on the
+import, Mutter's WL_DISPLAY_ERROR_INVALID_OBJECT, since zxdg_imported_v1 has
+no error enum. Real socketpair tests in
+crates/compositor/tests/protocol_gaps.rs cover v1 export with v2 import, v2
+export with v1 import, revocation and unknown handles. The isolated diff is
+retained in XDG-FOREIGN-V1-PATCH.diff; the pinned version stays 0.7.0.

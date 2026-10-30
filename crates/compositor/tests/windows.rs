@@ -105,6 +105,8 @@ struct Client {
     configure_states: Vec<Vec<u8>>,
     /// Whether the server asked this client to close.
     close_requested: bool,
+    /// Highest xdg_wm_base version to bind; 0 binds up to 7.
+    xdg_cap: u32,
 }
 
 /// Whether a raw xdg-toplevel state array carries `want` (native-endian
@@ -156,8 +158,9 @@ impl Dispatch<WlRegistry, ()> for Client {
                     state.seat = Some(seat);
                 }
                 "xdg_wm_base" => {
+                    let cap = if state.xdg_cap == 0 { 7 } else { state.xdg_cap };
                     state.xdg_base =
-                        Some(registry.bind::<XdgWmBase, _, _>(name, version.min(7), qh, ()));
+                        Some(registry.bind::<XdgWmBase, _, _>(name, version.min(cap), qh, ()));
                 }
                 "xdg_wm_dialog_v1" => {
                     state.dialogs = Some(registry.bind::<XdgWmDialogV1, _, _>(name, 1, qh, ()));
@@ -402,12 +405,19 @@ fn pump(
 /// Connect one client and bind globals (compositor, seat with keyboard
 /// and pointer, xdg shell).
 fn connect(comp: &mut TestCompositor) -> (Connection, EventQueue<Client>, Client) {
+    connect_as(comp, Client::default())
+}
+
+/// [`connect`] with a client prepared before its registry is read.
+fn connect_as(
+    comp: &mut TestCompositor,
+    mut client: Client,
+) -> (Connection, EventQueue<Client>, Client) {
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
     comp.add_client(server_stream);
     let conn = Connection::from_socket(client_stream).unwrap();
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
-    let mut client = Client::default();
     conn.display().get_registry(&qh, ());
     pump(comp, &mut queue, &mut client, |c| c.ready());
     (conn, queue, client)
@@ -1552,6 +1562,88 @@ fn tile_halves_toggle_and_fullscreen_cover() {
         f.manager.window_layout(f.id_b),
         Some(WindowLayout::Floating)
     );
+}
+
+/// The edge states a client's last configure carried, as xdg-shell
+/// enum values (5-8 tiled left/right/top/bottom, 10-13 constrained
+/// left/right/top/bottom).
+fn edge_states(states: &[u8]) -> Vec<u32> {
+    (5..=13)
+        .filter(|state| *state != 9 && has_state(states, *state))
+        .collect()
+}
+
+#[test]
+fn edge_states_follow_mutters_edge_constraints() {
+    // Mutter 51 (window.c update_edge_constraints, meta-wayland-xdg-
+    // shell.c fill_states): maximized constrains every edge, a half
+    // tile its top, bottom and outer edge; constrained edges are also
+    // tiled. xdg_wm_base 7 carries the constrained states.
+    let mut f = layout_windows();
+    let (conn_c, mut queue_c, mut client_c) = connect_as(
+        &mut f.comp,
+        Client {
+            xdg_cap: 6,
+            ..Client::default()
+        },
+    );
+    map_toplevel(&mut f.comp, &conn_c, &mut queue_c, &mut client_c, "six");
+    f.manager.reconcile(&mut f.comp.state);
+    sync_client(&mut f.comp, &conn_c, &mut queue_c, &mut client_c);
+    let id_c = f
+        .manager
+        .model()
+        .windows()
+        .find(|w| w.title == "six")
+        .unwrap()
+        .id;
+    use wayland_client::Proxy as _;
+    assert_eq!(f.client_a.xdg_base.as_ref().unwrap().version(), 7);
+    assert_eq!(client_c.xdg_base.as_ref().unwrap().version(), 6);
+
+    let mut last = |f: &mut Fixture, a: bool, size: (i32, i32)| -> Vec<u32> {
+        if a {
+            pump(&mut f.comp, &mut f.queue_a, &mut f.client_a, |c| {
+                c.configure_sizes.last() == Some(&size)
+            });
+            edge_states(f.client_a.configure_states.last().unwrap())
+        } else {
+            pump(&mut f.comp, &mut queue_c, &mut client_c, |c| {
+                c.configure_sizes.last() == Some(&size)
+            });
+            edge_states(client_c.configure_states.last().unwrap())
+        }
+    };
+
+    assert!(f.manager.set_maximized(&mut f.comp.state, f.id_a, true));
+    assert_eq!(
+        last(&mut f, true, (1280, 768)),
+        vec![5, 6, 7, 8, 10, 11, 12, 13]
+    );
+    assert!(f
+        .manager
+        .set_tiled(&mut f.comp.state, f.id_a, TileSide::Left));
+    // The inner (right) edge stays free: Tuna Desktop pairs no tiles.
+    assert_eq!(last(&mut f, true, (640, 768)), vec![5, 7, 8, 10, 12, 13]);
+    assert!(f
+        .manager
+        .set_tiled(&mut f.comp.state, f.id_a, TileSide::Right));
+    f.client_a.configure_sizes.clear();
+    assert_eq!(last(&mut f, true, (640, 768)), vec![6, 7, 8, 11, 12, 13]);
+    assert!(f.manager.restore_window(f.id_a));
+    let floating = f.manager.geometry(f.id_a).unwrap().size;
+    assert_eq!(
+        last(&mut f, true, (floating.w, floating.h)),
+        Vec::<u32>::new(),
+        "a floating window is neither tiled nor constrained"
+    );
+
+    // A version 6 bind gets the same tiled states and no constrained
+    // state, which its protocol cannot name.
+    assert!(f.manager.set_maximized(&mut f.comp.state, id_c, true));
+    assert_eq!(last(&mut f, false, (1280, 768)), vec![5, 6, 7, 8]);
+    assert!(f.manager.set_tiled(&mut f.comp.state, id_c, TileSide::Left));
+    assert_eq!(last(&mut f, false, (640, 768)), vec![5, 7, 8]);
 }
 
 #[test]
