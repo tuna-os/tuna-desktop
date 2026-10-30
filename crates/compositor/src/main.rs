@@ -37,6 +37,15 @@ fn main() -> ExitCode {
         }
         return tuna_compositor::pam_helper::entry();
     }
+    // Client connections are descriptors: start from the hard limit, as
+    // Mutter does; spawned processes get the original back.
+    match tuna_compositor::nofile::raise() {
+        Some((old, new)) if old != new => {
+            eprintln!("tuna-compositor: open-file limit raised from {old} to {new}");
+        }
+        Some(_) => {}
+        None => eprintln!("tuna-compositor: open-file limit unchanged (could not raise it)"),
+    }
     let mut session = NestedSession::default_for_pid();
     session.xwayland = tuna_compositor::runtime::xwayland_wanted(
         std::env::var_os("TUNA_XWAYLAND"),

@@ -332,6 +332,7 @@ impl Reader {
             }
             self.attempts += 1;
             let mut command = Command::new("/usr/bin/orca");
+            crate::nofile::restore_in_child(&mut command);
             command
                 .env("WAYLAND_DISPLAY", &self.display)
                 .env("XDG_SESSION_TYPE", "wayland")
