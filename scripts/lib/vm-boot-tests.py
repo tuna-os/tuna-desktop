@@ -4349,5 +4349,116 @@ class OrcaDepartureProbe(unittest.TestCase):
         self.assertIn('result = {"original_alive": alive, **orca_observation(session_settings=False)}', source)
 
 
+class VmSoak(unittest.TestCase):
+    """The nightly lane's bounded soak: guest file transfer and the V-SOAK gate."""
+    NAMES = {"SOAK_UNIT", "SOAK_OUT", "SOAK_FILES", "SOAK_CHUNK", "soak_status", "soak_read"}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.guest = Path(self.temp.name, "guest")
+        self.guest.mkdir()
+        self.unit = "ActiveState=active\nSubState=exited\nResult=success\nExecMainCode=1\nExecMainStatus=0"
+        tree = ast.parse(LIFECYCLE_SOURCE.read_text())
+        nodes = [node for node in tree.body
+                 if (isinstance(node, ast.FunctionDef) and node.name in self.NAMES)
+                 or (isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) in self.NAMES)]
+        self.scope = {"json": json, "os": os, "base64": base64, "hashlib": __import__("hashlib"),
+                      "pathlib": __import__("pathlib"),
+                      "call": lambda *args, check=True: self.unit if args[0] == "systemctl" else "observer journal"}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(LIFECYCLE_SOURCE), "exec"), self.scope)
+        self.scope["SOAK_OUT"] = self.guest
+        fixture = Path(__file__).parent / "fixtures/endurance-control.jsonl"
+        (self.guest / "presentation.jsonl").write_bytes(fixture.read_bytes())
+        (self.guest / "presentation.stderr").write_bytes(b"")
+        (self.guest / "provenance.json").write_text(json.dumps({
+            "requested_duration_s": 3, "warmup_s": 1, "interval_s": 1,
+            "scope": "bounded 3 s rehearsal; not the 24-hour qualification run",
+            "source_revision": "a" * 40, "boot_id": "boot", "presentation_workload": {}}))
+        samples = [{"elapsed_s": float(t), "pss_kib": 1024, "rss_kib": 2048, "fds": 10, "processes": 3,
+                    "presentation": {"frames": 18, "interval_ms": {"count": 1, "p50": 16.0, "p99": 17.0}}}
+                   for t in range(4)]
+        (self.guest / "samples.jsonl").write_text("".join(json.dumps(s) + "\n" for s in samples))
+        (self.guest / "report.json").write_text(json.dumps({
+            "complete": True, "samples": 4, "elapsed_s": 3.0, "baseline": samples[1],
+            "scope": "bounded 3 s rehearsal; not the 24-hour qualification run"}))
+
+    def guest_call(self, agent_path, action, *arguments, timeout=60):
+        if action == "soak-start":
+            return {"unit": "tuna-vm-soak", "wayland_display": "tuna-nested-7"}
+        if action == "soak-status":
+            return json.loads(json.dumps(self.scope["soak_status"]()))
+        return json.loads(json.dumps(self.scope["soak_read"](arguments[0], int(arguments[1]))))
+
+    def test_a_full_read_fits_the_guest_agent_reply_bound(self):
+        (self.guest / "presentation.jsonl").write_bytes(b"{}\n" * (1 << 20))
+        chunk = self.scope["soak_read"]("presentation.jsonl", 0)
+        self.assertEqual(len(base64.b64decode(chunk["data"])), self.scope["SOAK_CHUNK"])
+        stdout = (json.dumps(chunk) + "\n").encode()
+        reply = json.dumps({"return": {"exited": True, "exitcode": 0,
+                                       "out-data": base64.b64encode(stdout).decode()},
+                            "id": "tuna-qga-0:1"}) + "\n"
+        self.assertLess(len(reply), lane.guest_agent.GuestAgent.MAX_REPLY)
+        with self.assertRaises(ValueError):
+            self.scope["soak_read"]("../etc/shadow", 0)
+
+    def test_status_counts_whole_rows_and_digests_only_after_exit(self):
+        with (self.guest / "samples.jsonl").open("a") as stream:
+            stream.write('{"elapsed_s": 4')
+        self.unit = "ActiveState=active\nSubState=running\nResult=success"
+        running = self.scope["soak_status"]()
+        self.assertTrue(running["running"])
+        self.assertEqual((running["samples"], running["last"]["elapsed_s"]), (4, 3.0))
+        self.assertNotIn("sha256", running)
+        self.unit = "ActiveState=failed\nSubState=failed\nResult=exit-code\nExecMainStatus=1"
+        stopped = self.scope["soak_status"]()
+        self.assertFalse(stopped["running"])
+        self.assertEqual(set(stopped["sha256"]), set(stopped["files"]))
+
+    def test_transfer_is_reassembled_and_checked(self):
+        (self.guest / "presentation.jsonl").write_bytes(os.urandom(900 * 1024))
+        status = self.scope["soak_status"]()
+        out = Path(self.temp.name, "host")
+        out.mkdir()
+        with patch.object(lane, "soak_call", self.guest_call):
+            self.assertEqual(lane.fetch_soak("qga", str(out), status), [])
+            self.assertEqual((out / "presentation.jsonl").read_bytes(),
+                             (self.guest / "presentation.jsonl").read_bytes())
+            status["sha256"]["report.json"] = "0" * 64
+            self.assertEqual(lane.fetch_soak("qga", str(out), status),
+                             ["report.json transfer differs from the guest copy"])
+
+    def run_soak(self):
+        results = {}
+        out = Path(self.temp.name, "host")
+        vm = SimpleNamespace(poll=lambda: None)
+        qmp = SimpleNamespace(frame=lambda path: Path(path).write_bytes(b"png"))
+        with patch.object(lane, "soak_call", self.guest_call), patch.object(lane, "SOAK_POLL_S", 0):
+            lane.run_soak(qmp, vm, "qga", str(out), lambda name, ok, desc: results.update({name: (ok, desc)}),
+                          3, 1, 1, "a" * 40)
+        return results["V-SOAK"], out / "soak"
+
+    def test_complete_soak_publishes_its_summary(self):
+        (ok, detail), soak = self.run_soak()
+        self.assertTrue(ok, detail)
+        self.assertIn("not the 24-hour qualification run", detail)
+        self.assertIn("54 native frames", detail)
+        for name in ("summary.md", "summary.json", "samples.jsonl", "presentation.jsonl",
+                     "status.json", "observer-journal.txt", "soak-start.png", "soak-end.png"):
+            self.assertTrue((soak / name).exists(), name)
+
+    def test_failed_observer_fails_the_gate_with_its_reason(self):
+        self.unit = "ActiveState=failed\nSubState=failed\nResult=exit-code\nExecMainStatus=1"
+        report = json.loads((self.guest / "report.json").read_text())
+        report.update(complete=False, failure="critical process exited or restarted")
+        (self.guest / "report.json").write_text(json.dumps(report))
+        (ok, detail), soak = self.run_soak()
+        self.assertFalse(ok)
+        self.assertIn("observer unit exit-code (status 1): observer journal", detail)
+        self.assertIn("critical process exited or restarted", detail)
+        self.assertIn("**FAILED**", (soak / "summary.md").read_text())
+
+
+
 if __name__ == "__main__":
     unittest.main()
