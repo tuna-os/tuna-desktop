@@ -58,6 +58,8 @@ mod a11y_shadow;
 pub mod animation;
 pub mod animation_clock;
 mod auth_owner;
+mod background_blur;
+pub mod background_effect;
 mod bell;
 pub mod capture_security;
 pub mod color_manager;

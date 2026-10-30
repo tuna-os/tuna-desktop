@@ -44,6 +44,8 @@
 //! - presentation-time, fifo and commit-timing: see [`crate::frame_timing`].
 //! - wl_fixes v1: `destroy_registry` frees a wl_registry, which the
 //!   core protocol gives no destructor (Mutter's meta-wayland-fixes.c).
+//! - ext-background-effect v1: the blur behind a surface's blur region
+//!   (`background_effect.rs`, drawn by `background_blur.rs`).
 //!
 //! Deliberately absent, matching Mutter: xdg-decoration (GNOME is
 //! client-side decorations only).
@@ -144,6 +146,8 @@ pub(crate) struct Protocols {
     pub(crate) shortcut_locked: bool,
     _pointer_warp: GlobalId,
     _fixes: GlobalId,
+    /// ext_background_effect_manager_v1 (blur behind surfaces).
+    pub(crate) background_effects: crate::background_effect::BackgroundEffects,
     /// Pointer warps clients asked for, drained by the window manager:
     /// surface, surface-local position, enter serial.
     pub(crate) pointer_warps: Vec<(WlSurface, Point<f64, Logical>, u32)>,
@@ -201,6 +205,7 @@ impl Protocols {
             x11_interop: crate::x11_interop::Interop::new(dh),
             _pointer_warp: dh.create_global::<State, WpPointerWarpV1, ()>(1, ()),
             _fixes: dh.create_global::<State, WlFixes, ()>(1, ()),
+            background_effects: crate::background_effect::BackgroundEffects::new(dh),
             pointer_warps: Vec::new(),
             bell: Bell::default(),
             inhibitors: Vec::new(),

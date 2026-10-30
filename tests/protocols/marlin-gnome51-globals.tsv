@@ -43,7 +43,7 @@ wp_commit_timing_manager_v1	1	capture	match
 wp_fifo_manager_v1	1	capture	match
 wp_cursor_shape_manager_v1	2	capture	match
 wp_color_representation_manager_v1	1	capture	gap:#89
-ext_background_effect_manager_v1	1	capture	gap:#89
+ext_background_effect_manager_v1	1	capture	match
 wl_fixes	1	capture	match
 wp_drm_lease_device_v1	1	capture	gap:#89
 wp_linux_drm_syncobj_manager_v1	1	source	gap:#89

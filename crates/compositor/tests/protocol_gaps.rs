@@ -1,7 +1,7 @@
 //! The GNOME 51 protocols Tuna Desktop added to close P-SY-06's gaps (#89):
 //! presentation-time, fifo, keyboard-shortcuts-inhibit, xdg-dialog,
-//! xdg-foreign, xdg-system-bell and xdg-toplevel-tag, driven by a real
-//! client against the headless compositor.
+//! xdg-foreign, xdg-system-bell, xdg-toplevel-tag and ext-background-effect,
+//! driven by a real client against the headless compositor.
 
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
@@ -20,6 +20,10 @@ use wayland_client::{
         wl_surface::WlSurface,
     },
     Connection, Dispatch, EventQueue, QueueHandle,
+};
+use wayland_protocols::ext::background_effect::v1::client::{
+    ext_background_effect_manager_v1::{self, ExtBackgroundEffectManagerV1},
+    ext_background_effect_surface_v1::{self, ExtBackgroundEffectSurfaceV1},
 };
 use wayland_protocols::wp::fifo::v1::client::{
     wp_fifo_manager_v1::WpFifoManagerV1, wp_fifo_v1::WpFifoV1,
@@ -74,6 +78,8 @@ struct Client {
     handle: Option<String>,
     /// xdg_imported destroyed events received (either version).
     imports_destroyed: usize,
+    /// ext_background_effect_manager_v1 capabilities, as sent.
+    background_effects: Option<u32>,
 }
 
 impl Dispatch<WlCallback, ()> for Client {
@@ -275,6 +281,24 @@ impl Dispatch<ZxdgImportedV1, ()> for Client {
     }
 }
 
+impl Dispatch<ExtBackgroundEffectManagerV1, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &ExtBackgroundEffectManagerV1,
+        event: ext_background_effect_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let ext_background_effect_manager_v1::Event::Capabilities {
+            flags: wayland_client::WEnum::Value(flags),
+        } = event
+        {
+            state.background_effects = Some(flags.bits());
+        }
+    }
+}
+
 wayland_client::delegate_noop!(Client: ignore WlCompositor);
 wayland_client::delegate_noop!(Client: ignore WlSurface);
 wayland_client::delegate_noop!(Client: ignore WlSeat);
@@ -290,6 +314,8 @@ wayland_client::delegate_noop!(Client: ignore ZxdgExporterV2);
 wayland_client::delegate_noop!(Client: ignore ZxdgImporterV2);
 wayland_client::delegate_noop!(Client: ignore ZxdgExporterV1);
 wayland_client::delegate_noop!(Client: ignore ZxdgImporterV1);
+wayland_client::delegate_noop!(Client: ignore ExtBackgroundEffectSurfaceV1);
+wayland_client::delegate_noop!(Client: ignore wayland_client::protocol::wl_region::WlRegion);
 
 struct Peer {
     _conn: Connection,
@@ -1093,4 +1119,140 @@ fn child_mapping_and_closing_cannot_restore_hidden_parent() {
     assert!(manager.is_minimized(parent_id));
     assert!(manager.visible_windows().is_empty());
     assert_eq!(manager.model().focused(), None);
+}
+
+/// The committed blur region's area, `None` without an effect.
+fn blur_area(
+    surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+) -> Option<i32> {
+    tuna_compositor::background_effect::blur_region(surface)
+        .map(|rects| rects.iter().map(|r| r.size.w * r.size.h).sum())
+}
+
+/// Pump until the compositor kills the connection, which then refuses
+/// further I/O; returns the protocol error it sent.
+fn pump_to_error(
+    comp: &mut TestCompositor,
+    manager: &mut WindowManager,
+    peer: &mut Peer,
+) -> wayland_client::backend::protocol::ProtocolError {
+    for _ in 0..ROUNDS {
+        let _ = peer.queue.flush();
+        comp.pump();
+        manager.reconcile(&mut comp.state);
+        comp.pump();
+        if let Some(guard) = peer.queue.prepare_read() {
+            let _ = guard.read();
+        }
+        let _ = peer.queue.dispatch_pending(&mut peer.client);
+        if let Some(error) = peer._conn.protocol_error() {
+            return error;
+        }
+    }
+    panic!("no protocol error");
+}
+
+#[test]
+fn background_blur_regions_apply_on_commit_like_mutter() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    // meta_wayland_init_background_effect: version 1, always offered.
+    assert_eq!(
+        peer.client
+            .globals
+            .get("ext_background_effect_manager_v1")
+            .map(|g| g.1),
+        Some(1)
+    );
+    let effects: ExtBackgroundEffectManagerV1 = peer.bind(1);
+    let compositor: WlCompositor = peer.bind(6);
+    let (surface, _toplevel) = window(&mut peer, "terminal");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    // Told at bind: blur is supported.
+    assert_eq!(
+        peer.client.background_effects,
+        Some(ext_background_effect_manager_v1::Capability::Blur.bits())
+    );
+    let server = comp.state.toplevels()[0].wl_surface().clone();
+    assert_eq!(blur_area(&server), None, "no effect until asked");
+
+    let qh = peer.qh();
+    let effect = effects.get_background_effect(&surface, &qh, ());
+    let region = compositor.create_region(&qh, ());
+    region.add(10, 20, 100, 50);
+    region.subtract(10, 20, 10, 10);
+    effect.set_blur_region(Some(&region));
+    // Copy semantics: the region may go before the commit.
+    region.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(
+        blur_area(&server),
+        None,
+        "double-buffered: pending until commit"
+    );
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(blur_area(&server), Some(100 * 50 - 10 * 10));
+
+    // A NULL region removes the effect, on commit.
+    effect.set_blur_region(None);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(blur_area(&server), Some(100 * 50 - 10 * 10));
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(blur_area(&server), None);
+
+    // Destroying the object unsets the region on the next commit, and
+    // the surface may take a new object.
+    let region = compositor.create_region(&qh, ());
+    region.add(0, 0, 64, 64);
+    effect.set_blur_region(Some(&region));
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(blur_area(&server), Some(64 * 64));
+    effect.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(blur_area(&server), Some(64 * 64));
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(blur_area(&server), None);
+    let again = effects.get_background_effect(&surface, &qh, ());
+    again.set_blur_region(Some(&region));
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(peer._conn.protocol_error().is_none());
+    assert_eq!(blur_area(&server), Some(64 * 64));
+
+    // A second object on the surface: background_effect_exists.
+    let _second = effects.get_background_effect(&surface, &qh, ());
+    let error = pump_to_error(&mut comp, &mut manager, &mut peer);
+    assert_eq!(error.object_interface, "ext_background_effect_manager_v1");
+    assert_eq!(
+        error.code,
+        ext_background_effect_manager_v1::Error::BackgroundEffectExists as u32
+    );
+}
+
+#[test]
+fn a_blur_region_for_a_destroyed_surface_is_a_protocol_error() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let effects: ExtBackgroundEffectManagerV1 = peer.bind(1);
+    let compositor: WlCompositor = peer.bind(6);
+    let qh = peer.qh();
+    let surface = compositor.create_surface(&qh, ());
+    let effect = effects.get_background_effect(&surface, &qh, ());
+    surface.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(
+        peer._conn.protocol_error().is_none(),
+        "the object turns inert"
+    );
+    effect.set_blur_region(None);
+    let error = pump_to_error(&mut comp, &mut manager, &mut peer);
+    assert_eq!(error.object_interface, "ext_background_effect_surface_v1");
+    assert_eq!(
+        error.code,
+        ext_background_effect_surface_v1::Error::SurfaceDestroyed as u32
+    );
 }
