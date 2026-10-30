@@ -1914,6 +1914,7 @@ impl Runtime {
         self.control.set_locked(false);
         self.state.set_shortcut_inhibition_locked(false);
         self.overlay.hide();
+        self.manager.refocus_after_lock(&mut self.state);
     }
 
     /// logind's `Lock` signal (`loginctl lock-session`): `screenShield.js`
