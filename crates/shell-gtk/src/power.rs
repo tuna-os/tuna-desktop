@@ -196,13 +196,20 @@ fn system_call(conn: &gio::DBusConnection, method: &str) {
 fn end_compositor() {
     let parent = unsafe { libc::getppid() };
     let comm = std::fs::read_to_string(format!("/proc/{parent}/comm")).unwrap_or_default();
-    if parent > 1 && comm.trim_end() == "tuna-composito" {
+    if parent > 1 && is_compositor_comm(&comm) {
         unsafe {
             libc::kill(parent, libc::SIGTERM);
         }
     } else {
         eprintln!("tuna-shell-gtk: parent {parent} is not the compositor; Log Out not sent");
     }
+}
+
+/// Whether a `/proc/<pid>/comm` value names the compositor. The kernel
+/// keeps the first 15 bytes of the executable name, which is all of
+/// `tuna-compositor`.
+fn is_compositor_comm(comm: &str) -> bool {
+    comm.trim_end() == "tuna-compositor"
 }
 
 /// Carry out `action` now.
@@ -592,6 +599,21 @@ fn open_args(params: &glib::Variant) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_process_running_the_compositor_binary_is_recognised_by_its_comm() {
+        let dir = std::env::temp_dir().join(format!("tuna-comm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("tuna-compositor");
+        std::fs::copy("/bin/sleep", &exe).unwrap();
+        let mut child = std::process::Command::new(&exe).arg("5").spawn().unwrap();
+        let comm = std::fs::read_to_string(format!("/proc/{}/comm", child.id())).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(is_compositor_comm(&comm), "comm was {comm:?}");
+        assert!(!is_compositor_comm("tuna-shell-gtk\n"));
+    }
 
     #[test]
     fn nested_sessions_only_offer_log_out() {
