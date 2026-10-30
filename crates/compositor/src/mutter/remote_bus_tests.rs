@@ -470,6 +470,12 @@ fn session_clipboard_and_keysyms_are_owned_bounded_and_revocable() {
         assert_error(result, "AccessDenied");
     }
     assert!(matches!(registry.lock().unwrap().remove(1), Effect::None));
+    // grd's Stop after its grant ended (its EIS client disconnects first)
+    // succeeds for the owner and changes nothing; another caller is
+    // still refused, and the ended grant never restarts.
+    assert_error(session(&foreign, "Stop", &()), "AccessDenied");
+    session(&owner, "Stop", &()).unwrap();
+    assert_error(session(&owner, "Start", &()), "AccessDenied");
 
     stop.store(true, Ordering::SeqCst);
     event_loop_thread.join().unwrap();

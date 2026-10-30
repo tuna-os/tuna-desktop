@@ -307,6 +307,16 @@ impl RemoteSession {
         Ok(())
     }
     async fn stop(&self, #[zbus(header)] header: zbus::message::Header<'_>) -> fdo::Result<()> {
+        // grd disconnects its EIS client, which ends the grant here, and
+        // then calls Stop (`grd_session_stop` in grd-session.c): the
+        // owner's Stop of an ended grant has nothing left to do.
+        if self.grant.stopped.load(Ordering::SeqCst)
+            && header
+                .sender()
+                .is_some_and(|sender| sender.as_str() == self.grant.owner)
+        {
+            return Ok(());
+        }
         self.admitted(&header, false)?;
         self.grant.stopped.store(true, Ordering::SeqCst);
         self.to_loop
