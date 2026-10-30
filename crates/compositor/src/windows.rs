@@ -8050,7 +8050,7 @@ const TOUCH_BUTTON: u32 = 0x110;
 /// Motion must precede the press because press handlers act at the last
 /// motion position, not at any position the button event carries.
 /// Pure so unit tests pin the pairing without backend event types.
-fn touch_press(pos: (f64, f64), time: u32) -> [ManagerInput; 2] {
+pub(crate) fn touch_press(pos: (f64, f64), time: u32) -> [ManagerInput; 2] {
     [
         ManagerInput::Motion {
             pos: pos.into(),
@@ -8092,8 +8092,9 @@ pub fn is_v120_wheel(amount: f64) -> bool {
 /// Generic over the backend (nested winit or hardware libinput): every
 /// backend reports XKB keycodes (evdev + 8) and absolute positions are
 /// scaled into `area`, the logical size the event's device maps onto
-/// (the nested window, or the primary output on hardware). Relative
-/// pointer motion is backend-owned and yields nothing here.
+/// (the nested window). The hardware backend maps touch contacts and
+/// absolute pointers itself (`drm::touch`, Mutter's input mapper) and
+/// owns relative pointer motion, which yields nothing here.
 pub fn translate_input<B: InputBackend>(
     event: InputEvent<B>,
     area: Size<i32, Logical>,

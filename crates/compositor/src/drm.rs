@@ -50,6 +50,7 @@ pub mod libinput;
 pub mod libwacom;
 pub mod privacy;
 pub mod tablet;
+pub mod touch;
 
 /// Scanout surface type: GBM buffers on the DRM device, each queued
 /// frame carrying the presentation feedback of what it drew (#89).
@@ -297,6 +298,8 @@ pub struct DrmBackend {
     input_settings: tuna_shell_control::InputSettings,
     /// Drawing tablets and pads (P-IN-05).
     tablets: tablet::Tablets,
+    /// Touchscreens and the monitor each drives (P-DS-04).
+    touchscreens: touch::Touchscreens,
     /// Bumped by every applied layout or reverted mode (#340).
     layout_generation: u64,
     /// Mutter's privacy screen policy (#356).
@@ -630,6 +633,7 @@ impl DrmBackend {
             touch_mode: Default::default(),
             input_settings: Default::default(),
             tablets: Default::default(),
+            touchscreens: Default::default(),
             corner_pressure: Default::default(),
             hot_corner_active: true,
             relative_motion_events: 0,
@@ -1377,9 +1381,12 @@ impl DrmBackend {
                     libinput::apply(&self.input_settings, device, two_finger);
                 }
                 if let Some(device) = self.devices.last() {
-                    let monitors = self.tablet_monitors();
+                    let monitors = self.mapped_monitors();
                     self.tablets.set_monitors(monitors);
                     self.tablets.device_added(device);
+                    let device = device.clone();
+                    self.sync_touch_monitors();
+                    self.touchscreens.device_added(&device);
                 }
                 self.recount_touch_devices();
                 Vec::new()
@@ -1389,6 +1396,7 @@ impl DrmBackend {
                 let had_two_finger = self.two_finger_available();
                 self.devices.retain(|d| *d != device);
                 self.tablets.device_removed(&device);
+                self.touchscreens.device_removed(&device);
                 // Mutter reapplies every setting once the last touchpad that
                 // scrolls with two fingers leaves (edge scrolling may return).
                 if had_two_finger && !self.two_finger_available() {
@@ -1465,40 +1473,81 @@ impl DrmBackend {
                     self.primary_size(),
                 )
             }
-            other => {
-                let mut inputs = crate::windows::translate_input(other, self.primary_size());
-                // Rotation (#345): absolute devices report panel-native
-                // pixels; remap them into the rotated logical frame the
-                // manager works in. Touch and absolute pointers arrive
-                // as Motion here; relative motion has its own arm.
-                if let Some(primary) = self.outputs.first() {
-                    if primary.transform != 0 {
-                        let (w, h) = (primary.size.w, primary.size.h);
-                        let transform = primary.transform;
-                        for input in &mut inputs {
-                            if let ManagerInput::Motion { pos, .. } = input {
-                                let (x, y) = crate::orientation::touch_point(
-                                    w,
-                                    h,
-                                    transform,
-                                    pos.x.round() as i32,
-                                    pos.y.round() as i32,
-                                );
-                                pos.x = f64::from(x);
-                                pos.y = f64::from(y);
-                            }
-                        }
-                    }
-                }
-                for input in &inputs {
-                    if let ManagerInput::Motion { pos, .. } = input {
-                        self.corner_pressure.observe_position(*pos);
-                        self.pointer = *pos;
-                    }
-                }
-                inputs
+            // Touchscreens (#345): each contact through its device's
+            // monitor mapping (meta-seat-impl.c TOUCH_DOWN/TOUCH_MOTION).
+            InputEvent::TouchDown { event } => {
+                let time = (event.time() / 1000) as u32;
+                let pos = self.touch_position(&event);
+                self.observe_motion(pos);
+                crate::windows::touch_press((pos.x, pos.y), time).into()
             }
+            InputEvent::TouchMotion { event } => {
+                let time = (event.time() / 1000) as u32;
+                let pos = self.touch_position(&event);
+                self.observe_motion(pos);
+                vec![ManagerInput::Motion { pos, time }]
+            }
+            // Absolute pointers span the whole desktop, unrotated: Mutter
+            // maps no pointer device to a monitor (meta-seat-impl.c
+            // POINTER_MOTION_ABSOLUTE).
+            InputEvent::PointerMotionAbsolute { event } => {
+                use smithay::backend::input::AbsolutePositionEvent;
+                let (w, h) = self.stage_extents();
+                let pos: Point<f64, Logical> = (
+                    event.x_transformed(w.round() as i32),
+                    event.y_transformed(h.round() as i32),
+                )
+                    .into();
+                self.observe_motion(pos);
+                vec![ManagerInput::Motion {
+                    pos,
+                    time: (event.time() / 1000) as u32,
+                }]
+            }
+            other => crate::windows::translate_input(other, self.primary_size()),
         }
+    }
+
+    /// An absolute position the pointer moved to (touch or absolute
+    /// pointer): hot-corner pressure and the drawn cursor follow it.
+    fn observe_motion(&mut self, pos: Point<f64, Logical>) {
+        self.corner_pressure.observe_position(pos);
+        self.pointer = pos;
+    }
+
+    /// The touchscreens' monitors, retaken when the layout moved.
+    fn sync_touch_monitors(&mut self) {
+        let generation = self.layout_generation;
+        if !self.touchscreens.monitors_current(generation) {
+            let monitors = self.mapped_monitors();
+            self.touchscreens.set_monitors(generation, monitors);
+        }
+    }
+
+    /// Mutter's stage extents (`meta_viewport_info_get_extents`).
+    fn stage_extents(&mut self) -> (f64, f64) {
+        self.sync_touch_monitors();
+        self.touchscreens.stage()
+    }
+
+    /// Where a touch contact lands: its touchscreen's mapping, or the
+    /// whole desktop for a device the mapper does not know.
+    fn touch_position<E>(&mut self, event: &E) -> Point<f64, Logical>
+    where
+        E: smithay::backend::input::AbsolutePositionEvent<LibinputInputBackend>,
+    {
+        let (w, h) = self.stage_extents();
+        if w <= 0.0 || h <= 0.0 {
+            return self.pointer;
+        }
+        let norm = (
+            event.x_transformed(w.round() as i32) / w,
+            event.y_transformed(h.round() as i32) / h,
+        );
+        let device = smithay::backend::input::Event::device(event);
+        self.touchscreens
+            .position(&device, norm)
+            .unwrap_or_else(|| (norm.0 * w, norm.1 * h).into())
     }
 
     /// GNOME's touchpad and mouse settings on every device, now and as
@@ -1595,17 +1644,18 @@ impl DrmBackend {
         self.devices.iter().map(libinput::device_state).collect()
     }
 
-    /// The lit logical monitors as the tablet mapper matches them: the
+    /// The lit logical monitors as the input mapper matches them: the
     /// DisplayConfig identity (vendor, product, the connector as serial),
-    /// physical size, desktop rectangle, transform and mode size.
-    fn tablet_monitors(&self) -> Vec<crate::tablet::Monitor> {
+    /// physical size, desktop rectangle, transform, mode size and
+    /// whether it is the built-in panel.
+    fn mapped_monitors(&self) -> Vec<crate::input_mapper::Monitor> {
         self.outputs
             .iter()
             .filter(|out| out.is_leader())
             .map(|out| {
                 let properties = out.output.physical_properties();
                 let (w, h) = out.logical_size();
-                crate::tablet::Monitor {
+                crate::input_mapper::Monitor {
                     connector: out.name.clone(),
                     vendor: properties.make,
                     product: properties.model,
@@ -1615,13 +1665,14 @@ impl DrmBackend {
                     rect: Rectangle::new(out.loc.into(), (w, h).into()),
                     transform: out.transform,
                     mode: (out.size.w, out.size.h),
+                    builtin: crate::orientation::is_builtin_panel(&out.name),
                 }
             })
             .collect()
     }
 
     fn tablet_tool(&mut self, event: smithay::reexports::input::event::TabletToolEvent) {
-        let monitors = self.tablet_monitors();
+        let monitors = self.mapped_monitors();
         self.tablets.set_monitors(monitors);
         self.tablets.tool_event(event);
     }
@@ -1636,18 +1687,31 @@ impl DrmBackend {
         &mut self.tablets
     }
 
-    /// The tablet and stylus settings paths to read.
-    pub(crate) fn tablet_settings_wanted(
+    /// The tablet, stylus, pad and touchscreen settings paths to read.
+    pub(crate) fn peripheral_settings_wanted(
         &self,
     ) -> std::collections::BTreeSet<(crate::tablet_settings::Kind, String)> {
-        self.tablets.wanted()
+        let mut wanted = self.tablets.wanted();
+        wanted.extend(self.touchscreens.wanted());
+        wanted
     }
 
-    /// Apply a completed tablet settings read.
-    pub(crate) fn set_tablet_settings(&mut self, snapshot: crate::tablet_settings::Snapshot) {
-        let monitors = self.tablet_monitors();
+    /// Apply a completed tablet and touchscreen settings read.
+    pub(crate) fn set_peripheral_settings(
+        &mut self,
+        mut snapshot: crate::tablet_settings::Snapshot,
+    ) {
+        self.sync_touch_monitors();
+        self.touchscreens
+            .set_outputs(std::mem::take(&mut snapshot.touchscreens));
+        let monitors = self.mapped_monitors();
         self.tablets.set_monitors(monitors);
         self.tablets.set_settings(snapshot);
+    }
+
+    /// Touchscreens for the compositor state file.
+    pub fn touchscreens_introspect(&self) -> serde_json::Value {
+        self.touchscreens.introspect()
     }
 
     /// Tablets and pads for the compositor state file.

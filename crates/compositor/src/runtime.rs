@@ -67,6 +67,7 @@ mod auth;
 mod color;
 mod display;
 mod motion;
+mod orientation;
 mod osk;
 
 /// Display-rate loop pacing: while anything moves, dispatch blocks at
@@ -746,9 +747,6 @@ pub struct Runtime {
     /// hardware session only, #356).
     #[cfg(feature = "drm")]
     privacy_screen_settings: Option<crate::privacy_screen_settings::PrivacyScreenSettings>,
-    /// Configured transform per connector (Settings/monitors.xml):
-    /// the sensor overrides these live but never rewrites them.
-    manual_transforms: std::collections::HashMap<String, u32>,
     /// What org.gnome.Mutter.DisplayConfig reports (#340), shared with
     /// the D-Bus thread, and the key it was last published at.
     display_share: std::sync::Arc<crate::display_config::DisplayShare>,
@@ -1043,7 +1041,7 @@ impl Runtime {
                         let tablet_events = match &mut rt.backend {
                             Backend::Drm(drm) => {
                                 rt.tablet_settings
-                                    .want(drm.tablet_settings_wanted(), Instant::now());
+                                    .want(drm.peripheral_settings_wanted(), Instant::now());
                                 drm.take_tablet_events()
                             }
                             Backend::Winit(_) => Vec::new(),
@@ -1052,6 +1050,9 @@ impl Runtime {
                             rt.on_tablet_input(event);
                         }
                         rt.pad_osd_tick();
+                        // Touch mode follows hotplug and the tablet-mode
+                        // switch; Mutter's managed panel follows it.
+                        rt.sync_orientation_seat();
                         // The window manager has the final say (a locked
                         // pointer stays put): the drawn cursor follows it.
                         let pos = rt.manager.pointer_pos();
@@ -1473,7 +1474,6 @@ impl Runtime {
             night_light: crate::night_light::NightLightController::new(night_light_share.clone()),
             color: color_share.clone(),
             colord,
-            manual_transforms: Default::default(),
             display_share,
             display_published: None,
             display_configs: Default::default(),
@@ -2723,6 +2723,7 @@ impl Runtime {
         // GNOME Settings' display configuration (#340): modes, the
         // kernel's CRTC modes on hardware, pending confirmation.
         doc["display_config"] = self.display_config_diagnostics();
+        doc["orientation"] = self.orientation_diagnostics();
         doc["color"] = self.color_diagnostics();
         let motion = self.input_settings.motion;
         doc["motion_policy"] = serde_json::json!(motion.level.as_str());
@@ -2808,6 +2809,7 @@ impl Runtime {
         #[cfg(feature = "drm")]
         if let Backend::Drm(drm) = &self.backend {
             doc["tablets"] = drm.tablets_introspect();
+            doc["touchscreens"] = drm.touchscreens_introspect();
         }
         let doc = doc.to_string();
         if doc == self.state_last {
@@ -4139,11 +4141,8 @@ impl Runtime {
             crate::mutter::ToLoop::SensorSample {
                 present,
                 orientation,
-            } => {
-                self.orientation.sensor_present = present;
-                self.orientation.sensor = orientation;
-                self.apply_orientation_policy();
-            }
+                claimed,
+            } => self.on_sensor_sample(present, orientation, claimed),
             crate::mutter::ToLoop::ApplyMonitors {
                 config,
                 method,
@@ -4288,60 +4287,10 @@ impl Runtime {
         if let Backend::Drm(drm) = &mut self.backend {
             drm.apply_input_settings(&settings);
         }
-        // Orientation lock (#345): stop sensor rotation live (and tell
-        // the sensor thread to release its claim, as mutter does).
-        if self.orientation.lock != settings.orientation_lock {
-            self.orientation.lock = settings.orientation_lock;
-            self.orientation_share
-                .set_inhibited(settings.orientation_lock);
-            self.apply_orientation_policy();
-        }
+        // Orientation lock (#345): tracking stops (the sensor thread
+        // releases its claim, as mutter does); the rotation stays.
+        self.set_orientation_lock(settings.orientation_lock);
         self.input_settings = settings;
-    }
-
-    /// Recompute sensor management and rotate unlocked built-in panels
-    /// to the accelerometer reading (live only: manual transforms in
-    /// monitors.xml are never rewritten). Called on every sensor
-    /// sample and every orientation-lock change.
-    fn apply_orientation_policy(&mut self) {
-        let entries = self.state.output_entries();
-        let has_builtin = entries
-            .iter()
-            .any(|(name, _, _, _)| crate::orientation::is_builtin_panel(name));
-        self.orientation_share
-            .set_managed(self.orientation.managed(has_builtin));
-        #[cfg(feature = "drm")]
-        {
-            let wants: Vec<(String, u32)> = entries
-                .iter()
-                .filter(|(name, _, _, _)| crate::orientation::is_builtin_panel(name))
-                .map(|(name, _, _, _)| {
-                    let manual = self.manual_transforms.get(name).copied().unwrap_or(0);
-                    (name.clone(), self.orientation.effective(name, manual))
-                })
-                .collect();
-            if let Backend::Drm(drm) = &mut self.backend {
-                for (name, want) in wants {
-                    let Some(out) = drm.outputs.iter_mut().find(|o| o.name == name) else {
-                        continue;
-                    };
-                    if out.transform == want {
-                        continue;
-                    }
-                    out.transform = want;
-                    out.output.change_current_state(
-                        None,
-                        Some(crate::orientation::smithay_transform(want)),
-                        None,
-                        None,
-                    );
-                    let (lw, lh) = out.logical_size();
-                    self.state
-                        .add_output(&name, Some(out.output.clone()), lw, lh);
-                    eprintln!("tuna-compositor: orientation: {name} rotated to transform {want}");
-                }
-            }
-        }
     }
 
     /// Each output's current picture (`None`: the nested window), for
@@ -5176,7 +5125,7 @@ impl Runtime {
         }
         #[cfg(feature = "drm")]
         if let (Some(snapshot), Backend::Drm(drm)) = (snapshot, &mut self.backend) {
-            drm.set_tablet_settings(snapshot);
+            drm.set_peripheral_settings(snapshot);
             self.pad_osd_tick();
         }
     }

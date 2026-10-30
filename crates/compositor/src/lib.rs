@@ -80,6 +80,7 @@ pub mod icc;
 pub mod idle_monitor;
 pub mod ime;
 pub mod input_aids;
+pub mod input_mapper;
 pub mod introspect;
 pub mod layer;
 pub mod lock;
