@@ -1068,10 +1068,11 @@ class Stress:
 
     def wire_motions(self, name):
         """wl_pointer.motion events a WAYLAND_DEBUG client logged, with
-        their libwayland timestamps in ms."""
+        their libwayland timestamps in ms. libwayland 1.23 and later name
+        the queue and write `wl_pointer#N`; older ones `wl_pointer@N`."""
         stamps = []
         for line in (self.out / f"{name}.log").read_text(errors="replace").splitlines():
-            match = re.match(r"\[\s*(\d+\.\d+)\]\s+wl_pointer@\d+\.motion\(", line)
+            match = re.match(r"\[\s*(\d+\.\d+)\]\s+(?:\{[^}]*\}\s+)?wl_pointer[@#]\d+\.motion\(", line)
             if match:
                 stamps.append(float(match.group(1)))
         return stamps
