@@ -175,6 +175,86 @@ enum Mode {
     Window,
 }
 
+/// What a key press does in the screenshot UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Binding {
+    /// Escape: the grab's ungrab closes the UI.
+    Close,
+    /// `activate`: Return, Space or Ctrl+C.
+    Capture,
+    /// `selection` (S), `screen` (C), `window` (W).
+    Mode(Mode),
+    /// `screencast` (V).
+    ToggleCast,
+    /// `pointer` (P).
+    TogglePointer,
+    /// `reset` (R).
+    Reset,
+    /// `move-*` (plain), `resize-selection-*-control/-shift` and
+    /// `move-selection-*` with their Ctrl and Shift variants.
+    Arrow {
+        direction: Direction,
+        alt: bool,
+        ctrl: bool,
+        shift: bool,
+    },
+    /// An arrow with modifiers no binding takes (Ctrl+Shift, Super):
+    /// nothing happens, and the key stays inside the UI's grab.
+    Unbound,
+}
+
+/// The binding a key press activates, as gnome-shell 51.0's
+/// `ScreenshotUI` binding pool (`js/ui/screenshot.js`) matches it:
+/// Clutter's `clutter_binding_pool_activate` compares the keyval and the
+/// held Shift, Ctrl, Alt, Super and Hyper modifiers exactly, lock
+/// modifiers ignored, so Ctrl+C captures while C picks Screen, and an
+/// uppercase keyval (Shift or Caps Lock held) or KP_Enter has no binding.
+/// Escape closes through the UI's grab whatever is held (`GrabHelper`).
+/// Meta is left out of the comparison: GTK can report it for Alt.
+fn binding(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<Binding> {
+    use gdk::ModifierType as M;
+    let held = modifiers
+        & (M::SHIFT_MASK | M::CONTROL_MASK | M::ALT_MASK | M::SUPER_MASK | M::HYPER_MASK);
+    let plain = held.is_empty();
+    let direction = match key {
+        gdk::Key::Left => Some(Direction::Left),
+        gdk::Key::Right => Some(Direction::Right),
+        gdk::Key::Up => Some(Direction::Up),
+        gdk::Key::Down => Some(Direction::Down),
+        _ => None,
+    };
+    if let Some(direction) = direction {
+        let (alt, ctrl, shift) = (
+            held.contains(M::ALT_MASK),
+            held.contains(M::CONTROL_MASK),
+            held.contains(M::SHIFT_MASK),
+        );
+        let bound = !held.intersects(M::SUPER_MASK | M::HYPER_MASK) && !(ctrl && shift);
+        return Some(if bound {
+            Binding::Arrow {
+                direction,
+                alt,
+                ctrl,
+                shift,
+            }
+        } else {
+            Binding::Unbound
+        });
+    }
+    Some(match key {
+        gdk::Key::Escape => Binding::Close,
+        gdk::Key::Return | gdk::Key::space if plain => Binding::Capture,
+        gdk::Key::c if held == M::CONTROL_MASK => Binding::Capture,
+        gdk::Key::s if plain => Binding::Mode(Mode::Selection),
+        gdk::Key::c if plain => Binding::Mode(Mode::Screen),
+        gdk::Key::w if plain => Binding::Mode(Mode::Window),
+        gdk::Key::v if plain => Binding::ToggleCast,
+        gdk::Key::p if plain => Binding::TogglePointer,
+        gdk::Key::r if plain => Binding::Reset,
+        _ => return None,
+    })
+}
+
 /// One window in the selector: its picture and its button.
 struct PickerWindow {
     texture: gdk::Texture,
@@ -420,10 +500,11 @@ impl ScreenshotUi {
             });
         }
         overlay.add_controller(drag_gesture);
-        // GNOME's keys: Escape closes, Enter/Space captures, S/C/W pick
-        // the mode, V switches between screenshot and screencast, P
-        // toggles the pointer. Arrows resize the current edge; Alt moves,
-        // Ctrl adjusts by one pixel, Shift reaches the edge, and R resets.
+        // GNOME's keys ([`binding`]): Escape closes, Enter/Space/Ctrl+C
+        // capture, S/C/W pick the mode, V switches between screenshot and
+        // screencast, P toggles the pointer. Arrows resize the current
+        // edge; Alt moves, Ctrl adjusts by one pixel, Shift reaches the
+        // edge, and R resets.
         let keys = gtk::EventControllerKey::new();
         // The mode toggle can own focus and consume Return/Space itself.
         // GNOME's overlay shortcuts precede focused button activation.
@@ -434,23 +515,25 @@ impl ScreenshotUi {
                 let Some(ui) = weak.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                match key {
-                    gdk::Key::Escape => ui.close(),
-                    gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::space => ui.capture(),
-                    gdk::Key::s | gdk::Key::S => ui.set_mode(Mode::Selection),
-                    gdk::Key::c | gdk::Key::C => ui.set_mode(Mode::Screen),
-                    gdk::Key::w | gdk::Key::W => {
+                let Some(action) = binding(key, modifiers) else {
+                    return glib::Propagation::Proceed;
+                };
+                match action {
+                    Binding::Close => ui.close(),
+                    Binding::Capture => ui.capture(),
+                    Binding::Mode(Mode::Window) => {
                         if !ui.cast.is_active() {
                             ui.set_mode(Mode::Window);
                         }
                     }
-                    gdk::Key::v | gdk::Key::V => {
+                    Binding::Mode(mode) => ui.set_mode(mode),
+                    Binding::ToggleCast => {
                         if ui.cast.is_sensitive() {
                             ui.set_cast(!ui.cast.is_active());
                         }
                     }
-                    gdk::Key::p | gdk::Key::P => ui.pointer.set_active(!ui.pointer.is_active()),
-                    gdk::Key::r | gdk::Key::R => {
+                    Binding::TogglePointer => ui.pointer.set_active(!ui.pointer.is_active()),
+                    Binding::Reset => {
                         ui.selection.set(Some(initial_selection(
                             f64::from(ui.canvas.width()),
                             f64::from(ui.canvas.height()),
@@ -464,13 +547,12 @@ impl ScreenshotUi {
                         ui.describe_selection();
                         ui.canvas.queue_draw();
                     }
-                    gdk::Key::Left | gdk::Key::Right | gdk::Key::Up | gdk::Key::Down => {
-                        let direction = match key {
-                            gdk::Key::Left => Direction::Left,
-                            gdk::Key::Right => Direction::Right,
-                            gdk::Key::Up => Direction::Up,
-                            _ => Direction::Down,
-                        };
+                    Binding::Arrow {
+                        direction,
+                        alt,
+                        ctrl,
+                        shift,
+                    } => {
                         if ui.mode.get() == Mode::Selection {
                             let Some(rect) = ui.selection.get() else {
                                 return glib::Propagation::Proceed;
@@ -481,23 +563,18 @@ impl ScreenshotUi {
                                 .unwrap_or_else(|| SelectionKeys::new(rect));
                             let rect = selection.adjust(
                                 direction,
-                                modifiers.contains(gdk::ModifierType::ALT_MASK),
-                                modifiers.contains(gdk::ModifierType::CONTROL_MASK),
-                                modifiers.contains(gdk::ModifierType::SHIFT_MASK),
+                                alt,
+                                ctrl,
+                                shift,
                                 (f64::from(ui.canvas.width()), f64::from(ui.canvas.height())),
                             );
                             ui.selection_keys.set(Some(selection));
                             ui.selection.set(Some(rect));
                             ui.describe_selection();
                             ui.canvas.queue_draw();
-                            (ui.move_pointer)(
-                                selection.cursor(modifiers.contains(gdk::ModifierType::ALT_MASK)),
-                            );
-                        } else if !modifiers.intersects(
-                            gdk::ModifierType::ALT_MASK
-                                | gdk::ModifierType::CONTROL_MASK
-                                | gdk::ModifierType::SHIFT_MASK,
-                        ) {
+                            (ui.move_pointer)(selection.cursor(alt));
+                        } else if !alt && !ctrl && !shift {
+                            // `_moveFocus`: the window or screen selectors.
                             ui.overlay.child_focus(match direction {
                                 Direction::Left => gtk::DirectionType::Left,
                                 Direction::Right => gtk::DirectionType::Right,
@@ -506,7 +583,7 @@ impl ScreenshotUi {
                             });
                         }
                     }
-                    _ => return glib::Propagation::Proceed,
+                    Binding::Unbound => {}
                 }
                 glib::Propagation::Stop
             });
@@ -1082,6 +1159,84 @@ fn save(texture: &gdk::Texture, crop: Rect, w: f64, h: f64, to_disk: bool) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_match_gnome_bindings_exactly() {
+        use gdk::ModifierType as M;
+        let none = M::empty();
+        assert_eq!(binding(gdk::Key::c, M::CONTROL_MASK), Some(Binding::Capture));
+        assert_eq!(binding(gdk::Key::c, none), Some(Binding::Mode(Mode::Screen)));
+        assert_eq!(binding(gdk::Key::Return, none), Some(Binding::Capture));
+        assert_eq!(binding(gdk::Key::space, none), Some(Binding::Capture));
+        assert_eq!(binding(gdk::Key::s, none), Some(Binding::Mode(Mode::Selection)));
+        assert_eq!(binding(gdk::Key::w, none), Some(Binding::Mode(Mode::Window)));
+        assert_eq!(binding(gdk::Key::v, none), Some(Binding::ToggleCast));
+        assert_eq!(binding(gdk::Key::p, none), Some(Binding::TogglePointer));
+        assert_eq!(binding(gdk::Key::r, none), Some(Binding::Reset));
+        // Lock modifiers do not count.
+        assert_eq!(
+            binding(gdk::Key::s, M::LOCK_MASK),
+            Some(Binding::Mode(Mode::Selection))
+        );
+        // Bindings take only their own modifiers, and only lowercase
+        // keyvals: no binding for these.
+        for (key, modifiers) in [
+            (gdk::Key::S, M::SHIFT_MASK),
+            (gdk::Key::S, M::LOCK_MASK),
+            (gdk::Key::s, M::CONTROL_MASK),
+            (gdk::Key::r, M::ALT_MASK),
+            (gdk::Key::c, M::CONTROL_MASK | M::SHIFT_MASK),
+            (gdk::Key::Return, M::SHIFT_MASK),
+            (gdk::Key::KP_Enter, none),
+            (gdk::Key::a, none),
+        ] {
+            assert_eq!(binding(key, modifiers), None, "{key:?} {modifiers:?}");
+        }
+        // Escape closes whatever is held.
+        assert_eq!(binding(gdk::Key::Escape, M::SHIFT_MASK), Some(Binding::Close));
+    }
+
+    #[test]
+    fn arrows_take_gnomes_modifier_combinations_only() {
+        use gdk::ModifierType as M;
+        let arrow = |alt, ctrl, shift| {
+            Some(Binding::Arrow {
+                direction: Direction::Left,
+                alt,
+                ctrl,
+                shift,
+            })
+        };
+        assert_eq!(binding(gdk::Key::Left, M::empty()), arrow(false, false, false));
+        assert_eq!(binding(gdk::Key::Left, M::CONTROL_MASK), arrow(false, true, false));
+        assert_eq!(binding(gdk::Key::Left, M::SHIFT_MASK), arrow(false, false, true));
+        assert_eq!(binding(gdk::Key::Left, M::ALT_MASK), arrow(true, false, false));
+        assert_eq!(
+            binding(gdk::Key::Left, M::ALT_MASK | M::CONTROL_MASK),
+            arrow(true, true, false)
+        );
+        assert_eq!(
+            binding(gdk::Key::Left, M::ALT_MASK | M::SHIFT_MASK | M::META_MASK),
+            arrow(true, false, true)
+        );
+        for modifiers in [
+            M::CONTROL_MASK | M::SHIFT_MASK,
+            M::ALT_MASK | M::CONTROL_MASK | M::SHIFT_MASK,
+            M::SUPER_MASK,
+            M::HYPER_MASK | M::ALT_MASK,
+        ] {
+            assert_eq!(binding(gdk::Key::Left, modifiers), Some(Binding::Unbound));
+        }
+        assert_eq!(
+            binding(gdk::Key::Down, M::empty()),
+            Some(Binding::Arrow {
+                direction: Direction::Down,
+                alt: false,
+                ctrl: false,
+                shift: false,
+            })
+        );
+    }
 
     #[test]
     #[ignore = "requires a supervised GTK test process inside a Wayland layer-shell session"]
