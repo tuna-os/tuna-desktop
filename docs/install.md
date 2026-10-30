@@ -111,3 +111,9 @@ unlocked:
 ```sh
 install -Dm0644 share/pam.d/tuna-lock /etc/pam.d/tuna-lock
 ```
+
+## When something goes wrong
+
+[Troubleshooting](troubleshooting.md) covers package, build and login
+problems; [session operations](session-operations.md) covers logs, the lock
+screen and recovering a running session.
