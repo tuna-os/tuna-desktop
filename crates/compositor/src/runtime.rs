@@ -2703,7 +2703,7 @@ impl Runtime {
                 "conversations": self.auth.diagnostics(),
                 "backend_unretired": self.unlock_quarantined.is_some(),
                 "epoch": self.unlock_generation.load(std::sync::atomic::Ordering::Acquire),
-                "attempt": self.unlock_worker.as_ref().map(|worker| worker.attempt).or(self.unlock_quarantined).map(|attempt| serde_json::json!({
+                "attempt": self.unlock_worker.as_ref().map(|worker| worker.attempt).or(self.unlock_quarantined).or(self.auth.password_attempt()).map(|attempt| serde_json::json!({
                     "serial": attempt.serial, "epoch": attempt.epoch,
                     "origin": attempt.origin.map(|origin| serde_json::json!({
                         "connection": origin.connection, "request": origin.request }))

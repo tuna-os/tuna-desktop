@@ -130,6 +130,13 @@ impl Conversations {
         })
     }
 
+    /// The common Slot attempt the password conversation owns, if any.
+    pub(super) fn password_attempt(&self) -> Option<Attempt> {
+        self.password
+            .as_ref()
+            .map(|conversation| conversation.attempt)
+    }
+
     /// The password conversation's shared idle/total deadline.
     pub(super) fn next_deadline(&self) -> Option<Instant> {
         self.password
@@ -593,6 +600,25 @@ impl Runtime {
                 epoch: attempt.epoch,
             });
             return;
+        }
+        // The same owned-retirement receipt the single-password worker
+        // writes (`Runtime::finish_unlock`), so the VM lanes bind a
+        // cancelled conversation helper exactly as they bind that worker.
+        if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
+            eprintln!(
+                "tuna-compositor: lock authentication owned retirement {}",
+                serde_json::json!({
+                    "pid": std::process::id(), "joined_ok": true,
+                    "retired": matches!(result, Verification::Retired { .. }),
+                    "authenticated": result.authenticated(), "denied": true,
+                    "cancel_requested": conversation.canceled, "reported_ok": false,
+                    "applied": false, "attempt_serial": attempt.serial,
+                    "attempt_epoch": attempt.epoch,
+                    "current_epoch": self.unlock_generation.load(Ordering::Acquire),
+                    "origin": { "connection": origin.connection, "request": origin.request },
+                    "locked_after": self.is_locked()
+                })
+            );
         }
         // GDM reports a failed (not cancelled) conversation as a problem.
         if !conversation.canceled && live && matches!(result, Verification::Retired { .. }) {

@@ -3054,6 +3054,38 @@ class PrivatePamSleepControls(unittest.TestCase):
                       self.trace(denial=self.legacy.denial.replace('false','true'))]:
             self.assertIsNone(self.match(trace=trace))
 
+    # The lock conversation (#366): the password conversation owns the
+    # common Slot attempt and its begin request gets the shell's denial.
+    CONVERSATION_DENIAL = 'tuna-shell-gtk: lock auth result service=password request=12 applied=false'
+
+    def conversation_snapshot(self):
+        import copy
+        snapshot = copy.deepcopy(self.legacy.snapshot)
+        owner = snapshot['state']['auth_owner']
+        owner['outer_pending'] = False
+        owner['conversations'] = {'password': True, 'fingerprint': False,
+                                  'fingerprint_slot': False, 'winner': False}
+        return snapshot
+
+    def test_conversation_pending_attempt_and_its_denial_accepted(self):
+        snapshot = self.conversation_snapshot()
+        self.assertEqual(lane.sleep_auth_attempt(snapshot), self.expected)
+        observed = dict(self.observed, auth_owner=snapshot['state']['auth_owner'])
+        self.assertEqual(lane.sleep_auth_helper_observation(observed, snapshot), self.original)
+        self.assertEqual(self.match(trace=self.trace(denial=self.CONVERSATION_DENIAL)), self.event)
+
+    def test_conversation_not_pending_or_wrong_denial_refused(self):
+        snapshot = self.conversation_snapshot()
+        for conversations in [None, {}, {'password': False}, {'password': 1}, []]:
+            snapshot['state']['auth_owner']['conversations'] = conversations
+            with self.subTest(conversations=conversations), self.assertRaises(ValueError):
+                lane.sleep_auth_attempt(snapshot)
+        for denial in [self.CONVERSATION_DENIAL.replace('12', '13'),
+                       self.CONVERSATION_DENIAL.replace('false', 'true'),
+                       self.CONVERSATION_DENIAL.replace('password', 'fingerprint')]:
+            with self.subTest(denial=denial):
+                self.assertIsNone(self.match(trace=self.trace(denial=denial)))
+
     def production(self):
         source = Path(__file__).resolve().parents[2] / 'packaging/marlin/vm-lane/tuna-vm-lifecycle'
         wanted = {'auth_process','public_auth_identity','classify_pam_helpers','pam_process_snapshot','delayed_auth_state','auth_retirement_state'}
@@ -3121,6 +3153,32 @@ class PrivatePamSleepControls(unittest.TestCase):
         self.assertIn('"retired":matches!(result, crate::pam_backend::Verification::Retired { .. })',text)
         self.assertIn('"cancel_requested":cancel_requested',text)
         self.assertEqual(lane.stale_sleep_auth_retirement(self.legacy.trace(),self.expected,8),self.legacy.event)
+
+
+class PamRefusalMilestones(unittest.TestCase):
+    RETIRED = {'event': 'retired', 'service': 'password', 'request': 31, 'connection': 2,
+               'epoch': 5, 'locked': True, 'retired': True, 'authenticated': False, 'canceled': False}
+    RESULT = 'tuna-shell-gtk: lock auth result service=password request=31 applied=false'
+
+    def records(self, event=None, result=None):
+        return ['tuna-compositor: lock conversation ' + json.dumps(self.RETIRED if event is None else event),
+                self.RESULT if result is None else result]
+
+    def test_single_password_and_conversation_refusals_accepted(self):
+        self.assertTrue(lane.pam_refusal_observed(['tuna-shell-gtk: lock password submitted',
+                                                   'tuna-shell-gtk: lock command result applied=false request_id=4']))
+        self.assertTrue(lane.pam_refusal_observed(self.records()))
+
+    def test_cancelled_authenticated_unretired_other_request_or_missing_denial_refused(self):
+        for key, value in [('canceled', True), ('authenticated', True), ('retired', False),
+                           ('service', 'fingerprint'), ('event', 'begin'), ('request', 32)]:
+            with self.subTest(key=key):
+                self.assertFalse(lane.pam_refusal_observed(self.records({**self.RETIRED, key: value})))
+        for result in ['', self.RESULT.replace('false', 'true'), self.RESULT.replace('31', '30')]:
+            with self.subTest(result=result):
+                self.assertFalse(lane.pam_refusal_observed(self.records(result=result)))
+        self.assertFalse(lane.pam_refusal_observed(['tuna-shell-gtk: lock password submitted']))
+        self.assertFalse(lane.pam_refusal_observed(['tuna-compositor: lock conversation {broken', self.RESULT]))
 
 
 

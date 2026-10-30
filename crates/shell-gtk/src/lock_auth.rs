@@ -547,11 +547,15 @@ impl AuthMachine {
             && self.restart_wait.is_none()
         {
             // Nothing of this cycle runs any more and nothing will restart
-            // it (the compositor cancelled on a lock-epoch change or origin
-            // loss, or refused while a helper retires): begin again after
-            // a backoff rather than leave a dead prompt. A service that
-            // lost to the other is still current here, so a win never
-            // restarts.
+            // it (the compositor cancelled on a lock-epoch change such as
+            // suspend or origin loss, or refused while a helper retires):
+            // begin again after a backoff rather than leave a dead prompt.
+            // A service that lost to the other is still current here, so a
+            // win never restarts. An answer held for this cycle is dropped:
+            // the next conversation never replays what was typed for a
+            // cancelled one (the stale-attempt rule of the single-password
+            // `Unlock`, which is denied and never resubmitted).
+            self.preemptive_answer = None;
             let token = self.token();
             self.restart_wait = Some(token);
             self.effects.push(Effect::Timer {
@@ -1628,22 +1632,28 @@ mod tests {
     }
 
     #[test]
-    fn a_restart_keeps_a_held_answer() {
+    fn a_cancelled_conversation_never_replays_a_held_answer() {
         let host = Fake::new();
         host.fingerprint.set(false);
         let mut m = AuthMachine::new(1.0);
         m.show_prompt(&host, true);
         let pw = host.begins()[0].1;
         host.take();
-        m.submit(&host, "typed-early".into());
-        // A busy refusal: Denied, no Problem, nothing else running.
+        // Typed before PAM asked (e.g. a delay module), then a suspend
+        // cancels the conversation: Denied, no Problem, nothing running.
+        m.submit(&host, "typed-before-suspend".into());
+        m.take_effects();
         m.result(&host, pw, false);
         let (backoff, _) = timers(&m.take_effects())[0];
         m.timeout(&host, backoff);
+        assert!(m.take_effects().contains(&Effect::ClearEntry));
         let pw2 = host.begins()[0].1;
         host.take();
         m.event(&host, pw2, PW, &query(1, "Password:", true));
-        assert_eq!(host.take(), vec![Call::Answer(1, "typed-early".into())]);
+        assert!(host.take().is_empty(), "the held answer is never replayed");
+        assert!(m.view().sensitive, "the new question takes fresh input");
+        m.submit(&host, "fresh".into());
+        assert_eq!(host.take(), vec![Call::Answer(1, "fresh".into())]);
     }
 
     #[test]

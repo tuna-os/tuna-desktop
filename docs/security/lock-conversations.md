@@ -54,6 +54,12 @@ permanent refusals (greetd, no backend or user, a quarantined Slot, no reader
 or prints); a begin refused because a previous attempt is still retiring, and
 every cancellation the compositor starts itself (lock-epoch change such as
 suspend, origin loss), end with a plain `Denied` that the shell may retry.
+The shell never replays an answer it held for such a conversation (typed
+before PAM asked): the restarted conversation asks for fresh input, as the
+single-password `Unlock` is denied and never resubmitted. The cancelled
+helper's retirement writes the same `lock authentication owned retirement`
+receipt as the single-password worker, and the `auth_owner` snapshot names
+the conversation's Slot attempt, so the VM lanes bind it the same way.
 
 ## Fingerprint conversation
 
@@ -105,7 +111,11 @@ idle or sleep lock), origin loss or unlock cancels the conversation.
 - `scripts/tuna-lock-auth-proof`: the nested GTK lock screen against a
   pam_wrapper stack (pam_matrix password, then a one-time code) and an
   emulated fprintd on a private system bus.
+- `scripts/tuna-vm-lane` V-SLEEP-AUTH-FAIL-CLOSED and V-AUTH-FAIL-CLOSED
+  (marlin-vm, KVM, CI only): a real delayed PAM helper of an open
+  conversation is cancelled and physically retired by real S3 without
+  unlocking, and a real `pam_deny` stack refuses a conversation.
 
 Not covered: real readers, smartcards and PIN pads (`pam_pkcs11` or
-`pam_sss` smartcard), web login (GDM's `eidp` extension), installed PAM
-stacks on the published image, and suspend with a conversation open.
+`pam_sss` smartcard), web login (GDM's `eidp` extension) and installed PAM
+stacks on the published image.
