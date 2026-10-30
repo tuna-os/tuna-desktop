@@ -639,6 +639,26 @@ window.tuna-overview-grid {
   background-color: rgba(250, 250, 251, 0.1);
 }
 
+/* GNOME's .dash-label (_dash.scss:103-106, %tooltip in _common.scss:
+   225-237): a pill above the hovered item; the popover carrying it
+   draws nothing of its own. */
+popover.dash-label-popover,
+popover.dash-label-popover > contents {
+  background: none;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  margin: 0;
+}
+
+.dash-label {
+  background-color: rgba(0, 0, 0, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #ffffff;
+  border-radius: 999px;
+  padding: 6px 12px;
+}
+
 /* GNOME 51's app results (.grid-search-results): no card, 145px tiles
    (.grid-search-result: 12px padding, 24px corners, a 96px icon) 30px
    apart, 21px under the entry; the first, Enter's target, is

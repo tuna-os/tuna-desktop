@@ -166,7 +166,19 @@ fn connect_app_activation(
     entry: AppEntry,
     closing: impl Fn() + 'static,
 ) {
+    connect_live_app_activation(tile, actions, move || entry.clone(), closing);
+}
+
+/// [`connect_app_activation`] for a tile that outlives rebuilds (the
+/// dash's): `entry` gives the app as it is when the tile activates.
+fn connect_live_app_activation(
+    tile: &gtk::Button,
+    actions: Rc<dyn OverviewActions>,
+    entry: impl Fn() -> AppEntry + 'static,
+    closing: impl Fn() + 'static,
+) {
     let activate = Rc::new(move |tile: &gtk::Button, new_window_requested: bool| {
+        let entry = entry();
         let result = activate_app(
             actions.as_ref(),
             &entry,
@@ -202,40 +214,65 @@ fn connect_app_activation(
 }
 
 /// One dash item (`#dash .overview-tile`): the 64px icon in a 76px
-/// rounded tile, with GNOME's running dot under it.
-fn dash_tile(entry: &AppEntry, running: bool) -> (gtk::Button, gtk::Image) {
+/// rounded tile, with GNOME's running dot under it while it runs.
+fn dash_tile(name: &str, icon: Option<&str>) -> (gtk::Button, gtk::Image, gtk::Widget) {
     let tile = gtk::Overlay::new();
-    let icon = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    icon.add_css_class("overview-icon");
-    let image = app_icon(entry, 64);
+    let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    frame.add_css_class("overview-icon");
+    let image = gtk::Image::new();
+    set_app_icon(&image, icon);
+    image.set_pixel_size(64);
     image.set_halign(gtk::Align::Center);
     image.set_valign(gtk::Align::Center);
-    icon.append(&image);
-    tile.set_child(Some(&icon));
-    if running {
-        let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        dot.add_css_class("app-grid-running-dot");
-        dot.set_halign(gtk::Align::Center);
-        dot.set_valign(gtk::Align::End);
-        tile.add_overlay(&dot);
-    }
+    frame.append(&image);
+    tile.set_child(Some(&frame));
+    let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    dot.add_css_class("app-grid-running-dot");
+    dot.set_halign(gtk::Align::Center);
+    dot.set_valign(gtk::Align::End);
+    dot.set_visible(false);
+    tile.add_overlay(&dot);
     let button = gtk::Button::builder().child(&tile).build();
     button.add_css_class("dash-tile");
-    if running {
-        button.add_css_class("running");
+    button.update_property(&[gtk::accessible::Property::Label(name)]);
+    (button, image, dot.upcast())
+}
+
+/// An app's icon: a file path, a themed name, or the generic one.
+fn set_app_icon(image: &gtk::Image, icon: Option<&str>) {
+    match icon {
+        Some(icon) if icon.starts_with('/') => image.set_from_file(Some(icon)),
+        Some(icon) => image.set_icon_name(Some(icon)),
+        None => image.set_icon_name(Some("application-x-executable")),
     }
-    button.update_property(&[gtk::accessible::Property::Label(&entry.name)]);
-    (button, image)
 }
 
 fn app_icon(entry: &AppEntry, size: i32) -> gtk::Image {
-    let image = match entry.icon.as_deref() {
-        Some(icon) if icon.starts_with('/') => gtk::Image::from_file(icon),
-        Some(icon) => gtk::Image::from_icon_name(icon),
-        None => gtk::Image::from_icon_name("application-x-executable"),
-    };
+    let image = gtk::Image::new();
+    set_app_icon(&image, entry.icon.as_deref());
     image.set_pixel_size(size);
     image
+}
+
+/// One app or window-backed item in the dash.
+struct DashSlot {
+    item: crate::dash_motion::DashItem,
+    button: gtk::Button,
+    image: gtk::Image,
+    dot: gtk::Widget,
+    /// The app it activates; a window-backed item raises its window.
+    entry: Option<Rc<RefCell<AppEntry>>>,
+    /// Its windows, for their minimize targets.
+    windows: Vec<u64>,
+}
+
+/// What the dash should show for one item.
+struct DashWant {
+    key: String,
+    name: String,
+    icon: Option<String>,
+    entry: Option<AppEntry>,
+    windows: Vec<u64>,
 }
 
 fn app_button(entry: &AppEntry, icon_size: i32, with_label: bool) -> gtk::Button {
@@ -306,6 +343,15 @@ pub struct OverviewUi {
     dash: gtk::ApplicationWindow,
     dash_row: gtk::Box,
     dash_signature: Vec<(u64, Option<String>, Option<String>)>,
+    /// The dash's items in row order, with any still animating out.
+    dash_items: Rc<RefCell<Vec<DashSlot>>>,
+    /// Between the favorites and the other running apps.
+    dash_separator: gtk::Separator,
+    /// Show Apps, the dash's last item, once built, with its `toggled`
+    /// handler.
+    show_apps: Option<(gtk::ToggleButton, gtk::glib::SignalHandlerId)>,
+    /// The items' hover labels.
+    dash_labels: Rc<crate::dash_motion::Labels>,
     dash_icons: Vec<(Vec<u64>, gtk::Image)>,
     dash_layout: Option<(gtk::gdk::Surface, gtk::glib::SignalHandlerId)>,
     icon_publication_pending: Rc<std::cell::Cell<bool>>,
@@ -447,6 +493,15 @@ impl OverviewUi {
             dash,
             dash_row,
             dash_signature: Vec::new(),
+            dash_items: Rc::default(),
+            dash_separator: {
+                let separator = gtk::Separator::new(gtk::Orientation::Vertical);
+                separator.add_css_class("dash-separator");
+                separator.set_valign(gtk::Align::Center);
+                separator
+            },
+            show_apps: None,
+            dash_labels: Rc::default(),
             dash_icons: Vec::new(),
             dash_layout: None,
             icon_publication_pending: Rc::new(std::cell::Cell::new(false)),
@@ -734,30 +789,36 @@ impl OverviewUi {
         });
     }
 
-    fn rebuild_dash(ui: &Rc<RefCell<Self>>) {
+    /// GNOME's `Dash._redisplay` (dash.js:677-840): favorites, then
+    /// running apps that are not favorites after a separator, then Show
+    /// Apps. Items persist across redisplays: an app joining the dash
+    /// zooms in and one leaving zooms out (`animate`: the dash is on
+    /// screen and this is not the overview's initial fill), each from
+    /// where it is drawn.
+    fn rebuild_dash(ui: &Rc<RefCell<Self>>, animate: bool) {
         let mut me = ui.borrow_mut();
-        me.dash_icons.clear();
-        while let Some(child) = me.dash_row.first_child() {
-            me.dash_row.remove(&child);
-        }
-        // GNOME's dash (dash.js): favorites, then running apps that are
-        // not favorites after a separator, then Show Apps.
         // Running apps in the order their windows appeared.
         let mut running = me.actions.running();
         running.sort_by_key(|(id, _)| *id);
         let live_apps = me.apps.clone();
         let apps = live_apps.get();
-        let window_of = |entry: &AppEntry| {
+        let windows_of = |entry: &AppEntry| -> Vec<u64> {
             running
                 .iter()
-                .find(|(_, app)| app.as_deref() == Some(entry.app_id.trim_end_matches(".desktop")))
+                .filter(|(_, app)| {
+                    app.as_deref() == Some(entry.app_id.trim_end_matches(".desktop"))
+                })
                 .map(|(id, _)| *id)
+                .collect()
         };
-        let mut shown: Vec<AppEntry> = me
-            .favorites
-            .iter()
-            .filter_map(|id| providers::provider_app(&apps, id).cloned())
-            .collect();
+        let mut shown: Vec<AppEntry> = Vec::new();
+        for id in &me.favorites {
+            if let Some(entry) = providers::provider_app(&apps, id) {
+                if !shown.iter().any(|e| e.app_id == entry.app_id) {
+                    shown.push(entry.clone());
+                }
+            }
+        }
         let favorites = shown.len();
         // Running windows no installed app claims become window-backed
         // apps, as GNOME's WindowTracker makes them: one per window,
@@ -779,55 +840,203 @@ impl OverviewUi {
                 }
             }
         }
-        let orphans_need_separator = favorites == shown.len() && !orphans.is_empty();
-        for (i, entry) in shown.iter().enumerate() {
-            if i == favorites {
-                let separator = gtk::Separator::new(gtk::Orientation::Vertical);
-                separator.add_css_class("dash-separator");
-                separator.set_valign(gtk::Align::Center);
-                me.dash_row.append(&separator);
+        let wants: Vec<DashWant> = shown
+            .into_iter()
+            .map(|entry| DashWant {
+                key: format!("app:{}", entry.app_id),
+                name: entry.name.clone(),
+                icon: entry.icon.clone(),
+                windows: windows_of(&entry),
+                entry: Some(entry),
+            })
+            .chain(orphans.into_iter().map(|(window, name)| {
+                DashWant {
+                    key: format!("window:{window}"),
+                    icon: me
+                        .actions
+                        .window_icon(window)
+                        .or_else(|| Some("application-x-executable".to_owned())),
+                    name,
+                    entry: None,
+                    windows: vec![window],
+                }
+            }))
+            .collect();
+        drop(apps);
+        let show_apps = Self::show_apps_item(ui, &mut me);
+        let items = me.dash_items.clone();
+        let mut slots = items.borrow_mut();
+        // An item leaving stays where it stands, after the item before it.
+        let mut leaving: Vec<(Option<String>, DashSlot)> = Vec::new();
+        let mut kept: std::collections::HashMap<String, DashSlot> = Default::default();
+        let mut before: Option<String> = None;
+        for slot in slots.drain(..) {
+            let key = slot.item.key();
+            if wants.iter().any(|want| want.key == key) {
+                before = Some(key.clone());
+                kept.insert(key, slot);
+            } else {
+                leaving.push((before.clone(), slot));
             }
-            let (button, image) = dash_tile(entry, window_of(entry).is_some());
-            let ids = running
+        }
+        let mut eases: Vec<(crate::dash_motion::DashItem, bool)> = Vec::new();
+        for (_, slot) in &leaving {
+            // animateOutAndDestroy; one already on its way out goes on
+            // unless the dash fills unanimated.
+            if slot.item.shown() || !animate {
+                eases.push((slot.item.clone(), false));
+            }
+        }
+        let take_leaving = |after: Option<&str>,
+                            leaving: &mut Vec<(Option<String>, DashSlot)>,
+                            slots: &mut Vec<DashSlot>,
+                            order: &mut Vec<gtk::Widget>| {
+            while let Some(index) = leaving
                 .iter()
-                .filter(|(_, app)| {
-                    app.as_deref() == Some(entry.app_id.trim_end_matches(".desktop"))
-                })
-                .map(|(id, _)| *id)
-                .collect();
-            me.dash_icons.push((ids, image));
-            // DashIcon inherits AppIcon.activate (dash.js:22).
-            connect_app_activation(&button, me.actions.clone(), entry.clone(), || {});
-            me.dash_row.append(&button);
-        }
-        if orphans_need_separator {
-            let separator = gtk::Separator::new(gtk::Orientation::Vertical);
-            separator.add_css_class("dash-separator");
-            separator.set_valign(gtk::Align::Center);
-            me.dash_row.append(&separator);
-        }
-        for (window, name) in orphans {
-            let entry = AppEntry {
-                app_id: name.clone(),
-                name,
-                generic_name: None,
-                keywords: Vec::new(),
-                argv: Vec::new(),
-                icon: me
-                    .actions
-                    .window_icon(window)
-                    .or_else(|| Some("application-x-executable".to_owned())),
-                categories: Vec::new(),
-                new_window: Default::default(),
+                .position(|(before, _)| before.as_deref() == after)
+            {
+                let (_, slot) = leaving.remove(index);
+                order.push(slot.item.clone().upcast());
+                slots.push(slot);
+            }
+        };
+        let mut order: Vec<gtk::Widget> = Vec::new();
+        let mut icons = Vec::new();
+        let separated = favorites > 0 && favorites < wants.len();
+        take_leaving(None, &mut leaving, &mut slots, &mut order);
+        for (index, want) in wants.into_iter().enumerate() {
+            let mut slot = match kept.remove(&want.key) {
+                Some(slot) => {
+                    // Back while it was leaving, or still settling while
+                    // the dash fills unanimated: ease it in.
+                    if !slot.item.shown() || (!animate && slot.item.look() != (1.0, 1.0)) {
+                        eases.push((slot.item.clone(), true));
+                    }
+                    slot
+                }
+                None => {
+                    let slot = Self::dash_slot(&me, &want);
+                    eases.push((slot.item.clone(), true));
+                    slot
+                }
             };
-            let (button, image) = dash_tile(&entry, true);
-            me.dash_icons.push((vec![window], image));
-            let actions = me.actions.clone();
-            button.connect_clicked(move |_| {
-                actions.activate_window(window);
-                actions.close_overview();
+            // The app as it is now: a reinstalled desktop file renames it.
+            slot.button
+                .update_property(&[gtk::accessible::Property::Label(&want.name)]);
+            slot.item.set_label_text(&want.name);
+            set_app_icon(&slot.image, want.icon.as_deref());
+            let running = !want.windows.is_empty();
+            slot.dot.set_visible(running);
+            if running {
+                slot.button.add_css_class("running");
+            } else {
+                slot.button.remove_css_class("running");
+            }
+            if let (Some(current), Some(entry)) = (slot.entry.as_ref(), want.entry) {
+                *current.borrow_mut() = entry;
+            }
+            slot.windows = want.windows;
+            icons.push((slot.windows.clone(), slot.image.clone()));
+            order.push(slot.item.clone().upcast());
+            slots.push(slot);
+            take_leaving(Some(&want.key), &mut leaving, &mut slots, &mut order);
+            if separated && index + 1 == favorites {
+                order.push(me.dash_separator.clone().upcast());
+            }
+        }
+        // Anything left had no item before it that stays.
+        for (_, slot) in leaving.drain(..) {
+            order.push(slot.item.clone().upcast());
+            slots.push(slot);
+        }
+        order.push(show_apps.upcast());
+        let row = me.dash_row.clone();
+        let mut previous: Option<gtk::Widget> = None;
+        for widget in &order {
+            if widget.parent().as_ref() == Some(row.upcast_ref()) {
+                row.reorder_child_after(widget, previous.as_ref());
+            } else {
+                row.insert_child_after(widget, previous.as_ref());
+            }
+            previous = Some(widget.clone());
+        }
+        if !separated && me.dash_separator.parent().is_some() {
+            row.remove(&me.dash_separator);
+        }
+        me.dash_icons = icons;
+        drop(slots);
+        drop(me);
+        // Ease once nothing is borrowed: an unanimated ease lands at once.
+        let weak = Rc::downgrade(ui);
+        for (item, shown) in eases {
+            let weak = weak.clone();
+            let items = items.clone();
+            item.ease(shown, animate, move |item| {
+                if !shown {
+                    // animateOutAndDestroy's onComplete.
+                    items.borrow_mut().retain(|slot| slot.item != *item);
+                    item.unparent();
+                }
+                // The settled icons are the minimize targets.
+                gtk::glib::idle_add_local_once(move || {
+                    if let Some(ui) = weak.upgrade() {
+                        Self::publish_dash_icons(&ui);
+                    }
+                });
             });
-            me.dash_row.append(&button);
+        }
+        Self::publish_dash_icons(ui);
+        Self::rebuild_grid(ui);
+    }
+
+    /// A new dash item for `want` (`_createAppItem`, dash.js:505-524):
+    /// its tile, hover label and activation.
+    fn dash_slot(me: &Self, want: &DashWant) -> DashSlot {
+        let (button, image, dot) = dash_tile(&want.name, want.icon.as_deref());
+        let item = crate::dash_motion::DashItem::new(&want.key, &button, &want.name);
+        me.dash_labels.hook(&item, &button);
+        let entry = want.entry.clone().map(|entry| Rc::new(RefCell::new(entry)));
+        match (&entry, want.windows.first()) {
+            // DashIcon inherits AppIcon.activate (dash.js:22).
+            (Some(entry), _) => {
+                let entry = entry.clone();
+                connect_live_app_activation(
+                    &button,
+                    me.actions.clone(),
+                    move || entry.borrow().clone(),
+                    || {},
+                );
+            }
+            // A window-backed app is always running: activate raises it.
+            (None, Some(&window)) => {
+                let actions = me.actions.clone();
+                button.connect_clicked(move |_| {
+                    actions.activate_window(window);
+                    actions.close_overview();
+                });
+            }
+            (None, None) => {}
+        }
+        DashSlot {
+            item,
+            button,
+            image,
+            dot,
+            entry,
+            windows: want.windows.clone(),
+        }
+    }
+
+    /// GNOME's ShowAppsIcon: the dash's last item, built once and shown
+    /// without animating (dash.js:354-356), with its own label.
+    fn show_apps_item(ui: &Rc<RefCell<Self>>, me: &mut Self) -> crate::dash_motion::DashItem {
+        if let Some(item) = me
+            .show_apps
+            .as_ref()
+            .and_then(|(toggle, _)| toggle.parent())
+            .and_downcast::<crate::dash_motion::DashItem>()
+        {
+            return item;
         }
         let show_apps = gtk::ToggleButton::builder()
             .child(&{
@@ -842,7 +1051,7 @@ impl OverviewUi {
             .build();
         show_apps.add_css_class("dash-tile");
         show_apps.update_property(&[gtk::accessible::Property::Label("Show Apps")]);
-        {
+        let toggled = {
             let ui = ui.clone();
             show_apps.connect_toggled(move |t| {
                 let active = t.is_active();
@@ -858,13 +1067,13 @@ impl OverviewUi {
                 if active {
                     Self::rebuild_grid(&ui);
                 }
-            });
-        }
-        me.dash_row.append(&show_apps);
-        drop(apps);
-        drop(me);
-        Self::publish_dash_icons(ui);
-        Self::rebuild_grid(ui);
+            })
+        };
+        let item = crate::dash_motion::DashItem::new("show-apps", &show_apps, "Show Apps");
+        me.dash_labels.hook(&item, &show_apps);
+        item.ease(true, false, |_| {});
+        me.show_apps = Some((show_apps, toggled));
+        item
     }
 
     fn rebuild_grid(ui: &Rc<RefCell<Self>>) {
@@ -1159,11 +1368,7 @@ impl OverviewUi {
     pub fn show_apps(ui: &Rc<RefCell<Self>>) {
         let me = ui.borrow();
         if me.open {
-            if let Some(toggle) = me
-                .dash_row
-                .last_child()
-                .and_then(|w| w.downcast::<gtk::ToggleButton>().ok())
-            {
+            if let Some(toggle) = me.show_apps.as_ref().map(|(toggle, _)| toggle.clone()) {
                 drop(me);
                 toggle.set_active(true);
             }
@@ -1192,11 +1397,7 @@ impl OverviewUi {
     pub fn focus_search(ui: &Rc<RefCell<Self>>) {
         let me = ui.borrow();
         if me.open {
-            if let Some(toggle) = me
-                .dash_row
-                .last_child()
-                .and_then(|w| w.downcast::<gtk::ToggleButton>().ok())
-            {
+            if let Some((toggle, _)) = me.show_apps.as_ref() {
                 toggle.set_active(false);
             }
             me.entry.grab_focus();
@@ -1254,14 +1455,16 @@ impl OverviewUi {
         if ui.borrow().open == open {
             if open && ui.borrow().dash_signature != signature {
                 ui.borrow_mut().dash_signature = signature;
-                Self::rebuild_dash(ui);
+                // Dash._redisplay with the overview up: items animate.
+                Self::rebuild_dash(ui, true);
             }
             return;
         }
         ui.borrow_mut().dash_signature = signature;
         ui.borrow_mut().open = open;
         if open {
-            Self::rebuild_dash(ui);
+            // The initial fill does not animate (dash.js:784-798).
+            Self::rebuild_dash(ui, false);
             let me = ui.borrow();
             // The compositor resets search on close; start clean.
             me.search_active.set(false);
@@ -1278,6 +1481,26 @@ impl OverviewUi {
         } else {
             let me = ui.borrow();
             me.folder_dialog.close_now();
+            // The overview's `hiding`: no label waits or stays.
+            let show_apps = me
+                .show_apps
+                .as_ref()
+                .and_then(|(toggle, _)| toggle.parent())
+                .and_downcast::<crate::dash_motion::DashItem>();
+            me.dash_labels.reset(
+                me.dash_items
+                    .borrow()
+                    .iter()
+                    .map(|slot| &slot.item)
+                    .chain(show_apps.as_ref()),
+            );
+            // The next overview opens on the window picker with Show Apps
+            // off, without telling anyone the grid hid: it closes here.
+            if let Some((toggle, toggled)) = me.show_apps.as_ref() {
+                toggle.block_signal(toggled);
+                toggle.set_active(false);
+                toggle.unblock_signal(toggled);
+            }
             me.search.set_keyboard_mode(KeyboardMode::None);
             me.search.set_visible(false);
             me.dash.set_visible(false);

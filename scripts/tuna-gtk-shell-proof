@@ -45,6 +45,11 @@
 #   G-GRID-ACTIVATE-RUNNING a running app's grid tile raises its window
 #                  without launching it again or zooming; Ctrl+click
 #                  opens a new window with the zoom (AppIcon.activate)
+#   G-DASH-MOTION  dash items zoom and fade in and out over 200 ms
+#                  ease-out-quad (a leaving item reverses from where it
+#                  stands) and hover labels fade in over 150 ms after
+#                  300 ms and out over 100 ms; Reduced Motion only
+#                  fades, animations off are instant (frozen proof clock)
 #   G-GRID-FADE    Show Apps fades the grid in over 400 ms after 100 ms
 #   G-APP-FOLDERS  GNOME's app-folders settings group the app grid: the
 #                  folder replaces its apps and opens to show them
@@ -1040,6 +1045,9 @@ export TUNA_GRID_TRACE
 # settled (G-TRANSIENT-*).
 TUNA_TRANSIENT_TRACE=1
 export TUNA_TRANSIENT_TRACE
+# The dash logs its item and label eases, frame by frame (G-DASH-MOTION).
+TUNA_DASH_TRACE=1
+export TUNA_DASH_TRACE
 TUNA_PROOF_SWIPE_INPUT="$ARTIFACTS/swipe-input.json"
 export TUNA_PROOF_SWIPE_INPUT
 # G-ANIMATION-CLOCK drives compositor animation time through this file;
@@ -2923,16 +2931,20 @@ RUNNING_MARKER="$ARTIFACTS/running-app-relaunched"
 rm -f "$RUNNING_MARKER"
 printf '[Desktop Entry]\nName=Tuna Running Probe\nExec=touch %s\nType=Application\n' "$RUNNING_MARKER" >"$running_desktop"
 sleep 1.5
-# The tile, on whichever grid page holds it: its centre on the output
-# from the App Grid window's own nodes (the dash lists the app too).
-running_tile() {
-    jq -er --arg name "Tuna Running Probe" --argjson ox "$grid_origin_x" --argjson oy "$grid_origin_y" --argjson width "$WIDTH" '
+# A showing button's centre on the output, from one shell window's own
+# nodes ($2: its frame's name) at that window's origin ($4, $5).
+frame_point() {
+    jq -er --arg frame "$2" --arg name "$3" --argjson ox "$4" --argjson oy "$5" --argjson width "$WIDTH" '
         [foreach .[] as $n (null; if $n.role == "frame" then $n.name else . end; [., $n])]
-        | map(select(.[0] == "App Grid") | .[1]
+        | map(select(.[0] == $frame) | .[1]
             | select(.showing and (.role == "push button" or .role == "button") and .name == $name
                 and .bounds[2] > 0 and .bounds[3] > 0
                 and .bounds[0] + $ox >= 0 and .bounds[0] + $ox + .bounds[2] <= $width))
         | first | .bounds | "\((.[0] + $ox + .[2] / 2) | floor) \((.[1] + $oy + .[3] / 2) | floor)"' "$1"
+}
+# The tile, on whichever grid page holds it (the dash lists the app too).
+running_tile() {
+    frame_point "$1" "App Grid" "Tuna Running Probe" "$grid_origin_x" "$grid_origin_y"
 }
 running_open_grid() {
     xdotool key super+a
@@ -2987,6 +2999,165 @@ cstate '.overview_open | not' "closed after Ctrl+click" ||
 cp "$ARTIFACTS/running-app-hidden.desktop" "$running_desktop"
 sleep 1.5
 pass G-GRID-ACTIVATE-RUNNING "a running app's grid tile raises its window without relaunching or zooming; Ctrl+click opens another with the zoom"
+
+# GNOME's dash (dash.js:16-190, 640-780): an app joining the dash zooms
+# and fades in over DASH_ANIMATION_TIME 200 ms ease-out-quad and one
+# leaving zooms and fades out from where it is drawn; a hovered item's
+# label fades in above it over 150 ms after DASH_ITEM_HOVER_TIMEOUT
+# 300 ms and out over 100 ms. The shell reads this proof's animation
+# clock, so its traced frames (TUNA_DASH_TRACE) are sampled at exact
+# delays. Test windows are window-backed dash items.
+motion_policy Full
+xdotool key Super_L
+cstate '.overview_open and .overview_progress == 1' "overview for the dash" ||
+    fail G-DASH-MOTION "the overview did not open"
+sleep 1
+anim_clock 0
+cstate '.animation_clock_manual' "frozen dash clock" ||
+    fail G-DASH-MOTION "the clock file did not freeze animation time"
+dash_clock=0
+# Move the frozen animation clock on by $1 ms.
+dash_after() {
+    dash_clock=$((dash_clock + $1))
+    anim_clock "$dash_clock"
+}
+# Map test window $1 ($2: its colour); dash_key names its dash item.
+dash_window() {
+    dash_windows=$(jq '.windows | length' "$CSTATE")
+    WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-test-window.py" "$1" "$2" \
+        >"$ARTIFACTS/window-dash-$1.log" 2>&1 &
+    dash_pid=$!
+    cstate "(.windows | length) == $((dash_windows + 1))" "$1 mapped" ||
+        fail G-DASH-MOTION "$1 never mapped"
+    dash_app="tuna-test-$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+    dash_key="window:$(jq -r --arg a "$dash_app" '[.windows[] | select(.app_id == $a) | .id] | max' "$CSTATE")"
+    cstate '.overview_open' "overview kept" || fail G-DASH-MOTION "mapping $1 closed the overview"
+}
+dash_close() {
+    kill "$1"
+    cstate "(.windows | length) == $dash_windows" "window gone" ||
+        fail G-DASH-MOTION "a test window did not close"
+}
+dash_mark="$(log_mark)"
+dash_window Delta '#c061cb'
+delta_pid=$dash_pid
+delta_key=$dash_key
+log_wait "$dash_mark" "dash item $delta_key show start from=0.0000,0.0000 ms=200 motion=full clock=manual" ||
+    fail G-DASH-MOTION "a new running app did not start GNOME's 200 ms zoom in on the frozen clock"
+dash_after 100
+log_wait "$dash_mark" "dash item $delta_key frame scale=0.7500 opacity=0.7500" ||
+    fail G-DASH-MOTION "100 ms in, the new item was not at ease-out-quad 75% size and opacity"
+scrot "$ARTIFACTS/dash-add-100ms.png" >/dev/null
+dash_after 100
+log_wait "$dash_mark" "dash item $delta_key settle scale=1.0000 opacity=1.0000" ||
+    fail G-DASH-MOTION "the new item did not settle 200 ms in"
+# Its hover label, above it.
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-dash-motion.json" 20 ||
+    fail G-DASH-MOTION "accessibility dump failed"
+cstate '.layers | any(.namespace == "tuna-shell-dash")' "dash layer" || fail G-DASH-MOTION "dash layer missing"
+dash_ox="$(jq '.layers[] | select(.namespace == "tuna-shell-dash") | .rect[0]' "$CSTATE")"
+dash_oy="$(jq '.layers[] | select(.namespace == "tuna-shell-dash") | .rect[1]' "$CSTATE")"
+dash_point="$(frame_point "$ARTIFACTS/a11y-dash-motion.json" Dash tuna-test-delta "$dash_ox" "$dash_oy")" ||
+    fail G-DASH-MOTION "the new dash item has no bounds"
+dash_mark="$(log_mark)"
+# shellcheck disable=SC2086
+xdotool mousemove --window "$WID" $dash_point
+sleep 0.1
+log_has "$dash_mark" "dash label $delta_key show" &&
+    fail G-DASH-MOTION "the label showed before GNOME's 300 ms hover timeout"
+log_wait "$dash_mark" "dash label $delta_key show start from=0.0000 ms=150 motion=full clock=manual" ||
+    fail G-DASH-MOTION "hovering the item did not start its label's 150 ms fade"
+dash_after 75
+log_wait "$dash_mark" "dash label $delta_key frame opacity=0.7500" ||
+    fail G-DASH-MOTION "75 ms in, the label was not at ease-out-quad 75%"
+scrot "$ARTIFACTS/dash-label-75ms.png" >/dev/null
+dash_after 75
+log_wait "$dash_mark" "dash label $delta_key settle opacity=1.0000" ||
+    fail G-DASH-MOTION "the label did not settle 150 ms in"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-dash-label.json" 20 ||
+    fail G-DASH-MOTION "accessibility dump failed"
+[ "$(jq '[.[] | select(.showing and .name == "tuna-test-delta")] | length' "$ARTIFACTS/a11y-dash-label.json")" = 1 ] ||
+    fail G-DASH-MOTION "the label repeated the item's name to assistive technology"
+dash_mark="$(log_mark)"
+xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 3))
+log_wait "$dash_mark" "dash label $delta_key hide start from=1.0000 ms=100 motion=full clock=manual" ||
+    fail G-DASH-MOTION "leaving the item did not start its label's 100 ms fade out"
+dash_after 50
+log_wait "$dash_mark" "dash label $delta_key frame opacity=0.2500" ||
+    fail G-DASH-MOTION "50 ms out, the label was not at ease-out-quad 25%"
+dash_after 50
+log_wait "$dash_mark" "dash label $delta_key settle opacity=0.0000" ||
+    fail G-DASH-MOTION "the label did not fade out in 100 ms"
+# An item leaving while it still zooms in shrinks back from where it is
+# drawn, over the whole 200 ms.
+dash_mark="$(log_mark)"
+dash_window Epsilon '#986a44'
+log_wait "$dash_mark" "dash item $dash_key show start from=0.0000,0.0000 ms=200" ||
+    fail G-DASH-MOTION "the second item did not zoom in"
+dash_after 100
+log_wait "$dash_mark" "dash item $dash_key frame scale=0.7500 opacity=0.7500" ||
+    fail G-DASH-MOTION "the second item was not at 75% 100 ms in"
+dash_close "$dash_pid"
+log_wait "$dash_mark" "dash item $dash_key hide start from=0.7500,0.7500 ms=200 motion=full clock=manual" ||
+    fail G-DASH-MOTION "the item leaving mid-zoom did not reverse from where it was drawn"
+log_has "$dash_mark" "dash item $dash_key frame scale=0.0000" &&
+    fail G-DASH-MOTION "the item leaving mid-zoom jumped"
+dash_after 100
+log_wait "$dash_mark" "dash item $dash_key frame scale=0.1875 opacity=0.1875" ||
+    fail G-DASH-MOTION "100 ms into the reversal the item was not at ease-out-quad from 75%"
+dash_after 100
+log_wait "$dash_mark" "dash item $dash_key settle scale=0.0000 opacity=0.0000" ||
+    fail G-DASH-MOTION "the reversed item did not leave 200 ms after its window closed"
+dash_mark="$(log_mark)"
+dash_windows=$(($(jq '.windows | length' "$CSTATE") - 1))
+dash_close "$delta_pid"
+log_wait "$dash_mark" "dash item $delta_key hide start from=1.0000,1.0000 ms=200 motion=full clock=manual" ||
+    fail G-DASH-MOTION "a closed app's item did not start zooming out"
+dash_after 100
+log_wait "$dash_mark" "dash item $delta_key frame scale=0.2500 opacity=0.2500" ||
+    fail G-DASH-MOTION "100 ms out, the item was not at ease-out-quad 25%"
+dash_after 100
+log_wait "$dash_mark" "dash item $delta_key settle scale=0.0000 opacity=0.0000" ||
+    fail G-DASH-MOTION "the closed app's item did not leave in 200 ms"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-dash-removed.json" 20 ||
+    fail G-DASH-MOTION "accessibility dump failed"
+showing "$ARTIFACTS/a11y-dash-removed.json" tuna-test-delta &&
+    fail G-DASH-MOTION "the removed item stayed in the dash"
+# Reduced Motion: the item keeps its size and only fades.
+motion_policy FadesOnly
+dash_mark="$(log_mark)"
+dash_window Epsilon '#986a44'
+log_wait "$dash_mark" "dash item $dash_key show start from=0.0000,0.0000 ms=200 motion=fade-only clock=manual" ||
+    fail G-DASH-MOTION "Reduced Motion dropped the item's fade"
+dash_after 100
+log_wait "$dash_mark" "dash item $dash_key frame scale=1.0000 opacity=0.7500" ||
+    fail G-DASH-MOTION "under Reduced Motion the item zoomed, or did not fade"
+dash_after 100
+log_wait "$dash_mark" "dash item $dash_key settle scale=1.0000 opacity=1.0000" ||
+    fail G-DASH-MOTION "under Reduced Motion the item did not settle"
+dash_close "$dash_pid"
+log_wait "$dash_mark" "dash item $dash_key hide start from=1.0000,1.0000 ms=200 motion=fade-only" ||
+    fail G-DASH-MOTION "under Reduced Motion the leaving item did not fade"
+dash_after 100
+log_wait "$dash_mark" "dash item $dash_key frame scale=1.0000 opacity=0.2500" ||
+    fail G-DASH-MOTION "under Reduced Motion the leaving item shrank"
+dash_after 100
+log_wait "$dash_mark" "dash item $dash_key settle scale=1.0000 opacity=0.0000" ||
+    fail G-DASH-MOTION "under Reduced Motion the leaving item did not settle"
+# Animations off: in and out at once.
+motion_policy Off
+dash_mark="$(log_mark)"
+dash_window Epsilon '#986a44'
+log_wait "$dash_mark" "dash item $dash_key show instant motion=off" ||
+    fail G-DASH-MOTION "with animations off the item still zoomed in"
+dash_close "$dash_pid"
+log_wait "$dash_mark" "dash item $dash_key hide instant motion=off" ||
+    fail G-DASH-MOTION "with animations off the item still zoomed out"
+motion_policy Full
+real_clock || fail G-DASH-MOTION "removing the clock file did not resume real time"
+xdotool key Escape
+cstate '.overview_open | not' "dash overview closed" || fail G-DASH-MOTION "the overview would not close"
+pass G-DASH-MOTION "dash items zoom and fade in and out over 200 ms ease-out-quad, a leaving item reverses from where it stands, hover labels fade 150/100 ms after 300 ms; Reduced Motion only fades, off is instant"
 
 # Notifications (#56). Close whatever the grid left open first (#97).
 xdotool key Escape
