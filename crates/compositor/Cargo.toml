@@ -25,6 +25,10 @@ xkbcommon.workspace = true
 png = "0.18"
 # EDID and ICC checksums (colord device/profile ids, P-DS-03).
 md-5 = "0.11"
+# ICC image descriptions without a matrix/TRC model (wp_color_manager_v1,
+# P-DS-03): the profile's transform sampled into a 3D LUT, as Mutter does
+# with lcms2. Already built for `image`.
+moxcms = "=0.8.1"
 # PNP vendor names from the udev hwdb, as gnome-desktop looks them up.
 udev = { version = "0.9", features = ["hwdb"], optional = true }
 # Raw KMS property blobs for GAMMA_LUT/CTM (the drm crate takes sized values only).
