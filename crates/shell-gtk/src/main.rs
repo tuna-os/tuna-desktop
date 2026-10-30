@@ -161,6 +161,8 @@ struct Drained {
     osk: Vec<(Option<tuna_shell_control::TextFieldFocus>, bool, bool)>,
     /// Drawing-tablet OSD messages, in arrival order.
     tablet: Vec<TabletUi>,
+    /// Mutter's seat touch-mode, when the compositor changed it.
+    touch_mode: Option<bool>,
 }
 
 /// One compositor request for the tablet OSDs (wire 0.45).
@@ -295,6 +297,7 @@ fn drain(
                 out.tablet.push(TabletUi::Input { pad, event });
             }
             Handled::ClosePadOsd { pad } => out.tablet.push(TabletUi::Close(pad)),
+            Handled::SeatTouchMode(touch_mode) => out.touch_mode = Some(touch_mode),
             Handled::CommandResult { id, status } => out.results.push((
                 id,
                 matches!(status, tuna_shell_control::CommandStatus::Applied),
@@ -3625,6 +3628,7 @@ fn build(app: &adw::Application) {
                     pointer_timeouts,
                     tablet,
                     osk: osk_updates,
+                    touch_mode,
                 } = drained;
                 let mut shell = shell.borrow_mut();
                 let locked = shell.control.as_ref().is_some_and(|c| c.locked());
@@ -3675,6 +3679,9 @@ fn build(app: &adw::Application) {
                     release_panel_focus(&panel_focus_window, &panel_focus_held);
                 }
                 ibus_properties.sync_lock();
+                if let Some(touch_mode) = touch_mode {
+                    lock_ui.set_touch_mode(touch_mode);
+                }
                 lock_ui.sync_connection_generation(auth_generation);
                 if let Some(locked) = authoritative_lock {
                     lock_ui.sync(locked);

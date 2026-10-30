@@ -10,16 +10,22 @@
 //! key, click or wheel step eases the value over [`CROSSFADE_MS`]
 //! ease-out quad (`_showPrompt`, `_showClock`). A vertical pointer drag
 //! (`Clutter.PanGesture`, recognized after [`DRAG_THRESHOLD`] px; the
-//! session hands touch to the lock surface as the primary button) moves
-//! the value with the pointer; on release `SwipeTracker` projects the
-//! release velocity onto the two pages and finishes in 100-400 ms
-//! ease-out cubic.
+//! session hands touch to the lock surface as the primary button), a
+//! three-finger touchpad swipe ([`TouchpadSwipe`]) or a two-finger
+//! touchpad scroll ([`ScrollGesture`], ended by the axis stop) moves the
+//! value; on release `SwipeTracker` projects the release velocity onto
+//! the two pages and finishes in 100-400 ms ease-out cubic.
+//!
+//! The clock's hint ([`Hint`], `UnlockDialogClock._hint`) is hidden
+//! until the session has been idle for [`HINT_TIMEOUT_MS`], then fades
+//! in over [`CROSSFADE_MS`]; it says "Swipe up" in touch mode and "Click
+//! or press a key" otherwise ([`hint_text`]).
 //!
 //! Reduced Motion keeps the fades and drops the translation and scale
 //! (as `_setTransitionProgress` does); animations off land at once; the
 //! slow-down factor stretches every ease. Time is
-//! [`crate::anim_clock`], so a nested proof can sample the curtain on
-//! the compositor's frozen clock.
+//! [`crate::anim_clock`], so a nested proof can sample the curtain and
+//! the hint on the compositor's frozen clock.
 //!
 //! Only the two pages move inside the lock window: the window, its
 //! input and the authentication path are untouched. A page is hidden
@@ -37,6 +43,7 @@ use gtk4::subclass::prelude::*;
 
 use crate::transient::{ease_out_quad, lerp, Frame};
 use crate::ws_dots::ease_out_cubic;
+use tuna_shell_control::MotionPolicy;
 
 /// `CROSSFADE_TIME`: clock to prompt and back by key, click or wheel.
 pub const CROSSFADE_MS: f64 = 300.0;
@@ -61,6 +68,567 @@ const DECELERATION_PARABOLA_MULTIPLIER: f64 = 0.35;
 /// The derivative of ease-out cubic at 0: a release keeps its speed.
 const DURATION_MULTIPLIER: f64 = 3.0;
 const ANIMATION_BASE_VELOCITY: f64 = 0.002;
+/// `TOUCHPAD_BASE_HEIGHT`: the page a touchpad swipe or scroll moves
+/// over (swipeTracker.js passes it, not the stack's height, for
+/// touchpad updates and releases).
+pub const TOUCHPAD_DISTANCE: f64 = 300.0;
+const VELOCITY_THRESHOLD_TOUCHPAD: f64 = 0.6;
+const DECELERATION_TOUCHPAD: f64 = 0.997;
+/// `GESTURE_FINGER_COUNT`: fewer fingers are not a swipe.
+pub const SWIPE_FINGERS: u32 = 3;
+/// `HINT_TIMEOUT` (unlockDialog.js:31): idle time before the hint shows.
+pub const HINT_TIMEOUT_MS: u32 = 4000;
+
+/// What moves the curtain: a pointer or touch drag, or a touchpad
+/// swipe or scroll (`isTouchpad` in `_endGesture`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Source {
+    #[default]
+    Drag,
+    Swipe,
+    Scroll,
+}
+
+impl Source {
+    pub fn name(self) -> &'static str {
+        match self {
+            Source::Drag => "drag",
+            Source::Swipe => "swipe",
+            Source::Scroll => "scroll",
+        }
+    }
+
+    pub fn touchpad(self) -> bool {
+        self != Source::Drag
+    }
+}
+
+/// swipeTracker.js `EventHistory`: the touchpad deltas of the last
+/// 150 ms. `trim` keeps everything when nothing is that recent, as
+/// `splice(0, -1)` removes nothing.
+#[derive(Debug, Default, Clone)]
+pub struct EventHistory {
+    samples: VecDeque<(u32, f64)>,
+}
+
+impl EventHistory {
+    pub fn trim(&mut self, time: u32) {
+        let threshold = i64::from(time) - i64::from(HISTORY_MS);
+        if let Some(index) = self
+            .samples
+            .iter()
+            .position(|&(at, _)| i64::from(at) >= threshold)
+        {
+            self.samples.drain(..index);
+        }
+    }
+
+    pub fn append(&mut self, time: u32, delta: f64) {
+        self.trim(time);
+        self.samples.push_back((time, delta));
+    }
+
+    /// `calculateVelocity`: every delta but the first over the time the
+    /// samples span, in delta units per ms.
+    pub fn velocity(&self) -> f64 {
+        let (Some(&(first, _)), Some(&(last, _))) = (self.samples.front(), self.samples.back())
+        else {
+            return 0.0;
+        };
+        if self.samples.len() < 2 || first == last {
+            return 0.0;
+        }
+        let total: f64 = self.samples.iter().skip(1).map(|&(_, delta)| delta).sum();
+        total / (f64::from(last) - f64::from(first))
+    }
+
+    pub fn reset(&mut self) {
+        self.samples.clear();
+    }
+}
+
+/// What a touchpad gesture hands the tracker: a begin (with the delta of
+/// the event that began it), an update, or the end.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Step {
+    Begin { time: u32, delta: f64 },
+    Update { time: u32, delta: f64 },
+    End { time: u32 },
+}
+
+/// A touchpad swipe event's phase; GNOME ends on a cancel as on an end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwipePhase {
+    Begin,
+    Update,
+    End,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PadState {
+    #[default]
+    None,
+    Pending,
+    Handling,
+    Ignored,
+}
+
+/// swipeTracker.js `TouchpadSwipeGesture`, vertical: three or more
+/// fingers; nothing moves until they have gone [`DRAG_THRESHOLD`] px,
+/// then a vertical swipe is handled and a horizontal one ignored to its
+/// end. The deltas are the fingers', turned round under natural
+/// scrolling.
+#[derive(Debug, Default, Clone)]
+pub struct TouchpadSwipe {
+    state: PadState,
+    cumulative: (f64, f64),
+}
+
+impl TouchpadSwipe {
+    /// One touchpad swipe event (`_handleEvent`). Returns what the
+    /// tracker hears and whether the event is the curtain's.
+    pub fn event(
+        &mut self,
+        phase: SwipePhase,
+        fingers: u32,
+        (dx, dy): (f64, f64),
+        time: u32,
+        natural_scroll: bool,
+    ) -> (Option<Step>, bool) {
+        if phase == SwipePhase::Begin {
+            self.state = PadState::None;
+        }
+        if fingers < SWIPE_FINGERS || self.state == PadState::Ignored {
+            return (None, false);
+        }
+        if self.state == PadState::None {
+            if dx == 0.0 && dy == 0.0 {
+                return (None, false);
+            }
+            self.cumulative = (0.0, 0.0);
+            self.state = PadState::Pending;
+        }
+        let mut began = false;
+        if self.state == PadState::Pending {
+            self.cumulative.0 += dx;
+            self.cumulative.1 += dy;
+            let (cx, cy) = self.cumulative;
+            if cx.hypot(cy) < DRAG_THRESHOLD {
+                return (None, false);
+            }
+            self.cumulative = (0.0, 0.0);
+            if cx.abs() > cy.abs() {
+                self.state = PadState::Ignored;
+                return (None, false);
+            }
+            self.state = PadState::Handling;
+            began = true;
+        }
+        let step = match phase {
+            SwipePhase::Begin | SwipePhase::Update => {
+                let delta = if natural_scroll { -dy } else { dy };
+                if began {
+                    Step::Begin { time, delta }
+                } else {
+                    Step::Update { time, delta }
+                }
+            }
+            SwipePhase::End => {
+                self.state = PadState::None;
+                Step::End { time }
+            }
+        };
+        (Some(step), self.state == PadState::Handling)
+    }
+}
+
+/// swipeTracker.js `ScrollGesture`, vertical: a two-finger touchpad
+/// scroll follows from its first moving event and ends on the axis stop.
+/// GTK's surface-unit deltas are libinput's pixels, Clutter's deltas
+/// times `SCROLL_MULTIPLIER`, so they are the tracker's deltas as they
+/// come.
+#[derive(Debug, Default, Clone)]
+pub struct ScrollGesture {
+    began: bool,
+}
+
+impl ScrollGesture {
+    /// One smooth touchpad scroll; both deltas zero is the stop.
+    pub fn scroll(&mut self, dx: f64, dy: f64, time: u32) -> Step {
+        if dx == 0.0 && dy == 0.0 {
+            return self.stop(time);
+        }
+        if self.began {
+            Step::Update { time, delta: dy }
+        } else {
+            self.began = true;
+            Step::Begin { time, delta: dy }
+        }
+    }
+
+    /// The axis stop (`get_scroll_delta` 0, 0): the end, even of a
+    /// scroll that never began (the tracker ignores that one).
+    pub fn stop(&mut self, time: u32) -> Step {
+        self.began = false;
+        Step::End { time }
+    }
+}
+
+/// `Clock._updateHint` without an authentication mechanism's hint.
+pub fn hint_text(touch_mode: bool) -> &'static str {
+    if touch_mode {
+        "Swipe up"
+    } else {
+        "Click or press a key"
+    }
+}
+
+/// The hint's opacity (`_hint.opacity`, unlockDialog.js:378-409): 0
+/// until the idle watch fires, then eased to 1 over [`CROSSFADE_MS`] from
+/// where it stands, on Clutter's default mode, ease-out cubic (mutter
+/// 51.0 clutter-actor.c:17306, `ease` names no mode here); a power-save
+/// change sets 0 at once, dropping any ease.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HintFade {
+    opacity: f64,
+    tween: Option<Tween>,
+}
+
+impl HintFade {
+    pub fn opacity(&self) -> f64 {
+        self.opacity
+    }
+
+    pub fn easing(&self) -> bool {
+        self.tween.is_some()
+    }
+
+    /// The idle watch fired at `now`. Returns the ease's length under
+    /// `policy`; 0 lands at once (animations off). Reduced Motion keeps
+    /// the fade, as it keeps every opacity change.
+    pub fn show(&mut self, now: Duration, policy: MotionPolicy) -> f64 {
+        let duration = policy.adjust_ms(CROSSFADE_MS);
+        if duration <= 0.0 {
+            self.opacity = 1.0;
+            self.tween = None;
+        } else {
+            self.tween = Some(Tween {
+                from: self.opacity,
+                to: 1.0,
+                start: now,
+                duration_ms: duration,
+                ease: Ease::OutCubic,
+            });
+        }
+        duration
+    }
+
+    /// `power-save-mode-changed`: transparent at once.
+    pub fn hide(&mut self) {
+        self.opacity = 0.0;
+        self.tween = None;
+    }
+
+    /// Move the ease to `now`; true while it still runs.
+    pub fn tick(&mut self, now: Duration) -> bool {
+        let Some(tween) = self.tween else {
+            return false;
+        };
+        let (value, done) = tween.at(now);
+        self.opacity = value;
+        if done {
+            self.tween = None;
+        }
+        !done
+    }
+}
+
+/// The clock's hint label on [`HintFade`], stepped on the label's frame
+/// clock and timed on [`crate::anim_clock`].
+pub struct Hint {
+    label: gtk::Label,
+    fade: Cell<HintFade>,
+    ticking: Cell<bool>,
+}
+
+impl Hint {
+    /// The hint over `label`, transparent, saying what `touch_mode` asks.
+    pub fn new(label: &gtk::Label, touch_mode: bool) -> Rc<Self> {
+        label.set_opacity(0.0);
+        let hint = Rc::new(Self {
+            label: label.clone(),
+            fade: Cell::new(HintFade::default()),
+            ticking: Cell::new(false),
+        });
+        hint.set_touch_mode(touch_mode);
+        hint
+    }
+
+    /// `_updateHint` on `notify::touch-mode`.
+    pub fn set_touch_mode(&self, touch_mode: bool) {
+        let text = hint_text(touch_mode);
+        if self.label.label() != text {
+            self.label.set_label(text);
+            trace(format_args!("hint text={text}"));
+        }
+    }
+
+    /// The idle watch fired: ease in. An unmapped hint lands at once.
+    pub fn show(self: &Rc<Self>) {
+        let mapped = self.label.is_mapped();
+        let policy = if mapped {
+            crate::motion::current()
+        } else {
+            MotionPolicy::from_gnome(false, false, 1.0)
+        };
+        let mut fade = self.fade.get();
+        let from = fade.opacity();
+        let now = if mapped {
+            crate::anim_clock::now()
+        } else {
+            Duration::ZERO
+        };
+        let duration = fade.show(now, policy);
+        self.fade.set(fade);
+        trace(format_args!(
+            "hint ease to=1 from={from:.3} duration={duration:.0} nominal={CROSSFADE_MS:.0} mode=ease-out-cubic clock={}",
+            if !fade.easing() {
+                "instant"
+            } else if crate::anim_clock::manual() {
+                "manual"
+            } else {
+                "real"
+            }
+        ));
+        self.apply();
+        if !fade.easing() {
+            trace(format_args!("hint settled opacity={:.3}", fade.opacity()));
+        } else if !self.ticking.replace(true) {
+            let weak = Rc::downgrade(self);
+            self.label.add_tick_callback(move |_, _| {
+                weak.upgrade()
+                    .map_or(glib::ControlFlow::Break, |hint| hint.tick())
+            });
+        }
+    }
+
+    /// A power-save change: transparent at once.
+    pub fn hide(&self) {
+        let mut fade = self.fade.get();
+        fade.hide();
+        self.fade.set(fade);
+        self.apply();
+        trace(format_args!("hint hidden"));
+    }
+
+    fn tick(&self) -> glib::ControlFlow {
+        let mut fade = self.fade.get();
+        let before = fade.opacity();
+        let running = fade.tick(crate::anim_clock::now());
+        self.fade.set(fade);
+        if fade.opacity() != before {
+            self.apply();
+            trace(format_args!("hint frame opacity={:.3}", fade.opacity()));
+        }
+        if running {
+            return glib::ControlFlow::Continue;
+        }
+        self.ticking.set(false);
+        if fade.opacity() >= 1.0 {
+            trace(format_args!("hint settled opacity={:.3}", fade.opacity()));
+        }
+        glib::ControlFlow::Break
+    }
+
+    fn apply(&self) {
+        self.label
+            .set_opacity(self.fade.get().opacity().clamp(0.0, 1.0));
+    }
+}
+
+const IDLE_MONITOR: &str = "org.gnome.Mutter.IdleMonitor";
+const IDLE_MONITOR_CORE: &str = "/org/gnome/Mutter/IdleMonitor/Core";
+const DISPLAY_CONFIG: &str = "org.gnome.Mutter.DisplayConfig";
+const DISPLAY_CONFIG_PATH: &str = "/org/gnome/Mutter/DisplayConfig";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum IdleWatch {
+    #[default]
+    Off,
+    /// AddIdleWatch sent, no reply yet.
+    Pending,
+    Armed(u32),
+}
+
+/// What the hints follow while the lock screens are up: the core idle
+/// monitor's [`HINT_TIMEOUT_MS`] watch (`add_idle_watch`, over
+/// org.gnome.Mutter.IdleMonitor), mutter's power-save changes (the
+/// DisplayConfig `PowerSaveMode` property) and the seat's touch-mode.
+#[derive(Default)]
+pub struct HintWatch {
+    hints: RefCell<Vec<std::rc::Weak<Hint>>>,
+    touch_mode: Cell<bool>,
+    watch: Cell<IdleWatch>,
+    /// Watch ids fired before AddIdleWatch answered: a session already
+    /// idle that long fires at once, as Mutter's does.
+    early: RefCell<Vec<u32>>,
+    conn: RefCell<Option<gio::DBusConnection>>,
+    subscriptions: RefCell<Vec<gio::SignalSubscription>>,
+}
+
+impl HintWatch {
+    pub fn new() -> Rc<Self> {
+        Rc::default()
+    }
+
+    /// A lock window's hint joins: it says what touch-mode asks and
+    /// shows when the watch fires.
+    pub fn add(&self, hint: &Rc<Hint>) {
+        hint.set_touch_mode(self.touch_mode.get());
+        self.hints.borrow_mut().push(Rc::downgrade(hint));
+    }
+
+    /// The seat's touch-mode changed (`notify::touch-mode`).
+    pub fn set_touch_mode(&self, touch_mode: bool) {
+        self.touch_mode.set(touch_mode);
+        for hint in self.live() {
+            hint.set_touch_mode(touch_mode);
+        }
+    }
+
+    fn live(&self) -> Vec<Rc<Hint>> {
+        let mut hints = self.hints.borrow_mut();
+        hints.retain(|hint| hint.strong_count() > 0);
+        hints.iter().filter_map(std::rc::Weak::upgrade).collect()
+    }
+
+    fn fire(&self) {
+        for hint in self.live() {
+            hint.show();
+        }
+    }
+
+    /// The lock screens are up: watch for [`HINT_TIMEOUT_MS`] of idle
+    /// time and for power-save changes. Without a session bus the hints
+    /// stay hidden.
+    pub fn arm(self: &Rc<Self>) {
+        if self.watch.get() != IdleWatch::Off {
+            return;
+        }
+        let Ok(conn) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        let fired = conn.subscribe_to_signal(
+            Some(IDLE_MONITOR),
+            Some(IDLE_MONITOR),
+            Some("WatchFired"),
+            Some(IDLE_MONITOR_CORE),
+            None,
+            gio::DBusSignalFlags::NONE,
+            move |signal| {
+                let (Some(watch), Some((id,))) =
+                    (weak.upgrade(), signal.parameters.get::<(u32,)>())
+                else {
+                    return;
+                };
+                match watch.watch.get() {
+                    IdleWatch::Armed(armed) if armed == id => watch.fire(),
+                    IdleWatch::Pending => watch.early.borrow_mut().push(id),
+                    _ => {}
+                }
+            },
+        );
+        let weak = Rc::downgrade(self);
+        let power = conn.subscribe_to_signal(
+            Some(DISPLAY_CONFIG),
+            Some("org.freedesktop.DBus.Properties"),
+            Some("PropertiesChanged"),
+            Some(DISPLAY_CONFIG_PATH),
+            Some(DISPLAY_CONFIG),
+            gio::DBusSignalFlags::NONE,
+            move |signal| {
+                let Some(watch) = weak.upgrade() else {
+                    return;
+                };
+                let changed = signal
+                    .parameters
+                    .get::<(String, glib::VariantDict, Vec<String>)>()
+                    .is_some_and(|(_, changed, invalidated)| {
+                        changed.contains("PowerSaveMode")
+                            || invalidated.iter().any(|name| name == "PowerSaveMode")
+                    });
+                if changed {
+                    for hint in watch.live() {
+                        hint.hide();
+                    }
+                }
+            },
+        );
+        *self.subscriptions.borrow_mut() = vec![fired, power];
+        self.watch.set(IdleWatch::Pending);
+        let weak = Rc::downgrade(self);
+        conn.call(
+            Some(IDLE_MONITOR),
+            IDLE_MONITOR_CORE,
+            IDLE_MONITOR,
+            "AddIdleWatch",
+            Some(&(u64::from(HINT_TIMEOUT_MS),).to_variant()),
+            glib::VariantTy::new("(u)").ok(),
+            gio::DBusCallFlags::NO_AUTO_START,
+            1000,
+            gio::Cancellable::NONE,
+            move |reply| {
+                let id = reply.ok().and_then(|r| r.get::<(u32,)>()).map(|(id,)| id);
+                let Some(watch) = weak.upgrade() else {
+                    return;
+                };
+                let early = std::mem::take(&mut *watch.early.borrow_mut());
+                match (watch.watch.get(), id) {
+                    (IdleWatch::Pending, Some(id)) => {
+                        watch.watch.set(IdleWatch::Armed(id));
+                        if early.contains(&id) {
+                            watch.fire();
+                        }
+                    }
+                    // Disarmed meanwhile: give the watch back.
+                    (IdleWatch::Off, Some(id)) => watch.remove(id),
+                    (IdleWatch::Pending, None) => watch.watch.set(IdleWatch::Off),
+                    _ => {}
+                }
+            },
+        );
+        *self.conn.borrow_mut() = Some(conn);
+    }
+
+    fn remove(&self, id: u32) {
+        if let Some(conn) = self.conn.borrow().as_ref() {
+            conn.call(
+                Some(IDLE_MONITOR),
+                IDLE_MONITOR_CORE,
+                IDLE_MONITOR,
+                "RemoveWatch",
+                Some(&(id,).to_variant()),
+                None,
+                gio::DBusCallFlags::NO_AUTO_START,
+                1000,
+                gio::Cancellable::NONE,
+                |_| {},
+            );
+        }
+    }
+
+    /// The lock screens went: drop the watch (`_onDestroy`) and the
+    /// hints.
+    pub fn disarm(&self) {
+        if let IdleWatch::Armed(id) = self.watch.replace(IdleWatch::Off) {
+            self.remove(id);
+        }
+        self.subscriptions.borrow_mut().clear();
+        self.early.borrow_mut().clear();
+        self.hints.borrow_mut().clear();
+    }
+}
 
 /// The page the dialog shows or is heading to (`_activePage`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -230,10 +798,6 @@ impl Pan {
         }
     }
 
-    pub fn recognized(&self) -> bool {
-        self.recognized
-    }
-
     /// The drag is `offset_y` px from where it started at `time`: the
     /// vertical delta to apply, once recognized.
     pub fn motion(&mut self, offset_y: f64, time: u32) -> Option<f64> {
@@ -281,8 +845,9 @@ impl Swipe {
 
     /// Where the released swipe settles and how long it takes
     /// (`_getEndProgress` and `_endGesture`); `velocity` is in swipe
-    /// units per ms, toward the prompt positive.
-    pub fn end(&self, velocity: f64, distance: f64, cancelled: bool) -> (f64, f64) {
+    /// units per ms, toward the prompt positive; `touchpad` picks the
+    /// touchpad thresholds.
+    pub fn end(&self, velocity: f64, distance: f64, cancelled: bool, touchpad: bool) -> (f64, f64) {
         release(
             self.progress,
             self.initial,
@@ -290,6 +855,7 @@ impl Swipe {
             velocity,
             distance,
             cancelled,
+            touchpad,
         )
     }
 }
@@ -303,8 +869,8 @@ fn closest(pos: f64) -> f64 {
     }
 }
 
-/// `_getEndProgress` and `_endGesture` for a pan (touch thresholds,
-/// `isTouchpad` false) over snap points `[0, 1]`.
+/// `_getEndProgress` and `_endGesture` over snap points `[0, 1]`, with
+/// the touch or (`touchpad`) the touchpad thresholds.
 fn release(
     progress: f64,
     initial: f64,
@@ -312,13 +878,19 @@ fn release(
     velocity: f64,
     distance: f64,
     cancelled: bool,
+    touchpad: bool,
 ) -> (f64, f64) {
+    let (threshold, deceleration) = if touchpad {
+        (VELOCITY_THRESHOLD_TOUCHPAD, DECELERATION_TOUCHPAD)
+    } else {
+        (VELOCITY_THRESHOLD_TOUCH, DECELERATION_TOUCH)
+    };
     let end = if cancelled {
         cancel
-    } else if velocity.abs() < VELOCITY_THRESHOLD_TOUCH {
+    } else if velocity.abs() < threshold {
         closest(progress)
     } else {
-        let slope = DECELERATION_TOUCH / (1.0 - DECELERATION_TOUCH) / 1000.0;
+        let slope = deceleration / (1.0 - deceleration) / 1000.0;
         let speed = velocity.abs();
         let travel = if speed > VELOCITY_CURVE_THRESHOLD {
             let c = slope / 2.0 / DECELERATION_PARABOLA_MULTIPLIER;
@@ -385,6 +957,10 @@ mod imp {
         pub active: Cell<Page>,
         pub motion: Cell<bool>,
         pub swipe: Cell<Option<Swipe>>,
+        /// What began the swipe under way.
+        pub source: Cell<Source>,
+        /// The touchpad gesture's deltas (`SwipeTracker._history`).
+        pub history: RefCell<EventHistory>,
         pub tween: Cell<Option<Tween>>,
         pub ticking: Cell<bool>,
         pub settled: RefCell<Option<Settled>>,
@@ -549,21 +1125,31 @@ impl Curtain {
     }
 
     /// `_swipeBegin`: stop any ease and follow from the current progress.
-    /// Returns the page distance for drags (`_stack.height`, the taller
-    /// page).
-    pub fn swipe_begin(&self, source: &str) -> f64 {
+    /// Returns the page distance the source moves over (`_stack.height`
+    /// for drags, [`TOUCHPAD_DISTANCE`] for the touchpad), or `None`
+    /// while another swipe is under way (`_beginGesture`).
+    pub fn swipe_begin(&self, source: Source) -> Option<f64> {
         let imp = self.imp();
+        if imp.swipe.get().is_some() {
+            return None;
+        }
         imp.tween.set(None);
         imp.motion.set(crate::motion::current().allows_motion());
         imp.swipe.set(Some(Swipe::begin(imp.progress.get())));
+        imp.source.set(source);
         // Both pages take part while the pointer leads.
         self.apply();
-        let distance = self.stack_height();
+        let distance = if source.touchpad() {
+            TOUCHPAD_DISTANCE
+        } else {
+            self.stack_height()
+        };
         trace(format_args!(
-            "swipe begin source={source} progress={:.4} distance={distance:.0}",
+            "swipe begin source={} progress={:.4} distance={distance:.0}",
+            source.name(),
             imp.progress.get()
         ));
-        distance
+        Some(distance)
     }
 
     /// `_swipeUpdate`: `delta` swipe units over a page of `distance`.
@@ -580,27 +1166,66 @@ impl Curtain {
 
     /// `_swipeEnd`: settle on the page the release velocity (swipe units
     /// per ms, toward the prompt positive) projects to. Returns that page.
-    pub fn swipe_end(
-        &self,
-        source: &str,
-        velocity: f64,
-        distance: f64,
-        cancelled: bool,
-    ) -> Option<Page> {
+    pub fn swipe_end(&self, velocity: f64, distance: f64, cancelled: bool) -> Option<Page> {
         let imp = self.imp();
         let swipe = imp.swipe.take()?;
-        let (end, duration) = swipe.end(velocity, distance, cancelled);
+        let source = imp.source.get();
+        imp.history.borrow_mut().reset();
+        let (end, duration) = swipe.end(velocity, distance, cancelled, source.touchpad());
         let page = if end > 0.5 { Page::Prompt } else { Page::Clock };
         imp.active.set(page);
         if page == Page::Clock {
             self.leave_prompt();
         }
         trace(format_args!(
-            "swipe end source={source} progress={:.6} initial={:.6} velocity={:.6} distance={distance:.0} cancelled={cancelled} end={end:.0} duration={duration:.3}",
-            swipe.progress, swipe.initial, velocity
+            "swipe end source={} progress={:.6} initial={:.6} velocity={:.6} distance={distance:.0} cancelled={cancelled} end={end:.0} duration={duration:.3}",
+            source.name(),
+            swipe.progress,
+            swipe.initial,
+            velocity
         ));
         self.ease_to(end, duration, Ease::OutCubic);
         Some(page)
+    }
+
+    /// One step of a touchpad swipe or scroll (`_beginTouchpadGesture`,
+    /// `_updateTouchpadGesture`, `_endTouchpadGesture`). `begin` runs
+    /// when this step began the swipe (`_ensureAuthPrompt`). Returns the
+    /// page an end settles on.
+    pub fn touchpad(&self, source: Source, step: Step, begin: impl FnOnce()) -> Option<Page> {
+        let imp = self.imp();
+        let ours = || imp.swipe.get().is_some() && imp.source.get() == source;
+        match step {
+            Step::Begin { time, delta } => {
+                imp.history.borrow_mut().append(time, 0.0);
+                if self.swipe_begin(source).is_some() {
+                    begin();
+                }
+                if ours() {
+                    imp.history.borrow_mut().append(time, delta);
+                    self.swipe_update(delta, TOUCHPAD_DISTANCE);
+                }
+                None
+            }
+            Step::Update { time, delta } => {
+                if ours() {
+                    imp.history.borrow_mut().append(time, delta);
+                    self.swipe_update(delta, TOUCHPAD_DISTANCE);
+                }
+                None
+            }
+            Step::End { time } => {
+                if !ours() {
+                    return None;
+                }
+                let velocity = {
+                    let mut history = imp.history.borrow_mut();
+                    history.trim(time);
+                    history.velocity()
+                };
+                self.swipe_end(velocity, TOUCHPAD_DISTANCE, false)
+            }
+        }
     }
 
     /// `_stack.height`: the taller page's content, without the margin
@@ -852,7 +1477,6 @@ mod tests {
         // The event that crosses the threshold moves by its own delta.
         let delta = pan.motion(-26.0, 1030).unwrap();
         assert!(close(delta, -10.1));
-        assert!(pan.recognized());
         assert!(close(pan.motion(-36.0, 1040).unwrap(), -10.0));
         // Moving back down counts as well.
         assert!(close(pan.motion(-30.0, 1050).unwrap(), 6.0));
@@ -883,12 +1507,12 @@ mod tests {
     fn slow_releases_settle_on_the_nearer_page() {
         let mut swipe = Swipe::begin(0.0);
         assert!(close(swipe.update(90.0, 300.0), 0.3));
-        let (end, duration) = swipe.end(0.0, 300.0, false);
+        let (end, duration) = swipe.end(0.0, 300.0, false, false);
         assert_eq!(end, 0.0);
         // Back at ANIMATION_BASE_VELOCITY: 0.3 / 0.002 * 3 = 450, capped.
         assert!(close(duration, 400.0));
         swipe.update(120.0, 300.0);
-        let (end, duration) = swipe.end(0.1, 300.0, false);
+        let (end, duration) = swipe.end(0.1, 300.0, false, false);
         assert_eq!(end, 1.0);
         // Too slow to project: the nearer page, the prompt; capped at
         // 400 ms (0.3 / (0.1 / 300) * 3 = 2700 ms).
@@ -899,7 +1523,7 @@ mod tests {
             progress: 0.5,
             cancel: 0.0,
         };
-        assert_eq!(half.end(0.0, 300.0, false).0, 0.0);
+        assert_eq!(half.end(0.0, 300.0, false, false).0, 0.0);
         // Never past either page.
         let mut far = Swipe::begin(1.0);
         assert_eq!(far.update(500.0, 300.0), 1.0);
@@ -911,26 +1535,26 @@ mod tests {
         let mut swipe = Swipe::begin(0.0);
         swipe.update(30.0, 300.0);
         // 0.6 px/ms toward the prompt beats the 0.3 touch threshold.
-        let (end, duration) = swipe.end(0.6, 300.0, false);
+        let (end, duration) = swipe.end(0.6, 300.0, false, false);
         assert_eq!(end, 1.0);
         // (1 - 0.1) / (0.6 / 300) * 3 = 1350 ms, capped at 400.
         assert!(close(duration, 400.0));
         // A fast flick finishes sooner: 0.9 / (6 / 300) * 3 = 135 ms.
-        let (_, fast) = swipe.end(6.0, 300.0, false);
+        let (_, fast) = swipe.end(6.0, 300.0, false, false);
         assert!(close(fast, 135.0));
         // Toward the clock from the prompt.
         let mut down = Swipe::begin(1.0);
         down.update(-30.0, 300.0);
-        assert_eq!(down.end(-0.6, 300.0, false).0, 0.0);
+        assert_eq!(down.end(-0.6, 300.0, false, false).0, 0.0);
         // Below the touch threshold the nearer page wins.
-        assert_eq!(swipe.end(0.29, 300.0, false).0, 0.0);
+        assert_eq!(swipe.end(0.29, 300.0, false, false).0, 0.0);
         // Velocity against the end slows to the base rate, min 100 ms.
         let near = Swipe {
             initial: 0.0,
             progress: 0.99,
             cancel: 0.0,
         };
-        let (end, duration) = near.end(0.0, 300.0, false);
+        let (end, duration) = near.end(0.0, 300.0, false, false);
         assert_eq!(end, 1.0);
         assert!(close(duration, 100.0));
     }
@@ -939,10 +1563,255 @@ mod tests {
     fn a_cancelled_swipe_returns_to_where_it_began() {
         let mut swipe = Swipe::begin(0.0);
         swipe.update(250.0, 300.0);
-        assert_eq!(swipe.end(5.0, 300.0, true).0, 0.0);
+        assert_eq!(swipe.end(5.0, 300.0, true, false).0, 0.0);
         let mut back = Swipe::begin(1.0);
         back.update(-250.0, 300.0);
-        assert_eq!(back.end(-5.0, 300.0, true).0, 1.0);
+        assert_eq!(back.end(-5.0, 300.0, true, false).0, 1.0);
+        assert_eq!(back.end(-5.0, 300.0, true, true).0, 1.0);
+    }
+
+    /// swipeTracker.js `_getEndProgress` with `isTouchpad`: the release
+    /// must beat 0.6 (not 0.3) to project, and projects with 0.997.
+    #[test]
+    fn touchpad_releases_use_the_touchpad_thresholds() {
+        let mut swipe = Swipe::begin(0.0);
+        swipe.update(30.0, TOUCHPAD_DISTANCE);
+        // 0.5 delta/ms flicks a touch drag up, not a touchpad.
+        assert_eq!(swipe.end(0.5, TOUCHPAD_DISTANCE, false, false).0, 1.0);
+        assert_eq!(swipe.end(0.5, TOUCHPAD_DISTANCE, false, true).0, 0.0);
+        // Past 0.6 it projects: 0.997 / 0.003 / 1000 * 0.7 = 0.23 more,
+        // short of half way, yet `_findPointForProjection` moves on.
+        let (end, duration) = swipe.end(0.7, TOUCHPAD_DISTANCE, false, true);
+        assert_eq!(end, 1.0);
+        // 0.9 / (0.7 / 300) * 3 = 1157 ms, capped at 400.
+        assert!(close(duration, 400.0));
+        // A fast one finishes sooner: 0.9 / (6 / 300) * 3 = 135 ms.
+        let (_, fast) = swipe.end(6.0, TOUCHPAD_DISTANCE, false, true);
+        assert!(close(fast, 135.0));
+    }
+
+    /// `EventHistory`: deltas of the last 150 ms over the span they
+    /// cover, the first left out; nothing recent keeps everything.
+    #[test]
+    fn touchpad_history_is_gnomes_event_history() {
+        let mut history = EventHistory::default();
+        assert_eq!(history.velocity(), 0.0);
+        history.append(1000, 0.0);
+        assert_eq!(history.velocity(), 0.0, "one sample has no span");
+        for (i, delta) in [10.0, 10.0, 10.0].into_iter().enumerate() {
+            history.append(1000 + 20 * (i as u32 + 1), delta);
+        }
+        // 30 over 60 ms; the first sample's delta never counts.
+        assert!(close(history.velocity(), 30.0 / 60.0));
+        // At 1180 everything before 1030 goes.
+        history.trim(1180);
+        assert!(close(history.velocity(), 10.0 / 20.0));
+        // Held still past 150 ms: `splice(0, -1)` removes nothing.
+        history.trim(5000);
+        assert!(close(history.velocity(), 10.0 / 20.0));
+        history.append(5010, 40.0);
+        assert!(
+            close(history.velocity(), 50.0 / (5010.0 - 1040.0)),
+            "an append after a pause keeps the stale samples once"
+        );
+        history.append(5020, 30.0);
+        assert!(close(history.velocity(), 30.0 / 10.0));
+        history.reset();
+        assert_eq!(history.velocity(), 0.0);
+    }
+
+    /// `TouchpadSwipeGesture`: three fingers, 16 px before anything
+    /// moves, a vertical swipe handled from the event that crossed the
+    /// threshold (by its own delta), a horizontal one ignored to its end,
+    /// natural scrolling turning the deltas round.
+    #[test]
+    fn touchpad_swipe_follows_gnomes_three_finger_gesture() {
+        let mut pad = TouchpadSwipe::default();
+        let ev = |pad: &mut TouchpadSwipe, phase, fingers, d, time| {
+            pad.event(phase, fingers, d, time, true)
+        };
+        // Two fingers are never a swipe.
+        assert_eq!(
+            ev(&mut pad, SwipePhase::Begin, 2, (0.0, 0.0), 1),
+            (None, false)
+        );
+        assert_eq!(
+            ev(&mut pad, SwipePhase::Update, 2, (0.0, -40.0), 2),
+            (None, false)
+        );
+        // Three: the begin carries nothing, 10 px is under the threshold.
+        assert_eq!(
+            ev(&mut pad, SwipePhase::Begin, 3, (0.0, 0.0), 10),
+            (None, false)
+        );
+        assert_eq!(
+            ev(&mut pad, SwipePhase::Update, 3, (0.0, -10.0), 20),
+            (None, false)
+        );
+        // 18 px up: begun, moving by this event's 8 px, natural: +8.
+        assert_eq!(
+            ev(&mut pad, SwipePhase::Update, 3, (2.0, -8.0), 30),
+            (
+                Some(Step::Begin {
+                    time: 30,
+                    delta: 8.0
+                }),
+                true
+            )
+        );
+        assert_eq!(
+            ev(&mut pad, SwipePhase::Update, 3, (0.0, -12.0), 40),
+            (
+                Some(Step::Update {
+                    time: 40,
+                    delta: 12.0
+                }),
+                true
+            )
+        );
+        assert_eq!(
+            ev(&mut pad, SwipePhase::End, 3, (0.0, 0.0), 50),
+            (Some(Step::End { time: 50 }), false)
+        );
+        // Without natural scrolling the fingers' delta is the progress.
+        pad.event(SwipePhase::Begin, 4, (0.0, 0.0), 60, false);
+        assert_eq!(
+            pad.event(SwipePhase::Update, 4, (0.0, 20.0), 70, false),
+            (
+                Some(Step::Begin {
+                    time: 70,
+                    delta: 20.0
+                }),
+                true
+            )
+        );
+        pad.event(SwipePhase::End, 4, (0.0, 0.0), 80, false);
+        // Sideways first: ignored, end included, until the next begin.
+        assert_eq!(
+            ev(&mut pad, SwipePhase::Begin, 3, (0.0, 0.0), 90),
+            (None, false)
+        );
+        assert_eq!(
+            ev(&mut pad, SwipePhase::Update, 3, (-20.0, -5.0), 100),
+            (None, false)
+        );
+        assert_eq!(
+            ev(&mut pad, SwipePhase::Update, 3, (0.0, -40.0), 110),
+            (None, false)
+        );
+        assert_eq!(
+            ev(&mut pad, SwipePhase::End, 3, (0.0, 0.0), 120),
+            (None, false)
+        );
+        assert_eq!(
+            ev(&mut pad, SwipePhase::Begin, 3, (0.0, 0.0), 130),
+            (None, false)
+        );
+        assert_eq!(
+            ev(&mut pad, SwipePhase::Update, 3, (0.0, -20.0), 140),
+            (
+                Some(Step::Begin {
+                    time: 140,
+                    delta: 20.0
+                }),
+                true
+            )
+        );
+    }
+
+    /// `ScrollGesture`: the first moving scroll begins, each one moves
+    /// by its delta, and the stop ends it.
+    #[test]
+    fn touchpad_scroll_follows_and_the_stop_ends_it() {
+        let mut scroll = ScrollGesture::default();
+        assert_eq!(
+            scroll.scroll(0.0, 6.0, 10),
+            Step::Begin {
+                time: 10,
+                delta: 6.0
+            }
+        );
+        assert_eq!(
+            scroll.scroll(1.0, 4.0, 20),
+            Step::Update {
+                time: 20,
+                delta: 4.0
+            }
+        );
+        assert_eq!(scroll.scroll(0.0, 0.0, 30), Step::End { time: 30 });
+        assert_eq!(
+            scroll.scroll(0.0, -3.0, 40),
+            Step::Begin {
+                time: 40,
+                delta: -3.0
+            }
+        );
+        assert_eq!(scroll.stop(50), Step::End { time: 50 });
+        assert_eq!(
+            scroll.scroll(0.0, 2.0, 60),
+            Step::Begin {
+                time: 60,
+                delta: 2.0
+            }
+        );
+    }
+
+    /// `Clock._updateHint`: touch mode says swipe.
+    #[test]
+    fn the_hint_follows_touch_mode() {
+        assert_eq!(hint_text(false), "Click or press a key");
+        assert_eq!(hint_text(true), "Swipe up");
+    }
+
+    /// `_hint.ease({opacity: 255, duration: CROSSFADE_TIME})`: Clutter's
+    /// default ease-out cubic over 300 ms from where it stands; the
+    /// power-save reset is immediate; Reduced Motion keeps the fade,
+    /// animations off land at once and the slow-down factor stretches it.
+    #[test]
+    fn the_hint_fades_in_on_clutters_default_ease_and_hides_at_once() {
+        let ms = Duration::from_millis;
+        let mut fade = HintFade::default();
+        assert_eq!(fade.opacity(), 0.0, "hidden until the idle watch fires");
+        assert_eq!(fade.show(ms(1000), MotionPolicy::default()), 300.0);
+        assert!(fade.tick(ms(1000)) && fade.opacity() == 0.0);
+        assert!(fade.tick(ms(1150)) && close(fade.opacity(), 0.875));
+        assert!(!fade.tick(ms(1300)) && fade.opacity() == 1.0 && !fade.easing());
+        // A power-save change mid-fade: 0 at once, the ease gone.
+        fade.hide();
+        fade.show(ms(2000), MotionPolicy::default());
+        fade.tick(ms(2150));
+        fade.hide();
+        assert!(fade.opacity() == 0.0 && !fade.easing());
+        assert!(!fade.tick(ms(2300)) && fade.opacity() == 0.0);
+        // Shown again part way: from the drawn value, the full 300 ms.
+        fade.show(ms(3000), MotionPolicy::default());
+        fade.tick(ms(3150));
+        fade.show(ms(3150), MotionPolicy::default());
+        fade.tick(ms(3300));
+        assert!(close(fade.opacity(), 0.875 + 0.125 * 0.875));
+        // Reduced Motion keeps the fade.
+        let mut reduced = HintFade::default();
+        assert_eq!(
+            reduced.show(ms(0), MotionPolicy::from_gnome(true, true, 1.0)),
+            300.0
+        );
+        reduced.tick(ms(150));
+        assert!(close(reduced.opacity(), 0.875));
+        // Animations off: opaque at once.
+        let mut off = HintFade::default();
+        assert_eq!(
+            off.show(ms(0), MotionPolicy::from_gnome(false, false, 1.0)),
+            0.0
+        );
+        assert!(off.opacity() == 1.0 && !off.easing());
+        // The slow-down factor stretches it.
+        let mut slow = HintFade::default();
+        assert_eq!(
+            slow.show(ms(0), MotionPolicy::from_gnome(true, false, 2.0)),
+            600.0
+        );
+        slow.tick(ms(300));
+        assert!(close(slow.opacity(), 0.875));
     }
 }
 
@@ -1021,7 +1890,11 @@ mod gtk_curtain_tests {
 
         // A swipe: both pages shown; at 0.5 each is half faded, 65% about
         // its centre and 100 px off.
-        let distance = curtain.swipe_begin("test");
+        let distance = curtain.swipe_begin(Source::Drag).unwrap();
+        assert!(
+            curtain.swipe_begin(Source::Scroll).is_none(),
+            "one swipe at a time"
+        );
         assert!(distance > 1.0);
         assert!(clock.is_visible() && prompt.is_visible());
         curtain.swipe_update(0.5 * distance, distance);
@@ -1049,10 +1922,7 @@ mod gtk_curtain_tests {
 
         // Released slowly past half: the prompt, ease-out cubic.
         curtain.swipe_update(0.1 * distance, distance);
-        assert_eq!(
-            curtain.swipe_end("test", 0.0, distance, false),
-            Some(Page::Prompt)
-        );
+        assert_eq!(curtain.swipe_end(0.0, distance, false), Some(Page::Prompt));
         assert!(pump_until(Duration::from_secs(3), || settled
             .borrow()
             .last()
@@ -1092,7 +1962,7 @@ mod gtk_curtain_tests {
         crate::motion::set(tuna_shell_control::MotionPolicy::from_gnome(
             true, true, 1.0,
         ));
-        let distance = curtain.swipe_begin("test");
+        let distance = curtain.swipe_begin(Source::Drag).unwrap();
         curtain.swipe_update(0.5 * distance, distance);
         assert!(pump_until(Duration::from_secs(2), || {
             alpha(clock.opacity(), 0.5)
@@ -1106,10 +1976,7 @@ mod gtk_curtain_tests {
             clock_rest.height(),
             "no shrink under Reduced Motion",
         );
-        assert_eq!(
-            curtain.swipe_end("test", 0.0, distance, true),
-            Some(Page::Clock)
-        );
+        assert_eq!(curtain.swipe_end(0.0, distance, true), Some(Page::Clock));
         assert!(pump_until(Duration::from_secs(3), || !prompt.is_visible()));
 
         // Animations off: the prompt is up at once.

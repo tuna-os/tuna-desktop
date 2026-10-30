@@ -9,7 +9,7 @@
 use std::os::unix::net::UnixStream;
 
 use smithay::utils::{Logical, Point};
-use tuna_compositor::windows::{ManagerInput, WindowManager, WHEEL_STEP_PX};
+use tuna_compositor::windows::{AxisStop, ManagerInput, WindowManager, WHEEL_STEP_PX};
 use tuna_compositor::TestCompositor;
 use wayland_client::{
     protocol::{
@@ -58,6 +58,10 @@ struct Client {
     axes: Vec<(u32, f64)>,
     /// v120 values for every wl_pointer.axis_value120.
     v120: Vec<i32>,
+    /// The axis of every wl_pointer.axis_stop, vertical = 0.
+    stops: Vec<u32>,
+    /// Every wl_pointer.axis_source, finger = 1.
+    sources: Vec<u32>,
 }
 
 impl Client {
@@ -197,6 +201,14 @@ impl Dispatch<WlPointer, ()> for Client {
                 state.axes.push((axis, value));
             }
             PointerEvent::AxisValue120 { value120, .. } => state.v120.push(value120),
+            PointerEvent::AxisStop { axis, .. } => state.stops.push(match axis {
+                wayland_client::WEnum::Value(a) => a as u32,
+                wayland_client::WEnum::Unknown(a) => a,
+            }),
+            PointerEvent::AxisSource { axis_source } => state.sources.push(match axis_source {
+                wayland_client::WEnum::Value(s) => s as u32,
+                wayland_client::WEnum::Unknown(s) => s,
+            }),
             PointerEvent::Button {
                 state: wayland_client::WEnum::Value(s),
                 ..
@@ -368,6 +380,7 @@ fn wheel_scrolls_the_client_under_the_pointer() {
         ManagerInput::Axis {
             horizontal: 0.0,
             vertical: 120.0,
+            stop: AxisStop::NONE,
             time: 2,
         },
     );
@@ -390,10 +403,68 @@ fn touchpad_scroll_is_continuous() {
         ManagerInput::Axis {
             horizontal: 3.5,
             vertical: 0.0,
+            stop: AxisStop::NONE,
             time: 2,
         },
     );
     sync(&mut f);
     assert_eq!(f.client.axes, vec![(1, 3.5)], "horizontal, pixel distance");
     assert!(f.client.v120.is_empty(), "no discrete steps for touchpads");
+    assert!(f.client.stops.is_empty(), "a moving axis has not stopped");
+}
+
+/// libinput ends a finger scroll with a zero: Mutter sends it on as
+/// `wl_pointer.axis_stop` in its own frame (meta-wayland-pointer.c
+/// 927-967), which GTK turns into the stop that ends a touchpad scroll
+/// (kinetic scrolling, the unlock dialog's `ScrollGesture`).
+#[test]
+fn a_finished_finger_scroll_sends_axis_stop() {
+    let mut f = fixture();
+    let at = inside(&f);
+    f.manager.pointer_motion(&mut f.comp.state, at, 1);
+    f.manager.on_input(
+        &mut f.comp.state,
+        ManagerInput::Axis {
+            horizontal: 0.0,
+            vertical: 7.0,
+            stop: AxisStop::NONE,
+            time: 2,
+        },
+    );
+    sync(&mut f);
+    let frames = f.client.frames;
+    f.manager.on_input(
+        &mut f.comp.state,
+        ManagerInput::Axis {
+            horizontal: 0.0,
+            vertical: 0.0,
+            stop: AxisStop {
+                horizontal: false,
+                vertical: true,
+            },
+            time: 3,
+        },
+    );
+    sync(&mut f);
+    assert_eq!(f.client.axes, vec![(0, 7.0)], "the stop carries no value");
+    assert_eq!(f.client.stops, vec![0], "the vertical axis stopped");
+    assert_eq!(
+        f.client.sources,
+        vec![1, 1],
+        "both frames are finger scrolls"
+    );
+    assert_eq!(f.client.frames, frames + 1, "the stop is its own frame");
+    // A zero with no stop (a wheel's idle axis) still sends nothing.
+    f.manager.on_input(
+        &mut f.comp.state,
+        ManagerInput::Axis {
+            horizontal: 0.0,
+            vertical: 0.0,
+            stop: AxisStop::NONE,
+            time: 4,
+        },
+    );
+    sync(&mut f);
+    assert_eq!(f.client.frames, frames + 1);
+    assert_eq!(f.client.stops, vec![0]);
 }
