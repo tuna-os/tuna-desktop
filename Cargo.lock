@@ -4241,6 +4241,7 @@ dependencies = [
  "libc",
  "libloading 0.9.0",
  "md-5",
+ "moxcms",
  "pipewire",
  "png",
  "rand 0.10.3",
