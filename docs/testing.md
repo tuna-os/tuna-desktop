@@ -123,9 +123,12 @@ Cleanup is automatic where it is safe:
 - `just proof` runs each proof with a fresh `HOME`, XDG directories and
   `XDG_RUNTIME_DIR`, and without your `DISPLAY`, `WAYLAND_DISPLAY` or
   session bus, as on a CI runner, so desktop state in your own session
-  can't leak in. Nested proofs start their own Xvfb on a display it picks
-  (`-displayfd`), with per-run Wayland sockets, buses and runtime
-  directories, so up to a quarter of the CPUs' worth of them run at once
+  can't leak in. Nested proofs start their own Xvfb through
+  `scripts/lib/tuna-xvfb`, which locks the first free display from `:120`
+  up (plain `Xvfb -displayfd` takes no lock and lands on the low numbers
+  every nested compositor's XWayland claims by lock file, which breaks
+  it), with per-run Wayland sockets, buses and runtime directories, so up
+  to a quarter of the CPUs' worth of them run at once
   (`/tmp/tuna-local-proof.slot.N`, `TUNA_PROOF_SLOTS`). Proofs that touch
   machine-wide state (vkms, seatd, uinput, `sudo` or apt, like
   `drm-smoke`), and scripts that don't start an Xvfb, run one at a time

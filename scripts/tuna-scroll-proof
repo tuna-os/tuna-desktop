@@ -85,9 +85,9 @@ if ! display_works; then
         Xvfb "$DISPLAY" -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp >"$ARTIFACTS/xvfb.log" 2>&1 &
         OWNED_XVFB=$!
     else
-        # Xvfb picks a free display itself, so concurrent runs never collide.
+        # tuna-xvfb picks a free display and locks it, so concurrent runs never collide.
         rm -f "$ARTIFACTS/xvfb-display"
-        Xvfb -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp \
+        "$ROOT/scripts/lib/tuna-xvfb" -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp \
             3>"$ARTIFACTS/xvfb-display" >"$ARTIFACTS/xvfb.log" 2>&1 &
         OWNED_XVFB=$!
         for _ in $(seq 1 30); do [ -s "$ARTIFACTS/xvfb-display" ] && break; sleep 1; done

@@ -136,9 +136,9 @@ try:
             raise RuntimeError("display already in use; choose a private unused display")
         spawn(["Xvfb", a.display, "-screen", "0", "1280x800x24", "-nolisten", "tcp"], "xvfb")
     else:
-        # Xvfb picks a free display itself, so concurrent proofs never collide.
+        # tuna-xvfb picks a free display and locks it, so concurrent proofs never collide.
         r, w = os.pipe()
-        spawn(["Xvfb", "-displayfd", str(w), "-screen", "0", "1280x800x24", "-nolisten", "tcp"], "xvfb", pass_fds=(w,))
+        spawn([str(root / "scripts/lib/tuna-xvfb"), "-displayfd", str(w), "-screen", "0", "1280x800x24", "-nolisten", "tcp"], "xvfb", pass_fds=(w,))
         os.close(w)
         number, deadline = b"", time.monotonic() + 30
         while not number.endswith(b"\n"):

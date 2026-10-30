@@ -8,7 +8,7 @@ Minimize renders current native surface buffers and cancels earlier map/size-cha
 
 ## Reproducible checks
 
-`scripts/tuna-minimize-proof --bin-dir <immutable-source-matched-bundle> --artifacts <directory>` runs under `dbus-run-session`; Xvfb picks a free display unless `--display` names an unused one. The bundle must contain compositor, GTK shell and native proof client binaries, source commit, lockfile and SHA-256 manifest. The harness refuses a dirty or different source revision, isolates its runtime and accessibility buses, and treats unverified cleanup as failure. `--rtl` exercises GTK's inverted text direction.
+`scripts/tuna-minimize-proof --bin-dir <immutable-source-matched-bundle> --artifacts <directory>` runs under `dbus-run-session`; it locks a free display for its Xvfb unless `--display` names an unused one. The bundle must contain compositor, GTK shell and native proof client binaries, source commit, lockfile and SHA-256 manifest. The harness refuses a dirty or different source revision, isolates its runtime and accessibility buses, and treats unverified cleanup as failure. `--rtl` exercises GTK's inverted text direction.
 
 CI uses `scripts/tuna-minimize-ci-proof <outside-checkout-directory>` to build all three executables from the clean committed source, freeze Cargo.lock and executable hashes, and run both directions. Freeze rejection tests cover missing/duplicate binaries, dirty source and reused bundles. Failure logs and partial receipts are uploaded; no assertion receipt is produced before all pixel and cleanup checks pass.
 

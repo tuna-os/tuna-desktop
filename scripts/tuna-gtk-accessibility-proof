@@ -86,8 +86,9 @@ PY_GATE
     exit "$proof_status"
 }
 trap cleanup EXIT INT TERM
-# Xvfb chooses a free server without sharing a pre-existing graphical session.
-Xvfb -displayfd 3 -screen 0 1280x800x24 3>"$ARTIFACTS/display-number" >"$ARTIFACTS/xvfb.log" 2>&1 &
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+# tuna-xvfb picks a free, locked server without sharing a pre-existing graphical session.
+"$SCRIPT_DIR/lib/tuna-xvfb" -displayfd 3 -screen 0 1280x800x24 3>"$ARTIFACTS/display-number" >"$ARTIFACTS/xvfb.log" 2>&1 &
 X_PID=$!
 # Xvfb writes its display number to -displayfd only once it accepts
 # clients. Hosted runners have taken over 10 s to get there; never start
@@ -129,7 +130,6 @@ export AT_SPI_BUS_ADDRESS
 import os
 assert os.environ['XDG_RUNTIME_DIR'] in os.environ['AT_SPI_BUS_ADDRESS']
 PY_ADDRESS
-SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 rm -f "$ARTIFACTS/guard-ready" "$ARTIFACTS/guard-stop"
 /usr/bin/python3 "$SCRIPT_DIR/lib/tuna-a11y-proof-guard.py" "$AT_SPI_BUS_ADDRESS" "$ARTIFACTS" "$AT_PID" "$X_PID" >"$ARTIFACTS/guard.log" 2>&1 &
 GUARD_PID=$!

@@ -151,7 +151,7 @@ proof name *args: _disk _sccache
     # one that touches machine-wide state (vkms, seatd, uinput, sudo, apt),
     # or isn't nested, runs alone. Builds keep their own slots.
     if grep -qE 'uinput|seatd|/dev/dri|vkms|/dev/input|sudo|apt-get|playwright install' "$script" ||
-        ! grep -q Xvfb "$script"; then
+        ! grep -qi xvfb "$script"; then
         slot=(flock -o "{{proof_lock}}")
     else
         slot=("{{semaphore}}" "{{proof_slot_base}}" "{{proof_slots}}")
