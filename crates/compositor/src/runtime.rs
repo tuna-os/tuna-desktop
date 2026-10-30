@@ -1206,17 +1206,27 @@ impl Runtime {
             );
         }
 
-        // linux-dmabuf lists exactly what this renderer imports (#89).
+        // linux-dmabuf lists exactly what this renderer imports (#89),
+        // with feedback naming the renderer's device as Mutter's does.
         let mut backend = backend;
         let mut state = state;
         {
             use smithay::backend::renderer::ImportDma;
-            let formats: Vec<_> = match &mut backend {
-                Backend::Winit(winit) => winit.renderer().dmabuf_formats().into_iter().collect(),
+            let (formats, main_device): (Vec<_>, _) = match &mut backend {
+                Backend::Winit(winit) => {
+                    let renderer = winit.renderer();
+                    (
+                        renderer.dmabuf_formats().into_iter().collect(),
+                        crate::protocols::renderer_main_device(renderer),
+                    )
+                }
                 #[cfg(feature = "drm")]
-                Backend::Drm(drm) => drm.renderer.dmabuf_formats().into_iter().collect(),
+                Backend::Drm(drm) => (
+                    drm.renderer.dmabuf_formats().into_iter().collect(),
+                    crate::protocols::renderer_main_device(&drm.renderer),
+                ),
             };
-            state.enable_dmabuf(formats);
+            state.enable_dmabuf(formats, main_device);
         }
 
         // org.gnome.Mutter.ScreenCast and DisplayConfig (#61): screen

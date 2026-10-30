@@ -1,10 +1,11 @@
 //! Protocols beyond the core slice (#89): what GTK4, libadwaita and
 //! Chromium look for on a GNOME 51 session.
 //!
-//! - linux-dmabuf (v3, formats from the renderer): GPU clients and the
-//!   GTK4 GL renderer stop falling back to software. The runtime
-//!   creates the global once its renderer exists
-//!   ([`State::enable_dmabuf`]); buffers import lazily at draw time.
+//! - linux-dmabuf (v5 with feedback naming the renderer's device, v3
+//!   without one; formats from the renderer): GPU clients and the GTK4
+//!   GL renderer stop falling back to software. The runtime creates the
+//!   global once its renderer exists ([`State::enable_dmabuf`]); buffers
+//!   import lazily at draw time.
 //! - xdg-activation v1: an app may hand focus to another only with a
 //!   token minted while the requesting client held keyboard focus,
 //!   used within [`ACTIVATION_TOKEN_TTL`] (Mutter's focus-stealing
@@ -29,7 +30,7 @@
 //! - xdg-dialog v1: a modal dialog is attached to its parent as in
 //!   GNOME (attach-modal-dialogs): focusing the parent focuses the
 //!   dialog. xdg-foreign v2 lets the portal parent its dialogs to the
-//!   app's window the same way.
+//!   app's window the same way; v1 (GTK 3) shares v2's handle table.
 //! - xdg-system-bell v1: rings GNOME's `bell-window-system` theme sound
 //!   (Mutter's audible bell) through libcanberra's player.
 //! - xdg-toplevel-tag v1: each window keeps its tag and description.
@@ -41,6 +42,8 @@
 //! - pointer-warp v1: a client may move the pointer within its own
 //!   surface while it has pointer focus (the enter serial must match).
 //! - presentation-time, fifo and commit-timing: see [`crate::frame_timing`].
+//! - wl_fixes v1: `destroy_registry` frees a wl_registry, which the
+//!   core protocol gives no destructor (Mutter's meta-wayland-fixes.c).
 //!
 //! Deliberately absent, matching Mutter: xdg-decoration (GNOME is
 //! client-side decorations only).
@@ -61,8 +64,12 @@ use smithay::{
             xdg::shell::server::xdg_toplevel::XdgToplevel,
         },
         wayland_server::{
-            backend::GlobalId, protocol::wl_surface::WlSurface, Client, DataInit, Dispatch,
-            DisplayHandle, GlobalDispatch, New, Resource,
+            backend::GlobalId,
+            protocol::{
+                wl_fixes::{self, WlFixes},
+                wl_surface::WlSurface,
+            },
+            Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
         },
     },
     utils::{Logical, Point, Rectangle},
@@ -136,6 +143,7 @@ pub(crate) struct Protocols {
     shortcut_changed: bool,
     pub(crate) shortcut_locked: bool,
     _pointer_warp: GlobalId,
+    _fixes: GlobalId,
     /// Pointer warps clients asked for, drained by the window manager:
     /// surface, surface-local position, enter serial.
     pub(crate) pointer_warps: Vec<(WlSurface, Point<f64, Logical>, u32)>,
@@ -192,6 +200,7 @@ impl Protocols {
             #[cfg(feature = "xwayland")]
             x11_interop: crate::x11_interop::Interop::new(dh),
             _pointer_warp: dh.create_global::<State, WpPointerWarpV1, ()>(1, ()),
+            _fixes: dh.create_global::<State, WlFixes, ()>(1, ()),
             pointer_warps: Vec::new(),
             bell: Bell::default(),
             inhibitors: Vec::new(),
@@ -245,26 +254,70 @@ fn update_tag(state: &State, toplevel: &XdgToplevel, update: impl FnOnce(&mut To
     });
 }
 
+/// The main device Mutter gives linux-dmabuf feedback
+/// (`meta_wayland_dma_buf_manager_new` in meta-wayland-dma-buf.c): the
+/// renderer's EGL device's render node, else its DRM device node. None
+/// (no EGL device, neither extension, or the node cannot be read) keeps
+/// the global at version 3, as in Mutter.
+pub fn renderer_main_device(
+    renderer: &smithay::backend::renderer::gles::GlesRenderer,
+) -> Option<libc::dev_t> {
+    use std::os::unix::fs::MetadataExt;
+    let device =
+        smithay::backend::egl::EGLDevice::device_for_display(renderer.egl_context().display())
+            .ok()?;
+    let path = device
+        .render_device_path()
+        .or_else(|_| device.drm_device_path())
+        .ok()?;
+    std::fs::metadata(path).ok().map(|meta| meta.rdev())
+}
+
 impl State {
     /// Advertise linux-dmabuf with the renderer's importable formats.
     /// No formats (software rendering) means no global: clients then
     /// use shm, exactly as before.
-    pub fn enable_dmabuf(&mut self, formats: Vec<Format>) {
+    ///
+    /// With the renderer's `main_device` the global is version 5, as
+    /// Mutter's: its default feedback names that device and one tranche
+    /// of the same formats, and surface feedback is the default (Tuna
+    /// Desktop composites every surface, so it offers no scanout
+    /// tranche). Without one it stays version 3, as Mutter does.
+    pub fn enable_dmabuf(&mut self, formats: Vec<Format>, main_device: Option<libc::dev_t>) {
         if formats.is_empty() || self.protocols.dmabuf_global.is_some() {
             if formats.is_empty() {
                 eprintln!("tuna-compositor: no dmabuf formats, linux-dmabuf not advertised");
             }
             return;
         }
-        eprintln!(
-            "tuna-compositor: linux-dmabuf v3 with {} formats",
-            formats.len()
-        );
+        let feedback = main_device.and_then(|device| {
+            smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(device, formats.iter().copied())
+                .build()
+                .map_err(|e| eprintln!("tuna-compositor: dmabuf feedback: {e}"))
+                .ok()
+        });
         let dh = self.dh.clone();
-        let global = self
-            .protocols
-            .dmabuf_state
-            .create_global::<State>(&dh, formats);
+        let global = match feedback {
+            Some(feedback) => {
+                eprintln!(
+                    "tuna-compositor: linux-dmabuf v5 with {} formats on device {:#x}",
+                    formats.len(),
+                    main_device.unwrap_or_default()
+                );
+                self.protocols
+                    .dmabuf_state
+                    .create_global_with_default_feedback::<State>(&dh, &feedback)
+            }
+            None => {
+                eprintln!(
+                    "tuna-compositor: linux-dmabuf v3 with {} formats (no renderer device)",
+                    formats.len()
+                );
+                self.protocols
+                    .dmabuf_state
+                    .create_global::<State>(&dh, formats)
+            }
+        };
         self.protocols.dmabuf_global = Some(global);
     }
 
@@ -952,6 +1005,38 @@ impl Dispatch<WpPointerWarpV1, ()> for State {
                 .protocols
                 .pointer_warps
                 .push((surface, (x, y).into(), serial));
+        }
+    }
+}
+
+impl GlobalDispatch<WlFixes, ()> for State {
+    fn bind(
+        _state: &mut Self,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<WlFixes>,
+        _data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<WlFixes, ()> for State {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &WlFixes,
+        request: wl_fixes::Request,
+        _data: &(),
+        dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        // Mutter's wl_fixes_destroy_registry: wl_resource_destroy on the
+        // registry, which tells the client its id is free (delete_id)
+        // and stops global announcements to it.
+        if let wl_fixes::Request::DestroyRegistry { registry } = request {
+            let _ = dh.backend_handle().destroy_object::<State>(&registry.id());
         }
     }
 }
