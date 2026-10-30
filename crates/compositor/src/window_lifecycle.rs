@@ -605,7 +605,7 @@ pub fn step_frame(
             let Some(surface) = window.wl_surface() else {
                 continue;
             };
-            let Some(size) = crate::windows::committed_size(surface.as_ref()) else {
+            let Some(size) = crate::windows::buffer_size(surface.as_ref()) else {
                 continue;
             };
             if size.w <= 0 || size.h <= 0 {

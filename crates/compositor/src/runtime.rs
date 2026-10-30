@@ -2569,7 +2569,7 @@ impl Runtime {
                 "rect": [w.geometry.loc.x, w.geometry.loc.y, w.geometry.size.w, w.geometry.size.h],
                 // The committed buffer, client shadows included (GNOME's buffer rect).
                 "buffer_rect": self.manager.surface_of(w.id).and_then(|s| {
-                    let size = crate::windows::committed_size(&s)?;
+                    let size = crate::windows::buffer_size(&s)?;
                     let origin = crate::popup::surface_origin(&s, w.geometry.loc);
                     Some([origin.x, origin.y, size.w, size.h])
                 }),
@@ -6951,7 +6951,7 @@ fn scene_elements(
                 split_from = Some(elements.len());
             }
             let buffer_size =
-                crate::windows::committed_size(surface.as_ref()).unwrap_or(geometry.size);
+                crate::windows::buffer_size(surface.as_ref()).unwrap_or(geometry.size);
             let buffer_geometry = Rectangle::new(
                 crate::popup::surface_origin(&surface, geometry.loc),
                 buffer_size,
@@ -7015,7 +7015,7 @@ fn scene_elements(
                 continue;
             }
             let buffer_size =
-                crate::windows::committed_size(surface.as_ref()).unwrap_or(geometry.size);
+                crate::windows::buffer_size(surface.as_ref()).unwrap_or(geometry.size);
             let buffer_geometry = Rectangle::new(
                 crate::popup::surface_origin(&surface, geometry.loc),
                 buffer_size,

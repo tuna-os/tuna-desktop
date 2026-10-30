@@ -8579,15 +8579,22 @@ mod resize_tests {
     }
 }
 
+/// The main surface's buffer size in logical pixels: the extent GNOME's
+/// `meta_window_get_buffer_rect` covers, client-side shadows included.
+/// `None` before the first buffer.
+pub(crate) fn buffer_size(
+    surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+) -> Option<Size<i32, Logical>> {
+    smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| s.surface_size())
+        .flatten()
+}
+
 /// The size a client committed for its window: its xdg window geometry,
 /// else its buffer's size. `None` before the first buffer.
 pub(crate) fn committed_size(
     surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
 ) -> Option<Size<i32, Logical>> {
-    let buffer = smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
-        s.surface_size()
-    })
-    .flatten()?;
+    let buffer = buffer_size(surface)?;
     let geometry = smithay::wayland::compositor::with_states(surface, |states| {
         states
             .cached_state

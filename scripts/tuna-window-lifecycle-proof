@@ -173,17 +173,25 @@ try:
     wait(lambda d: len(d["window_lifecycle"]["destroying"]) == 1, "dialog-destroy-start")
     move(350)
     wait(lambda d: not d["window_lifecycle"]["destroying"], "dialog-destroy-end")
+    # The parent undims over 250 ms once its attached dialog goes
+    # (windowManager.js _checkDimming); let it finish so the retained
+    # frame below is compared at full brightness.
+    move(600)
+    wait(lambda d: not d["modal_dim"]["running"] and all(not p["dimmed"] and p["multiplier"] == 1.0 for p in d["modal_dim"]["parents"]), "parent-undimmed")
     action("close", 3)
     client.wait(timeout=10)
     wait(lambda d: not d["windows"] and len(d["window_lifecycle"]["destroying"]) == 1, "normal-destroy-start")
     retained = screenshot("04-destroy-retained")
     top_point = (x+w//2+70,y+h//3)
-    assert retained.getpixel(point) == mapped.getpixel(point) and retained.getpixel(top_point) == mapped.getpixel(top_point), "last frame lost/flipped after client exit"
-    move(425)
+    # GNOME retains the whole buffer actor: the frame's right and bottom
+    # edges survive, not a window-geometry-sized crop of the buffer.
+    edge_points = [(x+w-4,y+h//2+50),(x+w//2+70,y+h-4)]
+    assert all(retained.getpixel(q) == mapped.getpixel(q) for q in [point, top_point, *edge_points]), "last frame lost/flipped/cropped after client exit"
+    move(675)
     wait(lambda d: d["window_lifecycle"]["destroying"][0]["elapsed_ms"] == 75, "normal-destroy-half")
     faded = screenshot("05-destroy-half")
     assert faded.getpixel(point) != retained.getpixel(point), "destroy did not fade"
-    move(500)
+    move(750)
     wait(lambda d: not d["window_lifecycle"]["destroying"], "normal-destroy-end")
     ended = screenshot("06-destroy-end")
     assert ended.getpixel(point) == baseline.getpixel(point), "destroy left stale pixels"
@@ -193,13 +201,13 @@ try:
     second = spawn(["/usr/bin/python3",str(root / "scripts/lib/tuna-window-lifecycle-client.py")],"reduced-client",{"WAYLAND_DISPLAY":"lifecycle-proof","GDK_BACKEND":"wayland"})
     reduced = wait(lambda d:len(d["window_lifecycle"]["opening"]) == 1,"reduced-map-start")
     assert reduced["window_lifecycle"]["opening"][0]["frame"]["scale"] == [1.0,1.0]
-    move(650)
+    move(900)
     wait(lambda d:not d["window_lifecycle"]["opening"],"reduced-map-end")
     action("close",4)
     second.wait(timeout=10)
     reduced_close = wait(lambda d:len(d["window_lifecycle"]["destroying"]) == 1,"reduced-destroy-start")
     assert reduced_close["window_lifecycle"]["destroying"][0]["frame"]["scale"] == [1.0,1.0]
-    move(800)
+    move(1050)
     wait(lambda d:not d["window_lifecycle"]["destroying"],"reduced-destroy-end")
     subprocess.run(["gsettings","set","org.gnome.desktop.interface","enable-animations","false"],env=env,check=True)
     wait(lambda d:d["motion_policy"] == "off","animations-off")
@@ -217,7 +225,7 @@ try:
     fourth = spawn(["/usr/bin/python3",str(root / "scripts/lib/tuna-window-lifecycle-client.py")],"interrupted-client",{"WAYLAND_DISPLAY":"lifecycle-proof","GDK_BACKEND":"wayland"})
     early = wait(lambda d:len(d["window_lifecycle"]["opening"]) == 1,"interrupted-map-start")
     early_id = early["window_lifecycle"]["opening"][0]["window"]
-    move(875)
+    move(1125)
     wait(lambda d:d["window_lifecycle"]["opening"][0]["elapsed_ms"] == 75,"interrupted-map-half")
     action("close",6)
     fourth.wait(timeout=10)

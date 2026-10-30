@@ -214,7 +214,8 @@ try:
     normal = window_of(landed, wid)["rect"]
     nx, ny, nw, nh = normal
     shown = screenshot("01-x11-normal")
-    require_rgb(shown.getpixel((nx + nw // 2, ny + nh // 2)), CLIENT_RGB, "X11 client body")
+    # The host pointer rests at the output centre; probe the body away from it.
+    require_rgb(shown.getpixel((round(nx + nw * .7), round(ny + nh * .8))), CLIENT_RGB, "X11 client body")
     assertions.append(f"X11-MAP pass GTK3 X11 window {xid:#x} mapped at {normal}")
 
     # reload_icon_geometry: four CARDINALs set the target.
@@ -242,7 +243,7 @@ try:
 
     image = minimize_capture(lambda: screenshot("02-x11-minimize-quarter"), scene, quarter, wid, TARGET)
     x, y, w, h = q["rect"]
-    point = (round(x + w / 2), round(y + h / 2))
+    point = (round(x + w * .7), round(y + h * .8))
     bg = baseline.getpixel(point)
     require_rgb(image.getpixel(point), tuple(CLIENT_RGB[i] * q["alpha"] + bg[i] * (1 - q["alpha"]) for i in range(3)), (point, q))
     assertions.append(f"X11-MINIMIZE-FRAME pass 100ms rect {q['rect']} lerps toward the icon by {weight:.6f}; pixel at {point} blends alpha {q['alpha']:.4f}")
