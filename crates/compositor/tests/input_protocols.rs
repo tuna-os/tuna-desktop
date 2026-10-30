@@ -5,7 +5,7 @@
 use std::os::unix::net::UnixStream;
 
 use smithay::utils::{Logical, Point};
-use tuna_compositor::windows::{swipe_action, ManagerInput, SwipeAction, WindowManager};
+use tuna_compositor::windows::{ManagerInput, WindowManager};
 use tuna_compositor::TestCompositor;
 use wayland_client::{
     protocol::{
@@ -485,18 +485,6 @@ fn a_locked_pointer_stays_put_while_relative_motion_flows() {
         "the locked pointer did not move"
     );
     assert_eq!(game.client.relative, [(12.0, -5.0)]);
-}
-
-#[test]
-fn three_finger_swipes_follow_gnome() {
-    assert_eq!(swipe_action(0.0, -150.0), Some(SwipeAction::OpenOverview));
-    assert_eq!(swipe_action(10.0, 140.0), Some(SwipeAction::CloseOverview));
-    assert_eq!(swipe_action(-160.0, 20.0), Some(SwipeAction::NextWorkspace));
-    assert_eq!(
-        swipe_action(160.0, -20.0),
-        Some(SwipeAction::PreviousWorkspace)
-    );
-    assert_eq!(swipe_action(40.0, -60.0), None, "short swipes do nothing");
 }
 
 #[test]

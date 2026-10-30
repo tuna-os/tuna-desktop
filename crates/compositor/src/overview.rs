@@ -766,6 +766,8 @@ pub struct OverviewMotion {
     progress: Tween,
     /// A swipe holds the transition.
     swipe: Option<Swipe>,
+    /// The transition eases out a swipe's release.
+    releasing: bool,
     open_trace: Option<Trace>,
     close_trace: Option<Trace>,
     release: Option<Release>,
@@ -787,6 +789,7 @@ impl Default for OverviewMotion {
         Self {
             progress: Tween::settled(0.0),
             swipe: None,
+            releasing: false,
             open_trace: None,
             close_trace: None,
             release: None,
@@ -834,6 +837,7 @@ impl OverviewMotion {
     /// Jump everything to its end state (motion turned off).
     pub fn snap(&mut self, open: bool) {
         self.progress = Tween::settled(if open { 1.0 } else { 0.0 });
+        self.releasing = false;
         self.search = Tween::settled(self.search.to);
         self.morph = None;
         self.revert = None;
@@ -854,6 +858,7 @@ impl OverviewMotion {
         let target = if open { 1.0 } else { 0.0 };
         let retargeted = self.progress.to != target;
         if retargeted {
+            self.releasing = false;
             let curve = if open { OPEN_CURVE } else { CLOSE_CURVE };
             self.progress
                 .retarget(target, motion.adjust_ms(TRANSITION_MS), curve, animate);
@@ -868,7 +873,9 @@ impl OverviewMotion {
                     self.close_trace = trace;
                 }
             }
-        } else if !animate {
+        } else if !animate && !self.releasing {
+            // A swipe's release keeps its ease under reduced motion, as
+            // GNOME's does; only animations off removes it (at release).
             self.progress = Tween::settled(target);
         }
         // dt_ms is time since the last rendered frame, not since this
@@ -877,6 +884,9 @@ impl OverviewMotion {
         // only subsequent frames advance it. The same boundary applies to
         // reversal, so pre-request time cannot consume the replacement tween.
         self.progress.step(if retargeted { 0.0 } else { dt_ms });
+        if self.progress.done() {
+            self.releasing = false;
+        }
         let (t, value) = (self.progress.elapsed_ms, self.progress.value());
         for trace in [&mut self.open_trace, &mut self.close_trace]
             .into_iter()
@@ -901,32 +911,35 @@ impl OverviewMotion {
 
     /// The swipe has travelled `travel` touchpad units toward open in
     /// all, at `time`, over `distance` units for the whole transition.
-    /// The first call begins it where the transition is. The transition
-    /// follows the fingers, or with motion off jumps to the nearer end.
-    pub fn swipe_update(&mut self, time: u32, travel: f64, distance: f64, motion: MotionPolicy) {
-        let animate = motion.allows_motion();
+    /// The first call begins it where the transition is, its velocity
+    /// history starting from a still sample (swipeTracker.js:509-513).
+    /// The transition follows the fingers under every motion policy:
+    /// GNOME sets the state adjustment directly (overview.js:359-380,
+    /// overviewControls.js:777-779), which no animation setting touches.
+    pub fn swipe_update(&mut self, time: u32, travel: f64, distance: f64) {
         let at = self.progress.value();
-        let swipe = self.swipe.get_or_insert_with(|| Swipe {
-            initial: at,
-            travel: 0.0,
-            history: Default::default(),
+        let swipe = self.swipe.get_or_insert_with(|| {
+            let mut history = crate::workspace_slide::SwipeHistory::default();
+            history.append(time, 0.0);
+            Swipe {
+                initial: at,
+                travel: 0.0,
+                history,
+            }
         });
         swipe.history.append(time, travel - swipe.travel);
         swipe.travel = travel;
         let raw = (swipe.initial + travel / distance.max(1.0)).clamp(0.0, 1.0);
-        let shown = if animate {
-            raw
-        } else if raw >= 0.5 {
-            1.0
-        } else {
-            0.0
-        };
-        self.progress = Tween::settled(shown);
+        self.progress = Tween::settled(raw);
+        self.releasing = false;
     }
 
     /// The swipe ended at `time`: finish toward where GNOME's tracker
     /// would, carrying the fingers' velocity into an `EASE_OUT_CUBIC`
-    /// of matching duration (back where it began when `cancelled`).
+    /// of matching duration (back where it began when `cancelled`). The
+    /// duration takes the slow-down factor and is zero with animations
+    /// off (overviewControls.js:781-796 eases through
+    /// animationUtils.js:23-33); reduced motion leaves it as it is.
     /// Returns whether the overview ends open, or `None` without a swipe.
     pub fn swipe_end(
         &mut self,
@@ -935,7 +948,6 @@ impl OverviewMotion {
         distance: f64,
         motion: MotionPolicy,
     ) -> Option<bool> {
-        let animate = motion.allows_motion();
         let Swipe {
             initial,
             mut history,
@@ -952,16 +964,17 @@ impl OverviewMotion {
             distance,
         );
         let duration = motion.adjust_ms(duration);
-        self.progress = if animate && duration > 0.0 {
+        self.progress = if duration > 0.0 {
             Tween::new(at, target, duration, Curve::EaseOutCubic)
         } else {
             Tween::settled(target)
         };
+        self.releasing = duration > 0.0;
         self.release = Some(Release {
             from: at,
             target,
             velocity,
-            duration_ms: if animate { duration } else { 0.0 },
+            duration_ms: duration,
         });
         Some(target >= 1.0)
     }
@@ -2050,6 +2063,10 @@ mod tests {
         level: tuna_shell_control::motion::MotionLevel::Off,
         slowdown_milli: 1000,
     };
+    const FADE_ONLY: MotionPolicy = MotionPolicy {
+        level: tuna_shell_control::motion::MotionLevel::FadeOnly,
+        slowdown_milli: 1000,
+    };
 
     const BLUE: [f32; 3] = [53.0 / 255.0, 132.0 / 255.0, 228.0 / 255.0];
 
@@ -2679,30 +2696,52 @@ mod tests {
     fn a_released_swipe_keeps_its_momentum() {
         let mut motion = OverviewMotion::default();
         for (i, travel) in [15.0, 45.0, 75.0].into_iter().enumerate() {
-            motion.swipe_update(1000 + 10 * i as u32, travel, 300.0, FULL);
+            motion.swipe_update(1000 + 10 * i as u32, travel, 300.0);
         }
         assert!((motion.progress() - 0.25).abs() < 1e-9);
         assert_eq!(motion.swipe_end(1030, false, 300.0, FULL), Some(true));
         let d = motion.diagnostics();
         assert_eq!(d["release"]["curve"], "ease-out-cubic");
-        assert!((d["release"]["velocity"].as_f64().unwrap() - 3.0).abs() < 1e-9);
-        // 0.75 left at 3 px/ms over 300: 225 ms, eased out-cubic.
+        // The history starts still at the first event, so all 75 units
+        // count over its 20 ms (swipeTracker.js:72-86, 509-513).
+        assert!((d["release"]["velocity"].as_f64().unwrap() - 3.75).abs() < 1e-9);
+        // 0.75 left at 3.75 units/ms over 300: 180 ms, eased out-cubic.
         let duration = d["release"]["duration_ms"].as_f64().unwrap();
-        assert!((duration - 225.0).abs() < 1e-6, "{duration}");
+        assert!((duration - 180.0).abs() < 1e-6, "{duration}");
         motion.step_progress(duration / 2.0, true, FULL);
         assert!((motion.progress() - (0.25 + 0.75 * ease_out_cubic(0.5))).abs() < 1e-9);
         motion.step_progress(duration, true, FULL);
         assert_eq!(motion.progress(), 1.0);
         // Cancelled: back where it began.
-        motion.swipe_update(2000, -100.0, 300.0, FULL);
+        motion.swipe_update(2000, -100.0, 300.0);
         assert_eq!(motion.swipe_end(2010, true, 300.0, FULL), Some(true));
-        // Motion off: the held swipe sits at an end and releases there.
-        let mut motion = OverviewMotion::default();
-        motion.swipe_update(0, 180.0, 300.0, OFF);
-        assert_eq!(motion.progress(), 1.0);
-        assert_eq!(motion.swipe_end(10, false, 300.0, OFF), Some(true));
-        assert_eq!(motion.progress(), 1.0);
-        assert_eq!(motion.swipe_end(20, false, 300.0, OFF), None);
+        assert_eq!(motion.swipe_end(2020, false, 300.0, FULL), None);
+    }
+
+    #[test]
+    fn a_held_swipe_follows_the_fingers_under_every_motion_policy() {
+        for policy in [FULL, FADE_ONLY, OFF] {
+            let mut motion = OverviewMotion::default();
+            motion.swipe_update(0, 90.0, 300.0);
+            assert!((motion.progress() - 0.3).abs() < 1e-9, "{policy:?}");
+            motion.swipe_update(400, 180.0, 300.0);
+            assert!((motion.progress() - 0.6).abs() < 1e-9, "{policy:?}");
+            // A slow release past half way opens: eased (reduced motion
+            // leaves GNOME's ease alone), instant with animations off.
+            assert_eq!(motion.swipe_end(900, false, 300.0, policy), Some(true));
+            let duration = motion.diagnostics()["release"]["duration_ms"]
+                .as_f64()
+                .unwrap();
+            if policy == OFF {
+                assert_eq!(duration, 0.0);
+                assert_eq!(motion.progress(), 1.0);
+            } else {
+                assert_eq!(duration, 400.0, "{policy:?}");
+                assert!((motion.progress() - 0.6).abs() < 1e-9, "{policy:?}");
+                motion.step_progress(duration, true, policy);
+                assert_eq!(motion.progress(), 1.0, "{policy:?}");
+            }
+        }
     }
 
     fn cues(app_grid: bool, search: bool) -> OverviewCues {

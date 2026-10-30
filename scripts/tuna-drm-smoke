@@ -35,6 +35,15 @@
 #              keybinding actions, strip keybindings, the pad OSD in the
 #              GTK shell (help button, org.gnome.Shell.Wacom.PadOsd),
 #              hotplug, and nothing reaching the client while locked
+#   D-TOUCHPAD-SWIPE an emulated (uinput) Synaptics clickpad through real
+#              libinput (P-IN-02, #593): three-finger swipes up/down open
+#              and close the overview following the fingers, left/right
+#              switch workspace, a slow half swipe stays, a short fast
+#              flick completes (swipeTracker.js velocity projection),
+#              four fingers are the shell's too, two-finger scrolling and
+#              no swipe reach a GTK 4 client, natural-scroll off reverses
+#              the gestures, and under reduced motion the held swipe
+#              follows and eases while with animations off it lands at once
 # and captures a scanout screenshot with ffmpeg kmsgrab when possible.
 # Needs root (sudo) for modprobe, seatd and uinput. Exits nonzero on any failure.
 set -eu
@@ -46,7 +55,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --seconds) SECONDS_UP="$2"; shift 2 ;;
-        --help|-h) sed -n '2,30p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,48p' "$0"; exit 0 ;;
         *) echo "tuna-drm-smoke: unknown argument $1" >&2; exit 1 ;;
     esac
 done
@@ -67,12 +76,17 @@ SYSTEM_BUS_PID=""
 CALIBRATION_PID=""
 EMU_PID=""
 CLIENT_PID=""
+TOUCHPAD_EMU_PID=""
+TOUCHPAD_CLIENT_PID=""
 
 cleanup() {
     if [ -n "$CLIENT_PID" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
-    # The emulator (root) exits when its command pipe closes.
+    if [ -n "$TOUCHPAD_CLIENT_PID" ]; then kill "$TOUCHPAD_CLIENT_PID" 2>/dev/null || true; fi
+    # The emulators (root) exit when their command pipes close.
     exec 8>&- 2>/dev/null || true
+    exec 9>&- 2>/dev/null || true
     if [ -n "$EMU_PID" ]; then wait "$EMU_PID" 2>/dev/null || true; fi
+    if [ -n "$TOUCHPAD_EMU_PID" ]; then wait "$TOUCHPAD_EMU_PID" 2>/dev/null || true; fi
     if [ -n "$COMP_PID" ]; then kill "$COMP_PID" 2>/dev/null || true; fi
     if [ -n "$CALIBRATION_PID" ]; then kill "$CALIBRATION_PID" 2>/dev/null || true; fi
     if [ -n "$COLORD_PID" ]; then sudo kill "$COLORD_PID" 2>/dev/null || true; fi
@@ -938,5 +952,249 @@ kill -TERM "$COMP_PID"
 wait "$COMP_PID" || true
 COMP_PID=""
 if grep -q panicked "$TABLET_LOG"; then fail D-NOPANIC "panic in the tablet session"; fi
+
+# Touchpad swipes (P-IN-02, #593) through real libinput: a uinput
+# clickpad as the rmi4 driver creates it (scripts/lib/tuna-uinput-touchpad.py)
+# whose finger motion the kernel timestamps and libinput turns into
+# pointer, scroll and LIBINPUT_EVENT_GESTURE_SWIPE_* events, against
+# GNOME 51's swipe trackers (js/ui/swipeTracker.js, overview.js,
+# workspaceAnimation.js). Lengths below are millimetres on the pad
+# (libinput reports about 10.5 unaccelerated units per mm on it; the
+# overview's whole step is 300 units, a workspace 400).
+kill "$DBUS_PID" 2>/dev/null || true
+TOUCHPAD_LOG="$ARTIFACTS/compositor-touchpad.log"
+CSTATE="$ARTIFACTS/compositor-state-touchpad.json"
+CLIENT_LOG="$ARTIFACTS/touchpad-client.jsonl"
+TP_OUT="$ARTIFACTS/touchpad-emulator.log"
+mkdir -p "$ARTIFACTS/config-touchpad" "$ARTIFACTS/schemas-touchpad"
+# Ubuntu's gsettings-desktop-schemas predates GNOME's reduced-motion key.
+if ! gsettings range org.gnome.desktop.a11y.interface reduced-motion >/dev/null 2>&1; then
+    cp "$ROOT/tests/settings/gnome51-a11y-interface.gschema.xml" "$ARTIFACTS/schemas-touchpad/"
+    glib-compile-schemas "$ARTIFACTS/schemas-touchpad"
+    GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas-touchpad:$GSETTINGS_SCHEMA_DIR"
+    export GSETTINGS_SCHEMA_DIR
+fi
+XDG_CONFIG_HOME="$ARTIFACTS/config-touchpad"
+export XDG_CONFIG_HOME
+dbus-daemon --session --fork --print-address=1 --print-pid=1 >"$ARTIFACTS/dbus-touchpad.txt"
+DBUS_SESSION_BUS_ADDRESS="$(sed -n 1p "$ARTIFACTS/dbus-touchpad.txt")"
+DBUS_PID="$(sed -n 2p "$ARTIFACTS/dbus-touchpad.txt")"
+export DBUS_SESSION_BUS_ADDRESS
+LOG="$TOUCHPAD_LOG"
+env -u DISPLAY -u WAYLAND_DISPLAY \
+    XDG_RUNTIME_DIR="$RUNTIME" XDG_STATE_HOME="$ARTIFACTS/state" XDG_DATA_HOME="$ARTIFACTS/data" \
+    LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD" TUNA_COMPOSITOR_STATE="$CSTATE" \
+    "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-touchpad \
+    --shell-bin "$ROOT/target/debug/tuna-shell-gtk" >"$TOUCHPAD_LOG" 2>&1 &
+COMP_PID=$!
+state '.display_config.serial >= 1 and (.layers | length > 0)' 30 ||
+    fail D-TOUCHPAD-SWIPE "the touchpad session never lit its output"
+state '.layers | any(.namespace == "tuna-panel")' 30 || fail D-TOUCHPAD-SWIPE "the GTK shell never mapped its panel"
+
+mkfifo "$ARTIFACTS/touchpad-emulator.fifo"
+# shellcheck disable=SC2024
+sudo python3 "$ROOT/scripts/lib/tuna-uinput-touchpad.py" <"$ARTIFACTS/touchpad-emulator.fifo" >"$TP_OUT" 2>&1 &
+TOUCHPAD_EMU_PID=$!
+exec 9>"$ARTIFACTS/touchpad-emulator.fifo"
+tp_sent=0
+# tp COMMAND: the emulator has written the whole command to the kernel.
+tp() {
+    echo "$*" >&9
+    tp_sent=$((tp_sent + 1))
+    end=$(($(date +%s) + 15))
+    until [ "$(grep -c '^ok$' "$TP_OUT")" -ge "$tp_sent" ]; do
+        grep -q '^error' "$TP_OUT" && fail D-TOUCHPAD-SWIPE "emulator: $(grep '^error' "$TP_OUT" | tail -1)"
+        [ "$(date +%s)" -le "$end" ] || fail D-TOUCHPAD-SWIPE "emulator did not answer '$*'"
+        sleep 0.02
+    done
+}
+TP_NAME="Synaptics TM3053-004"
+state ".input_devices | any(.name == \"$TP_NAME\" and .kind == \"touchpad\" and .natural_scroll == true)" 15 ||
+    fail D-TOUCHPAD-SWIPE "libinput did not add the emulated clickpad as a touchpad: $(jq -c .input_devices "$CSTATE")"
+
+env -u DISPLAY XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY=tuna-drm-touchpad GDK_BACKEND=wayland \
+    python3 "$ROOT/scripts/lib/tuna-touchpad-client.py" >"$CLIENT_LOG" 2>"$ARTIFACTS/touchpad-client.stderr" &
+TOUCHPAD_CLIENT_PID=$!
+client_mark=0
+client 'r["event"] == "ready" and W > 0' 20 || fail D-TOUCHPAD-SWIPE "the GTK client never mapped: $(tail -3 "$ARTIFACTS/touchpad-client.stderr")"
+client "r['event'] == 'ready' and W == $MODE_W" || fail D-TOUCHPAD-SWIPE "the client is not fullscreen on the ${MODE_W}px output"
+HOME_WS="$(jq -r '.active_workspace' "$CSTATE")"
+jq -e '.multitasking.workspaces_only_on_primary' "$CSTATE" >/dev/null ||
+    fail D-TOUCHPAD-SWIPE "GNOME's default workspaces-only-on-primary is not in force"
+# at_rest PROGRESS WORKSPACE: no swipe held, nothing moving.
+at_rest() {
+    state "(.touchpad_swipe.active | not) and .overview_progress == $1 and .overview_open == ($1 == 1)
+           and .workspace_slide.in_flight == null and .active_workspace == $2" 10
+}
+# released JQ: a new overview release satisfies JQ (on .overview_motion.release).
+last_release() { jq -c '.overview_motion.release' "$CSTATE"; }
+released() {
+    state ".overview_motion.release != $prev_release and (.overview_motion.release | $1)" 10
+}
+# switched JQ: a new finished workspace motion satisfies JQ.
+last_switch() { jq -c '.workspace_slide.history[-1]' "$CSTATE"; }
+switched() {
+    state ".workspace_slide.history[-1] != $prev_switch and (.workspace_slide.history[-1] | $1)" 10
+}
+at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "the session did not start at rest: $(jq -c '{overview_progress, active_workspace}' "$CSTATE")"
+
+# One finger moves the pointer onto the client, which then has pointer
+# focus. Two fingers scroll it; the shell takes nothing. With natural
+# scrolling (GNOME's default) fingers moving up scroll down.
+mark
+tp down 1
+tp move 10 5 200
+tp up
+client "r['event'] == 'motion'" || fail D-TOUCHPAD-SWIPE "one-finger motion did not reach the client's event controller"
+mark
+tp scroll 0 -15 300
+client "r['event'] == 'scroll' and r['source'] == 'touchpad' and r['dy'] > 0" ||
+    fail D-TOUCHPAD-SWIPE "a two-finger natural scroll did not reach the client: $(tail -2 "$CLIENT_LOG")"
+at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "a two-finger scroll moved the shell"
+pass D-TOUCHPAD-SWIPE "two-finger scrolling reached the GTK client as natural touchpad scroll; the shell took nothing"
+
+# Three fingers up: the overview follows the held fingers, then opens.
+prev_release="$(last_release)"
+tp down 3
+tp move 0 -15 300
+state '.touchpad_swipe.active and .touchpad_swipe.orientation == "vertical" and .touchpad_swipe.fingers == 3
+       and .overview_progress > 0.1 and .overview_progress < 0.9 and (.overview_open | not)' 5 ||
+    fail D-TOUCHPAD-SWIPE "the held swipe did not hold the overview part way: $(jq -c '{touchpad_swipe, overview_progress}' "$CSTATE")"
+held="$(jq '.overview_progress' "$CSTATE")"
+tp move 0 -10 200
+state ".touchpad_swipe.active and .overview_progress > $held" 5 ||
+    fail D-TOUCHPAD-SWIPE "the overview stopped following the fingers at $held"
+held_more="$(jq '.overview_progress' "$CSTATE")"
+tp up
+released '.target == 1 and .curve == "ease-out-cubic" and .duration_ms > 0' ||
+    fail D-TOUCHPAD-SWIPE "the release did not ease open: $(last_release)"
+at_rest 1 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "three fingers up did not open the overview"
+prev_release="$(last_release)"
+tp swipe 3 0 25 250
+released '.target == 0 and .from > 0' || fail D-TOUCHPAD-SWIPE "three fingers down did not release toward closed: $(last_release)"
+at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "three fingers down did not close the overview"
+pass D-TOUCHPAD-SWIPE "three fingers up held the overview at $held then $held_more and opened it eased; down closed it"
+
+# Released slowly short of half way: back where it began. A short fast
+# flick completes on its velocity (_getEndProgress).
+prev_release="$(last_release)"
+tp down 3
+tp move 0 -10 500
+tp hold 400
+tp up
+released '.target == 0 and .from > 0.05 and .from < 0.5 and .velocity == 0' ||
+    fail D-TOUCHPAD-SWIPE "a slow half swipe did not settle back: $(last_release)"
+at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "a slow half swipe left the overview open"
+cancel="$(last_release)"
+prev_release="$cancel"
+tp swipe 3 0 -8 40
+released '.target == 1 and .from < 0.5 and .velocity >= 0.6' ||
+    fail D-TOUCHPAD-SWIPE "a short fast flick did not complete: $(last_release)"
+at_rest 1 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "the flick did not open the overview"
+flick="$(last_release)"
+tp swipe 3 0 25 250
+at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "could not close the overview after the flick"
+pass D-TOUCHPAD-SWIPE "slow half swipe settled back ($cancel); short fast flick completed ($flick)"
+
+# Sideways on the desktop: the workspace strip.
+prev_switch="$(last_switch)"
+tp swipe 3 -30 0 300
+switched ".gesture and .from == $HOME_WS and .to == $HOME_WS + 1" ||
+    fail D-TOUCHPAD-SWIPE "three fingers left did not slide to the next workspace: $(last_switch)"
+at_rest 0 $((HOME_WS + 1)) || fail D-TOUCHPAD-SWIPE "three fingers left did not switch workspace"
+prev_switch="$(last_switch)"
+tp swipe 3 30 0 300
+switched ".gesture and .to == $HOME_WS" || fail D-TOUCHPAD-SWIPE "three fingers right did not slide back: $(last_switch)"
+at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "three fingers right did not return"
+prev_switch="$(last_switch)"
+tp down 3
+tp move -15 0 500
+tp hold 400
+tp up
+switched ".gesture and .to == $HOME_WS and .velocity == 0" ||
+    fail D-TOUCHPAD-SWIPE "a slow half sideways swipe did not slide back: $(last_switch)"
+at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "a slow half sideways swipe switched workspace"
+pass D-TOUCHPAD-SWIPE "three fingers left/right slid to the next workspace and back; a slow half swipe stayed"
+
+# Four fingers are the shell's too (fingers >= GESTURE_FINGER_COUNT).
+prev_release="$(last_release)"
+tp swipe 4 0 -25 300
+released '.target == 1' || fail D-TOUCHPAD-SWIPE "four fingers up did not open the overview: $(last_release)"
+at_rest 1 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "four fingers up did not settle open"
+tp swipe 4 0 25 300
+at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "four fingers down did not close the overview"
+client_mark=0
+client "r['event'].startswith('touchpad-')" 1 &&
+    fail D-TOUCHPAD-SWIPE "a shell swipe reached the client: $(grep touchpad- "$CLIENT_LOG" | head -2)"
+pass D-TOUCHPAD-SWIPE "four-finger swipes open and close the overview; no three- or four-finger swipe reached the client"
+
+# Natural scrolling off reverses scrolling and every gesture
+# (swipeTracker.js:188-189).
+gsettings set org.gnome.desktop.peripherals.touchpad natural-scroll false
+state ".input_devices | any(.name == \"$TP_NAME\" and .natural_scroll == false)" ||
+    fail D-TOUCHPAD-SWIPE "natural-scroll false did not reach libinput"
+sleep 0.5
+mark
+tp scroll 0 -15 300
+client "r['event'] == 'scroll' and r['dy'] < 0" || fail D-TOUCHPAD-SWIPE "traditional scrolling did not reverse the scroll"
+prev_release="$(last_release)"
+tp swipe 3 0 25 300
+released '.target == 1' || fail D-TOUCHPAD-SWIPE "with natural scrolling off, fingers down did not open the overview: $(last_release)"
+at_rest 1 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "reversed open did not settle"
+tp swipe 3 0 -25 300
+at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "with natural scrolling off, fingers up did not close the overview"
+tp swipe 3 30 0 300
+at_rest 0 $((HOME_WS + 1)) || fail D-TOUCHPAD-SWIPE "with natural scrolling off, fingers right did not go to the next workspace"
+tp swipe 3 -30 0 300
+at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "with natural scrolling off, fingers left did not come back"
+gsettings set org.gnome.desktop.peripherals.touchpad natural-scroll true
+state ".input_devices | any(.name == \"$TP_NAME\" and .natural_scroll == true)" ||
+    fail D-TOUCHPAD-SWIPE "natural-scroll true did not come back"
+sleep 0.5
+pass D-TOUCHPAD-SWIPE "natural-scroll off reversed the scroll, the overview gesture and the workspace gesture"
+
+# Reduced motion leaves GNOME's swipes alone: the held overview follows
+# and the release eases. Animations off still follow; the release lands
+# at once (animationUtils.js:23-33).
+gsettings set org.gnome.desktop.a11y.interface reduced-motion reduce
+state '.motion_policy == "fade-only"' || fail D-TOUCHPAD-SWIPE "reduced motion did not reach the compositor"
+prev_release="$(last_release)"
+tp down 3
+tp move 0 -15 300
+state '.touchpad_swipe.active and .overview_progress > 0.1 and .overview_progress < 0.9' 5 ||
+    fail D-TOUCHPAD-SWIPE "under reduced motion the held swipe did not follow: $(jq '.overview_progress' "$CSTATE")"
+tp move 0 -10 200
+tp up
+released '.target == 1 and .duration_ms > 0' || fail D-TOUCHPAD-SWIPE "under reduced motion the release did not ease: $(last_release)"
+at_rest 1 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "under reduced motion the overview did not open"
+tp swipe 3 0 25 250
+at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "under reduced motion the overview did not close"
+gsettings set org.gnome.desktop.a11y.interface reduced-motion no-preference
+gsettings set org.gnome.desktop.interface enable-animations false
+state '.motion_policy == "off"' || fail D-TOUCHPAD-SWIPE "animations off did not reach the compositor"
+prev_release="$(last_release)"
+tp down 3
+tp move 0 -15 300
+state '.touchpad_swipe.active and .overview_progress > 0.1 and .overview_progress < 0.9' 5 ||
+    fail D-TOUCHPAD-SWIPE "with animations off the held swipe did not follow: $(jq '.overview_progress' "$CSTATE")"
+tp move 0 -10 200
+tp up
+released '.target == 1 and .duration_ms == 0' || fail D-TOUCHPAD-SWIPE "with animations off the release was animated: $(last_release)"
+state '.overview_open and .overview_progress == 1' 2 || fail D-TOUCHPAD-SWIPE "with animations off the overview did not land open at once"
+tp swipe 3 0 25 250
+at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "with animations off the overview did not close"
+gsettings set org.gnome.desktop.interface enable-animations true
+state '.motion_policy == "full"' || fail D-TOUCHPAD-SWIPE "could not restore animations"
+pass D-TOUCHPAD-SWIPE "reduced motion: held swipe followed and the release eased; animations off: followed, landed at once"
+
+kill "$TOUCHPAD_CLIENT_PID" 2>/dev/null || true
+TOUCHPAD_CLIENT_PID=""
+exec 9>&-
+wait "$TOUCHPAD_EMU_PID" 2>/dev/null || true
+TOUCHPAD_EMU_PID=""
+kill -TERM "$COMP_PID"
+wait "$COMP_PID" || true
+COMP_PID=""
+if grep -q panicked "$TOUCHPAD_LOG"; then fail D-NOPANIC "panic in the touchpad session"; fi
 
 echo "tuna-drm-smoke: OK, artifacts in $ARTIFACTS"

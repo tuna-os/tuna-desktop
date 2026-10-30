@@ -220,6 +220,26 @@ or a still-missing module fails setup, and package installation errors are
 fatal. Module loading and the real vkms device and presentation assertions
 remain mandatory in the smoke test.
 
+The smoke test also drives real libinput with uinput devices (ADR 0008),
+so it needs `python3-evdev` and the GTK 4 PyGObject client packages the
+CI job installs. `D-TABLET` emulates a Wacom Cintiq 22HD
+(`scripts/lib/tuna-uinput-tablet.py`). `D-TOUCHPAD-SWIPE` (P-IN-02)
+emulates a Synaptics TM3053-004 clickpad as the kernel's rmi4 driver
+creates it (`scripts/lib/tuna-uinput-touchpad.py`, the capabilities of
+libinput's `litest-device-synaptics-rmi4.c`). The kernel timestamps its
+finger motion and libinput classifies it as a touchpad and turns it into
+pointer motion, two-finger scrolling and `LIBINPUT_EVENT_GESTURE_SWIPE_*`.
+The phase then checks GNOME 51's swipe trackers against the compositor
+state: up and down open and close the overview, which follows the held
+fingers; left and right switch workspace; a slow half swipe settles
+back; a short fast flick completes; four fingers are the shell's too;
+scrolling, and no swipe, reaches a GTK 4 client; turning natural-scroll
+off reverses the gestures; and the swipe follows under reduced motion
+and with animations off. The emulator also runs on its own and reads
+commands (`down N`, `move DX DY MS`, `hold MS`, `up`, `swipe N DX DY MS
+[PAUSE]`, `scroll`, `tap`, `click`) on stdin, in millimetres and
+milliseconds. Other phases can import `create_touchpad()` from it.
+
 ## Marlin VM lane
 
 The `marlin-vm` job (#68) boots the real TunaOS Marlin image with Tuna Desktop
@@ -334,6 +354,11 @@ Proof `G-ANIMATION-CLOCK` samples the overview this way at 125 and 250 ms
 in both directions. `G-ANIMATIONS-OFF` and `G-INTROSPECT-MOTION` check the
 live motion policy: animations off snaps everything, Reduced Motion
 (fade-only) snaps overview and strip motion but keeps the idle-shield fade.
+A held touchpad swipe is not an animation. As in GNOME 51 (overview.js:359-380,
+animationUtils.js:23-33), the overview follows the fingers under every
+policy. The release eases under full motion and Reduced Motion, with the
+slow-down factor applied, and lands at once with animations off
+(`G-SWIPE-REDUCED-MOTION`, `D-TOUCHPAD-SWIPE`).
 
 ## Frame cost
 

@@ -9037,29 +9037,32 @@ if ! jq -e '.gesture and .velocity >= 0.6 and .duration_ms >= 100 and .duration_
 fi
 pass G-SWIPE-VELOCITY "a fast flick lands in ${flick_ms}ms, a slow drag in ${drag_ms}ms"
 
+# GNOME sets the overview's state adjustment straight from a held swipe
+# (overview.js:359-380), so it follows the fingers with animations off
+# too; only the release's ease drops to 0 ms (animationUtils.js:23-33).
 gsettings set org.gnome.desktop.interface enable-animations false
-cstate '(.animations_enabled | not) and .overview_progress == 0' "reduced-motion swipe ready" ||
-    fail G-SWIPE-REDUCED-MOTION "live reduced-motion setting did not arrive"
+cstate '(.animations_enabled | not) and .overview_progress == 0' "animations-off swipe ready" ||
+    fail G-SWIPE-REDUCED-MOTION "live animations setting did not arrive"
 swipe_phase begin 0 0
 swipe_phase update 0 -180
-cstate '.overview_progress == 1 and (.overview_open | not)' "reduced-motion held up" ||
-    fail G-SWIPE-REDUCED-MOTION "held upward swipe retained an intermediate transition"
+cstate '.overview_progress > 0.55 and .overview_progress < 0.65 and (.overview_open | not)' "animations-off held up" ||
+    fail G-SWIPE-REDUCED-MOTION "held upward swipe did not follow the fingers"
 cp "$CSTATE" "$ARTIFACTS/swipe-reduced-motion-held-up.json"
 swipe_phase end 0 0
-cstate '.overview_open and .overview_progress == 1' "reduced-motion up released" ||
-    fail G-SWIPE-REDUCED-MOTION "upward release did not open the overview"
+cstate '.overview_open and .overview_progress == 1 and .overview_motion.release.duration_ms == 0' "animations-off up released" ||
+    fail G-SWIPE-REDUCED-MOTION "upward release did not open the overview at once"
 swipe_phase begin 0 0
 swipe_phase update 0 180
-cstate '.overview_progress == 0 and .overview_open' "reduced-motion held down" ||
-    fail G-SWIPE-REDUCED-MOTION "held downward swipe retained an intermediate transition"
+cstate '.overview_progress > 0.35 and .overview_progress < 0.45 and .overview_open' "animations-off held down" ||
+    fail G-SWIPE-REDUCED-MOTION "held downward swipe did not follow the fingers"
 cp "$CSTATE" "$ARTIFACTS/swipe-reduced-motion-held-down.json"
 swipe_phase end 0 0
-cstate '(.overview_open | not) and .overview_progress == 0' "reduced-motion down released" ||
-    fail G-SWIPE-REDUCED-MOTION "downward release did not close the overview"
+cstate '(.overview_open | not) and .overview_progress == 0 and .overview_motion.release.duration_ms == 0' "animations-off down released" ||
+    fail G-SWIPE-REDUCED-MOTION "downward release did not close the overview at once"
 gsettings set org.gnome.desktop.interface enable-animations true
 cstate '.animations_enabled' "gesture animations restored" ||
     fail G-SWIPE-REDUCED-MOTION "could not restore animation setting"
-pass G-SWIPE-REDUCED-MOTION "up/down gestures snap while held and settle correctly with reduced motion"
+pass G-SWIPE-REDUCED-MOTION "with animations off up/down gestures follow the fingers while held and land at once"
 
 # GNOME 51 eases the overview open with EASE_OUT_SINE and closed with
 # EASE_OUT_QUAD over 250 ms (#499). The compositor records the progress
@@ -9093,8 +9096,10 @@ jq -e '
 pass G-OVERVIEW-EASING "opening follows EASE_OUT_SINE and closing EASE_OUT_QUAD over 250 ms, sampled mid-transition"
 
 # A quick upward flick opens the overview from a quarter of the way,
-# as GNOME's swipe tracker projects it, and the fingers' 3 px/ms set
-# an out-cubic finish of 225 ms rather than a fixed rate.
+# as GNOME's swipe tracker projects it, and the fingers' 3.75 px/ms (75
+# px over the 20 ms after the still sample the tracker starts with,
+# swipeTracker.js:509-513) set an out-cubic finish of 180 ms rather than
+# a fixed rate. The first update crosses the 16 px drag threshold.
 swipe_timed() {
     swipe_sequence=$((swipe_sequence + 1))
     printf '{"phase":"%s","dy":%s,"time":%s,"sequence":%s}\n' \
@@ -9104,11 +9109,11 @@ swipe_timed() {
     sleep 0.2
 }
 swipe_timed begin 0 5000
-swipe_timed update -15 5010
+swipe_timed update -30 5010
 swipe_timed update -30 5020
-swipe_timed update -30 5030
+swipe_timed update -15 5030
 swipe_timed end 0 5040
-cstate '.overview_open and .overview_motion.release.target == 1 and .overview_motion.release.from == 0.25 and .overview_motion.release.curve == "ease-out-cubic" and (.overview_motion.release.duration_ms - 225 | if . < 0 then -. else . end) < 0.01' "flick release" ||
+cstate '.overview_open and .overview_motion.release.target == 1 and .overview_motion.release.from == 0.25 and .overview_motion.release.curve == "ease-out-cubic" and (.overview_motion.release.duration_ms - 180 | if . < 0 then -. else . end) < 0.01' "flick release" ||
     fail G-SWIPE-MOMENTUM "a quarter-way flick did not carry its velocity into the finish"
 cstate '.overview_progress == 1' "flick settled" ||
     fail G-SWIPE-MOMENTUM "the flick did not settle open"

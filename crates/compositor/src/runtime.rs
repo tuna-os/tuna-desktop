@@ -757,8 +757,10 @@ pub struct Runtime {
     pad_osd_labels_sent: Option<tuna_shell_control::PadOsdLabels>,
     /// Window list org.gnome.Shell.Introspect serves (window sharing).
     introspect: crate::introspect::Handle,
-    /// A three-finger swipe in progress: its travel so far (#60).
-    shell_swipe: Option<Point<f64, Logical>>,
+    /// The touchpad swipe the shell holds (#60, GNOME's
+    /// `TouchpadSwipeGesture`) and the tracker it drives.
+    shell_swipe: crate::touchpad_swipe::TouchpadSwipe,
+    swipe_target: SwipeTarget,
     /// The overview's animations (#499): the open/close transition,
     /// the swipe driving it, and the settled scene's own motion.
     overview_motion: crate::overview::OverviewMotion,
@@ -1417,7 +1419,8 @@ impl Runtime {
             blank_watched: false,
             shell_retry_ms: None,
             proof_polling: false,
-            shell_swipe: None,
+            shell_swipe: Default::default(),
+            swipe_target: SwipeTarget::None,
             overview_motion: Default::default(),
             overview_progress_at: Duration::ZERO,
             tile_animation: None,
@@ -2072,6 +2075,10 @@ impl Runtime {
                 .feed_matched(&input, matches_key, self.manager.pointer_pos(), now);
         }
         if self.is_locked() {
+            // Locking ends the session's action mode mid-swipe: GNOME's
+            // trackers interrupt back to where they began
+            // (swipeTracker.js:487-491, 587-591).
+            self.interrupt_shell_swipe(input_time(&input) as u32);
             // The lock takes the keyboard: a held Escape's release
             // never comes back to the drag cancel below.
             self.dnd_escape_held = false;
@@ -2126,8 +2133,8 @@ impl Runtime {
                 return;
             }
         }
-        // Three-finger swipes are the shell's (GNOME 51): consumed here,
-        // acted on at the end. Other swipes reach the client.
+        // Swipes of three or more fingers are the shell's (GNOME 51):
+        // consumed here. Other swipes reach the client.
         if self.shell_swipe_input(&input) {
             return;
         }
@@ -2682,6 +2689,7 @@ impl Runtime {
         let manual = self.animation_clock.is_manual();
         doc["animation_clock_manual"] = serde_json::json!(manual);
         doc["proof_swipe_sequence"] = serde_json::json!(self.proof_swipe_sequence);
+        doc["touchpad_swipe"] = self.shell_swipe.snapshot();
         doc["animation_clock_ms"] =
             serde_json::json!(manual.then(|| self.animation_clock.now().as_millis() as u64));
         doc["overview_motion"] = self.overview_motion.diagnostics();
@@ -2896,7 +2904,7 @@ impl Runtime {
     /// three-finger swipe is held, as GNOME's `_shouldAnimate`.
     fn step_size_changes(&mut self) {
         let policy = crate::size_change::Policy::from_motion(self.input_settings.motion);
-        let allowed = !self.control.overview_open() && self.shell_swipe.is_none();
+        let allowed = !self.control.overview_open() && !self.shell_swipe.active();
         let now = self.animation_clock.now();
         let renderer = match &mut self.backend {
             Backend::Winit(backend) => backend.renderer(),
@@ -3035,15 +3043,22 @@ impl Runtime {
             .as_u64()
             .map_or(crate::state::system_millis() as u32, |t| t as u32);
         let input = match value["phase"].as_str() {
-            Some("begin") => ManagerInput::SwipeBegin { fingers: 3, time },
-            Some("update") => ManagerInput::SwipeUpdate {
-                delta: (
+            Some("begin") => ManagerInput::SwipeBegin {
+                fingers: value["fingers"].as_u64().map_or(3, |f| f as u32),
+                time,
+            },
+            Some("update") => {
+                let delta: Point<f64, Logical> = (
                     value["dx"].as_f64().unwrap_or(0.0),
                     value["dy"].as_f64().unwrap_or(0.0),
                 )
-                    .into(),
-                time,
-            },
+                    .into();
+                ManagerInput::SwipeUpdate {
+                    delta,
+                    delta_unaccel: delta,
+                    time,
+                }
+            }
             Some("end") => ManagerInput::SwipeEnd {
                 cancelled: value["cancelled"].as_bool().unwrap_or(false),
                 time,
@@ -3053,111 +3068,222 @@ impl Runtime {
         self.on_manager_input(input);
     }
 
-    /// Track a three-finger swipe; returns whether `input` was one of
-    /// its phases (and so consumed).
+    /// Track a touchpad swipe as GNOME's swipe trackers do; returns
+    /// whether `input` was one of the shell's swipe phases (and so
+    /// consumed).
     fn shell_swipe_input(&mut self, input: &ManagerInput) -> bool {
+        use crate::touchpad_swipe::Step;
         match *input {
             ManagerInput::SwipeBegin { fingers, .. } => {
-                if fingers == crate::windows::SHELL_SWIPE_FINGERS {
-                    self.shell_swipe = Some(Point::from((0.0, 0.0)));
-                    return true;
-                }
-                false
+                // A begin replaces whatever an unfinished swipe left.
+                self.swipe_target = SwipeTarget::None;
+                self.shell_swipe.begin(fingers)
             }
-            ManagerInput::SwipeUpdate { delta, time } => match self.shell_swipe.as_mut() {
-                Some(travel) => {
-                    *travel += delta;
-                    let travel = *travel;
-                    // On the desktop a horizontal swipe drags the
-                    // workspace strip with the fingers (GNOME).
-                    let desktop =
-                        !self.control.overview_open() && self.overview_motion.progress() == 0.0;
-                    if self.manager.workspace_slide().following() {
-                        self.manager
-                            .workspace_slide_mut()
-                            .update_swipe(delta.x, time);
-                    } else if desktop
-                        && !self.overview_motion.swiping()
-                        && travel.x.abs() > travel.y.abs()
-                    {
-                        let policy = self.input_settings.motion;
-                        let now = self.animation_clock.now();
-                        let width = self.state.primary_size().w;
-                        let model = self.manager.model();
-                        let active = model.active_workspace();
-                        let workspaces = model.workspaces().to_vec();
-                        let slide = self.manager.workspace_slide_mut();
-                        slide.begin_swipe(active, &workspaces, width, policy, now);
-                        slide.update_swipe(travel.x, time);
+            ManagerInput::SwipeUpdate {
+                delta_unaccel,
+                time,
+                ..
+            } => {
+                let natural = self.input_settings.touchpad_natural_scroll;
+                match self
+                    .shell_swipe
+                    .update(delta_unaccel.x, delta_unaccel.y, natural)
+                {
+                    None => false,
+                    Some(Step::Pending) => true,
+                    Some(Step::Update {
+                        orientation,
+                        delta,
+                        begin,
+                    }) => {
+                        if begin {
+                            self.begin_swipe_target(orientation, time);
+                        }
+                        self.update_swipe_target(delta, time);
+                        true
                     }
-                    // GNOME's overview follows the fingers: a vertical
-                    // swipe moves the transition (up opens) as it goes.
-                    if travel.y.abs() > travel.x.abs()
-                        && !self.manager.workspace_slide().following()
-                    {
-                        self.overview_motion.swipe_update(
-                            time,
-                            -travel.y,
-                            OVERVIEW_SWIPE_DISTANCE,
-                            self.input_settings.motion,
-                        );
-                    }
-                    true
                 }
-                None => false,
-            },
-            ManagerInput::SwipeEnd { cancelled, time } => {
-                let Some(travel) = self.shell_swipe.take() else {
+            }
+            ManagerInput::SwipeEnd { time, .. } => {
+                if self.shell_swipe.end().is_none() {
                     return false;
-                };
-                if self.manager.workspace_slide().following() {
-                    // Released: the slide finishes on the fingers'
-                    // velocity; the model switches now so focus and
-                    // input never wait for it.
-                    let now = self.animation_clock.now();
-                    let target = self
-                        .manager
-                        .workspace_slide_mut()
-                        .end_swipe(cancelled, time, now);
-                    if let Some(target) = target {
-                        if target != self.manager.model().active_workspace()
-                            && !self.manager.switch_to_workspace(&mut self.state, target)
-                        {
-                            // GNOME's trailing empty workspace: create it.
-                            self.manager.switch_relative(&mut self.state, 1);
-                        }
-                    }
-                    return true;
                 }
-                // Released: finish where GNOME's swipe tracker would,
-                // keeping the fingers' momentum (back where it began
-                // when cancelled).
-                if let Some(open) = self.overview_motion.swipe_end(
-                    time,
-                    cancelled,
-                    OVERVIEW_SWIPE_DISTANCE,
-                    self.input_settings.motion,
-                ) {
-                    self.control.set_overview(open);
-                    return true;
-                }
-                if !cancelled {
-                    use crate::windows::SwipeAction;
-                    match crate::windows::swipe_action(travel.x, travel.y) {
-                        Some(SwipeAction::OpenOverview) => self.control.set_overview(true),
-                        Some(SwipeAction::CloseOverview) => self.control.set_overview(false),
-                        Some(SwipeAction::NextWorkspace) => {
-                            self.manager.switch_relative(&mut self.state, 1);
-                        }
-                        Some(SwipeAction::PreviousWorkspace) => {
-                            self.manager.switch_relative(&mut self.state, -1);
-                        }
-                        None => {}
-                    }
-                }
+                // A libinput cancel lands as a release does
+                // (swipeTracker.js:194-198).
+                self.end_swipe_target(time, false);
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Lose a held swipe without its release (the session locked).
+    fn interrupt_shell_swipe(&mut self, time: u32) {
+        if self.shell_swipe.end().is_some() {
+            self.end_swipe_target(time, true);
+        }
+    }
+
+    /// The swipe committed to `orientation`: start the tracker GNOME
+    /// has on that axis now. Vertical is always the overview's
+    /// (overview.js:226-233, normal and overview modes). Horizontal is
+    /// the desktop's workspace strip, or the overview's workspaces
+    /// while it is open or opening (workspaceAnimation.js:363-372); with
+    /// workspaces only on the primary monitor, a horizontal swipe over
+    /// another monitor moves nothing (workspaceAnimation.js:509-512,
+    /// workspacesView.js:961-962).
+    fn begin_swipe_target(&mut self, orientation: crate::touchpad_swipe::Orientation, time: u32) {
+        use crate::touchpad_swipe::Orientation;
+        self.swipe_target = match orientation {
+            Orientation::Vertical => SwipeTarget::Overview { travel: 0.0 },
+            Orientation::Horizontal if self.swipe_over_secondary() => SwipeTarget::None,
+            Orientation::Horizontal if self.control.overview_open() => {
+                let model = self.manager.model();
+                let workspaces = model.workspaces().to_vec();
+                let active = model.active_workspace();
+                let initial = workspaces.iter().position(|w| *w == active).unwrap_or(0) as f64;
+                let mut history = crate::workspace_slide::SwipeHistory::default();
+                history.append(time, 0.0);
+                SwipeTarget::OverviewWorkspaces {
+                    workspaces,
+                    initial,
+                    progress: initial,
+                    history,
+                }
+            }
+            Orientation::Horizontal => {
+                self.workspace_swipe_begin(time);
+                SwipeTarget::Workspaces
+            }
+        };
+    }
+
+    /// The tracker moves by `delta` touchpad units (GNOME's sign).
+    fn update_swipe_target(&mut self, delta: f64, time: u32) {
+        match &mut self.swipe_target {
+            SwipeTarget::None => {}
+            SwipeTarget::Overview { travel } => {
+                *travel += delta;
+                let travel = *travel;
+                self.overview_motion.swipe_update(
+                    time,
+                    travel,
+                    crate::touchpad_swipe::TOUCHPAD_BASE_HEIGHT,
+                );
+            }
+            SwipeTarget::Workspaces => self.workspace_swipe_update(-delta, time),
+            SwipeTarget::OverviewWorkspaces {
+                workspaces,
+                initial,
+                progress,
+                history,
+            } => {
+                history.append(time, delta);
+                let last = workspaces.len().saturating_sub(1) as f64;
+                *progress = (*progress + delta / crate::workspace_slide::TOUCHPAD_BASE_WIDTH)
+                    .clamp((*initial - 1.0).max(0.0), (*initial + 1.0).min(last));
+            }
+        }
+    }
+
+    /// The fingers lifted (`interrupted`: the swipe was lost): finish
+    /// where GNOME's tracker lands, keeping the fingers' momentum.
+    fn end_swipe_target(&mut self, time: u32, interrupted: bool) {
+        match std::mem::replace(&mut self.swipe_target, SwipeTarget::None) {
+            SwipeTarget::None => {}
+            SwipeTarget::Overview { .. } => {
+                if let Some(open) = self.overview_motion.swipe_end(
+                    time,
+                    interrupted,
+                    crate::touchpad_swipe::TOUCHPAD_BASE_HEIGHT,
+                    self.input_settings.motion,
+                ) {
+                    self.control.set_overview(open);
+                }
+            }
+            SwipeTarget::Workspaces => self.workspace_swipe_end(time, interrupted),
+            SwipeTarget::OverviewWorkspaces {
+                workspaces,
+                initial,
+                progress,
+                mut history,
+            } => {
+                let (end, _) = crate::workspace_slide::swipe_release(
+                    progress,
+                    initial,
+                    workspaces.len(),
+                    history.velocity(time),
+                    interrupted,
+                );
+                // The overview's own workspace scroll animates the change.
+                if let Some(&target) = workspaces.get(end as usize) {
+                    if target != self.manager.model().active_workspace() {
+                        self.manager.switch_to_workspace(&mut self.state, target);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the pointer, where a swipe acts, is over a monitor other
+    /// than the primary while workspaces are only on the primary.
+    fn swipe_over_secondary(&self) -> bool {
+        if !self.input_settings.workspace_policy.only_on_primary {
+            return false;
+        }
+        let outputs: Vec<_> = self
+            .state
+            .hot_corner_outputs()
+            .into_iter()
+            .map(|(rect, primary)| crate::workspace_policy::OutputBounds {
+                x: rect.loc.x,
+                y: rect.loc.y,
+                width: rect.size.w,
+                height: rect.size.h,
+                primary,
+            })
+            .collect();
+        let pointer = self.manager.pointer_pos();
+        crate::workspace_policy::on_secondary(
+            (pointer.x.floor() as i32, pointer.y.floor() as i32, 1, 1),
+            &outputs,
+        )
+    }
+
+    /// A horizontal swipe on the desktop holds the workspace strip
+    /// where it is drawn.
+    fn workspace_swipe_begin(&mut self, _time: u32) {
+        let policy = self.input_settings.motion;
+        let now = self.animation_clock.now();
+        let width = self.state.primary_size().w;
+        let model = self.manager.model();
+        let active = model.active_workspace();
+        let workspaces = model.workspaces().to_vec();
+        let slide = self.manager.workspace_slide_mut();
+        slide.begin_swipe(active, &workspaces, width, policy, now);
+    }
+
+    /// The strip follows the fingers' `dx` (negative towards the next
+    /// workspace, natural scrolling applied).
+    fn workspace_swipe_update(&mut self, dx: f64, time: u32) {
+        self.manager.workspace_slide_mut().update_swipe(dx, time);
+    }
+
+    /// Released: the slide finishes on the fingers' velocity; the model
+    /// switches now so focus and input never wait for it.
+    fn workspace_swipe_end(&mut self, time: u32, cancelled: bool) {
+        let now = self.animation_clock.now();
+        let target = self
+            .manager
+            .workspace_slide_mut()
+            .end_swipe(cancelled, time, now);
+        if let Some(target) = target {
+            if target != self.manager.model().active_workspace()
+                && !self.manager.switch_to_workspace(&mut self.state, target)
+            {
+                // GNOME's trailing empty workspace: create it.
+                self.manager.switch_relative(&mut self.state, 1);
+            }
         }
     }
 
@@ -4440,7 +4566,7 @@ impl Runtime {
                     < 0.2 * self.input_settings.motion.slowdown()
             })
             || self.state.protocols.bell.visual(now).is_some()
-            || self.shell_swipe.is_some()
+            || self.shell_swipe.active()
             || self.overlay.visible
             || !self.casts.is_empty()
             // A running PAM worker publishes its terminal phase before
@@ -5418,7 +5544,7 @@ impl Runtime {
         let flashes = self.screenshot_flashes.samples(now);
         let allowed = crate::window_lifecycle::effects_allowed(
             self.control.overview_open(),
-            self.shell_swipe.is_some(),
+            self.shell_swipe.active(),
             self.manager.workspace_slide().running(),
             locked,
         );
@@ -6345,11 +6471,26 @@ impl Runtime {
     }
 }
 
-/// Overview backdrop (GNOME 51's `#overviewGroup`, #222226).
-/// Vertical finger travel for a whole overview transition (logical
-/// touchpad units, as libinput reports swipe deltas).
-const OVERVIEW_SWIPE_DISTANCE: f64 = 300.0;
+/// The tracker a committed touchpad swipe drives.
+#[derive(Debug)]
+enum SwipeTarget {
+    /// Nothing moves (no swipe, or one GNOME's trackers ignore).
+    None,
+    /// The overview's transition, `travel` touchpad units toward open.
+    Overview { travel: f64 },
+    /// The desktop's workspace strip ([`crate::workspace_slide`]).
+    Workspaces,
+    /// The open overview's workspaces (`WorkspacesView`): `progress`
+    /// along `workspaces` from slot `initial`, settled on release.
+    OverviewWorkspaces {
+        workspaces: Vec<u32>,
+        initial: f64,
+        progress: f64,
+        history: crate::workspace_slide::SwipeHistory,
+    },
+}
 
+/// Overview backdrop (GNOME 51's `#overviewGroup`, #222226).
 const OVERVIEW_BACKGROUND: Color32F = Color32F::new(34.0 / 255.0, 34.0 / 255.0, 38.0 / 255.0, 1.0);
 
 /// The overview's solid fills (the workspace thumbnails strip) in

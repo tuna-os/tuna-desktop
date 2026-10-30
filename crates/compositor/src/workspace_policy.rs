@@ -86,6 +86,14 @@ mod tests {
     }
 
     #[test]
+    fn a_swipe_point_belongs_to_the_monitor_under_it() {
+        // GNOME picks a swipe's monitor from a 1x1 rect at the gesture's
+        // coordinates (swipeTracker.js:493-501).
+        assert!(on_secondary((-1, 50, 1, 1), &outputs()));
+        assert!(!on_secondary((0, 50, 1, 1), &outputs()));
+    }
+
+    #[test]
     fn coordinate_additions_do_not_overflow_i32() {
         let layout = [
             OutputBounds {
