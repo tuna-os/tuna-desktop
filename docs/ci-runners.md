@@ -26,7 +26,7 @@ Both chart releases use the same chart version (0.15.1 at install).
 ## What runs where
 
 The `runs-on` of a moved job is a YAML alias (`*runner-24` / `*runner-26`)
-of the expressions anchored on `select-lanes` and `journey` in
+of the expressions anchored on `select-lanes` and `orca-speech` in
 `.github/workflows/ci.yml`. They pick the self-hosted scale set when the
 repository variable `CI_RUNNERS` is not `hosted` **and** the event is a push,
 schedule, dispatch or a pull request whose head repository is
@@ -34,11 +34,12 @@ schedule, dispatch or a pull request whose head repository is
 
 | Runner | Lanes |
 | --- | --- |
-| `tuna-ci-24.04` | select-lanes, check, fprint-phase-proof, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, marlin-image, parity-ledger, docs-shots, ci-gate |
-| `tuna-ci-26.04` | journey, orca-speech, portal-security, remote-security, niri-parity |
-| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (both matrix legs) |
+| `tuna-ci-24.04` | select-lanes, check, fprint-phase-proof, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, parity-ledger, docs-shots, ci-gate |
+| `tuna-ci-26.04` | orca-speech |
+| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (both matrix legs), journey |
+| GitHub-hosted, not yet proven self-hosted | portal-security, remote-security, niri-parity, marlin-image |
 
-Why the last three stay hosted:
+Why the always-hosted lanes stay hosted:
 
 - **arch-package** is a `container:` job; the runner needs a Docker daemon
   to start the job container, and a daemon needs a privileged pod.
@@ -51,6 +52,18 @@ Why the last three stay hosted:
   --via-loopback`, i.e. loop devices and a privileged container, which is
   root on the node. KVM through KubeVirt's device plugin would work, the
   disk build would not.
+- **journey**'s "Qualify disposable Debian lifecycle" step (`docker run …
+  legacy-upgrade-evidence.py`) fails under the runners' rootless podman
+  (`podman-docker`): two to five dpkg conffile lifecycle cases error
+  (`end of file on stdin at conffile prompt`), reproduced with a
+  GitHub-hosted-built candidate package, while every hosted run passes.
+  Until that difference is understood the lane stays hosted.
+
+The podman lanes (portal-security, remote-security, niri-parity,
+marlin-image) wait on hosted `arch-package`; rootless podman, `podman
+build` and `docker run` work in the runner pods, but these lanes have not
+passed self-hosted yet. Move one by switching its `runs-on` to the alias
+and proving it green on a pull request.
 
 Other workflows (`stress`, `fuzz`, `baseline`, …) still use GitHub-hosted
 runners; the same aliases can move them.
