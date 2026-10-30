@@ -239,7 +239,7 @@ pub struct WindowInfo {
     pub workspace: WorkspaceId,
     /// Whether the window currently holds keyboard focus.
     pub focused: bool,
-    /// Fresh one-use activation Bearer [REDACTED] for this window, minted with the
+    /// Fresh one-use [`ActivationToken`] for this window, minted with the
     /// snapshot or delta that carries it. The shell presents it back in
     /// `ActivateWindow`; presenting it consumes it. Several live tokens
     /// for one window may coexist (each snapshot/delta mints anew); each
@@ -331,7 +331,7 @@ pub enum CommandKind {
     ActivateWindow {
         /// Window to activate.
         window: WindowId,
-        /// Compositor-minted Bearer [REDACTED] proving a recent user interaction.
+        /// Compositor-minted [`ActivationToken`] proving a recent user interaction.
         token: ActivationToken,
     },
     /// Make a workspace active.
@@ -1712,7 +1712,7 @@ impl From<DecodeError> for ControlError {
     }
 }
 
-/// Compositor-minted activation Bearer [REDACTED] authorizing one privileged window action.
+/// Compositor-minted activation token authorizing one privileged window action.
 ///
 /// Opaque to the shell: minting, expiry (30 s), one-use removal, seat
 /// binding, and `app_id` matching are compositor policy (ADR 0002), not
