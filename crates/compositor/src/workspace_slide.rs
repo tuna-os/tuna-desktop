@@ -178,7 +178,7 @@ pub fn swipe_bounds(progress: f64, slots: usize) -> (f64, f64) {
 /// [`swipe_release_over`] within explicit `bounds` (`_getEndProgress`
 /// and `_endGesture`, swipeTracker.js:601-658).
 #[allow(clippy::too_many_arguments)]
-fn release_within(
+pub(crate) fn release_within(
     progress: f64,
     initial: f64,
     (low, high): (f64, f64),
