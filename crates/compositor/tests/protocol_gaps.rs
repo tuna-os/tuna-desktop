@@ -1,16 +1,23 @@
 //! The GNOME 51 protocols Tuna Desktop added to close P-SY-06's gaps (#89):
 //! presentation-time, fifo, keyboard-shortcuts-inhibit, xdg-dialog,
-//! xdg-foreign, xdg-system-bell, xdg-toplevel-tag and ext-background-effect,
-//! driven by a real client against the headless compositor.
+//! xdg-foreign, xdg-system-bell, xdg-toplevel-tag, ext-background-effect
+//! and text-input-v3 version 2, driven by a real client against the
+//! headless compositor.
 
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use tuna_compositor::control::ControlHub;
+use tuna_compositor::osk::InputPanel;
+use tuna_compositor::state::{StateModel, TokenStore};
 use tuna_compositor::windows::{
     ManagerInput, WindowManager, ESCAPE_KEYCODE, PAGE_DOWN_KEYCODE, SUPER_LEFT_KEYCODE,
 };
-use tuna_compositor::TestCompositor;
+use tuna_compositor::{TestCompositor, SEAT_NAME};
+use tuna_shell_control::{
+    decode_frame, encode_frame, Message, ProtocolVersion, TextFieldFocus, CURRENT_VERSION,
+};
 use wayland_client::{
     protocol::{
         wl_callback::{self, WlCallback},
@@ -35,6 +42,9 @@ use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
 use wayland_protocols::wp::presentation_time::client::{
     wp_presentation::{self, WpPresentation},
     wp_presentation_feedback::{self, WpPresentationFeedback},
+};
+use wayland_protocols::wp::text_input::zv3::client::{
+    zwp_text_input_manager_v3::ZwpTextInputManagerV3, zwp_text_input_v3::ZwpTextInputV3,
 };
 use wayland_protocols::xdg::dialog::v1::client::{
     xdg_dialog_v1::XdgDialogV1, xdg_wm_dialog_v1::XdgWmDialogV1,
@@ -316,6 +326,8 @@ wayland_client::delegate_noop!(Client: ignore ZxdgExporterV1);
 wayland_client::delegate_noop!(Client: ignore ZxdgImporterV1);
 wayland_client::delegate_noop!(Client: ignore ExtBackgroundEffectSurfaceV1);
 wayland_client::delegate_noop!(Client: ignore wayland_client::protocol::wl_region::WlRegion);
+wayland_client::delegate_noop!(Client: ignore ZwpTextInputManagerV3);
+wayland_client::delegate_noop!(Client: ignore ZwpTextInputV3);
 
 struct Peer {
     _conn: Connection,
@@ -1255,4 +1267,262 @@ fn a_blur_region_for_a_destroyed_surface_is_a_protocol_error() {
         error.code,
         ext_background_effect_surface_v1::Error::SurfaceDestroyed as u32
     );
+}
+
+/// A control-channel shell peer handshaken at `minor`.
+fn shell_peer(
+    hub: &mut ControlHub,
+    model: &mut StateModel,
+    path: &std::path::Path,
+    minor: u16,
+) -> UnixStream {
+    use std::io::Write;
+    let mut shell = UnixStream::connect(path).unwrap();
+    shell
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    hub.poll(model);
+    let hello = Message::Hello {
+        version: ProtocolVersion::new(CURRENT_VERSION.major, minor),
+    };
+    shell.write_all(&encode_frame(&hello)).unwrap();
+    hub.poll(model);
+    assert!(matches!(shell_read(&mut shell), Message::Hello { .. }));
+    assert!(matches!(shell_read(&mut shell), Message::Snapshot { .. }));
+    assert!(matches!(shell_read(&mut shell), Message::Overview { .. }));
+    shell
+}
+
+fn shell_read(shell: &mut UnixStream) -> Message {
+    use std::io::Read;
+    let mut frame = vec![0_u8; 4];
+    shell.read_exact(&mut frame).unwrap();
+    let len = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    frame.resize(4 + len, 0);
+    shell.read_exact(&mut frame[4..]).unwrap();
+    decode_frame(&frame).unwrap()
+}
+
+/// Nothing more waits for the shell.
+fn shell_quiet(shell: &mut UnixStream) -> bool {
+    use std::io::Read;
+    shell.set_nonblocking(true).unwrap();
+    let quiet = matches!(shell.read(&mut [0_u8; 1]),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock);
+    shell.set_nonblocking(false).unwrap();
+    quiet
+}
+
+/// One runtime tick of `publish_on_screen_keyboard`, unlocked: what the
+/// hub is handed, then broadcast.
+fn publish_osk(
+    comp: &mut TestCompositor,
+    hub: &mut ControlHub,
+    model: &mut StateModel,
+) -> (Option<TextFieldFocus>, Option<InputPanel>) {
+    let (field, panel) = comp.state.on_screen_keyboard(false);
+    hub.set_on_screen_keyboard(field, panel, false);
+    hub.poll(model);
+    (field, panel)
+}
+
+fn osk_update(focus: Option<TextFieldFocus>, show: bool) -> Message {
+    Message::OnScreenKeyboard {
+        focus,
+        show,
+        touch_auto: false,
+    }
+}
+
+/// Mutter 51's text_input_commit_state for a version 2 text input:
+/// show_input_panel and hide_input_panel are double-buffered until
+/// commit, the last one wins, and they set input-panel ON or OFF; enabling
+/// again asks for nothing. The shell hears ON in `OnScreenKeyboard` and OFF
+/// as `HideInputPanel` (0.47); a 0.46 shell gets the update alone.
+#[test]
+fn text_input_v2_panel_requests_reach_the_shell_like_mutter() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    assert_eq!(peer.client.globals["zwp_text_input_manager_v3"].1, 2);
+    let seat: WlSeat = peer.bind(9);
+    let text_inputs: ZwpTextInputManagerV3 = peer.bind(2);
+    let (_surface, _toplevel) = window(&mut peer, "field");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(focused_title(&manager).as_deref(), Some("field"));
+    let text_input: ZwpTextInputV3 = text_inputs.get_text_input(&seat, &peer.qh(), ());
+    assert_eq!(wayland_client::Proxy::version(&text_input), 2);
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let path = dir.path().join("control.sock");
+    let mut hub =
+        ControlHub::bind(path.clone(), std::rc::Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let mut model = StateModel::new();
+    let mut shell = shell_peer(&mut hub, &mut model, &path, CURRENT_VERSION.minor);
+    let mut old_shell = shell_peer(&mut hub, &mut model, &path, 46);
+    let field = Some(TextFieldFocus {
+        purpose: 0,
+        hints: 0,
+    });
+
+    // Enabling gives input-method focus and no panel request.
+    text_input.enable();
+    text_input.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(publish_osk(&mut comp, &mut hub, &mut model), (field, None));
+    for shell in [&mut shell, &mut old_shell] {
+        assert_eq!(shell_read(shell), osk_update(field, false));
+    }
+    // Enabling again is version 1's panel request, not version 2's.
+    text_input.enable();
+    text_input.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(publish_osk(&mut comp, &mut hub, &mut model), (field, None));
+    assert!(shell_quiet(&mut shell) && shell_quiet(&mut old_shell));
+
+    // show_input_panel: ON, applied at commit.
+    text_input.show_input_panel();
+    text_input.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(
+        publish_osk(&mut comp, &mut hub, &mut model),
+        (field, Some(InputPanel::On))
+    );
+    for shell in [&mut shell, &mut old_shell] {
+        assert_eq!(shell_read(shell), osk_update(field, true));
+        assert!(shell_quiet(shell));
+    }
+
+    // hide_input_panel waits for commit, then OFF.
+    text_input.hide_input_panel();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(publish_osk(&mut comp, &mut hub, &mut model), (field, None));
+    assert!(shell_quiet(&mut shell) && shell_quiet(&mut old_shell));
+    text_input.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(
+        publish_osk(&mut comp, &mut hub, &mut model),
+        (field, Some(InputPanel::Off))
+    );
+    assert_eq!(shell_read(&mut shell), osk_update(field, false));
+    assert_eq!(shell_read(&mut shell), Message::HideInputPanel);
+    assert_eq!(shell_read(&mut old_shell), osk_update(field, false));
+    assert!(shell_quiet(&mut shell) && shell_quiet(&mut old_shell));
+
+    // The last request before commit wins; a valid action set is taken.
+    let submit = 1_u32.to_ne_bytes().to_vec();
+    text_input.set_available_actions(submit);
+    text_input.hide_input_panel();
+    text_input.show_input_panel();
+    text_input.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(peer._conn.protocol_error().is_none());
+    assert_eq!(
+        publish_osk(&mut comp, &mut hub, &mut model),
+        (field, Some(InputPanel::On))
+    );
+    assert_eq!(shell_read(&mut shell), osk_update(field, true));
+    text_input.show_input_panel();
+    text_input.hide_input_panel();
+    text_input.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(
+        publish_osk(&mut comp, &mut hub, &mut model),
+        (field, Some(InputPanel::Off))
+    );
+    assert_eq!(shell_read(&mut shell), osk_update(field, false));
+    assert_eq!(shell_read(&mut shell), Message::HideInputPanel);
+
+    // Disabling drops input-method focus and the request with it.
+    text_input.disable();
+    text_input.show_input_panel();
+    text_input.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(publish_osk(&mut comp, &mut hub, &mut model), (None, None));
+    assert_eq!(shell_read(&mut shell), osk_update(None, false));
+    assert!(shell_quiet(&mut shell));
+
+    // Locked, nothing leaves the session.
+    text_input.enable();
+    text_input.show_input_panel();
+    text_input.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(comp.state.on_screen_keyboard(true), (None, None));
+}
+
+/// A version 1 bind is unchanged: enabling a focused text input again is
+/// mutter's version 1 input-panel ON (`enable_panel_v1`).
+#[test]
+fn text_input_v1_binds_keep_mutters_reenable_panel_request() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let seat: WlSeat = peer.bind(9);
+    let text_inputs: ZwpTextInputManagerV3 = peer.bind(1);
+    let (_surface, _toplevel) = window(&mut peer, "gtk3");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let text_input: ZwpTextInputV3 = text_inputs.get_text_input(&seat, &peer.qh(), ());
+    assert_eq!(wayland_client::Proxy::version(&text_input), 1);
+    let field = Some(TextFieldFocus {
+        purpose: 0,
+        hints: 0,
+    });
+    text_input.enable();
+    text_input.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(comp.state.on_screen_keyboard(false), (field, None));
+    text_input.enable();
+    text_input.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(
+        comp.state.on_screen_keyboard(false),
+        (field, Some(InputPanel::On))
+    );
+    assert_eq!(comp.state.on_screen_keyboard(false), (field, None));
+    text_input.disable();
+    text_input.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(comp.state.on_screen_keyboard(false), (None, None));
+}
+
+/// Mutter's text_input_set_available_actions: none ("Invalid 'none'
+/// action in set"), an action listed twice ("Action 1 doubly set") or an
+/// unknown one ("Unknown action 7 in set") is the invalid_action protocol
+/// error, whatever the focus; submit alone, or no action, is accepted.
+#[test]
+fn set_available_actions_raises_mutters_invalid_action_errors() {
+    let (mut comp, mut manager) = compositor();
+    let actions = |list: &[u32]| -> Vec<u8> { list.iter().flat_map(|a| a.to_ne_bytes()).collect() };
+    for (list, invalid) in [
+        (&[1][..], false),
+        (&[][..], false),
+        (&[0][..], true),
+        (&[1, 1][..], true),
+        (&[1, 7][..], true),
+    ] {
+        let mut peer = connect(&mut comp, &mut manager);
+        let seat: WlSeat = peer.bind(9);
+        let text_inputs: ZwpTextInputManagerV3 = peer.bind(2);
+        let text_input: ZwpTextInputV3 = text_inputs.get_text_input(&seat, &peer.qh(), ());
+        text_input.set_available_actions(actions(list));
+        text_input.commit();
+        for _ in 0..ROUNDS {
+            let _ = peer.queue.flush();
+            comp.pump();
+            if let Some(guard) = peer.queue.prepare_read() {
+                let _ = guard.read();
+            }
+            let _ = peer.queue.dispatch_pending(&mut peer.client);
+        }
+        // `zwp_text_input_v3.error.invalid_action` is 0.
+        let error = peer
+            ._conn
+            .protocol_error()
+            .map(|e| (e.object_interface, e.code));
+        let expected = invalid.then(|| ("zwp_text_input_v3".to_owned(), 0));
+        assert_eq!(error, expected, "{list:?}");
+    }
 }

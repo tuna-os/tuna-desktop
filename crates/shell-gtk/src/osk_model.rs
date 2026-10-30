@@ -479,6 +479,15 @@ impl Presence {
         }
     }
 
+    /// `set_input_panel_state(OFF)` from the focused client (text-input-v3
+    /// version 2 `hide_input_panel`): `_onKeyboardStateChanged` →
+    /// `close(true)`.
+    pub fn panel_off(&mut self, now: u64) {
+        if self.enabled {
+            self.close(true, now);
+        }
+    }
+
     /// `open(true)`: what the timers see once a keyboard is on screen.
     #[cfg(test)]
     pub fn open_now(&mut self, now: u64) {
@@ -824,6 +833,37 @@ mod tests {
         p.hide_key(10);
         assert!(!p.visible());
         assert_eq!(p.deadline(), None);
+    }
+
+    #[test]
+    fn presence_input_panel_off_hides_at_once() {
+        // Shown: the client's OFF closes immediately, focus kept.
+        let mut p = Presence::new();
+        p.open_now(0);
+        p.focus(true, false, 0, 10);
+        p.panel_off(20);
+        assert!(!p.visible());
+        assert_eq!(p.deadline(), None);
+        assert!(!p.tick(1000));
+
+        // ON then OFF before the rest time: the pending show never lands.
+        let mut p = Presence::new();
+        p.focus(true, true, 0, 0);
+        p.panel_off(100);
+        assert_eq!(shown_after(&mut p, 100, 1000), None);
+
+        // OFF then ON: ON opens again after the rest time.
+        let mut p = Presence::new();
+        p.open_now(0);
+        p.panel_off(10);
+        p.focus(true, true, 0, 20);
+        assert_eq!(shown_after(&mut p, 20, 1000), Some(320));
+
+        // A disabled keyboard ignores it.
+        let mut p = Presence::new();
+        p.set_enabled(false, 0);
+        p.panel_off(0);
+        assert!(!p.visible());
     }
 
     #[test]

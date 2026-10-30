@@ -1022,6 +1022,17 @@ impl Osk {
         self.session_changed(&session);
     }
 
+    /// The compositor's `HideInputPanel`: the focused text input asked to
+    /// hide the input panel (input-panel OFF).
+    pub fn hide_panel(self: &Rc<Self>) {
+        let Some(session) = self.session.borrow().clone() else {
+            return;
+        };
+        let now = self.now();
+        session.presence.borrow_mut().panel_off(now);
+        self.session_changed(&session);
+    }
+
     /// The session locked or unlocked: the session keyboard never shows
     /// over the lock screen.
     pub fn set_locked(self: &Rc<Self>, locked: bool) {

@@ -30,7 +30,7 @@ zxdg_importer_v1	1	capture	match
 zwp_linux_dmabuf_v1	3	capture	match
 wp_single_pixel_buffer_manager_v1	1	capture	match
 zwp_keyboard_shortcuts_inhibit_manager_v1	1	capture	match
-zwp_text_input_manager_v3	2	capture	min:1
+zwp_text_input_manager_v3	2	capture	match
 wp_presentation	2	capture	match
 xdg_activation_v1	1	capture	match
 zwp_idle_inhibit_manager_v1	1	capture	match

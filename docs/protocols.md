@@ -69,7 +69,7 @@ and this page together.
 | wp_single_pixel_buffer_manager_v1 | 1 | |
 | wp_cursor_shape_manager_v1 | 2 | shapes accepted; the compositor cursor is still the default arrow |
 | zwp_idle_inhibit_manager_v1 | 1 | a live inhibitor holds off the idle lock |
-| zwp_text_input_manager_v3 | 1 | text fields reach the input method (#60) |
+| zwp_text_input_manager_v3 | 2 | text fields reach the input method (#60) and GNOME's on-screen keyboard; as Mutter 51's text_input_commit_state, a version 2 client's show_input_panel and hide_input_panel set input-panel ON and OFF at commit (the shell's keyboard opens, or closes at once), while enabling a focused version 1 field again stays its ON request; set_available_actions raises Mutter's invalid_action errors and is otherwise accepted. The action, language and preedit_hint events are never sent: Mutter sends no language and no action reachable from GNOME Shell 51, and preedit hints need IBus attributes that input-method-v2 cannot carry (`third-party/smithay/TEXT-INPUT-V3-V2-PATCH.diff`) |
 | zwp_input_method_manager_v2 | 1 | IMEs such as fcitx5; candidate popups are tracked like any popup |
 | zwp_pointer_gestures_v1 | 3 | swipes reach apps; three-finger swipes are the shell's (overview, workspaces) |
 | zwp_relative_pointer_manager_v1 | 1 | raw motion from the DRM backend |
@@ -159,7 +159,6 @@ GNOME's version.
 | Protocol | GNOME 51 | Tuna Desktop | Why, and where tracked |
 |---|---|---|---|
 | wl_seat | 10 | 9 | Smithay 0.7 creates the seat at 9 and implements nothing newer; bumps with Smithay (#89) |
-| zwp_text_input_manager_v3 | 2 | 1 | Smithay 0.7 implements v1 only; bumps with Smithay (#60) |
 | xdg_toplevel_drag_manager_v1 | 1 | missing | not in Smithay 0.7: a window attached to a drag-and-drop operation and moved with it (detachable browser tabs) (#89) |
 | wp_color_manager_v1 (v2), wp_color_representation_manager_v1 | 2, 1 | missing | not in Smithay 0.7: needs a colour-managed renderer (ICC/HDR, YUV conversion); the GLES path is sRGB only (#89) |
 | wp_linux_drm_syncobj_manager_v1 | source-derived floor 1; absent in this VM capture | missing | explicit sync needs the DRM backend's syncobj import; GPU-capable native acceptance remains open (#68, #89) |
