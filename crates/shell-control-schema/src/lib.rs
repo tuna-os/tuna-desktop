@@ -204,9 +204,12 @@ impl ProtocolVersion {
     /// `ShowOsd`, `ShowPadOsd`, `PadOsdLabels`, `PadOsdInput`, `ClosePadOsd`
     /// and shell-to-compositor `RequestPadOsd`, `PadOsdClosed`.
     /// Positional postcard peers must ship together.
+    /// `0.46` appends the compositor-to-shell `WorkspaceProgress` message
+    /// (a finger-following workspace swipe's position, for the Activities
+    /// dots, #596).
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 45,
+        minor: 46,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -1076,7 +1079,27 @@ pub enum Message {
     PadOsdInput { pad: u32, event: PadOsdEvent },
     /// Since 0.45: the shown pad was unplugged; close its OSD.
     ClosePadOsd { pad: u32 },
+    /// Since 0.46: where a finger-following workspace swipe holds the
+    /// workspace strip, so the Activities dots follow it (GNOME 51
+    /// `workspaceAnimation.js:255-268` binds the primary monitor's swipe
+    /// progress to the shared workspaces adjustment that `panel.js`
+    /// `WorkspaceIndicators` reads). `position` is a fractional workspace
+    /// index in [`WORKSPACE_PROGRESS_SCALE`]ths; `duration_us` is 0 while
+    /// the fingers hold it and, on release, how long the strip takes to
+    /// settle there (ease-out-cubic, already scaled by the motion policy).
+    /// Sent only on swipe begin, update and release, to peers advertising
+    /// minor >=46.
+    WorkspaceProgress { position: u32, duration_us: u32 },
 }
+
+/// [`Message::WorkspaceProgress`] positions are workspace indices times
+/// this.
+pub const WORKSPACE_PROGRESS_SCALE: u32 = 10_000;
+/// The highest [`Message::WorkspaceProgress`] position: workspace 1024.
+pub const MAX_WORKSPACE_PROGRESS: u32 = 1024 * WORKSPACE_PROGRESS_SCALE;
+/// The longest [`Message::WorkspaceProgress`] settle: a minute, far past
+/// GNOME's 400 ms swipe ceiling times any sane slow-down factor.
+pub const MAX_WORKSPACE_PROGRESS_US: u32 = 60_000_000;
 
 /// The click a hover (dwell) makes: GNOME's dwell click types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2254,6 +2277,15 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
         }
         Message::PadOsdLabels { labels, .. } => check_pad_labels(labels)?,
         Message::PadOsdInput { .. } | Message::ClosePadOsd { .. } => {}
+        Message::WorkspaceProgress {
+            position,
+            duration_us,
+        } if *position > MAX_WORKSPACE_PROGRESS || *duration_us > MAX_WORKSPACE_PROGRESS_US => {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ));
+        }
+        Message::WorkspaceProgress { .. } => {}
     }
     Ok(())
 }
@@ -2472,8 +2504,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_45() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 45));
+    fn current_version_is_0_46() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 46));
     }
 
     #[test]
@@ -3816,5 +3848,34 @@ mod tablet_osd_wire_order_tests {
             tag(postcard::to_slice(&close, &mut buffer).unwrap()),
             auth + 5
         );
+    }
+
+    #[test]
+    fn workspace_progress_follows_close_pad_osd_and_is_bounded() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 256];
+        let close = tag(postcard::to_slice(&Message::ClosePadOsd { pad: 1 }, &mut buffer).unwrap());
+        let progress = Message::WorkspaceProgress {
+            position: 12_500,
+            duration_us: 0,
+        };
+        assert_eq!(
+            tag(postcard::to_slice(&progress, &mut buffer).unwrap()),
+            close + 1
+        );
+        assert_eq!(decode_frame(&encode_frame(&progress)).unwrap(), progress);
+        for (position, duration_us) in [
+            (MAX_WORKSPACE_PROGRESS + 1, 0),
+            (10_000, MAX_WORKSPACE_PROGRESS_US + 1),
+        ] {
+            let bad = Message::WorkspaceProgress {
+                position,
+                duration_us,
+            };
+            assert!(
+                decode_frame(&encode_frame(&bad)).is_err(),
+                "{position} {duration_us}"
+            );
+        }
     }
 }
