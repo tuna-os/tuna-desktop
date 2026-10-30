@@ -305,6 +305,10 @@ pub struct LockUi {
     hints: Rc<lock_curtain::HintWatch>,
     /// Where the notifications box reads what to show (#348).
     notifications: RefCell<Option<LockNotifications>>,
+    /// What the lock screens list now; `None` until the first fill.
+    shown_entries: RefCell<Option<Vec<LockEntry>>>,
+    /// Wakes the blanked screen for a notification (#348).
+    wake: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
 impl LockUi {
@@ -330,6 +334,8 @@ impl LockUi {
             osk: RefCell::new(None),
             hints: lock_curtain::HintWatch::new(),
             notifications: RefCell::new(None),
+            shown_entries: RefCell::new(None),
+            wake: RefCell::new(None),
         });
         {
             let weak = Rc::downgrade(&ui);
@@ -382,6 +388,27 @@ impl LockUi {
         for screen in screens.iter() {
             screen.notifications.show(&entries);
         }
+        drop(screens);
+        // The fill as the lock screen comes up wakes nothing (GNOME's
+        // `initial` sources); later arrivals and count changes do.
+        let wakes = self
+            .shown_entries
+            .borrow()
+            .as_deref()
+            .is_some_and(|previous| crate::lock_notifications::wakes_screen(previous, &entries));
+        *self.shown_entries.borrow_mut() = Some(entries);
+        if wakes {
+            let wake = self.wake.borrow().clone();
+            if let Some(wake) = wake {
+                wake();
+            }
+        }
+    }
+
+    /// Call `wake` when a notification should wake the locked screen
+    /// (unlockDialog.js `_wakeUpScreenForSource`, #348).
+    pub fn set_wake(&self, wake: Rc<dyn Fn()>) {
+        *self.wake.borrow_mut() = Some(wake);
     }
 
     /// Drop every lock window. Their entries are wiped at once, which is
@@ -398,6 +425,7 @@ impl LockUi {
         self.applying.set(was_applying);
         self.wall_clock.take();
         self.hints.disarm();
+        self.shown_entries.take();
         glib::idle_add_local_once(move || {
             for window in windows {
                 window.destroy();

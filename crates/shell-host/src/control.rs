@@ -796,6 +796,18 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// Wake the locked, blanked screen for a lock-screen notification
+    /// (screenShield.js `_wakeUpScreen`, #348). The compositor denies it
+    /// unless the session is locked.
+    pub fn wake_up_screen(&mut self) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::WakeUpScreen,
+        })?;
+        Ok(id)
+    }
+
     /// Carry out one of GNOME's window-menu actions. Returns the request id.
     pub fn window_action(
         &mut self,
@@ -2056,6 +2068,19 @@ mod tests {
             Message::Command {
                 id,
                 kind: CommandKind::CloseMenuUnanimated,
+            }
+        );
+    }
+
+    #[test]
+    fn wake_up_screen_is_one_command() {
+        let (mut client, mut peer) = handshook();
+        let id = client.wake_up_screen().expect("wake");
+        assert_eq!(
+            server_read(&mut peer),
+            Message::Command {
+                id,
+                kind: CommandKind::WakeUpScreen,
             }
         );
     }

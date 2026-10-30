@@ -67,6 +67,8 @@
 #                    restores the frame
 #   G-NOTIFY-LOCK-LIVE arrivals and policy keys reach the locked screen at
 #                    once; unlocking brings the queued banners and sounds
+#   G-NOTIFY-WAKE    a lock-screen notification wakes the blanked locked
+#                    screen (WakeUpScreen), not with show-banners off
 #   G-NOTIFY-SOUND   banners play sound-name / sound-file as they show,
 #                    silenced by enable-sound-alerts or event-sounds off
 #   G-NOTIFY-RESTORE re-enabling a disabled app brings what it sent while
