@@ -23,6 +23,12 @@ async-io = "2.6"
 futures-lite = "2.6.1"
 xkbcommon.workspace = true
 png = "0.18"
+# EDID and ICC checksums (colord device/profile ids, P-DS-03).
+md-5 = "0.10"
+# PNP vendor names from the udev hwdb, as gnome-desktop looks them up.
+udev = { version = "0.9", features = ["hwdb"], optional = true }
+# Raw KMS property blobs for GAMMA_LUT/CTM (the drm crate takes sized values only).
+drm-ffi = { version = "0.9", optional = true }
 # GNOME's cursor themes (#342): Xcursor files, parsed only; theme
 # lookup and inheritance are our own (src/cursor.rs).
 xcursor = "0.3"
@@ -70,6 +76,8 @@ drm = [
     "smithay/backend_session_libseat",
     "smithay/backend_udev",
     "smithay/renderer_gl",
+    "dep:udev",
+    "dep:drm-ffi",
 ]
 
 [dev-dependencies]

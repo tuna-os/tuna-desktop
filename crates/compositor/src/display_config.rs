@@ -214,7 +214,7 @@ pub fn supported_scales(width: i32, height: i32) -> Vec<f32> {
 
 /// `meta_monitor_has_aspect_as_size`: an EDID that stores the aspect
 /// ratio where the physical size belongs.
-fn has_aspect_as_size(width_mm: i32, height_mm: i32) -> bool {
+pub(crate) fn has_aspect_as_size(width_mm: i32, height_mm: i32) -> bool {
     matches!(
         (width_mm, height_mm),
         (1600, 900) | (1600, 1000) | (160, 90) | (160, 100) | (16, 9) | (16, 10)

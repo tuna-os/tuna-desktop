@@ -1220,6 +1220,7 @@ pub fn start(
     night_light: std::sync::Arc<crate::night_light::NightLightShare>,
     power_save: std::sync::Arc<crate::power_save::PowerSaveShare>,
     display_state: Arc<crate::display_config::DisplayShare>,
+    color: Arc<crate::color_manager::ColorShare>,
 ) -> calloop::channel::Channel<ToLoop> {
     let (to_loop, from_dbus) = calloop::channel::channel();
     let _ = std::thread::Builder::new()
@@ -1268,6 +1269,14 @@ pub fn start(
                 .and_then(|b| b.serve_at("/org/gnome/Mutter/RemoteDesktop", remote_desktop))
                 .and_then(|b| b.serve_at("/org/gnome/Mutter/ServiceChannel", service_channel))
                 .and_then(|b| b.serve_at("/org/gnome/SettingsDaemon/Color", night_light_color))
+                .and_then(|b| {
+                    b.serve_at(
+                        "/org/gnome/Mutter/ColorManager",
+                        crate::color_manager::MutterColorManager {
+                            share: color.clone(),
+                        },
+                    )
+                })
                 .and_then(|b| b.build())
             {
                 Ok(conn) => conn,
@@ -1277,6 +1286,16 @@ pub fn start(
                 }
             };
             let flags = zbus::fdo::RequestNameFlags::DoNotQueue.into();
+            // GNOME Settings' calibration (P-DS-03): independent of the
+            // portal names below.
+            match conn.request_name_with_flags("org.gnome.Mutter.ColorManager", flags) {
+                Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
+                    eprintln!("tuna-compositor: serving org.gnome.Mutter.ColorManager");
+                }
+                _ => eprintln!(
+                    "tuna-compositor: org.gnome.Mutter.ColorManager is taken; calibration off"
+                ),
+            }
             for name in [
                 "org.gnome.Mutter.DisplayConfig",
                 "org.gnome.Mutter.ScreenCast",

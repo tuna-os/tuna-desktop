@@ -12,8 +12,8 @@
 //!   fixed from/to window) and the in-memory "disabled until
 //!   tomorrow" state. The temperature clamps to
 //!   [`MIN_TEMPERATURE_K`]..=[`MAX_TEMPERATURE_K`].
-//! - [`temperature_to_gains`]: colour-temperature-to-gains mapping,
-//!   normalised so [`NEUTRAL_TEMPERATURE_K`] is unity.
+//! - [`temperature_to_gains`]: colord's Planckian blackbody colour for
+//!   a temperature, unity at [`NEUTRAL_TEMPERATURE_K`].
 //! - The owned GIO settings reader caches six typed keys and watches changes.
 //!   Native calls run on one worker; the render and D-Bus consumers never wait
 //!   for native I/O. Failure retains the previous config; deadline expiry
@@ -22,9 +22,12 @@
 //!   refresh, schedule, smear, temp-disable, preview, 10 K hysteresis)
 //!   shared with the D-Bus thread through [`NightLightShare`].
 //! - [`tint_program`]: the GL texture program that multiplies every
-//!   drawn texel by the gains. The override lives for one frame only,
-//!   so neutral restore is by construction: disabled means the
-//!   program is never installed.
+//!   drawn texel by the gains, used only where no CRTC white point
+//!   exists (nested outputs, CRTCs without GAMMA_LUT or CTM). The
+//!   override lives for one frame only, so neutral restore is by
+//!   construction: disabled means the program is never installed.
+//!   Hardware outputs take the temperature as a CRTC gamma ramp or
+//!   CTM through [`crate::color_manager`].
 //!
 //! Schedule math runs in local time over Unix timestamps: the fixed
 //! from/to hours are local wall-clock hours and the automatic
@@ -51,8 +54,9 @@
 //!   `Sunrise`/`Sunset` in local hours, `NightLightPreview`);
 //!   mutter reads `Temperature` and folds it into each output's
 //!   gamma LUT (GAMMA_LUT, else CTM). We serve the same interface
-//!   on the same bus name from the compositor and apply the gains
-//!   in GL instead (pinned smithay 0.7 exposes no gamma LUT API).
+//!   on the same bus name from the compositor; on hardware the
+//!   temperature reaches the CRTC the same way
+//!   ([`crate::color_manager::WhitePoint`]), nested outputs tint in GL.
 //!   A `Temperature` write applies until Night Light's own
 //!   temperature next changes, as `gsd_color_state_set_temperature`
 //!   is overwritten by `notify::temperature`.
@@ -87,12 +91,11 @@
 //!   the mutter.rs owner.
 //!
 //! Known divergences from GNOME 51, all recorded rather than
-//! invented: Kelvin maps through Tanner Helland's approximation where
-//! mutter uses colord's Planckian blackbody
-//! (`cd_color_get_blackbody_rgb`); settings refresh watches changes with a fallback recheck every
+//! invented: settings refresh watches changes with a fallback recheck every
 //! [`READ_INTERVAL`]; polar
 //! day/night read inactive/active where g-s-d keeps its last
-//! sunrise/sunset (manual fallback); transient solid feedback
+//! sunrise/sunset (manual fallback); where the GL tint applies
+//! (nested, or CRTCs without GAMMA_LUT/CTM), transient solid feedback
 //! (screenshot flashes; the bell and the blank shield are black, so
 //! gains are a no-op on them) and the DRM hardware cursor bypass the
 //! tint; screenshots and screen casts stay untinted, matching GNOME
@@ -257,49 +260,18 @@ pub struct ColorGains {
     pub blue: f64,
 }
 
-/// Map a colour temperature in Kelvin to per-channel gains.
+/// Map a colour temperature in Kelvin to per-channel gains: colord's
+/// Planckian blackbody colour, as Mutter folds it into the CRTC gamma
+/// ramp (`set_blackbody_color_for_temperature` in
+/// `meta-color-profile.c`, see [`crate::color_manager::blackbody_rgb`]).
 ///
 /// Warm temperatures (low Kelvin) keep red and dim blue; cool ones do
 /// the opposite. The input clamps to
-/// [`MIN_TEMPERATURE_K`]..=[`MAX_TEMPERATURE_K`], and the output
-/// normalises against [`NEUTRAL_TEMPERATURE_K`], so 6500 K is exactly
+/// [`MIN_TEMPERATURE_K`]..=[`MAX_TEMPERATURE_K`]; 6500 K is exactly
 /// unity on every channel. Pure function of its argument.
 pub fn temperature_to_gains(kelvin: u32) -> ColorGains {
-    let kelvin = clamp_temperature(kelvin);
-    let (r, g, b) = raw_channels(kelvin);
-    let (nr, ng, nb) = raw_channels(NEUTRAL_TEMPERATURE_K);
-    ColorGains {
-        red: (r / nr).clamp(0.0, 1.0),
-        green: (g / ng).clamp(0.0, 1.0),
-        blue: (b / nb).clamp(0.0, 1.0),
-    }
-}
-
-/// Unnormalised Tanner Helland warm/cool channels for `kelvin`.
-fn raw_channels(kelvin: u32) -> (f64, f64, f64) {
-    let t = f64::from(kelvin) / 100.0;
-    let red = if t <= 66.0 {
-        255.0
-    } else {
-        329.698_727_446 * (t - 60.0).powf(-0.133_204_759_2)
-    };
-    let green = if t <= 66.0 {
-        99.470_802_586_1 * t.ln() - 161.119_568_166_1
-    } else {
-        288.122_169_528_3 * (t - 60.0).powf(-0.075_514_849_2)
-    };
-    let blue = if t >= 66.0 {
-        255.0
-    } else if t <= 19.0 {
-        0.0
-    } else {
-        138.517_731_223_1 * (t - 10.0).ln() - 305.044_792_730_7
-    };
-    (
-        red.clamp(0.0, 255.0),
-        green.clamp(0.0, 255.0),
-        blue.clamp(0.0, 255.0),
-    )
+    let [red, green, blue] = crate::color_manager::blackbody_rgb(clamp_temperature(kelvin));
+    ColorGains { red, green, blue }
 }
 
 /// When the filter may be active.
@@ -1544,6 +1516,12 @@ impl NightLightController {
         self.applied_gains
     }
 
+    /// The temperature the last tick published (`Temperature`), which
+    /// Mutter folds into each CRTC's white point.
+    pub fn applied_kelvin(&self) -> u32 {
+        self.share.temperature()
+    }
+
     /// Re-read the settings when [`READ_INTERVAL`] elapsed since the
     /// last read (always on the first call). A successful read
     /// replaces the config but preserves the live "disabled until
@@ -2015,14 +1993,11 @@ mod tests {
 
     #[test]
     fn coldest_boundary_keeps_red_kills_blue() {
+        // colord's Planckian 1000 K entry.
         let gains = temperature_to_gains(MIN_TEMPERATURE_K);
         assert_eq!(gains.red, 1.0);
         assert_eq!(gains.blue, 0.0);
-        assert!(
-            gains.green > 0.2 && gains.green < 0.35,
-            "green={}",
-            gains.green
-        );
+        assert_eq!(gains.green, 0.1817);
     }
 
     #[test]

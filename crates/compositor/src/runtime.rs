@@ -63,6 +63,7 @@ use crate::xwayland::XWaylandSupervisor;
 use crate::{ClientState, State};
 
 mod aids;
+mod color;
 mod display;
 mod osk;
 
@@ -717,6 +718,11 @@ pub struct Runtime {
     /// The controller also owns the live state shared with the D-Bus
     /// thread (active, temperature, "disabled until tomorrow").
     night_light: crate::night_light::NightLightController,
+    /// colord devices, calibration sessions and the CRTC white point
+    /// (P-DS-03), shared with the colord and D-Bus threads.
+    color: std::sync::Arc<crate::color_manager::ColorShare>,
+    /// The colord client thread (hardware sessions only).
+    colord: Option<crate::color_manager::ColordClient>,
     /// `org.gnome.desktop.wm.preferences` focus keys (owned GIO reader).
     wm_preferences: crate::wm_preferences::Reader,
     /// Last reported reader status, so a change logs once.
@@ -1169,6 +1175,22 @@ impl Runtime {
         let power_save_share: std::sync::Arc<crate::power_save::PowerSaveShare> =
             Default::default();
         let display_share: std::sync::Arc<crate::display_config::DisplayShare> = Default::default();
+        let color_share: std::sync::Arc<crate::color_manager::ColorShare> = Default::default();
+        // Mutter registers physical monitors with colord; nested outputs
+        // are virtual monitors and get no colord device.
+        let colord = match &backend {
+            Backend::Winit(_) => None,
+            #[cfg(feature = "drm")]
+            Backend::Drm(drm) => {
+                color_share.set_gamma_sizes(drm.gamma_sizes());
+                Some(crate::color_manager::ColordClient::start(
+                    color_share.clone(),
+                    drm.colord_monitors(),
+                    crate::color_manager::Bus::System,
+                    crate::color_manager::icc_directory(),
+                ))
+            }
+        };
         // org.gnome.Shell.Introspect: the portal's window picker.
         let capture_authority = crate::capture_security::Authority::default();
         let introspect = crate::introspect::start(state.desktop_size(), capture_authority.clone());
@@ -1184,6 +1206,7 @@ impl Runtime {
                     night_light_share.clone(),
                     power_save_share.clone(),
                     display_share.clone(),
+                    color_share.clone(),
                 ),
                 |event, _, rt: &mut Runtime| {
                     if let calloop::channel::Event::Msg(request) = event {
@@ -1377,6 +1400,8 @@ impl Runtime {
             power_save_share,
             power_save_beat: None,
             night_light: crate::night_light::NightLightController::new(night_light_share.clone()),
+            color: color_share.clone(),
+            colord,
             manual_transforms: Default::default(),
             display_share,
             display_published: None,
@@ -1417,6 +1442,7 @@ impl Runtime {
         // them, so no second wake source or thread is needed.
         night_light_share.set_wake(&runtime.wake);
         night_light_share.start_reader(&runtime.wake);
+        color_share.set_wake(&runtime.wake);
         runtime.orca.set_wake(&runtime.wake);
         runtime.idle_monitor.set_wake(&runtime.wake);
         if let Some(ime) = &runtime.ime {
@@ -2604,6 +2630,7 @@ impl Runtime {
         // GNOME Settings' display configuration (#340): modes, the
         // kernel's CRTC modes on hardware, pending confirmation.
         doc["display_config"] = self.display_config_diagnostics();
+        doc["color"] = self.color_diagnostics();
         let motion = self.input_settings.motion;
         doc["motion_policy"] = serde_json::json!(motion.level.as_str());
         doc["animation_slowdown"] = serde_json::json!(motion.slowdown());
@@ -5071,6 +5098,10 @@ impl Runtime {
             locked,
         );
         let wellbeing = self.wellbeing_effects.sample(self.animation_clock.now());
+        // Hardware outputs take Night Light and the assigned profile's
+        // calibration as the CRTC white point (P-DS-03); the renderer
+        // tints only outputs without one.
+        let tint_needed = self.update_white_points(self.night_light.applied_kelvin());
         let renderer = match &mut self.backend {
             Backend::Winit(backend) => backend.renderer(),
             #[cfg(feature = "drm")]
@@ -5100,8 +5131,17 @@ impl Runtime {
         );
         // The tint program is compiled once per renderer and cached;
         // a compile failure draws this frame untinted.
-        let night_tint =
-            crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, night_gains);
+        let night_tint = crate::wellbeing_effects::FrameColor::new(
+            renderer,
+            wellbeing,
+            night_gains.filter(|_| tint_needed),
+        );
+        // Outputs whose CRTC carries the white point draw untinted.
+        #[cfg(feature = "drm")]
+        let plain_tint = match night_gains {
+            Some(_) => crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, None),
+            None => night_tint.clone(),
+        };
         let overview = (show_content && !overlay_visible && drawn).then(|| self.overview_layout());
         // While search shows results, the workspace view steps aside.
         let cards = overview
@@ -5529,6 +5569,11 @@ impl Runtime {
                         continue;
                     }
                     let size = out.size;
+                    let output_tint = if out.tint_fallback {
+                        night_tint.as_ref()
+                    } else {
+                        plain_tint.as_ref()
+                    };
                     // Per-output scale from GNOME's monitors.xml (#59).
                     let view = View {
                         offset: out.loc,
@@ -5762,7 +5807,7 @@ impl Runtime {
                                         damage,
                                         scale: view.scale,
                                         blank_alpha,
-                                        tint: night_tint.as_ref(),
+                                        tint: output_tint,
                                     },
                                     &decor,
                                     &previews,
@@ -5807,7 +5852,7 @@ impl Runtime {
                                         damage: &damage,
                                         scale: view.scale,
                                         blank_alpha,
-                                        tint: night_tint.as_ref(),
+                                        tint: output_tint,
                                     },
                                     &decor,
                                     &previews,
@@ -7447,6 +7492,7 @@ fn run_loop(
     let mut wait = Duration::ZERO;
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            runtime.shutdown_colord();
             restore_env(prev_env);
             return Ok(runtime.stats);
         }
@@ -7491,6 +7537,7 @@ fn run_loop(
                 continue;
             }
             done => {
+                runtime.shutdown_colord();
                 restore_env(prev_env);
                 return done.map(|_| runtime.stats);
             }
