@@ -115,7 +115,7 @@ int main(int argc, char **argv) {
 }
 ''')
         cls.elf = cls.root / 'native-version'
-        subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', str(source), '-o', str(cls.elf)], check=True)
+        subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', str(source), '-o', str(cls.elf)], check=True, timeout=120)
         for name in BINS:
             path = cls.stage / 'usr/bin' / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -144,9 +144,9 @@ Provides: roost
                 path.chmod(0o755 if path.is_dir() or path.parent == cls.stage / 'usr/bin' else 0o644)
         cls.baseline = cls.root / 'genuine.deb'
         subprocess.run(['dpkg-deb', '--root-owner-group', '-Znone', '--build', str(cls.stage), str(cls.baseline)],
-                       check=True, capture_output=True)
-        cls.data = read_tar(subprocess.check_output(['dpkg-deb', '--fsys-tarfile', str(cls.baseline)]))
-        cls.control = read_tar(subprocess.check_output(['dpkg-deb', '--ctrl-tarfile', str(cls.baseline)]))
+                       check=True, capture_output=True, timeout=120)
+        cls.data = read_tar(subprocess.check_output(['dpkg-deb', '--fsys-tarfile', str(cls.baseline)], timeout=120))
+        cls.control = read_tar(subprocess.check_output(['dpkg-deb', '--ctrl-tarfile', str(cls.baseline)], timeout=120))
 
     def check(self, data=None, control=None):
         path = self.root / 'candidate.deb'
@@ -220,9 +220,9 @@ printf '%s\\n' 'shlibs:Depends=libc6 (>= 2.34)'
         self.assertTrue(package.is_file(), result.stdout)
         # Inspect original archives, so extraction cannot conceal unsafe modes.
         data = {item.name.removeprefix('./'): (item, body) for item, body in
-                read_tar(subprocess.check_output(['dpkg-deb', '--fsys-tarfile', str(package)]))}
+                read_tar(subprocess.check_output(['dpkg-deb', '--fsys-tarfile', str(package)], timeout=120))}
         control = {item.name.removeprefix('./'): (item, body) for item, body in
-                   read_tar(subprocess.check_output(['dpkg-deb', '--ctrl-tarfile', str(package)]))}
+                   read_tar(subprocess.check_output(['dpkg-deb', '--ctrl-tarfile', str(package)], timeout=120))}
         for name in ('etc', 'etc/pam.d', 'usr', 'usr/bin', 'usr/share', 'usr/share/wayland-sessions'):
             with self.subTest(ancestor=name):
                 item, _ = data[name]

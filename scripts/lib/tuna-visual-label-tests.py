@@ -56,7 +56,7 @@ class LabelCase(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(LABEL), "--dir", str(directory),
              "--baseline", "00-baseline-desktop.png"],
-            capture_output=True, text=True)
+            capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         return {entry["file"]: entry
                 for entry in json.loads((directory / "frames.json").read_text())["frames"]}
@@ -95,11 +95,11 @@ class LabelCase(unittest.TestCase):
             same.save(directory / "c.png")
             differs = subprocess.run(
                 [sys.executable, str(LABEL), "--compare", str(directory / "a.png"),
-                 str(directory / "b.png")], capture_output=True, text=True)
+                 str(directory / "b.png")], capture_output=True, text=True, timeout=60)
             self.assertEqual(differs.returncode, 0, differs.stderr)
             same_result = subprocess.run(
                 [sys.executable, str(LABEL), "--compare", str(directory / "a.png"),
-                 str(directory / "c.png")], capture_output=True, text=True)
+                 str(directory / "c.png")], capture_output=True, text=True, timeout=60)
             self.assertEqual(same_result.returncode, 1)
 
     def test_compare_fails_closed(self):
@@ -109,11 +109,11 @@ class LabelCase(unittest.TestCase):
             solid(directory / "small.png", (2, 60, 136), size=(64, 64))
             missing = subprocess.run(
                 [sys.executable, str(LABEL), "--compare", str(directory / "a.png"),
-                 str(directory / "nope.png")], capture_output=True, text=True)
+                 str(directory / "nope.png")], capture_output=True, text=True, timeout=60)
             self.assertEqual(missing.returncode, 2)
             mismatch = subprocess.run(
                 [sys.executable, str(LABEL), "--compare", str(directory / "a.png"),
-                 str(directory / "small.png")], capture_output=True, text=True)
+                 str(directory / "small.png")], capture_output=True, text=True, timeout=60)
             self.assertEqual(mismatch.returncode, 2)
 
 

@@ -17,7 +17,7 @@ SCRIPT = ROOT / "scripts" / "tuna-visual-capture"
 
 def git(*args):
     return subprocess.run(["git", "-C", str(ROOT), *args],
-                          capture_output=True, text=True).stdout.strip()
+                          capture_output=True, text=True, timeout=60).stdout.strip()
 
 
 class ProvenanceCase(unittest.TestCase):
@@ -25,7 +25,7 @@ class ProvenanceCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run(
                 [str(SCRIPT), "--provenance", "--artifacts", directory],
-                capture_output=True, text=True)
+                capture_output=True, text=True, timeout=60)
             self.assertEqual(result.returncode, 0, result.stderr)
             manifest = json.loads((Path(directory) / "provenance.json").read_text())
             source = manifest["source"]
@@ -40,7 +40,7 @@ class ProvenanceCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run(
                 [str(SCRIPT), "--provenance", "--artifacts", directory],
-                capture_output=True, text=True)
+                capture_output=True, text=True, timeout=60)
             self.assertEqual(result.returncode, 0, result.stderr)
             manifest = json.loads((Path(directory) / "provenance.json").read_text())
             binaries = manifest["binaries"]

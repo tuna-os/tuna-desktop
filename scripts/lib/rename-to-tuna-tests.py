@@ -160,8 +160,8 @@ class Checkout(unittest.TestCase):
         (self.root / "scripts/roost-journey").chmod(0o755)
         (self.root / "docs/roost-logo.bin").write_bytes(b"\0roost\0")
         git = ["git", "-C", str(self.root)]
-        subprocess.run(git + ["init", "-q"], check=True)
-        subprocess.run(git + ["add", "-A"], check=True)
+        subprocess.run(git + ["init", "-q"], check=True, timeout=60)
+        subprocess.run(git + ["add", "-A"], check=True, timeout=60)
         # One untracked file: branches carry new work too.
         (self.root / "scripts/lib/roost-new-probe.py").write_text("print('roost')\n")
 
@@ -222,7 +222,7 @@ class Checkout(unittest.TestCase):
         self.assertEqual(self.read("tests/a11y/gnome51/comparison.md"), "Tuna Desktop: 6 nodes\n")
         self.assertFalse((self.root / "scripts/roost-journey").exists())
         staged = subprocess.run(["git", "-C", str(self.root), "diff", "--cached", "--name-status"],
-                                check=True, stdout=subprocess.PIPE).stdout.decode()
+                                check=True, stdout=subprocess.PIPE, timeout=60).stdout.decode()
         self.assertIn("scripts/tuna-journey", staged, "tracked files move with git mv")
 
         after = tree_digest(self.root)

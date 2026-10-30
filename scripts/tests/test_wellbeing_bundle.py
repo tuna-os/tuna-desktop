@@ -26,10 +26,10 @@ class BundleAdmission(unittest.TestCase):
         self.root = self.base / 'root'
         self.root.mkdir()
         (self.root / 'Cargo.lock').write_text('fixture lock\n')
-        subprocess.run(['git', 'init', '--quiet', str(self.root)], check=True)
-        subprocess.run(['git', 'add', 'Cargo.lock'], cwd=self.root, check=True)
-        subprocess.run(['git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'fixture'], cwd=self.root, check=True)
-        self.revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.root, text=True).strip()
+        subprocess.run(['git', 'init', '--quiet', str(self.root)], check=True, timeout=60)
+        subprocess.run(['git', 'add', 'Cargo.lock'], cwd=self.root, check=True, timeout=60)
+        subprocess.run(['git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'fixture'], cwd=self.root, check=True, timeout=60)
+        self.revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.root, text=True, timeout=60).strip()
         self.frozen = self.base / 'frozen'
         self.frozen.mkdir()
         (self.frozen / 'Cargo.lock').write_bytes((self.root / 'Cargo.lock').read_bytes())

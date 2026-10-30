@@ -71,7 +71,7 @@ sys.exit(int(os.environ['ENGINE_FAILURE']))
 
     def run_check(self):
         return subprocess.run([str(SCRIPT), str(self.package), 'ubuntu:26.04'],
-                              env=self.env, text=True, capture_output=True)
+                              env=self.env, text=True, capture_output=True, timeout=60)
 
     def test_clean_image_and_dependencies_are_explicit(self):
         result = self.run_check()
