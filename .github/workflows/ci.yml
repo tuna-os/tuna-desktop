@@ -1229,7 +1229,9 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift
           sudo mkdir -p /mnt/vm && sudo chown "$(id -u):$(id -g)" /mnt/vm
           df -h / /mnt
-      - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core zstd
+      # qemu-system-modules-opengl holds QEMU's D-Bus display (ui-dbus.so),
+      # which the app-integration boot uses for virtio-gpu output hotplug.
+      - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-system-modules-opengl qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core zstd dbus-daemon libglib2.0-bin
       - name: Build the Marlin Tuna Desktop image and the VM test layer
         run: |
           cp arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst ./tuna.pkg.tar.zst
@@ -1308,6 +1310,17 @@ jobs:
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
           --meta "tuna_package=$(basename arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)"
           --meta "commit=${{ github.sha }}"
+      # V-PICKER / V-INTROSPECT on their own two-head boot of the same disk:
+      # Nautilus file chooser parenting from real X11 and Wayland GTK callers,
+      # Introspect ScreenSize across virtio-gpu hotplug/rotation/unplug, and
+      # Flatpak sandbox identity through xdg-desktop-portal-gnome.
+      - name: App-integration boot (file chooser, Introspect display size and sandbox identity)
+        if: matrix.orca == 'distribution'
+        run: >-
+          scripts/tuna-vm-lane --disk /mnt/vm/disk.raw --out vm-lane-artifacts/app-integration --app-integration
+          --orca-contract ${{ matrix.orca }}
+          --meta "test_image_id=$(cat /mnt/vm/image-id)"
+          --meta "commit=${{ github.sha }}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
@@ -1385,6 +1398,7 @@ jobs:
           --assertions ledger-in/orca-speech/assertions.txt
           --assertions ledger-in/drm-smoke/assertions.txt
           --assertions ledger-in/marlin-vm/assertions.txt
+          --assertions ledger-in/marlin-vm/app-integration/assertions.txt
 
   docs-shots:
     timeout-minutes: 20

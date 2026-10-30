@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# CI image only: build tuna-vm-sandbox-client and a local Flatpak repository
+# holding it as the org.tuna.VmSandbox app on a minimal runtime made of the
+# client's own shared libraries. V-INTROSPECT installs it from that local
+# repository in the booted guest and runs it in Flatpak's real sandbox.
+set -euo pipefail
+[[ ${TUNA_CI_ONLY:-} == 1 ]] || { echo "sandbox fixture build is CI-only" >&2; exit 1; }
+build=$(mktemp -d)
+trap 'rm -rf "$build"' EXIT
+xml=/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
+wayland-scanner client-header "$xml" "$build/xdg-shell-client.h"
+wayland-scanner private-code "$xml" "$build/xdg-shell-protocol.c"
+# shellcheck disable=SC2046 # pkg-config flags are meant to split
+cc -std=c11 -O2 -Wall -Wextra -Werror -I"$build" /build/tuna-vm-sandbox-client.c \
+  "$build/xdg-shell-protocol.c" $(pkg-config --cflags --libs wayland-client) \
+  -o "$build/tuna-vm-sandbox-client"
+install -Dm755 "$build/tuna-vm-sandbox-client" /usr/libexec/tuna-vm-sandbox-client
+
+# Runtime: the client's dynamic loader and libraries under /usr/lib (with
+# lib64 pointing there, as the ELF interpreter path needs), and ldconfig,
+# which flatpak runs in the sandbox to build its ld.so cache.
+runtime="$build/runtime"
+mkdir -p "$runtime/files/lib" "$runtime/files/bin" "$runtime/files/etc"
+ln -s lib "$runtime/files/lib64"
+for lib in $(ldd /usr/libexec/tuna-vm-sandbox-client | grep -o '/[^ ]*'); do
+  cp -L "$lib" "$runtime/files/lib/"
+done
+cp -L /usr/bin/ldconfig "$runtime/files/bin/ldconfig"
+touch "$runtime/files/etc/ld.so.conf"
+cat > "$runtime/metadata" <<'EOF'
+[Runtime]
+name=org.tuna.VmProof.Platform
+runtime=org.tuna.VmProof.Platform/x86_64/1
+sdk=org.tuna.VmProof.Platform/x86_64/1
+EOF
+
+app="$build/app"
+mkdir -p "$app/files/bin" "$app/export"
+install -m755 /usr/libexec/tuna-vm-sandbox-client "$app/files/bin/tuna-vm-sandbox-client"
+cat > "$app/metadata" <<'EOF'
+[Application]
+name=org.tuna.VmSandbox
+runtime=org.tuna.VmProof.Platform/x86_64/1
+command=tuna-vm-sandbox-client
+
+[Context]
+sockets=wayland;
+EOF
+
+repo=/usr/share/tuna-vm/flatpak-repo
+mkdir -p "$repo"
+ostree init --mode=archive-z2 --repo="$repo"
+flatpak build-export --runtime --files=files --arch=x86_64 "$repo" "$runtime" 1
+flatpak build-export --arch=x86_64 "$repo" "$app" 1
+flatpak build-update-repo "$repo"
+mkdir -p /usr/share/tuna-vm-sandbox
+pacman -Q wayland wayland-protocols gcc flatpak ostree > /usr/share/tuna-vm-sandbox/packages.txt
+sha256sum /build/tuna-vm-sandbox-client.c /usr/libexec/tuna-vm-sandbox-client > /usr/share/tuna-vm-sandbox/build-sha256sums

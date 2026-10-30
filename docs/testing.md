@@ -288,6 +288,25 @@ receipt records capture attempts. Window identity/geometry drift, malformed
 images and QMP failures remain terminal. A retry never qualifies pixels from
 the rejected frame or claims presentation latency.
 
+The distribution matrix leg then boots the same disk once more with
+`scripts/tuna-vm-lane --app-integration` into
+`vm-lane-artifacts/app-integration/`. That boot gives virtio-vga a second,
+initially disconnected scanout (`max_outputs=2`) and exposes QEMU's D-Bus
+display (`-display dbus`) on a private bus, so the lane can plug, resize and
+unplug the second head with `org.qemu.Display1.Console.SetUIInfo`, which is
+real DRM connector hotplug in the guest. Guest fixtures
+(`packaging/marlin/vm-lane/tuna-vm-picker`, `tuna-vm-introspect-watch`,
+`tuna-vm-sandbox-client` packaged as the Flatpak `org.tuna.VmSandbox` in a
+local repository, and the root probe `tuna-vm-app-integration`, reached
+through `tuna-vm-lifecycle app-*`) only launch clients and read state; every
+click and key is QEMU input.
+
+| ID | What it asserts |
+|---|---|
+| `V-PICKER` | For an X11 (`GDK_BACKEND=x11`) and a native Wayland GTK 4 caller, each opening the installed GNOME FileChooser portal (Nautilus) through its own parent handle: the caller is allocated its requested 1100x700; for OpenFile and SaveFile, cancel (Escape) and accept (type-ahead and Enter), the dialog maps as the focused transient child of the caller, horizontally centred on it; a click on the exposed parent is blocked; the portal answers 1 with no URI or 0 with the chosen file (SaveFile's file is then written by the caller); focus returns to the caller and a real key and click reach it; an unrelated bystander app receives nothing |
+| `V-INTROSPECT-SCREEN` | A session-bus client subscribed to Introspect `PropertiesChanged` sees `ScreenSize` equal the union of Mutter `GetCurrentState` logical monitors initially (1280x800), after hotplugging a 1024x768 second head, after rotating it 90° through `ApplyMonitorsConfig`, and after unplugging it, with no notification that repeats an unchanged size |
+| `V-INTROSPECT-SANDBOX` | After installing the local Flatpak, xdg-desktop-portal-gnome's `Background.GetAppState` omits an unsandboxed client claiming the app ID `org.tuna.VmSandbox`, reports the Flatpak-sandboxed one as running or active, and drops it after it exits |
+
 The artifact (`marlin-vm`) holds `serial.log`, `tuna-lines.log` (every
 `tuna-*` line), the boot frames, `V-OVERVIEW.png` (the login overview),
 `V-SESSION.png` (the desktop), and `manifest.json`.

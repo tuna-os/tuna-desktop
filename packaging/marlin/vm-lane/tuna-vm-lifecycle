@@ -2098,6 +2098,10 @@ def main():
     if os.geteuid() != 0 or OWNER.pw_uid == 0:
         raise RuntimeError("probe must be root and session owner must not be root")
     action = sys.argv[1]
+    # V-PICKER / V-INTROSPECT probes live in their own fixed root helper; the
+    # guest agent only ever executes this lifecycle path.
+    if action.startswith("app-"):
+        os.execv("/usr/libexec/tuna-vm-app-integration", ["tuna-vm-app-integration", *sys.argv[1:]])
     if action == "background-diagnostics":
         inventory()  # Verify the original actual login owner before re-exec.
         result = json.loads(call(sys.executable, __file__, "background-user-diagnostics", user=True))

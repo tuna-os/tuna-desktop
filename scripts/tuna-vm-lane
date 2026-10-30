@@ -58,6 +58,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -74,6 +75,11 @@ _guest_spec = importlib.util.spec_from_loader("vm_guest_agent", _guest_loader)
 guest_agent = importlib.util.module_from_spec(_guest_spec)
 _guest_loader.exec_module(guest_agent)
 import soak_report  # noqa: E402  (scripts/lib, on sys.path above)
+_app_loader = importlib.machinery.SourceFileLoader("vm_app_integration",
+                                                   os.path.join(HERE, "lib", "vm_app_integration.py"))
+_app_spec = importlib.util.spec_from_loader("vm_app_integration", _app_loader)
+app_integration = importlib.util.module_from_spec(_app_spec)
+_app_loader.exec_module(app_integration)
 
 WIDTH, HEIGHT = baseline.WIDTH, baseline.HEIGHT
 DRM_RE = re.compile(r"tuna-compositor: drm: output (\S+) (\d+)x(\d+)")
@@ -3591,7 +3597,7 @@ def run_soak(qmp, vm, agent_path, out, record, seconds, warmup, interval, revisi
 
 
 def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, native_relative_mouse=False,
-         observer_records=None):
+         observer_records=None, display_bus=None):
     ovmf = next((p for p in OVMF if os.path.exists(p)), None)
     if not ovmf:
         sys.exit("tuna-vm-lane: OVMF firmware not found (install ovmf)")
@@ -3604,7 +3610,7 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
     qemu = ["qemu-system-x86_64", "-machine", "q35", "-m", "6144", "-smp", "4",
             "-bios", ovmf, "-snapshot",
             "-drive", f"file={disk},format=raw,if=virtio,cache=unsafe",
-            *baseline.gpu_devices(),
+            *baseline.gpu_devices(outputs=2 if display_bus else 1),
             "-device", "qemu-xhci", "-device", "usb-tablet", "-device", "usb-kbd",
             # The virtio keyboard carries multimedia evdev codes; USB's
             # boot-protocol keyboard has no consumer-control usages.
@@ -3612,7 +3618,11 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
             "-audiodev", "none,id=tuna-audio",
             "-device", "ich9-intel-hda",
             "-device", "hda-duplex,audiodev=tuna-audio",
-            "-display", "none", "-serial", f"file:{serial}",
+            # The app-integration boot exposes QEMU's D-Bus display on a
+            # private bus: its Console.SetUIInfo connects/disconnects the
+            # second virtio-gpu scanout (real guest DRM hotplug).
+            "-display", f"dbus,addr={display_bus},gl=off" if display_bus else "none",
+            "-serial", f"file:{serial}",
             "-qmp", f"unix:{qmp_path},server=on,wait=off",
             "-nic", "user,model=virtio-net-pci"]
     if native_relative_mouse:
@@ -3727,6 +3737,8 @@ def main():
     ap.add_argument("--soak-interval", type=int, default=60, metavar="SECONDS")
     ap.add_argument("--soak-revision", metavar="COMMIT",
                     help="the shipped payload's exact 40-digit source commit (deployment record)")
+    ap.add_argument("--app-integration", action="store_true",
+                    help="two-head boot running V-PICKER and V-INTROSPECT instead of the tour")
     a = ap.parse_args()
     if a.soak:
         if a.tour or a.boots != 1:
@@ -3735,6 +3747,8 @@ def main():
             ap.error("--soak must exceed a nonnegative warmup, at most 86400, with a positive interval")
         if not re.fullmatch("[0-9a-f]{40}", a.soak_revision or ""):
             ap.error("--soak needs --soak-revision, the exact 40-digit source commit")
+    if a.app_integration and (a.tour or a.boots > 1 or a.strip_image or a.soak):
+        ap.error("--app-integration is its own single boot")
     strip_image = None
     if a.strip_edge and not a.strip_image:
         ap.error("--strip-edge requires exact installed image admission")
@@ -3764,7 +3778,22 @@ def main():
         results[test_id] = (ok, desc)
         log(f"{test_id} {'pass' if ok else 'FAIL'}: {desc}")
 
-    vm, qmp_path, serial_path, kvm, agent_path = boot(os.path.abspath(a.disk), out, scratch, a.timeout, a.require_kvm, guest_agent=True, native_relative_mouse=True)
+    display_bus = display_daemon = display_dir = None
+    if a.app_integration:
+        # sun_path holds 108 bytes; the runner's scratch path can exceed it.
+        display_dir = tempfile.mkdtemp(prefix="tuna-qd-")
+        display_socket = os.path.join(display_dir, "bus")
+        display_bus = f"unix:path={display_socket}"
+        display_daemon = subprocess.Popen(["dbus-daemon", "--session", "--nofork", f"--address={display_bus}"])
+        for _ in range(50):
+            if os.path.exists(display_socket):
+                break
+            time.sleep(0.1)
+        else:
+            sys.exit(f"tuna-vm-lane: the QEMU display bus never appeared at {display_socket}")
+    vm, qmp_path, serial_path, kvm, agent_path = boot(os.path.abspath(a.disk), out, scratch, a.timeout, a.require_kvm,
+                                                      guest_agent=True, native_relative_mouse=True,
+                                                      display_bus=display_bus)
     start = time.time()
     drm = shell = None
     elapsed = 0.0
@@ -3887,6 +3916,13 @@ def main():
                             diagnostic_agent.close()
                     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
                         log(f"bounded lifecycle failure diagnostics unavailable: {error}")
+            if a.app_integration:
+                try:
+                    app_integration.run(qmp, lambda: guest_agent.GuestAgent(agent_path), out, record, display_bus)
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                    for gate in ("V-PICKER", "V-INTROSPECT-SCREEN", "V-INTROSPECT-SANDBOX"):
+                        results.setdefault(gate, (False, f"app-integration failed: {error}"))
+                        log(f"{gate} FAIL: app-integration failed: {error}")
         # Give activation probes a bounded chance to report before shutdown.
         deadline = time.time() + 180
         while drm and shell and time.time() < deadline:
@@ -3900,7 +3936,14 @@ def main():
             vm.wait(timeout=30)
         except subprocess.TimeoutExpired:
             vm.kill()
+        if display_daemon is not None:
+            display_daemon.kill()
+            display_daemon.wait()
+            shutil.rmtree(display_dir, ignore_errors=True)
 
+    if a.app_integration:
+        for gate in ("V-PICKER", "V-INTROSPECT-SCREEN", "V-INTROSPECT-SANDBOX"):
+            results.setdefault(gate, (False, "session never came up; app-integration not run"))
     text = read_text(serial_path)
     drm = drm or DRM_RE.search(text)
     shell = shell or SHELL_RE.search(text)
