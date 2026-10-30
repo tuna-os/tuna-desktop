@@ -23,7 +23,7 @@ class NotifyCallbackContract(unittest.TestCase):
                          'delay.emit_clicked()', 'ui.clear.emit_clicked()',
                          'button(&ui.banner_box, "close").emit_clicked()',
                          'button(&ui.list, "close").emit_clicked()',
-                         'ui.update()', 'ui.dismiss_notification(id)',
+                         'ui.update()', 'ui.remove_notification(id)',
                          'ui.drop_notification_actions(id)',
                          'TUNA_REQUIRE_NOTIFY_UI', 'DBUS_SESSION_BUS_ADDRESS',
                          'WAYLAND_DISPLAY', 'WAYLAND_SOCKET'):
