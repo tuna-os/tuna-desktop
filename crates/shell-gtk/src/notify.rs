@@ -419,9 +419,13 @@ type DndListener = Box<dyn Fn(bool)>;
 /// One notification as GNOME 51 draws it (messageList.js
 /// NotificationMessage): a header with the source icon, app name, time
 /// and close button, then the title and body. Returns the card and its
-/// close button.
+/// close button. Banner and list cards alike carry GNOME's message role
+/// (`Atk.Role.NOTIFICATION`, GTK's alert).
 fn card(n: &Notification) -> (gtk::Box, gtk::Button) {
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .accessible_role(gtk::AccessibleRole::Alert)
+        .build();
     card.add_css_class("message");
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     header.add_css_class("message-header");

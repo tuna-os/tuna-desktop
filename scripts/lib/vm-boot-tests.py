@@ -2119,11 +2119,22 @@ class OrcaLifecycleAuthority(unittest.TestCase):
         # genuine VM can qualify actual bus credentials and reader exclusion.
 
     def test_compositor_authority_comes_from_actual_backend(self):
-        source = (Path(__file__).resolve().parents[2] / "crates/compositor/src/runtime.rs").read_text()
-        self.assertIn("let hardware = matches!(self.backend, Backend::Drm(_));", source)
-        self.assertIn("self.orca.set_enabled(enabled && hardware);", source)
+        # Reader authority is the session serving the KeyboardMonitor: the
+        # actual DRM backend, or a nested session started with the explicit
+        # --screen-reader command-line flag (never environment or config).
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "crates/compositor/src/runtime.rs").read_text()
+        flat = " ".join(source.split())
+        self.assertIn("let hardware = matches!(backend, Backend::Drm(_));", source)
         self.assertIn("let hardware = false;", source)
+        self.assertIn("let a11y_keyboard = (hardware || session.screen_reader)"
+                      ".then(crate::a11y_keyboard::Monitor::start);", flat)
+        self.assertIn("self.orca .set_enabled(enabled && self.a11y_keyboard.is_some());", flat)
         self.assertTrue('doc["screen_reader_pid"] = serde_json::json!(self.orca.pid());' in source)
+        main = " ".join((root / "crates/compositor/src/main.rs").read_text().split())
+        self.assertIn('"--screen-reader" => { session.screen_reader = true; }', main)
+        self.assertEqual(main.count("screen_reader = true"), 1)
+        self.assertIn("screen_reader: false,", source)
 
     def test_no_global_orca_service_control_or_replace(self):
         root = Path(__file__).resolve().parents[2]

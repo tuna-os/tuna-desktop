@@ -627,6 +627,12 @@ hidden() {
     jq -e --arg n "$2" 'any(.[]; .name == $n and .showing) | not' "$1" >/dev/null
 }
 
+# A showing push button named NAME: quick settings' "Lock Screen" shares
+# its name with the lock surfaces' frames (GNOME's name for both).
+button_showing() {
+    jq -e --arg n "$2" 'any(.[]; .name == $n and .showing and (.role == "push button" or .role == "button"))' "$1" >/dev/null
+}
+
 focused() {
     jq -e --arg n "$2" 'any(.[]; .name == $n and .focused)' "$1" >/dev/null
 }
@@ -1385,10 +1391,12 @@ if showing "$ARTIFACTS/a11y-battery.json" '82%'; then
 fi
 pass G-BATTERY "UPower hotplug, charging/discharging and percentage setting update live"
 
-for label in "Wired" "Dark Style" "Do Not Disturb" "Volume" "Lock Screen"; do
+for label in "Wired" "Dark Style" "Do Not Disturb" "Volume"; do
     showing "$ARTIFACTS/a11y-qs.json" "$label" ||
         fail A11Y-QS "no showing accessible control named '$label'"
 done
+button_showing "$ARTIFACTS/a11y-qs.json" "Lock Screen" ||
+    fail A11Y-QS "no showing button named 'Lock Screen'"
 pass A11Y-QS "quick-settings toggles, slider, and lock exposed"
 
 xdotool key Escape
@@ -10055,7 +10063,7 @@ cstate '(.lock_screen_allowed | not) and .idle_timeout_ms > 1e18 and (.locked | 
 open_qs
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-lockdown-lock.json" 20 ||
     fail G-LOCKDOWN-LOCK "accessibility dump failed"
-hidden "$ARTIFACTS/a11y-lockdown-lock.json" "Lock Screen" ||
+! button_showing "$ARTIFACTS/a11y-lockdown-lock.json" "Lock Screen" ||
     fail G-LOCKDOWN-LOCK "the Lock button still shows with disable-lock-screen"
 showing "$ARTIFACTS/a11y-lockdown-lock.json" "Power Off Menu" ||
     fail G-LOCKDOWN-LOCK "quick settings did not open for the Lock check"
@@ -10077,7 +10085,7 @@ cstate '.lock_screen_allowed and .idle_timeout_ms < 1e18 and (.locked | not)' "l
 open_qs
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-lockdown-lock-restored.json" 20 ||
     fail G-LOCKDOWN-LOCK "accessibility dump failed"
-showing "$ARTIFACTS/a11y-lockdown-lock-restored.json" "Lock Screen" ||
+button_showing "$ARTIFACTS/a11y-lockdown-lock-restored.json" "Lock Screen" ||
     fail G-LOCKDOWN-LOCK "the Lock button did not return"
 open_qs
 pass G-LOCKDOWN-LOCK "disable-lock-screen turns the idle lock and compositor Lock off, hides Lock, refuses Super+L and ScreenSaver.Lock without locking, and restores"

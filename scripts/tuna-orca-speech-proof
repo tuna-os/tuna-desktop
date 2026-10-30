@@ -164,8 +164,6 @@ printf 'auth required %s passdb=%s\naccount required %s passdb=%s\n' \
 for tool in orca speech-dispatcher xdotool jq; do
     command -v "$tool" >/dev/null 2>&1 || fail G-ORCA-SPEECH-TOGGLE "$tool is required"
 done
-orca --version >"$ARTIFACTS/orca-version.txt" 2>&1 || true
-speech-dispatcher --version >"$ARTIFACTS/speechd-version.txt" 2>&1 || true
 
 # speech-dispatcher, autospawned by Orca with this configuration: one
 # generic module whose "synthesis" appends the utterance to spoken.log.
@@ -229,6 +227,10 @@ if ! xdotool getdisplaygeometry >/dev/null 2>&1; then
     export DISPLAY
     for _ in $(seq 1 30); do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 1; done
 fi
+# Orca initialises its AT-SPI device even for --version; without a display
+# it segfaults (atspi_device_x11_init), so ask once one exists.
+orca --version >"$ARTIFACTS/orca-version.txt" 2>&1 || true
+speech-dispatcher --version >"$ARTIFACTS/speechd-version.txt" 2>&1 || true
 
 # The private HOME below hides the real toolchain config; point the
 # build at the invoking user's cargo/rustup homes explicitly.

@@ -955,7 +955,9 @@ jobs:
           key: ${{ steps.cache-platform.outputs.distro }}
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
       - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool jq dbus dbus-x11 libglib2.0-bin xwayland at-spi2-core python3-gi gir1.2-gtk-4.0 libnotify-bin fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libwayland-dev wayland-protocols libpam-wrapper libpam0g-dev libgtk4-layer-shell-dev gsettings-desktop-schemas libclang-dev orca speech-dispatcher
-      - run: pkg-config --atleast-version=1.1 gtk4-layer-shell-0 && orca --version && speech-dispatcher --version
+      # orca --version initialises AT-SPI's X11 device and segfaults
+      # without a display; the proof records it once Xvfb is up.
+      - run: pkg-config --atleast-version=1.1 gtk4-layer-shell-0 && dpkg-query -W orca speech-dispatcher
       - run: shellcheck -x scripts/tuna-orca-speech-proof
       - run: scripts/tuna-orca-speech-proof --artifacts orca-speech-artifacts
       - if: always()
