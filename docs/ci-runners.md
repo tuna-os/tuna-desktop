@@ -35,9 +35,8 @@ schedule, dispatch or a pull request whose head repository is
 | Runner | Lanes |
 | --- | --- |
 | `tuna-ci-24.04` | select-lanes, check, fprint-phase-proof, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, parity-ledger, docs-shots, ci-gate |
-| `tuna-ci-26.04` | orca-speech |
-| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (both matrix legs) |
-| GitHub-hosted, not yet proven self-hosted | journey, portal-security, remote-security, niri-parity, marlin-image |
+| `tuna-ci-26.04` | journey, orca-speech, portal-security, remote-security, niri-parity |
+| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (both matrix legs), marlin-image |
 
 Why the always-hosted lanes stay hosted:
 
@@ -52,16 +51,16 @@ Why the always-hosted lanes stay hosted:
   --via-loopback`, i.e. loop devices and a privileged container, which is
   root on the node. KVM through KubeVirt's device plugin would work, the
   disk build would not.
+- **marlin-image** builds the OCI image and, on `main`, pushes it to GHCR
+  with a `packages: write` token. Publishing stays on GitHub's ephemeral VMs
+  so a compromised long-lived node (or its shared image store) can never
+  sign or push a release image.
 
-journey's self-hosted attempt failed in "Qualify disposable Debian lifecycle"
-(`end of file on stdin at conffile prompt`), but that failure came from #899
-changing a tuna-lock conffile, not from the runners; #930 restores it.
-
-The podman lanes (journey, and portal-security, remote-security, niri-parity
-and marlin-image, which also wait on hosted `arch-package`); rootless podman, `podman
-build` and `docker run` work in the runner pods, but these lanes have not
-passed self-hosted yet. Move one by switching its `runs-on` to the alias
-and proving it green on a pull request.
+journey once failed self-hosted in "Qualify disposable Debian lifecycle"
+(`end of file on stdin at conffile prompt`); that came from #899 changing
+the tuna-lock conffile, which fails hosted runs too, not from the runners
+(#930 restores the bytes). The podman lanes (journey, portal-security,
+remote-security, niri-parity) use the pods' rootless podman.
 
 Other workflows (`stress`, `fuzz`, `baseline`, …) still use GitHub-hosted
 runners; the same aliases can move them.
@@ -73,7 +72,9 @@ code as root inside its pod.
 
 1. **Only this repository's own branches reach the runners.**
    - Workflow: the `runs-on` expression above sends fork pull requests to
-     GitHub-hosted runners.
+     GitHub-hosted runners. `scripts/lib/ci-runner-guard-tests.py` (in
+     `check`) dry-runs every alias for own/fork/rollback cases, rejects any
+     other self-hosted `runs-on`, and runs the job-started hook below.
    - Runner image: a fork could edit that expression in its own pull
      request, so every job first runs
      [`job-started.sh`](../.github/runners/image/job-started.sh)

@@ -97,6 +97,7 @@ jobs:
       - run: scripts/rename-to-tuna --check --no-cargo
       - run: python3 scripts/lib/tuna-soak-tests.py
       - run: python3 scripts/lib/vm-boot-tests.py
+      - run: python3 scripts/lib/ci-runner-guard-tests.py
       - run: python3 scripts/tests/test_vm_guest_agent_deadline.py
       - run: python3 scripts/tests/test_vm_strip_acceptance.py
       - run: python3 scripts/tests/test_vm_strip_fixture_owner.py
@@ -316,8 +317,8 @@ jobs:
           retention-days: 14
 
   journey:
-    # GitHub-hosted until proven self-hosted (docs/ci-runners.md).
-    runs-on: ubuntu-26.04
+    # Same choice as select-lanes' runs-on, on the Ubuntu 26.04 runners.
+    runs-on: &runner-26 ${{ vars.CI_RUNNERS != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'tuna-ci-26.04' || 'ubuntu-26.04' }}
     needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'journey')
     timeout-minutes: 60
@@ -946,8 +947,7 @@ jobs:
     # (GNOME's KeyboardMonitor) and speech-dispatcher on Ubuntu 26.04,
     # against the nested session that owns the screen reader. Ubuntu
     # 24.04's Orca 46 predates the KeyboardMonitor.
-    # Same choice as select-lanes' runs-on, on the Ubuntu 26.04 runners.
-    runs-on: &runner-26 ${{ vars.CI_RUNNERS != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'tuna-ci-26.04' || 'ubuntu-26.04' }}
+    runs-on: *runner-26
     needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'orca-speech')
     timeout-minutes: 45
@@ -986,7 +986,7 @@ jobs:
   portal-security:
     needs: [select-lanes, arch-package]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'portal-security')
-    runs-on: ubuntu-26.04
+    runs-on: *runner-26
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1020,7 +1020,7 @@ jobs:
   remote-security:
     needs: [select-lanes, arch-package]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'remote-security')
-    runs-on: ubuntu-26.04
+    runs-on: *runner-26
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1049,7 +1049,7 @@ jobs:
           retention-days: 90
 
   niri-parity:
-    runs-on: ubuntu-26.04
+    runs-on: *runner-26
     needs: [select-lanes, arch-package]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'niri-parity')
     timeout-minutes: 30
