@@ -4,7 +4,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
-use zbus::{fdo, message::Header, Connection};
+use zbus::{fdo, message::Header, names::UniqueName, Connection};
 
 /// GNOME's typed display bootstrap roles. These never confer capture authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +202,29 @@ impl Authority {
         self.unlocked()?;
         Ok(sender)
     }
+    /// [`Self::admit`] for a call the supervised shell relays from its
+    /// `org.gnome.Shell` connection on behalf of `caller` (GNOME Shell owns
+    /// both names on one connection; Tuna's shell owns only that one). The
+    /// relay must be the shell itself, and `caller`, a unique name the bus
+    /// never reuses, passes the same rule as a direct sender, so the second
+    /// name widens nobody's access.
+    pub async fn admit_forwarded(
+        &self,
+        conn: &Connection,
+        header: &Header<'_>,
+        caller: &str,
+    ) -> fdo::Result<String> {
+        self.unlocked()?;
+        let (_, relay) = self.authenticate_caller(conn, header).await?;
+        if relay != CaptureCaller::Shell {
+            return Err(denied("only the supervised shell forwards calls"));
+        }
+        let caller =
+            UniqueName::try_from(caller).map_err(|_| denied("caller must be a unique bus name"))?;
+        self.authenticate_sender(conn, &caller).await?;
+        self.unlocked()?;
+        Ok(caller.to_string())
+    }
     /// Authenticate desktop-service identity without authorizing capture.
     /// Screenshot's documented false result can deny an authenticated locked
     /// backend while other capture APIs retain their AccessDenied result.
@@ -223,12 +246,20 @@ impl Authority {
         header: &Header<'_>,
     ) -> fdo::Result<(String, CaptureCaller)> {
         let sender = header.sender().ok_or_else(|| denied("missing sender"))?;
+        let caller = self.authenticate_sender(conn, sender).await?;
+        Ok((sender.to_string(), caller))
+    }
+    async fn authenticate_sender(
+        &self,
+        conn: &Connection,
+        sender: &UniqueName<'_>,
+    ) -> fdo::Result<CaptureCaller> {
         let dbus = fdo::DBusProxy::new(conn).await?;
         let pid = dbus
             .get_connection_unix_process_id(sender.clone().into())
             .await?;
         if pid != 0 && pid == self.shell_pid.load(Ordering::SeqCst) {
-            return Ok((sender.to_string(), CaptureCaller::Shell));
+            return Ok(CaptureCaller::Shell);
         }
         let name =
             zbus::names::BusName::try_from("org.freedesktop.impl.portal.desktop.gnome").unwrap();
@@ -236,12 +267,12 @@ impl Authority {
             .get_name_owner(name)
             .await
             .map_err(|_| denied("portal not running"))?;
-        if owner != *sender || !installed_portal(pid) {
+        if owner.as_str() != sender.as_str() || !installed_portal(pid) {
             return Err(denied(
                 "capture requires the supervised shell or installed portal",
             ));
         }
-        Ok((sender.to_string(), CaptureCaller::Portal))
+        Ok(CaptureCaller::Portal)
     }
 }
 /// Which desktop service passed capture authentication.
