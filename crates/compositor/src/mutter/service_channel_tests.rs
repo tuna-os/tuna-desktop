@@ -68,10 +68,20 @@ fn service_connection_transports_real_sync_and_reclaims_disconnected_slots() {
         Err(fdo::Error::LimitsExceeded(_))
     ));
     drop(sockets.pop());
-    comp.pump();
-    let replacement = channel
-        .open_connection(":1.2".into(), false, None, None)
-        .unwrap();
+    // The kernel reports the hang-up only once every copy of the fd is
+    // closed; a process another test forks meanwhile holds one until its
+    // exec, so poll the disconnect instead of assuming one dispatch.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let replacement = loop {
+        comp.pump();
+        match channel.open_connection(":1.2".into(), false, None, None) {
+            Ok(fd) => break fd,
+            Err(fdo::Error::LimitsExceeded(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("the disconnected slot was never reclaimed: {e}"),
+        }
+    };
     assert_eq!(channel.clients.values().map(Vec::len).sum::<usize>(), 32);
     drop(replacement);
 }
