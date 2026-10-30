@@ -2553,6 +2553,8 @@ impl Runtime {
                 "mouse": self.input_settings.mouse,
                 "trackball": self.input_settings.trackball,
                 "pointing_stick": self.input_settings.pointing_stick,
+                "custom_accel": self.input_settings.custom_accel,
+                "disable_while_typing_timeout_ms": self.input_settings.disable_while_typing_timeout_ms,
             },
             "locked": self.is_locked(),
             // Administrative lockdown backstop (#357): the live

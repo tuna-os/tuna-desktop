@@ -28,6 +28,12 @@
 #              and a vanished caller both restore the white point
 #   D-COLOR-RESTART a restart unregisters the device and colord's mapping
 #              restores the calibrated profile to the next session
+#   D-POINTER-SETTINGS emulated (uinput, ADR 0008) mouse, trackball,
+#              pointing stick and clickpad (P-IN-04, #343): GNOME 51's
+#              mouse, touchpad, trackball and pointing-stick keys reach
+#              each device's own libinput configuration with Mutter 51's
+#              per-class rules, on arrival, live and on hotplug, and
+#              reset to GNOME's defaults
 #   D-TABLET   an emulated (uinput, ADR 0008) Wacom Cintiq 22HD pen and pad
 #              (P-IN-05): libwacom identity and pen/pad pairing, a GTK 4
 #              GtkGestureStylus client's position, pressure, tilt and tool
@@ -66,6 +72,8 @@ DBUS_PID=""
 COLORD_PID=""
 SYSTEM_BUS_PID=""
 CALIBRATION_PID=""
+POINTER_EMU_PID=""
+POINTER_UDEV_RULE=/run/udev/rules.d/71-tuna-d-pointer-trackball.rules
 EMU_PID=""
 CLIENT_PID=""
 
@@ -74,6 +82,9 @@ cleanup() {
     # The emulator (root) exits when its command pipe closes.
     exec 8>&- 2>/dev/null || true
     if [ -n "$EMU_PID" ]; then wait "$EMU_PID" 2>/dev/null || true; fi
+    exec 7>&- 2>/dev/null || true
+    if [ -n "$POINTER_EMU_PID" ]; then wait "$POINTER_EMU_PID" 2>/dev/null || true; fi
+    if [ -e "$POINTER_UDEV_RULE" ]; then sudo rm -f "$POINTER_UDEV_RULE" && sudo udevadm control --reload || true; fi
     if [ -n "$COMP_PID" ]; then kill "$COMP_PID" 2>/dev/null || true; fi
     if [ -n "$CALIBRATION_PID" ]; then kill "$CALIBRATION_PID" 2>/dev/null || true; fi
     if [ -n "$COLORD_PID" ]; then sudo kill "$COLORD_PID" 2>/dev/null || true; fi
@@ -652,6 +663,235 @@ COLORD_PID=""
 kill "$SYSTEM_BUS_PID" 2>/dev/null || true
 SYSTEM_BUS_PID=""
 
+# state JQ [SECONDS]: the compositor state satisfies JQ in time.
+state() {
+    end=$(($(date +%s) + ${2:-10}))
+    until [ -s "$CSTATE" ] && jq -e "$1" "$CSTATE" >/dev/null 2>&1; do
+        kill -0 "$COMP_PID" 2>/dev/null || return 1
+        [ "$(date +%s)" -le "$end" ] || return 1
+        sleep 0.1
+    done
+}
+
+# GNOME's pointer device settings (P-IN-04, #343), emulated per ADR 0008:
+# a uinput mouse, trackball, pointing stick and clickpad as their drivers
+# and udev present them, GNOME 51's peripherals schemas in a private
+# keyfile, and the GTK shell that reads them. Every assertion reads
+# libinput's own configuration back from the compositor's input_devices
+# snapshot, never the settings echo.
+kill "$DBUS_PID" 2>/dev/null || true
+POINTER_LOG="$ARTIFACTS/compositor-pointer.log"
+CSTATE="$ARTIFACTS/compositor-state-pointer.json"
+POINTER_EMU_OUT="$ARTIFACTS/pointer-emulator.log"
+mkdir -p "$ARTIFACTS/config-pointer" "$ARTIFACTS/schemas-pointer"
+cp "$ROOT/tests/settings/gnome51-peripherals-pointer.gschema.xml" "$ARTIFACTS/schemas-pointer/"
+glib-compile-schemas "$ARTIFACTS/schemas-pointer"
+POINTER_SCHEMA_DIR_BEFORE="${GSETTINGS_SCHEMA_DIR-}"
+GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas-pointer${GSETTINGS_SCHEMA_DIR:+:$GSETTINGS_SCHEMA_DIR}"
+GSETTINGS_BACKEND=keyfile
+XDG_CONFIG_HOME="$ARTIFACTS/config-pointer"
+export GSETTINGS_SCHEMA_DIR GSETTINGS_BACKEND XDG_CONFIG_HOME
+dbus-daemon --session --fork --print-address=1 --print-pid=1 >"$ARTIFACTS/dbus-pointer.txt"
+DBUS_SESSION_BUS_ADDRESS="$(sed -n 1p "$ARTIFACTS/dbus-pointer.txt")"
+DBUS_PID="$(sed -n 2p "$ARTIFACTS/dbus-pointer.txt")"
+export DBUS_SESSION_BUS_ADDRESS
+LOG="$POINTER_LOG"
+start_pointer_session() {
+    rm -f "$CSTATE"
+    env -u DISPLAY -u WAYLAND_DISPLAY \
+        XDG_RUNTIME_DIR="$RUNTIME" XDG_STATE_HOME="$ARTIFACTS/state" XDG_DATA_HOME="$ARTIFACTS/data" \
+        LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD" TUNA_COMPOSITOR_STATE="$CSTATE" \
+        "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-pointer \
+        --shell-bin "$ROOT/target/debug/tuna-shell-gtk" >>"$POINTER_LOG" 2>&1 &
+    COMP_PID=$!
+    state '.display_config.serial >= 1 and (.layers | length > 0)' 30 ||
+        fail D-POINTER-SETTINGS "the pointer session never lit its output"
+    state '.layers | any(.namespace == "tuna-panel")' 30 ||
+        fail D-POINTER-SETTINGS "the GTK shell never mapped its panel"
+}
+start_pointer_session
+
+# The emulator answers one line per command on the pipe. Only uinput
+# needs root; the pipe and the log stay ours.
+# A uinput device has no USB parent, so 70-mouse.rules never looks its
+# name up in hwdb; this rule gives the emulated trackball the property
+# hwdb gives real ones (`mouse:*:name:*Trackball*:*`, ID_INPUT_TRACKBALL).
+echo 'ACTION!="remove", SUBSYSTEM=="input", ATTRS{name}=="Tuna D-POINTER Trackball", ENV{ID_INPUT_TRACKBALL}="1"' |
+    sudo tee "$POINTER_UDEV_RULE" >/dev/null
+sudo udevadm control --reload
+mkfifo "$ARTIFACTS/pointer-emulator.fifo"
+# shellcheck disable=SC2024
+sudo python3 "$ROOT/scripts/lib/tuna-uinput-pointers.py" <"$ARTIFACTS/pointer-emulator.fifo" >"$POINTER_EMU_OUT" 2>&1 &
+POINTER_EMU_PID=$!
+exec 7>"$ARTIFACTS/pointer-emulator.fifo"
+pointer_sent=0
+pemu() {
+    echo "$*" >&7
+    pointer_sent=$((pointer_sent + 1))
+    end=$(($(date +%s) + 10))
+    until [ "$(grep -c '^ok$' "$POINTER_EMU_OUT")" -ge "$pointer_sent" ]; do
+        grep -q '^error' "$POINTER_EMU_OUT" &&
+            fail D-POINTER-SETTINGS "emulator: $(grep '^error' "$POINTER_EMU_OUT" | tail -1)"
+        [ "$(date +%s)" -le "$end" ] || fail D-POINTER-SETTINGS "emulator did not answer '$*'"
+        sleep 0.05
+    done
+}
+for kind in mouse trackball pointing-stick touchpad; do pemu add "$kind"; done
+
+MOUSE='.name == "Tuna D-POINTER Mouse"'
+TRACKBALL='.name == "Tuna D-POINTER Trackball"'
+STICK='.name == "Tuna D-POINTER TrackPoint"'
+PAD='.name == "Synaptics TM3053-004"'
+# device SELECT JQ [SECONDS]: exactly one device matches SELECT and its
+# libinput state satisfies JQ.
+device() {
+    state "[.input_devices[]? | select($1)] | length == 1 and all($2)" "${3:-10}" && return 0
+    # Name the device that missed and its libinput state at that moment.
+    echo "D-POINTER-SETTINGS mismatch on $1: $(jq -c "[.input_devices[]? | select($1)]" "$CSTATE")" |
+        tee -a "$ARTIFACTS/pointer-mismatch.txt" >&2
+    return 1
+}
+speed() { echo "(.accel_speed > $1 - 0.01 and .accel_speed < $1 + 0.01)"; }
+# libinput's custom profile has no speed (it reads back 0, under Mutter too).
+custom_speed() { echo "(.accel_profile == \"custom\" or $(speed "$1"))"; }
+# An option the device lacks is reported unavailable and left alone.
+middle() { echo "((.middle_emulation_available | not) or .middle_emulation_enabled == $1)"; }
+custom() { echo "(if .accel_custom_available then .accel_profile == \"custom\" else .accel_profile == \"$1\" end)"; }
+dwt() { echo "((.dwt_available | not) or .dwt_enabled == $1)"; }
+dwt_timeout() { echo "((.dwt_timeout_available | not) or .dwt_timeout_ms == $1)"; }
+# Sticky drag lock arrived in libinput 1.27; older libinput rejects it and
+# the touchpad takes the timeout drag lock.
+LIBINPUT_VERSION="$(pkg-config --modversion libinput)"
+if printf '1.27\n%s\n' "$LIBINPUT_VERSION" | sort -V -C; then DRAG_LOCK=sticky; else DRAG_LOCK=timeout; fi
+
+pointer_classes() {
+    device "$MOUSE" '.kind == "pointer" and (.trackball | not) and (.pointing_stick | not)' 15 &&
+        device "$TRACKBALL" '.kind == "pointer" and .trackball' &&
+        device "$STICK" '.kind == "pointer" and .pointing_stick' &&
+        device "$PAD" '.kind == "touchpad" and .tap_fingers > 0'
+}
+pointer_classes ||
+    fail D-POINTER-SETTINGS "the emulated devices did not arrive as Mutter's device classes: $(jq -c '.input_devices' "$CSTATE")"
+# GNOME 51's defaults, applied as each device arrived.
+pointer_defaults() {
+    device "$MOUSE" "(.natural_scroll | not) and (.left_handed | not) and $(speed 0)
+        and .accel_profile == \"adaptive\" and $(middle false) and .scroll_method == \"no-scroll\"" &&
+        device "$TRACKBALL" "(.natural_scroll | not) and (.left_handed | not) and $(speed 0)
+            and .accel_profile == \"adaptive\" and $(middle false) and .scroll_method == \"no-scroll\"" &&
+        device "$STICK" "(.natural_scroll | not) and (.left_handed | not) and $(speed 0)
+            and .accel_profile == \"adaptive\" and .scroll_method == \"on-button-down\"" &&
+        device "$PAD" ".tap_enabled and .natural_scroll and (.left_handed | not) and $(speed 0)
+            and $(dwt true) and $(dwt_timeout 500) and .send_events_mode == \"enabled\"
+            and .click_method == \"clickfinger\" and .scroll_method == \"two-finger\"
+            and .tap_drag_enabled and .tap_drag_lock == \"disabled\" and .tap_button_map == \"lrm\"
+            and $(middle false) and .accel_profile == \"adaptive\""
+}
+pointer_defaults || fail D-POINTER-SETTINGS "GNOME 51's defaults are not each device's libinput state: $(jq -c '.input_devices' "$CSTATE")"
+pass D-POINTER-SETTINGS "a uinput mouse, hwdb-tagged trackball, INPUT_PROP_POINTING_STICK stick and RMI4 clickpad arrive as Mutter's classes with GNOME 51's defaults in libinput (libinput $LIBINPUT_VERSION)"
+
+# Distinct values per class, so a key reaching the wrong class shows.
+MOUSE_KEYS=org.gnome.desktop.peripherals.mouse
+PAD_KEYS=org.gnome.desktop.peripherals.touchpad
+TRACKBALL_KEYS=org.gnome.desktop.peripherals.trackball
+STICK_KEYS=org.gnome.desktop.peripherals.pointingstick
+gsettings set $MOUSE_KEYS speed 0.5
+gsettings set $MOUSE_KEYS natural-scroll true
+gsettings set $MOUSE_KEYS left-handed true
+gsettings set $MOUSE_KEYS accel-profile flat
+gsettings set $MOUSE_KEYS middle-click-emulation true
+gsettings set $MOUSE_KEYS scroll-wheel-emulation-button 2
+gsettings set $MOUSE_KEYS scroll-wheel-emulation-button-lock true
+gsettings set $TRACKBALL_KEYS accel-profile custom
+gsettings set $TRACKBALL_KEYS custom-accel-config "{'pointer-step': <0.25>, 'pointer-speeds': <@ad [0.0, 0.5, 1.0]>}"
+gsettings set $TRACKBALL_KEYS middle-click-emulation true
+gsettings set $TRACKBALL_KEYS scroll-wheel-emulation-button 8
+gsettings set $STICK_KEYS speed -0.5
+gsettings set $STICK_KEYS accel-profile flat
+gsettings set $STICK_KEYS scroll-method none
+gsettings set $PAD_KEYS tap-to-click false
+gsettings set $PAD_KEYS natural-scroll false
+gsettings set $PAD_KEYS speed -0.25
+gsettings set $PAD_KEYS disable-while-typing false
+gsettings set $PAD_KEYS disable-while-typing-timeout 1500
+gsettings set $PAD_KEYS left-handed right
+gsettings set $PAD_KEYS send-events disabled-on-external-mouse
+gsettings set $PAD_KEYS click-method areas
+gsettings set $PAD_KEYS two-finger-scrolling-enabled false
+gsettings set $PAD_KEYS edge-scrolling-enabled true
+gsettings set $PAD_KEYS tap-and-drag false
+gsettings set $PAD_KEYS tap-and-drag-lock true
+gsettings set $PAD_KEYS tap-button-map lmr
+gsettings set $PAD_KEYS middle-click-emulation true
+gsettings set $PAD_KEYS accel-profile custom
+gsettings set $PAD_KEYS custom-accel-config "{'pointer-step': <2.0>, 'pointer-speeds': <@ad [0.0, 4.0]>}"
+# Mutter: trackballs and pointing sticks take the mouse's natural scroll
+# and handedness; trackballs its speed, sticks their own; the touchpad's
+# `right` overrides the mouse's left-handedness.
+pointer_applied() {
+    device "$MOUSE" ".natural_scroll and .left_handed and $(speed 0.5) and .accel_profile == \"flat\"
+        and $(middle true) and .scroll_method == \"on-button-down\" and .scroll_button == 274
+        and .scroll_button_lock" "${1:-10}" &&
+        device "$TRACKBALL" ".natural_scroll and .left_handed and $(custom_speed 0.5) and $(custom adaptive)
+            and $(middle true) and .scroll_method == \"on-button-down\" and .scroll_button == 275
+            and (.scroll_button_lock | not)" &&
+        device "$STICK" ".natural_scroll and .left_handed and $(speed -0.5) and .accel_profile == \"flat\"
+            and .scroll_method == \"no-scroll\"" &&
+        device "$PAD" "(.tap_enabled | not) and (.natural_scroll | not) and (.left_handed | not)
+            and $(custom_speed -0.25) and $(dwt false) and $(dwt_timeout 1500)
+            and .send_events_mode == \"disabled-on-external-mouse\" and .click_method == \"button-areas\"
+            and (if (.scroll_methods | index(\"edge\")) then .scroll_method == \"edge\" else .scroll_method == \"no-scroll\" end)
+            and (.tap_drag_enabled | not) and .tap_drag_lock == \"$DRAG_LOCK\" and .tap_button_map == \"lmr\"
+            and $(middle true) and $(custom adaptive)"
+}
+pointer_applied ||
+    fail D-POINTER-SETTINGS "live GNOME keys did not reach each class's libinput state: $(jq -c '.input_devices' "$CSTATE")"
+cp "$CSTATE" "$ARTIFACTS/pointer-applied.json"
+AVAILABILITY="$(jq -r '[.input_devices[] | select(.name | startswith("Tuna D-POINTER") or . == "Synaptics TM3053-004")
+    | "\(.name): custom \(.accel_custom_available), middle \(.middle_emulation_available), typing \(.dwt_available), typing timeout \(.dwt_timeout_available)"] | join("; ")' "$CSTATE")"
+pass D-POINTER-SETTINGS "live mouse, trackball, pointing-stick and touchpad keys reach each device's libinput state with Mutter 51's class rules; drag lock $DRAG_LOCK; $AVAILABILITY"
+
+# Hotplug: unplugged devices arrive back with the current settings.
+pemu remove touchpad
+pemu remove mouse
+state "[.input_devices[]? | select($PAD or $MOUSE)] | length == 0" ||
+    fail D-POINTER-SETTINGS "unplugged devices stayed in the snapshot"
+pemu add touchpad
+pemu add mouse
+pointer_applied 15 ||
+    fail D-POINTER-SETTINGS "replugged devices did not arrive with the current keys: $(jq -c '.input_devices' "$CSTATE")"
+pass D-POINTER-SETTINGS "a replugged mouse and touchpad arrive with the current keys"
+
+for key in speed natural-scroll left-handed accel-profile middle-click-emulation \
+    scroll-wheel-emulation-button scroll-wheel-emulation-button-lock; do
+    gsettings reset $MOUSE_KEYS "$key"
+done
+for key in accel-profile custom-accel-config middle-click-emulation scroll-wheel-emulation-button; do
+    gsettings reset $TRACKBALL_KEYS "$key"
+done
+for key in speed accel-profile scroll-method; do gsettings reset $STICK_KEYS "$key"; done
+for key in tap-to-click natural-scroll speed disable-while-typing disable-while-typing-timeout left-handed \
+    send-events click-method two-finger-scrolling-enabled edge-scrolling-enabled tap-and-drag \
+    tap-and-drag-lock tap-button-map middle-click-emulation accel-profile custom-accel-config; do
+    gsettings reset $PAD_KEYS "$key"
+done
+pointer_defaults || fail D-POINTER-SETTINGS "resetting the keys did not restore GNOME 51's defaults: $(jq -c '.input_devices' "$CSTATE")"
+pass D-POINTER-SETTINGS "resetting every key restores GNOME 51's defaults on each device"
+
+exec 7>&-
+wait "$POINTER_EMU_PID" 2>/dev/null || true
+POINTER_EMU_PID=""
+sudo rm -f "$POINTER_UDEV_RULE"
+sudo udevadm control --reload
+kill -TERM "$COMP_PID"
+wait "$COMP_PID" || true
+COMP_PID=""
+if grep -q panicked "$POINTER_LOG"; then fail D-NOPANIC "panic in the pointer sessions"; fi
+if [ -n "$POINTER_SCHEMA_DIR_BEFORE" ]; then
+    GSETTINGS_SCHEMA_DIR="$POINTER_SCHEMA_DIR_BEFORE"
+else
+    unset GSETTINGS_SCHEMA_DIR
+fi
+
 # Drawing tablets (P-IN-05, #344), emulated per ADR 0008: uinput devices
 # exactly as the wacom driver creates them for a Cintiq 22HD, a GTK 4
 # stylus client, GNOME 51's tablet settings in a private keyfile, and the
@@ -679,15 +919,6 @@ env -u DISPLAY -u WAYLAND_DISPLAY \
     "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-tablet \
     --shell-bin "$ROOT/target/debug/tuna-shell-gtk" >"$TABLET_LOG" 2>&1 &
 COMP_PID=$!
-# state JQ [SECONDS]: the compositor state satisfies JQ in time.
-state() {
-    end=$(($(date +%s) + ${2:-10}))
-    until [ -s "$CSTATE" ] && jq -e "$1" "$CSTATE" >/dev/null 2>&1; do
-        kill -0 "$COMP_PID" 2>/dev/null || return 1
-        [ "$(date +%s)" -le "$end" ] || return 1
-        sleep 0.1
-    done
-}
 state '.display_config.serial >= 1 and (.layers | length > 0)' 30 ||
     fail D-TABLET "the tablet session never lit its output"
 state '.layers | any(.namespace == "tuna-panel")' 30 || fail D-TABLET "the GTK shell never mapped its panel"

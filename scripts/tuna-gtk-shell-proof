@@ -110,7 +110,8 @@
 #   G-SETTINGS-POINTER GNOME's touchpad, mouse, trackball and pointing-stick
 #                  keys (send-events, click method, scroll methods, tap
 #                  options, middle-click and scroll-wheel emulation,
-#                  per-class acceleration) reach the compositor live and
+#                  per-class acceleration and custom curves, the typing
+#                  timeout) reach the compositor live and
 #                  reset to GNOME 51's defaults (#343); the native VM lane
 #                  proves libinput device state
 #   G-INPUT-SOURCE-MRU Super+Space flips between the two most recent
@@ -5360,10 +5361,43 @@ if gsettings list-keys org.gnome.desktop.peripherals.mouse | grep -qx scroll-whe
     pointer_mouse_wheel='{"button":2,"lock":true}'
     pointer_wheel_note="mouse scroll-wheel emulation included"
 fi
-set_pointer_keys
-if [ -n "$pointer_mouse_wheel_keys" ]; then
-    gsettings set org.gnome.desktop.peripherals.mouse scroll-wheel-emulation-button 2
-    gsettings set org.gnome.desktop.peripherals.mouse scroll-wheel-emulation-button-lock true
+# custom-accel-config (all four schemas) and the touchpad
+# disable-while-typing-timeout (gsettings-desktop-schemas 51) likewise.
+# The pointing stick's curve is written with integers: Mutter 51 finds no
+# `d`/`ad` entries there, so the shell sends an empty curve that the
+# compositor replaces with Mutter's fallback.
+pointer_default_curves='{"mouse": {"step": 1, "speeds": [0, 1]}, "touchpad": {"step": 1, "speeds": [0, 1]},
+    "trackball": {"step": 1, "speeds": [0, 1]}, "pointing_stick": {"step": 1, "speeds": [0, 1]}}'
+pointer_curves=$pointer_default_curves
+pointer_custom_schemas=""
+for schema in mouse touchpad trackball pointingstick; do
+    if gsettings list-keys "org.gnome.desktop.peripherals.$schema" | grep -qx custom-accel-config; then
+        pointer_custom_schemas="$pointer_custom_schemas $schema"
+    fi
+done
+if [ "$pointer_custom_schemas" = " mouse touchpad trackball pointingstick" ]; then
+    gsettings set org.gnome.desktop.peripherals.mouse custom-accel-config \
+        "{'pointer-step': <0.5>, 'pointer-speeds': <@ad [0.0, 1.0, 2.5]>}"
+    gsettings set org.gnome.desktop.peripherals.touchpad custom-accel-config \
+        "{'pointer-step': <2.0>, 'pointer-speeds': <@ad [0.0, 4.0]>}"
+    gsettings set org.gnome.desktop.peripherals.trackball custom-accel-config \
+        "{'pointer-step': <0.25>, 'pointer-speeds': <@ad [0.0, 0.5, 1.0]>}"
+    gsettings set org.gnome.desktop.peripherals.pointingstick custom-accel-config \
+        "{'pointer-step': <1>, 'pointer-speeds': <[0, 1]>}"
+    pointer_curves='{"mouse": {"step": 0.5, "speeds": [0, 1, 2.5]}, "touchpad": {"step": 2, "speeds": [0, 4]},
+        "trackball": {"step": 0.25, "speeds": [0, 0.5, 1]}, "pointing_stick": {"step": 0, "speeds": []}}'
+    pointer_wheel_note="$pointer_wheel_note; custom acceleration curves included"
+else
+    pointer_custom_schemas=""
+    pointer_wheel_note="$pointer_wheel_note; host schemas predate custom-accel-config"
+fi
+pointer_dwt_timeout=500
+if gsettings list-keys org.gnome.desktop.peripherals.touchpad | grep -qx disable-while-typing-timeout; then
+    gsettings set org.gnome.desktop.peripherals.touchpad disable-while-typing-timeout 1500
+    pointer_dwt_timeout=1500
+    pointer_wheel_note="$pointer_wheel_note; disable-while-typing timeout included"
+else
+    pointer_wheel_note="$pointer_wheel_note; host touchpad schema predates disable-while-typing-timeout"
 fi
 cstate ".pointer_device_settings == {
     \"mouse_accel_profile\": \"Default\",
@@ -5374,21 +5408,31 @@ cstate ".pointer_device_settings == {
     \"mouse\": {\"middle_click_emulation\": true, \"scroll_wheel_emulation\": $pointer_mouse_wheel},
     \"trackball\": {\"accel_profile\": \"Adaptive\", \"middle_click_emulation\": true,
         \"scroll_wheel_emulation\": {\"button\": 8, \"lock\": true}},
-    \"pointing_stick\": {\"speed_milli\": -500, \"accel_profile\": \"Flat\", \"scroll_method\": \"None\"}}" \
+    \"pointing_stick\": {\"speed_milli\": -500, \"accel_profile\": \"Flat\", \"scroll_method\": \"None\"},
+    \"custom_accel\": $pointer_curves,
+    \"disable_while_typing_timeout_ms\": $pointer_dwt_timeout}" \
     "pointer device keys applied" ||
     fail G-SETTINGS-POINTER "GNOME's touchpad, mouse, trackball and pointing-stick keys did not reach the compositor"
 cp "$CSTATE" "$ARTIFACTS/pointer-device-settings.json"
 reset_pointer_keys
-cstate '.pointer_device_settings == {
-    "mouse_accel_profile": "Default",
-    "touchpad": {"send_events": "Enabled", "click_method": "Fingers",
-        "edge_scrolling": false, "two_finger_scrolling": true, "tap_and_drag": true,
-        "tap_and_drag_lock": false, "tap_button_map": "Default",
-        "middle_click_emulation": false, "accel_profile": "Default"},
-    "mouse": {"middle_click_emulation": false, "scroll_wheel_emulation": {"button": 0, "lock": false}},
-    "trackball": {"accel_profile": "Default", "middle_click_emulation": false,
-        "scroll_wheel_emulation": {"button": 0, "lock": false}},
-    "pointing_stick": {"speed_milli": 0, "accel_profile": "Default", "scroll_method": "Default"}}' \
+for schema in $pointer_custom_schemas; do
+    gsettings reset "org.gnome.desktop.peripherals.$schema" custom-accel-config
+done
+if [ "$pointer_dwt_timeout" != 500 ]; then
+    gsettings reset org.gnome.desktop.peripherals.touchpad disable-while-typing-timeout
+fi
+cstate ".pointer_device_settings == {
+    \"mouse_accel_profile\": \"Default\",
+    \"touchpad\": {\"send_events\": \"Enabled\", \"click_method\": \"Fingers\",
+        \"edge_scrolling\": false, \"two_finger_scrolling\": true, \"tap_and_drag\": true,
+        \"tap_and_drag_lock\": false, \"tap_button_map\": \"Default\",
+        \"middle_click_emulation\": false, \"accel_profile\": \"Default\"},
+    \"mouse\": {\"middle_click_emulation\": false, \"scroll_wheel_emulation\": {\"button\": 0, \"lock\": false}},
+    \"trackball\": {\"accel_profile\": \"Default\", \"middle_click_emulation\": false,
+        \"scroll_wheel_emulation\": {\"button\": 0, \"lock\": false}},
+    \"pointing_stick\": {\"speed_milli\": 0, \"accel_profile\": \"Default\", \"scroll_method\": \"Default\"},
+    \"custom_accel\": $pointer_default_curves,
+    \"disable_while_typing_timeout_ms\": 500}" \
     "pointer device keys reset" ||
     fail G-SETTINGS-POINTER "resetting the pointer device keys did not restore GNOME 51 defaults"
 pass G-SETTINGS-POINTER "touchpad, mouse, trackball and pointing-stick keys reach the compositor live and reset to GNOME 51 defaults; $pointer_wheel_note"

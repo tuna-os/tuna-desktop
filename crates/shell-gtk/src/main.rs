@@ -130,6 +130,40 @@ fn settings(schema: &str) -> Option<gio::Settings> {
     Some(gio::Settings::new(schema))
 }
 
+/// GNOME's `custom-accel-config` (`a{sv}`) as read by Mutter 51
+/// (`update_pointer_accel_profile`): `pointer-step` must be a `d` and
+/// `pointer-speeds` an `ad`. A missing or mistyped entry arrives as step
+/// 0 with no speeds, which the compositor replaces with Mutter's fallback.
+fn custom_accel_curve(value: &glib::Variant) -> tuna_shell_control::CustomAccelCurve {
+    let dict = glib::VariantDict::new(Some(value));
+    let step = dict
+        .lookup_value("pointer-step", Some(glib::VariantTy::DOUBLE))
+        .and_then(|step| step.get::<f64>());
+    let speeds = glib::VariantTy::new("ad").ok().and_then(|ty| {
+        dict.lookup_value("pointer-speeds", Some(ty))
+            .and_then(|speeds| speeds.get::<Vec<f64>>())
+    });
+    match (step, speeds) {
+        (Some(step), Some(speeds)) => tuna_shell_control::CustomAccelCurve { step, speeds },
+        _ => tuna_shell_control::CustomAccelCurve {
+            step: 0.0,
+            speeds: Vec::new(),
+        },
+    }
+}
+
+/// A pointer schema's `custom-accel-config`, or GNOME's default where the
+/// installed schema predates the key.
+fn custom_accel_setting(s: &gio::Settings) -> tuna_shell_control::CustomAccelCurve {
+    if s.settings_schema()
+        .is_some_and(|schema| schema.has_key("custom-accel-config"))
+    {
+        custom_accel_curve(&s.value("custom-accel-config"))
+    } else {
+        tuna_shell_control::CustomAccelCurve::default()
+    }
+}
+
 /// Nothing to read now: the socket would block, or the client deferred
 /// (or just made) a redial whose answer is still on its way.
 fn is_would_block(e: &ControlError) -> bool {
@@ -3271,6 +3305,15 @@ fn build(app: &adw::Application) {
                             &pad.string("accel-profile"),
                         ),
                     };
+                    out.custom_accel.touchpad = custom_accel_setting(pad);
+                    // GNOME 51 added the key; older schemas keep libinput's.
+                    if pad
+                        .settings_schema()
+                        .is_some_and(|schema| schema.has_key("disable-while-typing-timeout"))
+                    {
+                        out.disable_while_typing_timeout_ms =
+                            pad.uint("disable-while-typing-timeout");
+                    }
                 }
                 // GNOME's 0..24 `scroll-wheel-emulation-button` and its lock;
                 // the mouse schema gained them in gsettings-desktop-schemas 51.
@@ -3301,6 +3344,7 @@ fn build(app: &adw::Application) {
                         middle_click_emulation: mouse.boolean("middle-click-emulation"),
                         scroll_wheel_emulation: wheel_emulation(mouse),
                     };
+                    out.custom_accel.mouse = custom_accel_setting(mouse);
                 }
                 if let Some(trackball) = all[11].as_ref() {
                     out.trackball = tuna_shell_control::TrackballSettings {
@@ -3310,6 +3354,7 @@ fn build(app: &adw::Application) {
                         middle_click_emulation: trackball.boolean("middle-click-emulation"),
                         scroll_wheel_emulation: wheel_emulation(trackball),
                     };
+                    out.custom_accel.trackball = custom_accel_setting(trackball);
                 }
                 if let Some(stick) = all[12].as_ref() {
                     out.pointing_stick = tuna_shell_control::PointingStickSettings {
@@ -3322,6 +3367,7 @@ fn build(app: &adw::Application) {
                                 &stick.string("scroll-method"),
                             ),
                     };
+                    out.custom_accel.pointing_stick = custom_accel_setting(stick);
                 }
                 out.touchpad_left_handed = logic::touchpad_left_handed(
                     all[2]
@@ -4037,4 +4083,45 @@ fn main() -> glib::ExitCode {
     app.connect_startup(privacy_portal::start);
     app.connect_activate(build);
     app.run_with_args::<&str>(&[])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::custom_accel_curve;
+    use tuna_shell_control::CustomAccelCurve;
+
+    fn parse(text: &str) -> glib::Variant {
+        glib::Variant::parse(Some(glib::VariantTy::VARDICT), text).unwrap()
+    }
+
+    #[test]
+    fn custom_accel_config_reads_like_mutter_51() {
+        assert_eq!(
+            custom_accel_curve(&parse(
+                "{'pointer-step': <0.5>, 'pointer-speeds': <[0.0, 1.0, 2.5]>}"
+            )),
+            CustomAccelCurve {
+                step: 0.5,
+                speeds: vec![0.0, 1.0, 2.5],
+            }
+        );
+        // Mutter requires `d` and `ad`: integers or a missing entry are not
+        // found, and the compositor falls back.
+        let unreadable = CustomAccelCurve {
+            step: 0.0,
+            speeds: Vec::new(),
+        };
+        for text in [
+            "{'pointer-step': <1>, 'pointer-speeds': <[0.0, 1.0]>}",
+            "{'pointer-step': <1.0>, 'pointer-speeds': <[0, 1]>}",
+            "{'pointer-speeds': <[0.0, 1.0]>}",
+            "@a{sv} {}",
+        ] {
+            assert_eq!(custom_accel_curve(&parse(text)), unreadable, "{text}");
+            assert_eq!(
+                custom_accel_curve(&parse(text)).or_mutter_fallback(),
+                CustomAccelCurve::default()
+            );
+        }
+    }
 }
