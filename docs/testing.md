@@ -339,8 +339,9 @@ The shell's Alt+Tab fades read the same clock (`crates/shell-gtk/src/anim_clock.
 and the compositor state lists `switcher_thumbnail_alphas`, the opacity each
 switcher window image is drawn at. `G-SWITCHER-FADE` freezes the clock and
 samples them at 0, 50 and 100 ms of the thumbnails' fade in and 50 ms into
-the fade out (Escape), where GNOME's ease-out quad gives 0, 191/255 and 1, then
-64/255.
+the fade out (Alt+Escape, which cancels without moving focus), where GNOME's
+ease-out quad gives 0, 191/255 and 1, then 64/255. The grid-cancel comparison
+slice skips the sampling: its old binaries predate the published alphas.
 
 ## Frame cost
 

@@ -2075,40 +2075,47 @@ done
 # the thumbnail list inside the popup, so on the frozen proof clock the
 # compositor draws them at the strip's opacity, 100 ms ease-out quad in
 # (THUMBNAIL_FADE_TIME) and out with the popup (POPUP_FADE_OUT_TIME).
-# Escape cancels, keeping the focus the next steps expect.
-thumb_alphas() {
-    printf '.switcher_thumbnails == 2 and (.switcher_thumbnail_alphas | length) == 2 and all(.switcher_thumbnail_alphas[]; %s)' "$1"
-}
-anim_clock 0
-xdotool keydown Alt_L key grave
-cstate "$(thumb_alphas '. == 0')" "frozen transparent thumbnails" 5 ||
-    { xdotool keyup Alt_L; real_clock; fail G-SWITCHER-FADE "the thumbnails' windows did not start transparent with their frames"; }
-anim_clock 50
-cstate "$(thumb_alphas '((. - 191 / 255) | fabs) < 1e-6')" "thumbnails 50 ms in" ||
-    { xdotool keyup Alt_L; real_clock; fail G-SWITCHER-FADE "the thumbnails' windows were not three quarters opaque 50 ms in"; }
-cp "$CSTATE" "$ARTIFACTS/switcher-thumbnails-50ms.json"
-anim_clock 100
-cstate "$(thumb_alphas '. == 1')" "thumbnails 100 ms in" ||
-    { xdotool keyup Alt_L; real_clock; fail G-SWITCHER-FADE "the thumbnails' windows were not opaque 100 ms in"; }
-out_mark="$(wc -c <"$LOG")"
-xdotool key Escape
-xdotool keyup Alt_L
-out_started() {
-    tail -c +"$((out_mark + 1))" "$LOG" | "$ROOT/scripts/lib/tuna-fade-match" thumbnails-out start true
-}
-for _ in $(seq 1 25); do out_started && break; sleep 0.2; done
-out_started || { real_clock; fail G-SWITCHER-FADE "Escape did not start the thumbnails' fade-out"; }
-cstate "$(thumb_alphas '. == 1')" "frozen closing thumbnails" 5 ||
-    { real_clock; fail G-SWITCHER-FADE "the windows stopped drawing before their frames faded out"; }
-anim_clock 150
-cstate "$(thumb_alphas '((. - 64 / 255) | fabs) < 1e-6')" "thumbnails 50 ms into the fade-out" ||
-    { real_clock; fail G-SWITCHER-FADE "the thumbnails' windows were not a quarter opaque 50 ms into the fade-out"; }
-cp "$CSTATE" "$ARTIFACTS/switcher-thumbnails-out-50ms.json"
-anim_clock 200
-cstate '.switcher_thumbnails == 0' "thumbnails faded out" ||
-    { real_clock; fail G-SWITCHER-FADE "the thumbnails' windows were still drawn after the fade-out"; }
-real_clock || fail G-SWITCHER-FADE "removing the clock file did not resume real time"
-pass G-SWITCHER-FADE "the switcher's thumbnails fade in and its popup fades out, animated and settled; the compositor draws the window images at their frames' opacity (0, 191/255, 1 in; 1, 64/255, gone out) on the proof clock"
+# Alt+Escape cancels (the popup holds GNOME's cycle-windows chord),
+# keeping the focus the next steps expect. The comparison slice runs
+# old binaries that predate the published alphas.
+if [ "$GRID_CANCEL_ONLY" = 1 ]; then
+    pass G-SWITCHER-FADE "the switcher's thumbnails fade in and its popup fades out, animated and settled"
+else
+    thumb_alphas() {
+        printf '.switcher_thumbnails == 2 and (.switcher_thumbnail_alphas | length) == 2 and all(.switcher_thumbnail_alphas[]; %s)' "$1"
+    }
+    fade_focus="$(jq -r '.focused' "$CSTATE")"
+    anim_clock 0
+    xdotool keydown Alt_L key grave
+    cstate "$(thumb_alphas '. == 0')" "frozen transparent thumbnails" 5 ||
+        { xdotool keyup Alt_L; real_clock; fail G-SWITCHER-FADE "the thumbnails' windows did not start transparent with their frames"; }
+    anim_clock 50
+    cstate "$(thumb_alphas '((. - 191 / 255) | fabs) < 1e-6')" "thumbnails 50 ms in" ||
+        { xdotool keyup Alt_L; real_clock; fail G-SWITCHER-FADE "the thumbnails' windows were not three quarters opaque 50 ms in"; }
+    cp "$CSTATE" "$ARTIFACTS/switcher-thumbnails-50ms.json"
+    anim_clock 100
+    cstate "$(thumb_alphas '. == 1')" "thumbnails 100 ms in" ||
+        { xdotool keyup Alt_L; real_clock; fail G-SWITCHER-FADE "the thumbnails' windows were not opaque 100 ms in"; }
+    out_mark="$(wc -c <"$LOG")"
+    xdotool key Escape
+    xdotool keyup Alt_L
+    out_started() {
+        tail -c +"$((out_mark + 1))" "$LOG" | "$ROOT/scripts/lib/tuna-fade-match" thumbnails-out start true
+    }
+    for _ in $(seq 1 25); do out_started && break; sleep 0.2; done
+    out_started || { real_clock; fail G-SWITCHER-FADE "Escape did not start the thumbnails' fade-out"; }
+    cstate "$(thumb_alphas '. == 1') and .focused == $fade_focus" "frozen closing thumbnails" 5 ||
+        { real_clock; fail G-SWITCHER-FADE "the windows stopped drawing before their frames faded out, or Alt+Escape moved focus instead of cancelling"; }
+    anim_clock 150
+    cstate "$(thumb_alphas '((. - 64 / 255) | fabs) < 1e-6')" "thumbnails 50 ms into the fade-out" ||
+        { real_clock; fail G-SWITCHER-FADE "the thumbnails' windows were not a quarter opaque 50 ms into the fade-out"; }
+    cp "$CSTATE" "$ARTIFACTS/switcher-thumbnails-out-50ms.json"
+    anim_clock 200
+    cstate ".switcher_thumbnails == 0 and .focused == $fade_focus" "thumbnails faded out" ||
+        { real_clock; fail G-SWITCHER-FADE "the thumbnails' windows were still drawn after the fade-out, or focus moved"; }
+    real_clock || fail G-SWITCHER-FADE "removing the clock file did not resume real time"
+    pass G-SWITCHER-FADE "the switcher's thumbnails fade in and its popup fades out, animated and settled; the compositor draws the window images at their frames' opacity (0, 191/255, 1 in; 1, 64/255, gone out) on the proof clock; Alt+Escape cancels without moving focus"
+fi
 sleep 0.5
 xdotool keydown Alt_L key grave
 sleep 1

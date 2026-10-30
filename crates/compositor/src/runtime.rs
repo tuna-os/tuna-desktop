@@ -1704,6 +1704,9 @@ impl Runtime {
             });
         }
         self.control.set_overview(false);
+        // The shield covers GNOME's switcher popup and its window clones;
+        // no window image may draw over the lock.
+        self.switcher_thumbnails.clear();
         self.overlay.show(Vec::new());
     }
 
@@ -2243,7 +2246,8 @@ impl Runtime {
                 // A closing switcher's window images fade out with its
                 // popup (switcherPopup.js fadeAndDestroy): the shell keeps
                 // sending their frames at the fading opacity and clears
-                // them once the fade ends.
+                // them once the fade ends; the control hub clears them if
+                // that shell goes away first, and the lock clears them.
                 self.control.queue_switcher(action);
             }
             for (action, time, mode) in self.manager.take_accelerators_fired() {
@@ -4738,7 +4742,12 @@ impl Runtime {
             self.manager.window_action(&mut self.state, window, action);
         }
         if let Some(thumbnails) = outcome.switcher_thumbnails {
-            self.switcher_thumbnails = thumbnails;
+            // A fade frame landing after the lock engaged draws nothing.
+            self.switcher_thumbnails = if self.is_locked() {
+                Vec::new()
+            } else {
+                thumbnails
+            };
         }
         if let Some(keys) = outcome.switcher_keys {
             self.manager.set_switcher_keys(keys);
