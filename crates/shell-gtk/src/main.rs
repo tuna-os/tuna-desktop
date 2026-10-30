@@ -2097,8 +2097,11 @@ fn build(app: &adw::Application) {
             on_tray_escape.clone(),
         )
     };
-    end.append(&dwell_chooser.button);
+    // AppIndicator items sit right after the screen-recording indicator
+    // (`addToStatusArea(id, icon, 1)` in the extension), ahead of the
+    // dwell-click chooser.
     end.append(&tray_box);
+    end.append(&dwell_chooser.button);
     end.append(&input);
     end.append(&a11y);
     end.append(&system);
