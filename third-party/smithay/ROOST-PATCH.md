@@ -139,3 +139,15 @@ meta_x11_display_set_input_focus does; enter/leave are unchanged. The
 nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
 The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
 version stays 0.7.0.
+
+Issue #203 changes src/wayland/compositor/handlers.rs: wl_region add and
+subtract with an empty, negative or overflowing rectangle, and
+wl_surface.damage with a negative size (damage_buffer already returned
+early), panicked in
+`Size::new` and took the whole session down (found by the nested stress
+suite's protocol fuzzer). Mutter hands the rectangle to pixman
+(meta-wayland-region.c, mtk_region_union_rectangle), which leaves the
+region unchanged for such a rectangle; the handler now ignores it the same
+way. The stress suite's `bad-region` adversary covers it. The isolated diff
+is retained in REGION-RECT-PATCH.diff; the pinned
+version stays 0.7.0.
