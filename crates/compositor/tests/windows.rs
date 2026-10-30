@@ -45,6 +45,12 @@ use wayland_client::{
 use wayland_protocols::xdg::dialog::v1::client::{
     xdg_dialog_v1::XdgDialogV1, xdg_wm_dialog_v1::XdgWmDialogV1,
 };
+use wayland_protocols::xdg::foreign::zv2::client::{
+    zxdg_exported_v2::{self, ZxdgExportedV2},
+    zxdg_exporter_v2::ZxdgExporterV2,
+    zxdg_imported_v2::ZxdgImportedV2,
+    zxdg_importer_v2::ZxdgImporterV2,
+};
 use wayland_protocols::xdg::shell::client::{
     xdg_surface::XdgSurface, xdg_toplevel::XdgToplevel, xdg_wm_base::XdgWmBase,
 };
@@ -67,6 +73,10 @@ struct Client {
     seat: Option<WlSeat>,
     xdg_base: Option<XdgWmBase>,
     dialogs: Option<XdgWmDialogV1>,
+    exporter: Option<ZxdgExporterV2>,
+    importer: Option<ZxdgImporterV2>,
+    /// The last xdg-foreign handle this client's exports were given.
+    export_handle: Option<String>,
     surface: Option<WlSurface>,
     xdg_surface: Option<XdgSurface>,
     toplevel: Option<XdgToplevel>,
@@ -151,6 +161,12 @@ impl Dispatch<WlRegistry, ()> for Client {
                 }
                 "xdg_wm_dialog_v1" => {
                     state.dialogs = Some(registry.bind::<XdgWmDialogV1, _, _>(name, 1, qh, ()));
+                }
+                "zxdg_exporter_v2" => {
+                    state.exporter = Some(registry.bind::<ZxdgExporterV2, _, _>(name, 1, qh, ()));
+                }
+                "zxdg_importer_v2" => {
+                    state.importer = Some(registry.bind::<ZxdgImporterV2, _, _>(name, 1, qh, ()));
                 }
                 "zwlr_layer_shell_v1" => {
                     state.layer_shell =
@@ -4125,6 +4141,24 @@ fn keymap_reload_keeps_num_lock_and_the_active_layout() {
 
 wayland_client::delegate_noop!(Client: ignore XdgWmDialogV1);
 wayland_client::delegate_noop!(Client: ignore XdgDialogV1);
+wayland_client::delegate_noop!(Client: ignore ZxdgExporterV2);
+wayland_client::delegate_noop!(Client: ignore ZxdgImporterV2);
+wayland_client::delegate_noop!(Client: ignore ZxdgImportedV2);
+
+impl Dispatch<ZxdgExportedV2, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &ZxdgExportedV2,
+        event: zxdg_exported_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zxdg_exported_v2::Event::Handle { handle } = event {
+            state.export_handle = Some(handle);
+        }
+    }
+}
 
 #[test]
 fn modal_parent_blocks_pointer_clicks_scroll_and_super_drag_until_unset() {
@@ -4318,6 +4352,171 @@ fn native_modal_close_with_destroyed_parent_focuses_live_window() {
 #[test]
 fn unfocused_native_modal_close_does_not_steal_focus_from_another_app() {
     close_native_modal(false, false, true);
+}
+
+/// How the portal provider's picker in [`foreign_picker_provider_exit`]
+/// meets its end.
+#[derive(Clone, Copy, PartialEq)]
+enum PickerExit {
+    /// The provider (Nautilus) exits or restarts while its picker holds focus.
+    ProviderWhileFocused,
+    /// The user moves to another app first; then the provider exits.
+    ProviderAfterFocusMoved,
+    /// The caller exits (or restarts) first; then the provider exits.
+    ParentThenProvider,
+}
+
+/// A portal file chooser that belongs to another client (Nautilus in GNOME 51)
+/// is parented to the caller's exported window through xdg-foreign. An
+/// unrelated application sits above the caller. Then the provider's
+/// connection drops without any teardown requests, the way a crashed or
+/// restarted provider leaves.
+///
+/// Mutter 51: `meta_window_unmanage` of the focused window calls
+/// `meta_workspace_focus_default_window`, whose `focus_ancestor_or_top_window`
+/// focuses the closing window's `transient_for` ancestor before the
+/// top window (src/core/window.c, src/core/workspace.c). An imported
+/// `set_parent_of` is that `transient_for`
+/// (src/wayland/meta-wayland-xdg-foreign.c). So focus returns to the
+/// caller. A dead caller is never chosen, and an unfocused picker's exit does
+/// not take focus from the app the user moved to. Real keyboard delivery
+/// is asserted on both remaining connections.
+fn foreign_picker_provider_exit(exit: PickerExit) {
+    let Fixture {
+        mut comp,
+        mut manager,
+        conn_a,
+        mut queue_a,
+        mut client_a,
+        conn_b,
+        mut queue_b,
+        mut client_b,
+        id_a,
+        id_b,
+    } = two_windows();
+    // The caller exports its window for the portal request.
+    let qa = queue_a.handle();
+    let exported = client_a.exporter.as_ref().unwrap().export_toplevel(
+        client_a.surface.as_ref().unwrap(),
+        &qa,
+        (),
+    );
+    sync_client(&mut comp, &conn_a, &mut queue_a, &mut client_a);
+    let handle = client_a.export_handle.clone().expect("export handle");
+    // The unrelated application is the topmost window when the picker opens.
+    assert!(manager.focus(&mut comp.state, Some(id_b)));
+
+    let (conn_c, mut queue_c, mut client_c) = connect(&mut comp);
+    let qc = queue_c.handle();
+    let surface = client_c
+        .compositor
+        .as_ref()
+        .unwrap()
+        .create_surface(&qc, ());
+    let xdg = client_c
+        .xdg_base
+        .as_ref()
+        .unwrap()
+        .get_xdg_surface(&surface, &qc, ());
+    let top = xdg.get_toplevel(&qc, ());
+    top.set_title("provider-picker".into());
+    let imported = client_c
+        .importer
+        .as_ref()
+        .unwrap()
+        .import_toplevel(handle, &qc, ());
+    imported.set_parent_of(&surface);
+    let dialog = client_c
+        .dialogs
+        .as_ref()
+        .unwrap()
+        .get_xdg_dialog(&top, &qc, ());
+    dialog.set_modal();
+    surface.commit();
+    sync_client(&mut comp, &conn_c, &mut queue_c, &mut client_c);
+    manager.reconcile(&mut comp.state);
+    sync_client(&mut comp, &conn_c, &mut queue_c, &mut client_c);
+    let picker = manager
+        .model()
+        .windows()
+        .find(|w| w.title == "provider-picker")
+        .unwrap()
+        .id;
+    assert_eq!(manager.transient_parent(picker), Some(id_a));
+    assert_eq!(manager.model().focused(), Some(picker));
+
+    let parent_alive = exit != PickerExit::ParentThenProvider;
+    let mut caller = Some((conn_a, queue_a, client_a, exported));
+    match exit {
+        PickerExit::ProviderWhileFocused => {}
+        PickerExit::ProviderAfterFocusMoved => {
+            assert!(manager.focus(&mut comp.state, Some(id_b)));
+        }
+        PickerExit::ParentThenProvider => {
+            // The caller's process ends while its picker is open.
+            drop(caller.take());
+            comp.pump();
+            manager.reconcile(&mut comp.state);
+            assert!(!manager.model().windows().any(|w| w.id == id_a));
+            assert_eq!(manager.transient_parent(picker), None);
+            assert_eq!(
+                manager.model().focused(),
+                Some(picker),
+                "an unfocused parent's exit leaves the picker focused"
+            );
+        }
+    }
+
+    // The provider's connection ends without destroying anything.
+    drop((
+        conn_c, queue_c, client_c, surface, xdg, top, imported, dialog,
+    ));
+    comp.pump();
+    manager.reconcile(&mut comp.state);
+    assert!(!manager.model().windows().any(|w| w.id == picker));
+    let expected = if exit == PickerExit::ProviderWhileFocused {
+        id_a
+    } else {
+        id_b
+    };
+    assert_eq!(manager.model().focused(), Some(expected));
+
+    sync_client(&mut comp, &conn_b, &mut queue_b, &mut client_b);
+    client_b.keys.clear();
+    if let Some((conn_a, queue_a, client_a, _)) = caller.as_mut() {
+        sync_client(&mut comp, conn_a, queue_a, client_a);
+        client_a.keys.clear();
+    }
+    press(&mut manager, &mut comp, R_KEYCODE);
+    release(&mut manager, &mut comp, R_KEYCODE);
+    sync_client(&mut comp, &conn_b, &mut queue_b, &mut client_b);
+    let expected_keys = [(R_KEYCODE, true), (R_KEYCODE, false)];
+    if let Some((conn_a, queue_a, client_a, _)) = caller.as_mut() {
+        sync_client(&mut comp, conn_a, queue_a, client_a);
+        assert!(parent_alive);
+        if expected == id_a {
+            assert_eq!(client_a.keys, expected_keys);
+            assert!(client_b.keys.is_empty());
+            return;
+        }
+        assert!(client_a.keys.is_empty());
+    }
+    assert_eq!(client_b.keys, expected_keys);
+}
+
+#[test]
+fn provider_exit_returns_focus_to_the_pickers_foreign_parent() {
+    foreign_picker_provider_exit(PickerExit::ProviderWhileFocused);
+}
+
+#[test]
+fn provider_exit_after_focus_moved_does_not_steal_focus() {
+    foreign_picker_provider_exit(PickerExit::ProviderAfterFocusMoved);
+}
+
+#[test]
+fn caller_exit_then_provider_exit_never_focuses_the_dead_caller() {
+    foreign_picker_provider_exit(PickerExit::ParentThenProvider);
 }
 
 /// Geometry from the actual actor/render path, never a shell dash icon hint.
