@@ -242,10 +242,7 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
 
 
 class DeviceInventoryProjection(unittest.TestCase):
-    GREETD = {"manager": "greetd", "unit": "greetd.service", "service": "greetd", "vt": "1"}
-    GDM = {"manager": "gdm", "unit": "gdm.service", "service": "gdm-password", "vt": None}
-
-    def inventory(self, state, login=GREETD, session="Id=1\nVTNr=1\nUser=1000\nService=greetd\nType=wayland\nClass=user"):
+    def inventory(self, state, session="Id=3\nVTNr=2\nUser=1000\nService=gdm-password\nType=wayland\nClass=user"):
         source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
         fn = next(n for n in ast.parse(source.read_text()).body
                   if isinstance(n, ast.FunctionDef) and n.name == "inventory")
@@ -255,7 +252,7 @@ class DeviceInventoryProjection(unittest.TestCase):
             return session
         scope = {"json": json, "STATE": SimpleNamespace(read_text=lambda: json.dumps(state)),
                  "pathlib": SimpleNamespace(Path=lambda _: SimpleNamespace(iterdir=lambda: [])),
-                 "OWNER": SimpleNamespace(pw_uid=1000), "LOGIN_SESSION": login,
+                 "OWNER": SimpleNamespace(pw_uid=1000), "LOGIN_SERVICE": "gdm-password",
                  "os": SimpleNamespace(geteuid=lambda: 0), "call": call,
                  "classify_pam_helpers": lambda _: (None, []), "pam_process_snapshot": lambda: []}
         exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), "exec"), with_owner_login_session(scope))
@@ -263,17 +260,15 @@ class DeviceInventoryProjection(unittest.TestCase):
 
     def test_gdm_password_session_on_its_new_vt_is_the_owner(self):
         gdm = "Id=3\nVTNr=2\nUser=1000\nService=gdm-password\nType=wayland\nClass=user"
-        self.assertEqual(self.inventory(self.state(), self.GDM, gdm)["session"]["Service"], "gdm-password")
+        self.assertEqual(self.inventory(self.state(), gdm)["session"]["Service"], "gdm-password")
 
     def test_login_service_and_vt_must_match_the_fixture(self):
-        for login, session in ((self.GDM, "Id=1\nVTNr=1\nUser=1000\nService=greetd\nClass=user"),
-                               (self.GDM, "Id=3\nVTNr=\nUser=1000\nService=gdm-password\nClass=user"),
-                               (self.GDM, "Id=3\nVTNr=2\nUser=1001\nService=gdm-password\nClass=user"),
-                               (self.GDM, "Id=3\nVTNr=2\nUser=1000\nService=gdm-password\nClass=manager"),
-                               (self.GREETD, "Id=3\nVTNr=2\nUser=1000\nService=gdm-password\nClass=user"),
-                               (self.GREETD, "Id=1\nVTNr=2\nUser=1000\nService=greetd\nClass=user")):
-            with self.subTest(login=login["manager"], session=session), self.assertRaises(RuntimeError):
-                self.inventory(self.state(), login, session)
+        for session in ("Id=1\nVTNr=1\nUser=1000\nService=greetd\nClass=user",
+                        "Id=3\nVTNr=\nUser=1000\nService=gdm-password\nClass=user",
+                        "Id=3\nVTNr=2\nUser=1001\nService=gdm-password\nClass=user",
+                        "Id=3\nVTNr=2\nUser=1000\nService=gdm-password\nClass=manager"):
+            with self.subTest(session=session), self.assertRaises(RuntimeError):
+                self.inventory(self.state(), session)
 
     def state(self):
         return dict.fromkeys(("locked", "windows", "focused", "active_workspace",
@@ -464,21 +459,16 @@ class OrcaFixturePackages(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
         # Controlled shell admission only; no Podman image/runtime proof.
 
-    def test_actual_fixture_session_fixes_inherited_locale_before_child_exec(self):
-        source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-session"
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            command = root / "systemd-cat"
-            command.write_text("#!/usr/bin/env python3\nimport json,os\nprint(json.dumps({k:os.environ[k] for k in ['LC_ALL','LANG','LANGUAGE','XDG_SESSION_TYPE']}))\n")
-            command.chmod(0o755)
-            result = subprocess.run(["bash", str(source)], env={**os.environ,
-                "PATH": str(root) + os.pathsep + os.environ["PATH"], "XDG_RUNTIME_DIR": str(root),
-                "LC_ALL": "C", "LANG": "fr_FR.UTF-8", "LANGUAGE": "fr"},
-                capture_output=True, text=True, timeout=10)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout), {"LC_ALL": "C.UTF-8", "LANG": "C.UTF-8",
-                "LANGUAGE": "C", "XDG_SESSION_TYPE": "wayland"})
-            self.assertTrue((root / "tuna-vm-orca-token").is_file())
+    def test_current_build_session_environment_fixes_locale_and_ci_diagnostics(self):
+        # gdm-wayland-session lets GDM's own LANG win over the imported user
+        # manager environment; LC_ALL, which GDM does not set, overrides it.
+        source = (Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/Containerfile").read_text()
+        block = source.split("> /usr/share/tuna-vm/environment.conf", 1)[1].split(">> /usr/share/tuna-vm/environment.conf", 1)[0]
+        lines = [line.strip().strip("'\\").strip() for line in block.splitlines()]
+        for setting in ("LC_ALL=C.UTF-8", "LANGUAGE=C", "TUNA_PERF_TRACE=1", "TUNA_VM_PUBLIC_SEARCH_DIAGNOSTICS=1"):
+            self.assertIn(setting, " ".join(lines))
+        self.assertIn("COPY packaging/marlin/vm-lane/tuna-vm-orca-token "
+                      "/usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token", source)
         # Fixture setup policy only, not a genuine reader or translated-label proof.
 
     def run_builder_admission(self, upgraded="2.58.9", failed=False):
@@ -1159,7 +1149,7 @@ class OrcaReadChurn(unittest.TestCase):
                 if check:
                     raise lane.subprocess.CalledProcessError(1, list(args))
                 return ""
-            return "Id=2\nVTNr=1\nUser=1000\nType=wayland\nService=greetd\nClass=user"
+            return "Id=2\nVTNr=2\nUser=1000\nType=wayland\nService=gdm-password\nClass=user"
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory, "state")
             state.write_text(json.dumps({k: None for k in (
@@ -1168,7 +1158,7 @@ class OrcaReadChurn(unittest.TestCase):
             empty_proc = Path(directory, "proc")
             empty_proc.mkdir()
             scope = {"json": json, "STATE": state, "call": call, "os": lane.os,
-                     "OWNER": SimpleNamespace(pw_uid=1000), "LOGIN_SESSION": DeviceInventoryProjection.GREETD,
+                     "OWNER": SimpleNamespace(pw_uid=1000), "LOGIN_SERVICE": "gdm-password",
                      "pathlib": SimpleNamespace(Path=lambda path: empty_proc),
                      "classify_pam_helpers": lambda _: (None, []), "pam_process_snapshot": lambda: []}
             result = self.load("inventory", with_owner_login_session(scope))()
@@ -2318,7 +2308,7 @@ class RepeatedCoverage(unittest.TestCase):
             return SimpleNamespace(returncode=code)
 
         args = SimpleNamespace(out=str(root), boots=5, disk="disk.raw", timeout=30,
-                               tour=True, greeter_login=False, require_kvm=False,
+                               tour=True, published=False, require_kvm=False,
                                meta=[], orca_contract="distribution")
         with patch.object(lane.subprocess, "run", side_effect=boot):
             lane.repeat_boots(args)
@@ -2924,9 +2914,9 @@ class PrivatePamSleepControls(unittest.TestCase):
                           origin=dict(connection=4, request=12), locked_after=True)
 
     def trace(self, event=None, denial=None):
-        return ('tuna-vm-session[600]: tuna-compositor: lock authentication owned retirement '
+        return ('gdm-wayland-session[600]: tuna-compositor: lock authentication owned retirement '
                 + json.dumps(self.event if event is None else event) + '\n'
-                + 'tuna-vm-session[601]: ' + (self.legacy.denial if denial is None else denial))
+                + 'gdm-wayland-session[601]: ' + (self.legacy.denial if denial is None else denial))
 
     def fragmented_trace(self, event=None):
         # Run 39584168097 sheared the JSON after {, "applied and ".
@@ -2934,16 +2924,16 @@ class PrivatePamSleepControls(unittest.TestCase):
         payload = json.dumps(self.event if event is None else event,
                              sort_keys=True, separators=(',', ':'))
         return '\n'.join([
-            'tuna-vm-session[601]: tuna-shell-gtk: lock command result applied=',
-            'tuna-vm-session[600]: tuna-compositor: lock authentication owned retirement {',
+            'gdm-wayland-session[601]: tuna-shell-gtk: lock command result applied=',
+            'gdm-wayland-session[600]: tuna-compositor: lock authentication owned retirement {',
             'NetworkManager[702]: state changed',
-            'tuna-vm-session[602]: tuna-ibus-bridge: text field ',
-            'tuna-vm-session[600]: "applied',
-            'tuna-vm-session[601]: false request_id=',
-            'tuna-vm-session[602]: focused',
-            'tuna-vm-session[600]: "',
-            'tuna-vm-session[601]: 12',
-            'tuna-vm-session[600]: ' + payload[len('{"applied"'):],
+            'gdm-wayland-session[602]: tuna-ibus-bridge: text field ',
+            'gdm-wayland-session[600]: "applied',
+            'gdm-wayland-session[601]: false request_id=',
+            'gdm-wayland-session[602]: focused',
+            'gdm-wayland-session[600]: "',
+            'gdm-wayland-session[601]: 12',
+            'gdm-wayland-session[600]: ' + payload[len('{"applied"'):],
         ])
 
     def test_fragmented_interleaved_retirement_and_denial_reassemble(self):
@@ -2969,12 +2959,12 @@ class PrivatePamSleepControls(unittest.TestCase):
         invalid = [incomplete, incomplete + '\n' + self.trace(),
                    serial.replace('"retired":true}', '"retired":tru}'),
                    serial + '\n' + self.trace(),
-                   serial.replace('tuna-vm-session[600]: :false', 'tuna-vm-session[603]: :false'),
-                   serial.replace('tuna-vm-session[600]: "applied', 'tuna-vm-session[603]: "applied'),
-                   serial.replace('tuna-vm-session[600]: "applied',
-                                  'tuna-vm-session[600]: tuna-compositor: unrelated record\n'
-                                  'tuna-vm-session[600]: "applied'),
-                   serial.replace('tuna-vm-session[601]: 12', 'tuna-vm-session[603]: 12')]
+                   serial.replace('gdm-wayland-session[600]: :false', 'gdm-wayland-session[603]: :false'),
+                   serial.replace('gdm-wayland-session[600]: "applied', 'gdm-wayland-session[603]: "applied'),
+                   serial.replace('gdm-wayland-session[600]: "applied',
+                                  'gdm-wayland-session[600]: tuna-compositor: unrelated record\n'
+                                  'gdm-wayland-session[600]: "applied'),
+                   serial.replace('gdm-wayland-session[601]: 12', 'gdm-wayland-session[603]: 12')]
         for trace in invalid:
             with self.subTest(trace=trace):
                 self.assertIsNone(self.match(trace=trace))
@@ -2989,18 +2979,18 @@ class PrivatePamSleepControls(unittest.TestCase):
                     'lagging behind by 644ms, your system is too slow')
         mesa = 'MESA-EGL: warning: egl: failed to create dri2 screen'
         orca = 'TUNA_ORCA_DIAGNOSTIC stage=child-exit pid=9813 attempt=0 code=-1 signal=9'
-        serial = '\n'.join([self.trace(), 'tuna-vm-session[600]: ' + libinput,
-                            'tuna-vm-session[600]: ' + mesa, 'tuna-vm-session[600]: ' + orca])
+        serial = '\n'.join([self.trace(), 'gdm-wayland-session[600]: ' + libinput,
+                            'gdm-wayland-session[600]: ' + mesa, 'gdm-wayland-session[600]: ' + orca])
         records = lane.session_records(serial)
         for line in (libinput, mesa, orca):
             self.assertIn(line, records)
         self.assertEqual(self.match(trace=serial), self.event)
         for line in (libinput, orca):
-            fragmented = self.fragmented_trace() + '\n' + 'tuna-vm-session[600]: ' + line
+            fragmented = self.fragmented_trace() + '\n' + 'gdm-wayland-session[600]: ' + line
             self.assertEqual(self.match(trace=fragmented), self.event)
         # A sheared piece of a Tuna record is still its continuation.
-        self.assertEqual(lane.session_records('tuna-vm-session[600]: tuna-compositor: \n'
-                                              'tuna-vm-session[600]: libinput: scroll-wheel emulation rejected'),
+        self.assertEqual(lane.session_records('gdm-wayland-session[600]: tuna-compositor: \n'
+                                              'gdm-wayland-session[600]: libinput: scroll-wheel emulation rejected'),
                          ['tuna-compositor: libinput: scroll-wheel emulation rejected'])
 
     def match(self, trace=None, original=None, physical=None, current=8):
@@ -3227,7 +3217,7 @@ class S3AbsoluteDeadline(unittest.TestCase):
 
 
 class ShippedSnapshotInventory(unittest.TestCase):
-    # Run 37696030597: the graphical PAM login produced a real greetd
+    # Run 37696030597: the graphical PAM login produced a real login
     # session, yet every inventory() probe failed because the published
     # tuna-desktop 0.1.0-2 snapshot predates the newer instrumentation keys.
     # Session detection must not hard-require keys the shipped binary
@@ -3252,9 +3242,9 @@ class ShippedSnapshotInventory(unittest.TestCase):
             state_path = root / "tuna-vm-state.json"
             state_path.write_text(json.dumps(state))
             descriptions = {
-                "1": "Id=1\nVTNr=1\nUser=959\nType=tty\nService=greetd\nClass=greeter",
-                "3": (f"Id=3\nVTNr=1\nUser={uid}\nType=tty\n"
-                      "Service=greetd\nClass=user"),
+                "1": "Id=1\nVTNr=1\nUser=959\nType=wayland\nService=gdm-launch-environment\nClass=greeter",
+                "3": (f"Id=3\nVTNr=2\nUser={uid}\nType=wayland\n"
+                      "Service=gdm-password\nClass=user"),
                 "4": (f"Id=4\nVTNr=\nUser={uid}\nType=unspecified\n"
                       "Service=systemd-user\nClass=manager"),
             }
@@ -3269,7 +3259,7 @@ class ShippedSnapshotInventory(unittest.TestCase):
                      "pathlib": SimpleNamespace(
                          Path=lambda path: proc if str(path) == "/proc" else real_pathlib.Path(path)),
                      "OWNER": SimpleNamespace(pw_uid=uid, pw_name="tuna-test"),
-                     "LOGIN_SESSION": DeviceInventoryProjection.GREETD,
+                     "LOGIN_SERVICE": "gdm-password",
                      "RUNTIME": f"/run/user/{uid}", "STATE": state_path,
                      "call": fake_call, **identity,
                      # Owned PAM helper accounting is proven by PrivatePamSleepControls.
@@ -3286,7 +3276,7 @@ class ShippedSnapshotInventory(unittest.TestCase):
             ("4", f"{uid} tuna-test - -"),
         ])
         self.assertEqual(result["session"]["Id"], "3")
-        self.assertEqual(result["session"]["Service"], "greetd")
+        self.assertEqual(result["session"]["Service"], "gdm-password")
         self.assertEqual(result["session_uid"], uid)
         self.assertTrue(any(p["executable"] == "tuna-compositor" for p in result["processes"]))
         self.assertTrue(result["state"]["overview_open"])
@@ -3308,7 +3298,7 @@ class ShippedSnapshotInventory(unittest.TestCase):
         uid = os.getuid()
         state = {**self.SHIPPED_STATE, "pointer_position": [0, 0],
                  "native_relative_motion_count": 0}
-        with self.assertRaisesRegex(RuntimeError, "expected exactly one greetd user session"):
+        with self.assertRaisesRegex(RuntimeError, "expected exactly one gdm-password user session"):
             self.run_inventory(state, [("4", f"{uid} tuna-test - -")])
 
 
@@ -3393,15 +3383,15 @@ class PredatingGuestQualification(unittest.TestCase):
     def test_sheared_lock_result_record_reassembles(self):
         # Run 38855306157 serial: one shell eprintln! split across records.
         serial = "\n".join([
-            "[  330.422991] tuna-vm-session[1104]: tuna-shell-gtk: lock password submitted",
-            "[  330.424643] tuna-vm-session[1108]: tuna-ibus-bridge: text field left",
-            "[  330.439349] tuna-vm-session[1104]: tuna-shell-gtk: lock command result applied=",
-            "[  330.441502] tuna-vm-session[957]: tuna-compositor: lock authentication retired",
-            "[  330.443201] tuna-vm-session[1104]: false",
-            '[  330.444105] tuna-vm-session[957]: {"',
-            "[  330.444875] tuna-vm-session[1104]:  request_id=",
-            "[  330.445852] tuna-vm-session[957]: applied",
-            "[  330.446000] tuna-vm-session[1104]: 55",
+            "[  330.422991] gdm-wayland-session[1104]: tuna-shell-gtk: lock password submitted",
+            "[  330.424643] gdm-wayland-session[1108]: tuna-ibus-bridge: text field left",
+            "[  330.439349] gdm-wayland-session[1104]: tuna-shell-gtk: lock command result applied=",
+            "[  330.441502] gdm-wayland-session[957]: tuna-compositor: lock authentication retired",
+            "[  330.443201] gdm-wayland-session[1104]: false",
+            '[  330.444105] gdm-wayland-session[957]: {"',
+            "[  330.444875] gdm-wayland-session[1104]:  request_id=",
+            "[  330.445852] gdm-wayland-session[957]: applied",
+            "[  330.446000] gdm-wayland-session[1104]: 55",
         ])
         records = lane.session_records(serial)
         self.assertIn("tuna-shell-gtk: lock command result applied=false request_id=55", records)
@@ -3410,7 +3400,7 @@ class PredatingGuestQualification(unittest.TestCase):
 
     def test_unsheared_true_result_never_reads_as_refusal(self):
         records = lane.session_records(
-            "[ 1.0] tuna-vm-session[1104]: tuna-shell-gtk: lock command result applied=true request_id=7")
+            "[ 1.0] gdm-wayland-session[1104]: tuna-shell-gtk: lock command result applied=true request_id=7")
         self.assertFalse(any("applied=false" in line for line in records))
 
     def test_media_volume_strict_sequence_passes(self):
@@ -3595,30 +3585,90 @@ class GdmSessionList(unittest.TestCase):
 
 
 class FixtureLoginSession(unittest.TestCase):
-    def test_fixture_file_selects_the_qualified_login(self):
-        login_session = lifecycle_scope("login_session")["login_session"]
-        with tempfile.TemporaryDirectory() as root:
-            path = Path(root, "display-manager")
-            self.assertEqual(login_session(path)["service"], "greetd")
-            path.write_text("gdm\n")
-            self.assertEqual(login_session(path), {"manager": "gdm", "unit": "gdm.service",
-                                                   "service": "gdm-password", "vt": None})
-            path.write_text("lightdm\n")
-            with self.assertRaises(RuntimeError):
-                login_session(path)
+    def fixture(self, name):
+        return (Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane" / name).read_text()
 
-    def test_published_fixture_names_gdm_without_preselecting_a_session(self):
-        root = Path(__file__).resolve().parents[2]
-        containerfile = (root / "packaging/marlin/vm-lane/Containerfile.published").read_text()
-        tmpfiles = (root / "packaging/marlin/vm-lane/tuna-vm-published.tmpfiles").read_text()
-        self.assertIn("printf 'gdm\\n' > /usr/share/tuna-vm/display-manager", containerfile)
-        self.assertIn("COPY packaging/marlin/vm-lane/tuna-vm-published.tmpfiles", containerfile)
-        self.assertNotIn("greetd", containerfile.split("RUN mkdir -p /usr/share/tuna-vm", 1)[1])
-        for path in ("/usr/lib/pam.d/gdm-password", "/etc/gdm/custom.conf", "/etc/pam.d/tuna-lock",
-                     "/usr/share/wayland-sessions/*.desktop", "sha256sum --check"):
-            self.assertIn(path, containerfile)
+    def test_both_fixtures_log_in_through_gdm_without_preselecting_a_session(self):
+        tmpfiles = self.fixture("tuna-vm-gdm.tmpfiles")
         self.assertNotIn("Session=", tmpfiles)
-        self.assertNotIn("AutomaticLogin", containerfile.replace("AutomaticLoginEnable|TimedLoginEnable", ""))
+        for name in ("Containerfile", "Containerfile.published"):
+            with self.subTest(fixture=name):
+                containerfile = self.fixture(name)
+                self.assertIn("COPY packaging/marlin/vm-lane/tuna-vm-gdm.tmpfiles", containerfile)
+                body = containerfile.split("RUN mkdir -p /usr/share/tuna-vm", 1)[1]
+                for absent in ("greetd", "gtkgreet", "cage", "systemctl disable gdm"):
+                    self.assertNotIn(absent, body)
+                for path in ("/usr/lib/pam.d/gdm-password", "/etc/gdm/custom.conf", "/etc/pam.d/tuna-lock",
+                             "/usr/share/wayland-sessions/*.desktop", "sha256sum --check",
+                             "display-manager.service)\" = /usr/lib/systemd/system/gdm.service"):
+                    self.assertIn(path, containerfile)
+                self.assertNotIn("AutomaticLogin", containerfile.replace("AutomaticLoginEnable|TimedLoginEnable", ""))
+
+    def test_current_build_runs_tunaos_tuna_flavor_gdm_steps_in_manifest_order(self):
+        containerfile = self.fixture("Containerfile")
+        steps = ["tuna-gdm-theme.sh", "tuna-gdm-default-session.sh", "tuna-hide-other-sessions.sh"]
+        positions = [containerfile.index(f"bash /tmp/tunaos/{step}") for step in steps]
+        self.assertEqual(positions, sorted(positions))
+        self.assertLess(containerfile.index("Name=Tuna Desktop/'"), positions[0])
+        self.assertLess(positions[-1], containerfile.index("> /usr/share/tuna-vm/shipped-payload.sha256"))
+        self.assertEqual(sorted(p.name for p in (Path(__file__).resolve().parents[2]
+                                                 / "packaging/marlin/vm-lane/tunaos").iterdir()), sorted(steps))
+
+    def test_tunaos_steps_give_the_preview_image_the_published_login_path(self):
+        source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tunaos"
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            (root / "etc/gdm").mkdir(parents=True)
+            (root / "etc/gdm/custom.conf").write_text("[daemon]\nDefaultSession=gnome.desktop\n")
+            (root / "usr/share/accountsservice/user-templates").mkdir(parents=True)
+            (root / "usr/share/accountsservice/user-templates/standard").write_text("[User]\nSession=gnome\n")
+            sessions = root / "usr/share/wayland-sessions"
+            sessions.mkdir(parents=True)
+            (sessions / "tuna.desktop").write_text("[Desktop Entry]\nName=Tuna Desktop\nExec=tuna-session\n")
+            (sessions / "gnome.desktop").write_text("[Desktop Entry]\nName=GNOME\nExec=gnome-session\n")
+            environment = {**os.environ, "TUNAOS_GDM_DEFAULT_ROOT": str(root),
+                           "TUNAOS_GDM_SESSIONS_ROOT": str(root)}
+            for step in ("tuna-gdm-default-session.sh", "tuna-hide-other-sessions.sh"):
+                subprocess.run(["bash", str(source / step)], env=environment, check=True,
+                               capture_output=True, timeout=10)
+            scope = lifecycle_scope(*GdmSessionList.NAMES, "gdm_daemon_key", "gdm_fallback_session",
+                                    "GDM_LAUNCH_DIRS")
+            which = lambda program: program if program in ("tuna-session", "gnome-session") else None
+            offered = scope["gdm_sessions"](tuple(str(root) + d for d in scope["GDM_SESSION_DIRS"]), which=which)
+            fallback = scope["gdm_fallback_session"](root / "etc/gdm/custom.conf",
+                                                     tuple(str(root) + d for d in scope["GDM_LAUNCH_DIRS"]),
+                                                     which=which)
+            self.assertTrue(lane.greeter_list_ok({"sessions": offered})[0], offered)
+            self.assertTrue(lane.fallback_session_ok({"fallback_session": fallback})[0], fallback)
+            self.assertIn("NoDisplay=true", (sessions / "gnome.desktop").read_text())
+            self.assertNotIn("NoDisplay", (sessions / "tuna.desktop").read_text())
+            self.assertIn("Session=tuna", (root / "etc/accountsservice/user-templates/standard").read_text())
+            self.assertNotIn("DefaultSession", (root / "etc/gdm/custom.conf").read_text())
+        # Configuration-file policy only, not a booted GDM.
+
+    def test_orca_secret_generator_serves_only_the_fixture_user_once_per_login(self):
+        source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-orca-token"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stubs = root / "bin"
+            stubs.mkdir()
+            runtime = root / "run/user/1000"
+            runtime.mkdir(parents=True)
+            def run(user):
+                (stubs / "id").write_text(f"#!/bin/sh\n[ \"$1\" = -un ] && echo {user} || echo 1000\n")
+                (stubs / "id").chmod(0o755)
+                script = source.read_text().replace("/run/user/", str(root / "run/user") + "/")
+                return subprocess.run(["bash", "-c", script], env={**os.environ,
+                    "PATH": str(stubs) + os.pathsep + os.environ["PATH"]},
+                    capture_output=True, text=True, timeout=10, check=True).stdout
+            self.assertEqual(run("gdm-greeter"), "")
+            self.assertFalse((runtime / "tuna-vm-orca-token").exists())
+            first = run("tuna-test")
+            self.assertRegex(first, r"^ORCA_TEST_RPC_SECRET=[0-9a-f]{64}\n$")
+            self.assertEqual(run("tuna-test"), first)
+            self.assertEqual("ORCA_TEST_RPC_SECRET=" + (runtime / "tuna-vm-orca-token").read_text() + "\n", first)
+            self.assertEqual((runtime / "tuna-vm-orca-token").stat().st_mode & 0o777, 0o600)
+        # Fixture setup policy only, not a genuine reader proof.
 
 
 class GdmGreeterReadiness(unittest.TestCase):
@@ -3630,7 +3680,7 @@ class GdmGreeterReadiness(unittest.TestCase):
         return greeter | changes
 
     def test_active_non_root_gdm_greeter_is_ready(self):
-        self.assertTrue(lane.greeter_ready(self.gdm(), True))
+        self.assertTrue(lane.greeter_ready(self.gdm()))
 
     def test_gdm_greeter_needs_its_active_session_and_no_survivor(self):
         session = self.gdm()["greeter_sessions"][0]
@@ -3640,18 +3690,7 @@ class GdmGreeterReadiness(unittest.TestCase):
                         {"greeter_sessions": [session | {"Service": "gdm-password"}]},
                         {"greeter_sessions": [session | {"User": "0"}]}, {"probe_uid": 1000}):
             with self.subTest(changes=changes):
-                self.assertFalse(lane.greeter_ready(self.gdm(**changes), True))
-
-    def test_current_build_greetd_logout_greeter(self):
-        greetd = {"manager": "greetd", "manager_active": True, "probe_uid": 0, "greeter_pids": ["700"],
-                  "greeter_uids": [958], "compositor_pids": []}
-        self.assertTrue(lane.greeter_ready(greetd, False))
-        self.assertFalse(lane.greeter_ready(greetd | {"compositor_pids": ["900"]}, False))
-        self.assertFalse(lane.greeter_ready(self.gdm(), False))
-
-    def test_login_service_follows_the_lane(self):
-        self.assertEqual(lane.login_service(True), "gdm-password")
-        self.assertEqual(lane.login_service(False), "greetd")
+                self.assertFalse(lane.greeter_ready(self.gdm(**changes)))
 
     def test_gdm_session_stream_records_reassemble(self):
         text = ("[  42.1] /usr/lib/gdm-wayland-session[1203]: tuna-shell-gtk: lock password submitted\n"
@@ -3659,6 +3698,24 @@ class GdmGreeterReadiness(unittest.TestCase):
                 "[  42.3] /usr/lib/gdm-wayland-session[1203]: false\n")
         self.assertEqual(lane.session_records(text), ["tuna-shell-gtk: lock password submitted",
                                                       "tuna-shell-gtk: lock command result applied=false"])
+
+    def test_warning_coloured_gdm_stream_reads_as_plain_records(self):
+        # Run 40969124480: journald colours GDM's warning-priority stderr
+        # stream on the console; the colour must not glue records together.
+        colour = "\x1b[0;1;33m\x1b[0;1;38:5:185m"
+        serial = ("[ 465.7] /usr/lib/gdm-wayland-session[2059]: " + colour
+                  + "tuna-shell-gtk: lock command result applied=false request_id=93\x1b[0m\n"
+                  "[ 469.5] /usr/lib/gdm-wayland-session[1947]: " + colour
+                  + 'tuna-compositor: lock authentication owned retirement {"pid":1947}\x1b[0m\n'
+                  "[ 469.6] /usr/lib/gdm-wayland-session[2059]: " + colour + "false\x1b[0m\n")
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root, "serial.log")
+            path.write_bytes(serial.encode())
+            text = lane.read_text(str(path))
+        self.assertNotIn("\x1b", text)
+        self.assertEqual(lane.session_records(text), [
+            "tuna-shell-gtk: lock command result applied=false request_id=93false",
+            'tuna-compositor: lock authentication owned retirement {"pid":1947}'])
 
 
 class DelayedAuthFailureDiagnostics(unittest.TestCase):
@@ -3915,7 +3972,7 @@ class InventoryProcessRaces(unittest.TestCase):
             if args[:2] == ("loginctl", "list-sessions"):
                 return f"1 {uid} tuna-test seat0 tty1"
             if args[:2] == ("loginctl", "show-session"):
-                return f"Id=1\nVTNr=1\nUser={uid}\nService=greetd\nType=wayland\nClass=user"
+                return f"Id=1\nVTNr=2\nUser={uid}\nService=gdm-password\nType=wayland\nClass=user"
             raise AssertionError(args)
         state_path = self.root / "tuna-vm-state.json"
         state_path.write_text(json.dumps(self.STATE) if state is None else state)
@@ -3924,7 +3981,7 @@ class InventoryProcessRaces(unittest.TestCase):
                      os=SimpleNamespace(readlink=readlink, geteuid=lambda: 0),
                      pathlib=SimpleNamespace(Path=proc_path), time=SimpleNamespace(sleep=sleep),
                      OWNER=SimpleNamespace(pw_uid=uid, pw_name="tuna-test"),
-                     LOGIN_SESSION=DeviceInventoryProjection.GREETD, call=call or sessions,
+                     LOGIN_SERVICE="gdm-password", call=call or sessions,
                      PAM_HELPER_FLAG=b"--internal-pam-conversation", **guest_identity())
         return scope
 
@@ -4142,18 +4199,18 @@ class OrcaLogoutRetirement(unittest.TestCase):
                           if line.strip() and not line.strip().startswith("//")][0], "self.orca.shutdown();")
 
     def test_exact_reaped_receipt_for_the_original_reader(self):
-        trace = "\n".join(["[ 535.1] tuna-vm-session[912]: tuna-compositor: modifier super keycode=125 pressed=false",
-                           "[ 537.1] tuna-vm-session[912]: " + self.RECEIPT])
+        trace = "\n".join(["[ 535.1] gdm-wayland-session[912]: tuna-compositor: modifier super keycode=125 pressed=false",
+                           "[ 537.1] gdm-wayland-session[912]: " + self.RECEIPT])
         self.assertEqual(lane.orca_logout_retirement(trace, 21699),
                          {"pid": 21699, "terminated": True, "exited_in_grace": False,
                           "reaped": True, "elapsed_ms": 2004})
-        sheared = ("[ 537.1] tuna-vm-session[912]: tuna-compositor: screen reader retired pid=21699 terminated=\n"
-                   "[ 537.1] tuna-vm-session[1164]: tuna-shell-gtk: unrelated\n"
-                   "[ 537.1] tuna-vm-session[912]: true exited_in_grace=false reaped=true elapsed_ms=2004")
+        sheared = ("[ 537.1] gdm-wayland-session[912]: tuna-compositor: screen reader retired pid=21699 terminated=\n"
+                   "[ 537.1] gdm-wayland-session[1164]: tuna-shell-gtk: unrelated\n"
+                   "[ 537.1] gdm-wayland-session[912]: true exited_in_grace=false reaped=true elapsed_ms=2004")
         self.assertEqual(lane.orca_logout_retirement(sheared, 21699)["elapsed_ms"], 2004)
 
     def test_missing_unreaped_foreign_duplicate_or_malformed_receipt_refused(self):
-        line = "[ 537.1] tuna-vm-session[912]: "
+        line = "[ 537.1] gdm-wayland-session[912]: "
         for trace in ["", line + self.RECEIPT.replace("reaped=true", "reaped=false"),
                       line + self.RECEIPT.replace("pid=21699", "pid=21700"),
                       line + self.RECEIPT + "\n" + line + self.RECEIPT,

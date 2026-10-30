@@ -1,0 +1,17 @@
+#!/bin/bash
+# CI-only systemd user environment generator (systemd.environment-generator(7))
+# of the current-build VM lane. GDM's gdm-wayland-session imports the user
+# manager's environment into the session, so Tuna Desktop and the Orca it
+# starts inherit this secret, which enables only upstream Orca's token-gated
+# test presenter recording; it does not replace Speech Dispatcher or add any
+# speech-consuming extension. The root lane probe reads the runtime copy. One
+# secret per login: a manager reload reuses it.
+set -eu
+[[ "$(id -un)" == tuna-test ]] || exit 0
+token="/run/user/$(id -u)/tuna-vm-orca-token"
+if [[ ! -s "$token" ]]; then
+    umask 077
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$token.tmp"
+    mv "$token.tmp" "$token"
+fi
+printf 'ORCA_TEST_RPC_SECRET=%s\n' "$(< "$token")"

@@ -1,13 +1,25 @@
-# CI-only test layer for the Marlin VM lane (#68). NOT shipped.
+# CI-only test layer for the current-build Marlin VM lanes (#68). NOT shipped.
 #
-# Derives from the marlin-tuna-preview image (packaging/marlin/
-# Containerfile) and changes only what a hands-off boot test needs; the
-# shipped preview image keeps GDM's normal login screen and kernel arguments.
+# Derives from the marlin-tuna-preview image (packaging/marlin/Containerfile)
+# and gives it the published marlin:tuna login path: stock GDM with tunaOS's
+# tuna-flavor GDM steps (tunaos.toml [desktops.tuna] after_install, run in that
+# order), vendored byte-for-byte in tunaos/ from tuna-os/tunaOS 193cc0ef:
 #
-#   - a test user, tuna-test (password "tuna"), whose AccountsService
-#     record selects the Tuna Desktop session;
-#   - a CI-only greetd initial session of that user straight into Tuna Desktop,
-#     then the qualified Cage/gtkgreet login screen after logout;
+#   - tuna-gdm-theme.sh: the greeter-only GNOME Shell stylesheet overlay;
+#   - tuna-gdm-default-session.sh: [daemon] FallbackSession=tuna and
+#     Session=tuna AccountsService user templates;
+#   - tuna-hide-other-sessions.sh: NoDisplay on every non-Tuna session;
+#
+# on the package's own "Tuna Desktop" session entry (the preview image's
+# "(preview)" label is the preview's, not the package's). The lane then logs
+# in by typing the fixture password into GDM's user list, as on the published
+# flavor (Containerfile.published). Fixtures, as there:
+#
+#   - a test user, tuna-test (password "tuna"), with no saved session, so
+#     GDM's configuration alone decides what starts;
+#   - its session telemetry environment through environment.d, plus this
+#     lane's overview trace, public-search diagnostics and fixed C locale, and
+#     a per-login Orca test secret (tuna-vm-orca-token);
 #   - kernel console on ttyS0 and journald forwarded to it, so the
 #     session's stderr (tuna-compositor:, tuna-shell-gtk:) reaches the
 #     QEMU serial log the lane asserts on. The serial login prompt is
@@ -29,14 +41,13 @@ FROM ${BASE_IMAGE}
 COPY --from=constraint-builder /usr/libexec/tuna-vm-constraints /usr/libexec/tuna-vm-constraints
 COPY --from=constraint-builder /usr/share/tuna-vm-constraints /usr/share/tuna-vm-constraints
 
-COPY packaging/marlin/vm-lane/greetd.toml /etc/greetd/config.toml
-COPY packaging/marlin/vm-lane/gtkgreet.css /etc/greetd/gtkgreet.css
-COPY packaging/marlin/vm-lane/tuna-vm-session /usr/libexec/tuna-vm-session
+COPY packaging/marlin/vm-lane/tunaos /tmp/tunaos
 COPY packaging/marlin/vm-lane/tuna-vm-lifecycle /usr/libexec/tuna-vm-lifecycle
 COPY scripts/lib/gnome-brightness-proof.py /usr/libexec/tuna-brightness-proof
 COPY packaging/marlin/vm-lane/tuna-vm-input /usr/libexec/tuna-vm-input
 COPY packaging/marlin/vm-lane/tuna-vm-shell-focus /usr/libexec/tuna-vm-shell-focus
-COPY packaging/marlin/vm-lane/tuna-vm-lane.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
+COPY packaging/marlin/vm-lane/tuna-vm-orca-token /usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token
+COPY packaging/marlin/vm-lane/tuna-vm-gdm.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
 COPY packaging/marlin/vm-lane/journald.conf /usr/lib/systemd/journald.conf.d/90-tuna-vm-lane.conf
 COPY packaging/marlin/vm-lane/kargs.toml /usr/lib/bootc/kargs.d/90-tuna-vm-lane.toml
 
@@ -46,18 +57,50 @@ COPY packaging/marlin/vm-lane/tuna-vm-health.service /usr/lib/systemd/system/tun
 # /home is a symlink to /var/home on bootc systems and /var is only
 # seeded at install time, so the home directory and the AccountsService
 # record come from tmpfiles.d on every boot rather than from this layer.
-RUN pacman -Syu --needed --noconfirm greetd greetd-gtkgreet cage qemu-guest-agent python python-gobject python-cairo grim wtype wayland-utils gdb \
+# The payload hashes cover the same login-path files Containerfile.published
+# pins, taken after the tunaOS steps; the booted lane re-checks them before
+# it types into GDM.
+RUN mkdir -p /usr/share/tuna-vm \
+    && pacman -Q tuna-desktop > /usr/share/tuna-vm/shipped-package.txt \
+    && pacman -Q > /usr/share/tuna-vm/shipped-packages.txt \
+    && pacman -Syu --needed --noconfirm qemu-guest-agent python python-gobject python-cairo grim wtype wayland-utils gdb \
     && /usr/libexec/tuna-image-kernels vm \
+    && test "$(pacman -Q tuna-desktop)" = "$(cat /usr/share/tuna-vm/shipped-package.txt)" \
+    && sed -i -E 's/^Name=Tuna Desktop \(preview\)$/Name=Tuna Desktop/' /usr/share/wayland-sessions/tuna.desktop \
+    && grep -qx 'Name=Tuna Desktop' /usr/share/wayland-sessions/tuna.desktop \
+    && bash /tmp/tunaos/tuna-gdm-theme.sh \
+    && bash /tmp/tunaos/tuna-gdm-default-session.sh \
+    && bash /tmp/tunaos/tuna-hide-other-sessions.sh \
+    && rm -rf /tmp/tunaos \
+    && sha256sum /usr/bin/tuna-session /usr/bin/tuna-compositor \
+         /usr/bin/tuna-shell-host /usr/bin/tuna-shell-gtk \
+         /usr/bin/tuna-ibus-bridge /usr/bin/tuna-greeter \
+         /usr/share/wayland-sessions/*.desktop /etc/pam.d/tuna-lock \
+         /usr/lib/pam.d/gdm-password /usr/lib/pam.d/gdm-launch-environment \
+         /etc/gdm/custom.conf /usr/lib/systemd/system/gdm.service \
+         /etc/systemd/user/org.gnome.Shell@gdm.service.d/tunaos-gdm-theme.conf \
+         /usr/share/tunaos/gdm-theme/gnome-shell-*.css > /usr/share/tuna-vm/shipped-payload.sha256 \
+    && test "$(readlink -f /etc/systemd/system/display-manager.service)" = /usr/lib/systemd/system/gdm.service \
+    && ! grep -Eiq '^[[:space:]]*(AutomaticLoginEnable|TimedLoginEnable)[[:space:]]*=[[:space:]]*(true|yes|y|1)[[:space:]]*$' /etc/gdm/custom.conf \
+    && grep -qx 'FallbackSession=tuna' /etc/gdm/custom.conf \
     && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test \
     && echo 'tuna-test:tuna' | chpasswd \
-    && test -f /usr/share/wayland-sessions/tuna.desktop \
-    && chmod 0755 /usr/libexec/tuna-vm-session /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-input /usr/libexec/tuna-vm-shell-focus \
-    && printf 'tuna-session\n' > /etc/greetd/environments \
-    && systemctl disable gdm.service \
+    && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-input /usr/libexec/tuna-vm-shell-focus \
+         /usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token \
+    && printf 'TUNA_COMPOSITOR_STATE=/run/user/%s/tuna-vm-state.json\nTUNA_LOCK_TRACE=1\nTUNA_POINTER_TRACE=1\n' \
+         "$(id -u tuna-test)" > /usr/share/tuna-vm/environment.conf \
+    && printf '%s\n' \
+         '# CI receipts use fixed allowlisted English labels; GDM sets LANG first.' \
+         'LC_ALL=C.UTF-8' 'LANGUAGE=C' \
+         '# CI-only anonymous overview action-to-scanout trace, capped at 64 actions.' \
+         'TUNA_PERF_TRACE=1' \
+         '# Fixed public-query/catalog diagnostics only in this controlled CI session.' \
+         'TUNA_VM_PUBLIC_SEARCH_DIAGNOSTICS=1' >> /usr/share/tuna-vm/environment.conf \
     && systemctl mask serial-getty@ttyS0.service \
-    && systemctl enable greetd.service tuna-vm-health.service \
+    && systemctl enable tuna-vm-health.service \
     && systemctl add-wants multi-user.target qemu-guest-agent.service \
-    && printf '\nTUNA_LOCK_TRACE=1\nTUNA_POINTER_TRACE=1\n' >> /etc/environment
+    && sha256sum --check /usr/share/tuna-vm/shipped-payload.sha256 \
+    && pacman -Q > /usr/share/tuna-vm/fixture-packages.txt
 
 LABEL org.opencontainers.image.title="marlin-tuna-vm-lane" \
-      org.opencontainers.image.description="CI-only Marlin Tuna Desktop test layer: greetd initial session, real lifecycle probes, journal on serial"
+      org.opencontainers.image.description="CI-only Marlin Tuna Desktop test layer: stock GDM with tunaOS's tuna-flavor login path, real lifecycle probes, journal on serial"

@@ -1,13 +1,24 @@
 # Marlin VM lifecycle proof
 
-The existing `marlin-vm` CI job installs the ordinary Marlin preview image,
-then a CI-only fixture layer. The fixture starts `tuna-test` once through
-greetd's initial session. Its default greeter is Cage with normal-window
-gtkgreet, matching the measured TunaOS launcher; logout must reach that
-actual greeter. This changes neither the shipped preview image nor the
-number of CI VM profiles.
-The CI session wrapper routes its output through `systemd-cat` so greetd's
-VT output reaches the fixture's journal-to-serial capture.
+The `marlin-vm` and `marlin-vm-orca51` CI jobs install the ordinary Marlin
+preview image built from source, then a CI-only fixture layer
+(`packaging/marlin/vm-lane/Containerfile`). The layer gives the image the
+published `marlin:tuna` login path: stock GDM with tunaOS's tuna-flavor GDM
+steps (`tunaos.toml` `[desktops.tuna]` `after_install`: greeter theme
+overlay, `FallbackSession=tuna` with `Session=tuna` account templates, every
+other session hidden), vendored byte-for-byte in
+`packaging/marlin/vm-lane/tunaos/` from tunaOS 193cc0ef, on the package's
+own `Tuna Desktop` session entry. The fixture account has no saved session.
+No autologin or initial session exists: the lane drives GDM's user list and
+types the fixture password exactly as the published-flavor nightly does
+(`V-GREETER-LIST`, `V-GDM-FALLBACK`, `V-GDM-LOGIN`;
+`docs/marlin-tuna-nightly.md`), from the same `scripts/tuna-vm-lane` code.
+Logout must return to that GDM greeter. This changes neither the shipped
+preview image nor the number of CI VM profiles. GDM's session worker opens a
+journal stream for `gdm-wayland-session`, which the fixture forwards to the
+serial port. The fixture's session environment comes from `environment.d`,
+which gdm-wayland-session imports from the user manager; the per-login Orca
+test secret comes from a user environment generator.
 
 The Python lane.boot API keeps its original four-value return and original
 VM device profile by default. Lifecycle callers explicitly request
@@ -25,7 +36,7 @@ feature tour:
 
 | Gate | Actual operation and evidence |
 | --- | --- |
-| V-LIFECYCLE-OWNER | Root probe, non-root login session (greetd on the CI fixture, gdm-password on the published flavor), three application surfaces/processes |
+| V-LIFECYCLE-OWNER | Root probe, non-root `gdm-password` login session, three application surfaces/processes |
 | V-NORMAL-INPUT / V-NORMAL-INPUT-FAIL-CLOSED | A real GTK client receives ordinary QMP keys while unlocked, then receives none while locked; artifacts contain only counts and PID, never key values |
 | V-MOUSE-HANDEDNESS | Nine physical QMP clicks pass through native libinput to the same non-root GTK client while the real GNOME mouse setting changes false→true→false; left/right swap, middle stays unchanged, exact before/after counters retained in lifecycle/mouse-handedness.json |
 | V-POINTER-LIVE | GNOME mouse speed/natural-scroll, acceleration profile (`flat`, then `adaptive`), middle-click emulation (on, then off) and scroll-wheel emulation (button 2 → `on-button-down` with BTN_MIDDLE and button lock, then off) reach live libinput device state and restore, asserted on the compositor's per-device libinput readback with per-option availability (each option needs at least one mouse offering it; scroll-wheel emulation is asserted on mice that offer button scrolling and report BTN_MIDDLE in `pointer_buttons`, since libinput rejects a scroll button the device lacks, e.g. the guest's VMMouse); a published guest that predates profile or middle-click/scroll-button reporting skips only those checks, a current build that omits them fails, and a guest mouse schema without GNOME 51's scroll-wheel emulation keys skips only that check; snapshots retained in lifecycle/pointer-live.json (#343) |
@@ -42,7 +53,7 @@ feature tour:
 | V-GSD-POWER-IDLE | With `idle-delay` set to 20 s and no input, dbus-monitor records gsd-power's own `SetDimming(true)` before its `PowerSaveMode=3`; the compositor snapshot reports locked and `power_save_mode` 3; Return wakes it to 0 and gsd-power undims; the original delay is restored (lifecycle/gsd-power-idle.json, #355) |
 | V-LOCKED-HINT | logind's `LockedHint` for the login session reads `no`; the session user's `loginctl lock-session` locks the compositor and the hint turns `yes`; the real password unlocks and it reads `no`; Super+L locks with `yes`; `loginctl unlock-session` unlocks with `no`, as GNOME 51's `screenShield.js` does (lifecycle/locked-hint.json, #846). The published flavor predates the integration and defers to the current-build lane |
 | V-POWER-BUTTON | gsd-media-keys (its unit's main PID, the session user) holds logind's `block` inhibitor on `handle-power-key:handle-suspend-key:handle-hibernate-key` with Why "GNOME handling keypresses". On a fixture desktop chassis, after each gsd restart a new gsd-media-keys must own its name, hold that inhibitor, have `XF86PowerOff` granted by `GrabAccelerators` and the shell must log that it yielded the bindings. QMP `system_powerdown` (ACPI power button) with `power-button-action` `interactive`: `AcceleratorActivated` reaches gsd, gsd calls `org.gnome.SessionManager.Shutdown`, the compositor calls `EndSessionDialog.Open(1, …)` and the `tuna-shell-end-session` layer shows within 15 s; 5 s after the press QEMU is `running` with the same compositor process and logind session and no logind power request; Escape (always sent, far inside the 60 s countdown) removes the layer, the shell emits `Canceled` and logs its D-Bus Power Off dialog. `nothing`: gsd receives the key, and for at least 8 s no Shutdown, dialog call, layer or logind request follows. On the image's `vm` chassis with a fixture `shutdown` block inhibitor held by root: the key reaches gsd and gsd's own process calls logind `PowerOffWithFlags(0)`; gsd sends it without a reply callback (NO_REPLY_EXPECTED), so logind's refusal has no bus reply, and 5 s later logind has emitted no `PrepareForShutdown`/`PrepareForSleep`, `PreparingForShutdown` is still false with the fixture inhibitor held, no other logind request or non-error reply followed, no dialog opened and QEMU, compositor and session are unchanged. Setting, chassis and `/etc/machine-info` are restored (lifecycle/power-button.json, #353, #589) |
-| V-LOGOUT | Terminate the real logind session; the display manager's non-root greeter (gtkgreet under active greetd on the CI fixture; GDM's gnome-shell greeter in its active gdm-launch-environment session on the published flavor) repaints and no original compositor survives |
+| V-LOGOUT | The product's Log Out: `org.gnome.SessionManager.Logout(1)` on the session bus, which ends the compositor (the session leader) through its orderly shutdown, as gnome-session's exit ends a GNOME session; a published guest that predates that manager logs out as its shell did, through logind `Session.Terminate`. Within 30 s GDM's non-root gnome-shell greeter in its active gdm-launch-environment session repaints the greeter frame captured before login and no original compositor survives. logind's Terminate signals GDM's session worker together with the compositor; the worker's switch to the login VT could then be cancelled by logind restoring the session VT, leaving GDM without a greeter on the session VT (published nightly runs 40883859027 and 40940329310 attempt 1) |
 
 The original tour's `V-LOCK` still requires exactly unlocked → locked →
 unlocked. Its observations end before lifecycle operations add their own
