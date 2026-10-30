@@ -474,6 +474,7 @@ pub fn step_frame(
             let geometry = manager.geometry(*id)?;
             let monitor = state.monitor_geometry(geometry);
             let icon = crate::minimize::target(
+                manager.client_icon_geometry(*id),
                 manager.icon_geometry(*id),
                 destination.dash_visible,
                 monitor,

@@ -81,19 +81,22 @@ pub fn fallback(
 }
 /// The destination GNOME Shell 51 minimizes toward (`windowManager.js`
 /// `_minimizeWindow`, lines 1183-1201): `meta_window_get_icon_geometry`,
-/// else the monitor's upper leading corner at scale 0. GNOME Shell never
-/// sets icon geometry on Wayland; Mutter only reads X11
-/// `_NET_WM_ICON_GEOMETRY` (`src/x11/window-props.c:295`), so a GNOME 51
-/// window always goes to the corner. The dash lives in the overview, so its
-/// published icon counts only while it is on screen.
+/// else the monitor's upper leading corner at scale 0. Mutter sets icon
+/// geometry only from X11 `_NET_WM_ICON_GEOMETRY` (`src/x11/window-props.c`
+/// `reload_icon_geometry`, line 295), so `client_icon` is that property and
+/// wins whenever set. GNOME Shell never sets one on Wayland; Tuna's dash
+/// lives in the overview, so its published icon counts only while it is on
+/// screen.
 pub fn target(
+    client_icon: Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>>,
     dash_icon: Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>>,
     dash_visible: bool,
     monitor: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
     rtl: bool,
 ) -> crate::size_change::RectF {
-    match dash_icon {
-        Some(icon) if dash_visible => icon.to_f64(),
+    match (client_icon, dash_icon) {
+        (Some(icon), _) => icon.to_f64(),
+        (None, Some(icon)) if dash_visible => icon.to_f64(),
         _ => fallback(monitor, rtl),
     }
 }
@@ -176,10 +179,34 @@ mod tests {
         let monitor = smithay::utils::Rectangle::new((0, 0).into(), (1280, 800).into());
         let icon = smithay::utils::Rectangle::new((600, 720).into(), (64, 64).into());
         let corner = fallback(monitor, false);
-        assert_eq!(target(Some(icon), false, monitor, false), corner);
-        assert_eq!(target(None, true, monitor, false), corner);
-        assert_eq!(target(None, false, monitor, true), fallback(monitor, true));
-        assert_eq!(target(Some(icon), true, monitor, false), icon.to_f64());
+        assert_eq!(target(None, Some(icon), false, monitor, false), corner);
+        assert_eq!(target(None, None, true, monitor, false), corner);
+        assert_eq!(
+            target(None, None, false, monitor, true),
+            fallback(monitor, true)
+        );
+        assert_eq!(
+            target(None, Some(icon), true, monitor, false),
+            icon.to_f64()
+        );
+    }
+    #[test]
+    fn x11_icon_geometry_wins_like_mutter_get_icon_geometry() {
+        let monitor = smithay::utils::Rectangle::new((0, 0).into(), (1280, 800).into());
+        let dash = smithay::utils::Rectangle::new((600, 720).into(), (64, 64).into());
+        let client = smithay::utils::Rectangle::new((40, 760).into(), (32, 24).into());
+        for dash_visible in [false, true] {
+            for rtl in [false, true] {
+                assert_eq!(
+                    target(Some(client), Some(dash), dash_visible, monitor, rtl),
+                    client.to_f64()
+                );
+                assert_eq!(
+                    target(Some(client), None, dash_visible, monitor, rtl),
+                    client.to_f64()
+                );
+            }
+        }
     }
     #[test]
     fn minimize_400ms_expo_moves_scales_and_fades() {

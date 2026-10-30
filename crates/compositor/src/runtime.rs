@@ -2559,6 +2559,9 @@ impl Runtime {
                 "app_id": app_of(w.id),
                 "introspect_eligible": self.manager.is_introspect_eligible(w.id),
                 "x11_window_id": self.manager.x11_window_id(w.id),
+                // `_NET_WM_ICON_GEOMETRY`, the X11 client's minimize target.
+                "client_icon_geometry": self.manager.client_icon_geometry(w.id)
+                    .map(|r| [r.loc.x, r.loc.y, r.size.w, r.size.h]),
                 "parent_window_id": self.manager.transient_parent(w.id),
                 "application_window_id": self.manager.application_window(w.id),
                 "icon": model.window(w.id).and_then(|w| w.icon.clone()),

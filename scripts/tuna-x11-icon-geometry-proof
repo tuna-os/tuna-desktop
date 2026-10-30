@@ -1,0 +1,328 @@
+#!/usr/bin/python3
+"""Nested XWayland proof that minimize honours X11 `_NET_WM_ICON_GEOMETRY`.
+
+Mutter reads the property (src/x11/window-props.c `reload_icon_geometry`)
+and GNOME Shell 51 minimizes toward it, else the monitor's leading corner
+(windowManager.js `_minimizeWindow` 1183-1201, `_unminimizeWindow`
+1253-1270). A GTK3 X11 client on the compositor's own XWayland gets the
+property and the ICCCM IconicState request from xprop/xdotool.
+
+Run under dbus-run-session. --bin-dir points to a source-identified frozen
+bundle (scripts/tuna-minimize-ci-proof). Uses a private display, settings,
+runtime directory and manual animation clock. Local rendering evidence on
+winit/Xvfb/llvmpipe, not a GNOME paired benchmark.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import gi
+from gi.repository import Gio, GLib
+from PIL import Image
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from minimize_body_pixel import require_rgb, wait_clock_frames, minimize_quarter, minimize_capture  # noqa: E402
+
+p = argparse.ArgumentParser(description=__doc__)
+p.add_argument("--bin-dir", type=Path, required=True)
+p.add_argument("--artifacts", type=Path, required=True)
+p.add_argument("--display", default=":96")
+a = p.parse_args()
+root = Path(__file__).resolve().parent.parent
+art = a.artifacts.resolve()
+art.mkdir(parents=True, exist_ok=True)
+runtime = art / "runtime"
+runtime.mkdir(mode=0o700, exist_ok=True)
+os.chmod(runtime, 0o700)
+state = art / "state.json"
+clock = art / "clock"
+clock.write_text("0\n")
+(art / "assertions.txt").unlink(missing_ok=True)
+state.unlink(missing_ok=True)
+env = dict(os.environ, DISPLAY=a.display, XDG_RUNTIME_DIR=str(runtime),
+           XDG_CONFIG_HOME=str(art / "config"), XDG_DATA_HOME=str(art / "data"), GSETTINGS_BACKEND="keyfile",
+           TUNA_COMPOSITOR_STATE=str(state), TUNA_ANIMATION_CLOCK=str(clock),
+           TUNA_XWAYLAND="1", LIBGL_ALWAYS_SOFTWARE="1", ADW_DISABLE_PORTAL="1", GSK_RENDERER="cairo")
+for key in ("WAYLAND_DISPLAY", "WAYLAND_SOCKET"):
+    env.pop(key, None)
+CLIENT_RGB = (200, 40, 60)
+TARGET = [40, 700, 48, 32]
+frozen = art / "bin"
+frozen.mkdir(exist_ok=True)
+
+
+def digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+binaries = {}
+for name in ("tuna-compositor", "tuna-shell-gtk"):
+    dest = frozen / name
+    shutil.copy2(a.bin_dir.resolve() / name, dest)
+    binaries[name] = {"source_path": str(a.bin_dir.resolve() / name), "sha256": digest(dest)}
+manifest = {
+    "source_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
+    "source_dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=root, text=True).strip()),
+    "binaries": binaries,
+    "binary_source_revision": (a.bin_dir / "SOURCE_COMMIT").read_text().strip(),
+    "proof_sha256": digest(Path(__file__).resolve()),
+    "client_sha256": digest(root / "scripts/lib/tuna-x11-icon-geometry-client.py"),
+    "backend": "winit/Xvfb/llvmpipe + XWayland", "gnome_comparison": False,
+}
+freeze = json.loads((a.bin_dir / "manifest.json").read_text())
+assert manifest["source_revision"] == manifest["binary_source_revision"] == freeze["source_commit"], "bundle is not this source"
+for name, record in binaries.items():
+    assert record["sha256"] == freeze["sha256"][name], f"{name} differs from the frozen bundle"
+(art / "manifest.json").write_text(json.dumps(manifest, indent=2))
+processes = []
+logs = []
+assertions = []
+clock_base = 0
+
+
+def spawn(args, name, extra=None):
+    log = (art / f"{name}.log").open("w")
+    logs.append(log)
+    proc = subprocess.Popen(args, env=env | (extra or {}), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    processes.append(proc)
+    return proc
+
+
+def wait(check, label):
+    end = time.monotonic() + 25
+    while time.monotonic() < end:
+        try:
+            data = json.loads(state.read_text())
+            if check(data):
+                (art / f"{label}.json").write_text(json.dumps(data, indent=2))
+                return data
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            pass
+        time.sleep(.05)
+    raise AssertionError(f"timed out: {label}; see {art}")
+
+
+def screenshot(name):
+    time.sleep(.1)
+    path = art / f"{name}.png"
+    path.unlink(missing_ok=True)
+    subprocess.run(["scrot", str(path)], env=env, check=True)
+    return Image.open(path).convert("RGB")
+
+
+def move(ms):
+    temp = art / "clock.tmp"
+    temp.write_text(str(ms))
+    temp.replace(clock)
+    wait_clock_frames(wait, clock_base + ms, f"clock-{ms}")
+
+
+def keys(*args):
+    subprocess.run(["xdotool", *args], env=env, check=True)
+
+
+def window_of(scene, wid):
+    return next(w for w in scene["windows"] if w["id"] == wid)
+
+
+def lerp_weight(normal, icon, rect):
+    """The one weight every component moved by, as `minimize::geometry` lerps."""
+    weights = [(rect[i] - normal[i]) / (icon[i] - normal[i]) for i in range(4) if icon[i] != normal[i]]
+    assert weights and max(weights) - min(weights) < 1e-6 and 0 < weights[0] < 1, (normal, icon, rect)
+    return weights[0]
+
+
+def expected_missing_accessibility_owner(name, remote_error):
+    return name == "org.a11y.atspi.Registry" and remote_error == "org.freedesktop.DBus.Error.NameHasNoOwner"
+
+
+success = False
+owned_pidfds = []
+accessibility = None
+try:
+    launcher = spawn(["/usr/libexec/at-spi-bus-launcher", "--launch-immediately"], "atspi")
+    session_bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            address = session_bus.call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress", None, None, Gio.DBusCallFlags.NO_AUTO_START, 2000, None).unpack()[0]
+            break
+        except Exception:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(.1)
+    assert str(runtime) in address, "accessibility bus escaped private runtime"
+    env["AT_SPI_BUS_ADDRESS"] = address
+    accessibility = Gio.DBusConnection.new_for_address_sync(address, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+    bus_pid = accessibility.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetConnectionUnixProcessID", GLib.Variant("(s)", ("org.freedesktop.DBus",)), None, Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+    owned_pidfds.append(os.pidfd_open(bus_pid))
+    manifest["session_isolation"] = {"runtime_directory": str(runtime), "accessibility_bus": address, "accessibility_bus_pid": bus_pid}
+    if Path(f"/tmp/.X11-unix/X{a.display.lstrip(':')}").exists():
+        raise RuntimeError("display already in use; choose a private unused display")
+    spawn(["Xvfb", a.display, "-screen", "0", "1280x800x24"], "xvfb")
+    for _ in range(100):
+        if subprocess.run(["xdotool", "getdisplaygeometry"], env=env, capture_output=True).returncode == 0:
+            break
+        time.sleep(.05)
+    if subprocess.run(["gsettings", "range", "org.gnome.desktop.a11y.interface", "reduced-motion"], env=env, capture_output=True).returncode:
+        schemas = art / "schemas"
+        schemas.mkdir(exist_ok=True)
+        shutil.copy(root / "tests/settings/gnome51-a11y-interface.gschema.xml", schemas)
+        subprocess.run(["glib-compile-schemas", str(schemas)], check=True)
+        env["GSETTINGS_SCHEMA_DIR"] = str(schemas)
+    subprocess.run(["gsettings", "set", "org.gnome.desktop.a11y.interface", "reduced-motion", "no-preference"], env=env, check=True)
+    subprocess.run(["gsettings", "set", "org.gnome.desktop.interface", "enable-animations", "true"], env=env, check=True)
+    compositor = spawn([str(frozen / "tuna-compositor"), "--socket", "x11-icon-geometry-proof", "--shell-bin", str(frozen / "tuna-shell-gtk")], "compositor")
+    ready = wait(lambda d: d["animation_clock_manual"] and d["rendered_frames"] >= 5 and d["x11_display"]
+                 and d["wallpaper_diagnostics"]["decode_result_count"] > 0
+                 and any(layer["namespace"] == "tuna-panel" for layer in d["layers"]), "ready")
+    x11 = {"DISPLAY": ready["x11_display"]}
+    host = subprocess.check_output(["xdotool", "search", "--pid", str(compositor.pid), "--name", "Smithay"], env=env, text=True).splitlines()
+    assert len(host) == 1
+    keys("windowfocus", "--sync", host[0])
+    clock_base = ready["animation_clock_ms"]
+    move(1000)  # settle the wallpaper crossfade before alpha checks
+    baseline = screenshot("00-baseline")
+
+    def xprop(xid, *args):
+        subprocess.run(["xprop", "-id", str(xid), *args], env=env | x11, check=True)
+
+    def xminimize(xid):
+        # xdotool sends ICCCM WM_CHANGE_STATE IconicState to the root window.
+        subprocess.run(["xdotool", "windowminimize", str(xid)], env=env | x11, check=True)
+
+    def restore():
+        keys("keydown", "Alt_L", "key", "Tab")
+        time.sleep(.7)
+        keys("keyup", "Alt_L")
+
+    client = spawn(["/usr/bin/python3", str(root / "scripts/lib/tuna-x11-icon-geometry-client.py")], "client", x11)
+    mapped = wait(lambda d: len(d["windows"]) == 1 and d["windows"][0]["x11_window_id"] and d["window_lifecycle"]["opening"], "x11-map")
+    wid = mapped["windows"][0]["id"]
+    xid = mapped["windows"][0]["x11_window_id"]
+    assert window_of(mapped, wid)["client_icon_geometry"] is None
+    move(1150)
+    landed = wait(lambda d: not d["window_lifecycle"]["opening"], "x11-map-complete")
+    normal = window_of(landed, wid)["rect"]
+    nx, ny, nw, nh = normal
+    shown = screenshot("01-x11-normal")
+    require_rgb(shown.getpixel((nx + nw // 2, ny + nh // 2)), CLIENT_RGB, "X11 client body")
+    assertions.append(f"X11-MAP pass GTK3 X11 window {xid:#x} mapped at {normal}")
+
+    # reload_icon_geometry: four CARDINALs set the target.
+    xprop(xid, "-f", "_NET_WM_ICON_GEOMETRY", "32c", "-set", "_NET_WM_ICON_GEOMETRY", ",".join(map(str, TARGET)))
+    wait(lambda d: window_of(d, wid)["client_icon_geometry"] == TARGET, "property-set")
+    # Any other count keeps the previous geometry; X delivers this
+    # PropertyNotify before the IconicState message below.
+    xprop(xid, "-f", "_NET_WM_ICON_GEOMETRY", "32c", "-set", "_NET_WM_ICON_GEOMETRY", "1,2,3")
+    xminimize(xid)
+    started = wait(lambda d: wid in d["minimized"] and d["window_lifecycle"]["minimizing"], "x11-minimize-start")
+    actor = started["window_lifecycle"]["minimizing"][0]
+    assert actor["window"] == wid and actor["icon"] == TARGET and actor["duration_ms"] == 400, actor
+    assert window_of(started, wid)["client_icon_geometry"] == TARGET, "three-value property replaced the geometry"
+    assertions.append(f"X11-ICONIC pass WM_CHANGE_STATE IconicState minimized toward _NET_WM_ICON_GEOMETRY {TARGET}")
+    assertions.append("X11-ICON-COUNT pass a three-value property kept the previous geometry (Mutter reload_icon_geometry)")
+    move(1250)
+    quarter = wait(lambda d: minimize_quarter(d, wid, TARGET), "x11-minimize-quarter")
+    q = quarter["window_lifecycle"]["minimizing"][0]
+    weight = lerp_weight(normal, TARGET, q["rect"])
+
+    def scene(label):
+        data = json.loads(state.read_text())
+        (art / f"02-x11-minimize-quarter-{label}.json").write_text(json.dumps(data, indent=2))
+        return data
+
+    image = minimize_capture(lambda: screenshot("02-x11-minimize-quarter"), scene, quarter, wid, TARGET)
+    x, y, w, h = q["rect"]
+    point = (round(x + w / 2), round(y + h / 2))
+    bg = baseline.getpixel(point)
+    require_rgb(image.getpixel(point), tuple(CLIENT_RGB[i] * q["alpha"] + bg[i] * (1 - q["alpha"]) for i in range(3)), (point, q))
+    assertions.append(f"X11-MINIMIZE-FRAME pass 100ms rect {q['rect']} lerps toward the icon by {weight:.6f}; pixel at {point} blends alpha {q['alpha']:.4f}")
+    move(1550)
+    wait(lambda d: not d["window_lifecycle"]["minimizing"], "x11-minimize-finished")
+    restore()
+    restoring = wait(lambda d: wid not in d["minimized"] and d["window_lifecycle"]["restoring"], "x11-restore-start")
+    assert restoring["window_lifecycle"]["restoring"][0]["icon"] == TARGET, restoring["window_lifecycle"]["restoring"]
+    assertions.append("X11-RESTORE pass unminimize grows from _NET_WM_ICON_GEOMETRY (windowManager.js 1253-1258)")
+    move(1950)
+    wait(lambda d: not d["window_lifecycle"]["restoring"], "x11-restore-finished")
+
+    # A deleted property unsets it: GNOME's leading-corner fallback.
+    xprop(xid, "-remove", "_NET_WM_ICON_GEOMETRY")
+    wait(lambda d: window_of(d, wid)["client_icon_geometry"] is None, "property-removed")
+    xminimize(xid)
+    corner = wait(lambda d: wid in d["minimized"] and d["window_lifecycle"]["minimizing"], "x11-corner-minimize-start")
+    assert corner["window_lifecycle"]["minimizing"][0]["icon"] == [0, 0, 0, 0], corner["window_lifecycle"]["minimizing"]
+    assertions.append("X11-ICON-REMOVED pass a deleted property minimizes to the leading corner [0,0,0,0]")
+    move(2350)
+    wait(lambda d: not d["window_lifecycle"]["minimizing"], "x11-corner-minimize-finished")
+    client.terminate()
+    client.wait(timeout=10)
+    wait(lambda d: not d["windows"] and not d["window_lifecycle"]["minimizing"], "x11-client-gone")
+    assert compositor.poll() is None, "compositor exited"
+    success = True
+finally:
+    owned_accessibility_pids = [manifest["session_isolation"]["accessibility_bus_pid"]] if "session_isolation" in manifest else []
+    cleanup_query_errors = []
+    if accessibility:
+        try:
+            owned_accessibility_pids.append(accessibility.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetConnectionUnixProcessID", GLib.Variant("(s)", ("org.a11y.atspi.Registry",)), None, Gio.DBusCallFlags.NONE, 2000, None).unpack()[0])
+        except GLib.Error as error:
+            if not expected_missing_accessibility_owner("org.a11y.atspi.Registry", Gio.DBusError.get_remote_error(error)):
+                cleanup_query_errors.append(str(error))
+    for pid in owned_accessibility_pids[1:]:
+        try:
+            owned_pidfds.append(os.pidfd_open(pid))
+        except ProcessLookupError:
+            pass
+    for proc in reversed(processes):
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+    accessibility_stopped = True
+    for pidfd in owned_pidfds:
+        poller = select.poll()
+        poller.register(pidfd, select.POLLIN)
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        if not poller.poll(1000):
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            accessibility_stopped = bool(poller.poll(1000)) and accessibility_stopped
+        os.close(pidfd)
+    if accessibility:
+        try:
+            accessibility.close_sync(None)
+        except GLib.Error:
+            pass
+    shutil.rmtree(runtime, ignore_errors=True)
+    manifest["owned_cleanup"] = {"runtime_removed": not runtime.exists(), "accessibility_processes_stopped": accessibility_stopped,
+                                 "accessibility_identity_verified": bool(owned_accessibility_pids) and not cleanup_query_errors,
+                                 "query_errors": cleanup_query_errors}
+    (art / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    for log in logs:
+        log.close()
+
+cleanup = manifest["owned_cleanup"]
+if not (cleanup["runtime_removed"] and cleanup["accessibility_processes_stopped"] and cleanup["accessibility_identity_verified"]):
+    raise AssertionError("owned proof session cleanup failed")
+if success:
+    assertions.append("X11-CLEANUP pass private runtime and accessibility processes removed")
+    (art / "assertions.txt").write_text("\n".join(assertions) + "\n")
+    print(f"X11 icon geometry proof passed: {art}")

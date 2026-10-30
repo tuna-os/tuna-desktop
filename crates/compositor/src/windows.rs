@@ -1126,8 +1126,19 @@ impl WindowManager {
             .get(&id)
             .is_some_and(|w| w.layout == WindowLayout::Fullscreen)
     }
+    /// Shell-published dash icon bounds for `id`.
     pub fn icon_geometry(&self, id: u64) -> Option<Rectangle<i32, Logical>> {
         self.icon_geometries.get(&id).copied()
+    }
+    /// The client's own minimize target: X11 `_NET_WM_ICON_GEOMETRY`, as
+    /// Mutter's `meta_window_get_icon_geometry` reports it (Wayland clients
+    /// have no such request).
+    pub fn client_icon_geometry(&self, id: u64) -> Option<Rectangle<i32, Logical>> {
+        match self.windows.get(&id)?.surface.underlying_surface() {
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(surface) => surface.icon_geometry(),
+            _ => None,
+        }
     }
     /// Published dash icon bounds as `[window, x, y, w, h]`, by window id.
     pub fn icon_geometries_json(&self) -> serde_json::Value {
@@ -2205,6 +2216,11 @@ impl WindowManager {
                 X11ManagerEvent::Fullscreen(id, on) => {
                     if let Some(model) = self.x11_index.get(&id).copied() {
                         self.set_fullscreen(state, model, on);
+                    }
+                }
+                X11ManagerEvent::Minimize(id) => {
+                    if let Some(model) = self.x11_index.get(&id).copied() {
+                        self.minimize(state, model);
                     }
                 }
             }
