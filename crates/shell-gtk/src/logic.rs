@@ -758,10 +758,6 @@ impl VolumeFeedback {
         self.dragging = true;
     }
 
-    pub fn dragging(&self) -> bool {
-        self.dragging
-    }
-
     /// A drag ended: true to sound now, else when the last write lands.
     pub fn drag_end(&mut self) -> bool {
         if !std::mem::take(&mut self.dragging) {
@@ -864,7 +860,7 @@ mod service_tests {
         let last = feedback.write_started();
         assert!(!feedback.write_finished(first, true));
         assert!(!feedback.drag_end());
-        assert!(!feedback.dragging());
+        assert!(!feedback.dragging);
         assert!(feedback.write_finished(last, true));
         // A press and release that moved nothing still sounds (drag-end).
         feedback.drag_begin();

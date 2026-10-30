@@ -207,7 +207,13 @@ fn x11() {
         NONE,
     };
     let (conn, screen) = smithay::reexports::x11rb::connect(None).unwrap();
-    assert!(conn.xkb_use_extension(1, 0).unwrap().reply().unwrap().supported);
+    assert!(
+        conn.xkb_use_extension(1, 0)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .supported
+    );
     let root = &conn.setup().roots[screen];
     let window = conn.generate_id().unwrap();
     conn.create_window(
@@ -277,7 +283,13 @@ fn xsettings(name: &str) {
     use smithay::reexports::x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
     let (conn, screen) = smithay::reexports::x11rb::connect(None).unwrap();
     let selection = format!("_XSETTINGS_S{screen}");
-    let atom = |name: &str| conn.intern_atom(false, name.as_bytes()).unwrap().reply().unwrap().atom;
+    let atom = |name: &str| {
+        conn.intern_atom(false, name.as_bytes())
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom
+    };
     let owner = conn
         .get_selection_owner(atom(&selection))
         .unwrap()
@@ -289,7 +301,14 @@ fn xsettings(name: &str) {
         return;
     }
     let data = conn
-        .get_property(false, owner, atom("_XSETTINGS_SETTINGS"), AtomEnum::ANY, 0, 1 << 16)
+        .get_property(
+            false,
+            owner,
+            atom("_XSETTINGS_SETTINGS"),
+            AtomEnum::ANY,
+            0,
+            1 << 16,
+        )
         .unwrap()
         .reply()
         .unwrap()
@@ -308,7 +327,11 @@ fn xsettings_integer(data: &[u8], name: &str) -> Option<i32> {
     let big = *data.first()? == 1;
     let u16_at = |at: usize| -> Option<u16> {
         let bytes = [*data.get(at)?, *data.get(at + 1)?];
-        Some(if big { u16::from_be_bytes(bytes) } else { u16::from_le_bytes(bytes) })
+        Some(if big {
+            u16::from_be_bytes(bytes)
+        } else {
+            u16::from_le_bytes(bytes)
+        })
     };
     let u32_at = |at: usize| -> Option<u32> {
         let bytes = [
@@ -317,7 +340,11 @@ fn xsettings_integer(data: &[u8], name: &str) -> Option<i32> {
             *data.get(at + 2)?,
             *data.get(at + 3)?,
         ];
-        Some(if big { u32::from_be_bytes(bytes) } else { u32::from_le_bytes(bytes) })
+        Some(if big {
+            u32::from_be_bytes(bytes)
+        } else {
+            u32::from_le_bytes(bytes)
+        })
     };
     let pad = |n: usize| n.div_ceil(4) * 4;
     let count = u32_at(8)?;

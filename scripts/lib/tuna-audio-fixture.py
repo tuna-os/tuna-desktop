@@ -42,11 +42,11 @@ def sink_state():
 def emit():
     selected = int(number('default-sink', 48))
     route = int(number('audio-route', 1))
-    batch = [node(48, 'Built-in Audio Analog Stereo', 'Audio/Sink', number('volume', .8), (root / 'volume-muted').exists(),
+    batch = [node(48, 'Built-in Audio Analog Stereo', 'Audio/Sink', number('volume', .8), number('volume-muted', 0) >= 1,
                   state=sink_state(), **{'device.id': 40, 'card.profile.device': 0}),
              node(52, 'Tuna Desktop HDMI Output', 'Audio/Sink', 1),
              node(49, 'Microphone', 'Audio/Source', number('mic-volume', .5),
-                  (root / 'mic-muted').exists()),
+                  number('mic-muted', 0) >= 1),
              {'id': 40, 'type': 'PipeWire:Interface:Device', 'info': {'params': {
                  'EnumRoute': [{'index': 1, 'direction': 'Output', 'description': 'Speakers',
                                 'available': 'yes', 'devices': [0]},
