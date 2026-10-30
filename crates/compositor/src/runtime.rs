@@ -1181,16 +1181,17 @@ impl Runtime {
             &session.socket_name,
             |stream, runtime: &mut Runtime| {
                 let client_data = ClientState::native_connection(&stream);
-                if let Ok(client) = runtime
+                if runtime
                     .display
                     .handle()
                     .insert_client(stream, Arc::new(client_data))
+                    .is_ok()
                 {
-                    let _ = client;
                     runtime.stats.clients += 1;
                 }
-            })
-            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+            },
+        )
+        .map_err(|e| RuntimeError::Socket(e.to_string()))?;
 
         // The shell offers power actions only on a hardware session: in
         // the nested preview, logind's session is the host's, so Log Out
@@ -2743,6 +2744,15 @@ impl Runtime {
         doc["magnifier"] = self.magnifier.diagnostics();
         doc["screen_reader_pid"] = serde_json::json!(self.orca.pid());
         doc["screen_reader_state"] = serde_json::json!(self.orca.state());
+        // Shell supervision (#203's crash-loop stress): the supervised
+        // shell's PID, restarts spent from its budget, and whether the
+        // compositor's recovery overlay is up.
+        doc["shell"] = serde_json::json!({
+            "pid": self.shell.child_pid(),
+            "restarts_used": self.shell.restarts_used(),
+            "max_restarts": self.shell.policy().max_attempts,
+            "overlay_visible": self.overlay.visible,
+        });
         doc["a11y_keyboard"] = self
             .a11y_keyboard
             .as_ref()
