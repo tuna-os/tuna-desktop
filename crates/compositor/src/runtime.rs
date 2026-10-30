@@ -1875,6 +1875,9 @@ impl Runtime {
         self.control.set_locked(false);
         self.state.set_shortcut_inhibition_locked(false);
         self.overlay.hide();
+        // The lock held the keyboard (`hold_lock_focus`); hand it back,
+        // as GNOME's unlock returns focus to the focused window.
+        self.manager.restore_keyboard_owner(&mut self.state);
     }
 
     /// logind's `Lock` signal (`loginctl lock-session`): `screenShield.js`
@@ -4908,6 +4911,15 @@ impl Runtime {
             if !self.overlay.visible {
                 self.overlay.show(Vec::new());
             }
+            // Keyboard focus belongs to the lock screen from the moment
+            // the session locks, not from the first key: an application
+            // behind the lock must not go on believing it is focused.
+            let lock_surface = self
+                .state
+                .primary_output_name()
+                .and_then(|name| self.state.lock_surface_for(&name));
+            self.manager
+                .hold_lock_focus(&mut self.state, lock_surface.as_ref());
         } else {
             if let Some(ime) = &mut self.ime {
                 ime.poll(crate::state::system_millis(), &mut self.display.handle());
