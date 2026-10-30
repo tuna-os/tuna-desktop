@@ -1,0 +1,12 @@
+f86b561949990f62ad19920331ff57f0ad756576224fe256101bd984ed62a6bb  tuna-datetime-proof.py
+G-DATETIME-NTP pass NTP=yes service=active synchronized=yes provider=systemd-timesyncd
+G-DATETIME-TZ pass UTC -> Pacific/Auckland observed, reverted to UTC and verified
+G-DATETIME-TZ-REJECT pass Invalid/Zone rejected (exit=1), zone stayed UTC
+G-DATETIME-RTC pass LocalRTC=no (../usr/share/zoneinfo/UTC); no RTC hardware claim
+G-DATETIME-CLOCK pass panel 'Oct 30\u2002\u20073:28 PM' vs system epoch 1793374125 (UTC): delta 45s, tolerance 120s
+G-DATETIME-CLOCK-TZ fail UTC -> Pacific/Auckland: panel 'Oct 30\u2002\u20073:28 PM' vs Pacific/Auckland wall time: delta 39544s, vs the unrepainted reading: 56s; 10 dump(s) over 11s (tolerance 120s, deadline 10s)
+G-DATETIME-MANUAL pass systemd-timesyncd.service: SetTime while NTP on -> exit 1; NTP off; +7620s observed (delta -0.21595001220703125s); restored (delta -0.40246105194091797s), NTP=yes
+G-DATETIME-CLOCK-SET pass SetTime +7620s: panel 'Oct 30\u2002\u20075:35 PM' vs UTC wall time: delta 56s, vs the unrepainted reading: 7564s; 1 dump(s) over 0s (tolerance 120s, deadline 10s)
+G-DATETIME-POLKIT pass tuna-test (in wheel) non-interactive SetTimezone Pacific/Auckland: expected allowed, allowed (zone -> Pacific/Auckland, restored=True)
+G-DATETIME-NTP-ABSENT fail systemd-timesyncd.service: stopped NTP=yes/CanNTP=yes; masked NTP=no/CanNTP=no, SetNTP(true) 'Call failed: NTP not supported'; restored NTP=yes/CanNTP=yes; failed: stopped: NTP=no CanNTP=yes
+Removing user tuna-test from group wheel

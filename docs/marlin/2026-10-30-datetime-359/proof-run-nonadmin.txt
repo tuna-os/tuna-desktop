@@ -1,0 +1,22 @@
+a07fee51eef6ca7e2733d5d5843920942ee0a981592a72bc3588a9e2e09b2d3e  tuna-datetime-proof.py
+uid=1000(tuna-test) gid=1000(tuna-test) groups=1000(tuna-test)
+ 3    0 root      -     1309 user          -    no -
+ 4    0 root      -     1442 manager-early -    no -
+72 1000 tuna-test seat0 8979 user          tty2 no -
+73 1000 tuna-test -     9074 manager       -    no -
+G-DATETIME-NTP pass NTP=yes service=active synchronized=yes provider=systemd-timesyncd
+G-DATETIME-TZ pass UTC -> Pacific/Auckland observed, reverted to UTC and verified
+G-DATETIME-TZ-REJECT pass Invalid/Zone rejected (exit=1), zone stayed UTC
+G-DATETIME-RTC pass LocalRTC=no (../usr/share/zoneinfo/UTC); no RTC hardware claim
+G-DATETIME-CLOCK pass panel 'Oct 30\u2002\u20073:30 PM' vs system epoch 1793374251 (UTC): delta 51s, tolerance 120s
+G-DATETIME-CLOCK-TZ fail UTC -> Pacific/Auckland: panel 'Oct 30\u2002\u20073:31 PM' vs Pacific/Auckland wall time: delta 39598s, vs the unrepainted reading: 2s; 10 dump(s) over 11s (tolerance 120s, deadline 10s)
+G-DATETIME-MANUAL pass systemd-timesyncd.service: SetTime while NTP on -> exit 1; NTP off; +7620s observed (delta -0.24214887619018555s); restored (delta -0.4579048156738281s), NTP=yes
+G-DATETIME-CLOCK-SET pass SetTime +7620s: panel 'Oct 30\u2002\u20075:38 PM' vs UTC wall time: delta 2s, vs the unrepainted reading: 7618s; 1 dump(s) over 0s (tolerance 120s, deadline 10s)
+G-DATETIME-POLKIT pass tuna-test (not in wheel) non-interactive SetTimezone Pacific/Auckland: expected denied, refused ('Call failed: Access denied as the requested operation requires interactive authentication. However, interactive authentication has not been enabled by the calling program.'), zone stayed UTC
+G-DATETIME-NTP-ABSENT pass systemd-timesyncd.service: stopped NTP=no/CanNTP=yes; masked NTP=no/CanNTP=no, SetNTP(true) 'Call failed: NTP not supported'; restored NTP=yes/CanNTP=yes
+You are using a client virtctl version that is different from the KubeVirt version running in the cluster
+Client Version: v1.8.2
+Server Version: v1.9.1
+
+exit status 1
+exit status 1

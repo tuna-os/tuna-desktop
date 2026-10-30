@@ -633,7 +633,7 @@ fn calendar_popover(notes: &gtk::Box) -> (gtk::Popover, Rc<calendar::CalendarUi>
     popover.set_has_arrow(false);
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     row.add_css_class("calendar-area");
-    let cal = calendar::CalendarUi::new(jiff::Zoned::now().date());
+    let cal = calendar::CalendarUi::new(wall_clock::now().date());
     row.append(notes);
     row.append(&cal.column);
     popover.set_child(Some(&row));
@@ -2238,7 +2238,7 @@ fn build(app: &adw::Application) {
         let interface = interface.clone();
         let shown = RefCell::new(String::new());
         Rc::new(move || {
-            let now = jiff::Zoned::now().datetime();
+            let now = wall_clock::now().datetime();
             let format = interface
                 .as_ref()
                 .map(|s| ClockFormat::from_setting(&s.string("clock-format")))

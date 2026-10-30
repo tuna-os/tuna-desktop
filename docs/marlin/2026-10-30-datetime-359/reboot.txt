@@ -1,0 +1,11 @@
+boot_before=fee0378d-4c36-45c0-b423-45300a05ca27
+ba801344-4634-42d3-9c02-6986d9deeee1
+               Local time: Sat 2026-10-31 03:56:55 NZDT
+           Universal time: Fri 2026-10-30 14:56:55 UTC
+                 RTC time: Fri 2026-10-30 14:56:54
+                Time zone: Pacific/Auckland (NZDT, +1300)
+System clock synchronized: yes
+              NTP service: active
+          RTC in local TZ: no
+../usr/share/zoneinfo/Pacific/Auckland
+Sat Oct 31 03:56:55 NZDT 2026

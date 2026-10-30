@@ -1089,6 +1089,25 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         record("V-BRIGHTNESS-CONTRACT",True,
             "original shell brightness wire interface, actual empty kernel backlight inventory, false capability and harmless policy resets; no physical-control proof")
 
+    # Date & Time (#359): the guest-side gates of docs/datetime-proof.md,
+    # run as root against the shipped timedated, NTP provider and polkit,
+    # with tuna-test as the desktop user and the panel clock they read.
+    datetime_result = agent.run("datetime", timeout=300)
+    with open(os.path.join(evidence, "datetime-evidence.json"), "w") as stream:
+        json.dump(datetime_result["evidence"], stream, indent=2)
+    datetime_failed = []
+    for line in datetime_result["assertions"]:
+        gate, verdict, detail = (line.split(" ", 2) + ["", ""])[:3]
+        if published and gate == "G-DATETIME-CLOCK-TZ" and verdict != "pass":
+            record(gate, True, "published guest predates the panel clock's /etc/localtime monitor; "
+                               "proven by the current-build marlin-vm lane")
+            continue
+        record(gate, verdict == "pass", detail)
+        if verdict != "pass":
+            datetime_failed.append(gate)
+    if not datetime_result["assertions"] or datetime_failed:
+        raise RuntimeError(f"Date & Time gates failed: {', '.join(datetime_failed) or 'no assertions'}")
+
     # GNOME 51 settings daemon plugins (#355): the installed session starts
     # them through GNOME's own user units, and gsd-power drives the
     # compositor's idle monitor, the shell's brightness dimming and

@@ -1,0 +1,5 @@
+Groups:	998 1000 
+Groups:	998 1000 
+settz-rc=0
+Timezone=Pacific/Auckland
+Timezone=UTC

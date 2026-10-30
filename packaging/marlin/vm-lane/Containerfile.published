@@ -13,6 +13,7 @@ COPY --from=constraint-builder /usr/libexec/tuna-vm-constraints /usr/libexec/tun
 COPY --from=constraint-builder /usr/share/tuna-vm-constraints /usr/share/tuna-vm-constraints
 
 COPY packaging/marlin/vm-lane/tuna-vm-lifecycle /usr/libexec/tuna-vm-lifecycle
+COPY scripts/lib/tuna-datetime-proof.py /usr/libexec/tuna-datetime-proof
 COPY packaging/marlin/vm-lane/tuna-vm-input /usr/libexec/tuna-vm-input
 COPY packaging/marlin/vm-lane/tuna-vm-gdm.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
 COPY packaging/marlin/vm-lane/journald.conf /usr/lib/systemd/journald.conf.d/90-tuna-vm-lane.conf

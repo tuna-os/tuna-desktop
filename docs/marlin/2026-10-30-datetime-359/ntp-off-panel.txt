@@ -1,0 +1,10 @@
+CanNTP=yes
+NTP=no
+NTPSynchronized=yes
+inactive
+disabled
+tuna-shell-gtk: polkit agent registered
+systemd-timesyncd.service: Disabling unit.
+Set NTP to be disabled.
+systemd-timesyncd.service: Deactivated successfully.
+SERVICE_STOP pid=1 uid=0 auid=4294967295 ses=4294967295 msg='unit=systemd-timesyncd comm="systemd" exe="/usr/lib/systemd/systemd" hostname=? addr=? terminal=? res=success'

@@ -44,6 +44,7 @@ COPY --from=constraint-builder /usr/share/tuna-vm-constraints /usr/share/tuna-vm
 COPY packaging/marlin/vm-lane/tunaos /tmp/tunaos
 COPY packaging/marlin/vm-lane/tuna-vm-lifecycle /usr/libexec/tuna-vm-lifecycle
 COPY scripts/lib/gnome-brightness-proof.py /usr/libexec/tuna-brightness-proof
+COPY scripts/lib/tuna-datetime-proof.py /usr/libexec/tuna-datetime-proof
 COPY packaging/marlin/vm-lane/tuna-vm-input /usr/libexec/tuna-vm-input
 COPY packaging/marlin/vm-lane/tuna-vm-shell-focus /usr/libexec/tuna-vm-shell-focus
 COPY packaging/marlin/vm-lane/tuna-vm-orca-token /usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token
