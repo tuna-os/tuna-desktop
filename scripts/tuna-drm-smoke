@@ -967,6 +967,13 @@ CSTATE="$ARTIFACTS/compositor-state-touchpad.json"
 CLIENT_LOG="$ARTIFACTS/touchpad-client.jsonl"
 TP_OUT="$ARTIFACTS/touchpad-emulator.log"
 mkdir -p "$ARTIFACTS/config-touchpad" "$ARTIFACTS/schemas-touchpad"
+# GNOME's touchpad and interface settings drive natural scrolling and
+# the motion policy here, as on a GNOME install.
+for key in "org.gnome.desktop.peripherals.touchpad natural-scroll" "org.gnome.desktop.interface enable-animations"; do
+    # shellcheck disable=SC2086
+    gsettings range $key >/dev/null 2>&1 ||
+        fail D-TOUCHPAD-SWIPE "no $key setting: install gsettings-desktop-schemas"
+done
 # Ubuntu's gsettings-desktop-schemas predates GNOME's reduced-motion key.
 if ! gsettings range org.gnome.desktop.a11y.interface reduced-motion >/dev/null 2>&1; then
     cp "$ROOT/tests/settings/gnome51-a11y-interface.gschema.xml" "$ARTIFACTS/schemas-touchpad/"
