@@ -18,6 +18,7 @@ v4), `gh` logged in as an org admin, and `ssh karnataka` with sudo.
 | Scale set `tuna-ci-26.04` | namespace `tuna-ci`, release `tuna-ci-26-04` | [values](../.github/runners/values-26.04.yaml); jobs that use `ubuntu-26.04` on GitHub |
 | Runner image | node-local containerd, `localhost/tuna-ci-runner:<ubuntu>-<runner>-<stamp>` | [Containerfile](../.github/runners/image/Containerfile), built by [build-image](../.github/runners/build-image) |
 | Guard rails | [cluster.yaml](../.github/runners/cluster.yaml) | namespace, admission policy, NetworkPolicy, quota, priority class |
+| Scripts | [.github/runners](../.github/runners) | `build-image` (images), `deploy` (guard rails + Helm releases) |
 | GitHub side | org `tuna-os` | runner group `tuna-desktop-karnataka` (only repository: `tuna-os/tuna-desktop`), secret `tuna-ci-github` in `tuna-ci` |
 
 Both chart releases use the same chart version (0.15.1 at install).
@@ -138,22 +139,17 @@ rid=$(gh api repos/tuna-os/tuna-desktop --jq .id)
 gh api -X POST orgs/tuna-os/actions/runner-groups -f name=tuna-desktop-karnataka \
   -f visibility=selected -F "selected_repository_ids[]=$rid" -F allows_public_repositories=true
 
-# 3. Credential, from a file, never on the command line (see "Credentials").
+# 3. Credential, from files, never on the command line (see "Credentials").
 kubectl --context karnataka-k3s -n tuna-ci create secret generic tuna-ci-github \
   --from-file=github_app_id=app_id --from-file=github_app_installation_id=installation_id \
   --from-file=github_app_private_key=app.pem
 
-# 4. Images (prints the tags; put them in values-24.04.yaml / values-26.04.yaml).
+# 4. Images: builds both on karnataka, imports them into k3s' containerd and
+#    points values-24.04.yaml / values-26.04.yaml at the new tags.
 .github/runners/build-image
 
-# 5. Controller, then the scale sets.
-chart=oci://ghcr.io/actions/actions-runner-controller-charts
-helm --kube-context karnataka-k3s install arc -n arc-systems --create-namespace \
-  --version 0.15.1 $chart/gha-runner-scale-set-controller --set flags.watchSingleNamespace=tuna-ci
-for v in 24 26; do
-  helm --kube-context karnataka-k3s install tuna-ci-$v-04 -n tuna-ci --version 0.15.1 \
-    -f .github/runners/values-$v.04.yaml $chart/gha-runner-scale-set
-done
+# 5. Guard rails again (idempotent), ARC controller, both scale sets.
+.github/runners/deploy
 ```
 
 Check: `kubectl -n tuna-ci get autoscalingrunnersets` shows both `Running`,
@@ -186,30 +182,24 @@ behind the latest `actions/runner` release, so rebuild at least monthly, and
 whenever a job needs a new preinstalled tool):
 
 ```
-.github/runners/build-image            # builds on karnataka, imports into k3s containerd
-# put the printed tags into values-24.04.yaml and values-26.04.yaml, then:
-for v in 24 26; do
-  helm --kube-context karnataka-k3s upgrade tuna-ci-$v-04 -n tuna-ci --version 0.15.1 \
-    -f .github/runners/values-$v.04.yaml oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
-done
+.github/runners/build-image             # new tags written into the values files
+.github/runners/deploy --sets-only      # new pods use them; running jobs finish on the old
+git commit .github/runners/values-*.yaml
 # after running jobs finished, drop the old tags:
 ssh karnataka 'sudo k3s ctr -n k8s.io images ls -q | grep tuna-ci-runner'
 ssh karnataka 'sudo k3s ctr -n k8s.io images rm localhost/tuna-ci-runner:<old tag>'
 ```
 
+`values-24.04.yaml` and `values-26.04.yaml` differ only in the scale set
+name, image and min/max runners; change both together.
+
 Images are node-local and `imagePullPolicy: Never`; if kubelet image garbage
 collection ever removes one (disk above 85%), pods fail with
 `ErrImageNeverPull`: rebuild.
 
-**ARC chart**: upgrade the controller first, then both scale sets, all to the
-same chart version (ARC requires matching versions):
-
-```
-helm --kube-context karnataka-k3s upgrade arc -n arc-systems --version <new> \
-  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller \
-  --set flags.watchSingleNamespace=tuna-ci
-# then the scale-set loop above with --version <new>
-```
+**ARC chart**: controller and scale sets must run the same chart version.
+Bump `ARC_CHART_VERSION`'s default in `deploy` (and the version in this
+page), then run `.github/runners/deploy`: it upgrades the controller first.
 
 ## Scale
 
@@ -217,23 +207,22 @@ helm --kube-context karnataka-k3s upgrade arc -n arc-systems --version <new> \
 files: 24.04 is 1–5, 26.04 is 0–3. Keep `maxRunners` of both sets within the
 quota's 8 pods; change the quota in `cluster.yaml` only together with a look
 at punjab's and KubeVirt's needs (`kubectl describe node karnataka`). Apply
-with the Helm upgrade loop above. Temporary change without editing files:
+with `.github/runners/deploy --sets-only`. A temporary change without editing
+files applies the same `--set` to both sets:
 
 ```
-helm --kube-context karnataka-k3s upgrade tuna-ci-24-04 -n tuna-ci --version 0.15.1 \
-  -f .github/runners/values-24.04.yaml --set maxRunners=3 \
-  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+.github/runners/deploy --sets-only -- --set maxRunners=2
 ```
 
 ## Drain (maintenance on karnataka)
 
 1. Send new jobs to GitHub: `gh variable set CI_RUNNERS -b hosted -R tuna-os/tuna-desktop`.
-2. Stop creating runners: Helm upgrade both sets with
-   `--set minRunners=0 --set maxRunners=0`. Running jobs finish; idle
-   runners are removed.
+2. Stop creating runners:
+   `.github/runners/deploy --sets-only -- --set minRunners=0 --set maxRunners=0`.
+   Running jobs finish; idle runners are removed.
 3. Wait for `kubectl --context karnataka-k3s -n tuna-ci get pods` to be
    empty (or cancel the remaining runs).
-4. Undo in reverse order: Helm upgrade with the values files, then
+4. Undo in reverse order: `.github/runners/deploy --sets-only`, then
    `gh variable delete CI_RUNNERS -R tuna-os/tuna-desktop`.
 
 Jobs already queued for a `tuna-ci-*` label when you flip the variable keep
