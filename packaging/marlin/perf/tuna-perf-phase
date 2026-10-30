@@ -66,6 +66,12 @@ def notify(index):
     return int(match[1])
 
 
+# 240 frames at the virtual display's 75 Hz last ~3.2 s, fewer than the three
+# whole 1 s observer intervals the frames-phase CPU metric needs; earlier runs
+# reached three only because serial-console stalls stretched the phase.
+PRESENTED_FRAMES = 480
+
+
 def frames():
     uid = pwd.getpwnam("tuna-test").pw_uid
     marker = Path("/run/tuna-perf-desktop.json")
@@ -84,7 +90,8 @@ def frames():
     process = subprocess.Popen([
         "runuser", "-u", "tuna-test", "--", "env", "-i", "PATH=/usr/bin:/bin",
         f"XDG_RUNTIME_DIR={runtime}", f"WAYLAND_DISPLAY={name}",
-        "/usr/libexec/tuna-frame-pacer"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        "/usr/libexec/tuna-frame-pacer", "--frames", str(PRESENTED_FRAMES)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, start_new_session=True)
     try:
         output, errors = process.communicate(timeout=17)

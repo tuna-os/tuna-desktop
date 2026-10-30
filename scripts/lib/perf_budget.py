@@ -194,8 +194,9 @@ def session_metrics(directory):
     return summarize(session_series(directory))
 
 
-# One serialized observer record per second is forwarded through journald to
-# the serial console. Thread-diagnostic records of ~45 KiB (journald's 48 KiB
+# One serialized observer record per second. Until records moved to their own
+# virtio-serial port they were forwarded through journald to the serial
+# console, where thread-diagnostic records of ~45 KiB (journald's 48 KiB
 # LineMax) stalled every GNOME session from 2026-10-22 (#782); records this
 # large are an observer that perturbs what it measures, never a gated sample.
 OBSERVER_RECORD_BYTES = 32 * 1024

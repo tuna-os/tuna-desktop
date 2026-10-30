@@ -124,6 +124,18 @@ session's summary (40914419860). Each record now carries a SHA-256 of its
 JSON, and `tuna-vm-perf` drops any record whose digest does not match, as it
 already dropped unparseable ones.
 
+*Resolved after this report (#859).* The load also stalled what it measured:
+in run 40931135786, 64 of the 66 frame intervals of 100 ms or more, on both
+desktops, began 0–0.35 s after an observer record reached the console (8250
+port I/O holds QEMU's main loop, which drives virtio-gpu flushes). Records now
+go to a dedicated virtio-serial port, and a digest mismatch or a gap in the
+per-record `seq` fails the session. In runs 40968110837, 40982805214 and
+40982813550 (36 sessions) no frame interval reached 110 ms, and the 49
+intervals of 40 ms or more are spread across the second after a record (25 in
+its first 0.4 s). `serial.log` fell from 4.8–6.9 MB to about 0.2 MB a session.
+With the stalls gone, 240 frames no longer spanned three whole CPU intervals,
+so the frames phase now presents 480.
+
 **Not measured yet.** #820 (gsd plugins in the Tuna session) merged after every
 run analysed here. Its plugins count as `services`, so they affect the `total`
 metrics, not `desktop`. The first runs with main's package after #820 are

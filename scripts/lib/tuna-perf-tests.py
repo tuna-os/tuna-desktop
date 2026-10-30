@@ -663,10 +663,18 @@ class Accounting(unittest.TestCase):
             host.raw_globals(self.globals_serial(b"interface: 'zwp_input_method_manager_v2'"))
 
     def presentation(self):
-        return {"clock_id": 1, "commits": 242, "discarded": 1, "pending": 1,
+        return {"clock_id": 1, "commits": 482, "discarded": 1, "pending": 1,
                 "frames": [dict(commit=i+1, presented_ns=(i+1)*16000000,
                                 refresh_ns=16000000, sequence=i, flags=1)
-                           for i in range(240)]}
+                           for i in range(480)]}
+
+    def test_guest_presents_the_frames_the_host_requires(self):
+        # 240 frames at 75 Hz fit only two whole observer intervals once the
+        # serial-console stalls were gone (run 40968110837: cpu.frames missing).
+        self.assertEqual(phase.PRESENTED_FRAMES, host.PRESENTED_FRAMES)
+        self.assertGreaterEqual(host.PRESENTED_FRAMES / 75, 3 + 2)
+        self.assertIn('"--frames", str(PRESENTED_FRAMES)',
+                      (ROOT / "packaging/marlin/perf/tuna-perf-phase").read_text())
 
     def test_presentation_requires_complete_monotonic_nonduplicate_feedback(self):
         for case in ("missing", "duplicate", "backwards", "unbalanced", "boolean"):
@@ -690,10 +698,10 @@ class Accounting(unittest.TestCase):
             row["refresh_ns"] = 0
             row["flags"] = 0
         result = host.presentation_summary(trace)
-        self.assertEqual(result["interval_ms"]["count"], 239)
+        self.assertEqual(result["interval_ms"]["count"], 479)
         self.assertEqual(result["interval_ms"]["p99"], 16)
         self.assertEqual(result["reported_refresh_ms"], {"count": 0})
-        self.assertEqual(result["unknown_refresh_count"], 240)
+        self.assertEqual(result["unknown_refresh_count"], 480)
         self.assertEqual(result["flag_counts"], dict(vsync=0, hw_clock=0, hw_completion=0, zero_copy=0))
         self.assertEqual(result["discarded_count"], 1)
 
@@ -1163,27 +1171,51 @@ class Accounting(unittest.TestCase):
             self.assertEqual(result["unreadable"], [])
             self.assertEqual(result["process_count"], 0)
 
-    def test_journal_prefix_and_truncated_serial_do_not_corrupt_valid_samples(self):
-        valid = guest.sample_line({"pss_kib": 7})
-        result = host.raw_samples(f'[ 1.0] python3[770]: {valid}\r\ntuna-perf-sample: {{bad\n')
-        self.assertEqual(result, [{"pss_kib": 7}])
+    def test_journal_prefix_is_ignored_and_an_unterminated_last_record_is_not_yet_read(self):
+        first, second = guest.sample_line({"pss_kib": 7, "seq": 0}), guest.sample_line({"pss_kib": 8, "seq": 1})
+        result = host.raw_samples(f'[ 1.0] python3[770]: {first}\r\ntuna-perf-observer: records on journal\n{second[:-9]}')
+        self.assertEqual(result, [{"pss_kib": 7, "seq": 0}])
+        self.assertEqual(host.raw_samples(f'{first}\n{second}\n'), [{"pss_kib": 7, "seq": 0}, {"pss_kib": 8, "seq": 1}])
 
-    def test_a_record_missing_bytes_is_dropped_even_when_it_still_parses(self):
+    def test_a_record_missing_bytes_fails_even_when_it_still_parses(self):
         # Run 40914419860: the serial console dropped '":47,...,"c' and left
         # valid JSON whose process had no cpu_ticks.
         row = {"processes": [{"pid": 965, "cpu_ticks": 47, "comm": "systemd"},
-                             {"pid": 1188, "cmd": "gsd-datetime"}]}
+                             {"pid": 1188, "cmd": "gsd-datetime"}], "seq": 0}
         line = guest.sample_line(row)
         lost = line.replace('":47,"comm":"systemd"},{"pid":1188,"c', '')
         self.assertIn('"cpu_ticksmd":"gsd-datetime"', lost)
         json.loads(lost.split('tuna-perf-sample: ', 1)[1].rpartition(' sha256=')[0])
-        self.assertEqual(host.raw_samples(lost), [])
         # A missing or altered digest, or a pre-digest record, is never accepted.
         payload, _, digest = line.rpartition(' sha256=')
-        for corrupt in (payload, payload + ' sha256=' + digest[:-1],
+        for corrupt in (lost, payload, payload + ' sha256=' + digest[:-1],
                         payload + ' sha256=' + digest.upper(), line.replace('47', '4')):
-            self.assertEqual(host.raw_samples(corrupt), [])
-        self.assertEqual(host.raw_samples(line), [row])
+            with self.subTest(corrupt=corrupt[-20:]), self.assertRaisesRegex(ValueError, "digest"):
+                host.raw_samples(corrupt + "\n")
+        self.assertEqual(host.raw_samples(line + "\n"), [row])
+
+    def test_a_lost_or_reordered_record_fails_the_session(self):
+        lines = [guest.sample_line({"seq": seq}) for seq in range(3)]
+        self.assertEqual(len(host.raw_samples("\n".join(lines) + "\n")), 3)
+        for broken in ([lines[0], lines[2]], [lines[1], lines[0]], [lines[1]], [lines[0], lines[0]],
+                       [guest.sample_line({"pss_kib": 7})]):
+            with self.subTest(broken=broken), self.assertRaisesRegex(ValueError, "lost or reordered"):
+                host.raw_samples("\n".join(broken) + "\n")
+
+    def test_records_use_the_virtio_port_exclusively_when_the_vm_provides_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            port = Path(directory) / "org.tuna.perf.0"
+            sink, channel = guest.record_sink(port)
+            self.assertEqual((sink, channel), (sys.stdout, "journal"))
+            port.touch()
+            sink, channel = guest.record_sink(port)
+            self.assertEqual(channel, "virtio-serial")
+            with sink, patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                guest.emit(sink, guest.sample_line({"seq": 0}))
+                guest.emit(sink, guest.sample_line({"seq": 1}))
+                self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(guest.RECORD_PORT, Path("/dev/virtio-ports/org.tuna.perf.0"))
+            self.assertEqual(len(host.raw_samples(port.read_text())), 2)
 
     def test_small_sample_percentiles_keep_the_extreme_tail(self):
         result = host.distribution([1, 9, 2, 3])
