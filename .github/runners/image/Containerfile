@@ -26,7 +26,7 @@ RUN apt-get update \
       g++ gcc git git-lfs gnupg imagemagick iproute2 iputils-ping jq \
       libssl-dev libtool libyaml-dev locales lsb-release lz4 m4 make \
       net-tools netcat-openbsd openssh-client p7zip-full parallel patchelf \
-      pigz pkg-config podman buildah skopeo fuse-overlayfs uidmap \
+      pigz pkg-config podman podman-docker buildah skopeo passt slirp4netns uidmap \
       python-is-python3 python3 python3-pip python3-venv pipx rsync \
       shellcheck sqlite3 sudo tar time tree tzdata unzip wget xvfb \
       xz-utils zip zstd \
@@ -46,6 +46,15 @@ RUN useradd -m -u "${RUNNER_UID}" -s /bin/bash runner \
  && echo 'Defaults env_keep += "DEBIAN_FRONTEND"' > /etc/sudoers.d/env_keep \
  && mkdir -p /opt/hostedtoolcache && chown runner:runner /opt/hostedtoolcache
 
+# Nested containers (podman, and `docker` via podman-docker) inside the
+# pod's user namespace, which spans uids 0-65535: root maps the whole
+# range, runner every id but its own. The pod's cgroupfs is read-only, so
+# nested containers run without their own cgroups (the pod's limits apply).
+RUN printf 'root:1:65535\nrunner:1:1000\nrunner:1002:64534\n' | tee /etc/subuid > /etc/subgid \
+ && printf '[containers]\ncgroups = "disabled"\n[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\n' \
+      > /etc/containers/containers.conf \
+ && touch /etc/containers/nodocker
+
 WORKDIR /home/runner
 RUN curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \
       | tar -xz \
@@ -54,8 +63,8 @@ RUN curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VE
  && chown -R runner:runner /home/runner
 
 # Refuses jobs from forks and foreign repositories, whatever runs-on says.
-COPY --chmod=0755 job-started /opt/tuna-ci/job-started
-ENV ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/tuna-ci/job-started
+COPY --chmod=0755 job-started.sh /opt/tuna-ci/job-started.sh
+ENV ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/tuna-ci/job-started.sh
 
 USER runner
 ENV PATH=/home/runner/.cargo/bin:/home/runner/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \

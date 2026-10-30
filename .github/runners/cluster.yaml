@@ -6,13 +6,67 @@ kind: Namespace
 metadata:
   name: tuna-ci
   labels:
-    # Runner pods are unprivileged; nothing in this namespace may be
-    # privileged, use host namespaces or mount host paths.
-    pod-security.kubernetes.io/enforce: baseline
-    pod-security.kubernetes.io/enforce-version: latest
+    # Pod Security "baseline" would forbid CAP_SYS_ADMIN, which rootless
+    # podman needs inside the pod's own user namespace. The admission policy
+    # below enforces the stricter, runner-specific rules instead.
+    pod-security.kubernetes.io/enforce: privileged
 ---
-# Runner pods get no API credentials: the default service account never
-# mounts a token and has no RoleBindings.
+# Every pod in tuna-ci must be a contained runner: its own user namespace
+# (root and CAP_SYS_ADMIN in the pod are an unprivileged uid range on the
+# node), no privileged containers, no host namespaces, ports or paths, only
+# emptyDir volumes, no service account token, no capability beyond
+# SYS_ADMIN. Devices come only from device plugins (KubeVirt's tun).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: tuna-ci-runner-pods
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: tuna-ci
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [pods, pods/ephemeralcontainers]
+  variables:
+    - name: containers
+      expression: >-
+        object.spec.containers
+        + (has(object.spec.initContainers) ? object.spec.initContainers : [])
+        + (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])
+  validations:
+    - expression: has(object.spec.hostUsers) && object.spec.hostUsers == false
+      message: runner pods must run in their own user namespace (hostUsers false)
+    - expression: >-
+        !(has(object.spec.hostNetwork) && object.spec.hostNetwork)
+        && !(has(object.spec.hostPID) && object.spec.hostPID)
+        && !(has(object.spec.hostIPC) && object.spec.hostIPC)
+      message: runner pods must not share host namespaces
+    - expression: has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false
+      message: runner pods must not mount a service account token
+    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir))"
+      message: runner pods may only use emptyDir volumes
+    - expression: >-
+        variables.containers.all(c,
+          !(has(c.securityContext) && has(c.securityContext.privileged) && c.securityContext.privileged)
+          && !(has(c.securityContext) && has(c.securityContext.capabilities) && has(c.securityContext.capabilities.add)
+               && c.securityContext.capabilities.add.exists(cap, cap != 'SYS_ADMIN'))
+          && !(has(c.ports) && c.ports.exists(p, has(p.hostPort) && p.hostPort != 0)))
+      message: runner containers must not be privileged, add capabilities other than SYS_ADMIN, or bind host ports
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: tuna-ci-runner-pods
+spec:
+  policyName: tuna-ci-runner-pods
+  validationActions: [Deny]
+---
+# Runner pods get no API credentials: no service account token is mounted
+# (enforced above) and the service accounts have no RoleBindings.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

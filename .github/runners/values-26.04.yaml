@@ -6,7 +6,7 @@ githubConfigSecret: tuna-ci-github
 runnerGroup: tuna-desktop-karnataka
 runnerScaleSetName: tuna-ci-26.04
 minRunners: 0
-maxRunners: 2
+maxRunners: 3
 
 controllerServiceAccount:
   namespace: arc-systems
@@ -32,18 +32,36 @@ template:
     enableServiceLinks: false
     containers:
       - name: runner
-        image: localhost/tuna-ci-runner:26.04-2.338.2-202610301959
+        image: localhost/tuna-ci-runner:26.04-2.338.2-202610302016
         imagePullPolicy: Never
         command: ["/home/runner/run.sh"]
+        securityContext:
+          # Rootless podman needs both to set up its nested user namespace;
+          # they hold only inside the pod's own user namespace
+          # (hostUsers: false), never on the node.
+          procMount: Unmasked
+          capabilities:
+            add: [SYS_ADMIN]
         resources:
           requests: {cpu: "2", memory: 6Gi, ephemeral-storage: 20Gi}
-          limits: {cpu: "4", memory: 14Gi, ephemeral-storage: 45Gi}
+          # /dev/net/tun (KubeVirt's device plugin) for podman's pasta
+          # networking; no host paths are mounted.
+          limits: {cpu: "4", memory: 14Gi, ephemeral-storage: 45Gi, devices.kubevirt.io/tun: "1"}
         volumeMounts:
           - name: dshm
             mountPath: /dev/shm
+          # Container storage cannot be overlayfs on the image's overlayfs.
+          - name: containers-root
+            mountPath: /var/lib/containers
+          - name: containers-runner
+            mountPath: /home/runner/.local/share/containers
     volumes:
       # Chromium and GTK need more than the 64 MiB container default.
       - name: dshm
         emptyDir:
           medium: Memory
           sizeLimit: 2Gi
+      - name: containers-root
+        emptyDir: {}
+      - name: containers-runner
+        emptyDir: {}

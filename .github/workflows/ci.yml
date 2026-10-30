@@ -24,7 +24,11 @@ permissions:
 
 jobs:
   select-lanes:
-    runs-on: ubuntu-latest
+    # Runner choice (docs/ci-runners.md): this repository's own pushes,
+    # schedules, dispatches and branch pull requests run on the self-hosted
+    # karnataka scale sets; fork pull requests, and every job while the
+    # CI_RUNNERS repository variable is `hosted`, use GitHub-hosted runners.
+    runs-on: &runner-24 ${{ vars.CI_RUNNERS != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'tuna-ci-24.04' || 'ubuntu-latest' }}
     outputs:
       lanes: ${{ steps.lanes.outputs.lanes }}
     steps:
@@ -54,10 +58,7 @@ jobs:
           fi
 
   check:
-    # Self-hosted on karnataka (docs/ci-runners.md) for this repository's own
-    # branches; fork pull requests, and every job when the CI_RUNNERS
-    # repository variable is `hosted`, use GitHub-hosted runners.
-    runs-on: ${{ vars.CI_RUNNERS != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'tuna-ci-24.04' || 'ubuntu-latest' }}
+    runs-on: *runner-24
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -1414,7 +1415,7 @@ jobs:
     # skipped, any failed or cancelled job fails the gate.
     if: always()
     needs: [select-lanes, check, fprint-phase-proof, journey, app-content, scroll-proof, drm-smoke, grid-cancel-comparison, gtk-shell, orca-speech, portal-security, remote-security, niri-parity, arch-package, marlin-image, marlin-vm, parity-ledger, docs-shots]
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     steps:
       - env:
           RESULTS: ${{ toJSON(needs) }}
