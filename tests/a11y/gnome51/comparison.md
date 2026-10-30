@@ -11,7 +11,7 @@ GNOME: 41 visible nodes; 2 named controls. Tuna Desktop: 6 named nodes in the pr
 | GNOME named control | Tuna Desktop named node |
 | --- | --- |
 | toggle button: Activities | frame: Top Bar |
-| menu: System | push button: Activities |
+| menu: System | toggle button: Activities |
 | — | push button: Date and Time |
 | — | toggle button: Date and Time |
 | — | push button: System |
@@ -24,7 +24,7 @@ GNOME: 136 visible nodes; 9 named controls. Tuna Desktop: 15 named nodes in the 
 | GNOME named control | Tuna Desktop named node |
 | --- | --- |
 | push button: Files | frame: Top Bar |
-| push button: Text Editor | push button: Activities |
+| push button: Text Editor | toggle button: Activities |
 | push button: Calculator | push button: Date and Time |
 | push button: tuna-test-beta | toggle button: Date and Time |
 | push button: tuna-test-gamma | push button: System |
@@ -46,7 +46,7 @@ GNOME: 93 visible nodes; 7 named controls. Tuna Desktop: 29 named nodes in the p
 | GNOME named control | Tuna Desktop named node |
 | --- | --- |
 | toggle button: Activities | frame: Top Bar |
-| menu: System | push button: Activities |
+| menu: System | toggle button: Activities |
 | push button: Take Screenshot | push button: Date and Time |
 | push button: Settings | toggle button: Date and Time |
 | push button: Lock Screen | push button: System |

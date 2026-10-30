@@ -83,6 +83,9 @@ fn main() -> ExitCode {
             "--startup-overview" => {
                 session.startup_overview = true;
             }
+            "--screen-reader" => {
+                session.screen_reader = true;
+            }
             "--backend" => match args.next().as_deref().and_then(BackendChoice::parse) {
                 Some(choice) => session.backend = choice,
                 None => {
@@ -98,7 +101,7 @@ fn main() -> ExitCode {
                 println!("tuna-compositor: nested Tuna Desktop session (001 developer preview)");
                 println!();
                 println!(
-                    "Usage: tuna-compositor [--backend auto|winit|drm] [--socket NAME] [--width W] [--height H] [--shell-bin PATH] [--xwayland] [--startup-overview]"
+                    "Usage: tuna-compositor [--backend auto|winit|drm] [--socket NAME] [--width W] [--height H] [--shell-bin PATH] [--xwayland] [--startup-overview] [--screen-reader]"
                 );
                 println!();
                 println!("Starts one isolated nested Wayland session on a private");
@@ -113,6 +116,10 @@ fn main() -> ExitCode {
                 println!("process only and restored on shutdown.");
                 println!("--startup-overview opens the overview at start, as GNOME");
                 println!("does at login (tuna-session passes it).");
+                println!("--screen-reader lets a nested session own the screen");
+                println!("reader as a hardware session always does: it serves");
+                println!("org.freedesktop.a11y.Manager and runs Orca while");
+                println!("screen-reader-enabled is set.");
                 return ExitCode::SUCCESS;
             }
             other => {

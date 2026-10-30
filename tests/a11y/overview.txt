@@ -1,5 +1,5 @@
 frame: Top Bar
-push button: Activities
+toggle button: Activities
 push button: Date and Time
 toggle button: Date and Time
 push button: System

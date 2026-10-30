@@ -1,4 +1,5 @@
-//! GNOME accessibility indicator and keyboard focus visibility preference.
+//! GNOME accessibility indicator, keyboard focus visibility preference, and
+//! screen reader announcements.
 use crate::gtk;
 use gtk::prelude::*;
 use std::cell::Cell;
@@ -58,6 +59,17 @@ fn has_key(settings: &gio::Settings, key: &str) -> bool {
 }
 fn indicator_visible(always: bool, mut active: impl Iterator<Item = bool>) -> bool {
     always || active.any(|a| a)
+}
+
+/// Speak `message` through the screen reader without moving its focus.
+/// gnome-shell reaches Orca through ATK roles GTK 4 lacks (a banner's
+/// `NOTIFICATION`, the switcher's selected-item focus that Orca's
+/// gnome-shell script follows); GTK's AT-SPI announcement is the event
+/// Orca presents for them here.
+pub fn announce(widget: &impl IsA<gtk::Accessible>, message: &str) {
+    if !message.is_empty() {
+        widget.announce(message, gtk::AccessibleAnnouncementPriority::Medium);
+    }
 }
 
 pub fn menu() -> gtk::MenuButton {

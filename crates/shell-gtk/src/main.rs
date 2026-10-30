@@ -479,13 +479,6 @@ impl shell_dbus::ShellActions for GnomeShellDbus {
     }
 }
 
-fn panel_button(child: &impl IsA<gtk::Widget>, label: &str) -> gtk::Button {
-    let button = gtk::Button::builder().child(child).build();
-    button.add_css_class("panel-button");
-    button.update_property(&[gtk::accessible::Property::Label(label)]);
-    button
-}
-
 fn panel_menu_button(
     child: &impl IsA<gtk::Widget>,
     label: &str,
@@ -1786,7 +1779,16 @@ fn build(app: &adw::Application) {
     // The compositor toggles the overview on presses over the
     // Activities control (ACTIVITIES_WIDTH_PX); sending a toggle here
     // as well would cancel it out.
-    let activities = panel_button(&pills, "Activities");
+    // GNOME's ActivitiesButton: role toggle button, named Activities.
+    let activities = gtk::Button::builder()
+        .child(&pills)
+        .accessible_role(gtk::AccessibleRole::ToggleButton)
+        .build();
+    activities.add_css_class("panel-button");
+    activities.update_property(&[gtk::accessible::Property::Label("Activities")]);
+    activities.update_state(&[gtk::accessible::State::Pressed(
+        gtk::AccessibleTristate::False,
+    )]);
 
     let notify = notify::NotifyUi::new(app.upcast_ref());
     let clock_label = gtk::Label::new(None);
@@ -2910,6 +2912,7 @@ fn build(app: &adw::Application) {
                         );
                     }
                     Action::ToggleMagnifier => magnifier_sync::toggle(),
+                    Action::ToggleScreenReader => orca::toggle(),
                     Action::MagnifierZoom { zoom_in } => magnifier_sync::zoom(zoom_in),
                     Action::VolumeMute | Action::VolumeMuteQuiet | Action::MicrophoneMute => {
                         media_keys.change(
@@ -3742,7 +3745,8 @@ fn build(app: &adw::Application) {
                     pad_osd_service.command_result(id, applied);
                 }
                 // The bar goes see-through and Activities shows as checked
-                // while the overview is open, as GNOME draws them.
+                // while the overview is open, as GNOME draws them; it is a
+                // toggle button (panel.js), pressed while the overview is open.
                 if open {
                     panel_window.add_css_class("overview");
                     activities_button.add_css_class("checked");
@@ -3750,6 +3754,11 @@ fn build(app: &adw::Application) {
                     panel_window.remove_css_class("overview");
                     activities_button.remove_css_class("checked");
                 }
+                activities_button.update_state(&[gtk::accessible::State::Pressed(if open {
+                    gtk::AccessibleTristate::True
+                } else {
+                    gtk::AccessibleTristate::False
+                })]);
                 overview::OverviewUi::set_open(&overview_ui, open);
                 if open != last_open.replace(open) {
                     // Panel focus follows the overview: opening hands the

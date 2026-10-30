@@ -1,4 +1,5 @@
-//! Genuine distribution Orca, owned by the hardware compositor rather than a
+//! Genuine distribution Orca, owned by the compositor (every hardware
+//! session; a nested one only with `--screen-reader`) rather than a
 //! global user-manager service. No --replace, global PID selection or bus-stop
 //! request can affect another display's reader.
 use std::io::Read;

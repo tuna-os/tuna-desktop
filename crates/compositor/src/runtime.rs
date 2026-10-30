@@ -212,6 +212,12 @@ pub struct NestedSession {
     /// login. `tuna-session` (real logins) sets it; developer and proof
     /// runs start on the desktop.
     pub startup_overview: bool,
+    /// A nested session owns the screen reader as a hardware session
+    /// does: it serves `org.freedesktop.a11y.Manager` and runs Orca while
+    /// `screen-reader-enabled` is set. Off by default because a nested
+    /// session normally runs inside a desktop that already has its own
+    /// reader and accessibility manager (`--screen-reader`).
+    pub screen_reader: bool,
 }
 
 /// Which display backend a session runs on.
@@ -274,6 +280,7 @@ impl NestedSession {
             xwayland: false,
             backend: BackendChoice::Auto,
             startup_overview: false,
+            screen_reader: false,
         }
     }
 
@@ -1332,11 +1339,15 @@ impl Runtime {
             .insert_source(wake_source, |_, _, _: &mut Runtime| {})
             .map_err(|e| RuntimeError::Loop(e.to_string()))?;
 
+        // The session that owns the screen reader serves GNOME's
+        // KeyboardMonitor for it: every hardware session, and a nested one
+        // only when asked (`--screen-reader`).
         #[cfg(feature = "drm")]
-        let a11y_keyboard =
-            matches!(backend, Backend::Drm(_)).then(crate::a11y_keyboard::Monitor::start);
+        let hardware = matches!(backend, Backend::Drm(_));
         #[cfg(not(feature = "drm"))]
-        let a11y_keyboard = None;
+        let hardware = false;
+        let a11y_keyboard =
+            (hardware || session.screen_reader).then(crate::a11y_keyboard::Monitor::start);
         let loop_handle = event_loop.handle();
         let mut runtime = Runtime {
             display,
@@ -4669,11 +4680,9 @@ impl Runtime {
             self.move_screenshot_pointer(x, y);
         }
         if let Some(enabled) = outcome.screen_reader {
-            #[cfg(feature = "drm")]
-            let hardware = matches!(self.backend, Backend::Drm(_));
-            #[cfg(not(feature = "drm"))]
-            let hardware = false;
-            self.orca.set_enabled(enabled && hardware);
+            // Only the session serving the KeyboardMonitor runs a reader.
+            self.orca
+                .set_enabled(enabled && self.a11y_keyboard.is_some());
         }
         let diagnostics_visible = !self.is_locked();
         let reader_changed = self.orca.poll(diagnostics_visible).is_some();
