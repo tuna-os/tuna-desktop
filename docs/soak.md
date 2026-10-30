@@ -100,7 +100,8 @@ validates. A failure names the observer's own reason from its journal.
 
 The `published-marlin-tuna-soak-<run id>` artifact holds the boot's serial
 log, assertions and manifest, and `soak/` with the observer files, the
-summary, the observer journal and the first and last soak frames. The job
+summary, the observer journal, a frame of the running workload
+(`soak-start.png`) and one after the observer exits (`soak-end.png`). The job
 summary and `qualification.json` (`soak`) repeat the result beside, not
 inside, the digest's qualification checks; a soak failure still fails the
 nightly. The source revision comes from the deployment record: the shipped
