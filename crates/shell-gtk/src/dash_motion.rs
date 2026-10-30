@@ -171,6 +171,8 @@ struct HoverLabel {
     popover: gtk::Popover,
     text: gtk::Label,
     tween: Cell<Option<Tween>>,
+    /// The opacity drawn, exactly (GTK keeps a widget's in 1/255 steps).
+    opacity: Cell<f64>,
     /// Its tick callback runs (GTK drops it when the label unrealizes).
     ticking: Rc<Cell<bool>>,
 }
@@ -204,6 +206,7 @@ impl HoverLabel {
             popover,
             text: label,
             tween: Cell::new(None),
+            opacity: Cell::new(0.0),
             ticking,
         }
     }
@@ -220,6 +223,9 @@ mod imp {
         pub child: RefCell<Option<gtk::Widget>>,
         pub key: RefCell<String>,
         pub scale: Cell<f64>,
+        /// The opacity drawn, exactly (GTK keeps a widget's in 1/255
+        /// steps): reversals start from it.
+        pub opacity: Cell<f64>,
         pub scale_tween: Cell<Option<Tween>>,
         pub opacity_tween: Cell<Option<Tween>>,
         pub ticking: Cell<bool>,
@@ -237,6 +243,7 @@ mod imp {
                 child: RefCell::new(None),
                 key: RefCell::default(),
                 scale: Cell::new(0.0),
+                opacity: Cell::new(0.0),
                 scale_tween: Cell::new(None),
                 opacity_tween: Cell::new(None),
                 ticking: Cell::new(false),
@@ -339,7 +346,7 @@ impl DashItem {
 
     /// (scale, opacity) as drawn now.
     pub fn look(&self) -> (f64, f64) {
-        (self.imp().scale.get(), self.opacity())
+        (self.imp().scale.get(), self.imp().opacity.get())
     }
 
     /// Whether it is shown or on its way in (not leaving).
@@ -358,6 +365,7 @@ impl DashItem {
 
     fn set_look(&self, scale: f64, opacity: f64) {
         let imp = self.imp();
+        imp.opacity.set(opacity);
         self.set_opacity(opacity.clamp(0.0, 1.0));
         if imp.scale.replace(scale) != scale {
             self.queue_resize();
@@ -483,7 +491,7 @@ impl DashItem {
         let key = self.key();
         let (text, ticking) = self.with_label(|label| {
             let drawn = if label.popover.is_visible() {
-                label.text.opacity()
+                label.opacity.get()
             } else {
                 0.0
             };
@@ -546,9 +554,10 @@ impl DashItem {
             return false;
         };
         let (opacity, done) = tween.at(crate::anim_clock::now());
-        if opacity != label.text.opacity() {
+        if opacity != label.opacity.get() {
             trace(format_args!("label {key} frame opacity={opacity:.4}"));
         }
+        label.opacity.set(opacity);
         label.text.set_opacity(opacity);
         if !done {
             return true;
@@ -566,6 +575,7 @@ impl DashItem {
     pub fn hide_label_now(&self) {
         if let Some(label) = self.imp().label.borrow().as_ref() {
             label.tween.set(None);
+            label.opacity.set(0.0);
             label.text.set_opacity(0.0);
             label.popover.popdown();
         }
