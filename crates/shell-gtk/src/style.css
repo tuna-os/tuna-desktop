@@ -736,6 +736,9 @@ window.tuna-banners {
   font-size: 9pt;
 }
 
+/* The header's round buttons: expand (banners) and close. Expanded, the
+   expand arrow turns over (messageList.js rotates it 180 degrees). */
+.message-expand-button,
 .message-close-button {
   min-width: 28px;
   min-height: 28px;
@@ -746,8 +749,13 @@ window.tuna-banners {
   box-shadow: none;
 }
 
+.message-expand-button:hover,
 .message-close-button:hover {
   background-color: rgba(255, 255, 255, 0.25);
+}
+
+.message.expanded .message-expand-button image {
+  -gtk-icon-transform: rotate(180deg);
 }
 
 .message-content {

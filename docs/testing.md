@@ -292,11 +292,11 @@ TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --artifacts gtk-shell-ar
 ```
 
 `--notify-lock-only` stops after panel readiness and runs just the
-lock-screen notification, notification sound and disabled-app restore
-gates (G-NOTIFY-LOCK, G-NOTIFY-LOCK-PIXELS, G-NOTIFY-LOCK-LIVE,
-G-NOTIFY-SOUND, G-NOTIFY-RESTORE); it needs pam_wrapper to unlock. The
-proof's `canberra-gtk-play` stand-in records every event sound the shell
-asks for in `canberra-calls`.
+lock-screen notification, notification sound, disabled-app restore and
+banner expansion gates (G-NOTIFY-LOCK, G-NOTIFY-LOCK-PIXELS,
+G-NOTIFY-LOCK-LIVE, G-NOTIFY-SOUND, G-NOTIFY-RESTORE, G-NOTIFY-EXPANDED);
+it needs pam_wrapper to unlock. The proof's `canberra-gtk-play` stand-in
+records every event sound the shell asks for in `canberra-calls`.
 The restore gate opens the real message-tray binding after retaining the
 long-word redaction-test notifications in history. Card text must wrap at
 character boundaries when needed, and collapsed groups must measure only
