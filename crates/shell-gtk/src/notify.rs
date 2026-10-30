@@ -341,9 +341,15 @@ impl ActionDispatch {
     }
 
     /// Release callbacks whose center entries were removed or history-pruned.
-    /// Banner absence is not removal: dismissed history still belongs to the center.
+    /// Banner absence is not removal: dismissed history still belongs to the
+    /// center, and so does a disabled app's hidden notification.
     fn retain_history(&mut self, center: &NotificationCenter) {
-        let present: HashSet<u64> = center.history().iter().map(|n| n.id).collect();
+        let present: HashSet<u64> = center
+            .history()
+            .iter()
+            .chain(center.hidden())
+            .map(|n| n.id)
+            .collect();
         self.handlers.retain(|(id, _), _| present.contains(id));
         self.live.retain(|id| present.contains(id));
     }
@@ -555,11 +561,11 @@ impl NotifyUi {
     pub fn new(app: &gtk::Application) -> Rc<Self> {
         let center = Arc::new(Mutex::new(NotificationCenter::load_system()));
         // GNOME Settings' notification policy, read live on every
-        // arrival and banner (#348); a restart drops whatever an app
-        // disabled since it was filed.
+        // arrival and banner (#348); a restart hides whatever an app
+        // disabled since it was filed, and restores what it enabled.
         if let Ok(mut filed) = center.lock() {
             filed.set_policy(Arc::new(GioPolicyStore::new()));
-            filed.enforce_policy();
+            filed.apply_policy();
         }
         let ui = Self::build(app, center, true);
         *ui.policy_watch.borrow_mut() = Some(HashMap::new());
@@ -940,6 +946,7 @@ impl NotifyUi {
             let mut apps: Vec<String> = center
                 .history()
                 .iter()
+                .chain(center.hidden())
                 .map(|n| n.app_id())
                 .filter(|id| !id.is_empty() && !watched.contains_key(*id))
                 .map(str::to_owned)
@@ -990,18 +997,15 @@ impl NotifyUi {
     }
 
     /// A notification key changed. GNOME's policies notify at once: an app
-    /// switched off leaves the tray with its notifications
-    /// (`_onSourceEnableChanged`), and the lock screen re-reads
-    /// `show-in-lock-screen` and `details-in-lock-screen`
+    /// switched off leaves the tray, its notifications kept, and comes back
+    /// with them when switched on (`_onSourceEnableChanged`), and the lock
+    /// screen re-reads `show-in-lock-screen` and `details-in-lock-screen`
     /// (`_visibleChanged`, `_detailedChanged`). Banner, sound and
     /// expansion keys are read as each banner is asked for or shows.
     fn policy_changed(self: &Rc<Self>) {
-        let dropped = match self.center.lock() {
-            Ok(mut center) => center.enforce_policy(),
+        match self.center.lock() {
+            Ok(mut center) => center.apply_policy(),
             Err(_) => return,
-        };
-        for id in dropped {
-            self.retire_local_actions(id);
         }
         self.update();
     }

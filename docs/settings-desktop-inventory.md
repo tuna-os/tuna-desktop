@@ -289,7 +289,7 @@ Consumers re-checked against gnome-shell 51.0, gnome-session 51.0 and gnome-sett
 |---|---|---|
 | application-id | Honored | Written with the app's desktop id on its first notification (`store()`). Proof G-NOTIFY-POLICY |
 | details-in-lock-screen | Honored | Lock-screen titles and bodies only with it (or for an all-`x-gnome-privacy-scope=system` source); otherwise name and count only, absent from pixels and the accessible tree; live while locked. Proofs G-NOTIFY-LOCK, G-NOTIFY-LOCK-PIXELS |
-| enable | Honored | Off drops the app's arrivals, critical included, and live (or at startup) what it already filed. GNOME hides the source and shows it again if re-enabled in the same session; Tuna Desktop does not keep them. Proof G-NOTIFY-POLICY |
+| enable | Honored | Off hides the app's arrivals, critical included, and live (or at startup) what it already filed; on again brings them all back to the list with no banner, as messageTray.js `_onSourceEnableChanged` removes and re-adds the source. Hidden ones persist across a shell restart. Proofs G-NOTIFY-POLICY, G-NOTIFY-RESTORE |
 | enable-sound-alerts | Honored | Read as each banner shows; off keeps its `sound-name`/`sound-file` silent (messageTray.js `playSound`). Proof G-NOTIFY-SOUND |
 | force-expanded | Ignored | Read per arrival into the store's expanded flag, but the GTK banner always shows the whole body: it has no collapsed state to expand from |
 | show-banners | Honored | Combined with the global key at arrival; critical notifications break through. Proof G-NOTIFY-POLICY (enable) and the store's unit tests |
