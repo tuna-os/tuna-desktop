@@ -394,9 +394,9 @@ impl Runtime {
         }
         // Mutter re-homes every window when the monitors change
         // (`meta_window_update_for_monitors_changed`).
-        if self.state.output_slices() != before
-            || self.state.primary_output_name() != primary_before
-        {
+        let after = self.state.output_slices();
+        if after != before || self.state.primary_output_name() != primary_before {
+            eprintln!("tuna-compositor: outputs changed from {before:?} to {after:?}");
             self.manager
                 .relocate_for_monitors_changed(&self.state, &before);
             self.manager.reapply_derived_layouts(&mut self.state);

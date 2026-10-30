@@ -6165,6 +6165,12 @@ impl WindowManager {
             let mut shifted = false;
             if window.layout == WindowLayout::Floating {
                 if let Some(geo) = relocate(window.geometry, preferred.as_deref()) {
+                    eprintln!(
+                        "tuna-compositor: window {id} re-homed to {} from {:?} to {:?}",
+                        preferred.as_deref().unwrap_or("-"),
+                        window.geometry,
+                        geo
+                    );
                     window.geometry = geo;
                     shifted = true;
                 }
