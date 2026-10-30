@@ -227,6 +227,27 @@
 #                  manager, which asks the logind stub itself (Reboot,
 #                  PowerOff) or, for Log Out (last), ends the compositor
 #                  through its orderly shutdown (#589)
+#   G-END-SESSION-USERS Restart… and Power Off… list the other users'
+#                  logind sessions under "Other users are logged in" as
+#                  GNOME 51 titles them (graphical by user name, console
+#                  and remote by real name), leaving out the greeter's,
+#                  the closing one and this one; Log Out… lists none
+#   G-END-SESSION-REALNAME Log Out… names the user by their
+#                  AccountsService real name ("Log Out Proof Person");
+#                  without AccountsService the plain strings stay
+#   G-END-SESSION-BATTERY with gnome-software's offline update prepared
+#                  and UPower's display device discharging below 30 %,
+#                  "Install pending software updates" starts unchecked
+#                  and checking it shows the low-battery warning; a
+#                  scheduled update turns Restart… into "Restart &
+#                  Install Updates" with the warning, which hides live
+#                  once charging; without updates no warning shows;
+#                  cancelling leaves gnome-software untouched
+#   G-END-SESSION-BOOT-OPTIONS where logind can reboot into the boot
+#                  loader menu, holding Alt swaps Restart for Boot Options
+#                  (not on Power Off…); releasing it swaps back; Boot
+#                  Options has the shell set logind's 60 s boot loader
+#                  menu before the manager's Reboot(true)
 #   G-LOCKDOWN-LOG-OUT disable-log-out flipped live removes Log Out…,
 #                  Restart… and Power Off… from the open power menu,
 #                  keeps Suspend, and restores them (#357)
@@ -10310,6 +10331,177 @@ grep -q "^PowerOff True pid=$MANAGER_PID$" "$POWER_LOG" ||
 end_bus signal ConfirmedShutdown || fail G-END-SESSION-POWEROFF "Power Off emitted no ConfirmedShutdown"
 end_bus returned Shutdown || fail G-END-SESSION-POWEROFF "the manager did not answer Shutdown once confirmed"
 pass G-END-SESSION-POWEROFF "Power Off… asks org.gnome.SessionManager.Shutdown, whose dialog lists the inhibiting app and counts down from 60; Cancel leaves the session, Power Off has the manager ask logind PowerOff(true)"
+
+# The rest of GNOME 51's endSessionDialog.js (P-SY-07): other users'
+# sessions, the real name, the low-battery warning with offline updates,
+# and Restart's Alt Boot Options. AccountsService answers for this gate
+# only (the stub's opt-in "accounts"), so the rest of the proof keeps
+# GNOME's no-AccountsService strings.
+TUNA_STUB_SERVICES=accounts "$PY" "$ROOT/scripts/lib/tuna-service-stubs.py" "$BACKLIGHT" \
+    >"$ARTIFACTS/stubs-accounts.log" 2>&1 &
+ACCOUNTS_PID=$!
+for _ in $(seq 1 20); do grep -q ready "$ARTIFACTS/stubs-accounts.log" && break; sleep 0.3; done
+grep -q ready "$ARTIFACTS/stubs-accounts.log" || fail G-END-SESSION-REALNAME "the AccountsService stub did not start"
+# $1 tag, $2 menu row, $3 jq filter the open dialog must meet.
+end_open() {
+    end_bus_mark=$(($(wc -l <"$END_BUS_LOG") + 1))
+    open_power_menu "end-$1" || return 1
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-$1-press.json" 20 \
+        --press "$2" || return 1
+    end_dump_until "end-$1" "$3" 10
+}
+end_cancel() {
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-$1-cancel.json" 20 \
+        --press "Cancel" || return 1
+    end_dump_until "end-$1-cancelled" '(any(.[]; .showing and (.name | test("automatically"))) | not)' 5
+}
+me=$(id -un)
+for row in "Restart…" "Power Off…"; do
+    tag=users-$([ "$row" = "Restart…" ] && echo restart || echo poweroff)
+    end_open "$tag" "$row" 'any(.[]; .showing and .name == "Other users are logged in")
+        and any(.[]; .showing and .name == "alice") and any(.[]; .showing and .name == "Bob Builder (console)")
+        and any(.[]; .showing and .name == "carol (remote)")' ||
+        fail G-END-SESSION-USERS "$row did not list the other users' sessions"
+    for left_out in dave gdm-greeter "$me" "dave (console)" "Proof Person"; do
+        hidden "$ARTIFACTS/a11y-end-$tag.json" "$left_out" ||
+            fail G-END-SESSION-USERS "$row lists '$left_out' (closing, greeter or this session)"
+    done
+    scrot "$ARTIFACTS/22-end-session-$tag.png" >/dev/null
+    end_cancel "$tag" || fail G-END-SESSION-USERS "could not cancel $row"
+done
+pass G-END-SESSION-USERS "Restart… and Power Off… list alice, Bob Builder (console) and carol (remote) under \"Other users are logged in\", not the greeter, the closing session or this one"
+
+end_open realname "Log Out…" 'any(.[]; .showing and .name == "Log Out Proof Person")
+    and any(.[]; .showing and (.name | test("^Proof Person will be logged out automatically in 60 seconds$")))' ||
+    fail G-END-SESSION-REALNAME "Log Out… did not name the user by their real name"
+hidden "$ARTIFACTS/a11y-end-realname.json" "Other users are logged in" ||
+    fail G-END-SESSION-REALNAME "Log Out… lists other users' sessions"
+scrot "$ARTIFACTS/22-end-session-realname.png" >/dev/null
+end_cancel realname || fail G-END-SESSION-REALNAME "could not cancel Log Out…"
+kill "$ACCOUNTS_PID" 2>/dev/null || true
+wait "$ACCOUNTS_PID" 2>/dev/null || true
+end_open no-accounts "Log Out…" 'any(.[]; .showing and .name == "Log Out")
+    and any(.[]; .showing and (.name | test("^You will be logged out automatically in")))' ||
+    fail G-END-SESSION-REALNAME "without AccountsService Log Out… did not fall back to GNOME's plain strings"
+end_cancel no-accounts || fail G-END-SESSION-REALNAME "could not cancel Log Out…"
+pass G-END-SESSION-REALNAME "Log Out… reads \"Log Out Proof Person\" from AccountsService and falls back to \"Log Out\" without it"
+
+# gnome-software's OfflineUpdates on the session bus: GetState answers
+# the state file; SetAction and Cancel are logged.
+SOFTWARE_STATE="$ARTIFACTS/offline-update-state"
+SOFTWARE_LOG="$ARTIFACTS/offline-update.log"
+: >"$SOFTWARE_LOG"
+echo prepared >"$SOFTWARE_STATE"
+"$PY" - "$SOFTWARE_STATE" "$SOFTWARE_LOG" >"$ARTIFACTS/offline-update-stub.log" 2>&1 <<'PYSOFT' &
+import sys
+from gi.repository import Gio, GLib
+state_file, log_file = sys.argv[1:3]
+node = Gio.DBusNodeInfo.new_for_xml("""<node><interface name="org.gnome.Software.OfflineUpdates">
+<method name="GetState"><arg type="s" direction="out"/></method><method name="Cancel"/>
+<method name="SetAction"><arg type="s" direction="in"/></method></interface></node>""")
+def call(c, sender, path, iface, method, params, invocation):
+    if method == "GetState":
+        invocation.return_value(GLib.Variant("(s)", (open(state_file).read().strip(),)))
+        return
+    with open(log_file, "a") as fh:
+        fh.write(f"{method} {' '.join(map(str, params.unpack()))}".rstrip() + "\n")
+    invocation.return_value(None)
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+bus.register_object("/org/gnome/Software/OfflineUpdates", node.interfaces[0], call, None, None)
+Gio.bus_own_name_on_connection(bus, "org.gnome.Software", Gio.BusNameOwnerFlags.NONE, None, None)
+print("ready", flush=True)
+GLib.MainLoop().run()
+PYSOFT
+SOFTWARE_PID=$!
+for _ in $(seq 1 20); do grep -q ready "$ARTIFACTS/offline-update-stub.log" && break; sleep 0.3; done
+grep -q ready "$ARTIFACTS/offline-update-stub.log" || fail G-END-SESSION-BATTERY "the gnome-software stub did not start"
+upower_set() {
+    gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.UPower \
+        --object-path /org/freedesktop/UPower/devices/DisplayDevice \
+        --method org.freedesktop.DBus.Properties.Set org.freedesktop.UPower.Device "$1" "$2" >/dev/null
+}
+upower_set Percentage '<20.0>'
+upower_set State '<uint32 2>'
+upower_set IsPresent '<true>'
+WARNING="Low battery power: please plug in before installing updates"
+end_open battery-prepared "Power Off…" 'any(.[]; .showing and .name == "Install pending software updates" and (.checked | not))
+    and any(.[]; .showing and .name == "Power Off")' ||
+    fail G-END-SESSION-BATTERY "with a prepared update and a low battery Power Off… did not offer the unchecked update box"
+hidden "$ARTIFACTS/a11y-end-battery-prepared.json" "$WARNING" ||
+    fail G-END-SESSION-BATTERY "the warning showed with no update to install"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-battery-check.json" 20 \
+    --press "Install pending software updates" || fail G-END-SESSION-BATTERY "could not check the update box"
+end_dump_until end-battery-checked "any(.[]; .showing and .name == \"$WARNING\")
+    and any(.[]; .showing and .name == \"Install Updates & Power Off\")" 5 ||
+    fail G-END-SESSION-BATTERY "checking the update box did not show the low-battery warning and GNOME's title"
+scrot "$ARTIFACTS/22-end-session-battery.png" >/dev/null
+end_cancel battery-prepared || fail G-END-SESSION-BATTERY "could not cancel Power Off…"
+echo scheduled >"$SOFTWARE_STATE"
+end_open battery-scheduled "Restart…" "any(.[]; .showing and .name == \"Restart & Install Updates\")
+    and any(.[]; .showing and (.name | test(\"^The system will automatically restart and install updates in 60 seconds$\")))
+    and any(.[]; .showing and .name == \"Restart & Install\") and any(.[]; .showing and .name == \"$WARNING\")" ||
+    fail G-END-SESSION-BATTERY "a scheduled update did not open GNOME's Restart & Install Updates with the warning"
+hidden "$ARTIFACTS/a11y-end-battery-scheduled.json" "Install pending software updates" ||
+    fail G-END-SESSION-BATTERY "Restart & Install Updates offered the update box"
+upower_set State '<uint32 1>'
+end_dump_until end-battery-charging "(any(.[]; .showing and .name == \"$WARNING\") | not)
+    and any(.[]; .showing and .name == \"Restart & Install Updates\")" 5 ||
+    fail G-END-SESSION-BATTERY "the warning stayed once the battery charged"
+end_cancel battery-scheduled || fail G-END-SESSION-BATTERY "could not cancel Restart & Install Updates"
+upower_set State '<uint32 2>'
+echo none >"$SOFTWARE_STATE"
+end_open battery-none "Restart…" 'any(.[]; .showing and .name == "Restart") and any(.[]; .showing and (.name | test("will restart automatically in 60")))' ||
+    fail G-END-SESSION-BATTERY "without updates Restart… did not open plainly"
+for absent in "$WARNING" "Install pending software updates"; do
+    hidden "$ARTIFACTS/a11y-end-battery-none.json" "$absent" ||
+        fail G-END-SESSION-BATTERY "without updates the dialog shows '$absent'"
+done
+end_cancel battery-none || fail G-END-SESSION-BATTERY "could not cancel Restart…"
+[ ! -s "$SOFTWARE_LOG" ] || fail G-END-SESSION-BATTERY "cancelling told gnome-software: $(cat "$SOFTWARE_LOG")"
+upower_set IsPresent '<false>'
+upower_set Percentage '<37.0>'
+kill "$SOFTWARE_PID" 2>/dev/null || true
+pass G-END-SESSION-BATTERY "below 30 % discharging, a prepared update's box starts unchecked and checking it warns; a scheduled one opens Restart & Install Updates warned until charging; no updates, no warning"
+
+end_open boot-poweroff "Power Off…" 'any(.[]; .showing and (.name | test("will power off automatically in 60")))' ||
+    fail G-END-SESSION-BOOT-OPTIONS "Power Off… did not open"
+xdotool keydown Alt_L
+sleep 0.5
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-boot-poweroff-alt.json" 20 ||
+    { xdotool keyup Alt_L; fail G-END-SESSION-BOOT-OPTIONS "accessibility dump failed"; }
+xdotool keyup Alt_L
+button_showing "$ARTIFACTS/a11y-end-boot-poweroff-alt.json" "Power Off" &&
+    hidden "$ARTIFACTS/a11y-end-boot-poweroff-alt.json" "Boot Options" ||
+    fail G-END-SESSION-BOOT-OPTIONS "Alt on Power Off… offered Boot Options"
+end_cancel boot-poweroff || fail G-END-SESSION-BOOT-OPTIONS "could not cancel Power Off…"
+end_open boot "Restart…" 'any(.[]; .showing and (.name | test("will restart automatically in 60")))' ||
+    fail G-END-SESSION-BOOT-OPTIONS "Restart… did not open"
+button_showing "$ARTIFACTS/a11y-end-boot.json" "Restart" && hidden "$ARTIFACTS/a11y-end-boot.json" "Boot Options" ||
+    fail G-END-SESSION-BOOT-OPTIONS "Boot Options showed without Alt"
+xdotool keydown Alt_L
+end_dump_until end-boot-alt 'any(.[]; .showing and .name == "Boot Options")
+    and (any(.[]; .showing and .name == "Restart" and (.role == "push button" or .role == "button")) | not)' 5 ||
+    { xdotool keyup Alt_L; fail G-END-SESSION-BOOT-OPTIONS "holding Alt did not swap Restart for Boot Options"; }
+scrot "$ARTIFACTS/22-end-session-boot-options.png" >/dev/null
+xdotool keyup Alt_L
+end_dump_until end-boot-released '(any(.[]; .showing and .name == "Boot Options") | not)
+    and any(.[]; .showing and .name == "Restart" and (.role == "push button" or .role == "button"))' 5 ||
+    fail G-END-SESSION-BOOT-OPTIONS "releasing Alt did not bring Restart back"
+power_mark=$(wc -l <"$POWER_LOG")
+xdotool keydown Alt_L
+end_dump_until end-boot-alt-again 'any(.[]; .showing and .name == "Boot Options")' 5 ||
+    { xdotool keyup Alt_L; fail G-END-SESSION-BOOT-OPTIONS "holding Alt again did not show Boot Options"; }
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-boot-press.json" 20 \
+    --press "Boot Options" || { xdotool keyup Alt_L; fail G-END-SESSION-BOOT-OPTIONS "could not press Boot Options"; }
+xdotool keyup Alt_L
+end=$(($(date +%s) + 10))
+until tail -n +"$((power_mark + 1))" "$POWER_LOG" | grep -q "^Reboot True pid=$MANAGER_PID$" || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
+boot_calls=$(tail -n +"$((power_mark + 1))" "$POWER_LOG")
+[ "$(printf '%s\n' "$boot_calls" | sed -n 1p)" = "SetRebootToBootLoaderMenu 60000000 pid=$(bus_pid "$END_SHELL")" ] &&
+    [ "$(printf '%s\n' "$boot_calls" | sed -n 2p)" = "Reboot True pid=$MANAGER_PID" ] ||
+    fail G-END-SESSION-BOOT-OPTIONS "Boot Options did not set the boot loader menu before the manager's Reboot: $boot_calls"
+end_bus signal ConfirmedReboot || fail G-END-SESSION-BOOT-OPTIONS "Boot Options emitted no ConfirmedReboot"
+pass G-END-SESSION-BOOT-OPTIONS "holding Alt swaps Restart for Boot Options (not on Power Off…), which sets logind's 60 s boot loader menu before the manager's Reboot(true)"
 
 # Log Out…'s confirmation ends the session, so it runs last (below).
 end_session_gate G-END-SESSION-LOGOUT logout "Log Out…" Logout 0 "logged out" ""

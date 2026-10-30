@@ -985,6 +985,15 @@ window.tuna-audio-device-selection {
   color: #f2f2f2;
 }
 
+/* _dialogs.scss .end-session-dialog-battery-warning: warning-colored
+   text on a 10% warning tint, 9px padding, rounded. */
+.tuna-end-session .end-session-dialog-battery-warning {
+  color: #f8e45c;
+  background-color: rgba(248, 228, 92, 0.1);
+  padding: 9px;
+  border-radius: 12px;
+}
+
 /* GNOME 51's Run a Command dialog (_dialogs.scss .run-dialog): a 24em
    card, the entry padded 12px x 9px, a caption-sized dimmed hint. */
 .tuna-run-dialog .run-dialog {
