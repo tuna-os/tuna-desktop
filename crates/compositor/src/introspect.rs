@@ -180,12 +180,15 @@ impl Service {
 }
 
 /// The event loop's side: publish the window list, signal changes.
+/// Signals go through a [`SignalQueue`](crate::dbus_signals::SignalQueue)
+/// so publishing never waits on the bus (#657).
 #[derive(Clone)]
 pub struct Handle {
     pub windows: Windows,
     animations_enabled: Arc<AtomicBool>,
     screen_size: Arc<Mutex<(i32, i32)>>,
     conn: Arc<OnceLock<zbus::blocking::Connection>>,
+    signals: crate::dbus_signals::SignalQueue,
 }
 
 impl Default for Handle {
@@ -195,26 +198,38 @@ impl Default for Handle {
             screen_size: Arc::default(),
             animations_enabled: Arc::new(AtomicBool::new(true)),
             conn: Arc::default(),
+            signals: crate::dbus_signals::SignalQueue::new("tuna-introspect-signals"),
         }
     }
 }
 
 impl Handle {
+    /// Queue one signal on the served connection, if any.
+    fn emit<B>(&self, interface: &'static str, member: &'static str, body: B)
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType + Send + Sync + 'static,
+    {
+        let Some(conn) = self.conn.get() else {
+            return;
+        };
+        let conn = conn.inner().clone();
+        self.signals.emit(async move {
+            conn.emit_signal(None::<()>, PATH, interface, member, &body)
+                .await
+        });
+    }
+
     /// Publish the same effective motion preference used by the compositor.
     pub fn publish_animations_enabled(&self, enabled: bool) {
         if self.animations_enabled.swap(enabled, Ordering::AcqRel) == enabled {
             return;
         }
-        if let Some(conn) = self.conn.get() {
-            let changed = HashMap::from([("AnimationsEnabled", Value::from(enabled))]);
-            let _ = conn.emit_signal(
-                None::<()>,
-                PATH,
-                "org.freedesktop.DBus.Properties",
-                "PropertiesChanged",
-                &(NAME, changed, Vec::<String>::new()),
-            );
-        }
+        let changed = HashMap::from([("AnimationsEnabled", Value::from(enabled))]);
+        self.emit(
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            (NAME, changed, Vec::<String>::new()),
+        );
     }
 
     /// Update GNOME clients only when the effective desktop dimensions change.
@@ -227,16 +242,12 @@ impl Handle {
         }
         *current = size;
         drop(current);
-        if let Some(conn) = self.conn.get() {
-            let changed = HashMap::from([("ScreenSize", Value::from(size))]);
-            let _ = conn.emit_signal(
-                None::<()>,
-                PATH,
-                "org.freedesktop.DBus.Properties",
-                "PropertiesChanged",
-                &(NAME, changed, Vec::<String>::new()),
-            );
-        }
+        let changed = HashMap::from([("ScreenSize", Value::from(size))]);
+        self.emit(
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            (NAME, changed, Vec::<String>::new()),
+        );
     }
 
     /// Replace the window list; signal clients when it changed.
@@ -250,11 +261,9 @@ impl Handle {
         let apps_changed = running_apps(&current) != running_apps(&snapshot);
         *current = snapshot;
         drop(current);
-        if let Some(conn) = self.conn.get() {
-            let _ = conn.emit_signal(None::<()>, PATH, NAME, "WindowsChanged", &());
-            if apps_changed {
-                let _ = conn.emit_signal(None::<()>, PATH, NAME, "RunningApplicationsChanged", &());
-            }
+        self.emit(NAME, "WindowsChanged", ());
+        if apps_changed {
+            self.emit(NAME, "RunningApplicationsChanged", ());
         }
     }
 }
@@ -318,6 +327,75 @@ mod tests {
             x11: false,
             standalone: true,
             introspect_eligible: true,
+        }
+    }
+
+    /// #657: the event loop publishes every window-list and display
+    /// change; a bus that stops reading must not stall it. The blocking
+    /// emission this replaced parked the loop once the socket filled.
+    #[test]
+    fn publishing_never_waits_on_a_wedged_bus() {
+        let (conn, _peer) = crate::dbus_signals::wedged_link();
+        let handle = Handle::default();
+        handle.conn.set(conn).unwrap();
+        let started = std::time::Instant::now();
+        for n in 0..5000u64 {
+            handle.publish(vec![window(n, Some("org.gnome.Editor"), n % 2 == 0)]);
+            handle.publish_screen_size((640 + n as i32, 480));
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "publishing waited on the bus for {elapsed:?}"
+        );
+        assert_eq!(*handle.screen_size.lock().unwrap(), (640 + 4999, 480));
+    }
+
+    /// Queued publication still reaches a reading client in order: the
+    /// window list, then each ScreenSize value, the last one last.
+    #[test]
+    fn queued_publication_arrives_in_order() {
+        let (server_end, client_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            zbus::blocking::connection::Builder::async_io_unix_stream(server_end)
+                .server(zbus::Guid::generate())
+                .unwrap()
+                .p2p()
+                .build()
+                .unwrap()
+        });
+        let client = zbus::blocking::connection::Builder::async_io_unix_stream(client_end)
+            .p2p()
+            .build()
+            .unwrap();
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .path(PATH)
+            .unwrap()
+            .build();
+        let mut received =
+            zbus::blocking::MessageIterator::for_match_rule(rule, &client, Some(64)).unwrap();
+        let handle = Handle::default();
+        handle.conn.set(server.join().unwrap()).unwrap();
+        handle.publish(vec![window(1, Some("org.gnome.Editor"), true)]);
+        for width in [800, 1024, 1920] {
+            handle.publish_screen_size((width, 1080));
+        }
+        let mut next = || received.next().unwrap().unwrap();
+        let members: Vec<String> = (0..2)
+            .map(|_| next().header().member().unwrap().to_string())
+            .collect();
+        assert_eq!(members, ["WindowsChanged", "RunningApplicationsChanged"]);
+        for width in [800, 1024, 1920] {
+            let message = next();
+            let (iface, changed, _): (
+                String,
+                HashMap<String, zbus::zvariant::OwnedValue>,
+                Vec<String>,
+            ) = message.body().deserialize().unwrap();
+            assert_eq!(iface, NAME);
+            let size: (i32, i32) = changed["ScreenSize"].clone().try_into().unwrap();
+            assert_eq!(size, (width, 1080));
         }
     }
 

@@ -4030,7 +4030,7 @@ impl Runtime {
             } => {
                 if self.is_locked() || grant.load(std::sync::atomic::Ordering::SeqCst) {
                     grant.store(true, std::sync::atomic::Ordering::SeqCst);
-                    crate::mutter::session_closed(&signal, session_id);
+                    signal.session_closed(session_id);
                     return;
                 }
                 self.cast_grants.insert(session_id, grant);
@@ -4038,7 +4038,7 @@ impl Runtime {
                     self.pipewire = crate::screencast::PipeWire::new(&self.loop_handle);
                     if self.pipewire.is_none() {
                         eprintln!("tuna-compositor: screen cast: PipeWire is not running");
-                        crate::mutter::session_closed(&signal, session_id);
+                        signal.session_closed(session_id);
                         return;
                     }
                 }
@@ -4055,7 +4055,7 @@ impl Runtime {
                     crate::mutter::CastTarget::Area(_, (_, _, w, h)) => Some((*w, *h)),
                 };
                 let Some((width, height)) = size else {
-                    crate::mutter::session_closed(&signal, session_id);
+                    signal.session_closed(session_id);
                     return;
                 };
                 let Some(pw) = self.pipewire.as_ref() else {
