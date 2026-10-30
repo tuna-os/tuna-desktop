@@ -168,6 +168,7 @@ jobs:
       - run: python3 scripts/lib/gtk-privacy-portal-proof-tests.py
       - run: python3 scripts/lib/gnome-brightness-tests.py
       - run: scripts/tuna-settings-inventory-check
+      - run: python3 scripts/lib/settings-inventory-check-tests.py
       - name: Verify bundled cursor assets and rejection checks
         run: |
           scripts/tuna-cursor-assets-check share/tuna-desktop/icons/Adwaita

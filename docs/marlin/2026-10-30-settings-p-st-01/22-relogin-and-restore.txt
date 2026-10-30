@@ -1,0 +1,24 @@
+relogin clock-format='24h'
+relogin clock-show-seconds=true
+relogin clock-show-weekday=true
+relogin text-scaling-factor=1.51
+relogin font-name='DejaVu Serif 11'
+relogin document-font-name='Nimbus Roman 14'
+relogin monospace-font-name='Liberation Mono 15'
+4729 /usr/bin/tuna-compositor --shell-bin /usr/bin/tuna-shell-gtk --startup-overview
+4760 /usr/bin/tuna-shell-gtk
+1
+29 1000 tuna-test seat0 4596 user          tty2 no -
+ 3    0 root      -     834  user          -    no -
+30 1000 tuna-test -     4689 manager       -    no -
+ 4    0 root      -     923  manager-early -    no -
+restored clock-format='24h'
+restored clock-show-seconds=false
+restored clock-show-weekday=false
+restored text-scaling-factor=1.0
+restored font-name='Adwaita Sans 11'
+restored document-font-name='Adwaita Sans 12'
+restored monospace-font-name='Adwaita Mono 11'
+'12h'
+4902 /usr/lib/gnome-shell-calendar-server
+tuna-test
