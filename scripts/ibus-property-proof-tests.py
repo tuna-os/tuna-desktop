@@ -179,7 +179,7 @@ class Controls(unittest.TestCase):
         self.assertIn("return child_failure(error, app_bus, pid, bus_pid)",
                       ast.get_source_segment(source, functions["atspi_child"]))
 
-    def test_indicator_selects_the_showing_inner_toggle_of_the_menu_button(self):
+    def test_indicator_selects_the_showing_inner_menu_of_the_menu_button(self):
         class Node:
             def __init__(self, role, name, showing=True):
                 self.role, self.name, self.showing = role, name, showing
@@ -191,10 +191,11 @@ class Controls(unittest.TestCase):
                     def contains(self, state): return state == "showing" and showing
                 return States()
         # Shape of a gtk::MenuButton in the shell's a11y dumps (Date and Time,
-        # System): an outer "button" and an inner "toggle button", same name.
-        outer, inner = Node("button", "中"), Node("toggle button", "中")
-        tree = [outer, inner, Node("label", "中"), Node("toggle button", "中", showing=False),
-                Node("toggle button", "Date and Time")]
+        # System): an outer "button" and an inner toggle with GNOME's
+        # PanelMenu.Button role, "menu", same name.
+        outer, inner = Node("button", "中"), Node("menu", "中")
+        tree = [outer, inner, Node("label", "中"), Node("menu", "中", showing=False),
+                Node("menu", "Date and Time")]
         self.assertEqual(namespace["matching"](tree, "中"), [outer, inner])
         self.assertEqual(namespace["matching"](tree, *namespace["INDICATOR"]), [inner])
         helper = SOURCE.read_text()

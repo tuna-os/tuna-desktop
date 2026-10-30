@@ -55,8 +55,10 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("packaging/marlin/vm-lane/Containerfile"),
                          ["arch-package", "marlin-image", "marlin-vm"])
         self.assertEqual(pr("docs/parity-ledger.md"),
-                         ["journey", "drm-smoke", "gtk-shell",
+                         ["journey", "drm-smoke", "gtk-shell", "orca-speech",
                           "arch-package", "marlin-vm", "parity-ledger"])
+        self.assertEqual(pr("scripts/tuna-orca-speech-proof"), ["orca-speech"])
+        self.assertEqual(pr("scripts/lib/tuna-orca-speech.py"), ["orca-speech"])
 
 
     def test_transition_policy_and_suite_always_run_journey(self):

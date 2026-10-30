@@ -69,6 +69,8 @@ pub enum Action {
     MagnifierZoom {
         zoom_in: bool,
     },
+    /// `gsd-media-keys`' `screenreader`: flip `screen-reader-enabled`.
+    ToggleScreenReader,
     /// GNOME's Ctrl+Alt+Tab "Switch system controls"
     /// (`switch-panels`): move keyboard focus into the top bar, where
     /// Tab/arrows walk every control and Enter activates it. GNOME
@@ -366,10 +368,16 @@ fn specs() -> Vec<Spec> {
         specs.push(media(key, action, vec![]));
         specs.push(media(&format!("{key}-static"), action, defaults));
     }
-    // The magnifier keys (`shortcuts-list.h`: SHELL_ACTION_MODE_ALL),
-    // GNOME 51 defaults in `org.gnome.settings-daemon.plugins.media-keys`.
+    // The magnifier and screen reader keys (`shortcuts-list.h`:
+    // SHELL_ACTION_MODE_ALL), GNOME 51 defaults in
+    // `org.gnome.settings-daemon.plugins.media-keys`.
     specs.extend([
         media("magnifier", Action::ToggleMagnifier, vec!["<Alt><Super>8"]),
+        media(
+            "screenreader",
+            Action::ToggleScreenReader,
+            vec!["<Alt><Super>s"],
+        ),
         media(
             "magnifier-zoom-in",
             Action::MagnifierZoom { zoom_in: true },
@@ -542,11 +550,13 @@ pub struct Binding {
 
 impl Action {
     /// The `MetaKeyBindingFlags` GNOME grabs this action with: the
-    /// magnifier toggle ignores autorepeat (`shortcuts-list.h` at
-    /// gsd 51.0), so holding the chord flips it once.
+    /// magnifier and screen reader toggles ignore autorepeat
+    /// (`shortcuts-list.h` at gsd 51.0), so holding the chord flips once.
     pub fn grab_flags(self) -> u32 {
         match self {
-            Action::ToggleMagnifier => tuna_shell_control::GRAB_IGNORE_AUTOREPEAT,
+            Action::ToggleMagnifier | Action::ToggleScreenReader => {
+                tuna_shell_control::GRAB_IGNORE_AUTOREPEAT
+            }
             _ => 0,
         }
     }
@@ -792,6 +802,7 @@ mod tests {
         );
         assert_eq!(find(Action::VolumeMute), ["XF86AudioMute"]);
         assert_eq!(find(Action::ToggleMagnifier), ["<Alt><Super>8"]);
+        assert_eq!(find(Action::ToggleScreenReader), ["<Alt><Super>s"]);
         assert_eq!(
             find(Action::MagnifierZoom { zoom_in: true }),
             ["<Alt><Super>equal"]
@@ -800,23 +811,22 @@ mod tests {
             find(Action::MagnifierZoom { zoom_in: false }),
             ["<Alt><Super>minus"]
         );
-        for binding in all.iter().filter(|b| {
-            matches!(
-                b.action,
-                Action::ToggleMagnifier | Action::MagnifierZoom { .. }
-            )
-        }) {
+        let toggles =
+            |action| matches!(action, Action::ToggleMagnifier | Action::ToggleScreenReader);
+        for binding in all
+            .iter()
+            .filter(|b| toggles(b.action) || matches!(b.action, Action::MagnifierZoom { .. }))
+        {
             // SHELL_ACTION_MODE_ALL: they work on the lock screen too.
             assert_eq!(binding.modes, ALL);
-            let ignores_repeat = binding.action == Action::ToggleMagnifier;
             assert_eq!(
                 binding.flags & tuna_shell_control::GRAB_IGNORE_AUTOREPEAT != 0,
-                ignores_repeat
+                toggles(binding.action)
             );
         }
         assert!(all
             .iter()
-            .filter(|b| !matches!(b.action, Action::ToggleMagnifier))
+            .filter(|b| !toggles(b.action))
             .all(|b| b.flags == 0));
         assert_eq!(find(Action::VolumeMuteQuiet), ["<Alt>XF86AudioMute"]);
         assert_eq!(
@@ -914,6 +924,7 @@ mod tests {
             Action::VolumeMuteQuiet,
             Action::MicrophoneMute,
             Action::ToggleMagnifier,
+            Action::ToggleScreenReader,
             Action::MagnifierZoom { zoom_in: true },
             Action::MagnifierZoom { zoom_in: false },
         ];

@@ -4,8 +4,13 @@
 //! on its top-right corner. The compositor draws the previews and tells
 //! the shell where they are (`OverviewPreviews`); this click-through
 //! overlay draws the chrome, taking input only on the close button.
+//! Under keyboard navigation (Tab from the search entry) it also holds
+//! one focusable push button per preview, named by its window's title,
+//! as GNOME's previews are; the focused one shows its caption and close
+//! button as a hovered one does, and Enter activates its window.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gtk::prelude::*;
@@ -118,15 +123,128 @@ pub struct PreviewWindow {
     pub icon: gio::Icon,
 }
 
+/// A key's move through the window picker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+    /// Tab: the next preview in the picker's order.
+    Next,
+    /// Shift+Tab: the previous one.
+    Previous,
+}
+
+impl Direction {
+    fn of(key: gtk::gdk::Key) -> Option<Self> {
+        use gtk::gdk::Key;
+        Some(match key {
+            Key::Left | Key::KP_Left => Self::Left,
+            Key::Right | Key::KP_Right => Self::Right,
+            Key::Up | Key::KP_Up => Self::Up,
+            Key::Down | Key::KP_Down => Self::Down,
+            Key::Tab | Key::KP_Tab => Self::Next,
+            Key::ISO_Left_Tab => Self::Previous,
+            _ => return None,
+        })
+    }
+}
+
+/// Where a key takes the window picker's focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewStep {
+    /// Focus the preview at this index.
+    Preview(usize),
+    /// Back to the search entry: up from the top row, or back from the
+    /// first preview (GNOME keeps the entry in the overview's Tab path).
+    Search,
+    /// Nothing that way: the focus stays.
+    Stay,
+}
+
+/// St's directional focus between the previews (`x, y, width, height`):
+/// the nearest preview whose center lies that way, the distance across
+/// the move counting double so a row's neighbour wins over a diagonal.
+pub fn preview_step(
+    rects: &[(i32, i32, i32, i32)],
+    from: usize,
+    direction: Direction,
+) -> PreviewStep {
+    let center = |(x, y, w, h): (i32, i32, i32, i32)| (x + w / 2, y + h / 2);
+    let Some(&here) = rects.get(from) else {
+        return PreviewStep::Stay;
+    };
+    let (cx, cy) = center(here);
+    let edge = |direction| match direction {
+        Direction::Up | Direction::Previous => PreviewStep::Search,
+        _ => PreviewStep::Stay,
+    };
+    match direction {
+        Direction::Next => {
+            if from + 1 < rects.len() {
+                PreviewStep::Preview(from + 1)
+            } else {
+                edge(direction)
+            }
+        }
+        Direction::Previous => {
+            if from > 0 {
+                PreviewStep::Preview(from - 1)
+            } else {
+                edge(direction)
+            }
+        }
+        _ => rects
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != from)
+            .filter_map(|(index, rect)| {
+                let (x, y) = center(*rect);
+                let (along, across) = match direction {
+                    Direction::Left => (cx - x, y - cy),
+                    Direction::Right => (x - cx, y - cy),
+                    Direction::Up => (cy - y, x - cx),
+                    _ => (y - cy, x - cx),
+                };
+                (along > 0).then_some((along + 2 * across.abs(), index))
+            })
+            .min()
+            .map_or_else(|| edge(direction), |(_, index)| PreviewStep::Preview(index)),
+    }
+}
+
+/// Hands the keyboard back to the search entry, with any typed text.
+pub type OnLeave = Rc<dyn Fn(Option<char>)>;
+
 pub struct PreviewChrome {
     window: gtk::ApplicationWindow,
     fixed: gtk::Fixed,
     shown: RefCell<(Vec<PreviewInfo>, Option<u64>)>,
+    /// Each shown preview's title and icon, looked up at the last update.
+    windows: RefCell<HashMap<u64, PreviewWindow>>,
+    /// Previews whose caption and close button the last render showed.
+    overlaid: RefCell<Vec<u64>>,
+    /// Keyboard navigation of the window picker (windowPreview.js: each
+    /// preview is a focusable push button named by its window's title):
+    /// one focus target per preview while it runs, kept across renders
+    /// so the focus survives preview updates.
+    keynav: RefCell<Option<Vec<(u64, gtk::Button)>>>,
+    /// The preview the keyboard focus is on; it shows its caption and
+    /// close button as a hovered one does.
+    key_focus: Cell<Option<u64>>,
     close: Rc<dyn Fn(u64)>,
+    activate: Rc<dyn Fn(u64)>,
+    /// Hands the keyboard back to the search entry, with any typed text.
+    on_leave: RefCell<Option<OnLeave>>,
 }
 
 impl PreviewChrome {
-    pub fn new(app: &gtk::Application, close: Rc<dyn Fn(u64)>) -> Rc<Self> {
+    pub fn new(
+        app: &gtk::Application,
+        close: Rc<dyn Fn(u64)>,
+        activate: Rc<dyn Fn(u64)>,
+    ) -> Rc<Self> {
         let window = gtk::ApplicationWindow::new(app);
         window.add_css_class("tuna-overview-chrome");
         window.init_layer_shell();
@@ -149,12 +267,66 @@ impl PreviewChrome {
                 surface.set_input_region(Some(&gtk::cairo::Region::create()));
             }
         });
-        Rc::new(Self {
+        let chrome = Rc::new(Self {
             window,
             fixed,
             shown: RefCell::new((Vec::new(), None)),
+            windows: RefCell::default(),
+            overlaid: RefCell::default(),
+            keynav: RefCell::new(None),
+            key_focus: Cell::new(None),
             close,
-        })
+            activate,
+            on_leave: RefCell::new(None),
+        });
+        // Arrows and Tab move between the previews; typing goes back to
+        // the search entry with the typed text, as GNOME's entry
+        // intercepts it anywhere in the overview.
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(&chrome);
+        keys.connect_key_pressed(move |_, key, _, state| {
+            let Some(chrome) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            if chrome.keynav.borrow().is_none() {
+                return glib::Propagation::Proceed;
+            }
+            if let Some(c) = crate::overview::typed_text(key, state) {
+                chrome.leave(Some(c));
+                return glib::Propagation::Stop;
+            }
+            let Some(direction) = Direction::of(key) else {
+                // Enter and Space activate the focused preview.
+                return glib::Propagation::Proceed;
+            };
+            let ids = chrome.focusable();
+            let rects: Vec<_> = {
+                let shown = chrome.shown.borrow();
+                ids.iter()
+                    .filter_map(|id| shown.0.iter().find(|p| p.window == *id))
+                    .map(|p| (p.x, p.y, p.width, p.height))
+                    .collect()
+            };
+            let from = chrome
+                .key_focus
+                .get()
+                .and_then(|id| ids.iter().position(|shown| *shown == id))
+                .unwrap_or(0);
+            match preview_step(&rects, from, direction) {
+                PreviewStep::Preview(index) => chrome.focus(ids[index]),
+                PreviewStep::Search => chrome.leave(None),
+                PreviewStep::Stay => {}
+            }
+            glib::Propagation::Stop
+        });
+        chrome.window.add_controller(keys);
+        chrome
+    }
+
+    /// Who takes the keyboard back when the navigation leaves the picker.
+    pub fn set_on_leave(&self, on_leave: OnLeave) {
+        *self.on_leave.borrow_mut() = Some(on_leave);
     }
 
     /// Show `previews` (empty hides the overlay); `windows` gives each
@@ -165,26 +337,169 @@ impl PreviewChrome {
         hovered: Option<u64>,
         windows: &dyn Fn(u64) -> Option<PreviewWindow>,
     ) {
-        let newly_hovered = {
+        {
             let shown = self.shown.borrow();
             if shown.0 == previews && shown.1 == hovered {
                 return;
             }
-            shown.1 != hovered
-        };
+        }
         *self.shown.borrow_mut() = (previews.to_vec(), hovered);
-        while let Some(child) = self.fixed.first_child() {
-            self.fixed.remove(&child);
+        *self.windows.borrow_mut() = previews
+            .iter()
+            .filter_map(|p| Some((p.window, windows(p.window)?)))
+            .collect();
+        self.render();
+    }
+
+    /// The previews keyboard navigation can focus, in the picker's order.
+    fn focusable(&self) -> Vec<u64> {
+        let windows = self.windows.borrow();
+        self.shown
+            .borrow()
+            .0
+            .iter()
+            .map(|p| p.window)
+            .filter(|id| windows.contains_key(id))
+            .collect()
+    }
+
+    /// GNOME's Tab from the search entry into the window picker: the
+    /// chrome takes the keyboard and the first preview (the last going
+    /// `backward`) the focus. False with no previews.
+    pub fn enter_keynav(self: &Rc<Self>, backward: bool) -> bool {
+        let ids = self.focusable();
+        let Some(&id) = (if backward { ids.last() } else { ids.first() }) else {
+            return false;
+        };
+        if self.keynav.borrow().is_none() {
+            *self.keynav.borrow_mut() = Some(Vec::new());
+        }
+        self.key_focus.set(Some(id));
+        self.render();
+        self.window.set_keyboard_mode(KeyboardMode::Exclusive);
+        self.window.set_focus_visible(true);
+        self.focus(id);
+        true
+    }
+
+    /// End keyboard navigation: the focus targets go and the chrome stops
+    /// asking for the keyboard, which the compositor parks on search.
+    pub fn leave_keynav(self: &Rc<Self>) {
+        let Some(targets) = self.keynav.borrow_mut().take() else {
+            return;
+        };
+        for (_, target) in targets {
+            self.fixed.remove(&target);
+        }
+        self.key_focus.set(None);
+        self.window.set_keyboard_mode(KeyboardMode::None);
+        self.render();
+    }
+
+    fn leave(&self, typed: Option<char>) {
+        let on_leave = self.on_leave.borrow().clone();
+        if let Some(on_leave) = on_leave {
+            on_leave(typed);
+        }
+    }
+
+    fn focus(&self, id: u64) {
+        let target = self.keynav.borrow().as_ref().and_then(|targets| {
+            targets
+                .iter()
+                .find(|(target, _)| *target == id)
+                .map(|(_, button)| button.clone())
+        });
+        if let Some(target) = target {
+            target.grab_focus();
+        }
+    }
+
+    /// One preview's focus target: a transparent push button over it,
+    /// named by its window's title; Enter or Space activates the window.
+    fn focus_target(self: &Rc<Self>, id: u64) -> gtk::Button {
+        let target = gtk::Button::new();
+        target.add_css_class("window-preview-focus");
+        let activate = self.activate.clone();
+        target.connect_clicked(move |_| activate(id));
+        let weak = Rc::downgrade(self);
+        target.connect_has_focus_notify(move |target| {
+            let Some(chrome) = weak.upgrade() else {
+                return;
+            };
+            if !target.has_focus() || chrome.key_focus.replace(Some(id)) == Some(id) {
+                return;
+            }
+            // The caption and close button follow the focus, as on hover;
+            // render after the focus change finishes.
+            glib::idle_add_local_once(move || chrome.render());
+        });
+        target
+    }
+
+    /// Draw the chrome for the shown previews.
+    fn render(self: &Rc<Self>) {
+        let (previews, hovered) = self.shown.borrow().clone();
+        let mut keynav = self.keynav.borrow_mut();
+        // Rebuild everything but the focus targets.
+        let mut child = self.fixed.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            let kept = keynav.as_ref().is_some_and(|targets| {
+                targets
+                    .iter()
+                    .any(|(_, t)| t.upcast_ref::<gtk::Widget>() == &widget)
+            });
+            if !kept {
+                self.fixed.remove(&widget);
+            }
+        }
+        let windows = self.windows.borrow();
+        if let Some(targets) = keynav.as_mut() {
+            targets.retain(|(id, target)| {
+                let keep = windows.contains_key(id) && previews.iter().any(|p| p.window == *id);
+                if !keep {
+                    self.fixed.remove(target);
+                }
+                keep
+            });
         }
         if previews.is_empty() {
+            if keynav.take().is_some() {
+                self.key_focus.set(None);
+                self.window.set_keyboard_mode(KeyboardMode::None);
+            }
+            self.overlaid.borrow_mut().clear();
             self.window.set_visible(false);
             return;
         }
-        let mut input = None;
-        for p in previews {
-            let Some(info) = windows(p.window) else {
+        let focused = self.key_focus.get().filter(|_| keynav.is_some());
+        let previous = self.overlaid.replace(Vec::new());
+        let mut inputs = Vec::new();
+        for p in &previews {
+            let Some(info) = windows.get(&p.window) else {
                 continue;
             };
+            if let Some(targets) = keynav.as_mut() {
+                let existing = targets
+                    .iter()
+                    .find(|(id, _)| *id == p.window)
+                    .map(|(_, target)| target.clone());
+                let target = match existing {
+                    Some(target) => {
+                        self.fixed.move_(&target, f64::from(p.x), f64::from(p.y));
+                        target
+                    }
+                    None => {
+                        let target = self.focus_target(p.window);
+                        self.fixed.put(&target, f64::from(p.x), f64::from(p.y));
+                        targets.push((p.window, target.clone()));
+                        target
+                    }
+                };
+                target.set_size_request(p.width, p.height);
+                target.update_property(&[gtk::accessible::Property::Label(&info.title)]);
+            }
             let bottom = f64::from(p.y + p.height);
             let center_x = f64::from(p.x) + f64::from(p.width) / 2.0;
             let icon = gtk::Image::from_gicon(&info.icon);
@@ -195,7 +510,7 @@ impl PreviewChrome {
                 center_x - f64::from(ICON_SIZE) / 2.0,
                 bottom - f64::from(ICON_SIZE) * ICON_OVERLAP,
             );
-            if hovered != Some(p.window) {
+            if hovered != Some(p.window) && focused != Some(p.window) {
                 continue;
             }
             // Centered under the preview, never wider than it.
@@ -213,8 +528,10 @@ impl PreviewChrome {
                 f64::from(p.x),
                 bottom + f64::from(ICON_SIZE) * (1.0 - ICON_OVERLAP) + ICON_TITLE_SPACING,
             );
+            // St.Button's default: the pointer's, not in the Tab path.
             let close = gtk::Button::from_icon_name("preview-close-symbolic");
             close.add_css_class("window-close");
+            close.set_focusable(false);
             close.update_property(&[gtk::accessible::Property::Label("Close")]);
             let (x, y) = (p.x + p.width - CLOSE_SIZE / 2, p.y - CLOSE_SIZE / 2);
             self.fixed.put(&close, f64::from(x), f64::from(y));
@@ -222,11 +539,13 @@ impl PreviewChrome {
                 let (close_fn, id) = (self.close.clone(), p.window);
                 close.connect_clicked(move |_| close_fn(id));
             }
-            input = Some(gtk::cairo::RectangleInt::new(x, y, CLOSE_SIZE, CLOSE_SIZE));
-            if newly_hovered {
+            inputs.push(gtk::cairo::RectangleInt::new(x, y, CLOSE_SIZE, CLOSE_SIZE));
+            if !previous.contains(&p.window) {
                 fade_in(vec![row.upcast(), close.upcast()]);
             }
+            self.overlaid.borrow_mut().push(p.window);
         }
+        drop((windows, keynav));
         // A transparent full-output buffer still shades every pixel on
         // transition frames. Keep the same widgets and output positions,
         // but allocate only their union, including CSS shadows.
@@ -270,16 +589,16 @@ impl PreviewChrome {
         self.window.set_margin(Edge::Top, bounds.y());
         self.window.set_visible(true);
         // Clicks fall through to the compositor's previews except on
-        // the close button.
-        let region = match input {
-            Some(rect) => gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(
+        // the close buttons.
+        let region = gtk::cairo::Region::create();
+        for rect in inputs {
+            let _ = region.union_rectangle(&gtk::cairo::RectangleInt::new(
                 rect.x() - bounds.x(),
                 rect.y() - bounds.y(),
                 rect.width(),
                 rect.height(),
-            )),
-            None => gtk::cairo::Region::create(),
-        };
+            ));
+        }
         if let Some(surface) = self.window.surface() {
             surface.set_input_region(Some(&region));
         }
@@ -295,7 +614,7 @@ impl PreviewChrome {
 
 #[cfg(test)]
 mod tests {
-    use super::{chrome_bounds, overlay_opacity};
+    use super::{chrome_bounds, overlay_opacity, preview_step, Direction, PreviewStep};
     use tuna_shell_control::{MotionLevel, MotionPolicy};
 
     #[test]
@@ -338,6 +657,54 @@ mod tests {
         assert_eq!(
             overlay_opacity(0.0, MotionPolicy::new(MotionLevel::Off, 1.0)),
             1.0
+        );
+    }
+
+    #[test]
+    fn arrows_move_to_the_nearest_preview_that_way_and_up_leaves_for_search() {
+        // Two previews side by side over a wide third.
+        let rects = [
+            (100, 100, 300, 200),
+            (500, 100, 300, 200),
+            (200, 400, 600, 250),
+        ];
+        assert_eq!(
+            preview_step(&rects, 0, Direction::Right),
+            PreviewStep::Preview(1)
+        );
+        assert_eq!(
+            preview_step(&rects, 1, Direction::Left),
+            PreviewStep::Preview(0)
+        );
+        assert_eq!(
+            preview_step(&rects, 0, Direction::Down),
+            PreviewStep::Preview(2)
+        );
+        // The wide preview's center (500, 525) is nearer the right one's.
+        assert_eq!(
+            preview_step(&rects, 2, Direction::Up),
+            PreviewStep::Preview(1)
+        );
+        assert_eq!(preview_step(&rects, 2, Direction::Down), PreviewStep::Stay);
+        assert_eq!(preview_step(&rects, 1, Direction::Right), PreviewStep::Stay);
+        assert_eq!(preview_step(&rects, 0, Direction::Up), PreviewStep::Search);
+    }
+
+    #[test]
+    fn tab_follows_the_picker_order_and_back_from_the_first_leaves_for_search() {
+        let rects = [(500, 100, 300, 200), (100, 100, 300, 200)];
+        assert_eq!(
+            preview_step(&rects, 0, Direction::Next),
+            PreviewStep::Preview(1)
+        );
+        assert_eq!(preview_step(&rects, 1, Direction::Next), PreviewStep::Stay);
+        assert_eq!(
+            preview_step(&rects, 1, Direction::Previous),
+            PreviewStep::Preview(0)
+        );
+        assert_eq!(
+            preview_step(&rects, 0, Direction::Previous),
+            PreviewStep::Search
         );
     }
 }

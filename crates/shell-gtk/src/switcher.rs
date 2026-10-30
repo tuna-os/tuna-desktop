@@ -376,8 +376,15 @@ impl SwitcherUi {
                 }
             } else {
                 stop(&self.window, &self.popup_fade);
-                self.rebuild(&now);
+                let selected_name = self.rebuild(&now);
                 self.window.present();
+                // Orca's gnome-shell script follows the selected switcher
+                // item as its focus; say each newly selected one.
+                if now.selected != self.shown.borrow().selected {
+                    if let Some(name) = selected_name {
+                        crate::accessibility::announce(&self.window, &name);
+                    }
+                }
             }
             *self.shown.borrow_mut() = now.clone();
         }
@@ -453,14 +460,26 @@ impl SwitcherUi {
             if !wanted.windows.is_empty() {
                 self.place_thumbnails();
             }
-        } else if !wanted.windows.is_empty() && current.windows == wanted.windows {
-            // Only the focus moved: keep the strip, move the highlight.
-            self.highlight_thumbnail(wanted.focused);
-            *self.thumbs.borrow_mut() = wanted;
-            self.place_thumbnails();
         } else {
-            self.rebuild_thumbnails(&wanted);
-            *self.thumbs.borrow_mut() = wanted;
+            // A window newly focused in the thumbnails is said, as the
+            // selected app is.
+            let focused_title = wanted
+                .focused
+                .filter(|_| wanted.focused != current.focused)
+                .and_then(|i| wanted.windows.get(i))
+                .map(|(_, title)| title.clone());
+            if !wanted.windows.is_empty() && current.windows == wanted.windows {
+                // Only the focus moved: keep the strip, move the highlight.
+                self.highlight_thumbnail(wanted.focused);
+                *self.thumbs.borrow_mut() = wanted;
+                self.place_thumbnails();
+            } else {
+                self.rebuild_thumbnails(&wanted);
+                *self.thumbs.borrow_mut() = wanted;
+            }
+            if let Some(title) = focused_title {
+                crate::accessibility::announce(&self.thumbs_window, &title);
+            }
         }
     }
 
@@ -750,7 +769,9 @@ impl SwitcherUi {
             .collect()
     }
 
-    fn rebuild(&self, now: &Shown) {
+    /// Rebuild the tiles; the selected tile's accessible name.
+    fn rebuild(&self, now: &Shown) -> Option<String> {
+        let mut selected_name = None;
         while let Some(child) = self.row.first_child() {
             self.row.remove(&child);
         }
@@ -817,11 +838,13 @@ impl SwitcherUi {
             }
             // Screen readers hear "<app>: <title>"; the selection is
             // marked selected, as GNOME's switcher does.
+            let accessible_name = format!("{name}: {title}");
             tile.set_accessible_role(gtk::AccessibleRole::ListItem);
-            tile.update_property(&[gtk::accessible::Property::Label(&format!(
-                "{name}: {title}"
-            ))]);
+            tile.update_property(&[gtk::accessible::Property::Label(&accessible_name)]);
             tile.update_state(&[gtk::accessible::State::Selected(Some(selected))]);
+            if selected {
+                selected_name = Some(accessible_name);
+            }
             // An app with several windows gets GNOME's arrow under its tile.
             let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
             column.append(&tile);
@@ -832,6 +855,7 @@ impl SwitcherUi {
             column.append(&arrow);
             self.row.append(&column);
         }
+        selected_name
     }
 }
 

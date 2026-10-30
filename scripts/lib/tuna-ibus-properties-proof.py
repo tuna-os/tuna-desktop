@@ -84,10 +84,11 @@ def validate_traffic(before, after, positive):
         raise RuntimeError("old property emitted traffic after engine change")
 
 
-# gtk::MenuButton exposes an outer "button" wrapping an inner "toggle button",
-# both carrying the indicator's name (the clock and System menus have the same
-# shape); the inner toggle button is the actionable control.
-INDICATOR = ("中", "toggle button")
+# gtk::MenuButton exposes an outer "button" wrapping an inner toggle that
+# takes GNOME's PanelMenu.Button role, "menu"; both carry the indicator's
+# name (the clock and System menus have the same shape) and the inner menu
+# is the actionable control.
+INDICATOR = ("中", "menu")
 
 
 def matching(nodes, name, role=None):

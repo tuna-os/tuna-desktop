@@ -1578,11 +1578,15 @@ impl WindowManager {
     /// open; restore the previous window on dismiss. An explicit `focus`
     /// while parked chooses the window restored on close. A vanished
     /// overview surface restores early so keys never route into a dead
-    /// surface.
+    /// surface. While the shell navigates its app grid or window picker
+    /// by keyboard, the park moves to that surface and back to search
+    /// when it lets go (GNOME's overview focus chain).
     fn reconcile_overview_focus(&mut self, state: &mut State) {
-        let surface = state.overview_surface();
         if self.overview_open {
-            match (surface, self.overview_held.clone()) {
+            match (
+                state.overview_keyboard_surface(),
+                self.overview_held.clone(),
+            ) {
                 (Some(target), held) if held.as_ref() != Some(&target) => {
                     if held.is_none() {
                         self.pre_overview_focus = self.model.focused();

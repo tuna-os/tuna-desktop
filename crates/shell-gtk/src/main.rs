@@ -479,11 +479,14 @@ impl shell_dbus::ShellActions for GnomeShellDbus {
     }
 }
 
-fn panel_button(child: &impl IsA<gtk::Widget>, label: &str) -> gtk::Button {
-    let button = gtk::Button::builder().child(child).build();
-    button.add_css_class("panel-button");
-    button.update_property(&[gtk::accessible::Property::Label(label)]);
-    button
+/// GNOME's PanelMenu.Button is an ATK MENU named by its label
+/// (panelMenu.js), so Orca says "System menu". The focusable toggle inside
+/// GTK's menu button takes that role; call this before the button is
+/// realized, while the role can still change.
+pub(crate) fn panel_menu_role(button: &gtk::MenuButton) {
+    if let Some(toggle) = button.first_child() {
+        toggle.set_property("accessible-role", gtk::AccessibleRole::Menu);
+    }
 }
 
 fn panel_menu_button(
@@ -498,6 +501,7 @@ fn panel_menu_button(
         .build();
     button.add_css_class("panel-button");
     button.update_property(&[gtk::accessible::Property::Label(label)]);
+    panel_menu_role(&button);
     // GNOME focuses a panel menu's first item only when the keyboard
     // opened it: a click shows no focus ring (keyboard opens set it
     // back, see the keybinding toggle).
@@ -918,7 +922,7 @@ fn quick_settings_popover(
     ))));
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
-    let lock = qs_round("system-lock-screen-symbolic", "Lock");
+    let lock = qs_round("system-lock-screen-symbolic", "Lock Screen");
     let power = qs_round("system-shutdown-symbolic", "Power Off Menu");
     top.append(&screenshot);
     top.append(&settings_btn);
@@ -1786,7 +1790,16 @@ fn build(app: &adw::Application) {
     // The compositor toggles the overview on presses over the
     // Activities control (ACTIVITIES_WIDTH_PX); sending a toggle here
     // as well would cancel it out.
-    let activities = panel_button(&pills, "Activities");
+    // GNOME's ActivitiesButton: role toggle button, named Activities.
+    let activities = gtk::Button::builder()
+        .child(&pills)
+        .accessible_role(gtk::AccessibleRole::ToggleButton)
+        .build();
+    activities.add_css_class("panel-button");
+    activities.update_property(&[gtk::accessible::Property::Label("Activities")]);
+    activities.update_state(&[gtk::accessible::State::Pressed(
+        gtk::AccessibleTristate::False,
+    )]);
 
     let notify = notify::NotifyUi::new(app.upcast_ref());
     let clock_label = gtk::Label::new(None);
@@ -2910,6 +2923,7 @@ fn build(app: &adw::Application) {
                         );
                     }
                     Action::ToggleMagnifier => magnifier_sync::toggle(),
+                    Action::ToggleScreenReader => orca::toggle(),
                     Action::MagnifierZoom { zoom_in } => magnifier_sync::zoom(zoom_in),
                     Action::VolumeMute | Action::VolumeMuteQuiet | Action::MicrophoneMute => {
                         media_keys.change(
@@ -3547,14 +3561,23 @@ fn build(app: &adw::Application) {
         let last_open = Cell::new(false);
         let chrome = {
             let shell = shell.clone();
-            preview_chrome::PreviewChrome::new(
+            let actions = ShellActions(shell.clone());
+            let chrome = preview_chrome::PreviewChrome::new(
                 app.upcast_ref(),
                 Rc::new(move |id| {
                     if let Some(control) = shell.borrow_mut().control.as_mut() {
                         let _ = control.close_window(id);
                     }
                 }),
-            )
+                // A preview activated by keyboard: its window, as a click
+                // on the compositor's preview picks it.
+                Rc::new(move |id| {
+                    overview::OverviewActions::activate_window(&actions, id);
+                    overview::OverviewActions::close_overview(&actions);
+                }),
+            );
+            overview::OverviewUi::set_previews(&overview_ui, chrome.clone());
+            chrome
         };
         let chrome_apps = apps.clone();
         let shell_rc = shell.clone();
@@ -3742,7 +3765,8 @@ fn build(app: &adw::Application) {
                     pad_osd_service.command_result(id, applied);
                 }
                 // The bar goes see-through and Activities shows as checked
-                // while the overview is open, as GNOME draws them.
+                // while the overview is open, as GNOME draws them; it is a
+                // toggle button (panel.js), pressed while the overview is open.
                 if open {
                     panel_window.add_css_class("overview");
                     activities_button.add_css_class("checked");
@@ -3750,6 +3774,11 @@ fn build(app: &adw::Application) {
                     panel_window.remove_css_class("overview");
                     activities_button.remove_css_class("checked");
                 }
+                activities_button.update_state(&[gtk::accessible::State::Pressed(if open {
+                    gtk::AccessibleTristate::True
+                } else {
+                    gtk::AccessibleTristate::False
+                })]);
                 overview::OverviewUi::set_open(&overview_ui, open);
                 if open != last_open.replace(open) {
                     // Panel focus follows the overview: opening hands the

@@ -360,6 +360,19 @@ pub fn layer_layout(state: &State) -> Vec<(WlSurface, (i32, i32), Layer)> {
     placed
 }
 
+/// Whether a mapped layer surface asked for exclusive keyboard
+/// interactivity.
+fn wants_exclusive_keyboard(surface: &WlSurface) -> bool {
+    compositor::with_states(surface, |states| {
+        states
+            .cached_state
+            .get::<LayerSurfaceCachedState>()
+            .current()
+            .keyboard_interactivity
+            == KeyboardInteractivity::Exclusive
+    })
+}
+
 /// The topmost mapped surface on the top or overlay layer that asked
 /// for exclusive keyboard interactivity: under wlr-layer-shell it gets
 /// the keyboard while mapped (a modal dialog, the unlock prompt).
@@ -369,24 +382,39 @@ pub fn exclusive_keyboard_layer(state: &State) -> Option<WlSurface> {
         .rev()
         .filter(|(_, _, layer)| matches!(layer, Layer::Top | Layer::Overlay))
         .map(|(surface, _, _)| surface)
-        .find(|surface| {
-            smithay::wayland::compositor::with_states(surface, |states| {
-                states
-                    .cached_state
-                    .get::<LayerSurfaceCachedState>()
-                    .current()
-                    .keyboard_interactivity
-                    == smithay::wayland::shell::wlr_layer::KeyboardInteractivity::Exclusive
-            })
-        })
+        .find(wants_exclusive_keyboard)
 }
 
-/// Exclusive popups use their own accelerator mode. The shell's overview also
-/// owns the keyboard exclusively, but retains overview navigation/accelerators.
+/// Exclusive popups use their own accelerator mode. The shell's overview
+/// surfaces also own the keyboard exclusively (the search entry, and the
+/// app grid or window picker under keyboard navigation), but retain
+/// overview navigation/accelerators.
 pub fn exclusive_popup_keyboard_layer(state: &State) -> Option<WlSurface> {
     let surface = exclusive_keyboard_layer(state)?;
-    (state.overview_surface().as_ref() != Some(&surface)).then_some(surface)
+    (state.overview_surface().as_ref() != Some(&surface)
+        && !state.is_overview_keynav_surface(&surface))
+    .then_some(surface)
 }
+
+/// Shell overview surfaces that take the keyboard from the search
+/// surface while they ask for it exclusively: GNOME's keyboard
+/// navigation from the search entry into the app grid or the window
+/// picker's previews (overviewControls.js `vfunc_navigate_focus`).
+const OVERVIEW_KEYNAV_NAMESPACES: [&str; 2] = [
+    tuna_shell_control::APP_GRID_NAMESPACE,
+    tuna_shell_control::PREVIEW_CHROME_NAMESPACE,
+];
+
+/// Every shell overview surface that holds the keyboard while it asks for
+/// it exclusively, first match wins: the app folder dialog (a grid tile
+/// opened by keyboard keeps the keyboard in the folder, as GNOME's
+/// AppFolderDialog grabs key focus) over the keyboard-navigated grid or
+/// window picker. The folder dialog keeps its popup accelerator mode.
+const OVERVIEW_KEYBOARD_PRIORITY: [&str; 3] = [
+    tuna_shell_control::FOLDER_DIALOG_NAMESPACE,
+    tuna_shell_control::APP_GRID_NAMESPACE,
+    tuna_shell_control::PREVIEW_CHROME_NAMESPACE,
+];
 
 /// Whether a press on a layer surface with this keyboard interactivity
 /// gives it the keyboard. wlr-layer-shell: a surface asking for `none`
@@ -497,6 +525,37 @@ impl State {
             .iter()
             .find(|record| record.namespace == OVERVIEW_NAMESPACE)
             .map(|record| record.surface.clone())
+    }
+
+    /// Whether `surface` is a shell overview surface that takes the
+    /// keyboard from the search surface while it asks for it exclusively
+    /// (the app grid, the window previews' chrome).
+    pub fn is_overview_keynav_surface(&self, surface: &WlSurface) -> bool {
+        self.panel_surfaces.iter().any(|record| {
+            &record.surface == surface
+                && OVERVIEW_KEYNAV_NAMESPACES.contains(&record.namespace.as_str())
+        })
+    }
+
+    /// Where the open overview parks the keyboard: the app folder dialog,
+    /// or the app grid or window picker while the shell navigates them by
+    /// keyboard (each asks for exclusive keyboard meanwhile), otherwise
+    /// the search surface. `None` without a mapped search surface.
+    pub fn overview_keyboard_surface(&self) -> Option<WlSurface> {
+        let search = self.overview_surface()?;
+        let placed = layer_layout(self);
+        let keynav = OVERVIEW_KEYBOARD_PRIORITY.iter().find_map(|namespace| {
+            self.panel_surfaces
+                .iter()
+                .filter(|record| record.namespace == *namespace)
+                .map(|record| &record.surface)
+                .find(|surface| {
+                    placed.iter().any(|(mapped, _, _)| mapped == *surface)
+                        && wants_exclusive_keyboard(surface)
+                })
+                .cloned()
+        });
+        Some(keynav.unwrap_or(search))
     }
 
     /// Whether `surface` is the GTK shell's top bar, whose popovers are

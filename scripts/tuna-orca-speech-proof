@@ -1,0 +1,458 @@
+#!/bin/sh
+# tuna-orca-speech-proof — what Orca says on GNOME 51's shell surfaces (P-A11Y-06).
+#
+# Usage:
+#   scripts/tuna-orca-speech-proof [--display :N] [--artifacts DIR]
+#
+# Runs the distribution Orca (50 or later: it uses GNOME's
+# org.freedesktop.a11y.KeyboardMonitor) against a nested session that owns
+# the screen reader (`tuna-compositor --screen-reader`). Speech goes
+# through the real speech-dispatcher, whose generic output module writes
+# each utterance as one UTF-8 line to spoken.log instead of a synthesizer.
+# Real keys (xdotool through the nested window) drive the shell, and every
+# gate asserts the exact lines Orca spoke after its step:
+#   G-ORCA-SPEECH-TOGGLE   Super+Alt+S (gsd's screenreader key) starts Orca
+#                         ("Screen reader on.") with the KeyboardMonitor
+#                         owned; pressed again it stops Orca
+#   G-ORCA-SPEECH-LEARN    Orca's own keys pass through the compositor:
+#                         Insert+H enters learn mode, Insert+T is
+#                         described there, Escape leaves it
+#   G-ORCA-SPEECH-PANEL    Ctrl+Alt+Tab focuses the top bar: Activities is
+#                         a toggle button, Date and Time a menu
+#                         (panelMenu.js's MENU role)
+#   G-ORCA-SPEECH-SEARCH   Super opens the overview on the search entry;
+#                         typing then Down reaches the app result
+#   G-ORCA-SPEECH-PREVIEWS Tab from the entry walks the window previews by
+#                         title, Up returns to the entry, Enter on a
+#                         preview activates its window
+#   G-ORCA-SPEECH-GRID     Tab from the entry on Super+A walks the app grid
+#                         by app name, Up returns to the entry
+#   G-ORCA-SPEECH-QS       Super+S opens quick settings on its buttons, and
+#                         Escape returns to the System menu
+#   G-ORCA-SPEECH-SWITCHER Alt+Tab names each newly selected app and window
+#   G-ORCA-SPEECH-NOTIFY   a new banner is announced with its source, title
+#                         and body; Super+N focuses the banner itself
+#   G-ORCA-SPEECH-LOCK     the lock screen's password field is announced,
+#                         typing it speaks only bullets (no plaintext
+#                         letter or word) and it unlocks through PAM
+#                         (pam_wrapper)
+# Writes assertions.txt for the parity ledger.
+set -eu
+
+if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
+    TUNA_PROOF_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
+fi
+unset CDPATH
+# Speech is logged as UTF-8 text: the password field's bullets included.
+LANG=C.UTF-8
+LC_ALL=C.UTF-8
+export LANG LC_ALL
+ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+DISPLAY_ARG=""
+ARTIFACTS="$ROOT/orca-speech-artifacts"
+WIDTH=1280
+HEIGHT=800
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --display) DISPLAY_ARG="$2"; shift 2 ;;
+        --artifacts) ARTIFACTS="$2"; shift 2 ;;
+        --help|-h) sed -n '2,40p' "$0"; exit 0 ;;
+        *) echo "tuna-orca-speech-proof: unknown argument $1" >&2; exit 1 ;;
+    esac
+done
+mkdir -p "$ARTIFACTS"
+ARTIFACTS="$(cd "$ARTIFACTS" && pwd)"
+LOG="$ARTIFACTS/nested.log"
+ASSERTIONS="$ARTIFACTS/assertions.txt"
+: >"$ASSERTIONS"
+CSTATE="$ARTIFACTS/compositor-state.json"
+SPOKEN="$ARTIFACTS/spoken.log"
+: >"$SPOKEN"
+HOME_PRIV="$ARTIFACTS/home"
+# Keep AF_UNIX socket paths below SUN_LEN even in long CI checkout paths.
+RUN_PRIV="$(mktemp -d /tmp/tuna-orca.XXXXXX)"
+CONF_PRIV="$ARTIFACTS/config"
+DATA_PRIV="$ARTIFACTS/data"
+mkdir -p "$HOME_PRIV" "$RUN_PRIV" "$CONF_PRIV/speech-dispatcher/modules" \
+    "$DATA_PRIV/applications" "$ARTIFACTS/speechd"
+chmod 700 "$RUN_PRIV"
+ORIG_HOME="$HOME"
+TUNA_COMPOSITOR_STATE="$CSTATE"
+XDG_RUNTIME_DIR="$RUN_PRIV"
+HOME="$HOME_PRIV"
+# keyfile (not dconf): GSettings writes stay in the private config dir.
+GSETTINGS_BACKEND=keyfile
+XDG_CONFIG_HOME="$CONF_PRIV"
+XDG_DATA_HOME="$DATA_PRIV"
+export TUNA_COMPOSITOR_STATE XDG_RUNTIME_DIR HOME GSETTINGS_BACKEND XDG_CONFIG_HOME XDG_DATA_HOME
+PY=/usr/bin/python3
+[ -x "$PY" ] || PY=python3
+BIN_DIR="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
+LIB="$ROOT/scripts/lib/tuna-orca-speech.py"
+
+OWNED_XVFB=""
+COMPOSITOR_PID=""
+PROBE_PIDS=""
+cleanup() {
+    for pid in $PROBE_PIDS; do kill "$pid" 2>/dev/null || true; done
+    if [ -n "$COMPOSITOR_PID" ]; then kill "$COMPOSITOR_PID" 2>/dev/null || true; fi
+    if [ -n "$COMPOSITOR_PID" ]; then wait "$COMPOSITOR_PID" 2>/dev/null || true; fi
+    # speech-dispatcher was autospawned on this private bus and runtime dir.
+    if [ -s "$RUN_PRIV/speech-dispatcher/pid/speech-dispatcher.pid" ]; then
+        kill "$(cat "$RUN_PRIV/speech-dispatcher/pid/speech-dispatcher.pid")" 2>/dev/null || true
+    fi
+    if [ -n "$OWNED_XVFB" ]; then kill "$OWNED_XVFB" 2>/dev/null || true; fi
+    rm -rf "$RUN_PRIV"
+}
+trap cleanup EXIT INT TERM
+pass() { echo "$1 pass $2" >>"$ASSERTIONS"; echo "tuna-orca-speech-proof: $1 pass: $2"; }
+fail() {
+    echo "$1 fail $2" >>"$ASSERTIONS"
+    echo "tuna-orca-speech-proof: $1 FAIL: $2" >&2
+    cp "$CSTATE" "$ARTIFACTS/fail-state.json" 2>/dev/null || true
+    tail -20 "$LOG" >&2 || true
+    exit 1
+}
+cstate() {
+    # Query, label, optional timeout (default 20 seconds).
+    end=$(($(date +%s) + ${3:-20}))
+    while [ "$(date +%s)" -le "$end" ]; do
+        if [ -n "$COMPOSITOR_PID" ]; then
+            kill -0 "$COMPOSITOR_PID" 2>/dev/null || return 1
+        fi
+        [ -s "$CSTATE" ] && jq -e "$1" "$CSTATE" >/dev/null 2>&1 && return 0
+        sleep 0.1
+    done
+    echo "tuna-orca-speech-proof: timed out waiting for $2" >&2
+    return 1
+}
+# mark NAME: everything Orca says from here on belongs to step NAME.
+mark() { echo "=== $1" >>"$SPOKEN"; }
+# step NAME KEYS...: mark the step, then press the keys in the nested window.
+step() {
+    name="$1"
+    shift
+    mark "$name"
+    xdotool key --clearmodifiers "$@"
+}
+# said GATE NAME LINE...: Orca said every LINE, in order and exactly, after
+# step NAME (key echo and other speech may come between); 30 s at most.
+said() {
+    gate="$1"
+    name="$2"
+    shift 2
+    "$PY" "$LIB" expect "$SPOKEN" "$name" 30 "$@" >/dev/null 2>"$ARTIFACTS/said.err" ||
+        fail "$gate" "$(tr '\n' ' ' <"$ARTIFACTS/said.err")"
+    # Let the rest of the step's speech land before the next mark.
+    sleep 1
+}
+
+# The lock screen's password goes through a real PAM stack: pam_wrapper
+# serves the compositor's tuna-lock service from a private password file.
+PAM_WRAPPER_LIB=/usr/lib/x86_64-linux-gnu/libpam_wrapper.so
+PAM_MATRIX=/usr/lib/x86_64-linux-gnu/pam_wrapper/pam_matrix.so
+UNLOCK_PASSWORD="tunaspeak"
+if [ ! -e "$PAM_WRAPPER_LIB" ] || [ ! -e "$PAM_MATRIX" ]; then
+    fail G-ORCA-SPEECH-LOCK "pam_wrapper is required (libpam-wrapper)"
+fi
+mkdir -p "$ARTIFACTS/pam/services"
+echo "$(id -un):$UNLOCK_PASSWORD:tuna-lock" >"$ARTIFACTS/pam/passdb"
+printf 'auth required %s passdb=%s\naccount required %s passdb=%s\n' \
+    "$PAM_MATRIX" "$ARTIFACTS/pam/passdb" "$PAM_MATRIX" "$ARTIFACTS/pam/passdb" \
+    >"$ARTIFACTS/pam/services/tuna-lock"
+
+for tool in orca speech-dispatcher xdotool jq; do
+    command -v "$tool" >/dev/null 2>&1 || fail G-ORCA-SPEECH-TOGGLE "$tool is required"
+done
+
+# speech-dispatcher, autospawned by Orca with this configuration: one
+# generic module whose "synthesis" appends the utterance to spoken.log.
+# UTF-8 throughout (sd_generic otherwise recodes to ISO-8859-1, turning
+# the password bullets into '?'); no audio device is needed.
+cat >"$CONF_PRIV/speech-dispatcher/speechd.conf" <<CONF
+LogLevel 3
+LogDir "$ARTIFACTS/speechd"
+AudioOutputMethod "alsa"
+AddModule "tunalog" "sd_generic" "tunalog.conf"
+DefaultModule tunalog
+DefaultLanguage "en"
+CONF
+cat >"$CONF_PRIV/speech-dispatcher/modules/tunalog.conf" <<CONF
+GenericExecuteSynth "printf '%s\\\\n' \\'\$DATA\\' >> $SPOKEN"
+GenericLanguage "en" "en" "UTF-8"
+GenericDefaultCharset "UTF-8"
+AddVoice "en" "MALE1" "tuna"
+DefaultVoice "tuna"
+CONF
+printf 'pcm.!default { type null }\nctl.!default { type null }\n' >"$HOME/.asoundrc"
+
+# Two apps the overview finds, first in the app grid (GNOME's saved
+# app-picker-layout), for hosts with or without gnome-shell's schema.
+for app in "tuna-speech-probe:Speech Probe" "tuna-grid-probe:Grid Probe"; do
+    printf '[Desktop Entry]\nType=Application\nName=%s\nExec=true\nIcon=utilities-terminal\n' \
+        "${app#*:}" >"$DATA_PRIV/applications/${app%%:*}.desktop"
+done
+if ! gsettings list-schemas 2>/dev/null | grep -qx org.gnome.shell; then
+    mkdir -p "$ARTIFACTS/schemas"
+    cat >"$ARTIFACTS/schemas/org.gnome.shell.gschema.xml" <<'XML'
+<schemalist>
+  <schema id="org.gnome.shell" path="/org/gnome/shell/">
+    <key name="favorite-apps" type="as"><default>[]</default></key>
+    <key name="app-picker-layout" type="aa{sv}"><default>[]</default></key>
+  </schema>
+</schemalist>
+XML
+    glib-compile-schemas "$ARTIFACTS/schemas"
+    GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas${GSETTINGS_SCHEMA_DIR:+:$GSETTINGS_SCHEMA_DIR}"
+    export GSETTINGS_SCHEMA_DIR
+fi
+gsettings set org.gnome.shell favorite-apps "[]"
+gsettings set org.gnome.shell app-picker-layout \
+    "[{'tuna-speech-probe.desktop': <{'position': <0>}>, 'tuna-grid-probe.desktop': <{'position': <1>}>}]"
+gsettings set org.gnome.desktop.a11y.applications screen-reader-enabled false
+
+if [ -x /usr/libexec/at-spi-bus-launcher ]; then
+    /usr/libexec/at-spi-bus-launcher --launch-immediately >"$ARTIFACTS/atspi.log" 2>&1 &
+else
+    fail G-ORCA-SPEECH-TOGGLE "the AT-SPI bus launcher is required (at-spi2-core)"
+fi
+[ -n "$DISPLAY_ARG" ] && DISPLAY="$DISPLAY_ARG" && export DISPLAY
+if ! xdotool getdisplaygeometry >/dev/null 2>&1; then
+    Xvfb -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" \
+        3>"$ARTIFACTS/xvfb-display" >"$ARTIFACTS/xvfb.log" 2>&1 &
+    OWNED_XVFB=$!
+    for _ in $(seq 1 30); do [ -s "$ARTIFACTS/xvfb-display" ] && break; sleep 1; done
+    [ -s "$ARTIFACTS/xvfb-display" ] || fail G-ORCA-SPEECH-TOGGLE "Xvfb did not allocate a display"
+    DISPLAY=":$(cat "$ARTIFACTS/xvfb-display")"
+    export DISPLAY
+    for _ in $(seq 1 30); do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 1; done
+fi
+# Orca initialises its AT-SPI device even for --version; without a display
+# it segfaults (atspi_device_x11_init), so ask once one exists.
+orca --version >"$ARTIFACTS/orca-version.txt" 2>&1 || true
+speech-dispatcher --version >"$ARTIFACTS/speechd-version.txt" 2>&1 || true
+
+# The private HOME below hides the real toolchain config; point the
+# build at the invoking user's cargo/rustup homes explicitly.
+RUSTUP_HOME="${RUSTUP_HOME:-$ORIG_HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$ORIG_HOME/.cargo}" \
+    cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-gtk
+{
+    echo "source $(git -C "$ROOT" rev-parse HEAD) $(git -C "$ROOT" status --short | head -c 200)"
+    sha256sum "$BIN_DIR/tuna-compositor" "$BIN_DIR/tuna-shell-gtk"
+} >"$ARTIFACTS/manifest.txt" 2>&1 || fail G-ORCA-SPEECH-TOGGLE "build identity failed"
+SOCKET="tuna-orca-$$"
+# TUNA_LOCK_TRACE: the shell logs the lock prompt's PAM steps (no
+# credentials), so the proof types only once the password is asked for.
+RUST_BACKTRACE=1 TUNA_LOCK_TRACE=1 LD_PRELOAD="$PAM_WRAPPER_LIB" PAM_WRAPPER=1 \
+    PAM_WRAPPER_SERVICE_DIR="$ARTIFACTS/pam/services" \
+    "$BIN_DIR/tuna-compositor" --backend winit --socket "$SOCKET" --screen-reader \
+    --width "$WIDTH" --height "$HEIGHT" --shell-bin "$BIN_DIR/tuna-shell-gtk" >"$LOG" 2>&1 &
+COMPOSITOR_PID=$!
+WID=""
+for _ in $(seq 1 60); do
+    kill -0 "$COMPOSITOR_PID" 2>/dev/null || fail G-ORCA-SPEECH-TOGGLE "compositor exited during startup"
+    WID="$(xdotool search --name Smithay 2>/dev/null | head -1 || true)"
+    [ -n "$WID" ] && break
+    sleep 1
+done
+[ -n "$WID" ] || fail G-ORCA-SPEECH-TOGGLE "no nested window"
+xdotool windowfocus --sync "$WID"
+cstate '.layers | any(.namespace == "tuna-panel" and .rect == [0, 0, 1280, 32])' "panel" 180 ||
+    fail G-ORCA-SPEECH-TOGGLE "the top bar never mapped"
+cstate '.screen_reader_state == "disabled"' "no reader at start" ||
+    fail G-ORCA-SPEECH-TOGGLE "a screen reader ran before Super+Alt+S"
+sleep 2
+
+# ---- G-ORCA-SPEECH-TOGGLE (on)
+step toggle-on super+alt+s
+cstate '.screen_reader_state == "active" and .screen_reader_pid != null and .a11y_keyboard.owner != null' \
+    "Orca owning the KeyboardMonitor" 90 ||
+    fail G-ORCA-SPEECH-TOGGLE "Super+Alt+S did not start Orca with the KeyboardMonitor"
+[ "$(gsettings get org.gnome.desktop.a11y.applications screen-reader-enabled)" = true ] ||
+    fail G-ORCA-SPEECH-TOGGLE "screen-reader-enabled is not set"
+"$PY" "$LIB" expect "$SPOKEN" toggle-on 60 "Screen reader on." >/dev/null 2>"$ARTIFACTS/said.err" ||
+    fail G-ORCA-SPEECH-TOGGLE "$(tr '\n' ' ' <"$ARTIFACTS/said.err")"
+READER_PID="$(jq -r '.screen_reader_pid' "$CSTATE")"
+sleep 3
+
+# ---- G-ORCA-SPEECH-LEARN: Orca's Insert-modified keys reach Orca.
+step learn Insert+h
+said G-ORCA-SPEECH-LEARN learn "Entering learn mode."
+step learn-key Insert+t
+said G-ORCA-SPEECH-LEARN learn-key "Present current time"
+step learn-exit Escape
+said G-ORCA-SPEECH-LEARN learn-exit "Exiting learn mode."
+pass G-ORCA-SPEECH-LEARN "Insert+H: 'Entering learn mode.'; Insert+T: 'Present current time'; Escape: 'Exiting learn mode.' (Orca's keys through GNOME's KeyboardMonitor)"
+
+# Two windows for the previews and the switcher.
+for title in Alpha Beta; do
+    WAYLAND_DISPLAY="$SOCKET" "$PY" "$LIB" window "$title" >"$ARTIFACTS/probe-$title.log" 2>&1 &
+    PROBE_PIDS="$PROBE_PIDS $!"
+    cstate ".windows | any(.app_id == \"org.tuna.Probe$title\")" "window $title" 30 ||
+        fail G-ORCA-SPEECH-PREVIEWS "probe window $title never mapped"
+    sleep 2
+done
+cstate '.focused_app_id == "org.tuna.ProbeBeta"' "Beta focused" ||
+    fail G-ORCA-SPEECH-PREVIEWS "the last window opened is not focused"
+sleep 2
+
+# ---- G-ORCA-SPEECH-PANEL
+step panel ctrl+alt+Tab
+said G-ORCA-SPEECH-PANEL panel "Top Bar" "Activities" "toggle button not pressed."
+step panel-next Right
+said G-ORCA-SPEECH-PANEL panel-next "Date and Time" "menu."
+step panel-leave Escape
+said G-ORCA-SPEECH-PANEL panel-leave "Beta button"
+pass G-ORCA-SPEECH-PANEL "Ctrl+Alt+Tab: 'Top Bar', 'Activities', 'toggle button not pressed.'; Right: 'Date and Time', 'menu.'; Escape back to 'Beta button'"
+
+# ---- G-ORCA-SPEECH-SEARCH
+step search super
+cstate '.overview_open == true' "overview open" ||
+    fail G-ORCA-SPEECH-SEARCH "Super did not open the overview"
+said G-ORCA-SPEECH-SEARCH search "Search" "entry" "Type to search."
+mark search-type
+xdotool type --delay 150 speech
+said G-ORCA-SPEECH-SEARCH search-type s p e e c h
+step search-result Down
+said G-ORCA-SPEECH-SEARCH search-result "Speech Probe" "button."
+step search-close Escape
+cstate '.overview_open == false' "overview closed" ||
+    fail G-ORCA-SPEECH-SEARCH "Escape did not close the overview"
+said G-ORCA-SPEECH-SEARCH search-close "Beta button"
+pass G-ORCA-SPEECH-SEARCH "Super: 'Search', 'entry', 'Type to search.'; typing echoed 's p e e c h'; Down: 'Speech Probe', 'button.'"
+
+# ---- G-ORCA-SPEECH-PREVIEWS
+step previews super
+cstate '.overview_open == true' "overview open" ||
+    fail G-ORCA-SPEECH-PREVIEWS "Super did not open the overview"
+said G-ORCA-SPEECH-PREVIEWS previews "Search" "entry" "Type to search."
+step previews-first Tab
+said G-ORCA-SPEECH-PREVIEWS previews-first "Window Previews" "Alpha" "button."
+step previews-next Right
+said G-ORCA-SPEECH-PREVIEWS previews-next "Beta" "button."
+step previews-back Left
+said G-ORCA-SPEECH-PREVIEWS previews-back "Alpha" "button."
+step previews-up Up
+said G-ORCA-SPEECH-PREVIEWS previews-up "Search" "entry" "Type to search."
+step previews-again Tab
+said G-ORCA-SPEECH-PREVIEWS previews-again "Alpha" "button."
+step previews-activate Return
+cstate '.overview_open == false and .focused_app_id == "org.tuna.ProbeAlpha"' "Alpha activated" ||
+    fail G-ORCA-SPEECH-PREVIEWS "Enter on the Alpha preview did not activate Alpha"
+said G-ORCA-SPEECH-PREVIEWS previews-activate "Alpha button"
+pass G-ORCA-SPEECH-PREVIEWS "Tab: 'Window Previews', 'Alpha', 'button.'; Right: 'Beta', 'button.'; Left: 'Alpha', 'button.'; Up: 'Search', 'entry'; Enter on Alpha activated it ('Alpha button')"
+
+# ---- G-ORCA-SPEECH-GRID
+step grid super+a
+cstate '.overview_open == true and .overview_app_grid == true' "app grid" ||
+    fail G-ORCA-SPEECH-GRID "Super+A did not open the app grid"
+said G-ORCA-SPEECH-GRID grid "Search" "entry" "Type to search."
+step grid-first Tab
+said G-ORCA-SPEECH-GRID grid-first "App Grid" "Speech Probe" "button."
+step grid-next Right
+said G-ORCA-SPEECH-GRID grid-next "Grid Probe" "button."
+step grid-up Up
+said G-ORCA-SPEECH-GRID grid-up "Search" "entry" "Type to search."
+step grid-close Escape
+cstate '.overview_open == false' "overview closed" ||
+    fail G-ORCA-SPEECH-GRID "Escape did not close the overview"
+said G-ORCA-SPEECH-GRID grid-close "Alpha button"
+pass G-ORCA-SPEECH-GRID "Super+A then Tab: 'App Grid', 'Speech Probe', 'button.'; Right: 'Grid Probe', 'button.'; Up: 'Search', 'entry'"
+
+# ---- G-ORCA-SPEECH-QS
+step qs super+s
+said G-ORCA-SPEECH-QS qs "Take Screenshot" "button."
+step qs-next Tab
+said G-ORCA-SPEECH-QS qs-next "Settings" "button."
+step qs-lock Tab
+said G-ORCA-SPEECH-QS qs-lock "Lock Screen" "button."
+step qs-close Escape
+said G-ORCA-SPEECH-QS qs-close "System" "menu."
+pass G-ORCA-SPEECH-QS "Super+S: 'Take Screenshot', 'button.'; Tab: 'Settings', 'button.'; Tab: 'Lock Screen', 'button.'; Escape: 'System', 'menu.'"
+"$PY" "$LIB" expect "$SPOKEN" qs-close 30 "Alpha button" >/dev/null 2>"$ARTIFACTS/said.err" ||
+    fail G-ORCA-SPEECH-QS "the keyboard never returned to Alpha: $(tr '\n' ' ' <"$ARTIFACTS/said.err")"
+sleep 1
+
+# ---- G-ORCA-SPEECH-SWITCHER: Alpha was activated last, so Alt+Tab
+# selects Beta first.
+cstate '.focused_app_id == "org.tuna.ProbeAlpha"' "Alpha focused" ||
+    fail G-ORCA-SPEECH-SWITCHER "Alpha lost the focus before Alt+Tab"
+mark switcher
+xdotool keydown alt key Tab
+said G-ORCA-SPEECH-SWITCHER switcher "org.tuna.ProbeBeta: Beta"
+mark switcher-next
+xdotool key Tab
+said G-ORCA-SPEECH-SWITCHER switcher-next "org.tuna.ProbeAlpha: Alpha"
+xdotool keyup alt
+cstate '.focused_app_id == "org.tuna.ProbeAlpha"' "Alpha chosen" ||
+    fail G-ORCA-SPEECH-SWITCHER "releasing Alt did not focus Alpha"
+pass G-ORCA-SPEECH-SWITCHER "Alt+Tab: 'org.tuna.ProbeBeta: Beta'; Tab: 'org.tuna.ProbeAlpha: Alpha'"
+sleep 2
+
+# ---- G-ORCA-SPEECH-NOTIFY
+mark notify
+WAYLAND_DISPLAY="$SOCKET" notify-send -a "Tuna Proof" "Build finished" "All tests passed" ||
+    fail G-ORCA-SPEECH-NOTIFY "notify-send failed"
+"$PY" "$LIB" expect "$SPOKEN" notify 30 "Notification, Tuna Proof, Build finished, All tests passed" \
+    >/dev/null 2>"$ARTIFACTS/said.err" || fail G-ORCA-SPEECH-NOTIFY "$(tr '\n' ' ' <"$ARTIFACTS/said.err")"
+# Within the banner's four seconds.
+step notify-focus super+n
+said G-ORCA-SPEECH-NOTIFY notify-focus "alert" "Build finished." "All tests passed"
+xdotool key Escape
+pass G-ORCA-SPEECH-NOTIFY "arrival: 'Notification, Tuna Proof, Build finished, All tests passed'; Super+N: 'alert', 'Build finished.', 'All tests passed'"
+sleep 4
+
+# ---- G-ORCA-SPEECH-LOCK
+# The curtain and then its unlock prompt, one step: Orca may name the
+# lock screen as it maps or once the prompt takes the focus.
+step lock super+l
+cstate '.locked == true' "locked" || fail G-ORCA-SPEECH-LOCK "Super+L did not lock the session"
+sleep 2
+xdotool key Return
+said G-ORCA-SPEECH-LOCK lock "Lock Screen" "Password" "password text."
+# PAM's password question reaches the prompt before typing, so no key
+# lands while the entry is still starting its conversation.
+asked=0
+for _ in $(seq 1 100); do
+    grep -q "lock auth query service=password" "$LOG" && { asked=1; break; }
+    sleep 0.2
+done
+[ "$asked" = 1 ] || fail G-ORCA-SPEECH-LOCK "the unlock prompt never asked PAM's password question"
+mark lock-type
+xdotool type --clearmodifiers --delay 200 "$UNLOCK_PASSWORD"
+bullets="$(printf '%s' "$UNLOCK_PASSWORD" | sed 's/./● /g')"
+# shellcheck disable=SC2086
+said G-ORCA-SPEECH-LOCK lock-type $bullets
+"$PY" "$LIB" never "$SPOKEN" lock-type "$UNLOCK_PASSWORD" 2>"$ARTIFACTS/leak.txt" ||
+    fail G-ORCA-SPEECH-LOCK "Orca spoke the password: $(tr '\n' ' ' <"$ARTIFACTS/leak.txt")"
+count="$("$PY" "$LIB" count "$SPOKEN" lock-type "●")"
+[ "$count" -eq "${#UNLOCK_PASSWORD}" ] ||
+    fail G-ORCA-SPEECH-LOCK "$count bullets spoken for a ${#UNLOCK_PASSWORD}-character password"
+step lock-unlock Return
+cstate '.locked == false' "unlocked" 20 ||
+    fail G-ORCA-SPEECH-LOCK "the typed password did not unlock the session"
+"$PY" "$LIB" never "$SPOKEN" lock-unlock "$UNLOCK_PASSWORD" 2>"$ARTIFACTS/leak.txt" ||
+    fail G-ORCA-SPEECH-LOCK "Orca spoke the password on unlock: $(tr '\n' ' ' <"$ARTIFACTS/leak.txt")"
+pass G-ORCA-SPEECH-LOCK "'Lock Screen', 'Password', 'password text.'; typing $count characters spoke '●' $count times and no letter or word of the password; Enter unlocked through PAM"
+sleep 3
+
+# ---- G-ORCA-SPEECH-TOGGLE (off)
+step toggle-off super+alt+s
+cstate '.screen_reader_state == "disabled" and .screen_reader_pid == null' "Orca stopped" 30 ||
+    fail G-ORCA-SPEECH-TOGGLE "Super+Alt+S did not stop Orca"
+# The shell's keyfile write can trail Orca's exit on a loaded runner.
+off=0
+for _ in $(seq 1 50); do
+    [ "$(gsettings get org.gnome.desktop.a11y.applications screen-reader-enabled)" = false ] && { off=1; break; }
+    sleep 0.2
+done
+[ "$off" = 1 ] || fail G-ORCA-SPEECH-TOGGLE "screen-reader-enabled is still set"
+if kill -0 "$READER_PID" 2>/dev/null; then
+    fail G-ORCA-SPEECH-TOGGLE "Orca (pid $READER_PID) outlived Super+Alt+S"
+fi
+pass G-ORCA-SPEECH-TOGGLE "Super+Alt+S started Orca (pid $READER_PID, KeyboardMonitor owned): 'Screen reader on.'; pressed again it set screen-reader-enabled off and Orca exited"
+
+cp "$CSTATE" "$ARTIFACTS/final-state.json"
+grep -qi panicked "$LOG" && fail G-ORCA-SPEECH-NOPANIC "panic in nested log"
+echo "G-ORCA-SPEECH-NOPANIC pass no panic in nested log" >>"$ASSERTIONS"
+echo "tuna-orca-speech-proof: OK, artifacts in $ARTIFACTS"

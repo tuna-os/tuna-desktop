@@ -102,7 +102,7 @@ state records its state observation next to its stills and clips.
 | P-SY-06 | Mutter protocols advertised | `nonvisual` | No adequate capture | no pixels; wayland-info consumer output lives in CI logs |
 | P-SY-07 | End session dialog | stage:quick-settings `nested` + stage:system `nested` | No adequate capture | power menu + dialog stills; real suspend/restart/power-off need Corral |
 | P-SY-05 | Portals capture and sharing | stage:system `partial` | No adequate capture | screenshot-UI still; casts, recordings, consent UI need Corral + CI artifacts |
-| P-A11Y-01 | Screen reader sees shell surfaces | `nonvisual` | No adequate capture | AT-SPI dumps ship in every stage artifact; spoken Orca needs Corral |
+| P-A11Y-01 | Screen reader sees shell surfaces | `nonvisual` | No adequate capture | AT-SPI dumps ship in every stage artifact; spoken Orca is P-A11Y-06's speech proof |
 | P-A11Y-02 | Keyboard equivalent for every pointer action | `nonvisual` | No adequate capture | keymap/journey behavior; no dedicated visual |
 | P-IN-01 | IME composition in GTK apps | stage:input `nested` | No adequate capture | preedit + candidates stills; surrounding-text/cursor-move visuals open |
 | P-IN-02 | Touchpad gestures | `unsupported-in-nested` | No adequate capture | physical touchpad/libinput run needs Corral |
@@ -125,7 +125,7 @@ state records its state observation next to its stills and clips.
 | P-A11Y-03 | Magnifier and on-screen keyboard | `missing-product` | No adequate capture | magnifier applies to captures only (no live on-screen zoom); OSK keys ignored |
 | P-A11Y-04 | Sticky/slow/bounce keys, Mouse Keys, dwell | `missing-product` | No adequate capture | seat-level input policy absent |
 | P-A11Y-05 | Reduced motion, focus visibility, a11y menu | stage:settings-a11y `partial` | No adequate capture | a11y indicator/menu still; motion-preference transition variants unproven |
-| P-A11Y-06 | Orca activation and spoken navigation | `unsupported-in-nested` | No adequate capture | complete spoken Orca journey needs Corral |
+| P-A11Y-06 | Orca activation and spoken navigation | `nonvisual` | No adequate capture | speech has no pixels; the nested speech proof (G-ORCA-SPEECH-*) logs what Orca says, activation on hardware is V-ORCA-ACTIVATION |
 | P-A11Y-07 | Simulated secondary and hover click, click-type chooser | stage:settings-a11y `partial` | No adequate capture | `dwell-chooser` collects the real hover-click chooser; pie-timer intermediate frames and native pointer input remain outside these stills |
 | P-SN-01 | Sound prefs, over-amplification, bell | stage:quick-settings `partial` | No adequate capture | volume OSD captured; overdrive/feedback/audible-visual bell unproven |
 | P-ST-02 | Wellbeing, screen time, breaks | `missing-product` | No adequate capture | no consumer and no history file |
@@ -211,8 +211,8 @@ their ledger rows above:
   `partial`), P-ST-03 (`partial`), P-ST-07/P-ST-09/P-ST-10
   (`unsupported-in-nested`, installed image), P-ST-08 (`partial`),
   P-ST-11 (`nonvisual`).
-- a11y: P-A11Y-01 (`nonvisual`), P-A11Y-05 (`partial`), P-A11Y-06
-  (`unsupported-in-nested`), P-A11Y-03/P-A11Y-04 (`missing-product`).
+- a11y: P-A11Y-01/P-A11Y-06 (`nonvisual`), P-A11Y-05 (`partial`),
+  P-A11Y-03/P-A11Y-04 (`missing-product`).
 - privacy: P-ST-04 (`missing-product`), P-NT-03 (`missing-product`).
 - nightlight: P-DS-01 (tile `nested`, transform `missing-product`).
 - session restore: P-SY-08 (`unproven`).

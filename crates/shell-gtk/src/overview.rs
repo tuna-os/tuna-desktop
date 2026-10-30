@@ -162,6 +162,17 @@ fn fit_tile_label(button: &gtk::Button) {
     button.set_size_request(113, 113);
 }
 
+/// One grid page's tiles (app and folder buttons), in grid order.
+fn page_tiles(pager: &crate::grid_pager::GridPager, page: u32) -> Vec<gtk::Widget> {
+    let Some(flow) = pager.nth_page(page).and_downcast::<gtk::FlowBox>() else {
+        return Vec::new();
+    };
+    (0..)
+        .map_while(|index| flow.child_at_index(index))
+        .filter_map(|child| child.child())
+        .collect()
+}
+
 fn layer_window(app: &gtk::Application, namespace: &str, css: &str) -> gtk::ApplicationWindow {
     let window = gtk::ApplicationWindow::new(app);
     window.add_css_class(css);
@@ -210,6 +221,101 @@ pub struct OverviewUi {
     apps_shown: Cell<bool>,
     /// The grid's fade in and out (animateSwitch).
     grid_fade: Rc<crate::grid_animation::Slot>,
+    /// Which overview surface the keyboard navigates (GNOME's focus chain
+    /// from the search entry into the grid or the window picker).
+    keynav: Cell<Keynav>,
+    /// The window previews' chrome, which the window picker's keyboard
+    /// navigation moves through.
+    previews: RefCell<Option<Rc<crate::preview_chrome::PreviewChrome>>>,
+}
+
+/// Where the overview's keyboard navigation is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Keynav {
+    /// The search entry (or its results) holds the keys.
+    #[default]
+    Search,
+    /// An app grid tile has the focus; the grid holds the keyboard.
+    Grid,
+    /// A window preview has the focus; the chrome holds the keyboard.
+    Previews,
+}
+
+/// One step of keyboard navigation in the paged app grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridStep {
+    /// Focus this tile: (page, index on the page).
+    Tile(u32, u32),
+    /// Back to the search entry (up from the first row, or back from the
+    /// first tile), as GNOME's focus trap keeps the entry in the path.
+    Search,
+    /// Nowhere to go: the focus stays.
+    Stay,
+}
+
+/// GNOME's IconGrid arrow and Tab navigation across pages: `count(page)`
+/// tiles per page, `columns` per row. Right and Tab run on to the next
+/// page's first tile, Left and Shift+Tab back to the previous page's
+/// last; Up from the first row and Shift+Tab from the very first tile
+/// leave for the search entry.
+pub fn grid_step(
+    (page, index): (u32, u32),
+    pages: u32,
+    columns: u32,
+    count: impl Fn(u32) -> u32,
+    key: gtk::gdk::Key,
+) -> GridStep {
+    use gtk::gdk::Key;
+    let here = count(page);
+    match key {
+        Key::Right | Key::KP_Right | Key::Tab | Key::KP_Tab => {
+            if index + 1 < here {
+                GridStep::Tile(page, index + 1)
+            } else if page + 1 < pages && count(page + 1) > 0 {
+                GridStep::Tile(page + 1, 0)
+            } else {
+                GridStep::Stay
+            }
+        }
+        Key::Left | Key::KP_Left | Key::ISO_Left_Tab => {
+            if index > 0 {
+                GridStep::Tile(page, index - 1)
+            } else if page > 0 && count(page - 1) > 0 {
+                GridStep::Tile(page - 1, count(page - 1) - 1)
+            } else if key == Key::ISO_Left_Tab {
+                GridStep::Search
+            } else {
+                GridStep::Stay
+            }
+        }
+        Key::Down | Key::KP_Down => {
+            if index + columns < here {
+                GridStep::Tile(page, index + columns)
+            } else {
+                GridStep::Stay
+            }
+        }
+        Key::Up | Key::KP_Up => {
+            if index >= columns {
+                GridStep::Tile(page, index - columns)
+            } else {
+                GridStep::Search
+            }
+        }
+        _ => GridStep::Stay,
+    }
+}
+
+/// A key that types text: GNOME's search entry intercepts it from
+/// anywhere in the overview and starts a search with it. Space stays
+/// with the focused tile or preview, which it activates.
+pub fn typed_text(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> Option<char> {
+    use gtk::gdk::ModifierType as M;
+    if state.intersects(M::CONTROL_MASK | M::ALT_MASK | M::SUPER_MASK | M::META_MASK) {
+        return None;
+    }
+    key.to_unicode()
+        .filter(|c| !c.is_control() && !c.is_whitespace())
 }
 
 impl OverviewUi {
@@ -307,7 +413,11 @@ impl OverviewUi {
         dash.set_child(Some(&dash_scroll));
 
         // App grid: between search and dash, over the previews.
-        let grid = layer_window(app, "tuna-shell-appgrid", "tuna-overview-grid");
+        let grid = layer_window(
+            app,
+            tuna_shell_control::APP_GRID_NAMESPACE,
+            "tuna-overview-grid",
+        );
         for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
             grid.set_anchor(edge, true);
         }
@@ -350,6 +460,8 @@ impl OverviewUi {
             ),
             apps_shown: Cell::new(false),
             grid_fade: Rc::new(crate::grid_animation::Slot::default()),
+            keynav: Cell::new(Keynav::Search),
+            previews: RefCell::new(None),
         }));
         // A folder setting change applies without waiting for the
         // compositor, which sends nothing while its state is unchanged.
@@ -441,6 +553,217 @@ impl OverviewUi {
                     }
                 }
             });
+        }
+        // GNOME's focus chain out of the search entry (searchController.js,
+        // overviewControls.js `vfunc_navigate_focus`): with no search
+        // running, Tab or Down moves into the window picker's previews or
+        // the app grid, Shift+Tab to their last item. A running search
+        // keeps GTK's own Tab through its results.
+        {
+            let keys = gtk::EventControllerKey::new();
+            keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let weak = Rc::downgrade(ui);
+            keys.connect_key_pressed(move |_, key, _, state| {
+                use gtk::gdk::{Key, ModifierType as M};
+                let Some(ui) = weak.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                if ui.borrow().search_active.get()
+                    || state.intersects(M::CONTROL_MASK | M::ALT_MASK | M::SUPER_MASK)
+                {
+                    return glib::Propagation::Proceed;
+                }
+                let backward = match key {
+                    Key::Tab | Key::KP_Tab | Key::Down | Key::KP_Down => false,
+                    Key::ISO_Left_Tab => true,
+                    _ => return glib::Propagation::Proceed,
+                };
+                if Self::enter_keynav(&ui, backward) {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
+            me.search.add_controller(keys);
+        }
+        // Arrows and Tab walk the grid's tiles across its pages; typing
+        // goes back to search with the typed text.
+        {
+            let keys = gtk::EventControllerKey::new();
+            keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let weak = Rc::downgrade(ui);
+            keys.connect_key_pressed(move |_, key, _, state| {
+                let Some(ui) = weak.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                if ui.borrow().keynav.get() != Keynav::Grid {
+                    return glib::Propagation::Proceed;
+                }
+                if let Some(c) = typed_text(key, state) {
+                    Self::leave_keynav(&ui, Some(c));
+                    return glib::Propagation::Stop;
+                }
+                let step = ui.borrow().grid_step_from_focus(key);
+                match step {
+                    Some(GridStep::Tile(page, index)) => {
+                        ui.borrow().focus_grid_tile(page, index);
+                        glib::Propagation::Stop
+                    }
+                    Some(GridStep::Search) => {
+                        Self::leave_keynav(&ui, None);
+                        glib::Propagation::Stop
+                    }
+                    Some(GridStep::Stay) => glib::Propagation::Stop,
+                    None => glib::Propagation::Proceed,
+                }
+            });
+            me.grid.add_controller(keys);
+        }
+    }
+
+    /// Hand the window picker's keyboard navigation the preview chrome;
+    /// it returns here (to search, with any typed text) when it lets go.
+    pub fn set_previews(ui: &Rc<RefCell<Self>>, chrome: Rc<crate::preview_chrome::PreviewChrome>) {
+        let weak = Rc::downgrade(ui);
+        chrome.set_on_leave(Rc::new(move |typed| {
+            if let Some(ui) = weak.upgrade() {
+                Self::leave_keynav(&ui, typed);
+            }
+        }));
+        *ui.borrow().previews.borrow_mut() = Some(chrome);
+    }
+
+    /// Move the keyboard from the search entry into the app grid (when it
+    /// shows) or the window picker's previews: the first item, or the
+    /// last going `backward`. False when there is nothing to focus.
+    fn enter_keynav(ui: &Rc<RefCell<Self>>, backward: bool) -> bool {
+        let me = ui.borrow();
+        if me.apps_shown.get() {
+            let Some(pager) = me.grid_pager() else {
+                return false;
+            };
+            let page = pager.page();
+            let count = page_tiles(&pager, page).len() as u32;
+            if count == 0 {
+                return false;
+            }
+            me.keynav.set(Keynav::Grid);
+            me.grid.set_keyboard_mode(KeyboardMode::Exclusive);
+            me.grid.set_focus_visible(true);
+            me.focus_grid_tile(page, if backward { count - 1 } else { 0 });
+            return true;
+        }
+        let chrome = me.previews.borrow().clone();
+        match chrome {
+            Some(chrome) if chrome.enter_keynav(backward) => {
+                me.keynav.set(Keynav::Previews);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Give the keyboard back to the search entry, appending `typed` to
+    /// it (GNOME's entry intercepts typing anywhere in the overview).
+    fn leave_keynav(ui: &Rc<RefCell<Self>>, typed: Option<char>) {
+        let me = ui.borrow();
+        me.reset_keynav();
+        if me.open {
+            me.entry.grab_focus();
+            if let Some(c) = typed {
+                let mut text = me.entry.text().to_string();
+                text.push(c);
+                me.entry.set_text(&text);
+                me.entry.set_position(-1);
+            }
+        }
+    }
+
+    /// Drop any grid or preview keyboard navigation: their surfaces stop
+    /// asking for the keyboard, so the compositor parks it on search.
+    fn reset_keynav(&self) {
+        match self.keynav.replace(Keynav::Search) {
+            Keynav::Search => {}
+            Keynav::Grid => self.grid.set_keyboard_mode(KeyboardMode::None),
+            Keynav::Previews => {
+                if let Some(chrome) = self.previews.borrow().as_ref() {
+                    chrome.leave_keynav();
+                }
+            }
+        }
+    }
+
+    /// The app grid's pager, if the grid is built.
+    fn grid_pager(&self) -> Option<crate::grid_pager::GridPager> {
+        let mut pending = vec![self.grid.child()?];
+        while let Some(widget) = pending.pop() {
+            if let Ok(pager) = widget.clone().downcast::<crate::grid_pager::GridPager>() {
+                return Some(pager);
+            }
+            let mut child = widget.first_child();
+            while let Some(next) = child {
+                child = next.next_sibling();
+                pending.push(next);
+            }
+        }
+        None
+    }
+
+    /// Where `key` takes the grid's focus from the focused tile; `None`
+    /// for keys the grid leaves to GTK (Enter, Space, Page Up/Down).
+    fn grid_step_from_focus(&self, key: gtk::gdk::Key) -> Option<GridStep> {
+        use gtk::gdk::Key;
+        if !matches!(
+            key,
+            Key::Left
+                | Key::Right
+                | Key::Up
+                | Key::Down
+                | Key::KP_Left
+                | Key::KP_Right
+                | Key::KP_Up
+                | Key::KP_Down
+                | Key::Tab
+                | Key::KP_Tab
+                | Key::ISO_Left_Tab
+        ) {
+            return None;
+        }
+        let pager = self.grid_pager()?;
+        let page = pager.page();
+        let tiles = page_tiles(&pager, page);
+        let focus = gtk::prelude::GtkWindowExt::focus(&self.grid);
+        let index = tiles
+            .iter()
+            .position(|tile| {
+                focus
+                    .as_ref()
+                    .is_some_and(|f| f.is_ancestor(tile) || f == tile)
+            })
+            .unwrap_or(0) as u32;
+        let columns = pager
+            .nth_page(page)
+            .and_downcast::<gtk::FlowBox>()
+            .map_or(1, |flow| flow.max_children_per_line().max(1));
+        Some(grid_step(
+            (page, index),
+            pager.n_pages(),
+            columns,
+            |page| page_tiles(&pager, page).len() as u32,
+            key,
+        ))
+    }
+
+    /// Focus one grid tile, turning the pager to its page first.
+    fn focus_grid_tile(&self, page: u32, index: u32) {
+        let Some(pager) = self.grid_pager() else {
+            return;
+        };
+        if pager.page() != page {
+            pager.scroll_to(page, true);
+        }
+        if let Some(tile) = page_tiles(&pager, page).get(index as usize) {
+            tile.grab_focus();
         }
     }
 
@@ -1042,6 +1365,13 @@ impl OverviewUi {
             content.set_can_target(old.can_target());
         }
         me.grid.set_child(Some(&content));
+        // A rebuild under keyboard navigation (the app list changed)
+        // keeps the keyboard in the grid, on its first tile.
+        if me.keynav.get() == Keynav::Grid {
+            if let Some(pager) = me.grid_pager() {
+                me.focus_grid_tile(pager.page(), 0);
+            }
+        }
     }
 
     /// Who to tell when the folder dialog shades the overview.
@@ -1172,6 +1502,7 @@ impl OverviewUi {
         } else {
             let me = ui.borrow();
             me.folder_dialog.close_now();
+            me.reset_keynav();
             me.search.set_keyboard_mode(KeyboardMode::None);
             me.search.set_visible(false);
             me.dash.set_visible(false);
@@ -1187,6 +1518,9 @@ impl OverviewUi {
     fn fade_grid(&self, shown: bool) {
         use crate::grid_animation as anim;
         self.apps_shown.set(shown);
+        // Switching between the window picker and the grid starts again
+        // from the search entry.
+        self.reset_keynav();
         let Some(content) = self.grid.child() else {
             self.grid.set_visible(shown);
             return;
@@ -2580,5 +2914,53 @@ mod search_activation_tests {
         });
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
         assert!(actions.events.borrow().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod keynav_tests {
+    use super::{grid_step, typed_text, GridStep};
+    use gtk4::gdk::{Key, ModifierType};
+
+    /// Two pages of a 3-column grid: 7 tiles, then 2.
+    fn step(at: (u32, u32), key: Key) -> GridStep {
+        grid_step(at, 2, 3, |page| [7, 2][page as usize], key)
+    }
+
+    #[test]
+    fn arrows_and_tab_walk_the_grid_across_pages_like_gnome() {
+        assert_eq!(step((0, 0), Key::Right), GridStep::Tile(0, 1));
+        assert_eq!(step((0, 1), Key::Tab), GridStep::Tile(0, 2));
+        assert_eq!(step((0, 1), Key::Down), GridStep::Tile(0, 4));
+        assert_eq!(step((0, 4), Key::Up), GridStep::Tile(0, 1));
+        // The short last row: nothing below, the focus stays.
+        assert_eq!(step((0, 5), Key::Down), GridStep::Stay);
+        // Off a page's last tile onto the next page's first, and back.
+        assert_eq!(step((0, 6), Key::Right), GridStep::Tile(1, 0));
+        assert_eq!(step((1, 0), Key::Left), GridStep::Tile(0, 6));
+        assert_eq!(step((1, 0), Key::ISO_Left_Tab), GridStep::Tile(0, 6));
+        assert_eq!(step((1, 1), Key::Tab), GridStep::Stay);
+        assert_eq!(step((0, 0), Key::Left), GridStep::Stay);
+    }
+
+    #[test]
+    fn the_search_entry_is_up_from_the_first_row_and_back_from_the_first_tile() {
+        assert_eq!(step((0, 2), Key::Up), GridStep::Search);
+        assert_eq!(step((1, 1), Key::Up), GridStep::Search);
+        assert_eq!(step((0, 0), Key::ISO_Left_Tab), GridStep::Search);
+        // Keys the grid leaves alone.
+        assert_eq!(step((0, 0), Key::Return), GridStep::Stay);
+    }
+
+    #[test]
+    fn printable_keys_type_into_search_but_space_and_shortcuts_do_not() {
+        let none = ModifierType::empty();
+        assert_eq!(typed_text(Key::a, none), Some('a'));
+        assert_eq!(typed_text(Key::A, ModifierType::SHIFT_MASK), Some('A'));
+        assert_eq!(typed_text(Key::space, none), None);
+        assert_eq!(typed_text(Key::Tab, none), None);
+        assert_eq!(typed_text(Key::Return, none), None);
+        assert_eq!(typed_text(Key::a, ModifierType::CONTROL_MASK), None);
+        assert_eq!(typed_text(Key::a, ModifierType::ALT_MASK), None);
     }
 }

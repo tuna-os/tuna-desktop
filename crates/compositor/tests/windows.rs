@@ -1860,6 +1860,124 @@ fn overview_parks_keyboard_focus_and_restores_on_dismiss() {
     assert_eq!(f.manager.model().focused(), Some(f.id_a));
 }
 
+/// One shell layer surface on its own client, committed and configured.
+fn shell_layer(
+    comp: &mut TestCompositor,
+    namespace: &str,
+    keyboard: KeyboardInteractivity,
+) -> (
+    Connection,
+    EventQueue<Client>,
+    Client,
+    WlSurface,
+    ZwlrLayerSurfaceV1,
+) {
+    let (conn, mut queue, mut client) = connect(comp);
+    let qh = queue.handle();
+    let surface = client.compositor.as_ref().unwrap().create_surface(&qh, ());
+    let layer = client.layer_shell.as_ref().unwrap().get_layer_surface(
+        &surface,
+        None,
+        Layer::Top,
+        namespace.to_owned(),
+        &qh,
+        (),
+    );
+    layer.set_size(0, 200);
+    layer.set_anchor(Anchor::Top | Anchor::Left | Anchor::Right);
+    layer.set_keyboard_interactivity(keyboard);
+    for _ in 0..2 {
+        surface.commit();
+        client.synced = false;
+        conn.display().sync(&qh, ());
+        pump(comp, &mut queue, &mut client, |c| c.synced);
+    }
+    (conn, queue, client, surface, layer)
+}
+
+/// Commit a new keyboard interactivity and let the server see it.
+fn set_layer_keyboard(
+    comp: &mut TestCompositor,
+    conn: &Connection,
+    queue: &mut EventQueue<Client>,
+    client: &mut Client,
+    (surface, layer): (&WlSurface, &ZwlrLayerSurfaceV1),
+    keyboard: KeyboardInteractivity,
+) {
+    layer.set_keyboard_interactivity(keyboard);
+    surface.commit();
+    client.synced = false;
+    conn.display().sync(&queue.handle(), ());
+    pump(comp, queue, client, |c| c.synced);
+}
+
+#[test]
+fn overview_keyboard_moves_into_the_app_grid_and_back_to_search() {
+    use tuna_shell_control::APP_GRID_NAMESPACE;
+    let mut f = two_windows();
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    let (_conn_s, mut queue_s, mut search, _search_surface, _search_layer) = shell_layer(
+        &mut f.comp,
+        OVERVIEW_NAMESPACE,
+        KeyboardInteractivity::Exclusive,
+    );
+    let (conn_g, mut queue_g, mut grid, grid_surface, grid_layer) =
+        shell_layer(&mut f.comp, APP_GRID_NAMESPACE, KeyboardInteractivity::None);
+    f.manager.set_overview_open(true);
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(f.manager.overview_focus_held());
+
+    // GNOME's Tab from the search entry into the grid: the shell asks for
+    // the grid's keyboard and the park follows, still the overview's
+    // (overview accelerators, no popup mode, the window restored on close
+    // unchanged).
+    set_layer_keyboard(
+        &mut f.comp,
+        &conn_g,
+        &mut queue_g,
+        &mut grid,
+        (&grid_surface, &grid_layer),
+        KeyboardInteractivity::Exclusive,
+    );
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(f.manager.overview_focus_held());
+    assert!(tuna_compositor::layer::exclusive_popup_keyboard_layer(&f.comp.state).is_none());
+    search.keys.clear();
+    grid.keys.clear();
+    press(&mut f.manager, &mut f.comp, KEY_A);
+    release(&mut f.manager, &mut f.comp, KEY_A);
+    pump(&mut f.comp, &mut queue_g, &mut grid, |c| c.keys.len() >= 2);
+    pump(&mut f.comp, &mut queue_s, &mut search, |_| true);
+    assert_eq!(grid.keys, vec![(KEY_A, true), (KEY_A, false)]);
+    assert!(search.keys.is_empty(), "the grid's keys leaked to search");
+
+    // Letting go hands the keyboard back to the search entry.
+    set_layer_keyboard(
+        &mut f.comp,
+        &conn_g,
+        &mut queue_g,
+        &mut grid,
+        (&grid_surface, &grid_layer),
+        KeyboardInteractivity::None,
+    );
+    f.manager.reconcile(&mut f.comp.state);
+    grid.keys.clear();
+    press(&mut f.manager, &mut f.comp, KEY_A);
+    release(&mut f.manager, &mut f.comp, KEY_A);
+    pump(&mut f.comp, &mut queue_s, &mut search, |c| {
+        c.keys.len() >= 2
+    });
+    pump(&mut f.comp, &mut queue_g, &mut grid, |_| true);
+    assert_eq!(search.keys, vec![(KEY_A, true), (KEY_A, false)]);
+    assert!(grid.keys.is_empty(), "search's keys leaked to the grid");
+
+    // Closing restores the window focused before the overview.
+    f.manager.set_overview_open(false);
+    f.manager.reconcile(&mut f.comp.state);
+    assert!(!f.manager.overview_focus_held());
+    assert_eq!(f.manager.model().focused(), Some(f.id_a));
+}
+
 #[test]
 fn fresh_session_defaults_to_gnome_mode() {
     let f = two_windows();

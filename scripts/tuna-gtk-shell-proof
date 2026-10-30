@@ -627,6 +627,12 @@ hidden() {
     jq -e --arg n "$2" 'any(.[]; .name == $n and .showing) | not' "$1" >/dev/null
 }
 
+# A showing push button named NAME: quick settings' "Lock Screen" shares
+# its name with the lock surfaces' frames (GNOME's name for both).
+button_showing() {
+    jq -e --arg n "$2" 'any(.[]; .name == $n and .showing and (.role == "push button" or .role == "button"))' "$1" >/dev/null
+}
+
 focused() {
     jq -e --arg n "$2" 'any(.[]; .name == $n and .focused)' "$1" >/dev/null
 }
@@ -1385,10 +1391,15 @@ if showing "$ARTIFACTS/a11y-battery.json" '82%'; then
 fi
 pass G-BATTERY "UPower hotplug, charging/discharging and percentage setting update live"
 
-for label in "Wired" "Dark Style" "Do Not Disturb" "Volume" "Lock"; do
+for label in "Wired" "Dark Style" "Do Not Disturb" "Volume"; do
     showing "$ARTIFACTS/a11y-qs.json" "$label" ||
         fail A11Y-QS "no showing accessible control named '$label'"
 done
+# The comparison slice runs old binaries that predate GNOME's name.
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then
+    button_showing "$ARTIFACTS/a11y-qs.json" "Lock Screen" ||
+        fail A11Y-QS "no showing button named 'Lock Screen'"
+fi
 pass A11Y-QS "quick-settings toggles, slider, and lock exposed"
 
 xdotool key Escape
@@ -9843,7 +9854,8 @@ fi
 pass G-POWER-SAVE-MODE "gsd idle sequence: Shell.Brightness dim, DisplayConfig PowerSaveMode 3 stops scanout (-1 ignored), 0 repaints, live idle restore and undim restore baseline; nested, no CRTC off"
 rm -rf "$ARTIFACTS/backlight/aaa-other"
 pass G-MONITOR-BRIGHTNESS-KEYS "bound monitor up/down/cycle change only the connector under the pointer; cycle wraps"
-# A rebound notification key focuses the active banner's real button.
+# A rebound notification key focuses the active banner itself, as GNOME's
+# FocusGrabber navigates into the focusable message before its buttons.
 # The earlier DND proof intentionally leaves banners disabled. Restore
 # them through the actual quick-settings control before testing focus.
 if [ "$(gsettings get org.gnome.desktop.notifications show-banners)" = false ]; then
@@ -9869,7 +9881,7 @@ showing "$ARTIFACTS/a11y-notification-focus-before.json" "Focus Proof Banner" ||
 fkey_tap Super_L ffc3 || fail G-NOTIFICATION-FOCUS-KEY "Super+F6 tap failed"
 sleep 0.5
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-notification-focus.json" 20 || fail G-NOTIFICATION-FOCUS-KEY "a11y dump failed"
-jq -e '.[] | select(.showing and .focused and .name == "Close")' "$ARTIFACTS/a11y-notification-focus.json" >/dev/null || fail G-NOTIFICATION-FOCUS-KEY "banner's Close button did not get keyboard focus"
+jq -e '.[] | select(.showing and .focused and .name == "Focus Proof Banner")' "$ARTIFACTS/a11y-notification-focus.json" >/dev/null || fail G-NOTIFICATION-FOCUS-KEY "the banner did not get keyboard focus"
 xdotool key Escape
 gsettings reset org.gnome.shell.keybindings focus-active-notification
 pass G-NOTIFICATION-FOCUS-KEY "the rebound key focuses the active banner; Escape restores client input"
@@ -10054,7 +10066,7 @@ cstate '(.lock_screen_allowed | not) and .idle_timeout_ms > 1e18 and (.locked | 
 open_qs
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-lockdown-lock.json" 20 ||
     fail G-LOCKDOWN-LOCK "accessibility dump failed"
-hidden "$ARTIFACTS/a11y-lockdown-lock.json" "Lock" ||
+! button_showing "$ARTIFACTS/a11y-lockdown-lock.json" "Lock Screen" ||
     fail G-LOCKDOWN-LOCK "the Lock button still shows with disable-lock-screen"
 showing "$ARTIFACTS/a11y-lockdown-lock.json" "Power Off Menu" ||
     fail G-LOCKDOWN-LOCK "quick settings did not open for the Lock check"
@@ -10076,7 +10088,7 @@ cstate '.lock_screen_allowed and .idle_timeout_ms < 1e18 and (.locked | not)' "l
 open_qs
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-lockdown-lock-restored.json" 20 ||
     fail G-LOCKDOWN-LOCK "accessibility dump failed"
-showing "$ARTIFACTS/a11y-lockdown-lock-restored.json" "Lock" ||
+button_showing "$ARTIFACTS/a11y-lockdown-lock-restored.json" "Lock Screen" ||
     fail G-LOCKDOWN-LOCK "the Lock button did not return"
 open_qs
 pass G-LOCKDOWN-LOCK "disable-lock-screen turns the idle lock and compositor Lock off, hides Lock, refuses Super+L and ScreenSaver.Lock without locking, and restores"

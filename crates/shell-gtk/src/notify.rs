@@ -419,9 +419,13 @@ type DndListener = Box<dyn Fn(bool)>;
 /// One notification as GNOME 51 draws it (messageList.js
 /// NotificationMessage): a header with the source icon, app name, time
 /// and close button, then the title and body. Returns the card and its
-/// close button.
+/// close button. Banner and list cards alike carry GNOME's message role
+/// (`Atk.Role.NOTIFICATION`, GTK's alert).
 fn card(n: &Notification) -> (gtk::Box, gtk::Button) {
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .accessible_role(gtk::AccessibleRole::Alert)
+        .build();
     card.add_css_class("message");
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     header.add_css_class("message-header");
@@ -471,7 +475,24 @@ fn card(n: &Notification) -> (gtk::Box, gtk::Button) {
     }
     card.append(&content);
     card.update_property(&[gtk::accessible::Property::Label(n.summary())]);
+    if !n.body().is_empty() {
+        card.update_property(&[gtk::accessible::Property::Description(n.body())]);
+    }
     (card, close)
+}
+
+/// What a screen reader says when a banner arrives. GNOME's banner is an
+/// ATK `NOTIFICATION` (messageList.js), which Orca presents on showing as
+/// its role name, then the message's labels: source, title and body.
+pub fn announcement(source: &str, summary: &str, body: &str) -> String {
+    let mut text = String::from("Notification");
+    for part in [source, summary, body] {
+        if !part.is_empty() {
+            text.push_str(", ");
+            text.push_str(part);
+        }
+    }
+    text
 }
 
 /// A notification's source name and icon: the app's own when its
@@ -811,7 +832,9 @@ impl NotifyUi {
         self.dnd_changed.borrow_mut().push(Box::new(f));
     }
 
-    /// GNOME's Super+N gives the current banner keyboard focus.
+    /// GNOME's Super+N gives the current banner keyboard focus: the
+    /// banner itself (messageList.js's focusable message), not its first
+    /// button.
     pub fn focus_active(&self) {
         if !self.banner_window.is_visible() {
             return;
@@ -820,7 +843,9 @@ impl NotifyUi {
             .set_keyboard_mode(KeyboardMode::Exclusive);
         self.banner_window.present();
         self.banner_window.set_focus_visible(true);
-        self.banner_box.child_focus(gtk::DirectionType::TabForward);
+        if let Some(banner) = self.banner_box.first_child() {
+            banner.grab_focus();
+        }
     }
 
     /// A locked session must not keep the banner's exclusive keyboard grab.
@@ -1077,11 +1102,10 @@ impl NotifyUi {
                 .collect();
             let step = tray_step(self.tray.get(), self.showing.get(), &queue);
             let card = match step {
-                TrayStep::Show(id) => center
-                    .banners()
-                    .into_iter()
-                    .find(|n| n.id == id)
-                    .map(|n| self.banner_card(n)),
+                TrayStep::Show(id) => center.banners().into_iter().find(|n| n.id == id).map(|n| {
+                    let spoken = announcement(&source_of(n).0, n.summary(), n.body());
+                    (self.banner_card(n), spoken)
+                }),
                 _ => None,
             };
             if let TrayStep::Show(id) = step {
@@ -1091,7 +1115,7 @@ impl NotifyUi {
             (step, card)
         };
         match (step, card) {
-            (TrayStep::Show(id), Some(card)) => {
+            (TrayStep::Show(id), Some((card, spoken))) => {
                 while let Some(child) = self.banner_box.first_child() {
                     self.banner_box.remove(&child);
                 }
@@ -1102,6 +1126,9 @@ impl NotifyUi {
                 }
                 *self.timer.borrow_mut() = None;
                 self.enter_banner(again);
+                if !again {
+                    crate::accessibility::announce(&self.banner_window, &spoken);
+                }
             }
             (TrayStep::Hide, _) => {
                 // GNOME slides out only an expired banner; a dismissed
@@ -1154,10 +1181,13 @@ impl NotifyUi {
                 me.refresh();
             });
         }
-        let click = gtk::GestureClick::new();
-        {
+        // GNOME's banner is a focusable button (messageList.js): the
+        // focus-active-notification key lands on it, and Enter or Space
+        // does what a click does.
+        c.set_focusable(true);
+        let activate: Rc<dyn Fn()> = {
             let (me, id) = (self.clone(), n.id);
-            click.connect_released(move |_, _, _, _| {
+            Rc::new(move || {
                 let bus = me.bus.borrow();
                 let _ = if has_default {
                     bus.invoke_action(id as u32, "default")
@@ -1167,9 +1197,28 @@ impl NotifyUi {
                 drop(bus);
                 me.retire_local_actions(id);
                 me.refresh();
-            });
+            })
+        };
+        let click = gtk::GestureClick::new();
+        {
+            let activate = activate.clone();
+            click.connect_released(move |_, _, _, _| activate());
         }
         c.add_controller(click);
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(move |keys, key, _, _| {
+            use gtk::gdk::Key;
+            // Only the card's own focus: its buttons handle their keys.
+            let on_card = keys.widget().is_some_and(|card| card.has_focus());
+            match key {
+                Key::Return | Key::KP_Enter | Key::space if on_card => {
+                    activate();
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        c.add_controller(keys);
         c
     }
 
@@ -1471,6 +1520,18 @@ impl NotifyUi {
 #[cfg(test)]
 mod group_tests {
     use super::*;
+
+    #[test]
+    fn banner_announcement_is_role_then_source_title_and_body() {
+        assert_eq!(
+            announcement("Tuna Proof", "Build finished", "All tests passed"),
+            "Notification, Tuna Proof, Build finished, All tests passed"
+        );
+        assert_eq!(
+            announcement("Tuna Proof", "Build finished", ""),
+            "Notification, Tuna Proof, Build finished"
+        );
+    }
 
     #[test]
     fn notifications_group_per_app_newest_first() {
