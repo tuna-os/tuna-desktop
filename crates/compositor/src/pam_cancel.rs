@@ -11,7 +11,7 @@ struct State {
 }
 
 /// Clone this exact latch into the runtime worker, ticket and admitted job.
-/// An unbound greetd latch cannot initialize a PAM backend or choose a helper.
+/// An unbound latch cannot initialize a PAM backend or choose a helper.
 #[derive(Clone, Default)]
 pub struct Cancellation(Arc<State>);
 impl Cancellation {

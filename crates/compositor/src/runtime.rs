@@ -217,8 +217,8 @@ pub struct NestedSession {
 /// Which display backend a session runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendChoice {
-    /// Hardware when no host display exists (started from a TTY by
-    /// greetd), nested otherwise.
+    /// Hardware when no host display exists (started by the display
+    /// manager or from a TTY), nested otherwise.
     Auto,
     /// Nested window inside a host Wayland/X11 session.
     Winit,
@@ -1686,12 +1686,11 @@ impl Runtime {
         self.overlay.show(Vec::new());
     }
 
-    /// Attempt unlock against the live daemon: verify `password` for
-    /// `user` through the greeter login path and clear the lock on
-    /// success (see [`crate::unlock`]). No socket configured or no
-    /// daemon reachable fails closed — the session stays locked and
-    /// silent; auth is never invented. Returns whether the session is
-    /// unlocked afterwards.
+    /// Attempt unlock through PAM: verify `password` for `user` against
+    /// the `tuna-lock` service and clear the lock on success (see
+    /// [`crate::unlock`]). No PAM backend or an unreachable helper fails
+    /// closed — the session stays locked and silent; auth is never
+    /// invented. Returns whether the session is unlocked afterwards.
     pub fn try_unlock(&mut self, user: &str, password: &str) -> bool {
         use crate::pam_backend::{Initial, Verification};
         if !self.is_locked() {
@@ -1704,13 +1703,6 @@ impl Runtime {
         let Some(attempt) = self.unlock_slot.begin(None, epoch) else {
             return false;
         };
-        // A configured greetd path never falls back to PAM.
-        if let Some(path) = crate::unlock::greetd_socket_path() {
-            let ok = crate::unlock::verify_greetd(&path, user, password);
-            return self.unlock_slot.retire(attempt)
-                && ok
-                && self.apply_verified_unlock(attempt.epoch);
-        }
         let cancel = crate::pam_cancel::Cancellation::default();
         let ticket = crate::pam_backend::Backend::live()
             .ok_or(Verification::RejectedBeforeSpawn)

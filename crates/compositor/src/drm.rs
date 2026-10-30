@@ -1,8 +1,8 @@
 //! DRM/KMS hardware session backend (#52).
 //!
 //! The nested winit backend draws into a window of a host session; this
-//! backend owns the display hardware itself, so Tuna Desktop can start from a
-//! TTY through greetd:
+//! backend owns the display hardware itself, so Tuna Desktop can start as a
+//! display-manager (GDM) session or from a TTY:
 //!
 //! - **Session**: libseat (logind or seatd) grants device access and
 //!   reports VT pause/activate. Ctrl+Alt+F1..F12 switches VTs.

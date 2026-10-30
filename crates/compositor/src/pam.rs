@@ -1,24 +1,21 @@
 //! Lock-screen authentication through PAM (#62, the 004 gate).
 //!
-//! Under GDM (TunaOS Marlin's login manager) no greetd socket exists,
-//! so the greetd unlock path alone would leave a locked session locked
-//! for good. This is the other path, the one swaylock uses: a PAM
-//! transaction for the session's own user against the `tuna-lock`
-//! service (`/etc/pam.d/tuna-lock`, shipped with the package, which
-//! includes `login`). Checking one's own password needs no privilege:
-//! pam_unix hands it to its setuid helper.
+//! The lock screen verifies the session's own user the way swaylock does:
+//! a PAM transaction against the `tuna-lock` service (`/etc/pam.d/tuna-lock`,
+//! shipped with the package, which includes `login`). Checking one's own
+//! password needs no privilege: pam_unix hands it to its setuid helper.
 //!
 //! libpam is loaded at run time, so builds need no PAM headers and a
-//! system without libpam fails closed. [`PamClient`] answers the same
-//! [`UnlockClient`](crate::unlock::UnlockClient) seam as greetd, so the
-//! prompt flow and its silent-failure rules stay in one place. The
-//! transaction runs in a private helper owned by a stable creator thread. A
-//! deadline denies without releasing a still-live or quarantined helper.
+//! system without libpam fails closed. [`PamClient`] answers the
+//! [`UnlockClient`](crate::unlock::UnlockClient) seam, so the prompt flow
+//! and its silent-failure rules stay in one place. The transaction runs
+//! in a private helper owned by a stable creator thread. A deadline denies
+//! without releasing a still-live or quarantined helper.
 
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::time::Duration;
 
-use greetd_ipc::{codec::Error as CodecError, AuthMessageType, ErrorType, Response};
+use crate::unlock::{AuthReply, Unreachable};
 
 /// PAM service the lock screen authenticates against.
 pub const DEFAULT_SERVICE: &str = "tuna-lock";
@@ -81,6 +78,29 @@ impl Drop for Secrets {
     }
 }
 
+/// True when `text` asks for a fingerprint rather than a typed secret
+/// (#366): unlock must never answer it with the typed password.
+///
+/// Matches fprintd's `pam/fingerprint-strings.h` English source strings
+/// ("Place your finger on the fingerprint reader", "Swipe your finger
+/// across ...", "Swipe your finger again", "Swipe was too short, try
+/// again", per-finger variants) plus the generic "fingerprint"/"fprint"
+/// words. A bare "swipe" counts on its own: typed secrets are never
+/// swiped. Localized strings do not match; that gap is recorded, not
+/// guessed at.
+pub fn is_fingerprint_prompt(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    if lower.contains("fingerprint") || lower.contains("fprint") || lower.contains("swipe") {
+        return true;
+    }
+    if !lower.contains("finger") {
+        return false;
+    }
+    ["place", "scan", "reader", "touch", "sensor"]
+        .iter()
+        .any(|word| lower.contains(word))
+}
+
 /// True when a PAM message's text asks for a fingerprint rather than
 /// a typed secret (#366). A null or undecodable message is not one:
 /// the historical single-password behavior answers those unchanged.
@@ -90,7 +110,7 @@ unsafe fn message_asks_fingerprint(message: *const PamMessage) -> bool {
         return false;
     }
     let text = std::ffi::CStr::from_ptr(text).to_string_lossy();
-    tuna_greeter::model::is_fingerprint_prompt(&text)
+    is_fingerprint_prompt(&text)
 }
 
 /// The PAM conversation: the password for hidden prompts, the user name
@@ -232,8 +252,8 @@ pub fn service() -> String {
         .unwrap_or_else(|| DEFAULT_SERVICE.to_owned())
 }
 
-/// [`UnlockClient`](crate::unlock::UnlockClient) over PAM, speaking the
-/// greetd shapes: one hidden prompt, then success or a generic failure.
+/// [`UnlockClient`](crate::unlock::UnlockClient) over PAM: one hidden
+/// prompt, then acceptance or a generic refusal.
 pub struct PamClient {
     service: String,
     user: Option<String>,
@@ -260,21 +280,18 @@ impl PamClient {
 }
 
 impl crate::unlock::UnlockClient for PamClient {
-    fn create_session(&mut self, user: &str) -> Result<Response, CodecError> {
+    fn begin(&mut self, user: &str) -> Result<AuthReply, Unreachable> {
         self.user = Some(user.to_owned());
-        Ok(Response::AuthMessage {
-            auth_message_type: AuthMessageType::Secret,
-            auth_message: "Password:".to_owned(),
+        Ok(AuthReply::Prompt {
+            text: "Password:".to_owned(),
+            secret: true,
         })
     }
 
-    fn answer(&mut self, text: Option<String>) -> Result<Response, CodecError> {
+    fn answer(&mut self, text: Option<String>) -> Result<AuthReply, Unreachable> {
         let password = text.map(crate::pam_backend::Credential::from_string);
         let (Some(user), Some(password)) = (self.user.as_deref(), password) else {
-            return Ok(Response::Error {
-                error_type: ErrorType::AuthError,
-                description: String::new(),
-            });
+            return Ok(AuthReply::Refused);
         };
         let accepted = self.backend.as_ref().and_then(|backend| {
             backend.begin_credential(self.service.clone(), user.to_owned(), password,
@@ -282,19 +299,15 @@ impl crate::unlock::UnlockClient for PamClient {
         }).is_some_and(|mut ticket| {
             matches!(ticket.initial(), crate::pam_backend::Initial::Finished(result) if result.authenticated())
         });
-        if accepted {
-            Ok(Response::Success)
+        Ok(if accepted {
+            AuthReply::Accepted
         } else {
-            Ok(Response::Error {
-                error_type: ErrorType::AuthError,
-                description: String::new(),
-            })
-        }
+            AuthReply::Refused
+        })
     }
 
-    fn cancel(&mut self) -> Result<(), CodecError> {
+    fn cancel(&mut self) {
         self.user = None;
-        Ok(())
     }
 }
 
@@ -420,6 +433,35 @@ mod tests {
             let (rc, reply) = run_once(style, Some("Place your finger on the fingerprint reader"));
             assert_eq!(rc, PAM_SUCCESS);
             assert_eq!(reply, None);
+        }
+    }
+
+    #[test]
+    fn fingerprint_prompts_are_flagged() {
+        for text in [
+            "Place your finger on the fingerprint reader",
+            "Swipe your finger across the fingerprint reader",
+            "Swipe your right index finger across the fingerprint reader",
+            "Place your left thumb on the fingerprint reader",
+            "Swipe your finger again",
+            "Place your finger on the reader again",
+            "Swipe was too short, try again",
+            "Verify fingerprint:",
+        ] {
+            assert!(is_fingerprint_prompt(text), "missed: {text}");
+        }
+    }
+
+    #[test]
+    fn password_and_pin_prompts_are_not_fingerprints() {
+        for text in [
+            "Password:",
+            "PIN:",
+            "Token:",
+            "Username:",
+            "Verification code:",
+        ] {
+            assert!(!is_fingerprint_prompt(text), "false hit: {text}");
         }
     }
 }

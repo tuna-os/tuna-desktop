@@ -237,7 +237,7 @@ receipt = {
     'scope': 'nested winit session on Xvfb; PAM via pam_wrapper (pam_matrix + tuna-pam-otp), '
              'fprintd via a D-Bus mock on a private bus; real compositor, shell, GTK widgets, '
              'X11 input and AT-SPI',
-    'not_covered': ['greetd-launched sessions (legacy single-password fallback)',
+    'not_covered': ['the legacy single-password fallback (password service Unavailable)',
                     'real fprintd/libfprint hardware and polkit',
                     'installed PAM stacks (pam_unix, pam_fprintd, OTP modules)',
                     'smartcard and web login'],

@@ -17,7 +17,7 @@
 //! `verify-match`, `verify-no-match`, the `verify-retry-*` reasons,
 //! `verify-unknown-error` or `verify-disconnected`. Prompt wording
 //! matches fprintd's `pam/fingerprint-strings.h` English source
-//! strings (see [`tuna_greeter::model::is_fingerprint_prompt`]).
+//! strings (see [`crate::pam::is_fingerprint_prompt`]).
 //!
 //! Failure rules: no daemon, no device, no enrolled prints, a denied
 //! PolicyKit check, a dropped connection or a timeout all fail closed

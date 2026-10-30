@@ -1,9 +1,20 @@
 //! Owned CI driver: controlled epoch injection, never a logind/S3 proof.
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::{Duration, Instant};
 use tuna_compositor::runtime::{run_auth_owner_probe, NestedSession};
 
-fn main() {
+fn main() -> ExitCode {
+    // The private PAM helper re-executes this held image, exactly like the
+    // compositor binary: never initialize a display there.
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(tuna_compositor::pam_helper::FLAG))
+    {
+        if std::env::args_os().count() != 2 {
+            return ExitCode::FAILURE;
+        }
+        return tuna_compositor::pam_helper::entry();
+    }
     let root = PathBuf::from(std::env::var_os("TUNA_AUTH_OWNER_ROOT").expect("owned fixture root"));
     let mut session = NestedSession::default_for_pid();
     session.shell_bin = Some(
@@ -60,7 +71,7 @@ fn main() {
                 root.join("sync-result.tmp"),
                 serde_json::to_vec(&serde_json::json!({
                     "applied":applied,"before":before.epoch,"after":after.epoch,
-                    "scope":"real public Runtime::try_unlock on controlled greetd"
+                    "scope":"real public Runtime::try_unlock on controlled PAM"
                 }))
                 .unwrap(),
             )
@@ -74,4 +85,5 @@ fn main() {
         Some(Duration::from_millis(20))
     })
     .expect("actual runtime probe loop");
+    ExitCode::SUCCESS
 }

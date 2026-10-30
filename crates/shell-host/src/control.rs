@@ -848,7 +848,7 @@ impl ControlClient {
     }
 
     /// Offer the lock screen's password (ext-session-lock prompt). The
-    /// compositor verifies it off its loop (PAM or greetd) and answers
+    /// compositor verifies it off its loop through PAM and answers
     /// `Applied` once the session is unlocked or `Denied` when the
     /// password was wrong; the unlocked snapshot follows an `Applied`.
     /// Credentials are never replayed after an uncertain write or reconnect.

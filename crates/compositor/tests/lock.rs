@@ -719,26 +719,20 @@ fn lock_surface_carries_no_titles() {
 /// mirror exactly as they were.
 #[test]
 fn three_wrong_passwords_stay_locked_without_leak() {
-    use greetd_ipc::{codec::Error as CodecError, AuthMessageType, ErrorType, Response};
-    use tuna_compositor::unlock::{unlock_session, UnlockClient};
+    use tuna_compositor::unlock::{unlock_session, AuthReply, UnlockClient, Unreachable};
 
     struct DenyAll;
     impl UnlockClient for DenyAll {
-        fn create_session(&mut self, _user: &str) -> Result<Response, CodecError> {
-            Ok(Response::AuthMessage {
-                auth_message_type: AuthMessageType::Secret,
-                auth_message: "Password:".to_string(),
+        fn begin(&mut self, _user: &str) -> Result<AuthReply, Unreachable> {
+            Ok(AuthReply::Prompt {
+                text: "Password:".to_string(),
+                secret: true,
             })
         }
-        fn answer(&mut self, _text: Option<String>) -> Result<Response, CodecError> {
-            Ok(Response::Error {
-                error_type: ErrorType::AuthError,
-                description: "PAM authentication failed".to_string(),
-            })
+        fn answer(&mut self, _text: Option<String>) -> Result<AuthReply, Unreachable> {
+            Ok(AuthReply::Refused)
         }
-        fn cancel(&mut self) -> Result<(), CodecError> {
-            Ok(())
-        }
+        fn cancel(&mut self) {}
     }
 
     let dir = private_tempdir();

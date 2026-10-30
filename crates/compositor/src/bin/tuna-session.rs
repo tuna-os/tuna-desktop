@@ -66,9 +66,10 @@ fn current_desktop(set: Option<&std::ffi::OsStr>) -> Option<&'static str> {
     }
 }
 
-/// `XDG_SESSION_TYPE` for the session and every process it starts. greetd
-/// opens the logind session as `tty` and puts that in the environment, and
-/// Wayland-aware toolkits (Qt, Firefox, Electron) read it to choose a backend.
+/// `XDG_SESSION_TYPE` for the session and every process it starts. A TTY
+/// login opens the logind session as `tty` and puts that in the environment,
+/// and Wayland-aware toolkits (Qt, Firefox, Electron) read it to choose a
+/// backend.
 const SESSION_TYPE: &str = "wayland";
 
 fn print_help() {

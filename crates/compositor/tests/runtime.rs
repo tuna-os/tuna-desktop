@@ -187,7 +187,7 @@ fn backend_choice_parses_and_auto_resolves_by_host_display() {
     assert_eq!(BackendChoice::parse("vulkan"), None);
     // A host display always means nested.
     assert_eq!(BackendChoice::Auto.resolve(true), BackendChoice::Winit);
-    // No host display (greetd on a TTY): hardware when built with it.
+    // No host display (GDM or a TTY): hardware when built with it.
     let bare = BackendChoice::Auto.resolve(false);
     if cfg!(feature = "drm") {
         assert_eq!(bare, BackendChoice::Drm);

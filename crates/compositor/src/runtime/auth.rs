@@ -242,9 +242,9 @@ impl Runtime {
     }
 
     fn begin_password(&mut self, origin: Origin) {
-        // A configured greetd daemon is authoritative and has no relay: the
-        // shell falls back to the single-password `Unlock` path.
-        if crate::unlock::greetd_socket_path().is_some() || self.unlock_quarantined.is_some() {
+        // A quarantined helper is a permanent refusal: the shell falls back
+        // to the single-password `Unlock` path.
+        if self.unlock_quarantined.is_some() {
             self.refuse_verification(origin, AuthService::Password);
             return;
         }
@@ -311,11 +311,7 @@ impl Runtime {
     }
 
     fn begin_fingerprint(&mut self, origin: Origin) {
-        // A configured greetd daemon is authoritative for unlock: no direct
-        // fprintd path bypasses it.
-        if crate::fprintd::Fprintd::disabled_by_env()
-            || crate::unlock::greetd_socket_path().is_some()
-        {
+        if crate::fprintd::Fprintd::disabled_by_env() {
             self.refuse_verification(origin, AuthService::Fingerprint);
             return;
         }

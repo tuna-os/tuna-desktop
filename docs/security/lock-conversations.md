@@ -46,12 +46,10 @@ relay's 120 s inactivity watch matches GNOME's unlock-dialog idle timeout;
 real seat key and button input to the locked session counts as activity,
 as GNOME's idle monitor does. A failed conversation that was not cancelled
 reports GDM's `gdm-password` message ("Sorry, password authentication
-didn’t work. Please try again.") before its denial. A configured greetd
-daemon has no relay: the password service reports `Unavailable` and the
-shell keeps the single-password `Unlock` path; fingerprint is refused too, so
-no direct fprintd match bypasses greetd. `Unavailable` is only sent for such
-permanent refusals (greetd, no backend or user, a quarantined Slot, no reader
-or prints); a begin refused because a previous attempt is still retiring, and
+didn’t work. Please try again.") before its denial. `Unavailable` is only
+sent for permanent refusals (no backend or user, a quarantined Slot, no reader
+or prints); after a password `Unavailable` the shell keeps the single-password
+`Unlock` path. A begin refused because a previous attempt is still retiring, and
 every cancellation the compositor starts itself (lock-epoch change such as
 suspend, origin loss), end with a plain `Denied` that the shell may retry.
 The shell never replays an answer it held for such a conversation (typed

@@ -56,12 +56,8 @@ class Admission(unittest.TestCase):
         (self.out / 'probe-build.json').write_text('\n'.join(map(json.dumps, self.probe_rows)))
         self.execute(BLOCKS[0])
         r = json.loads((self.out / 'binary-receipt.json').read_text())
-        (self.out / 'runtime').mkdir(exist_ok=True)
-        (self.out / 'runtime/success.json').write_text(json.dumps({
-            'late_closed_origin_success_denied': True, 'fresh_origin_success': True}))
-        (self.out / 'test.log').write_text('auth owner compositor sha256: ' + r['executables'][str(self.bin)] + '\n')
         (self.out/'runtime-epoch').mkdir(exist_ok=True)
-        (self.out/'runtime-epoch/success.json').write_text(json.dumps({k:True for k in ['late_epoch_success_denied','busy_public_sync_denied','fresh_origin_success','public_sync_success']}))
+        (self.out/'runtime-epoch/success.json').write_text(json.dumps({k:True for k in ['stale_epoch_attempt_denied_retired','busy_other_origin_denied','busy_public_sync_denied','fresh_origin_success','public_sync_success']}))
         (self.out/'test-epoch.log').write_text('auth owner probe sha256: '+r['executables'][str(self.probe)]+'\n')
         (self.out/'runtime-pam').mkdir(exist_ok=True)
         (self.out/'runtime-pam/success.json').write_text(json.dumps({
@@ -84,7 +80,7 @@ class Admission(unittest.TestCase):
         original = copy.deepcopy(self.rows)
         for target in [0, 1]:
             for field, wrong in [('kind', ['example']), ('profile', not original[target]['profile']['test']),
-                                 ('package', 'wrong-package'), ('source', str(ROOT/'crates/greeter/src/main.rs'))]:
+                                 ('package', 'wrong-package'), ('source', str(ROOT/'crates/shell-host/src/main.rs'))]:
                 self.rows = copy.deepcopy(original)
                 if field == 'kind': self.rows[target]['target']['kind'] = wrong
                 elif field == 'profile': self.rows[target]['profile']['test'] = wrong
@@ -103,7 +99,7 @@ class Admission(unittest.TestCase):
     def test_final_admission_reuses_exact_matcher(self):
         self.admit()
         rows = self.rows
-        rows[0]['target']['src_path'] = str(ROOT/'crates/greeter/src/main.rs')
+        rows[0]['target']['src_path'] = str(ROOT/'crates/shell-host/src/main.rs')
         (self.out/'build.json').write_text('\n'.join(map(json.dumps, rows))+'\n')
         with self.assertRaises(AssertionError): self.execute(BLOCKS[1])
 
@@ -139,14 +135,17 @@ class Admission(unittest.TestCase):
 
     def test_actual_compositor_hash_cannot_be_test_hash(self):
         r = self.admit()
-        (self.out / 'test.log').write_text('auth owner compositor sha256: ' + r['executables'][str(self.test)] + '\n')
+        (self.out / 'test-pam.log').write_text('auth owner pam sha256: ' + r['executables'][str(self.test)] + '\n')
         with self.assertRaises(AssertionError): self.execute(BLOCKS[1])
 
     def test_runtime_requirement_and_negative_receipt_remain_strict(self):
         self.admit()
-        (self.out / 'runtime/success.json').write_text(json.dumps({
-            'late_closed_origin_success_denied': False, 'fresh_origin_success': True}))
-        with self.assertRaises(AssertionError): self.execute(BLOCKS[1])
+        for key in ['stale_epoch_attempt_denied_retired', 'busy_other_origin_denied']:
+            path = self.out/'runtime-epoch/success.json'
+            receipt = json.loads(path.read_text()); receipt[key] = False
+            path.write_text(json.dumps(receipt))
+            with self.subTest(key=key), self.assertRaises(AssertionError): self.execute(BLOCKS[1])
+            receipt[key] = True; path.write_text(json.dumps(receipt))
         self.assertIn('TUNA_REQUIRE_AUTH_OWNER_RUNTIME=1', SCRIPT)
         self.assertIn('timeout --kill-after=3s 45s', SCRIPT)
         self.assertIn('1 passed; 0 failed; 0 ignored;', SCRIPT)

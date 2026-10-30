@@ -74,7 +74,7 @@ RUN mkdir -p /usr/share/tuna-vm \
     && rm -rf /tmp/tunaos \
     && sha256sum /usr/bin/tuna-session /usr/bin/tuna-compositor \
          /usr/bin/tuna-shell-host /usr/bin/tuna-shell-gtk \
-         /usr/bin/tuna-ibus-bridge /usr/bin/tuna-greeter \
+         /usr/bin/tuna-ibus-bridge \
          /usr/share/wayland-sessions/*.desktop /etc/pam.d/tuna-lock \
          /usr/lib/pam.d/gdm-password /usr/lib/pam.d/gdm-launch-environment \
          /etc/gdm/custom.conf /usr/lib/systemd/system/gdm.service \

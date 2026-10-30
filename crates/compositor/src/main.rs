@@ -105,7 +105,7 @@ fn main() -> ExitCode {
                 println!("socket (default tuna-nested-<pid>) and drives it until the");
                 println!("window closes. --backend auto (default) runs nested when a");
                 println!("host Wayland/X display exists and as a DRM/KMS hardware");
-                println!("session otherwise (from a TTY via greetd; needs a seat");
+                println!("session otherwise (from GDM or a TTY; needs a seat");
                 println!("from logind or seatd). --width/--height apply to nested runs.");
                 println!("The shell binary (default: TUNA_SHELL_BIN, else the");
                 println!("tuna-shell-host sibling) is spawned supervised with a");

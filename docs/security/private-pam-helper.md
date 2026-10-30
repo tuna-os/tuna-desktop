@@ -66,8 +66,8 @@ build or helper execution qualifies this source draft.
 GNOME 51 uses GDM's reauthentication services and exposes distinct challenge and
 web-login handling in [authPrompt.js](https://raw.githubusercontent.com/GNOME/gnome-shell/51.0/js/gdm/authPrompt.js)
 and [userVerifier.js](https://raw.githubusercontent.com/GNOME/gnome-shell/51.0/js/gdm/userVerifier.js).
-This private PAM foundation does not qualify that stack, native-greeter session
-launch, keystore integration, smartcard hardware, web login or all of issue #366.
+This private PAM foundation does not qualify that stack, GDM session launch,
+keystore integration, smartcard hardware, web login or all of issue #366.
 Common-slot ownership and live helper routing are present in the new source
 increment below. Accessible challenge UI and installed-method proofs remain
 subsequent required increments.
@@ -84,7 +84,6 @@ Runtime retains its outer wrapper while helper retirement is pending. Its event
 channel wakes the loop for denial and completion. Quarantine does not request
 continuous frame polling. Public synchronous PAM calls deny after the same budget
 and retain the slot until actual retirement. Late results cannot grant access.
-Configured greetd keeps its existing route and never falls back to PAM.
 
 The password adapter answers one Secret challenge per transaction. A second
 Secret, or a Visible challenge after a Secret, is unsupported and denied. It never

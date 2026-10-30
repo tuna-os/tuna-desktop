@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
 
 # The GTK shell is preferred; shell-host is the alternative legacy renderer.
 CRITICAL = ('tuna-compositor', 'tuna-shell-gtk')
-BINARIES = CRITICAL + ('tuna-shell-host', 'tuna-session', 'tuna-ibus-bridge', 'tuna-greeter')
+BINARIES = CRITICAL + ('tuna-shell-host', 'tuna-session', 'tuna-ibus-bridge')
 
 
 def identity(proc):

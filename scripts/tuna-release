@@ -78,7 +78,7 @@ if [ -z "$VERSION" ]; then
 fi
 
 export TUNA_VERSION="$VERSION"
-cargo build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host -p tuna-greeter
+cargo build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT INT TERM
@@ -89,7 +89,7 @@ install -d -m0755 "$STAGE/DEBIAN" "$STAGE/usr" "$STAGE/usr/bin" \
     "$STAGE/usr/share" "$STAGE/usr/share/wayland-sessions" \
     "$STAGE/etc" "$STAGE/etc/pam.d"
 
-for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus-bridge tuna-greeter tuna-wallpaper-svg; do
+for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus-bridge tuna-wallpaper-svg; do
     install -m0755 "target/release/$bin" "$STAGE/usr/bin/$bin"
 done
 install -d "$STAGE/usr/share/tuna-desktop/icons"
@@ -119,7 +119,7 @@ chmod 0644 "$STAGE/DEBIAN/conffiles"
 LEGACY_PACKAGE=roost  # tuna-rename: keep
 
 # Agreement check: the stamped binaries must report the stamped version.
-for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus-bridge tuna-greeter tuna-wallpaper-svg; do
+for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus-bridge tuna-wallpaper-svg; do
     (ulimit -f 8; timeout 10 "$STAGE/usr/bin/$bin" --version) >"$STAGE/version-output" || { echo "tuna-release: version command failed" >&2; exit 1; }
     [ "$(wc -c <"$STAGE/version-output")" -le 256 ] || exit 1
     LINE="$(cat "$STAGE/version-output")"
@@ -140,7 +140,7 @@ rm "$STAGE/version-output" "$STAGE/version-expected"
 # shlibs/symbols information. Explicit dependencies below cover dlopen/tools.
 mkdir "$STAGE/debian"
 printf 'Source: tuna-desktop\nSection: x11\nPriority: optional\nMaintainer: Tuna Desktop Developers <tuna@example.invalid>\n\nPackage: tuna\nArchitecture: any\nDescription: Tuna Desktop\n' >"$STAGE/debian/control"
-SHLIBS="$(cd "$STAGE" && dpkg-shlibdeps -O -eusr/bin/tuna-compositor -eusr/bin/tuna-session -eusr/bin/tuna-shell-gtk -eusr/bin/tuna-shell-host -eusr/bin/tuna-ibus-bridge -eusr/bin/tuna-greeter -eusr/bin/tuna-wallpaper-svg)" || exit 1
+SHLIBS="$(cd "$STAGE" && dpkg-shlibdeps -O -eusr/bin/tuna-compositor -eusr/bin/tuna-session -eusr/bin/tuna-shell-gtk -eusr/bin/tuna-shell-host -eusr/bin/tuna-ibus-bridge -eusr/bin/tuna-wallpaper-svg)" || exit 1
 case "$SHLIBS" in shlibs:Depends=*) SHLIBS="${SHLIBS#shlibs:Depends=}" ;; *) echo "tuna-release: missing ELF dependency closure" >&2; exit 1 ;; esac
 [ -n "$SHLIBS" ] || exit 1
 rm -r "$STAGE/debian"
@@ -162,7 +162,7 @@ Description: Tuna Desktop Wayland desktop session
  A GNOME-style Wayland desktop with an optional scrollable tiling shell,
  with the preferred GTK shell and a supervised compositor.
  .
- Installs the compositor, GTK and legacy shell hosts, session launcher, IBus bridge, and greeter plus
+ Installs the compositor, GTK and legacy shell hosts, session launcher, and IBus bridge plus
  the login-screen session entry.
 EOF
 chmod 0644 "$STAGE/DEBIAN/control"

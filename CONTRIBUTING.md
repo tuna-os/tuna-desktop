@@ -5,7 +5,7 @@ developer preview and experimental installed sessions (see [README.md](README.md
 and [the roadmap](docs/roadmap.md#public-roadmap)). Its Smithay compositor
 supervises the GTK4/libadwaita shell, the installed-session default described in
 [ADR 0006](docs/adr/0006-gtk4-libadwaita-shell.md). The project also includes a
-session supervisor, greetd greeter and versioned control protocol, tested across
+session supervisor and versioned control protocol, tested across
 nested graphical journeys, AT-SPI accessibility and Marlin VM lanes. Daily-driver
 and release qualification remain open.
 

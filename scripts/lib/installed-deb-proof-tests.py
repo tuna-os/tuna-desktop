@@ -388,7 +388,7 @@ class ReleaseDelegatePolicy(unittest.TestCase):
                 path.write_text('#!/bin/sh\nset -eu\n' + body + '\n')
                 path.chmod(0o755)
             tool('git', 'echo v0.1.0')
-            tool('cargo', 'test "$*" = "build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host -p tuna-greeter"')
+            tool('cargo', 'test "$*" = "build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host"')
             tool('dpkg-shlibdeps', 'exit 9' if failure == 'shlibs' else ('echo unknown' if failure == 'malformed' else 'echo "shlibs:Depends=libc6 (>= 2.36)"'))
             # tuna-rename: keep-begin
             tool('dpkg-deb', '''test "$1" = --root-owner-group

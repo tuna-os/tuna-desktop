@@ -55,7 +55,7 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("packaging/marlin/vm-lane/Containerfile"),
                          ["arch-package", "marlin-image", "marlin-vm"])
         self.assertEqual(pr("docs/parity-ledger.md"),
-                         ["journey", "drm-smoke", "greeter", "gtk-shell",
+                         ["journey", "drm-smoke", "gtk-shell",
                           "arch-package", "marlin-vm", "parity-ledger"])
 
 

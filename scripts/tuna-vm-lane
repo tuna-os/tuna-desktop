@@ -489,7 +489,7 @@ LEGACY_GUEST_PREFIXES = ("roost-",)
 
 LEGACY_LOG_RE = re.compile(
     "(?:" + "|".join(re.escape(prefix) for prefix in LEGACY_GUEST_PREFIXES) + ")"
-    r"(compositor|session|shell-host|shell-gtk|ibus-bridge|greeter)\b")
+    r"(compositor|session|shell-host|shell-gtk|ibus-bridge)\b")
 
 
 def normalize_guest_log(text):
