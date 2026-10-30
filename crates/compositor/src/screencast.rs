@@ -29,7 +29,6 @@ use pipewire::spa::utils::{
 use pipewire::stream::{StreamFlags, StreamListener, StreamRc, StreamState};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
-use zbus::object_server::SignalEmitter;
 
 use crate::mutter::CastTarget;
 
@@ -79,7 +78,7 @@ impl PipeWire {
         target: CastTarget,
         width: i32,
         height: i32,
-        signal: SignalEmitter<'static>,
+        signal: crate::mutter::CastSignals,
     ) -> Option<Cast> {
         let session_signal = signal.clone();
         let stream = StreamRc::new(
@@ -101,7 +100,7 @@ impl PipeWire {
                             if inner.node_id.is_none() {
                                 let id = stream.node_id();
                                 inner.node_id = Some(id);
-                                crate::mutter::stream_added(&signal, id);
+                                signal.stream_added(id);
                             }
                             inner.streaming = false;
                         }
@@ -223,8 +222,8 @@ pub struct Cast {
     pub target: CastTarget,
     /// Size last offered to the consumer (window casts follow resizes).
     offered: (i32, i32),
-    /// The stream's D-Bus emitter, for ending the session.
-    signal: SignalEmitter<'static>,
+    /// The stream's D-Bus signals, for ending the session.
+    signal: crate::mutter::CastSignals,
     stream: StreamRc,
     _listener: StreamListener<()>,
     inner: Rc<RefCell<Inner>>,
@@ -265,7 +264,7 @@ impl Cast {
 
     /// Tell the consumer its session ended (the cast window closed).
     pub fn close(&self) {
-        crate::mutter::session_closed(&self.signal, self.session_id);
+        self.signal.session_closed(self.session_id);
     }
 
     /// Whether PipeWire reported the stream broken.

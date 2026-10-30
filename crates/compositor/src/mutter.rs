@@ -167,7 +167,7 @@ pub enum ToLoop {
         session_id: u64,
         grant: Arc<AtomicBool>,
         target: CastTarget,
-        signal: SignalEmitter<'static>,
+        signal: CastSignals,
     },
     StopCast {
         session_id: u64,
@@ -854,6 +854,7 @@ struct ScreenCast {
     outputs: Outputs,
     windows: Windows,
     to_loop: calloop::channel::Sender<ToLoop>,
+    signals: crate::dbus_signals::SignalQueue,
     next_id: Arc<AtomicU64>,
 }
 
@@ -868,6 +869,7 @@ struct Session {
     outputs: Outputs,
     windows: Windows,
     to_loop: calloop::channel::Sender<ToLoop>,
+    signals: crate::dbus_signals::SignalQueue,
     next_id: Arc<AtomicU64>,
     streams: SessionStreams,
     stopped: Arc<AtomicBool>,
@@ -975,6 +977,7 @@ impl ScreenCast {
             outputs: self.outputs.clone(),
             windows: self.windows.clone(),
             to_loop: self.to_loop.clone(),
+            signals: self.signals.clone(),
             next_id: self.next_id.clone(),
             streams: Arc::new(Mutex::new(Vec::new())),
             stopped: linked.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
@@ -1009,7 +1012,10 @@ impl Session {
                 session_id: self.id,
                 grant: self.stopped.clone(),
                 target: stream.target(),
-                signal: iface.signal_emitter().to_owned(),
+                signal: CastSignals {
+                    stream: iface.signal_emitter().to_owned(),
+                    queue: self.signals.clone(),
+                },
             });
         }
         Ok(())
@@ -1194,18 +1200,74 @@ impl Stream {
     }
 }
 
-/// Announce a stream's PipeWire node (from the event loop).
-pub fn stream_added(signal: &SignalEmitter<'static>, node_id: u32) {
-    let _ = zbus::block_on(Stream::pipe_wire_stream_added(signal, node_id));
+/// A cast stream's signals, sent from the event loop through the mutter
+/// thread's [`SignalQueue`](crate::dbus_signals::SignalQueue): the loop
+/// never waits on the bus (#657).
+#[derive(Clone)]
+pub struct CastSignals {
+    stream: SignalEmitter<'static>,
+    queue: crate::dbus_signals::SignalQueue,
 }
 
-/// Tell a session's client it ended (from the event loop). `stream` is
-/// any of its streams' emitters; the signal goes out on the session.
-pub fn session_closed(stream: &SignalEmitter<'static>, session_id: u64) {
-    let path = format!("/org/gnome/Mutter/ScreenCast/Session/u{session_id}");
-    if let Ok(session) = SignalEmitter::new(stream.connection(), path) {
-        let _ = zbus::block_on(Session::closed(&session));
+impl CastSignals {
+    /// Announce the stream's PipeWire node.
+    pub fn stream_added(&self, node_id: u32) {
+        let stream = self.stream.clone();
+        self.queue
+            .emit(async move { Stream::pipe_wire_stream_added(&stream, node_id).await });
     }
+
+    /// Tell the session's client it ended; the signal goes out on the
+    /// session, after anything this stream already queued.
+    pub fn session_closed(&self, session_id: u64) {
+        let path = format!("/org/gnome/Mutter/ScreenCast/Session/u{session_id}");
+        if let Ok(session) = SignalEmitter::new(self.stream.connection(), path) {
+            self.queue
+                .emit(async move { Session::closed(&session).await });
+        }
+    }
+}
+
+/// How long the revocation scan waits for the bus to vouch for a
+/// capture owner. A bus that cannot answer in time revokes the grant
+/// (fail closed) rather than stalling every other revocation (#657).
+const OWNER_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether each of `owners` is still an admitted capture owner, asked
+/// concurrently on the connection's executor and bounded by `timeout`
+/// overall. An unanswered check counts as gone. The checks themselves
+/// are not cancelled: dropping a send mid-write would corrupt the link.
+fn owners_alive(
+    authority: &crate::capture_security::Authority,
+    conn: &zbus::Connection,
+    owners: &[String],
+    timeout: std::time::Duration,
+) -> Vec<bool> {
+    let pending: Vec<_> = owners
+        .iter()
+        .map(|owner| {
+            let (reply, answer) = std::sync::mpsc::sync_channel(1);
+            let (authority, task_conn, owner) = (authority.clone(), conn.clone(), owner.clone());
+            conn.executor()
+                .spawn(
+                    async move {
+                        let _ = reply.send(authority.owner_alive(&task_conn, &owner).await);
+                    },
+                    "tuna-capture-owner-check",
+                )
+                .detach();
+            answer
+        })
+        .collect();
+    let deadline = std::time::Instant::now() + timeout;
+    pending
+        .into_iter()
+        .map(|answer| {
+            answer
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or(false)
+        })
+        .collect()
 }
 
 /// Serve DisplayConfig and ScreenCast on the session bus from a thread.
@@ -1238,6 +1300,9 @@ pub fn start(
             let sessions: Sessions = Default::default();
             let remote: remote_desktop::RemoteSessions = Default::default();
             let next_id = Arc::new(AtomicU64::new(1));
+            // Signals the loop and the revocation scan send without
+            // waiting on the bus (#657).
+            let signals = crate::dbus_signals::SignalQueue::new("tuna-mutter-signals");
             let screencast = ScreenCast {
                 remote: remote.clone(),
                 sessions: sessions.clone(),
@@ -1245,6 +1310,7 @@ pub fn start(
                 outputs: outputs.clone(),
                 windows,
                 to_loop: to_loop.clone(),
+                signals: signals.clone(),
                 next_id: next_id.clone(),
             };
             let remote_desktop = remote_desktop::RemoteDesktop {
@@ -1339,11 +1405,21 @@ pub fn start(
             // Revoke on lock, unique-name disconnect or loss of the trusted
             // service identity. 100ms admission scan plus one compositor tick
             // bounds stream teardown; frames additionally fail closed on lock.
+            // A bus that stops answering revokes within OWNER_CHECK_TIMEOUT.
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(100));
-                let remote_snapshot = remote.lock().map(|s| s.clone()).unwrap_or_default();
-                for (remote_id, grant) in remote_snapshot {
-                    let alive = zbus::block_on(authority.owner_alive(conn.inner(), &grant.owner));
+                let remote_snapshot: Vec<_> = remote
+                    .lock()
+                    .map(|s| s.clone())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                let owners: Vec<String> = remote_snapshot
+                    .iter()
+                    .map(|(_, grant)| grant.owner.clone())
+                    .collect();
+                let alive = owners_alive(&authority, conn.inner(), &owners, OWNER_CHECK_TIMEOUT);
+                for ((remote_id, grant), alive) in remote_snapshot.into_iter().zip(alive) {
                     if alive && !grant.stopped.load(Ordering::SeqCst) {
                         continue;
                     }
@@ -1353,7 +1429,9 @@ pub fn start(
                     });
                     let path = format!("/org/gnome/Mutter/RemoteDesktop/Session/u{}", grant.id);
                     if let Ok(signal) = SignalEmitter::new(conn.inner(), path.clone()) {
-                        let _ = zbus::block_on(remote_desktop::RemoteSession::closed(&signal));
+                        signals.emit(async move {
+                            remote_desktop::RemoteSession::closed(&signal).await
+                        });
                     }
                     let _ = conn
                         .object_server()
@@ -1363,8 +1441,12 @@ pub fn start(
                     }
                 }
                 let snapshot = sessions.lock().map(|s| s.clone()).unwrap_or_default();
-                for (session, path) in snapshot {
-                    let alive = zbus::block_on(authority.owner_alive(conn.inner(), &session.owner));
+                let owners: Vec<String> = snapshot
+                    .iter()
+                    .map(|(session, _)| session.owner.clone())
+                    .collect();
+                let alive = owners_alive(&authority, conn.inner(), &owners, OWNER_CHECK_TIMEOUT);
+                for ((session, path), alive) in snapshot.into_iter().zip(alive) {
                     if alive && !session.stopped.load(Ordering::SeqCst) {
                         continue;
                     }
@@ -1373,7 +1455,7 @@ pub fn start(
                         session_id: session.id,
                     });
                     if let Ok(signal) = SignalEmitter::new(conn.inner(), path.clone()) {
-                        let _ = zbus::block_on(Session::closed(&signal));
+                        signals.emit(async move { Session::closed(&signal).await });
                     }
                     let streams = session
                         .streams
@@ -1407,6 +1489,83 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bus daemon's half of the owner check, answering every PID
+    /// query with one process.
+    struct AnsweringBus(u32);
+
+    #[zbus::interface(name = "org.freedesktop.DBus")]
+    impl AnsweringBus {
+        #[zbus(name = "GetConnectionUnixProcessID")]
+        fn get_connection_unix_process_id(&self, _name: String) -> u32 {
+            self.0
+        }
+    }
+
+    /// #657: a bus that stops answering revokes every capture owner
+    /// within one bound, checked concurrently rather than one blocked
+    /// call after another; an answering bus still vouches for the shell.
+    #[test]
+    fn owner_checks_are_bounded_and_fail_closed_on_a_wedged_bus() {
+        let authority = crate::capture_security::Authority::default();
+        authority.publish(false, Some(4242));
+        let owners: Vec<String> = [":1.7", ":1.8", ":1.9"].map(String::from).to_vec();
+        let timeout = std::time::Duration::from_millis(400);
+
+        let (wedged, _peer) = crate::dbus_signals::wedged_link();
+        let started = std::time::Instant::now();
+        let alive = owners_alive(&authority, wedged.inner(), &owners, timeout);
+        let elapsed = started.elapsed();
+        assert_eq!(
+            alive,
+            [false, false, false],
+            "unanswered owners are revoked"
+        );
+        assert!(
+            elapsed >= timeout,
+            "the checks waited on the bus: {elapsed:?}"
+        );
+        assert!(
+            elapsed < timeout * 2,
+            "three wedged checks share one bound: {elapsed:?}"
+        );
+
+        let (server_end, client_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let bus = std::thread::spawn(move || {
+            zbus::blocking::connection::Builder::async_io_unix_stream(server_end)
+                .server(zbus::Guid::generate())
+                .unwrap()
+                .p2p()
+                .serve_at("/org/freedesktop/DBus", AnsweringBus(4242))
+                .unwrap()
+                .build()
+                .unwrap()
+        });
+        let caller = zbus::blocking::connection::Builder::async_io_unix_stream(client_end)
+            .p2p()
+            .build()
+            .unwrap();
+        let _bus = bus.join().unwrap();
+        let alive = owners_alive(
+            &authority,
+            caller.inner(),
+            &owners,
+            std::time::Duration::from_secs(10),
+        );
+        assert_eq!(
+            alive,
+            [true, true, true],
+            "the shell's own sessions survive"
+        );
+        authority.publish(true, Some(4242));
+        let alive = owners_alive(
+            &authority,
+            caller.inner(),
+            &owners,
+            std::time::Duration::from_secs(10),
+        );
+        assert_eq!(alive, [false, false, false], "a locked session revokes");
+    }
 
     #[test]
     fn color_properties_round_trip_through_the_share() {
