@@ -4,6 +4,8 @@
 # Usage:
 #   scripts/tuna-gtk-shell-proof [--display :N] [--artifacts DIR]
 #   --screenshot-keys-only runs panel readiness and actual keyboard captures only.
+#   --a11y-focus-only runs panel readiness, G-FOCUS-RING, G-FOCUS-RING-TIMEOUT,
+#   G-A11Y-MENU-RESTART and G-SHELL-STABLE only.
 #   --grid-cancel-only --grid-cancel-admission FILE is an exact CI comparison slice.
 #   --expect-grid-cancel-old-negative is permitted only in that admitted slice.
 #
@@ -299,7 +301,17 @@
 #                  reopening replaces the close (#501)
 #   A11Y-GOLDEN    the panel, calendar, quick settings and overview
 #                  accessible trees match tests/a11y/ (#71)
-#   G-SHELL-STABLE the shell never exits or restarts during the journey
+#   G-FOCUS-RING   real Ctrl+Alt+Tab and Tab light GNOME 51's focus fill
+#                  (white at 17%) on exactly the focused panel control,
+#                  read from X frames (P-A11Y-05, #351)
+#   G-FOCUS-RING-TIMEOUT keyboard-focus-visible-timeout clears a real
+#                  key's indication at the toolkit's 3 s by default, at
+#                  2 s and 5 s when set, never at 0, with focus kept
+#   G-A11Y-MENU-RESTART a menu row toggled with real keys persists across
+#                  one deliberate shell restart and the restarted menu
+#                  follows the settings live
+#   G-SHELL-STABLE the shell never exits or restarts during the journey,
+#                  except G-A11Y-MENU-RESTART's one deliberate restart
 
 #   G-APP-DRAG  dragging an app's header bar moves the window (#58)
 #   G-TILE-PREVIEW dragging a window to the left edge shows GNOME's tile
@@ -350,6 +362,7 @@ WIDTH=1280
 HEIGHT=800
 INSTALLED_PACKAGE=0
 SCREENSHOT_KEYS_ONLY=0
+A11Y_FOCUS_ONLY=0
 GRID_CANCEL_ONLY=0
 GRID_CANCEL_OLD_NEGATIVE=0
 GRID_CANCEL_ADMISSION=""
@@ -361,18 +374,22 @@ while [ $# -gt 0 ]; do
         --expect-grid-cancel-old-negative) GRID_CANCEL_OLD_NEGATIVE=1; shift ;;
         --grid-cancel-admission) GRID_CANCEL_ADMISSION="$2"; shift 2 ;;
         --screenshot-keys-only) SCREENSHOT_KEYS_ONLY=1; shift ;;
+        --a11y-focus-only) A11Y_FOCUS_ONLY=1; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
-        --help|-h) sed -n '2,17p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,19p' "$0"; exit 0 ;;
         *) echo "tuna-gtk-shell-proof: unknown argument $1" >&2; exit 1 ;;
     esac
 done
 if [ "$GRID_CANCEL_ONLY" = 1 ]; then
-    if [ "$INSTALLED_PACKAGE" != 0 ] || [ "$SCREENSHOT_KEYS_ONLY" != 0 ] || [ -z "$GRID_CANCEL_ADMISSION" ]; then
+    if [ "$INSTALLED_PACKAGE" != 0 ] || [ "$SCREENSHOT_KEYS_ONLY" != 0 ] || [ "$A11Y_FOCUS_ONLY" != 0 ] || [ -z "$GRID_CANCEL_ADMISSION" ]; then
         echo "grid comparison requires an admitted source-mode tuple" >&2; exit 1
     fi
 elif [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || [ -n "$GRID_CANCEL_ADMISSION" ]; then
     echo "old-negative/admission flags require --grid-cancel-only" >&2; exit 1
+fi
+if [ "$SCREENSHOT_KEYS_ONLY" = 1 ] && [ "$A11Y_FOCUS_ONLY" = 1 ]; then
+    echo "--screenshot-keys-only and --a11y-focus-only are separate slices" >&2; exit 1
 fi
 mkdir -p "$ARTIFACTS"
 ARTIFACTS="$(cd "$ARTIFACTS" && pwd)"
@@ -649,6 +666,7 @@ cstate() {
 }
 
 . "$ROOT/scripts/lib/tuna-screenshot-keys-proof.sh"
+. "$ROOT/scripts/lib/tuna-a11y-focus-proof.sh"
 
 # Compositor-side state (overview, focus, previews) for app stages.
 CSTATE="$ARTIFACTS/compositor-state.json"
@@ -810,9 +828,11 @@ COLOR_SCHEMA
     GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas"
     export GSETTINGS_SCHEMA_DIR
 fi
-# Exercise the GNOME 51 enum contract on older CI hosts too. This overlay
-# preserves all four upstream a11y.interface keys and is test-only.
-if ! gsettings range org.gnome.desktop.a11y.interface reduced-motion >/dev/null 2>&1; then
+# Exercise the GNOME 51 enum contract and focus timeout on older CI hosts
+# too. This overlay preserves all four upstream a11y.interface keys and is
+# test-only.
+if ! gsettings range org.gnome.desktop.a11y.interface reduced-motion >/dev/null 2>&1 ||
+    ! gsettings range org.gnome.desktop.a11y.interface keyboard-focus-visible-timeout >/dev/null 2>&1; then
     mkdir -p "$ARTIFACTS/schemas"
     cp "$ROOT/tests/settings/gnome51-a11y-interface.gschema.xml" "$ARTIFACTS/schemas/"
     glib-compile-schemas --strict "$ARTIFACTS/schemas"
@@ -1052,7 +1072,7 @@ rm -f "$TUNA_ANIMATION_CLOCK"
 export TUNA_ANIMATION_CLOCK
 if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
     cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host
-    if [ "$SCREENSHOT_KEYS_ONLY" = 0 ]; then
+    if [ "$SCREENSHOT_KEYS_ONLY" = 0 ] && [ "$A11Y_FOCUS_ONLY" = 0 ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example icon-probe
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example shortcut-inhibit-client
     fi
@@ -1065,7 +1085,7 @@ fi
 : >"$LOG"
 # Persist the disabled policy before the GTK publisher starts. The portal
 # probe must observe it on first acquisition, before testing live toggles.
-if [ "$SCREENSHOT_KEYS_ONLY" != 1 ]; then
+if [ "$SCREENSHOT_KEYS_ONLY" != 1 ] && [ "$A11Y_FOCUS_ONLY" != 1 ]; then
     gsettings set org.gnome.desktop.privacy disable-camera true
 fi
 if [ -n "$PAM_ON" ]; then
@@ -1165,6 +1185,17 @@ output.write_text(json.dumps(proof, indent=2) + "\n")
 SCREENSHOT_SOURCE
     fi
     screenshot_keys_proof
+    exit 0
+fi
+if [ "$A11Y_FOCUS_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "accessibility desktop ready" ||
+        fail G-FOCUS-RING "desktop never became ready"
+    # The startup cover must be gone before frames are read.
+    sleep 3
+    a11y_focus_ring_proof
+    if [ "$INSTALLED_PACKAGE" = 0 ]; then a11y_menu_restart_proof; fi
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
     exit 0
 fi
 
@@ -10789,14 +10820,14 @@ pass G-TRANSIENT-SETTLE "OSD, banners, panel menus (fade, rise and growth), quic
     fail A11Y-GOLDEN "accessible trees differ from tests/a11y/ (see above)"
 pass A11Y-GOLDEN "panel, calendar, quick settings and overview trees match their goldens"
 
+# P-A11Y-05 (#351) runs last: its restart is the one G-SHELL-STABLE
+# admits. The installed run keeps its original shell for
+# G-INSTALLED-STABLE, so it proves only the focus indication.
+a11y_focus_ring_proof
+if [ "$INSTALLED_PACKAGE" = 0 ]; then a11y_menu_restart_proof; fi
+
 grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
-# The shell must survive the whole journey: a crash the supervisor
-# quietly restarts is still a failure (the overview-close teardown bug
-# hid behind exactly that).
-if grep -q 'ShellExited' "$LOG"; then
-    fail G-SHELL-STABLE "the shell exited during the journey: $(grep -c ShellExited "$LOG") time(s)"
-fi
-pass G-SHELL-STABLE "the shell never exited or restarted"
+shell_stable_gate
 if grep -q 'g_variant_get_variant: assertion' "$LOG"; then
     fail G-IME-VARIANT-TYPES "IBus focus/composition emitted a native variant type critical"
 fi

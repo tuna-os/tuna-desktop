@@ -35,8 +35,8 @@ window.tuna-panel.overview.shaded {
 /* Panel buttons, measured against GNOME Shell 51 (#panel .panel-button):
    a 3px transparent border around a pill highlight with 9px of padding
    inside it (12px for the clock, whose highlight GNOME draws on the
-   label); white at 17% on hover, 28% when open, 32% when open and
-   hovered. */
+   label); white at 17% on hover or keyboard focus, 28% when open, 32%
+   when open and hovered. GNOME draws no focus ring on them. */
 .tuna-panel button.panel-button,
 .tuna-panel menubutton.panel-button > button {
   background: none;
@@ -46,11 +46,18 @@ window.tuna-panel.overview.shaded {
   margin: 3px;
   min-height: 26px;
   box-shadow: none;
+  outline: none;
   font-weight: bold;
 }
 
 .tuna-panel button.panel-button:hover,
 .tuna-panel menubutton.panel-button > button:hover {
+  background-color: alpha(#ffffff, 0.17);
+}
+
+/* panel_button's &:focus is its hover fill; the open fills below win. */
+.tuna-panel button.panel-button:focus:focus-visible:not(:checked):not(.checked):not(:active),
+.tuna-panel menubutton.panel-button > button:focus:focus-visible:not(:checked):not(:active) {
   background-color: alpha(#ffffff, 0.17);
 }
 
