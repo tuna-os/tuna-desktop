@@ -157,6 +157,42 @@ pub fn volume(quiet: bool, changed: bool, muted: bool) {
     });
 }
 
+/// One theme sound (Mutter's `MetaSoundPlayer`: canberra, enabled only
+/// with `org.gnome.desktop.sound event-sounds`), spawned with the same
+/// guards as volume feedback. Best effort: silence on failure.
+pub fn play_event(id: &str, description: &str) {
+    let Some(settings) = SETTINGS.with(Clone::clone) else {
+        return;
+    };
+    if !settings.boolean("event-sounds") {
+        return;
+    }
+    let theme = format!("canberra.xdg-theme.name={}", settings.string("theme-name"));
+    let launcher = gio::SubprocessLauncher::new(
+        gio::SubprocessFlags::STDOUT_SILENCE | gio::SubprocessFlags::STDERR_SILENCE,
+    );
+    let parent = std::process::id() as libc::pid_t;
+    launcher.set_child_setup(move || unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
+            || libc::getppid() != parent
+        {
+            libc::_exit(127);
+        }
+        // The deadline survives exec and is independent of GTK's loop.
+        libc::signal(libc::SIGALRM, libc::SIG_DFL);
+        libc::alarm(5);
+    });
+    let _ = launcher.spawn(&[
+        "canberra-gtk-play".as_ref(),
+        "--id".as_ref(),
+        id.as_ref(),
+        "--description".as_ref(),
+        description.as_ref(),
+        "--property".as_ref(),
+        theme.as_ref(),
+    ]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

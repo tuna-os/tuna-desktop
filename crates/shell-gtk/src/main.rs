@@ -30,6 +30,7 @@ mod folders;
 mod grid_animation;
 mod grid_pager;
 mod group_animation;
+mod hotplug_sniffer;
 mod ibus_panel;
 mod ibus_property_menu;
 mod input_sources;
@@ -46,6 +47,7 @@ mod logic;
 mod magnifier_sync;
 mod media_keys;
 mod motion;
+mod mount_operation;
 mod network_agent;
 mod network_secrets;
 mod notify;
@@ -68,6 +70,7 @@ mod privacy;
 mod privacy_portal;
 mod providers;
 mod public_search_diagnostic;
+mod removable_media;
 mod renderer;
 mod run_dialog;
 mod screencast;
@@ -2591,6 +2594,9 @@ fn build(app: &adw::Application) {
     polkit::start(app.upcast_ref());
     // GNOME's NetworkManager secret agent (Wi-Fi passwords).
     network_agent::start(app.upcast_ref());
+    // GNOME's automount and autorun components (#361); off until the
+    // compositor says the session is unlocked.
+    let removable_media = removable_media::RemovableMedia::start(app.upcast_ref(), notify.clone());
 
     // GNOME Shell is IBus's panel: it draws the candidate window.
     ibus_panel::start(app.upcast_ref(), ibus_properties.clone());
@@ -3679,6 +3685,11 @@ fn build(app: &adw::Application) {
                 if let Some(locked) = authoritative_lock {
                     lock_ui.sync(locked);
                     lock_ui.resume_verification();
+                }
+                // GNOME runs automount and autorun only in the `user`
+                // session mode, never under the lock screen.
+                if let Some(media) = removable_media.as_ref() {
+                    media.sync_lock(authoritative_lock);
                 }
                 screensaver.sync(locked);
                 // The session keyboard never shows over the lock screen.
