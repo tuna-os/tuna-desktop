@@ -1025,7 +1025,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                                                         restored_middle, restored_wheel),
                                    label="pointer-live-restored")
             pointer_live.append({"restored": restored["state"]["input_devices"]})
-            # GNOME's custom acceleration curve (protocol 0.46). A current
+            # GNOME's custom acceleration curve (protocol 0.47). A current
             # build reports per-device availability. The curve reaches
             # libinput as the custom profile; a curve libinput rejects leaves
             # the device default (Mutter's set_device_accel_profile); a curve
