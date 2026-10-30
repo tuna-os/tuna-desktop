@@ -86,6 +86,14 @@ pub enum Handled {
         /// How many workspaces there are.
         count: u32,
     },
+    /// A finger-following workspace swipe moved (or released) the strip:
+    /// the Activities dots follow it.
+    WorkspaceProgress {
+        /// Workspace index in `WORKSPACE_PROGRESS_SCALE`ths.
+        position: u32,
+        /// 0 while held; the settle time on release, in microseconds.
+        duration_us: u32,
+    },
     /// A client asked for GNOME's window menu.
     WindowMenu(WindowMenuRequest),
     /// Connector under the compositor pointer changed.
@@ -1223,6 +1231,13 @@ impl ControlClient {
             Message::WorkspacePopup { index, count } => {
                 Ok(Handled::WorkspacePopup { index, count })
             }
+            Message::WorkspaceProgress {
+                position,
+                duration_us,
+            } => Ok(Handled::WorkspaceProgress {
+                position,
+                duration_us,
+            }),
             Message::AcceleratorDeactivated { action, time, mode } => {
                 // A GRAB_TRIGGER_RELEASE grab's release: UI state only.
                 Ok(Handled::AcceleratorDeactivated { action, time, mode })
@@ -1475,6 +1490,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::AcceleratorDeactivated { .. } => "AcceleratorDeactivated",
         Message::WindowMenu { .. } => "WindowMenu",
         Message::WorkspacePopup { .. } => "WorkspacePopup",
+        Message::WorkspaceProgress { .. } => "WorkspaceProgress",
         Message::ScreenReader { .. } => "ScreenReader",
         Message::PointerOutput { .. } => "PointerOutput",
         Message::ShortcutConsent { .. } => "ShortcutConsent",

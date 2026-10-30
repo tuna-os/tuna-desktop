@@ -335,6 +335,18 @@ in both directions. `G-ANIMATIONS-OFF` and `G-INTROSPECT-MOTION` check the
 live motion policy: animations off snaps everything, Reduced Motion
 (fade-only) snaps overview and strip motion but keeps the idle-shield fade.
 
+The GTK shell reads the same clock file (`crates/shell-gtk/src/anim_clock.rs`)
+for the animations proofs sample from its side. With `TUNA_TRANSIENT_TRACE`
+set, the workspace switcher popup and the Activities dots log each fade,
+swipe phase and changed frame (`tuna-shell-gtk: ws-popup ...`,
+`tuna-shell-gtk: ws-dots ...`, one write per line), and
+`scripts/lib/ws-anim-proof.py` recomputes GNOME 51's values from
+`workspaceSwitcherPopup.js` and `panel.js` to check them. The popup's
+600 ms hold is measured on this clock too, so a frozen clock holds it.
+Gates `G-WS-POPUP-CLOCK`, `G-WS-DOTS-CLOCK`, `G-WS-DOTS-SWIPE` and their
+`-POLICY` variants sample them; the swipe gates check the dots against the
+release time the compositor records for the strip.
+
 ## Frame cost
 
 The compositor state (`TUNA_COMPOSITOR_STATE`) carries `frame_cost`, one

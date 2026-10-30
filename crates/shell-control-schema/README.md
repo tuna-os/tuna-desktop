@@ -16,6 +16,11 @@ before decoding.
   `ProtocolVersion::CURRENT` in `src/lib.rs`, whose doc comment lists every
   minor; the wire-change rules are in the
   [API stability policy](../../docs/api-stability.md#shell-control-protocol-tuna-shell-control).
+- Workspace swipe progress (0.46): `Message::WorkspaceProgress { position,
+  duration_us }` (peers >=46 only) carries a finger-following workspace
+  swipe's position in `WORKSPACE_PROGRESS_SCALE`ths of a workspace on begin,
+  each update and release (with the settle duration), so the shell's
+  Activities dots follow the fingers as GNOME 51's do.
 - Display-change confirmation (0.42): `Message::ConfirmDisplayChange
   { timeout_secs }` (sent only to peers advertising minor >=42) asks the shell
   for GNOME's "Keep these display settings?" dialog; the shell answers with

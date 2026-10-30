@@ -151,6 +151,9 @@ struct Drained {
     /// The latest display-change confirmation countdown, in seconds.
     display_change: Option<u32>,
     popups: Vec<(u32, u32)>,
+    /// The latest workspace swipe phase `(position, duration_us)`, wire
+    /// fixed point: the Activities dots follow it.
+    workspace_progress: Option<(u32, u32)>,
     aid_switches: Vec<(tuna_shell_control::KeyboardAid, bool)>,
     /// The click the next hover click makes, when the compositor changed it.
     dwell_click: Option<tuna_shell_control::DwellClick>,
@@ -272,6 +275,10 @@ fn drain(
                 .pointer_timeouts
                 .push((kind, duration_ms, clicked, x, y)),
             Handled::WorkspacePopup { index, count } => out.popups.push((index, count)),
+            Handled::WorkspaceProgress {
+                position,
+                duration_us,
+            } => out.workspace_progress = Some((position, duration_us)),
             Handled::Accelerator { action, time, mode } => {
                 out.accelerators.push((action, time, mode, false));
             }
@@ -2845,32 +2852,25 @@ fn build(app: &adw::Application) {
                             .filter(|w| !w.on_all_workspaces)
                             .map(|w| w.workspace)
                             .collect();
-                        let Some(workspace) =
-                            target.resolve(model.active_workspace(), model.workspaces(), &occupied)
-                        else {
-                            return;
-                        };
-                        let workspace = if let Some(count) = model.fixed_workspace_count() {
-                            if target == keybindings::Target::Last {
-                                count - 1
-                            } else if workspace >= count {
-                                return;
-                            } else {
-                                workspace
-                            }
-                        } else {
-                            workspace
-                        };
+                        let active = model.active_workspace();
+                        let workspace = target.destination(
+                            active,
+                            model.workspaces(),
+                            &occupied,
+                            model.fixed_workspace_count(),
+                        );
                         let focused = model.windows().iter().find(|w| w.active).map(|w| w.id);
-                        if matches!(action, Action::MoveToWorkspace(_)) {
-                            // Mutter moves the window and follows it.
-                            let Some(id) = focused else { return };
-                            let _ = control.window_action(
-                                id,
-                                tuna_shell_control::WindowAction::MoveToWorkspace { workspace },
-                            );
+                        if workspace != active {
+                            if matches!(action, Action::MoveToWorkspace(_)) {
+                                // Mutter moves the window and follows it.
+                                let Some(id) = focused else { return };
+                                let _ = control.window_action(
+                                    id,
+                                    tuna_shell_control::WindowAction::MoveToWorkspace { workspace },
+                                );
+                            }
+                            let _ = control.focus_workspace(workspace);
                         }
-                        let _ = control.focus_workspace(workspace);
                         // GNOME's switcher popup, outside the overview.
                         if !control.model().is_overview_open() {
                             let moved = matches!(action, Action::MoveToWorkspace(_));
@@ -3620,6 +3620,7 @@ fn build(app: &adw::Application) {
                     consent,
                     display_change,
                     popups,
+                    workspace_progress,
                     aid_switches,
                     dwell_click,
                     pointer_timeouts,
@@ -3635,6 +3636,15 @@ fn build(app: &adw::Application) {
                     .filter(|c| !c.needs_snapshot())
                     .map(|c| c.locked());
                 render_pills(&mut shell);
+                // After the model: a swipe's release retimes the switch
+                // the model just reported.
+                if let Some((position, duration_us)) = workspace_progress {
+                    shell.pills.follow(
+                        f64::from(position)
+                            / f64::from(tuna_shell_control::WORKSPACE_PROGRESS_SCALE),
+                        f64::from(duration_us) / 1000.0,
+                    );
+                }
                 if let Some(control) = shell.control.as_ref() {
                     switcher_ui.sync(control.model());
                 }

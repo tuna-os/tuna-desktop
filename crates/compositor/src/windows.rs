@@ -7441,10 +7441,12 @@ impl WindowManager {
                     "tuna-compositor: workspace now {}",
                     self.model.active_workspace()
                 );
-                // GNOME's switcher popup, outside the overview.
-                if !self.overview_open {
-                    self.workspace_popups.push(self.workspace_popup());
-                }
+            }
+            // GNOME's switcher popup, outside the overview, even when the
+            // key cannot leave the first or last workspace
+            // (windowManager.js:1869-1880).
+            if !self.overview_open {
+                self.workspace_popups.push(self.workspace_popup());
             }
         } else if pressed
             && self.super_held

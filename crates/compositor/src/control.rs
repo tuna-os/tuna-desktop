@@ -608,9 +608,13 @@ impl<'a> Session<'a> {
 
     /// Ask the shell to draw GNOME's window menu.
     /// Peers older than 0.42 cannot decode `ConfirmDisplayChange`, nor
-    /// older than 0.45 the tablet OSD messages, and receive nothing.
+    /// older than 0.45 the tablet OSD messages, nor older than 0.46
+    /// `WorkspaceProgress`, and receive nothing.
     pub fn send_window_menu(&mut self, menu: &Message) -> Result<(), ControlError> {
         if matches!(menu, Message::ConfirmDisplayChange { .. }) && self.peer_minor < 42 {
+            return Ok(());
+        }
+        if matches!(menu, Message::WorkspaceProgress { .. }) && self.peer_minor < 46 {
             return Ok(());
         }
         let tablet = matches!(
@@ -1250,6 +1254,7 @@ impl<'a> Session<'a> {
             | Message::AcceleratorDeactivated { .. }
             | Message::WindowMenu { .. }
             | Message::WorkspacePopup { .. }
+            | Message::WorkspaceProgress { .. }
             | Message::PointerOutput { .. }
             | Message::ScreenReader { .. }
             | Message::KeyboardAidToggled { .. }
@@ -1308,6 +1313,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::AcceleratorDeactivated { .. } => "AcceleratorDeactivated",
         Message::WindowMenu { .. } => "WindowMenu",
         Message::WorkspacePopup { .. } => "WorkspacePopup",
+        Message::WorkspaceProgress { .. } => "WorkspaceProgress",
         Message::PointerOutput { .. } => "PointerOutput",
         Message::ShortcutConsent { .. } => "ShortcutConsent",
         Message::ConfirmDisplayChange { .. } => "ConfirmDisplayChange",

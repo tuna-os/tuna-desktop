@@ -134,6 +134,29 @@ impl Target {
             Target::Right => Some(active + 1),
         }
     }
+
+    /// Where the key goes from `active`, with `fixed` GNOME's fixed
+    /// workspace count: [`resolve`](Self::resolve) bounded by the fixed
+    /// count, and `active` itself where there is nowhere to go (Left on
+    /// the first workspace, Right on the last fixed one). Mutter's
+    /// `meta_workspace_get_neighbor` returns the workspace itself there
+    /// (workspace.c:1312-1321) and GNOME still shows the switcher popup
+    /// for it (windowManager.js:1869-1880).
+    pub fn destination(
+        self,
+        active: u32,
+        workspaces: &[u32],
+        occupied: &[u32],
+        fixed: Option<u32>,
+    ) -> u32 {
+        self.resolve(active, workspaces, occupied)
+            .and_then(|workspace| match fixed {
+                Some(count) if self == Target::Last => Some(count.saturating_sub(1)),
+                Some(count) if workspace >= count => None,
+                _ => Some(workspace),
+            })
+            .unwrap_or(active)
+    }
 }
 
 /// Which schema a key lives in.
@@ -745,6 +768,18 @@ mod tests {
         assert_eq!(Target::Right.resolve(2, &ws, &[0]), Some(3));
         // Everything on the first workspace: Last is the empty one after.
         assert_eq!(Target::Last.resolve(0, &[0], &[0]), Some(1));
+    }
+
+    #[test]
+    fn workspace_keys_at_the_ends_stay_put_for_the_popup() {
+        // Left on the first workspace: nowhere to go, the popup shows it.
+        assert_eq!(Target::Left.destination(0, &[0, 1], &[0], None), 0);
+        // Right on the last fixed workspace stays; within the count moves.
+        assert_eq!(Target::Right.destination(3, &[0, 1, 2, 3], &[], Some(4)), 3);
+        assert_eq!(Target::Right.destination(2, &[0, 1, 2, 3], &[], Some(4)), 3);
+        assert_eq!(Target::Last.destination(0, &[0, 1, 2, 3], &[], Some(4)), 3);
+        assert_eq!(Target::First.destination(2, &[0, 1, 2, 3], &[], Some(4)), 0);
+        assert_eq!(Target::Left.destination(2, &[0, 1, 2], &[0], None), 1);
     }
 
     #[test]
