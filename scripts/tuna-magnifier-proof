@@ -511,17 +511,27 @@ fi
 pass M-LIVE "factor 2 around the pointer: green $gs-$ge, orange $os-$oe for a ${AW}px area"
 
 # M-CLICK: the sprite sits on the output centre; what it covers there
-# is what the click hits.
+# is what the click hits. Each click waits for the probe to log its
+# press: the log already holds the M-ATSPI-FOCUS activation press, so
+# the read below must follow both of these, not a count of two.
+probe_click() {
+    pressed="$(grep -c '"click"' "$PROBE_LOG" || true)"
+    xdotool click 1
+    for _ in $(seq 1 50); do
+        [ "$(grep -c '"click"' "$PROBE_LOG")" -gt "$pressed" ] && return 0
+        sleep 0.1
+    done
+    fail M-CLICK "the probe never logged the click on the $1 half"
+}
 GX=$((AX + AW / 4)) OX=$((AX + 3 * AW / 4))
 point "$GX" "$CY" M-CLICK
 grab 11-click-green M-CLICK
 expect M-CLICK 11-click-green 620 400 "$GREEN" 16 "green beside the magnified sprite"
-xdotool click 1
+probe_click green
 point "$OX" "$CY" M-CLICK
 grab 11-click-orange M-CLICK
 expect M-CLICK 11-click-orange 620 400 "$ORANGE" 16 "orange beside the magnified sprite"
-xdotool click 1
-for _ in $(seq 1 50); do [ "$(grep -c '"click"' "$PROBE_LOG")" -ge 2 ] && break; sleep 0.1; done
+probe_click orange
 clicks="$(jq -rs '[.[] | select(.click) | .click | map(round) | "\(.[0]) \(.[1])"] | join(" ")' "$PROBE_LOG")"
 # shellcheck disable=SC2086
 set -- $clicks
