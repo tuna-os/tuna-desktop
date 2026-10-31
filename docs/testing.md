@@ -50,13 +50,20 @@ skipped. To run every lane on a branch, dispatch `ci` on it.
 The `orca-speech` CI job builds Ubuntu Orca with Tuna's package-owned password
 feedback correction before running the unchanged `scripts/tuna-orca-speech-proof`.
 It uses the canonical `tuna-os/tunaos-packages` factory at immutable commit
-`c0998b94bd7b4fbc67360c239e439de6debf539b`, in a fresh `RUNNER_TEMP` checkout
+`01d74f3c354fe8219ccf21acd4122273b6984588`, in a fresh `RUNNER_TEMP` checkout
 with full history for the recipe's `SOURCE_DATE_EPOCH`. Native APT installs the
 built `orca_50.3-0ubuntu0.1+tuna1_all.deb`; there is no published-package fallback.
 The existing `orca-speech` artifact retains `native-orca-factory.log` and
 `native-orca-package.txt` (factory commit, source epoch, DEB SHA-256, installed
 version and application-script package ownership). This is nested speech-proof
 evidence, not package or image qualification.
+
+This factory revision includes the executable-mode fix from
+[`tunaos-packages#960`](https://github.com/tuna-os/tunaos-packages/pull/960).
+The workflow executes the runner directly through `env`; the factory tracks
+that entry point as `100755` and tests direct execution with Bats.
+The previous pin, `c0998b94bd7b4fbc67360c239e439de6debf539b`, tracked it as
+`100644`, so native builds stopped with exit 126 before any speech proof.
 
 ## Dependency caches
 
