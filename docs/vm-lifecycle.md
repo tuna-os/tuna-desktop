@@ -232,7 +232,7 @@ new native proof result; the failed run is not retroactively qualified.
 The native proof isolates `XDG_STATE_HOME` and `XDG_CACHE_HOME` under its
 artifact root as well as HOME/config/data. A local native attempt stopped
 before the speech gates because inherited state selected
-`~/.local/state/roost-shell` for upgrade, where the ownership/ancestor
+`~/.local/state/roost-shell` for upgrade, where the ownership/ancestor <!-- tuna-rename: keep -->
 guard refused migration. `user_upgrade::pairs_from` and the shell's
 `xdg::state_home_from` prefer an absolute `XDG_STATE_HOME` over HOME;
 changing HOME alone does not isolate that route. The proof now exports
