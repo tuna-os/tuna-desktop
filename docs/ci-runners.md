@@ -114,6 +114,11 @@ code as root inside its pod.
    use PriorityClass `tuna-ci-runner` (-100, never preempts): new VMs and
    cluster services preempt them, and the kubelet evicts them first under
    memory pressure.
+   All 14 new pods reserve 21 CPU / 70 GiB together; the request quota allows
+   older pods during rollout. The scheduler also accounts for VM reservations.
+   Aggregate memory limits exceed node capacity: they are not a guarantee that
+   every runner can peak at once. Check memory pressure and disk latency before
+   raising concurrency further.
 
 The ARC listener uses the GitHub credential in secret `tuna-ci-github`
 (`tuna-ci` namespace, copied by the controller to `arc-systems`). Runner
@@ -219,10 +224,12 @@ page), then run `.github/runners/deploy`: it upgrades the controller first.
 
 `minRunners` (idle, pre-registered pods) and `maxRunners` live in the values
 files: 24.04 is 1–10, 26.04 is 0–4. Keep `maxRunners` of both sets within the
-quota's 14 pods (all 14 run concurrently with 1.5 CPU / 5 GiB requests); change the quota in `cluster.yaml` only together with a look
-at punjab's and KubeVirt's needs (`kubectl describe node karnataka`). Apply
-with `.github/runners/deploy --sets-only`. A temporary change without editing
-files applies the same `--set` to both sets:
+quota's 14 pods; the scheduler can still withhold slots for VM reservations.
+Change the quota in `cluster.yaml` only after checking punjab and KubeVirt
+(`kubectl describe node karnataka`). Apply guard rails with
+`kubectl --context karnataka-k3s apply -f .github/runners/cluster.yaml`, then
+runner values with `.github/runners/deploy --sets-only`. A temporary change
+without editing files applies the same `--set` to both sets:
 
 ```
 .github/runners/deploy --sets-only -- --set maxRunners=2

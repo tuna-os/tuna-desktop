@@ -114,10 +114,10 @@ spec:
 ---
 # Hard ceiling for all runner pods together, whatever the scale sets ask
 # for. karnataka has 28 CPU / 125 GiB allocatable; punjab is sized at
-# 12 cores / 24 GiB. Requests allow up to 14 runners x 1.5 CPU / 5 GiB (21 CPU /
-# 70 GiB requests + 7 CPU / 12 GiB burst buffer up to 28 CPU / 82 GiB),
-# so all 14 pods across the scale sets (10 on 24.04 + 4 on 26.04) can schedule concurrently
-# while punjab and KubeVirt keep headroom; they also preempt runners (below).
+# 12 cores / 24 GiB. All 14 configured runners request 21 CPU / 70 GiB
+# together. The 28 CPU / 82 GiB request quota also permits old 2 CPU / 6 GiB
+# pods during rollout; the node scheduler still accounts for VM reservations.
+# Aggregate limits are overcommitted, not reserved memory. VMs preempt runners.
 apiVersion: v1
 kind: ResourceQuota
 metadata:
