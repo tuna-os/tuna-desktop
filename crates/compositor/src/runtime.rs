@@ -960,12 +960,7 @@ impl Runtime {
                 let handle = event_loop.handle();
                 handle
                     .insert_source(sources.session, |event, _, rt: &mut Runtime| {
-                        if matches!(event, smithay::backend::session::Event::PauseSession) {
-                            rt.manager.cancel_strip_pointer(&mut rt.state);
-                        }
-                        if let Backend::Drm(drm) = &mut rt.backend {
-                            drm.on_session_event(event);
-                        }
+                        rt.on_session_event(event);
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
                 handle
@@ -1695,6 +1690,32 @@ impl Runtime {
     /// Whether the session is locked (hub flag: what the snapshots say).
     fn is_locked(&self) -> bool {
         self.control.is_locked()
+    }
+
+    /// Apply the compositor-thread half of a coalesced logind update.
+    /// The monitor invalidates auth epochs before waking this thread.
+    fn on_sleep_update(&mut self, lock: bool, wake: bool) {
+        if lock {
+            self.engage_lock();
+        }
+        if wake {
+            // Lock is compositor-owned even if the supervised shell died.
+            self.engage_lock();
+            #[cfg(feature = "drm")]
+            if let Backend::Drm(drm) = &mut self.backend {
+                drm.resume_from_sleep();
+            }
+        }
+    }
+
+    #[cfg(feature = "drm")]
+    fn on_session_event(&mut self, event: smithay::backend::session::Event) {
+        if matches!(event, smithay::backend::session::Event::PauseSession) {
+            self.manager.cancel_strip_pointer(&mut self.state);
+        }
+        if let Backend::Drm(drm) = &mut self.backend {
+            drm.on_session_event(event);
+        }
     }
 
     /// Engage the lock: flag (idle machine plus hub mirror for
@@ -7848,6 +7869,26 @@ impl AuthOwnerProbe<'_> {
     pub fn invalidate_epoch(&mut self) -> bool {
         crate::auth_owner::advance_epoch(&self.runtime.unlock_generation)
     }
+    /// Inject the same compositor-thread sleep update as the logind
+    /// monitor. This trusted Rust-only probe does not simulate S3/KMS.
+    pub fn prepare_for_sleep(&mut self, sleeping: bool) {
+        if sleeping {
+            crate::auth_owner::advance_epoch(&self.runtime.unlock_generation);
+        }
+        self.runtime.on_sleep_update(sleeping, !sleeping);
+    }
+
+    /// Inject libseat's runtime notification, not a kernel VT switch.
+    #[cfg(feature = "drm")]
+    pub fn set_session_active(&mut self, active: bool) {
+        use smithay::backend::session::Event;
+        self.runtime.on_session_event(if active {
+            Event::ActivateSession
+        } else {
+            Event::PauseSession
+        });
+    }
+
     pub fn try_unlock(&mut self, user: &str, password: &str) -> bool {
         self.runtime.try_unlock(user, password)
     }
@@ -7961,16 +8002,7 @@ fn run_loop(
         #[cfg(feature = "drm")]
         if let Some(monitor) = &sleep_monitor {
             let (lock, wake) = monitor.take();
-            if lock {
-                runtime.engage_lock();
-            }
-            if wake {
-                // Lock is compositor-owned even if the supervised shell died.
-                runtime.engage_lock();
-                if let Backend::Drm(drm) = &mut runtime.backend {
-                    drm.resume_from_sleep();
-                }
-            }
+            runtime.on_sleep_update(lock, wake);
         }
         #[cfg(feature = "drm")]
         match logind_session.as_ref().and_then(|session| session.take()) {

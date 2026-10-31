@@ -1570,32 +1570,44 @@ fn load_static_wallpaper(
     let image = if settings.placement == tuna_shell_control::background::Placement::None {
         None
     } else if let Some(expected) = expected {
-        let mut file = std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&expected.path)
-            .ok()?;
-        if FileIdentity::from_metadata(expected.path.clone(), &file.metadata().ok()?)
-            != Some(expected.clone())
         {
-            return None;
+            // A picture the session cannot read shows the background
+            // color and shading, as a missing or undecodable one does
+            // (Mutter draws the color when its image fails to load).
+            // Not cached: a later chmod changes the identity anyway.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                cacheable = false;
+                None
+            }
+            Err(_) => return None,
+            Ok(mut file) => {
+                if FileIdentity::from_metadata(expected.path.clone(), &file.metadata().ok()?)
+                    != Some(expected.clone())
+                {
+                    return None;
+                }
+                let mut bytes = Vec::new();
+                file.by_ref()
+                    .take(64 * 1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                if bytes.len() as u64 != expected.bytes
+                    || FileIdentity::from_metadata(expected.path.clone(), &file.metadata().ok()?)
+                        != Some(expected.clone())
+                    || FileIdentity::for_uri(uri) != Some(expected)
+                {
+                    return None;
+                }
+                // A native SVG render also depends on the installed loader and
+                // fonts, which this source-file key does not identify.
+                cacheable = tuna_wallpaper::is_raster(&bytes);
+                tuna_wallpaper::decode(&bytes).map(|im| im.to_rgba8())
+            }
         }
-        let mut bytes = Vec::new();
-        file.by_ref()
-            .take(64 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        if bytes.len() as u64 != expected.bytes
-            || FileIdentity::from_metadata(expected.path.clone(), &file.metadata().ok()?)
-                != Some(expected.clone())
-            || FileIdentity::for_uri(uri) != Some(expected)
-        {
-            return None;
-        }
-        // A native SVG render also depends on the installed loader and
-        // fonts, which this source-file key does not identify.
-        cacheable = tuna_wallpaper::is_raster(&bytes);
-        tuna_wallpaper::decode(&bytes).map(|im| im.to_rgba8())
     } else {
         None
     };
@@ -2600,5 +2612,46 @@ mod tests {
             false
         ));
         assert_eq!(shown.len(), 2);
+    }
+
+    /// A picture that is missing, unreadable (EACCES) or undecodable
+    /// shows the background color and shading GNOME's settings give,
+    /// never a panic, a blank or a stale picture (Mutter draws
+    /// `primary-color`/`color-shading-type` when its image fails).
+    #[test]
+    fn missing_unreadable_and_undecodable_pictures_fall_back_to_the_color() {
+        use std::os::unix::fs::PermissionsExt;
+        let settings = PictureSettings {
+            placement: tuna_shell_control::background::Placement::Zoom,
+            shading: tuna_shell_control::background::Shading::Vertical,
+            primary: [240, 0, 0],
+            secondary: [0, 0, 240],
+        };
+        let g = test_geometry();
+        let color = tuna_wallpaper::background::render(None, settings, g).unwrap();
+        let load = |uri: &str| load_static_wallpaper(uri, settings, g, FileIdentity::for_uri(uri));
+        let dir = tempfile::TempDir::new().unwrap();
+        let uri = |name: &str| format!("file://{}", dir.path().join(name).display());
+
+        assert_eq!(load(&uri("missing.png")), Some(color.clone()), "missing");
+        std::fs::write(dir.path().join("junk.png"), b"not an image").unwrap();
+        assert_eq!(load(&uri("junk.png")), Some(color.clone()), "undecodable");
+        std::fs::write(dir.path().join("empty.png"), b"").unwrap();
+        assert_eq!(load(&uri("empty.png")), Some(color.clone()), "empty");
+
+        let png = dir.path().join("wall.png");
+        checker_png(&png, 16, 16);
+        let picture = load(&uri("wall.png")).expect("readable picture decodes");
+        assert_ne!(picture, color, "the picture itself, not the color");
+        std::fs::set_permissions(&png, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&png).is_ok() {
+            // root / CAP_DAC_OVERRIDE reads anything: nothing to test.
+            eprintln!("skipping unreadable-file case: running with DAC override");
+            return;
+        }
+        assert_eq!(load(&uri("wall.png")), Some(color.clone()), "unreadable");
+        // Readable again: the picture returns (chmod changed its identity).
+        std::fs::set_permissions(&png, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(load(&uri("wall.png")), Some(picture));
     }
 }
