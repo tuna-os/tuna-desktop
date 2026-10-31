@@ -143,8 +143,8 @@
 #                  radius at 415 ms, towards the lightened accent, at 100%
 #                  and 125%, and no residue once they end
 #   G-CURSOR-SCALE at 125% (a temporary DisplayConfig change) a size-24
-#                  cursor loads the theme's 48px legacy or SVG image (the
-#                  ceiled scale, Mutter 51's cursor renderer) and draws 30
+#                  cursor loads a 48px legacy image at the ceiled output
+#                  scale or rasterizes SVG directly at 30px; both draw 30
 #                  physical px at the scaled hotspot
 #   G-A11Y-DWELL   hover click: a resting pointer clicks once with GNOME's
 #                  pie timer; gesture mode picks the click by direction
@@ -5237,9 +5237,9 @@ cursor_scale() {
 }
 ripple_pixels 1
 
-# Mutter 51's cursor renderer at 125%: the sprite loads at the ceiled
-# scale (the theme's 48px image for size 24) and draws at the theme size,
-# 24 logical = 30 physical px, the hotspot scaled with it.
+# Mutter 51's legacy cursor renderer at 125%: the sprite loads at the
+# ceiled output scale (48px for size 24) and draws 24 logical = 30 physical
+# px. SVG instead rasterizes at ceil(24 * 1.25) = 30px, with a scaled hotspot.
 gsettings set org.gnome.desktop.interface cursor-theme 'TunaProof'
 gsettings set org.gnome.desktop.interface cursor-size 24
 cursor_probe shape default G-CURSOR-SCALE
@@ -5253,8 +5253,8 @@ cp "$CSTATE" "$ARTIFACTS/cursor-scale-125.json"
 "$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-scale-125.png" 30 0.625 0.625 25,173,125 --tolerance 1 ||
     fail G-CURSOR-SCALE "the 48px legacy image is not drawn as 30 physical px at its scaled hotspot"
 gsettings set org.gnome.desktop.interface cursor-theme TunaProofSvg
-cstate '.cursor.image_theme == "TunaProofSvg" and .cursor.image == [48, 48] and .cursor.logical == [24, 24]' "scalable cursor at 125%" ||
-    fail G-CURSOR-SCALE "at 125% the scalable theme did not rasterize at the ceiled scale: $(jq -c .cursor "$CSTATE")"
+cstate '.cursor.image_theme == "TunaProofSvg" and .cursor.image == [30, 30] and .cursor.logical == [24, 24]' "scalable cursor at 125%" ||
+    fail G-CURSOR-SCALE "at 125% the scalable theme did not rasterize directly at 30 physical px: $(jq -c .cursor "$CSTATE")"
 "$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-scale-125-svg.png" 30 5 7.5 49,95,199 --tolerance 1 ||
     fail G-CURSOR-SCALE "the SVG cursor is not drawn as 30 physical px at its scaled hotspot"
 kill "$CURSOR_PID" 2>/dev/null || true
@@ -5264,7 +5264,7 @@ cstate ".windows | length == $cursor_windows" "scale cursor probe closed" ||
     fail G-CURSOR-SCALE "the cursor probe did not close"
 gsettings set org.gnome.desktop.interface cursor-theme "$cursor_theme_before"
 gsettings set org.gnome.desktop.interface cursor-size "$cursor_size_before"
-pass G-CURSOR-SCALE "at 125% a size-24 cursor loads the theme's 48px legacy or SVG image and draws 30 physical px at the scaled hotspot"
+pass G-CURSOR-SCALE "at 125% a size-24 cursor uses a 48px legacy image or a 30px SVG raster; both draw 30 physical px at the scaled hotspot"
 ripple_pixels 1.25
 cursor_scale 1 "$WIDTH"
 pass G-LOCATE-RIPPLE-PIXELS "locate-pointer ripples draw GNOME's 1.1875x first ring at 415 ms (32 px at 100%, 40 px at 125%) towards the lightened accent and leave no residue"

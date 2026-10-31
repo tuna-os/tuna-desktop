@@ -710,11 +710,13 @@ export DBUS_SESSION_BUS_ADDRESS
 LOG="$POINTER_LOG"
 start_pointer_session() {
     rm -f "$CSTATE"
+    # The restarted compositor and its shell must not retain the emulator's
+    # FIFO writer, or closing it below (also on failure) never delivers EOF.
     env -u DISPLAY -u WAYLAND_DISPLAY \
         XDG_RUNTIME_DIR="$RUNTIME" XDG_STATE_HOME="$ARTIFACTS/state" XDG_DATA_HOME="$ARTIFACTS/data" \
         LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD" TUNA_COMPOSITOR_STATE="$CSTATE" \
         "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-pointer \
-        --shell-bin "$ROOT/target/debug/tuna-shell-gtk" >>"$POINTER_LOG" 2>&1 &
+        --shell-bin "$ROOT/target/debug/tuna-shell-gtk" 7>&- >>"$POINTER_LOG" 2>&1 &
     COMP_PID=$!
     state '.display_config.serial >= 1 and (.layers | length > 0)' 30 ||
         fail D-POINTER-SETTINGS "the pointer session never lit its output"

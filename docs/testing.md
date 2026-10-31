@@ -313,6 +313,22 @@ or a still-missing module fails setup, and package installation errors are
 fatal. Module loading and the real vkms device and presentation assertions
 remain mandatory in the smoke test.
 
+`D-POINTER-SETTINGS` retains its uinput mouse, trackball, pointing stick and
+touchpad across a native compositor restart, then reads every device's
+libinput configuration again without motion or another hotplug. In
+[CI run 41175449190](https://github.com/tuna-os/tuna-desktop/actions/runs/41175449190/job/124476667615),
+defaults, live changes and replug passed with libinput 1.25, but the restarted
+session published an empty device list. Seat assignment queues startup device
+additions before the polling fd necessarily becomes readable; native setup
+now consumes those additions through the same configuration path as hotplug,
+without dispatching input or consuming a pending non-addition event. See
+[libinput's event queue API](https://wayland.freedesktop.org/libinput/doc/latest/api/group__base.html).
+The pointer launcher also closes the inherited emulator FIFO writer (FD 7),
+so a running restarted compositor cannot prevent emulator EOF during cleanup.
+`scripts/tests/test_ci_install_vkms.py` contains launcher descriptor and
+coldplug/restart contract regressions; these do not qualify native device
+behavior. A fresh DRM smoke run must still pass the unchanged restart gate.
+
 ## Marlin VM lane
 
 The `marlin-vm` job (#68) boots the real TunaOS Marlin image with Tuna Desktop

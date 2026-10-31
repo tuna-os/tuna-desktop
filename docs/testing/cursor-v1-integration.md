@@ -42,6 +42,26 @@ acknowledgment, and writes PNG plus pixel receipt for each case. It rejects
 cropped, displaced and incorrectly colored fixtures in four focused tests.
 Animated fixture assertions additionally capture a second real frame without pointer input for legacy and SVG themes. All assertions await a fresh native CI journey on this port; fractional-output pixels, multiple physical outputs and hardware measurements remain separate qualification.
 
+`G-CURSOR-SCALE` distinguishes the two loading paths at 125% for size 24:
+Xcursor selects the 48 px image at the ceiled output scale, while SVG
+rasterizes directly at `ceil(24 * 1.25) = 30` px. Both retain 24 logical px
+and draw 30 physical px with their scaled hotspots. The actual framebuffer
+checks require those dimensions and colors independently of the state check.
+
+[CI run 41175449190](https://github.com/tuna-os/tuna-desktop/actions/runs/41175449190),
+GTK job 124476667566, passed `G-CURSOR-FRAME` and captured all 900 legacy
+cursor pixels at 125% at 08:15:33. Its 08:15:54 failure was the next SVG
+state predicate: it wrongly required `[48,48]`, while the compositor
+reported `image_theme: "TunaProofSvg"`, `image: [30,30]`, `logical: [24,24]`
+and `scale: 1.25`. The `G-CURSOR-SCALE FAIL` text is attached to the long
+state-dump line in the job log. The inactive locate effect (count 2) and
+real animation clock belong to this pre-ripple stage, not a failed 125%
+ripple clock. The proof now requires the direct 30 px SVG raster without
+relaxing either actual-pixel assertion. `scripts/lib/cursor-pixels-tests.py`
+exercises the proof's own two predicates, accepting their distinct raster
+sizes and rejecting wrong sizes, logical geometry and theme. This diagnosis
+and regression change do not claim a fresh runtime qualification.
+
 `G-LOCATE-RIPPLE-PIXELS` captures locate-pointer at 415 ms on the frozen
 animation clock and after all rings end. GNOME Shell 51's
 [ripples.js](https://github.com/GNOME/gnome-shell/blob/51.0/js/ui/ripples.js)

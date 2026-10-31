@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Exercise real vkms setup control flow with hermetic command doubles.
+"""Exercise native DRM setup and pointer restart lifecycle contracts.
 
-No package installation, root access, or host kernel changes are performed.
+Command doubles cover setup and compositor-launch descriptor ownership without
+package installation, root access, kernel changes, or a running compositor.
 These tests do not substitute for the native DRM smoke lane.
 """
 import json
@@ -228,6 +229,81 @@ class VkmsSetup(unittest.TestCase):
         self.assertLess(drm_job.index(test_command),
                         drm_job.index("name: Use the Ubuntu archive for DRM dependencies"))
         self.assertLess(drm_job.index(test_command), drm_job.index("apt-get"))
+
+
+class PointerRestart(unittest.TestCase):
+    def test_pointer_session_does_not_inherit_the_emulator_fifo_writer(self):
+        source = SMOKE.read_text()
+        body = source.split("\nstart_pointer_session() {\n", 1)[1].split("\n}\n", 1)[0]
+        launch = "start_pointer_session() {\n" + body + "\n}\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            compositor = root / "target/debug/tuna-compositor"
+            compositor.parent.mkdir(parents=True)
+            compositor.write_text(r'''#!/usr/bin/python3
+import errno
+import json
+import os
+
+closed = False
+try:
+    os.fstat(7)
+except OSError as error:
+    if error.errno != errno.EBADF:
+        raise
+    closed = True
+with open(os.environ["RECEIPTS"], "a") as stream:
+    stream.write(json.dumps({"writer_closed": closed}) + "\n")
+''')
+            compositor.chmod(0o755)
+            receipts = root / "receipts.jsonl"
+            env = dict(os.environ, ROOT=str(root), ARTIFACTS=str(root),
+                       RUNTIME=str(root / "runtime"), CARD="/dev/not-a-real-card",
+                       CSTATE=str(root / "state.json"), POINTER_LOG=str(root / "compositor.log"),
+                       RECEIPTS=str(receipts))
+            # Exercise the real launcher both before and after opening FD 7.
+            # Retaining that descriptor in the restarted process prevents the
+            # root emulator from seeing EOF during normal or failure cleanup.
+            result = subprocess.run(
+                ["/bin/sh", "-ec", launch + r'''
+state() { return 0; }
+fail() { exit 1; }
+start_pointer_session
+wait "$COMP_PID"
+exec 7>"$ARTIFACTS/emulator-writer"
+start_pointer_session
+wait "$COMP_PID"
+exec 7>&-
+'''], env=env, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual([json.loads(line) for line in receipts.read_text().splitlines()],
+                             [{"writer_closed": True}, {"writer_closed": True}])
+
+    def test_coldplug_uses_hotplug_configuration_without_consuming_other_events(self):
+        drm = (ROOT / "crates/compositor/src/drm.rs").read_text()
+        constructor = drm.split("pub fn new()", 1)[1].split("\n    /// Apply a layout", 1)[0]
+        coldplug = constructor.split("// udev_assign_seat has already queued", 1)[1]
+        self.assertLess(constructor.index(".udev_assign_seat("),
+                        constructor.index("libinput_next_event_type("))
+        self.assertLess(coldplug.index("libinput_next_event_type("),
+                        coldplug.index("backend.libinput.next()"))
+        self.assertIn("== input_ffi::libinput_event_type_LIBINPUT_EVENT_DEVICE_ADDED", coldplug)
+        self.assertIn("LibinputEvent::Device(DeviceEvent::Added(added))", coldplug)
+        self.assertIn("backend.translate(InputEvent::DeviceAdded { device }, &[]);", coldplug)
+        self.assertNotIn(".dispatch()", coldplug)
+        self.assertLess(coldplug.index("backend.translate("), coldplug.index("Ok(("))
+
+    def test_restart_still_requires_retained_devices_with_applied_settings(self):
+        source = SMOKE.read_text()
+        restart = source.split("# Restart: a new native session", 1)[1].split(
+            'pass D-POINTER-SETTINGS "a restarted native session', 1)[0]
+        self.assertIn('kill -TERM "$COMP_PID"', restart)
+        self.assertIn('wait "$COMP_PID"', restart)
+        self.assertIn("start_pointer_session\npointer_applied 20 ||", restart)
+        self.assertIn('fail D-POINTER-SETTINGS "after a restart', restart)
+        # Motion or a replug would wake the fd and mask coldplug starvation.
+        self.assertNotIn("pemu ", restart)
+
 
 
 if __name__ == "__main__":

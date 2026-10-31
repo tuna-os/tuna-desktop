@@ -38,8 +38,8 @@ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::drm::control::{
     self, connector, crtc, Device as ControlDevice, ModeTypeFlags,
 };
-use smithay::reexports::input::event::TabletToolEvent;
-use smithay::reexports::input::Libinput;
+use smithay::reexports::input::event::{DeviceEvent, TabletToolEvent};
+use smithay::reexports::input::{ffi as input_ffi, AsRaw, Event as LibinputEvent, Libinput};
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size};
 
@@ -674,6 +674,20 @@ impl DrmBackend {
             f64::from(first_loc.1) + f64::from(first_h) / 2.0,
         )
             .into();
+        // udev_assign_seat has already queued coldplug DEVICE_ADDED events,
+        // but an idle seat need not make libinput's fd readable. Configure
+        // these devices through the same path as hotplug before polling.
+        // Do not dispatch here: ordinary input stays unread for the loop.
+        // Peek first so any non-addition event remains in its normal queue.
+        // SAFETY: backend.libinput owns the live context used by this getter.
+        while unsafe { input_ffi::libinput_next_event_type(backend.libinput.as_raw_mut()) }
+            == input_ffi::libinput_event_type_LIBINPUT_EVENT_DEVICE_ADDED
+        {
+            if let Some(LibinputEvent::Device(DeviceEvent::Added(added))) = backend.libinput.next() {
+                let device = smithay::reexports::input::event::EventTrait::device(&added);
+                backend.translate(InputEvent::DeviceAdded { device }, &[]);
+            }
+        }
         Ok((
             backend,
             DrmSources {
