@@ -727,6 +727,9 @@ jobs:
           name: auth-owner-runtime-proof
           path: ${{ runner.temp }}/auth-owner-proof/
           retention-days: 14
+      - name: Prove shell state sync across simulated seat and sleep notifications
+        timeout-minutes: 10
+        run: scripts/tuna-session-sync-proof gtk-shell-artifacts/session-sync
       # Freeze source before live proofs create checkout-local artifacts.
       - name: Check native minimize freeze identity and failure handling
         run: |
