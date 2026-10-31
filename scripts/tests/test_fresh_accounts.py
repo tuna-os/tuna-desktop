@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "scripts/lib"))
 import fresh_accounts  # noqa: E402
 
 GUEST = ROOT / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+FIXTURE = ROOT / "packaging/marlin/vm-lane/tuna-vm-fresh-accounts"
 CONF = "[daemon]\nFallbackSession=tuna\n"
 
 
@@ -278,6 +279,16 @@ class GuestStateTest(unittest.TestCase):
 
     def test_absent_record_is_record_free(self):
         self.assertTrue(fresh_accounts.record_free(self.probe({}), False)[0])
+
+
+class FixtureTest(unittest.TestCase):
+    def test_fresh_boot_asks_for_user_name_without_session_state(self):
+        text = FIXTURE.read_text()
+        self.assertIn("grep -qx 'system-db:gdm' /usr/share/dconf/profile/gdm", text)
+        self.assertIn("[org/gnome/login-screen]\\ndisable-user-list=true\\n", text)
+        self.assertIn("dconf update", text)
+        self.assertNotIn("Session=", text)
+        self.assertNotIn("AutomaticLogin", text)
 
 
 if __name__ == "__main__":
