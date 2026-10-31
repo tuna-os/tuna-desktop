@@ -436,6 +436,15 @@ in both directions. `G-ANIMATIONS-OFF` and `G-INTROSPECT-MOTION` check the
 live motion policy: animations off snaps everything, Reduced Motion
 (fade-only) snaps overview and strip motion but keeps the idle-shield fade.
 
+The workspace popup's 100 ms fade starts at the display/fade request, not
+the first GTK tick. A delayed first frame therefore samples the fade's
+elapsed time rather than restarting it while the independent 600 ms hide
+timer is already running (GNOME 51 `workspaceSwitcherPopup.js:93-121`).
+`cargo:a_late_first_frame_samples_the_requested_fade_not_a_new_one` covers
+that boundary, slow-down scaling, animations off and fade-out.
+`G-WS-POPUP` keeps its original 300 ms capture delay and RGB thresholds;
+a partially faded pill is not accepted as an opaque one.
+
 The shell's Alt+Tab fades read the same clock (`crates/shell-gtk/src/anim_clock.rs`),
 and the compositor state lists `switcher_thumbnail_alphas`, the opacity each
 switcher window image is drawn at. `G-SWITCHER-FADE` freezes the clock and
