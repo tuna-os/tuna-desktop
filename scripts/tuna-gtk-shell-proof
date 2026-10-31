@@ -6,6 +6,7 @@
 #   --screenshot-keys-only runs panel readiness and actual keyboard captures only.
 #   --a11y-focus-only runs panel readiness, G-FOCUS-RING, G-FOCUS-RING-TIMEOUT,
 #   G-A11Y-MENU-RESTART and G-SHELL-STABLE only.
+#   --folder-dnd-only runs panel readiness and the unchanged G-FOLDER-DND gate.
 #   --grid-cancel-only --grid-cancel-admission FILE is an exact CI comparison slice.
 #   --expect-grid-cancel-old-negative is permitted only in that admitted slice.
 #
@@ -381,6 +382,7 @@ INSTALLED_PACKAGE=0
 SCREENSHOT_KEYS_ONLY=0
 A11Y_FOCUS_ONLY=0
 GRID_CANCEL_ONLY=0
+FOLDER_DND_ONLY=0
 GRID_CANCEL_OLD_NEGATIVE=0
 GRID_CANCEL_ADMISSION=""
 COMPANIONS="${TUNA_PROOF_COMPANIONS:-$ROOT/target/debug/examples}"
@@ -392,6 +394,7 @@ while [ $# -gt 0 ]; do
         --grid-cancel-admission) GRID_CANCEL_ADMISSION="$2"; shift 2 ;;
         --screenshot-keys-only) SCREENSHOT_KEYS_ONLY=1; shift ;;
         --a11y-focus-only) A11Y_FOCUS_ONLY=1; shift ;;
+        --folder-dnd-only) FOLDER_DND_ONLY=1; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --help|-h) sed -n '2,19p' "$0"; exit 0 ;;
@@ -407,6 +410,9 @@ elif [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || [ -n "$GRID_CANCEL_ADMISSION" ]; the
 fi
 if [ "$SCREENSHOT_KEYS_ONLY" = 1 ] && [ "$A11Y_FOCUS_ONLY" = 1 ]; then
     echo "--screenshot-keys-only and --a11y-focus-only are separate slices" >&2; exit 1
+fi
+if [ "$FOLDER_DND_ONLY" = 1 ] && { [ "$SCREENSHOT_KEYS_ONLY" = 1 ] || [ "$A11Y_FOCUS_ONLY" = 1 ] || [ "$GRID_CANCEL_ONLY" = 1 ]; }; then
+    echo "--folder-dnd-only cannot be combined with another slice" >&2; exit 1
 fi
 mkdir -p "$ARTIFACTS"
 ARTIFACTS="$(cd "$ARTIFACTS" && pwd)"
@@ -684,6 +690,85 @@ cstate() {
 
 . "$ROOT/scripts/lib/tuna-screenshot-keys-proof.sh"
 . "$ROOT/scripts/lib/tuna-a11y-focus-proof.sh"
+
+# Select the rendered icon through actual accessibility bounds, including
+# the descendant button; distribution app catalogs change grid allocation.
+grid_origin() {
+    grid_namespace="${1:-tuna-shell-appgrid}"
+    cstate ".layers | any(.namespace == \"$grid_namespace\")" "grid layer" || fail G-GRID-DRAG-PAGE "grid layer missing"
+    grid_origin_x="$(jq --arg namespace "$grid_namespace" '.layers[] | select(.namespace == $namespace) | .rect[0]' "$CSTATE")"
+    grid_origin_y="$(jq --arg namespace "$grid_namespace" '.layers[] | select(.namespace == $namespace) | .rect[1]' "$CSTATE")"
+}
+grid_point() {
+    jq -er --arg name "$2" --argjson ox "$grid_origin_x" --argjson oy "$grid_origin_y" --argjson edge "${3:--1}" '[.[] | select(.showing and (.role == "push button" or .role == "button") and .name == $name and (.bounds[2] > 0) and (.bounds[3] > 0))][0].bounds | select(length == 4) | "\((.[0] + $ox + (if $edge >= 0 then $edge else .[2] / 2 end)) | floor) \((.[1] + $oy + .[3] / 2) | floor)"' "$1"
+}
+
+folder_dnd_proof() {
+# GNOME's folder edits by drag: one app onto another makes a folder of
+# the two (org.gnome.desktop.app-folders); one dragged out of the
+# folder's dialog onto the shade leaves it. Two apps named to sort first
+# sit in the first two cells (113px tiles 12px apart, centred).
+for n in One Two; do
+    printf '[Desktop Entry]\nName=AAA Drag %s\nExec=true\nType=Application\n' "$n" \
+        >"$XDG_DATA_HOME/applications/tuna-drag-$n.desktop"
+done
+sleep 1.5
+before="$(gsettings get org.gnome.desktop.app-folders folder-children)"
+drag() {
+    xdotool mousemove --window "$WID" "$1" "$2"
+    sleep 0.3
+    xdotool mousedown 1
+    sleep 0.2
+    for i in $(seq 1 20); do
+        xdotool mousemove --window "$WID" $(($1 + ($3 - $1) * i / 20)) $(($2 + ($4 - $2) * i / 20))
+        sleep 0.03
+    done
+    sleep 0.4
+    xdotool mouseup 1
+    sleep 1.5
+}
+xdotool key super+a
+cstate '.overview_open and .overview_app_grid' "app grid" || fail G-FOLDER-DND "Super+A did not show the app grid"
+sleep 1.5
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-drag-source.json" 20 || fail G-FOLDER-DND "source dump failed"
+grid_origin
+source_point="$(grid_point "$ARTIFACTS/a11y-folder-drag-source.json" "AAA Drag Two")" || fail G-FOLDER-DND "source bounds missing"
+target_point="$(grid_point "$ARTIFACTS/a11y-folder-drag-source.json" "AAA Drag One")" || fail G-FOLDER-DND "target bounds missing"
+# shellcheck disable=SC2086
+drag $source_point $target_point
+scrot "$ARTIFACTS/11e-folder-made.png" >/dev/null
+after="$(gsettings get org.gnome.desktop.app-folders folder-children)"
+folder=""
+for f in $(echo "$after" | tr -d "[]',"); do
+    case " $(echo "$before" | tr -d "[]',") " in *" $f "*) ;; *) folder="$f" ;; esac
+done
+[ -n "$folder" ] || fail G-FOLDER-DND "dropping an app on another made no folder ($after)"
+fpath="org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder/"
+apps="$(gsettings get "$fpath" apps)"
+case "$apps" in
+    *tuna-drag-One.desktop*tuna-drag-Two.desktop*|*tuna-drag-Two.desktop*tuna-drag-One.desktop*) ;;
+    *) fail G-FOLDER-DND "the new folder holds $apps" ;;
+esac
+name="$(gsettings get "$fpath" name | tr -d "'")"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-new.json" 20 \
+    --press "$name" || fail G-FOLDER-DND "could not open the new folder '$name'"
+sleep 1.5
+scrot "$ARTIFACTS/11f-folder-dialog.png" >/dev/null
+# The dialog's second tile (AAA Drag Two) out onto the shade.
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-dialog-source.json" 20 || fail G-FOLDER-DND "dialog dump failed"
+grid_origin tuna-folder-dialog
+source_point="$(grid_point "$ARTIFACTS/a11y-folder-dialog-source.json" "AAA Drag Two")" || fail G-FOLDER-DND "dialog source bounds missing"
+# shellcheck disable=SC2086
+drag $source_point 140 560
+apps="$(gsettings get "$fpath" apps)"
+[ "$apps" = "['tuna-drag-One.desktop']" ] ||
+    fail G-FOLDER-DND "dragging an app out left the folder with $apps"
+pass G-FOLDER-DND "an app dropped on another makes a GNOME folder; one dragged out of its dialog leaves it"
+xdotool key Escape
+cstate '.overview_open | not' "closed" || { xdotool key Escape; cstate '.overview_open | not' "closed" || fail G-FOLDER-DND "overview stayed open"; }
+rm -f "$XDG_DATA_HOME"/applications/tuna-drag-*.desktop
+sleep 1.5
+}
 
 # Compositor-side state (overview, focus, previews) for app stages.
 CSTATE="$ARTIFACTS/compositor-state.json"
@@ -1089,7 +1174,7 @@ rm -f "$TUNA_ANIMATION_CLOCK"
 export TUNA_ANIMATION_CLOCK
 if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
     cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host
-    if [ "$SCREENSHOT_KEYS_ONLY" = 0 ] && [ "$A11Y_FOCUS_ONLY" = 0 ]; then
+    if [ "$SCREENSHOT_KEYS_ONLY" = 0 ] && [ "$A11Y_FOCUS_ONLY" = 0 ] && [ "$FOLDER_DND_ONLY" = 0 ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example icon-probe
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example shortcut-inhibit-client
     fi
@@ -1211,6 +1296,14 @@ if [ "$A11Y_FOCUS_ONLY" = 1 ]; then
     sleep 3
     a11y_focus_ring_proof
     if [ "$INSTALLED_PACKAGE" = 0 ]; then a11y_menu_restart_proof; fi
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
+    exit 0
+fi
+if [ "$FOLDER_DND_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "folder desktop ready" ||
+        fail G-FOLDER-DND "desktop never became ready"
+    folder_dnd_proof
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
     exit 0
@@ -2342,17 +2435,6 @@ if [ "$GRID_CANCEL_ONLY" != 1 ]; then
     pass G-GRID-PAGE-ANIM "page switches ease out-cubic over 300 ms (every frame-clock sample on GNOME's curve, page dots following the drawn position) and the arrows fade over 200 ms; with animations off both jump"
 fi
 
-# Select the rendered icon through actual accessibility bounds, including
-# the descendant button; distribution app catalogs change grid allocation.
-grid_origin() {
-    grid_namespace="${1:-tuna-shell-appgrid}"
-    cstate ".layers | any(.namespace == \"$grid_namespace\")" "grid layer" || fail G-GRID-DRAG-PAGE "grid layer missing"
-    grid_origin_x="$(jq --arg namespace "$grid_namespace" '.layers[] | select(.namespace == $namespace) | .rect[0]' "$CSTATE")"
-    grid_origin_y="$(jq --arg namespace "$grid_namespace" '.layers[] | select(.namespace == $namespace) | .rect[1]' "$CSTATE")"
-}
-grid_point() {
-    jq -er --arg name "$2" --argjson ox "$grid_origin_x" --argjson oy "$grid_origin_y" --argjson edge "${3:--1}" '[.[] | select(.showing and (.role == "push button" or .role == "button") and .name == $name and (.bounds[2] > 0) and (.bounds[3] > 0))][0].bounds | select(length == 4) | "\((.[0] + $ox + (if $edge >= 0 then $edge else .[2] / 2 end)) | floor) \((.[1] + $oy + .[3] / 2) | floor)"' "$1"
-}
 grid_edge() { grid_point "$1" "$2" 4; }
 # Carousel maps neighboring pages, so STATE_SHOWING alone includes tiles
 # outside its clip. Compare their real window bounds with the viewport.
@@ -2623,70 +2705,7 @@ cstate '.overview_open | not' "closed" || { xdotool key Escape; cstate '.overvie
 rm -f "$XDG_DATA_HOME"/applications/tuna-page-*.desktop
 sleep 1.5
 
-# GNOME's folder edits by drag: one app onto another makes a folder of
-# the two (org.gnome.desktop.app-folders); one dragged out of the
-# folder's dialog onto the shade leaves it. Two apps named to sort first
-# sit in the first two cells (113px tiles 12px apart, centred).
-for n in One Two; do
-    printf '[Desktop Entry]\nName=AAA Drag %s\nExec=true\nType=Application\n' "$n" \
-        >"$XDG_DATA_HOME/applications/tuna-drag-$n.desktop"
-done
-sleep 1.5
-before="$(gsettings get org.gnome.desktop.app-folders folder-children)"
-drag() {
-    xdotool mousemove --window "$WID" "$1" "$2"
-    sleep 0.3
-    xdotool mousedown 1
-    sleep 0.2
-    for i in $(seq 1 20); do
-        xdotool mousemove --window "$WID" $(($1 + ($3 - $1) * i / 20)) $(($2 + ($4 - $2) * i / 20))
-        sleep 0.03
-    done
-    sleep 0.4
-    xdotool mouseup 1
-    sleep 1.5
-}
-xdotool key super+a
-cstate '.overview_open and .overview_app_grid' "app grid" || fail G-FOLDER-DND "Super+A did not show the app grid"
-sleep 1.5
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-drag-source.json" 20 || fail G-FOLDER-DND "source dump failed"
-grid_origin
-source_point="$(grid_point "$ARTIFACTS/a11y-folder-drag-source.json" "AAA Drag Two")" || fail G-FOLDER-DND "source bounds missing"
-target_point="$(grid_point "$ARTIFACTS/a11y-folder-drag-source.json" "AAA Drag One")" || fail G-FOLDER-DND "target bounds missing"
-# shellcheck disable=SC2086
-drag $source_point $target_point
-scrot "$ARTIFACTS/11e-folder-made.png" >/dev/null
-after="$(gsettings get org.gnome.desktop.app-folders folder-children)"
-folder=""
-for f in $(echo "$after" | tr -d "[]',"); do
-    case " $(echo "$before" | tr -d "[]',") " in *" $f "*) ;; *) folder="$f" ;; esac
-done
-[ -n "$folder" ] || fail G-FOLDER-DND "dropping an app on another made no folder ($after)"
-fpath="org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder/"
-apps="$(gsettings get "$fpath" apps)"
-case "$apps" in
-    *tuna-drag-One.desktop*tuna-drag-Two.desktop*|*tuna-drag-Two.desktop*tuna-drag-One.desktop*) ;;
-    *) fail G-FOLDER-DND "the new folder holds $apps" ;;
-esac
-name="$(gsettings get "$fpath" name | tr -d "'")"
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-new.json" 20 \
-    --press "$name" || fail G-FOLDER-DND "could not open the new folder '$name'"
-sleep 1.5
-scrot "$ARTIFACTS/11f-folder-dialog.png" >/dev/null
-# The dialog's second tile (AAA Drag Two) out onto the shade.
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-dialog-source.json" 20 || fail G-FOLDER-DND "dialog dump failed"
-grid_origin tuna-folder-dialog
-source_point="$(grid_point "$ARTIFACTS/a11y-folder-dialog-source.json" "AAA Drag Two")" || fail G-FOLDER-DND "dialog source bounds missing"
-# shellcheck disable=SC2086
-drag $source_point 140 560
-apps="$(gsettings get "$fpath" apps)"
-[ "$apps" = "['tuna-drag-One.desktop']" ] ||
-    fail G-FOLDER-DND "dragging an app out left the folder with $apps"
-pass G-FOLDER-DND "an app dropped on another makes a GNOME folder; one dragged out of its dialog leaves it"
-xdotool key Escape
-cstate '.overview_open | not' "closed" || { xdotool key Escape; cstate '.overview_open | not' "closed" || fail G-FOLDER-DND "overview stayed open"; }
-rm -f "$XDG_DATA_HOME"/applications/tuna-drag-*.desktop
-sleep 1.5
+folder_dnd_proof
 
 # GNOME's grid reorder: an app dropped on another tile's edge takes its
 # place, and the grid is saved to org.gnome.shell app-picker-layout.
