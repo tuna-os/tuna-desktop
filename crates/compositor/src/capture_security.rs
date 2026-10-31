@@ -483,7 +483,6 @@ mod tests {
     }
     #[test]
     fn remote_desktop_daemon_identity_is_the_root_owned_installed_binary() {
-        use std::os::unix::fs::PermissionsExt;
         // This test process, a missing pid and pid 0 are not grd.
         assert!(!installed_executable(
             std::process::id(),
@@ -504,8 +503,15 @@ mod tests {
         // ...but not a user-owned copy named like the daemon.
         let directory = tempfile::tempdir().unwrap();
         let copy = directory.path().join("gnome-remote-desktop-daemon");
-        std::fs::copy("/bin/sleep", &copy).unwrap();
-        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Copy in a separate process: a concurrent test can fork while an
+        // in-process copy holds this inode writable, retaining that descriptor
+        // until exec and making our immediate exec fail with ETXTBSY.
+        assert!(std::process::Command::new("/bin/cp")
+            .args(["--", "/bin/sleep"])
+            .arg(&copy)
+            .status()
+            .unwrap()
+            .success());
         let mut spoof = std::process::Command::new(&copy).arg("60").spawn().unwrap();
         let copy_path = copy.to_str().unwrap();
         assert!(!installed_executable(spoof.id(), &[copy_path]));
