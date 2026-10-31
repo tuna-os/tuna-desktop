@@ -264,18 +264,19 @@ notify_lock_proof() {
     gsettings set org.gnome.desktop.sound event-sounds true
     pass G-NOTIFY-SOUND "a banner plays its sound-name, else its sound-file, through the event-sound player as it shows; enable-sound-alerts or event-sounds off keeps it silent"
 
-    # A disabled app's notification waits hidden; the earlier ones were
-    # closed above (CloseNotification drops them for good), so send fresh
-    # ones: one listed as usual, one from the app still switched off.
+    # CloseNotification dismissed the earlier banners but retained history,
+    # including its long-word cards. Add fresh summaries so this gate can
+    # distinguish an enabled source from the app still switched off.
     nl_listed=$(nl_notify tuna-lock-private "Listed Summary" "listed body" 1) ||
         fail G-NOTIFY-RESTORE "Notify failed"
     nl_off_again=$(nl_notify tuna-lock-off "Off Again" "OFF-AGAIN-BODY" 1) ||
         fail G-NOTIFY-RESTORE "Notify failed"
     sleep 1
-    # Use the same real panel click as the notification-list gates. GTK's
-    # MenuButton accessibility action can report success without opening it.
-    xdotool mousemove --window "$WID" $((WIDTH / 2)) 16 click 1
+    # The last sound banner can still own a pointer grab. Open through the
+    # actual message-tray binding rather than clicking through that grab.
+    xdotool key super+v
     sleep 2
+    nl_shot restore-menu
     nl_until restore-disabled '[.[] | select(.showing)] | (any(.name == "Clear") and any(.name == "Listed Summary"))' G-NOTIFY-RESTORE ||
         fail G-NOTIFY-RESTORE "the date menu does not list the history"
     nl_mentions "$nl_tree" "Off Again" &&

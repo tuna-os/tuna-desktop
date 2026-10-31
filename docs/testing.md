@@ -297,6 +297,11 @@ gates (G-NOTIFY-LOCK, G-NOTIFY-LOCK-PIXELS, G-NOTIFY-LOCK-LIVE,
 G-NOTIFY-SOUND, G-NOTIFY-RESTORE); it needs pam_wrapper to unlock. The
 proof's `canberra-gtk-play` stand-in records every event sound the shell
 asks for in `canberra-calls`.
+The restore gate opens the real message-tray binding after retaining the
+long-word redaction-test notifications in history. Card text must wrap at
+character boundaries when needed, and collapsed groups must measure only
+their visible page horizontally, so hidden expanded content cannot force
+the date popup wider than the nested output.
 
 The full GTK proof's media callback barrier waits at most 25 seconds:
 one key can execute four serialized `wpctl` subprocesses with five-second

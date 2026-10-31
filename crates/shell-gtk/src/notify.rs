@@ -489,12 +489,15 @@ fn card(n: &Notification) -> (gtk::Box, gtk::Button) {
     summary.add_css_class("message-title");
     summary.set_xalign(0.0);
     summary.set_wrap(true);
+    summary.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    summary.set_max_width_chars(48);
     content.append(&summary);
     if !n.body().is_empty() {
         let body = gtk::Label::new(Some(n.body()));
         body.add_css_class("message-body");
         body.set_xalign(0.0);
         body.set_wrap(true);
+        body.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         body.set_max_width_chars(48);
         content.append(&body);
     }
