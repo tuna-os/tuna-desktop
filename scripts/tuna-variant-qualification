@@ -23,10 +23,22 @@ def command(argv, timeout=120):
 
 
 def github(path):
-    result = command(['gh', 'api', path])
-    if result['exit']:
-        raise RuntimeError(json.dumps(result))
-    return json.loads(result['stdout'])
+    """Read public source through Git transport, not the shared REST quota."""
+    if path == 'repos/tuna-os/tunaOS/commits/main':
+        result = command(['git', 'ls-remote', 'https://github.com/tuna-os/tunaOS.git', 'refs/heads/main'])
+        if result['exit'] or not re.fullmatch(r'[0-9a-f]{40}\trefs/heads/main\n?', result['stdout']):
+            raise RuntimeError(json.dumps(result))
+        return {'sha': result['stdout'].split()[0]}
+    prefix = 'repos/tuna-os/tunaOS/contents/tunaos.toml?ref='
+    if not path.startswith(prefix) or not re.fullmatch(r'[0-9a-f]{40}', path[len(prefix):]):
+        raise ValueError(f'unsupported source path {path!r}')
+    url = f'https://raw.githubusercontent.com/tuna-os/tunaOS/{path[len(prefix):]}/tunaos.toml'
+    result = subprocess.run(['curl', '--fail', '--location', '--silent', '--show-error', url],
+                            capture_output=True, timeout=120)
+    if result.returncode:
+        raise RuntimeError(json.dumps({'argv': result.args, 'exit': result.returncode,
+                                       'stderr': result.stderr.decode(errors='replace')}))
+    return {'content': base64.b64encode(result.stdout).decode()}
 
 
 def save(path, report):

@@ -177,9 +177,10 @@ Neither `punjab` nor the independent soak VM was touched.
 | Variant(s) | Install / GDM / session | Portals | Lock/unlock | Qualification |
 |---|---|---|---|---|
 | yellowfin old `355f66…` (beta1) | pass in both retained runs | availability only; expanded run Screenshot Response 2 and ScreenCast Start timeout because generic Enter did not activate the visible Allow/Share controls | `LockedHint=no` fails; refusal/unlock pass | fail |
-| yellowfin refreshed `64e7a29…` | trusted refresh run [41221855489](https://github.com/tuna-os/tunaOS/actions/runs/41221855489) succeeded; guest reports beta2-2.el10 | AT-SPI consent activated; Screenshot then rejected: returned URI was not a local file | pending at snapshot | not qualified |
+| yellowfin refreshed `64e7a29…` | trusted refresh run [41221855489](https://github.com/tuna-os/tunaOS/actions/runs/41221855489) succeeded; guest reports beta2-2.el10; retained core run 10 pass/3 fail | retained capture failures were **locked-session denials**, not product capture defects; later untouched-image unlocked Screenshot and ScreenCast both deliver real frames | `LockedHint=no`; refusal/unlock/logout pass | not qualified; timed unlocked flow and lock-triggered withdrawal still require corrected matrix receipt |
 | marlin | existing exact beta2-2 journey passes these gates | not qualified by that daily-driver receipt | lock hint fails; refused password/unlock pass | fail, not a v1 pass |
-| albacore, skipjack, wahoo, bonito, sailfin | expanded run: install/GDM/session pass | Screenshot Response 2 and ScreenCast timeout from the superseded Enter input; not functional proof | `LockedHint=no` | fail on retained receipts; rerun with corrected consent pending |
+| albacore `b68a195…` | pass; actual beta1; subsequent retained core run 12 pass/1 fail | real Screenshot PNG and ScreenCast frame/caller isolation pass | `LockedHint=no`; withdrawal unproven because requester expired before host armed the unchanged 30-second handshake | not qualified; capture failures from the earlier Enter run are superseded, not product defects |
+| skipjack, wahoo, bonito, sailfin | expanded run: install/GDM/session pass | earlier receipts lack unlocked/timely-consent preconditions; not functional qualification | `LockedHint=no` | fail on retained receipts; corrected preconditions pending |
 | bonito-rawhide | builder Secret label exceeded Kubernetes' 63-byte limit before the VM existed | unproven | unproven | harness failure fixed by VM-name bound; rerun pending |
 | grouper | expanded run interrupted during build; orphan builder VM/Secret/PVC deleted, inventory empty | unproven | unproven | not qualified |
 | flounder, flounder-sid | publication resolved; not yet run | unproven | unproven | not qualified |
@@ -191,6 +192,29 @@ the published desktop. The visible GNOME dialogs prove the harness pressed
 Enter while Allow/Share remained visible. They do prove portal qualification
 remained incomplete. The consent path now uses the existing AT-SPI helper with
 Corral's external capture; it does not spoof app IDs or replace backends.
+
+The refreshed Yellowfin run at 19:19–19:50 UTC retained a black Screenshot
+prompt frame and a ScreenCast prompt showing the lock password screen. It did
+not assert `ScreenSaver.GetActive=false` at request/consent time. Its Screenshot
+Response 0 with empty URI and ScreenCast Response 2 must **not** be attributed
+to broken capture. On the same untouched `64e7a29…` image, the independent
+InstalledSessionGaps receipt at `/tmp/isg/proof` records actual unlocked
+`GetActive=false` before/after timely Allow/Share: a real 1280×800 Screenshot
+file and a decoded ScreenCast frame from node 58. Explicit Session.Close
+removed that node in 0.013 seconds; that is not lock-triggered withdrawal.
+The deliberate locked negatives reproduce the earlier responses, with no new
+Screenshot image and no ScreenCast stream. Raw failed receipts remain unchanged.
+
+The [subsequent interrupted sequence](variants/2026-10-31/corrected-interrupted/matrix.json)
+completed Albacore and Skipjack before its coordinator stopped during Wahoo's
+builder phase. Albacore actually captured both portal images. Its lock observer
+expired with `runner did not revoke the active grant`: remote evidence collection
+used the client's unchanged 30-second `.active`→`.revoke` handshake before the
+host armed the lock. That receipt does not establish a product stream-withdrawal
+failure. Skipjack's capture attempts lacked the unlocked preconditions and remain
+unqualified. [Recovery cleanup](variants/2026-10-31/recovery-interruption.json)
+records deletion of only the interrupted Wahoo builder VM/Secret/disk and empty
+owned-prefix inventory. Coordinator loss is not an unsupported-variant reason.
 
 Exact admission/publication [gate snapshot](variants/2026-10-31/admission-gates.json):
 
@@ -270,12 +294,13 @@ requester logs, varied frame, hashes and the withdrawal snapshot are retained.
 Missing native Python/GObject/GStreamer/`pw-dump` tools remain explicit failures/prerequisites,
 not reasons to call the image unsupported or to install a replacement backend.
 
-At a pending decision, the actual console receives Enter. Rejection and
-timeouts remain failures. Request-time console frames need visual review to
-establish which consent UI appeared and whether the default action selected
-the intended source; no pixel judgment is fabricated.
+At a pending decision, the existing AT-SPI helper activates the actual visible
+GNOME Allow/Share control; Corral retains the console frame externally instead
+of using X11-only `scrot`. A grant test requires an unlocked session at request,
+consent and response; locked-session denial is a separate negative result, never
+a capture-product failure. Console frames still require visual review.
 
-New matrix runs freeze the host journey and its three native requester/parser
+New matrix runs freeze the host journey, consent helper and native requester/parser
 sources into the output's `harness/` directory before starting any VM, recording
 their hashes. Subsequent worktree edits cannot mutate those long-running tests.
 Only test requester code is placed in the fixture user's runtime directory;
