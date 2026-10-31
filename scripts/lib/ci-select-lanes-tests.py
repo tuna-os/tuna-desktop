@@ -86,6 +86,20 @@ class Selection(unittest.TestCase):
                 'arch-package', 'marlin-image', 'marlin-vm'], path)
         # tuna-rename: keep-end
 
+    def test_shipped_pam_conffile_always_runs_journey_and_package_consumers(self):
+        # /etc/pam.d/tuna-lock is a dpkg conffile and an Arch backup file:
+        # any byte change prompts upgraders, which only journey's disposable
+        # Debian lifecycle catches (#899 changed it in a run whose rotation
+        # skipped journey and turned it red for every later PR).
+        for run in range(len(m.ROTATION)):
+            with self.subTest(run=run):
+                self.assertEqual(pr("share/pam.d/tuna-lock", run=run), [
+                    'fprint-phase-proof', 'journey', 'grid-cancel-comparison', 'gtk-shell',
+                    'portal-security', 'remote-security', 'niri-parity', 'arch-package',
+                    'marlin-image', 'marlin-vm'])
+        # Control: other shipped runtime data still rotates journey.
+        self.assertNotIn('journey', pr("share/applications/tuna-settings.desktop", run=1))
+
 
 class WorkflowSync(unittest.TestCase):
     def setUp(self):
