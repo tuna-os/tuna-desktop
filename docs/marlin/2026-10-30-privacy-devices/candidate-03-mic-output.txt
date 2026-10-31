@@ -1,0 +1,28 @@
+## 2026-10-30T15:02:42+00:00 candidate-mic-output-disabled
+gsettings disable-camera=true
+gsettings disable-microphone=true
+gsettings disable-sound-output=true
+impl.gnome Lockdown disable-camera: (<true>,)
+impl.gnome Lockdown disable-microphone: (<true>,)
+impl.gnome Lockdown disable-sound-output: (<true>,)
+impl.tuna Lockdown disable-camera: (<true>,)
+impl.tuna Lockdown disable-microphone: (<true>,)
+impl.tuna Lockdown disable-sound-output: (<true>,)
+portal Camera.IsCameraPresent: (<false>,)
+portal Camera.AccessCamera: Error: GDBus.Error:org.freedesktop.portal.Error.NotAllowed: Camera access disabled
+portal Camera.OpenPipeWireRemote: Error: GDBus.Error:org.freedesktop.portal.Error.NotAllowed: Camera access disabled
+## 2026-10-30T15:02:46+00:00 candidate-all-restored
+gsettings disable-camera=false
+gsettings disable-microphone=false
+gsettings disable-sound-output=false
+impl.gnome Lockdown disable-camera: (<false>,)
+impl.gnome Lockdown disable-microphone: (<false>,)
+impl.gnome Lockdown disable-sound-output: (<false>,)
+impl.tuna Lockdown disable-camera: (<false>,)
+impl.tuna Lockdown disable-microphone: (<false>,)
+impl.tuna Lockdown disable-sound-output: (<false>,)
+portal Camera.IsCameraPresent: (<false>,)
+portal Camera.AccessCamera: (objectpath '/org/freedesktop/portal/desktop/request/1_330/t',)
+portal Camera.OpenPipeWireRemote: Error: GDBus.Error:org.freedesktop.portal.Error.NotAllowed: Permission denied
+Oct 30 15:02:38 tuna-q-privacy /usr/lib/gdm-wayland-session[5829]: tuna-shell-gtk: privacy enforcement [SetMute { node: 53, muted: true }]
+Oct 30 15:02:42 tuna-q-privacy /usr/lib/gdm-wayland-session[5829]: tuna-shell-gtk: privacy enforcement [SetMute { node: 53, muted: false }]

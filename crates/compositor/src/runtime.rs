@@ -742,6 +742,10 @@ pub struct Runtime {
     /// GNOME's per-device tablet and stylus settings (owned GIO reader).
     tablet_settings: crate::tablet_settings::Reader,
     tablet_settings_status: Option<crate::night_light_settings::CacheStatus>,
+    /// `org.gnome.desktop.privacy` `privacy-screen` (owned GIO worker;
+    /// hardware session only, #356).
+    #[cfg(feature = "drm")]
+    privacy_screen_settings: Option<crate::privacy_screen_settings::PrivacyScreenSettings>,
     /// Configured transform per connector (Settings/monitors.xml):
     /// the sensor overrides these live but never rewrites them.
     manual_transforms: std::collections::HashMap<String, u32>,
@@ -1056,6 +1060,20 @@ impl Runtime {
                         }
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                if let Some(udev) = sources.udev {
+                    // Privacy screen hw-state changes (#356) arrive as
+                    // DRM `change` uevents.
+                    handle
+                        .insert_source(udev, |event, _, rt: &mut Runtime| {
+                            if let smithay::backend::udev::UdevEvent::Changed { device_id } = event
+                            {
+                                if let Backend::Drm(drm) = &mut rt.backend {
+                                    drm.on_device_changed(device_id);
+                                }
+                            }
+                        })
+                        .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                }
                 Some(Backend::Drm(Box::new(drm)))
             }
             _ => None,
@@ -1352,6 +1370,12 @@ impl Runtime {
         let hardware = false;
         let a11y_keyboard =
             (hardware || session.screen_reader).then(crate::a11y_keyboard::Monitor::start);
+        // org.gnome.desktop.privacy privacy-screen, on its own GIO thread
+        // as mutter's meta-settings.c reads it in-process (#356); only
+        // the hardware session has privacy screens.
+        #[cfg(feature = "drm")]
+        let privacy_screen_settings =
+            hardware.then(|| crate::privacy_screen_settings::PrivacyScreenSettings::start(&wake));
         let loop_handle = event_loop.handle();
         let mut runtime = Runtime {
             display,
@@ -1379,6 +1403,8 @@ impl Runtime {
             // Mutter's meta-input-settings.c reads them in-process.
             tablet_settings: crate::tablet_settings::Reader::new(&wake),
             tablet_settings_status: None,
+            #[cfg(feature = "drm")]
+            privacy_screen_settings,
             numlock: {
                 let wake = wake.clone();
                 crate::numlock::NumlockMemory::start(crate::numlock::CliStore, move || {
@@ -5054,6 +5080,8 @@ impl Runtime {
         );
         self.publish_state();
         self.publish_cast_outputs();
+        #[cfg(feature = "drm")]
+        self.privacy_screen_tick();
         self.publish_display_state();
         self.publish_overview_previews();
         let strip_was_animating = self.manager.strip_animating();

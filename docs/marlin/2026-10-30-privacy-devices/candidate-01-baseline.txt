@@ -1,0 +1,18 @@
+## 2026-10-30T14:59:12+00:00 candidate-baseline
+gsettings disable-camera=false
+gsettings disable-microphone=false
+gsettings disable-sound-output=false
+impl.gnome Lockdown disable-camera: (<false>,)
+impl.gnome Lockdown disable-microphone: (<false>,)
+impl.gnome Lockdown disable-sound-output: (<false>,)
+impl.tuna Lockdown disable-camera: (<false>,)
+impl.tuna Lockdown disable-microphone: (<false>,)
+impl.tuna Lockdown disable-sound-output: (<false>,)
+portal Camera.IsCameraPresent: (<true>,)
+portal Camera.AccessCamera: (objectpath '/org/freedesktop/portal/desktop/request/1_110/t',)
+portal Camera.OpenPipeWireRemote: Error: GDBus.Error:org.freedesktop.portal.Error.NotAllowed: Permission denied
+pw node 59 tuna-q-sink Audio/Sink mute=False
+pw node 45 tuna-q-mic Audio/Source mute=False
+pw node 60 tuna-q-cam Video/Source mute=None
+wpctl get-volume tuna-q-sink(59): Volume: 1.00
+wpctl get-volume tuna-q-mic(45): Volume: 1.00

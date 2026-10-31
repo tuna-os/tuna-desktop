@@ -48,6 +48,7 @@ use crate::windows::ManagerInput;
 pub mod color;
 pub mod libinput;
 pub mod libwacom;
+pub mod privacy;
 pub mod tablet;
 
 /// Scanout surface type: GBM buffers on the DRM device, each queued
@@ -118,6 +119,8 @@ pub struct DrmOutput {
     edid: Option<Vec<u8>>,
     /// The white point programmed on the CRTC.
     white_point: crate::color_manager::WhitePoint,
+    /// The connector's privacy screen (#356).
+    privacy: privacy::PrivacyScreen,
     /// The CRTC takes no white point: the renderer tints instead.
     pub tint_fallback: bool,
 }
@@ -296,6 +299,12 @@ pub struct DrmBackend {
     tablets: tablet::Tablets,
     /// Bumped by every applied layout or reverted mode (#340).
     layout_generation: u64,
+    /// Mutter's privacy screen policy (#356).
+    privacy: crate::privacy_screen::PrivacyScreens,
+    /// A setting read that arrived off-seat, applied on activation.
+    privacy_read_pending: Option<bool>,
+    /// A setting write the runtime owes GSettings (the hotkey).
+    privacy_write: Option<bool>,
 }
 
 /// Event sources the runtime installs on its loop.
@@ -306,6 +315,9 @@ pub struct DrmSources {
     pub drm: DrmDeviceNotifier,
     /// Input events.
     pub input: LibinputInputBackend,
+    /// DRM device `change` uevents (privacy screen hw-state, #356);
+    /// `None` when udev cannot be monitored.
+    pub udev: Option<smithay::backend::udev::UdevBackend>,
 }
 
 /// Why the hardware session could not start.
@@ -507,6 +519,7 @@ impl DrmBackend {
             let mut color = color::CrtcColor::new(&drm, crtc);
             color.reset(&drm);
             let edid = color::connector_edid(&drm, *handle);
+            let privacy = privacy::discover(&drm, *handle);
             let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
             let (w, h) = mode.size();
             let size: Size<i32, Physical> = (i32::from(w), i32::from(h)).into();
@@ -557,6 +570,7 @@ impl DrmBackend {
                 color,
                 edid,
                 white_point: Default::default(),
+                privacy,
                 tint_fallback: false,
             });
         }
@@ -592,6 +606,11 @@ impl DrmBackend {
             .udev_assign_seat(&seat)
             .map_err(|()| DrmInitError(format!("libinput: cannot assign seat {seat}")))?;
         let input = LibinputInputBackend::new(libinput.clone());
+        let udev = smithay::backend::udev::UdevBackend::new(&seat)
+            .inspect_err(|e| {
+                eprintln!("tuna-compositor: drm: udev monitor unavailable: {e}; privacy screen hotkeys are not followed");
+            })
+            .ok();
         let mut backend = Self {
             session,
             drm,
@@ -615,6 +634,9 @@ impl DrmBackend {
             hot_corner_active: true,
             relative_motion_events: 0,
             layout_generation: 0,
+            privacy: Default::default(),
+            privacy_read_pending: None,
+            privacy_write: None,
         };
         if let Err(error) = backend.apply_layout(&layouts) {
             // A stored mode the kernel refused: Mutter falls back to its
@@ -658,6 +680,7 @@ impl DrmBackend {
                 session: session_notifier,
                 drm: drm_notifier,
                 input,
+                udev,
             },
         ))
     }
@@ -791,12 +814,15 @@ impl DrmBackend {
             let primary = self.outputs.remove(position);
             self.outputs.insert(0, primary);
         }
+        // meta_monitor_manager_rebuild: every privacy screen takes the
+        // setting again.
+        self.privacy_step(|policy, targets| policy.rebuild(targets));
         self.layout_generation += 1;
         Ok(())
     }
 
-    /// Bumped by every applied layout and reverted mode: the runtime
-    /// republishes the display state when it moves.
+    /// Bumped by every applied layout, reverted mode and privacy screen
+    /// change: the runtime republishes the display state when it moves.
     pub fn layout_generation(&self) -> u64 {
         self.layout_generation
     }
@@ -812,6 +838,99 @@ impl DrmBackend {
             self.layout_generation += 1;
         }
         reverted
+    }
+
+    /// Whether KMS properties can be programmed now (on-seat).
+    fn privacy_programmable(&self) -> bool {
+        self.active && self.drm.is_active()
+    }
+
+    /// Run one privacy screen policy step over every output, then
+    /// republish on change and queue the setting write it asks for.
+    fn privacy_step(
+        &mut self,
+        step: impl FnOnce(
+            &mut crate::privacy_screen::PrivacyScreens,
+            &mut [privacy::Target<'_>],
+        ) -> crate::privacy_screen::Outcome,
+    ) {
+        if !self.privacy_programmable() {
+            return;
+        }
+        let drm = &self.drm;
+        let mut targets: Vec<privacy::Target<'_>> = self
+            .outputs
+            .iter_mut()
+            .map(|out| privacy::Target {
+                drm,
+                name: &out.name,
+                connector: out.connector,
+                active: out.enabled,
+                screen: &mut out.privacy,
+            })
+            .collect();
+        let outcome = step(&mut self.privacy, &mut targets);
+        drop(targets);
+        if outcome.monitors_changed {
+            self.layout_generation += 1;
+        }
+        if let Some(value) = outcome.write_setting {
+            self.privacy_write = Some(value);
+        }
+    }
+
+    /// A read of `org.gnome.desktop.privacy` `privacy-screen`. Off-seat
+    /// it waits for activation.
+    pub fn privacy_setting_read(&mut self, value: bool) {
+        if !self.privacy_programmable() {
+            self.privacy_read_pending = Some(value);
+            return;
+        }
+        self.privacy_step(|policy, targets| policy.setting_read(value, targets));
+    }
+
+    /// The setting write a hardware change asked for, once.
+    pub fn take_privacy_setting_write(&mut self) -> Option<bool> {
+        self.privacy_write.take()
+    }
+
+    /// Re-read every privacy screen's hw-state; returns whether any changed.
+    fn privacy_refresh(&mut self) -> bool {
+        let mut changed = false;
+        for out in &mut self.outputs {
+            changed |= privacy::refresh(&self.drm, out.connector, &mut out.privacy);
+        }
+        changed
+    }
+
+    /// A udev `change` of a DRM device: the kernel announces a privacy
+    /// screen hw-state change (the firmware hotkey) this way, as a
+    /// connector property event. An unrequested change writes the
+    /// setting back (`on_kms_resources_changed`).
+    pub fn on_device_changed(&mut self, device: libc::dev_t) {
+        if device != self.drm.device_id() || !self.privacy_programmable() {
+            return;
+        }
+        if self.privacy_refresh() {
+            self.privacy_step(|policy, targets| policy.hardware_changed(targets));
+        }
+    }
+
+    /// Activation: another VT owner may have switched the privacy
+    /// screens. Re-read them, apply a setting read that arrived
+    /// off-seat, and switch every screen to the setting again (mutter
+    /// reprograms every output's privacy screen after
+    /// `meta_onscreen_native_invalidate`).
+    fn privacy_resume(&mut self) {
+        let refreshed = self.privacy_programmable() && self.privacy_refresh();
+        if let Some(value) = self.privacy_read_pending.take() {
+            self.privacy_setting_read(value);
+        }
+        let generation = self.layout_generation;
+        self.privacy_step(|policy, targets| policy.rebuild(targets));
+        if refreshed && self.layout_generation == generation {
+            self.layout_generation += 1;
+        }
     }
 
     /// What `org.gnome.Mutter.DisplayConfig` reports (#340): every
@@ -845,6 +964,7 @@ impl DrmBackend {
                     modes: out.modes.iter().map(|(spec, _)| *spec).collect(),
                     preferred: out.preferred_mode,
                     current: out.enabled.then(|| out.current_mode_index()).flatten(),
+                    privacy_screen: out.privacy.state(),
                 }
             })
             .collect();
@@ -1041,6 +1161,7 @@ impl DrmBackend {
                     out.white_point.invalidate();
                 }
                 self.active = true;
+                self.privacy_resume();
                 if self.sleep_reset_pending {
                     self.resume_from_sleep();
                 }

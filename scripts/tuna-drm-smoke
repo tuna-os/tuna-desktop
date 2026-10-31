@@ -14,7 +14,8 @@
 #   D-FRAMES   a real active Wayland client receives 240 page-flip presentations
 #   D-SCALE    a GNOME monitors.xml giving the connector scale 2 is
 #              honored: logical layout at half the mode size, frames flip
-#   D-MODES    GNOME Settings' DisplayConfig lists the connector's modes;
+#   D-MODES    GNOME Settings' DisplayConfig lists the connector's modes
+#              (and no privacy-screen-state: vkms has no privacy screen);
 #              ApplyMonitorsConfig switches the CRTC to another mode (the
 #              kernel reports it, frames keep flipping) and an unconfirmed
 #              persistent change reverts after Mutter's 20 s (#340)
@@ -389,6 +390,11 @@ assert target is not None, "no other resolution"
 print(current[0][0], target[0], len(ids))
 PY
 )" || fail D-MODES "GetCurrentState does not list the connector's modes: $(head -c 2000 "$ARTIFACTS/modes-state.txt")"
+# A connector without the KMS privacy-screen properties (vkms has none)
+# reports no privacy screen, as Mutter omits the property (#356).
+if grep -q "'privacy-screen-state'" "$ARTIFACTS/modes-state.txt"; then
+    fail D-MODES "a connector without KMS privacy-screen properties reports privacy-screen-state"
+fi
 ORIGINAL_MODE="${picked%% *}"
 rest="${picked#* }"
 TARGET_MODE="${rest%% *}"
