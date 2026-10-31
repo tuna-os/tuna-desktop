@@ -50,6 +50,24 @@ fn identity(m: &Metadata) -> Identity {
     )
 }
 
+fn directory_members(
+    file: &std::fs::File,
+    limit: usize,
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    // Bind both enumerations to the opened directory, not its replaceable path.
+    use std::os::fd::AsRawFd;
+    let mut members = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/self/fd/{}", file.as_raw_fd()))? {
+        let name = entry?.file_name();
+        members.push(name.as_bytes().to_vec());
+        if members.len() > limit {
+            return Err("FontConfig directory member bound".into());
+        }
+    }
+    members.sort();
+    Ok(members)
+}
+
 fn observe_with(
     path: &Path,
     kind: Kind,
@@ -98,17 +116,8 @@ fn observe_with(
             if !before.is_dir() {
                 return Err("declared FontConfig directory changed type".into());
             }
-            // The /proc fd binds enumeration to the opened directory, even if
-            // its configured pathname is concurrently replaced. No recursive
-            // walk and no following member symlinks is needed for membership.
-            for entry in std::fs::read_dir(format!("/proc/self/fd/{}", file.as_raw_fd()))? {
-                let name = entry?.file_name();
-                members.push(name.as_bytes().to_vec());
-                if members.len() > limits.members {
-                    return Err("FontConfig directory member bound".into());
-                }
-            }
-            members.sort();
+            // No recursive walk or following member symlinks is needed.
+            members = directory_members(&file, limits.members)?;
             hash.update(b"fontconfig-directory-v1\0");
             hash.update((members.len() as u64).to_le_bytes());
             for name in &members {
@@ -119,20 +128,12 @@ fn observe_with(
         }
     };
     after_read();
-    if matches!(kind, Kind::FontConfigDirectory) {
-        // Directory timestamps and size can collide across a member change.
-        // Compare a second bounded inventory of the same opened directory.
-        let mut current_members = Vec::with_capacity(members.len());
-        for entry in std::fs::read_dir(format!("/proc/self/fd/{}", file.as_raw_fd()))? {
-            current_members.push(entry?.file_name().as_bytes().to_vec());
-            if current_members.len() > limits.members {
-                return Err("FontConfig directory member bound".into());
-            }
-        }
-        current_members.sort();
-        if members != current_members {
-            return Err("native resource changed during observation".into());
-        }
+    // Directory size and even nanosecond timestamps can remain unchanged
+    // across membership changes. Validate the names, not just that metadata.
+    if matches!(kind, Kind::FontConfigDirectory)
+        && members != directory_members(&file, limits.members)?
+    {
+        return Err("FontConfig directory membership changed during observation".into());
     }
     if identity(&before) != identity(&file.metadata()?)
         || identity(&before) != identity(&path.metadata()?)
@@ -233,6 +234,22 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.to_string(), "FontConfig directory member bound");
+    fn directory_member_recheck_preserves_raw_names_and_same_count_changes() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join(OsString::from_vec(b"\xff.conf".to_vec()));
+        let replacement = temp.path().join(OsString::from_vec(b"\xfe.conf".to_vec()));
+        std::fs::write(&original, b"").unwrap();
+        std::fs::write(temp.path().join("a.conf"), b"").unwrap();
+        let opened = std::fs::File::open(temp.path()).unwrap();
+        let before = directory_members(&opened, limits().members).unwrap();
+        assert_eq!(before, vec![b"a.conf".to_vec(), b"\xff.conf".to_vec()]);
+        std::fs::rename(original, replacement).unwrap();
+        let after = directory_members(&opened, limits().members).unwrap();
+        assert_eq!(after, vec![b"a.conf".to_vec(), b"\xfe.conf".to_vec()]);
+        assert_eq!(before.len(), after.len());
+        assert_ne!(before, after);
+        assert!(directory_members(&opened, 1).is_err());
     }
     #[test]
     fn directory_retains_raw_member_names_and_native_file_symlinks() {

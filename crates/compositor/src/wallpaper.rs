@@ -10,6 +10,7 @@
 //! oversized output — degrades to the solid clear, never an error.
 
 use crate::slideshow::{Sample, Timeline, MAX_XML_BYTES};
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::io::Read;
 use std::os::unix::ffi::OsStringExt;
@@ -31,6 +32,7 @@ pub const WALLPAPER_FILE: &str = "tuna-wallpaper";
 /// Largest output area (in pixels) a wallpaper is scaled to; bigger
 /// outputs keep the solid clear rather than burning memory.
 pub const MAX_WALLPAPER_AREA: u64 = 7680 * 4320;
+const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Runtime-dir drop path for the wallpaper URI, beside the control
 /// socket and the Wayland socket.
@@ -1283,22 +1285,20 @@ fn card_placement(
     (at.into(), Some(size.into()))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct FileIdentity {
-    path: PathBuf,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileMetadata {
     dev: u64,
     ino: u64,
     bytes: u64,
     modified: (i64, i64),
     changed: (i64, i64),
 }
-impl FileIdentity {
-    fn from_metadata(path: PathBuf, m: &std::fs::Metadata) -> Option<Self> {
-        if !m.is_file() || m.len() > 64 * 1024 * 1024 {
+impl FileMetadata {
+    fn from_metadata(m: &std::fs::Metadata) -> Option<Self> {
+        if !m.is_file() || m.len() > MAX_SOURCE_BYTES {
             return None;
         }
         Some(Self {
-            path,
             dev: m.dev(),
             ino: m.ino(),
             bytes: m.len(),
@@ -1306,12 +1306,51 @@ impl FileIdentity {
             changed: (m.ctime(), m.ctime_nsec()),
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FileIdentity {
+    path: PathBuf,
+    metadata: FileMetadata,
+    sha256: [u8; 32],
+}
+impl FileIdentity {
     fn for_uri(uri: &str) -> Option<Self> {
         Self::for_path(&wallpaper_uri_to_path(uri)?)
     }
     fn for_path(path: &std::path::Path) -> Option<Self> {
         let path = path.canonicalize().ok()?;
-        Self::from_metadata(path.clone(), &std::fs::metadata(path).ok()?)
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+            .ok()?;
+        let metadata = FileMetadata::from_metadata(&file.metadata().ok()?)?;
+        // Equal-size in-place writes can share even nanosecond mtime/ctime.
+        // Hash on the bounded source worker, without retaining another image.
+        let mut hash = Sha256::new();
+        let mut buffer = [0; 16384];
+        let mut reader = file.by_ref().take(metadata.bytes + 1);
+        let mut bytes = 0;
+        loop {
+            let count = reader.read(&mut buffer).ok()?;
+            if count == 0 {
+                break;
+            }
+            bytes += count as u64;
+            hash.update(&buffer[..count]);
+        }
+        if bytes != metadata.bytes
+            || FileMetadata::from_metadata(&file.metadata().ok()?) != Some(metadata)
+            || FileMetadata::from_metadata(&std::fs::metadata(&path).ok()?) != Some(metadata)
+        {
+            return None;
+        }
+        Some(Self {
+            path,
+            metadata,
+            sha256: hash.finalize().into(),
+        })
     }
 }
 /// This entire observer executes on a bounded worker, including timezone
@@ -1386,7 +1425,7 @@ impl SourceObservation {
     }
 }
 fn read_identity(expected: &FileIdentity, limit: u64) -> Option<Vec<u8>> {
-    if expected.bytes > limit {
+    if expected.metadata.bytes > limit {
         return None;
     }
     let mut file = std::fs::OpenOptions::new()
@@ -1394,16 +1433,17 @@ fn read_identity(expected: &FileIdentity, limit: u64) -> Option<Vec<u8>> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&expected.path)
         .ok()?;
-    if FileIdentity::from_metadata(expected.path.clone(), &file.metadata().ok()?)
-        != Some(expected.clone())
-    {
+    if FileMetadata::from_metadata(&file.metadata().ok()?) != Some(expected.metadata) {
         return None;
     }
-    let mut bytes = Vec::new();
-    file.by_ref().take(limit + 1).read_to_end(&mut bytes).ok()?;
-    (bytes.len() as u64 == expected.bytes
-        && FileIdentity::from_metadata(expected.path.clone(), &file.metadata().ok()?)
-            == Some(expected.clone()))
+    let mut bytes = Vec::with_capacity(expected.metadata.bytes as usize + 1);
+    file.by_ref()
+        .take(expected.metadata.bytes + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 == expected.metadata.bytes
+        && FileMetadata::from_metadata(&file.metadata().ok()?) == Some(expected.metadata)
+        && <[u8; 32]>::from(Sha256::digest(&bytes)) == expected.sha256)
     .then_some(bytes)
 }
 fn load_animation_wallpaper(
@@ -1421,9 +1461,6 @@ fn load_animation_wallpaper(
                 .iter()
                 .all(|(path, id)| FileIdentity::for_path(path) == *id)
     };
-    if !unchanged() {
-        return None;
-    }
     let decode = |path: &PathBuf| -> Option<std::sync::Arc<image::RgbaImage>> {
         let identity = references.iter().find(|(p, _)| p == path)?.1.as_ref()?;
         if let Some(found) = caches
@@ -1437,11 +1474,8 @@ fn load_animation_wallpaper(
             return Some(found);
         }
         let image = std::sync::Arc::new(
-            tuna_wallpaper::decode(&read_identity(identity, 64 * 1024 * 1024)?)?.to_rgba8(),
+            tuna_wallpaper::decode(&read_identity(identity, MAX_SOURCE_BYTES)?)?.to_rgba8(),
         );
-        if FileIdentity::for_path(path) != Some(identity.clone()) {
-            return None;
-        }
         let mut slots = caches.images.lock().ok()?;
         let mut bytes = slots
             .iter()
@@ -1536,9 +1570,6 @@ fn load_static_wallpaper(
         // Do not observe or decode its unused source, or consult an image cache.
         return tuna_wallpaper::background::render(None, settings, geometry);
     }
-    if FileIdentity::for_uri(uri) != expected {
-        return None;
-    }
     let original_identity = expected.clone();
     let cache = static_cache_path(uri, settings, geometry, expected.as_ref());
     let want = geometry.physical[0] as usize * geometry.physical[1] as usize * 4;
@@ -1567,31 +1598,8 @@ fn load_static_wallpaper(
         }
     }
     let mut cacheable = true;
-    let image = if settings.placement == tuna_shell_control::background::Placement::None {
-        None
-    } else if let Some(expected) = expected {
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&expected.path)
-            .ok()?;
-        if FileIdentity::from_metadata(expected.path.clone(), &file.metadata().ok()?)
-            != Some(expected.clone())
-        {
-            return None;
-        }
-        let mut bytes = Vec::new();
-        file.by_ref()
-            .take(64 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        if bytes.len() as u64 != expected.bytes
-            || FileIdentity::from_metadata(expected.path.clone(), &file.metadata().ok()?)
-                != Some(expected.clone())
-            || FileIdentity::for_uri(uri) != Some(expected)
-        {
-            return None;
-        }
+    let image = if let Some(expected) = expected {
+        let bytes = read_identity(&expected, MAX_SOURCE_BYTES)?;
         // A native SVG render also depends on the installed loader and
         // fonts, which this source-file key does not identify.
         cacheable = tuna_wallpaper::is_raster(&bytes);
@@ -1627,7 +1635,7 @@ fn static_cache_path(
         return None;
     }
     let mut hash = std::collections::hash_map::DefaultHasher::new();
-    4u32.hash(&mut hash);
+    5u32.hash(&mut hash);
     uri.hash(&mut hash);
     settings.hash(&mut hash);
     geometry.hash(&mut hash);
@@ -2515,6 +2523,82 @@ mod tests {
         std::fs::write(&xml, "<!DOCTYPE background [<!ENTITY a 'x'>]><background/>").unwrap();
         let invalid = SourceObservation::observe(&uri);
         assert!(invalid.xml && invalid.timeline.is_none());
+    }
+
+    #[test]
+    fn same_metadata_content_change_rejects_stale_cached_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let picture = dir.path().join("frame.png");
+        let red = std::sync::Arc::new(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([240, 0, 0, 255]),
+        ));
+        red.save(&picture).unwrap();
+        let original = FileIdentity::for_path(&picture).unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 240, 255]))
+            .save(&picture)
+            .unwrap();
+        let current = FileIdentity::for_path(&picture).unwrap();
+        assert_eq!(original.metadata.bytes, current.metadata.bytes);
+        // Simulate a filesystem returning every old metadata field for new
+        // bytes, independently of this machine's timestamp resolution.
+        let stale = FileIdentity {
+            metadata: current.metadata,
+            ..original
+        };
+        assert_eq!(stale.metadata, current.metadata);
+        assert_ne!(stale, current);
+        assert!(read_identity(&stale, MAX_SOURCE_BYTES).is_none());
+        assert!(read_identity(&current, MAX_SOURCE_BYTES).is_some());
+        let picture_uri = format!("file://{}", picture.display());
+        assert!(load_static_wallpaper(
+            &picture_uri,
+            PictureSettings::default(),
+            test_geometry(),
+            Some(stale.clone()),
+        )
+        .is_none());
+
+        let xml = dir.path().join("timeline.xml");
+        std::fs::write(
+            &xml,
+            format!(
+                "<background><static><duration>4</duration><file>{}</file></static></background>",
+                picture.display()
+            ),
+        )
+        .unwrap();
+        let uri = format!("file://{}", xml.display());
+        let observed = SourceObservation::observe(&uri);
+        let sample = observed
+            .timeline
+            .as_ref()
+            .unwrap()
+            .sample(100.0, [8, 8])
+            .unwrap();
+        let caches = BackgroundCaches::default();
+        caches.images.lock().unwrap().push((stale.clone(), red));
+        assert!(load_animation_wallpaper(
+            &uri,
+            observed.identity.clone(),
+            sample.clone(),
+            vec![(picture.clone(), Some(stale))],
+            PictureSettings::default(),
+            test_geometry(),
+            &caches,
+        )
+        .is_none());
+        assert!(load_animation_wallpaper(
+            &uri,
+            observed.identity,
+            sample,
+            observed.references,
+            PictureSettings::default(),
+            test_geometry(),
+            &caches,
+        )
+        .is_some());
     }
 
     #[test]
