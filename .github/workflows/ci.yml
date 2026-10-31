@@ -106,6 +106,8 @@ jobs:
           sparse-checkout: |
             /.github/actions/ci-tool/
             /scripts/ci-install-gtk4-layer-shell
+            /scripts/ci-install-gtk4-atspi-root
+            /scripts/gtk-atspi-root-proof
       - uses: ./.ci-workflow-tools/.github/actions/ci-tool
         with:
           tool: gtk4-layer-shell
@@ -647,6 +649,14 @@ jobs:
         with:
           tool: gtk4-layer-shell
           version: 4867d7b85cdf1e829fc1fd6f1d5f04c42cc99389
+      - name: Install controlled GTK build and private proof dependencies
+        run: sudo apt-get install -y --no-install-recommends quilt gettext libvulkan-dev glslc libtiff-dev libjpeg-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev python3-gi gir1.2-gtk-4.0 dbus-x11 xauth
+      - uses: ./.ci-workflow-tools/.github/actions/ci-tool
+        with:
+          tool: gtk4-atspi-root
+          version: 4.14.5+ds-0ubuntu0.10+21d3eb76
+      - name: Prove real stock failure and repaired AT-SPI root references
+        run: /usr/bin/python3 .ci-workflow-tools/scripts/gtk-atspi-root-proof --artifacts "$RUNNER_TEMP/gtk-atspi-root-proof"
       - name: Check exact source/build/negative-verdict admission
         run: |
           /usr/bin/python3 scripts/tests/test_grid_cancel_proof.py
@@ -667,6 +677,8 @@ jobs:
             ${{ runner.temp }}/grid-cancel-comparison/*.txt
             ${{ runner.temp }}/grid-cancel-comparison/old/
             ${{ runner.temp }}/grid-cancel-comparison/fixed/
+            ${{ runner.temp }}/gtk-atspi-root-proof/
+            ${{ runner.temp }}/ci-tool-gtk4-atspi-root/usr/local/share/doc/tuna-ci-gtk4-atspi-root/
           retention-days: 14
 
   gtk-shell:
