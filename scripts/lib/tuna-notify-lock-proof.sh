@@ -274,7 +274,8 @@ notify_lock_proof() {
     sleep 1
     # Use the same real panel click as the notification-list gates. GTK's
     # MenuButton accessibility action can report success without opening it.
-    open_calendar
+    xdotool mousemove --window "$WID" $((WIDTH / 2)) 16 click 1
+    sleep 2
     nl_until restore-disabled '[.[] | select(.showing)] | (any(.name == "Clear") and any(.name == "Listed Summary"))' G-NOTIFY-RESTORE ||
         fail G-NOTIFY-RESTORE "the date menu does not list the history"
     nl_mentions "$nl_tree" "Off Again" &&
