@@ -1,7 +1,7 @@
 //! The GNOME 51 protocols Tuna Desktop added to close P-SY-06's gaps (#89):
 //! presentation-time, fifo, keyboard-shortcuts-inhibit, xdg-dialog,
-//! xdg-foreign, xdg-system-bell and xdg-toplevel-tag, driven by a real
-//! client against the headless compositor.
+//! xdg-foreign, xdg-system-bell, xdg-toplevel-tag and ext-background-effect,
+//! driven by a real client against the headless compositor.
 
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
@@ -21,6 +21,10 @@ use wayland_client::{
     },
     Connection, Dispatch, EventQueue, QueueHandle,
 };
+use wayland_protocols::ext::background_effect::v1::client::{
+    ext_background_effect_manager_v1::{self, ExtBackgroundEffectManagerV1},
+    ext_background_effect_surface_v1::{self, ExtBackgroundEffectSurfaceV1},
+};
 use wayland_protocols::wp::fifo::v1::client::{
     wp_fifo_manager_v1::WpFifoManagerV1, wp_fifo_v1::WpFifoV1,
 };
@@ -35,10 +39,16 @@ use wayland_protocols::wp::presentation_time::client::{
 use wayland_protocols::xdg::dialog::v1::client::{
     xdg_dialog_v1::XdgDialogV1, xdg_wm_dialog_v1::XdgWmDialogV1,
 };
+use wayland_protocols::xdg::foreign::zv1::client::{
+    zxdg_exported_v1::{self, ZxdgExportedV1},
+    zxdg_exporter_v1::ZxdgExporterV1,
+    zxdg_imported_v1::{self, ZxdgImportedV1},
+    zxdg_importer_v1::ZxdgImporterV1,
+};
 use wayland_protocols::xdg::foreign::zv2::client::{
     zxdg_exported_v2::{self, ZxdgExportedV2},
     zxdg_exporter_v2::ZxdgExporterV2,
-    zxdg_imported_v2::ZxdgImportedV2,
+    zxdg_imported_v2::{self, ZxdgImportedV2},
     zxdg_importer_v2::ZxdgImporterV2,
 };
 use wayland_protocols::xdg::shell::client::{
@@ -66,6 +76,10 @@ struct Client {
     fates: HashMap<u32, Fate>,
     inhibitor_active: Option<bool>,
     handle: Option<String>,
+    /// xdg_imported destroyed events received (either version).
+    imports_destroyed: usize,
+    /// ext_background_effect_manager_v1 capabilities, as sent.
+    background_effects: Option<u32>,
 }
 
 impl Dispatch<WlCallback, ()> for Client {
@@ -222,6 +236,69 @@ impl Dispatch<ZxdgExportedV2, ()> for Client {
     }
 }
 
+impl Dispatch<ZxdgExportedV1, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &ZxdgExportedV1,
+        event: zxdg_exported_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zxdg_exported_v1::Event::Handle { handle } = event {
+            state.handle = Some(handle);
+        }
+    }
+}
+
+impl Dispatch<ZxdgImportedV2, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &ZxdgImportedV2,
+        event: zxdg_imported_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zxdg_imported_v2::Event::Destroyed = event {
+            state.imports_destroyed += 1;
+        }
+    }
+}
+
+impl Dispatch<ZxdgImportedV1, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &ZxdgImportedV1,
+        event: zxdg_imported_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zxdg_imported_v1::Event::Destroyed = event {
+            state.imports_destroyed += 1;
+        }
+    }
+}
+
+impl Dispatch<ExtBackgroundEffectManagerV1, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &ExtBackgroundEffectManagerV1,
+        event: ext_background_effect_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let ext_background_effect_manager_v1::Event::Capabilities {
+            flags: wayland_client::WEnum::Value(flags),
+        } = event
+        {
+            state.background_effects = Some(flags.bits());
+        }
+    }
+}
+
 wayland_client::delegate_noop!(Client: ignore WlCompositor);
 wayland_client::delegate_noop!(Client: ignore WlSurface);
 wayland_client::delegate_noop!(Client: ignore WlSeat);
@@ -235,7 +312,10 @@ wayland_client::delegate_noop!(Client: ignore XdgDialogV1);
 wayland_client::delegate_noop!(Client: ignore XdgToplevelTagManagerV1);
 wayland_client::delegate_noop!(Client: ignore ZxdgExporterV2);
 wayland_client::delegate_noop!(Client: ignore ZxdgImporterV2);
-wayland_client::delegate_noop!(Client: ignore ZxdgImportedV2);
+wayland_client::delegate_noop!(Client: ignore ZxdgExporterV1);
+wayland_client::delegate_noop!(Client: ignore ZxdgImporterV1);
+wayland_client::delegate_noop!(Client: ignore ExtBackgroundEffectSurfaceV1);
+wayland_client::delegate_noop!(Client: ignore wayland_client::protocol::wl_region::WlRegion);
 
 struct Peer {
     _conn: Connection,
@@ -677,6 +757,91 @@ fn exported_windows_parent_another_clients_dialog() {
     );
 }
 
+/// The window titled `child` has the window titled `parent` as its
+/// parent.
+fn parented(comp: &TestCompositor, child: &str, parent: &str) -> bool {
+    use smithay::wayland::{compositor::with_states, shell::xdg::XdgToplevelSurfaceData};
+    let toplevels = comp.state.toplevels();
+    let titled = |title: &str| {
+        toplevels
+            .iter()
+            .find(|t| {
+                with_states(t.wl_surface(), |states| {
+                    states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()
+                        .is_some_and(|data| data.lock().unwrap().title.as_deref() == Some(title))
+                })
+            })
+            .cloned()
+    };
+    let (Some(child), Some(parent)) = (titled(child), titled(parent)) else {
+        return false;
+    };
+    child.parent().as_ref() == Some(parent.wl_surface())
+}
+
+#[test]
+fn gtk3_v1_exports_import_through_either_version_and_revoke() {
+    // Mutter keeps one handle table for zxdg_foreign v1 and v2
+    // (meta-wayland-legacy-xdg-foreign.c calls the v2 export/import
+    // functions): GTK 3 exports with v1 and the portal imports with v2.
+    let (mut comp, mut manager) = compositor();
+    let mut gtk3 = connect(&mut comp, &mut manager);
+    let mut portal = connect(&mut comp, &mut manager);
+    assert_eq!(gtk3.client.globals["zxdg_exporter_v1"].1, 1);
+    assert_eq!(gtk3.client.globals["zxdg_importer_v1"].1, 1);
+    let exporter_v1: ZxdgExporterV1 = gtk3.bind(1);
+    let importer_v1: ZxdgImporterV1 = gtk3.bind(1);
+    let exporter_v2: ZxdgExporterV2 = portal.bind(1);
+    let importer_v2: ZxdgImporterV2 = portal.bind(1);
+    let (app_surface, _app) = window(&mut gtk3, "gtk3 app");
+    let (dialog_surface, _dialog) = window(&mut portal, "portal chooser");
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+
+    // v1 export, v2 import.
+    let exported = exporter_v1.export(&app_surface, &gtk3.qh(), ());
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    let handle = gtk3.client.handle.take().expect("v1 export handle");
+    let imported = importer_v2.import_toplevel(handle.clone(), &portal.qh(), ());
+    imported.set_parent_of(&dialog_surface);
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    assert!(parented(&comp, "portal chooser", "gtk3 app"));
+    assert_eq!(portal.client.imports_destroyed, 0);
+
+    // Revoking the v1 export destroys the v2 import and frees the dialog
+    // (Mutter's meta_wayland_xdg_exported_destroy).
+    exported.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    assert_eq!(portal.client.imports_destroyed, 1);
+    assert!(!parented(&comp, "portal chooser", "gtk3 app"));
+    // The revoked handle no longer imports, through either version.
+    let stale = importer_v2.import_toplevel(handle, &portal.qh(), ());
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    assert_eq!(portal.client.imports_destroyed, 2);
+    stale.set_parent_of(&dialog_surface);
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    assert!(!parented(&comp, "portal chooser", "gtk3 app"));
+
+    // v2 export, v1 import, and the import's own destruction unparents.
+    let _exported = exporter_v2.export_toplevel(&dialog_surface, &portal.qh(), ());
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    let handle = portal.client.handle.take().expect("v2 export handle");
+    let imported = importer_v1.import(handle, &gtk3.qh(), ());
+    imported.set_parent_of(&app_surface);
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    assert!(parented(&comp, "gtk3 app", "portal chooser"));
+    imported.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    assert!(!parented(&comp, "gtk3 app", "portal chooser"));
+    assert_eq!(gtk3.client.imports_destroyed, 0);
+
+    // An unknown v1 handle is destroyed at once.
+    let _unknown = importer_v1.import("not-a-handle".into(), &gtk3.qh(), ());
+    pump(&mut comp, &mut manager, &mut [&mut gtk3, &mut portal]);
+    assert_eq!(gtk3.client.imports_destroyed, 1);
+}
+
 #[test]
 fn running_app_eligibility_follows_real_transient_parent_changes() {
     let (mut comp, mut manager) = compositor();
@@ -954,4 +1119,140 @@ fn child_mapping_and_closing_cannot_restore_hidden_parent() {
     assert!(manager.is_minimized(parent_id));
     assert!(manager.visible_windows().is_empty());
     assert_eq!(manager.model().focused(), None);
+}
+
+/// The committed blur region's area, `None` without an effect.
+fn blur_area(
+    surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+) -> Option<i32> {
+    tuna_compositor::background_effect::blur_region(surface)
+        .map(|rects| rects.iter().map(|r| r.size.w * r.size.h).sum())
+}
+
+/// Pump until the compositor kills the connection, which then refuses
+/// further I/O; returns the protocol error it sent.
+fn pump_to_error(
+    comp: &mut TestCompositor,
+    manager: &mut WindowManager,
+    peer: &mut Peer,
+) -> wayland_client::backend::protocol::ProtocolError {
+    for _ in 0..ROUNDS {
+        let _ = peer.queue.flush();
+        comp.pump();
+        manager.reconcile(&mut comp.state);
+        comp.pump();
+        if let Some(guard) = peer.queue.prepare_read() {
+            let _ = guard.read();
+        }
+        let _ = peer.queue.dispatch_pending(&mut peer.client);
+        if let Some(error) = peer._conn.protocol_error() {
+            return error;
+        }
+    }
+    panic!("no protocol error");
+}
+
+#[test]
+fn background_blur_regions_apply_on_commit_like_mutter() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    // meta_wayland_init_background_effect: version 1, always offered.
+    assert_eq!(
+        peer.client
+            .globals
+            .get("ext_background_effect_manager_v1")
+            .map(|g| g.1),
+        Some(1)
+    );
+    let effects: ExtBackgroundEffectManagerV1 = peer.bind(1);
+    let compositor: WlCompositor = peer.bind(6);
+    let (surface, _toplevel) = window(&mut peer, "terminal");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    // Told at bind: blur is supported.
+    assert_eq!(
+        peer.client.background_effects,
+        Some(ext_background_effect_manager_v1::Capability::Blur.bits())
+    );
+    let server = comp.state.toplevels()[0].wl_surface().clone();
+    assert_eq!(blur_area(&server), None, "no effect until asked");
+
+    let qh = peer.qh();
+    let effect = effects.get_background_effect(&surface, &qh, ());
+    let region = compositor.create_region(&qh, ());
+    region.add(10, 20, 100, 50);
+    region.subtract(10, 20, 10, 10);
+    effect.set_blur_region(Some(&region));
+    // Copy semantics: the region may go before the commit.
+    region.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(
+        blur_area(&server),
+        None,
+        "double-buffered: pending until commit"
+    );
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(blur_area(&server), Some(100 * 50 - 10 * 10));
+
+    // A NULL region removes the effect, on commit.
+    effect.set_blur_region(None);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(blur_area(&server), Some(100 * 50 - 10 * 10));
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(blur_area(&server), None);
+
+    // Destroying the object unsets the region on the next commit, and
+    // the surface may take a new object.
+    let region = compositor.create_region(&qh, ());
+    region.add(0, 0, 64, 64);
+    effect.set_blur_region(Some(&region));
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(blur_area(&server), Some(64 * 64));
+    effect.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(blur_area(&server), Some(64 * 64));
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(blur_area(&server), None);
+    let again = effects.get_background_effect(&surface, &qh, ());
+    again.set_blur_region(Some(&region));
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(peer._conn.protocol_error().is_none());
+    assert_eq!(blur_area(&server), Some(64 * 64));
+
+    // A second object on the surface: background_effect_exists.
+    let _second = effects.get_background_effect(&surface, &qh, ());
+    let error = pump_to_error(&mut comp, &mut manager, &mut peer);
+    assert_eq!(error.object_interface, "ext_background_effect_manager_v1");
+    assert_eq!(
+        error.code,
+        ext_background_effect_manager_v1::Error::BackgroundEffectExists as u32
+    );
+}
+
+#[test]
+fn a_blur_region_for_a_destroyed_surface_is_a_protocol_error() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let effects: ExtBackgroundEffectManagerV1 = peer.bind(1);
+    let compositor: WlCompositor = peer.bind(6);
+    let qh = peer.qh();
+    let surface = compositor.create_surface(&qh, ());
+    let effect = effects.get_background_effect(&surface, &qh, ());
+    surface.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(
+        peer._conn.protocol_error().is_none(),
+        "the object turns inert"
+    );
+    effect.set_blur_region(None);
+    let error = pump_to_error(&mut comp, &mut manager, &mut peer);
+    assert_eq!(error.object_interface, "ext_background_effect_surface_v1");
+    assert_eq!(
+        error.code,
+        ext_background_effect_surface_v1::Error::SurfaceDestroyed as u32
+    );
 }

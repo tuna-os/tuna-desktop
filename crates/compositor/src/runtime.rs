@@ -957,17 +957,61 @@ impl Runtime {
                     state.set_output_location(&out.name, out.loc);
                     state.note_output_global(&out.name, global);
                 }
+                // One lease device global per DRM device, native backend
+                // only (meta_wayland_drm_lease_manager_new).
+                match drm.lease_device(&dh) {
+                    Ok(device) => {
+                        eprintln!(
+                            "tuna-compositor: drm-lease: wp_drm_lease_device_v1 advertised ({} connector(s) for lease)",
+                            device.connector_count()
+                        );
+                        state.protocols.drm_lease = Some(device);
+                    }
+                    Err(e) => eprintln!("tuna-compositor: drm-lease: no lease device: {e}"),
+                }
                 let handle = event_loop.handle();
                 handle
                     .insert_source(sources.session, |event, _, rt: &mut Runtime| {
                         if matches!(event, smithay::backend::session::Event::PauseSession) {
                             rt.manager.cancel_strip_pointer(&mut rt.state);
                         }
+                        let active =
+                            matches!(event, smithay::backend::session::Event::ActivateSession);
                         if let Backend::Drm(drm) = &mut rt.backend {
                             drm.on_session_event(event);
                         }
+                        if let Some(lease) = rt.state.protocols.drm_lease.as_mut() {
+                            if active {
+                                lease.resume();
+                            } else {
+                                lease.pause();
+                            }
+                        }
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                // Hotplug and lessee changes (Mutter's resources-changed
+                // and lease-changed) reach the lease device through udev.
+                let device_id = drm.drm.device_id();
+                let seat = smithay::backend::session::Session::seat(&drm.session);
+                match smithay::backend::udev::UdevBackend::new(seat) {
+                    Ok(udev) => {
+                        handle
+                            .insert_source(udev, move |event, _, rt: &mut Runtime| {
+                                if let smithay::backend::udev::UdevEvent::Changed {
+                                    device_id: id,
+                                } = event
+                                {
+                                    if id == device_id {
+                                        if let Some(lease) = rt.state.protocols.drm_lease.as_mut() {
+                                            lease.device_changed();
+                                        }
+                                    }
+                                }
+                            })
+                            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                    }
+                    Err(e) => eprintln!("tuna-compositor: drm-lease: no udev monitor: {e}"),
+                }
                 handle
                     .insert_source(sources.drm, |event, metadata, rt: &mut Runtime| {
                         let flip = match &mut rt.backend {
@@ -1206,17 +1250,27 @@ impl Runtime {
             );
         }
 
-        // linux-dmabuf lists exactly what this renderer imports (#89).
+        // linux-dmabuf lists exactly what this renderer imports (#89),
+        // with feedback naming the renderer's device as Mutter's does.
         let mut backend = backend;
         let mut state = state;
         {
             use smithay::backend::renderer::ImportDma;
-            let formats: Vec<_> = match &mut backend {
-                Backend::Winit(winit) => winit.renderer().dmabuf_formats().into_iter().collect(),
+            let (formats, main_device): (Vec<_>, _) = match &mut backend {
+                Backend::Winit(winit) => {
+                    let renderer = winit.renderer();
+                    (
+                        renderer.dmabuf_formats().into_iter().collect(),
+                        crate::protocols::renderer_main_device(renderer),
+                    )
+                }
                 #[cfg(feature = "drm")]
-                Backend::Drm(drm) => drm.renderer.dmabuf_formats().into_iter().collect(),
+                Backend::Drm(drm) => (
+                    drm.renderer.dmabuf_formats().into_iter().collect(),
+                    crate::protocols::renderer_main_device(&drm.renderer),
+                ),
             };
-            state.enable_dmabuf(formats);
+            state.enable_dmabuf(formats, main_device);
         }
 
         // org.gnome.Mutter.ScreenCast and DisplayConfig (#61): screen
@@ -5777,7 +5831,15 @@ impl Runtime {
                     let passes = [
                         Tracked::pass(&paper, 1.0),
                         Tracked::pass(&previews, view.scale),
-                        Tracked::covered_pass(&elements.elements, view.scale, &cover),
+                        // A blur reads what lies under the windows in
+                        // front of it, so with one in the frame nothing is
+                        // culled (#503's cover only when no surface blurs).
+                        if elements.blur_markers.is_empty() {
+                            Tracked::covered_pass(&elements.elements, view.scale, &cover)
+                        } else {
+                            Tracked::pass(&elements.elements, view.scale)
+                        },
+                        Tracked::pass(&elements.blur_markers, 1.0),
                         Tracked::pass(&elements.tile, 1.0),
                         Tracked::pass(&elements.top, view.scale),
                         elements
@@ -5864,7 +5926,7 @@ impl Runtime {
                         let damage = if zoom_plan.is_some() {
                             vec![Rectangle::from_size(size)]
                         } else {
-                            damage
+                            elements.blur_damage(damage, Rectangle::from_size(size))
                         };
                         self.winit_signature = Some(signature);
                         let zoom_program = zoom_plan
@@ -6123,7 +6185,15 @@ impl Runtime {
                     let passes = [
                         Tracked::pass(&paper, 1.0),
                         Tracked::pass(&previews, view.scale),
-                        Tracked::covered_pass(&elements.elements, view.scale, &cover),
+                        // A blur reads what lies under the windows in
+                        // front of it, so with one in the frame nothing is
+                        // culled (#503's cover only when no surface blurs).
+                        if elements.blur_markers.is_empty() {
+                            Tracked::covered_pass(&elements.elements, view.scale, &cover)
+                        } else {
+                            Tracked::pass(&elements.elements, view.scale)
+                        },
+                        Tracked::pass(&elements.blur_markers, 1.0),
                         Tracked::pass(&elements.tile, 1.0),
                         Tracked::pass(&elements.top, view.scale),
                         elements
@@ -6227,7 +6297,7 @@ impl Runtime {
                     let damage = if zoom_plan.is_some() {
                         vec![Rectangle::from_size(logical)]
                     } else {
-                        damage
+                        elements.blur_damage(damage, Rectangle::from_size(logical))
                     };
                     let zoom_program = zoom_plan
                         .as_ref()
@@ -6659,6 +6729,11 @@ struct Scene {
     /// The window each of `elements` belongs to (popups included), for
     /// reporting which windows occlusion hid; `None` for layers.
     owners: Vec<Option<u64>>,
+    /// Surfaces with an ext-background-effect blur region, by element.
+    blur: Vec<crate::background_blur::Behind>,
+    /// Their sample areas, for damage tracking only (never drawn): a
+    /// region that changes or moves repaints old and new areas.
+    blur_markers: Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement>,
 }
 
 /// A size-change snapshot, drawn at scale 1.
@@ -6691,7 +6766,76 @@ impl Scene {
             brightness: vec![1.0; above],
             dim_program: None,
             owners: vec![None; above],
+            blur: Vec::new(),
+            blur_markers: Vec::new(),
         }
+    }
+
+    /// Find the surfaces among `elements` with a committed
+    /// ext-background-effect blur region (none: no work at all), in
+    /// frame pixels at the pass `scale`, clipped to the surface.
+    fn with_blur(mut self, state: &State, scale: f64) -> Self {
+        use smithay::backend::renderer::element::{solid::SolidColorRenderElement, Element};
+        let blurred = state.protocols.background_effects.blurred();
+        if blurred.is_empty() {
+            return self;
+        }
+        for (index, element) in self.elements.iter().enumerate() {
+            let Some(surface) = blurred.iter().find(|b| b.id == *element.id()) else {
+                continue;
+            };
+            if surface.size.w <= 0 || surface.size.h <= 0 {
+                continue;
+            }
+            // Logical surface pixels to frame pixels, rescaling included.
+            let geometry = element.geometry(scale.into());
+            let sx = f64::from(geometry.size.w) / f64::from(surface.size.w);
+            let sy = f64::from(geometry.size.h) / f64::from(surface.size.h);
+            let rects: Vec<_> = surface
+                .rects
+                .iter()
+                .filter_map(|r| {
+                    let x0 = geometry.loc.x + (f64::from(r.loc.x) * sx).round() as i32;
+                    let y0 = geometry.loc.y + (f64::from(r.loc.y) * sy).round() as i32;
+                    let x1 = geometry.loc.x + (f64::from(r.loc.x + r.size.w) * sx).round() as i32;
+                    let y1 = geometry.loc.y + (f64::from(r.loc.y + r.size.h) * sy).round() as i32;
+                    Rectangle::new((x0, y0).into(), (x1 - x0, y1 - y0).into())
+                        .intersection(geometry)
+                })
+                .collect();
+            let behind = crate::background_blur::Behind {
+                index,
+                rects,
+                radius: (crate::background_blur::BLUR_RADIUS * sx.max(sy)) as f32,
+                alpha: element.alpha(),
+            };
+            let Some(sample) = behind.sample() else {
+                continue;
+            };
+            self.blur_markers.push(SolidColorRenderElement::new(
+                surface.marker.clone(),
+                sample,
+                surface.commit,
+                Color32F::TRANSPARENT,
+                Kind::Unspecified,
+            ));
+            self.blur.push(behind);
+        }
+        self
+    }
+
+    /// The frame's damage with every blur sample area it touches.
+    fn blur_damage(
+        &self,
+        damage: Vec<Rectangle<i32, smithay::utils::Physical>>,
+        output: Rectangle<i32, smithay::utils::Physical>,
+    ) -> Vec<Rectangle<i32, smithay::utils::Physical>> {
+        if self.blur.is_empty() {
+            return damage;
+        }
+        crate::native_repaint::coalesce(crate::background_blur::expand_damage(
+            damage, &self.blur, output,
+        ))
     }
 }
 
@@ -6933,7 +7077,8 @@ fn scene_elements(
                 )
             })
             .unwrap_or_default(),
-        );
+        )
+        .with_blur(state, view.scale);
     }
     if overview.is_some() {
         // Overview (#54): windows are drawn as rescaled previews in
@@ -6960,7 +7105,7 @@ fn scene_elements(
                 ));
             }
         }
-        return Scene::flat(crate::layer::front_to_back(elements));
+        return Scene::flat(crate::layer::front_to_back(elements)).with_blur(state, view.scale);
     }
     let mut elements: Vec<PreviewElement> = Vec::new();
     let mut owners: Vec<Option<u64>> = Vec::new();
@@ -7203,7 +7348,10 @@ fn scene_elements(
         bell: Vec::new(),
         snapshots,
         owners: crate::layer::front_to_back(owners),
+        blur: Vec::new(),
+        blur_markers: Vec::new(),
     }
+    .with_blur(state, view.scale)
 }
 
 fn background_geometry(
@@ -7409,9 +7557,9 @@ fn draw_scene(
     set_tint(frame, 1.0);
     draw_planned::<GlesRenderer, _>(frame, scale, previews, &previews_plan).map_err(error)?;
     frame.clear_tex_program_override();
-    draw_slots(frame, scale, scene, &under, &under_plan, tint).map_err(error)?;
+    draw_slots(frame, output, scale, scene, &under, &under_plan, tint).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, tile, &tile_plan).map_err(error)?;
-    draw_slots(frame, scale, scene, &over, &over_plan, tint).map_err(error)?;
+    draw_slots(frame, output, scale, scene, &over, &over_plan, tint).map_err(error)?;
     set_tint(frame, 1.0);
     draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan).map_err(error)?;
     frame.clear_tex_program_override();
@@ -7551,9 +7699,21 @@ fn plan_slots(
         .iter()
         .map(|slot| {
             let plan = match *slot {
-                SceneSlot::Element(index) => occlusion
-                    .plan(scale, std::slice::from_ref(&scene.elements[index]))
-                    .remove(0),
+                SceneSlot::Element(index) => {
+                    let plan = occlusion
+                        .plan(scale, std::slice::from_ref(&scene.elements[index]))
+                        .remove(0);
+                    // What a background blur reads repaints beneath it.
+                    if let Some(sample) = scene
+                        .blur
+                        .iter()
+                        .find(|blur| blur.index == index)
+                        .and_then(crate::background_blur::Behind::sample)
+                    {
+                        occlusion.uncover(&[sample]);
+                    }
+                    plan
+                }
                 SceneSlot::Bell(k) => occlusion
                     .plan(1.0, std::slice::from_ref(&scene.bell[k].1))
                     .remove(0),
@@ -7566,8 +7726,12 @@ fn plan_slots(
         .unzip()
 }
 
+/// Draw the slots bottom to top; a surface with a background blur gets
+/// it painted under itself first, over what is already drawn.
+#[allow(clippy::too_many_arguments)]
 fn draw_slots(
     frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+    output: Rectangle<i32, smithay::utils::Physical>,
     scale: f64,
     scene: &Scene,
     slots: &[SceneSlot],
@@ -7576,6 +7740,22 @@ fn draw_slots(
 ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
     use crate::occlusion::draw_planned;
     for (slot, visible) in slots.iter().zip(plan).rev() {
+        if let SceneSlot::Element(index) = *slot {
+            if let Some(blur) = scene.blur.iter().find(|blur| blur.index == index) {
+                let under: Vec<_> = blur
+                    .rects
+                    .iter()
+                    .flat_map(|rect| visible.iter().filter_map(|v| v.intersection(*rect)))
+                    .collect();
+                crate::background_blur::draw_behind(
+                    frame,
+                    &under,
+                    blur.radius,
+                    blur.alpha,
+                    output,
+                )?;
+            }
+        }
         let visible = std::slice::from_ref(visible);
         let brightness = match *slot {
             SceneSlot::Element(index) => scene.brightness[index],

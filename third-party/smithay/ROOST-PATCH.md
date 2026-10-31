@@ -139,3 +139,58 @@ meta_x11_display_set_input_focus does; enter/leave are unchanged. The
 nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
 The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
 version stays 0.7.0.
+
+Issue #364 changes src/wayland/shell/xdg/mod.rs: xdg_wm_base is created at
+version 7, as Mutter 51 advertises it (META_XDG_WM_BASE_VERSION). Version 7
+adds only the four xdg_toplevel constrained_* states. A configure keeps
+every state a client's bind can name and drops the rest: tiled states below
+version 2, suspended below 6 and constrained below 7, the same version
+gates as Mutter's fill_states (meta-wayland-xdg-shell.c). Roost sets the
+states from Mutter's edge constraints. Real-client tests in
+crates/compositor/tests/windows.rs bind versions 7 and 6 and read the
+configure states. The isolated diff is retained in
+XDG-WM-BASE-7-PATCH.diff; the pinned version stays 0.7.0.
+
+Issue #364 additionally changes src/wayland/xdg_foreign/mod.rs and
+handlers.rs: zxdg_exporter_v1 and zxdg_importer_v1 join the v2 globals,
+sharing one handle table, as Mutter's meta-wayland-legacy-xdg-foreign.c
+calls the same export and import functions as v2. GTK 3 exports with v1 and
+the portal imports with v2, so each version imports the other's handles.
+Each import now parents at most one child (Mutter's imported->parent_of;
+upstream kept one child per export, so a second importer replaced the
+first's relationship), and revoking an export sends destroyed to every
+import and clears the parents they set, as meta_wayland_xdg_exported_destroy
+does; upstream only cleared the parent. An import of an unknown handle is
+destroyed at once, as before. An invalid v1 parent posts error 0 on the
+import, Mutter's WL_DISPLAY_ERROR_INVALID_OBJECT, since zxdg_imported_v1 has
+no error enum. Real socketpair tests in
+crates/compositor/tests/protocol_gaps.rs cover v1 export with v2 import, v2
+export with v1 import, revocation and unknown handles. The isolated diff is
+retained in XDG-FOREIGN-V1-PATCH.diff; the pinned version stays 0.7.0.
+
+Issues #364 and #588 change src/wayland/drm_lease/mod.rs, with a crate-private
+accessor in src/backend/drm/device/mod.rs and a crate-private re-export in
+src/backend/drm/mod.rs, for wp_drm_lease_device_v1 as Mutter 51 offers it
+(meta-wayland-drm-lease.c, meta-drm-lease.c). DrmLeaseBuilder is now Clone
+and shares its device's plane claims: a compositor keeps an empty builder and
+claims planes on a clone (DrmLeaseBuilder::claim_plane) when a request
+arrives, as the lease handler has no access to the DrmDevice. The additive
+DrmLeaseState::revoke_lease ends a lease from the compositor's side (finished,
+connectors offered again), for Mutter's update_leases (a lessee the kernel
+destroyed because its client closed the lease fd) and update_connectors (a
+leased connector unplugged). Request validation follows
+wp_drm_lease_request_request_connector and wp_drm_lease_request_submit: a
+connector of another lease device posts wrong_device and a repeated one
+duplicate_connector when it is requested (upstream checked only at submit
+and posted wrong_device for a withdrawn connector); an empty submit posts
+empty_lease and stops (upstream went on to call the handler); a connector
+withdrawn since it was requested fails the lease with finished. A binding
+that cannot open a non-master DRM fd stays pending without events, as
+Mutter's lease_device_bind keeps it, until
+DrmLeaseState::retry_pending_binds (session activation); upstream sent the
+released destructor from inside the bind, which made wayland-backend panic
+on the destroyed object, and refused to create the global when the
+compositor could not open the node, where Mutter advertises it anyway.
+drm-smoke's D-LEASE leases the vkms connector through it with a real
+client. The isolated diff is retained in DRM-LEASE-PATCH.diff; the pinned
+version stays 0.7.0.

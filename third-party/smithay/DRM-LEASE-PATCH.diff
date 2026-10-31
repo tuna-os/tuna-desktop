@@ -1,0 +1,354 @@
+diff --git a/src/backend/drm/device/mod.rs b/src/backend/drm/device/mod.rs
+index 2562a80f..9f3fb8bd 100644
+--- a/src/backend/drm/device/mod.rs
++++ b/src/backend/drm/device/mod.rs
+@@ -287,6 +287,11 @@ impl DrmDevice {
+         self.plane_claim_storage.claim(plane, crtc)
+     }
+ 
++    /// The device's plane claims, shared with lease builders.
++    pub(crate) fn plane_claim_storage(&self) -> &PlaneClaimStorage {
++        &self.plane_claim_storage
++    }
++
+     /// Returns the size of the hardware cursor
+     ///
+     /// Note: In case of universal planes this is the
+diff --git a/src/backend/drm/mod.rs b/src/backend/drm/mod.rs
+index 2ccec8dc..dc348c39 100644
+--- a/src/backend/drm/mod.rs
++++ b/src/backend/drm/mod.rs
+@@ -91,6 +91,7 @@ pub use device::{
+     DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmEvent, EventMetadata as DrmEventMetadata, PlaneClaim,
+     Time as DrmEventTime, WeakDrmDeviceFd,
+ };
++pub(crate) use device::PlaneClaimStorage;
+ pub use drm::node::{CreateDrmNodeError, DrmNode, NodeType};
+ use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
+ pub use error::AccessError as DrmAccessError;
+diff --git a/src/wayland/drm_lease/mod.rs b/src/wayland/drm_lease/mod.rs
+index 47c57cac..56823067 100644
+--- a/src/wayland/drm_lease/mod.rs
++++ b/src/wayland/drm_lease/mod.rs
+@@ -92,7 +92,7 @@ use wayland_protocols::wp::drm_lease::v1::server::*;
+ use wayland_server::backend::GlobalId;
+ use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
+ 
+-use crate::backend::drm::{DrmDevice, DrmDeviceFd, DrmNode, NodeType, PlaneClaim};
++use crate::backend::drm::{DrmDevice, DrmDeviceFd, DrmNode, NodeType, PlaneClaim, PlaneClaimStorage};
+ 
+ /// Delegate type for a drm_lease global
+ #[derive(Debug)]
+@@ -102,6 +102,10 @@ pub struct DrmLeaseState {
+     global: Option<GlobalId>,
+     connectors: Vec<DrmLeaseConnector>,
+     known_lease_devices: Vec<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1>,
++    /// Bindings whose DRM fd could not be opened yet (Mutter's
++    /// pending_resources): no events until [`Self::retry_pending_binds`].
++    pending_lease_devices: Vec<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1>,
++    path: PathBuf,
+     active_leases: Vec<DrmLeaseRef>,
+ }
+ 
+@@ -130,9 +134,13 @@ pub struct DrmLeaseRequest {
+ }
+ 
+ /// Builder struct to collect DRM resources to be leased
+-#[derive(Debug)]
++///
++/// A builder is cheap to clone: a compositor may keep an empty one for
++/// its device and fill a clone when a request arrives.
++#[derive(Debug, Clone)]
+ pub struct DrmLeaseBuilder {
+     drm: DrmDeviceFd,
++    claims: PlaneClaimStorage,
+     planes: HashMap<plane::Handle, PlaneClaim>,
+     connectors: HashSet<connector::Handle>,
+     crtcs: HashSet<crtc::Handle>,
+@@ -143,12 +151,21 @@ impl DrmLeaseBuilder {
+     pub fn new(drm: &DrmDevice) -> DrmLeaseBuilder {
+         DrmLeaseBuilder {
+             drm: drm.device_fd().clone(),
++            claims: drm.plane_claim_storage().clone(),
+             planes: HashMap::new(),
+             connectors: HashSet::new(),
+             crtcs: HashSet::new(),
+         }
+     }
+ 
++    /// Claim a plane of the builder's device for a CRTC, as
++    /// [`DrmDevice::claim_plane`] does.
++    ///
++    /// Returns `None` if the plane is claimed for a different CRTC.
++    pub fn claim_plane(&self, plane: plane::Handle, crtc: crtc::Handle) -> Option<PlaneClaim> {
++        self.claims.claim(plane, crtc)
++    }
++
+     /// Add a CRTC to the to be leased resources
+     pub fn add_crtc(&mut self, crtc: crtc::Handle) {
+         self.crtcs.insert(crtc);
+@@ -417,12 +434,11 @@ impl DrmLeaseState {
+             .dev_path_with_type(NodeType::Primary)
+             .ok_or(Error::UnableToGetPath)?;
+ 
+-        // test once if we can get a non-master fd before initializing the global
+-        let _ = get_non_master_fd(&path)?;
+-
++        // Mutter advertises the global without trying the node: a binding
++        // that cannot get a DRM fd yet waits (`retry_pending_binds`).
+         let data = DrmLeaseDeviceGlobalData {
+             filter: Box::new(filter),
+-            path,
++            path: path.clone(),
+             node: *drm_node,
+         };
+ 
+@@ -434,6 +450,8 @@ impl DrmLeaseState {
+             global: Some(global),
+             connectors: Vec::new(),
+             known_lease_devices: Vec::new(),
++            pending_lease_devices: Vec::new(),
++            path,
+             active_leases: Vec::new(),
+         })
+     }
+@@ -619,6 +637,88 @@ impl DrmLeaseState {
+         Some(lease_ref)
+     }
+ 
++    /// End an active lease from the compositor's side: the client gets
++    /// `finished`, the kernel lease is revoked (unless it already was) and
++    /// the lease's connectors are offered again.
++    ///
++    /// For a lessee the kernel already destroyed (its client closed the
++    /// lease fd) or resources that are about to go away. Returns `false`
++    /// for an unknown lease. The [`DrmLease`] handed to
++    /// [`DrmLeaseHandler::new_active_lease`] stays with the caller; dropping
++    /// it afterwards does nothing more.
++    pub fn revoke_lease<D>(&mut self, lease_id: u32) -> bool
++    where
++        D: DrmLeaseHandler
++            + GlobalDispatch<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1, DrmLeaseDeviceGlobalData>
++            + Dispatch<wp_drm_lease_connector_v1::WpDrmLeaseConnectorV1, DrmNode, D>
++            + Dispatch<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1, DrmNode, D>
++            + Dispatch<wp_drm_lease_request_v1::WpDrmLeaseRequestV1, DrmLeaseRequestData, D>
++            + Dispatch<wp_drm_lease_v1::WpDrmLeaseV1, DrmLeaseData, D>
++            + 'static,
++    {
++        self.remove_lease::<D>(lease_id).is_some()
++    }
++
++    /// Mutter's send_pending_on_device_bind_events: give bindings that could
++    /// not get a DRM fd when they bound (no access to the device) their
++    /// fd, connectors and `done` now, for instance once the session is
++    /// active again. Those that still fail stay pending.
++    pub fn retry_pending_binds<D>(&mut self)
++    where
++        D: DrmLeaseHandler
++            + GlobalDispatch<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1, DrmLeaseDeviceGlobalData>
++            + Dispatch<wp_drm_lease_connector_v1::WpDrmLeaseConnectorV1, DrmNode, D>
++            + Dispatch<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1, DrmNode, D>
++            + Dispatch<wp_drm_lease_request_v1::WpDrmLeaseRequestV1, DrmLeaseRequestData, D>
++            + Dispatch<wp_drm_lease_v1::WpDrmLeaseV1, DrmLeaseData, D>
++            + 'static,
++    {
++        for device in std::mem::take(&mut self.pending_lease_devices) {
++            let Some(client) = device.client() else {
++                continue;
++            };
++            if self.send_bind_events::<D>(&device, &client) {
++                self.known_lease_devices.push(device);
++            } else {
++                self.pending_lease_devices.push(device);
++            }
++        }
++    }
++
++    /// Mutter's send_on_device_bind_events: a non-master DRM fd, the
++    /// connectors for lease, then `done`. Sends nothing without the fd.
++    fn send_bind_events<D>(
++        &mut self,
++        device: &wp_drm_lease_device_v1::WpDrmLeaseDeviceV1,
++        client: &Client,
++    ) -> bool
++    where
++        D: DrmLeaseHandler
++            + GlobalDispatch<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1, DrmLeaseDeviceGlobalData>
++            + Dispatch<wp_drm_lease_connector_v1::WpDrmLeaseConnectorV1, DrmNode, D>
++            + Dispatch<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1, DrmNode, D>
++            + Dispatch<wp_drm_lease_request_v1::WpDrmLeaseRequestV1, DrmLeaseRequestData, D>
++            + Dispatch<wp_drm_lease_v1::WpDrmLeaseV1, DrmLeaseData, D>
++            + 'static,
++    {
++        let fd = match get_non_master_fd(&self.path) {
++            Ok(fd) => fd,
++            Err(err) => {
++                tracing::warn!(?err, "No DRM fd for a lease device binding yet");
++                return false;
++            }
++        };
++        device.drm_fd(fd.as_fd());
++        for connector in self.connectors.iter_mut().filter(|c| c.enabled) {
++            if let Some(id) = connector.new_instance::<D>(&self.dh, client) {
++                device.connector(&id);
++                connector.send_info(&id);
++            }
++        }
++        device.done();
++        true
++    }
++
+     /// [`DrmNode`] belonging to this DRM lease global
+     pub fn node(&self) -> DrmNode {
+         self.node
+@@ -707,7 +807,7 @@ where
+ {
+     fn bind(
+         state: &mut D,
+-        dh: &DisplayHandle,
++        _dh: &DisplayHandle,
+         client: &Client,
+         resource: New<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1>,
+         global_data: &DrmLeaseDeviceGlobalData,
+@@ -716,22 +816,14 @@ where
+         let drm_lease_state = state.drm_lease_state(global_data.node);
+         let wp_drm_lease_device = data_init.init(resource, global_data.node);
+ 
+-        let Ok(fd) = get_non_master_fd(&global_data.path) else {
+-            // nothing we can do
+-            wp_drm_lease_device.released();
+-            return;
+-        };
+-
+-        wp_drm_lease_device.drm_fd(fd.as_fd());
+-        for connector in drm_lease_state.connectors.iter_mut().filter(|c| c.enabled) {
+-            if let Some(id) = connector.new_instance::<D>(dh, client) {
+-                wp_drm_lease_device.connector(&id);
+-                connector.send_info(&id);
+-            }
++        // Mutter's lease_device_bind: without a DRM fd the binding stays
++        // pending, silent. (Sending the `released` destructor from inside
++        // the bind destroyed the object before the bind returned.)
++        if drm_lease_state.send_bind_events::<D>(&wp_drm_lease_device, client) {
++            drm_lease_state.known_lease_devices.push(wp_drm_lease_device);
++        } else {
++            drm_lease_state.pending_lease_devices.push(wp_drm_lease_device);
+         }
+-        wp_drm_lease_device.done();
+-
+-        drm_lease_state.known_lease_devices.push(wp_drm_lease_device);
+     }
+ 
+     fn can_view(client: Client, global_data: &DrmLeaseDeviceGlobalData) -> bool {
+@@ -773,6 +865,9 @@ where
+                 drm_lease_state
+                     .known_lease_devices
+                     .retain(|device| device != resource);
++                drm_lease_state
++                    .pending_lease_devices
++                    .retain(|device| device != resource);
+                 resource.released();
+             }
+             _ => {}
+@@ -835,43 +930,74 @@ where
+     ) {
+         match request {
+             wp_drm_lease_request_v1::Request::RequestConnector { connector } => {
+-                data.connectors.lock().unwrap().push(connector);
+-            }
+-            wp_drm_lease_request_v1::Request::Submit { id } => {
++                // Checked when the connector is added, as Mutter's
++                // wp_drm_lease_request_request_connector does.
++                if connector.data::<DrmNode>() != Some(&data.node) {
++                    resource.post_error(
++                        wp_drm_lease_request_v1::Error::WrongDevice,
++                        "Requested lease for wrong device",
++                    );
++                    return;
++                }
+                 let drm_lease_state = state.drm_lease_state(data.node);
+-
+-                let mut connector_handles = Vec::new();
+-                for connector in &*data.connectors.lock().unwrap() {
+-                    if let Some(conn) = drm_lease_state
++                let handle_of = |obj: &wp_drm_lease_connector_v1::WpDrmLeaseConnectorV1| {
++                    drm_lease_state
+                         .connectors
+                         .iter()
+-                        .find(|conn| conn.known_instances.iter().any(|obj| obj == connector))
+-                    {
+-                        if connector_handles.iter().any(|handle| handle == &conn.handle) {
+-                            resource.post_error(
+-                                wp_drm_lease_request_v1::Error::DuplicateConnector,
+-                                format!("Duplicate connector: {}", conn.name),
+-                            );
+-                            return;
+-                        } else {
+-                            connector_handles.push(conn.handle);
+-                        }
+-                    } else {
+-                        resource.post_error(
+-                            wp_drm_lease_request_v1::Error::WrongDevice,
+-                            "Requested lease for wrong device",
+-                        );
+-                        return;
+-                    }
++                        .find(|conn| conn.known_instances.iter().any(|known| known == obj))
++                        .map(|conn| conn.handle)
++                };
++                let handle = handle_of(&connector);
++                let mut connectors = data.connectors.lock().unwrap();
++                if connectors
++                    .iter()
++                    .any(|requested| requested == &connector || (handle.is_some() && handle_of(requested) == handle))
++                {
++                    resource.post_error(
++                        wp_drm_lease_request_v1::Error::DuplicateConnector,
++                        "Connector requested twice",
++                    );
++                    return;
+                 }
+-
+-                if connector_handles.is_empty() {
++                connectors.push(connector);
++            }
++            wp_drm_lease_request_v1::Request::Submit { id } => {
++                let requested = std::mem::take(&mut *data.connectors.lock().unwrap());
++                if requested.is_empty() {
+                     resource.post_error(
+                         wp_drm_lease_request_v1::Error::EmptyLease,
+                         "Lease doesn't contain any connectors",
+                     );
++                    return;
+                 }
+ 
++                // A connector withdrawn since the client requested it fails
++                // the lease with `finished`, as in Mutter's
++                // find_resources_to_lease.
++                let drm_lease_state = state.drm_lease_state(data.node);
++                let connector_handles: Option<Vec<connector::Handle>> = requested
++                    .iter()
++                    .map(|connector| {
++                        drm_lease_state
++                            .connectors
++                            .iter()
++                            .find(|conn| conn.known_instances.iter().any(|obj| obj == connector))
++                            .map(|conn| conn.handle)
++                    })
++                    .collect();
++                let Some(connector_handles) = connector_handles else {
++                    tracing::debug!("Lease requested a withdrawn connector");
++                    let lease_obj = data_init.init(
++                        id,
++                        DrmLeaseData {
++                            id: 0,
++                            node: data.node,
++                        },
++                    );
++                    lease_obj.finished();
++                    return;
++                };
++
+                 match state.lease_request(
+                     data.node,
+                     DrmLeaseRequest {
