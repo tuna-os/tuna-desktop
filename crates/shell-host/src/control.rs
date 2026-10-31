@@ -141,7 +141,7 @@ pub enum Handled {
         show: bool,
         touch_auto: bool,
     },
-    /// The touchscreen bottom-edge OSK drag (0.47): gnome-shell's
+    /// The touchscreen bottom-edge OSK drag (0.48): gnome-shell's
     /// `KeyboardManager` bottom drag gesture progress, end or cancel.
     OskGesture(tuna_shell_control::OskGesturePhase),
     /// A pointer accessibility timeout started or stopped (pie timer).

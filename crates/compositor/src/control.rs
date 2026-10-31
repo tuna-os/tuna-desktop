@@ -611,7 +611,7 @@ impl<'a> Session<'a> {
 
     /// Ask the shell to draw GNOME's window menu.
     /// Peers older than 0.42 cannot decode `ConfirmDisplayChange`, nor
-    /// older than 0.45 the tablet OSD messages, nor older than 0.47
+    /// older than 0.45 the tablet OSD messages, nor older than 0.48
     /// `OskGesture`, and receive nothing.
     pub fn send_window_menu(&mut self, menu: &Message) -> Result<(), ControlError> {
         if matches!(menu, Message::ConfirmDisplayChange { .. }) && self.peer_minor < 42 {
@@ -628,7 +628,7 @@ impl<'a> Session<'a> {
         if tablet && self.peer_minor < 45 {
             return Ok(());
         }
-        if matches!(menu, Message::OskGesture { .. }) && self.peer_minor < 47 {
+        if matches!(menu, Message::OskGesture { .. }) && self.peer_minor < 48 {
             return Ok(());
         }
         self.conn.write_frame(menu)
@@ -2305,7 +2305,7 @@ impl ControlHub {
         self.menu_queue.push(message);
     }
 
-    /// Tell the shell how GNOME's bottom-edge OSK drag goes (wire 0.47;
+    /// Tell the shell how GNOME's bottom-edge OSK drag goes (wire 0.48;
     /// older peers receive nothing).
     pub fn queue_osk_gesture(&mut self, phase: tuna_shell_control::OskGesturePhase) {
         self.queue_message(Message::OskGesture { phase });

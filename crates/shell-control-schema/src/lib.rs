@@ -218,7 +218,7 @@ impl ProtocolVersion {
     /// `OskGesture` (`ShellEdgeDragGesture` progress, activate, cancel).
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 47,
+        minor: 48,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -1111,9 +1111,9 @@ pub enum Message {
     /// and in each handshake snapshot, only to peers advertising
     /// minor >= 46.
     SeatTouchMode { touch_mode: bool },
-    /// Since 0.47: the touchscreen bottom-edge drag (gnome-shell's
+    /// Since 0.48: the touchscreen bottom-edge drag (gnome-shell's
     /// `KeyboardManager` bottom drag gesture) progressed, completed or
-    /// was cancelled. Sent only to peers advertising minor >= 47.
+    /// was cancelled. Sent only to peers advertising minor >= 48.
     OskGesture { phase: OskGesturePhase },
 }
 
@@ -2534,8 +2534,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_47() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 47));
+    fn current_version_is_0_48() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 48));
         // A 0.46 shell still negotiates; a newer minor does not.
         assert!(ProtocolVersion::new(0, 46).is_compatible_with(&CURRENT_VERSION));
         assert!(!ProtocolVersion::new(0, 49).is_compatible_with(&CURRENT_VERSION));

@@ -164,7 +164,7 @@ struct Drained {
     /// The compositor's on-screen keyboard updates, in order: focus, the
     /// input-panel request, touch-mode auto-show.
     osk: Vec<(Option<tuna_shell_control::TextFieldFocus>, bool, bool)>,
-    /// The compositor's bottom-edge OSK drag phases, in order (wire 0.47).
+    /// The compositor's bottom-edge OSK drag phases, in order (wire 0.48).
     osk_gestures: Vec<tuna_shell_control::OskGesturePhase>,
     /// Drawing-tablet OSD messages, in arrival order.
     tablet: Vec<TabletUi>,
