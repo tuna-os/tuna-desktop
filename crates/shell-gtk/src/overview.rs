@@ -2128,7 +2128,8 @@ fn paged_grid(
             let mut samples = Vec::new();
             for (i, dot) in dots.iter().enumerate() {
                 let Some(dot) = dot.upgrade() else { continue };
-                let Some((scale, opacity, hover, pressed)) = sync_page_dot(&dot, i, position) else {
+                let Some((scale, opacity, hover, pressed)) = sync_page_dot(&dot, i, position)
+                else {
                     continue;
                 };
                 if tracing {
@@ -2707,12 +2708,18 @@ fn scale_and_fade(tile: &gtk::Widget, slot: &Rc<crate::grid_animation::Slot>, aw
 /// pageIndicators.js _updateIndicator on page dot `index` with the
 /// pages drawn at `position`: its stored (scale, opacity, hover, pressed).
 /// A disposed button with no drawing child has no sample.
-fn sync_page_dot(button: &gtk::Button, index: usize, position: f64) -> Option<(f64, f64, bool, bool)> {
+fn sync_page_dot(
+    button: &gtk::Button,
+    index: usize,
+    position: f64,
+) -> Option<(f64, f64, bool, bool)> {
     let flags = button.state_flags();
     let hover = flags.contains(gtk::StateFlags::PRELIGHT);
     let pressed = flags.contains(gtk::StateFlags::ACTIVE);
     let (scale, opacity) = crate::grid_animation::page_dot_look(position, index, hover, pressed);
-    let look = button.child().and_downcast::<crate::grid_animation::Zoom>()?;
+    let look = button
+        .child()
+        .and_downcast::<crate::grid_animation::Zoom>()?;
     look.set_look(scale, opacity);
     // Trace what snapshot() will read, not the intended values: a setter
     // defect must not be hidden by logging its inputs.
