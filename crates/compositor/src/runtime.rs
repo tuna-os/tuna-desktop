@@ -1052,11 +1052,16 @@ impl Runtime {
                             rt.on_tablet_input(event);
                         }
                         rt.pad_osd_tick();
-                        // The window manager has the final say (a locked
-                        // pointer stays put): the drawn cursor follows it.
-                        let pos = rt.manager.pointer_pos();
-                        if let Backend::Drm(drm) = &mut rt.backend {
-                            drm.set_pointer(pos);
+                        // The manager has the final say (a locked pointer
+                        // stays put), but only after queued motion reaches it.
+                        // Until then DRM owns the accumulated position; using
+                        // the stale manager position would lose relative moves
+                        // delivered before the next frame.
+                        if !rt.motion_queue.pending() {
+                            let pos = rt.manager.pointer_pos();
+                            if let Backend::Drm(drm) = &mut rt.backend {
+                                drm.set_pointer(pos);
+                            }
                         }
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
@@ -2553,6 +2558,8 @@ impl Runtime {
                 "mouse": self.input_settings.mouse,
                 "trackball": self.input_settings.trackball,
                 "pointing_stick": self.input_settings.pointing_stick,
+                "custom_accel": self.input_settings.custom_accel,
+                "disable_while_typing_timeout_ms": self.input_settings.disable_while_typing_timeout_ms,
             },
             "locked": self.is_locked(),
             // Administrative lockdown backstop (#357): the live
@@ -2797,6 +2804,9 @@ impl Runtime {
         doc["pointer_fullscreen_blocked"] = serde_json::json!(
             (!self.is_locked()).then(|| self.manager.fullscreen_at(self.manager.pointer_pos()))
         );
+        // GTK's default text direction as the shell reports it: the side
+        // GNOME's hot corner and pressure barrier take (#336).
+        doc["right_to_left"] = serde_json::Value::Bool(self.input_settings.right_to_left);
         // Live libinput device configuration (#343): beside the macro,
         // which is already at its recursion limit.
         // Keep this unlocked drag observation outside the large scene macro.

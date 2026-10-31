@@ -954,7 +954,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         buttons_reported = any("middle_emulation_available" in d for d in devices_now)
         if not published and not buttons_reported:
             raise RuntimeError("current build does not report libinput middle-click and scroll-button state")
-        wheel_available = False
+        wheel_available = custom_available = False
         try:
             def pointer_live_matches(speed, natural, profile=None, middle=None, wheel=None):
                 def matches(value):
@@ -1025,6 +1025,52 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                                                         restored_middle, restored_wheel),
                                    label="pointer-live-restored")
             pointer_live.append({"restored": restored["state"]["input_devices"]})
+            # GNOME's custom acceleration curve (protocol 0.48). A current
+            # build reports per-device availability. The curve reaches
+            # libinput as the custom profile; a curve libinput rejects leaves
+            # the device default (Mutter's set_device_accel_profile); a curve
+            # Mutter itself rejects (zero step) is replaced by Mutter's
+            # fallback curve, so the device is custom again.
+            custom_reported = any("accel_custom_available" in d for d in devices_now)
+            if not published and not custom_reported:
+                raise RuntimeError("current build does not report custom acceleration availability")
+            def custom_mice(devices):
+                # Names are not unique: QEMU's relative and absolute VMMouse
+                # share one, but only the relative device offers acceleration.
+                return [d for d in devices
+                        if d.get("accel_custom_available") and d["kind"] == "pointer"
+                        and not d.get("trackball") and not d.get("pointing_stick")]
+            custom_names = sorted(d["name"] for d in custom_mice(devices_now))
+            if custom_names:
+                def custom_profile(expect_custom):
+                    def matches(value):
+                        mice = custom_mice(value["state"].get("input_devices", []))
+                        return (sorted(d["name"] for d in mice) == custom_names
+                                and all((d["accel_profile"] == "custom") is expect_custom
+                                        for d in mice))
+                    return matches
+                curve = agent.run("mouse-custom-accel", "0.5", "0.0,0.5,1.0,2.0")
+                custom_available = curve["available"]
+            if custom_available:
+                if not curve["stored"]:
+                    raise RuntimeError("GNOME mouse custom-accel-config did not persist")
+                if not agent.run("mouse-accel", "custom")["stored"]:
+                    raise RuntimeError("GNOME mouse custom acceleration profile did not persist")
+                for label, step, speeds, expect_custom in (
+                        ("pointer-custom", "0.5", "0.0,0.5,1.0,2.0", True),
+                        # 65 points with a negative speed: libinput refuses it.
+                        ("pointer-custom-rejected", "1.0",
+                         ",".join(["-1.0"] + [f"{i}.0" for i in range(64)]), False),
+                        # A zero step: Mutter's fallback curve [0.0, 1.0].
+                        ("pointer-custom-fallback", "0.0", "0.0,2.0", True)):
+                    if not agent.run("mouse-custom-accel", step, speeds)["stored"]:
+                        raise RuntimeError(f"GNOME mouse custom-accel-config for {label} did not persist")
+                    observed = await_state(custom_profile(expect_custom), label=label)
+                    pointer_live.append({label: observed["state"]["input_devices"]})
+                agent.run("mouse-accel", "default")
+                agent.run("mouse-custom-accel-reset")
+                observed = await_state(custom_profile(False), label="pointer-custom-restored")
+                pointer_live.append({"pointer-custom-restored": observed["state"]["input_devices"]})
             covered = "speed/natural-scroll"
             if profiles_reported:
                 covered += "/acceleration profile (flat then adaptive)"
@@ -1032,6 +1078,9 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                 covered += "/middle-click emulation"
             if wheel_available:
                 covered += "/scroll-wheel emulation (button 2 with lock, then off)"
+            if custom_available:
+                covered += ("/custom acceleration curve (applied, libinput-rejected curve keeps the"
+                            " device default, Mutter fallback curve, restored)")
             gaps = []
             if not profiles_reported:
                 gaps.append("published guest predates acceleration-profile reporting")
@@ -1039,6 +1088,12 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                 gaps.append("published guest predates middle-click and scroll-button reporting")
             elif not wheel_available:
                 gaps.append("guest mouse schema lacks GNOME 51 scroll-wheel emulation keys")
+            if not custom_reported:
+                gaps.append("published guest predates custom-acceleration reporting")
+            elif not custom_names:
+                gaps.append("guest libinput offers no custom acceleration profile")
+            elif not custom_available:
+                gaps.append("guest mouse schema lacks custom-accel-config")
             record("V-POINTER-LIVE", True,
                    f"GNOME mouse {covered} reach live libinput device state and restore; availability-gated per device"
                    + (f"; {'; '.join(gaps)}" if gaps else ""))
@@ -1047,6 +1102,8 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
             agent.run("mouse-natural", "false")
             if profiles_reported:
                 agent.run("mouse-accel", "default")
+            if custom_available:
+                agent.run("mouse-custom-accel-reset")
             if buttons_reported:
                 agent.run("mouse-middle", "false")
             if wheel_available:

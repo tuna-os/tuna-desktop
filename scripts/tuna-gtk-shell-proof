@@ -110,7 +110,8 @@
 #   G-SETTINGS-POINTER GNOME's touchpad, mouse, trackball and pointing-stick
 #                  keys (send-events, click method, scroll methods, tap
 #                  options, middle-click and scroll-wheel emulation,
-#                  per-class acceleration) reach the compositor live and
+#                  per-class acceleration and custom curves, the typing
+#                  timeout) reach the compositor live and
 #                  reset to GNOME 51's defaults (#343); the native VM lane
 #                  proves libinput device state
 #   G-INPUT-SOURCE-MRU Super+Space flips between the two most recent
@@ -137,6 +138,14 @@
 #                  cursor surface draws at its own size
 #   G-LOCATE-POINTER with locate-pointer on, a lone Ctrl tap draws GNOME's
 #                  ripples at the pointer; off, it draws nothing
+#   G-LOCATE-RIPPLE-PIXELS the ripples' actual pixels on the frozen clock
+#                  (locatePointer.js, ripples.js): the first ring's 1.1875x
+#                  radius at 415 ms, towards the lightened accent, at 100%
+#                  and 125%, and no residue once they end
+#   G-CURSOR-SCALE at 125% (a temporary DisplayConfig change) a size-24
+#                  cursor loads a 48px legacy image at the ceiled output
+#                  scale or rasterizes SVG directly at 30px; both draw 30
+#                  physical px at the scaled hotspot
 #   G-A11Y-DWELL   hover click: a resting pointer clicks once with GNOME's
 #                  pie timer; gesture mode picks the click by direction
 #   G-A11Y-SECONDARY a held primary button makes a secondary click
@@ -5172,6 +5181,100 @@ jq -e ".cursor.locate_pointer.at == [$((WIDTH / 2)), $((HEIGHT / 2))]" "$CSTATE"
     fail G-LOCATE-POINTER "the ripples did not center on the pointer: $(jq -c '.cursor.locate_pointer' "$CSTATE")"
 cstate '.cursor.locate_pointer.active | not' "ripples finished" 5 ||
     fail G-LOCATE-POINTER "the ripples did not finish"
+
+# Actual ripple pixels (gnome-shell 51 locatePointer.js, ripples.js) on
+# the frozen animation clock: 415 ms after the tap the first ring is at
+# out-quad scale 0.25 + (1.5 - 0.25) * 0.75 = 1.1875 of its 54 px
+# (disc plus glow), i.e. a radius of 32.0625 logical px; at 1400 ms all
+# three rings are gone without residue.
+# ripple_pixels SCALE: at the output centre, radii derived from GNOME's curve.
+ripple_pixels() {
+    xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
+    locate_count="$(jq '.cursor.locate_pointer.count' "$CSTATE")"
+    anim_clock 0
+    cstate '.animation_clock_manual and (.cursor.locate_pointer.active | not)' "ripple clock $1" ||
+        fail G-LOCATE-RIPPLE-PIXELS "the clock file did not freeze animation time at scale $1"
+    sleep 0.5
+    scrot -o "$ARTIFACTS/ripple-$1-before.png" >/dev/null
+    xdotool key Control_L
+    cstate ".cursor.locate_pointer.count == $((locate_count + 1)) and .cursor.locate_pointer.active" "ripple at scale $1" 3 ||
+        fail G-LOCATE-RIPPLE-PIXELS "a Ctrl tap did not start the ripples at scale $1"
+    # The state reports the frozen clock against its own base.
+    ripple_frames="$(jq '.cursor.locate_pointer.frames' "$CSTATE")"
+    ripple_clock="$(jq '.animation_clock_ms' "$CSTATE")"
+    anim_clock 415
+    cstate ".animation_clock_ms == $((ripple_clock + 415)) and .cursor.locate_pointer.frames > $ripple_frames" "ripple at 415 ms, scale $1" 5 ||
+        fail G-LOCATE-RIPPLE-PIXELS "no ripple frame drew at 415 ms at scale $1"
+    sleep 0.5
+    scrot -o "$ARTIFACTS/ripple-$1-415ms.png" >/dev/null
+    anim_clock 1400
+    cstate '.cursor.locate_pointer.active | not' "ripples ended at scale $1" 5 ||
+        fail G-LOCATE-RIPPLE-PIXELS "the ripples did not end by 1400 ms at scale $1"
+    sleep 0.5
+    scrot -o "$ARTIFACTS/ripple-$1-settled.png" >/dev/null
+    "$PY" "$ROOT/scripts/lib/ripple-pixels.py" "$ARTIFACTS/ripple-$1-before.png" "$ARTIFACTS/ripple-$1-415ms.png" \
+        $((WIDTH / 2)) $((HEIGHT / 2)) "$1" 3 --settled "$ARTIFACTS/ripple-$1-settled.png" \
+        >"$ARTIFACTS/ripple-$1.log" 2>&1 ||
+        fail G-LOCATE-RIPPLE-PIXELS "the drawn ripples at scale $1 are not GNOME's: $(tail -1 "$ARTIFACTS/ripple-$1.log")"
+    real_clock || fail G-LOCATE-RIPPLE-PIXELS "removing the clock file did not resume real time"
+}
+# cursor_scale SCALE LOGICAL_WIDTH: a temporary DisplayConfig change, as
+# GNOME Settings' Displays panel sends one (no confirmation, not saved).
+cursor_scale() {
+    scale_serial="$(gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method org.gnome.Mutter.DisplayConfig.GetCurrentState | sed -n 's/^(uint32 \([0-9]*\),.*/\1/p')"
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig \
+        "$scale_serial" 1 "[(0, 0, $1, uint32 0, true, [('tuna-0', '${WIDTH}x${HEIGHT}@60.000', {'color-mode': <uint32 0>, 'underscanning': <false>})])]" \
+        "@a{sv} {}" >>"$ARTIFACTS/cursor-scale.log" 2>&1 ||
+        fail G-CURSOR-SCALE "ApplyMonitorsConfig scale $1 failed: $(tail -2 "$ARTIFACTS/cursor-scale.log")"
+    cstate ".layers | any(.namespace == \"tuna-panel\" and .rect[2] == $2)" "scale $1" ||
+        fail G-CURSOR-SCALE "the layout did not follow scale $1"
+    # GNOME's screen transition (250 ms hold, 500 ms fade) settles first.
+    sleep 1.5
+}
+ripple_pixels 1
+
+# Mutter 51's legacy cursor renderer at 125%: the sprite loads at the
+# ceiled output scale (48px for size 24) and draws 24 logical = 30 physical
+# px. SVG instead rasterizes at ceil(24 * 1.25) = 30px, with a scaled hotspot.
+gsettings set org.gnome.desktop.interface cursor-theme 'TunaProof'
+gsettings set org.gnome.desktop.interface cursor-size 24
+cursor_probe shape default G-CURSOR-SCALE
+cursor_scale 1.25 1024
+probe_center="$(jq -r '.windows[] | select(.app_id == "tuna-cursor-probe") | .rect | "\(((.[0] + .[2] / 2) * 5 / 4) | floor) \(((.[1] + .[3] / 2) * 5 / 4) | floor)"' "$CSTATE")"
+# shellcheck disable=SC2086 # two physical coordinates
+xdotool mousemove --window "$WID" $probe_center
+cstate '.cursor.name == "default" and .cursor.source == "client" and .cursor.scale == 1.25 and .cursor.image_theme == "TunaProofBase" and .cursor.image == [48, 48] and .cursor.logical == [24, 24]' "48px image at 125%" ||
+    fail G-CURSOR-SCALE "at 125% size 24 did not load the theme's 48px image drawn at 24 logical px: $(jq -c .cursor "$CSTATE")"
+cp "$CSTATE" "$ARTIFACTS/cursor-scale-125.json"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-scale-125.png" 30 0.625 0.625 25,173,125 --tolerance 1 ||
+    fail G-CURSOR-SCALE "the 48px legacy image is not drawn as 30 physical px at its scaled hotspot"
+gsettings set org.gnome.desktop.interface cursor-theme TunaProofSvg
+cstate '.cursor.image_theme == "TunaProofSvg" and .cursor.image == [30, 30] and .cursor.logical == [24, 24]' "scalable cursor at 125%" ||
+    fail G-CURSOR-SCALE "at 125% the scalable theme did not rasterize directly at 30 physical px: $(jq -c .cursor "$CSTATE")"
+"$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-scale-125-svg.png" 30 5 7.5 49,95,199 --tolerance 1 ||
+    fail G-CURSOR-SCALE "the SVG cursor is not drawn as 30 physical px at its scaled hotspot"
+ripple_scale_probe_id="$(jq '.windows[] | select(.app_id == "tuna-cursor-probe") | .id' "$CSTATE")"
+kill "$CURSOR_PID" 2>/dev/null || true
+wait "$CURSOR_PID" 2>/dev/null || true
+CURSOR_PID=""
+cstate ".windows | length == $cursor_windows" "scale cursor probe closed" ||
+    fail G-CURSOR-SCALE "the cursor probe did not close"
+# Unmapping removes the live window before its 150 ms destroy snapshot
+# disappears. Let that exact effect complete on the real clock before
+# ripple_pixels freezes time; otherwise the magenta ghost contaminates
+# BEFORE and vanishes when the ripple clock advances to 415 ms.
+cstate "(.animation_clock_manual | not) and (.window_lifecycle.history | any(.window == $ripple_scale_probe_id and .effect == \"destroy\" and .outcome == \"completed\"))" "scale cursor destroy completed" 5 ||
+    fail G-LOCATE-RIPPLE-PIXELS "the scale cursor's destroy effect did not finish before freezing the ripple baseline"
+gsettings set org.gnome.desktop.interface cursor-theme "$cursor_theme_before"
+gsettings set org.gnome.desktop.interface cursor-size "$cursor_size_before"
+pass G-CURSOR-SCALE "at 125% a size-24 cursor uses a 48px legacy image or a 30px SVG raster; both draw 30 physical px at the scaled hotspot"
+ripple_pixels 1.25
+cursor_scale 1 "$WIDTH"
+pass G-LOCATE-RIPPLE-PIXELS "locate-pointer ripples draw GNOME's 1.1875x first ring at 415 ms (32 px at 100%, 40 px at 125%) towards the lightened accent and leave no residue"
 gsettings set org.gnome.desktop.interface locate-pointer false
 pass G-LOCATE-POINTER "a Ctrl tap ripples at the pointer with locate-pointer on, nothing with it off"
 
@@ -5360,10 +5463,43 @@ if gsettings list-keys org.gnome.desktop.peripherals.mouse | grep -qx scroll-whe
     pointer_mouse_wheel='{"button":2,"lock":true}'
     pointer_wheel_note="mouse scroll-wheel emulation included"
 fi
-set_pointer_keys
-if [ -n "$pointer_mouse_wheel_keys" ]; then
-    gsettings set org.gnome.desktop.peripherals.mouse scroll-wheel-emulation-button 2
-    gsettings set org.gnome.desktop.peripherals.mouse scroll-wheel-emulation-button-lock true
+# custom-accel-config (all four schemas) and the touchpad
+# disable-while-typing-timeout (gsettings-desktop-schemas 51) likewise.
+# The pointing stick's curve is written with integers: Mutter 51 finds no
+# `d`/`ad` entries there, so the shell sends an empty curve that the
+# compositor replaces with Mutter's fallback.
+pointer_default_curves='{"mouse": {"step": 1, "speeds": [0, 1]}, "touchpad": {"step": 1, "speeds": [0, 1]},
+    "trackball": {"step": 1, "speeds": [0, 1]}, "pointing_stick": {"step": 1, "speeds": [0, 1]}}'
+pointer_curves=$pointer_default_curves
+pointer_custom_schemas=""
+for schema in mouse touchpad trackball pointingstick; do
+    if gsettings list-keys "org.gnome.desktop.peripherals.$schema" | grep -qx custom-accel-config; then
+        pointer_custom_schemas="$pointer_custom_schemas $schema"
+    fi
+done
+if [ "$pointer_custom_schemas" = " mouse touchpad trackball pointingstick" ]; then
+    gsettings set org.gnome.desktop.peripherals.mouse custom-accel-config \
+        "{'pointer-step': <0.5>, 'pointer-speeds': <@ad [0.0, 1.0, 2.5]>}"
+    gsettings set org.gnome.desktop.peripherals.touchpad custom-accel-config \
+        "{'pointer-step': <2.0>, 'pointer-speeds': <@ad [0.0, 4.0]>}"
+    gsettings set org.gnome.desktop.peripherals.trackball custom-accel-config \
+        "{'pointer-step': <0.25>, 'pointer-speeds': <@ad [0.0, 0.5, 1.0]>}"
+    gsettings set org.gnome.desktop.peripherals.pointingstick custom-accel-config \
+        "{'pointer-step': <1>, 'pointer-speeds': <[0, 1]>}"
+    pointer_curves='{"mouse": {"step": 0.5, "speeds": [0, 1, 2.5]}, "touchpad": {"step": 2, "speeds": [0, 4]},
+        "trackball": {"step": 0.25, "speeds": [0, 0.5, 1]}, "pointing_stick": {"step": 0, "speeds": []}}'
+    pointer_wheel_note="$pointer_wheel_note; custom acceleration curves included"
+else
+    pointer_custom_schemas=""
+    pointer_wheel_note="$pointer_wheel_note; host schemas predate custom-accel-config"
+fi
+pointer_dwt_timeout=500
+if gsettings list-keys org.gnome.desktop.peripherals.touchpad | grep -qx disable-while-typing-timeout; then
+    gsettings set org.gnome.desktop.peripherals.touchpad disable-while-typing-timeout 1500
+    pointer_dwt_timeout=1500
+    pointer_wheel_note="$pointer_wheel_note; disable-while-typing timeout included"
+else
+    pointer_wheel_note="$pointer_wheel_note; host touchpad schema predates disable-while-typing-timeout"
 fi
 cstate ".pointer_device_settings == {
     \"mouse_accel_profile\": \"Default\",
@@ -5374,21 +5510,31 @@ cstate ".pointer_device_settings == {
     \"mouse\": {\"middle_click_emulation\": true, \"scroll_wheel_emulation\": $pointer_mouse_wheel},
     \"trackball\": {\"accel_profile\": \"Adaptive\", \"middle_click_emulation\": true,
         \"scroll_wheel_emulation\": {\"button\": 8, \"lock\": true}},
-    \"pointing_stick\": {\"speed_milli\": -500, \"accel_profile\": \"Flat\", \"scroll_method\": \"None\"}}" \
+    \"pointing_stick\": {\"speed_milli\": -500, \"accel_profile\": \"Flat\", \"scroll_method\": \"None\"},
+    \"custom_accel\": $pointer_curves,
+    \"disable_while_typing_timeout_ms\": $pointer_dwt_timeout}" \
     "pointer device keys applied" ||
     fail G-SETTINGS-POINTER "GNOME's touchpad, mouse, trackball and pointing-stick keys did not reach the compositor"
 cp "$CSTATE" "$ARTIFACTS/pointer-device-settings.json"
 reset_pointer_keys
-cstate '.pointer_device_settings == {
-    "mouse_accel_profile": "Default",
-    "touchpad": {"send_events": "Enabled", "click_method": "Fingers",
-        "edge_scrolling": false, "two_finger_scrolling": true, "tap_and_drag": true,
-        "tap_and_drag_lock": false, "tap_button_map": "Default",
-        "middle_click_emulation": false, "accel_profile": "Default"},
-    "mouse": {"middle_click_emulation": false, "scroll_wheel_emulation": {"button": 0, "lock": false}},
-    "trackball": {"accel_profile": "Default", "middle_click_emulation": false,
-        "scroll_wheel_emulation": {"button": 0, "lock": false}},
-    "pointing_stick": {"speed_milli": 0, "accel_profile": "Default", "scroll_method": "Default"}}' \
+for schema in $pointer_custom_schemas; do
+    gsettings reset "org.gnome.desktop.peripherals.$schema" custom-accel-config
+done
+if [ "$pointer_dwt_timeout" != 500 ]; then
+    gsettings reset org.gnome.desktop.peripherals.touchpad disable-while-typing-timeout
+fi
+cstate ".pointer_device_settings == {
+    \"mouse_accel_profile\": \"Default\",
+    \"touchpad\": {\"send_events\": \"Enabled\", \"click_method\": \"Fingers\",
+        \"edge_scrolling\": false, \"two_finger_scrolling\": true, \"tap_and_drag\": true,
+        \"tap_and_drag_lock\": false, \"tap_button_map\": \"Default\",
+        \"middle_click_emulation\": false, \"accel_profile\": \"Default\"},
+    \"mouse\": {\"middle_click_emulation\": false, \"scroll_wheel_emulation\": {\"button\": 0, \"lock\": false}},
+    \"trackball\": {\"accel_profile\": \"Default\", \"middle_click_emulation\": false,
+        \"scroll_wheel_emulation\": {\"button\": 0, \"lock\": false}},
+    \"pointing_stick\": {\"speed_milli\": 0, \"accel_profile\": \"Default\", \"scroll_method\": \"Default\"},
+    \"custom_accel\": $pointer_default_curves,
+    \"disable_while_typing_timeout_ms\": 500}" \
     "pointer device keys reset" ||
     fail G-SETTINGS-POINTER "resetting the pointer device keys did not restore GNOME 51 defaults"
 pass G-SETTINGS-POINTER "touchpad, mouse, trackball and pointing-stick keys reach the compositor live and reset to GNOME 51 defaults; $pointer_wheel_note"

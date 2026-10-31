@@ -313,6 +313,53 @@ or a still-missing module fails setup, and package installation errors are
 fatal. Module loading and the real vkms device and presentation assertions
 remain mandatory in the smoke test.
 
+`D-POINTER-SETTINGS` retains its uinput mouse, trackball, pointing stick and
+touchpad across a native compositor restart, then reads every device's
+libinput configuration again without motion or another hotplug. In
+[CI run 41175449190](https://github.com/tuna-os/tuna-desktop/actions/runs/41175449190/job/124476667615),
+defaults, live changes and replug passed with libinput 1.25, but the restarted
+session published an empty device list. Seat assignment queues startup device
+additions before the polling fd necessarily becomes readable; native setup
+now consumes those additions through the same configuration path as hotplug,
+without dispatching input or consuming a pending non-addition event. See
+[libinput's event queue API](https://wayland.freedesktop.org/libinput/doc/latest/api/group__base.html).
+The pointer launcher also closes the inherited emulator FIFO writer (FD 7),
+so a running restarted compositor cannot prevent emulator EOF during cleanup.
+`scripts/tests/test_ci_install_vkms.py` contains launcher descriptor and
+coldplug/restart contract regressions; these do not qualify native device
+behavior. [CI run 41193585314](https://github.com/tuna-os/tuna-desktop/actions/runs/41193585314/job/124520435500)
+passed the unchanged arrival, live, replug, restart and reset gates with
+libinput 1.25. The subsequent hot-corner proof requires
+`gsettings-desktop-schemas` for `org.gnome.desktop.interface`; the DRM lane
+installs that package explicitly alongside the Hebrew locale and GTK translations.
+
+The next [native run 41202327855](https://github.com/tuna-os/tuna-desktop/actions/runs/41202327855/job/124540485483)
+again passed all pointer-settings gates, then failed `D-HOT-CORNER` parking:
+all six relative-motion events arrived, but the final pointer was
+`[400.0,460.0]` instead of `[60,60]`. The native input callback was copying
+the window manager's stale position back into DRM after each event while
+per-frame motion was still queued, losing accumulated relative motion.
+Like the tick path, the callback now reconciles DRM to the manager only
+after the queue drains; until then DRM retains the accumulated position.
+The six uinput commands, exact parking assertion, and pressure gates remain
+unchanged, without a timing delay workaround. The native script regressions
+cover the callback/tick ownership guards and preserve that parking sequence.
+[Native run 41207208893](https://github.com/tuna-os/tuna-desktop/actions/runs/41207208893/job/124563361107)
+then passed the exact parking assertion and the full left-to-right
+`D-HOT-CORNER` pressure, sliding, held-barrier and fullscreen checks at scale 1.25.
+
+That run next exposed an RTL-only fixture error after its opposite-corner
+negative control. The pointer reached `[758,55]`, with 132 relative-motion
+events delivered, RTL enabled, the overview closed and two prior successful
+pressure ripples. The negative control starts at y=5, but pushing upward
+against the unguarded top-left clamps to y=0. Its return route incorrectly
+added only 55 px while requiring y=60. The route now explicitly checks y=0
+after pressure and moves 60 px down; the exact final-position assertion,
+negative control and remaining pressure gates are retained. A shell-route
+regression covers this mirrored/clamped arithmetic without timing sleeps.
+Fresh native evidence is still required for that RTL route correction and
+the remainder of the DRM lane.
+
 ## Marlin VM lane
 
 The `marlin-vm` job (#68) boots the real TunaOS Marlin image with Tuna Desktop

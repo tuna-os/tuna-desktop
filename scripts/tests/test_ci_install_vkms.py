@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Exercise real vkms setup control flow with hermetic command doubles.
+"""Exercise native DRM setup and pointer restart lifecycle contracts.
 
-No package installation, root access, or host kernel changes are performed.
+Command doubles cover setup and compositor-launch descriptor ownership without
+package installation, root access, kernel changes, or a running compositor.
 These tests do not substitute for the native DRM smoke lane.
 """
 import json
@@ -228,6 +229,148 @@ class VkmsSetup(unittest.TestCase):
         self.assertLess(drm_job.index(test_command),
                         drm_job.index("name: Use the Ubuntu archive for DRM dependencies"))
         self.assertLess(drm_job.index(test_command), drm_job.index("apt-get"))
+
+
+class PointerRestart(unittest.TestCase):
+    def test_pointer_session_does_not_inherit_the_emulator_fifo_writer(self):
+        source = SMOKE.read_text()
+        body = source.split("\nstart_pointer_session() {\n", 1)[1].split("\n}\n", 1)[0]
+        launch = "start_pointer_session() {\n" + body + "\n}\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            compositor = root / "target/debug/tuna-compositor"
+            compositor.parent.mkdir(parents=True)
+            compositor.write_text(r'''#!/usr/bin/python3
+import errno
+import json
+import os
+
+closed = False
+try:
+    os.fstat(7)
+except OSError as error:
+    if error.errno != errno.EBADF:
+        raise
+    closed = True
+with open(os.environ["RECEIPTS"], "a") as stream:
+    stream.write(json.dumps({"writer_closed": closed}) + "\n")
+''')
+            compositor.chmod(0o755)
+            receipts = root / "receipts.jsonl"
+            env = dict(os.environ, ROOT=str(root), ARTIFACTS=str(root),
+                       RUNTIME=str(root / "runtime"), CARD="/dev/not-a-real-card",
+                       CSTATE=str(root / "state.json"), POINTER_LOG=str(root / "compositor.log"),
+                       RECEIPTS=str(receipts))
+            # Exercise the real launcher both before and after opening FD 7.
+            # Retaining that descriptor in the restarted process prevents the
+            # root emulator from seeing EOF during normal or failure cleanup.
+            result = subprocess.run(
+                ["/bin/sh", "-ec", launch + r'''
+state() { return 0; }
+fail() { exit 1; }
+start_pointer_session
+wait "$COMP_PID"
+exec 7>"$ARTIFACTS/emulator-writer"
+start_pointer_session
+wait "$COMP_PID"
+exec 7>&-
+'''], env=env, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual([json.loads(line) for line in receipts.read_text().splitlines()],
+                             [{"writer_closed": True}, {"writer_closed": True}])
+
+    def test_coldplug_uses_hotplug_configuration_without_consuming_other_events(self):
+        drm = (ROOT / "crates/compositor/src/drm.rs").read_text()
+        constructor = drm.split("pub fn new()", 1)[1].split("\n    /// Apply a layout", 1)[0]
+        coldplug = constructor.split("// udev_assign_seat has already queued", 1)[1]
+        self.assertLess(constructor.index(".udev_assign_seat("),
+                        constructor.index("libinput_next_event_type("))
+        self.assertLess(coldplug.index("libinput_next_event_type("),
+                        coldplug.index("backend.libinput.next()"))
+        self.assertIn("== input_ffi::libinput_event_type_LIBINPUT_EVENT_DEVICE_ADDED", coldplug)
+        self.assertIn("LibinputEvent::Device(DeviceEvent::Added(added))", coldplug)
+        self.assertIn("backend.translate(InputEvent::DeviceAdded { device }, &[]);", coldplug)
+        self.assertNotIn(".dispatch()", coldplug)
+        self.assertLess(coldplug.index("backend.translate("), coldplug.index("Ok(("))
+
+    def test_restart_still_requires_retained_devices_with_applied_settings(self):
+        source = SMOKE.read_text()
+        restart = source.split("# Restart: a new native session", 1)[1].split(
+            'pass D-POINTER-SETTINGS "a restarted native session', 1)[0]
+        self.assertIn('kill -TERM "$COMP_PID"', restart)
+        self.assertIn('wait "$COMP_PID"', restart)
+        self.assertIn("start_pointer_session\npointer_applied 20 ||", restart)
+        self.assertIn('fail D-POINTER-SETTINGS "after a restart', restart)
+        # Motion or a replug would wake the fd and mask coldplug starvation.
+        self.assertNotIn("pemu ", restart)
+
+
+
+class NativePointerMotion(unittest.TestCase):
+    def test_native_callback_does_not_rewind_the_pending_motion_accumulator(self):
+        runtime = (ROOT / "crates/compositor/src/runtime.rs").read_text()
+        callback = runtime.split(
+            ".insert_source(sources.input, |event, _, rt: &mut Runtime| {", 1)[1].split(
+                "if let Some(udev) = sources.udev", 1)[0]
+        # Every libinput callback runs before the frame may deliver motion to
+        # the manager. A later delta must start at DRM's accumulated position,
+        # not the stale manager position. Once drained, manager constraints win.
+        self.assertEqual(callback.count("drm.set_pointer("), 1)
+        self.assertRegex(
+            callback,
+            r"if !rt\.motion_queue\.pending\(\) \{\s*"
+            r"let pos = rt\.manager\.pointer_pos\(\);\s*"
+            r"if let Backend::Drm\(drm\) = &mut rt\.backend \{\s*"
+            r"drm\.set_pointer\(pos\);\s*\}\s*\}")
+        self.assertRegex(
+            runtime,
+            r"if !self\.motion_queue\.pending\(\) \{\s*"
+            r"drm\.set_pointer\(self\.manager\.pointer_pos\(\)\);\s*\}")
+
+    def test_hotcorner_parking_keeps_exact_motion_and_state_assertion(self):
+        corner = SMOKE.read_text().split("\ncorner_run() {\n", 1)[1].split(
+            "\n}\n", 1)[0]
+        parking = corner.split("# Park at (60, 60)", 1)[1].split('quiet "parking"', 1)[0]
+        self.assertIn(
+            "cm 0 400 1 0; cm 400 0 1 0; cm -3000 0 1 0; "
+            "cm 60 0 1 0; cm 0 -3000 1 0; cm 0 60 1 0", parking)
+        self.assertIn('at 60 60 || fail "$phase"', parking)
+        self.assertIn('state ".pointer_position == [$x, $2]" 5', corner)
+        self.assertNotIn("sleep", parking)
+
+    def test_rtl_return_accounts_for_pressure_clamping_to_the_top_edge(self):
+        corner = SMOKE.read_text().split("\ncorner_run() {\n", 1)[1].split(
+            "\n}\n", 1)[0]
+        marker = "# No barrier at the top-left:"
+        opposite_corner = marker + corner.split(marker, 1)[1].split("\n    fi", 1)[0]
+        # Execute the real shell route with flat, mirrored relative-motion
+        # doubles and output-edge clamping. This tests fixture arithmetic,
+        # not libinput delivery or the native pressure implementation.
+        result = subprocess.run(
+            ["/bin/sh", "-ec", r'''
+W=819
+H=614
+SIGN=-1
+px=$((W - 1 - 60))
+py=60
+phase=D-HOT-CORNER-RTL
+cm() {
+    index=0
+    while [ "$index" -lt "$3" ]; do
+        px=$((px + SIGN * $1))
+        py=$((py + $2))
+        if [ "$px" -lt 0 ]; then px=0; elif [ "$px" -ge "$W" ]; then px=$((W - 1)); fi
+        if [ "$py" -lt 0 ]; then py=0; elif [ "$py" -ge "$H" ]; then py=$((H - 1)); fi
+        index=$((index + 1))
+    done
+}
+at() { [ "$px" -eq "$((W - 1 - $1))" ] && [ "$py" -eq "$2" ]; }
+quiet() { :; }
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+''' + opposite_corner + "\nprintf '%s %s\\n' \"$px\" \"$py\"\n"],
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "758 60\n")
 
 
 if __name__ == "__main__":

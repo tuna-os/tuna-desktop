@@ -2,6 +2,7 @@
 """CI-only root probes through QGA. Never print credentials or process argv."""
 import json
 import hashlib
+import math
 import stat as file_stat
 import os
 import pathlib
@@ -2592,11 +2593,34 @@ print(json.dumps(result))
         result = {"stored": call("gsettings", "get", "org.gnome.desktop.peripherals.mouse", "natural-scroll", user=True) == value}
     elif action == "mouse-accel":
         value = sys.argv[2]
-        if value not in ("default", "flat", "adaptive"):
-            raise ValueError("mouse acceleration profile must be default, flat or adaptive")
+        if value not in ("default", "flat", "adaptive", "custom"):
+            raise ValueError("mouse acceleration profile must be default, flat, adaptive or custom")
         call("gsettings", "set", "org.gnome.desktop.peripherals.mouse", "accel-profile", value, user=True)
         # gsettings prints enum values quoted.
         result = {"stored": call("gsettings", "get", "org.gnome.desktop.peripherals.mouse", "accel-profile", user=True) == f"'{value}'"}
+    elif action == "mouse-custom-accel":
+        # GNOME's custom-accel-config: a pointer step and comma-separated
+        # speeds, written with the `d`/`ad` types Mutter requires.
+        step = float(sys.argv[2])
+        speeds = [float(speed) for speed in sys.argv[3].split(",")]
+        if not all(math.isfinite(value) for value in (step, *speeds)) or len(speeds) > 128:
+            raise ValueError("custom acceleration needs finite values and at most 128 speeds")
+        keys = call("gsettings", "list-keys", "org.gnome.desktop.peripherals.mouse", user=True).split()
+        if "custom-accel-config" not in keys:
+            result = {"available": False, "stored": False}
+        else:
+            value = "{'pointer-step': <%r>, 'pointer-speeds': <[%s]>}" % (
+                step, ", ".join(repr(speed) for speed in speeds))
+            call("gsettings", "set", "org.gnome.desktop.peripherals.mouse", "custom-accel-config",
+                 value.replace("<[", "<@ad ["), user=True)
+            result = {"available": True,
+                      "stored": call("gsettings", "get", "org.gnome.desktop.peripherals.mouse",
+                                     "custom-accel-config", user=True) == value}
+    elif action == "mouse-custom-accel-reset":
+        keys = call("gsettings", "list-keys", "org.gnome.desktop.peripherals.mouse", user=True).split()
+        if "custom-accel-config" in keys:
+            call("gsettings", "reset", "org.gnome.desktop.peripherals.mouse", "custom-accel-config", user=True)
+        result = {"available": "custom-accel-config" in keys}
     elif action == "mouse-middle":
         value = sys.argv[2]
         if value not in ("true", "false"):
