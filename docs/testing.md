@@ -481,6 +481,14 @@ the fade out (Alt+Escape, which cancels without moving focus), where GNOME's
 ease-out quad gives 0, 191/255 and 1, then 64/255. The grid-cancel comparison
 slice skips the sampling: its old binaries predate the published alphas.
 
+The native grid cancellation proof admits its held drag only after the
+neighboring-page preview is showing **and** the normal page arrows have
+disappeared. GTK creates the preview before its arrow fade finishes, so
+preview presence alone is not a settled first-page tree. This transition
+uses the existing 10-second preview budget; the owner-bound geometry,
+neutral pointer, unchanged page contents and pre-release cancellation
+checks remain mandatory.
+
 ## Frame cost
 
 The compositor state (`TUNA_COMPOSITOR_STATE`) carries `frame_cost`, one
