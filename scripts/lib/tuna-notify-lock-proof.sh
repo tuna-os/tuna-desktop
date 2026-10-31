@@ -272,11 +272,9 @@ notify_lock_proof() {
     nl_off_again=$(nl_notify tuna-lock-off "Off Again" "OFF-AGAIN-BODY" 1) ||
         fail G-NOTIFY-RESTORE "Notify failed"
     sleep 1
-    # Open the date menu by its button (a banner can still be up here); its
-    # Clear button showing is the menu open, where banners stay hidden.
-    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-notify-restore-open.json" 20 \
-        --press "Date and Time" || fail G-NOTIFY-RESTORE "could not open the date menu"
-    sleep 2
+    # Use the same real panel click as the notification-list gates. GTK's
+    # MenuButton accessibility action can report success without opening it.
+    open_calendar
     nl_until restore-disabled '[.[] | select(.showing)] | (any(.name == "Clear") and any(.name == "Listed Summary"))' G-NOTIFY-RESTORE ||
         fail G-NOTIFY-RESTORE "the date menu does not list the history"
     nl_mentions "$nl_tree" "Off Again" &&
