@@ -736,7 +736,9 @@ mod tests {
             let _ = daemon.wait();
             result.expect("actual activated permission store persists");
             assert!(
-                home.path().join("flatpak/db/tuna-fixture-isolation").is_file(),
+                home.path()
+                    .join("flatpak/db/tuna-fixture-isolation")
+                    .is_file(),
                 "the bus-activated service must write inside the fixture data home"
             );
         }
