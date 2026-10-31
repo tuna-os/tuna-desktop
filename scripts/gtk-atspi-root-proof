@@ -178,6 +178,11 @@ def session(artifacts, patched):
                 receipt['unpatched_exit'] = status
                 if status != -signal.SIGSEGV:
                     raise RuntimeError(f'unpatched negative control did not reproduce SIGSEGV: {status}')
+                receipt['unpatched_signal'] = 'SIGSEGV'
+                critical = (artifacts / 'application.stderr').read_text()
+                if 'g_variant_new_object_path' not in critical or 'CRITICAL' not in critical:
+                    raise RuntimeError('stock negative control lacks the actual NULL object-path critical')
+                receipt['unpatched_critical'] = critical
             else:
                 receipt['hidden_tail_invalid'] = invalid(3)
                 receipt['valid_after_first_error'] = children()
