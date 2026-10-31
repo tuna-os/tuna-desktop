@@ -531,6 +531,62 @@ refreshed from it. The docs show the GTK shell through the
 `scripts/lib/tuna-parity-compare.py`. CI does not run it. The workflow and
 the states are in [pixel parity with GNOME 51](gnome-parity.md).
 
+## Output hotplug storm
+
+The nested backend has one fixed output, so hotplug runs on real DRM: the
+`hotplug` job of the `nested stress` workflow (nightly, on
+`workflow_dispatch`, and on pull requests touching
+`scripts/tuna-hotplug-stress` or the workflow). `scripts/tuna-hotplug-stress`
+creates a vkms configfs instance (Linux 6.19 or newer; the job pins
+`ubuntu-26.04`) with three CRTC/connector pipes. Connector A stays
+connected; writing a connector's configfs `status` plugs or unplugs B and
+C and makes the kernel send a real udev `HOTPLUG=1` change for the card.
+`tuna-compositor --backend drm` runs on that card under a private seatd
+and session bus with the GTK shell. Three GTK 4 clients animate every
+frame; each is placed on its own output by moving a uinput mouse there,
+as Mutter places new windows on the pointer's monitor.
+
+Each round plugs B and C, applies an `ApplyMonitorsConfig` (method 1)
+that moves B after C and gives B, or A on odd rounds, its largest
+supported scale, toggles the overview with a uinput Super and Escape,
+unplugs and replugs the primary every third round, writes a
+`monitors.xml` configuration for A+B and replugs B into it every other
+round, then unplugs C and B. After every step the compositor state must
+show:
+
+- `H-OUTPUTS`: the wl_outputs and DisplayConfig's monitors are exactly the
+  connected connectors;
+- `H-REHOME`: every window sits on its own output while that is
+  connected, else on the primary, and still prefers its own output
+  (Mutter's `meta_window_update_for_monitors_changed`);
+- `H-CLIENTS`: every client process is alive and keeps drawing frames;
+- `H-SCALE` and `H-STORED`: the applied scale and arrangement, and the
+  rewritten `monitors.xml`, reach the outputs;
+- `H-INPUT`, `H-LIVE`: the overview answers the keyboard, the compositor
+  never exits or panics and the shell never exits.
+
+`H-GROWTH` bounds the compositor and shell as the churn lane does: final
+PSS within round-0 PSS × 1.25 + 64 MiB and fds within round-0 + 32.
+Pull requests and dispatches run 4 rounds, nightly 30. The artifacts keep
+the compositor, shell and client logs, every step's outputs and window
+rectangles (`report.json`), the metrics and the state at a failure.
+
+To run it on a host with Linux 6.19+ and sudo, after building
+`tuna-compositor` and `tuna-shell-gtk`:
+
+```sh
+scripts/tuna-hotplug-stress --rounds 4 --out /tmp/tuna-hotplug-fresh
+```
+
+Configuration changes come from connector hotplug the way Mutter's
+`meta_monitor_manager_ensure_configured` picks them: a stored
+configuration for exactly the connected monitors, else the current or
+previous configuration covering them, else a linear one with the primary
+kept first. Unlike Mutter, which reads `monitors.xml` once at startup,
+the stored configuration is read from the file at each hotplug. Real
+panels, EDIDs, colord device registration on hotplug and multiple GPUs
+are not covered.
+
 ## When a run fails
 
 Read `nested.log` in the artifacts directory first (`compositor.log` for
@@ -562,11 +618,9 @@ Run it on a development host after building the compositor and GTK shell:
 scripts/tuna-stress --rounds 10 --out /tmp/tuna-stress-fresh
 ```
 
-Use a fresh empty artifact directory for each run. The harness starts its
-own Xvfb, session bus and private user state. It covers client churn and
-notification flood portions of #203; malformed Wayland requests, service
-faults, hotplug, locked-input adversaries and a measured 24-hour VM soak
-remain open.
+Use a fresh empty artifact directory for each run. Real output hotplug and
+the VM endurance soak (`scripts/tuna-vm-soak`, [soak.md](soak.md)) are
+separate lanes.
 
 ## Control decoder fuzzing
 
