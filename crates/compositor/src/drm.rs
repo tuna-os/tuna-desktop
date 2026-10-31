@@ -683,7 +683,8 @@ impl DrmBackend {
         while unsafe { input_ffi::libinput_next_event_type(backend.libinput.as_raw_mut()) }
             == input_ffi::libinput_event_type_LIBINPUT_EVENT_DEVICE_ADDED
         {
-            if let Some(LibinputEvent::Device(DeviceEvent::Added(added))) = backend.libinput.next() {
+            if let Some(LibinputEvent::Device(DeviceEvent::Added(added))) = backend.libinput.next()
+            {
                 let device = smithay::reexports::input::event::EventTrait::device(&added);
                 backend.translate(InputEvent::DeviceAdded { device }, &[]);
             }
