@@ -175,6 +175,15 @@ markers are published only after complete PID contents are written.
 Artifacts retain supervised test-client panics and early compositor exit
 status; a compiled test or cache hit is not a substitute for these cases.
 
+The focused private-helper proof is
+`TUNA_REQUIRE_PAM_WRAPPER=1 cargo test -p tuna-compositor --test pam_helper`.
+An authenticated reply is provisional until the helper exits, its process
+group has no live members, and its leader is reaped. The bounded `/proc`
+scan tolerates only process-disappearance errors (`ENOENT`, or `ESRCH`
+when a process is reaped between opening and reading its `stat` file);
+other scan failures keep retirement quarantined. Its 500 ms cleanup budget
+is separate from the conversation deadline and is not extended on a race.
+
 Run one crate with `cargo test -p <package>` (package names are in each
 crate's `README.md`, for example `cargo test -p tuna-compositor`).
 
