@@ -539,34 +539,75 @@ Read `nested.log` in the artifacts directory first (`compositor.log` for
 retry a deterministic test until it passes: the timing rule in the
 [development guide](development.md#writing-a-test) applies.
 
-## Bounded nested stress
+## Nested stress and torture suite
 
-`nested stress` runs four concurrent Wayland GTK clients. Each round maps
-and destroys 400 windows; three warmup rounds settle renderer caches.
-After every measured round, Escape and Super must still change the
-compositor's overview state, and every destroyed window must disappear.
-The lane then sends 1,000 notifications and closes each over D-Bus.
+`nested stress` (`scripts/tuna-stress`, `.github/workflows/stress.yml`)
+runs the real compositor and GTK shell nested on Xvfb with a private
+session bus, a private system bus of service stubs
+(`scripts/lib/tuna-service-stubs.py`), a pam_wrapper unlock stack and the
+compositor started at systemd's user-session open-file limit (1024 soft).
+Phases, in order (`--phases` runs a subset):
 
-The per-change smoke uses ten measured rounds; nightly uses 300. The
-report retains PSS/RSS, file descriptors and descendant process counts
-for the compositor and supervised shell after each round. Final PSS must
-stay within warmup PSS × 1.25 + 64 MiB, and fd count within warmup + 32.
-These diagnostic bounds catch unbounded growth in this workload; they
-are separate from the GNOME performance targets in #73. A panic, lost
-input response, orphaned window or hung worker fails the lane. Logs,
-metrics, final state, assertions and the exact source revision are kept.
+- `churn`: four clients map and destroy 400 windows per round.
+- `popup`: four clients each map 60 nested (depth three) popups.
+- `protocol`: four live adversaries per mode (`scripts/lib/tuna-wayland-adversary.c`)
+  beside a healthy popup client: malformed opcodes, zero and huge buffers,
+  out-of-order destruction, invalid and never-acknowledged configures,
+  death mid-transaction, 5,000 unthrottled commits each, 300 freshly
+  written 2 MiB SHM buffers each, 1,000 connections held open at once, and
+  a seeded fuzzer: per attacker 100 sessions of up to 256 random requests
+  to every bound global and the objects they create, shaped by each
+  request's signature and kept valid in type and lifetime except one
+  request in 32 (wrong-typed, destroyed or null objects, edge integers);
+  requests that ended earlier sessions are picked less often, and every
+  request must be answered within 5 s (the day's seeds are in the report).
+- `dbus`: 1,000 notifications, 2,000 `ShowOSD` calls, accelerator grab and
+  ungrab floods (then a live grab fires and a departed caller's grab is
+  released), 300 tray items registered from their own connections and
+  pruned after leaving, and a search-provider query flood with every other
+  reply 2.5 s late.
+- `scale`: 40 `ApplyMonitorsConfig` scale changes while clients map.
+- `services`: NetworkManager, BlueZ and power-profiles stubs vanish (half
+  killed) and return ten times; the shell must read each returned daemon
+  again without restarting. `ibus-daemon` is killed five times under a
+  focused field: typing continues without it, and the IBus bridge must
+  focus the returned daemon's new input context.
+- `input`: 1,000 typed keys must arrive exactly once; 2,000 pointer moves;
+  a held key's repeat must stop when focus leaves, not resume on refocus
+  and not leak into the window that gains focus.
+- `swipe`: 60 touchpad swipes interrupted (restarted, Escape mid-gesture,
+  cancelled) must settle.
+- `lock`: Super+L under an active popup grab, mid-swipe; no key, motion or
+  press may reach the client while locked; unlocking with the PAM
+  password restores typing.
+- `shell`: the shell is SIGKILLed through its restart budget, then once
+  more; the recovery overlay's relaunch must bring it back while a client
+  survives and keeps input.
 
-Run it on a development host after building the compositor and GTK shell:
+Every phase ends by proving the input path (Escape and Super change the
+overview). PSS/RSS, fd and mapping counts for the compositor and its
+descendants are sampled before and after each phase, per process and with
+PSS split by mapping kind (heap, anonymous, shared memory, GPU, files), in
+`metrics.jsonl`; a failing growth gate names the phase that grew most and
+the process and kind that grew. Final PSS must stay within
+warmup × 1.25 + 64 MiB, fds within warmup + 32 and mappings within
+warmup × 1.25 + 1024. These diagnostic bounds catch unbounded growth;
+they are separate from the GNOME performance targets in #73. A panic,
+compositor exit, lost input response, orphaned window or hung worker
+fails the lane. Pull requests touching the suite run ten churn rounds;
+the nightly run uses 300.
+
+Run it after building the compositor, GTK shell, shell host (IBus bridge)
+and wallpaper helper:
 
 ```sh
+cargo build -p tuna-compositor -p tuna-shell-gtk -p tuna-shell-host -p tuna-wallpaper-svg
 scripts/tuna-stress --rounds 10 --out /tmp/tuna-stress-fresh
 ```
 
-Use a fresh empty artifact directory for each run. The harness starts its
-own Xvfb, session bus and private user state. It covers client churn and
-notification flood portions of #203; malformed Wayland requests, service
-faults, hotplug, locked-input adversaries and a measured 24-hour VM soak
-remain open.
+Use a fresh empty artifact directory for each run. Real output hotplug and
+the VM endurance soak (`scripts/tuna-vm-soak`, [soak.md](soak.md)) are
+separate lanes.
 
 ## Control decoder fuzzing
 
@@ -590,5 +631,5 @@ cargo install cargo-fuzz --version 0.13.2 --locked
 cargo +nightly-2026-08-28 fuzz run control_body -- -max_total_time=60 -max_len=1048580 -timeout=5 -rss_limit_mb=2048
 ```
 
-This covers the decoder portion of #203. Wayland misuse, client churn,
-service failures and a measured long soak remain separate stress gates.
+This covers the control decoders of #203; Wayland request handlers are
+fuzzed live by the nested stress suite's `protocol` phase.

@@ -143,7 +143,9 @@ impl Grabs {
 
     /// Grab `accelerator` for `sender` with GNOME's MetaKeyBindingFlags:
     /// the new action id, or 0 when it does not parse, is grabbed
-    /// already, or carries an unsupported flag (as Mutter answers).
+    /// already, carries an unsupported flag (as Mutter answers), or the
+    /// callers' grabs would crowd the shell's own keybindings out of the
+    /// compositor's [`MAX_ACCELERATORS`](tuna_shell_control::MAX_ACCELERATORS).
     fn grab_with_flags(&mut self, sender: &str, accelerator: &str, modes: u32, flags: u32) -> u32 {
         if flags & !tuna_shell_control::SUPPORTED_GRAB_FLAGS != 0 {
             return 0;
@@ -156,7 +158,7 @@ impl Grabs {
                 .by_action
                 .values()
                 .any(|g| g.keysym == keysym && g.mods == mods)
-            || self.by_action.len() >= tuna_shell_control::MAX_ACCELERATORS
+            || self.by_action.len() + self.reserved.len() >= tuna_shell_control::MAX_ACCELERATORS
         {
             return 0;
         }
@@ -247,20 +249,23 @@ pub struct Service {
 }
 
 impl Service {
-    /// Hand the compositor every grab: callers' (with their GNOME flags)
-    /// and the shell's own.
+    /// Hand the compositor every grab: the shell's own first, then the
+    /// callers' (with their GNOME flags), within the protocol's
+    /// [`MAX_ACCELERATORS`](tuna_shell_control::MAX_ACCELERATORS). A
+    /// larger set would be refused whole by the compositor; callers are
+    /// admitted only while there is room, so only grabs taken before the
+    /// shell's own list grew (gsd-media-keys leaving) can fall off the end.
     fn push(&self) {
+        let mut typed: Vec<_> = self.internal.borrow().clone();
         let grabs = self.grabs.borrow();
-        let mut typed: Vec<_> = grabs
-            .list()
-            .into_iter()
-            .map(|accelerator| tuna_shell_control::AcceleratorGrab {
+        typed.extend(grabs.list().into_iter().map(|accelerator| {
+            tuna_shell_control::AcceleratorGrab {
                 flags: grabs.by_action[&accelerator.action].flags,
                 accelerator,
-            })
-            .collect();
+            }
+        }));
         drop(grabs);
-        typed.extend(self.internal.borrow().iter().copied());
+        typed.truncate(tuna_shell_control::MAX_ACCELERATORS);
         self.actions.set_accelerator_grabs(typed);
     }
 
@@ -754,6 +759,83 @@ mod tests {
         );
         assert!(actions.0.borrow().is_empty());
         service.accelerator_activated(u32::MAX - 1, 1, tuna_shell_control::MODE_NORMAL);
+    }
+
+    /// Distinct accelerators, far more than the compositor holds.
+    fn many_accelerators() -> Vec<String> {
+        let keys: Vec<String> = (b'a'..=b'z')
+            .map(|c| char::from(c).to_string())
+            .chain((1..=12).map(|n| format!("F{n}")))
+            .collect();
+        let mods = ["Shift", "Control", "Alt", "Super"];
+        (0..16u32)
+            .flat_map(|bits| {
+                let prefix: String = mods
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| bits & (1 << i) != 0)
+                    .map(|(_, m)| format!("<{m}>"))
+                    .collect();
+                keys.iter().map(move |k| format!("{prefix}{k}"))
+            })
+            .collect()
+    }
+
+    /// A caller grabbing everything it can never pushes the shell's own
+    /// keybindings (Super+L, the overview) out of the compositor's
+    /// bounded grab table, nor makes the compositor refuse the set.
+    #[test]
+    fn callers_cannot_crowd_out_the_shells_own_bindings() {
+        let actions = Rc::new(RecordedActions::default());
+        let service = test_service(actions.clone());
+        let own: Vec<(String, u32, u32)> = ["<Super>l", "<Super>s", "<Super>a"]
+            .iter()
+            .map(|a| ((*a).to_owned(), tuna_shell_control::MODE_NORMAL, 0))
+            .collect();
+        service.set_internal(&own, Rc::new(|_, _| {}));
+        let mut granted = 0;
+        for accelerator in many_accelerators() {
+            if service
+                .grabs
+                .borrow_mut()
+                .grab_with_flags(":1.9", &accelerator, 0, 0)
+                != 0
+            {
+                granted += 1;
+            }
+        }
+        service.push();
+        assert_eq!(granted, tuna_shell_control::MAX_ACCELERATORS - own.len());
+        let pushed = actions.0.borrow().clone();
+        assert_eq!(pushed.len(), tuna_shell_control::MAX_ACCELERATORS);
+        let internal = pushed.iter().filter(|a| a.action >= INTERNAL_BASE).count();
+        assert_eq!(internal, own.len());
+
+        // The shell's own list grows (gsd-media-keys left) while the
+        // table is full: its bindings still all go first.
+        let more: Vec<(String, u32, u32)> = own
+            .iter()
+            .cloned()
+            .chain(std::iter::once((
+                "XF86AudioMute".to_owned(),
+                tuna_shell_control::MODE_NORMAL,
+                0,
+            )))
+            .collect();
+        service.set_internal(&more, Rc::new(|_, _| {}));
+        let pushed = actions.0.borrow().clone();
+        assert_eq!(pushed.len(), tuna_shell_control::MAX_ACCELERATORS);
+        assert!(pushed[..more.len()]
+            .iter()
+            .all(|a| a.action >= INTERNAL_BASE));
+        assert_eq!(
+            service
+                .grabs
+                .borrow_mut()
+                .grab_with_flags(":1.9", "XF86AudioPlay", 0, 0),
+            0,
+            "a full table admits no new caller grab"
+        );
     }
 }
 

@@ -139,3 +139,56 @@ meta_x11_display_set_input_focus does; enter/leave are unchanged. The
 nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
 The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
 version stays 0.7.0.
+
+Issue #203 changes src/wayland/compositor/handlers.rs: wl_region add and
+subtract with an empty, negative or overflowing rectangle, and
+wl_surface.damage with a negative size (damage_buffer already returned
+early), panicked in
+`Size::new` and took the whole session down (found by the nested stress
+suite's protocol fuzzer). Mutter hands the rectangle to pixman
+(meta-wayland-region.c, mtk_region_union_rectangle), which leaves the
+region unchanged for such a rectangle; the handler now ignores it the same
+way. The stress suite's `bad-region` adversary covers it. The isolated diff
+is retained in REGION-RECT-PATCH.diff; the pinned
+version stays 0.7.0.
+
+Issue #203 also changes src/wayland/shm/handlers.rs: wl_shm_pool.resize
+with a size of zero or less posted the invalid-size error and then went on
+to `NonZeroUsize::try_from(size).unwrap()`, which panicked and took the
+whole session down (found by the deeper, error-aware protocol fuzzer).
+The handler now returns after the error, as libwayland-server's
+shm_pool_resize does. The isolated diff is retained in
+SHM-RESIZE-PATCH.diff; the pinned version stays 0.7.0.
+
+Issue #203 also changes src/wayland/shell/xdg/handlers/surface.rs,
+surface/toplevel.rs and positioner.rs, all found by the deeper protocol
+fuzzer:
+
+- xdg_surface.get_popup accepted any parent, including the popup's own
+  xdg_surface or a second xdg_surface on a surface that already was a
+  popup. The popup then descended from itself and
+  `find_popup_root_surface` (and every other walk up the popup chain)
+  looped forever, hanging the whole session. As Mutter's
+  xdg_surface_constructor_get_popup (meta-wayland-xdg-shell.c), a parent
+  without an xdg role is refused with `invalid_popup_parent`; so is one
+  that descends from the new popup.
+- xdg_toplevel.set_min_size and set_max_size with a negative size panicked
+  in `Size::new`. They now post `invalid_size`, as Mutter's
+  xdg_toplevel_set_min_size and xdg_toplevel_set_max_size do.
+- xdg_positioner.set_parent_size with a negative size panicked the same
+  way. Mutter stores any parent size without an error; a negative one
+  cannot be a `Size`, so it is ignored.
+
+crates/compositor/tests/popups.rs covers the popup parent checks. The
+isolated diff is retained in XDG-SHELL-FUZZ-PATCH.diff; the pinned version
+stays 0.7.0.
+
+Issue #203 also changes src/wayland/compositor/tree.rs: placing a
+subsurface above itself removed it from its parent's child list, then
+inserted past the end and panicked. Both above-self and below-self now
+return an error before changing the list, which the request handler turns
+into `wl_subsurface.bad_surface`. This matches Mutter's `is_sibling`
+and `subsurface_place` in meta-wayland-subsurface.c. A missing child in
+the parent's list likewise returns an error instead of unwrapping.
+The real-client regression in crates/compositor/tests/popups.rs covers
+both requests and confirms another client is still served afterward.

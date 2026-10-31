@@ -441,6 +441,89 @@ struct GnomeShellDbus {
     osd: Rc<osd::OsdUi>,
     overview: Rc<RefCell<overview::OverviewUi>>,
     shell: Rc<RefCell<Shell>>,
+    grabs: Rc<GrabSender>,
+}
+
+/// The accelerator grab set on its way to the compositor. It is state,
+/// not an event: a burst of GrabAccelerator/UngrabAccelerator calls
+/// sends only the latest set, and a set the control socket cannot take
+/// yet (backpressure, a redial) stays pending until it is written,
+/// instead of leaving the compositor on a stale set whose action ids the
+/// shell no longer knows.
+struct GrabSender {
+    shell: Rc<RefCell<Shell>>,
+    pending: RefCell<Option<Vec<tuna_shell_control::AcceleratorGrab>>>,
+    scheduled: Cell<bool>,
+}
+
+impl GrabSender {
+    fn new(shell: Rc<RefCell<Shell>>) -> Rc<Self> {
+        Rc::new(Self {
+            shell,
+            pending: RefCell::new(None),
+            scheduled: Cell::new(false),
+        })
+    }
+
+    /// Replace the pending set and send it once the main loop is idle.
+    fn queue(self: &Rc<Self>, grabs: Vec<tuna_shell_control::AcceleratorGrab>) {
+        *self.pending.borrow_mut() = Some(grabs);
+        if self.scheduled.replace(true) {
+            return;
+        }
+        let sender = self.clone();
+        glib::idle_add_local_once(move || sender.flush());
+    }
+
+    fn retry_after(self: &Rc<Self>, delay: Duration) {
+        if self.scheduled.replace(true) {
+            return;
+        }
+        let sender = self.clone();
+        glib::timeout_add_local_once(delay, move || sender.flush());
+    }
+
+    fn flush(self: &Rc<Self>) {
+        self.scheduled.set(false);
+        let Some(grabs) = self.pending.borrow_mut().take() else {
+            return;
+        };
+        let mut shell = self.shell.borrow_mut();
+        let Some(control) = shell.control.as_mut() else {
+            drop(shell);
+            *self.pending.borrow_mut() = Some(grabs);
+            self.retry_after(tuna_shell_host::control::REDIAL_INTERVAL);
+            return;
+        };
+        let locked = control.locked();
+        let subset = media_keys::trace_enabled().then(|| {
+            let accelerators: Vec<_> = grabs.iter().map(|g| g.accelerator).collect();
+            media_keys::media_subset(&accelerators)
+        });
+        let result = control.set_accelerator_grabs(grabs.clone());
+        drop(shell);
+        if let Some(subset) = subset {
+            media_keys::trace(
+                "accelerators-send",
+                serde_json::json!({
+                    "request_id": result.as_ref().ok(), "write_ok": result.is_ok(),
+                    "media": subset,
+                }),
+                locked,
+            );
+        }
+        if let Err(e) = result {
+            // A newer set queued meanwhile supersedes this one.
+            self.pending.borrow_mut().get_or_insert(grabs);
+            if is_would_block(&e) {
+                // The socket is full: try again a frame later.
+                self.retry_after(Duration::from_millis(16));
+            } else {
+                eprintln!("tuna-shell-gtk: accelerator grabs not sent: {e}");
+                self.retry_after(tuna_shell_host::control::REDIAL_INTERVAL);
+            }
+        }
+    }
 }
 
 impl shell_dbus::ShellActions for GnomeShellDbus {
@@ -465,24 +548,7 @@ impl shell_dbus::ShellActions for GnomeShellDbus {
     }
 
     fn set_accelerator_grabs(&self, grabs: Vec<tuna_shell_control::AcceleratorGrab>) {
-        if let Some(control) = self.shell.borrow_mut().control.as_mut() {
-            let locked = control.locked();
-            let subset = media_keys::trace_enabled().then(|| {
-                let accelerators: Vec<_> = grabs.iter().map(|g| g.accelerator).collect();
-                media_keys::media_subset(&accelerators)
-            });
-            let result = control.set_accelerator_grabs(grabs);
-            if let Some(subset) = subset {
-                media_keys::trace(
-                    "accelerators-send",
-                    serde_json::json!({
-                        "request_id": result.as_ref().ok(), "write_ok": result.is_ok(),
-                        "media": subset,
-                    }),
-                    locked,
-                );
-            }
-        }
+        self.grabs.queue(grabs);
     }
 }
 
@@ -2572,6 +2638,7 @@ fn build(app: &adw::Application) {
         osd: osd_ui.clone(),
         overview: overview_ui.clone(),
         shell: shell.clone(),
+        grabs: GrabSender::new(shell.clone()),
     }));
 
     // GNOME's screenshot UI (Print).

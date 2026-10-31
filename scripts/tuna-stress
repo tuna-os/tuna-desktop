@@ -1,21 +1,85 @@
 #!/usr/bin/python3
-"""Bounded window/popup churn; metrics are samples, not a 24h soak."""
+"""Nested stress and torture suite (#203).
+
+Runs the real compositor and GTK shell nested on Xvfb with a private session
+bus, a private system bus of service stubs, a pam_wrapper unlock stack and the
+open-file limit systemd gives user sessions (1024 soft). Phases, in this
+order (``--phases`` runs a subset; warmup and the growth gates always run):
+
+  churn     four clients map and unmap hundreds of windows per round
+  popup     nested popup storms from four clients
+  protocol  adversarial Wayland clients (malformed requests, out-of-order
+            destruction, unacknowledged configures, zero and huge buffers,
+            death mid-transaction), commit floods, fresh-buffer churn and
+            1000-connection storms, each beside a healthy client
+  dbus      notification, ShowOSD and accelerator-grab floods, tray item
+            registration churn and search-provider query floods
+  scale     a DisplayConfig scale storm while clients map windows and popups
+  services  NetworkManager, BlueZ and power-profiles daemons vanish and
+            return; ibus-daemon is killed and restarted under a focused field
+  input     key and pointer floods counted at the client; a held key's
+            repeat across focus changes
+  swipe     touchpad swipes interrupted mid-gesture
+  lock      the lock engaged mid-swipe under an active popup grab; nothing
+            reaches the client while locked; unlocking restores input
+  shell     the shell killed in a loop through its restart budget, then the
+            recovery overlay's relaunch, with a client mapped throughout
+
+Every phase ends by proving the input path. The run fails on a compositor
+exit or panic, a hung input path, or growth past the stated limits. It is not
+a soak: scripts/tuna-vm-soak measures hours of memory and frame pacing in a VM.
+"""
 import argparse
 import json
 import os
 from pathlib import Path
+import re
+import resource
+import secrets
+import signal
 import subprocess
 import sys
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
+SELF = str(Path(__file__).resolve())
+PHASES = ("churn", "popup", "protocol", "dbus", "scale", "services", "input", "swipe",
+          "lock", "shell")
+SOCKET = "tuna-stress"
+WIDTH, HEIGHT = 1280, 800
+# systemd's DefaultLimitNOFILE for user sessions: GNOME's session starts here.
+SESSION_NOFILE_SOFT = 1024
+# Adversarial clients: mode -> (expected outcome, seconds allowed).
+ADVERSARIES = {
+    "malformed-opcode": ("connection-rejected", 10),
+    "zero-buffer": ("protocol-rejected", 10),
+    "huge-buffer": ("protocol-rejected", 10),
+    "destroy-parent": ("protocol-rejected", 10),
+    "invalid-configure": ("protocol-rejected", 10),
+    "never-ack": ("configure-left-unacknowledged", 10),
+    "die-mid-transaction": ("disconnected-before-commit", 10),
+    "commit-flood": ("flood-served", 120),
+    "buffer-churn": ("churn-served", 120),
+    "connect-storm": ("all-connections-served", 60),
+    "bad-region": ("region-ignored", 10),
+    "fuzz": ("fuzz-served", 300),
+}
+POPUPS_PER_WORKER = {"mapped_wayland_popups": 60, "nested_depth": 3}
 
 
-def worker():
+# --- client workers (run as separate processes) -------------------------------
+
+def gtk():
     os.environ.setdefault("GSK_RENDERER", "cairo")
     import gi
     gi.require_version("Gtk", "4.0")
-    from gi.repository import GLib, Gtk
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Gdk, GLib, Gtk
+    return Gdk, GLib, Gtk
+
+
+def churn_worker():
+    _, GLib, Gtk = gtk()
     loop = GLib.MainLoop()
     windows, batches = [], 0
 
@@ -45,14 +109,9 @@ def worker():
         time.sleep(0.01)
 
 
-
 def popup_worker():
     """Require actual mapped Wayland popups, including three-level nesting."""
-    os.environ.setdefault("GSK_RENDERER", "cairo")
-    import gi
-    gi.require_version("Gtk", "4.0")
-    gi.require_version("Gdk", "4.0")
-    from gi.repository import Gdk, GLib, Gtk
+    Gdk, GLib, Gtk = gtk()
     context = GLib.MainContext.default()
 
     def dispatch_until(condition):
@@ -100,26 +159,144 @@ def popup_worker():
     print(json.dumps({"mapped_wayland_popups": mapped, "nested_depth": 3}), flush=True)
 
 
-def wait_for(condition, timeout=30):
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        if condition():
-            return
-        time.sleep(0.1)
-    raise RuntimeError("condition exceeded its wall-clock deadline")
+def input_worker(state_path, app_id, width, height, grab):
+    """A text field that publishes what actually reached it.
+
+    The state file counts key presses (window and grabbing popup), pointer
+    motion and presses, and the text length; the worker exits when
+    ``STATE.quit`` appears."""
+    _, GLib, Gtk = gtk()
+    GLib.set_prgname(app_id)
+    loop = GLib.MainLoop()
+    counts = {"keys": 0, "popup_keys": 0, "motions": 0, "presses": 0}
+
+    def bump(name):
+        def handler(*_):
+            counts[name] += 1
+            return False
+        return handler
+
+    window = Gtk.Window(title=app_id)
+    window.set_default_size(width, height)
+    text = Gtk.Text()
+    text.set_hexpand(True)
+    text.set_vexpand(True)
+    window.set_child(text)
+    keys = Gtk.EventControllerKey()
+    keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    keys.connect("key-pressed", bump("keys"))
+    window.add_controller(keys)
+    motion = Gtk.EventControllerMotion()
+    last_motion = [None]
+
+    def moved(_controller, x, y):
+        counts["motions"] += 1
+        last_motion[0] = [round(x, 2), round(y, 2)]
+    motion.connect("motion", moved)
+    window.add_controller(motion)
+    click = Gtk.GestureClick(button=0)
+    click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    click.connect("pressed", bump("presses"))
+    window.add_controller(click)
+    popover = None
+    opened = False
+    if grab:
+        popover = Gtk.Popover()
+        popover.set_autohide(True)
+        popover.set_child(Gtk.Label(label="Grabbing popup"))
+        popover.set_parent(text)
+        popup_keys = Gtk.EventControllerKey()
+        popup_keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        popup_keys.connect("key-pressed", bump("popup_keys"))
+        popover.add_controller(popup_keys)
+        popup_click = Gtk.GestureClick(button=0)
+        popup_click.connect("pressed", bump("presses"))
+        popover.add_controller(popup_click)
+
+        def open_popup(*_):
+            # A grabbing popup needs a fresh input serial: open it from the
+            # press that focused the window, as a menu button does. Not the
+            # release: the text field claims the press sequence, which
+            # cancels this window-level gesture before its release.
+            nonlocal opened
+            if not opened:
+                opened = True
+                popover.popup()
+        click.connect("pressed", open_popup)
+    window.connect("close-request", lambda *_: loop.quit() or False)
+    window.present()
+    last = None
+
+    def publish():
+        nonlocal last, opened
+        if Path(state_path + ".quit").exists():
+            window.destroy()
+            loop.quit()
+            return False
+        value = dict(counts, pid=os.getpid(), mapped=window.get_mapped(),
+                     active=window.is_active(), text=len(text.get_text()),
+                     popup=bool(popover is not None and popover.get_mapped()),
+                     popup_opened=opened, last_motion=last_motion[0])
+        if value != last:
+            last = value
+            tmp = state_path + ".tmp"
+            Path(tmp).write_text(json.dumps(value))
+            os.replace(tmp, state_path)
+        return True
+
+    GLib.timeout_add(20, publish)
+    loop.run()
+    for _ in range(10):
+        while GLib.MainContext.default().iteration(False):
+            pass
+        time.sleep(0.01)
 
 
-def metrics(root_pid):
+# --- harness -------------------------------------------------------------------
+
+def tree(root_pid):
     pairs = subprocess.check_output(["ps", "-eo", "pid=,ppid="], text=True)
     children = {root_pid}
     edges = [tuple(map(int, line.split())) for line in pairs.splitlines()]
     while True:
         expanded = children | {pid for pid, parent in edges if parent in children}
         if expanded == children:
-            break
+            return children
         children = expanded
-    pss, rss, fds = 0, 0, 0
-    for pid in children:
+
+
+def mapping_kind(name):
+    if not name:
+        return "anon"
+    if name.startswith(("memfd:", "/memfd:", "/dev/shm/", "/SYSV")):
+        return "shm"
+    if name.startswith("/dev/dri/"):
+        return "gpu"
+    if name.startswith("["):
+        return name.strip("[]").split(":")[0]
+    return "file"
+
+
+def process_memory(pid):
+    """PSS by mapping kind, so growth names its owner: heap, shm pools, GPU or files."""
+    kinds, name = {}, ""
+    for line in Path(f"/proc/{pid}/smaps").read_text().splitlines():
+        head = line.split(None, 1)[0]
+        if not head.endswith(":"):
+            fields = line.split(None, 5)
+            name = fields[5].strip() if len(fields) > 5 else ""
+        elif head == "Pss:":
+            kind = mapping_kind(name)
+            kinds[kind] = kinds.get(kind, 0) + int(line.split()[1])
+    return kinds
+
+
+def metrics(root_pid):
+    pss, rss, fds, maps = 0, 0, 0, 0
+    processes = tree(root_pid)
+    compositor_fds = 0
+    per_process = {}
+    for pid in processes:
         proc = Path(f"/proc/{pid}")
         try:
             values = {}
@@ -127,237 +304,1208 @@ def metrics(root_pid):
                 parts = line.split()
                 if parts[0] in ("Pss:", "Rss:"):
                     values[parts[0]] = int(parts[1])
-            pss += values.get("Pss:", 0)
-            rss += values.get("Rss:", 0)
-            fds += len(list((proc / "fd").iterdir()))
-        except FileNotFoundError:
+            count = len(list((proc / "fd").iterdir()))
+            mappings = (proc / "maps").read_text().count("\n")
+            comm = (proc / "comm").read_text().strip()
+            kinds = process_memory(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        pss += values.get("Pss:", 0)
+        rss += values.get("Rss:", 0)
+        fds += count
+        maps += mappings
+        if pid == root_pid:
+            compositor_fds = count
+        per_process[f"{comm}:{pid}"] = {"pss_kib": values.get("Pss:", 0), "fds": count,
+                                        "maps": mappings, "pss_by_kind_kib": kinds}
+    return {"elapsed_s": time.monotonic(), "pss_kib": pss, "rss_kib": rss, "fds": fds,
+            "maps": maps, "compositor_fds": compositor_fds, "processes": len(processes),
+            "per_process": per_process}
+
+
+def owned_pids(runtime_dir):
+    """Processes started with this run's private runtime directory."""
+    marker = f"XDG_RUNTIME_DIR={runtime_dir}".encode()
+    found = []
+    for environ in Path("/proc").glob("[0-9]*/environ"):
+        try:
+            if marker in environ.read_bytes().split(b"\0"):
+                found.append(int(environ.parent.name))
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
             pass
-    return {"elapsed_s": time.monotonic(), "pss_kib": pss, "rss_kib": rss,
-            "fds": fds, "processes": len(children)}
+    return [pid for pid in found if pid != os.getpid()]
 
 
-def run(args):
-    out = Path(args.out).resolve()
-    if out.exists() and any(out.iterdir()):
-        raise RuntimeError("stress artifacts must be a fresh empty directory")
-    out.mkdir(parents=True, exist_ok=True)
-    private = out / "private"
-    private.mkdir(mode=0o700, exist_ok=True)
-    os.chmod(private, 0o700)
-    env = os.environ.copy()
-    env.update(XDG_RUNTIME_DIR=str(private), GSK_RENDERER="cairo",
-               GSETTINGS_BACKEND="memory", ADW_DISABLE_PORTAL="1",
-               TUNA_COMPOSITOR_STATE=str(out / "state.json"),
-               XDG_CONFIG_HOME=str(private / "config"),
-               XDG_STATE_HOME=str(private / "state"),
-               XDG_DATA_HOME=str(private / "data"))
-    logs, processes, samples = [], [], []
-    assertions = {}
-    start = time.monotonic()
+def comm(pid):
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except (FileNotFoundError, ProcessLookupError):
+        return ""
 
-    def launch(command, name, child_env=env):
-        log = (out / f"{name}.log").open("w")
-        logs.append(log)
-        process = subprocess.Popen(command, env=child_env, stdout=log, stderr=log,
-                                   start_new_session=True)
-        processes.append(process)
+
+class Failure(Exception):
+    pass
+
+
+class Stress:
+    def __init__(self, args):
+        self.args = args
+        self.out = Path(args.out).resolve()
+        if self.out.exists() and any(self.out.iterdir()):
+            raise SystemExit("stress artifacts must be a fresh empty directory")
+        self.out.mkdir(parents=True, exist_ok=True)
+        # AF_UNIX paths stay short; artifacts keep the logs.
+        self.private = Path(subprocess.check_output(
+            ["mktemp", "-d", "/tmp/tuna-stress.XXXXXX"], text=True).strip())
+        os.chmod(self.private, 0o700)
+        self.logs, self.processes, self.samples = [], [], []
+        self.assertions = {}
+        self.phase = "start"
+        self.started_at = time.monotonic()
+        self.password = "stress-" + secrets.token_hex(6)
+        self.compositor = None
+        self.wid = None
+        self.glib = None
+        env = os.environ.copy()
+        for name in ("WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DISPLAY", "AT_SPI_BUS_ADDRESS"):
+            env.pop(name, None)
+        env.update(XDG_RUNTIME_DIR=str(self.private), GSK_RENDERER="cairo",
+                   GSETTINGS_BACKEND="memory", ADW_DISABLE_PORTAL="1",
+                   TUNA_COMPOSITOR_STATE=str(self.out / "state.json"),
+                   TUNA_PROOF_SWIPE_INPUT=str(self.private / "swipe.json"),
+                   TUNA_LOCK_TRACE="1", HOME=str(self.private / "home"),
+                   XDG_CONFIG_HOME=str(self.private / "config"),
+                   XDG_CACHE_HOME=str(self.private / "cache"),
+                   XDG_STATE_HOME=str(self.private / "state"),
+                   XDG_DATA_HOME=str(self.private / "data"))
+        for name in ("home", "config", "cache", "state", "data"):
+            (self.private / name).mkdir()
+        self.env = env
+
+    # -- plumbing --
+
+    def launch(self, command, name, env=None, **kwargs):
+        log = (self.out / f"{name}.log").open("w")
+        self.logs.append(log)
+        process = subprocess.Popen(command, env=env or self.env, stdout=log, stderr=log,
+                                   start_new_session=True, **kwargs)
+        self.processes.append(process)
         return process
 
-    def state():
+    def worker(self, kind, name, *extra, env=None):
+        return self.launch([sys.executable, SELF, "--worker", kind, *extra], name, env or self.client_env)
+
+    def pump(self):
+        if self.glib is not None:
+            context = self.glib.MainContext.default()
+            for _ in range(200):
+                if not context.iteration(False):
+                    break
+
+    def wait_for(self, condition, what, timeout=30):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            self.pump()
+            if self.compositor is not None and self.compositor.poll() is not None:
+                raise Failure(f"compositor exited while waiting for {what}")
+            if condition():
+                return
+            time.sleep(0.05)
+        raise Failure(f"{what}: not within {timeout} s")
+
+    def state(self):
         try:
-            return json.loads((out / "state.json").read_text())
+            return json.loads((self.out / "state.json").read_text())
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
 
-    def sample():
-        if compositor.poll() is not None:
-            raise RuntimeError("compositor exited during stress")
-        value = metrics(compositor.pid)
-        value["elapsed_s"] = round(value["elapsed_s"] - start, 3)
-        samples.append(value)
-        with (out / "metrics.jsonl").open("a") as stream:
+    def wait_state(self, predicate, what, timeout=30):
+        def check():
+            try:
+                return predicate(self.state())
+            except (KeyError, TypeError, IndexError):
+                return False
+        self.wait_for(check, what, timeout)
+
+    def xdotool(self, *args):
+        subprocess.run(["xdotool", *args], env=self.env, check=True)
+
+    def key(self, *keys):
+        self.xdotool("key", "--clearmodifiers", *keys)
+
+    def click(self, x, y):
+        self.xdotool("mousemove", "--window", self.wid, str(x), str(y), "click", "1")
+
+    def sample(self):
+        if self.compositor.poll() is not None:
+            raise Failure("compositor exited during stress")
+        value = {"phase": self.phase, **metrics(self.compositor.pid)}
+        value["elapsed_s"] = round(value["elapsed_s"] - self.started_at, 3)
+        self.samples.append(value)
+        with (self.out / "metrics.jsonl").open("a") as stream:
             stream.write(json.dumps(value) + "\n")
         return value
 
-    try:
-        launch(["Xvfb", "-displayfd", "1", "-screen", "0", "1280x800x24", "-nolisten", "tcp"], "xvfb")
+    def record(self, name, ok, detail):
+        self.assertions[name] = [bool(ok), detail]
+        if not ok:
+            raise Failure(f"{name}: {detail}")
+
+    def overview(self, open_):
+        self.wait_state(lambda s: s["overview_open"] is open_,
+                        f"overview {'open' if open_ else 'closed'}", 15)
+
+    def input_path(self):
+        """Keyboard input still reaches the shell: Escape, Super, Escape."""
+        self.key("Escape")
+        self.overview(False)
+        self.key("Super_L")
+        self.overview(True)
+        self.key("Escape")
+        self.overview(False)
+
+    def windows_gone(self, timeout=30):
+        self.wait_state(lambda s: s["windows"] == [], "every stress window unmapped", timeout)
+
+    def window_rect(self, app_id):
+        for window in self.state().get("windows", []):
+            if window.get("app_id") == app_id:
+                return window["rect"]
+        return None
+
+    def input_client(self, app_id, width=480, height=320, grab=False, env=None):
+        path = str(self.private / f"{app_id}.json")
+        extra = [path, app_id, str(width), str(height)] + (["--grab"] if grab else [])
+        process = self.worker("input", app_id, *extra, env=env)
+
+        def read():
+            try:
+                return json.loads(Path(path).read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                return {}
+        self.wait_for(lambda: read().get("mapped") and self.window_rect(app_id),
+                      f"{app_id} mapped", 30)
+        return process, path, read
+
+    def focus_client(self, app_id, read, x_frac=0.5):
+        rect = self.window_rect(app_id)
+        self.click(rect[0] + int(rect[2] * x_frac), rect[1] + rect[3] // 2)
+        self.wait_for(lambda: read().get("active"), f"{app_id} focused", 15)
+
+    def close_client(self, process, path):
+        Path(path + ".quit").touch()
+        self.wait_for(lambda: process.poll() is not None, "input client exit", 15)
+        if process.returncode != 0:
+            raise Failure(f"input client {path} exited {process.returncode}")
+
+    def wait_workers(self, workers, what, timeout):
+        self.wait_for(lambda: all(p.poll() is not None for p in workers), what, timeout)
+        if any(p.returncode != 0 for p in workers):
+            raise Failure(f"{what}: a client failed; see its retained log")
+
+    def session_bus(self):
+        from gi.repository import Gio
+        return Gio.bus_get_sync(Gio.BusType.SESSION, None)
+
+    def private_connection(self, address):
+        from gi.repository import Gio
+        flags = (Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+                 | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION)
+        return Gio.DBusConnection.new_for_address_sync(address, flags, None, None)
+
+    def call(self, conn, name, path, iface, method, args=None, reply=None, timeout=5000):
+        from gi.repository import Gio, GLib
+        return conn.call_sync(name, path, iface, method, args,
+                              GLib.VariantType.new(reply) if reply else None,
+                              Gio.DBusCallFlags.NONE, timeout, None)
+
+    def has_owner(self, conn, name):
+        return self.call(conn, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                         "org.freedesktop.DBus", "NameHasOwner",
+                         self.glib.Variant("(s)", (name,)), "(b)").unpack()[0]
+
+    # -- session --
+
+    def start_system_bus(self):
+        config = self.private / "system-bus.conf"
+        config.write_text(f"""<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>tuna-stress-system</type>
+  <listen>unix:path={self.private}/system_bus_socket</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow user="*"/><allow own="*"/>
+    <allow send_type="method_call"/><allow send_type="signal"/>
+    <allow send_type="method_return"/><allow send_type="error"/>
+    <allow receive_type="method_call"/><allow receive_type="method_return"/>
+    <allow receive_type="error"/><allow receive_type="signal"/>
+  </policy>
+</busconfig>
+""")
+        self.launch(["dbus-daemon", f"--config-file={config}", "--nofork"], "system-bus")
+        socket = self.private / "system_bus_socket"
+        self.wait_for(socket.exists, "private system bus socket", 10)
+        self.system_address = f"unix:path={socket}"
+        self.env["DBUS_SYSTEM_BUS_ADDRESS"] = self.system_address
+        self.system = self.private_connection(self.system_address)
+        backlight = self.private / "backlight"
+        backlight.mkdir()
+        (backlight / "brightness").write_text("50\n")
+        (backlight / "max_brightness").write_text("100\n")
+        self.call_log = self.out / "stub-calls.log"
+        self.stub_env = self.env | {"TUNA_STUB_CALL_LOG": str(self.call_log)}
+        self.launch([sys.executable, str(ROOT / "scripts/lib/tuna-service-stubs.py"),
+                     str(backlight), str(self.out / "power.log")], "stubs-stable",
+                    self.stub_env | {"TUNA_STUB_SERVICES": "logind,polkit,upower"})
+        self.start_churned_stubs(0)
+
+    CHURNED = {"org.freedesktop.NetworkManager": "org.freedesktop.NetworkManager",
+               "org.bluez": ("org.bluez.", "org.freedesktop.DBus.ObjectManager."),
+               "org.freedesktop.UPower.PowerProfiles": "org.freedesktop.UPower.PowerProfiles"}
+
+    def start_churned_stubs(self, generation):
+        self.churned_stubs = self.launch(
+            [sys.executable, str(ROOT / "scripts/lib/tuna-service-stubs.py"),
+             str(self.private / "backlight")], f"stubs-churned-{generation}",
+            self.stub_env | {"TUNA_STUB_SERVICES": "nm,bluez,ppd"})
+        self.wait_for(lambda: all(self.has_owner(self.system, name) for name in self.CHURNED),
+                      "churned service stubs on the system bus", 15)
+
+    def start_pam(self):
+        lib = Path("/usr/lib/x86_64-linux-gnu/libpam_wrapper.so")
+        matrix = Path("/usr/lib/x86_64-linux-gnu/pam_wrapper/pam_matrix.so")
+        if not lib.exists() or not matrix.exists():
+            raise Failure("pam_wrapper and pam_matrix are required (libpam-wrapper)")
+        services = self.private / "pam/services"
+        services.mkdir(parents=True)
+        passdb = self.private / "pam/passdb"
+        user = subprocess.check_output(["id", "-un"], text=True).strip()
+        passdb.write_text(f"{user}:{self.password}:tuna-lock\n")
+        os.chmod(passdb, 0o600)
+        (services / "tuna-lock").write_text(
+            f"auth required {matrix} passdb={passdb}\naccount required {matrix} passdb={passdb}\n")
+        return {"LD_PRELOAD": str(lib), "PAM_WRAPPER": "1", "PAM_WRAPPER_SERVICE_DIR": str(services)}
+
+    def install_search_provider(self):
+        data = self.private / "data"
+        (data / "applications").mkdir(parents=True)
+        (data / "applications/org.tuna.StressSearch.desktop").write_text(
+            "[Desktop Entry]\nType=Application\nName=Stress Search\nExec=true\n")
+        (data / "gnome-shell/search-providers").mkdir(parents=True)
+        (data / "gnome-shell/search-providers/org.tuna.StressSearch.ini").write_text(
+            "[Shell Search Provider]\nDesktopId=org.tuna.StressSearch.desktop\n"
+            "BusName=org.tuna.StressSearch\nObjectPath=/org/tuna/StressSearch\nVersion=2\n")
+
+    def start(self):
+        from gi.repository import GLib
+        self.glib = GLib
+        self.start_system_bus()
+        self.install_search_provider()
+        pam = self.start_pam()
+        self.launch(["Xvfb", "-displayfd", "1", "-screen", "0", f"{WIDTH}x{HEIGHT}x24",
+                     "-nolisten", "tcp"], "xvfb")
+
         def display_number():
-            return next((line for line in (out / "xvfb.log").read_text().splitlines()
+            return next((line for line in (self.out / "xvfb.log").read_text().splitlines()
                          if line.isdigit()), None)
-        wait_for(display_number)
-        env["DISPLAY"] = ":" + display_number()
-        wait_for(lambda: subprocess.run(["xdotool", "getdisplaygeometry"], env=env,
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0)
-        compositor = launch([str(ROOT / "target/debug/tuna-compositor"), "--backend", "winit",
-                             "--socket", "tuna-stress",
-                             "--shell-bin", str(ROOT / "target/debug/tuna-shell-gtk")], "nested")
-        wait_for(lambda: state().get("layers"))
-        wait_for(lambda: (private / "tuna-stress").exists())
-        windows = subprocess.check_output(["xdotool", "search", "--name", "Smithay"], env=env, text=True)
-        wid = windows.splitlines()[0]
-        subprocess.run(["xdotool", "windowfocus", wid], env=env, check=True)
-        client_env = env | {"WAYLAND_DISPLAY": "tuna-stress", "GDK_BACKEND": "wayland"}
+        self.wait_for(display_number, "Xvfb display", 30)
+        self.env["DISPLAY"] = ":" + display_number()
+        self.wait_for(lambda: subprocess.run(["xdotool", "getdisplaygeometry"], env=self.env,
+                                             stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL).returncode == 0,
+                      "Xvfb answering", 30)
+        _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
 
-        def churn_round(index):
-            workers = [launch([sys.executable, str(Path(__file__).resolve()), "--worker"],
-                              f"churn-{index}-{n}", client_env) for n in range(4)]
-            seen = False
-            deadline = time.monotonic() + 30
-            while any(process.poll() is None for process in workers):
-                seen = seen or bool(state().get("windows"))
-                if time.monotonic() > deadline:
-                    raise RuntimeError("window churn worker hung")
-                time.sleep(0.05)
-            if not seen or any(process.returncode != 0 for process in workers):
-                raise RuntimeError("churn failed to map windows or a worker crashed")
-            wait_for(lambda: state().get("windows") == [])
+        def session_limits():
+            resource.setrlimit(resource.RLIMIT_NOFILE, (min(SESSION_NOFILE_SOFT, hard), hard))
+        binaries = ROOT / "target/debug"
+        self.compositor = self.launch(
+            [str(binaries / "tuna-compositor"), "--backend", "winit", "--socket", SOCKET,
+             "--shell-bin", str(binaries / "tuna-shell-gtk")], "nested",
+            self.env | pam | {"RUST_BACKTRACE": "1"}, preexec_fn=session_limits)
+        self.wait_state(lambda s: any(layer["namespace"] == "tuna-panel" for layer in s["layers"]),
+                        "the top bar mapped", 180)
+        self.wait_for((self.private / SOCKET).exists, "Wayland socket", 30)
+        windows = subprocess.check_output(["xdotool", "search", "--name", "Smithay"],
+                                          env=self.env, text=True)
+        self.wid = windows.splitlines()[0]
+        self.xdotool("windowfocus", "--sync", self.wid)
+        self.client_env = self.env | {"WAYLAND_DISPLAY": SOCKET, "GDK_BACKEND": "wayland"}
+        self.client_env.pop("DISPLAY")
+        self.wait_state(lambda s: s["locked"] is False and s["shell"]["pid"], "unlocked session", 10)
 
-        # Settle renderer caches before the measured rounds.
-        for index in range(3):
-            churn_round(f"warmup-{index}")
-        time.sleep(2)
-        baseline = sample()
-        for index in range(args.rounds):
-            churn_round(index)
-            # Input must still reach the shell after every client flood.
-            subprocess.run(["xdotool", "key", "--clearmodifiers", "Escape"], env=env, check=True)
-            wait_for(lambda: state().get("overview_open") is False)
-            subprocess.run(["xdotool", "key", "--clearmodifiers", "Super_L"], env=env, check=True)
-            wait_for(lambda: state().get("overview_open") is True)
-            sample()
-        assertions["S-CHURN"] = [True, f"{(args.rounds + 3) * 400} windows across four concurrent clients"]
-        assertions["S-INPUT"] = [True, "overview input responded after every churn round"]
+    # -- phases --
 
-        popup_workers = [launch([sys.executable, str(Path(__file__).resolve()), "--popup-worker"],
-                                f"popup-{index}", client_env) for index in range(4)]
-        wait_for(lambda: all(process.poll() is not None for process in popup_workers), timeout=90)
+    def churn_round(self, label):
+        workers = [self.worker("churn", f"churn-{label}-{n}") for n in range(4)]
+        seen = False
+        deadline = time.monotonic() + 30
+        while any(process.poll() is None for process in workers):
+            seen = seen or bool(self.state().get("windows"))
+            if time.monotonic() > deadline:
+                raise Failure("window churn worker hung")
+            time.sleep(0.05)
+        if not seen or any(process.returncode != 0 for process in workers):
+            raise Failure("churn failed to map windows or a worker crashed")
+        self.windows_gone()
+
+    def phase_churn(self):
+        for index in range(self.args.rounds):
+            self.churn_round(index)
+            self.input_path()
+            self.sample()
+        self.record("S-CHURN", True, f"{self.args.rounds * 400} windows across four concurrent clients")
+        self.record("S-INPUT", True, "overview input responded after every churn round")
+
+    def popup_storm(self, label):
+        workers = [self.worker("popup", f"popup-{label}-{index}") for index in range(4)]
+        self.wait_workers(workers, "popup storm", 90)
         mapped = 0
-        for index, process in enumerate(popup_workers):
-            if process.returncode != 0:
-                raise RuntimeError(f"popup worker {index} failed; see its retained log")
-            rows = [json.loads(line) for line in (out / f"popup-{index}.log").read_text().splitlines()
+        for index in range(4):
+            rows = [json.loads(line) for line in
+                    (self.out / f"popup-{label}-{index}.log").read_text().splitlines()
                     if line.startswith('{"mapped_wayland_popups":')]
-            if len(rows) != 1 or rows[0] != {"mapped_wayland_popups": 60, "nested_depth": 3}:
-                raise RuntimeError(f"popup worker {index} did not prove its mapped nested surfaces")
+            if rows != [POPUPS_PER_WORKER]:
+                raise Failure(f"popup worker {label}-{index} did not prove its mapped nested surfaces")
             mapped += rows[0]["mapped_wayland_popups"]
-        wait_for(lambda: state().get("windows") == [])
-        subprocess.run(["xdotool", "key", "--clearmodifiers", "Escape"], env=env, check=True)
-        wait_for(lambda: state().get("overview_open") is False)
-        subprocess.run(["xdotool", "key", "--clearmodifiers", "Super_L"], env=env, check=True)
-        wait_for(lambda: state().get("overview_open") is True)
-        assertions["S-POPUP"] = [True, f"{mapped} mapped Wayland popups; depth three; four concurrent clients; input recovered"]
+        return mapped
 
-        adversary_dir = out / "adversary-client"
+    def phase_popup(self):
+        mapped = self.popup_storm("storm")
+        self.windows_gone()
+        self.input_path()
+        self.record("S-POPUP", True, f"{mapped} mapped Wayland popups; depth three; four concurrent clients; input recovered")
+        self.sample()
+
+    def phase_protocol(self):
+        adversary_dir = self.out / "adversary-client"
         subprocess.run([str(ROOT / "scripts/tuna-wayland-adversary-build"), str(adversary_dir)],
                        check=True, stdout=subprocess.DEVNULL)
-        expected = {"malformed-opcode": "connection-rejected", "zero-buffer": "protocol-rejected",
-                    "huge-buffer": "protocol-rejected", "destroy-parent": "protocol-rejected",
-                    "invalid-configure": "protocol-rejected",
-                    "never-ack": "configure-left-unacknowledged",
-                    "die-mid-transaction": "disconnected-before-commit"}
-        for mode, result in expected.items():
-            attacks = [launch([str(adversary_dir / "tuna-wayland-adversary"), mode],
-                              f"adversary-{mode}-{index}", client_env) for index in range(4)]
-            healthy = launch([sys.executable, str(Path(__file__).resolve()), "--popup-worker"],
-                             f"healthy-{mode}", client_env)
-            wait_for(lambda: all(process.poll() is not None for process in [*attacks, healthy]),
-                     timeout=10)
+        # A new fuzz seed each day; the report keeps it for a rerun.
+        seed_base = int(time.time()) // 86400 * 4
+        for mode, (result, timeout) in ADVERSARIES.items():
+            attacks = [self.launch([str(adversary_dir / "tuna-wayland-adversary"), mode,
+                                    *([str(seed_base + index)] if mode == "fuzz" else [])],
+                                   f"adversary-{mode}-{index}", self.client_env)
+                       for index in range(4)]
+            healthy = self.worker("popup", f"healthy-{mode}")
+            self.wait_for(lambda: all(p.poll() is not None for p in [*attacks, healthy]),
+                          f"{mode} attackers and healthy client finished", timeout)
+            evidence = []
             for index, process in enumerate(attacks):
                 if process.returncode != 0:
-                    raise RuntimeError(f"{mode} attacker {index} did not receive the expected outcome")
-                rows = [json.loads(line) for line in (out / f"adversary-{mode}-{index}.log").read_text().splitlines()
+                    raise Failure(f"{mode} attacker {index} did not receive the expected outcome")
+                rows = [json.loads(line) for line in
+                        (self.out / f"adversary-{mode}-{index}.log").read_text().splitlines()
                         if line.startswith('{"mode":')]
                 if len(rows) != 1 or rows[0].get("mode") != mode or rows[0].get("result") != result:
-                    raise RuntimeError(f"{mode} attacker {index} has no actual outcome evidence")
+                    raise Failure(f"{mode} attacker {index} has no actual outcome evidence")
                 if mode == "never-ack" and rows[0].get("configures", 0) < 1:
-                    raise RuntimeError("unacknowledged client never received a configure")
-            rows = [json.loads(line) for line in (out / f"healthy-{mode}.log").read_text().splitlines()
+                    raise Failure("unacknowledged client never received a configure")
+                if mode == "commit-flood" and rows[0].get("frames", 0) < 1:
+                    raise Failure("flooding client never received a frame callback")
+                evidence.append(rows[0])
+            rows = [json.loads(line) for line in
+                    (self.out / f"healthy-{mode}.log").read_text().splitlines()
                     if line.startswith('{"mapped_wayland_popups":')]
-            if healthy.returncode != 0 or rows != [{"mapped_wayland_popups": 60, "nested_depth": 3}]:
-                raise RuntimeError(f"healthy popup client failed alongside {mode}")
-            wait_for(lambda: state().get("windows") == [])
-            subprocess.run(["xdotool", "key", "--clearmodifiers", "Escape"], env=env, check=True)
-            wait_for(lambda: state().get("overview_open") is False)
-            subprocess.run(["xdotool", "key", "--clearmodifiers", "Super_L"], env=env, check=True)
-            wait_for(lambda: state().get("overview_open") is True)
-            assertions[f"S-PROTOCOL-{mode.upper()}"] = [True, "four actual clients; exact rejection/disconnect evidence; healthy nested popups and input recovered"]
+            if healthy.returncode != 0 or rows != [POPUPS_PER_WORKER]:
+                raise Failure(f"healthy popup client failed alongside {mode}")
+            self.windows_gone()
+            self.input_path()
+            detail = "four actual clients; exact rejection/disconnect evidence; healthy nested popups and input recovered"
+            if mode == "commit-flood":
+                detail = (f"{sum(r['commits'] for r in evidence)} unthrottled commits from four clients; "
+                          f"frames kept arriving; healthy nested popups and input recovered")
+            elif mode == "buffer-churn":
+                detail = (f"{sum(r['bytes'] for r in evidence) >> 20} MiB of fresh written SHM buffers "
+                          f"committed and dropped; healthy nested popups and input recovered")
+            elif mode == "connect-storm":
+                detail = (f"{sum(r['connections'] for r in evidence)} connections, "
+                          f"{4 * evidence[0]['concurrent']} open at once, under a {SESSION_NOFILE_SOFT} "
+                          f"soft open-file limit; healthy nested popups and input recovered")
+            elif mode == "fuzz":
+                detail = (f"{sum(r['requests'] for r in evidence)} random requests over "
+                          f"{sum(r['sessions'] for r in evidence)} sessions (seeds "
+                          f"{', '.join(str(r['seed']) for r in evidence)}): "
+                          f"{sum(r['protocol_errors'] for r in evidence)} protocol errors, "
+                          f"{sum(r['disconnected'] for r in evidence)} disconnects, "
+                          f"{sum(r['survived'] for r in evidence)} still served; none went unanswered; "
+                          "healthy nested popups and input recovered")
+            self.record(f"S-PROTOCOL-{mode.upper()}", True, detail)
+            self.sample()
 
-        import gi
+    def phase_dbus(self):
         from gi.repository import Gio, GLib
-        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        bus = self.session_bus()
         ids = []
         for index in range(1000):
-            answer = bus.call_sync("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
-                                   "org.freedesktop.Notifications", "Notify",
-                                   GLib.Variant("(susssasa{sv}i)", ("Stress", 0, "", f"Flood {index}",
-                                                                  "Fixture", [], {}, 1000)),
-                                   GLib.VariantType.new("(u)"), Gio.DBusCallFlags.NONE, 5000, None)
+            answer = self.call(bus, "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                               "org.freedesktop.Notifications", "Notify",
+                               GLib.Variant("(susssasa{sv}i)", ("Stress", 0, "", f"Flood {index}",
+                                                              "Fixture", [], {}, 1000)), "(u)")
             ids.append(answer.unpack()[0])
         for notification in ids:
-            bus.call_sync("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
-                          "org.freedesktop.Notifications", "CloseNotification",
-                          GLib.Variant("(u)", (notification,)), None, Gio.DBusCallFlags.NONE, 5000, None)
-        assertions["S-NOTIFY"] = [True, "1000 notifications and 1000 closes responded"]
-        time.sleep(5)
-        final = sample()
-        # Diagnostic limits for this bounded workload, not GNOME performance targets.
-        pss_limit = baseline["pss_kib"] * 1.25 + 65536
-        fd_limit = baseline["fds"] + 32
-        assertions["S-GROWTH"] = [final["pss_kib"] <= pss_limit and final["fds"] <= fd_limit,
-                                  f"PSS {final['pss_kib']}/{int(pss_limit)} KiB; fds {final['fds']}/{fd_limit}"]
-        text = (out / "nested.log").read_text()
-        assertions["S-LIVE"] = [compositor.poll() is None and "panicked" not in text,
-                                "compositor remained alive without panic"]
-    except Exception as error:
-        assertions["S-HARNESS"] = [False, str(error)]
-    finally:
-        for process in reversed(processes):
+            self.call(bus, "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                      "org.freedesktop.Notifications", "CloseNotification",
+                      GLib.Variant("(u)", (notification,)))
+        self.record("S-NOTIFY", True, "1000 notifications and 1000 closes responded")
+
+        # gnome-settings-daemon's media keys are ShowOSD's allowlisted caller.
+        media_keys = self.media_keys()
+        for index in range(2000):
+            self.call(media_keys, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell", "ShowOSD",
+                      GLib.Variant("(a{sv})", ({"icon": GLib.Variant("s", "audio-volume-high-symbolic"),
+                                                "label": GLib.Variant("s", f"Stress {index}"),
+                                                "level": GLib.Variant("d", (index % 100) / 100)},)))
+        media_keys.close_sync(None)
+        self.input_path()
+        self.record("S-OSD", True, "2000 ShowOSD calls answered; input recovered")
+        self.accelerator_flood()
+        self.tray_churn()
+        self.search_flood()
+        self.sample()
+
+    def media_keys(self):
+        """A connection owning the media-keys name GNOME allowlists for grabs."""
+        from gi.repository import Gio
+        conn = self.private_connection(Gio.dbus_address_get_for_bus_sync(Gio.BusType.SESSION, None))
+        owned = self.call(conn, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                          "RequestName", self.glib.Variant("(su)", ("org.gnome.SettingsDaemon.MediaKeys", 4)),
+                          "(u)").unpack()[0]
+        if owned != 1:
+            raise Failure(f"could not own the media-keys name (reply {owned})")
+        return conn
+
+    def accelerator_flood(self):
+        GLib = self.glib
+        conn = self.media_keys()
+        keys = [f"F{n}" for n in range(1, 13)] + list("abcdefghijklmnopqrstuvwxyz")
+        mods = ["<Control><Alt>", "<Control><Shift>", "<Alt><Shift>", "<Control><Alt><Shift>",
+                "<Super><Control>", "<Super><Alt>", "<Super><Shift><Control>", "<Super><Alt><Shift>"]
+        accelerators = [m + k for m in mods for k in keys]
+        granted = 0
+        for _ in range(3):
+            actions = []
+            for start in range(0, len(accelerators), 32):
+                batch = [(a, 1 | 2, 0) for a in accelerators[start:start + 32]]
+                actions += self.call(conn, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell",
+                                     "GrabAccelerators", GLib.Variant("(a(suu))", (batch,)),
+                                     "(au)").unpack()[0]
+            granted += sum(1 for action in actions if action)
+            for action in actions:
+                if action:
+                    self.call(conn, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell",
+                              "UngrabAccelerator", GLib.Variant("(u)", (action,)), "(b)")
+        activated = self.accelerator_activation(conn)
+        held = self.accelerator_table_full(conn)
+        # A grab outlives the flood, then leaves with its owner.
+        accelerator = "<Control><Alt>F11"
+        action = self.call(conn, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell",
+                           "GrabAccelerator", GLib.Variant("(suu)", (accelerator, 1 | 2, 0)),
+                           "(u)").unpack()[0]
+        if not action:
+            raise Failure("the post-flood accelerator was not granted (a flood grab leaked)")
+        conn.close_sync(None)
+        replacement = self.media_keys()
+        again = self.call(replacement, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell",
+                          "GrabAccelerator", GLib.Variant("(suu)", (accelerator, 1 | 2, 0)),
+                          "(u)").unpack()[0]
+        if not again:
+            raise Failure("a departed caller's grab was not released")
+        replacement.close_sync(None)
+        self.input_path()
+        self.record("S-ACCELERATORS", True,
+                    f"{granted} grants and ungrabs over {3 * len(accelerators)} requests; {activated}; "
+                    f"{held} grabs held at once until the shell's bound refused more, and the shell's own "
+                    "Super+A still opened the app grid; a fresh grab granted; a departed caller's grab "
+                    "was released; input recovered")
+
+    def accelerator_activation(self, conn):
+        """The caller's own grab fires: AcceleratorActivated, unicast to it."""
+        GLib = self.glib
+        from gi.repository import Gio
+        # Super+Alt+F11 stays at F11's first level; Ctrl+Alt+F11 would be
+        # the X server's own VT switch and never reach the compositor.
+        accelerator = "<Super><Alt>F11"
+        seen = []
+        subscription = conn.signal_subscribe(
+            None, "org.gnome.Shell", "AcceleratorActivated", "/org/gnome/Shell", None,
+            Gio.DBusSignalFlags.NONE, lambda *args: seen.append(args[5].unpack()[0]))
+        action = self.call(conn, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell",
+                           "GrabAccelerator", GLib.Variant("(suu)", (accelerator, 1 | 2, 0)),
+                           "(u)").unpack()[0]
+        if not action:
+            raise Failure(f"{accelerator} was not granted")
+        # The shell hands the compositor its grab set once its loop is idle.
+        time.sleep(0.5)
+        self.key("super+alt+F11")
+        self.wait_for(lambda: action in seen, f"AcceleratorActivated for the caller's {accelerator}", 10)
+        conn.signal_unsubscribe(subscription)
+        self.call(conn, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell",
+                  "UngrabAccelerator", GLib.Variant("(u)", (action,)), "(b)")
+        return f"the caller's {accelerator} fired AcceleratorActivated to it"
+
+    def accelerator_table_full(self, conn):
+        """A caller grabbing all it can leaves the shell's own bindings
+        working: the shell refuses grabs before the compositor's bound."""
+        GLib = self.glib
+        mods = ["Shift", "Control", "Alt", "Super"]
+        keys = list("abcdefghijklmnopqrstuvwxyz0123456789") + [f"F{n}" for n in range(1, 13)]
+        prefixes = ["".join(f"<{m}>" for i, m in enumerate(mods) if bits & (1 << i))
+                    for bits in range(1, 16)]
+        candidates = [p + k for p in prefixes for k in keys]
+        actions = []
+        for start in range(0, len(candidates), 32):
+            batch = [(a, 1 | 2, 0) for a in candidates[start:start + 32]]
+            actions += [a for a in self.call(conn, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell",
+                                             "GrabAccelerators", GLib.Variant("(a(suu))", (batch,)),
+                                             "(au)").unpack()[0] if a]
+        if not 0 < len(actions) < 512 or len(actions) == len(candidates):
+            raise Failure(f"{len(actions)} of {len(candidates)} grabs granted: the shell's bound did not hold")
+        time.sleep(0.5)
+        self.key("super+a")
+        self.overview(True)
+        self.key("Escape")
+        self.key("Escape")
+        self.overview(False)
+        for action in actions:
+            self.call(conn, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell",
+                      "UngrabAccelerator", GLib.Variant("(u)", (action,)), "(b)")
+        return len(actions)
+
+    def tray_churn(self):
+        GLib = self.glib
+        from gi.repository import Gio
+        node = Gio.DBusNodeInfo.new_for_xml("""<node><interface name="org.kde.StatusNotifierItem">
+  <property name="Category" type="s" access="read"/><property name="Id" type="s" access="read"/>
+  <property name="Title" type="s" access="read"/><property name="Status" type="s" access="read"/>
+  <property name="IconName" type="s" access="read"/>
+</interface></node>""")
+        address = Gio.dbus_address_get_for_bus_sync(Gio.BusType.SESSION, None)
+        bus = self.session_bus()
+
+        def registered():
+            value = self.call(bus, "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
+                              "org.freedesktop.DBus.Properties", "Get",
+                              GLib.Variant("(ss)", ("org.kde.StatusNotifierWatcher",
+                                                    "RegisteredStatusNotifierItems")), "(v)")
+            return value.unpack()[0]
+        self.wait_for(lambda: self.has_owner(bus, "org.kde.StatusNotifierWatcher"),
+                      "the shell's StatusNotifierWatcher", 30)
+        total = 0
+        for round_ in range(3):
+            items = []
+            for index in range(100):
+                conn = self.private_connection(address)
+                props = {"Category": "ApplicationStatus", "Id": f"stress-{round_}-{index}",
+                         "Title": f"Stress item {index}", "Status": "Active",
+                         "IconName": "dialog-information-symbolic"}
+                conn.register_object("/StatusNotifierItem", node.interfaces[0], None,
+                                     lambda c, s, p, i, prop, props=props: GLib.Variant("s", props[prop]),
+                                     None)
+                self.call(conn, "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
+                          "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem",
+                          GLib.Variant("(s)", (conn.get_unique_name(),)))
+                items.append(conn)
+            names = {conn.get_unique_name() for conn in items}
+            self.wait_for(lambda: names <= set(registered()), "100 tray items registered", 30)
+            for conn in items:
+                conn.close_sync(None)
+            self.wait_for(lambda: not names & set(registered()), "departed tray items pruned", 60)
+            total += len(items)
+        self.input_path()
+        self.record("S-TRAY", True, f"{total} StatusNotifierItems registered from their own connections "
+                    "and pruned after leaving; input recovered")
+
+    def search_flood(self):
+        GLib = self.glib
+        from gi.repository import Gio
+        node = Gio.DBusNodeInfo.new_for_xml("""<node><interface name="org.gnome.Shell.SearchProvider2">
+  <method name="GetInitialResultSet"><arg type="as" direction="in"/><arg type="as" direction="out"/></method>
+  <method name="GetSubsearchResultSet"><arg type="as" direction="in"/><arg type="as" direction="in"/><arg type="as" direction="out"/></method>
+  <method name="GetResultMetas"><arg type="as" direction="in"/><arg type="aa{sv}" direction="out"/></method>
+  <method name="ActivateResult"><arg type="s" direction="in"/><arg type="as" direction="in"/><arg type="u" direction="in"/></method>
+  <method name="LaunchSearch"><arg type="as" direction="in"/><arg type="u" direction="in"/></method>
+</interface></node>""")
+        calls = {"GetInitialResultSet": 0, "GetSubsearchResultSet": 0, "GetResultMetas": 0}
+        bus = self.session_bus()
+
+        def method(conn, sender, path, iface, name, params, invocation):
+            calls[name] = calls.get(name, 0) + 1
+            if name in ("GetInitialResultSet", "GetSubsearchResultSet"):
+                reply = GLib.Variant("(as)", ([f"result-{n}" for n in range(5)],))
+                # Every other query is slow: the shell must not wait on it.
+                if calls[name] % 2:
+                    GLib.timeout_add(2500, lambda: invocation.return_value(reply) or False)
+                else:
+                    invocation.return_value(reply)
+            elif name == "GetResultMetas":
+                ids = params.unpack()[0]
+                invocation.return_value(GLib.Variant("(aa{sv})", ([
+                    {"id": GLib.Variant("s", i), "name": GLib.Variant("s", f"Stress {i}")} for i in ids],)))
+            else:
+                invocation.return_value(None)
+        registration = bus.register_object("/org/tuna/StressSearch", node.interfaces[0], method, None, None)
+        owner = Gio.bus_own_name_on_connection(bus, "org.tuna.StressSearch", 0, None, None)
+        self.wait_for(lambda: self.has_owner(bus, "org.tuna.StressSearch"), "search provider name", 10)
+        self.key("Super_L")
+        self.overview(True)
+        for round_ in range(20):
+            self.xdotool("type", "--delay", "15", "tunastress")
+            self.pump()
+            self.xdotool("key", *(["BackSpace"] * 10))
+            self.pump()
+        self.xdotool("type", "--delay", "15", "tunastress")
+        self.wait_for(lambda: calls["GetResultMetas"] > 0, "search results requested from the provider", 20)
+        queries = calls["GetInitialResultSet"] + calls["GetSubsearchResultSet"]
+        self.key("Escape")
+        self.key("Escape")
+        self.overview(False)
+        self.input_path()
+        Gio.bus_unown_name(owner)
+        bus.unregister_object(registration)
+        self.record("S-SEARCH", queries > 0,
+                    f"{queries} provider queries ({calls['GetResultMetas']} result-meta calls) from "
+                    "420 keystrokes with every other reply 2.5 s late; input recovered")
+
+    def phase_scale(self):
+        GLib = self.glib
+        bus = self.session_bus()
+
+        def current():
+            return self.call(bus, "org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+                             "org.gnome.Mutter.DisplayConfig", "GetCurrentState", None,
+                             "(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})").unpack()
+        serial, monitors, _, _ = current()
+        connector = monitors[0][0][0]
+        mode = next(m for m in monitors[0][1] if m[6].get("is-current"))
+        scales = [s for s in mode[5] if s != 1.0] + [1.0]
+        workers = [self.worker("popup", f"scale-popup-{n}") for n in range(2)]
+        workers.append(self.worker("churn", "scale-churn"))
+        applied = 0
+        for round_ in range(10):
+            for scale in scales:
+                serial = current()[0]
+                self.call(bus, "org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+                          "org.gnome.Mutter.DisplayConfig", "ApplyMonitorsConfig",
+                          GLib.Variant("(uua(iiduba(ssa{sv}))a{sv})",
+                                       (serial, 1, [(0, 0, scale, 0, True, [(connector, mode[0], {})])], {})))
+                applied += 1
+        self.wait_workers(workers, "clients mapping through the scale storm", 120)
+        self.wait_state(lambda s: any(layer["namespace"] == "tuna-panel" and layer["rect"][2] == WIDTH
+                                      for layer in s["layers"]), "the panel back at scale 1", 15)
+        self.windows_gone()
+        self.input_path()
+        self.record("S-SCALE", True, f"{applied} ApplyMonitorsConfig scale changes across {scales} while "
+                    "two popup storms and a window churn mapped; layout back at scale 1; input recovered")
+        self.sample()
+
+    def stub_calls_since(self, since, prefix):
+        try:
+            lines = self.call_log.read_text().splitlines()
+        except FileNotFoundError:
+            return 0
+        count = 0
+        for line in lines:
+            stamp, _, _, _, member = line.split(" ", 4)
+            if float(stamp) > since and member.startswith(prefix):
+                count += 1
+        return count
+
+    def phase_services(self):
+        shell_pid = self.state()["shell"]["pid"]
+        for name, prefix in self.CHURNED.items():
+            self.wait_for(lambda: self.stub_calls_since(0, prefix) > 0,
+                          f"the shell reading {name}", 30)
+        rounds = 10
+        for round_ in range(rounds):
+            # Half the departures are crashes, half orderly exits.
+            os.killpg(self.churned_stubs.pid, signal.SIGKILL if round_ % 2 else signal.SIGTERM)
+            self.churned_stubs.wait(timeout=10)
+            self.wait_for(lambda: not any(self.has_owner(self.system, n) for n in self.CHURNED),
+                          "the services gone from the bus", 10)
+            time.sleep(0.5)
+            returned = time.time()
+            self.start_churned_stubs(round_ + 1)
+            for name, prefix in self.CHURNED.items():
+                self.wait_for(lambda: self.stub_calls_since(returned, prefix) > 0,
+                              f"the shell back on returned {name} (round {round_})", 30)
+            if self.state()["shell"]["pid"] != shell_pid:
+                raise Failure("the shell restarted while services vanished")
+        self.input_path()
+        self.record("S-SERVICES", True, f"NetworkManager, BlueZ and power-profiles vanished and returned "
+                    f"{rounds} times (half killed); the shell read each returned daemon again without "
+                    "restarting; input recovered")
+        self.ibus_restarts()
+        self.sample()
+
+    def ibus_address(self):
+        env = self.client_env.copy()
+        env.pop("IBUS_ADDRESS", None)
+        result = subprocess.run(["ibus", "address"], env=env, capture_output=True, text=True)
+        address = result.stdout.strip()
+        return address if result.returncode == 0 and address.startswith("unix:") else None
+
+    def ibus_focused_context(self):
+        """IBus's focused input context, or None while IBus is absent."""
+        address = self.ibus_address()
+        if not address:
+            return None
+        try:
+            conn = self.private_connection(address)
+        except self.glib.Error:
+            return None
+        try:
+            value = self.call(conn, "org.freedesktop.IBus", "/org/freedesktop/IBus",
+                              "org.freedesktop.DBus.Properties", "Get",
+                              self.glib.Variant("(ss)", ("org.freedesktop.IBus", "CurrentInputContext")),
+                              "(v)", timeout=2000).unpack()[0]
+        except self.glib.Error:
+            value = None
+        finally:
+            conn.close_sync(None)
+        return value if value and value != "/" else None
+
+    def ibus_daemons(self):
+        return [pid for pid in owned_pids(self.private) if comm(pid) == "ibus-daemon"]
+
+    def ibus_restarts(self):
+        if not any(comm(pid) == "tuna-ibus-bridg" for pid in tree(self.compositor.pid)):
+            raise Failure("the IBus bridge is not running (build tuna-shell-host's tuna-ibus-bridge)")
+        process, path, read = self.input_client("tuna-stress-ime")
+        self.focus_client("tuna-stress-ime", read)
+        self.wait_for(self.ibus_focused_context, "IBus focused on the bridge's input context", 30)
+        rounds = 5
+        for round_ in range(rounds):
+            daemons = self.ibus_daemons()
+            if not daemons:
+                raise Failure("no ibus-daemon to kill")
+            for pid in daemons:
+                os.kill(pid, signal.SIGKILL)
+            self.wait_for(lambda: not self.ibus_daemons(), "ibus-daemon gone", 10)
+            before = read()["text"]
+            self.xdotool("type", "--delay", "20", "ab")
+            self.wait_for(lambda: read()["text"] == before + 2, f"typing without IBus (round {round_})", 15)
+            env = self.client_env.copy()
+            subprocess.run(["ibus-daemon", "--panel", "disable", "--daemonize"], env=env, check=True)
+            self.wait_for(self.ibus_focused_context,
+                          f"the bridge back on the returned ibus-daemon (round {round_})", 30)
+            before = read()["text"]
+            self.xdotool("type", "--delay", "20", "cd")
+            self.wait_for(lambda: read()["text"] == before + 2, f"typing through IBus (round {round_})", 15)
+        self.close_client(process, path)
+        self.windows_gone()
+        self.input_path()
+        self.record("S-IBUS", True, f"ibus-daemon killed {rounds} times under a focused field: typing "
+                    "continued without it and the bridge refocused each returned daemon")
+
+    def wire_motions(self, name):
+        """wl_pointer.motion events a WAYLAND_DEBUG client logged, with
+        their libwayland timestamps in ms. libwayland 1.23 and later name
+        the queue and write `wl_pointer#N`; older ones `wl_pointer@N`."""
+        stamps = []
+        for line in (self.out / f"{name}.log").read_text(errors="replace").splitlines():
+            match = re.match(r"\[\s*(\d+\.\d+)\]\s+(?:\{[^}]*\}\s+)?wl_pointer[@#]\d+\.motion\(", line)
+            if match:
+                stamps.append(float(match.group(1)))
+        return stamps
+
+    def phase_input(self):
+        # The wire log measures what the compositor sends, before GTK's
+        # own per-frame motion compression.
+        env = dict(self.client_env, WAYLAND_DEBUG="client")
+        process, path, read = self.input_client("tuna-stress-keys", 640, 400, env=env)
+        self.focus_client("tuna-stress-keys", read)
+        text = "abcdefghij" * 100
+        start = read()["text"]
+        for chunk in range(0, len(text), 250):
+            self.xdotool("type", "--delay", "2", text[chunk:chunk + 250])
+        self.wait_for(lambda: read()["text"] == start + len(text), "every flooded key delivered once", 60)
+        rect = self.window_rect("tuna-stress-keys")
+        moves = []
+        for index in range(2000):
+            moves += ["mousemove", "--window", self.wid,
+                      str(rect[0] + 10 + (index * 37) % (rect[2] - 20)),
+                      str(rect[1] + 10 + (index * 53) % (rect[3] - 20))]
+        motions = read()["motions"]
+        wire_before = len(self.wire_motions("tuna-stress-keys"))
+        for chunk in range(0, len(moves), 2000):
+            self.xdotool(*moves[chunk:chunk + 2000])
+        self.wait_for(lambda: read()["motions"] > motions, "pointer flood delivered", 30)
+
+        def settled():
+            seen = read()["motions"]
+            time.sleep(0.5)
+            return read()["motions"] == seen
+        self.wait_for(settled, "the pointer flood settled", 30)
+        flood_end = read()["last_motion"]
+        wire = self.wire_motions("tuna-stress-keys")[wire_before:]
+        # One more move from the flood's last target: the client must see
+        # exactly this step, so whatever folded the flood (GTK's frame
+        # clock compresses motion; Mutter's stage does too) ended where
+        # the pointer did: compressed, not lost.
+        last_x, last_y = int(moves[-2]), int(moves[-1])
+        seen = read()["motions"]
+        self.xdotool("mousemove", "--window", self.wid, str(last_x + 17), str(last_y + 11))
+        self.wait_for(lambda: read()["motions"] > seen, "the step after the flood", 10)
+        after = read()["last_motion"]
+        step = [round(after[0] - flood_end[0], 2), round(after[1] - flood_end[1], 2)]
+        span_s = (wire[-1] - wire[0]) / 1000 if len(wire) > 1 else 0.0
+        # Mutter's stage processes queued events before each frame and
+        # folds consecutive motions into one (clutter-stage.c,
+        # _clutter_stage_process_queued_events): at most about one
+        # wl_pointer.motion per 60 Hz frame of the span. Reported, not
+        # gated: this compositor forwards every motion.
+        mutter_bound = int(span_s * 60) + 1
+        delivered = 0 < len(wire) <= 2000 and step == [17, 11]
+        self.wait_state(lambda s: s["seat_pressed_key_count"] == 0, "no key left pressed", 10)
+        self.record("S-INPUT-FLOOD", read()["text"] == start + len(text) and delivered,
+                    f"{len(text)} typed keys arrived exactly once; 2000 pointer moves reached the client as "
+                    f"{len(wire)} wl_pointer.motion over {span_s:.3f} s (Mutter's per-frame folding would "
+                    f"send about {mutter_bound}) and {read()['motions'] - motions - 1} GTK motions after "
+                    f"GTK's frame compression; the step after the flood moved the client's pointer by "
+                    f"{step} (want [17, 11]): the flood's last position arrived")
+        self.close_client(process, path)
+        self.windows_gone()
+
+        # A held key across focus changes: repeat stops when focus leaves
+        # and never starts in the window that gains focus.
+        held, held_path, read_held = self.input_client("tuna-stress-held", 640, 420)
+        other, other_path, read_other = self.input_client("tuna-stress-other", 320, 200)
+        self.focus_client("tuna-stress-held", read_held, x_frac=0.05)
+        self.xdotool("keydown", "a")
+        self.wait_for(lambda: read_held()["text"] > 3, "the held key repeating", 10)
+        self.key("Super_L")
+        self.overview(True)
+        time.sleep(0.3)
+        after_leave = read_held()["text"]
+        time.sleep(1)
+        stopped = read_held()["text"] == after_leave
+        self.key("Escape")
+        self.overview(False)
+        self.wait_for(lambda: read_held()["active"], "focus back on the held window", 10)
+        time.sleep(1)
+        resumed = read_held()["text"] - after_leave
+        Path(held_path + ".quit").touch()
+        self.wait_for(lambda: held.poll() is not None, "the focused window closed under a held key", 15)
+        self.wait_for(lambda: read_other()["active"], "focus moved to the remaining window", 10)
+        time.sleep(1)
+        leaked = read_other()["text"]
+        self.xdotool("keyup", "a")
+        self.wait_state(lambda s: s["seat_pressed_key_count"] == 0, "the held key released", 10)
+        self.xdotool("type", "--delay", "20", "b")
+        self.wait_for(lambda: read_other()["text"] == leaked + 1, "typing reaches the new focus", 10)
+        self.record("S-INPUT-HELD", stopped and resumed == 0 and leaked == 0,
+                    f"repeat stopped when focus left ({'yes' if stopped else 'no'}); resumed on refocus: "
+                    f"{resumed}; repeats leaked into the next focus: {leaked}; no key left pressed")
+        self.close_client(other, other_path)
+        self.windows_gone()
+        self.input_path()
+        self.sample()
+
+    swipe_sequence = 0
+
+    def swipe(self, phase, **fields):
+        self.swipe_sequence += 1
+        body = dict(fields, phase=phase, sequence=self.swipe_sequence)
+        target = self.private / "swipe.json"
+        tmp = self.private / "swipe.json.tmp"
+        tmp.write_text(json.dumps(body))
+        os.replace(tmp, target)
+        sequence = self.swipe_sequence
+        self.wait_state(lambda s: s["proof_swipe_sequence"] == sequence, f"swipe {phase} consumed", 10)
+
+    def settled(self, what):
+        def calm(s):
+            progress = s["overview_progress"]
+            return progress in (0, 1) and s["overview_open"] is (progress == 1) \
+                and not s["workspace_slide"].get("following", False)
+        self.wait_state(calm, what, 15)
+
+    def phase_swipe(self):
+        rounds = 20
+        for round_ in range(rounds):
+            # A new gesture begins before the old one ended.
+            self.swipe("begin")
+            self.swipe("update", dy=-150)
+            self.swipe("begin")
+            self.swipe("update", dy=-150)
+            self.swipe("end")
+            self.settled(f"overview settled after a restarted swipe (round {round_})")
+            self.key("Escape")
+            self.overview(False)
+            # A key interrupts a half-done swipe.
+            self.swipe("begin")
+            self.swipe("update", dy=-150)
+            self.key("Escape")
+            self.swipe("end")
+            self.settled(f"overview settled after Escape mid-swipe (round {round_})")
+            self.key("Escape")
+            self.overview(False)
+            # A horizontal workspace swipe is cancelled.
+            self.swipe("begin")
+            self.swipe("update", dx=300)
+            self.swipe("end", cancelled=True)
+            self.settled(f"workspace strip settled after a cancelled swipe (round {round_})")
+        self.input_path()
+        self.record("S-SWIPE", True, f"{rounds * 3} interrupted swipes (restarted, Escape mid-gesture, "
+                    "cancelled) all settled; input recovered")
+        self.sample()
+
+    def unlock(self):
+        log = self.out / "nested.log"
+        query = "tuna-shell-gtk: lock auth query service=password step=1 secret=true question=Password"
+
+        def asking():
+            lines = [line for line in log.read_text(errors="replace").splitlines()
+                     if line.startswith("tuna-shell-gtk: lock auth ") and " service=password" in line]
+            return bool(lines) and lines[-1] == query
+        # Keys typed while locked went to the lock screen's prompt, as in
+        # GNOME; Escape returns to the clock and discards them.
+        self.key("Escape")
+        time.sleep(1.5)
+        for _ in range(3):
+            # Lift the clock curtain with a click, as GNOME's shield does.
+            self.click(WIDTH // 2, HEIGHT * 3 // 4)
+            try:
+                self.wait_for(asking, "the unlock prompt asking for the password", 10)
+                break
+            except Failure:
+                continue
+        else:
+            raise Failure("the unlock prompt never asked for the password")
+        self.xdotool("type", "--delay", "30", self.password)
+        self.xdotool("key", "Return")
+        self.wait_state(lambda s: s["locked"] is False, "the session unlocked", 30)
+
+    def phase_lock(self):
+        process, path, read = self.input_client("tuna-stress-grab", 480, 320, grab=True)
+        self.focus_client("tuna-stress-grab", read)
+        self.wait_for(lambda: read()["popup"], "the grabbing popup mapped", 10)
+        self.swipe("begin")
+        self.swipe("update", dy=-150)
+        self.key("super+l")
+        self.wait_state(lambda s: s["locked"] is True, "Super+L locking under the popup grab", 15)
+        self.swipe("end")
+        time.sleep(1.5)
+        before = read()
+        rect = self.window_rect("tuna-stress-grab")
+        if rect is None:
+            # Locked: windows are hidden from the state; aim where it was mapped.
+            rect = [WIDTH // 2 - 240, HEIGHT // 2 - 160, 480, 320]
+        self.xdotool("type", "--delay", "10", "lockedkeys")
+        for index in range(40):
+            self.xdotool("mousemove", "--window", self.wid, str(rect[0] + 20 + index * 10),
+                         str(rect[1] + rect[3] // 2))
+        self.xdotool("click", "1")
+        time.sleep(1)
+        during = read()
+        leaked = {name: during[name] - before[name]
+                  for name in ("keys", "popup_keys", "motions", "presses", "text")}
+        state = self.state()
+        self.record("S-LOCK-CLOSED", not any(leaked.values()) and state["locked"] is True
+                    and state.get("pointer_position") is None,
+                    f"locked under an active popup grab mid-swipe; input reaching the client while locked: {leaked}")
+        self.unlock()
+        self.settled("overview settled after a swipe ended under the lock")
+        # GNOME Shell 51 locks with Main.pushModal (screenShield.js
+        # _becomeModal): a stage grab that revokes Mutter's Wayland popup
+        # grab (meta-wayland-input.c) without dismissing it, so the popup
+        # outlives the lock and has the keyboard again once it lifts.
+        popup_kept = read()["popup"]
+        popup_keys = read()["popup_keys"]
+        if popup_kept:
+            self.key("Shift_L")
+            self.wait_for(lambda: read()["popup_keys"] > popup_keys,
+                          "a key reaching the kept popup after unlock", 10)
+        self.focus_client("tuna-stress-grab", read)
+        start = read()["text"]
+        self.xdotool("type", "--delay", "20", "ok")
+        self.wait_for(lambda: read()["text"] == start + 2, "typing after unlock", 10)
+        self.record("S-LOCK-GRAB", popup_kept,
+                    "the popup grab outlived the lock and had the keyboard again after unlock, as GNOME's "
+                    "modal stage grab revokes rather than dismisses it; typing reached the client"
+                    if popup_kept else "the lock dismissed the client's popup grab; GNOME keeps it")
+        self.close_client(process, path)
+        self.windows_gone()
+        self.input_path()
+        self.sample()
+
+    def shell_back(self, old_pid, what):
+        self.wait_state(lambda s: s["shell"]["pid"] not in (None, old_pid)
+                        and not s["shell"]["overlay_visible"]
+                        and any(layer["namespace"] == "tuna-panel" for layer in s["layers"]),
+                        what, 60)
+
+    def phase_shell(self):
+        process, path, read = self.input_client("tuna-stress-survivor")
+        budget = self.state()["shell"]["max_restarts"]
+        if self.state()["shell"]["restarts_used"] != 0:
+            raise Failure("the shell restarted before its crash loop")
+        for kill in range(budget):
+            pid = self.state()["shell"]["pid"]
+            os.kill(pid, signal.SIGKILL)
+            self.shell_back(pid, f"the shell restarted after kill {kill + 1}")
+            self.input_path()
+        if self.state()["shell"]["restarts_used"] != budget:
+            raise Failure("restarts were not counted against the budget")
+        pid = self.state()["shell"]["pid"]
+        os.kill(pid, signal.SIGKILL)
+        self.wait_state(lambda s: s["shell"]["pid"] is None and s["shell"]["overlay_visible"],
+                        "the recovery overlay once the budget is spent", 30)
+        time.sleep(2)
+        if self.state()["shell"]["pid"] is not None:
+            raise Failure("the shell restarted past its budget")
+        self.key("r")
+        self.shell_back(pid, "the overlay's relaunch restarting the shell")
+        self.wait_state(lambda s: s["shell"]["restarts_used"] <= 1, "a fresh restart budget", 10)
+        self.input_path()
+        self.focus_client("tuna-stress-survivor", read)
+        start = read()["text"]
+        self.xdotool("type", "--delay", "20", "alive")
+        self.wait_for(lambda: read()["text"] == start + 5, "typing into the surviving client", 10)
+        self.close_client(process, path)
+        self.windows_gone()
+        self.record("S-SHELL-LOOP", True, f"shell SIGKILLed {budget + 1} times: {budget} supervised restarts, "
+                    "then the recovery overlay, whose relaunch restored it; a client survived and kept input")
+        self.sample()
+
+    def largest_rise(self):
+        """The phase whose end sample rose most over its start, with the process and kind."""
+        def by_kind(sample):
+            totals = {}
+            for key, process in sample["per_process"].items():
+                comm = key.rsplit(":", 1)[0]
+                for kind, kib in process["pss_by_kind_kib"].items():
+                    totals[(comm, kind)] = totals.get((comm, kind), 0) + kib
+            return totals
+        starts = {s["phase"].removesuffix(":start"): s for s in self.samples if s["phase"].endswith(":start")}
+        ends = {s["phase"]: s for s in self.samples if s["phase"] in starts}
+        rises = [(ends[p]["pss_kib"] - starts[p]["pss_kib"], p) for p in ends]
+        if not rises:
+            return "no phase samples"
+        rise, phase = max(rises)
+        before, after = by_kind(starts[phase]), by_kind(ends[phase])
+        parts = sorted(((after.get(k, 0) - before.get(k, 0), k) for k in after | before), reverse=True)[:3]
+        return f"{phase} +{rise >> 10} MiB (" + ", ".join(
+            f"{comm} {kind} {delta >> 10:+} MiB" for delta, (comm, kind) in parts) + ")"
+
+    # -- run --
+
+    def run(self):
+        try:
+            self.start()
+            # Settle renderer caches before the measured phases.
+            for index in range(3):
+                self.churn_round(f"warmup-{index}")
+            self.input_path()
+            time.sleep(2)
+            self.phase = "baseline"
+            baseline = self.sample()
+            for phase in self.args.phases:
+                self.phase = f"{phase}:start"
+                self.sample()
+                self.phase = phase
+                getattr(self, f"phase_{phase}")()
+            self.phase = "final"
+            time.sleep(5)
+            final = self.sample()
+            # Diagnostic limits for this bounded workload, not GNOME performance targets.
+            pss_limit = baseline["pss_kib"] * 1.25 + 65536
+            fd_limit = baseline["fds"] + 32
+            map_limit = baseline["maps"] * 1.25 + 1024
+            ok = final["pss_kib"] <= pss_limit and final["fds"] <= fd_limit and final["maps"] <= map_limit
+            detail = (f"PSS {final['pss_kib']}/{int(pss_limit)} KiB; fds {final['fds']}/{fd_limit}; "
+                      f"mappings {final['maps']}/{int(map_limit)}")
+            if not ok:
+                detail += f"; largest phase rise: {self.largest_rise()}"
+            self.assertions["S-GROWTH"] = [ok, detail]
+            text = (self.out / "nested.log").read_text(errors="replace")
+            self.assertions["S-LIVE"] = [self.compositor.poll() is None and "panicked" not in text,
+                                         "compositor remained alive without panic"]
+        except Exception as error:
+            self.assertions["S-HARNESS"] = [False, f"{type(error).__name__}: {error}"]
+        finally:
+            self.stop()
+
+    def stop(self):
+        for process in reversed(self.processes):
             if process.poll() is None:
-                os.killpg(process.pid, 15)
                 try:
+                    os.killpg(process.pid, signal.SIGTERM)
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, 9)
+                    os.killpg(process.pid, signal.SIGKILL)
                     process.wait()
-        for log in logs:
+                except ProcessLookupError:
+                    pass
+        # Daemonized helpers (ibus-daemon) outlive their parents.
+        for pid in owned_pids(self.private):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for log in self.logs:
             log.close()
-        (out / "assertions.txt").write_text("".join(
-            f"{name} {'pass' if value[0] else 'fail'} {value[1]}\n" for name, value in assertions.items()))
-        (out / "report.json").write_text(json.dumps({
+        subprocess.run(["rm", "-rf", str(self.private)], check=False)
+        (self.out / "assertions.txt").write_text("".join(
+            f"{name} {'pass' if value[0] else 'fail'} {value[1]}\n" for name, value in self.assertions.items()))
+        (self.out / "report.json").write_text(json.dumps({
             "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-            "rounds": args.rounds, "samples": samples, "assertions": assertions,
-            "kernel": os.uname().release, "resolution": "1280x800",
-            "growth_limit": "warmup PSS * 1.25 + 64 MiB; warmup fd count + 32",
-            "scope": "bounded nested churn; frame pacing and 24-hour VM soak are not measured",
+            "rounds": self.args.rounds, "phases": self.args.phases, "samples": self.samples,
+            "assertions": self.assertions, "kernel": os.uname().release,
+            "resolution": f"{WIDTH}x{HEIGHT}", "compositor_nofile_soft": SESSION_NOFILE_SOFT,
+            "growth_limit": "warmup PSS * 1.25 + 64 MiB; warmup fd count + 32; warmup mappings * 1.25 + 1024",
+            "scope": "bounded nested stress; real output hotplug, frame pacing and the 24-hour soak "
+                     "are measured elsewhere (scripts/tuna-vm-soak)",
         }, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--worker", nargs="+", help=argparse.SUPPRESS)
+    parser.add_argument("--rounds", type=int, default=10, help="churn rounds (400 windows each)")
+    parser.add_argument("--phases", default=",".join(PHASES),
+                        help=f"comma-separated subset of: {', '.join(PHASES)}")
+    parser.add_argument("--out", default="stress-artifacts")
+    args, extra = parser.parse_known_args()
+    if args.worker:
+        kind, *rest = args.worker + extra
+        if kind == "churn":
+            churn_worker()
+        elif kind == "popup":
+            popup_worker()
+        elif kind == "input":
+            state, app_id, width, height, *flags = rest
+            input_worker(state, app_id, int(width), int(height), "--grab" in flags)
+        else:
+            parser.error(f"unknown worker {kind}")
+        return
+    if extra:
+        parser.error(f"unrecognized arguments: {' '.join(extra)}")
+    if not 1 <= args.rounds <= 5000:
+        parser.error("--rounds must be between 1 and 5000")
+    args.phases = [p for p in args.phases.split(",") if p]
+    unknown = [p for p in args.phases if p not in PHASES]
+    if unknown:
+        parser.error(f"unknown phases: {', '.join(unknown)}")
+    args.phases = [p for p in PHASES if p in args.phases]
+    if not os.environ.get("TUNA_STRESS_PRIVATE_BUS"):
+        os.execvpe("dbus-run-session", ["dbus-run-session", "--", sys.executable, SELF, *sys.argv[1:]],
+                   os.environ | {"TUNA_STRESS_PRIVATE_BUS": "1"})
+    stress = Stress(args)
+    stress.run()
+    assertions = stress.assertions
+    out = stress.out
     if not assertions or not all(value[0] for value in assertions.values()):
         failures = [f"{name}: {value[1]}" for name, value in assertions.items() if not value[0]]
         detail = "; ".join(failures) if failures else "no assertions were recorded"
         raise SystemExit(f"tuna-stress: stress gate failed: {detail}; "
                          f"evidence: {out / 'assertions.txt'}, {out / 'report.json'}, "
                          f"{out / 'nested.log'}")
-    print("tuna-stress: window/popup churn, input, notification and growth gates passed")
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--popup-worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--rounds", type=int, default=10)
-    parser.add_argument("--out", default="stress-artifacts")
-    args = parser.parse_args()
-    if args.worker:
-        worker()
-    elif args.popup_worker:
-        popup_worker()
-    else:
-        if not 1 <= args.rounds <= 5000:
-            parser.error("--rounds must be between 1 and 5000")
-        if not os.environ.get("TUNA_STRESS_PRIVATE_BUS"):
-            os.execvpe("dbus-run-session", ["dbus-run-session", "--", sys.executable,
-                       str(Path(__file__).resolve()), *sys.argv[1:]],
-                       os.environ | {"TUNA_STRESS_PRIVATE_BUS": "1"})
-        run(args)
+    print(f"tuna-stress: {len(assertions)} stress gates passed ({', '.join(args.phases)})")
 
 
 if __name__ == "__main__":
