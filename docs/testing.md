@@ -317,6 +317,23 @@ page indicator's actual stored scale/opacity through page, hover and pressed
 updates. The per-frame page-dot trace reads these stored drawing properties,
 not the requested setter inputs; it emits no sample for a disposed drawing.
 
+The admitted `grid-tick-trace` case runs a real GTK frame clock and reads
+Linux main-thread scheduler counters. With `TUNA_GRID_TRACE` only, page
+ticks also retain frame-clock and monotonic timestamps, cumulative CPU/runqueue
+counters and their deltas, scheduler-statistics availability, and time spent
+reading the observation. The proc handle is opened once per traced thread;
+subsequent reads use a fixed stack buffer. Without tracing, no proc files or
+clock observations are read. Unreadable/malformed observations are explicitly
+unavailable, never guessed zeros.
+
+The matcher repeats these tick observations from the same log offset.
+`run_delta_ns` includes shell work and prior observer/logging overhead.
+`wait_delta_ns` measures runnable wait only when `schedstats=enabled`; disabled
+or unknown kernel accounting cannot establish absence of scheduler pressure.
+Low CPU/runqueue deltas alone cannot identify a compositor, renderer, protocol
+or presentation stall. These observations attribute callback gaps only within
+their measured scope and do not replace the unchanged frame/dot coverage gate.
+
 | CI job | Command | Extra packages | What it asserts |
 |---|---|---|---|
 | `journey` | `scripts/tuna-journey --artifacts journey-artifacts` | `xvfb xdotool x11-apps scrot jq dbus`, Mesa EGL (`libegl1 libgl1-mesa-dri`) | Overview, search, launch from search, Escape, workspace switch, Alt+Tab; writes `assertions.txt` |

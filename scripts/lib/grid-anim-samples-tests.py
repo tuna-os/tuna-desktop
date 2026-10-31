@@ -112,7 +112,7 @@ class DiagnosticTests(unittest.TestCase):
         self.assertIn('1/2 required intermediate page-dot updates', report)
         self.assertIn('219.015 ms (100.002 -> 319.017 ms)', report)
         self.assertIn('repeated frame times: 1', report)
-        self.assertIn('not presentation or scheduler evidence', report)
+        self.assertIn('callback samples, not presentation', report)
 
     def test_a_jump_remains_a_failure_even_with_correct_endpoints(self):
         frames, dots = samples.parse(switch_log(times=(0.0, 0.0, 333.340)))
@@ -140,6 +140,21 @@ class DiagnosticTests(unittest.TestCase):
             report = '\n'.join(samples.switch_diagnostics(frames, dots, 0.0, 1.0))
             self.assertIn('no advancing frame-time samples', report)
             self.assertNotIn('largest logged frame-time gap', report)
+
+
+    def test_tick_observations_preserve_counters_and_explicit_unavailability(self):
+        observed = (
+            'clock_us=1000 monotonic_us=1010 run_ns=2000 wait_ns=3000 '
+            'schedstats=enabled delta=baseline-or-reset observation_us=4',
+            'clock_us=18000 monotonic_us=18012 run_ns=5000 wait_ns=9000 '
+            'schedstats=enabled wall_delta_us=17002 run_delta_ns=3000 '
+            'wait_delta_ns=6000 observation_us=3',
+            'clock_us=35000 monotonic_us=35010 schedstat=unavailable reason=read observation_us=5',
+        )
+        text = switch_log() + '\n'.join(PREFIX + 'page-switch tick ' + line for line in observed)
+        self.assertEqual(samples.tick_diagnostics(text), list(observed))
+        self.assertEqual(check(text), [])
+        self.assertEqual(samples.tick_diagnostics(switch_log()), [])
 
 
 class InstantTests(unittest.TestCase):
