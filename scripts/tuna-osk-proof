@@ -419,12 +419,13 @@ grep -q 'OSK IBus took it: Some(false)' "$LOG" ||
     fail G-OSK-IBUS "the once-only character was not actually declined by the engine"
 session_tap "ABC" G-OSK-IBUS
 # Retiring the field resets unfinished composition, never commits it into a.
+ime_a_before="$(text_of a)"
 session_tap n G-OSK-IBUS
 press "$AX" "$AY" G-OSK-IBUS
-session_tap i G-OSK-IBUS
+for letter in n i h a o; do session_tap "$letter" G-OSK-IBUS; done
 session_tap Space G-OSK-IBUS
 expect_text b "TuNAs你好1" G-OSK-IBUS
-case "$(text_of a)" in *你*|*ni*) fail G-OSK-IBUS "old field composition leaked into a";; esac
+expect_text a "${ime_a_before}你好" G-OSK-IBUS
 # Restore the ordinary XKB source and check direct native text after IBus.
 ibus_private engine xkb:us::eng || fail G-OSK-IBUS "cannot restore XKB engine"
 xdotool key --clearmodifiers ctrl+a BackSpace

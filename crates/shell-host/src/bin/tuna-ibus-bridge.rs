@@ -134,56 +134,15 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let bus = ibus_connection()?;
-    let reply = bus.call_sync(
-        Some(IBUS),
-        IBUS_PATH,
-        IBUS,
-        "CreateInputContext",
-        Some(&("Tuna Desktop",).to_variant()),
-        glib::VariantTy::new("(o)").ok(),
-        gio::DBusCallFlags::NONE,
-        CALL_TIMEOUT_MS,
-        None::<&gio::Cancellable>,
-    )?;
-    let path = reply
-        .child_value(0)
-        .str()
-        .ok_or("CreateInputContext returned no path")?
-        .to_owned();
-    let context = IbusContext {
-        bus: bus.clone(),
-        path: path.clone(),
-    };
-    context.send("SetCapabilities", Some((CAPABILITIES,).to_variant()));
-    eprintln!("tuna-ibus-bridge: input context {path}");
-
-    // IBus sends the context's signals to this connection only; they
-    // queue here and are applied on the Wayland side, in order.
     let incoming: Rc<RefCell<VecDeque<FromIbus>>> = Rc::default();
-    {
-        let incoming = incoming.clone();
-        let subscription = bus.subscribe_to_signal(
-            None,
-            Some(CONTEXT),
-            None,
-            Some(&path),
-            None,
-            gio::DBusSignalFlags::NONE,
-            move |signal| {
-                if let Some(event) = ibus_event(signal.signal_name, signal.parameters) {
-                    incoming.borrow_mut().push_back(event);
-                }
-            },
-        );
-        // Kept for the life of the bridge.
-        std::mem::forget(subscription);
-    }
+    let context = IbusContext::create(bus.clone(), incoming.clone())?;
 
     let conn = Connection::connect_to_env()?;
     let mut queue: EventQueue<Bridge> = conn.new_event_queue();
     let qh = queue.handle();
     conn.display().get_registry(&qh, ());
     let mut bridge = Bridge {
+        ibus: Some(bus),
         context: Some(context),
         incoming,
         ..Bridge::default()
@@ -274,9 +233,53 @@ fn ibus_connection() -> Result<gio::DBusConnection, Box<dyn std::error::Error>> 
 struct IbusContext {
     bus: gio::DBusConnection,
     path: String,
+    _subscription: gio::SignalSubscription,
 }
 
 impl IbusContext {
+    fn create(
+        bus: gio::DBusConnection,
+        incoming: Rc<RefCell<VecDeque<FromIbus>>>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let reply = bus.call_sync(
+            Some(IBUS),
+            IBUS_PATH,
+            IBUS,
+            "CreateInputContext",
+            Some(&("Tuna Desktop",).to_variant()),
+            glib::VariantTy::new("(o)").ok(),
+            gio::DBusCallFlags::NONE,
+            CALL_TIMEOUT_MS,
+            None::<&gio::Cancellable>,
+        )?;
+        let path = reply
+            .child_value(0)
+            .str()
+            .ok_or("CreateInputContext returned no path")?
+            .to_owned();
+        let subscription = bus.subscribe_to_signal(
+            None,
+            Some(CONTEXT),
+            None,
+            Some(&path),
+            None,
+            gio::DBusSignalFlags::NONE,
+            move |signal| {
+                if let Some(event) = ibus_event(signal.signal_name, signal.parameters) {
+                    incoming.borrow_mut().push_back(event);
+                }
+            },
+        );
+        let context = Self {
+            bus,
+            path,
+            _subscription: subscription,
+        };
+        context.send("SetCapabilities", Some((CAPABILITIES,).to_variant()));
+        eprintln!("tuna-ibus-bridge: input context {}", context.path);
+        Ok(context)
+    }
+
     /// A call libibus makes without waiting for a reply (FocusIn,
     /// FocusOut, SetCapabilities); the daemon need not send one.
     fn send(&self, method: &str, args: Option<glib::Variant>) {
@@ -481,6 +484,7 @@ struct Bridge {
     vk: Option<ZwpVirtualKeyboardV1>,
     grab: Option<ZwpInputMethodKeyboardGrabV2>,
     osk: Option<TunaOskInputV1>,
+    ibus: Option<gio::DBusConnection>,
     context: Option<IbusContext>,
     incoming: Rc<RefCell<VecDeque<FromIbus>>>,
     /// `done` events so far: the serial a commit names.
@@ -541,13 +545,11 @@ impl Bridge {
         if !self.active || serial != self.serial {
             return;
         }
-        let Some(context) = &self.context else { return };
-        let Some(engine) = context.engine() else {
-            // An unavailable context cannot authorize either a direct commit
-            // or an engine-declined fallback. Never fabricate composition.
-            return;
-        };
-        if engine.starts_with("xkb:") {
+        let engine = self.context.as_ref().and_then(IbusContext::engine);
+        if engine
+            .as_deref()
+            .is_some_and(|name| name.starts_with("xkb:"))
+        {
             if let Some(im) = &self.im {
                 im.commit_string(text);
                 im.commit(serial);
@@ -562,6 +564,7 @@ impl Bridge {
             let handled = self
                 .context
                 .as_ref()
+                .filter(|_| engine.is_some())
                 .and_then(|context| context.try_process_key(keysym, 0, 0));
             if debug() {
                 eprintln!("tuna-ibus-bridge: OSK IBus took it: {handled:?}");
@@ -571,16 +574,19 @@ impl Bridge {
                 Some(true) => {
                     // GNOME only sends a release after a handled press.
                     if let Some(context) = &self.context {
-                        context.try_process_key(keysym, 0, RELEASE);
+                        if context.try_process_key(keysym, 0, RELEASE).is_none() {
+                            // The press was already consumed. Replaying it
+                            // after a release failure would duplicate text.
+                            eprintln!("tuna-ibus-bridge: OSK release failed after consumed press");
+                        }
                     }
                     self.apply_incoming();
                 }
-                Some(false) => {
+                Some(false) | None => {
                     if let Some(osk) = &self.osk {
                         osk.unhandled(serial, keysym);
                     }
                 }
-                None => return,
             }
         }
     }
@@ -770,11 +776,28 @@ impl Bridge {
             "tuna-ibus-bridge: text field {}",
             if active { "focused" } else { "left" }
         );
-        if let Some(context) = &self.context {
-            if !active {
-                context.send("Reset", None);
+        if active {
+            if self.context.is_none() {
+                self.context = self.ibus.as_ref().and_then(|bus| {
+                    match IbusContext::create(bus.clone(), self.incoming.clone()) {
+                        Ok(context) => Some(context),
+                        Err(error) => {
+                            eprintln!("tuna-ibus-bridge: create focused context: {error}");
+                            None
+                        }
+                    }
+                });
             }
-            context.send(if active { "FocusIn" } else { "FocusOut" }, None);
+            if let Some(context) = &self.context {
+                context.send("FocusIn", None);
+            }
+        } else if let Some(context) = self.context.take() {
+            // Retire the object path and its owned signal subscription.
+            // Delayed engine output from this field can never be stamped with
+            // the next field's input-method serial.
+            context.send("Reset", None);
+            context.send("FocusOut", None);
+            context.send_to("org.freedesktop.IBus.Service", "Destroy", None);
         }
         // Every focused field goes through IBus, including keyboard layouts.
         // Retain the supervised connection's grab across field changes and

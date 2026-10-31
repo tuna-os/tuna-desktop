@@ -79,17 +79,16 @@ impl Runtime {
                     if self.state.protocols.osk_ime.send(&self.state, &text) {
                         return;
                     }
-                    // A configured bridge that is starting/restarting cannot
-                    // tell us which engine owns this text. Drop, never replay
-                    // it or silently turn a composition into literal letters.
-                    // Sessions without IBus retain native direct commit.
+                    // Without IBus, keep native direct commit. A configured
+                    // but unavailable context takes GNOME's raw-key fallback
+                    // below, for the current focus only (never queued/replayed).
                     if self.ime.is_none() {
                         self.state
                             .protocols
                             .text_inputs
                             .commit(focus.as_ref(), &text);
+                        return;
                     }
-                    return;
                 }
                 for modifier in &modifiers {
                     self.osk_keyval(*modifier, true);
