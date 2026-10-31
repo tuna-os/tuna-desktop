@@ -1057,7 +1057,10 @@ mod gtk_zoom_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while !widget.is_mapped() {
             context.iteration(false);
-            assert!(std::time::Instant::now() < deadline, "GTK widget never mapped");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GTK widget never mapped"
+            );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let ticks = Rc::new(Cell::new(0));
@@ -1074,13 +1077,18 @@ mod gtk_zoom_tests {
         );
         while !done.get() {
             context.iteration(false);
-            assert!(std::time::Instant::now() < deadline, "GTK ticks never finished");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GTK ticks never finished"
+            );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(ticks.get() >= 2, "initial and terminal samples required");
         THREAD_SCHED.with(|reader| {
             let mut reader = reader.borrow_mut();
-            let observed = reader.read().expect("real Linux main-thread scheduler observation");
+            let observed = reader
+                .read()
+                .expect("real Linux main-thread scheduler observation");
             assert!(observed.run_ns > 0);
             println!(
                 "GRID-TICK-TRACE pass actual GTK ticks={} run_ns={} wait_ns={} schedstats={}",
