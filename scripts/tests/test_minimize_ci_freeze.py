@@ -4,10 +4,14 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import sys
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(ROOT / "scripts/lib"))
+from minimize_bundle import mode_artifacts, validate
 FREEZE = (ROOT / "scripts/tuna-minimize-ci-proof").read_text().split(
     "<<'PY'\n", 1
 )[1].split("\nPY\n", 1)[0]
@@ -34,6 +38,7 @@ class MinimizeFreezeTests(unittest.TestCase):
         for name in MEMBERS:
             executable = self.base / name
             executable.write_bytes(b"controlled fixture, not a native runtime binary: " + name.encode())
+            executable.chmod(0o755)
             self.messages.append({
                 "reason": "compiler-artifact", "target": {"name": name},
                 "executable": str(executable),
@@ -92,13 +97,124 @@ class MinimizeFreezeTests(unittest.TestCase):
         self.assertNotEqual(self.run_freeze().returncode, 0)
         self.assertFalse((self.art / "frozen/manifest.json").exists())
 
-    def test_ci_freezes_before_live_accessibility_creates_artifacts(self):
-        checkout = Path(__file__).resolve().parents[2]
-        workflow = (checkout / ".github/workflows/ci.yml").read_text()
-        freeze = workflow.index("Prove source-matched native minimize and restore in LTR and RTL")
-        accessibility = workflow.index("Prove live accessibility widgets and focus timers")
-        self.assertLess(freeze, accessibility)
-        self.assertIn('scripts/tuna-minimize-ci-proof "$RUNNER_TEMP/native-minimize"', workflow)
+    def frozen_bundle(self):
+        self.assertEqual(self.run_freeze().returncode, 0)
+        return self.art / "frozen"
+
+    def test_consumer_accepts_exact_freeze_without_changing_member_bytes(self):
+        frozen = self.frozen_bundle()
+        original = {path.name: path.read_bytes() for path in frozen.iterdir()}
+        snapshot = validate(self.root, self.art)
+        self.assertEqual(validate(self.root, self.art, snapshot), snapshot)
+        self.assertEqual({path.name: path.read_bytes() for path in frozen.iterdir()}, original)
+
+    def test_consumer_rejects_missing_role(self):
+        frozen = self.frozen_bundle()
+        (frozen / MEMBERS[0]).unlink()
+        with self.assertRaises(FileNotFoundError):
+            validate(self.root, self.art)
+
+    def test_consumer_rejects_mutated_role(self):
+        frozen = self.frozen_bundle()
+        (frozen / MEMBERS[0]).write_bytes(b"another worktree executable")
+        with self.assertRaisesRegex(ValueError, "role hashes"):
+            validate(self.root, self.art)
+
+    def test_consumer_rejects_nonexecutable_role(self):
+        frozen = self.frozen_bundle()
+        (frozen / MEMBERS[0]).chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "executable frozen role"):
+            validate(self.root, self.art)
+
+    def test_consumer_rejects_unowned_symlink_role(self):
+        frozen = self.frozen_bundle()
+        role = frozen / MEMBERS[0]
+        role.unlink()
+        role.symlink_to(self.base / MEMBERS[0])
+        with self.assertRaisesRegex(ValueError, "regular frozen member"):
+            validate(self.root, self.art)
+
+    def test_consumer_rejects_unowned_symlink_freeze(self):
+        frozen = self.frozen_bundle()
+        frozen.rename(self.art / "other-freeze")
+        frozen.symlink_to(self.art / "other-freeze", target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "owned frozen directory"):
+            validate(self.root, self.art)
+
+    def test_consumer_rejects_mismatched_source_commit(self):
+        frozen = self.frozen_bundle()
+        (frozen / "SOURCE_COMMIT").write_text("0" * 40 + "\n")
+        with self.assertRaisesRegex(ValueError, "source revision"):
+            validate(self.root, self.art)
+
+    def test_consumer_rejects_stale_source_even_with_clean_checkout(self):
+        self.frozen_bundle()
+        subprocess.run(["git", "-c", "user.name=Fixture", "-c",
+                        "user.email=fixture@example.invalid", "commit", "--quiet",
+                        "--allow-empty", "-m", "different source"], cwd=self.root, check=True)
+        with self.assertRaisesRegex(ValueError, "source revision"):
+            validate(self.root, self.art)
+
+    def test_consumer_rejects_dirty_source(self):
+        self.frozen_bundle()
+        (self.root / "untracked").write_text("uncommitted source")
+        with self.assertRaisesRegex(ValueError, "clean source"):
+            validate(self.root, self.art)
+
+    def test_consumer_rejects_frozen_lock_mutation(self):
+        frozen = self.frozen_bundle()
+        (frozen / "Cargo.lock").write_text("foreign lock")
+        with self.assertRaisesRegex(ValueError, "frozen lock"):
+            validate(self.root, self.art)
+
+    def test_consumer_rejects_lock_mismatched_to_clean_source(self):
+        frozen = self.frozen_bundle()
+        (frozen / "Cargo.lock").write_text("foreign lock")
+        manifest_path = frozen / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["cargo_lock_sha256"] = hashlib.sha256(b"foreign lock").hexdigest()
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "frozen lock"):
+            validate(self.root, self.art)
+
+    def test_post_cleanup_check_rejects_coherently_rewritten_role_and_manifest(self):
+        frozen = self.frozen_bundle()
+        before = validate(self.root, self.art)
+        (frozen / MEMBERS[0]).write_bytes(b"changed during live session")
+        manifest_path = frozen / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["sha256"][MEMBERS[0]] = hashlib.sha256(b"changed during live session").hexdigest()
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "changed during proof"):
+            validate(self.root, self.art, before)
+
+    def test_post_cleanup_check_rejects_manifest_only_change(self):
+        frozen = self.frozen_bundle()
+        before = validate(self.root, self.art)
+        path = frozen / "manifest.json"
+        path.write_text(path.read_text() + "\n")
+        with self.assertRaisesRegex(ValueError, "changed during proof"):
+            validate(self.root, self.art, before)
+
+    def test_modes_own_separate_fresh_state_without_copying_roles(self):
+        frozen = self.frozen_bundle()
+        before = validate(self.root, self.art)
+        ltr = mode_artifacts(self.art, False)
+        (ltr / "state.json").write_text("LTR state")
+        (ltr / "assertions.txt").write_text("earlier receipt")
+        rtl = mode_artifacts(self.art, True)
+        self.assertEqual(ltr, self.art / "ltr")
+        self.assertEqual(rtl, self.art / "rtl")
+        self.assertEqual(list(rtl.iterdir()), [])
+        with self.assertRaises(FileExistsError):
+            mode_artifacts(self.art, False)
+        self.assertEqual((ltr / "state.json").read_text(), "LTR state")
+        self.assertEqual((ltr / "assertions.txt").read_text(), "earlier receipt")
+        self.assertEqual(validate(self.root, self.art, before), before)
+        self.assertFalse((ltr / "bin").exists())
+        self.assertFalse((rtl / "bin").exists())
+        self.assertTrue(all((frozen / role).exists() for role in MEMBERS))
+
 
 
 if __name__ == "__main__":
