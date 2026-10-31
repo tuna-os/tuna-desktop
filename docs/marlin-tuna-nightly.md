@@ -6,12 +6,17 @@ published TunaOS Marlin Tuna Desktop flavor. The nightly resolves the newest
 a manual dispatch qualifies exactly the `digest` input. It installs a CI
 fixture layer on that image and does not rebuild or replace Tuna Desktop.
 The fixture requires every shipped package version to remain present
-unchanged, and checks hashes of the six Tuna Desktop binaries and of every
-shipped login-path file before and after setup: the session entries, the
-`gdm-password`, `gdm-launch-environment` and `tuna-lock` PAM services,
-GDM's `custom.conf` and unit, and the TunaOS greeter theme overlay. The
-build also requires `display-manager.service` to be `gdm.service` and
-GDM's configuration to enable neither automatic nor timed login.
+unchanged. It therefore installs its packages against the package databases
+the image shipped with (`tuna-vm-published-pacman`), never a fresh
+`pacman -Sy`, so Arch updates published after the image build cannot upgrade
+a shipped package; the Arch Linux Archive serves snapshot package files the
+mirrors have already replaced. The build also checks hashes of the six Tuna
+Desktop binaries and of every shipped login-path file before and after setup:
+the session entries, the `gdm-password`, `gdm-launch-environment` and
+`tuna-lock` PAM services, GDM's `custom.conf` and unit, and the TunaOS greeter
+theme overlay. The build also requires `display-manager.service` to be
+`gdm.service` and GDM's configuration to enable neither automatic nor timed
+login.
 
 Since tunaOS#3438 (2026-10-20) the published flavor logs in through stock
 GDM: it ships no greetd, gtkgreet or `/etc/greetd` files. The fixture
