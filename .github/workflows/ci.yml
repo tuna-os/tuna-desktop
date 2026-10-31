@@ -103,6 +103,7 @@ jobs:
       - run: python3 scripts/lib/ci-runner-guard-tests.py
       - run: python3 scripts/tests/test_vm_guest_agent_deadline.py
       - run: python3 scripts/tests/test_disk_guard.py
+      - run: python3 scripts/tests/test_reaper.py
       - run: python3 scripts/tests/test_vm_strip_acceptance.py
       - run: python3 scripts/tests/test_vm_strip_fixture_owner.py
       - run: python3 scripts/tests/test_vm_strip_image.py

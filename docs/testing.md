@@ -112,6 +112,20 @@ two: `/tmp/tuna-local-build.slot.N`, `TUNA_BUILD_SLOTS`), so two run at
 once and the rest queue instead of exhausting memory; a cold
 `cargo test --workspace` build at six jobs peaks at 6.4 GiB.
 
+Nothing waits forever. These defaults bound every recipe:
+
+| What | Default | Knob |
+|---|---|---|
+| `just build`, `test`, `clippy` | stopped after 60 min: TERM to cargo's process group (every `rustc` and test binary), KILL 30 s later, slot freed, exit 124 with `TIMED OUT` | `TUNA_BUILD_TIMEOUT` (minutes) |
+| `just proof <name>` | stopped the same way after its CI job's `timeout-minutes` (gtk-shell-proof: 60), at least 45 min; leftovers it started are reaped | `TUNA_PROOF_TIMEOUT` (minutes) |
+| waiting for a build or proof slot | gives up after 120 min with exit 75 | `TUNA_SLOT_WAIT` (minutes) |
+| a slot held past its timeout + 15 min | `scripts/tuna-reaper` reports it and kills the holder, the processes below it with the process groups they lead, and everything carrying its `TUNA_PROOF_RUN` marker | run by `scripts/tuna-disk-guard` on every pass |
+
+Each slot file's mtime records when it was taken (`scripts/lib/tuna-semaphore`),
+which is what the reaper measures. `scripts/lib/tuna-timeout MINUTES LABEL
+COMMAND...` is the wrapper the recipes use; Ctrl-C still reaches the
+command's group.
+
 When `sccache` is installed (`cargo install --locked sccache`, or a
 release binary on `PATH`) every recipe compiles through it, so a fresh
 worktree reuses the dependencies any other worktree already compiled from
@@ -139,9 +153,9 @@ Cleanup is automatic where it is safe:
   proof's timing-sensitive stages fail intermittently. Proofs that touch
   machine-wide state (vkms, seatd, uinput, `sudo` or apt, like
   `drm-smoke`), and scripts that don't start an Xvfb, run one at a time
-  (`/tmp/tuna-local-proof.lock`). A proof's own `cargo build` waits for a
-  build slot. A proof still running after 45 minutes
-  (`TUNA_PROOF_TIMEOUT`) is stopped and its slot freed. Proofs that need
+  (`/tmp/tuna-local-proof.lock.0`). A proof's own `cargo build` waits for a
+  build slot. A proof still running past its timeout (above) is stopped
+  and its slot freed. Proofs that need
   another proof's prebuilt binaries (`--bin-dir`) are refused with the
   name of their caller. When the proof ends, pass or fail, any process it
   started is stopped, including daemons that detached from it

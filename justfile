@@ -32,6 +32,10 @@ semaphore := justfile_directory() / "scripts/lib/tuna-semaphore"
 build_slot_base := env("TUNA_BUILD_SLOT_BASE", "/tmp/tuna-local-build.slot")
 build_slots := env("TUNA_BUILD_SLOTS", `m=$(awk '/^MemTotal:/ { print int($2 / 1048576 / 8) }' /proc/meminfo); echo $((m < 1 ? 1 : m > 2 ? 2 : m))`)
 lock := semaphore + " " + build_slot_base + " " + build_slots
+# A build, test or clippy run still going after this many minutes is
+# stopped with its whole process group, freeing its slot.
+build_timeout_min := env("TUNA_BUILD_TIMEOUT", "60")
+timed := justfile_directory() / "scripts/lib/tuna-timeout"
 # Nested proofs each get their own Xvfb, Wayland socket, buses and runtime
 # directory, but under concurrent load the gtk-shell proof's fixed waits
 # still flake (3-way runs: 1/3 and 2/3 passed), so one runs at a time unless
@@ -40,8 +44,9 @@ lock := semaphore + " " + build_slot_base + " " + build_slots
 proof_slot_base := env("TUNA_PROOF_SLOT_BASE", "/tmp/tuna-local-proof.slot")
 proof_slots := env("TUNA_PROOF_SLOTS", "1")
 proof_lock := env("TUNA_PROOF_LOCK", "/tmp/tuna-local-proof.lock")
-# A proof still running after this many minutes is stopped.
-proof_timeout_min := env("TUNA_PROOF_TIMEOUT", "45")
+# A proof still running after TUNA_PROOF_TIMEOUT minutes is stopped; unset,
+# that is the timeout-minutes of the CI job that runs the proof, at least 45.
+proof_timeout_min := env("TUNA_PROOF_TIMEOUT", "")
 # Below this much free disk (GiB), builds run `disk-guard` first.
 min_free_gb := env("TUNA_MIN_FREE_GB", "40")
 # Downloaded CI artifacts live here and expire after `artifact_ttl_min`.
@@ -64,15 +69,15 @@ fmt:
 
 # Clippy over every target with warnings as errors, as CI runs it.
 clippy: _disk _sccache
-    {{lock}} cargo clippy {{target_arg}} --workspace --all-targets -- -D warnings
+    {{lock}} {{timed}} {{build_timeout_min}} "just clippy (TUNA_BUILD_TIMEOUT)" cargo clippy {{target_arg}} --workspace --all-targets -- -D warnings
 
 # Build the workspace (extra arguments go to cargo, e.g. `just build --release`).
 build *args: _disk _sccache
-    {{lock}} cargo build {{target_arg}} --locked {{args}}
+    {{lock}} {{timed}} {{build_timeout_min}} "just build (TUNA_BUILD_TIMEOUT)" cargo build {{target_arg}} --locked {{args}}
 
 # Test the workspace, or pass cargo arguments: `just test -p tuna-compositor --lib orca::`.
 test *args: _disk _sccache
-    {{lock}} cargo test {{target_arg}} {{ if args == "" { "--workspace" } else { args } }}
+    {{lock}} {{timed}} {{build_timeout_min}} "just test (TUNA_BUILD_TIMEOUT)" cargo test {{target_arg}} {{ if args == "" { "--workspace" } else { args } }}
 
 # Run a nested proof (`just proof gtk-shell-proof`); artifacts are kept only if it fails.
 proof name *args: _disk _sccache
@@ -154,22 +159,29 @@ proof name *args: _disk _sccache
     # or isn't nested, runs alone. Builds keep their own slots.
     if grep -qE 'uinput|seatd|/dev/dri|vkms|/dev/input|sudo|apt-get|playwright install' "$script" ||
         ! grep -qi xvfb "$script"; then
-        slot=(flock -o "{{proof_lock}}")
+        slot=("{{semaphore}}" "{{proof_lock}}" 1)
     else
         slot=("{{semaphore}}" "{{proof_slot_base}}" "{{proof_slots}}")
     fi
-    # A hung proof is stopped after TUNA_PROOF_TIMEOUT minutes (TERM, then
-    # KILL 30 s later) and everything it started is reaped, freeing its slot.
-    # --foreground keeps it in this process group, so Ctrl-C still reaches it.
+    # A hung proof is stopped after its timeout (TERM to its process group,
+    # then KILL 30 s later) and everything it started is reaped, freeing its
+    # slot. The default is its CI job's timeout-minutes, at least 45.
+    timeout_min="{{proof_timeout_min}}"
+    if [ -z "$timeout_min" ]; then
+        timeout_min=$(awk -v s="scripts/tuna-{{name}}" '
+            /^  [A-Za-z0-9_-]+:[ \t]*$/ { job = $1 }
+            /^    timeout-minutes:/ { limit[job] = $2 }
+            { i = index($0, s); c = substr($0, i + length(s), 1) }
+            i && c !~ /[A-Za-z0-9_-]/ { used[job] = 1 }
+            END { m = 45; for (j in used) if (limit[j] > m) m = limit[j]; print m }
+        ' .github/workflows/*.yml)
+    fi
     status=0
-    "${slot[@]}" timeout --foreground --kill-after=30 "{{proof_timeout_min}}m" "$script" "$@" {{args}} || status=$?
+    "${slot[@]}" "{{timed}}" "$timeout_min" "proof {{name}} (TUNA_PROOF_TIMEOUT)" "$script" "$@" {{args}} || status=$?
     if [ "$status" = 0 ]; then
         rm -rf "$art"
         echo "proof {{name}} passed"
     else
-        case "$status" in
-            124 | 137) echo "proof {{name}} TIMED OUT after {{proof_timeout_min}} min (TUNA_PROOF_TIMEOUT)" >&2 ;;
-        esac
         echo "proof {{name}} FAILED (exit $status); artifacts kept in $art" >&2
         exit "$status"
     fi

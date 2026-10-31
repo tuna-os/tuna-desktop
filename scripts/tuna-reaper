@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# tuna-reaper — stop builds and proofs that hold a machine-wide slot past
+# their timeout.
+#
+# Usage: scripts/tuna-reaper
+#
+# `just build`/`test`/`clippy` and `just proof` hold a slot file
+# (scripts/lib/tuna-semaphore, which stamps its mtime when taken) and stop
+# themselves at their timeout. A holder still there 15 minutes later is
+# stuck: this reports it and kills it, every process below it with their
+# process groups, and every process carrying its TUNA_PROOF_RUN marker.
+#   build slots  ${TUNA_BUILD_SLOT_BASE:-/tmp/tuna-local-build.slot}.N,
+#                held longer than TUNA_BUILD_TIMEOUT (60) + 15 min
+#   proof slots  ${TUNA_PROOF_SLOT_BASE:-/tmp/tuna-local-proof.slot}.N and
+#                ${TUNA_PROOF_LOCK:-/tmp/tuna-local-proof.lock}.0, held longer
+#                than TUNA_PROOF_TIMEOUT (default: the largest timeout-minutes
+#                of a CI job that runs a proof, at least 45) + 15 min
+# scripts/tuna-disk-guard runs this on every pass.
+set -uo pipefail
+[ $# -eq 0 ] || { sed -n '2,18p' "$0" >&2; exit 2; }
+root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+grace=15
+build_min=$((${TUNA_BUILD_TIMEOUT:-60} + grace))
+if [ -n "${TUNA_PROOF_TIMEOUT:-}" ]; then
+    proof_min=$((TUNA_PROOF_TIMEOUT + grace))
+else
+    # As `just proof` picks a proof's timeout: its CI job's timeout-minutes.
+    proof_min=$(($(awk '
+        /^  [A-Za-z0-9_-]+:[ \t]*$/ { job = FILENAME ":" $1 }
+        /^    timeout-minutes:/ { limit[job] = $2 }
+        /scripts\/tuna-[A-Za-z0-9-]*proof/ { used[job] = 1 }
+        END { m = 45; for (j in used) if (limit[j] > m) m = limit[j]; print m }
+    ' "$root"/.github/workflows/*.yml) + grace))
+fi
+
+log() { echo "$(date -u +%FT%TZ) tuna-reaper: $*"; }
+
+# PID and its descendants, one per line.
+tree() {
+    ps -eo pid=,ppid= | awk -v root="$1" '
+        { kids[$2] = kids[$2] " " $1 }
+        END {
+            n = split(root, todo, " ")
+            while (n) {
+                p = todo[n--]; print p
+                m = split(kids[p], k, " ")
+                for (i = 1; i <= m; i++) todo[++n] = k[i]
+            }
+        }'
+}
+
+# TERM HOLDER, the processes below it and their groups, and the processes
+# carrying its TUNA_PROOF_RUN marker; record them all in all_pids/all_pgids.
+all_pids='' all_pgids=''
+stop() {
+    local holder=$1 marker pids pgids p self
+    self=$(ps -o pgid= -p $$ | tr -d ' ')
+    pids=$(tree "$holder")
+    # Only groups a descendant leads (tuna-timeout's): the holder's own group
+    # can be the caller's shell or an agent's, which must survive.
+    pgids=$(for p in $pids; do ps -o pgid= -p "$p" 2>/dev/null | tr -d ' '; done | sort -u | grep -Fx -f <(echo "$pids"))
+    marker=$(tr '\0' '\n' <"/proc/$holder/environ" 2>/dev/null | sed -n 's/^TUNA_PROOF_RUN=//p')
+    if [ -n "$marker" ]; then
+        for p in /proc/[0-9]*; do
+            grep -qzx "TUNA_PROOF_RUN=$marker" "$p/environ" 2>/dev/null && pids="$pids ${p#/proc/}"
+        done
+    fi
+    pgids=$(echo "$pgids" | grep -vx "$self")
+    for p in $pgids; do kill -TERM -- "-$p" 2>/dev/null; done
+    # shellcheck disable=SC2086
+    kill -TERM $pids 2>/dev/null
+    all_pids="$all_pids $pids" all_pgids="$all_pgids $pgids"
+    log "TERM sent to ${pids//$'\n'/ } (groups ${pgids//$'\n'/ })"
+}
+
+now=$(date +%s)
+reaped=
+for f in "${TUNA_BUILD_SLOT_BASE:-/tmp/tuna-local-build.slot}".* \
+    "${TUNA_PROOF_SLOT_BASE:-/tmp/tuna-local-proof.slot}".* \
+    "${TUNA_PROOF_LOCK:-/tmp/tuna-local-proof.lock}".*; do
+    [ -f "$f" ] || continue
+    case $f in "${TUNA_BUILD_SLOT_BASE:-/tmp/tuna-local-build.slot}".*) limit=$build_min ;; *) limit=$proof_min ;; esac
+    held=$(( (now - $(stat -c %Y "$f")) / 60 ))
+    [ "$held" -gt "$limit" ] || continue
+    # The holder has the file open with the flock on that open file: its
+    # fdinfo lists the lock. (/proc/locks pids are the host's, wrong inside
+    # a PID namespace, but its inodes say whether anyone holds it at all.)
+    grep -q ":$(stat -c %i "$f") " /proc/locks || continue
+    real=$(readlink -f "$f")
+    for fd in /proc/[0-9]*/fd/*; do
+        [ "$(readlink "$fd" 2>/dev/null)" = "$real" ] || continue
+        holder=${fd#/proc/}
+        holder=${holder%%/*}
+        grep -q FLOCK "/proc/$holder/fdinfo/${fd##*/}" 2>/dev/null || continue
+        log "pid $holder held $f for $held min (limit $limit); stopping: $(tr '\0' ' ' <"/proc/$holder/cmdline" | cut -c1-200)"
+        stop "$holder"
+        reaped=1
+    done
+done
+[ -n "$reaped" ] || exit 0
+sleep 10
+for p in $all_pgids; do kill -KILL -- "-$p" 2>/dev/null; done
+for p in $all_pids; do kill -KILL "$p" 2>/dev/null && log "KILL sent to $p"; done
+exit 0

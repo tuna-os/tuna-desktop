@@ -5,20 +5,25 @@
 # files BASE.0 .. BASE.<SLOTS-1>, so at most SLOTS such commands run at
 # once across every worktree. COMMAND does not inherit the lock, so a
 # daemon it leaves behind can't keep holding the slot (like `flock -o`);
+# the slot file's mtime records when it was taken (scripts/tuna-reaper);
 # the slot is released when this script exits, however it exits. Waits,
-# polling every second, while all slots are taken. Exits with COMMAND's
-# status.
+# polling every second, while all slots are taken, for at most
+# TUNA_SLOT_WAIT minutes (default 120), then gives up with status 75.
+# Otherwise exits with COMMAND's status.
 set -euo pipefail
-[ $# -ge 3 ] || { sed -n '2,10p' "$0" >&2; exit 2; }
+[ $# -ge 3 ] || { sed -n '2,11p' "$0" >&2; exit 2; }
 base=$1 slots=$2
 shift 2
 case "$slots" in '' | *[!0-9]* | 0) echo "tuna-semaphore: bad slot count '$slots'" >&2; exit 2 ;; esac
+wait_min=${TUNA_SLOT_WAIT:-120}
+case "$wait_min" in '' | *[!0-9]*) echo "tuna-semaphore: bad TUNA_SLOT_WAIT '$wait_min'" >&2; exit 2 ;; esac
 waiting=""
 while :; do
     for ((i = 0; i < slots; i++)); do
         exec {fd}>>"$base.$i"
         if flock -n "$fd"; then
             [ -z "$waiting" ] || echo "tuna-semaphore: got $base.$i after $((SECONDS - waiting))s" >&2
+            touch "$base.$i"
             status=0
             "$@" {fd}>&- || status=$?
             exit "$status"
@@ -27,7 +32,10 @@ while :; do
     done
     if [ -z "$waiting" ]; then
         waiting=$SECONDS
-        echo "tuna-semaphore: all $slots slots of $base are busy; waiting" >&2
+        echo "tuna-semaphore: all $slots slots of $base are busy; waiting up to $wait_min min" >&2
+    elif [ $((SECONDS - waiting)) -ge $((wait_min * 60)) ]; then
+        echo "tuna-semaphore: no slot of $base freed in $wait_min min (TUNA_SLOT_WAIT); giving up" >&2
+        exit 75
     fi
     sleep 1
 done
