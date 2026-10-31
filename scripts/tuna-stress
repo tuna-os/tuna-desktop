@@ -676,6 +676,7 @@ class Stress:
         self.windows_gone()
         self.input_path()
         self.record("S-POPUP", True, f"{mapped} mapped Wayland popups; depth three; four concurrent clients; input recovered")
+        self.sample()
 
     def phase_protocol(self):
         adversary_dir = self.out / "adversary-client"
