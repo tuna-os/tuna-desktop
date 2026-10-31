@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import sys
+import subprocess
 import tempfile
 import time
 import unittest
@@ -49,6 +50,34 @@ class PinnedBudgets(unittest.TestCase):
         self.assertEqual(mod.TICK_TOLERANCE_SECS, 5.0)
         self.assertEqual(mod.PRESS_SETTLE_SECS, 1.5)
         self.assertEqual(mod.SKIP_SCHEDULE_TOLERANCE_SECS, 8.0)
+
+
+class BannerActionWorkflow(unittest.TestCase):
+    def test_owned_visible_banner_expands_before_the_actual_action_press(self):
+        source = (HERE.parent / 'tuna-gtk-shell-proof').read_text()
+        helper = 'wb_press_banner() {' + source.split('wb_press_banner() {', 1)[1].split('\n}\n', 1)[0] + '\n}\n'
+        result = subprocess.run(
+            ['bash', '-c', '''
+set -eu
+# Keep the dumper trace separate from its suppressed stdout.
+exec 3>&1
+WID=1 WIDTH=1280 HEIGHT=800
+sleep() { :; }
+fail() { exit 1; }
+xdotool() { if [ "$1" = key ]; then printf 'key:%s\\n' "$2"; fi; }
+wb_a11y_dump() {
+    case " $* " in
+        *" --press "*) printf 'press\\n' >&3 ;;
+        *) printf 'observe\\n' >&3 ;;
+    esac
+}
+''' + helper + '''
+wb_press_banner gate /unused "Time for an Eyesight Break" Take 5
+'''],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['observe', 'key:super+n', 'press'])
 
 
 class ActionPredicates(unittest.TestCase):

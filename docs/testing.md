@@ -302,6 +302,9 @@ long-word redaction-test notifications in history. Card text must wrap at
 character boundaries when needed, and collapsed groups must measure only
 their visible page horizontally, so hidden expanded content cannot force
 the date popup wider than the nested output.
+The full proof expands wellbeing banners with the real Super+N binding
+before pressing Take, Delay or Skip: non-critical notices open collapsed
+and keep their action rows hidden until the user expands them.
 
 The full GTK proof's media callback barrier waits at most 25 seconds:
 one key can execute four serialized `wpctl` subprocesses with five-second

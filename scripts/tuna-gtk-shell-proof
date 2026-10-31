@@ -6380,6 +6380,9 @@ wb_a11y_dump() {
 # press a banner that had already expired, so one keep-alive move per short
 # step keeps the user active and the press within about a second of the
 # banner showing. Waits 1.5 s after the press, like --press alone.
+# Normal/high notices open collapsed, with their action row hidden. Once
+# the owned title is showing, use GNOME's Super+N to expand the current
+# banner before the same-pass title/action press below.
 wb_press_banner() {
     wbpb_gate="$1" wbpb_out="$2" wbpb_title="$3" wbpb_button="$4"
     wbpb_until=$(($(date +%s) + $5)) wbpb_step=0
@@ -6388,6 +6391,10 @@ wb_press_banner() {
             fail "$wbpb_gate" "keep-alive failed"
         wbpb_step=$((wbpb_step + 1))
         sleep 0.5
+        if wb_a11y_dump "$wbpb_out" 20 --when-showing "$wbpb_title" >/dev/null 2>&1; then
+            xdotool key super+n || fail "$wbpb_gate" "could not expand the due banner"
+            sleep 0.3
+        fi
         if wb_a11y_dump "$wbpb_out" 20 --when-showing "$wbpb_title" --press "$wbpb_button" >/dev/null 2>&1; then
             WB_PRESS_EPOCH="$(date +%s)"
             sleep 1.5
