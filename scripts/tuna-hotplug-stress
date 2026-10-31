@@ -535,7 +535,8 @@ def run(args):
 
         def consume_frames(connector, node):
             grab = subprocess.run(
-                ["gst-launch-1.0", "-q", "pipewiresrc", f"path={node}", "num-buffers=3", "!", "fakesink"],
+                ["gst-launch-1.0", "-q", "pipewiresrc", f"path={node}", "num-buffers=3", "!",
+                 "video/x-raw", "!", "fakesink"],
                 env=env, capture_output=True, text=True, timeout=30)
             (out / f"cast-frames-{connector}.log").write_text(grab.stdout + grab.stderr)
             if grab.returncode != 0:
@@ -550,8 +551,10 @@ def run(args):
             session, node = portal_cast(B)
             consume_frames(B, node)
             mark = len(log_path.read_text())
-            consumer = launch(["gst-launch-1.0", "-q", "pipewiresrc", f"path={node}", "!", "fakesink"],
-                              "cast-consumer-B")
+            # A concrete video caps filter is needed: ANY -> fakesink
+            # leaves media.type unset and WirePlumber cannot link it.
+            consumer = launch(["gst-launch-1.0", "-q", "pipewiresrc", f"path={node}", "!",
+                               "video/x-raw", "!", "fakesink"], "cast-consumer-B")
             wait_for(f"the cast of {B} streams to its consumer",
                      lambda: "-> Streaming" in log_path.read_text()[mark:] and state().get("capture_streams") == 1, 30)
             mark = len(log_path.read_text())
