@@ -1,6 +1,7 @@
 """Record-free fresh-account journey (tunaOS#4092): host journey against a
 simulated guest, plus the guest probe's record detection."""
 import ast
+import json
 import os
 import pathlib
 import sys
@@ -13,12 +14,13 @@ sys.path.insert(0, str(ROOT / "scripts/lib"))
 import fresh_accounts  # noqa: E402
 
 GUEST = ROOT / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+FIXTURE = ROOT / "packaging/marlin/vm-lane/tuna-vm-fresh-accounts"
 CONF = "[daemon]\nFallbackSession=tuna\n"
 
 
 class FakeGuest:
-    """A guest whose GDM logs an account in after the QMP keyboard typed its
-    name and password, and whose AccountsService writes the record then."""
+    """A guest whose GDM logs in after the QMP keyboard typed credentials.
+    Like the GNOME reference, login alone need not write a cache record."""
 
     def __init__(self, **faults):
         self.faults = faults
@@ -40,7 +42,7 @@ class FakeGuest:
             if password == "tuna" and user in self.uids and self.logged_in is None:
                 self.logged_in = user
                 self.logins.append((self.boot, user))
-                if not self.faults.get("no_record"):
+                if self.faults.get("write_record") or "saved" in self.faults:
                     self.records[user] = self.faults.get("saved", "[User]\nSession=tuna\nSystemAccount=false\n")
             self.typed = []
 
@@ -67,6 +69,8 @@ class FakeGuest:
                 return {"user": user, "exists": False}
             return {"user": user, "exists": True, "uid": self.uids[user], "groups": self.groups[user],
                     "home": f"/var/home/{user}", "home_exists": True, "record": self.records.get(user),
+                    "effective_session": (None if self.faults.get("lost_session") and self.boot > 1
+                                          else self.faults.get("effective_session", "tuna")),
                     "custom_conf": self.faults.get("custom_conf", CONF)}
         if action == "fresh-session":
             user = args[0]
@@ -127,8 +131,8 @@ class JourneyTest(unittest.TestCase):
         self.assertEqual(guest.logins, [(1, "tunastd"), (1, "tunaadmin"), (1, "tunastd"), (1, "tunaadmin"),
                                         (2, "tunastd"), (2, "tunaadmin")])
         for name in ("V-FRESH-RECORD-FREE-tunastd", "V-FRESH-RECORD-FREE-tunaadmin", "V-FRESH-CONTROL",
-                     "V-FRESH-RECORD-CREATED-tunastd", "V-FRESH-SUDO-tunaadmin", "V-FRESH-SUDO-tunastd",
-                     "V-FRESH-REBOOT", "V-FRESH-RECORD-KEPT-tunaadmin", "V-FRESH-LOGOUT-tunaadmin-reboot"):
+                     "V-FRESH-SESSION-tunastd-first", "V-FRESH-SUDO-tunaadmin", "V-FRESH-SUDO-tunastd",
+                     "V-FRESH-REBOOT", "V-FRESH-SESSION-RELOADED-tunaadmin", "V-FRESH-LOGOUT-tunaadmin-reboot"):
             self.assertIn(name, results)
 
     def test_preseeded_record_is_not_record_free(self):
@@ -175,15 +179,39 @@ class JourneyTest(unittest.TestCase):
         self.assertFalse(passed)
         self.assertFailed(results, "V-FRESH-LOGIN-tunastd-first")
 
-    def test_record_not_created_fails(self):
-        passed, results, _, _ = journey(FakeGuest(no_record=True))
+    def test_record_free_login_matches_gnome_reference(self):
+        reference = json.loads((ROOT / "scripts/lib/fixtures/fresh-account-gnome51-reference.json").read_text())
+        for account in reference["first_logins"]:
+            self.assertIsNone(account["record_before"])
+            self.assertIsNone(account["record_after"])
+            self.assertEqual(account["session"]["Service"], "gdm-password")
+            self.assertIn("gnome-shell", account["desktop"])
+        guest = FakeGuest()
+        passed, results, _, _ = journey(guest)
+        self.assertTrue(passed, results)
+        self.assertNotIn("tunastd", guest.records)
+        self.assertNotIn("tunaadmin", guest.records)
+
+    def test_saved_tuna_record_is_supported(self):
+        passed, results, _, _ = journey(FakeGuest(write_record=True))
+        self.assertTrue(passed, results)
+
+    def test_effective_session_must_be_tuna(self):
+        for session in ("", None, "gnome"):
+            with self.subTest(session=session):
+                passed, results, _, _ = journey(FakeGuest(effective_session=session))
+                self.assertFalse(passed)
+                self.assertFailed(results, "V-FRESH-SESSION-tunastd-first")
+
+    def test_effective_session_must_reload_after_reboot(self):
+        passed, results, _, _ = journey(FakeGuest(lost_session=True))
         self.assertFalse(passed)
-        self.assertFailed(results, "V-FRESH-RECORD-CREATED-tunastd")
+        self.assertFailed(results, "V-FRESH-SESSION-RELOADED-tunastd")
 
     def test_saved_gnome_session_fails(self):
         passed, results, _, _ = journey(FakeGuest(saved="[User]\nSession=gnome\n"))
         self.assertFalse(passed)
-        self.assertFailed(results, "V-FRESH-RECORD-CREATED-tunastd")
+        self.assertFailed(results, "V-FRESH-SESSION-tunastd-first")
 
     def test_standard_sudo_fails(self):
         passed, results, _, _ = journey(FakeGuest(std_sudo=True))
@@ -226,8 +254,15 @@ class GuestStateTest(unittest.TestCase):
             for name, text in records.items():
                 (users / name).write_text(text)
             entry = SimpleNamespace(pw_uid=1001, pw_dir=root)
+            def call(*args):
+                if args[0] == "id":
+                    return "tunastd"
+                if "FindUserByName" in args:
+                    return json.dumps({"type": "o", "data": ["/org/freedesktop/Accounts/User1001"]})
+                return json.dumps({"type": "s", "data": "tuna"})
+
             scope = {"pwd": SimpleNamespace(getpwnam=lambda name: entry), "os": os, "pathlib": pathlib,
-                     "ACCOUNTS_RECORD_DIR": users, "GDM_CUSTOM_CONF": conf, "call": lambda *args: "tunastd"}
+                     "json": json, "ACCOUNTS_RECORD_DIR": users, "GDM_CUSTOM_CONF": conf, "call": call}
             exec(compile(ast.Module(body=body, type_ignores=[]), str(GUEST), "exec"), scope)
             state = scope["fresh_state"]("tunastd")
         return state
@@ -235,6 +270,7 @@ class GuestStateTest(unittest.TestCase):
     def test_absent_record(self):
         state = self.probe({})
         self.assertIsNone(state["record"])
+        self.assertEqual(state["effective_session"], "tuna")
 
     def test_present_record_detected(self):
         state = self.probe({"tunastd": "[User]\nSystemAccount=false\n"})
@@ -243,6 +279,16 @@ class GuestStateTest(unittest.TestCase):
 
     def test_absent_record_is_record_free(self):
         self.assertTrue(fresh_accounts.record_free(self.probe({}), False)[0])
+
+
+class FixtureTest(unittest.TestCase):
+    def test_fresh_boot_asks_for_user_name_without_session_state(self):
+        text = FIXTURE.read_text()
+        self.assertIn("grep -qx 'system-db:gdm' /usr/share/dconf/profile/gdm", text)
+        self.assertIn("[org/gnome/login-screen]\\ndisable-user-list=true\\n", text)
+        self.assertIn("dconf update", text)
+        self.assertNotIn("Session=", text)
+        self.assertNotIn("AutomaticLogin", text)
 
 
 if __name__ == "__main__":
