@@ -15,6 +15,8 @@ struct Transition {
     value: f32,
 }
 impl Transition {
+    /// Clutter interpolates the dimmer's 8-bit CoglColor channel and stores
+    /// the truncated byte (GNOME 51 reads 97/127 a quarter-curve into a dim).
     fn advance(&mut self, now: Duration) {
         let p = if self.duration.is_zero() {
             1.0
@@ -23,7 +25,9 @@ impl Transition {
                 .clamp(0.0, 1.0)
         };
         let to = if self.target { DIM_MULTIPLIER } else { 1.0 };
-        self.value = self.from + (to - self.from) * (1.0 - (1.0 - p).powi(2));
+        let (from, to) = ((self.from * 127.0).round(), (to * 127.0).round());
+        let channel = from + (to - from) * (1.0 - (1.0 - p).powi(2));
+        self.value = (channel as u8) as f32 / 127.0;
     }
 }
 pub struct ModalDim {
@@ -204,7 +208,7 @@ mod tests {
             p(MotionLevel::Full),
             true,
         );
-        assert!((d.multiplier(1) - (1.0 + (DIM_MULTIPLIER - 1.0) * 0.75)).abs() < 1e-6);
+        assert_eq!(d.multiplier(1), 97.0 / 127.0);
         d.step(
             &ids,
             &parents,
@@ -229,6 +233,31 @@ mod tests {
         );
         assert_eq!(d.multiplier(1), 1.0);
         assert!(!d.running());
+        let mut d = ModalDim::default();
+        d.step(&ids, &parents, Duration::ZERO, p(MotionLevel::Full), true);
+        d.step(
+            &ids,
+            &parents,
+            Duration::from_millis(500),
+            p(MotionLevel::Full),
+            true,
+        );
+        d.step(
+            &ids,
+            &HashSet::new(),
+            Duration::from_millis(500),
+            p(MotionLevel::Full),
+            true,
+        );
+        // GNOME 51 paired capture: 25 ms into the 250 ms undim reads 95/127.
+        d.step(
+            &ids,
+            &HashSet::new(),
+            Duration::from_millis(525),
+            p(MotionLevel::Full),
+            true,
+        );
+        assert_eq!(d.multiplier(1), 95.0 / 127.0);
     }
     #[test]
     fn overlapping_modal_membership_does_not_restart_and_reversal_is_continuous() {

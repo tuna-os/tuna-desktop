@@ -2594,11 +2594,20 @@ impl Runtime {
                 "app_id": app_of(w.id),
                 "introspect_eligible": self.manager.is_introspect_eligible(w.id),
                 "x11_window_id": self.manager.x11_window_id(w.id),
+                // `_NET_WM_ICON_GEOMETRY`, the X11 client's minimize target.
+                "client_icon_geometry": self.manager.client_icon_geometry(w.id)
+                    .map(|r| [r.loc.x, r.loc.y, r.size.w, r.size.h]),
                 "parent_window_id": self.manager.transient_parent(w.id),
                 "application_window_id": self.manager.application_window(w.id),
                 "icon": model.window(w.id).and_then(|w| w.icon.clone()),
                 "workspace": w.workspace,
                 "rect": [w.geometry.loc.x, w.geometry.loc.y, w.geometry.size.w, w.geometry.size.h],
+                // The committed buffer, client shadows included (GNOME's buffer rect).
+                "buffer_rect": self.manager.surface_of(w.id).and_then(|s| {
+                    let size = crate::windows::buffer_size(&s)?;
+                    let origin = crate::popup::surface_origin(&s, w.geometry.loc);
+                    Some([origin.x, origin.y, size.w, size.h])
+                }),
             })).collect::<Vec<_>>(),
             "previews": previews,
             "thumbnails": thumbnails,
@@ -2679,6 +2688,8 @@ impl Runtime {
             "focus_change_on_pointer_rest": focus_policy.focus_change_on_pointer_rest,
         });
         doc["window_lifecycle"] = self.manager.window_lifecycle().to_json();
+        // Published dash icons; minimize uses one only while the dash shows.
+        doc["dash_icon_targets"] = self.manager.icon_geometries_json();
         doc["menu_close"] = self.menu_close.to_json();
         doc["modal_dim"] = self.manager.modal_dim().to_json();
         doc["frame_cost"] = self
@@ -5546,7 +5557,10 @@ impl Runtime {
             now,
             self.input_settings.motion,
             allowed,
-            self.input_settings.right_to_left,
+            crate::minimize::TargetContext {
+                right_to_left: self.input_settings.right_to_left,
+                dash_visible: self.control.overview_open(),
+            },
         );
         self.menu_close.step(
             renderer,
@@ -7014,7 +7028,7 @@ fn scene_elements(
                 split_from = Some(elements.len());
             }
             let buffer_size =
-                crate::windows::committed_size(surface.as_ref()).unwrap_or(geometry.size);
+                crate::windows::buffer_size(surface.as_ref()).unwrap_or(geometry.size);
             let buffer_geometry = Rectangle::new(
                 crate::popup::surface_origin(&surface, geometry.loc),
                 buffer_size,
@@ -7078,7 +7092,7 @@ fn scene_elements(
                 continue;
             }
             let buffer_size =
-                crate::windows::committed_size(surface.as_ref()).unwrap_or(geometry.size);
+                crate::windows::buffer_size(surface.as_ref()).unwrap_or(geometry.size);
             let buffer_geometry = Rectangle::new(
                 crate::popup::surface_origin(&surface, geometry.loc),
                 buffer_size,
@@ -7097,12 +7111,10 @@ fn scene_elements(
                 continue;
             }
             if let Some(frame) = manager.window_lifecycle().opening_frame(id) {
-                let r = crate::window_lifecycle::rect(geometry, frame);
-                let geo = crate::popup::window_geometry_loc(&surface);
-                let origin = view.physical(
-                    r.loc.x - f64::from(geo.x) * frame.scale.0,
-                    r.loc.y - f64::from(geo.y) * frame.scale.1,
-                );
+                // GNOME scales the whole actor, client shadows included, so
+                // the pivot sits on the buffer rect (windowManager.js:1514).
+                let r = crate::window_lifecycle::rect(buffer_geometry, frame);
+                let origin = view.physical(r.loc.x, r.loc.y);
                 let alpha = frame.alpha * manager.render_alpha(&window);
                 elements.extend(render_elements_from_surface_tree::<_,WaylandSurfaceRenderElement<_>>(renderer,&surface,origin,view.scale,alpha,Kind::Unspecified).into_iter().map(|e|smithay::backend::renderer::element::utils::RescaleRenderElement::from_element(e,origin,frame.scale)));
                 owners.resize(elements.len(), Some(id));
