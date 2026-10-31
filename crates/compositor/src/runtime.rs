@@ -3899,24 +3899,6 @@ impl Runtime {
             self.cast_grants.clear();
             return;
         }
-        // A cast window that closed ends its session, as in Mutter.
-        let manager = &self.manager;
-        self.casts.retain(|cast| {
-            let gone =
-                matches!(cast.target, CastTarget::Window(id) if manager.geometry(id).is_none());
-            if gone || cast.failed() {
-                if let Some(grant) = self.cast_grants.get(&cast.session_id) {
-                    grant.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-                cast.close();
-            }
-            !cast.failed()
-                && !gone
-                && !self
-                    .cast_grants
-                    .get(&cast.session_id)
-                    .is_none_or(|grant| grant.load(std::sync::atomic::Ordering::SeqCst))
-        });
         // Window casts follow their window's size.
         for index in 0..self.casts.len() {
             if let CastTarget::Window(id) = self.casts[index].target {
@@ -3925,15 +3907,44 @@ impl Runtime {
                 }
             }
         }
+        let guard = self.cast_outputs.lock().ok();
+        let outputs = guard.as_deref().map_or(&[][..], Vec::as_slice);
+        // A cast window that closed or a recorded monitor that left the
+        // layout ends its session, as in Mutter.
+        let manager = &self.manager;
+        crate::screencast::end_gone(&mut self.casts, &self.cast_grants, outputs, |id| {
+            manager.geometry(id).is_some()
+        });
+        // A kept monitor cast follows its monitor's mode (a scale switch
+        // that keeps the logical rect), as Mutter's monitor source does.
+        for cast in &mut self.casts {
+            let size = match (&cast.target, &cast.monitor) {
+                (CastTarget::Monitor(_), Some(recorded)) => {
+                    crate::mutter::monitor_after_change(recorded, outputs)
+                        .map(|o| (o.width, o.height))
+                }
+                _ => None,
+            };
+            if let Some((w, h)) = size {
+                cast.resize(w, h);
+            }
+        }
+        // An area cast with no output under it gets no frames
+        // (meta-stream-source-area.c watches only the views over it).
         let wanted: Vec<(usize, CastTarget, (i32, i32))> = self
             .casts
             .iter()
             .enumerate()
+            .filter(|(_, cast)| match &cast.target {
+                CastTarget::Area(connector, _) => outputs.iter().any(|o| &o.connector == connector),
+                CastTarget::Monitor(_) | CastTarget::Window(_) => true,
+            })
             .filter_map(|(i, cast)| {
                 cast.wants_frame()
                     .map(|size| (i, cast.target.clone(), size))
             })
             .collect();
+        drop(guard);
         let xrgb = smithay::backend::allocator::Fourcc::Xrgb8888;
         for (index, target, size) in wanted {
             let frame = match &target {
@@ -3968,12 +3979,25 @@ impl Runtime {
                     })
                 }
             };
-            let Some((w, h, bgrx)) = frame else {
+            let Some(cast) = self.casts.get_mut(index) else {
                 continue;
             };
-            if let Some(cast) = self.casts.get_mut(index) {
-                cast.send_frame(w, h, &bgrx);
-            }
+            let Some((w, h, bgrx)) = frame else {
+                // Once per gap, so a cast of an output that cannot render
+                // shows in the log without flooding it.
+                if !cast.frameless {
+                    cast.frameless = true;
+                    if let CastTarget::Monitor(output) | CastTarget::Area(output, _) = &target {
+                        eprintln!(
+                            "tuna-compositor: screen cast {}: output {output} gave no frame",
+                            cast.session_id
+                        );
+                    }
+                }
+                continue;
+            };
+            cast.frameless = false;
+            cast.send_frame(w, h, &bgrx);
         }
     }
 
@@ -4132,6 +4156,7 @@ impl Runtime {
                 session_id,
                 grant,
                 target,
+                monitor,
                 signal,
             } => {
                 if self.is_locked() || grant.load(std::sync::atomic::Ordering::SeqCst) {
@@ -4149,25 +4174,35 @@ impl Runtime {
                     }
                 }
                 let size = match &target {
-                    crate::mutter::CastTarget::Monitor(connector) => self
-                        .cast_outputs
-                        .lock()
-                        .ok()
-                        .and_then(|o| o.iter().find(|o| &o.connector == connector).cloned())
-                        .map(|o| (o.width, o.height)),
+                    // A monitor that changed since RecordMonitor already
+                    // stopped its stream in Mutter (`on_monitors_changed`).
+                    crate::mutter::CastTarget::Monitor(connector) => {
+                        self.cast_outputs.lock().ok().and_then(|outputs| {
+                            match &monitor {
+                                Some(recorded) => {
+                                    crate::mutter::monitor_after_change(recorded, &outputs)
+                                }
+                                None => outputs.iter().find(|o| &o.connector == connector),
+                            }
+                            .map(|o| (o.width, o.height))
+                        })
+                    }
                     crate::mutter::CastTarget::Window(id) => {
                         self.window_pixel_size(*id).map(|(size, _)| size)
                     }
                     crate::mutter::CastTarget::Area(_, (_, _, w, h)) => Some((*w, *h)),
                 };
-                let Some((width, height)) = size else {
+                let Some(size) = size else {
+                    if let Some(grant) = self.cast_grants.get(&session_id) {
+                        grant.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     signal.session_closed(session_id);
                     return;
                 };
                 let Some(pw) = self.pipewire.as_ref() else {
                     return;
                 };
-                match pw.start_cast(session_id, target, width, height, signal) {
+                match pw.start_cast(session_id, target, monitor, size, signal) {
                     Some(cast) => self.casts.push(cast),
                     None => eprintln!("tuna-compositor: screen cast: stream failed to start"),
                 }

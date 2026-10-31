@@ -120,6 +120,30 @@ pub fn area_on_output(
     })
 }
 
+/// The monitor a `RecordMonitor` stream keeps showing after the
+/// monitors changed, or `None` when the stream must stop. Mutter's
+/// meta-stream-monitor.c `on_monitors_changed`: the same monitor must
+/// still be there (`meta_monitor_is_same_as`; the snapshot has no
+/// serial, so connector, make and model), and `update_monitor` keeps
+/// the stream only while its logical monitor's rect is unchanged, so a
+/// refresh or scale switch that keeps the rect keeps the stream and
+/// anything else ends in `meta_stream_stop`.
+pub fn monitor_after_change<'a>(
+    recorded: &OutputSnapshot,
+    outputs: &'a [OutputSnapshot],
+) -> Option<&'a OutputSnapshot> {
+    let rect = |o: &OutputSnapshot| {
+        let (w, h) = crate::orientation::logical_extent(o.width, o.height, o.scale, o.transform);
+        (o.x, o.y, w, h)
+    };
+    outputs.iter().find(|o| {
+        o.connector == recorded.connector
+            && o.make == recorded.make
+            && o.model == recorded.model
+            && rect(o) == rect(recorded)
+    })
+}
+
 /// A window as the D-Bus side describes it (Introspect, RecordWindow).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowSnapshot {
@@ -167,6 +191,9 @@ pub enum ToLoop {
         session_id: u64,
         grant: Arc<AtomicBool>,
         target: CastTarget,
+        /// The monitor a `RecordMonitor` stream was created for, as
+        /// Mutter's MetaStreamMonitor holds its MetaMonitor.
+        monitor: Option<OutputSnapshot>,
         signal: CastSignals,
     },
     StopCast {
@@ -886,6 +913,9 @@ struct Session {
     streams: SessionStreams,
     stopped: Arc<AtomicBool>,
     started: Arc<AtomicBool>,
+    /// `Closed` went out: Mutter's meta_dbus_session_close emits it
+    /// once, whichever of Stop, a stream's end or revocation came first.
+    closed: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -994,6 +1024,7 @@ impl ScreenCast {
             streams: Arc::new(Mutex::new(Vec::new())),
             stopped: linked.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
             started: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
         };
         server.at(&path, session.clone()).await?;
         self.sessions
@@ -1024,9 +1055,14 @@ impl Session {
                 session_id: self.id,
                 grant: self.stopped.clone(),
                 target: stream.target(),
+                monitor: match &stream {
+                    Stream::Monitor(output) => Some(output.clone()),
+                    Stream::Window(_) | Stream::Area(..) => None,
+                },
                 signal: CastSignals {
                     stream: iface.signal_emitter().to_owned(),
                     queue: self.signals.clone(),
+                    closed: self.closed.clone(),
                 },
             });
         }
@@ -1051,7 +1087,9 @@ impl Session {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        let _ = Session::closed(&ctxt).await;
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            let _ = Session::closed(&ctxt).await;
+        }
         let _ = self.to_loop.send(ToLoop::StopCast {
             session_id: self.id,
         });
@@ -1219,6 +1257,8 @@ impl Stream {
 pub struct CastSignals {
     stream: SignalEmitter<'static>,
     queue: crate::dbus_signals::SignalQueue,
+    /// The session's `Closed` latch, shared with its D-Bus object.
+    closed: Arc<AtomicBool>,
 }
 
 impl CastSignals {
@@ -1230,8 +1270,12 @@ impl CastSignals {
     }
 
     /// Tell the session's client it ended; the signal goes out on the
-    /// session, after anything this stream already queued.
+    /// session, after anything this stream already queued, once per
+    /// session however many of its streams end.
     pub fn session_closed(&self, session_id: u64) {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let path = format!("/org/gnome/Mutter/ScreenCast/Session/u{session_id}");
         if let Ok(session) = SignalEmitter::new(self.stream.connection(), path) {
             self.queue
@@ -1466,8 +1510,10 @@ pub fn start(
                     let _ = to_loop.send(ToLoop::StopCast {
                         session_id: session.id,
                     });
-                    if let Ok(signal) = SignalEmitter::new(conn.inner(), path.clone()) {
-                        signals.emit(async move { Session::closed(&signal).await });
+                    if !session.closed.swap(true, Ordering::SeqCst) {
+                        if let Ok(signal) = SignalEmitter::new(conn.inner(), path.clone()) {
+                            signals.emit(async move { Session::closed(&signal).await });
+                        }
                     }
                     let streams = session
                         .streams
@@ -2472,5 +2518,156 @@ mod tests {
 
         stop.store(true, Ordering::SeqCst);
         event_loop_thread.join().unwrap();
+    }
+
+    /// A running cast for [`crate::screencast::end_gone`] without
+    /// PipeWire: its session's real `CastSignals`.
+    struct FakeCast {
+        session_id: u64,
+        target: CastTarget,
+        monitor: Option<OutputSnapshot>,
+        signal: CastSignals,
+    }
+
+    impl crate::screencast::Running for FakeCast {
+        fn session_id(&self) -> u64 {
+            self.session_id
+        }
+        fn target(&self) -> &CastTarget {
+            &self.target
+        }
+        fn monitor(&self) -> Option<&OutputSnapshot> {
+            self.monitor.as_ref()
+        }
+        fn failed(&self) -> bool {
+            false
+        }
+        fn close(&self) {
+            self.signal.session_closed(self.session_id);
+        }
+    }
+
+    /// Mutter's meta-stream-monitor.c `on_monitors_changed`: a monitor
+    /// stream survives a mode switch that keeps its logical rect, and
+    /// when its monitor is unplugged `meta_stream_stop` ends it and the
+    /// session sends `Closed` (once) over a real peer-to-peer link.
+    /// Window casts and area casts on the unplugged monitor stay.
+    #[test]
+    fn monitor_casts_stop_when_their_monitor_is_unplugged() {
+        let (server_end, client_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            zbus::blocking::connection::Builder::async_io_unix_stream(server_end)
+                .server(zbus::Guid::generate())
+                .unwrap()
+                .p2p()
+                .build()
+                .unwrap()
+        });
+        let client = zbus::blocking::connection::Builder::async_io_unix_stream(client_end)
+            .p2p()
+            .build()
+            .unwrap();
+        let server = server.join().unwrap();
+        let mut messages = zbus::blocking::MessageIterator::from(&client);
+        let queue = crate::dbus_signals::SignalQueue::new("cast-test-signals");
+        let signals = |stream: u64| CastSignals {
+            stream: SignalEmitter::new(
+                server.inner(),
+                format!("/org/gnome/Mutter/ScreenCast/Stream/u{stream}"),
+            )
+            .unwrap(),
+            queue: queue.clone(),
+            closed: Arc::new(AtomicBool::new(false)),
+        };
+
+        let a = snapshot("eDP-1");
+        let mut b = snapshot("DP-1");
+        b.x = 1920;
+        b.primary = false;
+        let b_session = signals(1);
+        let fake = |session_id, target, monitor, signal| FakeCast {
+            session_id,
+            target,
+            monitor,
+            signal,
+        };
+        let mut casts = vec![
+            fake(
+                1,
+                CastTarget::Monitor("DP-1".into()),
+                Some(b.clone()),
+                b_session.clone(),
+            ),
+            fake(
+                2,
+                CastTarget::Monitor("eDP-1".into()),
+                Some(a.clone()),
+                signals(2),
+            ),
+            fake(
+                3,
+                CastTarget::Area("DP-1".into(), (0, 0, 64, 64)),
+                None,
+                signals(3),
+            ),
+            fake(4, CastTarget::Window(7), None, signals(4)),
+        ];
+        let grants: HashMap<u64, Arc<AtomicBool>> = (1..=4)
+            .map(|id| (id, Arc::new(AtomicBool::new(false))))
+            .collect();
+        let ids = |casts: &[FakeCast]| casts.iter().map(|c| c.session_id).collect::<Vec<_>>();
+
+        // A mode switch that keeps both logical rects: B at another
+        // refresh, A at twice the pixels and scale 2.
+        let mut b_refresh = b.clone();
+        b_refresh.refresh_mhz = 30_000;
+        let mut a_hidpi = a.clone();
+        (a_hidpi.width, a_hidpi.height, a_hidpi.scale) = (3840, 2160, 2.0);
+        let modes = [a_hidpi.clone(), b_refresh];
+        crate::screencast::end_gone(&mut casts, &grants, &modes, |_| true);
+        assert_eq!(ids(&casts), [1, 2, 3, 4], "a mode switch keeps every cast");
+        assert_eq!(
+            monitor_after_change(&a, &modes).map(|o| (o.width, o.height)),
+            Some((3840, 2160)),
+            "the kept stream follows the new mode"
+        );
+        // A rect change (B at scale 2 is half the logical size) is what
+        // `update_monitor` refuses.
+        let mut b_scaled = b.clone();
+        b_scaled.scale = 2.0;
+        assert!(monitor_after_change(&b, &[a.clone(), b_scaled]).is_none());
+
+        // B is unplugged.
+        let unplugged = [a_hidpi];
+        crate::screencast::end_gone(&mut casts, &grants, &unplugged, |_| true);
+        assert_eq!(ids(&casts), [2, 3, 4], "only B's monitor cast ends");
+        assert!(grants[&1].load(Ordering::SeqCst), "its session is revoked");
+        assert!((2..=4).all(|id| !grants[&id].load(Ordering::SeqCst)));
+        // Closing the session again (Stop, revocation) sends nothing.
+        b_session.session_closed(1);
+        signals(9).stream_added(99);
+
+        let mut seen: Vec<(String, String)> = Vec::new();
+        while seen.last().map(|(member, _)| member.as_str()) != Some("PipeWireStreamAdded") {
+            let message = messages.next().unwrap().unwrap();
+            let header = message.header();
+            seen.push((
+                header.member().unwrap().to_string(),
+                header.path().unwrap().to_string(),
+            ));
+        }
+        assert_eq!(
+            seen,
+            [
+                (
+                    "Closed".to_string(),
+                    "/org/gnome/Mutter/ScreenCast/Session/u1".to_string()
+                ),
+                (
+                    "PipeWireStreamAdded".to_string(),
+                    "/org/gnome/Mutter/ScreenCast/Stream/u9".to_string()
+                ),
+            ]
+        );
     }
 }

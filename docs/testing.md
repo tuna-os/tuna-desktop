@@ -484,6 +484,18 @@ show:
   replugged output gets its device id back (Mutter's
   `meta_color_manager_monitors_changed` → `update_devices`).
 
+After the rounds, `H-CAST-REMOVED` plugs B and shares it through the
+installed `xdg-desktop-portal-gnome` (the backend's restore data stands in
+for the picker) to a `pipewiresrc` consumer on a private PipeWire, then
+unplugs B. As Mutter's `meta-stream-monitor.c` `on_monitors_changed`
+stops the stream (`meta_stream_stop`, then `on_stream_closed` closes the
+session), Mutter's `Session.Closed` and the portal session's `Closed`
+must arrive within 5 s, the PipeWire node and the compositor's capture
+stream must go, the log must show the stop and no frame attempted for B,
+and a new cast of A must stream. Monitor casts survive only a change that
+keeps their logical rect (Mutter's `update_monitor`); area casts stay
+open and get no frames while no output lies under them.
+
 `H-GROWTH` bounds the compositor and shell as the churn lane does: final
 PSS within round-0 PSS × 1.25 + 64 MiB and fds within round-0 + 32.
 

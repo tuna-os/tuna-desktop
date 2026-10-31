@@ -38,8 +38,15 @@ back. After every step it gates on the compositor state
              display device per connected output after every step, and a
              replugged output gets its device id back (Mutter's
              meta_color_manager_monitors_changed)
+  H-CAST-REMOVED  a monitor screencast of B shared through the installed
+             xdg-desktop-portal-gnome ends when B is unplugged: Mutter's
+             Session.Closed and the portal session's Closed arrive, the
+             PipeWire node goes, nothing renders B again, and a new cast
+             of A streams (meta-stream-monitor.c on_monitors_changed)
 Needs root (sudo) for modprobe, configfs, seatd and uinput, colord, and
-pam_wrapper (libpam-wrapper) for the unlock.
+pam_wrapper (libpam-wrapper) for the unlock. H-CAST-REMOVED needs
+pipewire, wireplumber, gst-launch-1.0 with pipewiresrc and the installed
+xdg-desktop-portal-gnome.
 """
 import argparse
 import json
@@ -351,6 +358,11 @@ def run(args):
             env["DBUS_SYSTEM_BUS_ADDRESS"],
             Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
             None, None)
+        # A private PipeWire for H-CAST-REMOVED (the compositor connects
+        # to it on the first cast), as the shell proofs run one.
+        launch(["pipewire"], "pipewire")
+        wait_for("the private PipeWire socket", lambda: (private / "pipewire-0").exists(), 10)
+        launch(["wireplumber"], "wireplumber")
 
         def colord_displays():
             """colord's display devices by XRANDR_name: {connector: [DeviceId, ...]}."""
@@ -637,6 +649,133 @@ def run(args):
                     f"client B re-homed onto {B}); unplugged, unlocked through PAM: "
                     f"{len(clients)} clients drawing on {A}, Super opens the overview")
 
+        def pump():
+            while GLib.MainContext.default().iteration(False):
+                pass
+
+        signals = []
+
+        def on_signal(_conn, _sender, path, iface, member, _params):
+            signals.append((iface, member, path, time.monotonic()))
+
+        for iface in ("org.gnome.Mutter.ScreenCast.Session", "org.freedesktop.impl.portal.Session"):
+            dbus.signal_subscribe(None, iface, "Closed", None, None, Gio.DBusSignalFlags.NONE, on_signal)
+        portal = {"backend": None, "serial": 0}
+
+        def portal_owned():
+            try:
+                owner = dbus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                                       "GetNameOwner", GLib.Variant("(s)", ("org.freedesktop.impl.portal.desktop.gnome",)),
+                                       None, Gio.DBusCallFlags.NO_AUTO_START, 1000, None).unpack()[0]
+                pid = dbus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                                     "GetConnectionUnixProcessID", GLib.Variant("(s)", (owner,)),
+                                     None, Gio.DBusCallFlags.NONE, 1000, None).unpack()[0]
+                return pid == portal["backend"].pid
+            except GLib.Error:
+                return False
+
+        def portal_cast(connector):
+            """Share one monitor the way the portal frontend asks the
+            installed GNOME backend, its restore data standing in for the
+            picker. Returns (portal session handle, PipeWire node)."""
+            if portal["backend"] is None:
+                exe = next((p for p in ("/usr/libexec/xdg-desktop-portal-gnome", "/usr/lib/xdg-desktop-portal-gnome")
+                            if os.access(p, os.X_OK)), None)
+                if exe is None:
+                    raise RuntimeError("xdg-desktop-portal-gnome is not installed")
+                portal["backend"] = launch([exe, "--replace"], "portal-gnome", env | {
+                    "XDG_CURRENT_DESKTOP": "GNOME", "WAYLAND_DISPLAY": SOCKET, "GDK_BACKEND": "wayland",
+                    "XDG_SESSION_TYPE": "wayland"})
+                wait_for("xdg-desktop-portal-gnome on the session bus", portal_owned, 30)
+            _, monitors, _, _ = display_call("GetCurrentState", None,
+                                             "(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})").unpack()
+            spec = next(s for s, _, _ in monitors if s[0] == connector)
+            # xdp-gnome's displaystatetracker.c match string.
+            match = connector if tuple(spec[1:]) == ("unknown",) * 3 else ":".join(spec[1:])
+            portal["serial"] += 1
+            token = f"tunahotplug{portal['serial']}"
+            session = f"/org/freedesktop/portal/desktop/session/1_1/{token}"
+            request = f"/org/freedesktop/portal/desktop/request/1_1/{token}"
+            app = "org.tuna.HotplugStress"
+
+            def impl(method, args):
+                code, results = dbus.call_sync(
+                    "org.freedesktop.impl.portal.desktop.gnome", "/org/freedesktop/portal/desktop",
+                    "org.freedesktop.impl.portal.ScreenCast", method, args, GLib.VariantType.new("(ua{sv})"),
+                    Gio.DBusCallFlags.NONE, 30000, None).unpack()
+                if code != 0:
+                    raise RuntimeError(f"portal {method} for {connector} answered {code}")
+                return results
+
+            impl("CreateSession", GLib.Variant("(oosa{sv})", (request + "c", session, app, {})))
+            now = int(time.time())
+            restore = GLib.Variant("(suv)", ("GNOME", 1, GLib.Variant(
+                "(xxa(uuv))", (now, now, [(0, 1, GLib.Variant("s", match))]))))
+            impl("SelectSources", GLib.Variant("(oosa{sv})", (request + "s", session, app, {
+                "types": GLib.Variant("u", 1), "multiple": GLib.Variant("b", False),
+                "cursor_mode": GLib.Variant("u", 1), "restore_data": restore})))
+            streams = impl("Start", GLib.Variant("(oossa{sv})", (request + "t", session, app, "", {}))).get("streams") or []
+            if len(streams) != 1:
+                raise RuntimeError(f"portal Start for {connector} gave streams {streams}")
+            return session, streams[0][0]
+
+        def pipewire_nodes():
+            text = subprocess.run(["pw-dump", "--no-colors"], env=env, capture_output=True, text=True,
+                                  timeout=10).stdout
+            return {o["id"] for o in json.loads(text or "[]") if o.get("type") == "PipeWire:Interface:Node"}
+
+        def cast_removed():
+            """H-CAST-REMOVED: Mutter's meta-stream-monitor.c on_monitors_changed
+            stops a monitor stream whose monitor left (meta_stream_stop), and
+            meta-screen-cast-session.c on_stream_closed closes its session."""
+            plug(1, {0, 1}, f"cast: plug {B}")
+            mark = len(log_path.read_text())
+            session, node = portal_cast(B)
+            consumer = launch(["gst-launch-1.0", "-q", "pipewiresrc", f"path={node}", "!", "fakesink"],
+                              "cast-consumer-B")
+            wait_for(f"the cast of {B} streams to its consumer",
+                     lambda: "-> Streaming" in log_path.read_text()[mark:] and state().get("capture_streams") == 1, 30)
+            mark = len(log_path.read_text())
+            pump()
+            del signals[:]
+            unplugged = time.monotonic()
+            vkms.plug(1, False)
+            counts["hotplugs"] += 1
+
+            def closed(iface, path=None):
+                pump()
+                return next((t for i, m, p, t in signals if i == iface and m == "Closed"
+                             and (path is None or p == path)), None)
+            mutter_at = wait_for(f"Mutter ScreenCast Session.Closed after unplugging {B}",
+                                 lambda: closed("org.gnome.Mutter.ScreenCast.Session"), 5)
+            portal_at = wait_for(f"the portal session's Closed after unplugging {B}",
+                                 lambda: closed("org.freedesktop.impl.portal.Session", session), 5)
+            wait_for("no capture stream left", lambda: state().get("capture_streams") == 0, 5)
+            wait_for(f"PipeWire node {node} gone", lambda: node not in pipewire_nodes(), 5)
+            check(f"cast: unplug {B}", [A])
+            # Nothing renders the phantom output afterwards.
+            time.sleep(2)
+            tail = log_path.read_text()[mark:]
+            stopped = f"monitor {B} changed or is gone; stopping the stream" in tail
+            phantom = tail.count(f"output {B} gave no frame")
+            if not stopped or phantom:
+                raise RuntimeError(f"cast of {B}: stop logged {stopped}, {phantom} phantom render attempts")
+            if consumer.poll() is None:
+                os.killpg(consumer.pid, 15)
+                consumer.wait(timeout=5)
+            # A new cast of A streams.
+            session_a, node_a = portal_cast(A)
+            grab = subprocess.run(["gst-launch-1.0", "-q", "pipewiresrc", f"path={node_a}", "num-buffers=3", "!",
+                                   "fakesink"], env=env, capture_output=True, text=True, timeout=30)
+            if grab.returncode != 0:
+                raise RuntimeError(f"a new cast of {A} gave no frames: {grab.stderr.strip()[-300:]}")
+            dbus.call_sync("org.freedesktop.impl.portal.desktop.gnome", session_a, "org.freedesktop.impl.portal.Session",
+                           "Close", None, None, Gio.DBusCallFlags.NONE, 10000, None)
+            wait_for(f"the cast of {A} ends on Close", lambda: state().get("capture_streams") == 0, 5)
+            return (f"cast of {B} (node {node}) ended {mutter_at - unplugged:.2f}s after unplug with Mutter "
+                    f"Session.Closed, portal Closed at {portal_at - unplugged:.2f}s, node gone, 0 phantom renders; "
+                    f"new cast of {A} (node {node_a}) streamed 3 buffers")
+
         check("start", [A])
         open_client("A", A)
         baseline = None
@@ -689,6 +828,14 @@ def run(args):
             print(f"tuna-hotplug-stress: round {r + 1}/{args.rounds} passed "
                   f"(PSS {value['pss_kib']} KiB, {value['fds']} fds)", flush=True)
 
+        try:
+            assertions["H-CAST-REMOVED"] = [True, cast_removed()]
+        except (RuntimeError, GLib.Error, subprocess.SubprocessError, StopIteration) as error:
+            assertions["H-CAST-REMOVED"] = [False, f"{type(error).__name__}: {error}"]
+        try:
+            assertions["H-LOCK-HOTPLUG"] = [True, lock_hotplug()]
+        except RuntimeError as error:
+            assertions["H-LOCK-HOTPLUG"] = [False, str(error)]
         # Every connector unplugged at once, then plugged back (Mutter's
         # meta_window_update_for_monitors_changed without, then with,
         # logical monitors). The linear arrangement first, so the replug
@@ -767,10 +914,6 @@ def run(args):
         fd_limit = baseline["fds"] + 32
         assertions["H-GROWTH"] = [final["pss_kib"] <= pss_limit and final["fds"] <= fd_limit,
                                   f"PSS {final['pss_kib']}/{int(pss_limit)} KiB; fds {final['fds']}/{fd_limit}"]
-        try:
-            assertions["H-LOCK-HOTPLUG"] = [True, lock_hotplug()]
-        except RuntimeError as error:
-            assertions["H-LOCK-HOTPLUG"] = [False, str(error)]
         text = (out / "compositor.log").read_text()
         assertions["H-LIVE"] = [compositor.poll() is None and "panicked" not in text
                                 and "ShellExited" not in text,

@@ -79,6 +79,8 @@ jobs:
       # H-COLORD: the real colord, started by the harness on a private
       # system bus (as the drm job's tuna-drm-smoke D-COLORD does).
       - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y colord
+      - name: PipeWire and the GNOME portal backend for H-CAST-REMOVED
+        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools xdg-desktop-portal-gnome
       - run: scripts/ci-install-gtk4-layer-shell
       - run: python3 -m py_compile scripts/tuna-hotplug-stress
       - run: scripts/ci-install-vkms
