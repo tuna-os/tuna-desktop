@@ -12,6 +12,7 @@ tempfile = "3"
 
 [dependencies]
 wayland-client.workspace = true
+wayland-scanner = "=0.31.11"
 wayland-protocols = { workspace = true, features = ["client", "unstable"] }
 wayland-protocols-wlr = { workspace = true, features = ["client"] }
 wayland-protocols-misc = { version = "=0.3.12", features = ["client"] }

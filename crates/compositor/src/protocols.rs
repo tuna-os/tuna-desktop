@@ -147,12 +147,14 @@ pub(crate) struct Protocols {
     pub(crate) preferred_scale: f64,
     /// Every text input's committed state, for the on-screen keyboard.
     pub(crate) text_inputs: crate::osk::TextInputs,
+    pub(crate) osk_ime: crate::osk_ime::OskIme,
 }
 
 impl Protocols {
     pub(crate) fn new(dh: &DisplayHandle) -> Self {
         Self {
             dmabuf_state: DmabufState::new(),
+            osk_ime: crate::osk_ime::OskIme::new(dh),
             dmabuf_global: None,
             activation_state: XdgActivationState::new::<State>(dh),
             _viewporter: ViewporterState::new::<State>(dh),
