@@ -547,6 +547,14 @@ it after a Num Lock change and before the next `gsettings set`. The
 applied. Wait for it after changing the input sources or `xkb-options`
 and before typing.
 
+The stock GNOME Settings journey (`tests/portal-reference/settings-run.sh`)
+uses a private dconf service instead. Settings and the shell are independent
+writers: shell initialization of app folders must not restore a stale
+hot-corner value from a whole-file keyfile snapshot. The proof retains
+`config/dconf/user` as its persistence receipt; the actual Settings action,
+independent key read, live corner behavior and cold-restart assertions remain
+required.
+
 ## Parity ledger check
 
 The `parity-ledger` job runs `scripts/tuna-ledger` against the test list
