@@ -504,6 +504,16 @@ starts the permission store with the runner's home even though the portal has
 a private data directory. Its live permission-store regression calls the
 installed service and requires the resulting database inside the fixture.
 
+The main portal fixture also requires bounded child retirement **before**
+artifact ownership finalization. On a failed chooser UI step, SIGTERM takes
+the chooser owner's normal exit path so its `atexit` hook reaps the independent
+GTK input writer. The fixture waits for those direct children and the
+compositor's supervised GTK shell, then requires `process-retirement.json`
+before traversing artifacts. A missing or failed retirement receipt fails
+closed; finalizer inode/type/ownership checks and the primary UI error stay
+unchanged. Real-process regressions cover delayed descendant teardown,
+abnormal compositor exit, and preserving an existing proof failure.
+
 ## Parity ledger check
 
 The `parity-ledger` job runs `scripts/tuna-ledger` against the test list

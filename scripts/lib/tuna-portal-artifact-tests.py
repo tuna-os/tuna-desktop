@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the actual FD-based portal artifact finalizer with bounded failures."""
 from contextlib import nullcontext
+import ast
 import importlib.util
 import os
 from pathlib import Path
@@ -157,7 +158,7 @@ class FinalizationTests(unittest.TestCase):
 
 
 class FixtureRetirementTests(unittest.TestCase):
-    FIXTURES = ('backgrounds-run.sh', 'slideshow-run.sh', 'svg-run.sh')
+    FIXTURES = ('run.sh', 'backgrounds-run.sh', 'slideshow-run.sh', 'svg-run.sh')
     ROOT = Path(__file__).parents[2]
 
     def start_child(self, body):
@@ -255,6 +256,37 @@ if (root/'x-retired').exists(): raise RuntimeError('X server retired before comp
                 self.assertEqual((root / 'writer-retired').read_text(), 'reaped')
                 self.assertTrue((root / 'x-retired').is_file())
                 self.assertIn('"qualified_retirement": true', (root / 'process-retirement.json').read_text())
+
+    def test_sigterm_runs_actual_chooser_child_teardown_before_owner_exit(self):
+        source = (self.ROOT / 'scripts/lib/tuna-portal-filechooser-client.py').read_text()
+        functions = '\n'.join(ast.get_source_segment(source, node)
+            for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in ('stop_unrelated', 'retire_on_signal'))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            writer = ('import pathlib,signal,time\n'
+                f'root=pathlib.Path({str(root)!r})\n'
+                'def stop(*_):\n'
+                ' time.sleep(.15)\n'
+                ' (root/"writer-retired").write_text("reaped")\n'
+                ' raise SystemExit(0)\n'
+                'signal.signal(signal.SIGTERM,stop)\n'
+                'print("ready",flush=True)\n'
+                'time.sleep(60)\n')
+            body = ('import atexit,signal,subprocess,sys\n' + functions + '\n' +
+                f'unrelated_process=subprocess.Popen([sys.executable,"-c",{writer!r}],stdout=subprocess.PIPE,text=True)\n'
+                'atexit.register(stop_unrelated)\n'
+                'signal.signal(signal.SIGTERM,retire_on_signal)\n'
+                'assert unrelated_process.stdout.readline()=="ready\\n"\n'
+                'print("ready",flush=True)\n'
+                'signal.pause()\n')
+            owner = self.start_child(body)
+            start = time.monotonic()
+            owner.terminate()
+            self.assertEqual(owner.wait(timeout=5), 128 + 15)
+            self.assertGreaterEqual(time.monotonic() - start, .1)
+            self.assertEqual((root / 'writer-retired').read_text(), 'reaped')
 
     def test_abnormally_exited_compositor_cannot_qualify_retirement(self):
         for name in self.FIXTURES:
