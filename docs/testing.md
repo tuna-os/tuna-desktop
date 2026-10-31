@@ -307,6 +307,16 @@ cannot satisfy the gate.
 `app-content` and `scroll-proof` download Playwright and Chromium into a
 temporary venv on every run, so they need network access.
 
+`G-GRID-PAGE-ANIM` keeps the raw frame and page-dot trace in `nested.log`
+and the matcher's combined output (including mismatch stderr) in
+`grid-anim-samples-{next,off,next-again}.txt`. On mismatch the proof also
+prints that output and its actual artifact path to stderr, without changing
+the assertion or its exit status. The `gtk-shell` upload retains these files
+at its root. In the `journey` job the installed GTK proof writes them under
+`package-artifacts/installed/controls` (`tuna-deb-installed-proof`); the
+always-run artifact preparation also copies just these diagnostics into
+`journey-shots/installed-controls`, including on an early proof failure.
+
 **Start `tuna-gtk-shell-proof` from a fresh artifacts directory.** The
 script points `XDG_STATE_HOME` at `gtk-shell-artifacts/state`, and the
 shell keeps its state, notification history included, under

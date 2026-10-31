@@ -2295,8 +2295,17 @@ grid_samples() {
     samples_mark="$1"
     samples_name="$2"
     shift 2
-    "$PY" "$ROOT/scripts/lib/grid-anim-samples.py" --log "$LOG" --offset "$samples_mark" "$@" \
-        >"$ARTIFACTS/grid-anim-samples-$samples_name.txt" 2>&1
+    samples_output="$ARTIFACTS/grid-anim-samples-$samples_name.txt"
+    if "$PY" "$ROOT/scripts/lib/grid-anim-samples.py" --log "$LOG" --offset "$samples_mark" "$@" \
+        >"$samples_output" 2>&1; then
+        return 0
+    else
+        samples_status=$?
+    fi
+    printf 'tuna-gtk-shell-proof: grid animation mismatch (samples: %s; raw trace: %s)\n' \
+        "$samples_output" "$LOG" >&2
+    cat "$samples_output" >&2
+    return "$samples_status"
 }
 if [ "$GRID_CANCEL_ONLY" != 1 ]; then
     log_has "$page_mark" "grid-anim page-switch start ms=300 motion=full" ||
@@ -2306,7 +2315,7 @@ if [ "$GRID_CANCEL_ONLY" != 1 ]; then
     log_has "$page_mark" "grid-anim page-arrow start ms=200" ||
         fail G-GRID-PAGE-ANIM "the page arrows did not fade over 200 ms"
     grid_samples "$page_mark" next --from 0 --to 1 ||
-        fail G-GRID-PAGE-ANIM "page-switch frames or page dots strayed from GNOME's 300 ms out-cubic (grid-anim-samples-next.txt)"
+        fail G-GRID-PAGE-ANIM "page-switch frames or page dots strayed from GNOME's 300 ms out-cubic ($ARTIFACTS/grid-anim-samples-next.txt)"
     # With animations off the switch and the arrows jump.
     motion_policy Off
     page_mark="$(log_mark)"
@@ -2317,7 +2326,7 @@ if [ "$GRID_CANCEL_ONLY" != 1 ]; then
     log_has "$page_mark" "grid-anim page-switch start" &&
         fail G-GRID-PAGE-ANIM "with animations off a page slide started"
     grid_samples "$page_mark" off --instant --to 0 ||
-        fail G-GRID-PAGE-ANIM "with animations off the pages or dots passed through between pages (grid-anim-samples-off.txt)"
+        fail G-GRID-PAGE-ANIM "with animations off the pages or dots passed through between pages ($ARTIFACTS/grid-anim-samples-off.txt)"
     "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-page1-off.json" 20 ||
         fail G-GRID-PAGE-ANIM "accessibility dump failed"
     showing "$ARTIFACTS/a11y-grid-page1-off.json" "Previous Page" &&
@@ -2328,7 +2337,7 @@ if [ "$GRID_CANCEL_ONLY" != 1 ]; then
         --press "Next Page" || fail G-GRID-PAGE-ANIM "could not return to page two"
     log_wait "$page_mark" "grid-anim page-switch settle" || fail G-GRID-PAGE-ANIM "the page switch back never settled"
     grid_samples "$page_mark" next-again --from 0 --to 1 ||
-        fail G-GRID-PAGE-ANIM "the second switch's frames or dots strayed from GNOME's curve (grid-anim-samples-next-again.txt)"
+        fail G-GRID-PAGE-ANIM "the second switch's frames or dots strayed from GNOME's curve ($ARTIFACTS/grid-anim-samples-next-again.txt)"
     sleep 0.5
     pass G-GRID-PAGE-ANIM "page switches ease out-cubic over 300 ms (every frame-clock sample on GNOME's curve, page dots following the drawn position) and the arrows fade over 200 ms; with animations off both jump"
 fi
