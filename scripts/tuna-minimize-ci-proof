@@ -9,7 +9,7 @@ if [[ -n $(git status --porcelain) ]]; then
   echo 'Native proof requires clean source' >&2
   exit 2
 fi
-mkdir -p "$art"
+mkdir -- "$art"
 cargo build --locked -p tuna-compositor -p tuna-shell-gtk --bins --example tuna-modal-dim-client --example tuna-wellbeing-proof-shell --message-format=json > "$art/build.json"
 python3 - "$root" "$art" <<'PY'
 import hashlib
@@ -53,5 +53,5 @@ manifest = {
 }
 (frozen / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 PY
-dbus-run-session -- /usr/bin/python3 scripts/tuna-minimize-proof --bin-dir "$art/frozen" --artifacts "$art/ltr" --display :109
-dbus-run-session -- /usr/bin/python3 scripts/tuna-minimize-proof --bin-dir "$art/frozen" --artifacts "$art/rtl" --display :110 --rtl
+dbus-run-session -- /usr/bin/python3 scripts/tuna-minimize-proof --bundle-root "$art" --display :109
+dbus-run-session -- /usr/bin/python3 scripts/tuna-minimize-proof --bundle-root "$art" --display :110 --rtl
