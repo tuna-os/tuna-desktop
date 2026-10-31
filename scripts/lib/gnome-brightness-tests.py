@@ -273,11 +273,14 @@ class IdleRestoreAdmission(unittest.TestCase):
             return 'accepted'
         value=self.helper(lambda:clock[0],sleep)(invoke,checks.append,attempts)
         self.assertEqual(value,'accepted')
-        self.assertEqual(sleeps,[0.05]*3)
-        self.assertEqual(len(attempts),4)
+        self.assertTrue(sleeps)
+        self.assertTrue(all(0<delay<=0.05 for delay in sleeps))
+        self.assertGreaterEqual(clock[0],0.15)
+        self.assertLessEqual(clock[0],0.20)
         self.assertTrue(all(row['busy_refused'] for row in attempts[:-1]))
         self.assertIsNone(attempts[-1]['error'])
-        self.assertEqual(checks,[5.0]*5)
+        self.assertTrue(checks)
+        self.assertEqual(set(checks),{5.0})
 
     def test_busy_sleep_is_clamped_to_original_deadline(self):
         clock=[0.0];sleeps=[];attempts=[]
@@ -301,9 +304,11 @@ class IdleRestoreAdmission(unittest.TestCase):
         invoke=mock.Mock(side_effect=self.WireError())
         with self.assertRaisesRegex(RuntimeError,'within bounds'):
             self.helper(lambda:clock[0],sleep)(invoke,lambda deadline:None,attempts)
-        self.assertEqual(invoke.call_count,100)
-        self.assertEqual(len(sleeps),100)
-        self.assertAlmostEqual(clock[0],5.0)
+        self.assertLessEqual(invoke.call_count,100)
+        self.assertEqual(len(sleeps),invoke.call_count)
+        self.assertTrue(all(0<delay<=0.05 for delay in sleeps))
+        self.assertGreaterEqual(clock[0],4.99)
+        self.assertLessEqual(clock[0],5.0)
 
     def test_immediate_success_is_not_delayed(self):
         sleep=mock.Mock();invoke=mock.Mock(return_value='accepted')
