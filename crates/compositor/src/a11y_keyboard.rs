@@ -62,6 +62,8 @@ struct Inner {
     last_custom: Option<(u32, Instant)>,
     passed_custom: HashSet<u16>,
     revoked: HashSet<String>,
+    /// The emitter sleeps until the next event; see [`Monitor::wake`].
+    parked: bool,
 }
 impl Inner {
     fn invalidate(&mut self) {
@@ -130,9 +132,11 @@ impl Inner {
 pub(crate) struct Event {
     epoch: u64,
     owner: String,
+    /// `None` stops the emitter, or only wakes it with `wake`.
     key: Option<Key>,
     lifetime: u64,
     custom_modifier: bool,
+    wake: bool,
 }
 #[derive(Clone)]
 pub struct Monitor {
@@ -160,6 +164,7 @@ impl Monitor {
             last_custom: None,
             passed_custom: HashSet::new(),
             revoked: HashSet::new(),
+            parked: false,
         }));
         let (events, incoming) = mpsc::sync_channel::<Event>(256);
         let monitor = Self { inner, events };
@@ -214,7 +219,22 @@ impl Monitor {
             key: None,
             lifetime: 0,
             custom_modifier: false,
+            wake: false,
         });
+    }
+    /// A parked emitter has no deadline to wake for: rouse it to service
+    /// a reset requested off its thread. A busy one sees it next pass.
+    fn wake(&self, inner: &mut Inner) {
+        if std::mem::take(&mut inner.parked) {
+            let _ = self.events.try_send(Event {
+                epoch: 0,
+                owner: String::new(),
+                key: None,
+                lifetime: 0,
+                custom_modifier: false,
+                wake: true,
+            });
+        }
     }
     pub fn set_locked(&self, locked: bool) {
         let mut inner = self.inner.lock().unwrap();
@@ -223,6 +243,7 @@ impl Monitor {
             if locked {
                 inner.suspend_holds();
                 inner.request_reset();
+                self.wake(&mut inner);
             }
             inner.epoch = inner.epoch.wrapping_add(1);
             inner.custom.clear();
@@ -302,6 +323,7 @@ impl Monitor {
                 key: Some(key),
                 lifetime: inner.lifetime,
                 custom_modifier: custom,
+                wake: false,
             };
             if self.events.try_send(event).is_err() {
                 // Losing a press/release can strand Orca modifiers. Fail closed
@@ -327,6 +349,7 @@ impl Monitor {
             if inner.revoked.len() >= 256 {
                 inner.pid = 0;
                 inner.available = Availability::Unavailable;
+                self.wake(&mut inner);
             }
             inner.revoked.insert(old.to_owned());
         }
@@ -401,7 +424,23 @@ impl Monitor {
                     delivery = Err(error);
                     break;
                 }
-                match incoming.recv_timeout(Duration::from_millis(10)) {
+                // Sleep until the next key (#503): only a pending reset,
+                // whose deadline fails the reader, needs the 10 ms check.
+                let resetting = {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.parked = inner.reset.is_none();
+                    !inner.parked
+                };
+                let next = if resetting {
+                    incoming.recv_timeout(Duration::from_millis(10))
+                } else {
+                    incoming
+                        .recv()
+                        .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                };
+                self.inner.lock().unwrap().parked = false;
+                match next {
+                    Ok(event) if event.wake => {}
                     Ok(event) if event.key.is_none() => break,
                     Ok(event) => {
                         if let Err(error) =
@@ -665,6 +704,7 @@ pub(crate) mod tests {
             last_custom: None,
             passed_custom: HashSet::new(),
             revoked: HashSet::new(),
+            parked: false,
         };
         (
             Monitor {
@@ -682,6 +722,21 @@ pub(crate) mod tests {
             state,
             unichar: 0,
         }
+    }
+    #[test]
+    fn a_parked_emitter_is_woken_only_for_a_reset_it_must_send() {
+        // The emitter blocks between keys instead of polling (#503); a
+        // lock's reset requested off its thread rouses it once.
+        let (m, events) = monitor(vec![0xffe5], vec![]);
+        m.inner.lock().unwrap().parked = true;
+        m.set_locked(true);
+        let wake = events.try_recv().unwrap();
+        assert!(wake.wake && wake.key.is_none());
+        assert!(m.inner.lock().unwrap().reset.is_some());
+        // Already roused: a second request adds no wake.
+        m.set_locked(false);
+        m.set_locked(true);
+        assert!(events.try_recv().is_err());
     }
     #[test]
     fn custom_modifier_single_is_grabbed_double_passes_balanced() {

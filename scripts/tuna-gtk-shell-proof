@@ -100,6 +100,7 @@
 #   G-OV-APPGRID Show Apps opens the app grid
 #   G-X11-APP      XWayland is on by default: an X11 app launched from
 #                  overview search gets DISPLAY and maps a window (#59)
+#   G-X11-INPUT-FOCUS the X server's input focus is the focused X11 window
 #   G-SETTINGS-CLOCK GNOME's clock-show-seconds key changes the panel clock
 #   G-SETTINGS-INPUT GNOME's input sources set the keymap (Super+Space
 #                  switches), repeat-interval the repeat rate, and
@@ -4328,6 +4329,28 @@ EOF
     hints_icon="$(jq -r '.windows[] | select(.app_id == "TunaHintsProbe") | .icon' "$CSTATE")"
     [ -s "$hints_icon" ] || fail G-WINDOW-ICONS "WM_HINTS icon cache missing"
     cp "$hints_icon" "$ARTIFACTS/wm-hints-window-icon.png"
+    # The X server's own input focus follows the focused X11 window (Mutter's
+    # meta_x11_display_set_input_focus). Left PointerRoot, keys reach
+    # whichever X11 window lies under the X pointer instead. xeyes asks for
+    # no input (WM_HINTS input False, no WM_TAKE_FOCUS), so like Mutter Tuna
+    # never gives it X focus; xev sets no WM_HINTS, ICCCM's Passive default.
+    x11_before="$(jq -c '[.windows[] | .id]' "$CSTATE")"
+    DISPLAY="$x11_display" xev >/dev/null 2>&1 &
+    XEV_PID=$!
+    cstate ".focused != null and (.focused as \$f | $x11_before | index(\$f) == null)" "xev focused" ||
+        fail G-X11-INPUT-FOCUS "xev never took model focus"
+    xev_window="$(DISPLAY="$x11_display" xdotool search --name '^Event Tester$' | head -1)"
+    x_focus=""
+    for _ in $(seq 1 25); do
+        x_focus="$(DISPLAY="$x11_display" xdotool getwindowfocus 2>/dev/null || true)"
+        [ -n "$xev_window" ] && [ "$x_focus" = "$xev_window" ] && break
+        sleep 0.2
+    done
+    if [ -z "$xev_window" ] || [ "$x_focus" != "$xev_window" ]; then
+        fail G-X11-INPUT-FOCUS "X input focus is '$x_focus', not the focused X11 window '$xev_window'"
+    fi
+    kill "$XEV_PID" 2>/dev/null || true
+    pass G-X11-INPUT-FOCUS "X input focus is the focused X11 window $xev_window"
 else
     echo "tuna-gtk-shell-proof: G-X11-APP skipped (no Xwayland or xeyes)"
 fi

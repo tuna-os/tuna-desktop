@@ -15,16 +15,24 @@ use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Transform};
 
 /// One drawn element as the damage tracker sees it: at the scale of the
 /// pass that draws it, with the element's own damage history. It claims
-/// no opaque region, so damage beneath it is never dropped.
+/// no opaque region of its own: the tracker is given the passes bottom to
+/// top, so its own opaque culling would hide elements under the ones
+/// below them. What covers it is carried in `above` instead.
 #[derive(Clone, Copy)]
 pub(crate) struct Tracked<'a> {
     element: &'a dyn Element,
     scale: f64,
+    /// Opaque frame-space area of the elements drawn over this one.
+    above: &'a [Rectangle<i32, Physical>],
 }
 
 impl<'a> Tracked<'a> {
     pub(crate) fn new(element: &'a dyn Element, scale: f64) -> Self {
-        Self { element, scale }
+        Self {
+            element,
+            scale,
+            above: &[],
+        }
     }
 
     /// A pass's elements, given front to back, bottom to top: an element
@@ -36,6 +44,54 @@ impl<'a> Tracked<'a> {
             .rev()
             .map(|element| Self::new(element, scale))
             .collect()
+    }
+
+    /// [`pass`](Self::pass) whose elements damage only what the opaque
+    /// elements in front of them in `cover` leave showing (#503), as
+    /// drawing culls it: a graph redrawing under another window repaints
+    /// nothing, like Mutter's unobscured-region clipping.
+    pub(crate) fn covered_pass<E: Element>(
+        elements: &'a [E],
+        scale: f64,
+        cover: &'a Cover,
+    ) -> Vec<Self> {
+        debug_assert_eq!(elements.len(), cover.ends.len());
+        elements
+            .iter()
+            .zip(&cover.ends)
+            .rev()
+            .map(|(element, end)| Self {
+                element,
+                scale,
+                above: &cover.rects[..*end],
+            })
+            .collect()
+    }
+}
+
+/// The opaque area in front of each element of one pass, in frame
+/// pixels, as [`crate::occlusion::Occlusion`] culls drawing beneath it:
+/// only `Element::opaque_regions`, clipped to the element's geometry.
+pub(crate) struct Cover {
+    rects: Vec<Rectangle<i32, Physical>>,
+    /// Per element, front to back: how many of `rects` lie in front of it.
+    ends: Vec<usize>,
+}
+
+impl Cover {
+    /// `elements` front to back, drawn at `scale`, every one of them
+    /// drawn after (over) everything below it in the slice.
+    pub(crate) fn new<E: Element>(elements: &[E], scale: f64) -> Self {
+        let mut rects = Vec::new();
+        let mut ends = Vec::with_capacity(elements.len());
+        for element in elements {
+            ends.push(rects.len());
+            let geometry = element.geometry(scale.into());
+            rects.extend(element.opaque_regions(scale.into()).iter().filter_map(|r| {
+                Rectangle::new(r.loc + geometry.loc, r.size).intersection(geometry)
+            }));
+        }
+        Self { rects, ends }
     }
 }
 
@@ -63,7 +119,22 @@ impl Element for Tracked<'_> {
         _scale: Scale<f64>,
         commit: Option<CommitCounter>,
     ) -> DamageSet<i32, Physical> {
-        self.element.damage_since(self.scale.into(), commit)
+        let damage = self.element.damage_since(self.scale.into(), commit);
+        if self.above.is_empty() || damage.is_empty() {
+            return damage;
+        }
+        // Damage is relative to the element, as the tracker places it.
+        let origin = self.element.geometry(self.scale.into()).loc;
+        Rectangle::subtract_rects_many_in_place(
+            damage
+                .iter()
+                .map(|r| Rectangle::new(r.loc + origin, r.size))
+                .collect(),
+            self.above.iter().copied(),
+        )
+        .into_iter()
+        .map(|r| Rectangle::new(r.loc - origin, r.size))
+        .collect()
     }
     fn alpha(&self) -> f32 {
         self.element.alpha()
@@ -158,6 +229,11 @@ impl FrameSignature {
 /// they save in fill; past it the damage collapses to its bounds.
 pub(crate) const MAX_DAMAGE_RECTS: usize = 16;
 
+/// The one pixel a frame without visible damage repaints (#503).
+fn timing_rect() -> Rectangle<i32, Physical> {
+    Rectangle::new((0, 0).into(), (1, 1).into())
+}
+
 /// The buffer-age damage as a set of rectangles (#503): a clock tick in
 /// the bar and a progress bar in a window repaint two small areas, not
 /// the bounding box spanning the output. A surface's commit damages what
@@ -168,15 +244,46 @@ pub(crate) fn damage_region(
     age: usize,
     passes: &[Vec<Tracked<'_>>],
 ) -> Result<Vec<Rectangle<i32, Physical>>, OutputNoMode> {
-    let elements: Vec<_> = passes.iter().flatten().collect();
+    // Every frame damages the timing pixel, on top of everything: a frame
+    // whose element damage is all covered is still a submitted frame, so
+    // the tracker must record it and the commits it covered. With nothing
+    // damaged it records neither, and a window committing on under
+    // another soon outruns its surface damage history and damages whole.
+    let timing = timing_pixel();
+    let timing = Tracked::new(&timing, 1.0);
+    let elements: Vec<_> = passes
+        .iter()
+        .flatten()
+        .chain(std::iter::once(&timing))
+        .collect();
     let (damage, _) = tracker.damage_output(age, &elements)?;
-    // A timing-only request still needs an actual page flip. A minimal repaint
-    // submits that real frame rather than manufacturing presentation feedback.
-    let rects = coalesce(damage.map(|rects| rects.to_vec()).unwrap_or_default());
-    Ok(if rects.is_empty() {
-        vec![Rectangle::new((0, 0).into(), (1, 1).into())]
-    } else {
-        rects
+    let mut rects = coalesce(damage.map(|rects| rects.to_vec()).unwrap_or_default());
+    // The pixel never changes the picture: other damage paints alone. A
+    // timing-only request still needs an actual page flip; repainting the
+    // pixel submits that real frame rather than manufacturing
+    // presentation feedback.
+    let pixel = timing_rect();
+    if rects.len() > 1 {
+        rects.retain(|rect| *rect != pixel);
+    }
+    Ok(if rects.is_empty() { vec![pixel] } else { rects })
+}
+
+/// The timing pixel's element: a new commit each frame, never drawn.
+fn timing_pixel() -> smithay::backend::renderer::element::solid::SolidColorRenderElement {
+    use std::cell::Cell;
+    thread_local! {
+        static TIMING: (Id, Cell<usize>) = (Id::new(), Cell::new(0));
+    }
+    TIMING.with(|(id, frame)| {
+        frame.set(frame.get().wrapping_add(1));
+        smithay::backend::renderer::element::solid::SolidColorRenderElement::new(
+            id.clone(),
+            timing_rect(),
+            frame.get(),
+            Color32F::TRANSPARENT,
+            Kind::Unspecified,
+        )
     })
 }
 
@@ -567,6 +674,8 @@ mod tests {
         commit: CommitCounter,
         geometry: Rectangle<i32, Physical>,
         damage: Rectangle<i32, Physical>,
+        /// Whether the client declared the whole surface opaque.
+        opaque: bool,
     }
 
     impl Element for Surface {
@@ -600,6 +709,150 @@ mod tests {
                 _ => DamageSet::from_slice(&[Rectangle::from_size(self.geometry(scale).size)]),
             }
         }
+        fn opaque_regions(
+            &self,
+            scale: Scale<f64>,
+        ) -> smithay::backend::renderer::utils::OpaqueRegions<i32, Physical> {
+            if self.opaque {
+                [Rectangle::from_size(self.geometry(scale).size)]
+                    .into_iter()
+                    .collect()
+            } else {
+                Default::default()
+            }
+        }
+    }
+
+    /// One window pass, front to back, culled by its own opaque windows.
+    fn covered(
+        tracker: &mut OutputDamageTracker,
+        age: usize,
+        windows: &[Surface],
+    ) -> Vec<Rectangle<i32, Physical>> {
+        let cover = Cover::new(windows, 1.0);
+        damage_region(tracker, age, &[Tracked::covered_pass(windows, 1.0, &cover)]).unwrap()
+    }
+
+    fn window(
+        geometry: Rectangle<i32, Physical>,
+        damage: Rectangle<i32, Physical>,
+        opaque: bool,
+    ) -> Surface {
+        Surface {
+            id: Id::new(),
+            commit: CommitCounter::default(),
+            geometry,
+            damage,
+            opaque,
+        }
+    }
+
+    #[test]
+    fn damage_under_an_opaque_window_repaints_nothing() {
+        // System Monitor's graph redraws under Files (the perf lane's
+        // final settle): nothing on screen changes, so only the 1x1
+        // timing repaint is left, not the graph and Files over it.
+        let files = window(rect(195, 141, 890, 549), rect(0, 0, 1, 1), true);
+        let monitor = window(rect(240, 56, 800, 719), rect(20, 200, 760, 150), false);
+        let mut windows = [files, monitor];
+        let mut tracker = OutputDamageTracker::new((1280, 800), 1.0, Transform::Normal);
+        covered(&mut tracker, 0, &windows);
+        windows[1].commit.increment();
+        assert_eq!(covered(&mut tracker, 1, &windows), vec![rect(0, 0, 1, 1)]);
+        // Damage reaching past Files repaints only the part that shows.
+        windows[1].damage = rect(20, 600, 760, 100);
+        windows[1].commit.increment();
+        assert_eq!(
+            covered(&mut tracker, 1, &windows),
+            vec![rect(260, 690, 760, 66)]
+        );
+        // A buffer two frames old also repaints the previous frame's.
+        windows[1].damage = rect(20, 200, 760, 150);
+        windows[1].commit.increment();
+        assert_eq!(
+            covered(&mut tracker, 2, &windows),
+            vec![rect(260, 690, 760, 66)]
+        );
+    }
+
+    #[test]
+    fn translucent_windows_hide_no_damage() {
+        // A shadow, a fading window or a translucent terminal: whatever
+        // redraws beneath it shows through.
+        let glass = window(rect(100, 100, 400, 300), rect(0, 0, 1, 1), false);
+        let below = window(rect(150, 150, 200, 200), rect(10, 10, 50, 50), false);
+        let mut windows = [glass, below];
+        let mut tracker = OutputDamageTracker::new((1280, 800), 1.0, Transform::Normal);
+        covered(&mut tracker, 0, &windows);
+        windows[1].commit.increment();
+        assert_eq!(
+            covered(&mut tracker, 1, &windows),
+            vec![rect(160, 160, 50, 50)]
+        );
+    }
+
+    #[test]
+    fn covered_commits_never_outrun_the_surface_damage_history() {
+        // Each covered frame still records the commit it hid: ten graph
+        // updates under Files never fall back to damaging System Monitor
+        // whole (this test surface damages whole past one commit, as a
+        // surface past its damage history does).
+        let files = window(rect(195, 141, 890, 549), rect(0, 0, 1, 1), true);
+        let monitor = window(rect(240, 56, 800, 719), rect(20, 200, 760, 150), false);
+        let mut windows = [files, monitor];
+        let mut tracker = OutputDamageTracker::new((1280, 800), 1.0, Transform::Normal);
+        covered(&mut tracker, 0, &windows);
+        // Two buffers cycling: the first aged frame has no history yet.
+        windows[1].commit.increment();
+        covered(&mut tracker, 2, &windows);
+        for _ in 0..10 {
+            windows[1].commit.increment();
+            assert_eq!(covered(&mut tracker, 2, &windows), vec![rect(0, 0, 1, 1)]);
+        }
+    }
+
+    #[test]
+    fn uncovering_repaints_what_changed_beneath() {
+        // Damage hidden while covered is never lost: when the window on
+        // top moves away, what is beneath repaints as it is now.
+        let files = window(rect(100, 100, 400, 300), rect(0, 0, 1, 1), true);
+        let monitor = window(rect(100, 100, 400, 300), rect(0, 0, 400, 300), false);
+        let mut windows = [files, monitor];
+        let mut tracker = OutputDamageTracker::new((1280, 800), 1.0, Transform::Normal);
+        covered(&mut tracker, 0, &windows);
+        windows[1].commit.increment();
+        assert_eq!(covered(&mut tracker, 1, &windows), vec![rect(0, 0, 1, 1)]);
+        windows[0].geometry.loc.x = 600;
+        let shown = covered(&mut tracker, 1, &windows);
+        assert!(
+            contains(&shown, 100, 100) && contains(&shown, 499, 399),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn covered_damage_stays_relative_to_its_scaled_element() {
+        // At scale 2 the cover and the damage are both in frame pixels.
+        let top = window(rect(0, 0, 100, 100), rect(0, 0, 1, 1), true);
+        let below = window(rect(50, 0, 100, 100), rect(0, 0, 100, 10), false);
+        let mut windows = [top, below];
+        assert_eq!(
+            Cover::new(&windows[..1], 2.0).rects,
+            vec![rect(0, 0, 200, 200)]
+        );
+        let scaled = |tracker: &mut OutputDamageTracker, age, windows: &[Surface]| {
+            let cover = Cover::new(windows, 2.0);
+            damage_region(tracker, age, &[Tracked::covered_pass(windows, 2.0, &cover)]).unwrap()
+        };
+        let mut tracker = OutputDamageTracker::new((2560, 1600), 1.0, Transform::Normal);
+        scaled(&mut tracker, 0, &windows);
+        windows[1].commit.increment();
+        // `below` starts at x 50 and spans 200 frame pixels; its damage
+        // is 200x20 there, of which x 200..250 shows.
+        assert_eq!(
+            scaled(&mut tracker, 1, &windows),
+            vec![rect(200, 0, 50, 20)]
+        );
     }
 
     #[test]
@@ -610,6 +863,7 @@ mod tests {
             commit: CommitCounter::default(),
             geometry: rect(100, 100, 600, 400),
             damage: rect(20, 30, 100, 50),
+            opaque: false,
         };
         let mut tracker = OutputDamageTracker::new((1280, 800), 1.0, Transform::Normal);
         damage(&mut tracker, 0, std::slice::from_ref(&window));

@@ -183,3 +183,14 @@ compositor could not open the node, where Mutter advertises it anyway.
 drm-smoke's D-LEASE leases the vkms connector through it with a real
 client. The isolated diff is retained in DRM-LEASE-PATCH.diff; the pinned
 version stays 0.7.0.
+
+The X11 input-focus fix changes src/xwayland/xwm/surface.rs. Roost's seat
+keyboard focus is the X11 window's Xwayland wl_surface, so the X half of
+X11Surface's KeyboardTarget enter/leave (SetInputFocus and WM_TAKE_FOCUS by
+the ICCCM input mode) never ran: the X server stayed PointerRoot and keys
+went to whichever X11 window was under the X pointer. The additive
+X11Surface::set_input_focus performs exactly that X half, as Mutter's
+meta_x11_display_set_input_focus does; enter/leave are unchanged. The
+nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
+The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
+version stays 0.7.0.

@@ -555,6 +555,42 @@ impl X11Surface {
         Ok(())
     }
 
+    /// The X11 half of keyboard focus, per the window's ICCCM input mode:
+    /// `SetInputFocus` to this window (Passive, LocallyActive) and/or
+    /// `WM_TAKE_FOCUS` (LocallyActive, GloballyActive); unfocusing sets the
+    /// X input focus to None. [`KeyboardTarget`] for `X11Surface` does this
+    /// on enter/leave; compositors whose keyboard focus is the window's
+    /// `wl_surface` call it directly, as Mutter's
+    /// meta_x11_display_set_input_focus does for X11 windows.
+    pub fn set_input_focus(&self, focused: bool) -> Result<(), ConnectionError> {
+        let mode = self.input_mode();
+        if mode == InputMode::None || self.is_override_redirect() {
+            return Ok(());
+        }
+        let Some(conn) = self.conn.upgrade() else {
+            return Ok(());
+        };
+        if !focused {
+            conn.set_input_focus(InputFocus::NONE, x11rb::NONE, x11rb::CURRENT_TIME)?;
+            conn.flush()?;
+            return Ok(());
+        }
+        if matches!(mode, InputMode::Passive | InputMode::LocallyActive) {
+            conn.set_input_focus(InputFocus::NONE, self.window, x11rb::CURRENT_TIME)?;
+        }
+        if matches!(mode, InputMode::LocallyActive | InputMode::GloballyActive) {
+            let event = ClientMessageEvent::new(
+                32,
+                self.window,
+                self.atoms.WM_PROTOCOLS,
+                [self.atoms.WM_TAKE_FOCUS, x11rb::CURRENT_TIME, 0, 0, 0],
+            );
+            conn.send_event(false, self.window, EventMask::NO_EVENT, event)?;
+        }
+        conn.flush()?;
+        Ok(())
+    }
+
     /// Returns the reported window type of the underlying X11 window if set.
     ///
     /// Windows without a window type set should be considered to be of type `Normal` for

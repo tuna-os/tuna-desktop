@@ -60,11 +60,18 @@ nightly qualify gaps of the released build that those lanes prove.
 | Greeter | `V-GREETER-LIST`, `V-GDM-FALLBACK`, `V-GDM-LOGIN`, `V-DISPLAY-MANAGER` |
 | Session and portals | `V-CALENDAR`, `V-PORTAL`, `V-PORTAL-GNOME`, `V-PORTAL-SCREENSHOT`, `V-PORTAL-SCREENCAST` |
 | Lock and sleep | `V-LOCK`, `V-AUTH-FAIL-CLOSED`, `V-SLEEP-AUTH-FAIL-CLOSED`, `V-SLEEP-FRESH-AUTH`, `V-LIFECYCLE` |
+| Bounded soak | `V-SOAK` and the startup checks on a sixth pristine boot ([soak](soak.md)) |
 
 The VM profile is the existing q35/OVMF KVM guest: four CPUs, 6 GiB RAM,
 virtio VGA at 1280×800 and the existing 20 GiB raw disk. The daily workflow
 requires KVM rather than silently falling back to emulation. It also runs
 on pull requests that change the workflow, fixture or harness.
+
+After the qualification boots, a sixth pristine boot runs the bounded
+[VM soak](soak.md): 3000 s of memory sampling and native frame pacing
+(900 s on pull requests), published as the
+`published-marlin-tuna-soak-<run id>` artifact with a summary of memory and
+frame pacing over time. The job allows 150 minutes for both.
 
 The artifact records the digest under test, fixture image identity, shipped
 package version and hashes, harness commit, run ID, frames, tour clip,
@@ -77,8 +84,8 @@ markers; it is retained with the other evidence instead of sending
 messages or filing issues.
 
 The workflow must produce an actual green published-flavor run before
-issue #68 is accepted. These checks do not qualify physical hardware,
-output hotplug or a 24-hour soak.
+issue #68 is accepted. These checks do not qualify physical hardware or
+output hotplug, and the bounded soak is not the 24-hour soak.
 
 Source references: [TunaOS GDM switch for Tuna flavors](https://github.com/tuna-os/tunaOS/blob/main/experiences/tuna/README.md),
 [TunaOS session hiding](https://github.com/tuna-os/tunaOS/blob/main/build_scripts/desktop/tuna-hide-other-sessions.sh),

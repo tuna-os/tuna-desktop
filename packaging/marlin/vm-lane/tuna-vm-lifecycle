@@ -2029,6 +2029,68 @@ def shell_stack():
     return {"shells": shells}
 
 
+# The bounded nightly soak (docs/soak.md): the published fixture installs
+# scripts/tuna-vm-soak with its native frame workload beside it.
+SOAK_UNIT = "tuna-vm-soak"
+SOAK_OBSERVER = pathlib.Path("/usr/libexec/tuna-soak/tuna-vm-soak")
+SOAK_OUT = pathlib.Path("/var/tmp/tuna-vm-soak")
+SOAK_FILES = ("provenance.json", "samples.jsonl", "report.json", "presentation.jsonl", "presentation.stderr")
+# Raw bytes per read; base64 twice (here and QGA) stays under the lane's 1 MiB reply bound.
+SOAK_CHUNK = 384 * 1024
+
+
+def soak_start(seconds, warmup, interval, revision):
+    if SOAK_OUT.exists():
+        raise RuntimeError("soak output directory must be fresh")
+    compositor = owned_compositor(inventory()["processes"])
+    # The actual DRM session's socket, as runtime::default_for_pid names it.
+    display = f"{NESTED}{compositor['pid']}"
+    # A root transient service outside the session UID, as docs/soak.md runs it;
+    # RemainAfterExit keeps a successful exit status for soak-status.
+    call("systemd-run", f"--unit={SOAK_UNIT}", "--property=Type=exec", "--property=RemainAfterExit=yes",
+         "--quiet", str(SOAK_OBSERVER), "--user", OWNER.pw_name, "--source-revision", revision,
+         "--out", str(SOAK_OUT), "--seconds", str(seconds), "--warmup", str(warmup),
+         "--interval", str(interval), "--presentation", "--wayland-display", display)
+    return {"unit": SOAK_UNIT, "out": str(SOAK_OUT), "wayland_display": display, "compositor": compositor}
+
+
+def soak_status():
+    shown = call("systemctl", "show", SOAK_UNIT,
+                 "--property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus")
+    unit = dict(line.split("=", 1) for line in shown.splitlines() if "=" in line)
+    running = (unit.get("ActiveState") in ("activating", "active", "deactivating", "reloading")
+               and unit.get("SubState") != "exited")
+    files = {name: (SOAK_OUT / name).stat().st_size for name in SOAK_FILES if (SOAK_OUT / name).is_file()}
+    count, last = 0, None
+    if "samples.jsonl" in files:
+        # Only newline-terminated rows: the observer may be mid-write.
+        rows = (SOAK_OUT / "samples.jsonl").read_bytes().split(b"\n")[:-1]
+        count = len(rows)
+        if rows:
+            row = json.loads(rows[-1])
+            pacing = row.get("presentation") or {}
+            last = {key: row[key] for key in ("elapsed_s", "pss_kib", "rss_kib", "fds", "processes")}
+            last |= {"frames": pacing.get("frames"),
+                     "p99_ms": (pacing.get("interval_ms") or {}).get("p99")}
+    result = {"unit": unit, "running": running, "samples": count, "files": files, "last": last}
+    if not running:
+        result["sha256"] = {name: hashlib.sha256((SOAK_OUT / name).read_bytes()).hexdigest() for name in files}
+        # The observer's own failure text; it never prints credentials.
+        result["journal"] = call("journalctl", "--unit", SOAK_UNIT, "--output", "cat", "--no-pager",
+                                 "--lines", "80", check=False)[-8192:]
+    return result
+
+
+def soak_read(name, offset):
+    if name not in SOAK_FILES or offset < 0:
+        raise ValueError("unknown soak file or offset")
+    with (SOAK_OUT / name).open("rb") as stream:
+        stream.seek(offset)
+        data = stream.read(SOAK_CHUNK)
+        size = os.fstat(stream.fileno()).st_size
+    return {"name": name, "offset": offset, "size": size, "data": base64.b64encode(data).decode()}
+
+
 def main():
     if sys.argv[1] == "background-user-diagnostics":
         print(json.dumps(background_user_diagnostics()))
@@ -2047,6 +2109,20 @@ def main():
             # traceback text itself never leaves the guest.
             print(json.dumps({"inventory_error": inventory_error(error)}))
             raise SystemExit(1) from None
+    elif action == "soak-start":
+        if len(sys.argv) != 6:
+            raise ValueError("soak-start takes seconds, warmup, interval and source revision")
+        seconds, warmup, interval = (int(value) for value in sys.argv[2:5])
+        revision = sys.argv[5]
+        if len(revision) != 40 or set(revision) - set("0123456789abcdef"):
+            raise ValueError("soak source revision must be one full commit")
+        result = soak_start(seconds, warmup, interval, revision)
+    elif action == "soak-status":
+        result = soak_status()
+    elif action == "soak-read":
+        if len(sys.argv) != 4:
+            raise ValueError("soak-read takes a file name and offset")
+        result = soak_read(sys.argv[2], int(sys.argv[3]))
     elif action in ("strip-start", "strip-edge-start", "strip-state", "strip-stop"):
         if len(sys.argv) != 3:
             raise ValueError("strip action requires exactly one nonce")

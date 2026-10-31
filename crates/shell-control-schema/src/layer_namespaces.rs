@@ -44,6 +44,8 @@ pub const NETWORK_AGENT_NAMESPACE: &str = "tuna-network-agent";
 pub const OSD_NAMESPACE: &str = "tuna-osd";
 /// GTK PolicyKit authentication surface.
 pub const POLKIT_NAMESPACE: &str = "tuna-polkit";
+/// GTK mount-operation prompt surface (volume passphrases and questions).
+pub const MOUNT_OPERATION_NAMESPACE: &str = "tuna-mount-operation";
 /// GTK end-session dialog surface.
 pub const END_SESSION_NAMESPACE: &str = "tuna-shell-end-session";
 /// GTK overview preview chrome surface. Like the app grid, it takes the
