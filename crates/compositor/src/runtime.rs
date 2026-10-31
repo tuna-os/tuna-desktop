@@ -4515,7 +4515,7 @@ impl Runtime {
                 clock.saturating_sub(*start).as_secs_f64()
                     < 0.2 * self.input_settings.motion.slowdown()
             })
-            || self.state.protocols.bell.visual(now).is_some()
+            || self.state.protocols.bell.visual_active()
             || self.shell_swipe.is_some()
             || self.overlay.visible
             || !self.casts.is_empty()

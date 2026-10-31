@@ -316,6 +316,12 @@ once at its end, a scroll once, a playing sink or `event-sounds` off never).
 A `canberra-gtk-play` stand-in logs every event sound to `canberra-calls`;
 none of these gates plays or captures audio.
 
+The bell timeline presents each 50 ms leg's endpoint before reversing,
+including when a frame arrives late, as Mutter's Clutter timeline does.
+Deterministic bell tests cover delayed samples and a first frame after the
+nominal flash lifetime; the host-pixel coverage and intensity gates remain
+unchanged.
+
 The full GTK proof's media callback barrier waits at most 25 seconds:
 one key can execute four serialized `wpctl` subprocesses with five-second
 production timeouts, plus callback dispatch. It still requires accepted
