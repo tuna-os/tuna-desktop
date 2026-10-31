@@ -21,6 +21,8 @@ use wayland_client::{
         wl_pointer::{Event as PointerEvent, WlPointer},
         wl_registry::WlRegistry,
         wl_seat::WlSeat,
+        wl_subcompositor::WlSubcompositor,
+        wl_subsurface::WlSubsurface,
         wl_surface::WlSurface,
     },
     Connection, Dispatch, EventQueue, Proxy, QueueHandle,
@@ -46,6 +48,7 @@ const BTN_LEFT: u32 = 0x110;
 #[derive(Default)]
 struct Client {
     compositor: Option<WlCompositor>,
+    subcompositor: Option<WlSubcompositor>,
     seat: Option<WlSeat>,
     xdg_base: Option<XdgWmBase>,
     keyboard: Option<WlKeyboard>,
@@ -95,6 +98,9 @@ impl Dispatch<WlRegistry, ()> for Client {
             match interface.as_str() {
                 "wl_compositor" => {
                     state.compositor = Some(registry.bind(name, version.min(6), qh, ()));
+                }
+                "wl_subcompositor" => {
+                    state.subcompositor = Some(registry.bind(name, 1, qh, ()));
                 }
                 "wl_seat" => {
                     let seat: WlSeat = registry.bind(name, version, qh, ());
@@ -269,6 +275,8 @@ macro_rules! empty_dispatch {
 empty_dispatch!(WlDisplay);
 empty_dispatch!(WlCompositor);
 empty_dispatch!(WlSurface);
+empty_dispatch!(WlSubcompositor);
+empty_dispatch!(WlSubsurface);
 empty_dispatch!(WlSeat);
 empty_dispatch!(XdgToplevel);
 empty_dispatch!(XdgPositioner);
@@ -894,4 +902,38 @@ fn the_window_menu_needs_the_latest_press_on_the_window() {
     f.toplevel.show_window_menu(&seat, serial, 20, 10);
     sync(&mut f);
     assert_eq!(f.manager.take_menu_requests().len(), 1);
+}
+
+#[test]
+fn a_subsurface_cannot_be_placed_above_or_below_itself() {
+    for above in [true, false] {
+        let mut f = fixture();
+        let qh = f.queue.handle();
+        let child = f
+            .client
+            .compositor
+            .as_ref()
+            .unwrap()
+            .create_surface(&qh, ());
+        let subsurface = f.client.subcompositor.as_ref().unwrap().get_subsurface(
+            &child,
+            &f.toplevel_surface,
+            &qh,
+            (),
+        );
+        sync(&mut f);
+        if above {
+            subsurface.place_above(&child);
+        } else {
+            subsurface.place_below(&child);
+        }
+        let error = protocol_error(&mut f);
+        assert_eq!(error.object_interface, "wl_subsurface", "{error:?}");
+        assert_eq!(
+            error.code,
+            wayland_client::protocol::wl_subsurface::Error::BadSurface as u32,
+            "{error:?}"
+        );
+        another_client_is_served(&mut f);
+    }
 }

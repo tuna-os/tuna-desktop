@@ -182,3 +182,13 @@ fuzzer:
 crates/compositor/tests/popups.rs covers the popup parent checks. The
 isolated diff is retained in XDG-SHELL-FUZZ-PATCH.diff; the pinned version
 stays 0.7.0.
+
+Issue #203 also changes src/wayland/compositor/tree.rs: placing a
+subsurface above itself removed it from its parent's child list, then
+inserted past the end and panicked. Both above-self and below-self now
+return an error before changing the list, which the request handler turns
+into `wl_subsurface.bad_surface`. This matches Mutter's `is_sibling`
+and `subsurface_place` in meta-wayland-subsurface.c. A missing child in
+the parent's list likewise returns an error instead of unwrapping.
+The real-client regression in crates/compositor/tests/popups.rs covers
+both requests and confirms another client is still served afterward.
