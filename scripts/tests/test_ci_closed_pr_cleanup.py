@@ -137,7 +137,7 @@ class ClosedPRCleanupTests(unittest.TestCase):
         cancelled = []
 
         def get(path):
-            if "page=1" in path:
+            if path.endswith("page=1"):
                 return {"total_count": 101, "workflow_runs": [run(i) for i in range(1, 101)]}
             raise RuntimeError("second page failed")
 
