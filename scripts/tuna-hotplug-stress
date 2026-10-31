@@ -24,7 +24,12 @@ every step it gates on the compositor state (TUNA_COMPOSITOR_STATE):
   H-INPUT    Super opens and Escape closes the overview every round
   H-GROWTH   compositor+shell PSS and fds stay bounded over the storm
   H-LIVE     the compositor never exits or panics, the shell never exits
-Needs root (sudo) for modprobe, configfs, seatd and uinput.
+  H-LOCK-HOTPLUG  locked with Super+L, an output plugged in gets the
+             shell's own lock surface and draws no window or layer, even
+             with a window re-homed onto it; unplugged, the session then
+             unlocks through PAM (pam_wrapper) and windows and input are back
+Needs root (sudo) for modprobe, configfs, seatd and uinput, and pam_wrapper
+(libpam-wrapper) for the unlock.
 """
 import argparse
 import json
@@ -41,6 +46,10 @@ INSTANCE = "tuna-hotplug"
 SOCKET = "tuna-hotplug"
 PIPES = 3
 APP_PREFIX = "org.tuna.HotplugStress."
+PAM_WRAPPER = Path("/usr/lib/x86_64-linux-gnu/libpam_wrapper.so")
+PAM_MATRIX = Path("/usr/lib/x86_64-linux-gnu/pam_wrapper/pam_matrix.so")
+# Lowercase letters: typed on the uinput keyboard one key each.
+UNLOCK_PASSWORD = "tunahotplug"
 
 
 def client_worker(name):
@@ -93,7 +102,8 @@ def client_worker(name):
 
 def seat_worker():
     """uinput keyboard and relative mouse (root): one command per stdin
-    line, `key NAME` or `move DX DY`, each answered with `ok`."""
+    line, `key NAME`, `chord NAME...` (pressed in order, released in
+    reverse) or `move DX DY`, each answered with `ok`."""
     from evdev import UInput, ecodes as e
     keyboard = UInput({e.EV_KEY: list(range(e.KEY_ESC, e.KEY_MICMUTE + 1))},
                       name="Tuna hotplug keyboard", bustype=e.BUS_VIRTUAL)
@@ -111,6 +121,13 @@ def seat_worker():
                 keyboard.write(e.EV_KEY, code, value)
                 keyboard.syn()
                 time.sleep(0.03)
+        elif words[0] == "chord":
+            codes = [getattr(e, word) for word in words[1:]]
+            for value, order in ((1, codes), (0, codes[::-1])):
+                for code in order:
+                    keyboard.write(e.EV_KEY, code, value)
+                    keyboard.syn()
+                    time.sleep(0.03)
         elif words[0] == "move":
             mouse.write(e.EV_REL, e.REL_X, int(words[1]))
             mouse.write(e.EV_REL, e.REL_Y, int(words[2]))
@@ -233,6 +250,7 @@ def run(args):
     assertions = {}
     counts = {"hotplugs": 0, "scale_changes": 0, "stored_replugs": 0, "primary_unplugs": 0,
               "overview_toggles": 0}
+    counts["lock_hotplugs"] = 0
     vkms = Vkms()
     system_seatd = subprocess.run(["systemctl", "is-active", "--quiet", "seatd"]).returncode == 0
     seatd = dbus_pid = seat = compositor = None
@@ -284,9 +302,24 @@ def run(args):
                                        "--print-pid=1"], text=True).splitlines()
         env["DBUS_SESSION_BUS_ADDRESS"], dbus_pid = bus[0], int(bus[1])
 
+        # The lock screen's password goes through a real PAM stack:
+        # pam_wrapper serves the compositor's tuna-lock service from a
+        # private password file (as tuna-osk-proof does).
+        if not (PAM_WRAPPER.exists() and PAM_MATRIX.exists()):
+            raise RuntimeError(f"H-LOCK-HOTPLUG needs pam_wrapper (libpam-wrapper): {PAM_WRAPPER}, {PAM_MATRIX}")
+        pam = private / "pam"
+        (pam / "services").mkdir(parents=True)
+        user = subprocess.check_output(["id", "-un"], text=True).strip()
+        (pam / "passdb").write_text(f"{user}:{UNLOCK_PASSWORD}:tuna-lock\n")
+        (pam / "services" / "tuna-lock").write_text(
+            f"auth required {PAM_MATRIX} passdb={pam / 'passdb'}\n"
+            f"account required {PAM_MATRIX} passdb={pam / 'passdb'}\n")
         compositor = launch([str(ROOT / "target/debug/tuna-compositor"), "--backend", "drm",
                              "--socket", SOCKET, "--shell-bin", str(ROOT / "target/debug/tuna-shell-gtk")],
-                            "compositor", env | {"TUNA_DRM_DEVICE": card})
+                            "compositor", env | {"TUNA_DRM_DEVICE": card, "LD_PRELOAD": str(PAM_WRAPPER),
+                                                 "PAM_WRAPPER": "1",
+                                                 "PAM_WRAPPER_SERVICE_DIR": str(pam / "services"),
+                                                 "TUNA_LOCK_TRACE": "1"})
         log_path = out / "compositor.log"
         wait_for("the GTK shell's panel on the output",
                  lambda: any(layer.get("namespace") == "tuna-panel" for layer in state().get("layers", [])), 60)
@@ -440,6 +473,77 @@ def run(args):
             (config / "monitors.xml").write_text(
                 f'<monitors version="2"><configuration>{body}</configuration></monitors>\n')
 
+        def lock_hotplug():
+            """H-LOCK-HOTPLUG: GNOME's lock screen covers every monitor,
+            one plugged in while locked too (unlockDialog.js
+            `_updateBackgrounds` on `monitors-changed`; ext-session-lock-v1
+            wants a lock surface on each new output), and nothing of the
+            session shows on it meanwhile."""
+            polls = {"bare": 0, "covered": 0}
+
+            def locked_frame_on_b():
+                """B's last frame while locked drew no window or layer."""
+                snapshot = state()
+                if snapshot.get("locked") is not True:
+                    raise RuntimeError("the session unlocked before the password was typed")
+                cost = snapshot.get("frame_cost", {}).get(B) or {}
+                if cost.get("locked"):
+                    if cost.get("content_roots") or cost.get("drawn_windows"):
+                        raise RuntimeError(f"{B} drew session content while locked: {cost}")
+                    polls["covered" if cost.get("lock_surface") else "bare"] += 1
+                return snapshot, cost
+
+            def b_covered():
+                snapshot, cost = locked_frame_on_b()
+                return (B in snapshot.get("lock_outputs", []) and cost.get("locked") is True
+                        and cost.get("lock_surface") is True)
+
+            send("chord KEY_LEFTMETA KEY_L")
+            wait_for("Super+L locks the session", lambda: state().get("locked") is True)
+            wait_for(f"the shell's lock surface on {A}", lambda: state().get("lock_outputs") == [A])
+            vkms.plug(1, True)
+            counts["lock_hotplugs"] += 1
+            wait_for(f"wl_outputs are {sorted([A, B])} while locked",
+                     lambda: locked_frame_on_b() and sorted(outputs()) == sorted([A, B]))
+            wait_for(f"the shell's own lock surface on {B}, drawn alone", b_covered, 20)
+            # Client B's window goes back onto B under the lock: there is
+            # session content on B that must not be drawn.
+            wait_for(f"client B re-homed onto {B} under the lock", lambda: locked_frame_on_b() and home_ok("B"))
+            steady = time.monotonic() + 2
+            while time.monotonic() < steady:
+                alive()
+                if not b_covered():
+                    raise RuntimeError(f"{B} lost its lock surface while locked")
+                time.sleep(0.1)
+            vkms.plug(1, False)
+            counts["lock_hotplugs"] += 1
+            wait_for(f"wl_outputs are [{A}] while locked", lambda: sorted(outputs()) == [A])
+            wait_for(f"only {A}'s lock surface, still locked",
+                     lambda: state().get("lock_outputs") == [A] and state().get("locked") is True)
+            # Unlock as a user does: a key lifts the curtain (Ctrl types
+            # nothing), the prompt asks for the password through PAM, the
+            # password and Enter answer it.
+            mark = len(log_path.read_text())
+            send("key KEY_LEFTCTRL")
+            wait_for("lifting the curtain asks for the password",
+                     lambda: "lock auth query service=password step=1 secret=true"
+                     in log_path.read_text()[mark:], 20)
+            for letter in UNLOCK_PASSWORD:
+                send(f"key KEY_{letter.upper()}")
+            send("key KEY_ENTER")
+            wait_for("the password unlocks the session through PAM", lambda: state().get("locked") is False, 30)
+            if state().get("lock_outputs"):
+                raise RuntimeError(f"lock surfaces outlived the unlock: {state().get('lock_outputs')}")
+            check("H-LOCK-HOTPLUG: unlocked", [A])
+            wait_for(f"{A} draws the session's windows again",
+                     lambda: (lambda cost: cost.get("locked") is False and bool(cost.get("drawn_windows")))(
+                         state().get("frame_cost", {}).get(A) or {}))
+            overview()
+            return (f"locked, {B} plugged in got the shell's lock surface and drew no window or layer "
+                    f"({polls['bare']} polls on the lock background before it, {polls['covered']} under it, "
+                    f"client B re-homed onto {B}); unplugged, unlocked through PAM: "
+                    f"{len(clients)} clients drawing on {A}, Super opens the overview")
+
         check("start", [A])
         open_client("A", A)
         baseline = None
@@ -505,6 +609,10 @@ def run(args):
         fd_limit = baseline["fds"] + 32
         assertions["H-GROWTH"] = [final["pss_kib"] <= pss_limit and final["fds"] <= fd_limit,
                                   f"PSS {final['pss_kib']}/{int(pss_limit)} KiB; fds {final['fds']}/{fd_limit}"]
+        try:
+            assertions["H-LOCK-HOTPLUG"] = [True, lock_hotplug()]
+        except RuntimeError as error:
+            assertions["H-LOCK-HOTPLUG"] = [False, str(error)]
         text = (out / "compositor.log").read_text()
         assertions["H-LIVE"] = [compositor.poll() is None and "panicked" not in text
                                 and "ShellExited" not in text,

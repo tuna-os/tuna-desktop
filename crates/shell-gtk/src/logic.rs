@@ -158,6 +158,30 @@ pub fn lock_offsets(height: i32) -> (i32, i32) {
     ((third + 9).max(0), (third - 61).max(0))
 }
 
+/// The lock screens to drop and the monitors to cover after the
+/// monitor list changed: the indices into `covered` (each lock screen's
+/// monitor, `None` for one assigned to none) of screens whose monitor is
+/// gone, ascending, and the monitors no screen covers yet, in list order.
+/// Screens on a monitor that stays are kept (GNOME's unlock dialog
+/// follows `monitors-changed` without rebuilding its prompt).
+pub fn lock_monitors_changed<M: PartialEq + Clone>(
+    covered: &[Option<M>],
+    monitors: &[M],
+) -> (Vec<usize>, Vec<M>) {
+    let gone = covered
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.as_ref().is_some_and(|m| !monitors.contains(m)))
+        .map(|(i, _)| i)
+        .collect();
+    let added = monitors
+        .iter()
+        .filter(|m| !covered.iter().any(|c| c.as_ref() == Some(*m)))
+        .cloned()
+        .collect();
+    (gone, added)
+}
+
 /// The user's display name for the unlock prompt: the GECOS real name,
 /// else the login name (GNOME's user widget, without AccountsService).
 pub fn real_name() -> String {
@@ -275,6 +299,33 @@ mod tests {
         assert_eq!(display_name("Ada Lovelace,,,", "ada"), "Ada Lovelace");
         assert_eq!(display_name("", "ada"), "ada");
         assert_eq!(display_name(",,,", "ada"), "ada");
+    }
+
+    #[test]
+    fn lock_screens_follow_monitors_changed() {
+        // Locked on A: B plugged in gets a screen, A's is untouched.
+        let (gone, added) = lock_monitors_changed(&[Some("A")], &["A", "B"]);
+        assert!(gone.is_empty());
+        assert_eq!(added, ["B"]);
+        // B and C swap: B's screen goes, C gets one, A's stays.
+        let (gone, added) = lock_monitors_changed(&[Some("A"), Some("B")], &["A", "C"]);
+        assert_eq!(gone, [1]);
+        assert_eq!(added, ["C"]);
+        // The primary unplugged: only its screen goes.
+        let (gone, added) = lock_monitors_changed(&[Some("A"), Some("B"), Some("C")], &["B", "C"]);
+        assert_eq!(gone, [0]);
+        assert!(added.is_empty());
+        // Every monitor gone, then one back: indices ascend.
+        let (gone, added) = lock_monitors_changed(&[Some("A"), Some("B")], &[]);
+        assert_eq!(gone, [0, 1]);
+        assert!(added.is_empty());
+        let (gone, added) = lock_monitors_changed::<&str>(&[], &["A"]);
+        assert!(gone.is_empty());
+        assert_eq!(added, ["A"]);
+        // A screen assigned to no monitor is never dropped for it.
+        let (gone, added) = lock_monitors_changed(&[None, Some("A")], &["A"]);
+        assert!(gone.is_empty());
+        assert!(added.is_empty());
     }
 
     #[test]

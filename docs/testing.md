@@ -446,6 +446,17 @@ show:
 
 `H-GROWTH` bounds the compositor and shell as the churn lane does: final
 PSS within round-0 PSS × 1.25 + 64 MiB and fds within round-0 + 32.
+
+After the storm, `H-LOCK-HOTPLUG` locks the session with a uinput
+Super+L and plugs B in: the state's `lock_outputs` must list B (the GTK
+shell made B its own ext-session-lock surface, as GNOME's unlock dialog
+covers every monitor on `monitors-changed`), and every locked frame B
+draws (`frame_cost`) must hold no window or layer (`content_roots` 0, no
+`drawn_windows`) though client B's window is re-homed onto B. B is
+unplugged, then the session unlocks through a real PAM stack (pam_wrapper
+serving `tuna-lock` from a private password file, typed on the uinput
+keyboard); the clients must draw on A again and Super open the overview.
+
 Pull requests and dispatches run 4 rounds, nightly 30. The artifacts keep
 the compositor, shell and client logs, every step's outputs and window
 rectangles (`report.json`), the metrics and the state at a failure.

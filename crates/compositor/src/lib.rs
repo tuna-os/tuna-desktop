@@ -1113,7 +1113,9 @@ impl State {
     /// removal live; it stays bindable until the runtime destroys it
     /// ([`take_retired_output_globals`](Self::take_retired_output_globals)),
     /// so a client binding it as it goes is not disconnected. Virtual
-    /// entries just drop. Returns whether an entry was removed.
+    /// entries just drop. A lock surface on the output goes with it: the
+    /// output that next takes the name waits for one of its own.
+    /// Returns whether an entry was removed.
     pub fn remove_output(&mut self, name: &str) -> bool {
         let Some(index) = self.outputs.iter().position(|entry| entry.name == name) else {
             return false;
@@ -1124,6 +1126,7 @@ impl State {
             self.retired_output_globals.push(id);
         }
         self.outputs.remove(index);
+        self.forget_output_lock_surface(name);
         if was_primary {
             if let Some(first) = self.outputs.first_mut() {
                 first.primary = true;
