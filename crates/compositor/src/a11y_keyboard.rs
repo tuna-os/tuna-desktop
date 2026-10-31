@@ -921,7 +921,7 @@ pub(crate) mod tests {
         assert_eq!(m.snapshot()["resume_state"], "ready");
         assert_eq!(m.snapshot()["normal_events"], 2);
         assert_eq!(m.snapshot()["reset_events"], 1);
-        // Both lock/reset-origin repeats and their releases remain private.
+        // Reset-suppressed repeats and releases remain private.
         assert!(!m.key(key(0x70, 33, false, 0), delay));
         assert!(!m.key(key(0x70, 33, true, 0), delay));
         assert!(!m.key(key(0xffe5, 66, true, 0), delay));
