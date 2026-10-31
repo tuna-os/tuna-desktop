@@ -413,8 +413,25 @@ mod tests {
 
         /// Private bus daemon plus its address, or `None` when no
         /// daemon is usable (the caller skips the test).
-        fn private_bus() -> Option<(String, std::process::Child)> {
-            let mut child = std::process::Command::new("dbus-daemon")
+        fn private_bus(home: Option<&std::path::Path>) -> Option<(String, std::process::Child)> {
+            let mut command = std::process::Command::new("dbus-daemon");
+            if let Some(home) = home {
+                use std::os::unix::fs::PermissionsExt;
+                let run = home.join("run");
+                std::fs::create_dir_all(&run).expect("private bus runtime dir");
+                std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700))
+                    .expect("private bus runtime dir mode");
+                // Activated services inherit the daemon's environment, not the
+                // later portal child's. Keep permission-store writes private too.
+                command
+                    .env("HOME", home)
+                    .env("XDG_DATA_HOME", home)
+                    .env("XDG_CONFIG_HOME", home.join("config"))
+                    .env("XDG_CACHE_HOME", home.join("cache"))
+                    .env("XDG_STATE_HOME", home.join("state"))
+                    .env("XDG_RUNTIME_DIR", home.join("run"));
+            }
+            let mut child = command
                 .args(["--session", "--nofork", "--print-address=1"])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
@@ -504,7 +521,7 @@ mod tests {
 
         #[test]
         fn stub_portal_sees_hyphenated_properties_and_change_signals() {
-            let Some((address, mut daemon)) = private_bus() else {
+            let Some((address, mut daemon)) = private_bus(None) else {
                 eprintln!("SKIP live lockdown test: no usable dbus-daemon on PATH");
                 return;
             };
@@ -635,7 +652,7 @@ mod tests {
 
         #[test]
         fn bus_originated_set_persists_to_settings_on_poll() {
-            let Some((address, mut daemon)) = private_bus() else {
+            let Some((address, mut daemon)) = private_bus(None) else {
                 eprintln!("SKIP live lockdown test: no usable dbus-daemon on PATH");
                 return;
             };
@@ -680,6 +697,50 @@ mod tests {
             let _ = bus;
         }
 
+        #[test]
+        fn private_bus_activation_keeps_permission_store_writes_in_fixture() {
+            if ![
+                "/usr/libexec/xdg-permission-store",
+                "/usr/lib/xdg-permission-store",
+            ]
+            .into_iter()
+            .any(|path| std::path::Path::new(path).is_file())
+            {
+                eprintln!("SKIP live permission-store test: no daemon installed");
+                return;
+            }
+            let home = tempfile::tempdir().expect("permission-store home");
+            let Some((address, mut daemon)) = private_bus(Some(home.path())) else {
+                eprintln!("SKIP live permission-store test: no usable dbus-daemon on PATH");
+                return;
+            };
+            let client = client_conn(&address).expect("private permission-store bus");
+            let store = zbus::blocking::Proxy::new(
+                &client,
+                "org.freedesktop.impl.portal.PermissionStore",
+                "/org/freedesktop/impl/portal/PermissionStore",
+                "org.freedesktop.impl.portal.PermissionStore",
+            )
+            .expect("permission-store proxy");
+            let result = store.call::<&str, _, ()>(
+                "SetPermission",
+                &(
+                    "tuna-fixture-isolation",
+                    true,
+                    "isolation",
+                    "com.example.Fixture",
+                    vec!["yes"],
+                ),
+            );
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            result.expect("actual activated permission store persists");
+            assert!(
+                home.path().join("flatpak/db/tuna-fixture-isolation").is_file(),
+                "the bus-activated service must write inside the fixture data home"
+            );
+        }
+
         /// Real `xdg-desktop-portal` against the live [`LockdownBus`]
         /// edge: with the camera switch disabled, the portal's Camera
         /// interface must deny new sessions with its lockdown error;
@@ -699,7 +760,8 @@ mod tests {
                 eprintln!("SKIP live portal test: no xdg-desktop-portal daemon installed");
                 return;
             };
-            let Some((address, mut daemon)) = private_bus() else {
+            let home = tempfile::tempdir().expect("portal config dir");
+            let Some((address, mut daemon)) = private_bus(Some(home.path())) else {
                 eprintln!("SKIP live portal test: no usable dbus-daemon on PATH");
                 return;
             };
@@ -719,7 +781,6 @@ mod tests {
             // `.portal` files load from `XDG_DESKTOP_PORTAL_DIR` (the
             // daemon's documented test override); nothing else is
             // visible, so no other backend can answer instead.
-            let home = tempfile::tempdir().expect("portal config dir");
             let portals_dir = home.path().join("portals");
             std::fs::create_dir_all(&portals_dir).expect("portal config dir");
             std::fs::write(
@@ -730,12 +791,6 @@ mod tests {
             )
             .expect("portal config file");
             let run = home.path().join("run");
-            std::fs::create_dir_all(&run).expect("portal runtime dir");
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700))
-                    .expect("portal runtime dir mode");
-            }
             let log_path = home.path().join("xdp.log");
             let log_file = std::fs::File::create(&log_path).expect("portal log file");
 
@@ -748,6 +803,9 @@ mod tests {
                 .env("DBUS_SESSION_BUS_ADDRESS", &address)
                 .env("XDG_DESKTOP_PORTAL_DIR", &portals_dir)
                 .env("XDG_DATA_HOME", home.path())
+                .env("XDG_CONFIG_HOME", home.path().join("config"))
+                .env("XDG_CACHE_HOME", home.path().join("cache"))
+                .env("XDG_STATE_HOME", home.path().join("state"))
                 .env("XDG_CURRENT_DESKTOP", "tunaprivacylive")
                 .env("XDG_RUNTIME_DIR", &run)
                 .env("HOME", home.path())
@@ -890,7 +948,7 @@ mod tests {
 
         #[test]
         fn second_publisher_loses_the_backend_name() {
-            let Some((address, mut daemon)) = private_bus() else {
+            let Some((address, mut daemon)) = private_bus(None) else {
                 eprintln!("SKIP live lockdown test: no usable dbus-daemon on PATH");
                 return;
             };

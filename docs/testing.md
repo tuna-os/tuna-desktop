@@ -489,6 +489,21 @@ it after a Num Lock change and before the next `gsettings set`. The
 applied. Wait for it after changing the input sources or `xkb-options`
 and before typing.
 
+The stock GNOME Settings journey (`tests/portal-reference/settings-run.sh`)
+instead uses a private **dconf** backend. Settings and Tuna's first-run
+app-folder initialization are independent writers: keyfile's stale whole-file
+rewrite can restore an old `enable-hot-corners` value after the UI has changed
+it. The genuine session-bus dconf service merges their writes, with its database
+under the fixture's `XDG_CONFIG_HOME`; per-step `*-settings.dconf` snapshots and
+fresh independent `gsettings get` reads retain persistence evidence. The
+disabled/enabled/cold-restart corner assertions remain unchanged.
+
+The shell-host real-camera lockdown test isolates the **bus daemon's**
+HOME/XDG environment as well as the portal child. D-Bus activation otherwise
+starts the permission store with the runner's home even though the portal has
+a private data directory. Its live permission-store regression calls the
+installed service and requires the resulting database inside the fixture.
+
 ## Parity ledger check
 
 The `parity-ledger` job runs `scripts/tuna-ledger` against the test list
