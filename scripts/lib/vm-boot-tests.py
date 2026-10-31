@@ -71,6 +71,24 @@ class DatetimePublishedQualification(unittest.TestCase):
                 self.assertEqual(detail, f"raw-{gate}")
         self.assertTrue(all(" fail " in line for line in result["assertions"][:2]))
 
+    def test_beta2_rebuild_is_scoped_only_on_published_and_only_for_follow(self):
+        version = "1.0.0beta.2-2"
+        lane.record_datetime_gates(self.result(self.FOLLOW, version), True, self.record)
+        for gate, passed, detail in self.records:
+            self.assertTrue(passed)
+            if gate in self.FOLLOW:
+                self.assertIn(version, detail)
+                self.assertIn(f"observed fail: raw-{gate}", detail)
+                self.assertIn("current-build marlin-vm", detail)
+            else:
+                self.assertEqual(detail, f"raw-{gate}")
+        for gate in (*self.FOLLOW, *self.OTHER):
+            with self.subTest(current_build=gate), self.assertRaisesRegex(RuntimeError, gate):
+                lane.record_datetime_gates(self.result((gate,), version), False, self.record)
+        for gate in self.OTHER:
+            with self.subTest(published=gate), self.assertRaisesRegex(RuntimeError, gate):
+                lane.record_datetime_gates(self.result((gate,), version), True, self.record)
+
     def test_current_build_failures_always_fail_even_with_old_rpm(self):
         for gate in self.FOLLOW:
             with self.subTest(gate=gate), self.assertRaisesRegex(RuntimeError, gate):
@@ -78,7 +96,8 @@ class DatetimePublishedQualification(unittest.TestCase):
             self.assertIn((gate, False, f"raw-{gate}"), self.records)
 
     def test_supported_or_unknown_published_versions_remain_strict(self):
-        for version in ("1.0.0beta.2-1", "1.0.0-1", None, "", "1.0.0beta.1-2"):
+        for version in ("1.0.0beta.2-1", "1.0.0beta.2-3", "1.0.0beta.3-1",
+                        "1.0.0-1", None, "", "1.0.0beta.1-2"):
             for gate in self.FOLLOW:
                 with self.subTest(version=version, gate=gate):
                     with self.assertRaisesRegex(RuntimeError, gate):
