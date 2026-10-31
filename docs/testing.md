@@ -180,6 +180,16 @@ Cleanup is automatic where it is safe:
 VM lanes need KVM, so they run in CI's `marlin-vm` jobs or on a Corral
 VM, not through these recipes.
 
+The portal file-picker's blocked-parent probe retains a `*.parent-probe.json`
+receipt on success **and failure**. Its baseline is read after the sole real
+click; ten further caller GLib heartbeat callbacks must arrive within the
+unchanged two-second bound, without parent click/key delivery or loss of dialog
+focus. Each caller receipt includes monotonic and process-CPU timestamps.
+Progress before injection cannot satisfy this boundary. A missed heartbeat
+deadline remains a proof failure, not evidence by itself of a compositor focus
+bug or permission to increase the deadline; inspect the retained baseline and
+observations before attributing it to scheduling or blocked client work.
+
 ## Before opening a PR
 
 Run the workspace checks locally before opening a PR (`just check`):
