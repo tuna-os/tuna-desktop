@@ -175,6 +175,8 @@ jobs:
       - run: python3 scripts/lib/native-constraint-tests.py
       - run: python3 scripts/lib/window-menu-fixture-tests.py
       - run: python3 scripts/lib/focus-points-tests.py
+      - run: python3 scripts/tests/test_magnifier_probe_readiness.py
+      - run: python3 scripts/tests/test_osk_watcher_readiness.py
       - run: python3 scripts/lib/tuna-pipewire-dump-tests.py
       - run: python3 scripts/lib/tuna-fade-match-tests.py
       - run: python3 scripts/lib/gtk-privacy-portal-proof-tests.py
