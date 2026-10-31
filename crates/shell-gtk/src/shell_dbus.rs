@@ -11,7 +11,7 @@
 //! `TUNA_SHELL_DBUS_UNRESTRICTED=1`, GNOME's unsafe mode.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
 use gtk4::gio;
@@ -74,8 +74,11 @@ pub trait ShellActions {
     fn focus_search(&self);
     fn show_applications(&self);
     fn overview_active(&self) -> bool;
-    /// Hand the compositor the full set of grabs with their flags.
-    fn set_accelerator_grabs(&self, grabs: Vec<tuna_shell_control::AcceleratorGrab>);
+    /// Hand the compositor the full set of grabs with their flags: the
+    /// request id its `CommandResult` will answer, or `None` when nothing
+    /// was sent (no compositor link).
+    fn set_accelerator_grabs(&self, grabs: Vec<tuna_shell_control::AcceleratorGrab>)
+        -> Option<u64>;
 }
 
 /// Parse a GNOME accelerator string (`<Super>p`, `XF86AudioRaiseVolume`)
@@ -242,14 +245,24 @@ pub struct Service {
     actions: Rc<dyn ShellActions>,
     /// NameOwnerChanged, to drop a departed caller's grabs.
     watch: RefCell<Option<gio::SignalSubscription>>,
+    /// Grab and ungrab replies held until the compositor has applied the
+    /// table they changed (its `CommandResult` for that request id), so a
+    /// caller's key works once its call returns, as Mutter's synchronous
+    /// grab does. In request order: ids only grow.
+    replies: RefCell<VecDeque<(u64, PendingReply)>>,
     /// `/org/gnome/Shell/Introspect`, relayed to the compositor.
     introspect: RefCell<Option<crate::introspect_forward::Relay>>,
 }
 
+/// Completes a held grab call: `true` once its table is installed, `false`
+/// when the compositor refused it or the link carrying it was lost.
+type PendingReply = Box<dyn FnOnce(bool)>;
+
 impl Service {
     /// Hand the compositor every grab: callers' (with their GNOME flags)
-    /// and the shell's own.
-    fn push(&self) {
+    /// and the shell's own. Returns the request id the compositor will
+    /// acknowledge once the table is live.
+    fn push(&self) -> Option<u64> {
         let grabs = self.grabs.borrow();
         let mut typed: Vec<_> = grabs
             .list()
@@ -261,7 +274,45 @@ impl Service {
             .collect();
         drop(grabs);
         typed.extend(self.internal.borrow().iter().copied());
-        self.actions.set_accelerator_grabs(typed);
+        self.actions.set_accelerator_grabs(typed)
+    }
+
+    /// Run `reply` once request `id` is acknowledged; a table that was
+    /// never sent fails at once.
+    fn answer_after(&self, id: Option<u64>, reply: impl FnOnce(bool) + 'static) {
+        match id {
+            Some(id) => self.replies.borrow_mut().push_back((id, Box::new(reply))),
+            None => reply(false),
+        }
+    }
+
+    /// Complete held replies up to request `id` with `installed`; each
+    /// runs with no borrow held, so it may call back into the service.
+    fn complete_through(&self, id: u64, installed: bool) {
+        loop {
+            let next = {
+                let mut replies = self.replies.borrow_mut();
+                match replies.front() {
+                    Some((request, _)) if *request <= id => replies.pop_front(),
+                    _ => None,
+                }
+            };
+            let Some((_, reply)) = next else { break };
+            reply(installed);
+        }
+    }
+
+    /// The compositor answered request `id`. It handles requests in order
+    /// and every table is the full set, so an answer also settles any
+    /// earlier table whose own answer went with a lost link.
+    pub fn command_result(&self, id: u64, applied: bool) {
+        self.complete_through(id, applied);
+    }
+
+    /// The compositor link was lost or redialed: nothing sent on it will
+    /// be answered, and its tables may never have been installed.
+    pub fn release_replies(&self) {
+        self.complete_through(u64::MAX, false);
     }
 
     /// Bind the shell's own keys: `accelerators[i]` (accelerator, modes,
@@ -295,7 +346,7 @@ impl Service {
         *self.internal.borrow_mut() = list;
         *self.internal_indices.borrow_mut() = indices;
         *self.on_internal.borrow_mut() = Some(run);
-        self.push();
+        let _ = self.push();
     }
 
     /// A grabbed accelerator fired: one of the shell's own runs here;
@@ -411,6 +462,7 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
         on_internal: RefCell::new(None),
         actions: actions.clone(),
         watch: RefCell::new(None),
+        replies: RefCell::new(VecDeque::new()),
         introspect: RefCell::new(None),
     });
     let node = match gio::DBusNodeInfo::for_xml(XML) {
@@ -444,6 +496,8 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                         return;
                     }
                     let sender = sender.unwrap_or_default().to_owned();
+                    // A grab table change answers once the compositor has it.
+                    let mut sent = None;
                     let reply = match method {
                         "ShowOSD" => {
                             let request = params
@@ -474,7 +528,7 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                                 .grabs
                                 .borrow_mut()
                                 .grab_with_flags(&sender, &accel, modes, flags);
-                            grabs_svc.push();
+                            sent = Some(grabs_svc.push());
                             Some((action,).to_variant())
                         }
                         "GrabAccelerators" => {
@@ -493,13 +547,13 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                                     })
                                     .collect()
                             };
-                            grabs_svc.push();
+                            sent = Some(grabs_svc.push());
                             Some((actions,).to_variant())
                         }
                         "UngrabAccelerator" => {
                             let action = params.get::<(u32,)>().map(|(a,)| a).unwrap_or(0);
                             let ok = grabs_svc.grabs.borrow_mut().ungrab(&sender, action);
-                            grabs_svc.push();
+                            sent = Some(grabs_svc.push());
                             Some((ok,).to_variant())
                         }
                         "UngrabAccelerators" => {
@@ -518,7 +572,7 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                                     ok
                                 }
                             };
-                            grabs_svc.push();
+                            sent = Some(grabs_svc.push());
                             Some((ok,).to_variant())
                         }
                         _ => {
@@ -529,7 +583,20 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                             return;
                         }
                     };
-                    invocation.return_value(reply.as_ref());
+                    if let Some(sent) = sent {
+                        grabs_svc.answer_after(sent, move |installed| {
+                            if installed {
+                                invocation.return_value(reply.as_ref());
+                            } else {
+                                invocation.return_dbus_error(
+                                    "org.gnome.Shell.Error.Failed",
+                                    "The compositor did not install the accelerator table",
+                                );
+                            }
+                        });
+                    } else {
+                        invocation.return_value(reply.as_ref());
+                    }
                 })
                 .property(move |_, _, _, _, property| match property {
                     "Mode" => "user".to_variant(),
@@ -557,7 +624,7 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                         signal.parameters.get::<(String, String, String)>()
                     {
                         if new_owner.is_empty() && svc.grabs.borrow_mut().forget(&name) {
-                            svc.push();
+                            let _ = svc.push();
                         }
                     }
                 },
@@ -660,8 +727,10 @@ mod tests {
         assert_eq!(grabs.grab(":1.6", "XF86AudioMute", 0), 0);
     }
 
+    /// Records the last table sent and numbers each send like the
+    /// control client's request ids.
     #[derive(Default)]
-    struct RecordedActions(RefCell<Vec<tuna_shell_control::Accelerator>>);
+    struct RecordedActions(RefCell<Vec<tuna_shell_control::Accelerator>>, Cell<u64>);
 
     impl ShellActions for RecordedActions {
         fn show_osd(&self, _: &OsdRequest) {}
@@ -670,8 +739,13 @@ mod tests {
         fn overview_active(&self) -> bool {
             false
         }
-        fn set_accelerator_grabs(&self, grabs: Vec<tuna_shell_control::AcceleratorGrab>) {
+        fn set_accelerator_grabs(
+            &self,
+            grabs: Vec<tuna_shell_control::AcceleratorGrab>,
+        ) -> Option<u64> {
             *self.0.borrow_mut() = grabs.into_iter().map(|g| g.accelerator).collect();
+            self.1.set(self.1.get() + 1);
+            Some(self.1.get())
         }
     }
 
@@ -685,8 +759,76 @@ mod tests {
             on_internal: RefCell::new(None),
             actions,
             watch: RefCell::new(None),
+            replies: RefCell::new(VecDeque::new()),
             introspect: RefCell::new(None),
         }
+    }
+
+    #[test]
+    fn grab_replies_wait_for_the_compositor_to_apply_their_table() {
+        // Mutter grabs synchronously: when GrabAccelerator returns, the key
+        // is live. Here the table goes to the compositor over the control
+        // socket, so the reply waits for that request's CommandResult; a
+        // caller pressing its key at once otherwise reaches the old table.
+        let actions = Rc::new(RecordedActions::default());
+        let service = test_service(actions.clone());
+        let replied = Rc::new(RefCell::new(Vec::new()));
+        for (caller, key) in [(":1.5", "XF86AudioPlay"), (":1.6", "XF86AudioNext")] {
+            let action = service
+                .grabs
+                .borrow_mut()
+                .grab_with_flags(caller, key, 1, 0);
+            let sent = service.push();
+            let replied = replied.clone();
+            service.answer_after(sent, move |installed| {
+                replied.borrow_mut().push((action, installed))
+            });
+        }
+        // Both tables reached the compositor stand-in; neither is acknowledged.
+        assert_eq!(actions.0.borrow().len(), 2);
+        assert!(
+            replied.borrow().is_empty(),
+            "replied before any CommandResult"
+        );
+        service.command_result(0, true);
+        assert!(
+            replied.borrow().is_empty(),
+            "an earlier request releases nothing"
+        );
+        service.command_result(1, true);
+        assert_eq!(
+            *replied.borrow(),
+            [(1, true)],
+            "only the first table is live"
+        );
+        service.command_result(2, true);
+        assert_eq!(*replied.borrow(), [(1, true), (2, true)]);
+        service.command_result(2, true);
+        assert_eq!(replied.borrow().len(), 2, "each reply runs once");
+    }
+
+    #[test]
+    fn grab_replies_without_a_link_or_after_a_lost_one_run_at_once() {
+        let actions = Rc::new(RecordedActions::default());
+        let service = test_service(actions);
+        let replied = Rc::new(RefCell::new(Vec::new()));
+        let r = replied.clone();
+        service.answer_after(None, move |installed| r.borrow_mut().push(installed));
+        assert_eq!(*replied.borrow(), [false], "no link fails at once");
+        for id in [7, 8] {
+            let r = replied.clone();
+            service.answer_after(Some(id), move |installed| r.borrow_mut().push(installed));
+        }
+        service.command_result(7, false);
+        assert_eq!(*replied.borrow(), [false, false], "a denial fails its call");
+        service.release_replies();
+        assert_eq!(
+            *replied.borrow(),
+            [false, false, false],
+            "a lost link fails its call"
+        );
+        service.command_result(8, true);
+        assert_eq!(replied.borrow().len(), 3, "no second answer after a redial");
     }
 
     #[test]
