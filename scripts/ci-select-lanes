@@ -65,6 +65,7 @@ NEEDS = {
 # fnmatch patterns: `*` also matches `/`. First matching rule wins.
 FULL = [
     ".github/workflows/ci.yml",
+    ".github/actions/ci-tool/*",
     "scripts/ci-*",
     "Cargo.toml",
     "Cargo.lock",

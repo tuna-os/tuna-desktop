@@ -18,8 +18,8 @@ every proof lane. Both `select-lanes` and `check` always run. The lightweight
 `select-lanes` job runs `scripts/ci-select-lanes`, diffs the PR against its
 base, and picks the proof lanes the change can affect:
 
-- `ci.yml`, `scripts/ci-*`, `Cargo.toml`, `Cargo.lock`, `third-party/` or
-  `scripts/tuna-nested`: every lane.
+- `ci.yml`, `.github/actions/ci-tool/`, `scripts/ci-*`, `Cargo.toml`,
+  `Cargo.lock`, `third-party/` or `scripts/tuna-nested`: every lane.
 - most documentation, other workflows, `fuzz/` and the script self-tests: no
   proof lanes. The selector-owned documentation exceptions are
   `docs/nested-session.md` (`arch-package`), `docs/walkthrough*`
@@ -52,6 +52,32 @@ admission or a proof. Only non-PR runs on `refs/heads/main` may save them.
 PRs and branch dispatches restore main's compatible caches without
 creating competing branch copies. New keys need a successful main job
 to seed them; the first run after a key change can be cold.
+
+The `ci` and measured-coverage workflows also cache isolated installations
+of cargo-audit 0.22.2, cargo-llvm-cov 0.9.1 and the pinned gtk4-layer-shell
+source revision through `.github/actions/ci-tool`. Exact-key restores have
+no fallback: tool version, installer/action content, Rust compiler and host,
+native distro/architecture and the installed package inventory must match.
+Cold paths build the exact locked Cargo tools or revision-checked GTK source;
+warm paths activate those installations without recompiling. Only non-PR
+main runs publish tool caches, using the same trust boundary as Rust targets.
+The audit and instrumented tests still execute and all coverage reports keep
+their existing paths. GTK caches contain only its staged `/usr/local` install,
+not system packages, Rust targets or proof artifacts.
+The staged files stay runner-owned so the cache action can archive and restore
+them without sudo. Activation copies GTK into `/usr/local` as root without
+preserving the staged ownership; it never changes ownership inside the cache.
+
+Tool consumers sparsely check out `.ci-workflow-tools` at the immutable
+`github.workflow_sha`, separate from the candidate source checkout. The
+action invokes its paired installer through `GITHUB_ACTION_PATH` and hashes
+those actual workflow-owned files, not similarly named candidate files.
+Older PR heads need not contain the cache action or staged installer;
+exact-head jobs still test the PR head, not the tooling checkout.
+Before source scans, the action appends only `/.ci-workflow-tools/` to the
+candidate repository's local Git excludes, preserving existing rules. This
+also works on older heads with no matching `.gitignore` entry; genuinely
+untracked candidate source remains visible to Git-based source checks.
 
 The same writer policy and native-platform separation apply to measured
 coverage, fuzzing, nested stress and visual capture. Workflows without a
