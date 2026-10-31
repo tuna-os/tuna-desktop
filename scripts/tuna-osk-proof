@@ -413,10 +413,13 @@ session_tap Space G-OSK-IBUS
 expect_text b "TuNAs你好" G-OSK-IBUS
 # A declined key when not composing must arrive once, not twice or not at all.
 session_tap "?123" G-OSK-IBUS
+decline_start="$(now)"
 session_tap "1" G-OSK-IBUS
 expect_text b "TuNAs你好1" G-OSK-IBUS
 grep -q 'OSK IBus took it: Some(false)' "$LOG" ||
     fail G-OSK-IBUS "the once-only character was not actually declined by the engine"
+jq -es --argjson t "$decline_start" '[.[] | select(.t >= $t and .key == 49 and .pressed == true)] | length == 1' "$PROBE_LOG" >/dev/null ||
+    fail G-OSK-IBUS "declined digit did not produce exactly one client key press"
 session_tap "ABC" G-OSK-IBUS
 # Retiring the field resets unfinished composition, never commits it into a.
 ime_a_before="$(text_of a)"
@@ -429,8 +432,12 @@ expect_text a "${ime_a_before}你好" G-OSK-IBUS
 # Restore the ordinary XKB source and check direct native text after IBus.
 ibus_private engine xkb:us::eng || fail G-OSK-IBUS "cannot restore XKB engine"
 xdotool key --clearmodifiers ctrl+a BackSpace
+expect_text a "" G-OSK-IBUS
+xkb_start="$(now)"
 session_tap x G-OSK-IBUS
 expect_text a x G-OSK-IBUS
+jq -es --argjson t "$xkb_start" 'all(.[]; .t < $t or .key != 120 or .pressed != true)' "$PROBE_LOG" >/dev/null ||
+    fail G-OSK-IBUS "confirmed XKB text used raw keys instead of native commit"
 pass G-OSK-IBUS "real libpinyin OSK preedit/candidates and Space→你好; declined 1 exactly once; focus retirement and XKB native commit"
 
 # ---- G-OSK-LOCK
