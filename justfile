@@ -69,15 +69,15 @@ fmt:
 
 # Clippy over every target with warnings as errors, as CI runs it.
 clippy: _disk _sccache
-    {{lock}} {{timed}} {{build_timeout_min}} "just clippy (TUNA_BUILD_TIMEOUT)" cargo clippy {{target_arg}} --workspace --all-targets -- -D warnings
+    TUNA_SLOT_TIMEOUT={{build_timeout_min}} {{lock}} {{timed}} {{build_timeout_min}} "just clippy (TUNA_BUILD_TIMEOUT)" cargo clippy {{target_arg}} --workspace --all-targets -- -D warnings
 
 # Build the workspace (extra arguments go to cargo, e.g. `just build --release`).
 build *args: _disk _sccache
-    {{lock}} {{timed}} {{build_timeout_min}} "just build (TUNA_BUILD_TIMEOUT)" cargo build {{target_arg}} --locked {{args}}
+    TUNA_SLOT_TIMEOUT={{build_timeout_min}} {{lock}} {{timed}} {{build_timeout_min}} "just build (TUNA_BUILD_TIMEOUT)" cargo build {{target_arg}} --locked {{args}}
 
 # Test the workspace, or pass cargo arguments: `just test -p tuna-compositor --lib orca::`.
 test *args: _disk _sccache
-    {{lock}} {{timed}} {{build_timeout_min}} "just test (TUNA_BUILD_TIMEOUT)" cargo test {{target_arg}} {{ if args == "" { "--workspace" } else { args } }}
+    TUNA_SLOT_TIMEOUT={{build_timeout_min}} {{lock}} {{timed}} {{build_timeout_min}} "just test (TUNA_BUILD_TIMEOUT)" cargo test {{target_arg}} {{ if args == "" { "--workspace" } else { args } }}
 
 # Run a nested proof (`just proof gtk-shell-proof`); artifacts are kept only if it fails.
 proof name *args: _disk _sccache
@@ -177,7 +177,7 @@ proof name *args: _disk _sccache
         ' .github/workflows/*.yml)
     fi
     status=0
-    "${slot[@]}" "{{timed}}" "$timeout_min" "proof {{name}} (TUNA_PROOF_TIMEOUT)" "$script" "$@" {{args}} || status=$?
+    TUNA_SLOT_TIMEOUT="$timeout_min" "${slot[@]}" "{{timed}}" "$timeout_min" "proof {{name}} (TUNA_PROOF_TIMEOUT)" "$script" "$@" {{args}} || status=$?
     if [ "$status" = 0 ]; then
         rm -rf "$art"
         echo "proof {{name}} passed"

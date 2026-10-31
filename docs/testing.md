@@ -121,10 +121,16 @@ Nothing waits forever. These defaults bound every recipe:
 | waiting for a build or proof slot | gives up after 120 min with exit 75 | `TUNA_SLOT_WAIT` (minutes) |
 | a slot held past its timeout + 15 min | `scripts/tuna-reaper` reports it and kills the holder, the processes below it with the process groups they lead, and everything carrying its `TUNA_PROOF_RUN` marker | run by `scripts/tuna-disk-guard` on every pass |
 
-Each slot file's mtime records when it was taken (`scripts/lib/tuna-semaphore`),
+Each slot file's mtime records when it was taken, and its contents the
+command's timeout in minutes (`scripts/lib/tuna-semaphore`),
 which is what the reaper measures. `scripts/lib/tuna-timeout MINUTES LABEL
 COMMAND...` is the wrapper the recipes use; Ctrl-C still reaches the
 command's group.
+
+The reaper checks each holder's `/proc/PID/fdinfo` for the actual flock.
+It does not require a `/proc/locks` entry: PID namespaces can hide a live
+inherited lock after the short-lived `flock` utility exits. Merely opening an
+old slot file does not make a process eligible for retirement.
 
 When `sccache` is installed (`cargo install --locked sccache`, or a
 release binary on `PATH`) every recipe compiles through it, so a fresh

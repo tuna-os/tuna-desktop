@@ -5,7 +5,8 @@
 # files BASE.0 .. BASE.<SLOTS-1>, so at most SLOTS such commands run at
 # once across every worktree. COMMAND does not inherit the lock, so a
 # daemon it leaves behind can't keep holding the slot (like `flock -o`);
-# the slot file's mtime records when it was taken (scripts/tuna-reaper);
+# its mtime records when it was taken and its contents TUNA_SLOT_TIMEOUT,
+# the command's timeout in minutes, for scripts/tuna-reaper;
 # the slot is released when this script exits, however it exits. Waits,
 # polling every second, while all slots are taken, for at most
 # TUNA_SLOT_WAIT minutes (default 120), then gives up with status 75.
@@ -23,7 +24,7 @@ while :; do
         exec {fd}>>"$base.$i"
         if flock -n "$fd"; then
             [ -z "$waiting" ] || echo "tuna-semaphore: got $base.$i after $((SECONDS - waiting))s" >&2
-            touch "$base.$i"
+            printf '%s\n' "${TUNA_SLOT_TIMEOUT:-}" >"$base.$i"
             status=0
             "$@" {fd}>&- || status=$?
             exit "$status"

@@ -5,8 +5,8 @@
 # Usage: scripts/tuna-reaper
 #
 # `just build`/`test`/`clippy` and `just proof` hold a slot file
-# (scripts/lib/tuna-semaphore, which stamps its mtime when taken) and stop
-# themselves at their timeout. A holder still there 15 minutes later is
+# (scripts/lib/tuna-semaphore records its acquisition time and command's
+# timeout in minutes). A holder still there 15 minutes past it is
 # stuck: this reports it and kills it, every process below it with their
 # process groups, and every process carrying its TUNA_PROOF_RUN marker.
 #   build slots  ${TUNA_BUILD_SLOT_BASE:-/tmp/tuna-local-build.slot}.N,
@@ -62,7 +62,7 @@ stop() {
     marker=$(tr '\0' '\n' <"/proc/$holder/environ" 2>/dev/null | sed -n 's/^TUNA_PROOF_RUN=//p')
     if [ -n "$marker" ]; then
         for p in /proc/[0-9]*; do
-            grep -qzx "TUNA_PROOF_RUN=$marker" "$p/environ" 2>/dev/null && pids="$pids ${p#/proc/}"
+            grep -Fqzx "TUNA_PROOF_RUN=$marker" "$p/environ" 2>/dev/null && pids="$pids ${p#/proc/}"
         done
     fi
     pgids=$(echo "$pgids" | grep -vx "$self")
@@ -80,12 +80,18 @@ for f in "${TUNA_BUILD_SLOT_BASE:-/tmp/tuna-local-build.slot}".* \
     "${TUNA_PROOF_LOCK:-/tmp/tuna-local-proof.lock}".*; do
     [ -f "$f" ] || continue
     case $f in "${TUNA_BUILD_SLOT_BASE:-/tmp/tuna-local-build.slot}".*) limit=$build_min ;; *) limit=$proof_min ;; esac
+    # Each holder records its own deadline: e.g. gtk-shell gets 60 min,
+    # while another proof with an explicit override can be much shorter.
+    IFS= read -r slot_min <"$f" || slot_min=''
+    case $slot_min in
+        '' | *[!0-9]*) ;;
+        *) limit=$((slot_min + grace)) ;;
+    esac
     held=$(( (now - $(stat -c %Y "$f")) / 60 ))
     [ "$held" -gt "$limit" ] || continue
-    # The holder has the file open with the flock on that open file: its
-    # fdinfo lists the lock. (/proc/locks pids are the host's, wrong inside
-    # a PID namespace, but its inodes say whether anyone holds it at all.)
-    grep -q ":$(stat -c %i "$f") " /proc/locks || continue
+    # The held open-file description is authoritative. After `flock 9`
+    # exits, /proc/locks can hide its entry in a PID namespace even while
+    # an inheriting holder's fdinfo still reports the live FLOCK.
     real=$(readlink -f "$f")
     for fd in /proc/[0-9]*/fd/*; do
         [ "$(readlink "$fd" 2>/dev/null)" = "$real" ] || continue

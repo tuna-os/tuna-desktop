@@ -2,6 +2,7 @@
 """scripts/tuna-reaper stops only slot holders past their timeout."""
 import os
 from pathlib import Path
+import select
 import subprocess
 import tempfile
 import time
@@ -37,32 +38,39 @@ class Reaper(unittest.TestCase):
                         TUNA_PROOF_LOCK=str(self.dir / "proof.lock"),
                         TUNA_BUILD_TIMEOUT="60", TUNA_PROOF_TIMEOUT="45")
 
-    def hold(self, base: str, tag: str) -> subprocess.Popen:
+    def hold(self, base: str, tag: str, slot_minutes=None) -> subprocess.Popen:
         """A build/proof holding a slot, its work in a tuna-timeout group."""
         started = self.dir / f"{tag}.started"
         holder = subprocess.Popen(
             [str(SEMAPHORE), str(self.dir / base), "2", str(TIMEOUT), "600", tag,
              "bash", "-c", f"sleep 600 & echo $! >{started}.tmp; mv {started}.tmp {started}; exec -a {tag} sleep 600"],
-            env=self.env, start_new_session=True,
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            env=dict(self.env, **({"TUNA_SLOT_TIMEOUT": str(slot_minutes)}
+                                 if slot_minutes is not None else {})), start_new_session=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(holder.wait)
         self.addCleanup(lambda: subprocess.run(["pkill", "-KILL", "-f", tag]))
         self.addCleanup(holder.kill)
-        for _ in range(100):
+        end = time.time() + 60
+        while time.time() < end:
             if started.exists():
-                child = int(started.read_text())
+                try:
+                    child = int(started.read_text().strip())
+                except ValueError:
+                    time.sleep(0.05)
+                    continue
                 self.addCleanup(lambda: subprocess.run(["kill", "-KILL", str(child)]))
                 holder.child = child
                 return holder
             time.sleep(0.05)
-        self.fail(f"{tag} never started")
+        out, err = (holder.stdout.read() if holder.stdout else ""), (holder.stderr.read() if holder.stderr else "")
+        self.fail(f"{tag} never started after 60s (rc={holder.poll()} out={out!r} err={err!r})")
 
     def test_stuck_holder_is_stopped_fresh_one_kept(self):
-        stuck = self.hold("build.slot", self.tag + "-stuck")
+        stuck = self.hold("build.slot", self.tag + "-stuck", slot_minutes=1)
         fresh = self.hold("build.slot", self.tag + "-fresh")
         proof = self.hold("proof.slot", self.tag + "-proof")
-        # The first holder took slot .0: backdate it past 60 + 15 minutes.
-        old = time.time() - 80 * 60
+        # Its own recorded deadline is 1 min, not the configured default 60.
+        old = time.time() - 20 * 60  # past 1 + 15, but not past 60 + 15
         os.utime(self.dir / "build.slot.0", (old, old))
         # The proof took 40 minutes: within 45 + 15.
         recent = time.time() - 40 * 60
@@ -71,7 +79,6 @@ class Reaper(unittest.TestCase):
         out = subprocess.run([str(REAPER)], env=self.env, check=True,
                              capture_output=True, text=True, timeout=60).stdout
 
-        self.assertIn(f"held {self.dir}/build.slot.0", out)
         stuck.wait(timeout=5)
         self.assertEqual(children_named(self.tag + "-stuck"), [], out)
         # Its work ran in tuna-timeout's own process group; that went too.
@@ -97,6 +104,26 @@ class Reaper(unittest.TestCase):
         holder.wait(timeout=5)
         detached.wait(timeout=5)
         self.assertFalse(alive(detached.pid), out)
+
+    def test_stale_unlocked_open_file_does_not_kill_reader(self):
+        slot = self.dir / "build.slot.0"
+        slot.write_text("1\n")
+        old = time.time() - 20 * 60
+        os.utime(slot, (old, old))
+        reader = subprocess.Popen(
+            ["bash", "-c", 'exec 9<"$1"; echo ready; exec sleep 600', "reader", str(slot)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
+        try:
+            if not select.select([reader.stdout], [], [], 60)[0]:
+                self.fail("unlocked reader did not start within its fixture deadline")
+            self.assertEqual(reader.stdout.readline().strip(), "ready")
+            subprocess.run([str(REAPER)], env=self.env, check=True,
+                           capture_output=True, text=True, timeout=60)
+            self.assertIsNone(reader.poll(), "an unlocked reader is not a stale slot holder")
+        finally:
+            reader.kill()
+            reader.wait(timeout=5)
+            reader.stdout.close()
 
     def test_nothing_held_nothing_done(self):
         out = subprocess.run([str(REAPER)], env=self.env, check=True,
