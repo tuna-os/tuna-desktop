@@ -206,6 +206,9 @@ struct Screen {
     /// application would otherwise keep it, and with it a stale prompt in
     /// the accessibility tree.
     window: gtk::Window,
+    /// The monitor the window covers (`None` only for unassigned test
+    /// windows).
+    monitor: Option<gtk::gdk::Monitor>,
     curtain: Curtain,
     clock: gtk::Label,
     date: gtk::Label,
@@ -298,6 +301,13 @@ pub struct LockUi {
     osk: RefCell<Option<Rc<crate::osk::Osk>>>,
     /// What the clocks' hints follow (idle time, power save, touch-mode).
     hints: Rc<lock_curtain::HintWatch>,
+    /// The display's monitor list while the lock screens are up, with
+    /// the `items-changed` handler that keeps one screen per monitor.
+    monitors_watch: RefCell<Option<(gtk::gio::ListModel, glib::SignalHandlerId)>>,
+    /// A [`LockUi::follow_monitors`] pass is under way, and the monitor
+    /// list changed again during it.
+    following: Cell<bool>,
+    refollow: Cell<bool>,
 }
 
 impl LockUi {
@@ -322,6 +332,9 @@ impl LockUi {
             wall_clock: RefCell::new(None),
             osk: RefCell::new(None),
             hints: lock_curtain::HintWatch::new(),
+            monitors_watch: RefCell::new(None),
+            following: Cell::new(false),
+            refollow: Cell::new(false),
         });
         {
             let weak = Rc::downgrade(&ui);
@@ -361,6 +374,9 @@ impl LockUi {
     /// (`gtk_session_lock_instance_unlock`), so destroying them here would
     /// tear the lock surfaces down while the session is still locked.
     fn release_screens(&self) {
+        if let Some((monitors, handler)) = self.monitors_watch.take() {
+            monitors.disconnect(handler);
+        }
         let screens = std::mem::take(&mut *self.screens.borrow_mut());
         let windows: Vec<gtk::Window> = screens.iter().map(|s| s.window.clone()).collect();
         let was_applying = self.applying.replace(true);
@@ -385,22 +401,22 @@ impl LockUi {
                 return;
             }
             // One lock window per monitor, assigned right after lock()
-            // (gtk4-layer-shell 1.1's contract).
+            // (gtk4-layer-shell 1.1's contract), and for each monitor
+            // plugged in while locked: GNOME's unlock dialog follows
+            // `monitors-changed` (unlockDialog.js `_updateBackgrounds`),
+            // and ext-session-lock-v1 wants a lock surface on every output.
             let Some(display) = gtk::gdk::Display::default() else {
                 return;
             };
             let monitors = display.monitors();
-            for i in 0..monitors.n_items() {
-                let Some(monitor) = monitors
-                    .item(i)
-                    .and_then(|m| m.downcast::<gtk::gdk::Monitor>().ok())
-                else {
-                    continue;
-                };
-                let window = self.screen(Some(&self.app.clone()));
-                self.instance.assign_window_to_monitor(&window, &monitor);
-                window.present();
-            }
+            let weak = Rc::downgrade(self);
+            let handler = monitors.connect_items_changed(move |_, _, _, _| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.follow_monitors();
+                }
+            });
+            *self.monitors_watch.borrow_mut() = Some((monitors, handler));
+            self.follow_monitors();
             self.refresh_clock();
             self.hints.arm();
             let weak = Rc::downgrade(self);
@@ -413,6 +429,99 @@ impl LockUi {
         } else if !locked && self.requested.get() {
             self.requested.set(false);
             self.instance.unlock();
+        }
+    }
+
+    /// One lock window per monitor in the display's list: a window for
+    /// each monitor without one, and the window of each monitor gone
+    /// dropped (its lock surface with it), the way GNOME's unlock dialog
+    /// rebuilds its per-monitor backgrounds on `monitors-changed`
+    /// (unlockDialog.js `_updateBackgrounds`). Windows whose monitor
+    /// stays are left alone, so the prompt being answered keeps its text
+    /// and focus.
+    fn follow_monitors(self: &Rc<Self>) {
+        // Mapping a lock window round-trips the display
+        // (gtk4-layer-shell's `lock_surface_map`), which can add or remove
+        // a monitor under us: that change is followed once this pass ends,
+        // never by a nested pass that would cover a monitor twice.
+        if self.following.replace(true) {
+            self.refollow.set(true);
+            return;
+        }
+        loop {
+            self.refollow.set(false);
+            self.follow_monitors_once();
+            if !self.refollow.get() {
+                break;
+            }
+        }
+        self.following.set(false);
+    }
+
+    fn follow_monitors_once(self: &Rc<Self>) {
+        // Released (the lock failed or ended) since the change came in.
+        let released = || self.monitors_watch.borrow().is_none();
+        let Some(display) = gtk::gdk::Display::default().filter(|_| !released()) else {
+            return;
+        };
+        let list = display.monitors();
+        let monitors: Vec<gtk::gdk::Monitor> = (0..list.n_items())
+            .filter_map(|i| list.item(i).and_then(|m| m.downcast().ok()))
+            .collect();
+        let covered: Vec<Option<gtk::gdk::Monitor>> = self
+            .screens
+            .borrow()
+            .iter()
+            .map(|s| s.monitor.clone())
+            .collect();
+        let (gone, added) = logic::lock_monitors_changed(&covered, &monitors);
+        if !gone.is_empty() {
+            let dropped: Vec<Screen> = {
+                let mut screens = self.screens.borrow_mut();
+                gone.iter().rev().map(|&i| screens.remove(i)).collect()
+            };
+            let windows: Vec<gtk::Window> = dropped.iter().map(|s| s.window.clone()).collect();
+            let was_applying = self.applying.replace(true);
+            drop(dropped);
+            self.applying.set(was_applying);
+            // Out of the display's own signal emission.
+            glib::idle_add_local_once(move || {
+                for window in windows {
+                    window.destroy();
+                }
+            });
+        }
+        for monitor in &added {
+            if released() {
+                return;
+            }
+            // Unplugged while an earlier window of this pass mapped.
+            if !monitor.is_valid() {
+                continue;
+            }
+            let window = self.screen(Some(&self.app.clone()), Some(monitor));
+            self.instance.assign_window_to_monitor(&window, monitor);
+            window.present();
+        }
+        if !added.is_empty() {
+            self.refresh_clock();
+        }
+        if !gone.is_empty() || !added.is_empty() {
+            let connectors = |list: &[gtk::gdk::Monitor]| {
+                list.iter()
+                    .map(|m| {
+                        m.connector()
+                            .map_or_else(|| "?".to_owned(), |c| c.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            trace(&format!(
+                "lock screens follow monitors: added [{}], removed {}, now {}",
+                connectors(&added),
+                gone.len(),
+                self.screens.borrow().len()
+            ));
         }
     }
 
@@ -584,7 +693,11 @@ impl LockUi {
 
     /// Build one monitor's lock window: GNOME's unlock-screen top bar
     /// over the clock curtain and the prompt.
-    fn screen(self: &Rc<Self>, app: Option<&gtk::Application>) -> gtk::Window {
+    fn screen(
+        self: &Rc<Self>,
+        app: Option<&gtk::Application>,
+        monitor: Option<&gtk::gdk::Monitor>,
+    ) -> gtk::Window {
         let window = gtk::Window::new();
         if let Some(app) = app {
             window.set_application(Some(app));
@@ -1147,6 +1260,7 @@ impl LockUi {
 
         let screen = Screen {
             window: window.clone(),
+            monitor: monitor.cloned(),
             curtain,
             clock,
             date,
@@ -1241,7 +1355,7 @@ mod auth_transport_ui_tests {
             Box::new(|| logic::ClockFormat::TwentyFourHour),
         );
         ui.sync_connection_generation(Some(0));
-        let window = ui.screen(None);
+        let window = ui.screen(None, None);
         window.present();
         (ui, window)
     }

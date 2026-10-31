@@ -2697,6 +2697,9 @@ impl Runtime {
             .map(|(name, cost)| (name.clone(), cost.to_json()))
             .collect::<serde_json::Map<_, _>>()
             .into();
+        // The outputs whose lock surface the compositor draws while
+        // locked; the others show only the lock background.
+        doc["lock_outputs"] = self.state.lock_surface_outputs().into();
         // Windows whose frame callbacks run at the hidden rate.
         doc["throttled_windows"] = if self.overview_motion.progress() > 0.0
             || !self.switcher_thumbnails.is_empty()
@@ -5983,7 +5986,11 @@ impl Runtime {
                         let _ = frame
                             .finish()
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-                        let cost = FrameCost::new(&drew, &elements.owners, &damage, size);
+                        let content_roots = roots.len()
+                            - usize::from(lock_surface.is_some())
+                            - usize::from(presented_cursor.is_some());
+                        let cost = FrameCost::new(&drew, &elements.owners, &damage, size)
+                            .with_roots(locked, lock_surface.is_some(), content_roots);
                         presented = Some((damage, cost, presented_cursor));
                     }
                 }
@@ -6391,6 +6398,10 @@ impl Runtime {
                     }
                     cursor_presented |= presented_cursor.is_some();
                     out.last_frame = Some(signature);
+                    let content_roots = mine.len()
+                        - usize::from(lock_surface.is_some())
+                        - usize::from(presented_cursor.is_some());
+                    let cost = cost.with_roots(locked, lock_surface.is_some(), content_roots);
                     self.frame_costs.insert(out.name.clone(), cost);
                     queued = true;
                 }
