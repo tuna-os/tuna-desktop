@@ -98,8 +98,10 @@ release gates: this limited beta is not v1 or roadmap #577 completion.
 For the untagged candidate, declare beta.3 in Arch's `_semver` and build the
 Debian package with `scripts/tuna-release --candidate-version 1.0.0-beta.3`.
 Both installed packages must report the intended beta.3 version rather than
-the nearest older tag. Candidate mode refuses an exact release-tagged HEAD;
-after tagging, use the ordinary tag-derived command and review gate.
+the nearest older tag. Candidate versions support the runbook's `X.Y.Z`,
+`X.Y.Z-beta.N` and `X.Y.Z-rc.N` forms, without build metadata. Candidate mode
+refuses an exact release-tagged HEAD; after tagging, use the ordinary
+tag-derived command and review gate.
 
 After qualification, use the normal new-tag/prerelease, deterministic vendor,
 signed package factory, served-package verification and trusted Marlin image

@@ -77,9 +77,9 @@ fn release_script_stages_layout_and_metadata_from_the_stamp() {
 fn pretag_candidates_use_an_explicit_validated_stamp_without_weakening_release_gates() {
     let body = read_workspace("scripts/tuna-release");
     for token in [
-        "--candidate-version SEMVER",
+        "--candidate-version VERSION",
         "--candidate-version)",
-        "--candidate-version requires a valid SemVer version",
+        "--candidate-version requires VERSION: X.Y.Z, X.Y.Z-beta.N, or X.Y.Z-rc.N",
         "--candidate-version is not allowed on an exact release tag",
         "git describe --tags --exact-match --match 'v[0-9]*' HEAD",
         "VERSION=\"$CANDIDATE_VERSION\"",

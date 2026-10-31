@@ -133,12 +133,15 @@ exit 91
     def test_help_documents_explicit_candidate_and_clean_tree_policy(self):
         result, trace = self.release(['--help'])
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('--candidate-version SEMVER', result.stdout)
+        self.assertIn('--candidate-version VERSION', result.stdout)
+        self.assertIn('X.Y.Z, X.Y.Z-beta.N, or X.Y.Z-rc.N', result.stdout)
+        self.assertIn('no leading zeros', result.stdout)
+        self.assertIn('build metadata is not supported', result.stdout)
         self.assertIn('Candidates still require a clean tree', result.stdout)
         self.assertEqual(trace, '')
 
     def test_candidate_overrides_nearest_beta2_tag_and_ambient_stamp(self):
-        for version in ('0.1.0-beta.3', '1.2.3', '1.2.3-rc.1+build.7', '1.2.3+build-with-hyphen'):
+        for version in ('0.1.0-beta.3', '1.2.3', '1.2.3-rc.1', '0.0.0-beta.0'):
             with self.subTest(version=version):
                 result, trace = self.release(['--candidate-version', version])
                 self.assertEqual(result.returncode, 91, result.stderr)
@@ -150,12 +153,16 @@ exit 91
         cases = [[], [''], ['v0.1.0-beta.3'], ['0.1'], ['01.2.3'], ['1.02.3'],
                  ['1.2.03'], ['1.2.3-01'], ['1.2.3-beta.03'], ['1.2.3-'],
                  ['1.2.3+'], ['1.2.3-beta..3'], ['1.2.3 beta.3'],
-                 ['1.2.3\n0.1.0-beta.3'], ['--allow-dirty']]
+                 ['1.2.3\n0.1.0-beta.3'], ['--allow-dirty'], ['1.2.3+build-'],
+                 ['1.2.3+build.7'], ['1.2.3+build-with-hyphen'], ['1.2.3-beta-'],
+                 ['1.2.3-beta.3+build.7'], ['1.2.3-rc.1+build.7'], ['1.2.3-alpha.1'],
+                 ['1.2.3-beta'], ['1.2.3-rc.01'], ['1.2.3-preview.1'], ['1.2.3-1']]
         for value in cases:
             with self.subTest(value=value):
                 result, trace = self.release(['--candidate-version', *value])
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('--candidate-version requires', result.stderr)
+                self.assertIn('X.Y.Z, X.Y.Z-beta.N, or X.Y.Z-rc.N', result.stderr)
                 self.assertEqual(trace, '')
 
     def test_candidate_is_refused_on_any_exact_release_tag_even_allow_dirty(self):
@@ -354,7 +361,7 @@ printf '%s\\n' 'shlibs:Depends=libc6 (>= 2.34)'
         """Controlled Cargo/ABI delegates, but real staging, ELF and .deb tools."""
         for index, (version, deb_version) in enumerate((
                 ('0.1.0-beta.3', '0.1.0~beta.3'),
-                ('1.2.3+build-with-hyphen', '1.2.3+build-with-hyphen'))):
+                ('1.2.3-rc.1', '1.2.3~rc.1'))):
             with self.subTest(version=version):
                 work = self.root / f'candidate-builder-{index}'
                 target = work / 'target/release'

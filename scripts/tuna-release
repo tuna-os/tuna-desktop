@@ -2,7 +2,7 @@
 # tuna-release — build the Tuna Desktop Debian package from a clean checkout.
 #
 # Usage:
-#   scripts/tuna-release [--out DIR] [--candidate-version SEMVER] [--allow-dirty] [--help]
+#   scripts/tuna-release [--out DIR] [--candidate-version VERSION] [--allow-dirty] [--help]
 #
 # Builds the six release binaries with the version stamped from the git tag,
 # stages the documented install layout (binaries side by side plus the
@@ -13,8 +13,10 @@
 # binaries report the SemVer version; the package Version maps the prerelease
 # hyphen to "~" (X.Y.Z~beta.N) so dpkg orders it before the final X.Y.Z.
 #
-# --candidate-version SEMVER stamps an explicit pre-tag binary/package version
-# (for example 1.0.0-beta.3); it is rejected on any exact v-prefixed release tag.
+# --candidate-version VERSION stamps an explicit pre-tag binary/package version.
+# Supported forms: X.Y.Z, X.Y.Z-beta.N, or X.Y.Z-rc.N; all numeric components
+# are nonnegative with no leading zeros, and build metadata is not supported.
+# Candidates are rejected on any exact v-prefixed release tag.
 # Candidates still require a clean tree unless --allow-dirty is explicit.
 # Without a candidate, existing tag-derived versions and visual review apply.
 # --allow-dirty permits dev builds, using the nearest release tag or the crate
@@ -36,7 +38,7 @@ while [ "$#" -gt 0 ]; do
             ;;
         --candidate-version)
             if [ "$#" -lt 2 ]; then
-                echo "tuna-release: --candidate-version requires a SemVer version" >&2
+                echo "tuna-release: --candidate-version requires VERSION: X.Y.Z, X.Y.Z-beta.N, or X.Y.Z-rc.N" >&2
                 exit 1
             fi
             CANDIDATE_MODE="yes"
@@ -59,15 +61,15 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "$CANDIDATE_MODE" = "yes" ]; then
-    # Reject whitespace/newlines before the line-oriented SemVer expression.
+    # Reject whitespace/newlines before the line-oriented supported-form check.
     case "$CANDIDATE_VERSION" in
         '' | *[!0-9A-Za-z.+-]*)
-            echo "tuna-release: --candidate-version requires a valid SemVer version" >&2
+            echo "tuna-release: --candidate-version requires VERSION: X.Y.Z, X.Y.Z-beta.N, or X.Y.Z-rc.N (no leading zeros or build metadata)" >&2
             exit 1
             ;;
     esac
-    if ! printf '%s\n' "$CANDIDATE_VERSION" | LC_ALL=C grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'; then
-        echo "tuna-release: --candidate-version requires a valid SemVer version" >&2
+    if ! printf '%s\n' "$CANDIDATE_VERSION" | LC_ALL=C grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(beta|rc)\.(0|[1-9][0-9]*))?$'; then
+        echo "tuna-release: --candidate-version requires VERSION: X.Y.Z, X.Y.Z-beta.N, or X.Y.Z-rc.N (no leading zeros or build metadata)" >&2
         exit 1
     fi
     if [ -n "$(git describe --tags --exact-match --match 'v[0-9]*' HEAD 2>/dev/null || true)" ]; then
@@ -185,7 +187,7 @@ case "$SHLIBS" in shlibs:Depends=*) SHLIBS="${SHLIBS#shlibs:Depends=}" ;; *) ech
 [ -n "$SHLIBS" ] || exit 1
 rm -r "$STAGE/debian"
 # Debian orders "~" before everything, so X.Y.Z~beta.N < X.Y.Z.
-DEB_VERSION="$(printf '%s' "$VERSION" | sed 's/^\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)-/\1~/')"
+DEB_VERSION="$(printf '%s' "$VERSION" | sed 's/-/~/')"
 cat >"$STAGE/DEBIAN/control" <<EOF
 Package: tuna-desktop
 Version: $DEB_VERSION
