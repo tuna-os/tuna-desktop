@@ -140,6 +140,7 @@ jobs:
       - run: python3 scripts/lib/grid-target-settled-tests.py
       - run: python3 scripts/lib/grid-anim-samples-tests.py
       - run: python3 scripts/lib/tuna-a11y-dump-tests.py
+      - run: python3 scripts/lib/a11y-focus-proof-tests.py
       - run: /usr/bin/python3 scripts/tests/test_grid_cancel_proof.py
       - run: /usr/bin/python3 scripts/tests/test_grid_cancel_comparison.py
       - run: python3 scripts/lib/pam-helper-source-tests.py
