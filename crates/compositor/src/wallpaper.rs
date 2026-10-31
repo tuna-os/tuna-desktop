@@ -2487,7 +2487,13 @@ mod tests {
             .is_none(),
             "stale source worker cannot publish old image identity"
         );
-        std::fs::write(&xml, document.replace("<duration>4", "<duration>8")).unwrap();
+        let replacement_xml = dir.path().join("replacement.xml");
+        std::fs::write(
+            &replacement_xml,
+            document.replace("<duration>4", "<duration>8"),
+        )
+        .unwrap();
+        std::fs::rename(&replacement_xml, &xml).unwrap();
         assert!(
             load_animation_wallpaper(
                 &uri,
