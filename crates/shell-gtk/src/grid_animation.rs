@@ -820,10 +820,13 @@ impl Zoom {
 
     pub fn set(&self, shift: (f64, f64), scale: (f64, f64), alpha: f64) {
         let imp = self.imp();
-        if imp.shift.replace(shift) != shift
-            || imp.scale.replace(scale) != scale
-            || imp.alpha.replace(alpha) != alpha
-        {
+        // Apply every property before testing for damage: short-circuiting
+        // the replacements can leave the terminal frame at an old scale
+        // or opacity when its translation changes too.
+        let shifted = imp.shift.replace(shift) != shift;
+        let scaled = imp.scale.replace(scale) != scale;
+        let faded = imp.alpha.replace(alpha) != alpha;
+        if shifted || scaled || faded {
             self.queue_draw();
         }
     }
@@ -838,8 +841,9 @@ impl Zoom {
     /// Only the scale (about the pivot) and opacity, keeping the offset.
     pub fn set_look(&self, scale: f64, alpha: f64) {
         let imp = self.imp();
-        if imp.scale.replace((scale, scale)) != (scale, scale) || imp.alpha.replace(alpha) != alpha
-        {
+        let scaled = imp.scale.replace((scale, scale)) != (scale, scale);
+        let faded = imp.alpha.replace(alpha) != alpha;
+        if scaled || faded {
             self.queue_draw();
         }
     }
@@ -854,6 +858,55 @@ impl Zoom {
 
     pub fn alpha(&self) -> f64 {
         self.imp().alpha.get()
+    }
+}
+
+#[cfg(test)]
+mod gtk_zoom_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires owned Xvfb/private D-Bus and explicit grid zoom admission"]
+    fn actual_gtk_zoom_applies_all_properties_including_terminal_frame() {
+        assert_eq!(std::env::var("TUNA_REQUIRE_GRID_ZOOM").as_deref(), Ok("1"));
+        assert!(std::env::var_os("WAYLAND_DISPLAY").is_none());
+        gtk::init().expect("actual GTK display required");
+        let zoom = Zoom::new(&gtk::Label::new(Some("Folder apps")));
+        zoom.set_pivot(0.0, 0.0);
+        let source = (158.0, 268.0, 113.0, 113.0);
+        let dialog = (279.0, 56.0, 722.0, 720.0);
+        let full = Motion::from_gnome(true, false, 1.0);
+        let apply = |elapsed| {
+            let (shift, scale) = folder_zoom(source, dialog, FOLDER_ZOOM.at(elapsed, full));
+            let alpha = FOLDER_FADE_IN.at(elapsed, full);
+            zoom.set(shift, scale, alpha);
+            assert_eq!(zoom.shift(), shift, "translation at {elapsed} ms");
+            assert_eq!(zoom.scale(), scale, "scale at {elapsed} ms");
+            assert_eq!(zoom.alpha(), alpha, "opacity at {elapsed} ms");
+        };
+        apply(0.0);
+        apply(50.0);
+        // A delayed frame callback may jump straight past the end. No
+        // subsequent tick repairs it, so all three properties must land.
+        apply(2933.0);
+        assert_eq!(zoom.shift(), (0.0, 0.0));
+        assert_eq!(zoom.scale(), (1.0, 1.0));
+        assert_eq!(zoom.alpha(), 1.0);
+        // Identical values and single-property updates must work too.
+        apply(2933.0);
+        zoom.set((0.0, 0.0), (1.0, 1.0), 0.4);
+        assert_eq!(zoom.alpha(), 0.4);
+        zoom.set_shift((12.0, 8.0));
+        zoom.set_look(0.5, 0.0);
+        assert_eq!(zoom.shift(), (12.0, 8.0), "look preserves reflow");
+        assert_eq!(zoom.scale(), (0.5, 0.5));
+        assert_eq!(zoom.alpha(), 0.0, "drag shrinks and fades in one call");
+        zoom.set_look(1.0, 1.0);
+        assert_eq!(zoom.scale(), (1.0, 1.0));
+        assert_eq!(zoom.alpha(), 1.0, "drag end restores both properties");
+        zoom.set_look(1.0, 0.3);
+        assert_eq!(zoom.alpha(), 0.3, "opacity-only look update");
+        println!("GRID-ZOOM pass simultaneous translation/scale/opacity, delayed terminal frame and drag look updates");
     }
 }
 

@@ -293,6 +293,23 @@ is rejected, and the existing five-second polling budget must still obtain
 a valid tree. Persistent transport errors, wrong owners and incomplete trees
 cannot satisfy the gate.
 
+For folder-drag diagnosis, `just proof gtk-shell-proof --folder-dnd-only`
+runs panel readiness and the same `G-FOLDER-DND` journey/assertions as the
+full proof, then checks shell stability and exits. It creates a folder by
+dragging one app onto another, opens it, and requires dragging the second
+app onto the shade to remove exactly that app. This slice does not qualify
+the rest of the GTK journey or installed-image behavior.
+
+The GTK CI lane also runs
+`grid_animation::gtk_zoom_tests::actual_gtk_zoom_applies_all_properties_including_terminal_frame`
+on its admitted test binary under private Xvfb/D-Bus with
+`TUNA_REQUIRE_GRID_ZOOM=1`. It checks combined translation/scale/opacity
+updates, including a frame jumping past the 200 ms folder ease, and
+combined drag scale/fade updates. Each property is applied before deciding
+whether to queue damage: a changed translation must not short-circuit the
+scale or opacity writes, including on the last animation tick. This is
+widget-state coverage, not a frame-scheduling latency guarantee.
+
 | CI job | Command | Extra packages | What it asserts |
 |---|---|---|---|
 | `journey` | `scripts/tuna-journey --artifacts journey-artifacts` | `xvfb xdotool x11-apps scrot jq dbus`, Mesa EGL (`libegl1 libgl1-mesa-dri`) | Overview, search, launch from search, Escape, workspace switch, Alt+Tab; writes `assertions.txt` |
