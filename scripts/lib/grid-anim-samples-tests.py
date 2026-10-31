@@ -98,6 +98,50 @@ class SwitchTests(unittest.TestCase):
         self.assertEqual(check(log), [])
 
 
+class DiagnosticTests(unittest.TestCase):
+    def test_sparse_correct_samples_still_fail_coverage_not_the_curve(self):
+        # Installed journey 41181908245 / aee02d6, second page switch.
+        text = switch_log(times=(0.0, 0.0, 100.002, 319.017))
+        frames, dots = samples.parse(text)
+        self.assertEqual(samples.check_switch(frames, dots, 0.0, 1.0), [
+            '1 frames between the pages, fewer than 2',
+            '1 page-dots samples between the pages, fewer than 2',
+        ])
+        report = '\n'.join(samples.switch_diagnostics(frames, dots, 0.0, 1.0))
+        self.assertIn('1/2 required intermediate page frames', report)
+        self.assertIn('1/2 required intermediate page-dot updates', report)
+        self.assertIn('219.015 ms (100.002 -> 319.017 ms)', report)
+        self.assertIn('repeated frame times: 1', report)
+        self.assertIn('not presentation or scheduler evidence', report)
+
+    def test_a_jump_remains_a_failure_even_with_correct_endpoints(self):
+        frames, dots = samples.parse(switch_log(times=(0.0, 0.0, 333.340)))
+        self.assertEqual(samples.check_switch(frames, dots, 0.0, 1.0), [
+            '0 frames between the pages, fewer than 2',
+            '0 page-dots samples between the pages, fewer than 2',
+        ])
+        report = '\n'.join(samples.switch_diagnostics(frames, dots, 0.0, 1.0))
+        self.assertIn('0/2 required intermediate page frames', report)
+        self.assertIn('333.340 ms (0.000 -> 333.340 ms)', report)
+        self.assertIn('maximum GNOME position error: 0.000000000 page', report)
+
+    def test_wrong_curve_is_reported_independently_of_ample_coverage(self):
+        frames, dots = samples.parse(switch_log(curve=lambda e: min(e / 300.0, 1.0)))
+        self.assertTrue(any('ease-out-cubic' in error
+                            for error in samples.check_switch(frames, dots, 0.0, 1.0)))
+        report = '\n'.join(samples.switch_diagnostics(frames, dots, 0.0, 1.0))
+        self.assertIn('4/2 required intermediate page frames', report)
+        self.assertIn('maximum GNOME position error: 0.375000000 page', report)
+
+    def test_empty_or_stalled_clock_does_not_invent_a_gap(self):
+        for times in ((), (0.0, 0.0)):
+            frames, dots = samples.parse(switch_log(times=times))
+            self.assertTrue(samples.check_switch(frames, dots, 0.0, 1.0))
+            report = '\n'.join(samples.switch_diagnostics(frames, dots, 0.0, 1.0))
+            self.assertIn('no advancing frame-time samples', report)
+            self.assertNotIn('largest logged frame-time gap', report)
+
+
 class InstantTests(unittest.TestCase):
     def test_off_jumps(self):
         frames, dots = samples.parse(dots_line(0.0) + '\n')
@@ -169,6 +213,10 @@ class RetentionTests(unittest.TestCase):
             self.assertIn(str(output), result.stderr)
             self.assertIn(str(artifacts / 'nested.log'), result.stderr)
             self.assertIn('fewer than 2', output.read_text())
+            self.assertIn('source ' + str(artifacts / 'nested.log'), output.read_text())
+            self.assertIn('byte offset 0', output.read_text())
+            self.assertIn('0/2 required intermediate page frames', output.read_text())
+            self.assertIn('largest logged frame-time gap: 300.000 ms', output.read_text())
             self.assertIn('frame 300.000 ms', output.read_text())
             self.assertIn(output.read_text(), result.stderr)
 

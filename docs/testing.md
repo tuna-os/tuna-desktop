@@ -317,6 +317,16 @@ at its root. In the `journey` job the installed GTK proof writes them under
 always-run artifact preparation also copies just these diagnostics into
 `journey-shots/installed-controls`, including on an early proof failure.
 
+Each animated-switch report also gives the source byte offset, intermediate
+page/dot counts against the unchanged minimum of two, the largest logged
+frame-clock gap, repeated frame times, and maximum error against GNOME's
+curve. This distinguishes missing intermediate samples from wrong sampled
+positions; **either still fails**. Two zero-time records are normal:
+initialization and the first tick. A sparse callback trace alone cannot
+attribute a gap to shell work, compositor delivery, runner scheduling or
+presentation. Do not infer smooth presentation from correct endpoints, or
+apply the unrelated folder `Zoom` setter fix to the pager's drawing path.
+
 **Start `tuna-gtk-shell-proof` from a fresh artifacts directory.** The
 script points `XDG_STATE_HOME` at `gtk-shell-artifacts/state`, and the
 shell keeps its state, notification history included, under
