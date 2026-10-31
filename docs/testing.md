@@ -315,6 +315,10 @@ G-QS-VOLUME-FEEDBACK (a real drag of the quick-settings volume slider sounds
 once at its end, a scroll once, a playing sink or `event-sounds` off never).
 A `canberra-gtk-play` stand-in logs every event sound to `canberra-calls`;
 none of these gates plays or captures audio.
+The `gtk-shell` CI job runs this focused slice before the full shell proof,
+so an unrelated earlier full-shell gate cannot prevent sound qualification.
+Its `sound-alerts/` artifacts and the retained `bin/examples/tuna-bell-client`
+belong to the same exact PR head as the compositor and shell binaries.
 
 The bell timeline presents each 50 ms leg's endpoint before reversing,
 including when a frame arrives late, as Mutter's Clutter timeline does.

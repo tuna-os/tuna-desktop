@@ -924,6 +924,14 @@ jobs:
       - run: /usr/bin/python3 scripts/lib/gtk-folder-watch-proof-tests.py
       - run: /usr/bin/python3 scripts/lib/lock-curtain-proof-tests.py
       - run: /usr/bin/python3 scripts/lib/gsd-media-keys-bus-tests.py
+      # Qualify sound gates before unrelated full-shell stages can stop them.
+      - name: Prove visual bells and output-slider feedback independently
+        run: scripts/tuna-gtk-shell-proof --sound-alerts-only --artifacts gtk-shell-artifacts/sound-alerts
+        env:
+          TUNA_REQUIRE_PAM_WRAPPER: "1"
+          TUNA_REQUIRE_IBUS: "1"
+          TUNA_REQUIRE_WAYLAND_INFO: "1"
+          TUNA_REQUIRE_GSD_MEDIA_KEYS: "1"
       - run: scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts
         env:
           TUNA_REQUIRE_PAM_WRAPPER: "1"
@@ -961,8 +969,9 @@ jobs:
       # Keep runnable binaries even when a later live proof assertion fails.
       - if: always()
         run: |
-          mkdir -p gtk-shell-artifacts/bin
+          mkdir -p gtk-shell-artifacts/bin/examples
           cp target/debug/tuna-compositor target/debug/tuna-shell-gtk target/debug/tuna-wallpaper-svg gtk-shell-artifacts/bin/
+          cp target/debug/examples/tuna-bell-client gtk-shell-artifacts/bin/examples/
           cp /usr/local/lib/*/libgtk4-layer-shell.so* gtk-shell-artifacts/bin/ 2>/dev/null || cp /usr/local/lib/libgtk4-layer-shell.so* gtk-shell-artifacts/bin/
       # G-WS-INSERT publishes the targeted insertion frame/state. Full
       # parity captures need native fonts, wallpapers and installed apps;
