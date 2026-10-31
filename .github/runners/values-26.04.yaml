@@ -32,7 +32,7 @@ template:
     enableServiceLinks: false
     containers:
       - name: runner
-        image: localhost/tuna-ci-runner:26.04-2.338.2-202610302054
+        image: localhost/tuna-ci-runner:26.04-2.338.2-202610310435
         imagePullPolicy: Never
         command: ["/home/runner/run.sh"]
         # ARC uses this as the runner's work folder: /home/runner/work, as on
