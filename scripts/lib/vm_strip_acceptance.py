@@ -511,30 +511,61 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         ppm = destination / (label + '.ppm')
         if png.exists() or ppm.exists():
             raise RuntimeError('refuse reused framebuffer capture path')
-        transport.command('screendump', filename=str(png), format='png')
-        transport.command('screendump', filename=str(ppm), format='ppm')
-        actual_image = read_ppm(str(ppm))
-        if actual_image[:2] != (1280, 800):
-            raise RuntimeError('actual framebuffer dimensions differ from admitted viewport')
-        colored_frame(actual_image, found[role]['rect'], COLORS[role])
-        # QMP PNG and PPM are separate acquisitions. Validate both actual
-        # images; an earlier unvalidated PNG is not a qualified walkthrough.
-        from PIL import Image
-        with Image.open(png) as frame:
-            if frame.format != 'PNG' or frame.size != (1280, 800):
-                raise RuntimeError('actual PNG framebuffer format/dimensions differ')
-            png_image = frame.convert('RGB')
-            colored_frame((png_image.width, png_image.height, png_image.tobytes()),
-                          found[role]['rect'], COLORS[role])
-        after = read(deadline)
-        if time.monotonic() >= deadline:
-            raise TimeoutError('installed framebuffer validation exceeded absolute deadline')
+        capture_deadline = min(deadline, time.monotonic() + 10.0)
+        capture_transport = QmpDeadline(qmp, capture_deadline)
+        attempts = 0
+        last_error = None
+        while time.monotonic() < capture_deadline:
+            attempts += 1
+            capture_transport.command('screendump', filename=str(png), format='png')
+            capture_transport.command('screendump', filename=str(ppm), format='ppm')
+            actual_image = read_ppm(str(ppm))
+            if actual_image[:2] != (1280, 800):
+                raise RuntimeError('actual framebuffer dimensions differ from admitted viewport')
+            try:
+                colored_frame(actual_image, found[role]['rect'], COLORS[role])
+                # QMP PNG and PPM are separate acquisitions. Validate both actual
+                # images; an earlier unvalidated PNG is not a qualified walkthrough.
+                from PIL import Image
+                with Image.open(png) as frame:
+                    if frame.format != 'PNG' or frame.size != (1280, 800):
+                        raise RuntimeError('actual PNG framebuffer format/dimensions differ')
+                    png_image = frame.convert('RGB')
+                    colored_frame((png_image.width, png_image.height, png_image.tobytes()),
+                                  found[role]['rect'], COLORS[role])
+                if time.monotonic() >= capture_deadline:
+                    raise TimeoutError('installed framebuffer capture exceeded deadline')
+                break
+            except NotReady as error:
+                last_error = error
+                if attempts == 1:
+                    png.replace(destination / (label + '-not-ready.png'))
+                    ppm.replace(destination / (label + '-not-ready.ppm'))
+                remaining = capture_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(0.25, remaining))
+                refreshed = read(capture_deadline)
+                if windows(refreshed, original, edge=edge) != found:
+                    raise RuntimeError('actual window geometry changed while awaiting framebuffer')
+                sample = refreshed
+                if attempts > 1:
+                    png.unlink(missing_ok=True)
+                    ppm.unlink(missing_ok=True)
+        else:
+            if last_error is not None:
+                raise last_error
+            raise TimeoutError('installed framebuffer capture exceeded deadline')
+        after = read(capture_deadline)
+        if time.monotonic() >= capture_deadline:
+            raise TimeoutError('installed framebuffer validation exceeded capture deadline')
         if windows(after, original, edge=edge) != found:
             raise RuntimeError('actual window geometry changed across framebuffer acquisition')
         entry = {'label': label, 'sample': sample, 'after': after,
                  'png_sha256': hashlib.sha256(png.read_bytes()).hexdigest(),
                  'ppm_sha256': hashlib.sha256(ppm.read_bytes()).hexdigest(),
                  'capture_completed_monotonic_ns': time.monotonic_ns(),
+                 'capture_attempts': attempts,
                  'png_rgb_verified': True, 'ppm_rgb_verified': True,
                  'same_acquisition_qualified': False, 'presented_latency_qualified': False}
         receipt['cases'].append(entry)

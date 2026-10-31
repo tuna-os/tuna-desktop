@@ -2,7 +2,9 @@
 //! D-Bus interface that other GNOME components call (shellDBus.js).
 //! gnome-settings-daemon's media keys show the volume and brightness OSD
 //! through `ShowOSD`, and open search or the app grid through
-//! `FocusSearch` and `ShowApplications`.
+//! `FocusSearch` and `ShowApplications`. The same connection carries
+//! `/org/gnome/Shell/Introspect`, relayed to the compositor
+//! (`introspect_forward.rs`), as GNOME Shell serves it under this name.
 //!
 //! As in GNOME, those methods answer only allowlisted callers (Settings,
 //! the media-keys daemon, the GNOME portal backend). Harnesses set
@@ -240,6 +242,8 @@ pub struct Service {
     actions: Rc<dyn ShellActions>,
     /// NameOwnerChanged, to drop a departed caller's grabs.
     watch: RefCell<Option<gio::SignalSubscription>>,
+    /// `/org/gnome/Shell/Introspect`, relayed to the compositor.
+    introspect: RefCell<Option<crate::introspect_forward::Relay>>,
 }
 
 impl Service {
@@ -407,6 +411,7 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
         on_internal: RefCell::new(None),
         actions: actions.clone(),
         watch: RefCell::new(None),
+        introspect: RefCell::new(None),
     });
     let node = match gio::DBusNodeInfo::for_xml(XML) {
         Ok(node) => node,
@@ -558,6 +563,10 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                 },
             );
             *leave_svc.watch.borrow_mut() = Some(subscription);
+            match crate::introspect_forward::register(&conn) {
+                Ok(relay) => *leave_svc.introspect.borrow_mut() = Some(relay),
+                Err(e) => eprintln!("tuna-shell-gtk: org.gnome.Shell Introspect relay: {e}"),
+            }
         },
         |_, _| {},
         |_, _| eprintln!("tuna-shell-gtk: org.gnome.Shell is owned elsewhere"),
@@ -676,6 +685,7 @@ mod tests {
             on_internal: RefCell::new(None),
             actions,
             watch: RefCell::new(None),
+            introspect: RefCell::new(None),
         }
     }
 

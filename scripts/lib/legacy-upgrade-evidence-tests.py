@@ -460,8 +460,8 @@ for path in pathlib.Path(sys.argv[2]).iterdir():
         with self.assertRaises((ValueError, OSError, RuntimeError)):
             M.export_evidence(self.source, self.output, 0)
         self.assertTrue(archive.is_symlink())
-        self.assertEqual(outside.read_text(), MARKER)
         self.assertEqual(outside.stat(), before)
+        self.assertEqual(outside.read_text(), MARKER)
         self.assertEqual(list(self.output.iterdir()), [archive])
 
     def test_long_realistic_manifest_names_remain_flat_regular_members(self):
