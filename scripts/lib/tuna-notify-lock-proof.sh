@@ -272,14 +272,17 @@ notify_lock_proof() {
     nl_off_again=$(nl_notify tuna-lock-off "Off Again" "OFF-AGAIN-BODY" 1) ||
         fail G-NOTIFY-RESTORE "Notify failed"
     sleep 1
-    xdotool mousemove --window "$WID" $((WIDTH / 2)) 16 click 1
+    # Open the date menu by its button (a banner can still be up here); its
+    # Clear button showing is the menu open, where banners stay hidden.
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-notify-restore-open.json" 20 \
+        --press "Date and Time" || fail G-NOTIFY-RESTORE "could not open the date menu"
     sleep 2
-    nl_until restore-disabled 'any(.[]; .showing and .name == "Listed Summary")' G-NOTIFY-RESTORE ||
+    nl_until restore-disabled '[.[] | select(.showing)] | (any(.name == "Clear") and any(.name == "Listed Summary"))' G-NOTIFY-RESTORE ||
         fail G-NOTIFY-RESTORE "the date menu does not list the history"
     nl_mentions "$nl_tree" "Off Again" &&
         fail G-NOTIFY-RESTORE "a disabled app's notification reached the list"
     gsettings set "$(nl_app tuna-lock-off)" enable true
-    nl_until restored 'any(.[]; .showing and .name == "Off Again")' G-NOTIFY-RESTORE ||
+    nl_until restored '[.[] | select(.showing)] | (any(.name == "Clear") and any(.name == "Off Again"))' G-NOTIFY-RESTORE ||
         fail G-NOTIFY-RESTORE "enabling the app did not bring its notification back to the list"
     nl_shot restored
     "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-notify-restore-cleared.json" 20 \
