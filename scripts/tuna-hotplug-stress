@@ -49,6 +49,7 @@ pipewire, wireplumber, gst-launch-1.0 with pipewiresrc and the installed
 xdg-desktop-portal-gnome.
 """
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -661,6 +662,10 @@ def run(args):
         for iface in ("org.gnome.Mutter.ScreenCast.Session", "org.freedesktop.impl.portal.Session"):
             dbus.signal_subscribe(None, iface, "Closed", None, None, Gio.DBusSignalFlags.NONE, on_signal)
         portal = {"backend": None, "serial": 0}
+        dump_spec = importlib.util.spec_from_file_location(
+            "tuna_pipewire_dump", ROOT / "scripts/lib/tuna-pipewire-dump.py")
+        dump_module = importlib.util.module_from_spec(dump_spec)
+        dump_spec.loader.exec_module(dump_module)
 
         def portal_owned():
             try:
@@ -720,9 +725,18 @@ def run(args):
             return session, streams[0][0]
 
         def pipewire_nodes():
-            text = subprocess.run(["pw-dump", "--no-colors"], env=env, capture_output=True, text=True,
-                                  timeout=10).stdout
-            return {o["id"] for o in json.loads(text or "[]") if o.get("type") == "PipeWire:Interface:Node"}
+            raw = subprocess.run(["pw-dump", "--no-colors"], env=env, capture_output=True,
+                                 check=True, timeout=10).stdout
+            return {o["id"] for o in dump_module.dump_objects(raw)
+                    if o.get("type") == "PipeWire:Interface:Node"}
+
+        def consume_frames(connector, node):
+            grab = subprocess.run(
+                ["gst-launch-1.0", "-q", "pipewiresrc", f"path={node}", "num-buffers=3", "!", "fakesink"],
+                env=env, capture_output=True, text=True, timeout=30)
+            (out / f"cast-frames-{connector}.log").write_text(grab.stdout + grab.stderr)
+            if grab.returncode != 0:
+                raise RuntimeError(f"cast of {connector} gave no frames: {grab.stderr.strip()[-300:]}")
 
         def cast_removed():
             """H-CAST-REMOVED: Mutter's meta-stream-monitor.c on_monitors_changed
@@ -731,6 +745,8 @@ def run(args):
             plug(1, {0, 1}, f"cast: plug {B}")
             mark = len(log_path.read_text())
             session, node = portal_cast(B)
+            consume_frames(B, node)
+            mark = len(log_path.read_text())
             consumer = launch(["gst-launch-1.0", "-q", "pipewiresrc", f"path={node}", "!", "fakesink"],
                               "cast-consumer-B")
             wait_for(f"the cast of {B} streams to its consumer",
@@ -765,10 +781,7 @@ def run(args):
                 consumer.wait(timeout=5)
             # A new cast of A streams.
             session_a, node_a = portal_cast(A)
-            grab = subprocess.run(["gst-launch-1.0", "-q", "pipewiresrc", f"path={node_a}", "num-buffers=3", "!",
-                                   "fakesink"], env=env, capture_output=True, text=True, timeout=30)
-            if grab.returncode != 0:
-                raise RuntimeError(f"a new cast of {A} gave no frames: {grab.stderr.strip()[-300:]}")
+            consume_frames(A, node_a)
             dbus.call_sync("org.freedesktop.impl.portal.desktop.gnome", session_a, "org.freedesktop.impl.portal.Session",
                            "Close", None, None, Gio.DBusCallFlags.NONE, 10000, None)
             wait_for(f"the cast of {A} ends on Close", lambda: state().get("capture_streams") == 0, 5)

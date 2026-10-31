@@ -57,10 +57,10 @@ pub enum CastTarget {
     Monitor(String),
     /// One window, by its Introspect id.
     Window(u64),
-    /// Part of a monitor (`RecordArea`, what GNOME's screen recorder
-    /// asks for): the monitor's connector and the area in its physical
-    /// pixels, `(x, y, width, height)`.
-    Area(String, (i32, i32, i32, i32)),
+    /// A fixed stage region in global logical pixels (`RecordArea`).
+    /// Unlike a monitor stream it follows the views under the region,
+    /// not the connector that was there when recording started.
+    Area((i32, i32, i32, i32)),
 }
 
 /// Where a `RecordArea` rectangle (global logical pixels) lands: the
@@ -922,8 +922,8 @@ struct Session {
 enum Stream {
     Monitor(OutputSnapshot),
     Window(WindowSnapshot),
-    /// The output, the requested logical area, and its physical pixels.
-    Area(OutputSnapshot, (i32, i32, i32, i32), (i32, i32, i32, i32)),
+    /// The requested global logical area.
+    Area((i32, i32, i32, i32)),
 }
 
 impl Stream {
@@ -931,9 +931,7 @@ impl Stream {
         match self {
             Stream::Monitor(output) => CastTarget::Monitor(output.connector.clone()),
             Stream::Window(window) => CastTarget::Window(window.id),
-            Stream::Area(output, _, physical) => {
-                CastTarget::Area(output.connector.clone(), *physical)
-            }
+            Stream::Area(logical) => CastTarget::Area(*logical),
         }
     }
 }
@@ -1142,13 +1140,10 @@ impl Session {
         self.check_owner(&header)?;
         self.authority.unlocked()?;
         let outputs = self.outputs.lock().map(|o| o.clone()).unwrap_or_default();
-        let (output, physical) = area_on_output(&outputs, (x, y, width, height))
+        area_on_output(&outputs, (x, y, width, height))
             .ok_or_else(|| fdo::Error::Failed("the area is on no monitor".into()))?;
-        self.add_stream(
-            server,
-            Stream::Area(output, (x, y, width, height), physical),
-        )
-        .await
+        self.add_stream(server, Stream::Area((x, y, width, height)))
+            .await
     }
 
     /// GNOME's window share: the portal's picker lists windows from
@@ -1242,7 +1237,7 @@ impl Stream {
                 position: (0, 0),
                 size: (w.width.max(1), w.height.max(1)),
             },
-            Stream::Area(_, (x, y, w, h), _) => StreamParameters {
+            Stream::Area((x, y, w, h)) => StreamParameters {
                 position: (*x, *y),
                 size: (*w, *h),
             },
@@ -2542,7 +2537,7 @@ mod tests {
         fn failed(&self) -> bool {
             false
         }
-        fn close(&self) {
+        fn close(self) {
             self.signal.session_closed(self.session_id);
         }
     }
@@ -2604,12 +2599,7 @@ mod tests {
                 Some(a.clone()),
                 signals(2),
             ),
-            fake(
-                3,
-                CastTarget::Area("DP-1".into(), (0, 0, 64, 64)),
-                None,
-                signals(3),
-            ),
+            fake(3, CastTarget::Area((1920, 0, 64, 64)), None, signals(3)),
             fake(4, CastTarget::Window(7), None, signals(4)),
         ];
         let grants: HashMap<u64, Arc<AtomicBool>> = (1..=4)
@@ -2643,6 +2633,17 @@ mod tests {
         assert_eq!(ids(&casts), [2, 3, 4], "only B's monitor cast ends");
         assert!(grants[&1].load(Ordering::SeqCst), "its session is revoked");
         assert!((2..=4).all(|id| !grants[&id].load(Ordering::SeqCst)));
+        // The area stream remains anchored to stage coordinates. With
+        // no view under it it idles; when A moves underneath it, it watches
+        // A instead of trying to render the removed B connector.
+        let CastTarget::Area(logical) = casts[1].target else {
+            panic!("the area stream must survive");
+        };
+        assert!(area_on_output(&unplugged, logical).is_none());
+        let mut moved_a = a;
+        moved_a.x = 1920;
+        let (under_area, _) = area_on_output(&[moved_a], logical).unwrap();
+        assert_eq!(under_area.connector, "eDP-1");
         // Closing the session again (Stop, revocation) sends nothing.
         b_session.session_closed(1);
         signals(9).stream_added(99);

@@ -333,8 +333,13 @@ impl Running for Cast {
     fn failed(&self) -> bool {
         Cast::failed(self)
     }
-    fn close(&self) {
-        Cast::close(self)
+    fn close(self) {
+        // meta_stream_stop clears its source before emitting `closed`.
+        // Drop PipeWire before queueing the public session signal.
+        let signal = self.signal.clone();
+        let session_id = self.session_id;
+        drop(self);
+        signal.session_closed(session_id);
     }
 }
 
@@ -346,8 +351,8 @@ pub trait Running {
     fn monitor(&self) -> Option<&OutputSnapshot>;
     /// PipeWire reported the stream broken.
     fn failed(&self) -> bool;
-    /// Emit the session's `Closed`.
-    fn close(&self);
+    /// Tear down the stream, then emit the session's `Closed`.
+    fn close(self);
 }
 
 /// Drop every cast whose source is gone, broken or revoked; dropping
@@ -371,7 +376,7 @@ pub fn end_gone<C: Running>(
     window_alive: impl Fn(u64) -> bool,
 ) {
     use std::sync::atomic::Ordering::SeqCst;
-    casts.retain(|cast| {
+    let ended = casts.extract_if(.., |cast| {
         let gone = match cast.target() {
             CastTarget::Window(id) => !window_alive(*id),
             CastTarget::Monitor(connector) => {
@@ -396,10 +401,12 @@ pub fn end_gone<C: Running>(
             if let Some(grant) = grant {
                 grant.store(true, SeqCst);
             }
-            cast.close();
         }
-        !cast.failed() && !gone && !grant.is_none_or(|grant| grant.load(SeqCst))
+        gone || cast.failed() || grant.is_none_or(|grant| grant.load(SeqCst))
     });
+    for cast in ended {
+        cast.close();
+    }
 }
 
 /// The `(x, y, width, height)` part of a 4-byte-per-pixel frame of

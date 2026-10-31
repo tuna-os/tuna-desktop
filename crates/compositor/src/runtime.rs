@@ -3935,10 +3935,6 @@ impl Runtime {
             .casts
             .iter()
             .enumerate()
-            .filter(|(_, cast)| match &cast.target {
-                CastTarget::Area(connector, _) => outputs.iter().any(|o| &o.connector == connector),
-                CastTarget::Monitor(_) | CastTarget::Window(_) => true,
-            })
             .filter_map(|(i, cast)| {
                 cast.wants_frame()
                     .map(|size| (i, cast.target.clone(), size))
@@ -3959,16 +3955,29 @@ impl Runtime {
                     };
                     self.render_pixels(output, xrgb)
                 }
-                CastTarget::Area(connector, area) => {
+                CastTarget::Area(logical) => {
+                    // Like meta-stream-source-area.c on_monitors_changed,
+                    // watch the current view over the fixed stage region,
+                    // not the connector that was there at RecordArea.
+                    let mapped = self
+                        .cast_outputs
+                        .lock()
+                        .ok()
+                        .and_then(|outputs| crate::mutter::area_on_output(&outputs, *logical));
+                    let Some((snapshot, area)) = mapped else {
+                        // No view covers it: keep the stream open and idle.
+                        continue;
+                    };
+                    self.casts[index].resize(area.2, area.3);
                     let output = match &self.backend {
                         Backend::Winit(_) => None,
                         #[cfg(feature = "drm")]
-                        Backend::Drm(_) => Some(connector.as_str()),
+                        Backend::Drm(_) => Some(snapshot.connector.as_str()),
                     };
                     #[cfg(not(feature = "drm"))]
-                    let _ = connector;
+                    let _ = snapshot;
                     self.render_pixels(output, xrgb).and_then(|(w, h, pixels)| {
-                        let cropped = crate::screencast::crop(&pixels, (w, h), *area);
+                        let cropped = crate::screencast::crop(&pixels, (w, h), area);
                         if cropped.is_none() {
                             eprintln!(
                                 "tuna-compositor: screen cast area {area:?} is not inside the {w}x{h} frame ({} bytes)",
@@ -3987,7 +3996,7 @@ impl Runtime {
                 // shows in the log without flooding it.
                 if !cast.frameless {
                     cast.frameless = true;
-                    if let CastTarget::Monitor(output) | CastTarget::Area(output, _) = &target {
+                    if let CastTarget::Monitor(output) = &target {
                         eprintln!(
                             "tuna-compositor: screen cast {}: output {output} gave no frame",
                             cast.session_id
@@ -4190,7 +4199,12 @@ impl Runtime {
                     crate::mutter::CastTarget::Window(id) => {
                         self.window_pixel_size(*id).map(|(size, _)| size)
                     }
-                    crate::mutter::CastTarget::Area(_, (_, _, w, h)) => Some((*w, *h)),
+                    crate::mutter::CastTarget::Area(logical) => self
+                        .cast_outputs
+                        .lock()
+                        .ok()
+                        .and_then(|outputs| crate::mutter::area_on_output(&outputs, *logical))
+                        .map(|(_, (_, _, w, h))| (w, h)),
                 };
                 let Some(size) = size else {
                     if let Some(grant) = self.cast_grants.get(&session_id) {
