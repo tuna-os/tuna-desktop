@@ -29,6 +29,20 @@ A gate with missing inputs fails as unevaluable; missing evidence is
 never a pass. A probe that fails halfway keeps its partial record, and
 the gate's detail carries the probe error.
 
+The published-flavor lane reads the installed `tuna-desktop` RPM version into
+`desktop_rpm_version` in that evidence bundle. Only the known pre-fix
+`1.0.0beta.1-1` RPM scopes out **G-DATETIME-CLOCK-TZ** and
+**G-DATETIME-CLOCK-SET**: its panel caches the previous zone, so the timezone
+probe can also leave the subsequent manual-time panel reading in the wrong
+zone (CI run 41175449180 observed a 39611 s delta). Both probes still run,
+their raw assertions remain in the qualification detail, and their original
+measurements remain in the evidence. The qualification explicitly delegates
+those two panel-follow proofs to the current-build `marlin-vm` lane; it is
+not evidence that the obsolete published shell passed them. All other gates,
+including the baseline panel clock and actual timedated manual-time writes,
+remain enforced. Current-build lanes always enforce every gate, even with
+that RPM version; newer or unknown published versions also remain strict.
+
 ## Running
 
 Unit tests (no VM, no privileges, no clock writes):

@@ -2648,6 +2648,12 @@ print(json.dumps(result))
         with open(evidence, encoding="utf-8") as stream:
             result = {"evidence": json.load(stream),
                       "assertions": checked.stdout.splitlines()}
+        # Read the installed RPM, not the fixture/observer image identity.
+        package = subprocess.run(["rpm", "-q", "--qf", "%{VERSION}-%{RELEASE}",
+                                  "tuna-desktop"],
+                                 capture_output=True, text=True, timeout=10)
+        result["evidence"]["desktop_rpm_version"] = (
+            package.stdout.strip() if package.returncode == 0 else None)
     elif action == "gsd-power-idle-start":
         # Watch gsd-power's own calls, then shorten GNOME's idle delay. The
         # harness's last input preceded this; nothing touches input until wake.
