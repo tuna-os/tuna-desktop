@@ -280,6 +280,14 @@ both interfaces, so `tuna-portals.conf` routes them to a working backend),
 under `repeat-NN/`; `repeat-manifest.json` records every boot, while the
 root `assertions.txt` aggregates results for the parity ledger.
 
+The installed strip gate validates both PNG and PPM pixels against the same
+owned window geometry. A transient obstruction or an unpresented frame may
+retry for at most 10 seconds, within the existing 120-second strip deadline.
+The first rejected image pair is retained as `*-not-ready.{png,ppm}`; the
+receipt records capture attempts. Window identity/geometry drift, malformed
+images and QMP failures remain terminal. A retry never qualifies pixels from
+the rejected frame or claims presentation latency.
+
 The artifact (`marlin-vm`) holds `serial.log`, `tuna-lines.log` (every
 `tuna-*` line), the boot frames, `V-OVERVIEW.png` (the login overview),
 `V-SESSION.png` (the desktop), and `manifest.json`.
