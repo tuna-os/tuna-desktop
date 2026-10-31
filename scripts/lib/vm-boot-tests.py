@@ -3830,7 +3830,8 @@ class FixtureLoginSession(unittest.TestCase):
             with self.subTest(fixture=name):
                 containerfile = self.fixture(name)
                 self.assertIn("COPY packaging/marlin/vm-lane/tuna-vm-gdm.tmpfiles", containerfile)
-                body = containerfile.split("RUN mkdir -p /usr/share/tuna-vm", 1)[1]
+                # The published fixture's RUN carries a --mount flag before its body.
+                body = containerfile.split("mkdir -p /usr/share/tuna-vm", 1)[1]
                 for absent in ("greetd", "gtkgreet", "cage", "systemctl disable gdm"):
                     self.assertNotIn(absent, body)
                 for path in ("/usr/lib/pam.d/gdm-password", "/etc/gdm/custom.conf", "/etc/pam.d/tuna-lock",
