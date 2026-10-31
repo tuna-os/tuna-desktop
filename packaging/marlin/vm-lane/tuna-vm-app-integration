@@ -263,6 +263,41 @@ def flatpak(action):
     raise ValueError("unknown flatpak action")
 
 
+DRM_UEVENTS = pathlib.Path("/run/tuna-vm-drm-uevents.log")
+
+
+def drm(action):
+    """Guest-side evidence for a virtio-gpu scanout plug: every DRM connector's
+    sysfs status/enabled/modes, and the kernel DRM uevents seen since `watch`
+    (HOTPLUG=1 changes), so a missing output is attributable to QEMU/kernel or
+    to the compositor."""
+    if action == "watch":
+        log = DRM_UEVENTS.open("w")
+        # Bounded: the boot step's own timeout reaps it at the latest.
+        subprocess.Popen(["timeout", "600", "udevadm", "monitor", "--kernel", "--property",
+                          "--subsystem-match=drm"], stdout=log, stderr=subprocess.STDOUT,
+                         start_new_session=True)
+        return {"watching": str(DRM_UEVENTS)}
+    if action != "state":
+        raise ValueError("unknown drm action")
+    connectors = {}
+    for path in sorted(pathlib.Path("/sys/class/drm").glob("card*-*")):
+        def attr(name):
+            try:
+                return (path / name).read_text().strip()
+            except OSError:
+                return None
+        modes = attr("modes")
+        connectors[path.name] = {"status": attr("status"), "enabled": attr("enabled"),
+                                 "modes": modes.splitlines()[:4] if modes else []}
+    try:
+        uevents = DRM_UEVENTS.read_text()[-4000:]
+    except OSError:
+        uevents = None
+    return {"connectors": connectors, "uevents": uevents,
+            "hotplug_uevents": uevents.count("HOTPLUG=1") if uevents else 0}
+
+
 def background_state():
     """xdg-desktop-portal-gnome's Background.GetAppState: built from Introspect
     GetRunningApplications' sandboxed-app-id (xdg-desktop-portal-gnome 51
@@ -295,6 +330,8 @@ def main():
         result = json.loads(as_user(sys.executable, __file__, "user-rotate", connector, str(transform)).stdout)
     elif action.startswith("app-flatpak-"):
         result = flatpak(action.removeprefix("app-flatpak-"))
+    elif action.startswith("app-drm-"):
+        result = drm(action.removeprefix("app-drm-"))
     elif action == "app-background":
         result = background_state()
     elif action == "app-scene":

@@ -1316,6 +1316,9 @@ jobs:
       # Flatpak sandbox identity through xdg-desktop-portal-gnome.
       - name: App-integration boot (file chooser, Introspect display size and sandbox identity)
         if: matrix.orca == 'distribution'
+        # Picker (2 roles x 4 cases), Flatpak install (400 s cap) and the
+        # hotplug/rotate/unplug waits fit well inside this bound.
+        timeout-minutes: 30
         run: >-
           scripts/tuna-vm-lane --disk /mnt/vm/disk.raw --out vm-lane-artifacts/app-integration --app-integration
           --orca-contract ${{ matrix.orca }}

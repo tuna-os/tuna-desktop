@@ -307,9 +307,12 @@ class Lane:
             seen = len(value["changes"])
             return record
         try:
+            steps["drm_before"] = self.app("app-drm-state")
+            self.app("app-drm-watch")
             self.set_head(1, *SECOND, x=TOPLEVEL[0], y=0)
             plugged = change(lambda c: len(c["layout"]["logical"]) == 2,
                              "no ScreenSize change for the hotplugged second output")
+            steps["drm_plugged"] = self.app("app-drm-state")
             steps["hotplug"] = plugged
             self.frame("introspect-hotplug.png")
             if plugged["size"] != self.layout_size(plugged["layout"]):
@@ -346,6 +349,14 @@ class Lane:
             try:
                 steps["failure_state"] = self.app("app-introspect-state", key)
             except AppError:
+                pass
+            # Guest kernel's view: did the virtio-gpu event light the
+            # connector and raise a DRM HOTPLUG uevent the compositor missed?
+            try:
+                steps["drm_failure"] = drm = self.app("app-drm-state")
+                lit = sorted(name for name, c in drm["connectors"].items() if c["status"] == "connected")
+                failures.append(f"guest DRM: connected {lit}, {drm['hotplug_uevents']} HOTPLUG uevents")
+            except (AppError, KeyError, TypeError):
                 pass
         finally:
             try:
