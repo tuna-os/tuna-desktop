@@ -178,19 +178,29 @@ The script's header documents its options; they all start with `TRY_TUNA_`:
 | Variable | Default | Effect |
 |---|---|---|
 | `TUNA_TARGET_DIR` | `target/` in the checkout | Cargo target directory for every recipe. An inherited `CARGO_TARGET_DIR` is ignored. |
-| `TUNA_BUILD_LOCK` | `/tmp/tuna-local-build.lock` | Lock file that serializes builds across worktrees. |
-| `TUNA_PROOF_LOCK` | `/tmp/tuna-local-proof.lock` | Lock file that serializes `just proof` runs. |
+| `TUNA_BUILD_SLOTS` | one per 8 GiB of RAM, at most 2 | Cargo builds that may run at once across worktrees (and proofs' own builds). |
+| `TUNA_BUILD_SLOT_BASE` | `/tmp/tuna-local-build.slot` | Prefix of the build slots' lock files (`.0`, `.1`, …). |
+| `TUNA_PROOF_SLOTS` | `1` | Nested (private Xvfb) proofs that may run at once; above 1 is opt-in, as timing-sensitive proof stages flake under the load. |
+| `TUNA_PROOF_SLOT_BASE` | `/tmp/tuna-local-proof.slot` | Prefix of the nested proofs' slot lock files. |
+| `TUNA_PROOF_LOCK` | `/tmp/tuna-local-proof.lock` | Prefix of the one slot file (`.0`) that serializes proofs of machine-wide state (vkms, seatd, uinput, sudo). |
+| `TUNA_PROOF_TIMEOUT` | the proof's CI job `timeout-minutes`, at least 45 | Minutes before `just proof` stops a proof and everything it started. |
+| `TUNA_BUILD_TIMEOUT` | `60` | Minutes before `just build`, `test` or `clippy` stops cargo's process group. |
+| `TUNA_SLOT_WAIT` | `120` | Minutes a recipe waits for a build or proof slot before giving up (exit 75). |
 | `TUNA_MIN_FREE_GB` | `40` | Below this many GiB free on the repository's filesystem, `tuna-disk-guard` removes idle worktree targets and stale scratch. Build recipes run this guard first. |
 | `TUNA_IDLE_MINUTES` | `45` | How long a worktree target must be untouched before `tuna-disk-guard` may remove it; running-process references always protect it. |
 | `TUNA_CI_ARTIFACTS` | `/tmp/tuna-ci-artifacts` | Where `just ci-artifacts` downloads to. |
 | `TUNA_CI_ARTIFACT_TTL_MIN` | `360` | Minutes before `just gc` deletes a download. |
-| `CARGO_BUILD_JOBS` | `2` | Parallel compile jobs. |
-| `CARGO_INCREMENTAL` | `0` | Cargo's incremental compilation. |
+| `CARGO_BUILD_JOBS` | half the CPUs | Parallel compile jobs per build. |
+| `CARGO_INCREMENTAL` | `0` | Cargo's incremental compilation (sccache can't cache it). |
+| `RUSTC_WRAPPER` | `sccache` when installed | Compiler wrapper; sccache shares compiled crates between worktrees. |
+| `SCCACHE_DIR` / `SCCACHE_CACHE_SIZE` | `~/.cache/sccache` / `40G` | sccache's disk cache, read when its server starts. |
 | `PKG_CONFIG` | `/usr/bin/pkg-config` | The `pkg-config` binary the builds use. |
 
 `just proof` also exports `TUNA_PROOF_RUN`, the run's artifact directory, to
-every process it starts, so that it can find and stop them afterwards
-(`justfile:8-24`, `justfile:89-93`).
+every process it starts, so that it can find and stop them afterwards, and
+a private `XDG_RUNTIME_DIR`; it unsets `DISPLAY`, `WAYLAND_DISPLAY`,
+`WAYLAND_SOCKET`, `DBUS_SESSION_BUS_ADDRESS` and `AT_SPI_BUS_ADDRESS`
+(`justfile:8-47`, `justfile:75-173`).
 
 ### Packaging
 

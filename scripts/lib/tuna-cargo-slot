@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# `just proof` puts this first in a proof's PATH as `cargo`: the cargo
+# commands that compile wait for one of the machine's build slots, as
+# `just build` does, so concurrent proofs can't run more builds at once
+# than the host has memory for. Other commands, and cargo started from
+# within a slot, go straight to the real cargo.
+# Environment: TUNA_REAL_CARGO, TUNA_BUILD_SLOT_BASE, TUNA_BUILD_SLOTS.
+set -euo pipefail
+real=${TUNA_REAL_CARGO:?TUNA_REAL_CARGO names the real cargo}
+if [ -z "${TUNA_BUILD_SLOT_HELD:-}" ]; then
+    for arg; do
+        case $arg in
+            -* | +*) continue ;;
+            build | b | test | t | check | c | clippy | rustc | doc | d | bench | install | llvm-cov)
+                export TUNA_BUILD_SLOT_HELD=1 TUNA_SLOT_TIMEOUT="${TUNA_BUILD_TIMEOUT:-60}"
+                helper_dir=$(dirname -- "$(readlink -f -- "$0")")
+                exec "$helper_dir/tuna-semaphore" \
+                    "${TUNA_BUILD_SLOT_BASE:?}" "${TUNA_BUILD_SLOTS:?}" \
+                    "$helper_dir/tuna-timeout" "$TUNA_SLOT_TIMEOUT" \
+                    "proof cargo (TUNA_BUILD_TIMEOUT)" "$real" "$@"
+                ;;
+        esac
+        break
+    done
+fi
+exec "$real" "$@"

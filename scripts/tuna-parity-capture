@@ -46,10 +46,20 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-DISPLAY=":97"
-export DISPLAY
-Xvfb "$DISPLAY" -screen 0 "${WIDTH}x${HEIGHT}x24" >"$WORK/xvfb.log" 2>&1 &
+# The session's sockets and runtime files (wallpaper, control socket,
+# AT-SPI bus) are fixed names below XDG_RUNTIME_DIR; a private one keeps
+# concurrent runs apart.
+XDG_RUNTIME_DIR="$WORK/runtime"
+mkdir -m 0700 "$XDG_RUNTIME_DIR"
+export XDG_RUNTIME_DIR
+# tuna-xvfb picks a free display and locks it, so concurrent runs never collide.
+"$ROOT/scripts/lib/tuna-xvfb" -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp \
+    3>"$WORK/xvfb-display" >"$WORK/xvfb.log" 2>&1 &
 PIDS="$PIDS $!"
+for _ in $(seq 1 30); do [ -s "$WORK/xvfb-display" ] && break; sleep 0.5; done
+[ -s "$WORK/xvfb-display" ] || { echo "tuna-parity-capture: Xvfb did not allocate a display" >&2; exit 1; }
+DISPLAY=":$(cat "$WORK/xvfb-display")"
+export DISPLAY
 for _ in $(seq 1 30); do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 0.5; done
 if [ -x /usr/libexec/at-spi-bus-launcher ]; then
     /usr/libexec/at-spi-bus-launcher --launch-immediately >"$WORK/atspi.log" 2>&1 &
