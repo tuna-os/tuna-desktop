@@ -57,6 +57,170 @@ not provide Marlin or physical hardware qualification.
 The package version, the binaries' `--version` output, and the notes must
 agree — the release script enforces the first two by construction.
 
+## Pristine launcher VM assets
+
+`.github/workflows/vm-release.yml` is a separate, manually dispatched normal
+desktop release producer. It neither publishes TunaOS images/packages nor changes
+their publisher policies. It requires the existing real desktop release and
+qualified served package/image handoff; it does not create a tag or invent
+release identities. Its presence does **not** mean a launcher VM release has run
+or passed. Keep the shipped launcher unchanged until the resulting signed bytes
+have actually passed all native gates.
+
+Dispatch only from `main`, after the owning package/image qualification completes:
+
+```sh
+gh workflow run vm-release.yml --ref main \
+  -f handoff="$(cat /path/to/actual-qualified-handoff.json)"
+```
+
+The handoff JSON has exactly four objects: `release`, `package`, `image`, and
+`corral`, using schema `org.tunaos.desktop.vm/v1`'s corresponding manifest fields.
+Do not send a schema/example document as a handoff. Required identities are:
+
+- `release`: `repository`, `tag`, `commit`, `version`, `ciRunId`, `reviewPath`,
+  `reviewSha256`, `installedControlRunId`. The repository is
+  `tuna-os/tuna-desktop`; the exact tag resolves to `commit`. `version` is the
+  tag without its leading `v`. Both CI receipts must succeed at that exact
+  source; the full release CI is dispatched, with successful `check`, `ci-gate`,
+  `journey`, and `arch-package`. The tagged review must be filled, hash-identical,
+  have all nine unique journeys and both signoffs. Every required **Tuna Desktop
+  frame cell** must use a backticked `gtk-shell/PATH.png` or
+  `journey-shots/PATH.png`; multiple frames use comma-separated backticked paths,
+  as in the existing lock-screen review rows. Unwrapped filenames, Markdown
+  links/images, unsupported artifacts, duplicate stages and absent/corrupt PNG
+  members fail admission. Every declared frame resolves against the actual
+  review run's retained artifact bytes; provenance binds each journey to its
+  references and each reference to its SHA-256. A valid unrelated reference in
+  Notes or elsewhere cannot qualify a missing journey frame. Baseline commentary
+  is not a Tuna CI artifact reference. The review-input CI may precede the review
+  commit; the separate release CI must match the tag exactly.
+- `package`: `name`, `version`, `architecture`, `url`, `sha256`, `signatureUrl`,
+  `signerFingerprint`, `sourceCommit`, `factoryRunId`. `version` is the actual
+  pacman `pkgver-pkgrel`, **not** the SemVer string. Admission reacquires the
+  successful normal Arch publication run's recipe, source archive, output
+  artifact, production public key and served package/signature. It requires
+  actual served bytes to equal factory output, the recipe to name the release,
+  the fixed production primary signer
+  `4E5CC9F8B3B521793D95266E629BE6EA45188366`, and image payload files to match
+  those signed package bytes. Key rotation requires normal code review.
+- `image`: `repository`, `indexDigest`, `manifestDigest`, `architecture`,
+  `sourceCommit`, `buildRunId`, `qualificationRunId`, `certificateIdentity`.
+  Admission requires the trusted Marlin build run, its retained amd64 digest
+  artifact, signed platform manifest, independently hashed index bytes and unique
+  amd64 membership, actual OCI platform/config and version metadata, plus the
+  strict published-image qualification's source, package, digest, five pristine
+  boots, assertions, and real clock/timezone capabilities. `--published` selects
+  acquisition only: it never enables historical compatibility or current-build
+  substituted success. Each `qualification.json`, `manifest.json`,
+  `repeat-manifest.json` and all five actual boot manifests must carry these
+  exact top-level typed fields:
+  `acquisition: "published"`, `qualification_mode: "strict"`,
+  `waived_assertions: []`, `skipped_assertions: []`. Missing fields, old nested
+  compatibility modes, legacy-waiver fields, nonempty lists or wrong types fail.
+  Five ordered process receipts must be exactly boots 1–5 with integer exit
+  status zero. Every boot binds the same actual run, harness source, published
+  digest, installed package/version and KVM execution; startup assertions must
+  persist across all boots. Embedded repeat/final receipts must equal their
+  standalone artifact bytes' parsed content, including the final repeated boot.
+  Every assertion must be an actual boolean `pass: true` with a string `detail`,
+  never a waiver/skip-shaped row. The final boot, aggregate checks and text
+  assertions must contain all required lifecycle gates: native input/pointer,
+  brightness, gsd plugins/idle, lock integration, power button, audio, hot corners,
+  sleep authentication, actual Orca activation/logout/reaping and product logout,
+  plus `G-DATETIME-CLOCK-TZ` and `G-DATETIME-CLOCK-SET`. Startup-only boots do not
+  claim clock proof. `V-STRICT-PUBLISHED` and `V-STRICT-PUBLISHED-REPEAT` classify
+  the policy; they never replace feature assertions. A green unrelated run,
+  obsolete-package exemption, mutable tag or caller-provided success flag is
+  insufficient. There is no old-beta strict-pass prerequisite for a separately
+  approved core bootstrap release; final launcher publication still requires
+  this actual new-digest strict qualification.
+  The platform digest is the signed payload object; an index without its own
+  signature is not a bypass. Build from the verified platform digest and bind
+  both digests in the final signed launcher manifest.
+- `corral`: `repository`, `tag`, `commit`, `certificateIdentity`, `assets`.
+  This is an actual normal signed Corral release containing the owned lifecycle
+  and explicit guest-architecture APIs, not a PR binary. `assets` has exactly
+  `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`, each declaring
+  `name`, `url`, `sha256`, `bundleUrl`. The producer resolves the release/tag/source through
+  GitHub and verifies every native binary's full Sigstore bundle under the exact
+  tagged release-workflow identity and issuer.
+
+`scripts/lib/vm_release.py` implements the following workflow-owned stages:
+
+1. `admit --handoff FILE --output DIR` reacquires and validates provenance.
+   Missing/expired artifacts, changed bytes, failed/skipped required gates,
+   forks, wrong source, wrong signer, and unsafe archive entries are fatal.
+2. `build --output DIR --source NEW_CORRAL_CHECKOUT` checks out the verified
+   Corral release source and calls its `bootc.LocalBuilder` via
+   `scripts/lib/vm_release_disk.go`. Empty `SSHKey`, no customization and no
+   provisioning preserve the real image policy. Do not substitute
+   `corral-bootc`'s empty CLI key (it discovers runner keys), or TunaOS's
+   `build-qcow2.sh` (it scans the invoking user's SSH/Lima keys). The compressed
+   standalone qcow2 has recorded exact byte hash/size, virtual size, amd64 guest
+   architecture and UEFI boot evidence; oversized GitHub release assets fail.
+3. `boot --output DIR` boots **only a disposable copy**, checks actual serial
+   desktop/base contracts and painted output, stops/deletes its own synthetic VM
+   and retains a boot-only receipt. This is explicitly **not** firstboot/account
+   UX evidence.
+4. The signing-only job keylessly signs canonical sorted compact UTF-8 JSON
+   (one trailing newline). The identity is exactly
+   `https://github.com/tuna-os/tuna-desktop/.github/workflows/vm-release.yml@refs/heads/main`,
+   issuer `https://token.actions.githubusercontent.com`. Full transparency
+   material and normal verification are required; there is no unsigned path.
+5. Native Linux amd64 (`ubuntu-26.04`), Linux ARM64 (`ubuntu-24.04-arm`),
+   Intel macOS (`macos-15-intel`) and AppleSilicon macOS (`macos-15`) jobs run
+   `scripts/lib/try_tuna_desktop.py qualify --artifact-dir DIR --evidence-dir OUT
+   --platform PLATFORM`. Each receives the same signed `manifest.json`,
+   `manifest.json.sigstore.json`, exact manifest-declared **amd64 guest** disk
+   filename and all four signed **host** Corral binaries/bundles. Both ARM host
+   jobs deliberately use native `qemu-system-x86_64` with amd64 UEFI and explicit
+   TCG, never native ARM guests, KVM or HVF. Host architecture does not select an
+   alternate disk.
+6. `finalize --output DIR --evidence-dir ROOT` admits the same signed bytes
+   through the consumer's `inspect` command and requires each platform's
+   `qualification.json`: exact manifest/disk/host-Corral/producer hashes and run,
+   native host/QEMU/firmware identity, all fifteen named checks literally true,
+   and all indexed evidence bytes without symlinks/traversal. The checks include
+   actual untouched setup/account creation, Tuna session, logout/login, passworded
+   wheel membership and password-required sudo, reboot persistence, browser RFB,
+   stop/cancellation/failure/browser-failure cleanup, ownership isolation and
+   released disk lock. Ordinary user disks are preserved by the launcher;
+   only the qualifier's explicit synthetic copies/VMs are deleted.
+7. `publish --output DIR --evidence-dir ROOT` performs finalization itself,
+   rechecks actual release tags and uploads the disk, retained provenance/native
+   evidence archive, signature bundle and **last** the exact qualified manifest.
+   It never rewrites signed manifest bytes or clobbers existing release assets.
+   Only this job has release-write permission; only signing has OIDC permission.
+   The workflow has no inherited permissions: only admission/build has
+   `actions: read` for actual run/job/artifact APIs; signing/native jobs use
+   `contents: read`; publication uses `contents: write` for release/tag reads
+   and asset uploads, not speculative Actions API access. Signing and publication
+   install QEMU inspection tools before consumer admission. Build installs
+   `skopeo`, `qemu-img`, GPG, YAML and Pillow; native jobs install x86 QEMU/UEFI,
+   tesseract and an isolated Python environment with Requests, Pillow,
+   Playwright and its real Chromium dependencies.
+
+The offline artifact directory is an acquisition mode for these **same signed
+bytes**, not alternate trust: it must use the declared disk/Corral filenames and
+standard bundles. Behavioral producer rejection tests are
+`python3 scripts/lib/vm-release-tests.py`; they are not guest qualification.
+
+Shipping disks must contain no runner/test keys, fixed account/password or
+fixture bypass. Admission actually runs the digest-pinned source image read-only
+with networking disabled before any pristine build. It rejects fixture payloads,
+ordinary UID 1000–65533 accounts, every empty/unlocked shadow password (including
+root), authorized-key files and private SSH key names/content under `/root`,
+`/home` and existing `/etc/ssh`, following symlinks. The retained
+`provenance/image.json` binds the audited digest and records account UID/GID/shell
+inventory plus locked/disabled status only, never password hashes or key content.
+An empty LocalBuilder SSH key prevents new injection; it does not sanitize a
+credential-bearing source image. Never repair or enable fixture mode to admit
+such a source. Actual untouched firstboot/setup/passworded-admin/login/reboot
+proof remains a release prerequisite; a host-blocked reproduction is not evidence
+of a guest cause or grounds for a waiver. Unavailable actual qualified
+release/package/image/Corral identities are a dispatch fence, not placeholders.
+
 ## Prereleases (betas and release candidates)
 
 Tag a prerelease with a SemVer suffix: `vX.Y.Z-beta.N`, then `vX.Y.Z-rc.N`.
