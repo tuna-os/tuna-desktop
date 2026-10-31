@@ -70,6 +70,7 @@ const EXPECTED: &[(&str, u32)] = &[
     ("xdg_activation_v1", 1),
     ("xdg_session_manager_v1", 1),
     ("xdg_system_bell_v1", 1),
+    ("xdg_toplevel_drag_manager_v1", 1),
     ("xdg_toplevel_icon_manager_v1", 1),
     ("xdg_toplevel_tag_manager_v1", 1),
     ("xdg_wm_base", 7),
