@@ -1,0 +1,27 @@
+{
+  "time": "2026-10-31T22:04:49+00:00",
+  "context": "karnataka-k3s",
+  "namespace": "corral-vms",
+  "command": [
+    "kubectl",
+    "--context=karnataka-k3s",
+    "--request-timeout=30s",
+    "-n",
+    "corral-vms",
+    "get",
+    "vm,vmi,pvc,secret,pod,service",
+    "-o",
+    "json"
+  ],
+  "exit": 0,
+  "owned_prefix": "tuna-q-isg-mar1",
+  "owned_inventory": [],
+  "kinds_queried": [
+    "VirtualMachine",
+    "VirtualMachineInstance",
+    "PersistentVolumeClaim",
+    "Secret",
+    "Pod",
+    "Service"
+  ]
+}
