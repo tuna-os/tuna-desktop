@@ -4578,13 +4578,18 @@ class FakeEndSessionGuest:
                  "power-off": "The system will power off automatically in {} seconds",
                  "log-out": "You will be logged out automatically in {} seconds"}
 
-    def __init__(self, fault=None):
+    def __init__(self, fault=None, logout_name="Proof Person"):
         self.fault, self.clock, self.pressed, self.frames = fault, 100.0, [], []
         self.quick = self.menu = False
         self.focus = 0
         self.messages, self.requests, self.system = [], [], []
         self.dialog = None
         self.compositor = 1000
+        self.logout_name = logout_name
+        path = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-shell-focus"
+        loader = importlib.machinery.SourceFileLoader("fake_end_session_focus_policy", str(path))
+        self.focus_policy = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(self.focus_policy)
 
     # The lane's clock.
     def monotonic(self):
@@ -4689,9 +4694,29 @@ class FakeEndSessionGuest:
             focused = self.dialog["focus"] if self.dialog else (focusable[self.focus] if focusable else None)
             controls = [{"label": label, "role": "push button", "focused": label == focused, "active": True}
                         for label in focusable]
-            if self.dialog and self.fault != "no-countdown-label":
-                controls.append({"label": self.COUNTDOWN[self.dialog["case"]].format(self.shown()),
-                                 "role": "label", "focused": False, "active": True})
+            if self.dialog:
+                case = self.dialog["case"]
+                name = "Wrong Person" if self.fault == "wrong-user" else self.logout_name
+                title = "Log Out" if name is None else f"Log Out {name}"
+                body = self.COUNTDOWN[case].format(self.shown())
+                if case == "log-out":
+                    if name is not None:
+                        body = f"{name} will be logged out automatically in {self.shown()} seconds"
+                    if self.fault == "generic-with-account":
+                        title, body = "Log Out", self.COUNTDOWN[case].format(self.shown())
+                    if self.fault == "wrong-title":
+                        title = "Log Out Wrong Person"
+                    if self.fault == "malformed-title":
+                        title += ". Unsaved: diary.txt"
+                    if self.fault == "malformed-countdown":
+                        body += ". Unsaved: diary.txt"
+                    controls.append({"label": title, "role": "label", "focused": False, "active": True})
+                if self.fault != "no-countdown-label":
+                    controls.append({"label": body, "role": "label", "focused": False, "active": True})
+                controls = [record for node in controls
+                            if (record := self.focus_policy.public_node(
+                                node["label"], node["role"], True, node["focused"], node["active"],
+                                end_session=True, logout_name=self.logout_name)) is not None]
             return {"public_controls": controls}
         assert action == "power-button-observe", action
         manager = [self.MANAGER[0], 3000] if self.fault == "manager-not-compositor" else self.MANAGER
@@ -4716,8 +4741,8 @@ class ShellMenuEndSession(unittest.TestCase):
     manager's 60 s end-session dialog (V-RESTART-DIALOG, V-POWER-OFF-DIALOG,
     V-LOGOUT)."""
 
-    def drive(self, name, fault=None):
-        guest = FakeEndSessionGuest(fault)
+    def drive(self, name, fault=None, logout_name="Proof Person"):
+        guest = FakeEndSessionGuest(fault, logout_name)
         with patch.object(lane, "time", guest):
             result = lane.end_session_menu_case(guest, guest, name, guest.identity, guest.frame)
         return guest, result
@@ -4752,6 +4777,14 @@ class ShellMenuEndSession(unittest.TestCase):
         self.assertNotIn(("esc",), guest.pressed)
         self.assertTrue(0 <= result["opened_at"] - guest.dialog["opened"] < 1)
 
+    def test_log_out_personalized_and_service_unavailable_fallback(self):
+        for name in ("Proof Person", "proof", "A.* (Test)", None):
+            with self.subTest(name=name):
+                guest, result = self.drive("log-out", logout_name=name)
+                self.assertEqual(result["reply"]["type"], "method return")
+                self.assertNotIn(("esc",), guest.pressed)
+                self.assertIsNotNone(guest.dialog)
+
     def test_every_broken_link_fails_and_leaves_no_countdown_running(self):
         for name, fault, message in (
                 ("restart", "no-restart-row", "power menu's rows"),
@@ -4765,7 +4798,14 @@ class ShellMenuEndSession(unittest.TestCase):
                 ("power-off", "logind-during-countdown", "did not hold"),
                 ("restart", "vm-stopped", "did not hold"),
                 ("log-out", "logout-refused", "Logout\\(0\\) failed"),
-                ("log-out", "no-countdown-label", "60 s countdown")):
+                ("log-out", "no-countdown-label", "60 s countdown"),
+                ("log-out", "wrong-user", "60 s countdown"),
+                ("log-out", "wrong-title", "60 s countdown"),
+                ("log-out", "malformed-title", "60 s countdown"),
+                ("log-out", "malformed-countdown", "60 s countdown"),
+                ("log-out", "generic-with-account", "60 s countdown"),
+                ("log-out", "cancel-unfocused", "Cancel focused"),
+                ("log-out", "short-countdown", "did not open")):
             with self.subTest(fault=fault):
                 guest = self.fails(name, fault, message)
                 self.assertEqual(guest.pressed[-1], ("esc",), "Escape on every failure")
@@ -4849,6 +4889,76 @@ class ShellMenuEndSession(unittest.TestCase):
                                              end_session=True))
         self.assertIsNone(module.public_node(countdown, "label", False, False, True, end_session=True))
         self.assertIsNone(module.public_node(countdown, "push button", True, False, True, end_session=True))
+
+    def test_accounts_service_personalization_is_exact_and_private(self):
+        path = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-shell-focus"
+        loader = importlib.machinery.SourceFileLoader("end_session_accounts_policy", str(path))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        for properties, expected in (
+                ({"RealName": "Proof Person", "UserName": "proof"}, "Proof Person"),
+                ({"RealName": "", "UserName": "proof"}, "proof"),
+                ({"RealName": "", "UserName": ""}, "login"),
+                ({"RealName": "A.* (Test)", "UserName": "proof"}, "A.* (Test)"),
+                (None, None)):
+            with self.subTest(properties=properties):
+                calls = []
+                def query(path, interface, method, signature, arguments):
+                    calls.append((path, interface, method, signature, arguments))
+                    if properties is None:
+                        return None
+                    return ("/org/freedesktop/Accounts/User1000",) if method == "FindUserByName" else (properties,)
+                actual = module.accounts_logout_name(query, "login")
+                self.assertEqual(actual, expected)
+                self.assertEqual(calls[0], ("/org/freedesktop/Accounts", "org.freedesktop.Accounts",
+                                           "FindUserByName", "(s)", ("login",)))
+                if properties is not None:
+                    self.assertEqual(calls[1], ("/org/freedesktop/Accounts/User1000",
+                                               "org.freedesktop.DBus.Properties", "GetAll", "(s)",
+                                               ("org.freedesktop.Accounts.User",)))
+                prefix = "You" if actual is None else actual
+                title = "Log Out" if actual is None else f"Log Out {actual}"
+                def node(text):
+                    return module.public_node(text, "label", True, False, True,
+                                              end_session=True, logout_name=actual)
+                self.assertEqual(node(title)["label"], "Log Out")
+                for seconds, unit in ((60, "seconds"), (50, "seconds"), (1, "second")):
+                    text = f"{prefix} will be logged out automatically in {seconds} {unit}"
+                    record = node(text)
+                    self.assertEqual(record["label"],
+                                     f"You will be logged out automatically in {seconds} {unit}")
+                    self.assertIsNone(module.public_node(text, "label", True, False, True,
+                                                         logout_name=actual))
+                for text in ("Log Out Wrong Person",
+                             "Wrong Person will be logged out automatically in 60 seconds",
+                             title + ". Unsaved: diary.txt",
+                             f"{prefix} will be logged out automatically in 60 seconds. diary.txt",
+                             f"{prefix} will be logged out automatically in 060 seconds",
+                             "Log Out Axyz (Test)"):
+                    self.assertIsNone(node(text), text)
+                if actual is not None:
+                    self.assertIsNone(node("Log Out"))
+                    self.assertIsNone(node("You will be logged out automatically in 60 seconds"))
+        # User lookup succeeded, but unavailable account properties still mean
+        # the generic not-loaded fallback, not a fabricated username.
+        self.assertIsNone(module.accounts_logout_name(
+            lambda path, interface, method, signature, arguments:
+                ("/org/freedesktop/Accounts/User1000",) if method == "FindUserByName" else None,
+            "login"))
+
+    def test_canonical_logout_receipts_require_title_and_exact_countdown(self):
+        case = lane.END_SESSION_CASES["log-out"]
+        title = {"label": "Log Out", "role": "label", "focused": False, "active": True}
+        def countdown(text):
+            return {"label": text, "role": "label", "focused": False, "active": True}
+        valid = countdown("You will be logged out automatically in 60 seconds")
+        self.assertTrue(lane.countdown_showing([title, valid], case, 60))
+        self.assertFalse(lane.countdown_showing([valid], case, 60))
+        for text in ("You will be logged out automatically in 59 seconds",
+                     "You will be logged out automatically in 60 second",
+                     "Wrong Person will be logged out automatically in 60 seconds",
+                     valid["label"] + ". diary.txt"):
+            self.assertFalse(lane.countdown_showing([title, countdown(text)], case, 60))
 
 
 if __name__ == "__main__":
