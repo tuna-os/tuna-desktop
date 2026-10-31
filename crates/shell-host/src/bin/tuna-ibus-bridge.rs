@@ -926,9 +926,8 @@ impl Dispatch<TunaOskInputV1, ()> for Bridge {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let tuna_osk_input_v1::Event::Text { serial, text } = event {
-            state.virtual_text(serial, text);
-        }
+        let tuna_osk_input_v1::Event::Text { serial, text } = event;
+        state.virtual_text(serial, text);
     }
 }
 
