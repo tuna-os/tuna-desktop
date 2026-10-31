@@ -2179,17 +2179,118 @@ def fresh_logout(name):
     return {"user": name, "terminated": ended}
 
 
+def greeter_prompt_user(pid, ticks):
+    """Read only role/state from the original greeter's focused entry.
+
+    Never query entry names, values, text, or perform accessibility actions.
+    Passwords still travel only through the real QMP keyboard and GDM PAM.
+    """
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi, Gio, GLib
+
+    uid = os.geteuid()
+    def principal():
+        process = pathlib.Path(f"/proc/{pid}")
+        return (process.stat().st_uid,
+                int((process / "stat").read_text().rsplit(")", 1)[1].split()[19]),
+                (process / "comm").read_text().strip())
+    expected = (uid, ticks, "gnome-shell")
+    if uid == 0 or principal() != expected:
+        raise RuntimeError("original non-root greeter principal required")
+    deadline = time.monotonic() + 3
+    Atspi.set_timeout(250, 250)
+    def query(method, *args):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("greeter prompt observation deadline exceeded")
+        return method(*args)
+    desktop = query(Atspi.get_desktop, 0)
+    count = query(desktop.get_child_count)
+    if not 0 <= count <= 64:
+        raise RuntimeError("greeter accessibility desktop exceeds bound")
+    apps = [query(desktop.get_child_at_index, index) for index in range(count)]
+    apps = [app for app in apps if app is not None and query(app.get_process_id) == pid]
+    if len(apps) != 1:
+        raise RuntimeError("original greeter accessibility application not ready")
+    app = apps[0]
+    owner = app.app.bus_name
+    if not isinstance(owner, str) or not owner.startswith(":"):
+        raise RuntimeError("greeter accessibility owner must be unique")
+    session = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    address = session.call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress",
+                               None, GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, 500, None).unpack()[0]
+    bus = Gio.DBusConnection.new_for_address_sync(address,
+        Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+    def credentials():
+        return [query(bus.call_sync, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                      "org.freedesktop.DBus", method, GLib.Variant("(s)", (owner,)),
+                      None, Gio.DBusCallFlags.NONE, 500, None).unpack()[0]
+                for method in ("GetConnectionUnixProcessID", "GetConnectionUnixUser")]
+    if credentials() != [pid, uid]:
+        raise RuntimeError("greeter accessibility bus credentials disagree")
+    pending, visited, entries = [(app, 0)], 0, []
+    while pending:
+        node, depth = pending.pop()
+        visited += 1
+        if visited > 512 or depth > 32:
+            raise RuntimeError("greeter accessibility tree exceeds bound")
+        query(node.clear_cache)
+        states = query(node.get_state_set)
+        role = query(node.get_role)
+        if (role in (Atspi.Role.TEXT, Atspi.Role.ENTRY, Atspi.Role.PASSWORD_TEXT)
+                and all(states.contains(flag) for flag in
+                        (Atspi.StateType.FOCUSED, Atspi.StateType.SHOWING,
+                         Atspi.StateType.VISIBLE, Atspi.StateType.EDITABLE,
+                         Atspi.StateType.SENSITIVE, Atspi.StateType.ENABLED))):
+            entries.append("password" if role == Atspi.Role.PASSWORD_TEXT else "username")
+        count = query(node.get_child_count)
+        if not 0 <= count <= 512:
+            raise RuntimeError("greeter accessibility children exceed bound")
+        pending.extend((child, depth + 1) for index in range(count)
+                       if (child := query(node.get_child_at_index, index)) is not None)
+    if credentials() != [pid, uid] or principal() != expected:
+        raise RuntimeError("original greeter changed during prompt observation")
+    return {"pid": pid, "uid": uid, "start_ticks": ticks, "atspi_owner": owner,
+            "prompt": entries[0] if len(entries) == 1 else None}
+
+
+def greeter_prompt():
+    greeter = json.loads(call(sys.executable, __file__, "greeter"))
+    pids = greeter["greeter_pids"]
+    active = [s for s in greeter["greeter_sessions"] if s.get("Active") == "yes"
+              and s.get("Service") == "gdm-launch-environment"]
+    if len(pids) != 1 or len(active) != 1:
+        raise RuntimeError("one active GDM greeter required")
+    pid = int(pids[0])
+    process = pathlib.Path(f"/proc/{pid}")
+    uid = process.stat().st_uid
+    if uid == 0 or str(uid) != active[0].get("User"):
+        raise RuntimeError("active greeter owner disagrees")
+    ticks = int((process / "stat").read_text().rsplit(")", 1)[1].split()[19])
+    raw = call("runuser", "-u", pwd.getpwuid(uid).pw_name, "--", "env",
+               f"XDG_RUNTIME_DIR=/run/user/{uid}",
+               f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+               sys.executable, __file__, "greeter-prompt-user", str(pid), str(ticks))
+    return json.loads(raw)
+
+
 FRESH_ACTIONS = {"fresh-state": fresh_state, "fresh-session": fresh_session,
                  "fresh-sudo": fresh_sudo, "fresh-logout": fresh_logout}
 
 
 def main():
+    if sys.argv[1] == "greeter-prompt-user":
+        print(json.dumps(greeter_prompt_user(int(sys.argv[2]), int(sys.argv[3]))))
+        return
     if sys.argv[1] == "background-user-diagnostics":
         print(json.dumps(background_user_diagnostics()))
         return
     if os.geteuid() != 0 or OWNER.pw_uid == 0:
         raise RuntimeError("probe must be root and session owner must not be root")
     action = sys.argv[1]
+    if action == "greeter-prompt":
+        print(json.dumps(greeter_prompt()))
+        return
     if action == "background-diagnostics":
         inventory()  # Verify the original actual login owner before re-exec.
         result = json.loads(call(sys.executable, __file__, "background-user-diagnostics", user=True))

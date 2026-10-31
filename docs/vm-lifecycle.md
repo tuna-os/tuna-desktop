@@ -42,19 +42,49 @@ asks for the user name. In run 41230684089 the old Tab count to
 its failed password, then authenticated `tunaseeded` with the fixture
 password. The setting does not create account records or select a session.
 
+The process/logind greeter predicate is not an input-readiness predicate.
+In [run 41248530233](https://github.com/tuna-os/tuna-desktop/actions/runs/41248530233),
+artifact `marlin-vm-orca51` (ID `13061267386`, SHA-256
+`1de554a272722c7640b767cde1f75cfa7603910bd7c0c3cda4b4895f38d79af2`)
+retains a black `fresh-accounts/fresh-greeter.png`; its
+`tunastd-first-password.png` still shows **Username**, not Password, when
+the old driver sends the password. The serial journal records
+`pam_faillock(gdm-password:auth): User unknown` at 19.270579 seconds and no
+user session. The standard counterpart reaches a visible Password prompt
+and authenticates both accounts; its later admin sudo failure is separate.
+The run's PR source is `df05bde92cd4392871db9d36d3d3a21ce43b846b`;
+workflow checkout/manifest metadata is the synthetic merge
+`b4d42581e7299323fd6ead9f76dcd94862990f1c`. Both use published Marlin
+base `sha256:6c1e25b1fa9ddc07d7e71f767456839676333d3ebdc332b642a467f56c8ff71b`;
+the Orca test-layer image ID is
+`sha256:0e3b49a6df3ee644fb9ec4f1dc5b0971da0e6d67b4aedbbc0bedcb5ff116b2e8`.
+
+The fresh-account driver now waits for the actual greeter's focused,
+visible, showing, editable, sensitive and enabled AT-SPI entry before
+typing each credential. The probe runs as the active non-root greeter UID,
+binds the accessibility bus PID/UID to the original `gnome-shell` process
+and start time, and distinguishes text from password-text roles without
+reading names or entry contents or invoking accessibility actions.
+Prompt receipts and pre-input frames are retained. Initial readiness uses
+the existing greeter deadline; name, password and session readiness share
+one existing login deadline. There is one credential pair per login, no
+fixed-sleep increase and no retry. This fixes wrong-phase input; the old
+receipts alone do not identify which input was lost during startup.
+
+
 | Gate | Actual operation and evidence |
 | --- | --- |
 | V-FRESH-RECORD-FREE-<user> | Before any login: account exists with a home, no `/var/lib/AccountsService/users/<user>`, no GDM automatic/timed login, `wheel` only for the admin |
 | V-FRESH-CONTROL | The same probe classifies the pre-seeded `tunaseeded` as NOT record-free |
-| V-FRESH-LOGIN-<user>-{first,second,reboot} | GDM's user-name prompt, then the password, typed through QMP; exactly one `gdm-password` VT session of that account runs `tuna-compositor` and no `gnome-shell`/`gnome-session` |
+| V-FRESH-LOGIN-<user>-{first,second,reboot} | Owner-bound focused editable GDM text prompt, then password-text prompt, observed before each credential is typed through QMP; exactly one `gdm-password` VT session of that account runs `tuna-compositor` and no `gnome-shell`/`gnome-session` |
 | V-FRESH-SESSION-<user>-{first,second,reboot} | Read AccountsService's effective `Session` over the system bus: it must be `tuna`; if a cache record exists, any saved `Session` must also be `tuna` |
 | V-FRESH-SUDO-<user> | `sudo -S -k true` as the account with its password: admin succeeds, standard is refused by sudo policy |
 | V-FRESH-LOGOUT-<user>-<round> | logind ends the session and the greeter is ready again |
 | V-FRESH-REBOOT / V-FRESH-SESSION-RELOADED-<user> | In-guest reboot (new `boot_id`), effective AccountsService `Session=tuna` reloads before login, then both accounts authenticate into Tuna again |
 
-Receipts are in `fresh-accounts-receipts.json`; frames per attempt and
-session. Only Arch/GDM 51 is covered here; pre-51 GDM is not exercised by
-this lane.
+Receipts are in `fresh-accounts-receipts.json`; frames before each input,
+on prompt timeout and at each session. Only Arch/GDM 51 is covered here;
+pre-51 GDM is not exercised by this lane.
 
 ### Why a first login need not create a cache file
 

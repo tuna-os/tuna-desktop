@@ -33,9 +33,21 @@ class FakeGuest:
         self.logged_in = None
         self.typed = []
         self.logins = []
+        self.now = 0.0
+        self.phase = "username"
+        self.prompt_since = 0.0
+        self.sent = []
+        self.frames = []
 
     # QMP
     def keys(self, *names):
+        if names == ("esc",):
+            self.typed = []
+            self.phase = "username"
+            self.prompt_since = self.now
+        if names == ("ret",) and len(self.typed) == 1:
+            self.phase = "password"
+            self.prompt_since = self.now
         if names == ("ret",) and len(self.typed) >= 2:
             user, password = self.typed[-2], self.typed[-1]
             if password == "tuna" and user in self.uids and self.logged_in is None:
@@ -46,10 +58,14 @@ class FakeGuest:
             self.typed = []
 
     def type_text(self, text):
+        prompt = self.run("greeter-prompt")["prompt"]
+        if prompt != ("username" if not self.typed else "password"):
+            raise AssertionError("credentials typed before the real prompt was ready")
+        self.sent.append((self.now, prompt, text))
         self.typed.append(text)
 
     def frame(self, path):
-        pass
+        self.frames.append((pathlib.Path(path).name, self.now, self.phase))
 
     # guest agent
     def connect(self):
@@ -62,6 +78,13 @@ class FakeGuest:
         if action == "greeter":
             boot = self.boot if not self.faults.get("stale_boot") else 1
             return {"ready": self.logged_in is None, "boot_id": f"boot-{boot}"}
+        if action == "greeter-prompt":
+            delay = self.faults.get(f"{self.phase}_delay", 0)
+            ready = not self.faults.get("no_prompt") and self.now - self.prompt_since >= delay
+            prompt = self.phase if ready else (
+                "username" if self.phase == "password" and not self.faults.get("no_prompt") else None)
+            return {"pid": 1131, "uid": 60578, "start_ticks": 1200, "atspi_owner": ":1.7",
+                    "prompt": prompt}
         if action == "fresh-state":
             user = args[0]
             if user in self.faults.get("missing", ()):
@@ -87,11 +110,15 @@ class FakeGuest:
         if action == "fresh-logout":
             if not self.faults.get("stuck_session"):
                 self.logged_in = None
+                self.phase = "username"
+                self.prompt_since = self.now
             return {"user": args[0]}
         if action == "reboot":
             before = f"boot-{self.boot}"
             self.boot += 1
             self.logged_in = None
+            self.phase = "username"
+            self.prompt_since = self.now
             return {"boot_id": before}
         raise ValueError(action)
 
@@ -102,6 +129,7 @@ def journey(guest):
 
     def sleep(seconds):
         clock[0] += seconds
+        guest.now = clock[0]
 
     with tempfile.TemporaryDirectory() as out:
         run = fresh_accounts.Journey(guest, guest.connect, lambda greeter: greeter["ready"], out,
@@ -128,6 +156,38 @@ class JourneyTest(unittest.TestCase):
         self.assertTrue(all(ok for ok, _ in results.values()), results)
         self.assertEqual(guest.logins, [(1, "tunastd"), (1, "tunaadmin"), (1, "tunastd"), (1, "tunaadmin"),
                                         (2, "tunastd"), (2, "tunaadmin")])
+
+    def test_late_focused_username_and_password_before_single_attempt(self):
+        guest = FakeGuest(username_delay=1, password_delay=2)
+        passed, results, error, _ = journey(guest)
+        self.assertTrue(passed, (results, error))
+        self.assertEqual(len(guest.sent), 12)  # Exactly one name/password pair per login.
+        self.assertEqual([kind for _, kind, _ in guest.sent], ["username", "password"] * 6)
+        self.assertGreaterEqual(guest.sent[0][0], 1)
+        self.assertGreaterEqual(guest.sent[1][0] - guest.sent[0][0], 2)
+
+    def test_manager_and_greeter_process_without_prompt_do_not_receive_keys(self):
+        guest = FakeGuest(no_prompt=True)
+        passed, results, error, receipts = journey(guest)
+        self.assertFalse(passed)
+        self.assertIn("greeter did not become ready", error)
+        self.assertEqual(guest.sent, [])
+        self.assertEqual(guest.now, 5)
+        self.assertTrue(receipts)
+
+    def test_prompt_waits_share_original_login_deadline(self):
+        guest = FakeGuest(username_delay=2, password_delay=4)
+        passed, results, error, _ = journey(guest)
+        self.assertFalse(passed)
+        self.assertIsNone(error)
+        self.assertFailed(results, "V-FRESH-LOGIN-tunastd-first")
+        self.assertIn("password prompt", results["V-FRESH-LOGIN-tunastd-first"][1])
+        self.assertEqual(guest.sent, [(4, "username", "tunastd")])
+        # Preflight uses its original 5s bound; login gets one original 5s bound,
+        # not a new timeout per prompt or an authentication retry.
+        self.assertEqual(guest.now, 7)
+        self.assertEqual(guest.logins, [])
+        self.assertEqual(guest.frames[-1][0], "tunastd-first-password-timeout.png")
 
     def test_preseeded_record_is_not_record_free(self):
         passed, results, _, _ = journey(FakeGuest(records={"tunastd": "[User]\nSession=tuna\n"}))
