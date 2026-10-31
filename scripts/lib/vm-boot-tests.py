@@ -2482,7 +2482,35 @@ class PointerEvidenceRetention(unittest.TestCase):
 
 
 class TourRecorderTests(unittest.TestCase):
-    def recorder(self, directory, command, timeout=0.2):
+    # Success paths test ordering and frame ownership, not host scheduling speed.
+    # Only explicit expiry tests below use shorter, controlled deadlines.
+    SCHEDULING_TIMEOUT = 10
+
+    def controlled_timer(self, timers, deadline_reached=None):
+        """Keep real watchdog threads, but let the fixture advance their clock."""
+        import threading
+        class ControlledTimer(threading.Timer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.deadline_reached = (
+                    deadline_reached if deadline_reached is not None else threading.Event())
+                self.fired = threading.Event()
+                timers.append(self)
+
+            def run(self):
+                self.deadline_reached.wait(self.interval)
+                if not self.finished.is_set():
+                    self.fired.set()
+                    self.function(*self.args, **self.kwargs)
+                self.finished.set()
+
+            def cancel(self):
+                super().cancel()
+                self.deadline_reached.set()
+
+        return ControlledTimer
+
+    def recorder(self, directory, command, timeout=SCHEDULING_TIMEOUT):
         return lane.Recorder(SimpleNamespace(cmd=command), directory, timeout=timeout)
 
     def test_still_finishes_before_next_key_and_records_exact_frame(self):
@@ -2509,10 +2537,10 @@ class TourRecorderTests(unittest.TestCase):
             calls.append(args["filename"])
             if len(calls) == 1:
                 entered.set()
-                self.assertTrue(release.wait(1))
+                self.assertTrue(release.wait(self.SCHEDULING_TIMEOUT))
             Path(args["filename"]).write_bytes(str(len(calls)).encode())
         with tempfile.TemporaryDirectory() as directory:
-            recorder = self.recorder(directory, command, timeout=1)
+            recorder = self.recorder(directory, command)
             errors = []
             def capture():
                 try:
@@ -2521,10 +2549,10 @@ class TourRecorderTests(unittest.TestCase):
                     errors.append(error)
             worker = threading.Thread(target=capture)
             worker.start()
-            self.assertTrue(entered.wait(1))
+            self.assertTrue(entered.wait(self.SCHEDULING_TIMEOUT))
             release.set()
             recorder.still("calendar")
-            worker.join(1)
+            worker.join(self.SCHEDULING_TIMEOUT)
             self.assertFalse(worker.is_alive())
             self.assertEqual(errors, [])
             self.assertEqual(recorder.stills["calendar"], 1)
@@ -2551,10 +2579,16 @@ class TourRecorderTests(unittest.TestCase):
         import time
         with tempfile.TemporaryDirectory() as directory:
             recorder = self.recorder(directory, lambda *args, **kwargs: None, timeout=0.03)
+            now = [0.0]
+            def advance(seconds):
+                now[0] += seconds
             start = time.monotonic()
-            with self.assertRaises(TimeoutError):
-                recorder.still("app-grid")
-            self.assertLess(time.monotonic() - start, 1)
+            with patch.object(lane.time, "monotonic", lambda: now[0]), \
+                    patch.object(recorder.stop, "wait", advance):
+                with self.assertRaisesRegex(TimeoutError, "screendump did not produce a frame"):
+                    recorder.still("app-grid")
+            self.assertGreaterEqual(now[0], recorder.timeout)
+            self.assertLess(time.monotonic() - start, self.SCHEDULING_TIMEOUT)
             with self.assertRaisesRegex(RuntimeError, "previously failed"):
                 recorder.qmp.cmd("send-key")
             self.assertEqual(recorder.stills, {})
@@ -2566,21 +2600,27 @@ class TourRecorderTests(unittest.TestCase):
         import threading
         left, right = socket.socketpair()
         entered = threading.Event()
+        timers = []
         def command(*args, **kwargs):
             entered.set()
             return left.recv(1)
         try:
             qmp = SimpleNamespace(sock=left, cmd=command)
-            with tempfile.TemporaryDirectory() as directory:
-                recorder = lane.Recorder(qmp, directory, timeout=0.03)
+            timer = self.controlled_timer(timers, entered)
+            with tempfile.TemporaryDirectory() as directory, patch.object(lane.threading, "Timer", timer):
+                recorder = lane.Recorder(qmp, directory, timeout=self.SCHEDULING_TIMEOUT)
                 recorder.thread.start()
-                self.assertTrue(entered.wait(1))
+                self.assertTrue(entered.wait(self.SCHEDULING_TIMEOUT))
                 with self.assertRaisesRegex(RuntimeError, "capture failed"):
                     recorder.close()
                 self.assertFalse(recorder.thread.is_alive())
                 self.assertEqual(recorder.n, 0)
                 self.assertEqual(list(Path(recorder.dir).iterdir()), [])
                 self.assertIs(qmp.cmd, recorder.original_cmd)
+                self.assertIsInstance(recorder.error, TimeoutError)
+                self.assertEqual(len(timers), 1)
+                self.assertTrue(timers[0].fired.is_set())
+                self.assertFalse(timers[0].is_alive())
         finally:
             left.close()
             right.close()
@@ -2604,21 +2644,22 @@ class TourRecorderTests(unittest.TestCase):
         left, right = socket.socketpair()
         stop, entered = threading.Event(), threading.Event()
         timers = []
-        timer_class = threading.Timer
-        def timer(*args, **kwargs):
-            instance = timer_class(*args, **kwargs)
-            timers.append(instance)
-            return instance
+        timer = self.controlled_timer(timers, entered)
         def server():
-            right.settimeout(1)
+            right.settimeout(self.SCHEDULING_TIMEOUT)
             try:
                 right.recv(4096)  # Genuine baseline.Qmp command was sent.
-                entered.set()
                 payload = b' ' if partial else b'{"event":"TEST"}\n'
                 if partial:
                     right.sendall(b'{')
+                chunks = 0
                 while not stop.wait(0.002):
                     right.sendall(payload)
+                    chunks += 1
+                    if chunks == 3:
+                        # Expire only after the peer has begun the event flood
+                        # or partial-line dribble, never before its first read.
+                        entered.set()
             except OSError:
                 pass
         worker = threading.Thread(target=server)
@@ -2628,11 +2669,11 @@ class TourRecorderTests(unittest.TestCase):
         qmp.file = left.makefile("rw")
         try:
             with tempfile.TemporaryDirectory() as directory, patch.object(lane.threading, "Timer", timer):
-                recorder = lane.Recorder(qmp, directory, timeout=0.08)
+                recorder = lane.Recorder(qmp, directory, timeout=self.SCHEDULING_TIMEOUT)
                 started = time.monotonic()
                 if background:
                     recorder.thread.start()
-                    self.assertTrue(entered.wait(1))
+                    self.assertTrue(entered.wait(self.SCHEDULING_TIMEOUT))
                     with self.assertRaisesRegex(RuntimeError, "capture failed"):
                         recorder.close()
                     self.assertFalse(recorder.thread.is_alive())
@@ -2643,17 +2684,19 @@ class TourRecorderTests(unittest.TestCase):
                         recorder.qmp.cmd("send-key")
                     with self.assertRaisesRegex(RuntimeError, "capture failed"):
                         recorder.close()
-                self.assertLess(time.monotonic() - started, 1)
+                self.assertLess(time.monotonic() - started, self.SCHEDULING_TIMEOUT)
+                self.assertTrue(entered.is_set())
                 self.assertEqual(recorder.n, 0)
                 self.assertEqual(recorder.stills, {})
                 self.assertEqual(list(Path(recorder.dir).iterdir()), [])
                 self.assertTrue(timers)
+                self.assertTrue(all(t.fired.is_set() for t in timers))
                 self.assertTrue(all(not t.is_alive() for t in timers))
                 self.assertEqual(left.recv(1), b'')  # Timeout permanently retires this transport.
         finally:
             stop.set()
             right.close()
-            worker.join(1)
+            worker.join(self.SCHEDULING_TIMEOUT)
             qmp.file.close()
             left.close()
         self.assertFalse(worker.is_alive())
@@ -2670,27 +2713,11 @@ class TourRecorderTests(unittest.TestCase):
     def test_success_cancels_watchdog_before_next_command(self):
         import socket
         import threading
-        # Advance watchdog time explicitly; socket/thread scheduling must not
-        # consume the 80 ms window that this regression previously relied on.
-        class ControlledTimer(threading.Timer):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                self.deadline_reached = threading.Event()
-                timers.append(self)
-
-            def run(self):
-                self.deadline_reached.wait(self.interval)
-                if not self.finished.is_set():
-                    self.function(*self.args, **self.kwargs)
-                self.finished.set()
-
-            def cancel(self):
-                super().cancel()
-                self.deadline_reached.set()
 
         left, right = socket.socketpair()
-        right.settimeout(10)
+        right.settimeout(self.SCHEDULING_TIMEOUT)
         timers, errors = [], []
+        timer = self.controlled_timer(timers)
         def server():
             try:
                 with right.makefile("rw") as stream:
@@ -2707,14 +2734,15 @@ class TourRecorderTests(unittest.TestCase):
         qmp = lane.baseline.Qmp.__new__(lane.baseline.Qmp)
         qmp.sock, qmp.file = left, left.makefile("rw")
         try:
-            with tempfile.TemporaryDirectory() as directory, patch.object(lane.threading, "Timer", ControlledTimer):
-                recorder = lane.Recorder(qmp, directory, timeout=10)
+            with tempfile.TemporaryDirectory() as directory, patch.object(lane.threading, "Timer", timer):
+                recorder = lane.Recorder(qmp, directory, timeout=self.SCHEDULING_TIMEOUT)
                 recorder.still("intro")
                 self.assertEqual(len(timers), 1)
                 self.assertGreater(timers[0].interval, 0)
                 self.assertLessEqual(timers[0].interval, recorder.timeout)
                 self.assertTrue(timers[0].finished.is_set())
                 self.assertFalse(timers[0].is_alive())
+                self.assertFalse(timers[0].fired.is_set())
                 # The first deadline has elapsed before input resumes. A
                 # canceled, joined callback cannot retire the shared socket.
                 timers[0].deadline_reached.set()
@@ -2722,9 +2750,10 @@ class TourRecorderTests(unittest.TestCase):
                 recorder.close()
                 self.assertEqual(len(timers), 2)
                 self.assertTrue(all(not t.is_alive() for t in timers))
+                self.assertTrue(all(not t.fired.is_set() for t in timers))
         finally:
             right.close()
-            worker.join(1)
+            worker.join(self.SCHEDULING_TIMEOUT)
             qmp.file.close()
             left.close()
         self.assertFalse(worker.is_alive())
@@ -2738,17 +2767,17 @@ class TourRecorderTests(unittest.TestCase):
             def hold():
                 with recorder.lock:
                     held.set()
-                    release.wait(1)
+                    release.wait(self.SCHEDULING_TIMEOUT)
             worker = threading.Thread(target=hold)
             worker.start()
             try:
-                self.assertTrue(held.wait(1))
+                self.assertTrue(held.wait(self.SCHEDULING_TIMEOUT))
                 with self.assertRaises(TimeoutError):
                     recorder.mark("overview")
                 self.assertEqual(recorder.marks, [])
             finally:
                 release.set()
-                worker.join(1)
+                worker.join(self.SCHEDULING_TIMEOUT)
             self.assertFalse(worker.is_alive())
             with self.assertRaisesRegex(RuntimeError, "capture failed"):
                 recorder.close()
@@ -2788,18 +2817,24 @@ class TourRecorderTests(unittest.TestCase):
     def test_failed_tour_capture_removes_owned_work_and_restores_command(self):
         original = lane.Recorder
         recorders = []
+        now = [0.0]
+        def advance(seconds):
+            now[0] += seconds
         def construct(qmp, directory):
             recorder = original(qmp, directory, timeout=0.02)
             recorder.thread = SimpleNamespace(start=lambda: None, ident=None)
+            recorder.stop.wait = advance
             recorders.append(recorder)
             return recorder
         command = lambda *args, **kwargs: None
         qmp = SimpleNamespace(cmd=command, keys=lambda *args, **kwargs: None)
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(lane, "Recorder", construct), patch.object(lane.subprocess, "run"), \
-                    patch.object(lane.time, "sleep", lambda delay: None):
+                    patch.object(lane.time, "sleep", lambda delay: None), \
+                    patch.object(lane.time, "monotonic", lambda: now[0]):
                 with self.assertRaises(TimeoutError):
                     lane.run_tour(qmp, directory, "unused")
+            self.assertGreaterEqual(now[0], recorders[0].timeout)
             self.assertFalse((Path(directory) / "tour/.work").exists())
             self.assertIs(qmp.cmd, command)
             self.assertEqual(recorders[0].stills, {})
@@ -2861,11 +2896,21 @@ class TourViewPredicates(unittest.TestCase):
                 path.write_bytes(header + (probes.pop(0) if len(probes) > 1 else probes[0]))
             else:
                 path.write_bytes(b"png pixels")
-        with tempfile.TemporaryDirectory() as directory:
-            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory, timeout=1)
+        now = [0.0]
+        def advance(seconds):
+            now[0] += seconds
+        # Polling time advances only at sleep boundaries, not while the host
+        # writes a synthetic frame or schedules the test process.
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(lane.time, "monotonic", lambda: now[0]), \
+                patch.object(lane.time, "sleep", advance):
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory,
+                                     timeout=TourRecorderTests.SCHEDULING_TIMEOUT)
             self.assertTrue(recorder.await_still("alt-tab", lane.switcher_shown, timeout=5, settle=0))
+            deadline = now[0] + 0.05
             self.assertFalse(recorder.await_still("overview-windows", lane.overview_windows_shown,
                                                   timeout=0.05, settle=0))
+            self.assertGreaterEqual(now[0], deadline)
             self.assertEqual(recorder.stills, {"alt-tab": 0, "overview-windows": 1})
             self.assertEqual(recorder.unconfirmed, ["overview-windows"])
             self.assertEqual(sorted(p.name for p in Path(recorder.dir).iterdir()),
