@@ -754,7 +754,7 @@ jobs:
           path: ${{ runner.temp }}/native-minimize/
           retention-days: 14
       # A small failure-only subset can be retrieved without the full binaries.
-      # Keep the full native-minimize-proof upload above unchanged.
+      # The full upload retains the single frozen role set plus both mode proofs.
       - name: Collect bounded native minimize failure diagnostics
         id: minimize_failure_bundle
         if: failure() && steps.native_minimize.outcome == 'failure'
