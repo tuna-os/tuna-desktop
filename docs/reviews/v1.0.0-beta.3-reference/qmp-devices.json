@@ -1,0 +1,156 @@
+{
+  "query-kvm": {
+    "enabled": true,
+    "present": true
+  },
+  "query-block": [
+    {
+      "io-status": "ok",
+      "device": "virtio0",
+      "locked": false,
+      "removable": false,
+      "inserted": {
+        "iops_rd": 0,
+        "detect_zeroes": "off",
+        "active": true,
+        "image": {
+          "virtual-size": 21474836480,
+          "filename": "/w/home/.local/share/corral/vms/tuna-q-beta3-gnome-ref/disk.qcow2",
+          "cluster-size": 65536,
+          "format": "qcow2",
+          "actual-size": 18606313472,
+          "format-specific": {
+            "type": "qcow2",
+            "data": {
+              "compat": "1.1",
+              "compression-type": "zlib",
+              "lazy-refcounts": false,
+              "refcount-bits": 16,
+              "corrupt": false,
+              "extended-l2": false
+            }
+          },
+          "dirty-flag": false
+        },
+        "iops_wr": 0,
+        "ro": false,
+        "children": [
+          {
+            "node-name": "#block017",
+            "child": "file"
+          }
+        ],
+        "node-name": "#block162",
+        "backing_file_depth": 0,
+        "drv": "qcow2",
+        "iops": 0,
+        "bps_wr": 0,
+        "write_threshold": 0,
+        "encrypted": false,
+        "bps": 0,
+        "bps_rd": 0,
+        "cache": {
+          "no-flush": false,
+          "direct": false,
+          "writeback": true
+        },
+        "file": "/w/home/.local/share/corral/vms/tuna-q-beta3-gnome-ref/disk.qcow2"
+      },
+      "qdev": "/machine/peripheral-anon/device[2]/virtio-backend",
+      "type": "unknown"
+    },
+    {
+      "device": "pflash0",
+      "locked": false,
+      "removable": false,
+      "inserted": {
+        "iops_rd": 0,
+        "detect_zeroes": "off",
+        "active": true,
+        "image": {
+          "virtual-size": 1966080,
+          "filename": "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+          "format": "raw",
+          "actual-size": 1966080,
+          "dirty-flag": false
+        },
+        "iops_wr": 0,
+        "ro": true,
+        "children": [
+          {
+            "node-name": "#block290",
+            "child": "file"
+          }
+        ],
+        "node-name": "#block327",
+        "backing_file_depth": 0,
+        "drv": "raw",
+        "iops": 0,
+        "bps_wr": 0,
+        "write_threshold": 0,
+        "encrypted": false,
+        "bps": 0,
+        "bps_rd": 0,
+        "cache": {
+          "no-flush": false,
+          "direct": false,
+          "writeback": true
+        },
+        "file": "/usr/share/edk2/ovmf/OVMF_CODE.fd"
+      },
+      "qdev": "/machine/system.flash0",
+      "type": "unknown"
+    },
+    {
+      "device": "pflash1",
+      "locked": false,
+      "removable": false,
+      "inserted": {
+        "iops_rd": 0,
+        "detect_zeroes": "off",
+        "active": true,
+        "image": {
+          "virtual-size": 131072,
+          "filename": "/w/home/.local/share/corral/vms/tuna-q-beta3-gnome-ref/vars.fd",
+          "format": "raw",
+          "actual-size": 131072,
+          "dirty-flag": false
+        },
+        "iops_wr": 0,
+        "ro": false,
+        "children": [
+          {
+            "node-name": "#block477",
+            "child": "file"
+          }
+        ],
+        "node-name": "#block588",
+        "backing_file_depth": 0,
+        "drv": "raw",
+        "iops": 0,
+        "bps_wr": 0,
+        "write_threshold": 0,
+        "encrypted": false,
+        "bps": 0,
+        "bps_rd": 0,
+        "cache": {
+          "no-flush": false,
+          "direct": false,
+          "writeback": true
+        },
+        "file": "/w/home/.local/share/corral/vms/tuna-q-beta3-gnome-ref/vars.fd"
+      },
+      "qdev": "/machine/system.flash1",
+      "type": "unknown"
+    },
+    {
+      "io-status": "ok",
+      "device": "ide2-cd0",
+      "locked": false,
+      "removable": true,
+      "qdev": "/machine/unattached/device[19]",
+      "tray_open": false,
+      "type": "unknown"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+# Owned beta.3 GNOME appearance reference fixture, never a published image.
+FROM ghcr.io/tuna-os/marlin@sha256:4aac01014ecb392b05cc80beeefd58512379319314f23acfdf5d601c13dfa8c6
+COPY tuna-vm-published-pacman /run/tuna-vm-published-pacman
+RUN mkdir -p /usr/share/tuna-beta3-reference \
+    && pacman -Q > /usr/share/tuna-beta3-reference/shipped-packages.txt \
+    && sha256sum /etc/gdm/custom.conf /usr/lib/systemd/system/gdm.service > /usr/share/tuna-beta3-reference/shipped-gdm.sha256 \
+    && bash /run/tuna-vm-published-pacman qemu-guest-agent openssh python \
+    && useradd -M -d /home/tuna-test -s /bin/bash -U -c 'Tuna GNOME reference' tuna-test \
+    && echo 'tuna-test:tuna' | chpasswd \
+    && systemctl enable sshd.service \
+    && systemctl add-wants multi-user.target qemu-guest-agent.service \
+    && sha256sum --check /usr/share/tuna-beta3-reference/shipped-gdm.sha256 \
+    && pacman -Q > /usr/share/tuna-beta3-reference/fixture-packages.txt \
+    && python3 -c 'from pathlib import Path; p=Path("/usr/share/tuna-beta3-reference"); assert set((p/"shipped-packages.txt").read_text().splitlines()) <= set((p/"fixture-packages.txt").read_text().splitlines()), "reference fixture changed shipped package versions"' \
+    && rm /run/tuna-vm-published-pacman
+COPY reference.tmpfiles /usr/lib/tmpfiles.d/tuna-beta3-reference.conf
+LABEL org.opencontainers.image.title="Owned beta.3 GNOME reference fixture (not published)"

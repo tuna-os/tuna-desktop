@@ -1,0 +1,327 @@
+[
+  {
+    "utc": "2026-10-31T23:02:48.458888+00:00",
+    "command": "mkdir -p /var/tmp/tuna-q-beta3/native-reference",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:02:50.178763+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral ssh -o BatchMode=yes -o ConnectTimeout=10 -i /w/id_ed25519 -p 2207 root@127.0.0.1 'loginctl show-session 7 -p Service -p Type -p Class -p Active -p LockedHint; pacman -Q gnome-shell gdm mutter mesa nautilus libnotify; bootc status --json'",
+    "exit": 0,
+    "stdout": "Service=gdm-password\nType=wayland\nClass=user\nActive=yes\nLockedHint=no\ngnome-shell 1:51.1-1\ngdm 51.1.1-1\nmutter 51.1-1\nmesa 1:26.2.6-1\nnautilus 51.1-1\nlibnotify 0.8.9-1\n{\"apiVersion\":\"org.containers.bootc/v1\",\"kind\":\"BootcHost\",\"metadata\":{\"name\":\"host\"},\"spec\":{\"bootOrder\":\"default\",\"image\":{\"image\":\"localhost/tuna-beta3-gnome-native:reference\",\"transport\":\"registry\"}},\"status\":{\"booted\":{\"cachedUpdate\":null,\"composefs\":{\"bootDigest\":\"2fe64de9cc6eb7df3950af585aac97c07a79f398f15f1427a9af6be4b6065e53\",\"bootType\":\"Bls\",\"bootloader\":\"systemd\",\"missingVerityAllowed\":false,\"verity\":\"63495dbfc4916a4eddbfde0ac714f032dbc3e23a4ad968480bfe357001df62480cdc7fbcd90beb41a9c456faeea9b49ee7984b3edfd9a79271fc58400e7675fb\"},\"downloadOnly\":false,\"image\":{\"architecture\":\"amd64\",\"image\":{\"image\":\"localhost/tuna-beta3-gnome-native:reference\",\"transport\":\"registry\"},\"imageDigest\":\"sha256:1f801a42f8dce05428a940f47d79aae0ccbdaead88704f42538854b105a6b686\",\"timestamp\":\"2026-10-31T22:34:49.037214294Z\",\"version\":null},\"incompatible\":false,\"ostree\":null,\"pinned\":false,\"softRebootCapable\":false,\"store\":null},\"readOnly\":false,\"rollback\":null,\"rollbackQueued\":false,\"staged\":null,\"type\":null,\"usrOverlay\":null}}",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:02:50.885372+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral screenshot tuna-q-beta3-gnome-ref --require-paint -o /w/native-reference/GN-OV-OPEN.png",
+    "exit": 0,
+    "stdout": "Screenshot written to /w/native-reference/GN-OV-OPEN.png (1280x800, deviation 0.1734 \u2014 painted)\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:02:51.464767+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral type tuna-q-beta3-gnome-ref '<redacted>'",
+    "exit": 0,
+    "stdout": "",
+    "stderr": "",
+    "characters": 5
+  },
+  {
+    "utc": "2026-10-31T23:02:53.861997+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral screenshot tuna-q-beta3-gnome-ref --require-paint -o /w/native-reference/GN-OV-SEARCH.png",
+    "exit": 0,
+    "stdout": "Screenshot written to /w/native-reference/GN-OV-SEARCH.png (1280x800, deviation 0.0796 \u2014 painted)\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:02:54.291928+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral key tuna-q-beta3-gnome-ref ret",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:02:59.872879+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral ssh -o BatchMode=yes -o ConnectTimeout=10 -i /w/id_ed25519 -p 2207 root@127.0.0.1 'pgrep -a nautilus'",
+    "exit": 0,
+    "stdout": "3476 /usr/bin/nautilus --gapplication-service\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:03:00.312278+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral screenshot tuna-q-beta3-gnome-ref --require-paint -o /w/native-reference/GN-OV-LAUNCH.png",
+    "exit": 0,
+    "stdout": "Screenshot written to /w/native-reference/GN-OV-LAUNCH.png (1280x800, deviation 0.4048 \u2014 painted)\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:06:14.396470+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral key tuna-q-beta3-gnome-ref meta_l left",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:06:16.292173+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral screenshot tuna-q-beta3-gnome-ref --require-paint -o /w/native-reference/GN-TILE-LEFT.png",
+    "exit": 0,
+    "stdout": "Screenshot written to /w/native-reference/GN-TILE-LEFT.png (1280x800, deviation 0.3900 \u2014 painted)\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:06:17.249312+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral key tuna-q-beta3-gnome-ref meta_l",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:06:19.831391+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral type tuna-q-beta3-gnome-ref '<redacted>' --enter",
+    "exit": 0,
+    "stdout": "",
+    "stderr": "",
+    "characters": 8
+  },
+  {
+    "utc": "2026-10-31T23:06:25.345317+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral ssh -o BatchMode=yes -o ConnectTimeout=10 -i /w/id_ed25519 -p 2207 root@127.0.0.1 'pgrep -a gnome-control-center'",
+    "exit": 1,
+    "stdout": "",
+    "stderr": "pgrep: pattern that searches for process name longer than 15 characters will result in zero matches\nTry `pgrep -f' option to match against the complete command line.\n"
+  },
+  {
+    "utc": "2026-10-31T23:06:38.304725+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral ssh -o BatchMode=yes -o ConnectTimeout=10 -i /w/id_ed25519 -p 2207 root@127.0.0.1 'pgrep -af '\"'\"'^/usr/bin/gnome-control-center'\"'\"''",
+    "exit": 0,
+    "stdout": "3768 /usr/bin/gnome-control-center --gapplication-service\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:06:39.849152+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral qmp tuna-q-beta3-gnome-ref send-key '{\"keys\": [{\"type\": \"qcode\", \"data\": \"alt\"}, {\"type\": \"qcode\", \"data\": \"tab\"}], \"hold-time\": 1500}'",
+    "exit": 0,
+    "stdout": "{}\n\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:06:41.367242+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral screenshot tuna-q-beta3-gnome-ref --require-paint -o /w/native-reference/GN-SW-STEP.png",
+    "exit": 0,
+    "stdout": "Screenshot written to /w/native-reference/GN-SW-STEP.png (1280x800, deviation 0.3426 \u2014 painted)\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:06:45.100251+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral key tuna-q-beta3-gnome-ref meta_l pgdn",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:06:47.066367+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral screenshot tuna-q-beta3-gnome-ref --require-paint -o /w/native-reference/GN-WS-NEXT.png",
+    "exit": 0,
+    "stdout": "Screenshot written to /w/native-reference/GN-WS-NEXT.png (1280x800, deviation 0.2185 \u2014 painted)\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:06:48.592082+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral key tuna-q-beta3-gnome-ref meta_l pgup",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:06:50.233776+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral qmp tuna-q-beta3-gnome-ref input-send-event '{\"events\": [{\"type\": \"abs\", \"data\": {\"axis\": \"x\", \"value\": 31768}}, {\"type\": \"abs\", \"data\": {\"axis\": \"y\", \"value\": 492}}, {\"type\": \"btn\", \"data\": {\"down\": true, \"button\": \"left\"}}, {\"type\": \"btn\", \"data\": {\"down\": false, \"button\": \"left\"}}]}'",
+    "exit": 0,
+    "stdout": "{}\n\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:06:52.215455+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral screenshot tuna-q-beta3-gnome-ref --require-paint -o /w/native-reference/GN-QS-OPEN.png",
+    "exit": 0,
+    "stdout": "Screenshot written to /w/native-reference/GN-QS-OPEN.png (1280x800, deviation 0.3467 \u2014 painted)\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:06:52.839726+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral key tuna-q-beta3-gnome-ref esc",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:06:53.562772+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral qmp tuna-q-beta3-gnome-ref query-kvm",
+    "exit": 0,
+    "stdout": "{\n  \"enabled\": true,\n  \"present\": true\n}\n\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:07:28.482613+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral ssh -o BatchMode=yes -o ConnectTimeout=10 -i /w/id_ed25519 -p 2207 root@127.0.0.1 'runuser -u tuna-test -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications --method org.freedesktop.Notifications.GetServerInformation'",
+    "exit": 0,
+    "stdout": "('gnome-shell', 'GNOME', '51.1', '1.2')\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:07:29.284586+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral ssh -o BatchMode=yes -o ConnectTimeout=10 -i /w/id_ed25519 -p 2207 root@127.0.0.1 'runuser -u tuna-test -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus notify-send --app-name='\"'\"'Tuna native reference'\"'\"' --expire-time=10000 '\"'\"'Native GNOME 51 reference'\"'\"' '\"'\"'A notification delivered through the actual session service'\"'\"''",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:07:31.041281+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral screenshot tuna-q-beta3-gnome-ref --require-paint -o /w/native-reference/GN-NOTIFICATION.png",
+    "exit": 0,
+    "stdout": "Screenshot written to /w/native-reference/GN-NOTIFICATION.png (1280x800, deviation 0.3488 \u2014 painted)\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:07:31.813959+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral key tuna-q-beta3-gnome-ref meta_l l",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:07:34.126012+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral key tuna-q-beta3-gnome-ref shift",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:07:35.899664+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral ssh -o BatchMode=yes -o ConnectTimeout=10 -i /w/id_ed25519 -p 2207 root@127.0.0.1 'loginctl show-session 7 -p Service -p Active -p LockedHint; runuser -u tuna-test -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive'",
+    "exit": 0,
+    "stdout": "Service=gdm-password\nActive=yes\nLockedHint=yes\n(true,)\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:07:36.774557+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral screenshot tuna-q-beta3-gnome-ref --require-paint -o /w/native-reference/GN-LOCK.png",
+    "exit": 0,
+    "stdout": "Screenshot written to /w/native-reference/GN-LOCK.png (1280x800, deviation 0.1391 \u2014 painted)\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:07:38.170960+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral key tuna-q-beta3-gnome-ref ret",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:07:39.887685+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral screenshot tuna-q-beta3-gnome-ref --require-paint -o /w/native-reference/GN-LOCK-PROMPT.png",
+    "exit": 0,
+    "stdout": "Screenshot written to /w/native-reference/GN-LOCK-PROMPT.png (1280x800, deviation 0.1213 \u2014 painted)\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:07:40.777150+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral ssh -o BatchMode=yes -o ConnectTimeout=10 -i /w/id_ed25519 -p 2207 root@127.0.0.1 'readlink -f /sys/class/drm/card*/device/driver; uname -r; pacman -Q gnome-shell mutter mesa gdm libnotify; loginctl show-session 7 -p Service -p Type -p Class -p Name -p Active -p LockedHint'",
+    "exit": 0,
+    "stdout": "/sys/bus/pci/drivers/virtio-pci\n7.2.11-arch1-1\ngnome-shell 1:51.1-1\nmutter 51.1-1\nmesa 1:26.2.6-1\ngdm 51.1.1-1\nlibnotify 0.8.9-1\nName=tuna-test\nService=gdm-password\nType=wayland\nClass=user\nActive=yes\nLockedHint=yes\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:08:58.589050+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral type tuna-q-beta3-gnome-ref '<redacted>' --enter",
+    "exit": 0,
+    "stdout": "",
+    "stderr": "",
+    "characters": 4
+  },
+  {
+    "utc": "2026-10-31T23:09:02.255492+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral ssh -o BatchMode=yes -o ConnectTimeout=10 -i /w/id_ed25519 -p 2207 root@127.0.0.1 'loginctl show-session 7 -p LockedHint; runuser -u tuna-test -- env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus gsettings get org.gnome.shell.keybindings toggle-quick-settings'",
+    "exit": 0,
+    "stdout": "LockedHint=no\n['<Super>s']\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:09:02.636083+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral qmp tuna-q-beta3-gnome-ref input-send-event '{\"events\": [{\"type\": \"key\", \"data\": {\"down\": true, \"key\": {\"type\": \"qcode\", \"data\": \"alt\"}}}, {\"type\": \"key\", \"data\": {\"down\": true, \"key\": {\"type\": \"qcode\", \"data\": \"tab\"}}}, {\"type\": \"key\", \"data\": {\"down\": false, \"key\": {\"type\": \"qcode\", \"data\": \"tab\"}}}]}'",
+    "exit": 0,
+    "stdout": "{}\n\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:09:03.413246+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral screenshot tuna-q-beta3-gnome-ref --require-paint -o /w/native-reference/GN-SW-HELD.png",
+    "exit": 0,
+    "stdout": "Screenshot written to /w/native-reference/GN-SW-HELD.png (1280x800, deviation 0.3614 \u2014 painted)\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:09:03.797679+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral qmp tuna-q-beta3-gnome-ref input-send-event '{\"events\": [{\"type\": \"key\", \"data\": {\"down\": false, \"key\": {\"type\": \"qcode\", \"data\": \"alt\"}}}]}'",
+    "exit": 0,
+    "stdout": "{}\n\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:09:04.254118+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral key tuna-q-beta3-gnome-ref meta_l s",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:09:05.182795+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral screenshot tuna-q-beta3-gnome-ref --require-paint -o /w/native-reference/GN-QS-KEYBOARD.png",
+    "exit": 0,
+    "stdout": "Screenshot written to /w/native-reference/GN-QS-KEYBOARD.png (1280x800, deviation 0.3444 \u2014 painted)\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:09:05.723256+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral key tuna-q-beta3-gnome-ref esc",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:11:44.827047+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral qmp tuna-q-beta3-gnome-ref query-block",
+    "exit": 0,
+    "stdout": "[\n  {\n    \"io-status\": \"ok\",\n    \"device\": \"virtio0\",\n    \"locked\": false,\n    \"removable\": false,\n    \"inserted\": {\n      \"iops_rd\": 0,\n      \"detect_zeroes\": \"off\",\n      \"active\": true,\n      \"image\": {\n        \"virtual-size\": 21474836480,\n        \"filename\": \"/w/home/.local/share/corral/vms/tuna-q-beta3-gnome-ref/disk.qcow2\",\n        \"cluster-size\": 65536,\n        \"format\": \"qcow2\",\n        \"actual-size\": 18606313472,\n        \"format-specific\": {\n          \"type\": \"qcow2\",\n          \"data\": {\n            \"compat\": \"1.1\",\n            \"compression-type\": \"zlib\",\n            \"lazy-refcounts\": false,\n            \"refcount-bits\": 16,\n            \"corrupt\": false,\n            \"extended-l2\": false\n          }\n        },\n        \"dirty-flag\": false\n      },\n      \"iops_wr\": 0,\n      \"ro\": false,\n      \"children\": [\n        {\n          \"node-name\": \"#block017\",\n          \"child\": \"file\"\n        }\n      ],\n      \"node-name\": \"#block162\",\n      \"backing_file_depth\": 0,\n      \"drv\": \"qcow2\",\n      \"iops\": 0,\n      \"bps_wr\": 0,\n      \"write_threshold\": 0,\n      \"encrypted\": false,\n      \"bps\": 0,\n      \"bps_rd\": 0,\n      \"cache\": {\n        \"no-flush\": false,\n        \"direct\": false,\n        \"writeback\": true\n      },\n      \"file\": \"/w/home/.local/share/corral/vms/tuna-q-beta3-gnome-ref/disk.qcow2\"\n    },\n    \"qdev\": \"/machine/peripheral-anon/device[2]/virtio-backend\",\n    \"type\": \"unknown\"\n  },\n  {\n    \"device\": \"pflash0\",\n    \"locked\": false,\n    \"removable\": false,\n    \"inserted\": {\n      \"iops_rd\": 0,\n      \"detect_zeroes\": \"off\",\n      \"active\": true,\n      \"image\": {\n        \"virtual-size\": 1966080,\n        \"filename\": \"/usr/share/edk2/ovmf/OVMF_CODE.fd\",\n        \"format\": \"raw\",\n        \"actual-size\": 1966080,\n        \"dirty-flag\": false\n      },\n      \"iops_wr\": 0,\n      \"ro\": true,\n      \"children\": [\n        {\n          \"node-name\": \"#block290\",\n          \"child\": \"file\"\n        }\n      ],\n      \"node-name\": \"#block327\",\n      \"backing_file_depth\": 0,\n      \"drv\": \"raw\",\n      \"iops\": 0,\n      \"bps_wr\": 0,\n      \"write_threshold\": 0,\n      \"encrypted\": false,\n      \"bps\": 0,\n      \"bps_rd\": 0,\n      \"cache\": {\n        \"no-flush\": false,\n        \"direct\": false,\n        \"writeback\": true\n      },\n      \"file\": \"/usr/share/edk2/ovmf/OVMF_CODE.fd\"\n    },\n    \"qdev\": \"/machine/system.flash0\",\n    \"type\": \"unknown\"\n  },\n  {\n    \"device\": \"pflash1\",\n    \"locked\": false,\n    \"removable\": false,\n    \"inserted\": {\n      \"iops_rd\": 0,\n      \"detect_zeroes\": \"off\",\n      \"active\": true,\n      \"image\": {\n        \"virtual-size\": 131072,\n        \"filename\": \"/w/home/.local/share/corral/vms/tuna-q-beta3-gnome-ref/vars.fd\",\n        \"format\": \"raw\",\n        \"actual-size\": 131072,\n        \"dirty-flag\": false\n      },\n      \"iops_wr\": 0,\n      \"ro\": false,\n      \"children\": [\n        {\n          \"node-name\": \"#block477\",\n          \"child\": \"file\"\n        }\n      ],\n      \"node-name\": \"#block588\",\n      \"backing_file_depth\": 0,\n      \"drv\": \"raw\",\n      \"iops\": 0,\n      \"bps_wr\": 0,\n      \"write_threshold\": 0,\n      \"encrypted\": false,\n      \"bps\": 0,\n      \"bps_rd\": 0,\n      \"cache\": {\n        \"no-flush\": false,\n        \"direct\": false,\n        \"writeback\": true\n      },\n      \"file\": \"/w/home/.local/share/corral/vms/tuna-q-beta3-gnome-ref/vars.fd\"\n    },\n    \"qdev\": \"/machine/system.flash1\",\n    \"type\": \"unknown\"\n  },\n  {\n    \"io-status\": \"ok\",\n    \"device\": \"ide2-cd0\",\n    \"locked\": false,\n    \"removable\": true,\n    \"qdev\": \"/machine/unattached/device[19]\",\n    \"tray_open\": false,\n    \"type\": \"unknown\"\n  }\n]\n\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:11:45.027746+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral qmp tuna-q-beta3-gnome-ref query-kvm",
+    "exit": 0,
+    "stdout": "{\n  \"enabled\": true,\n  \"present\": true\n}\n\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:11:45.522504+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral ssh -o BatchMode=yes -o ConnectTimeout=10 -i /w/id_ed25519 -p 2207 root@127.0.0.1 'lsmod | grep \"^virtio_gpu\"; sha256sum /usr/bin/gnome-shell /usr/bin/gnome-control-center /usr/bin/nautilus /usr/bin/notify-send; sha256sum --check /usr/share/tuna-beta3-reference/shipped-gdm.sha256'",
+    "exit": 0,
+    "stdout": "virtio_gpu            114688  1\nd2b083ffd7a850b02f20c278a4d1c5d411e58f1ffeb23ec16d6b67ab46a9a60d  /usr/bin/gnome-shell\n431374a975335cda736518d45f48519c0d37898d2dd9920c2bb8056bd9c829f7  /usr/bin/gnome-control-center\ne4b0032088b2a2460e5a38759b6a6315973a0bcba8269d5d3512d56f96601aa7  /usr/bin/nautilus\n8f93cdd151f92ae77496482e71df578f49522f6921c945ef35bf6feb611c0323  /usr/bin/notify-send\n/etc/gdm/custom.conf: OK\n/usr/lib/systemd/system/gdm.service: OK\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:12:54.566734+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral ssh -o BatchMode=yes -o ConnectTimeout=10 -i /w/id_ed25519 -p 2207 root@127.0.0.1 'loginctl show-session 7 -p Name -p Desktop -p Service -p Type -p Class -p Remote -p Leader -p Active -p LockedHint; ps -p 2569 -o args=; sha256sum /etc/gdm/custom.conf /usr/lib/systemd/system/gdm.service'",
+    "exit": 0,
+    "stdout": "Name=tuna-test\nRemote=no\nService=gdm-password\nDesktop=\nLeader=2569\nType=wayland\nClass=user\nActive=yes\nLockedHint=no\ngdm-session-worker [pam/gdm-password]\n04022d30d148bf53461bc0fc6f8c5df8fbfcf590c06b684ce975e1e057894541  /etc/gdm/custom.conf\nf240bf33c498efe545afb4da463bd87d980bf462a94ef988c6722fc9ae2b2eaa  /usr/lib/systemd/system/gdm.service\n",
+    "stderr": ""
+  },
+  {
+    "utc": "2026-10-31T23:12:54.793578+00:00",
+    "command": "sudo podman exec tuna-q-beta3-corral /w/corral qmp tuna-q-beta3-gnome-ref query-pci",
+    "exit": 0,
+    "stdout": "[\n  {\n    \"bus\": 0,\n    \"devices\": [\n      {\n        \"irq_pin\": 0,\n        \"bus\": 0,\n        \"qdev_id\": \"\",\n        \"slot\": 0,\n        \"class_info\": {\n          \"class\": 1536,\n          \"desc\": \"Host bridge\"\n        },\n        \"id\": {\n          \"device\": 10688,\n          \"subsystem-vendor\": 6900,\n          \"vendor\": 32902,\n          \"subsystem\": 4352\n        },\n        \"function\": 0,\n        \"regions\": []\n      },\n      {\n        \"irq_pin\": 1,\n        \"bus\": 0,\n        \"qdev_id\": \"\",\n        \"irq\": 10,\n        \"slot\": 1,\n        \"class_info\": {\n          \"class\": 768,\n          \"desc\": \"VGA controller\"\n        },\n        \"id\": {\n          \"device\": 4176,\n          \"subsystem-vendor\": 6900,\n          \"vendor\": 6900,\n          \"subsystem\": 4352\n        },\n        \"function\": 0,\n        \"regions\": [\n          {\n            \"prefetch\": true,\n            \"mem_type_64\": false,\n            \"bar\": 0,\n            \"size\": 8388608,\n            \"address\": 2147483648,\n            \"type\": \"memory\"\n          },\n          {\n            \"prefetch\": true,\n            \"mem_type_64\": true,\n            \"bar\": 2,\n            \"size\": 16384,\n            \"address\": 61572651155456,\n            \"type\": \"memory\"\n          },\n          {\n            \"prefetch\": false,\n            \"mem_type_64\": false,\n            \"bar\": 4,\n            \"size\": 4096,\n            \"address\": 2156150784,\n            \"type\": \"memory\"\n          },\n          {\n            \"prefetch\": false,\n            \"mem_type_64\": false,\n            \"bar\": 6,\n            \"size\": 65536,\n            \"address\": -1,\n            \"type\": \"memory\"\n          }\n        ]\n      },\n      {\n        \"irq_pin\": 1,\n        \"bus\": 0,\n        \"qdev_id\": \"\",\n        \"irq\": 11,\n        \"slot\": 2,\n        \"class_info\": {\n          \"class\": 512,\n          \"desc\": \"Ethernet controller\"\n        },\n        \"id\": {\n          \"device\": 4096,\n          \"subsystem-vendor\": 6900,\n          \"vendor\": 6900,\n          \"subsystem\": 1\n        },\n        \"function\": 0,\n        \"regions\": [\n          {\n            \"bar\": 0,\n            \"size\": 32,\n            \"address\": 24832,\n            \"type\": \"io\"\n          },\n          {\n            \"prefetch\": false,\n            \"mem_type_64\": false,\n            \"bar\": 1,\n            \"size\": 4096,\n            \"address\": 2156146688,\n            \"type\": \"memory\"\n          },\n          {\n            \"prefetch\": true,\n            \"mem_type_64\": true,\n            \"bar\": 4,\n            \"size\": 16384,\n            \"address\": 61572651171840,\n            \"type\": \"memory\"\n          },\n          {\n            \"prefetch\": false,\n            \"mem_type_64\": false,\n            \"bar\": 6,\n            \"size\": 262144,\n            \"address\": -1,\n            \"type\": \"memory\"\n          }\n        ]\n      },\n      {\n        \"irq_pin\": 1,\n        \"bus\": 0,\n        \"qdev_id\": \"\",\n        \"irq\": 11,\n        \"slot\": 3,\n        \"class_info\": {\n          \"class\": 255\n        },\n        \"id\": {\n          \"device\": 4101,\n          \"subsystem-vendor\": 6900,\n          \"vendor\": 6900,\n          \"subsystem\": 4\n        },\n        \"function\": 0,\n        \"regions\": [\n          {\n            \"bar\": 0,\n            \"size\": 32,\n            \"address\": 24800,\n            \"type\": \"io\"\n          },\n          {\n            \"prefetch\": false,\n            \"mem_type_64\": false,\n            \"bar\": 1,\n            \"size\": 4096,\n            \"address\": 2156142592,\n            \"type\": \"memory\"\n          },\n          {\n            \"prefetch\": true,\n            \"mem_type_64\": true,\n            \"bar\": 4,\n            \"size\": 16384,\n            \"address\": 61572651188224,\n            \"type\": \"memory\"\n          }\n        ]\n      },\n      {\n        \"irq_pin\": 1,\n        \"bus\": 0,\n        \"qdev_id\": \"\",\n        \"irq\": 10,\n        \"slot\": 4,\n        \"class_info\": {\n          \"class\": 256,\n          \"desc\": \"SCSI controller\"\n        },\n        \"id\": {\n          \"device\": 4097,\n          \"subsystem-vendor\": 6900,\n          \"vendor\": 6900,\n          \"subsystem\": 2\n        },\n        \"function\": 0,\n        \"regions\": [\n          {\n            \"bar\": 0,\n            \"size\": 128,\n            \"address\": 24576,\n            \"type\": \"io\"\n          },\n          {\n            \"prefetch\": false,\n            \"mem_type_64\": false,\n            \"bar\": 1,\n            \"size\": 4096,\n            \"address\": 2156138496,\n            \"type\": \"memory\"\n          },\n          {\n            \"prefetch\": true,\n            \"mem_type_64\": true,\n            \"bar\": 4,\n            \"size\": 16384,\n            \"address\": 61572651204608,\n            \"type\": \"memory\"\n          }\n        ]\n      },\n      {\n        \"irq_pin\": 0,\n        \"bus\": 0,\n        \"qdev_id\": \"\",\n        \"slot\": 31,\n        \"class_info\": {\n          \"class\": 1537,\n          \"desc\": \"ISA bridge\"\n        },\n        \"id\": {\n          \"device\": 10520,\n          \"subsystem-vendor\": 6900,\n          \"vendor\": 32902,\n          \"subsystem\": 4352\n        },\n        \"function\": 0,\n        \"regions\": []\n      },\n      {\n        \"irq_pin\": 1,\n        \"bus\": 0,\n        \"qdev_id\": \"\",\n        \"irq\": 10,\n        \"slot\": 31,\n        \"class_info\": {\n          \"class\": 262,\n          \"desc\": \"SATA controller\"\n        },\n        \"id\": {\n          \"device\": 10530,\n          \"subsystem-vendor\": 6900,\n          \"vendor\": 32902,\n          \"subsystem\": 4352\n        },\n        \"function\": 2,\n        \"regions\": [\n          {\n            \"bar\": 4,\n            \"size\": 32,\n            \"address\": 24768,\n            \"type\": \"io\"\n          },\n          {\n            \"prefetch\": false,\n            \"mem_type_64\": false,\n            \"bar\": 5,\n            \"size\": 4096,\n            \"address\": 2156134400,\n            \"type\": \"memory\"\n          }\n        ]\n      },\n      {\n        \"irq_pin\": 1,\n        \"bus\": 0,\n        \"qdev_id\": \"\",\n        \"irq\": 10,\n        \"slot\": 31,\n        \"class_info\": {\n          \"class\": 3077,\n          \"desc\": \"SMBus\"\n        },\n        \"id\": {\n          \"device\": 10544,\n          \"subsystem-vendor\": 6900,\n          \"vendor\": 32902,\n          \"subsystem\": 4352\n        },\n        \"function\": 3,\n        \"regions\": [\n          {\n            \"bar\": 4,\n            \"size\": 64,\n            \"address\": 24704,\n            \"type\": \"io\"\n          }\n        ]\n      }\n    ]\n  }\n]\n\n",
+    "stderr": ""
+  }
+]

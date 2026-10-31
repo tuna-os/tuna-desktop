@@ -1,0 +1,158 @@
+{
+  "scope": "Native GNOME 51.1 appearance reference captured through owned karnataka Corral QEMU/KVM VM; not beta.3 product qualification, not GNOME 51.0, not a signed shipping disk or performance baseline",
+  "created_utc": "2026-10-31T23:14:09.995101+00:00",
+  "public_base": {
+    "image": "ghcr.io/tuna-os/marlin@sha256:4aac01014ecb392b05cc80beeefd58512379319314f23acfdf5d601c13dfa8c6",
+    "created": "2026-10-31T18:46:51.960277785Z",
+    "image_version_label": "f5b9344"
+  },
+  "local_reference_fixture": {
+    "image_id": "sha256:4f08645db7984d2ec0199ebdf477a115396da3f3e7c028ac1dced8948e67790f",
+    "created": "2026-10-31T22:34:49.037214294Z",
+    "booted_image_digest": "sha256:1f801a42f8dce05428a940f47d79aae0ccbdaead88704f42538854b105a6b686",
+    "boot_digest": "2fe64de9cc6eb7df3950af585aac97c07a79f398f15f1427a9af6be4b6065e53",
+    "unbooted_fixed_raw_sha256": "3d360e1cae3b6067d6444a67016c4d6a421922a0f0b689e3b484d74f60a87e1b",
+    "raw_size_bytes": 21474836480,
+    "fixture_constructor_sha256": "29dd954e29e5ce8ab15f155534f1c876aa7576dd1351dbbe2a12924c3e50007c",
+    "tmpfiles_sha256": "5b17ade6e8481d3ea54498fe77a6880959eb6d013382e8ce1d5ad2255430af20",
+    "package_installer_helper": {
+      "source_commit": "2885d287eeb40b6ff449f2226788ea70fa90539e",
+      "path": "packaging/marlin/vm-lane/tuna-vm-published-pacman",
+      "sha256": "c5049094e4afffe6dac5bd7851436c9390de24b012cc73c84d08c82a34189761"
+    },
+    "canonical_corral_composefs_fixup_sha256": "4b3c20d548a78a4ff2c9cfb0a49a7afeb334002ab853d8e1b4ed252dc603a869",
+    "changes": "Adds qemu-guest-agent and public fixture user/home/AccountsService record; enables sshd and guest agent. Does not change shipped package versions or GDM configuration; both checks passed at image build and GDM hashes passed in guest. No autologin/session preselection."
+  },
+  "corral": {
+    "host": "karnataka",
+    "vm": "tuna-q-beta3-gnome-ref",
+    "tool_container": "tuna-q-beta3-corral",
+    "service": "Beta3CorralHost",
+    "owned_workdir": "/var/tmp/tuna-q-beta3",
+    "home_context": "/w/home (isolated local QEMU store)",
+    "version": "v0.7.0+36.g76b6dd5, commit76b6dd52d35d, built2026-10-30T08:31:57Z, go1.27.0",
+    "binary_sha256": "14c6f45eb2345784dffa01d766770ecf260bc42dafb41ccb0f31090b4ad5ec3a",
+    "tool_image_id": "sha256:715b5bd18b2f0cbe75784932e7cf7aa84c72ab272d974c6cb7594348da860179",
+    "firmware": "UEFI",
+    "vcpus": 4,
+    "memory": "4G",
+    "kvm": {
+      "enabled": true,
+      "present": true
+    },
+    "graphics": {
+      "qemu_vga_vendor": "1af4",
+      "qemu_vga_device": "1050",
+      "kernel_module": "virtio_gpu",
+      "guest_kernel": "7.2.11-arch1-1",
+      "mesa_package": "1:26.2.6-1",
+      "gl_renderer": "not queried; no physical GPU/driver or performance claim"
+    },
+    "resolution": [
+      1280,
+      800
+    ]
+  },
+  "native_session": {
+    "user": "tuna-test",
+    "uid": 1000,
+    "session": "7",
+    "service": "gdm-password",
+    "leader": "gdm-session-worker [pam/gdm-password]",
+    "type": "wayland",
+    "class": "user",
+    "remote": false,
+    "gnome_shell_pid": 2769,
+    "gnome_shell_command": "/usr/bin/gnome-shell --mode=user",
+    "packages": {
+      "gnome-shell": "1:51.1-1",
+      "mutter": "51.1-1",
+      "gdm": "51.1.1-1",
+      "nautilus": "51.1-1",
+      "libnotify": "0.8.9-1"
+    },
+    "notification_server": [
+      "gnome-shell",
+      "GNOME",
+      "51.1",
+      "1.2"
+    ],
+    "locked_observation": {
+      "LockedHint": "yes",
+      "org.gnome.ScreenSaver.GetActive": true
+    },
+    "actual_password_unlock_observation": {
+      "LockedHint": "no"
+    },
+    "credentials": "Public fixture input values and keys are not retained in events"
+  },
+  "integrity": {
+    "gnome_shell_sha256": "d2b083ffd7a850b02f20c278a4d1c5d411e58f1ffeb23ec16d6b67ab46a9a60d",
+    "gnome_control_center_sha256": "431374a975335cda736518d45f48519c0d37898d2dd9920c2bb8056bd9c829f7",
+    "nautilus_sha256": "e4b0032088b2a2460e5a38759b6a6315973a0bcba8269d5d3512d56f96601aa7",
+    "notify_send_sha256": "8f93cdd151f92ae77496482e71df578f49522f6921c945ef35bf6feb611c0323",
+    "gdm_custom_conf_sha256": "04022d30d148bf53461bc0fc6f8c5df8fbfcf590c06b684ce975e1e057894541",
+    "gdm_service_sha256": "f240bf33c498efe545afb4da463bd87d980bf462a94ef988c6722fc9ae2b2eaa"
+  },
+  "stages": [
+    {
+      "review_stage": "Overview open",
+      "file": "GN-OV-OPEN.png",
+      "sha256": "992efdccaa427a7cf9d58646e86e8b06e8d5824b9229e6950f5fb4b31cd82e56"
+    },
+    {
+      "review_stage": "Search typed",
+      "file": "GN-OV-SEARCH.png",
+      "sha256": "03346fae028f536fc170441f4566da1be5c88f17c2f0cac3701243a135920f1e"
+    },
+    {
+      "review_stage": "App launched from search",
+      "file": "GN-OV-LAUNCH.png",
+      "sha256": "115efad9a19e17de6355d146b523a1a23c7d9a0e89854c489e73c7d5f81ed441"
+    },
+    {
+      "review_stage": "Workspace switch",
+      "file": "GN-WS-NEXT.png",
+      "sha256": "7943aa397a021f3b50d6091d0f36c0c4ae7dcb2d85adbcd150f6c2dd44eff9d5"
+    },
+    {
+      "review_stage": "Alt-Tab switcher",
+      "file": "GN-SW-HELD.png",
+      "sha256": "dfa528d3f237067294ebdc7b835b5f1c49600284cd9dfb59beaa57adca2bb96c"
+    },
+    {
+      "review_stage": "Tiled window",
+      "file": "GN-TILE-LEFT.png",
+      "sha256": "df365c03e8121e28383e8873475bba3b4267c55272ea7a99f9d26c7db6ca5538"
+    },
+    {
+      "review_stage": "Quick settings open",
+      "file": "GN-QS-KEYBOARD.png",
+      "sha256": "8ca3f0d831a63b2b166e1c89bdbe491245c5b1061c0e28e49a10544d0b541f39"
+    },
+    {
+      "review_stage": "Notification banner",
+      "file": "GN-NOTIFICATION.png",
+      "sha256": "57d71ff36206965b994c59d83342443efdd2d42ceffe9ab903245bd9e7615899"
+    },
+    {
+      "review_stage": "Lock screen",
+      "file": "GN-LOCK.png",
+      "sha256": "df3cc2527596689282b234271ef72c6e698a952ea6878021b013e3903dd4cffa"
+    }
+  ],
+  "supplemental_unlock_prompt": {
+    "file": "GN-LOCK-PROMPT.png",
+    "sha256": "c936e1829d9f2eded894d5e1c02e6983a45b54b850d23affca59d7ce6ede9add"
+  },
+  "excluded_captures": {
+    "GN-SW-STEP.png": "Auto-released held-key capture did not depict switcher; use explicit held physical Alt GN-SW-HELD instead",
+    "GN-QS-OPEN.png": "Pointer click did not open quick settings; use actual declared Super+s GN-QS-KEYBOARD instead",
+    "nested_Fedora_GNOME51.1_capture": "Diagnostic only, not this canonical reference or qualifying candidate proof"
+  },
+  "execution_corrections": [
+    "Corral wait-SSH used default client identity and timed out; explicit owned -i key succeeded without changing guest authentication or timeout. Subsequent guest observations and screenshots use explicit key.",
+    "Initial greeter screenshot was idle blank; physical Shift woke real GDM without lowering require-paint threshold.",
+    "A process query used pgrep comm longer than15characters; corrected query to anchored full command line, without replaying product actions."
+  ]
+}
