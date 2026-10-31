@@ -43,6 +43,15 @@ NESTED = f"{PREFIX}-nested-"
 LOCK_PAM = f"/etc/pam.d/{PREFIX}-lock"
 
 
+def desktop_package_version():
+    """Read the installed package through Marlin's native package manager."""
+    package = subprocess.run(["pacman", "-Q", PACKAGE],
+                             capture_output=True, text=True, timeout=10)
+    fields = package.stdout.split()
+    return (fields[1] if package.returncode == 0 and len(fields) == 2
+            and fields[0] == PACKAGE else None)
+
+
 # Both fixtures log in through stock GDM (tunaOS#3438): its PAM service is
 # gdm-password and the user session takes a new VT (GDM 51.1
 # daemon/gdm-session.c GDM_SESSION_DISPLAY_MODE_NEW_VT).
@@ -2648,6 +2657,7 @@ print(json.dumps(result))
         with open(evidence, encoding="utf-8") as stream:
             result = {"evidence": json.load(stream),
                       "assertions": checked.stdout.splitlines()}
+        result["evidence"]["desktop_package_version"] = desktop_package_version()
     elif action == "gsd-power-idle-start":
         # Watch gsd-power's own calls, then shorten GNOME's idle delay. The
         # harness's last input preceded this; nothing touches input until wake.

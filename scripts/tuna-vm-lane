@@ -516,6 +516,27 @@ def guest_role(executable):
     return executable
 
 
+def record_datetime_gates(result, published, record):
+    """Scope only the two panel-follow proofs on the known pre-wall-clock package."""
+    old_panel = (published and
+                 result["evidence"].get("desktop_package_version") == "1.0.0beta.1-1")
+    failed = []
+    for line in result["assertions"]:
+        gate, verdict, detail = (line.split(" ", 2) + ["", ""])[:3]
+        if old_panel and gate in ("G-DATETIME-CLOCK-TZ", "G-DATETIME-CLOCK-SET"):
+            record(gate, True,
+                   "published guest tuna-desktop 1.0.0beta.1-1 predates the panel clock's "
+                   "/etc/localtime monitor; zone-follow and subsequent manual-time panel "
+                   "proofs are proven by the current-build marlin-vm lane; "
+                   f"observed {verdict}: {detail}")
+            continue
+        record(gate, verdict == "pass", detail)
+        if verdict != "pass":
+            failed.append(gate)
+    if not result["assertions"] or failed:
+        raise RuntimeError(f"Date & Time gates failed: {', '.join(failed) or 'no assertions'}")
+
+
 def predates_newer_snapshot(state):
     """True when the guest compositor predates the newer snapshot keys.
 
@@ -1106,18 +1127,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     datetime_result = agent.run("datetime", timeout=300)
     with open(os.path.join(evidence, "datetime-evidence.json"), "w") as stream:
         json.dump(datetime_result["evidence"], stream, indent=2)
-    datetime_failed = []
-    for line in datetime_result["assertions"]:
-        gate, verdict, detail = (line.split(" ", 2) + ["", ""])[:3]
-        if published and gate == "G-DATETIME-CLOCK-TZ" and verdict != "pass":
-            record(gate, True, "published guest predates the panel clock's /etc/localtime monitor; "
-                               "proven by the current-build marlin-vm lane")
-            continue
-        record(gate, verdict == "pass", detail)
-        if verdict != "pass":
-            datetime_failed.append(gate)
-    if not datetime_result["assertions"] or datetime_failed:
-        raise RuntimeError(f"Date & Time gates failed: {', '.join(datetime_failed) or 'no assertions'}")
+    record_datetime_gates(datetime_result, published, record)
 
     # GNOME 51 settings daemon plugins (#355): the installed session starts
     # them through GNOME's own user units, and gsd-power drives the

@@ -38,6 +38,97 @@ def with_owner_login_session(scope):
     return scope
 
 
+class DatetimePublishedQualification(unittest.TestCase):
+    """Behavioral lane policy tests, not native Date & Time qualification."""
+
+    FOLLOW = ("G-DATETIME-CLOCK-TZ", "G-DATETIME-CLOCK-SET")
+    OTHER = ("G-DATETIME-NTP", "G-DATETIME-TZ", "G-DATETIME-TZ-REJECT",
+             "G-DATETIME-RTC", "G-DATETIME-CLOCK", "G-DATETIME-MANUAL",
+             "G-DATETIME-POLKIT", "G-DATETIME-NTP-ABSENT")
+
+    def result(self, failures=(), version="1.0.0beta.1-1"):
+        return {"evidence": {"desktop_package_version": version},
+                "assertions": [f"{gate} {'fail' if gate in failures else 'pass'} raw-{gate}"
+                               for gate in (*self.FOLLOW, *self.OTHER)]}
+
+    def record(self, gate, passed, detail):
+        self.records.append((gate, passed, detail))
+
+    def setUp(self):
+        self.records = []
+
+    def test_old_published_scopes_exactly_both_panel_follow_gates(self):
+        result = self.result(self.FOLLOW)
+        lane.record_datetime_gates(result, True, self.record)
+        self.assertEqual(len(self.records), 10)
+        for gate, passed, detail in self.records:
+            self.assertTrue(passed)
+            if gate in self.FOLLOW:
+                self.assertIn("predates", detail)
+                self.assertIn("current-build marlin-vm", detail)
+                self.assertIn(f"observed fail: raw-{gate}", detail)
+            else:
+                self.assertEqual(detail, f"raw-{gate}")
+        self.assertTrue(all(" fail " in line for line in result["assertions"][:2]))
+
+    def test_current_build_failures_always_fail_even_with_old_rpm(self):
+        for gate in self.FOLLOW:
+            with self.subTest(gate=gate), self.assertRaisesRegex(RuntimeError, gate):
+                lane.record_datetime_gates(self.result((gate,)), False, self.record)
+            self.assertIn((gate, False, f"raw-{gate}"), self.records)
+
+    def test_supported_or_unknown_published_versions_remain_strict(self):
+        for version in ("1.0.0beta.2-1", "1.0.0-1", None, "", "1.0.0beta.1-2"):
+            for gate in self.FOLLOW:
+                with self.subTest(version=version, gate=gate):
+                    with self.assertRaisesRegex(RuntimeError, gate):
+                        lane.record_datetime_gates(self.result((gate,), version), True, self.record)
+                    self.assertIn((gate, False, f"raw-{gate}"), self.records)
+        result = self.result(self.FOLLOW)
+        result["evidence"] = {}
+        with self.assertRaisesRegex(RuntimeError, self.FOLLOW[0]):
+            lane.record_datetime_gates(result, True, self.record)
+
+    def test_unaffected_failures_remain_enforced_on_old_published(self):
+        for gate in self.OTHER:
+            with self.subTest(gate=gate), self.assertRaisesRegex(RuntimeError, gate):
+                lane.record_datetime_gates(self.result((*self.FOLLOW, gate)), True, self.record)
+            self.assertIn((gate, False, f"raw-{gate}"), self.records)
+
+    def test_supported_passing_assertions_are_unchanged(self):
+        lane.record_datetime_gates(self.result(version="1.0.0beta.2-1"), True, self.record)
+        self.assertEqual(self.records, [(gate, True, f"raw-{gate}")
+                                       for gate in (*self.FOLLOW, *self.OTHER)])
+
+    def test_empty_assertions_still_fail(self):
+        result = self.result()
+        result["assertions"] = []
+        with self.assertRaisesRegex(RuntimeError, "no assertions"):
+            lane.record_datetime_gates(result, True, self.record)
+
+
+class DatetimeGuestPackageReadback(unittest.TestCase):
+    def test_native_package_readback_and_fail_closed_results(self):
+        source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+        tree = ast.parse(source.read_text())
+        helper = next(node for node in tree.body
+                      if isinstance(node, ast.FunctionDef) and node.name == "desktop_package_version")
+        for status, stdout, expected in (
+                (0, "tuna-desktop 1.0.0beta.1-1\n", "1.0.0beta.1-1"),
+                (0, "tuna-desktop 1.0.0beta.2-1\n", "1.0.0beta.2-1"),
+                (1, "", None), (0, "", None),
+                (0, "other 1.0.0beta.1-1\n", None),
+                (0, "tuna-desktop 1.0.0beta.1-1 extra\n", None)):
+            with self.subTest(status=status, stdout=stdout):
+                run = unittest.mock.Mock(return_value=SimpleNamespace(
+                    returncode=status, stdout=stdout))
+                scope = {"subprocess": SimpleNamespace(run=run), "PACKAGE": "tuna-desktop"}
+                exec(compile(ast.Module(body=[helper], type_ignores=[]), str(source), "exec"), scope)
+                self.assertEqual(scope["desktop_package_version"](), expected)
+                run.assert_called_once_with(["pacman", "-Q", "tuna-desktop"],
+                                            capture_output=True, text=True, timeout=10)
+
+
 class AudioAmplificationDiagnostics(unittest.TestCase):
     """Synthetic host-proof regressions; no native audio qualification."""
     SOURCE = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
