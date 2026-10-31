@@ -4640,10 +4640,12 @@ impl Runtime {
         );
         flushed.map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         self.manager.reconcile(&mut self.state);
+        crate::grid_trace::stage(&self.state, "reconciled");
         self.state.window_sessions_mut().save_if_due(Instant::now());
         self.focus_policy_tick();
         self.tablet_settings_tick();
         self.poll_input_aids();
+        crate::grid_trace::stage(&self.state, "input_aids");
         #[cfg(feature = "xwayland")]
         // DISPLAY may be a reserved idle listener. An icon helper must not
         // connect and accidentally activate XWayland before a real client.
@@ -4657,6 +4659,7 @@ impl Runtime {
                 }
             }
         }
+        crate::grid_trace::stage(&self.state, "x11_icons");
         // A client's pointer warp moved the manager's pointer: the
         // drawn cursor follows (#89).
         // Not while coalesced motion is pending: the backend's pointer
@@ -4707,6 +4710,7 @@ impl Runtime {
                 .set_seat_touch_mode(drm.touch_mode().touch_mode());
         }
         let outcome = self.control.poll(self.manager.model_mut());
+        crate::grid_trace::stage(&self.state, "control_poll");
         for workspace in outcome.departed_workspaces.iter().copied() {
             self.manager.keep_departed_workspace_alive(workspace);
         }
@@ -4784,6 +4788,7 @@ impl Runtime {
         }
         let diagnostics_visible = !self.is_locked();
         let reader_changed = self.orca.poll(diagnostics_visible).is_some();
+        crate::grid_trace::stage(&self.state, "orca_poll");
         if reader_changed || outcome.screen_reader.is_some() {
             self.control
                 .queue_message(tuna_shell_control::Message::ScreenReader {
@@ -4922,6 +4927,7 @@ impl Runtime {
         for connection in outcome.auth_cancel {
             self.cancel_verification(connection);
         }
+        crate::grid_trace::stage(&self.state, "control_outcome");
         self.idle_monitor.tick();
         // Idle timeout from input timestamps: lock the untouched session.
         // A live idle inhibitor (video, presentation) counts as activity,
@@ -4968,6 +4974,7 @@ impl Runtime {
             ShellStatus::Waiting { delay_ms } => Some(delay_ms),
             _ => None,
         };
+        crate::grid_trace::stage(&self.state, "shell_poll");
         // While locked the overlay stays up with its empty list no
         // matter what the shell does: a shell restart while locked
         // keeps the lock screen up.
@@ -4990,6 +4997,7 @@ impl Runtime {
                 }
             }
         }
+        crate::grid_trace::stage(&self.state, "ime_overlay");
         // Only the supervised shell may hold a control session (#30):
         // between restarts nobody may.
         self.capture_authority
@@ -5015,6 +5023,7 @@ impl Runtime {
             self.finish_unlock(attempt);
         }
         self.poll_conversations();
+        crate::grid_trace::stage(&self.state, "conversations");
 
         for event in self.shell.drain_events() {
             eprintln!("tuna-compositor: shell supervision: {event:?}");
@@ -5076,9 +5085,11 @@ impl Runtime {
             };
             self.xwayland.tick(now, Some(&mut spawner));
         }
+        crate::grid_trace::stage(&self.state, "xwayland");
         self.stats.shell_restarts = self.shell.restarts_used();
         self.proof_swipe_input();
         self.animation_clock.poll();
+        crate::grid_trace::stage(&self.state, "animation_clock");
         // GNOME completes a flashing screenshot reply when its feedback ends.
         // Locking or disabling animations also ends pending feedback promptly.
         let now = self.animation_clock.now();
@@ -5098,12 +5109,17 @@ impl Runtime {
             self.state.primary_size().w,
             self.input_settings.motion,
         );
+        crate::grid_trace::stage(&self.state, "dynamic_workspaces");
         self.publish_state();
+        crate::grid_trace::stage(&self.state, "publish_state");
         self.publish_cast_outputs();
+        crate::grid_trace::stage(&self.state, "publish_cast_outputs");
         #[cfg(feature = "drm")]
         self.privacy_screen_tick();
         self.publish_display_state();
+        crate::grid_trace::stage(&self.state, "publish_display_state");
         self.publish_overview_previews();
+        crate::grid_trace::stage(&self.state, "publish_overview_previews");
         let strip_was_animating = self.manager.strip_animating();
         self.render()?;
         // Rendering advances the strip's springs. Publish the terminal frame

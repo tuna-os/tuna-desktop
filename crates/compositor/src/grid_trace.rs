@@ -192,6 +192,55 @@ pub(crate) fn send_layer_frames(
     }
 }
 
+/// Main-thread runtime/runqueue/timeslice counters (CONFIG_SCHED_INFO), or
+/// `None` when unreadable, malformed or unpopulated: never invented zeros.
+fn parse_schedstat(bytes: &[u8]) -> Option<(u64, u64, u64)> {
+    let mut fields = std::str::from_utf8(bytes).ok()?.split_ascii_whitespace();
+    let run = fields.next()?.parse().ok()?;
+    let wait = fields.next()?.parse().ok()?;
+    let slices = fields.next()?.parse().ok()?;
+    (fields.next().is_none() && run > 0 && slices > 0).then_some((run, wait, slices))
+}
+
+thread_local! {
+    // Opened on the first traced stage only; reads reuse a stack buffer.
+    static SCHED: std::cell::RefCell<Option<std::fs::File>> =
+        std::cell::RefCell::new(std::fs::File::open("/proc/thread-self/schedstat").ok());
+}
+
+fn thread_sched() -> Option<(u64, u64, u64)> {
+    use std::io::{Read, Seek};
+    SCHED.with(|file| {
+        let mut file = file.borrow_mut();
+        let file = file.as_mut()?;
+        file.rewind().ok()?;
+        let mut bytes = [0_u8; 128];
+        let count = file.read(&mut bytes).ok()?;
+        (count < bytes.len()).then(|| parse_schedstat(&bytes[..count]))?
+    })
+}
+
+/// Bisects the compositor loop between client flush and repaint. Consecutive
+/// stage deltas separate compositor CPU, runnable wait and off-CPU time.
+pub(crate) fn stage(state: &State, stage: &str) {
+    if !enabled() {
+        return;
+    }
+    let at = state.presentation_now().as_micros();
+    match thread_sched() {
+        Some((run, wait, slices)) => emit(
+            at,
+            "tick_stage",
+            format_args!("stage={stage} run_ns={run} wait_ns={wait} timeslices={slices}"),
+        ),
+        None => emit(
+            at,
+            "tick_stage",
+            format_args!("stage={stage} schedstat=unavailable"),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +293,24 @@ mod tests {
             writer.calls, 1,
             "oversized records must not emit a partial line"
         );
+    }
+
+    #[test]
+    fn tick_stage_scheduler_counters_are_populated_or_unavailable() {
+        assert_eq!(parse_schedstat(b"10 0 2\n"), Some((10, 0, 2)));
+        for bytes in [
+            &b""[..],
+            b"0 0 0\n",
+            b"0 1 2\n",
+            b"1 2 0\n",
+            b"1 2",
+            b"1 x 3",
+            b"1 2 3 4",
+        ] {
+            assert_eq!(parse_schedstat(bytes), None);
+        }
+        // The real compositor thread exposes populated counters on Linux.
+        assert!(thread_sched().is_some_and(|(run, _, slices)| run > 0 && slices > 0));
     }
 
     fn words(values: &[u32]) -> Vec<u8> {
