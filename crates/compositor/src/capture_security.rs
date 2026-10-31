@@ -191,10 +191,15 @@ impl Authority {
         }
         let name =
             zbus::names::BusName::try_from("org.freedesktop.impl.portal.desktop.gnome").unwrap();
-        dbus.get_name_owner(name)
+        if dbus
+            .get_name_owner(name)
             .await
             .is_ok_and(|current| current.as_str() == owner)
             && installed_portal(pid)
+        {
+            return true;
+        }
+        remote_desktop_daemon(&dbus, owner, pid).await
     }
     pub async fn admit(&self, conn: &Connection, header: &Header<'_>) -> fdo::Result<String> {
         self.unlocked()?;
@@ -224,6 +229,38 @@ impl Authority {
         self.authenticate_sender(conn, &caller).await?;
         self.unlocked()?;
         Ok(caller.to_string())
+    }
+    /// RemoteDesktop session creation (and only that, plus the ScreenCast
+    /// session linked to it): the capture callers above, or the installed
+    /// gnome-remote-desktop daemon. GNOME's grd talks to Mutter directly
+    /// once Settings > System > Remote Desktop enabled it; its configured
+    /// credentials are the consent, as in GNOME (`grd-session.c`
+    /// `grd_session_start` calls `CreateSession` with no portal).
+    pub async fn admit_remote(
+        &self,
+        conn: &Connection,
+        header: &Header<'_>,
+    ) -> fdo::Result<String> {
+        self.unlocked()?;
+        let sender = match self.authenticate(conn, header).await {
+            Ok(sender) => sender,
+            Err(denial) => {
+                let sender = header.sender().ok_or_else(|| denied("missing sender"))?;
+                let dbus = fdo::DBusProxy::new(conn).await?;
+                let credentials = dbus
+                    .get_connection_credentials(sender.clone().into())
+                    .await?;
+                let pid = credentials.process_id().unwrap_or(0);
+                if credentials.unix_user_id() != Some(rustix::process::geteuid().as_raw())
+                    || !remote_desktop_daemon(&dbus, sender.as_str(), pid).await
+                {
+                    return Err(denial);
+                }
+                sender.to_string()
+            }
+        };
+        self.unlocked()?;
+        Ok(sender)
     }
     /// Authenticate desktop-service identity without authorizing capture.
     /// Screenshot's documented false result can deny an authenticated locked
@@ -292,11 +329,48 @@ pub fn denied(reason: &str) -> fdo::Error {
 fn installed_portal(pid: u32) -> bool {
     installed_service(pid, ServiceClient::Portal)
 }
+/// gnome-remote-desktop's session-bus daemons (`grd-private.h`): the
+/// user-mode Desktop Sharing daemon, the remote-login handover daemon and
+/// the headless daemon. All three run `gnome-remote-desktop-daemon`.
+const REMOTE_DESKTOP_DAEMON_NAMES: [&str; 3] = [
+    "org.gnome.RemoteDesktop.User",
+    "org.gnome.RemoteDesktop.Handover",
+    "org.gnome.RemoteDesktop.Headless",
+];
+const REMOTE_DESKTOP_DAEMON: [&str; 2] = [
+    "/usr/libexec/gnome-remote-desktop-daemon",
+    "/usr/lib/gnome-remote-desktop-daemon",
+];
+/// The caller is the root-owned installed grd executable and currently
+/// owns one of grd's well-known names, so neither a copied binary nor a
+/// process that merely claims a grd name passes.
+async fn remote_desktop_daemon(dbus: &fdo::DBusProxy<'_>, owner: &str, pid: u32) -> bool {
+    if !installed_executable(pid, &REMOTE_DESKTOP_DAEMON) {
+        return false;
+    }
+    for name in REMOTE_DESKTOP_DAEMON_NAMES {
+        let name = zbus::names::BusName::try_from(name).unwrap();
+        if dbus
+            .get_name_owner(name)
+            .await
+            .is_ok_and(|current| current.as_str() == owner)
+        {
+            return true;
+        }
+    }
+    false
+}
 fn installed_service(pid: u32, role: ServiceClient) -> bool {
+    installed_executable(pid, role.executables())
+}
+fn installed_executable(pid: u32, executables: &[&str]) -> bool {
+    if pid == 0 {
+        return false;
+    }
     let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
         return false;
     };
-    role.executables().iter().any(|path| {
+    executables.iter().any(|path| {
         let Ok(real) = std::fs::canonicalize(path) else {
             return false;
         };
@@ -406,6 +480,44 @@ mod tests {
         assert!(!owns_session(":1.1", Some(":1.2"), false));
         assert!(!owns_session(":1.1", None, false));
         assert!(!owns_session(":1.1", Some(":1.1"), true));
+    }
+    #[test]
+    fn remote_desktop_daemon_identity_is_the_root_owned_installed_binary() {
+        // This test process, a missing pid and pid 0 are not grd.
+        assert!(!installed_executable(
+            std::process::id(),
+            &REMOTE_DESKTOP_DAEMON
+        ));
+        assert!(!installed_executable(u32::MAX, &REMOTE_DESKTOP_DAEMON));
+        assert!(!installed_executable(0, &["/proc/self/exe"]));
+        // The identity check accepts a root-owned, non-writable binary
+        // the process really runs (here coreutils' sleep stands in)...
+        let mut sleep = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        assert!(installed_executable(sleep.id(), &["/bin/sleep"]));
+        assert!(!installed_executable(sleep.id(), &REMOTE_DESKTOP_DAEMON));
+        sleep.kill().unwrap();
+        sleep.wait().unwrap();
+        // ...but not a user-owned copy named like the daemon.
+        let directory = tempfile::tempdir().unwrap();
+        let copy = directory.path().join("gnome-remote-desktop-daemon");
+        // Copy in a separate process: a concurrent test can fork while an
+        // in-process copy holds this inode writable, retaining that descriptor
+        // until exec and making our immediate exec fail with ETXTBSY.
+        assert!(std::process::Command::new("/bin/cp")
+            .args(["--", "/bin/sleep"])
+            .arg(&copy)
+            .status()
+            .unwrap()
+            .success());
+        let mut spoof = std::process::Command::new(&copy).arg("60").spawn().unwrap();
+        let copy_path = copy.to_str().unwrap();
+        assert!(!installed_executable(spoof.id(), &[copy_path]));
+        assert!(!installed_executable(spoof.id(), &REMOTE_DESKTOP_DAEMON));
+        spoof.kill().unwrap();
+        spoof.wait().unwrap();
     }
     #[test]
     fn arbitrary_process_cannot_be_the_installed_portal() {

@@ -1,0 +1,161 @@
+{
+  "issue": 358,
+  "date": "2026-10-30",
+  "runs": {
+    "tuna-q-rdp (first worker)": {
+      "vm": "tuna-q-rdp (Corral, KubeVirt, 4 vCPU, 6G, bochs-drm 1280x800)",
+      "image": "ghcr.io/tuna-os/marlin@sha256:ae6363c185015849701328fc38694f5ddcc0b4c804034a1d8d05577f1c70cf7d (booted manifest sha256:a182a20b732b6f8954be4afd7c0b47fa67306143100b5377d0b015a873415beb, version cbb3569)",
+      "published_compositor_sha256": "9d8de57edf1b43fd6ff9933ae53568d5cc04e8e15aae381309e10b2e372fcbd3",
+      "sideloaded": {
+        "method": "bootc usroverlay (transient /usr)",
+        "gnome-remote-desktop": "51.0-2 (pacman), /usr/lib/gnome-remote-desktop-daemon sha256 dc748c8aec8f69baca0b19bd089d6e657b6a178475866a8ca90f01dedf973a73",
+        "freerdp": "2:3.32.2-1 (guest, unused); client: FreeRDP 3 xfreerdp3 in an Arch container on the Corral host over the VM network (10.42.0.165:3389)",
+        "candidate_compositor": "branch rdp-e2e-358 commit 5a43bb29, release build sha256 821fab9363be1b471bcf8311b7acb688543f61037122c1c7e5942e32aadb442a",
+        "tuna-session.target": "main e730d9e2 share/systemd/user/tuna-session.target sha256 22b3bc87...; the published one (39c3a99c...) does not pull gnome-session.target, so grd (WantedBy=gnome-session.target) does not autostart there"
+      },
+      "steps": [
+        {
+          "id": "published-settings",
+          "result": "fail",
+          "observed": "Settings > System has no Remote Desktop row: gnome-remote-desktop is not installed (cc-system-panel.c hides the row when the service is not-found)",
+          "frame": "01-system-published-no-grd.png"
+        },
+        {
+          "id": "settings-enable",
+          "result": "pass",
+          "observed": "with grd sideloaded, Settings > System > Remote Desktop: Desktop Sharing and Remote Control switched on by pointer clicks; grd user unit active, org.gnome.RemoteDesktop.User owned, :3389 listening, rdp enable=true view-only=false",
+          "frames": [
+            "02-remote-desktop-page-grd-sideloaded.png",
+            "03-sharing-and-control-enabled.png"
+          ]
+        },
+        {
+          "id": "published-rdp-connect",
+          "result": "fail",
+          "observed": "grd: Failed to start remote desktop session: AccessDenied: capture requires the supervised shell or installed portal",
+          "log": "published-connect-client.log"
+        },
+        {
+          "id": "candidate-rdp-connect",
+          "result": "fail",
+          "observed": "CreateSession, ConnectToEIS and the EIS keymap pass; grd: Failed to record monitor: Failed: capture session already started (grd records after RemoteDesktop.Start and calls Stream.Start, not served), client disconnected before a frame",
+          "log": "candidate-control3-client.log"
+        },
+        {
+          "id": "control-clipboard-viewonly-lock-revocation",
+          "result": "not-exercised",
+          "reason": "blocked by candidate-rdp-connect"
+        },
+        {
+          "id": "remote-login",
+          "result": "not-exercised",
+          "reason": "needs RecordVirtual and a GDM headless Tuna session; neither exists"
+        }
+      ]
+    },
+    "tuna-q-rdp2": {
+      "label": "candidate sideloaded",
+      "vm": "tuna-q-rdp2 (Corral, KubeVirt, 4 vCPU, 6G, bochs-drm 1280x800); deleted with corral delete --wait, absent from corral list",
+      "image": "ghcr.io/tuna-os/marlin@sha256:ae6363c185015849701328fc38694f5ddcc0b4c804034a1d8d05577f1c70cf7d (marlin:tuna re-resolved 2026-10-30, unchanged; booted manifest sha256:a182a20b732b6f8954be4afd7c0b47fa67306143100b5377d0b015a873415beb)",
+      "published_compositor_sha256": "9d8de57edf1b43fd6ff9933ae53568d5cc04e8e15aae381309e10b2e372fcbd3",
+      "sideloaded": {
+        "method": "bootc usroverlay (transient /usr), then log out and in at GDM",
+        "gnome-remote-desktop": "51.0-2 (pacman), /usr/lib/gnome-remote-desktop-daemon sha256 dc748c8aec8f69baca0b19bd089d6e657b6a178475866a8ca90f01dedf973a73",
+        "tuna-session.target": "main e730d9e2 share/systemd/user/tuna-session.target sha256 22b3bc87adfc42b329958ef21aeecba627331f9ac31dd89d2b6e93d5985e9aa9 (the published one does not pull gnome-session.target, so grd does not autostart)",
+        "candidate_compositor": [
+          "local commit 6f193c54 (pushed as 5b883594 after a clippy-only type-alias fixup) release sha256 e5b24e0e5143dd42c770fdeba00e24b3094afeeed0387f5f1192b8ff5b246ce4 (steps a-k)",
+          "local commit 6de6e3bb (pushed as d9beca21, same fixup) release sha256 a0aac94a9ba6f76a042cdd90713ce495e7531e2479ed743c6404b0f068359f09 (steps l-m)"
+        ],
+        "candidate_shell": "local commit 6f193c54 tuna-shell-gtk sha256 80af25cd738cb7e19f20fd4e61dd9b9c17e9bd4b25e97a01905f196e1932d796 and tuna-shell-host sha256 25e00bd0152b7c9480c9cdd38a4775db9c740d838027f2277155118de9cbae65: the published shell speaks wire 0.29 and fails the control handshake with a 0.45 compositor (its overview loses search), so the branch's shell was sideloaded with it",
+        "client": "FreeRDP 3 xfreerdp3 (Arch container, Xvfb) on the Corral host, /v:10.42.0.201 credentials from Settings, +clipboard; frames are the client's X root window"
+      },
+      "steps": [
+        {
+          "id": "a-frame-view-only",
+          "result": "pass",
+          "observed": "Desktop Sharing on, Remote Control off (view-only true): the client shows the live desktop; client click, Super and typing change nothing on the VM",
+          "frames": [
+            "05-viewonly-client-left-vm-right.jpg"
+          ],
+          "log": "rdp2-viewonly-client.log"
+        },
+        {
+          "id": "b-view-only-self-grant",
+          "result": "pass",
+          "observed": "a client click on the Remote Control switch leaves it off (gsettings view-only stays true); a local click turns it on (false)",
+          "frame": "06-viewonly-remote-click-leaves-control-off.jpg"
+        },
+        {
+          "id": "c-remote-control",
+          "result": "pass",
+          "observed": "client pointer clicks Settings' search button and types 'rdp control 42'; the VM shows it at the same place",
+          "frame": "07-remote-control-client-left-vm-right.jpg"
+        },
+        {
+          "id": "d-clipboard",
+          "result": "pass",
+          "observed": "VM to client: Ctrl+A/Ctrl+C in Settings' search reaches the client X clipboard as 'rdp control 42' (UTF8_STRING); client to VM: xclip 'from-rdp-client-77' pasted locally (VM keyboard Ctrl+V) into Settings' search",
+          "frame": "08-clipboard-client-text-pasted-locally.jpg"
+        },
+        {
+          "id": "e-disconnect-reconnect",
+          "result": "pass",
+          "observed": "killing the client stops the cast and removes every ScreenCast/RemoteDesktop session object; a new connection streams again"
+        },
+        {
+          "id": "f-lock",
+          "result": "pass",
+          "observed": "locking (Super+L) disconnects the client (ERRINFO_RPC_INITIATED_DISCONNECT); a connection while locked is refused by grd: 'Failed to start remote desktop session: AccessDenied: session locked' (GNOME: 'Session creation inhibited')",
+          "frame": "09-lock-ends-session-vm-locked.jpg",
+          "log": "rdp2-locked-connect-client.log"
+        },
+        {
+          "id": "g-unlock-reconnect",
+          "result": "pass",
+          "observed": "after local unlock a new connection streams"
+        },
+        {
+          "id": "h-settings-revocation",
+          "result": "pass",
+          "observed": "Desktop Sharing off in Settings with a client connected: client disconnected, grd unit inactive, :3389 closed, no ScreenCast objects left"
+        },
+        {
+          "id": "i-j-grd-restart",
+          "result": "pass",
+          "observed": "systemctl --user restart gnome-remote-desktop with a client connected: client disconnected and session objects gone; the new grd accepts a connection that streams and takes control",
+          "frame": "10-after-grd-restart-client-left-vm-right.jpg"
+        },
+        {
+          "id": "k-control-off-mid-session",
+          "result": "pass",
+          "observed": "Remote Control switched off locally during a session: client clicks and typing no longer reach Settings",
+          "frame": "11-control-off-mid-session-client-left-vm-right.jpg"
+        },
+        {
+          "id": "l-final-head-control-disconnect",
+          "result": "pass",
+          "observed": "6de6e3bb (d9beca21): control types into the overview search; disconnect leaves no 'Failed to stop' in grd's log (6f193c54 logged it four times: grd's Stop after its EIS client left)",
+          "frame": "12-final-head-control-client-left-vm-right.jpg"
+        },
+        {
+          "id": "m-final-head-lock",
+          "result": "pass",
+          "observed": "6de6e3bb (d9beca21): lock disconnects the client, a locked retry is refused (session locked), unlock restores",
+          "log": "rdp2-final-lock-client.log"
+        },
+        {
+          "id": "cursor",
+          "result": "limitation",
+          "observed": "frames carry no pointer and grd gets no cursor metadata, so the client keeps its own local pointer; clicks land where aimed"
+        },
+        {
+          "id": "remote-login",
+          "result": "not-exercised",
+          "reason": "needs RecordVirtual and a GDM headless Tuna session",
+          "observed": null
+        }
+      ],
+      "journal": "rdp2-vm-journal.log"
+    }
+  }
+}
