@@ -1,0 +1,831 @@
+Oct 31 01:38:15 tuna-q-soak-20261031 systemd[1]: Starting [systemd-run] /var/lib/tuna-soak/tuna-vm-soak --user tuna-test --source-revision d28578e590ff85a1616db7d6dcc0d7603bb86b31 --out /var/tmp/tuna-soak-20261031-24h --presentation --wayland-display tuna-nested-2525...
+Oct 31 01:38:15 tuna-q-soak-20261031 systemd[1]: Started [systemd-run] /var/lib/tuna-soak/tuna-vm-soak --user tuna-test --source-revision d28578e590ff85a1616db7d6dcc0d7603bb86b31 --out /var/tmp/tuna-soak-20261031-24h --presentation --wayland-display tuna-nested-2525.
+Oct 31 01:38:15 tuna-q-soak-20261031 runuser[3065]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:38:15 tuna-q-soak-20261031 runuser[3066]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:38:15 tuna-q-soak-20261031 runuser[3066]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:38:15 tuna-q-soak-20261031 runuser[3073]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:38:15 tuna-q-soak-20261031 runuser[3073]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:38:15 tuna-q-soak-20261031 runuser[3079]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:38:15 tuna-q-soak-20261031 runuser[3079]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:38:15 tuna-q-soak-20261031 runuser[3086]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:38:15 tuna-q-soak-20261031 runuser[3086]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:39:15 tuna-q-soak-20261031 runuser[3161]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:39:15 tuna-q-soak-20261031 runuser[3161]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:39:15 tuna-q-soak-20261031 runuser[3168]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:39:15 tuna-q-soak-20261031 runuser[3168]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:39:15 tuna-q-soak-20261031 runuser[3174]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:39:15 tuna-q-soak-20261031 runuser[3174]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:39:15 tuna-q-soak-20261031 runuser[3181]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:39:16 tuna-q-soak-20261031 runuser[3181]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:40:16 tuna-q-soak-20261031 runuser[3248]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:40:16 tuna-q-soak-20261031 runuser[3248]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:40:16 tuna-q-soak-20261031 runuser[3255]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:40:16 tuna-q-soak-20261031 runuser[3255]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:40:16 tuna-q-soak-20261031 runuser[3262]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:40:16 tuna-q-soak-20261031 runuser[3262]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:40:16 tuna-q-soak-20261031 runuser[3269]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:40:16 tuna-q-soak-20261031 runuser[3269]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:41:16 tuna-q-soak-20261031 runuser[3339]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:41:16 tuna-q-soak-20261031 runuser[3339]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:41:16 tuna-q-soak-20261031 runuser[3346]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:41:16 tuna-q-soak-20261031 runuser[3346]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:41:16 tuna-q-soak-20261031 runuser[3352]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:41:16 tuna-q-soak-20261031 runuser[3352]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:41:16 tuna-q-soak-20261031 runuser[3359]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:41:16 tuna-q-soak-20261031 runuser[3359]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:42:16 tuna-q-soak-20261031 runuser[3429]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:42:16 tuna-q-soak-20261031 runuser[3429]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:42:16 tuna-q-soak-20261031 runuser[3438]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:42:16 tuna-q-soak-20261031 runuser[3438]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:42:16 tuna-q-soak-20261031 runuser[3444]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:42:16 tuna-q-soak-20261031 runuser[3444]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:42:16 tuna-q-soak-20261031 runuser[3451]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:42:16 tuna-q-soak-20261031 runuser[3451]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:43:16 tuna-q-soak-20261031 runuser[3517]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:43:16 tuna-q-soak-20261031 runuser[3517]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:43:16 tuna-q-soak-20261031 runuser[3524]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:43:16 tuna-q-soak-20261031 runuser[3524]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:43:16 tuna-q-soak-20261031 runuser[3531]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:43:16 tuna-q-soak-20261031 runuser[3531]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:43:16 tuna-q-soak-20261031 runuser[3538]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:43:16 tuna-q-soak-20261031 runuser[3538]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:44:16 tuna-q-soak-20261031 runuser[3604]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:44:16 tuna-q-soak-20261031 runuser[3604]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:44:16 tuna-q-soak-20261031 runuser[3611]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:44:17 tuna-q-soak-20261031 runuser[3611]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:44:17 tuna-q-soak-20261031 runuser[3617]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:44:17 tuna-q-soak-20261031 runuser[3617]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:44:17 tuna-q-soak-20261031 runuser[3624]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:44:17 tuna-q-soak-20261031 runuser[3624]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:45:17 tuna-q-soak-20261031 runuser[3690]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:45:17 tuna-q-soak-20261031 runuser[3690]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:45:17 tuna-q-soak-20261031 runuser[3697]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:45:17 tuna-q-soak-20261031 runuser[3697]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:45:17 tuna-q-soak-20261031 runuser[3703]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:45:17 tuna-q-soak-20261031 runuser[3703]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:45:17 tuna-q-soak-20261031 runuser[3710]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:45:17 tuna-q-soak-20261031 runuser[3710]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:46:17 tuna-q-soak-20261031 runuser[3775]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:46:17 tuna-q-soak-20261031 runuser[3775]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:46:17 tuna-q-soak-20261031 runuser[3782]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:46:17 tuna-q-soak-20261031 runuser[3782]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:46:17 tuna-q-soak-20261031 runuser[3788]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:46:17 tuna-q-soak-20261031 runuser[3788]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:46:17 tuna-q-soak-20261031 runuser[3795]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:46:17 tuna-q-soak-20261031 runuser[3795]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:47:17 tuna-q-soak-20261031 runuser[3865]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:47:17 tuna-q-soak-20261031 runuser[3865]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:47:17 tuna-q-soak-20261031 runuser[3875]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:47:17 tuna-q-soak-20261031 runuser[3875]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:47:17 tuna-q-soak-20261031 runuser[3881]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:47:17 tuna-q-soak-20261031 runuser[3881]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:47:17 tuna-q-soak-20261031 runuser[3888]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:47:17 tuna-q-soak-20261031 runuser[3888]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:48:17 tuna-q-soak-20261031 runuser[3954]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:48:17 tuna-q-soak-20261031 runuser[3954]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:48:17 tuna-q-soak-20261031 runuser[3961]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:48:17 tuna-q-soak-20261031 runuser[3961]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:48:17 tuna-q-soak-20261031 runuser[3967]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:48:17 tuna-q-soak-20261031 runuser[3967]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:48:17 tuna-q-soak-20261031 runuser[3974]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:48:18 tuna-q-soak-20261031 runuser[3974]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:49:18 tuna-q-soak-20261031 runuser[4049]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:49:18 tuna-q-soak-20261031 runuser[4049]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:49:18 tuna-q-soak-20261031 runuser[4057]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:49:18 tuna-q-soak-20261031 runuser[4057]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:49:18 tuna-q-soak-20261031 runuser[4064]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:49:18 tuna-q-soak-20261031 runuser[4064]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:49:18 tuna-q-soak-20261031 runuser[4071]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:49:18 tuna-q-soak-20261031 runuser[4071]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:50:18 tuna-q-soak-20261031 runuser[4139]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:50:18 tuna-q-soak-20261031 runuser[4139]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:50:18 tuna-q-soak-20261031 runuser[4146]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:50:18 tuna-q-soak-20261031 runuser[4146]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:50:18 tuna-q-soak-20261031 runuser[4152]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:50:18 tuna-q-soak-20261031 runuser[4152]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:50:18 tuna-q-soak-20261031 runuser[4159]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:50:18 tuna-q-soak-20261031 runuser[4159]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:51:18 tuna-q-soak-20261031 runuser[4225]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:51:18 tuna-q-soak-20261031 runuser[4225]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:51:18 tuna-q-soak-20261031 runuser[4233]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:51:18 tuna-q-soak-20261031 runuser[4233]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:51:18 tuna-q-soak-20261031 runuser[4239]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:51:18 tuna-q-soak-20261031 runuser[4239]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:51:18 tuna-q-soak-20261031 runuser[4246]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:51:18 tuna-q-soak-20261031 runuser[4246]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:52:18 tuna-q-soak-20261031 runuser[4315]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:52:18 tuna-q-soak-20261031 runuser[4315]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:52:18 tuna-q-soak-20261031 runuser[4323]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:52:18 tuna-q-soak-20261031 runuser[4323]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:52:18 tuna-q-soak-20261031 runuser[4330]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:52:18 tuna-q-soak-20261031 runuser[4330]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:52:18 tuna-q-soak-20261031 runuser[4337]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:52:18 tuna-q-soak-20261031 runuser[4337]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:53:18 tuna-q-soak-20261031 runuser[4402]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:53:18 tuna-q-soak-20261031 runuser[4402]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:53:18 tuna-q-soak-20261031 runuser[4409]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:53:19 tuna-q-soak-20261031 runuser[4409]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:53:19 tuna-q-soak-20261031 runuser[4415]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:53:19 tuna-q-soak-20261031 runuser[4415]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:53:19 tuna-q-soak-20261031 runuser[4422]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:53:19 tuna-q-soak-20261031 runuser[4422]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:54:19 tuna-q-soak-20261031 runuser[4488]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:54:19 tuna-q-soak-20261031 runuser[4488]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:54:19 tuna-q-soak-20261031 runuser[4496]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:54:19 tuna-q-soak-20261031 runuser[4496]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:54:19 tuna-q-soak-20261031 runuser[4503]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:54:19 tuna-q-soak-20261031 runuser[4503]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:54:19 tuna-q-soak-20261031 runuser[4510]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:54:19 tuna-q-soak-20261031 runuser[4510]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:55:19 tuna-q-soak-20261031 runuser[4576]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:55:19 tuna-q-soak-20261031 runuser[4576]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:55:19 tuna-q-soak-20261031 runuser[4584]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:55:19 tuna-q-soak-20261031 runuser[4584]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:55:19 tuna-q-soak-20261031 runuser[4591]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:55:19 tuna-q-soak-20261031 runuser[4591]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:55:19 tuna-q-soak-20261031 runuser[4598]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:55:19 tuna-q-soak-20261031 runuser[4598]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:56:19 tuna-q-soak-20261031 runuser[4664]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:56:19 tuna-q-soak-20261031 runuser[4664]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:56:19 tuna-q-soak-20261031 runuser[4671]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:56:19 tuna-q-soak-20261031 runuser[4671]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:56:19 tuna-q-soak-20261031 runuser[4677]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:56:19 tuna-q-soak-20261031 runuser[4677]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:56:19 tuna-q-soak-20261031 runuser[4684]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:56:19 tuna-q-soak-20261031 runuser[4684]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:57:19 tuna-q-soak-20261031 runuser[4753]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:57:19 tuna-q-soak-20261031 runuser[4753]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:57:19 tuna-q-soak-20261031 runuser[4761]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:57:20 tuna-q-soak-20261031 runuser[4761]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:57:20 tuna-q-soak-20261031 runuser[4767]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:57:20 tuna-q-soak-20261031 runuser[4767]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:57:20 tuna-q-soak-20261031 runuser[4774]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:57:20 tuna-q-soak-20261031 runuser[4774]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:58:20 tuna-q-soak-20261031 runuser[4840]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:58:20 tuna-q-soak-20261031 runuser[4840]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:58:20 tuna-q-soak-20261031 runuser[4847]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:58:20 tuna-q-soak-20261031 runuser[4847]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:58:20 tuna-q-soak-20261031 runuser[4854]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:58:20 tuna-q-soak-20261031 runuser[4854]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:58:20 tuna-q-soak-20261031 runuser[4861]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:58:21 tuna-q-soak-20261031 runuser[4861]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:59:21 tuna-q-soak-20261031 runuser[4962]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:59:21 tuna-q-soak-20261031 runuser[4962]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:59:21 tuna-q-soak-20261031 runuser[4969]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:59:21 tuna-q-soak-20261031 runuser[4969]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:59:21 tuna-q-soak-20261031 runuser[4976]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:59:21 tuna-q-soak-20261031 runuser[4976]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 01:59:21 tuna-q-soak-20261031 runuser[4983]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 01:59:21 tuna-q-soak-20261031 runuser[4983]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:00:21 tuna-q-soak-20261031 runuser[5051]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:00:21 tuna-q-soak-20261031 runuser[5051]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:00:21 tuna-q-soak-20261031 runuser[5059]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:00:21 tuna-q-soak-20261031 runuser[5059]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:00:21 tuna-q-soak-20261031 runuser[5065]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:00:21 tuna-q-soak-20261031 runuser[5065]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:00:21 tuna-q-soak-20261031 runuser[5072]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:00:21 tuna-q-soak-20261031 runuser[5072]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:01:21 tuna-q-soak-20261031 runuser[5137]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:01:21 tuna-q-soak-20261031 runuser[5137]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:01:21 tuna-q-soak-20261031 runuser[5144]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:01:21 tuna-q-soak-20261031 runuser[5144]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:01:21 tuna-q-soak-20261031 runuser[5150]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:01:22 tuna-q-soak-20261031 runuser[5150]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:01:22 tuna-q-soak-20261031 runuser[5157]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:01:22 tuna-q-soak-20261031 runuser[5157]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:02:22 tuna-q-soak-20261031 runuser[5226]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:02:22 tuna-q-soak-20261031 runuser[5226]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:02:22 tuna-q-soak-20261031 runuser[5233]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:02:22 tuna-q-soak-20261031 runuser[5233]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:02:22 tuna-q-soak-20261031 runuser[5240]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:02:22 tuna-q-soak-20261031 runuser[5240]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:02:22 tuna-q-soak-20261031 runuser[5248]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:02:22 tuna-q-soak-20261031 runuser[5248]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:03:22 tuna-q-soak-20261031 runuser[5314]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:03:22 tuna-q-soak-20261031 runuser[5314]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:03:22 tuna-q-soak-20261031 runuser[5320]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:03:22 tuna-q-soak-20261031 runuser[5320]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:03:22 tuna-q-soak-20261031 runuser[5327]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:03:22 tuna-q-soak-20261031 runuser[5327]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:03:22 tuna-q-soak-20261031 runuser[5336]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:03:22 tuna-q-soak-20261031 runuser[5336]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:04:22 tuna-q-soak-20261031 runuser[5405]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:04:22 tuna-q-soak-20261031 runuser[5405]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:04:22 tuna-q-soak-20261031 runuser[5412]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:04:22 tuna-q-soak-20261031 runuser[5412]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:04:22 tuna-q-soak-20261031 runuser[5419]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:04:22 tuna-q-soak-20261031 runuser[5419]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:04:22 tuna-q-soak-20261031 runuser[5426]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:04:23 tuna-q-soak-20261031 runuser[5426]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:05:23 tuna-q-soak-20261031 runuser[5492]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:05:23 tuna-q-soak-20261031 runuser[5492]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:05:23 tuna-q-soak-20261031 runuser[5500]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:05:23 tuna-q-soak-20261031 runuser[5500]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:05:23 tuna-q-soak-20261031 runuser[5506]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:05:23 tuna-q-soak-20261031 runuser[5506]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:05:23 tuna-q-soak-20261031 runuser[5513]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:05:23 tuna-q-soak-20261031 runuser[5513]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:06:23 tuna-q-soak-20261031 runuser[5578]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:06:23 tuna-q-soak-20261031 runuser[5578]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:06:23 tuna-q-soak-20261031 runuser[5586]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:06:23 tuna-q-soak-20261031 runuser[5586]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:06:23 tuna-q-soak-20261031 runuser[5592]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:06:24 tuna-q-soak-20261031 runuser[5592]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:06:24 tuna-q-soak-20261031 runuser[5599]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:06:24 tuna-q-soak-20261031 runuser[5599]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:07:24 tuna-q-soak-20261031 runuser[5668]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:07:25 tuna-q-soak-20261031 runuser[5678]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:07:26 tuna-q-soak-20261031 runuser[5678]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:07:26 tuna-q-soak-20261031 runuser[5686]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:07:28 tuna-q-soak-20261031 runuser[5694]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:07:28 tuna-q-soak-20261031 runuser[5694]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:08:28 tuna-q-soak-20261031 runuser[5760]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:08:28 tuna-q-soak-20261031 runuser[5760]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:08:28 tuna-q-soak-20261031 runuser[5767]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:08:28 tuna-q-soak-20261031 runuser[5767]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:08:28 tuna-q-soak-20261031 runuser[5773]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:08:28 tuna-q-soak-20261031 runuser[5773]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:08:28 tuna-q-soak-20261031 runuser[5782]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:08:28 tuna-q-soak-20261031 runuser[5782]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:09:28 tuna-q-soak-20261031 runuser[5855]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:09:29 tuna-q-soak-20261031 runuser[5855]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:09:29 tuna-q-soak-20261031 runuser[5863]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:09:29 tuna-q-soak-20261031 runuser[5863]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:09:29 tuna-q-soak-20261031 runuser[5869]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:09:29 tuna-q-soak-20261031 runuser[5869]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:09:29 tuna-q-soak-20261031 runuser[5876]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:09:29 tuna-q-soak-20261031 runuser[5876]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:10:29 tuna-q-soak-20261031 runuser[5943]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:10:29 tuna-q-soak-20261031 runuser[5943]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:10:29 tuna-q-soak-20261031 runuser[5951]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:10:29 tuna-q-soak-20261031 runuser[5951]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:10:29 tuna-q-soak-20261031 runuser[5957]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:10:29 tuna-q-soak-20261031 runuser[5957]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:10:29 tuna-q-soak-20261031 runuser[5964]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:10:30 tuna-q-soak-20261031 runuser[5964]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:11:30 tuna-q-soak-20261031 runuser[6029]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:11:30 tuna-q-soak-20261031 runuser[6029]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:11:30 tuna-q-soak-20261031 runuser[6037]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:11:31 tuna-q-soak-20261031 runuser[6037]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:11:31 tuna-q-soak-20261031 runuser[6044]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:11:32 tuna-q-soak-20261031 runuser[6044]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:11:32 tuna-q-soak-20261031 runuser[6051]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:11:32 tuna-q-soak-20261031 runuser[6051]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:12:32 tuna-q-soak-20261031 runuser[6121]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:12:33 tuna-q-soak-20261031 runuser[6121]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:12:33 tuna-q-soak-20261031 runuser[6130]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:12:34 tuna-q-soak-20261031 runuser[6130]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:12:34 tuna-q-soak-20261031 runuser[6137]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:12:34 tuna-q-soak-20261031 runuser[6137]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:12:34 tuna-q-soak-20261031 runuser[6145]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:12:35 tuna-q-soak-20261031 runuser[6145]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:13:35 tuna-q-soak-20261031 runuser[6210]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:13:35 tuna-q-soak-20261031 runuser[6210]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:13:35 tuna-q-soak-20261031 runuser[6217]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:13:35 tuna-q-soak-20261031 runuser[6217]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:13:35 tuna-q-soak-20261031 runuser[6224]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:13:36 tuna-q-soak-20261031 runuser[6224]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:13:36 tuna-q-soak-20261031 runuser[6232]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:13:36 tuna-q-soak-20261031 runuser[6232]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:14:36 tuna-q-soak-20261031 runuser[6300]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:14:36 tuna-q-soak-20261031 runuser[6300]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:14:36 tuna-q-soak-20261031 runuser[6308]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:14:36 tuna-q-soak-20261031 runuser[6308]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:14:36 tuna-q-soak-20261031 runuser[6315]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:14:36 tuna-q-soak-20261031 runuser[6315]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:14:36 tuna-q-soak-20261031 runuser[6322]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:14:36 tuna-q-soak-20261031 runuser[6322]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:15:37 tuna-q-soak-20261031 runuser[6388]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:15:37 tuna-q-soak-20261031 runuser[6388]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:15:37 tuna-q-soak-20261031 runuser[6396]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:15:38 tuna-q-soak-20261031 runuser[6396]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:15:38 tuna-q-soak-20261031 runuser[6404]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:15:38 tuna-q-soak-20261031 runuser[6404]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:15:38 tuna-q-soak-20261031 runuser[6412]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:15:39 tuna-q-soak-20261031 runuser[6412]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:16:39 tuna-q-soak-20261031 runuser[6477]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:16:39 tuna-q-soak-20261031 runuser[6477]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:16:39 tuna-q-soak-20261031 runuser[6484]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:16:39 tuna-q-soak-20261031 runuser[6484]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:16:39 tuna-q-soak-20261031 runuser[6490]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:16:39 tuna-q-soak-20261031 runuser[6490]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:16:39 tuna-q-soak-20261031 runuser[6498]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:16:39 tuna-q-soak-20261031 runuser[6498]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:17:39 tuna-q-soak-20261031 runuser[6567]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:17:41 tuna-q-soak-20261031 runuser[6576]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:17:41 tuna-q-soak-20261031 runuser[6576]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:17:41 tuna-q-soak-20261031 runuser[6583]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:17:42 tuna-q-soak-20261031 runuser[6583]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:17:42 tuna-q-soak-20261031 runuser[6591]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:17:43 tuna-q-soak-20261031 runuser[6591]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:18:43 tuna-q-soak-20261031 runuser[6657]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:18:44 tuna-q-soak-20261031 runuser[6657]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:18:44 tuna-q-soak-20261031 runuser[6665]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:18:44 tuna-q-soak-20261031 runuser[6665]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:18:44 tuna-q-soak-20261031 runuser[6671]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:18:44 tuna-q-soak-20261031 runuser[6671]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:18:44 tuna-q-soak-20261031 runuser[6679]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:18:45 tuna-q-soak-20261031 runuser[6679]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:19:45 tuna-q-soak-20261031 runuser[6745]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:19:45 tuna-q-soak-20261031 runuser[6745]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:19:45 tuna-q-soak-20261031 runuser[6753]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:19:46 tuna-q-soak-20261031 runuser[6753]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:19:46 tuna-q-soak-20261031 runuser[6760]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:19:47 tuna-q-soak-20261031 runuser[6760]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:19:47 tuna-q-soak-20261031 runuser[6768]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:19:48 tuna-q-soak-20261031 runuser[6768]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:20:48 tuna-q-soak-20261031 runuser[6838]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:20:48 tuna-q-soak-20261031 runuser[6838]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:20:48 tuna-q-soak-20261031 runuser[6845]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:20:48 tuna-q-soak-20261031 runuser[6845]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:20:48 tuna-q-soak-20261031 runuser[6851]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:20:49 tuna-q-soak-20261031 runuser[6851]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:20:49 tuna-q-soak-20261031 runuser[6859]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:20:49 tuna-q-soak-20261031 runuser[6859]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:21:49 tuna-q-soak-20261031 runuser[6926]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:21:49 tuna-q-soak-20261031 runuser[6926]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:21:50 tuna-q-soak-20261031 runuser[6933]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:21:50 tuna-q-soak-20261031 runuser[6933]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:21:50 tuna-q-soak-20261031 runuser[6940]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:21:51 tuna-q-soak-20261031 runuser[6940]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:21:51 tuna-q-soak-20261031 runuser[6948]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:21:51 tuna-q-soak-20261031 runuser[6948]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:22:51 tuna-q-soak-20261031 runuser[7018]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:22:51 tuna-q-soak-20261031 runuser[7018]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:22:51 tuna-q-soak-20261031 runuser[7025]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:22:51 tuna-q-soak-20261031 runuser[7025]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:22:52 tuna-q-soak-20261031 runuser[7031]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:22:52 tuna-q-soak-20261031 runuser[7031]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:22:52 tuna-q-soak-20261031 runuser[7039]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:22:52 tuna-q-soak-20261031 runuser[7039]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:23:52 tuna-q-soak-20261031 runuser[7104]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:23:52 tuna-q-soak-20261031 runuser[7104]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:23:52 tuna-q-soak-20261031 runuser[7111]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:23:53 tuna-q-soak-20261031 runuser[7111]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:23:53 tuna-q-soak-20261031 runuser[7117]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:23:53 tuna-q-soak-20261031 runuser[7117]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:23:53 tuna-q-soak-20261031 runuser[7125]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:23:54 tuna-q-soak-20261031 runuser[7125]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:24:54 tuna-q-soak-20261031 runuser[7192]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:24:55 tuna-q-soak-20261031 runuser[7201]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:24:55 tuna-q-soak-20261031 runuser[7201]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:24:55 tuna-q-soak-20261031 runuser[7209]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:24:56 tuna-q-soak-20261031 runuser[7209]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:24:56 tuna-q-soak-20261031 runuser[7217]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:24:56 tuna-q-soak-20261031 runuser[7217]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:25:56 tuna-q-soak-20261031 runuser[7286]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:25:57 tuna-q-soak-20261031 runuser[7286]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:25:57 tuna-q-soak-20261031 runuser[7293]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:25:57 tuna-q-soak-20261031 runuser[7293]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:25:57 tuna-q-soak-20261031 runuser[7299]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:25:57 tuna-q-soak-20261031 runuser[7299]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:25:57 tuna-q-soak-20261031 runuser[7307]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:25:57 tuna-q-soak-20261031 runuser[7307]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:26:57 tuna-q-soak-20261031 runuser[7372]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:26:58 tuna-q-soak-20261031 runuser[7372]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:26:58 tuna-q-soak-20261031 runuser[7380]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:26:59 tuna-q-soak-20261031 runuser[7380]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:26:59 tuna-q-soak-20261031 runuser[7386]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:26:59 tuna-q-soak-20261031 runuser[7386]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:26:59 tuna-q-soak-20261031 runuser[7393]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:26:59 tuna-q-soak-20261031 runuser[7393]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:27:59 tuna-q-soak-20261031 runuser[7465]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:27:59 tuna-q-soak-20261031 runuser[7465]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:27:59 tuna-q-soak-20261031 runuser[7472]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:27:59 tuna-q-soak-20261031 runuser[7472]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:27:59 tuna-q-soak-20261031 runuser[7478]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:27:59 tuna-q-soak-20261031 runuser[7478]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:27:59 tuna-q-soak-20261031 runuser[7485]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:28:00 tuna-q-soak-20261031 runuser[7485]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:29:00 tuna-q-soak-20261031 runuser[7550]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:29:00 tuna-q-soak-20261031 runuser[7550]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:29:00 tuna-q-soak-20261031 runuser[7556]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:29:00 tuna-q-soak-20261031 runuser[7556]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:29:00 tuna-q-soak-20261031 runuser[7563]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:29:00 tuna-q-soak-20261031 runuser[7563]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:29:00 tuna-q-soak-20261031 runuser[7571]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:29:01 tuna-q-soak-20261031 runuser[7571]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:30:01 tuna-q-soak-20261031 runuser[7637]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:30:01 tuna-q-soak-20261031 runuser[7637]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:30:01 tuna-q-soak-20261031 runuser[7646]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:30:02 tuna-q-soak-20261031 runuser[7646]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:30:02 tuna-q-soak-20261031 runuser[7652]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:30:03 tuna-q-soak-20261031 runuser[7652]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:30:03 tuna-q-soak-20261031 runuser[7660]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:30:03 tuna-q-soak-20261031 runuser[7660]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:31:03 tuna-q-soak-20261031 runuser[7730]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:31:03 tuna-q-soak-20261031 runuser[7730]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:31:03 tuna-q-soak-20261031 runuser[7737]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:31:03 tuna-q-soak-20261031 runuser[7737]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:31:04 tuna-q-soak-20261031 runuser[7744]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:31:04 tuna-q-soak-20261031 runuser[7744]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:31:04 tuna-q-soak-20261031 runuser[7751]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:31:04 tuna-q-soak-20261031 runuser[7751]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:32:04 tuna-q-soak-20261031 runuser[7816]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:32:04 tuna-q-soak-20261031 runuser[7816]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:32:04 tuna-q-soak-20261031 runuser[7823]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:32:04 tuna-q-soak-20261031 runuser[7823]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:32:04 tuna-q-soak-20261031 runuser[7829]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:32:04 tuna-q-soak-20261031 runuser[7829]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:32:04 tuna-q-soak-20261031 runuser[7837]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:32:04 tuna-q-soak-20261031 runuser[7837]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:33:04 tuna-q-soak-20261031 runuser[7908]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:33:05 tuna-q-soak-20261031 runuser[7908]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:33:05 tuna-q-soak-20261031 runuser[7915]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:33:05 tuna-q-soak-20261031 runuser[7915]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:33:05 tuna-q-soak-20261031 runuser[7922]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:33:06 tuna-q-soak-20261031 runuser[7922]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:33:06 tuna-q-soak-20261031 runuser[7930]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:33:07 tuna-q-soak-20261031 runuser[7930]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:34:07 tuna-q-soak-20261031 runuser[7995]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:34:08 tuna-q-soak-20261031 runuser[7995]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:34:08 tuna-q-soak-20261031 runuser[8003]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:34:08 tuna-q-soak-20261031 runuser[8003]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:34:08 tuna-q-soak-20261031 runuser[8010]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:34:08 tuna-q-soak-20261031 runuser[8010]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:34:08 tuna-q-soak-20261031 runuser[8017]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:34:09 tuna-q-soak-20261031 runuser[8017]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:35:09 tuna-q-soak-20261031 runuser[8084]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:35:09 tuna-q-soak-20261031 runuser[8084]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:35:09 tuna-q-soak-20261031 runuser[8092]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:35:09 tuna-q-soak-20261031 runuser[8092]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:35:09 tuna-q-soak-20261031 runuser[8100]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:35:11 tuna-q-soak-20261031 runuser[8108]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:36:12 tuna-q-soak-20261031 runuser[8176]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:36:12 tuna-q-soak-20261031 runuser[8176]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:36:12 tuna-q-soak-20261031 runuser[8182]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:36:12 tuna-q-soak-20261031 runuser[8182]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:36:12 tuna-q-soak-20261031 runuser[8188]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:36:12 tuna-q-soak-20261031 runuser[8188]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:36:12 tuna-q-soak-20261031 runuser[8196]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:36:12 tuna-q-soak-20261031 runuser[8196]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:37:12 tuna-q-soak-20261031 runuser[8273]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:37:13 tuna-q-soak-20261031 runuser[8273]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:37:13 tuna-q-soak-20261031 runuser[8281]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:37:13 tuna-q-soak-20261031 runuser[8281]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:37:13 tuna-q-soak-20261031 runuser[8289]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:37:14 tuna-q-soak-20261031 runuser[8289]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:37:14 tuna-q-soak-20261031 runuser[8296]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:37:15 tuna-q-soak-20261031 runuser[8296]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:38:15 tuna-q-soak-20261031 runuser[8368]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:38:15 tuna-q-soak-20261031 runuser[8368]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:38:15 tuna-q-soak-20261031 runuser[8376]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:38:16 tuna-q-soak-20261031 runuser[8383]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:38:17 tuna-q-soak-20261031 runuser[8383]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:38:17 tuna-q-soak-20261031 runuser[8391]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:38:17 tuna-q-soak-20261031 runuser[8391]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:39:18 tuna-q-soak-20261031 runuser[8458]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:39:18 tuna-q-soak-20261031 runuser[8458]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:39:18 tuna-q-soak-20261031 runuser[8464]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:39:18 tuna-q-soak-20261031 runuser[8464]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:39:18 tuna-q-soak-20261031 runuser[8471]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:39:19 tuna-q-soak-20261031 runuser[8471]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:39:19 tuna-q-soak-20261031 runuser[8479]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:39:19 tuna-q-soak-20261031 runuser[8479]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:40:19 tuna-q-soak-20261031 runuser[8547]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:40:20 tuna-q-soak-20261031 runuser[8547]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:40:20 tuna-q-soak-20261031 runuser[8555]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:40:21 tuna-q-soak-20261031 runuser[8555]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:40:21 tuna-q-soak-20261031 runuser[8563]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:40:21 tuna-q-soak-20261031 runuser[8563]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:40:21 tuna-q-soak-20261031 runuser[8570]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:40:21 tuna-q-soak-20261031 runuser[8570]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:41:21 tuna-q-soak-20261031 runuser[8639]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:41:21 tuna-q-soak-20261031 runuser[8639]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:41:21 tuna-q-soak-20261031 runuser[8646]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:41:21 tuna-q-soak-20261031 runuser[8646]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:41:21 tuna-q-soak-20261031 runuser[8652]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:41:21 tuna-q-soak-20261031 runuser[8652]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:41:21 tuna-q-soak-20261031 runuser[8660]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:41:22 tuna-q-soak-20261031 runuser[8660]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:42:22 tuna-q-soak-20261031 runuser[8725]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:42:22 tuna-q-soak-20261031 runuser[8725]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:42:22 tuna-q-soak-20261031 runuser[8732]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:42:22 tuna-q-soak-20261031 runuser[8732]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:42:22 tuna-q-soak-20261031 runuser[8738]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:42:22 tuna-q-soak-20261031 runuser[8738]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:42:22 tuna-q-soak-20261031 runuser[8744]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:42:22 tuna-q-soak-20261031 runuser[8744]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:43:22 tuna-q-soak-20261031 runuser[8816]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:43:22 tuna-q-soak-20261031 runuser[8816]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:43:22 tuna-q-soak-20261031 runuser[8823]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:43:22 tuna-q-soak-20261031 runuser[8823]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:43:22 tuna-q-soak-20261031 runuser[8829]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:43:22 tuna-q-soak-20261031 runuser[8829]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:43:22 tuna-q-soak-20261031 runuser[8836]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:43:22 tuna-q-soak-20261031 runuser[8836]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:44:22 tuna-q-soak-20261031 runuser[8902]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:44:23 tuna-q-soak-20261031 runuser[8902]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:44:23 tuna-q-soak-20261031 runuser[8909]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:44:23 tuna-q-soak-20261031 runuser[8909]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:44:23 tuna-q-soak-20261031 runuser[8916]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:44:24 tuna-q-soak-20261031 runuser[8916]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:44:24 tuna-q-soak-20261031 runuser[8924]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:44:24 tuna-q-soak-20261031 runuser[8924]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:45:24 tuna-q-soak-20261031 runuser[8991]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:45:25 tuna-q-soak-20261031 runuser[8991]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:45:25 tuna-q-soak-20261031 runuser[8999]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:45:26 tuna-q-soak-20261031 runuser[8999]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:45:26 tuna-q-soak-20261031 runuser[9006]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:45:27 tuna-q-soak-20261031 runuser[9006]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:45:27 tuna-q-soak-20261031 runuser[9014]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:45:28 tuna-q-soak-20261031 runuser[9014]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:46:28 tuna-q-soak-20261031 runuser[9083]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:46:28 tuna-q-soak-20261031 runuser[9083]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:46:28 tuna-q-soak-20261031 runuser[9090]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:46:29 tuna-q-soak-20261031 runuser[9090]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:46:29 tuna-q-soak-20261031 runuser[9097]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:46:30 tuna-q-soak-20261031 runuser[9097]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:46:30 tuna-q-soak-20261031 runuser[9105]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:46:30 tuna-q-soak-20261031 runuser[9105]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:47:31 tuna-q-soak-20261031 runuser[9170]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:47:31 tuna-q-soak-20261031 runuser[9170]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:47:31 tuna-q-soak-20261031 runuser[9178]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:47:31 tuna-q-soak-20261031 runuser[9178]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:47:31 tuna-q-soak-20261031 runuser[9185]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:47:32 tuna-q-soak-20261031 runuser[9185]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:47:32 tuna-q-soak-20261031 runuser[9191]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:47:32 tuna-q-soak-20261031 runuser[9191]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:48:32 tuna-q-soak-20261031 runuser[9264]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:48:32 tuna-q-soak-20261031 runuser[9264]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:48:32 tuna-q-soak-20261031 runuser[9271]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:48:33 tuna-q-soak-20261031 runuser[9271]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:48:33 tuna-q-soak-20261031 runuser[9278]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:48:33 tuna-q-soak-20261031 runuser[9278]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:48:33 tuna-q-soak-20261031 runuser[9285]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:48:34 tuna-q-soak-20261031 runuser[9285]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:49:34 tuna-q-soak-20261031 runuser[9352]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:49:35 tuna-q-soak-20261031 runuser[9352]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:49:35 tuna-q-soak-20261031 runuser[9360]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:49:36 tuna-q-soak-20261031 runuser[9360]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:49:36 tuna-q-soak-20261031 runuser[9366]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:49:36 tuna-q-soak-20261031 runuser[9366]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:49:36 tuna-q-soak-20261031 runuser[9374]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:49:37 tuna-q-soak-20261031 runuser[9374]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:50:37 tuna-q-soak-20261031 runuser[9442]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:50:37 tuna-q-soak-20261031 runuser[9442]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:50:37 tuna-q-soak-20261031 runuser[9449]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:50:37 tuna-q-soak-20261031 runuser[9449]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:50:37 tuna-q-soak-20261031 runuser[9455]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:50:37 tuna-q-soak-20261031 runuser[9455]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:50:37 tuna-q-soak-20261031 runuser[9462]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:50:37 tuna-q-soak-20261031 runuser[9462]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:51:37 tuna-q-soak-20261031 runuser[9530]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:51:38 tuna-q-soak-20261031 runuser[9530]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:51:38 tuna-q-soak-20261031 runuser[9537]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:51:39 tuna-q-soak-20261031 runuser[9537]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:51:39 tuna-q-soak-20261031 runuser[9544]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:51:39 tuna-q-soak-20261031 runuser[9544]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:51:39 tuna-q-soak-20261031 runuser[9551]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:51:40 tuna-q-soak-20261031 runuser[9551]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:52:40 tuna-q-soak-20261031 runuser[9617]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:52:41 tuna-q-soak-20261031 runuser[9617]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:52:41 tuna-q-soak-20261031 runuser[9625]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:52:42 tuna-q-soak-20261031 runuser[9633]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:52:43 tuna-q-soak-20261031 runuser[9633]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:52:43 tuna-q-soak-20261031 runuser[9641]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:52:44 tuna-q-soak-20261031 runuser[9641]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:53:44 tuna-q-soak-20261031 runuser[9712]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:53:45 tuna-q-soak-20261031 runuser[9712]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:53:45 tuna-q-soak-20261031 runuser[9720]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:53:46 tuna-q-soak-20261031 runuser[9720]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:53:46 tuna-q-soak-20261031 runuser[9727]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:53:47 tuna-q-soak-20261031 runuser[9727]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:53:47 tuna-q-soak-20261031 runuser[9735]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:54:48 tuna-q-soak-20261031 runuser[9804]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:54:48 tuna-q-soak-20261031 runuser[9804]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:54:48 tuna-q-soak-20261031 runuser[9812]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:54:48 tuna-q-soak-20261031 runuser[9812]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:54:48 tuna-q-soak-20261031 runuser[9818]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:54:48 tuna-q-soak-20261031 runuser[9818]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:54:48 tuna-q-soak-20261031 runuser[9825]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:54:49 tuna-q-soak-20261031 runuser[9825]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:55:49 tuna-q-soak-20261031 runuser[9925]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:55:49 tuna-q-soak-20261031 runuser[9925]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:55:49 tuna-q-soak-20261031 runuser[9933]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:55:50 tuna-q-soak-20261031 runuser[9933]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:55:50 tuna-q-soak-20261031 runuser[9940]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:55:50 tuna-q-soak-20261031 runuser[9940]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:55:50 tuna-q-soak-20261031 runuser[9947]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:55:51 tuna-q-soak-20261031 runuser[9947]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:56:51 tuna-q-soak-20261031 runuser[10015]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:56:51 tuna-q-soak-20261031 runuser[10015]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:56:51 tuna-q-soak-20261031 runuser[10022]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:56:51 tuna-q-soak-20261031 runuser[10022]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:56:51 tuna-q-soak-20261031 runuser[10028]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:56:51 tuna-q-soak-20261031 runuser[10028]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:56:51 tuna-q-soak-20261031 runuser[10035]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:56:51 tuna-q-soak-20261031 runuser[10035]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:57:51 tuna-q-soak-20261031 runuser[10102]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:57:52 tuna-q-soak-20261031 runuser[10102]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:57:52 tuna-q-soak-20261031 runuser[10109]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:57:52 tuna-q-soak-20261031 runuser[10109]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:57:52 tuna-q-soak-20261031 runuser[10114]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:57:52 tuna-q-soak-20261031 runuser[10114]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:57:52 tuna-q-soak-20261031 runuser[10123]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:57:53 tuna-q-soak-20261031 runuser[10123]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:58:53 tuna-q-soak-20261031 runuser[10193]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:58:53 tuna-q-soak-20261031 runuser[10193]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:58:53 tuna-q-soak-20261031 runuser[10200]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:58:54 tuna-q-soak-20261031 runuser[10200]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:58:54 tuna-q-soak-20261031 runuser[10207]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:58:54 tuna-q-soak-20261031 runuser[10207]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:58:54 tuna-q-soak-20261031 runuser[10215]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:58:55 tuna-q-soak-20261031 runuser[10215]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:59:55 tuna-q-soak-20261031 runuser[10282]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:59:55 tuna-q-soak-20261031 runuser[10282]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:59:55 tuna-q-soak-20261031 runuser[10289]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:59:55 tuna-q-soak-20261031 runuser[10289]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:59:55 tuna-q-soak-20261031 runuser[10294]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:59:55 tuna-q-soak-20261031 runuser[10294]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 02:59:55 tuna-q-soak-20261031 runuser[10302]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 02:59:55 tuna-q-soak-20261031 runuser[10302]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:00:55 tuna-q-soak-20261031 runuser[10369]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:00:55 tuna-q-soak-20261031 runuser[10369]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:00:55 tuna-q-soak-20261031 runuser[10377]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:00:55 tuna-q-soak-20261031 runuser[10377]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:00:55 tuna-q-soak-20261031 runuser[10385]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:00:55 tuna-q-soak-20261031 runuser[10385]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:00:55 tuna-q-soak-20261031 runuser[10392]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:00:56 tuna-q-soak-20261031 runuser[10392]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:01:56 tuna-q-soak-20261031 runuser[10460]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:01:56 tuna-q-soak-20261031 runuser[10460]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:01:56 tuna-q-soak-20261031 runuser[10467]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:01:57 tuna-q-soak-20261031 runuser[10467]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:01:57 tuna-q-soak-20261031 runuser[10474]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:01:57 tuna-q-soak-20261031 runuser[10474]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:01:57 tuna-q-soak-20261031 runuser[10481]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:01:58 tuna-q-soak-20261031 runuser[10481]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:02:58 tuna-q-soak-20261031 runuser[10547]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:02:58 tuna-q-soak-20261031 runuser[10547]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:02:58 tuna-q-soak-20261031 runuser[10554]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:03:00 tuna-q-soak-20261031 runuser[10562]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:03:00 tuna-q-soak-20261031 runuser[10562]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:03:00 tuna-q-soak-20261031 runuser[10569]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:04:01 tuna-q-soak-20261031 runuser[10641]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:04:02 tuna-q-soak-20261031 runuser[10641]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:04:02 tuna-q-soak-20261031 runuser[10649]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:04:03 tuna-q-soak-20261031 runuser[10656]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:04:04 tuna-q-soak-20261031 runuser[10656]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:04:04 tuna-q-soak-20261031 runuser[10664]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:05:05 tuna-q-soak-20261031 runuser[10731]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:05:07 tuna-q-soak-20261031 runuser[10740]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:05:08 tuna-q-soak-20261031 runuser[10748]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:05:09 tuna-q-soak-20261031 runuser[10756]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:06:11 tuna-q-soak-20261031 runuser[10830]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:06:12 tuna-q-soak-20261031 runuser[10830]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:06:12 tuna-q-soak-20261031 runuser[10837]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:06:12 tuna-q-soak-20261031 runuser[10837]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:06:13 tuna-q-soak-20261031 runuser[10844]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:06:13 tuna-q-soak-20261031 runuser[10844]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:06:13 tuna-q-soak-20261031 runuser[10851]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:07:14 tuna-q-soak-20261031 runuser[10920]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:07:15 tuna-q-soak-20261031 runuser[10928]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:07:15 tuna-q-soak-20261031 runuser[10928]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:07:15 tuna-q-soak-20261031 runuser[10934]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:07:16 tuna-q-soak-20261031 runuser[10934]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:07:16 tuna-q-soak-20261031 runuser[10941]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:07:16 tuna-q-soak-20261031 runuser[10941]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:08:16 tuna-q-soak-20261031 runuser[11006]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:08:16 tuna-q-soak-20261031 runuser[11006]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:08:16 tuna-q-soak-20261031 runuser[11014]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:08:17 tuna-q-soak-20261031 runuser[11021]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:08:18 tuna-q-soak-20261031 runuser[11029]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:08:19 tuna-q-soak-20261031 runuser[11029]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:09:19 tuna-q-soak-20261031 runuser[11100]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:09:19 tuna-q-soak-20261031 runuser[11100]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:09:19 tuna-q-soak-20261031 runuser[11107]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:09:19 tuna-q-soak-20261031 runuser[11107]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:09:19 tuna-q-soak-20261031 runuser[11113]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:09:19 tuna-q-soak-20261031 runuser[11113]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:09:19 tuna-q-soak-20261031 runuser[11120]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:09:19 tuna-q-soak-20261031 runuser[11120]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:10:19 tuna-q-soak-20261031 runuser[11185]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:10:20 tuna-q-soak-20261031 runuser[11185]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:10:20 tuna-q-soak-20261031 runuser[11192]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:10:20 tuna-q-soak-20261031 runuser[11192]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:10:20 tuna-q-soak-20261031 runuser[11199]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:10:20 tuna-q-soak-20261031 runuser[11199]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:10:20 tuna-q-soak-20261031 runuser[11207]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:10:21 tuna-q-soak-20261031 runuser[11207]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:11:21 tuna-q-soak-20261031 runuser[11274]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:11:22 tuna-q-soak-20261031 runuser[11283]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:11:23 tuna-q-soak-20261031 runuser[11290]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:11:25 tuna-q-soak-20261031 runuser[11298]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:12:27 tuna-q-soak-20261031 runuser[11368]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:12:27 tuna-q-soak-20261031 runuser[11368]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:12:27 tuna-q-soak-20261031 runuser[11375]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:12:28 tuna-q-soak-20261031 runuser[11382]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:12:29 tuna-q-soak-20261031 runuser[11382]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:12:29 tuna-q-soak-20261031 runuser[11390]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:12:29 tuna-q-soak-20261031 runuser[11390]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:13:29 tuna-q-soak-20261031 runuser[11455]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:13:30 tuna-q-soak-20261031 runuser[11465]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:13:31 tuna-q-soak-20261031 runuser[11465]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:13:31 tuna-q-soak-20261031 runuser[11471]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:13:32 tuna-q-soak-20261031 runuser[11471]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:13:32 tuna-q-soak-20261031 runuser[11479]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:14:33 tuna-q-soak-20261031 runuser[11551]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:14:34 tuna-q-soak-20261031 runuser[11551]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:14:34 tuna-q-soak-20261031 runuser[11559]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:14:34 tuna-q-soak-20261031 runuser[11559]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:14:34 tuna-q-soak-20261031 runuser[11567]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:14:35 tuna-q-soak-20261031 runuser[11567]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:14:35 tuna-q-soak-20261031 runuser[11574]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:14:36 tuna-q-soak-20261031 runuser[11574]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:15:36 tuna-q-soak-20261031 runuser[11641]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:15:38 tuna-q-soak-20261031 runuser[11651]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:15:40 tuna-q-soak-20261031 runuser[11658]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:15:40 tuna-q-soak-20261031 runuser[11658]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:15:40 tuna-q-soak-20261031 runuser[11666]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:16:42 tuna-q-soak-20261031 runuser[11735]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:16:43 tuna-q-soak-20261031 runuser[11743]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:16:44 tuna-q-soak-20261031 runuser[11743]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:16:44 tuna-q-soak-20261031 runuser[11750]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:16:44 tuna-q-soak-20261031 runuser[11750]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:16:44 tuna-q-soak-20261031 runuser[11757]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:16:44 tuna-q-soak-20261031 runuser[11757]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:17:44 tuna-q-soak-20261031 runuser[11824]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:17:46 tuna-q-soak-20261031 runuser[11833]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:17:49 tuna-q-soak-20261031 runuser[11842]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:17:50 tuna-q-soak-20261031 runuser[11850]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:18:51 tuna-q-soak-20261031 runuser[11916]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:18:52 tuna-q-soak-20261031 runuser[11924]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:18:53 tuna-q-soak-20261031 runuser[11924]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:18:53 tuna-q-soak-20261031 runuser[11931]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:18:53 tuna-q-soak-20261031 runuser[11931]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:18:53 tuna-q-soak-20261031 runuser[11938]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:18:53 tuna-q-soak-20261031 runuser[11938]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:19:53 tuna-q-soak-20261031 runuser[12009]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:19:55 tuna-q-soak-20261031 runuser[12018]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:19:55 tuna-q-soak-20261031 runuser[12018]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:19:55 tuna-q-soak-20261031 runuser[12024]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:19:56 tuna-q-soak-20261031 runuser[12024]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:19:56 tuna-q-soak-20261031 runuser[12031]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:19:56 tuna-q-soak-20261031 runuser[12031]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:20:56 tuna-q-soak-20261031 runuser[12098]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:20:56 tuna-q-soak-20261031 runuser[12098]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:20:56 tuna-q-soak-20261031 runuser[12105]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:20:56 tuna-q-soak-20261031 runuser[12105]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:20:56 tuna-q-soak-20261031 runuser[12112]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:20:56 tuna-q-soak-20261031 runuser[12112]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:20:56 tuna-q-soak-20261031 runuser[12119]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:20:56 tuna-q-soak-20261031 runuser[12119]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:21:56 tuna-q-soak-20261031 runuser[12187]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:22:03 tuna-q-soak-20261031 runuser[12201]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:22:05 tuna-q-soak-20261031 runuser[12209]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:22:07 tuna-q-soak-20261031 runuser[12220]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:23:14 tuna-q-soak-20261031 runuser[12294]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:23:17 tuna-q-soak-20261031 runuser[12304]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:23:18 tuna-q-soak-20261031 runuser[12312]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:23:19 tuna-q-soak-20261031 runuser[12312]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:23:19 tuna-q-soak-20261031 runuser[12319]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:23:19 tuna-q-soak-20261031 runuser[12319]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:24:19 tuna-q-soak-20261031 runuser[12385]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:24:20 tuna-q-soak-20261031 runuser[12385]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:24:20 tuna-q-soak-20261031 runuser[12392]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:24:20 tuna-q-soak-20261031 runuser[12392]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:24:20 tuna-q-soak-20261031 runuser[12399]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:24:20 tuna-q-soak-20261031 runuser[12399]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:24:20 tuna-q-soak-20261031 runuser[12406]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:24:21 tuna-q-soak-20261031 runuser[12406]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:25:21 tuna-q-soak-20261031 runuser[12476]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:25:21 tuna-q-soak-20261031 runuser[12476]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:25:21 tuna-q-soak-20261031 runuser[12483]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:25:21 tuna-q-soak-20261031 runuser[12483]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:25:21 tuna-q-soak-20261031 runuser[12489]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:25:21 tuna-q-soak-20261031 runuser[12489]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:25:21 tuna-q-soak-20261031 runuser[12496]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:25:21 tuna-q-soak-20261031 runuser[12496]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:26:21 tuna-q-soak-20261031 runuser[12563]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:26:23 tuna-q-soak-20261031 runuser[12563]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:26:23 tuna-q-soak-20261031 runuser[12572]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:26:24 tuna-q-soak-20261031 runuser[12572]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:26:24 tuna-q-soak-20261031 runuser[12579]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:26:28 tuna-q-soak-20261031 runuser[12590]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:27:30 tuna-q-soak-20261031 runuser[12661]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:27:32 tuna-q-soak-20261031 runuser[12671]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:27:34 tuna-q-soak-20261031 runuser[12679]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:27:36 tuna-q-soak-20261031 runuser[12688]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:27:37 tuna-q-soak-20261031 runuser[12688]: pam_unix(runuser:session): session closed for user tuna-test
+Oct 31 03:28:37 tuna-q-soak-20261031 runuser[12756]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:28:41 tuna-q-soak-20261031 runuser[12767]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:28:44 tuna-q-soak-20261031 runuser[12776]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:28:49 tuna-q-soak-20261031 runuser[12788]: pam_unix(runuser:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+Oct 31 03:29:02 tuna-q-soak-20261031 tuna-vm-soak[3050]: Traceback (most recent call last):
+Oct 31 03:29:02 tuna-q-soak-20261031 tuna-vm-soak[3050]:   File "/var/lib/tuna-soak/tuna-vm-soak", line 280, in <module>
+Oct 31 03:29:02 tuna-q-soak-20261031 tuna-vm-soak[3050]:     main(args)
+Oct 31 03:29:02 tuna-q-soak-20261031 tuna-vm-soak[3050]:     ~~~~^^^^^^
+Oct 31 03:29:02 tuna-q-soak-20261031 tuna-vm-soak[3050]:   File "/var/lib/tuna-soak/tuna-vm-soak", line 220, in main
+Oct 31 03:29:02 tuna-q-soak-20261031 tuna-vm-soak[3050]:     value[name + '_reply'] = call(user_bus + ['gdbus', 'call', '--session', '--dest',
+Oct 31 03:29:02 tuna-q-soak-20261031 tuna-vm-soak[3050]:                              ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Oct 31 03:29:02 tuna-q-soak-20261031 tuna-vm-soak[3050]:                                             destination, '--object-path', object_path,
+Oct 31 03:29:02 tuna-q-soak-20261031 tuna-vm-soak[3050]:                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Oct 31 03:29:02 tuna-q-soak-20261031 tuna-vm-soak[3050]:                                             '--method', method] + parameters)
+Oct 31 03:29:02 tuna-q-soak-20261031 tuna-vm-soak[3050]:                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Oct 31 03:29:02 tuna-q-soak-20261031 tuna-vm-soak[3050]:   File "/var/lib/tuna-soak/tuna-vm-soak", line 96, in call
+Oct 31 03:29:02 tuna-q-soak-20261031 tuna-vm-soak[3050]:     raise RuntimeError('health helper exceeded its deadline')
+Oct 31 03:29:02 tuna-q-soak-20261031 tuna-vm-soak[3050]: RuntimeError: health helper exceeded its deadline
+Oct 31 03:29:01 tuna-q-soak-20261031 systemd[1]: tuna-soak.service: Main process exited, code=exited, status=1/FAILURE
+Oct 31 03:29:01 tuna-q-soak-20261031 systemd[1]: tuna-soak.service: Failed with result 'exit-code'.
+Oct 31 03:29:01 tuna-q-soak-20261031 systemd[1]: tuna-soak.service: Consumed 5.410s CPU time over 1h 50min 46.311s wall clock time, 36M memory peak.

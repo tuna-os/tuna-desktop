@@ -113,3 +113,9 @@ These runs measure one idle desktop with one controlled native client on
 virtio-gpu under KVM. They show growth and pacing trends between nightlies;
 they are not GNOME-relative thresholds, hardware evidence or a substitute for
 the 24-hour run that #203 and #73 still require.
+
+## Endurance soak reports
+
+- [2026-10-31 24-hour endurance soak run](soak/2026-10-31-24h/README.md):
+  Published `marlin:tuna` flavor (`sha256:ae6363c1`), source revision `d28578e5`.
+  **FAILED / not qualified:** observed for 6,644 s (107 samples), then the health helper's 10-second deadline expired. The timeout's root cause is unresolved; PAM/audit causality has not been established. Retained samples stayed within growth limits, but this is not evidence of completed 24-hour endurance.
