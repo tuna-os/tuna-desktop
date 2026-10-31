@@ -131,8 +131,9 @@ def idle_restore_call(invoke, verify, attempts):
     """Retry only a side-effect-free busy refusal at the post-settings boundary.
 
     Sysfs readback can precede the owned logind completion callback. Each
-    rejected admission is retained; one accepted call ends the loop. The same
-    deadline gates principal/signal verification and bounds each admission call.
+    rejected admission is retained and paced by up to 50ms within the existing
+    five-second deadline; one accepted call ends the loop. The same deadline
+    gates principal/signal verification and bounds each admission call.
     """
     deadline=time.monotonic()+5
     for index in range(100):
@@ -153,6 +154,8 @@ def idle_restore_call(invoke, verify, attempts):
                     error.message!='GDBus.Error:org.gnome.Shell.Brightness.Error.Failed: brightness update already pending'):
                 raise
             receipt['busy_refused']=True
+            remaining=deadline-time.monotonic()
+            if remaining>0:time.sleep(min(0.05,remaining))
             continue
         receipt.update(error=None,ended_ns=time.monotonic_ns())
         if time.monotonic()>deadline:raise RuntimeError('idle restore completion deadline exceeded')
