@@ -72,6 +72,12 @@ COPY packaging/marlin/vm-lane/tuna-vm-fresh-accounts.service /usr/lib/systemd/sy
 # real manual GDM login, then retain its sudo, logout, second-login and
 # reboot gates. Fixture setup must not seed those users' records or fake
 # persistence; a successful ordinary tuna-test login is not that proof.
+# The helper is silent about which template policy it chose, so after it
+# runs, `tuna-vm-lifecycle gdm-policy` prints one read-only JSON line to the
+# build log: the gdm binary the helper resolves and its realpath, bounded
+# --version output/status and parse, the FallbackSession literal-probe
+# status, the derived policy, pacman versions/ownership and only allowlisted
+# [User] keys of the global templates. It is a diagnostic, never a gate.
 # The payload hashes cover the same login-path files Containerfile.published
 # pins, taken after the tunaOS steps; the booted lane re-checks them before
 # it types into GDM.
@@ -102,6 +108,7 @@ RUN mkdir -p /usr/share/tuna-vm \
     && echo 'tuna-test:tuna' | chpasswd \
     && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-fresh-accounts /usr/libexec/tuna-vm-input /usr/libexec/tuna-vm-shell-focus \
          /usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token \
+    && /usr/libexec/tuna-vm-lifecycle gdm-policy \
     && printf 'TUNA_COMPOSITOR_STATE=/run/user/%s/tuna-vm-state.json\nTUNA_LOCK_TRACE=1\nTUNA_POINTER_TRACE=1\n' \
          "$(id -u tuna-test)" > /usr/share/tuna-vm/environment.conf \
     && printf '%s\n' \

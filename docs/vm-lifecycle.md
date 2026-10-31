@@ -67,6 +67,31 @@ login, reboot, record retention and post-reboot login gates. Only Arch/GDM
 51 is covered by this native lane; helper-execution tests also cover
 legacy GDM template policy, but do not constitute a pre-51 native proof.
 
+Run 41226473836 (desktop c3713c34) left the record absent after a real
+orca51 `tunastd` first login, and the helper's chosen policy unobserved.
+Two read-only diagnostics now record what happened; neither is a gate.
+The image build prints `tuna-vm-lifecycle gdm-policy`: the `gdm` the helper
+resolves and its realpath, bounded `--version` output/status and parse, the
+`daemon/FallbackSession` literal-probe status, the derived `empty`/`legacy`
+policy, `pacman -Q gdm libgdm accountsservice` and the binary's owner.
+Each `fresh-state` receipt adds an `accounts` block, collected in order:
+physical record presence, the global `standard`/`administrator` templates
+(candidate presence in `/run`, `/etc`, `/usr/local/share`, `/usr/share`
+precedence, the winner, and every `[User]` `Session`, `SessionType`,
+`XSession` and `SystemAccount` occurrence: `[]` is missing, `[""]` empty),
+`Properties.Get` without D-Bus activation of exactly `Session`,
+`SessionType`, `Saved` and `LocalAccount` on
+`/org/freedesktop/Accounts/User<uid>`, then record presence again.
+An unexported object, absent bus or wrong type is an explicit error
+(remote D-Bus error name or exception type only), never an empty Session or
+false `Saved`. Collection points: preflight, first session, after each
+first-round logout (before a missing-record abort), after reboot, and once
+when a login fails. Nothing calls `FindUserByName`, `CacheUser` or a
+setter, retries, or dumps other template keys, error messages or stderr.
+A record seen only after logout, `Saved=true` or an effective
+`Session=tuna` never substitutes for `V-FRESH-RECORD-CREATED-<user>` at
+the first session.
+
 The Debian package journey must retain the original beta package's
 `share/pam.d/tuna-lock` conffile bytes, including its comment. Run
 41151873648's `journey` failed on dpkg's conffile prompt before the
