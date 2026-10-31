@@ -6,6 +6,8 @@
 #   --screenshot-keys-only runs panel readiness and actual keyboard captures only.
 #   --a11y-focus-only runs panel readiness, G-FOCUS-RING, G-FOCUS-RING-TIMEOUT,
 #   G-A11Y-MENU-RESTART and G-SHELL-STABLE only.
+#   --tray-only runs panel readiness and the AppIndicator pointer, library,
+#   keyboard and X11 tray gates only.
 #   --grid-cancel-only --grid-cancel-admission FILE is an exact CI comparison slice.
 #   --expect-grid-cancel-old-negative is permitted only in that admitted slice.
 #
@@ -343,6 +345,17 @@
 #   G-TRAY      an AppIndicator item shows in the panel with its
 #               tooltip, its menu row reaches the item, and the row
 #               leaves the panel when the item exits (P-TR-01)
+#   G-TRAY-POINTER the AppIndicator extension's pointer: middle click is
+#               SecondaryActivate, the wheel Scroll, a double click
+#               Activate without the menu, single and secondary
+#               clicks the menu (P-TR-01)
+#   G-TRAY-AYATANA a real libayatana-appindicator item: label, keyboard
+#               route (Ctrl+Alt+Tab, Enter, arrows, Right into a
+#               submenu), check state, live menu/label/attention/
+#               Passive updates, middle click and scroll reach the
+#               library, and the item leaves on exit (P-TR-01, P-A11Y-02)
+#   G-TRAY-X11  the same library item from an XWayland (GDK_BACKEND=x11)
+#               client shows and fires its menu (P-TR-01)
 #   G-SWITCHER-GROUP Alt+Above_Tab shows an app's windows as thumbnails
 #               inside the output and steps through them; W closes the
 #               focused one
@@ -380,6 +393,7 @@ HEIGHT=800
 INSTALLED_PACKAGE=0
 SCREENSHOT_KEYS_ONLY=0
 A11Y_FOCUS_ONLY=0
+TRAY_ONLY=0
 GRID_CANCEL_ONLY=0
 GRID_CANCEL_OLD_NEGATIVE=0
 GRID_CANCEL_ADMISSION=""
@@ -392,6 +406,7 @@ while [ $# -gt 0 ]; do
         --grid-cancel-admission) GRID_CANCEL_ADMISSION="$2"; shift 2 ;;
         --screenshot-keys-only) SCREENSHOT_KEYS_ONLY=1; shift ;;
         --a11y-focus-only) A11Y_FOCUS_ONLY=1; shift ;;
+        --tray-only) TRAY_ONLY=1; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --help|-h) sed -n '2,19p' "$0"; exit 0 ;;
@@ -1168,10 +1183,223 @@ if [ "$INSTALLED_PACKAGE" = 1 ]; then
     cp "$CSTATE" "$ARTIFACTS/installed-desktop-before-panel.json"
 fi
 
+# Tray helpers: dump the shell, wait for a node, aim at a node's live
+# accessibility bounds (the panel surface sits at the output origin),
+# and wait for a fixture's marker line.
+tray_dump() {
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/$1" 20 >/dev/null 2>&1
+}
+tray_wait() {
+    for _ in $(seq 1 30); do
+        tray_dump "$1"
+        "$3" "$ARTIFACTS/$1" "$2" && return 0
+        sleep 0.5
+    done
+    return 1
+}
+tray_point() {
+    jq -er --arg n "$2" '[.[] | select(.showing and .name == $n and ((.bounds[2] // 0) > 0) and ((.bounds[3] // 0) > 0))][0].bounds | "\((.[0] + .[2] / 2) | floor) \((.[1] + .[3] / 2) | floor)"' "$ARTIFACTS/$1"
+}
+tray_marker() {
+    end=$(($(date +%s) + 10))
+    until grep -q -- "$2" "$1" 2>/dev/null || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
+    grep -q -- "$2" "$1" 2>/dev/null
+}
+tray_checked() {
+    jq -e --arg n "$2" --argjson c "$3" 'any(.[]; .name == $n and .showing and .checked == $c)' "$1" >/dev/null
+}
+
+tray_pointer_gate() {
+# Tray pointer (P-TR-01), as the AppIndicator extension's
+# indicatorStatusIcon.js vfunc_button_press_event/vfunc_scroll_event.
+TRAY_MARKER="$ARTIFACTS/tray-pointer-marker"
+rm -f "$TRAY_MARKER"
+"$PY" "$ROOT/scripts/lib/tuna-tray-item-stub.py" "$TRAY_MARKER" >"$ARTIFACTS/tray-pointer.log" 2>&1 &
+TRAY_PID=$!
+tray_wait a11y-tray-pointer.json "Tuna Desktop Tray Probe" showing ||
+    fail G-TRAY-POINTER "the item never showed in the panel"
+tray_xy="$(tray_point a11y-tray-pointer.json "Tuna Desktop Tray Probe")" ||
+    fail G-TRAY-POINTER "the item has no showing bounds"
+# shellcheck disable=SC2086
+xdotool mousemove --window "$WID" $tray_xy click 2
+tray_marker "$TRAY_MARKER" '^secondary$' || fail G-TRAY-POINTER "middle click did not reach SecondaryActivate"
+xdotool click 4
+tray_marker "$TRAY_MARKER" '^scroll -[1-9][0-9]* vertical$' || fail G-TRAY-POINTER "the wheel did not reach Scroll"
+xdotool click --repeat 2 --delay 60 1
+tray_marker "$TRAY_MARKER" '^activated$' || fail G-TRAY-POINTER "a double click did not Activate"
+sleep 1
+tray_dump a11y-tray-double.json
+hidden "$ARTIFACTS/a11y-tray-double.json" "Open Probe" ||
+    fail G-TRAY-POINTER "a double click opened the menu as well"
+xdotool click 1
+tray_wait a11y-tray-single.json "Open Probe" showing ||
+    fail G-TRAY-POINTER "a single click never opened the menu"
+scrot "$ARTIFACTS/03c-tray-pointer-menu.png" >/dev/null
+xdotool key Escape
+tray_wait a11y-tray-single-closed.json "Open Probe" hidden || fail G-TRAY-POINTER "Escape left the menu open"
+xdotool click 3
+tray_wait a11y-tray-secondary.json "Open Probe" showing ||
+    fail G-TRAY-POINTER "a secondary click never opened the menu"
+xdotool key Escape
+tray_wait a11y-tray-secondary-closed.json "Open Probe" hidden || fail G-TRAY-POINTER "Escape left the menu open"
+[ "$(grep -c '^activated$' "$TRAY_MARKER")" = 1 ] ||
+    fail G-TRAY-POINTER "single or secondary clicks activated the item"
+kill "$TRAY_PID" 2>/dev/null || true
+tray_wait a11y-tray-pointer-gone.json "Tuna Desktop Tray Probe" hidden ||
+    fail G-TRAY-POINTER "the item stayed after it exited"
+pass G-TRAY-POINTER "middle click, wheel, double, single and secondary clicks follow the AppIndicator extension"
+}
+
+tray_ayatana_gate() {
+# A real libayatana-appindicator item (P-TR-01): the library Ubuntu and
+# Fedora apps use, registering by object path and exporting a GtkMenu
+# through libdbusmenu. Driven from the keyboard (P-A11Y-02).
+if "$PY" -c 'import gi; gi.require_version("Gtk", "3.0"); gi.require_version("AyatanaAppIndicator3", "0.1")' 2>/dev/null; then
+    AYATANA_MARKER="$ARTIFACTS/tray-ayatana-marker"
+    rm -f "$AYATANA_MARKER"
+    env -u DISPLAY GDK_BACKEND=wayland WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-tray-ayatana.py" "$AYATANA_MARKER" >"$ARTIFACTS/tray-ayatana.log" 2>&1 &
+    AYATANA_PID=$!
+    tray_marker "$AYATANA_MARKER" '^ready$' || fail G-TRAY-AYATANA "the library item never started"
+    tray_wait a11y-ayatana.json "Tuna Ayatana Probe" showing ||
+        fail G-TRAY-AYATANA "the path-registered library item never showed"
+    jq -e 'any(.[]; .role == "label" and .name == "7" and .showing)' "$ARTIFACTS/a11y-ayatana.json" >/dev/null ||
+        fail G-TRAY-AYATANA "the item's label is not shown beside its icon"
+    scrot "$ARTIFACTS/03d-tray-ayatana.png" >/dev/null
+    # Ctrl+Alt+Tab into the bar, Tab to the item, Enter opens its menu.
+    # A fired row returns focus to the client (G-PANEL-FOCUS), so each
+    # visit walks in again.
+    ayatana_open() {
+        xdotool key ctrl+alt+Tab
+        sleep 1
+        for _ in $(seq 1 12); do
+            tray_dump "a11y-ayatana-walk-$1.json"
+            focused "$ARTIFACTS/a11y-ayatana-walk-$1.json" "Tuna Ayatana Probe" && break
+            xdotool key Tab
+            sleep 0.7
+        done
+        focused "$ARTIFACTS/a11y-ayatana-walk-$1.json" "Tuna Ayatana Probe" ||
+            fail G-TRAY-AYATANA "the bar's focus walk never reached the item"
+        xdotool key Return
+        tray_wait "a11y-ayatana-menu-$1.json" "Ayatana Open" showing || fail G-TRAY-AYATANA "Enter did not open the menu"
+        cp "$ARTIFACTS/a11y-ayatana-menu-$1.json" "$ARTIFACTS/a11y-ayatana-menu.json"
+    }
+    ayatana_open first
+    showing "$ARTIFACTS/a11y-ayatana-menu.json" "Ayatana More" || fail G-TRAY-AYATANA "the submenu row is missing"
+    tray_checked "$ARTIFACTS/a11y-ayatana-menu.json" "Ayatana Check" true ||
+        fail G-TRAY-AYATANA "the check item is not shown checked"
+    hidden "$ARTIFACTS/a11y-ayatana-menu.json" "Ayatana Deep" || fail G-TRAY-AYATANA "the submenu opened by itself"
+    scrot "$ARTIFACTS/03e-tray-ayatana-menu.png" >/dev/null
+    for _ in $(seq 1 8); do
+        tray_dump a11y-ayatana-down.json
+        focused "$ARTIFACTS/a11y-ayatana-down.json" "Ayatana More" && break
+        xdotool key Down
+        sleep 0.5
+    done
+    focused "$ARTIFACTS/a11y-ayatana-down.json" "Ayatana More" || fail G-TRAY-AYATANA "Down never reached the submenu row"
+    xdotool key Right
+    tray_wait a11y-ayatana-sub.json "Ayatana Deep" showing || fail G-TRAY-AYATANA "Right did not open the submenu"
+    tray_wait a11y-ayatana-sub-focus.json "Ayatana Deep" focused || fail G-TRAY-AYATANA "Right did not focus the submenu's row"
+    scrot "$ARTIFACTS/03f-tray-ayatana-submenu.png" >/dev/null
+    xdotool key Return
+    tray_marker "$AYATANA_MARKER" '^activate Ayatana Deep$' || fail G-TRAY-AYATANA "Enter on the submenu row never reached the app"
+    tray_wait a11y-ayatana-fired.json "Ayatana Open" hidden || fail G-TRAY-AYATANA "the menu stayed open after a row fired"
+    ayatana_open again
+    hidden "$ARTIFACTS/a11y-ayatana-menu.json" "Ayatana Deep" || fail G-TRAY-AYATANA "the submenu stayed open across menus"
+    for _ in $(seq 1 8); do
+        tray_dump a11y-ayatana-check.json
+        focused "$ARTIFACTS/a11y-ayatana-check.json" "Ayatana Check" && break
+        xdotool key Down
+        sleep 0.5
+    done
+    xdotool key Return
+    tray_marker "$AYATANA_MARKER" '^toggled Ayatana Check False$' || fail G-TRAY-AYATANA "the check item never toggled in the app"
+    tray_wait a11y-ayatana-toggled.json "Ayatana Check" hidden || fail G-TRAY-AYATANA "the menu stayed open after the toggle"
+    ayatana_open toggled
+    cp "$ARTIFACTS/a11y-ayatana-menu.json" "$ARTIFACTS/a11y-ayatana-unchecked.json"
+    tray_checked "$ARTIFACTS/a11y-ayatana-unchecked.json" "Ayatana Check" false ||
+        fail G-TRAY-AYATANA "the menu kept the stale check state"
+    # A row added while the menu is open appears in place.
+    kill -HUP "$AYATANA_PID"
+    tray_wait a11y-ayatana-added.json "Ayatana Added" showing || fail G-TRAY-AYATANA "a live LayoutUpdated row never appeared"
+    showing "$ARTIFACTS/a11y-ayatana-added.json" "Ayatana Open" || fail G-TRAY-AYATANA "the live update closed the menu"
+    xdotool key Escape
+    tray_wait a11y-ayatana-escaped.json "Ayatana Open" hidden || fail G-TRAY-AYATANA "Escape left the menu open"
+    xdotool key Escape
+    sleep 1
+    # Pointer actions reach the library: middle click its secondary
+    # target, the wheel its scroll-event; a primary click opens the menu
+    # at once (the library has no Activate).
+    tray_xy="$(tray_point a11y-ayatana-escaped.json "Tuna Ayatana Probe")" || fail G-TRAY-AYATANA "the item has no bounds"
+    # shellcheck disable=SC2086
+    xdotool mousemove --window "$WID" $tray_xy click 2
+    tray_marker "$AYATANA_MARKER" '^activate Ayatana Open$' || fail G-TRAY-AYATANA "middle click never reached the secondary target"
+    xdotool click 5
+    tray_marker "$AYATANA_MARKER" '^scroll ' || fail G-TRAY-AYATANA "the wheel never reached the library"
+    xdotool click 1
+    tray_wait a11y-ayatana-click.json "Ayatana Open" showing || fail G-TRAY-AYATANA "a click did not open the menu"
+    xdotool key Escape
+    tray_wait a11y-ayatana-click-closed.json "Ayatana Open" hidden || fail G-TRAY-AYATANA "Escape left the menu open"
+    # Live label, attention icon and description, Passive and back.
+    kill -USR1 "$AYATANA_PID"
+    tray_wait a11y-ayatana-attention.json "Tuna Ayatana Probe Alert" showing ||
+        fail G-TRAY-AYATANA "NeedsAttention never took the attention description"
+    jq -e 'any(.[]; .role == "label" and .name == "8" and .showing)' "$ARTIFACTS/a11y-ayatana-attention.json" >/dev/null ||
+        fail G-TRAY-AYATANA "the label did not update live"
+    scrot "$ARTIFACTS/03g-tray-ayatana-attention.png" >/dev/null
+    # Passive hides the item whatever its icon; Active brings back the
+    # normal icon and its description.
+    ayatana_hidden() { hidden "$1" "Tuna Ayatana Probe Alert" && hidden "$1" "Tuna Ayatana Probe"; }
+    kill -USR2 "$AYATANA_PID"
+    tray_wait a11y-ayatana-passive.json - ayatana_hidden || fail G-TRAY-AYATANA "a Passive item stayed visible"
+    kill -USR2 "$AYATANA_PID"
+    tray_wait a11y-ayatana-active.json "Tuna Ayatana Probe" showing || fail G-TRAY-AYATANA "the item never came back from Passive"
+    kill "$AYATANA_PID" 2>/dev/null || true
+    tray_wait a11y-ayatana-gone.json - ayatana_hidden || fail G-TRAY-AYATANA "the item stayed after the app exited"
+    pass G-TRAY-AYATANA "a libayatana item registers by path, its label, menu, submenu and check work from the keyboard, and it updates and leaves live"
+else
+    echo "tuna-gtk-shell-proof: G-TRAY-AYATANA skipped (no AyatanaAppIndicator3 typelib)"
+fi
+}
+
+# G-TRAY-X11 needs the session's XWayland display ($x11_display).
+tray_x11_gate() {
+    if "$PY" -c 'import gi; gi.require_version("Gtk", "3.0"); gi.require_version("AyatanaAppIndicator3", "0.1")' 2>/dev/null; then
+        X11_TRAY_MARKER="$ARTIFACTS/tray-x11-marker"
+        rm -f "$X11_TRAY_MARKER"
+        DISPLAY="$x11_display" GDK_BACKEND=x11 "$PY" "$ROOT/scripts/lib/tuna-tray-ayatana.py" "$X11_TRAY_MARKER" "Tuna X11 Tray Probe" >"$ARTIFACTS/tray-x11.log" 2>&1 &
+        X11_TRAY_PID=$!
+        tray_marker "$X11_TRAY_MARKER" '^ready$' || fail G-TRAY-X11 "the X11 library item never started"
+        tray_wait a11y-tray-x11.json "Tuna X11 Tray Probe" showing || fail G-TRAY-X11 "the X11 client's item never showed"
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-tray-x11-menu.json" 20 \
+            --press "Tuna X11 Tray Probe" >/dev/null 2>&1 || fail G-TRAY-X11 "could not open the X11 item"
+        tray_wait a11y-tray-x11-open.json "Ayatana Open" showing || fail G-TRAY-X11 "the X11 item's menu never showed"
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-tray-x11-fire.json" 20 \
+            --press "Ayatana Open" >/dev/null 2>&1 || fail G-TRAY-X11 "could not fire the X11 item's row"
+        tray_marker "$X11_TRAY_MARKER" '^activate Ayatana Open$' || fail G-TRAY-X11 "the row never reached the X11 client"
+        kill "$X11_TRAY_PID" 2>/dev/null || true
+        tray_wait a11y-tray-x11-gone.json "Tuna X11 Tray Probe" hidden || fail G-TRAY-X11 "the X11 item stayed after exit"
+        pass G-TRAY-X11 "an XWayland client's AppIndicator shows, fires its menu row and leaves"
+    else
+        echo "tuna-gtk-shell-proof: G-TRAY-X11 skipped (no AyatanaAppIndicator3 typelib)"
+    fi
+}
+
 # The panel is up once the shell registers on the a11y bus with its
 # controls; that also proves the accessible tree.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel.json" 60 ||
     fail A11Y-PANEL "shell never registered on the accessibility bus"
+SOCKET_NAME="$(sed -n 's/.*nested session on \([^ ]*\) .*/\1/p' "$LOG" | head -1)"
+[ -n "$SOCKET_NAME" ] || fail A11Y-PANEL "the nested session never logged its Wayland socket"
+if [ "$TRAY_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "tray desktop ready" ||
+        fail G-TRAY-POINTER "desktop never became ready"
+    tray_pointer_gate
+    tray_ayatana_gate
+    cstate '.x11_display != null' "xwayland" 30 || fail G-TRAY-X11 "XWayland display never advertised"
+    x11_display="$(jq -r '.x11_display' "$CSTATE")"
+    tray_x11_gate
+    exit 0
+fi
 if [ "$SCREENSHOT_KEYS_ONLY" = 1 ]; then
     cstate '.active_workspace != null and .locked == false' "screenshot desktop ready" ||
         fail G-SCREENSHOT-KEYS "desktop never became ready"
@@ -1497,6 +1725,12 @@ pass G-TRAY "an AppIndicator item shows with its tooltip, fires its menu, and le
 xdotool key Escape
 sleep 1
 
+# The comparison slice runs old binaries that predate these tray gates.
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then
+    tray_pointer_gate
+    tray_ayatana_gate
+fi
+
 # App stages: three libadwaita windows (scripts/lib/tuna-test-window.py).
 # Reserving an X11 display must not launch a compatibility process. The
 # panel/calendar are already real native Wayland clients at this point.
@@ -1515,7 +1749,6 @@ if command -v Xwayland >/dev/null 2>&1; then
     fi
     pass G-X11-DEMAND "native GTK and IBus startup advertise sockets without an XWayland or XIM process"
 fi
-SOCKET_NAME="$(sed -n 's/.*nested session on \([^ ]*\) .*/\1/p' "$LOG" | head -1)"
 # One at a time, so window ids (and with them GNOME's running-app order
 # in the dash) follow Alpha, Beta, Gamma.
 n=0
@@ -4434,6 +4667,7 @@ EOF
     fi
     kill "$XEV_PID" 2>/dev/null || true
     pass G-X11-INPUT-FOCUS "X input focus is the focused X11 window $xev_window"
+    tray_x11_gate
 else
     echo "tuna-gtk-shell-proof: G-X11-APP skipped (no Xwayland or xeyes)"
 fi
@@ -9930,7 +10164,17 @@ EOF
     fail G-POWER-SAVE-MODE "idle-brightness $power_idle and 1 dim aaa-other alike ($power_dimmed_other)"
 gsettings set org.gnome.settings-daemon.plugins.power idle-brightness 1
 [ "$(power_save_get)" = "(<0>,)" ] || fail G-POWER-SAVE-MODE "PowerSaveMode did not start on"
-shell_dimming true || fail G-POWER-SAVE-MODE "SetDimming(true) refused"
+end=$(($(date +%s) + 10))
+until power_dim_error="$(gdbus call --session --dest org.gnome.Shell.Brightness \
+    --object-path /org/gnome/Shell/Brightness \
+    --method org.gnome.Shell.Brightness.SetDimming true 2>&1 >/dev/null)"; do
+    case "$power_dim_error" in
+        *"brightness update already pending"*) ;;
+        *) fail G-POWER-SAVE-MODE "SetDimming(true) refused: $power_dim_error" ;;
+    esac
+    [ "$(date +%s)" -le "$end" ] || fail G-POWER-SAVE-MODE "SetDimming(true) stayed pending"
+    sleep 0.2
+done
 end=$(($(date +%s) + 10))
 until [ "$(cat "$power_other/brightness")" = "$power_dimmed_other" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
 if ! { [ "$(cat "$power_other/brightness")" = "$power_dimmed_other" ] &&

@@ -8539,12 +8539,7 @@ mod tests {
                 service: service.to_owned(),
                 title: "Tray".to_owned(),
                 status: status.to_owned(),
-                icon_name: String::new(),
-                icon_pixmap: Vec::new(),
-                attention_name: String::new(),
-                attention_pixmap: Vec::new(),
-                tooltip_title: String::new(),
-                tooltip_body: String::new(),
+                ..Default::default()
             }
         }
 
