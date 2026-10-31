@@ -10,6 +10,7 @@
 
 use std::process::ExitCode;
 
+use tuna_shell_host::eprintln;
 use tuna_shell_host::panel::{run_panel_with_control, PanelConfig};
 
 /// Release version stamped at build time: `TUNA_VERSION` (a `vX.Y.Z` tag or

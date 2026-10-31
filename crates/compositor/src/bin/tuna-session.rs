@@ -9,6 +9,7 @@
 use std::ffi::OsString;
 use std::process::ExitCode;
 
+use tuna_compositor::eprintln;
 use tuna_compositor::runtime::{current_exe_dir, resolve_shell_bin, sibling_binary};
 
 /// Release version stamped at build time: `TUNA_VERSION` (a `vX.Y.Z` tag or

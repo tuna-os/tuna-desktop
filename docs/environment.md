@@ -58,6 +58,22 @@ session and the journal under GDM (see
 [session operations](session-operations.md#logs)). None of them logs typed
 text, passwords or window titles.
 
+The compositor, shell, shell-host/IBus bridge, wallpaper loader and SVG helper
+assemble each stderr record (including its newline) before one
+`stderr().lock().write_all`. Each crate has a small `stderr_record` helper;
+a crate-root `eprintln!` macro sends existing diagnostics through it, including
+the bridge's formatted fields that previously became partial-line writes.
+Keep that macro before the module declarations and import it in sibling
+binaries. Existing opt-in trace guards are unchanged: no new logging runs
+on the default path. Records up to the pipe's `PIPE_BUF` stay contiguous
+between processes; this is not an unbounded-record atomicity guarantee.
+
+This generalizes the grid-only fix in `228e757d` (#922) and the earlier
+`windows.rs::trace_media` pattern. It also protects the unlock dialog's
+`ease to=clock` record from IBus output (PR #975, run `41229639977`,
+GTK job `124622737253`). Proof parsers remain strict; do not compensate for
+fragmented emission by accepting partial lines.
+
 | Variable | Read by | Effect | Source |
 |---|---|---|---|
 | `TUNA_LOCK_TRACE` | compositor, `tuna-shell-gtk` | When set, lock and unlock events are logged as JSON lines, including the authentication worker's lifecycle and, on DRM/KMS, the scanout reset after resume. Also adds an `auth_owner` section to the `TUNA_COMPOSITOR_STATE` file. | `crates/compositor/src/runtime/auth.rs:182`, `crates/compositor/src/runtime.rs:1916`, `crates/compositor/src/runtime.rs:2723`, `crates/compositor/src/drm.rs:1061`, `crates/shell-gtk/src/lock.rs:73` |
@@ -70,6 +86,30 @@ text, passwords or window titles.
 | `TUNA_MEDIA_DIAGNOSTICS` | compositor, `tuna-shell-gtk` | When it names an existing file, logs `tuna-media-diagnostic:` records for media-key routing. The file's contents are not read. | `crates/compositor/src/windows.rs:45-47`, `crates/shell-gtk/src/media_keys.rs:45-48` |
 | `TUNA_FOLDER_CREATE_TRACE`, `TUNA_FOLDER_CREATE_SOURCE_COMMIT`, `TUNA_FOLDER_CREATE_PROOF_CONFIG` | `tuna-shell-gtk` | With the first set to `1` and the second a 40-hex-digit commit, records app-folder creation steps for a proof. The third is a file path recorded alongside them. | `crates/shell-gtk/src/folders.rs:369-385` |
 | `TUNA_VM_PUBLIC_SEARCH_DIAGNOSTICS` | `tuna-shell-gtk` | `1` writes the search results the shell used to `/run/user/<uid>/tuna-vm-public-search.json`, for the Marlin VM lane. | `crates/shell-gtk/src/public_search_diagnostic.rs:101-120` |
+
+The shared-log consumers in `scripts/tuna-*-proof*` and `scripts/lib` map to
+these emitters (all paths below are under `crates/`):
+
+| Parsed records | Emitters |
+|---|---|
+| `tuna-compositor: drm: output`, session paused/activated | `compositor/src/drm.rs` |
+| Compositor workspace, switcher, modifier, session mode, media diagnostics | `compositor/src/windows.rs` |
+| Compositor lock conversation and authentication retirement | `compositor/src/runtime/auth.rs`, `compositor/src/runtime.rs` |
+| `screen reader retired`, `FPRINT-PHASE` receipts | `compositor/src/orca.rs`, `compositor/src/fprintd.rs` |
+| Shell grid, transient, unlock-dialog, switcher fade | `shell-gtk/src/grid_animation.rs`, `transient.rs`, `lock_curtain.rs`, `switcher.rs` |
+| Shell lock/auth, command results, password-submission **markers** (not passwords) | `shell-gtk/src/lock.rs`, `lock_auth.rs` |
+| Shell keybindings, media-key setup, policy refusals, screenshot-clipboard marker | `shell-gtk/src/main.rs`, `power.rs`, `run_dialog.rs` |
+| Shell audio-recording, wellbeing, end-session diagnostics | `shell-gtk/src/services.rs`, `wellbeing.rs`, `power.rs` |
+| Shell IBus candidate bounds/clicks and applied properties | `shell-gtk/src/ibus_panel.rs`, `ibus_property_menu.rs` |
+| Shell media diagnostics and `FOLDER-CREATE` observations | `shell-gtk/src/media_keys.rs`, `folders.rs` |
+| Bridge ready/context, key/cursor/focus, property and method diagnostics | `shell-host/src/bin/tuna-ibus-bridge.rs`, `shell-host/src/ibus.rs` |
+
+Preformatted switcher and fingerprint receipts also use their crate's helper,
+without allocating another buffer; the fingerprint proof still fails on a
+receipt write error. Python proof fixtures (IBus test engine, fprintd mock,
+service stubs) use separate artifact logs, not this shared session stream.
+Wallpaper/SVG helper diagnostics are not proof receipts, but are buffered too
+because they can otherwise fragment another process's receipt.
 
 ## Proof instrumentation
 
