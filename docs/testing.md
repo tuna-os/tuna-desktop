@@ -144,10 +144,44 @@ settings local builds need (`just` lists the recipes):
 | `just disk-guard [--watch [s]]` | frees disk now, or keeps checking every `s` seconds (below) |
 
 Every build uses its own checkout's `target/` (an inherited
-`CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one),
-two jobs, no incremental state, and waits on one machine-wide lock
-(`/tmp/tuna-local-build.lock`), so builds from parallel worktrees queue
-instead of exhausting memory.
+`CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one) and no
+incremental state, with half the host's CPUs as jobs. Builds from every
+worktree share two machine-wide build slots (one per 8 GiB of RAM, at most
+two: `/tmp/tuna-local-build.slot.N`, `TUNA_BUILD_SLOTS`), so two run at
+once and the rest queue instead of exhausting memory; a cold
+`cargo test --workspace` build at six jobs peaks at 6.4 GiB.
+
+Nothing waits forever. These defaults bound every recipe:
+
+| What | Default | Knob |
+|---|---|---|
+| `just build`, `test`, `clippy` | stopped after 60 min: TERM to cargo's process group (every `rustc` and test binary), KILL 30 s later, slot freed, exit 124 with `TIMED OUT` | `TUNA_BUILD_TIMEOUT` (minutes) |
+| `just proof <name>` | stopped the same way after its CI job's `timeout-minutes` (gtk-shell-proof: 60), at least 45 min; leftovers it started are reaped | `TUNA_PROOF_TIMEOUT` (minutes) |
+| waiting for a build or proof slot | gives up after 120 min with exit 75 | `TUNA_SLOT_WAIT` (minutes) |
+| a slot held past its timeout + 15 min | `scripts/tuna-reaper` reports it and kills the holder, the processes below it with the process groups they lead, and everything carrying its `TUNA_PROOF_RUN` marker | run by `scripts/tuna-disk-guard` on every pass |
+
+Each slot file's mtime records when it was taken, and its contents the
+command's timeout in minutes (`scripts/lib/tuna-semaphore`),
+which is what the reaper measures. `scripts/lib/tuna-timeout MINUTES LABEL
+COMMAND...` is the wrapper the recipes use; Ctrl-C still reaches the
+command's group.
+
+The reaper checks each holder's `/proc/PID/fdinfo` for the actual flock.
+It does not require a `/proc/locks` entry: PID namespaces can hide a live
+inherited lock after the short-lived `flock` utility exits. Merely opening an
+old slot file does not make a process eligible for retirement.
+
+When `sccache` is installed (`cargo install --locked sccache`, or a
+release binary on `PATH`) every recipe compiles through it, so a fresh
+worktree reuses the dependencies any other worktree already compiled from
+`~/.cache/sccache` (40 GiB cap): a cold `just build` in a fresh worktree
+takes about 39 s instead of 65 s once another worktree has filled the
+cache. The recipes start its server with no idle timeout;
+`sccache --show-stats` shows the hit rate. The workspace's own crates
+miss, since their paths differ per worktree, and the justfile exports no
+per-worktree `CARGO_*` variable, which would make every crate miss. A bare
+`cargo` in the same worktree reuses the recipes' build without the cache.
+See [environment](environment.md#justfile) for every knob.
 
 The polkit unit tests can be run with
 `timeout 15m just test -p tuna-shell-gtk polkit`. Their fake executable
@@ -162,16 +196,28 @@ handling.
 
 Cleanup is automatic where it is safe:
 
-- `just proof` runs each proof with a fresh `HOME` and XDG directories
-  inside its artifact directory, as on a CI runner, so desktop state in
-  your own home can't leak in. One proof runs at a time machine-wide
-  (`/tmp/tuna-local-proof.lock`). Proofs that need another proof's
-  prebuilt binaries (`--bin-dir`) are refused with the name of their
-  caller. When the proof ends, pass or fail, any process it started is
-  stopped, including daemons that detached from it (`ibus-daemon
-  --daemonize`, `dbus-daemon --fork`): each carries a `TUNA_PROOF_RUN`
-  marker in its environment. A passing proof deletes its artifacts; a
-  failing one keeps them and prints the path;
+- `just proof` runs each proof with a fresh `HOME`, XDG directories and
+  `XDG_RUNTIME_DIR`, and without your `DISPLAY`, `WAYLAND_DISPLAY` or
+  session bus, as on a CI runner, so desktop state in your own session
+  can't leak in. Nested proofs start their own Xvfb through
+  `scripts/lib/tuna-xvfb`, which locks the first free display from `:120`
+  up (plain `Xvfb -displayfd` takes no lock and lands on the low numbers
+  every nested compositor's XWayland claims by lock file, which breaks
+  it), with per-run Wayland sockets, buses and runtime directories. One
+  runs at a time by default; `TUNA_PROOF_SLOTS=N` lets N run at once
+  (`/tmp/tuna-local-proof.slot.N`), but under that load the gtk-shell
+  proof's timing-sensitive stages fail intermittently. Proofs that touch
+  machine-wide state (vkms, seatd, uinput, `sudo` or apt, like
+  `drm-smoke`), and scripts that don't start an Xvfb, run one at a time
+  (`/tmp/tuna-local-proof.lock.0`). A proof's own `cargo build` waits for a
+  build slot. A proof still running past its timeout (above) is stopped
+  and its slot freed. Proofs that need
+  another proof's prebuilt binaries (`--bin-dir`) are refused with the
+  name of their caller. When the proof ends, pass or fail, any process it
+  started is stopped, including daemons that detached from it
+  (`ibus-daemon --daemonize`, `dbus-daemon --fork`): each carries a
+  `TUNA_PROOF_RUN` marker in its environment. A passing proof deletes its
+  artifacts; a failing one keeps them and prints the path;
 - `just gc` deletes the targets of worktrees whose pull request is merged
   or closed, removes those worktrees when they have no uncommitted
   changes, and expires `just ci-artifacts` downloads after six hours. It

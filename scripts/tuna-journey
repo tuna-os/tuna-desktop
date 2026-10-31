@@ -2,7 +2,7 @@
 # tuna-journey — scripted nested-session screenshot journey for CI.
 #
 # Usage:
-#   scripts/tuna-journey [--display :98] [--artifacts DIR] [--socket NAME]
+#   scripts/tuna-journey [--display :N] [--artifacts DIR] [--socket NAME]
 #
 # Starts a private Xvfb (unless DISPLAY already works), builds and runs
 # the nested compositor with its supervised shell, then drives the
@@ -59,6 +59,7 @@ LOG="$ARTIFACTS/nested.log"
 . "$ROOT/scripts/lib/tuna-introspect.sh"
 OWNED_XVFB=""
 COMPOSITOR_PID=""
+OWNED_RUNTIME=""
 
 # Launch probe: a fake app only this journey can see. Its Exec
 # touches the marker, proving overview search actually launched it.
@@ -96,8 +97,16 @@ cleanup() {
         kill "$OWNED_XVFB" 2>/dev/null || true
         wait "$OWNED_XVFB" 2>/dev/null || true
     fi
+    if [ -n "$OWNED_RUNTIME" ]; then rm -rf "$OWNED_RUNTIME" || true; fi
 }
 trap cleanup EXIT INT TERM
+# The session's sockets and runtime files (wallpaper, control socket,
+# AT-SPI bus) are fixed names below XDG_RUNTIME_DIR; a private one keeps
+# concurrent runs apart. Short path: Unix sockets cap at 108 bytes.
+OWNED_RUNTIME="$(mktemp -d /tmp/tuna-journey-rt.XXXXXX)"
+chmod 0700 "$OWNED_RUNTIME"
+XDG_RUNTIME_DIR="$OWNED_RUNTIME"
+export XDG_RUNTIME_DIR
 
 display_works() {
     xdotool getdisplaygeometry >/dev/null 2>&1
@@ -108,11 +117,25 @@ if [ -n "$DISPLAY_ARG" ]; then
     export DISPLAY
 fi
 if ! display_works; then
-    DISPLAY=":98"
-    export DISPLAY
-    echo "tuna-journey: starting Xvfb on $DISPLAY"
-    Xvfb "$DISPLAY" -screen 0 "${WIDTH}x${HEIGHT}x24" >"$ARTIFACTS/xvfb.log" 2>&1 &
-    OWNED_XVFB=$!
+    if [ -n "$DISPLAY_ARG" ]; then
+        echo "tuna-journey: starting Xvfb on $DISPLAY"
+        Xvfb "$DISPLAY" -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp >"$ARTIFACTS/xvfb.log" 2>&1 &
+        OWNED_XVFB=$!
+    else
+        # tuna-xvfb picks a free display and locks it, so concurrent runs never collide.
+        rm -f "$ARTIFACTS/xvfb-display"
+        "$ROOT/scripts/lib/tuna-xvfb" -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp \
+            3>"$ARTIFACTS/xvfb-display" >"$ARTIFACTS/xvfb.log" 2>&1 &
+        OWNED_XVFB=$!
+        for _ in $(seq 1 30); do [ -s "$ARTIFACTS/xvfb-display" ] && break; sleep 1; done
+        [ -s "$ARTIFACTS/xvfb-display" ] || {
+            echo "tuna-journey: Xvfb did not allocate a display" >&2
+            exit 1
+        }
+        DISPLAY=":$(cat "$ARTIFACTS/xvfb-display")"
+        export DISPLAY
+        echo "tuna-journey: started Xvfb on $DISPLAY"
+    fi
     for _ in $(seq 1 30); do
         if display_works; then
             break
