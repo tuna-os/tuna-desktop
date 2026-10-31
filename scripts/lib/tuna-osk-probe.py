@@ -79,8 +79,10 @@ def build(loop):
 
     for name, entry in entries.items():
         entry.connect("changed", texts)
-        entry.connect("preedit-changed", lambda _entry, text, field=name:
-                      log({"preedit": text, "field": field}))
+        # GtkEntry delegates editing and the preedit signal to its GtkText.
+        entry.get_delegate().connect(
+            "preedit-changed", lambda _text, text, field=name:
+            log({"preedit": text, "field": field}))
 
     def focus(*_):
         widget = win.get_focus()
