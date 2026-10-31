@@ -517,6 +517,22 @@ def guest_role(executable):
     return executable
 
 
+def record_datetime_gates(result, published, record):
+    """Record actual Date & Time verdicts; unsupported panel proofs still fail."""
+    failed = []
+    for line in result["assertions"]:
+        gate, verdict, detail = (line.split(" ", 2) + ["", ""])[:3]
+        if (published and verdict != "pass"
+                and gate in ("G-DATETIME-CLOCK-TZ", "G-DATETIME-CLOCK-SET")):
+            detail = ("published panel capability unqualified/unsupported; an image that predates "
+                      "clock-change monitoring is not a pass: " + detail)
+        record(gate, verdict == "pass", detail)
+        if verdict != "pass":
+            failed.append(gate)
+    if not result["assertions"] or failed:
+        raise RuntimeError(f"Date & Time gates failed: {', '.join(failed) or 'no assertions'}")
+
+
 def predates_newer_snapshot(state):
     """True when the guest compositor predates the newer snapshot keys.
 
@@ -1107,17 +1123,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     datetime_result = agent.run("datetime", timeout=300)
     with open(os.path.join(evidence, "datetime-evidence.json"), "w") as stream:
         json.dump(datetime_result["evidence"], stream, indent=2)
-    datetime_failed = []
-    for line in datetime_result["assertions"]:
-        gate, verdict, detail = (line.split(" ", 2) + ["", ""])[:3]
-        if published and gate in ("G-DATETIME-CLOCK-TZ", "G-DATETIME-CLOCK-SET") and verdict != "pass":
-            detail = ("published panel capability unqualified/unsupported; an image that predates "
-                      "clock-change monitoring is not a pass: " + detail)
-        record(gate, verdict == "pass", detail)
-        if verdict != "pass":
-            datetime_failed.append(gate)
-    if not datetime_result["assertions"] or datetime_failed:
-        raise RuntimeError(f"Date & Time gates failed: {', '.join(datetime_failed) or 'no assertions'}")
+    record_datetime_gates(datetime_result, published, record)
 
     # GNOME 51 settings daemon plugins (#355): the installed session starts
     # them through GNOME's own user units, and gsd-power drives the

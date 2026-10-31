@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Run as root after mounting the dedicated LV; never create an OS-disk fallback.
+set -euo pipefail
+
+fail() {
+  printf 'prepare-scratch-pool: %s\n' "$*" >&2
+  exit 1
+}
+
+[[ $EUID -eq 0 ]] || fail 'must run as root'
+scratch=/var/lib/tuna-ci-scratch
+expected=/dev/vg1/tuna_ci_scratch
+[[ -b $expected ]] || fail "expected LV is not a block device: $expected"
+[[ ! -L $scratch ]] || fail "scratch path must not be a symlink: $scratch"
+mountpoint -q -- "$scratch" || fail "scratch filesystem is not mounted: $scratch"
+# Compare device identities, not /dev/mapper versus /dev/vg1 spelling.
+expected_device=$(stat -Lc '%t:%T' -- "$expected")
+source=$(findmnt --noheadings --raw --mountpoint "$scratch" --output SOURCE)
+[[ -b $source ]] || fail "scratch mount source is not a whole block device: $source"
+[[ $(stat -Lc '%t:%T' -- "$source") == "$expected_device" ]] || fail "scratch is mounted from $source, not $expected"
+[[ $(findmnt --noheadings --raw --mountpoint "$scratch" --output FSTYPE) == ext4 ]] || fail 'scratch filesystem must be ext4'
+[[ $(findmnt --noheadings --raw --mountpoint "$scratch" --output FSROOT) == / ]] || fail 'scratch must mount the LV root, not a bind-mounted subdirectory'
+[[ -f $scratch/.nvme-scratch && ! -L $scratch/.nvme-scratch ]] || fail 'missing regular .nvme-scratch marker on mounted LV'
+
+pool=$scratch/pool
+[[ ! -L $pool ]] || fail "pool must not be a symlink: $pool"
+mkdir -p -- "$pool"
+[[ $(stat -c '%d' -- "$pool") == $(stat -c '%d' -- "$scratch") ]] || fail 'pool is on a different filesystem'
+for number in {01..42}; do
+  slot=$pool/slot-$number
+  [[ ! -L $slot ]] || fail "slot must not be a symlink: $slot"
+  mkdir -p -- "$slot"
+  [[ $(stat -c '%d' -- "$slot") == $(stat -c '%d' -- "$scratch") ]] || fail "slot is on a different filesystem: $slot"
+  chmod 0777 -- "$slot"
+  if ! mountpoint -q -- "$slot"; then
+    mount --bind "$slot" "$slot"
+  fi
+done

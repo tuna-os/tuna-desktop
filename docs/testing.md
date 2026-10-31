@@ -18,8 +18,8 @@ every proof lane. Both `select-lanes` and `check` always run. The lightweight
 `select-lanes` job runs `scripts/ci-select-lanes`, diffs the PR against its
 base, and picks the proof lanes the change can affect:
 
-- `ci.yml`, `scripts/ci-*`, `Cargo.toml`, `Cargo.lock`, `third-party/` or
-  `scripts/tuna-nested`: every lane.
+- `ci.yml`, `.github/actions/ci-tool/`, `scripts/ci-*`, `Cargo.toml`,
+  `Cargo.lock`, `third-party/` or `scripts/tuna-nested`: every lane.
 - most documentation, other workflows, `fuzz/` and the script self-tests: no
   proof lanes. The selector-owned documentation exceptions are
   `docs/nested-session.md` (`arch-package`), `docs/walkthrough*`
@@ -65,6 +65,32 @@ admission or a proof. Only non-PR runs on `refs/heads/main` may save them.
 PRs and branch dispatches restore main's compatible caches without
 creating competing branch copies. New keys need a successful main job
 to seed them; the first run after a key change can be cold.
+
+The `ci` and measured-coverage workflows also cache isolated installations
+of cargo-audit 0.22.2, cargo-llvm-cov 0.9.1 and the pinned gtk4-layer-shell
+source revision through `.github/actions/ci-tool`. Exact-key restores have
+no fallback: tool version, installer/action content, Rust compiler and host,
+native distro/architecture and the installed package inventory must match.
+Cold paths build the exact locked Cargo tools or revision-checked GTK source;
+warm paths activate those installations without recompiling. Only non-PR
+main runs publish tool caches, using the same trust boundary as Rust targets.
+The audit and instrumented tests still execute and all coverage reports keep
+their existing paths. GTK caches contain only its staged `/usr/local` install,
+not system packages, Rust targets or proof artifacts.
+The staged files stay runner-owned so the cache action can archive and restore
+them without sudo. Activation copies GTK into `/usr/local` as root without
+preserving the staged ownership; it never changes ownership inside the cache.
+
+Tool consumers sparsely check out `.ci-workflow-tools` at the immutable
+`github.workflow_sha`, separate from the candidate source checkout. The
+action invokes its paired installer through `GITHUB_ACTION_PATH` and hashes
+those actual workflow-owned files, not similarly named candidate files.
+Older PR heads need not contain the cache action or staged installer;
+exact-head jobs still test the PR head, not the tooling checkout.
+Before source scans, the action appends only `/.ci-workflow-tools/` to the
+candidate repository's local Git excludes, preserving existing rules. This
+also works on older heads with no matching `.gitignore` entry; genuinely
+untracked candidate source remains visible to Git-based source checks.
 
 The same writer policy and native-platform separation apply to measured
 coverage, fuzzing, nested stress and visual capture. Workflows without a
@@ -123,6 +149,17 @@ two jobs, no incremental state, and waits on one machine-wide lock
 (`/tmp/tuna-local-build.lock`), so builds from parallel worktrees queue
 instead of exhausting memory.
 
+The polkit unit tests can be run with
+`timeout 15m just test -p tuna-shell-gtk polkit`. Their fake executable
+helpers are written and made executable by a dedicated child process,
+which exits before the helper is launched. Do not write those executables
+in the multithreaded test process: a concurrent fork can inherit the
+writable file descriptor and make execution fail with `ETXTBSY`, even
+after the parent closes it or renames the file. A parallel fixture test
+also checks immediate execution, literal script bytes and exit status;
+the existing session tests still assert socket fallback and password
+handling.
+
 Cleanup is automatic where it is safe:
 
 - `just proof` runs each proof with a fresh `HOME` and XDG directories
@@ -176,6 +213,13 @@ Clippy runs with `-D warnings`, so any warning fails CI.
 (`hundred_fault_runs_keep_apps_alive_and_resync` in
 `crates/compositor/tests/recovery.rs`) and needs no display or GPU.
 
+The real Wayland-wire pointer tests in `crates/compositor/tests/move_resize.rs`
+cover a window mapping beneath a stationary pointer (#425). The scene repick
+must send `wl_pointer.enter` before any press, the first click must arrive
+without replay, and closing the window must re-enter the window beneath.
+The existing press-time refresh remains a separate regression; releases
+keep Smithay's implicit grab ownership.
+
 The lock-screen PAM test (`crates/compositor/tests/pam_unlock.rs`) needs
 `pam_wrapper` (`libpam-wrapper` on Ubuntu). Without it the test prints
 `pam_unlock: pam_wrapper not installed, skipped` and passes. CI sets
@@ -192,14 +236,46 @@ markers are published only after complete PID contents are written.
 Artifacts retain supervised test-client panics and early compositor exit
 status; a compiled test or cache hit is not a substitute for these cases.
 
+The focused private-helper proof is
+`TUNA_REQUIRE_PAM_WRAPPER=1 cargo test -p tuna-compositor --test pam_helper`.
+An authenticated reply is provisional until the helper exits, its process
+group has no live members, and its leader is reaped. The bounded `/proc`
+scan tolerates only process-disappearance errors (`ENOENT`, or `ESRCH`
+when a process is reaped between opening and reading its `stat` file);
+other scan failures keep retirement quarantined. Its 500 ms cleanup budget
+is separate from the conversation deadline and is not extended on a race.
+
 Run one crate with `cargo test -p <package>` (package names are in each
 crate's `README.md`, for example `cargo test -p tuna-compositor`).
+
+Native resource observation regressions live in
+`crates/wallpaper-svg/src/resource.rs`. Select `resource::tests::` in the native
+test invocation when checking these cases separately.
+
+The concurrent membership regression adds `new.conf` after the first directory
+inventory and must reject that observation without sleeps or timestamp advances:
+directory size, mtime and ctime can all remain equal across a member addition.
+The observer compares two bounded, sorted raw-name inventories through the same
+opened directory, then retains the descriptor/pathname identity guards. The
+rescan-bound regression also requires an over-limit second inventory to fail.
+These are nonrecursive observations, not atomic filesystem snapshots or proof
+against mutations after the final guard; native file hashing and symlink
+following retain their separate coverage.
 
 Desktop-entry launch coverage lives in `tuna-shell-host`:
 `cargo test --locked -p tuna-shell-host --lib apps::`.
 It checks quoted multiword and empty arguments, field-code expansion after
 argument grouping, and literal `$HOME` handling. Desktop `Exec` commands are
 parsed as an argument vector, never evaluated by a shell.
+
+`scripts/lib/tuna-perf-repeatability-tests.py` uses POSIX-shell logging-only
+stubs for `sudo`, `truncate`, and `rm`, avoiding 96 unnecessary Python startups
+per full paired scenario; its arity-prefixed NUL argv journal preserves empty
+arguments, newlines, and non-UTF-8 bytes without shell re-parsing.
+The Python VM stub still exercises real `Popen`/`Handoff` termination and
+reaping rather than creating guests.
+This fixture optimization does not replace the twelve real guest acquisitions
+or change production measurement windows.
 
 ## Nested proofs
 

@@ -1,0 +1,599 @@
+{
+  "schema": 2,
+  "started": "2026-10-31T11:59:55+00:00",
+  "runner": "scripts/tuna-corral-journey",
+  "runner_sha256": "ffb9fe9fd9d1d3e9753d7923783e1692886a4216b87d2c444f623758eccb5900",
+  "corral": "corral v0.7.0+36.g76b6dd5 (commit 76b6dd52d35d, built 2026-10-30T08:31:57Z, go1.27.0)",
+  "image": {
+    "ref": "ghcr.io/tuna-os/marlin@sha256:d0e65bce0ac55cb6c58bcf3739e30d6372fe4be978e6ea7c0c1310b3962bdfa5",
+    "booted": "ghcr.io/tuna-os/marlin@sha256:d0e65bce0ac55cb6c58bcf3739e30d6372fe4be978e6ea7c0c1310b3962bdfa5",
+    "booted_manifest_digest": "sha256:9706311b7850d4dfcbf312b996a98793f9f0581d200fbe08c1c344924d49b691"
+  },
+  "vm": {
+    "name": "tuna-q-beta2-20261031",
+    "namespace": "corral-vms",
+    "backend": "kubevirt",
+    "requested": {
+      "cpu": 4,
+      "mem": "6G",
+      "disk": "40Gi",
+      "node": "karnataka"
+    },
+    "node": "karnataka",
+    "cpu": {
+      "vcpus": 4,
+      "sockets": 4,
+      "cores": 1,
+      "threads": 1,
+      "model": "host-passthrough",
+      "dedicatedCpuPlacement": false,
+      "isolateEmulatorThread": false
+    },
+    "memory": "6Gi",
+    "firmware": {
+      "type": "uefi",
+      "secureBoot": false,
+      "machine": "q35"
+    },
+    "inputs": [
+      {
+        "name": "tablet",
+        "type": "tablet",
+        "bus": "usb"
+      }
+    ],
+    "disks": [
+      {
+        "name": "rootdisk",
+        "type": "disk",
+        "bus": "virtio",
+        "source": "persistentVolumeClaim",
+        "claim": "tuna-q-beta2-20261031-bootc-disk",
+        "size": "40Gi"
+      }
+    ],
+    "tagValues": {
+      "purpose": "tuna-corral-journey"
+    },
+    "image": "ghcr.io/tuna-os/marlin@sha256:d0e65bce0ac55cb6c58bcf3739e30d6372fe4be978e6ea7c0c1310b3962bdfa5"
+  },
+  "console": "corral console page (noVNC), Playwright Chromium, 1:1; frames are the canvas pixels",
+  "steps": [
+    {
+      "id": "greeter-user-list",
+      "title": "GDM shows the user list",
+      "started": "2026-10-31T12:07:23+00:00",
+      "checks": [
+        {
+          "name": "console size",
+          "ok": true,
+          "observed": [
+            1280,
+            800
+          ]
+        },
+        {
+          "name": "GDM greeter session on seat0",
+          "ok": true,
+          "observed": "1"
+        },
+        {
+          "name": "no user session yet",
+          "ok": true,
+          "observed": null
+        }
+      ],
+      "result": "pass",
+      "frame": "01-greeter-user-list.png",
+      "frame_sha256": "7ed4104992c1527ddda5defd824316b5aa98086ddae2279c0f5005a919b1d58c",
+      "crosscheck": {
+        "identical": true,
+        "corral_png_sha256": "4001eef0d8eeec195759b18a7c35b90a2ca958d55f0ea9d216a3ae0f6c8578c9"
+      },
+      "journal": [],
+      "finished": "2026-10-31T12:07:41+00:00"
+    },
+    {
+      "id": "greeter-password",
+      "title": "Select the user; GDM asks for the password",
+      "started": "2026-10-31T12:07:41+00:00",
+      "checks": [
+        {
+          "name": "password prompt requested",
+          "ok": true,
+          "observed": "Enter on the focused user row changed the greeter"
+        }
+      ],
+      "result": "pass",
+      "frame": "02-greeter-password.png",
+      "frame_sha256": "865fe3db224b550ee7d58f19748c4ccece2b4424af0ba60a4970b512e17125b7",
+      "journal": [],
+      "finished": "2026-10-31T12:07:47+00:00"
+    },
+    {
+      "id": "session-is-tuna",
+      "title": "Password login starts Tuna Desktop (lands in the overview)",
+      "started": "2026-10-31T12:07:47+00:00",
+      "checks": [
+        {
+          "name": "logind session via gdm-password",
+          "ok": true,
+          "observed": {
+            "Service": "gdm-password",
+            "Desktop": "",
+            "Type": "wayland",
+            "Class": "user",
+            "State": "active",
+            "LockedHint": "no"
+          }
+        },
+        {
+          "name": "Tuna compositor and shell run",
+          "ok": true,
+          "observed": [
+            "tuna-compositor",
+            "tuna-ibus-bridg",
+            "tuna-shell-gtk"
+          ]
+        },
+        {
+          "name": "no gnome-shell for the user",
+          "ok": true,
+          "observed": false
+        },
+        {
+          "name": "session desktop is tuna",
+          "ok": true,
+          "observed": [
+            "XDG_CURRENT_DESKTOP=Tuna:GNOME",
+            "XDG_SESSION_DESKTOP=tuna",
+            "XDG_SESSION_TYPE=wayland"
+          ]
+        }
+      ],
+      "result": "pass",
+      "frame": "03-session-is-tuna.png",
+      "frame_sha256": "ae945ab6f08b7bfb68a95c111a4071a55ec92fc129e3539ee35ec396cd5285ee",
+      "crosscheck": {
+        "identical": true,
+        "corral_png_sha256": "8bacb6d722a8aba6ac7967b2863a7484f0a0a7722c70a4884894acac9123cfad"
+      },
+      "journal": [
+        "tuna-compositor: serving org.gnome.Mutter.RemoteDesktop",
+        "tuna-compositor: serving org.gnome.Mutter.ServiceChannel",
+        "tuna-compositor: serving org.gnome.SettingsDaemon.Color",
+        "tuna-compositor: session services: display environment imported (systemd=true bus=true)",
+        "tuna-compositor: session services: holding the session leader FIFO",
+        "tuna-compositor: ime: IBus bridge started",
+        "tuna-compositor: session services: graphical target active",
+        "tuna-shell-gtk: OpenGL is llvmpipe (LLVM 23.1.4, 256 bits); drawing with cairo",
+        "tuna-ibus-bridge: input context /org/freedesktop/IBus/InputContext_2",
+        "tuna-ibus-bridge: ready",
+        "tuna-compositor: session services: portals refreshed",
+        "tuna-shell-gtk: wellbeing: screen-time state Active",
+        "tuna-shell-gtk: keybindings: 73 grabs, maximize on [\"<Super>Up\"]",
+        "tuna-compositor: switcher keys: 12 chords, cycle-group Some(SwitcherKey { keysym: 65475, mods: 8, kind: CycleGroup }), cycle-windows Some(SwitcherKey { keysym: 65307, mods: 8, kind: CycleWindows })",
+        "tuna-compositor: overview focus parked",
+        "tuna-shell-gtk: search providers: org.gnome.Settings.desktop, org.gnome.Nautilus.desktop",
+        "tuna-ibus-bridge: text field focused",
+        "tuna-shell-gtk: media keys: gsd-media-keys owns the media-keys bindings",
+        "tuna-compositor: switcher keys: 12 chords, cycle-group Some(SwitcherKey { keysym: 65475, mods: 8, kind: CycleGroup }), cycle-windows Some(SwitcherKey { keysym: 65307, mods: 8, kind: CycleWindows })",
+        "tuna-shell-gtk: keybindings: 73 grabs, maximize on [\"<Super>Up\"]",
+        "tuna-shell-gtk: IBus panel: owns org.freedesktop.IBus.Panel on the IBus bus",
+        "tuna-shell-gtk: polkit agent registered",
+        "tuna-shell-gtk: network agent registered",
+        "tuna-compositor: wallpaper decoded for 1280x800 in 77 ms",
+        "tuna-compositor: session services: GDM session and display registered"
+      ],
+      "finished": "2026-10-31T12:08:17+00:00"
+    },
+    {
+      "id": "desktop",
+      "title": "Escape leaves the overview for the desktop",
+      "started": "2026-10-31T12:08:17+00:00",
+      "checks": [
+        {
+          "name": "overview closed",
+          "ok": true,
+          "observed": "Escape from the login overview (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "04-desktop.png",
+      "frame_sha256": "ddaf89695f5d9bbac228c114e079ceebc4e66ac0191ae1b77481db05e37798b5",
+      "journal": [
+        "tuna-compositor: libinput: scroll-wheel emulation button rejected for QEMU QEMU USB Tablet: Unsupported",
+        "tuna-compositor: overview focus restored",
+        "tuna-ibus-bridge: text field left"
+      ],
+      "finished": "2026-10-31T12:08:25+00:00"
+    },
+    {
+      "id": "overview",
+      "title": "Super opens the overview",
+      "started": "2026-10-31T12:08:27+00:00",
+      "checks": [
+        {
+          "name": "compositor parked focus for the overview",
+          "ok": true,
+          "observed": [
+            "tuna-compositor: overview focus parked"
+          ]
+        }
+      ],
+      "result": "pass",
+      "frame": "05-overview.png",
+      "frame_sha256": "ae945ab6f08b7bfb68a95c111a4071a55ec92fc129e3539ee35ec396cd5285ee",
+      "journal": [
+        "tuna-compositor: overview focus parked",
+        "tuna-ibus-bridge: text field focused"
+      ],
+      "finished": "2026-10-31T12:08:37+00:00"
+    },
+    {
+      "id": "app-grid",
+      "title": "Super+A shows the app grid",
+      "started": "2026-10-31T12:08:37+00:00",
+      "checks": [
+        {
+          "name": "app grid shown",
+          "ok": true,
+          "observed": "Super+A (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "06-app-grid.png",
+      "frame_sha256": "cfdccf2d23a8000d739016a0ea34163d45c0e3ea30b182d595f2b16ea7a79377",
+      "journal": [],
+      "finished": "2026-10-31T12:08:45+00:00"
+    },
+    {
+      "id": "search-files",
+      "title": "Type to search finds Files",
+      "started": "2026-10-31T12:08:45+00:00",
+      "checks": [
+        {
+          "name": "search typed",
+          "ok": true,
+          "observed": "typed 'files' into the overview (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "07-search-files.png",
+      "frame_sha256": "a0b32efc577f4b4247470e6913effcbb0dd74450384dfb56c18b2a232d269b5b",
+      "journal": [
+        "tuna-compositor: overview focus restored",
+        "tuna-ibus-bridge: text field left",
+        "tuna-compositor: overview focus parked",
+        "tuna-ibus-bridge: text field focused"
+      ],
+      "finished": "2026-10-31T12:08:57+00:00"
+    },
+    {
+      "id": "launch-files",
+      "title": "Enter launches Files",
+      "started": "2026-10-31T12:08:57+00:00",
+      "checks": [
+        {
+          "name": "Files (nautilus) running",
+          "ok": true,
+          "observed": "3451\n3520"
+        }
+      ],
+      "result": "pass",
+      "frame": "08-launch-files.png",
+      "frame_sha256": "ebe6f566ae70df24a5d7ceacc7fe405466eb598d88f4709ab80890bb444e445d",
+      "journal": [
+        "tuna-compositor: overview focus restored",
+        "tuna-ibus-bridge: text field left"
+      ],
+      "finished": "2026-10-31T12:09:09+00:00"
+    },
+    {
+      "id": "launch-settings",
+      "title": "Search and launch GNOME Settings",
+      "started": "2026-10-31T12:09:09+00:00",
+      "checks": [
+        {
+          "name": "GNOME Settings running",
+          "ok": true,
+          "observed": "3652"
+        }
+      ],
+      "result": "pass",
+      "frame": "09-launch-settings.png",
+      "frame_sha256": "8bb33cf347031e677a4b0788c67c39df396b82ddf45d73bbd63fe8b5121d4bc9",
+      "journal": [
+        "tuna-compositor: overview focus parked",
+        "tuna-ibus-bridge: text field focused",
+        "tuna-compositor: overview focus restored",
+        "tuna-ibus-bridge: text field left",
+        "tuna-ibus-bridge: text field focused",
+        "tuna-ibus-bridge: text field left",
+        "tuna-ibus-bridge: text field focused"
+      ],
+      "finished": "2026-10-31T12:09:27+00:00"
+    },
+    {
+      "id": "alt-tab-switcher",
+      "title": "Alt+Tab shows the window switcher",
+      "started": "2026-10-31T12:09:27+00:00",
+      "checks": [
+        {
+          "name": "switcher shown while Alt is held",
+          "ok": true,
+          "observed": "Alt held after Tab (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "10-alt-tab-switcher.png",
+      "frame_sha256": "54e1b19050189bf66cb14a1f6204b53adda18d1c19851028be32a3fddc1868e4",
+      "journal": [
+        "tuna-compositor: modifier alt keycode=56 pressed=true",
+        "tuna-compositor: modifier alt keycode=56 pressed=true",
+        "tuna-compositor: switcher Step { forward: true }"
+      ],
+      "finished": "2026-10-31T12:09:33+00:00"
+    },
+    {
+      "id": "alt-tab-commit",
+      "title": "Releasing Alt raises the other window",
+      "started": "2026-10-31T12:09:33+00:00",
+      "checks": [
+        {
+          "name": "Alt release commits",
+          "ok": true,
+          "observed": "Files should now be in front (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "11-alt-tab-commit.png",
+      "frame_sha256": "e9bb2519d608651ffd0f70564646c10e316a7bf9079c33a4447d258b1261ecb5",
+      "journal": [
+        "tuna-compositor: modifier alt keycode=56 pressed=false",
+        "tuna-compositor: modifier alt keycode=56 pressed=false",
+        "tuna-compositor: switcher Commit",
+        "tuna-shell-gtk: switcher fade popup-out start animated=true",
+        "tuna-ibus-bridge: text field left",
+        "tuna-shell-gtk: switcher fade popup-out settled"
+      ],
+      "finished": "2026-10-31T12:09:41+00:00"
+    },
+    {
+      "id": "alt-tab-back",
+      "title": "Alt+Tab tap returns to Settings",
+      "started": "2026-10-31T12:09:41+00:00",
+      "checks": [
+        {
+          "name": "Settings in front again",
+          "ok": true,
+          "observed": "Alt+Tab tap (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "12-alt-tab-back.png",
+      "frame_sha256": "8bb33cf347031e677a4b0788c67c39df396b82ddf45d73bbd63fe8b5121d4bc9",
+      "journal": [
+        "tuna-compositor: modifier alt keycode=56 pressed=true",
+        "tuna-compositor: modifier alt keycode=56 pressed=true",
+        "tuna-compositor: switcher Step { forward: true }",
+        "tuna-compositor: modifier alt keycode=56 pressed=false",
+        "tuna-compositor: modifier alt keycode=56 pressed=false",
+        "tuna-compositor: switcher Commit",
+        "tuna-shell-gtk: switcher fade popup-out start animated=true",
+        "tuna-ibus-bridge: text field focused",
+        "tuna-shell-gtk: switcher fade popup-out settled"
+      ],
+      "finished": "2026-10-31T12:09:48+00:00"
+    },
+    {
+      "id": "settings-appearance",
+      "title": "Open Settings > Appearance",
+      "started": "2026-10-31T12:09:48+00:00",
+      "checks": [
+        {
+          "name": "initial color-scheme recorded",
+          "ok": true,
+          "observed": "'default'"
+        }
+      ],
+      "result": "pass",
+      "frame": "13-settings-appearance.png",
+      "frame_sha256": "a97f21b76af1214a00f9bf17a6bda069a438b6006be9f287e34227dbc869870d",
+      "journal": [
+        "tuna-ibus-bridge: text field left",
+        "tuna-ibus-bridge: text field focused",
+        "tuna-ibus-bridge: text field left",
+        "tuna-ibus-bridge: text field focused"
+      ],
+      "finished": "2026-10-31T12:10:00+00:00"
+    },
+    {
+      "id": "settings-dark-style",
+      "title": "Choosing Dark applies dark style",
+      "started": "2026-10-31T12:10:00+00:00",
+      "checks": [
+        {
+          "name": "color-scheme is prefer-dark",
+          "ok": true,
+          "observed": "'prefer-dark'"
+        }
+      ],
+      "result": "pass",
+      "frame": "14-settings-dark-style.png",
+      "frame_sha256": "34615e116ae76c6d97722e3a010fd567e2366437ecea3096f576a3562b1af632",
+      "journal": [
+        "tuna-ibus-bridge: text field left",
+        "tuna-ibus-bridge: text field focused",
+        "tuna-compositor: libinput: scroll-wheel emulation button rejected for QEMU QEMU USB Tablet: Unsupported"
+      ],
+      "finished": "2026-10-31T12:10:11+00:00"
+    },
+    {
+      "id": "settings-wallpaper",
+      "title": "Choosing a background changes the wallpaper",
+      "started": "2026-10-31T12:10:11+00:00",
+      "checks": [
+        {
+          "name": "picture-uri changed",
+          "ok": true,
+          "observed": {
+            "before": "'file:///usr/share/backgrounds/tunaos/tunaos-default.jpg'",
+            "after": "'file:///usr/share/backgrounds/tunaos/albacore.jpg'"
+          }
+        }
+      ],
+      "result": "pass",
+      "frame": "15-settings-wallpaper.png",
+      "frame_sha256": "af8ab8c17277a9ef0ba7397ea70efd80fbe9353d3e89221e454420b68b406a59",
+      "journal": [
+        "tuna-ibus-bridge: text field left",
+        "tuna-ibus-bridge: text field focused",
+        "tuna-compositor: wallpaper decoded for 1280x800 in 54 ms"
+      ],
+      "finished": "2026-10-31T12:10:23+00:00"
+    },
+    {
+      "id": "quick-settings",
+      "title": "Super+S opens quick settings",
+      "started": "2026-10-31T12:10:23+00:00",
+      "checks": [
+        {
+          "name": "Dark Style setting is on (tile should show on)",
+          "ok": true,
+          "observed": "'prefer-dark'"
+        }
+      ],
+      "result": "pass",
+      "frame": "16-quick-settings.png",
+      "frame_sha256": "5634987a2d9a1ff4d83bf2bdc2cb65dd7d182781cff5f598f7afde749d383114",
+      "journal": [
+        "tuna-ibus-bridge: text field left"
+      ],
+      "finished": "2026-10-31T12:10:32+00:00"
+    },
+    {
+      "id": "quick-settings-night-light",
+      "title": "Night Light tile toggles Night Light",
+      "started": "2026-10-31T12:10:32+00:00",
+      "checks": [
+        {
+          "name": "step ran",
+          "ok": false,
+          "observed": "RuntimeError: guest command failed (1): gsettings get org.gnome.settings-daemon.plugins.color night-light-enabled: mux_client_request_session: read from master failed: Broken pipe\nConnection closed by UNKNOWN port 65535"
+        }
+      ],
+      "result": "fail",
+      "frame": "17-quick-settings-night-light.png",
+      "frame_sha256": "4e2f1b296869562e4d2afd5dffeeeb4f485deff852b1efa0cfc2615e30d299c6",
+      "journal": [
+        "unavailable: guest command failed (1): journalctl -b --after-cursor='s=202e19c8265546b1a9ab73461853dfeb;i=fe1;b=bb7fe280cec74199a6e7604553648efd;m=1950f127;t=65f21ccd2777f;x=f008454891e8a9af' _UID=$(id -u tuna-test) -o cat --no-pager | grep -E \"^tuna-\" | grep -v \"modifier super\" || true: Connection closed by UNKNOWN port 65535"
+      ],
+      "finished": "2026-10-31T12:11:18+00:00"
+    },
+    {
+      "id": "quick-settings-sliders",
+      "title": "Volume and brightness sliders",
+      "started": "2026-10-31T12:11:18+00:00",
+      "checks": [],
+      "result": "fail"
+    }
+  ],
+  "ready": {
+    "vm": "tuna-q-beta2-20261031",
+    "ready": true,
+    "elapsed_seconds": 166.5,
+    "boot_id": "bb7fe280-cec7-4199-a6e7-604553648efd",
+    "conditions": [
+      {
+        "name": "running",
+        "ok": true,
+        "elapsed_seconds": 3.2,
+        "observed": "Running"
+      },
+      {
+        "name": "ssh",
+        "ok": true,
+        "elapsed_seconds": 17.5,
+        "observed": "boot bb7fe280-cec7-4199-a6e7-604553648efd"
+      },
+      {
+        "name": "boot-complete",
+        "ok": true,
+        "elapsed_seconds": 165.9,
+        "observed": "degraded"
+      },
+      {
+        "name": "unit:gdm.service",
+        "ok": true,
+        "elapsed_seconds": 166,
+        "observed": "active"
+      },
+      {
+        "name": "exec:loginctl list-sessions --no-legend | awk '$6==\"greeter\" && $4==\"seat0\"' | grep -q .",
+        "ok": true,
+        "elapsed_seconds": 166.1,
+        "observed": "exit status 0"
+      },
+      {
+        "name": "paint",
+        "ok": true,
+        "elapsed_seconds": 166.5,
+        "observed": "painted 1280x800 (deviation 0.0488)"
+      }
+    ]
+  },
+  "guest": {
+    "packages": [
+      "tuna-desktop 1.0.0beta.2-2",
+      "gdm 51.1.1-1",
+      "gnome-shell 1:51.1-1",
+      "gnome-control-center 51.1-1",
+      "nautilus 51.1-1",
+      "libnotify 0.8.9-1"
+    ],
+    "kernel": "7.2.11-arch1-1",
+    "drm_driver": "bochs-drm",
+    "modes": [
+      "1280x800",
+      "1920x1440",
+      "2560x1080"
+    ],
+    "sessions_offered": [
+      "Name=Tuna Desktop"
+    ],
+    "gdm_custom_conf": [
+      "FallbackSession=tuna"
+    ],
+    "boot_id": "bb7fe280-cec7-4199-a6e7-604553648efd",
+    "account": "tuna-test:x:1000:1000::/var/home/tuna-test:/bin/bash"
+  },
+  "account": {
+    "user": "tuna-test",
+    "password": "public fixture password (packaging/marlin/vm-lane)",
+    "provisioned": "corral bootc create --user --password-stdin; image unchanged"
+  },
+  "console_endpoint": {
+    "vm": "tuna-q-beta2-20261031",
+    "namespace": "corral-vms",
+    "url": "http://127.0.0.1:35181/console/corral-vms/tuna-q-beta2-20261031",
+    "websocket": "ws://127.0.0.1:35181/api/vnc/corral-vms/tuna-q-beta2-20261031"
+  },
+  "cleanup": {
+    "deleted": true,
+    "result": [
+      {
+        "name": "tuna-q-beta2-20261031",
+        "deleted": true,
+        "removed": [
+          "virtualmachine.kubevirt.io/tuna-q-beta2-20261031",
+          "virtualmachineinstance.kubevirt.io/tuna-q-beta2-20261031",
+          "persistentvolumeclaim/tuna-q-beta2-20261031-bootc-disk"
+        ]
+      }
+    ],
+    "still_listed": [],
+    "stderr": ""
+  },
+  "finished": "2026-10-31T12:11:39+00:00"
+}

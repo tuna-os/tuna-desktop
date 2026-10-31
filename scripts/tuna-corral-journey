@@ -38,7 +38,7 @@ POINTS = {
     'settings-appearance': (240, 451),  # Settings sidebar row, window centred
     'appearance-dark': (861, 292),      # Style: Dark card
     'appearance-wallpaper': (600, 658), # Background: first tile
-    'qs-night-light': (978, 190),       # quick settings Night Light tile
+    'qs-night-light': (1165, 237),      # beta.2 Night Light tile (row 2, right)
     'qs-power': (1236, 76),             # quick settings power button
     'power-log-out': (950, 321),        # power menu "Log Out..."
     'dialog-log-out': (731, 457),       # end-session dialog "Log Out"
