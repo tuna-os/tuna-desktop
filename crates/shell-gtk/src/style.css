@@ -1209,6 +1209,35 @@ window.tuna-lock .login-dialog-message.login-dialog-message-warning {
 window.tuna-lock .login-dialog-message.login-dialog-message-hint {
   color: #dedee4;
 }
+/* NotificationsBox (_login-lock.scss): a 29em column of source boxes,
+   white at 10% (20% with a critical notification), 16px corners. */
+window.tuna-lock .unlock-dialog-notifications-container {
+  margin: 12px;
+  background: none;
+}
+window.tuna-lock .unlock-dialog-notification-source {
+  padding: 12px 16px;
+  border-radius: 16px;
+  background-color: rgba(250, 250, 251, 0.1);
+  color: #fafafb;
+}
+window.tuna-lock .unlock-dialog-notification-source.critical {
+  background-color: rgba(250, 250, 251, 0.2);
+}
+window.tuna-lock .unlock-dialog-notification-icon {
+  -gtk-icon-size: 32px;
+}
+window.tuna-lock .unlock-dialog-notification-label {
+  padding-left: 12px;
+  padding-right: 0;
+}
+window.tuna-lock .unlock-dialog-notification-count-text {
+  font-weight: bold;
+  padding: 0 12px;
+  color: #fafafb;
+  background-color: rgba(250, 250, 251, 0.1);
+  border-radius: 999px;
+}
 
 /* GNOME 51's OSD (.osd-window): a #2e2e33 pill, 12px by 18px of
    padding, a 32px icon, bold label, and a 160px level bar. */

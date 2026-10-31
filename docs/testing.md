@@ -291,6 +291,28 @@ rm -rf gtk-shell-artifacts
 TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts
 ```
 
+`--notify-lock-only` stops after panel readiness and runs just the
+lock-screen notification, notification sound and disabled-app restore
+gates (G-NOTIFY-LOCK, G-NOTIFY-LOCK-PIXELS, G-NOTIFY-LOCK-LIVE,
+G-NOTIFY-SOUND, G-NOTIFY-RESTORE); it needs pam_wrapper to unlock. The
+proof's `canberra-gtk-play` stand-in records every event sound the shell
+asks for in `canberra-calls`.
+The restore gate opens the real message-tray binding after retaining the
+long-word redaction-test notifications in history. Card text must wrap at
+character boundaries when needed, and collapsed groups must measure only
+their visible page horizontally, so hidden expanded content cannot force
+the date popup wider than the nested output.
+
+The full GTK proof's media callback barrier waits at most 25 seconds:
+one key can execute four serialized `wpctl` subprocesses with five-second
+production timeouts, plus callback dispatch. It still requires accepted
+tokens to finish successfully and the actual scheduler to be idle; a
+fixture volume write alone never proves completion.
+The power-save proof admits both dim and undim after live idle-brightness
+writes finish: only the explicit pending-transaction reply waits, for at
+most ten seconds. Other errors still fail immediately, and exact backlight
+readbacks remain required before blanking and fixture teardown.
+
 `scripts/tuna-drm-smoke` loads a kernel module and starts seatd as root.
 Run it in a VM or a disposable machine rather than your desktop session.
 The Ubuntu setup helper first checks whether vkms is already installed for
