@@ -96,6 +96,13 @@ def build(loop):
     click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
     click.connect("pressed", lambda _g, _n, x, y: log({"press": [x, y]}))
     win.add_controller(click)
+    keys = Gtk.EventControllerKey()
+    keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    keys.connect("key-pressed", lambda _keys, key, _code, _mods:
+                 log({"key": key, "pressed": True}) or False)
+    keys.connect("key-released", lambda _keys, key, _code, _mods:
+                 log({"key": key, "pressed": False}))
+    win.add_controller(keys)
 
     def report():
         found = {name: bounds(widget, win) for name, widget in widgets.items()}
