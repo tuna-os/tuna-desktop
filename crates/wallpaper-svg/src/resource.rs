@@ -55,7 +55,6 @@ fn directory_members(
     limit: usize,
 ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
     // Bind both enumerations to the opened directory, not its replaceable path.
-    use std::os::fd::AsRawFd;
     let mut members = Vec::new();
     for entry in std::fs::read_dir(format!("/proc/self/fd/{}", file.as_raw_fd()))? {
         let name = entry?.file_name();
@@ -234,6 +233,9 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.to_string(), "FontConfig directory member bound");
+    }
+
+    #[test]
     fn directory_member_recheck_preserves_raw_names_and_same_count_changes() {
         use std::{ffi::OsString, os::unix::ffi::OsStringExt};
         let temp = tempfile::tempdir().unwrap();
