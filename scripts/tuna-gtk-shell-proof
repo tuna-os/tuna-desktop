@@ -6,6 +6,9 @@
 #   --screenshot-keys-only runs panel readiness and actual keyboard captures only.
 #   --a11y-focus-only runs panel readiness, G-FOCUS-RING, G-FOCUS-RING-TIMEOUT,
 #   G-A11Y-MENU-RESTART and G-SHELL-STABLE only.
+#   --keyboard-routes-only runs panel readiness and the P-A11Y-02 keyboard
+#   route gates (G-PANEL-MENU-KEYS, G-QS-MENU-KEY, G-NOTIFICATION-KEYS,
+#   G-SCREENSHOT-CTRL-C) only.
 #   --grid-cancel-only --grid-cancel-admission FILE is an exact CI comparison slice.
 #   --expect-grid-cancel-old-negative is permitted only in that admitted slice.
 #
@@ -245,6 +248,17 @@
 #                  the system menu, Enter opens quick settings, Escape
 #                  unwinds and returns focus to the client; the
 #                  backward chord starts on the last control
+#   G-PANEL-MENU-KEYS Down on a focused panel button opens its menu with
+#                  focus inside; Left/Right at an open menu's edge switch
+#                  to the neighbouring panel menu (popupMenu.js, panelMenu.js)
+#   G-QS-MENU-KEY  Shift+F10 / Menu open quick settings' power and toggle
+#                  menus (St popup-menu)
+#   G-NOTIFICATION-KEYS Delete closes a focused banner or list group,
+#                  Escape expires a focused banner, Enter/Escape expand and
+#                  collapse a list group with focus kept (messageList.js,
+#                  messageTray.js, calendar.js)
+#   G-WINDOW-MENU-KEYS Up/Down walk the window menu's rows
+#   G-SCREENSHOT-CTRL-C Ctrl+C captures in the screenshot UI (screenshot.js)
 #   G-KEY-BRIGHTNESS the brightness key steps the backlight through logind
 #   G-SCREENSHOT-UI  Print opens the screenshot UI; Screen + Capture saves
 #   G-SCREENSHOT-UI-WINDOW Window shows GNOME's window selector, the
@@ -380,6 +394,7 @@ HEIGHT=800
 INSTALLED_PACKAGE=0
 SCREENSHOT_KEYS_ONLY=0
 A11Y_FOCUS_ONLY=0
+KEYBOARD_ROUTES_ONLY=0
 GRID_CANCEL_ONLY=0
 GRID_CANCEL_OLD_NEGATIVE=0
 GRID_CANCEL_ADMISSION=""
@@ -392,14 +407,15 @@ while [ $# -gt 0 ]; do
         --grid-cancel-admission) GRID_CANCEL_ADMISSION="$2"; shift 2 ;;
         --screenshot-keys-only) SCREENSHOT_KEYS_ONLY=1; shift ;;
         --a11y-focus-only) A11Y_FOCUS_ONLY=1; shift ;;
+        --keyboard-routes-only) KEYBOARD_ROUTES_ONLY=1; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
-        --help|-h) sed -n '2,19p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,22p' "$0"; exit 0 ;;
         *) echo "tuna-gtk-shell-proof: unknown argument $1" >&2; exit 1 ;;
     esac
 done
 if [ "$GRID_CANCEL_ONLY" = 1 ]; then
-    if [ "$INSTALLED_PACKAGE" != 0 ] || [ "$SCREENSHOT_KEYS_ONLY" != 0 ] || [ "$A11Y_FOCUS_ONLY" != 0 ] || [ -z "$GRID_CANCEL_ADMISSION" ]; then
+    if [ "$INSTALLED_PACKAGE" != 0 ] || [ "$SCREENSHOT_KEYS_ONLY" != 0 ] || [ "$A11Y_FOCUS_ONLY" != 0 ] || [ "$KEYBOARD_ROUTES_ONLY" != 0 ] || [ -z "$GRID_CANCEL_ADMISSION" ]; then
         echo "grid comparison requires an admitted source-mode tuple" >&2; exit 1
     fi
 elif [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || [ -n "$GRID_CANCEL_ADMISSION" ]; then
@@ -684,6 +700,7 @@ cstate() {
 
 . "$ROOT/scripts/lib/tuna-screenshot-keys-proof.sh"
 . "$ROOT/scripts/lib/tuna-a11y-focus-proof.sh"
+. "$ROOT/scripts/lib/tuna-keyboard-routes-proof.sh"
 
 # Compositor-side state (overview, focus, previews) for app stages.
 CSTATE="$ARTIFACTS/compositor-state.json"
@@ -1172,6 +1189,15 @@ fi
 # controls; that also proves the accessible tree.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel.json" 60 ||
     fail A11Y-PANEL "shell never registered on the accessibility bus"
+if [ "$KEYBOARD_ROUTES_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "keyboard routes desktop ready" ||
+        fail G-PANEL-MENU-KEYS "desktop never became ready"
+    sleep 2
+    keyboard_panel_menu_proof
+    keyboard_notification_proof
+    keyboard_screenshot_proof
+    exit 0
+fi
 if [ "$SCREENSHOT_KEYS_ONLY" = 1 ]; then
     cstate '.active_workspace != null and .locked == false' "screenshot desktop ready" ||
         fail G-SCREENSHOT-KEYS "desktop never became ready"
@@ -3258,6 +3284,11 @@ for label in "Wi-Fi" "Wired" "Bluetooth" "Power Mode" "Brightness" "Volume"; do
         fail G-QS-SERVICES "no '$label' control with its daemon on the bus"
 done
 pass G-QS-SERVICES "quick settings shows a tile per service on the bus"
+# Its menu toggles exist while their daemons are on the bus.
+xdotool key Escape
+sleep 1
+keyboard_quick_settings_proof
+open_qs
 
 # An external writer must update both DND chrome and the banner policy.
 gsettings set org.gnome.desktop.notifications show-banners true
@@ -8053,6 +8084,7 @@ showing "$ARTIFACTS/a11y-panel-returned.json" "Previous month" ||
 xdotool key Escape
 sleep 1
 pass G-PANEL-FOCUS "Ctrl+Alt+Tab walks the bar, Enter opens menus, Escape unwinds and returns focus"
+keyboard_panel_menu_proof
 # Both directions are rebound, then walk every overview state.
 gsettings set org.gnome.shell.keybindings shift-overview-up "['<Super>F8']"
 gsettings set org.gnome.shell.keybindings shift-overview-down "['<Super>F7']"
@@ -8123,6 +8155,7 @@ sleep 1.5
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wm-menu.json" 20 ||
     fail G-WM-KEYS "accessibility dump failed"
 showing "$ARTIFACTS/a11y-wm-menu.json" "Hide" || fail G-WM-KEYS "Alt+Space opened no window menu"
+keyboard_window_menu_proof "$ARTIFACTS/a11y-wm-menu.json"
 xdotool key Escape
 sleep 1
 before_w="$(jq -r '.focused_rect[2]' "$CSTATE")"
@@ -9411,6 +9444,7 @@ dims="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -
 pass G-SCREENSHOT-UI "Print opens GNOME's screenshot UI; Screen and Capture save the whole screen"
 
 screenshot_keys_proof
+keyboard_screenshot_proof
 
 # GNOME's window selector: Window lays the windows out as previews with
 # the focused one chosen; choosing another test window and Capture saves
@@ -10015,12 +10049,15 @@ for _attempt in 1 2 3 4 5 6 7 8 9 10; do
 done
 showing "$ARTIFACTS/a11y-notification-focus-before.json" "Focus Proof Banner" || fail G-NOTIFICATION-FOCUS-KEY "no active banner to focus"
 fkey_tap Super_L ffc3 || fail G-NOTIFICATION-FOCUS-KEY "Super+F6 tap failed"
-sleep 0.5
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-notification-focus.json" 20 || fail G-NOTIFICATION-FOCUS-KEY "a11y dump failed"
-jq -e '.[] | select(.showing and .focused and .name == "Focus Proof Banner")' "$ARTIFACTS/a11y-notification-focus.json" >/dev/null || fail G-NOTIFICATION-FOCUS-KEY "the banner did not get keyboard focus"
+# The layer keyboard-enter and AT-SPI focus events can trail presentation
+# under load. Observe the exact card rather than assuming a fixed delay.
+kr_until 'any(.[]; .showing and .focused and .name == "Focus Proof Banner")' 5 \
+    "$ARTIFACTS/a11y-notification-focus.json" ||
+    fail G-NOTIFICATION-FOCUS-KEY "the banner did not get keyboard focus"
 xdotool key Escape
 gsettings reset org.gnome.shell.keybindings focus-active-notification
 pass G-NOTIFICATION-FOCUS-KEY "the rebound key focuses the active banner; Escape restores client input"
+keyboard_notification_proof
 
 # With animations off the transient surfaces (#501) appear and go at
 # once: the OSD, a banner and a panel menu each log "instant".
