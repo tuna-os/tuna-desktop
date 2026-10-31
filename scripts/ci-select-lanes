@@ -15,7 +15,9 @@ commit, or --changed) can affect:
 - shared CI inputs (this script, ci.yml, the Cargo workspace manifests,
   vendored third-party crates, the nested-session launcher) run every lane;
 - docs and other non-runtime files add no lane;
-- a lane's own proof script, fixtures or packaging runs that lane;
+- a lane's own proof script, fixtures or packaging runs that lane, and a
+  packaged conffile (share/pam.d/) runs journey's lifecycle and every
+  package consumer;
 - anything else (crates, share/, other scripts) runs gtk-shell plus a
   round-robin slice of ROTATION: K lanes starting at
   (run_number * K) mod len(ROTATION), K from --size, $CI_ROUND_ROBIN_SIZE
@@ -95,6 +97,10 @@ OWNED = [
     ("scripts/lib/transition-package-policy*", ["journey"]),
     ("scripts/lib/legacy-upgrade-*", ["journey"]),
     ("share/compat/*", ["journey", *PACKAGE_CONSUMERS]),
+    # The lock screen's PAM service is a dpkg conffile and an Arch backup
+    # file: journey's Debian lifecycle prompts on any byte change (#899), the
+    # images ship it, and the lock screen authenticates through it.
+    ("share/pam.d/*", ["journey", *CORE, *PACKAGE_CONSUMERS]),
     ("scripts/tuna-app-content", ["app-content"]),
     ("scripts/tuna-scroll-proof", ["scroll-proof"]),
     ("scripts/tuna-drm-smoke", ["drm-smoke"]),
