@@ -2107,11 +2107,11 @@ fn paged_grid(
             let button = gtk::Button::builder().child(&look).build();
             button.add_css_class("page-indicator");
             button.update_property(&[gtk::accessible::Property::Label(&format!("Page {}", i + 1))]);
-            sync_page_dot(&button, i, carousel.position());
+            let _ = sync_page_dot(&button, i, carousel.position());
             let pager = carousel.downgrade();
             button.connect_state_flags_changed(move |button, _| {
                 if let Some(pager) = pager.upgrade() {
-                    sync_page_dot(button, i, pager.position());
+                    let _ = sync_page_dot(button, i, pager.position());
                 }
             });
             let carousel = carousel.clone();
@@ -2128,7 +2128,9 @@ fn paged_grid(
             let mut samples = Vec::new();
             for (i, dot) in dots.iter().enumerate() {
                 let Some(dot) = dot.upgrade() else { continue };
-                let (scale, opacity, hover, pressed) = sync_page_dot(&dot, i, position);
+                let Some((scale, opacity, hover, pressed)) = sync_page_dot(&dot, i, position) else {
+                    continue;
+                };
                 if tracing {
                     samples.push(format!(
                         "{i}:{scale:.6}:{opacity:.6}:{}:{}",
@@ -2703,16 +2705,18 @@ fn scale_and_fade(tile: &gtk::Widget, slot: &Rc<crate::grid_animation::Slot>, aw
 }
 
 /// pageIndicators.js _updateIndicator on page dot `index` with the
-/// pages drawn at `position`: its (scale, opacity, hover, pressed).
-fn sync_page_dot(button: &gtk::Button, index: usize, position: f64) -> (f64, f64, bool, bool) {
+/// pages drawn at `position`: its stored (scale, opacity, hover, pressed).
+/// A disposed button with no drawing child has no sample.
+fn sync_page_dot(button: &gtk::Button, index: usize, position: f64) -> Option<(f64, f64, bool, bool)> {
     let flags = button.state_flags();
     let hover = flags.contains(gtk::StateFlags::PRELIGHT);
     let pressed = flags.contains(gtk::StateFlags::ACTIVE);
     let (scale, opacity) = crate::grid_animation::page_dot_look(position, index, hover, pressed);
-    if let Some(look) = button.child().and_downcast::<crate::grid_animation::Zoom>() {
-        look.set_look(scale, opacity);
-    }
-    (scale, opacity, hover, pressed)
+    let look = button.child().and_downcast::<crate::grid_animation::Zoom>()?;
+    look.set_look(scale, opacity);
+    // Trace what snapshot() will read, not the intended values: a setter
+    // defect must not be hidden by logging its inputs.
+    Some((look.scale().0, look.alpha(), hover, pressed))
 }
 
 /// Accept a dropped string on `widget`: `act` edits the folders and
@@ -2740,6 +2744,44 @@ fn on_drop(
         true
     });
     widget.add_controller(target);
+}
+
+#[cfg(test)]
+mod gtk_page_dot_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires owned Xvfb/private D-Bus and explicit grid zoom admission"]
+    fn actual_gtk_page_dot_samples_observe_stored_look() {
+        assert_eq!(std::env::var("TUNA_REQUIRE_GRID_ZOOM").as_deref(), Ok("1"));
+        assert!(std::env::var_os("WAYLAND_DISPLAY").is_none());
+        gtk::init().expect("actual GTK display required");
+        for index in 0..2 {
+            let look =
+                crate::grid_animation::Zoom::new(&gtk::Box::new(gtk::Orientation::Vertical, 0));
+            let button = gtk::Button::builder().child(&look).build();
+            for flags in [
+                gtk::StateFlags::NORMAL,
+                gtk::StateFlags::PRELIGHT,
+                gtk::StateFlags::PRELIGHT | gtk::StateFlags::ACTIVE,
+            ] {
+                button.unset_state_flags(gtk::StateFlags::PRELIGHT | gtk::StateFlags::ACTIVE);
+                button.set_state_flags(flags, false);
+                for position in [0.0, 0.15, 0.5, 0.875, 1.0] {
+                    let (scale, opacity, hover, pressed) =
+                        sync_page_dot(&button, index, position).expect("live page dot");
+                    let expected =
+                        crate::grid_animation::page_dot_look(position, index, hover, pressed);
+                    assert_eq!((scale, opacity), expected, "dot {index} at {position}");
+                    assert_eq!(look.scale(), (scale, scale), "observed stored scale");
+                    assert_eq!(look.alpha(), opacity, "observed stored opacity");
+                }
+            }
+            button.set_child(gtk::Widget::NONE);
+            assert_eq!(sync_page_dot(&button, index, 0.5), None);
+        }
+        println!("GRID-PAGE-DOTS pass samples observe stored scale/opacity through page, hover and pressed updates; no sample for disposed drawing");
+    }
 }
 
 #[cfg(test)]

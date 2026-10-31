@@ -310,6 +310,13 @@ whether to queue damage: a changed translation must not short-circuit the
 scale or opacity writes, including on the last animation tick. This is
 widget-state coverage, not a frame-scheduling latency guarantee.
 
+The same admitted GTK binary also runs
+`overview::gtk_page_dot_tests::actual_gtk_page_dot_samples_observe_stored_look`
+under that admission flag. Its `grid-page-dots` output and receipt cover the
+page indicator's actual stored scale/opacity through page, hover and pressed
+updates. The per-frame page-dot trace reads these stored drawing properties,
+not the requested setter inputs; it emits no sample for a disposed drawing.
+
 | CI job | Command | Extra packages | What it asserts |
 |---|---|---|---|
 | `journey` | `scripts/tuna-journey --artifacts journey-artifacts` | `xvfb xdotool x11-apps scrot jq dbus`, Mesa EGL (`libegl1 libgl1-mesa-dri`) | Overview, search, launch from search, Escape, workspace switch, Alt+Tab; writes `assertions.txt` |
@@ -341,8 +348,10 @@ curve. This distinguishes missing intermediate samples from wrong sampled
 positions; **either still fails**. Two zero-time records are normal:
 initialization and the first tick. A sparse callback trace alone cannot
 attribute a gap to shell work, compositor delivery, runner scheduling or
-presentation. Do not infer smooth presentation from correct endpoints, or
-apply the unrelated folder `Zoom` setter fix to the pager's drawing path.
+presentation. Correct sampled endpoints are not proof of smooth presentation.
+The shared `Zoom::set_look` setter does control page-dot drawing, so its
+combined scale/opacity fix is required for accurate indicators; it does not
+control the pager's frame callback cadence.
 
 **Start `tuna-gtk-shell-proof` from a fresh artifacts directory.** The
 script points `XDG_STATE_HOME` at `gtk-shell-artifacts/state`, and the
