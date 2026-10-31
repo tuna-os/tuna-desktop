@@ -2876,12 +2876,18 @@ impl Runtime {
         if let Backend::Drm(drm) = &self.backend {
             doc["tablets"] = drm.tablets_introspect();
         }
-        let doc = doc.to_string();
+        let doc = crate::grid_trace::operation(&self.state, "state_serialize", || doc.to_string());
         if doc == self.state_last {
             return;
         }
         let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, &doc).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+        if crate::grid_trace::operation(&self.state, "state_write", || std::fs::write(&tmp, &doc))
+            .is_ok()
+            && crate::grid_trace::operation(&self.state, "state_rename", || {
+                std::fs::rename(&tmp, path)
+            })
+            .is_ok()
+        {
             self.state_last = doc;
         }
     }

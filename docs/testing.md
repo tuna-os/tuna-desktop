@@ -359,15 +359,22 @@ client-flush boundaries retain their real outcomes. `tick_stage` records split
 the loop between its pre-dispatch flush and repaint into named stages, each
 with the compositor main thread's runtime, runqueue wait and timeslices, so a
 stalled stage is classified as compositor CPU, runnable wait or off-CPU time.
+Consecutive stage gaps include the preceding observer write, so they alone
+cannot distinguish a blocked trace sink from the named operation. Snapshot
+serialization, write and rename also have `operation` records: their clock and
+checked scheduler-counter boundaries enclose only that work, with no trace
+output inside the measured interval. This excludes preceding logger blockage.
 
 Run 41227591692 (head e39b95b2) retained a real sparse switch: the shell's
-frame-clock gaps were 137.958/226.450 ms with only ~2 ms CPU and no runqueue
-wait, while the compositor spent 106–112 ms between its client flush and
+callback monotonic gaps were 137.958/226.450 ms with only ~2 ms CPU and almost
+no runqueue wait, while the compositor spent 106–112 ms between its client flush and
 repaint and then queued `done` without flushing until the next loop wake
 (~16 ms). The compositor now flushes the events a render queued on every
 backend, as native sessions already did (regression:
 `runtime::rendered_event_tests`). The in-tick delay is attributed by the stage
 records before any further fix.
+This render-then-flush order also matches
+[Niri's `refresh_and_flush_clients`](https://github.com/niri-wm/niri/blob/main/src/niri.rs#L825-L840).
 Disabled tracing performs no observer clock reads, allocation or surface walks.
 
 The installed `journey` qualification intentionally checks out the pull-request

@@ -220,6 +220,48 @@ fn thread_sched() -> Option<(u64, u64, u64)> {
     })
 }
 
+fn scheduler_delta(
+    before: Option<(u64, u64, u64)>,
+    after: Option<(u64, u64, u64)>,
+) -> Option<(u64, u64, u64)> {
+    let (before, after) = before.zip(after)?;
+    Some((
+        after.0.checked_sub(before.0)?,
+        after.1.checked_sub(before.1)?,
+        after.2.checked_sub(before.2)?,
+    ))
+}
+
+/// Time only the named work, with no trace write between the clock/counter
+/// boundaries. Unlike consecutive stage records, a preceding blocked stderr
+/// write is excluded. Trace-off simply executes the original operation.
+pub(crate) fn operation<T>(state: &State, name: &str, work: impl FnOnce() -> T) -> T {
+    if !enabled() {
+        return work();
+    }
+    let before = thread_sched();
+    let begin = state.presentation_now().as_micros();
+    let value = work();
+    let end = state.presentation_now().as_micros();
+    let after = thread_sched();
+    let wall_us = end.saturating_sub(begin);
+    match scheduler_delta(before, after) {
+        Some((run_ns, wait_ns, timeslices)) => emit(
+            end,
+            "operation",
+            format_args!(
+                "name={name} begin_us={begin} wall_us={wall_us} run_delta_ns={run_ns} wait_delta_ns={wait_ns} timeslices_delta={timeslices}"
+            ),
+        ),
+        None => emit(
+            end,
+            "operation",
+            format_args!("name={name} begin_us={begin} wall_us={wall_us} schedstat=unavailable"),
+        ),
+    }
+    value
+}
+
 /// Bisects the compositor loop between client flush and repaint. Consecutive
 /// stage deltas separate compositor CPU, runnable wait and off-CPU time.
 pub(crate) fn stage(state: &State, stage: &str) {
@@ -311,6 +353,20 @@ pub(crate) mod tests {
         }
         // The real compositor thread exposes populated counters on Linux.
         assert!(thread_sched().is_some_and(|(run, _, slices)| run > 0 && slices > 0));
+    }
+
+    #[test]
+    fn operation_counter_deltas_require_both_populated_monotonic_samples() {
+        let before = Some((100, 20, 2));
+        assert_eq!(
+            scheduler_delta(before, Some((150, 20, 3))),
+            Some((50, 0, 1))
+        );
+        assert_eq!(scheduler_delta(None, before), None);
+        assert_eq!(scheduler_delta(before, None), None);
+        for after in [(99, 20, 2), (100, 19, 2), (100, 20, 1)] {
+            assert_eq!(scheduler_delta(before, Some(after)), None);
+        }
     }
 
     fn words(values: &[u32]) -> Vec<u8> {
