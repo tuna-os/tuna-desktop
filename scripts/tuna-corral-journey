@@ -757,10 +757,10 @@ def main():
             console_proc.wait(timeout=30)
         if not args.keep:
             try:
-                # Delete the VM/disk and any builder left by an interrupted build;
-                # every name under this run-unique prefix is owned by this run.
+                # Only the requested VM and its exact Corral builder are owned.
+                # A prefix collision must never authorize deleting another run.
                 names = [args.vm] + [v['name'] for v in corral_json(['list', '--prefix', args.vm]) or []
-                                     if v['name'] != args.vm]
+                                     if v['name'] == args.vm + '-bootc-builder']
                 result, failures = [], []
                 for name in names:
                     r = run(['corral', '--json', 'delete', name, '-f', '--wait', '--timeout', '10m'],

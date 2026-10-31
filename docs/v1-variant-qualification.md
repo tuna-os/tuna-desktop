@@ -176,35 +176,51 @@ Neither `punjab` nor the independent soak VM was touched.
 
 | Variant(s) | Install / GDM / session | Portals | Lock/unlock | Qualification |
 |---|---|---|---|---|
-| yellowfin | pass on retained exact beta1 digest | availability only; functional flow not exercised in this receipt | lock hint fails; wrong-password refusal and unlock pass | fail, not a v1 pass |
+| yellowfin old `355f66…` (beta1) | pass in both retained runs | availability only; expanded run Screenshot Response 2 and ScreenCast Start timeout because generic Enter did not activate the visible Allow/Share controls | `LockedHint=no` fails; refusal/unlock pass | fail |
+| yellowfin refreshed `64e7a29…` | trusted refresh run [41221855489](https://github.com/tuna-os/tunaOS/actions/runs/41221855489) succeeded; guest reports beta2-2.el10 | AT-SPI consent activated; Screenshot then rejected: returned URI was not a local file | pending at snapshot | not qualified |
 | marlin | existing exact beta2-2 journey passes these gates | not qualified by that daily-driver receipt | lock hint fails; refused password/unlock pass | fail, not a v1 pass |
-| albacore | interrupted, no completed verdict | unproven | unproven | not qualified; interruption is not an unsupported waiver |
-| skipjack, wahoo, bonito, bonito-rawhide, sailfin, grouper, flounder, flounder-sid | publications resolved; runtime not run in the stopped sequence | unproven | unproven | not qualified; no unsupported exception invented |
+| albacore, skipjack, wahoo, bonito, sailfin | expanded run: install/GDM/session pass | Screenshot Response 2 and ScreenCast timeout from the superseded Enter input; not functional proof | `LockedHint=no` | fail on retained receipts; rerun with corrected consent pending |
+| bonito-rawhide | builder Secret label exceeded Kubernetes' 63-byte limit before the VM existed | unproven | unproven | harness failure fixed by VM-name bound; rerun pending |
+| grouper | expanded run interrupted during build; orphan builder VM/Secret/PVC deleted, inventory empty | unproven | unproven | not qualified |
+| flounder, flounder-sid | publication resolved; not yet run | unproven | unproven | not qualified |
 | hummingbird, guppy | admission branches remain open; no admitted immutable-image runtime proof | unproven | unproven | not qualified; stale package-unavailable reasons rejected |
 | gurnard | no native Tuna target | unproven | unproven | source-backed unsupported prerequisite, not a runtime pass |
+
+The expanded-run receipts are not retroactively converted into failures of
+the published desktop. The visible GNOME dialogs prove the harness pressed
+Enter while Allow/Share remained visible. They do prove portal qualification
+remained incomplete. The consent path now uses the existing AT-SPI helper with
+Corral's external capture; it does not spoof app IDs or replace backends.
 
 Exact admission/publication [gate snapshot](variants/2026-10-31/admission-gates.json):
 
 - Guppy PR #3883 head `b1150929473ead1316427b8eae48f76832cf65d1`.
   Earlier run `41215956243` selected no Guppy job because the migrated selector
-  omitted it; **that run is not Guppy evidence**. The selector is repaired.
-  [Run 41219478905](https://github.com/tuna-os/tunaOS/actions/runs/41219478905)
-  selected Guppy successfully and its actual image job was in progress at the
-  snapshot; the Albacore sibling failed. No overall green result is claimed.
+  omitted it; **that run is not Guppy evidence**. In
+  [run 41219478905](https://github.com/tuna-os/tunaOS/actions/runs/41219478905),
+  Guppy job `124590901178` succeeded, including image build and PR boot verify;
+  boot artifact `13054522656` records digest
+  `sha256:49b93f9e32579f03cb1f61978b080277ad8f2dd79d1dc463b59b0d96d8a1f662`.
+  That PR image is not a published immutable subject.
+- **Exact Guppy publication blocker:** the maintainer's
+  [tunaOS #3202 comment](https://github.com/tuna-os/tunaOS/issues/3202#issuecomment-6547926694)
+  says: “Merge stays manual, because the change touches workflow paths and has
+  the sentinel flag. The issue body's release gates still apply: no publication
+  before the tuna-desktop v1 epic (tuna-desktop#577) approves it.” No candidate
+  or signed registry image was published. Without that approval, Guppy GDM/session/
+  portal/lock qualification against a published digest is blocked.
 - Hummingbird PR #3885 head `0de95641bfdd350e1f148b7f0b1eb600acf58913`.
   [Exact-head run 41213419115](https://github.com/tuna-os/tunaOS/actions/runs/41213419115)
-  failed the native TuneD transaction before desktop/boot gates. The font
-  repair does not resolve the missing `(rpm-ostree if bootc)` provider.
-- Native Hummingbird package [run 41213268502](https://github.com/tuna-os/tunaos-packages/actions/runs/41213268502)
-  built successfully from packages `c0998b94…`; publication was still in progress.
-  Served release-2 publication/verification is not claimed from a green build.
-  Remote workflows were left running, not cancelled.
+  failed the native TuneD transaction before desktop/boot gates.
+- Native Hummingbird publisher [run 41213268502](https://github.com/tuna-os/tunaos-packages/actions/runs/41213268502)
+  built and signed beta2 in staging, then failed the pre-sync installability gate
+  on a new `libcanberra` blocker. The served index remains beta1. Maintainer-owned
+  [packages #959](https://github.com/tuna-os/tunaos-packages/pull/959) adds
+  native `rpm-ostree` and `libcanberra` roots. Its first native build was cancelled
+  by a later external commit, so no native closure result is claimed.
 
-The final frozen-harness functional Screenshot/ScreenCast/lock-revocation
-integration is implemented using existing native requesters, but **was not
-exercised by the completed Yellowfin receipt**. It requires main-agent
-verification and actual remaining digest-specific runs; code alone closes no
-runtime gate. Local unit tests/builds/linters were not run in this slice.
+Focused harness regressions: 8 tests pass, including prefix-collision cleanup.
+They are not runtime qualification.
 
 ## Reusable actual-image path
 

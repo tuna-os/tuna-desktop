@@ -167,8 +167,8 @@ def main():
                 row['error'] = f'{type(error).__name__}: {error}'
                 cleanup, deleted = [], []
                 listed = command(['corral', '--json', 'list', '--prefix', vm], timeout=120)
-                names = [vm] + ([v['name'] for v in json.loads(listed['stdout']) if v['name'] != vm]
-                                if listed['exit'] == 0 else [])
+                names = [vm] + ([v['name'] for v in json.loads(listed['stdout'])
+                                if v['name'] == vm + '-bootc-builder'] if listed['exit'] == 0 else [])
                 for owned in names:
                     result = command(['corral', '--json', 'delete', owned, '-f', '--wait', '--timeout', '10m'], timeout=900)
                     cleanup.append(result)

@@ -124,7 +124,7 @@ package_target = "el10"
         self.assertEqual(report['variants'][0]['runtime'], 'failed')
         self.assertEqual(report['variants'][1]['runtime'], 'not-run')
 
-    def interrupted_journey(self, name, builder=False):
+    def interrupted_journey(self, name, builder=False, unrelated=False):
         config = f'''
 [variants.{name}]
 description = "test image"
@@ -146,6 +146,8 @@ package_target = "el10"
             if argv[:3] == ['corral', '--json', 'list']:
                 # The first listing sees the interrupted builder; the final one proves absence.
                 listed = [{'name': argv[-1] + '-bootc-builder'}] if builder and not listings else []
+                if unrelated:
+                    listed.append({'name': argv[-1] + '-another-run'})
                 listings.append(listed)
                 return {'exit': 0, 'stdout': json.dumps(listed), 'stderr': ''}
             if argv[:3] == ['corral', '--json', 'delete']:
@@ -154,7 +156,11 @@ package_target = "el10"
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / 'evidence'
             with patch.object(module, 'github', side_effect=github), patch.object(module, 'command', side_effect=command), patch('sys.argv', [str(SCRIPT), '--out', str(out), '--run']):
-                module.main()
+                if unrelated:
+                    with self.assertRaisesRegex(RuntimeError, 'cleanup unproven'):
+                        module.main()
+                else:
+                    module.main()
             report = json.loads((out / 'matrix.json').read_text())
         return calls, report
 
@@ -166,6 +172,14 @@ package_target = "el10"
 
     def test_interrupted_build_deletes_owned_builder(self):
         calls, report = self.interrupted_journey('grouper', builder=True)
+        journey = next(argv for argv in calls if argv[0] != 'skopeo' and argv[0] != 'corral')
+        vm = journey[journey.index('--vm') + 1]
+        deleted = [argv[3] for argv in calls if argv[:3] == ['corral', '--json', 'delete']]
+        self.assertEqual(deleted, [vm, vm + '-bootc-builder'])
+        self.assertEqual(report['variants'][0]['runtime'], 'failed')
+
+    def test_cleanup_does_not_delete_prefix_collision(self):
+        calls, report = self.interrupted_journey('grouper', builder=True, unrelated=True)
         journey = next(argv for argv in calls if argv[0] != 'skopeo' and argv[0] != 'corral')
         vm = journey[journey.index('--vm') + 1]
         deleted = [argv[3] for argv in calls if argv[:3] == ['corral', '--json', 'delete']]
