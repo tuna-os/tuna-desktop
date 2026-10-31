@@ -2520,6 +2520,28 @@ root, shell_pid, shell_start, compositor_pid, output = sys.argv[1:]
 root = pathlib.Path(root)
 def digest(path):
     return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+def shell_identity():
+    return pathlib.Path(f"/proc/{shell_pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+gtk_runtime = None
+if os.environ.get("TUNA_CI_GTK_ROOT"):
+    if shell_identity() != shell_start:
+        raise SystemExit("owned GTK shell identity changed before runtime observation")
+    staged = pathlib.Path(os.environ["TUNA_CI_GTK_ROOT"]).resolve()
+    build = json.loads((staged / "usr/local/share/doc/tuna-ci-gtk4-atspi-root/source-build-receipt.json").read_text())
+    expected = (staged / build["runtime_relative_path"]).resolve()
+    mapped = {pathlib.Path(line.split()[-1]).resolve()
+              for line in pathlib.Path(f"/proc/{shell_pid}/maps").read_text().splitlines()
+              if "/libgtk-4.so." in line}
+    if mapped != {expected} or digest(expected) != build["runtime_sha256"]:
+        raise SystemExit("owned GTK shell did not map the exact private repaired runtime")
+    notes = subprocess.check_output(["readelf", "-n", str(expected)], text=True, timeout=10)
+    ids = [line.split("Build ID:", 1)[1].strip() for line in notes.splitlines() if "Build ID:" in line]
+    if ids != [build["runtime_build_id"]] or shell_identity() != shell_start:
+        raise SystemExit("owned GTK runtime build ID or shell identity mismatch")
+    gtk_runtime = {"path": str(expected), "sha256": build["runtime_sha256"],
+                   "build_id": ids[0], "upstream_commit": build["upstream_commit"]}
+elif os.environ.get("TUNA_PROOF_BINARY_SOURCE_COMMIT") and os.environ.get("CI"):
+    raise SystemExit("CI comparison requires the exact private GTK runtime")
 def git(*args):
     return subprocess.check_output(["git", "-C", str(root), *args]).decode().strip()
 receipt = {
@@ -2532,6 +2554,7 @@ receipt = {
     "run": os.environ.get("GITHUB_RUN_ID"), "attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
     "runtime": os.environ["XDG_RUNTIME_DIR"],
     "shell": {"pid": int(shell_pid), "start": shell_start, "binary_sha256": digest(f"/proc/{shell_pid}/exe")},
+    "gtk_runtime": gtk_runtime,
     "compositor": {"pid": int(compositor_pid), "binary_sha256": digest(f"/proc/{compositor_pid}/exe")},
 }
 pathlib.Path(output).write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
