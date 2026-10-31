@@ -44,6 +44,25 @@ It requires actual Cancel/Allow, a linked PipeWire frame, foreign input denial,
 legacy and EIS keyboard/button delivery, node removal after Close/client/backend
 loss/EIS disconnect/lock, and new-session lock denial. Candidate commit, runtime
 versions, consent screenshots, input logs and frame evidence accompany the run.
+
+The libei sender keeps its EIS descriptor open until the parent observes fresh
+keyboard and button delivery in that actual GTK client, then acknowledges the
+sender over stdin and closes it. A fixed post-send sleep is not a delivery
+barrier: disconnect deliberately revokes the grant, including queued input,
+so closing first can correctly discard frames on a busy compositor. The
+five-second delivery and fifteen-second sender bounds are unchanged; the
+following stream-withdrawal check still requires genuine EIS disconnection.
+The real-libeis `tests/remote-desktop-reference/eis-lifetime.c` regression delays
+consumption beyond the former sleep, requires both evdev key/button pairs and
+the absolute pointer frame while connected, acknowledges them, then requires
+the actual disconnect. It runs before the nested portal journey.
+The lifetime probe reserves its own `/dev/null` stdin before allocating the
+EIS and acknowledgement descriptors, including when the container inherited
+a closed stdin. Once its sender receipt is read, that pipe is removed from
+the poll set so an unconditional `POLLHUP` cannot turn the EIS dispatch wait
+into a busy loop. Timeout diagnostics retain the actual event/acknowledgement
+counts without changing the required five frames or either deadline.
+
 The exact `1f441bb` Remote head passed all sixteen checks in [CI 37214121497](https://github.com/tuna-os/tuna-desktop/actions/runs/37214121497). The combined Screenshot/Remote candidate `3249f362` passed the same complete GNOME 51 journey in [CI 37214394538](https://github.com/tuna-os/tuna-desktop/actions/runs/37214394538), including independent installed libei 1.6 keyboard and pointer delivery. See `remote-desktop-evidence.json` for candidate, runtime versions and retained artifacts. The proof requires fresh key/button events after each delivery baseline, then no new client input and an empty held seat after backend/lock revocation; a frontend void-method reply alone is not an admission oracle. New locked sessions are denied at CreateSession with response 2.
 
 Issue #61's stated consent, stream, revoke and locked-denial acceptance is complete. The unsupported capabilities above remain broader GNOME parity limits, and P-SY-05 stays partial.
