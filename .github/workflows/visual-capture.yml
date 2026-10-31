@@ -33,6 +33,7 @@ concurrency:
 
 jobs:
   build:
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -135,7 +136,7 @@ jobs:
 
   manifest:
     needs: capture
-    if: always()
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -161,3 +162,67 @@ jobs:
           name: visual-manifest
           path: visual-all/manifest.json
           retention-days: 90
+
+  old-launch-diagnostic:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: tuna-ci-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/ci-grid
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: 8eebec1308374d78b819c7f2fec48c03f7fc6d55
+          path: immutable-harness
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: ubuntu-24.04-grid-launch-diagnostic
+          save-if: false
+          workspaces: immutable-harness -> ../target/ci-grid/old
+      - name: Install exact original grid lane dependencies plus external debugger
+        run: |
+          /usr/bin/python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          source = Path("immutable-harness/.github/workflows/ci.yml").read_text()
+          block = source.split("\n  grid-cancel-comparison:", 1)[1].split("\n  gtk-shell:", 1)[0]
+          commands = [line.strip().removeprefix("- run: ") for line in block.splitlines()
+                      if line.strip().startswith("- run: sudo apt-get")]
+          assert len(commands) == 1, commands
+          subprocess.run(commands[0], shell=True, check=True, timeout=600)
+          subprocess.run(["sudo", "apt-get", "install", "-y", "--no-install-recommends", "gdb", "just"], check=True, timeout=120)
+          PY
+      - run: immutable-harness/scripts/ci-install-gtk4-layer-shell
+      - name: Observe exact old startup and launch under passive external debugger
+        run: /usr/bin/python3 scripts/notify348-old-launch-diagnostic.py immutable-harness "$RUNNER_TEMP/old-launch-diagnostic"
+      - if: always()
+        run: immutable-harness/scripts/ci-prepare-artifacts "$RUNNER_TEMP/old-launch-diagnostic/runtime"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: old-launch-diagnostic-NOT-ACCEPTANCE
+          path: |
+            ${{ runner.temp }}/old-launch-diagnostic/diagnostic-receipt.json
+            ${{ runner.temp }}/old-launch-diagnostic/debugger.txt
+            ${{ runner.temp }}/old-launch-diagnostic/shell.core
+            ${{ runner.temp }}/old-launch-diagnostic/proof-output.txt
+            ${{ runner.temp }}/old-launch-diagnostic/admission-old.json
+            ${{ runner.temp }}/old-launch-diagnostic/cargo-old-*.json
+            ${{ runner.temp }}/old-launch-diagnostic/runtime/
+          retention-days: 14
+      - if: always()
+        working-directory: immutable-harness
+        run: CARGO_TARGET_DIR="${CARGO_TARGET_DIR}/old" just clean
