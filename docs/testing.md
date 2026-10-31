@@ -497,7 +497,8 @@ disconnected throughout wake must reconnect into the current locked
 state, including when seat activation follows wake.
 
 The GTK CI lane runs this bounded proof and keeps `result.json` and
-`runtime.log` under `gtk-shell-artifacts/session-sync`. This qualifies
+`runtime.log` in the `session-sync-proof` artifact (built under
+`$RUNNER_TEMP`, so the later source-freeze gate sees a clean checkout). This qualifies
 runtime/control state propagation on **simulated notifications**, not
 physical VT switching, logind suspend delivery or S3. KMS scanout reset,
 libseat device-fd revocation and libinput resume still need a native
