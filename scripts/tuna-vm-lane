@@ -517,15 +517,17 @@ def guest_role(executable):
 
 
 def record_datetime_gates(result, published, record):
-    """Scope only the two panel-follow proofs on the known pre-wall-clock package."""
-    old_panel = (published and
-                 result["evidence"].get("desktop_package_version") == "1.0.0beta.1-1")
+    """Scope only panel-follow proofs on published packages known to predate #886."""
+    version = result["evidence"].get("desktop_package_version")
+    # beta.2-2 rebuilds the immutable beta.2 tag (1e6ce28f), not current main.
+    # That source is 27 commits before #886's /etc/localtime monitor.
+    old_panel = published and version in ("1.0.0beta.1-1", "1.0.0beta.2-2")
     failed = []
     for line in result["assertions"]:
         gate, verdict, detail = (line.split(" ", 2) + ["", ""])[:3]
         if old_panel and gate in ("G-DATETIME-CLOCK-TZ", "G-DATETIME-CLOCK-SET"):
             record(gate, True,
-                   "published guest tuna-desktop 1.0.0beta.1-1 predates the panel clock's "
+                   f"published guest tuna-desktop {version} predates the panel clock's "
                    "/etc/localtime monitor; zone-follow and subsequent manual-time panel "
                    "proofs are proven by the current-build marlin-vm lane; "
                    f"observed {verdict}: {detail}")
