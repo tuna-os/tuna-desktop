@@ -31,8 +31,13 @@ installer would: `tunastd` (standard), `tunaadmin` (`wheel`), and the
 control `tunaseeded`, whose record is pre-seeded. `tunastd` and `tunaadmin`
 get no AccountsService record, no Session preselection and no autologin.
 For this credential-only boot the fixture also sets GDM's own
-`org.gnome.login-screen disable-user-list=true` in the `gdm` dconf database,
-so the greeter asks for the user name. In run 41230684089 the old Tab count to
+`org.gnome.login-screen disable-user-list=true` in its own
+`tuna-vm-fresh-accounts` dconf database, explicitly inserted into the GDM
+profile ahead of the preserved vendor defaults. The fixture requires a real
+`gsettings get` readback of `true` before it finishes. Run 41234017707 showed
+the vendor profile need not include `system-db:gdm`, so writing `gdm.d`
+without installing a profile does not apply the setting. The greeter then
+asks for the user name. In run 41230684089 the old Tab count to
 "Not listed?" instead selected the listed `tunaseeded`, typed `tunastd` as
 its failed password, then authenticated `tunaseeded` with the fixture
 password. The setting does not create account records or select a session.
