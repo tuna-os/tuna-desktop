@@ -375,6 +375,23 @@ class Journey:
                 check(name + ' portal responds', code == 0, {'exit': code, 'stdout': stdout, 'stderr': stderr})
         self.step('portal-availability', 'Published portal interfaces respond (not capture consent)', portals)
 
+        def consent(record, kind):
+            # Activate the visible GNOME Allow/Share control through the existing
+            # AT-SPI consent helper. Corral already retained the console frame, so
+            # the helper skips its X11-only scrot capture.
+            helper = (Path(__file__).with_name('lib') / 'tuna-portal-consent.py').read_bytes()
+            uid = g.out(f'id -u {USER}')
+            tree = f'/run/user/{uid}/tuna-variant-consent-{kind}-{time.monotonic_ns()}.json'
+            launch = 'exec(__import__("base64").b64decode(' + repr(base64.b64encode(helper).decode()) + '))'
+            code, stdout, stderr = g.sh(f'timeout 60 python3 -c {shlex.quote(launch)} {shlex.quote(tree)} grant '
+                                        '--external-capture', user=True, timeout=90)
+            tree_code, tree_text, _ = g.sh(f'cat {shlex.quote(tree)}', user=True)
+            record['input'] = {'method': 'AT-SPI action on the visible GNOME portal consent control',
+                               'helper_sha256': hashlib.sha256(helper).hexdigest(),
+                               'exit': code, 'stdout': stdout.strip(), 'stderr': stderr.strip()[-1200:],
+                               'accessible_tree': json.loads(tree_text) if tree_code == 0 and tree_text else None}
+            return code == 0
+
         def portal_screenshot(check):
             # Reuse the existing strict native consent client, not a replacement
             # backend or a one-shot gdbus sender that disconnects before Response.
@@ -399,9 +416,9 @@ class Journey:
                 'frame': prompt.name, 'sha256': hashlib.sha256(prompt.read_bytes()).hexdigest(),
                 'meaning': 'console after request; prompt visibility requires visual review'}
             if g.sh(f'test -f {shlex.quote(exit_path)}', user=True)[0] != 0:
-                # Actual console input, never an app-ID or consent bypass.
-                self.receipt['portal_request_console']['input'] = 'Enter on the real console'
-                c.key('Enter', wait=2000)
+                check('actual portal consent control activated',
+                      consent(self.receipt['portal_request_console'], 'screenshot'),
+                      self.receipt['portal_request_console'].get('input'))
             def completed():
                 code, stdout, _ = g.sh(f'cat {shlex.quote(exit_path)}', user=True)
                 return stdout if code == 0 and stdout else None
@@ -451,8 +468,8 @@ class Journey:
             record.update(frame=prompt.name, frame_sha256=hashlib.sha256(prompt.read_bytes()).hexdigest(),
                           meaning='console at Start; consent visibility requires visual review')
             if g.sh(f'test -f {shlex.quote(exit_path)}', user=True)[0] != 0:
-                record['input'] = 'Enter on the real console'
-                c.key('Enter', wait=2000)
+                check('actual portal consent control activated', consent(record, 'screencast'),
+                      record.get('input'))
             active_path = str(remote.with_suffix('.active'))
             wait_for(lambda: g.sh(f'test -f {shlex.quote(active_path)} || test -f {shlex.quote(exit_path)}',
                                  user=True)[0] == 0, 100, 'active ScreenCast grant or requester exit')
@@ -693,6 +710,10 @@ def main():
         p.error('--image must be pinned by digest (REPO@sha256:...)')
     if not args.vm.startswith('tuna-q-'):
         p.error('--vm must start with tuna-q- so it never names somebody else\'s VM')
+    # Corral labels its builder Secret `<vm>-bootc-builder-cloudinit`; Kubernetes
+    # rejects label values above 63 bytes after the disk PVC already exists.
+    if len(args.vm + '-bootc-builder-cloudinit') > 63:
+        p.error('--vm is too long for the Corral bootc builder labels (max 39 characters)')
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
     from playwright.sync_api import sync_playwright
@@ -736,12 +757,20 @@ def main():
             console_proc.wait(timeout=30)
         if not args.keep:
             try:
-                r = run(['corral', '--json', 'delete', args.vm, '-f', '--wait', '--timeout', '10m'],
-                        timeout=900, check=False)
-                result = json.loads(r.stdout) if r.stdout.strip() else []
-                left = [v['name'] for v in corral_json(['list', '--prefix', args.vm]) or [] if v['name'] == args.vm]
-                receipt['cleanup'] = {'deleted': r.returncode == 0 and not left, 'result': result,
-                                      'still_listed': left, 'stderr': r.stderr.strip()[-400:]}
+                # Delete the VM/disk and any builder left by an interrupted build;
+                # every name under this run-unique prefix is owned by this run.
+                names = [args.vm] + [v['name'] for v in corral_json(['list', '--prefix', args.vm]) or []
+                                     if v['name'] != args.vm]
+                result, failures = [], []
+                for name in names:
+                    r = run(['corral', '--json', 'delete', name, '-f', '--wait', '--timeout', '10m'],
+                            timeout=900, check=False)
+                    result += json.loads(r.stdout) if r.stdout.strip() else []
+                    if r.returncode:
+                        failures.append({'name': name, 'stderr': r.stderr.strip()[-400:]})
+                left = [v['name'] for v in corral_json(['list', '--prefix', args.vm]) or []]
+                receipt['cleanup'] = {'deleted': not failures and not left, 'result': result,
+                                      'still_listed': left, 'failures': failures}
             except (subprocess.TimeoutExpired, RuntimeError, ValueError) as e:
                 receipt['cleanup'] = {'deleted': False, 'output': f'{type(e).__name__}: {e}'}
         receipt['finished'] = now()

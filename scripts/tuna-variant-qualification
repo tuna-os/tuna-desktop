@@ -56,7 +56,7 @@ def main():
         harness = args.out / 'harness'
         source_root = Path(__file__).resolve().parent
         report['harness_sha256'] = {}
-        for name in ('tuna-corral-journey', 'lib/tuna-portal-screenshot-client.py',
+        for name in ('tuna-corral-journey', 'lib/tuna-portal-screenshot-client.py', 'lib/tuna-portal-consent.py',
                      'lib/tuna-portal-capture-client.py', 'lib/tuna-pipewire-dump.py'):
             data = (source_root / name).read_bytes()
             target = harness / name
@@ -117,7 +117,9 @@ def main():
             name = row['variant']
             if not args.run or 'image' not in row or (args.variant and name not in args.variant):
                 continue
-            vm = f'tuna-q-variant-{name}-{started.strftime("%m%d%H%M%S")}'
+            # Day-time stamp keeps `<vm>-bootc-builder-cloudinit` within the
+            # 63-byte Kubernetes label limit for the longest variant name.
+            vm = f'tuna-q-variant-{name}-{started.strftime("%d%H%M%S")}'
             directory = args.out / name
             runner = harness / 'tuna-corral-journey'
             row['runtime'] = 'running'
@@ -163,13 +165,19 @@ def main():
             except (subprocess.TimeoutExpired, OSError, ValueError, KeyError) as error:
                 row['runtime'] = 'failed'
                 row['error'] = f'{type(error).__name__}: {error}'
-                cleanup = command(['corral', '--json', 'delete', vm, '-f', '--wait', '--timeout', '10m'], timeout=900)
+                cleanup, deleted = [], []
+                listed = command(['corral', '--json', 'list', '--prefix', vm], timeout=120)
+                names = [vm] + ([v['name'] for v in json.loads(listed['stdout']) if v['name'] != vm]
+                                if listed['exit'] == 0 else [])
+                for owned in names:
+                    result = command(['corral', '--json', 'delete', owned, '-f', '--wait', '--timeout', '10m'], timeout=900)
+                    cleanup.append(result)
+                    deleted += json.loads(result['stdout']) if result['exit'] == 0 else [{'name': owned, 'deleted': False}]
                 row['emergency_cleanup'] = cleanup
                 inventory = command(['corral', '--json', 'list', '--prefix', vm], timeout=120)
                 row['emergency_cleanup_inventory'] = inventory
-                deleted = json.loads(cleanup['stdout']) if cleanup['exit'] == 0 else []
                 absent = json.loads(inventory['stdout']) == [] if inventory['exit'] == 0 else False
-                if not deleted or not all(item.get('deleted') for item in deleted) or not absent:
+                if listed['exit'] or not deleted or not all(item.get('deleted') for item in deleted) or not absent:
                     raise RuntimeError('owned VM/disk cleanup unproven; refusing to create another VM')
             finally:
                 save(receipt, report)

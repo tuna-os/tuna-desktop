@@ -124,6 +124,54 @@ package_target = "el10"
         self.assertEqual(report['variants'][0]['runtime'], 'failed')
         self.assertEqual(report['variants'][1]['runtime'], 'not-run')
 
+    def interrupted_journey(self, name, builder=False):
+        config = f'''
+[variants.{name}]
+description = "test image"
+[[variants.{name}.flavors]]
+id = "tuna"
+build_image = true
+[tuna_rollout.{name}]
+status = "admitted"
+package_target = "el10"
+'''
+        source = {'content': base64.b64encode(config.encode()).decode()}
+        calls, listings = [], []
+        def github(path):
+            return {'sha': 'a' * 40} if path.endswith('commits/main') else source
+        def command(argv, timeout=120):
+            calls.append(argv)
+            if argv[0] == 'skopeo':
+                return {'exit': 0, 'stdout': json.dumps({'Digest': 'sha256:' + 'b' * 64}), 'stderr': ''}
+            if argv[:3] == ['corral', '--json', 'list']:
+                # The first listing sees the interrupted builder; the final one proves absence.
+                listed = [{'name': argv[-1] + '-bootc-builder'}] if builder and not listings else []
+                listings.append(listed)
+                return {'exit': 0, 'stdout': json.dumps(listed), 'stderr': ''}
+            if argv[:3] == ['corral', '--json', 'delete']:
+                return {'exit': 0, 'stdout': json.dumps([{'name': argv[3], 'deleted': True}]), 'stderr': ''}
+            raise module.subprocess.TimeoutExpired(argv, timeout)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'evidence'
+            with patch.object(module, 'github', side_effect=github), patch.object(module, 'command', side_effect=command), patch('sys.argv', [str(SCRIPT), '--out', str(out), '--run']):
+                module.main()
+            report = json.loads((out / 'matrix.json').read_text())
+        return calls, report
+
+    def test_longest_variant_vm_fits_corral_builder_label(self):
+        calls, _ = self.interrupted_journey('bonito-rawhide')
+        journey = next(argv for argv in calls if argv[0] != 'skopeo' and argv[0] != 'corral')
+        vm = journey[journey.index('--vm') + 1]
+        self.assertLessEqual(len(vm + '-bootc-builder-cloudinit'), 63)
+
+    def test_interrupted_build_deletes_owned_builder(self):
+        calls, report = self.interrupted_journey('grouper', builder=True)
+        journey = next(argv for argv in calls if argv[0] != 'skopeo' and argv[0] != 'corral')
+        vm = journey[journey.index('--vm') + 1]
+        deleted = [argv[3] for argv in calls if argv[:3] == ['corral', '--json', 'delete']]
+        self.assertEqual(deleted, [vm, vm + '-bootc-builder'])
+        self.assertEqual(report['variants'][0]['runtime'], 'failed')
+
 
 if __name__ == '__main__':
     unittest.main()

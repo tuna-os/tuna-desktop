@@ -9,6 +9,7 @@ import pyatspi
 from gi.repository import GLib
 out, decision = sys.argv[1:3]
 remote = len(sys.argv) > 3 and sys.argv[3] == "remote"
+external_capture = "--external-capture" in sys.argv[3:]
 def walk(acc, nodes, controls):
     try:
         showing = acc.getState().contains(pyatspi.STATE_SHOWING)
@@ -32,7 +33,8 @@ while time.monotonic() < deadline:
         buttons = [a for a in controls if a.getRoleName() in ("push button", "button") and a.name in (("Cancel", "Deny") if decision == "cancel" else ("Share", "Allow"))]
         if not buttons: continue
         with open(out, "w") as f: json.dump(nodes, f, indent=2)
-        subprocess.run(["scrot", str(Path(out).with_suffix(".png"))], check=True)
+        if not external_capture:
+            subprocess.run(["scrot", str(Path(out).with_suffix(".png"))], check=True)
         button = buttons[0]
         if remote and decision != "cancel":
             interaction = [control for control in controls
@@ -80,5 +82,6 @@ while time.monotonic() < deadline:
 nodes, controls = [], []
 walk(pyatspi.Registry.getDesktop(0), nodes, controls)
 Path(out).write_text(json.dumps(nodes, indent=2))
-subprocess.run(["scrot", str(Path(out).with_suffix(".png"))], check=True)
+if not external_capture:
+    subprocess.run(["scrot", str(Path(out).with_suffix(".png"))], check=True)
 raise RuntimeError("actual GNOME portal consent picker did not become actionable")
