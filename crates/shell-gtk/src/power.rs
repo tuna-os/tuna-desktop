@@ -828,6 +828,9 @@ pub struct PowerUi {
     /// Inhibitors still listed or loading (`_applications.length`).
     inhibitors: Cell<usize>,
     pending: Cell<Option<Action>>,
+    /// A confirmed dialog whose service call has not yet completed.
+    /// Close still owes its waiting manager a Closed signal.
+    confirming: Cell<bool>,
     /// The open dialog is the nested preview's own (no manager waits on
     /// its answer; it acts itself).
     local: Cell<bool>,
@@ -940,6 +943,7 @@ impl PowerUi {
             alt_capture: Cell::new(false),
             inhibitors: Cell::new(0),
             pending: Cell::new(None),
+            confirming: Cell::new(false),
             local: Cell::new(false),
             serial: Cell::new(0),
             total: Cell::new(0),
@@ -1109,6 +1113,7 @@ impl PowerUi {
         self.stop_timer();
         let serial = self.serial.get() + 1;
         self.serial.set(serial);
+        self.confirming.set(false);
         self.pending.set(Some(action));
         self.content.set(content);
         self.local.set(local);
@@ -1377,7 +1382,8 @@ impl PowerUi {
     fn cancel(&self) {
         self.serial.set(self.serial.get() + 1);
         self.stop_timer();
-        let open = self.pending.take().is_some();
+        let confirming = self.confirming.replace(false);
+        let open = self.pending.take().is_some() || confirming;
         self.fade.hide();
         if open {
             self.emit("Canceled");
@@ -1389,7 +1395,8 @@ impl PowerUi {
     fn close(&self) {
         self.serial.set(self.serial.get() + 1);
         self.stop_timer();
-        let open = self.pending.take().is_some();
+        let confirming = self.confirming.replace(false);
+        let open = self.pending.take().is_some() || confirming;
         self.fade.hide();
         if open {
             self.emit("Closed");
@@ -1440,6 +1447,7 @@ impl PowerUi {
         let checked = self.updates_check.is_visible() && self.updates_check.is_active();
         let plan = post_update(self.content.get(), checked, signal);
         let serial = self.serial.get();
+        self.confirming.set(true);
         let me = self.clone();
         glib::spawn_future_local(async move {
             if let (true, Some(system)) = (boot_menu, system.as_ref()) {
@@ -1482,6 +1490,7 @@ impl PowerUi {
             if me.serial.get() != serial {
                 return;
             }
+            me.confirming.set(false);
             if !action_allowed(action, crate::lockdown::read().entry_visibility().log_out) {
                 me.emit("Canceled");
                 me.emit("Closed");
@@ -1580,6 +1589,7 @@ fn serve_end_session_dialog(ui: &Rc<PowerUi>) {
                             ui.serial.set(serial);
                             ui.stop_timer();
                             ui.pending.set(None);
+                            ui.confirming.set(false);
                             ui.alt_capture.set(false);
                             ui.fade.hide();
                             // `OpenAsync` asks gnome-software first; a

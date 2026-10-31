@@ -10535,6 +10535,21 @@ for signal in ConfirmedShutdown ConfirmedReboot ConfirmedLogout; do
     if end_bus signal "$signal"; then fail G-END-SESSION-ASYNC "the old confirmation emitted $signal for the newer dialog"; fi
 done
 end_direct Close >/dev/null || fail G-END-SESSION-ASYNC "Close failed after the stale confirmation"
+# Close while a confirmation awaits its service reply still answers the
+# manager with Closed, rather than leaving Shutdown/Reboot waiting.
+echo prepared >"$SOFTWARE_STATE"
+end_direct Open 1 0 60 '[]' >/dev/null || fail G-END-SESSION-ASYNC "Power Off Open failed before Close"
+trace_mark=$(grep -c '^Cancel$' "$SOFTWARE_TRACE")
+end_bus_mark=$(($(wc -l <"$END_BUS_LOG") + 1))
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-async-confirm-close.json" 20 \
+    --press "Power Off" || fail G-END-SESSION-ASYNC "could not confirm Power Off before Close"
+software_received Cancel "$trace_mark" || fail G-END-SESSION-ASYNC "the closing confirmation did not reach Cancel"
+end_direct Close >/dev/null || fail G-END-SESSION-ASYNC "Close failed during the confirmation"
+sleep 3
+end_bus signal Closed || fail G-END-SESSION-ASYNC "Close during confirmation emitted no Closed"
+if end_bus signal ConfirmedShutdown; then fail G-END-SESSION-ASYNC "the closed confirmation emitted ConfirmedShutdown"; fi
+end_dump_until end-async-confirm-closed '(any(.[]; .showing and (.name | test("automatically"))) | not)' 5 ||
+    fail G-END-SESSION-ASYNC "the dialog survived Close during confirmation"
 : >"$SOFTWARE_DELAY"
 pass G-END-SESSION-ASYNC "delayed update calls cannot reopen after Close, replace a newer Open or confirm its dialog"
 upower_set IsPresent '<false>'
