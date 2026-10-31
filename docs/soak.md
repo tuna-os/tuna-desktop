@@ -118,4 +118,4 @@ the 24-hour run that #203 and #73 still require.
 
 - [2026-10-31 24-hour endurance soak run](soak/2026-10-31-24h/README.md):
   Published `marlin:tuna` flavor (`sha256:ae6363c1`), source revision `d28578e5`.
-  Observed for 6,644 s (107 samples); terminated early due to observer health helper deadline expiration under PAM session burst. Complete stability, negative PSS slope (-1.04 MiB/h), and steady 75 Hz presentation pacing (p50/p95/p99 13.334/13.335/13.335 ms) observed throughout.
+  **FAILED / not qualified:** observed for 6,644 s (107 samples), then the health helper's 10-second deadline expired. The timeout's root cause is unresolved; PAM/audit causality has not been established. Retained samples stayed within growth limits, but this is not evidence of completed 24-hour endurance.

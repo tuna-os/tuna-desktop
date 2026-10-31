@@ -1,6 +1,6 @@
 # Tuna Desktop 24-Hour Endurance Soak Report: 2026-10-31
 
-This report records the actual 24-hour endurance soak run (`requested_duration_s: 86400`, warmup 600 s, interval 60 s, with native frame-pacing workload) on the published Tuna Desktop flavor in an isolated Corral KubeVirt VM.
+This report records an attempted 24-hour endurance soak (`requested_duration_s: 86400`, warmup 600 s, interval 60 s, with native frame-pacing workload) on the published Tuna Desktop flavor in an isolated Corral KubeVirt VM. It failed early and does not establish 24-hour qualification.
 
 ## Target and Provenance
 
@@ -36,14 +36,15 @@ The run did not complete the requested 24 hours:
 RuntimeError: health helper exceeded its deadline
 ```
 
-At sample 108 (t ≈ 6644 s), the observer's internal 10-second deadline in `call()` expired while invoking the session health probe over D-Bus (`gdbus call --session`).
-Investigation revealed that running `runuser -u tuna-test` 4 times per sample (for ScreenSaver, CalendarServer, Desktop Portal Settings, and GNOME Portal Backend) opened and closed 444 PAM sessions (`session-*.scope` via `systemd-logind`). Kernel audit logging (`auditd` / `kauditd`) and PAM session teardown accumulated delays, causing session startup to exceed the 10-second helper deadline.
+During the next sample after the 107 retained samples, the observer's internal 10-second deadline in `call()` expired in the CalendarServer/portal health-call loop. That loop runs CalendarServer, Desktop Portal Settings, then GNOME Portal Backend; the last of four `runuser` invocations in that iteration timed out, consistent with the GNOME portal backend helper. The traceback does not record the destination explicitly.
 
-Upon the observer's termination, the probe was cleanly shut down and all evidence was gathered.
+The guest journal shows repeated PAM sessions from the observer's `runuser` helpers, including increasing session-open delays near failure. This establishes unwanted harness session churn, **not its causality**: neither a PAM/audit bottleneck nor a product service failure was isolated. Later diagnostic calls to all four endpoints returned successfully, which does not invalidate the original deadline failure. The earlier claim that PAM/audit scheduling definitively caused this failure was unsupported and is withdrawn.
+
+The observer killed the native workload during failure cleanup, leaving its capture without a completion record. `soak_report.py` correctly rejects it. No retry was made on this run and no limits were changed.
 
 ### Product Stability and Endurance Metrics Before Termination
 
-During the 1.85 hours observed, the product exhibited complete stability with zero leaks:
+All retained samples stayed within the growth limits below. A short run with negative aggregate PSS slope cannot establish zero leaks or complete product stability, particularly given the unresolved health-call timeout.
 
 | Metric | Baseline (t = 602 s) | Final (t = 6555 s) | Peak (post-warmup) | Limit | Margin |
 |---|---|---|---|---|---|
@@ -53,11 +54,11 @@ During the 1.85 hours observed, the product exhibited complete stability with ze
 | **Processes** | 35 | 35 | 35 | 47 | +12 procs |
 
 - **PSS Trend:** `-1.04 MiB/h` (least-squares slope across 97 post-warmup samples).
-- **Process Continuity:** `tuna-compositor` (PID 2525) and `tuna-shell-gtk` (PID 2556) never restarted or exited.
-- **Native Frame Pacing:**
-  - Total frames presented: 496,320 frames across 2,068 batches
-  - Frame interval percentiles: **p50 = 13.334 ms**, **p95 = 13.335 ms**, **p99 = 13.335 ms** (steady 75 Hz vsync)
-  - Vsync flags: 100% hardware clock, 100% hardware completion, 0 unknown refresh
+- **Process Continuity:** Both critical processes retained their PID/start-time identity in every completed sample. They were still running when inspected after the failure.
+- **Native Frame Pacing (partial capture, not qualified):**
+  - The observer consumed 496,320 frames across 2,068 batches before the failed health call.
+  - Its last reported polling window contained 5,040 frames with p50/p95/p99 **13.334/13.335/13.335 ms**; these are not whole-run percentiles.
+  - Hardware flags in virtual bochs-drm feedback do not establish physical GPU performance.
 
 ## Retained Evidence Files
 
@@ -71,3 +72,11 @@ During the 1.85 hours observed, the product exhibited complete stability with ze
 - `soak-start.png`: Frame capture confirming mapped native workload during warmup.
 - **Raw Presentation Data:** `presentation.jsonl.gz` (5.5 MiB, 496k frames) is attached as a release asset:
   - [Download presentation.jsonl.gz (v1.0.0-beta.1 asset)](https://github.com/tuna-os/tuna-desktop/releases/download/v1.0.0-beta.1/presentation.jsonl.gz)
+
+## Cleanup and reproduction
+
+`corral delete tuna-q-soak-20261031 -f --wait --timeout 10m` deleted three objects; the following `corral list` contained no `tuna-q-` VM.
+
+The image was digest-pinned and its bootc status checked. The shipped package mapped to the peeled release-tag commit using the nightly's version-to-tag rule. Login used the real GDM console keyboard, not display-manager changes. The observer, native pacer and validator were root-owned under `/var/lib/tuna-soak` because the bootc image's `/usr/local` was read-only. Observer and validator came from harness commit `57d40919`; the pacer was built in a disposable container from the pinned published image with `scripts/tuna-frame-pacer-build`. The observer SHA-256 was `53e7cc44e803c3b92c9b792eeaef88e162984ae5ba641448809e5bc5bd5d71c2`; the pacer SHA-256 is retained in provenance.
+
+The empty `presentation.stderr` is retained alongside this report. To regenerate the summary, download and decompress the raw presentation asset into this directory and run `python3 scripts/lib/soak_report.py docs/soak/2026-10-31-24h`; its failure result is expected.
