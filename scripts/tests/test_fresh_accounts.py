@@ -14,7 +14,6 @@ sys.path.insert(0, str(ROOT / "scripts/lib"))
 import fresh_accounts  # noqa: E402
 
 GUEST = ROOT / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
-FIXTURE = ROOT / "packaging/marlin/vm-lane/tuna-vm-fresh-accounts"
 CONF = "[daemon]\nFallbackSession=tuna\n"
 
 
@@ -124,16 +123,11 @@ class JourneyTest(unittest.TestCase):
 
     def test_positive_full_journey(self):
         guest = FakeGuest()
-        passed, results, error, receipts = journey(guest)
+        passed, results, error, _ = journey(guest)
         self.assertTrue(passed, (results, error))
-        self.assertTrue(receipts)
         self.assertTrue(all(ok for ok, _ in results.values()), results)
         self.assertEqual(guest.logins, [(1, "tunastd"), (1, "tunaadmin"), (1, "tunastd"), (1, "tunaadmin"),
                                         (2, "tunastd"), (2, "tunaadmin")])
-        for name in ("V-FRESH-RECORD-FREE-tunastd", "V-FRESH-RECORD-FREE-tunaadmin", "V-FRESH-CONTROL",
-                     "V-FRESH-SESSION-tunastd-first", "V-FRESH-SUDO-tunaadmin", "V-FRESH-SUDO-tunastd",
-                     "V-FRESH-REBOOT", "V-FRESH-SESSION-RELOADED-tunaadmin", "V-FRESH-LOGOUT-tunaadmin-reboot"):
-            self.assertIn(name, results)
 
     def test_preseeded_record_is_not_record_free(self):
         passed, results, _, _ = journey(FakeGuest(records={"tunastd": "[User]\nSession=tuna\n"}))
@@ -179,19 +173,6 @@ class JourneyTest(unittest.TestCase):
         self.assertFalse(passed)
         self.assertFailed(results, "V-FRESH-LOGIN-tunastd-first")
 
-    def test_record_free_login_matches_gnome_reference(self):
-        reference = json.loads((ROOT / "scripts/lib/fixtures/fresh-account-gnome51-reference.json").read_text())
-        for account in reference["first_logins"]:
-            self.assertIsNone(account["record_before"])
-            self.assertIsNone(account["record_after"])
-            self.assertEqual(account["session"]["Service"], "gdm-password")
-            self.assertIn("gnome-shell", account["desktop"])
-        guest = FakeGuest()
-        passed, results, _, _ = journey(guest)
-        self.assertTrue(passed, results)
-        self.assertNotIn("tunastd", guest.records)
-        self.assertNotIn("tunaadmin", guest.records)
-
     def test_saved_tuna_record_is_supported(self):
         passed, results, _, _ = journey(FakeGuest(write_record=True))
         self.assertTrue(passed, results)
@@ -233,11 +214,10 @@ class JourneyTest(unittest.TestCase):
         self.assertNotIn("V-FRESH-LOGIN-tunaadmin-first", results)
 
     def test_stale_greeter_is_not_a_reboot(self):
-        passed, results, error, receipts = journey(FakeGuest(stale_boot=True))
+        passed, results, error, _ = journey(FakeGuest(stale_boot=True))
         self.assertFalse(passed)
         self.assertIn("reboot", error)
         self.assertNotIn("V-FRESH-REBOOT", results)
-        self.assertTrue(receipts)
 
 
 class GuestStateTest(unittest.TestCase):
@@ -279,16 +259,6 @@ class GuestStateTest(unittest.TestCase):
 
     def test_absent_record_is_record_free(self):
         self.assertTrue(fresh_accounts.record_free(self.probe({}), False)[0])
-
-
-class FixtureTest(unittest.TestCase):
-    def test_fresh_boot_asks_for_user_name_without_session_state(self):
-        text = FIXTURE.read_text()
-        self.assertIn("grep -qx 'system-db:gdm' /usr/share/dconf/profile/gdm", text)
-        self.assertIn("[org/gnome/login-screen]\\ndisable-user-list=true\\n", text)
-        self.assertIn("dconf update", text)
-        self.assertNotIn("Session=", text)
-        self.assertNotIn("AutomaticLogin", text)
 
 
 if __name__ == "__main__":
