@@ -360,10 +360,12 @@ the loop between its pre-dispatch flush and repaint into named stages, each
 with the compositor main thread's runtime, runqueue wait and timeslices, so a
 stalled stage is classified as compositor CPU, runnable wait or off-CPU time.
 Consecutive stage gaps include the preceding observer write, so they alone
-cannot distinguish a blocked trace sink from the named operation. Snapshot
-serialization, write and rename also have `operation` records: their clock and
-checked scheduler-counter boundaries enclose only that work, with no trace
-output inside the measured interval. This excludes preceding logger blockage.
+cannot distinguish a blocked trace sink from the named operation. Attribution
+run 41249875435 therefore bracketed snapshot serialization, write and rename
+with direct `operation` clocks and checked scheduler-counter deltas, with no
+trace output inside the measured interval. Serialization still has that direct
+observer; file operations now belong to the snapshot worker rather than the
+compositor thread.
 
 Run 41227591692 (head e39b95b2) retained a real sparse switch: the shell's
 callback monotonic gaps were 137.958/226.450 ms with only ~2 ms CPU and almost
@@ -371,11 +373,32 @@ no runqueue wait, while the compositor spent 106–112 ms between its client flu
 repaint and then queued `done` without flushing until the next loop wake
 (~16 ms). The compositor now flushes the events a render queued on every
 backend, as native sessions already did (regression:
-`runtime::rendered_event_tests`). The in-tick delay is attributed by the stage
-records before any further fix.
+`runtime::rendered_event_tests`).
 This render-then-flush order also matches
 [Niri's `refresh_and_flush_clients`](https://github.com/niri-wm/niri/blob/main/src/niri.rs#L825-L840).
 Disabled tracing performs no observer clock reads, allocation or surface walks.
+
+Run 41249875435's merge-source installed evidence
+(`4850b19cdc70d3c217dd5e1c3082d090a190ab13`) then isolated the larger delay:
+`controls/nested.log:693850` records `state_rename` taking 217.082 ms wall time,
+0.510131 ms CPU and zero runnable wait; line 693738 records 209.122 ms wall,
+0.460597 ms CPU and zero runnable wait. No logger write occurred inside either
+measurement. Across 21,408 samples, write took at most 3.041 ms and serialization
+at most 0.200 ms. This is filesystem blocking on the compositor's publication
+path, not shell CPU, runnable starvation, or an attributed rendering fence.
+
+`TUNA_COMPOSITOR_STATE` now uses one owned background writer with one replaceable
+latest waiting body. It atomically publishes complete producer snapshots without
+mixing clocks, geometry or actual `rendered_frames`; intermediate snapshots may
+coalesce, but the unchanged frame/evidence floors still apply. Only successful
+write-and-rename updates the worker's deduplication baseline. Failure is surfaced
+by the worker and an unchanged body remains eligible on the next submission,
+without an autonomous retry loop. Graceful shutdown drains the latest body and
+joins the writer, so terminal publication does not require another input/tick
+and no old writer can publish afterward. Real filesystem, concurrent reader,
+failure, bounded-latest and shutdown regressions live in `state_snapshot::tests`;
+the VM inventory consumer still fails closed on malformed JSON. No source-text
+assertion substitutes for these behaviors.
 
 The installed `journey` qualification intentionally checks out the pull-request
 merge commit. Its companion receipt records that actual `git rev-parse HEAD`
