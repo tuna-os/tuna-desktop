@@ -1153,18 +1153,24 @@ impl DrmBackend {
     }
 
     /// The monitors Mutter's colour manager registers with colord: every
-    /// connector with its EDID identity and CRTC gamma size; the first
-    /// output is primary.
+    /// connector with its EDID identity and CRTC gamma size. The primary
+    /// is the primary leader (`meta_monitor_is_primary`), the first lit
+    /// leader as in [`Self::display_state`], not whichever output is
+    /// first: a switched-off or mirroring output is never primary.
     pub fn colord_monitors(&self) -> Vec<crate::color_manager::ColordMonitor> {
         let atomic = self.drm.is_atomic();
+        let primary = self
+            .outputs
+            .iter()
+            .find(|o| o.is_leader())
+            .map(|o| o.name.as_str());
         self.outputs
             .iter()
-            .enumerate()
-            .map(|(i, out)| crate::color_manager::ColordMonitor {
+            .map(|out| crate::color_manager::ColordMonitor {
                 identity: crate::edid::MonitorIdentity::new(
                     &out.name,
                     out.edid.as_deref(),
-                    i == 0,
+                    primary == Some(out.name.as_str()),
                     out.size_mm,
                     color::pnp_vendor_name,
                 ),
