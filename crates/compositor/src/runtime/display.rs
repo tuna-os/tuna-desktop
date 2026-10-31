@@ -277,6 +277,11 @@ impl Runtime {
         }
         drm.log_outputs();
         self.color.set_gamma_sizes(drm.gamma_sizes());
+        // meta_monitor_manager_notify_monitors_changed →
+        // meta_color_manager_monitors_changed: colord devices follow.
+        if let Some(colord) = &self.colord {
+            colord.monitors_changed(drm.colord_monitors());
+        }
         let primary_scale = drm.outputs.first().map(|o| o.scale);
         self.sync_drm_outputs();
         if let Some(scale) = primary_scale {

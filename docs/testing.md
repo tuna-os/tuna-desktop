@@ -445,9 +445,9 @@ The nested backend has one fixed output, so hotplug runs on real DRM: the
 `workflow_dispatch`, and on pull requests touching
 `scripts/tuna-hotplug-stress` or the workflow). `scripts/tuna-hotplug-stress`
 creates a vkms configfs instance (Linux 6.19 or newer; the job pins
-`ubuntu-26.04`) with three CRTC/connector pipes. Connector A stays
-connected; writing a connector's configfs `status` plugs or unplugs B and
-C and makes the kernel send a real udev `HOTPLUG=1` change for the card.
+`ubuntu-26.04`) with three CRTC/connector pipes. Connector A starts
+connected; writing a connector's configfs `status` plugs or unplugs any of
+them and makes the kernel send a real udev `HOTPLUG=1` change for the card.
 `tuna-compositor --backend drm` runs on that card under a private seatd
 and session bus with the GTK shell. Three GTK 4 clients animate every
 frame; each is placed on its own output by moving a uinput mouse there,
@@ -470,15 +470,50 @@ show:
 - `H-SCALE` and `H-STORED`: the applied scale and arrangement, and the
   rewritten `monitors.xml`, reach the outputs;
 - `H-INPUT`, `H-LIVE`: the overview answers the keyboard, the compositor
-  never exits or panics and the shell never exits.
+  never exits or panics and the shell never exits;
+- `H-ALL-UNPLUGGED`: after the rounds, A, B and C in a row at scale 1 are
+  all unplugged at once. With no connector the compositor, shell and
+  clients stay alive, every window keeps its geometry and its own output
+  and the pointer holds (Mutter's `meta_window_update_for_monitors_changed`
+  finds no monitor and moves nothing). Plugged back, the arrangement and
+  every window's pre-unplug geometry return, the clients draw again and
+  the overview and pointer answer;
+- `H-COLORD`: the real colord, on a private system bus as in
+  `tuna-drm-smoke`'s D-COLORD, lists exactly one display device per
+  connected output (`GetDevices`, `Kind` and `XRANDR_name`), and a
+  replugged output gets its device id back (Mutter's
+  `meta_color_manager_monitors_changed` → `update_devices`).
+
+After the rounds, `H-CAST-REMOVED` plugs B and shares it through the
+installed `xdg-desktop-portal-gnome` (the backend's restore data stands in
+for the picker) to a `pipewiresrc` consumer on a private PipeWire, then
+unplugs B. As Mutter's `meta-stream-monitor.c` `on_monitors_changed`
+stops the stream (`meta_stream_stop`, then `on_stream_closed` closes the
+session), Mutter's `Session.Closed` and the portal session's `Closed`
+must arrive within 5 s, the PipeWire node and the compositor's capture
+stream must go, the log must show the stop and no frame attempted for B,
+and a new cast of A must stream. Monitor casts survive only a change that
+keeps their logical rect (Mutter's `update_monitor`); area casts stay
+open and get no frames while no output lies under them.
 
 `H-GROWTH` bounds the compositor and shell as the churn lane does: final
 PSS within round-0 PSS × 1.25 + 64 MiB and fds within round-0 + 32.
+
+After the storm, `H-LOCK-HOTPLUG` locks the session with a uinput
+Super+L and plugs B in: the state's `lock_outputs` must list B (the GTK
+shell made B its own ext-session-lock surface, as GNOME's unlock dialog
+covers every monitor on `monitors-changed`), and every locked frame B
+draws (`frame_cost`) must hold no window or layer (`content_roots` 0, no
+`drawn_windows`) though client B's window is re-homed onto B. B is
+unplugged, then the session unlocks through a real PAM stack (pam_wrapper
+serving `tuna-lock` from a private password file, typed on the uinput
+keyboard); the clients must draw on A again and Super open the overview.
+
 Pull requests and dispatches run 4 rounds, nightly 30. The artifacts keep
 the compositor, shell and client logs, every step's outputs and window
 rectangles (`report.json`), the metrics and the state at a failure.
 
-To run it on a host with Linux 6.19+ and sudo, after building
+To run it on a host with Linux 6.19+, colord and sudo, after building
 `tuna-compositor` and `tuna-shell-gtk`:
 
 ```sh
@@ -491,8 +526,7 @@ configuration for exactly the connected monitors, else the current or
 previous configuration covering them, else a linear one with the primary
 kept first. Unlike Mutter, which reads `monitors.xml` once at startup,
 the stored configuration is read from the file at each hotplug. Real
-panels, EDIDs, colord device registration on hotplug and multiple GPUs
-are not covered.
+panels, EDIDs and multiple GPUs are not covered.
 
 ## When a run fails
 

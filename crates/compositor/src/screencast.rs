@@ -30,7 +30,7 @@ use pipewire::stream::{StreamFlags, StreamListener, StreamRc, StreamState};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 
-use crate::mutter::CastTarget;
+use crate::mutter::{CastTarget, OutputSnapshot};
 
 /// Longest gap a client waits between frames, and the shortest we send.
 pub const FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -76,8 +76,8 @@ impl PipeWire {
         &self,
         session_id: u64,
         target: CastTarget,
-        width: i32,
-        height: i32,
+        monitor: Option<OutputSnapshot>,
+        (width, height): (i32, i32),
         signal: crate::mutter::CastSignals,
     ) -> Option<Cast> {
         let session_signal = signal.clone();
@@ -195,6 +195,8 @@ impl PipeWire {
         Some(Cast {
             session_id,
             target,
+            monitor,
+            frameless: false,
             offered: (width, height),
             signal: session_signal,
             stream,
@@ -220,6 +222,10 @@ pub struct Cast {
     pub session_id: u64,
     /// Monitor or window this stream shows.
     pub target: CastTarget,
+    /// The monitor a `RecordMonitor` stream was created for.
+    pub monitor: Option<OutputSnapshot>,
+    /// Its output gave no frame since the last one sent (logged once).
+    pub frameless: bool,
     /// Size last offered to the consumer (window casts follow resizes).
     offered: (i32, i32),
     /// The stream's D-Bus signals, for ending the session.
@@ -311,6 +317,95 @@ impl Cast {
             }
             pipewire::sys::pw_stream_queue_buffer(self.stream.as_raw_ptr(), buffer);
         }
+    }
+}
+
+impl Running for Cast {
+    fn session_id(&self) -> u64 {
+        self.session_id
+    }
+    fn target(&self) -> &CastTarget {
+        &self.target
+    }
+    fn monitor(&self) -> Option<&OutputSnapshot> {
+        self.monitor.as_ref()
+    }
+    fn failed(&self) -> bool {
+        Cast::failed(self)
+    }
+    fn close(self) {
+        // meta_stream_stop clears its source before emitting `closed`.
+        // Drop PipeWire before queueing the public session signal.
+        let signal = self.signal.clone();
+        let session_id = self.session_id;
+        drop(self);
+        signal.session_closed(session_id);
+    }
+}
+
+/// A running cast as [`end_gone`] sees it.
+pub trait Running {
+    fn session_id(&self) -> u64;
+    fn target(&self) -> &CastTarget;
+    /// The monitor a `RecordMonitor` stream was created for.
+    fn monitor(&self) -> Option<&OutputSnapshot>;
+    /// PipeWire reported the stream broken.
+    fn failed(&self) -> bool;
+    /// Tear down the stream, then emit the session's `Closed`.
+    fn close(self);
+}
+
+/// Drop every cast whose source is gone, broken or revoked; dropping
+/// one destroys its PipeWire stream. A source that went away ends its
+/// session as in Mutter: `meta_stream_stop` emits the stream's
+/// `closed`, and meta-screen-cast-session.c `on_stream_closed` closes
+/// the session (`Closed` on the bus, its objects unexported once the
+/// D-Bus side sees the revoked grant). Sources go away when
+/// - a window closed (meta-stream-window.c `on_window_unmanaged`),
+/// - a recorded monitor left the layout or its logical rect changed
+///   (meta-stream-monitor.c `on_monitors_changed`, see
+///   [`monitor_after_change`](crate::mutter::monitor_after_change)).
+///
+/// Area casts survive a monitors change, as meta-stream-source-area.c
+/// `on_monitors_changed` only re-watches the views over the area: with
+/// no output under it the stream stays open and gets no frames.
+pub fn end_gone<C: Running>(
+    casts: &mut Vec<C>,
+    grants: &std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    outputs: &[OutputSnapshot],
+    window_alive: impl Fn(u64) -> bool,
+) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let ended = casts.extract_if(.., |cast| {
+        let gone = match cast.target() {
+            CastTarget::Window(id) => !window_alive(*id),
+            CastTarget::Monitor(connector) => {
+                let gone = match cast.monitor() {
+                    Some(recorded) => {
+                        crate::mutter::monitor_after_change(recorded, outputs).is_none()
+                    }
+                    None => !outputs.iter().any(|o| &o.connector == connector),
+                };
+                if gone {
+                    eprintln!(
+                        "tuna-compositor: screen cast {}: monitor {connector} changed or is gone; stopping the stream",
+                        cast.session_id()
+                    );
+                }
+                gone
+            }
+            CastTarget::Area(..) => false,
+        };
+        let grant = grants.get(&cast.session_id());
+        if gone || cast.failed() {
+            if let Some(grant) = grant {
+                grant.store(true, SeqCst);
+            }
+        }
+        gone || cast.failed() || grant.is_none_or(|grant| grant.load(SeqCst))
+    });
+    for cast in ended {
+        cast.close();
     }
 }
 

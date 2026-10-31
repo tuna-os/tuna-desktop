@@ -5,7 +5,7 @@ Usage:
   scripts/tuna-hotplug-stress [--rounds N] [--out DIR]
 
 A vkms configfs instance (Linux 6.19+) with three CRTC/connector pipes is
-the hardware: connector 0 (A) stays connected, B and C are plugged and
+the hardware: connector 0 (A) starts connected, B and C are plugged and
 unplugged by writing their configfs `status`, which emits a real udev
 HOTPLUG change on the card. tuna-compositor runs `--backend drm` on it
 under a private seatd with the GTK shell, three real GTK 4 clients (one
@@ -14,7 +14,9 @@ keyboard. Each round plugs B and C, applies a DisplayConfig
 ApplyMonitorsConfig scale and arrangement change (method 1, temporary),
 sometimes unplugs the primary, sometimes rewrites monitors.xml with a
 stored configuration for the next replug, then unplugs C and B. After
-every step it gates on the compositor state (TUNA_COMPOSITOR_STATE):
+the rounds every connector, A included, is unplugged at once and plugged
+back. After every step it gates on the compositor state
+(TUNA_COMPOSITOR_STATE):
   H-OUTPUTS  wl_outputs and DisplayConfig monitors are the connected set
   H-REHOME   every window is on a live output: its own when connected,
              else the primary (Mutter's update_for_monitors_changed)
@@ -23,10 +25,31 @@ every step it gates on the compositor state (TUNA_COMPOSITOR_STATE):
   H-STORED   a monitors.xml written mid-session configures the replug
   H-INPUT    Super opens and Escape closes the overview every round
   H-GROWTH   compositor+shell PSS and fds stay bounded over the storm
+  H-ALL-UNPLUGGED  with every connector unplugged the compositor, shell
+             and clients live, windows keep their geometry and output
+             and the pointer holds; replugged, every window is back on
+             its own output at its pre-unplug geometry and input works
   H-LIVE     the compositor never exits or panics, the shell never exits
-Needs root (sudo) for modprobe, configfs, seatd and uinput.
+  H-LOCK-HOTPLUG  locked with Super+L, an output plugged in gets the
+             shell's own lock surface and draws no window or layer, even
+             with a window re-homed onto it; unplugged, the session then
+             unlocks through PAM (pam_wrapper) and windows and input are back
+  H-COLORD   colord (real, on a private system bus) lists exactly one
+             display device per connected output after every step, and a
+             replugged output gets its device id back (Mutter's
+             meta_color_manager_monitors_changed)
+  H-CAST-REMOVED  a monitor screencast of B shared through the installed
+             xdg-desktop-portal-gnome ends when B is unplugged: Mutter's
+             Session.Closed and the portal session's Closed arrive, the
+             PipeWire node goes, nothing renders B again, and a new cast
+             of A streams (meta-stream-monitor.c on_monitors_changed)
+Needs root (sudo) for modprobe, configfs, seatd and uinput, colord, and
+pam_wrapper (libpam-wrapper) for the unlock. H-CAST-REMOVED needs
+pipewire, wireplumber, gst-launch-1.0 with pipewiresrc and the installed
+xdg-desktop-portal-gnome.
 """
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -41,6 +64,24 @@ INSTANCE = "tuna-hotplug"
 SOCKET = "tuna-hotplug"
 PIPES = 3
 APP_PREFIX = "org.tuna.HotplugStress."
+PAM_WRAPPER = Path("/usr/lib/x86_64-linux-gnu/libpam_wrapper.so")
+PAM_MATRIX = Path("/usr/lib/x86_64-linux-gnu/pam_wrapper/pam_matrix.so")
+# Lowercase letters: typed on the uinput keyboard one key each.
+UNLOCK_PASSWORD = "tunahotplug"
+SYSTEM_BUS_CONF = """<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>system</type>
+  <listen>unix:path={socket}</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow user="*"/>
+    <allow own="*"/>
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow receive_sender="*"/>
+  </policy>
+</busconfig>
+"""
 
 
 def client_worker(name):
@@ -93,7 +134,8 @@ def client_worker(name):
 
 def seat_worker():
     """uinput keyboard and relative mouse (root): one command per stdin
-    line, `key NAME` or `move DX DY`, each answered with `ok`."""
+    line, `key NAME`, `chord NAME...` (pressed in order, released in
+    reverse) or `move DX DY`, each answered with `ok`."""
     from evdev import UInput, ecodes as e
     keyboard = UInput({e.EV_KEY: list(range(e.KEY_ESC, e.KEY_MICMUTE + 1))},
                       name="Tuna hotplug keyboard", bustype=e.BUS_VIRTUAL)
@@ -111,6 +153,13 @@ def seat_worker():
                 keyboard.write(e.EV_KEY, code, value)
                 keyboard.syn()
                 time.sleep(0.03)
+        elif words[0] == "chord":
+            codes = [getattr(e, word) for word in words[1:]]
+            for value, order in ((1, codes), (0, codes[::-1])):
+                for code in order:
+                    keyboard.write(e.EV_KEY, code, value)
+                    keyboard.syn()
+                    time.sleep(0.03)
         elif words[0] == "move":
             mouse.write(e.EV_REL, e.REL_X, int(words[1]))
             mouse.write(e.EV_REL, e.REL_Y, int(words[2]))
@@ -203,6 +252,11 @@ class Vkms:
     def plug(self, index, connected):
         sudo_sh(f'echo {1 if connected else 2} > "{self.path}/connectors/connector{index}/status"')
 
+    def plug_all(self, connected):
+        """Every connector at once, A included, in one shell."""
+        sudo_sh("\n".join(f'echo {1 if connected else 2} > "{self.path}/connectors/connector{i}/status"'
+                          for i in range(PIPES)))
+
     def destroy(self):
         if not self.path.exists():
             return
@@ -232,10 +286,10 @@ def run(args):
     logs, processes, samples, steps = [], [], [], []
     assertions = {}
     counts = {"hotplugs": 0, "scale_changes": 0, "stored_replugs": 0, "primary_unplugs": 0,
-              "overview_toggles": 0}
+              "overview_toggles": 0, "all_unplugs": 0, "lock_hotplugs": 0}
     vkms = Vkms()
     system_seatd = subprocess.run(["systemctl", "is-active", "--quiet", "seatd"]).returncode == 0
-    seatd = dbus_pid = seat = compositor = None
+    seatd = dbus_pid = system_bus_pid = seat = compositor = None
     start = time.monotonic()
 
     def launch(command, name, child_env=None, **kwargs):
@@ -283,10 +337,73 @@ def run(args):
         bus = subprocess.check_output(["dbus-daemon", "--session", "--fork", "--print-address=1",
                                        "--print-pid=1"], text=True).splitlines()
         env["DBUS_SESSION_BUS_ADDRESS"], dbus_pid = bus[0], int(bus[1])
+        # H-COLORD: the real colord on a private system bus, as
+        # tuna-drm-smoke's D-COLORD. Its databases live on a private
+        # tmpfs and it runs as this user, so it trusts the compositor's
+        # calls as its own (cd_main_sender_authenticated) without polkit.
+        colord_bin = next((p for p in ("/usr/libexec/colord", "/usr/lib/colord/colord")
+                           if os.access(p, os.X_OK)), None)
+        if colord_bin is None:
+            raise RuntimeError("H-COLORD: colord is not installed")
+        (out / "system-bus.conf").write_text(SYSTEM_BUS_CONF.format(socket=private / "system_bus_socket"))
+        system_bus = subprocess.check_output(["dbus-daemon", f"--config-file={out / 'system-bus.conf'}", "--fork",
+                                              "--print-address=1", "--print-pid=1"], text=True).splitlines()
+        env["DBUS_SYSTEM_BUS_ADDRESS"], system_bus_pid = system_bus[0], int(system_bus[1])
+        subprocess.run(["sudo", "mkdir", "-p", "/var/lib/colord"], check=True)
+        launch(["sudo", "unshare", "--mount", "--propagation", "private", "sh", "-c",
+                'mount -t tmpfs tmpfs /var/lib/colord && exec setpriv --reuid="$1" --regid="$2" --clear-groups '
+                'env DBUS_SYSTEM_BUS_ADDRESS="$3" "$4" -v',
+                "sh", str(os.getuid()), str(os.getgid()), env["DBUS_SYSTEM_BUS_ADDRESS"], colord_bin], "colord")
+        from gi.repository import Gio, GLib
+        system = Gio.DBusConnection.new_for_address_sync(
+            env["DBUS_SYSTEM_BUS_ADDRESS"],
+            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+            None, None)
+        # A private PipeWire for H-CAST-REMOVED (the compositor connects
+        # to it on the first cast), as the shell proofs run one.
+        launch(["pipewire"], "pipewire")
+        wait_for("the private PipeWire socket", lambda: (private / "pipewire-0").exists(), 10)
+        launch(["wireplumber"], "wireplumber")
 
+        def colord_displays():
+            """colord's display devices by XRANDR_name: {connector: [DeviceId, ...]}."""
+            def call(path, interface, method, args, reply):
+                return system.call_sync("org.freedesktop.ColorManager", path, interface, method, args,
+                                        GLib.VariantType.new(reply), Gio.DBusCallFlags.NONE, 5000, None).unpack()
+            try:
+                found = {}
+                for path in call("/org/freedesktop/ColorManager", "org.freedesktop.ColorManager",
+                                 "GetDevices", None, "(ao)")[0]:
+                    props = call(path, "org.freedesktop.DBus.Properties", "GetAll",
+                                 GLib.Variant("(s)", ("org.freedesktop.ColorManager.Device",)), "(a{sv})")[0]
+                    if props.get("Kind") == "display":
+                        found.setdefault(props.get("Metadata", {}).get("XRANDR_name", ""), []).append(
+                            props.get("DeviceId"))
+                return found
+            except GLib.Error:
+                # Not up yet, or a device went away between the calls.
+                return None
+
+        wait_for("H-COLORD: colord on the private system bus", lambda: colord_displays() is not None, 30)
+
+        # The lock screen's password goes through a real PAM stack:
+        # pam_wrapper serves the compositor's tuna-lock service from a
+        # private password file (as tuna-osk-proof does).
+        if not (PAM_WRAPPER.exists() and PAM_MATRIX.exists()):
+            raise RuntimeError(f"H-LOCK-HOTPLUG needs pam_wrapper (libpam-wrapper): {PAM_WRAPPER}, {PAM_MATRIX}")
+        pam = private / "pam"
+        (pam / "services").mkdir(parents=True)
+        user = subprocess.check_output(["id", "-un"], text=True).strip()
+        (pam / "passdb").write_text(f"{user}:{UNLOCK_PASSWORD}:tuna-lock\n")
+        (pam / "services" / "tuna-lock").write_text(
+            f"auth required {PAM_MATRIX} passdb={pam / 'passdb'}\n"
+            f"account required {PAM_MATRIX} passdb={pam / 'passdb'}\n")
         compositor = launch([str(ROOT / "target/debug/tuna-compositor"), "--backend", "drm",
                              "--socket", SOCKET, "--shell-bin", str(ROOT / "target/debug/tuna-shell-gtk")],
-                            "compositor", env | {"TUNA_DRM_DEVICE": card})
+                            "compositor", env | {"TUNA_DRM_DEVICE": card, "LD_PRELOAD": str(PAM_WRAPPER),
+                                                 "PAM_WRAPPER": "1",
+                                                 "PAM_WRAPPER_SERVICE_DIR": str(pam / "services"),
+                                                 "TUNA_LOCK_TRACE": "1"})
         log_path = out / "compositor.log"
         wait_for("the GTK shell's panel on the output",
                  lambda: any(layer.get("namespace") == "tuna-panel" for layer in state().get("layers", [])), 60)
@@ -392,6 +509,27 @@ def run(args):
             target = home if home in outs else primary
             return bool(w and target and contains(outs[target]["rect"], w))
 
+        colord_ids, colord_steps = {}, [0]
+
+        def colord_check(label, want):
+            """H-COLORD: exactly one colord display device per connected
+            output; a connector's device id never changes across replugs."""
+            last = [None]
+
+            def exact():
+                last[0] = colord_displays()
+                return (last[0] is not None and sorted(last[0]) == want
+                        and all(len(ids) == 1 for ids in last[0].values()))
+            try:
+                wait_for(f"H-COLORD: {label}: colord has one display device for each of {want}", exact)
+            except RuntimeError as error:
+                raise RuntimeError(f"{error}; colord lists {last[0]}") from None
+            for name, (device_id,) in last[0].items():
+                if colord_ids.setdefault(name, device_id) != device_id:
+                    raise RuntimeError(f"H-COLORD: {label}: {name}'s colord device is {device_id}, "
+                                       f"was {colord_ids[name]}")
+            colord_steps[0] += 1
+
         def check(label, connected, extra=None):
             """Gate one storm step."""
             alive()
@@ -399,6 +537,7 @@ def run(args):
             wait_for(f"{label}: wl_outputs are {want}", lambda: sorted(outputs()) == want)
             wait_for(f"{label}: DisplayConfig lists {want}",
                      lambda: sorted(m["connector"] for m in state().get("display_config", {}).get("monitors", [])) == want)
+            colord_check(label, want)
             if extra:
                 wait_for(f"{label}: {extra[0]}", extra[1])
             for name in clients:
@@ -439,6 +578,219 @@ def run(args):
                 f"</logicalmonitor>" for name, x, scale, primary in logical)
             (config / "monitors.xml").write_text(
                 f'<monitors version="2"><configuration>{body}</configuration></monitors>\n')
+
+        def lock_hotplug():
+            """H-LOCK-HOTPLUG: GNOME's lock screen covers every monitor,
+            one plugged in while locked too (unlockDialog.js
+            `_updateBackgrounds` on `monitors-changed`; ext-session-lock-v1
+            wants a lock surface on each new output), and nothing of the
+            session shows on it meanwhile."""
+            polls = {"bare": 0, "covered": 0}
+
+            def locked_frame_on_b():
+                """B's last frame while locked drew no window or layer."""
+                snapshot = state()
+                if snapshot.get("locked") is not True:
+                    raise RuntimeError("the session unlocked before the password was typed")
+                cost = snapshot.get("frame_cost", {}).get(B) or {}
+                if cost.get("locked"):
+                    if cost.get("content_roots") or cost.get("drawn_windows"):
+                        raise RuntimeError(f"{B} drew session content while locked: {cost}")
+                    polls["covered" if cost.get("lock_surface") else "bare"] += 1
+                return snapshot, cost
+
+            def b_covered():
+                snapshot, cost = locked_frame_on_b()
+                return (B in snapshot.get("lock_outputs", []) and cost.get("locked") is True
+                        and cost.get("lock_surface") is True)
+
+            send("chord KEY_LEFTMETA KEY_L")
+            wait_for("Super+L locks the session", lambda: state().get("locked") is True)
+            wait_for(f"the shell's lock surface on {A}", lambda: state().get("lock_outputs") == [A])
+            vkms.plug(1, True)
+            counts["lock_hotplugs"] += 1
+            wait_for(f"wl_outputs are {sorted([A, B])} while locked",
+                     lambda: locked_frame_on_b() and sorted(outputs()) == sorted([A, B]))
+            wait_for(f"the shell's own lock surface on {B}, drawn alone", b_covered, 20)
+            # Client B's window goes back onto B under the lock: there is
+            # session content on B that must not be drawn.
+            wait_for(f"client B re-homed onto {B} under the lock", lambda: locked_frame_on_b() and home_ok("B"))
+            steady = time.monotonic() + 2
+            while time.monotonic() < steady:
+                alive()
+                if not b_covered():
+                    raise RuntimeError(f"{B} lost its lock surface while locked")
+                time.sleep(0.1)
+            vkms.plug(1, False)
+            counts["lock_hotplugs"] += 1
+            wait_for(f"wl_outputs are [{A}] while locked", lambda: sorted(outputs()) == [A])
+            wait_for(f"only {A}'s lock surface, still locked",
+                     lambda: state().get("lock_outputs") == [A] and state().get("locked") is True)
+            # Unlock as a user does: a key lifts the curtain (Ctrl types
+            # nothing), the prompt asks for the password through PAM, the
+            # password and Enter answer it.
+            mark = len(log_path.read_text())
+            send("key KEY_LEFTCTRL")
+            wait_for("lifting the curtain asks for the password",
+                     lambda: "lock auth query service=password step=1 secret=true"
+                     in log_path.read_text()[mark:], 20)
+            for letter in UNLOCK_PASSWORD:
+                send(f"key KEY_{letter.upper()}")
+            send("key KEY_ENTER")
+            wait_for("the password unlocks the session through PAM", lambda: state().get("locked") is False, 30)
+            if state().get("lock_outputs"):
+                raise RuntimeError(f"lock surfaces outlived the unlock: {state().get('lock_outputs')}")
+            check("H-LOCK-HOTPLUG: unlocked", [A])
+            wait_for(f"{A} draws the session's windows again",
+                     lambda: (lambda cost: cost.get("locked") is False and bool(cost.get("drawn_windows")))(
+                         state().get("frame_cost", {}).get(A) or {}))
+            overview()
+            return (f"locked, {B} plugged in got the shell's lock surface and drew no window or layer "
+                    f"({polls['bare']} polls on the lock background before it, {polls['covered']} under it, "
+                    f"client B re-homed onto {B}); unplugged, unlocked through PAM: "
+                    f"{len(clients)} clients drawing on {A}, Super opens the overview")
+
+        def pump():
+            while GLib.MainContext.default().iteration(False):
+                pass
+
+        signals = []
+
+        def on_signal(_conn, _sender, path, iface, member, _params):
+            signals.append((iface, member, path, time.monotonic()))
+
+        for iface in ("org.gnome.Mutter.ScreenCast.Session", "org.freedesktop.impl.portal.Session"):
+            dbus.signal_subscribe(None, iface, "Closed", None, None, Gio.DBusSignalFlags.NONE, on_signal)
+        portal = {"backend": None, "serial": 0}
+        dump_spec = importlib.util.spec_from_file_location(
+            "tuna_pipewire_dump", ROOT / "scripts/lib/tuna-pipewire-dump.py")
+        dump_module = importlib.util.module_from_spec(dump_spec)
+        dump_spec.loader.exec_module(dump_module)
+
+        def portal_owned():
+            try:
+                owner = dbus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                                       "GetNameOwner", GLib.Variant("(s)", ("org.freedesktop.impl.portal.desktop.gnome",)),
+                                       None, Gio.DBusCallFlags.NO_AUTO_START, 1000, None).unpack()[0]
+                pid = dbus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                                     "GetConnectionUnixProcessID", GLib.Variant("(s)", (owner,)),
+                                     None, Gio.DBusCallFlags.NONE, 1000, None).unpack()[0]
+                return pid == portal["backend"].pid
+            except GLib.Error:
+                return False
+
+        def portal_cast(connector):
+            """Share one monitor the way the portal frontend asks the
+            installed GNOME backend, its restore data standing in for the
+            picker. Returns (portal session handle, PipeWire node)."""
+            if portal["backend"] is None:
+                exe = next((p for p in ("/usr/libexec/xdg-desktop-portal-gnome", "/usr/lib/xdg-desktop-portal-gnome")
+                            if os.access(p, os.X_OK)), None)
+                if exe is None:
+                    raise RuntimeError("xdg-desktop-portal-gnome is not installed")
+                portal["backend"] = launch([exe, "--replace"], "portal-gnome", env | {
+                    "XDG_CURRENT_DESKTOP": "GNOME", "WAYLAND_DISPLAY": SOCKET, "GDK_BACKEND": "wayland",
+                    "XDG_SESSION_TYPE": "wayland"})
+                wait_for("xdg-desktop-portal-gnome on the session bus", portal_owned, 30)
+            _, monitors, _, _ = display_call("GetCurrentState", None,
+                                             "(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})").unpack()
+            spec = next(s for s, _, _ in monitors if s[0] == connector)
+            # xdp-gnome's displaystatetracker.c match string.
+            match = connector if tuple(spec[1:]) == ("unknown",) * 3 else ":".join(spec[1:])
+            portal["serial"] += 1
+            token = f"tunahotplug{portal['serial']}"
+            session = f"/org/freedesktop/portal/desktop/session/1_1/{token}"
+            request = f"/org/freedesktop/portal/desktop/request/1_1/{token}"
+            app = "org.tuna.HotplugStress"
+
+            def impl(method, args):
+                code, results = dbus.call_sync(
+                    "org.freedesktop.impl.portal.desktop.gnome", "/org/freedesktop/portal/desktop",
+                    "org.freedesktop.impl.portal.ScreenCast", method, args, GLib.VariantType.new("(ua{sv})"),
+                    Gio.DBusCallFlags.NONE, 30000, None).unpack()
+                if code != 0:
+                    raise RuntimeError(f"portal {method} for {connector} answered {code}")
+                return results
+
+            impl("CreateSession", GLib.Variant("(oosa{sv})", (request + "c", session, app, {})))
+            now = int(time.time())
+            restore = GLib.Variant("(suv)", ("GNOME", 1, GLib.Variant(
+                "(xxa(uuv))", (now, now, [(0, 1, GLib.Variant("s", match))]))))
+            impl("SelectSources", GLib.Variant("(oosa{sv})", (request + "s", session, app, {
+                "types": GLib.Variant("u", 1), "multiple": GLib.Variant("b", False),
+                "cursor_mode": GLib.Variant("u", 1), "restore_data": restore})))
+            streams = impl("Start", GLib.Variant("(oossa{sv})", (request + "t", session, app, "", {}))).get("streams") or []
+            if len(streams) != 1:
+                raise RuntimeError(f"portal Start for {connector} gave streams {streams}")
+            return session, streams[0][0]
+
+        def pipewire_nodes():
+            raw = subprocess.run(["pw-dump", "--no-colors"], env=env, capture_output=True,
+                                 check=True, timeout=10).stdout
+            return {o["id"] for o in dump_module.dump_objects(raw)
+                    if o.get("type") == "PipeWire:Interface:Node"}
+
+        def consume_frames(connector, node):
+            grab = subprocess.run(
+                ["gst-launch-1.0", "-q", "pipewiresrc", f"path={node}", "num-buffers=3", "!",
+                 "video/x-raw", "!", "fakesink"],
+                env=env, capture_output=True, text=True, timeout=30)
+            (out / f"cast-frames-{connector}.log").write_text(grab.stdout + grab.stderr)
+            if grab.returncode != 0:
+                raise RuntimeError(f"cast of {connector} gave no frames: {grab.stderr.strip()[-300:]}")
+
+        def cast_removed():
+            """H-CAST-REMOVED: Mutter's meta-stream-monitor.c on_monitors_changed
+            stops a monitor stream whose monitor left (meta_stream_stop), and
+            meta-screen-cast-session.c on_stream_closed closes its session."""
+            plug(1, {0, 1}, f"cast: plug {B}")
+            mark = len(log_path.read_text())
+            session, node = portal_cast(B)
+            consume_frames(B, node)
+            mark = len(log_path.read_text())
+            # A concrete video caps filter is needed: ANY -> fakesink
+            # leaves media.type unset and WirePlumber cannot link it.
+            consumer = launch(["gst-launch-1.0", "-q", "pipewiresrc", f"path={node}", "!",
+                               "video/x-raw", "!", "fakesink"], "cast-consumer-B")
+            wait_for(f"the cast of {B} streams to its consumer",
+                     lambda: "-> Streaming" in log_path.read_text()[mark:] and state().get("capture_streams") == 1, 30)
+            mark = len(log_path.read_text())
+            pump()
+            del signals[:]
+            unplugged = time.monotonic()
+            vkms.plug(1, False)
+            counts["hotplugs"] += 1
+
+            def closed(iface, path=None):
+                pump()
+                return next((t for i, m, p, t in signals if i == iface and m == "Closed"
+                             and (path is None or p == path)), None)
+            mutter_at = wait_for(f"Mutter ScreenCast Session.Closed after unplugging {B}",
+                                 lambda: closed("org.gnome.Mutter.ScreenCast.Session"), 5)
+            portal_at = wait_for(f"the portal session's Closed after unplugging {B}",
+                                 lambda: closed("org.freedesktop.impl.portal.Session", session), 5)
+            wait_for("no capture stream left", lambda: state().get("capture_streams") == 0, 5)
+            wait_for(f"PipeWire node {node} gone", lambda: node not in pipewire_nodes(), 5)
+            check(f"cast: unplug {B}", [A])
+            # Nothing renders the phantom output afterwards.
+            time.sleep(2)
+            tail = log_path.read_text()[mark:]
+            stopped = f"monitor {B} changed or is gone; stopping the stream" in tail
+            phantom = tail.count(f"output {B} gave no frame")
+            if not stopped or phantom:
+                raise RuntimeError(f"cast of {B}: stop logged {stopped}, {phantom} phantom render attempts")
+            if consumer.poll() is None:
+                os.killpg(consumer.pid, 15)
+                consumer.wait(timeout=5)
+            # A new cast of A streams.
+            session_a, node_a = portal_cast(A)
+            consume_frames(A, node_a)
+            dbus.call_sync("org.freedesktop.impl.portal.desktop.gnome", session_a, "org.freedesktop.impl.portal.Session",
+                           "Close", None, None, Gio.DBusCallFlags.NONE, 10000, None)
+            wait_for(f"the cast of {A} ends on Close", lambda: state().get("capture_streams") == 0, 5)
+            return (f"cast of {B} (node {node}) ended {mutter_at - unplugged:.2f}s after unplug with Mutter "
+                    f"Session.Closed, portal Closed at {portal_at - unplugged:.2f}s, node gone, 0 phantom renders; "
+                    f"new cast of {A} (node {node_a}) streamed 3 buffers")
 
         check("start", [A])
         open_client("A", A)
@@ -492,6 +844,76 @@ def run(args):
             print(f"tuna-hotplug-stress: round {r + 1}/{args.rounds} passed "
                   f"(PSS {value['pss_kib']} KiB, {value['fds']} fds)", flush=True)
 
+        try:
+            assertions["H-CAST-REMOVED"] = [True, cast_removed()]
+        except (RuntimeError, GLib.Error, subprocess.SubprocessError, StopIteration) as error:
+            assertions["H-CAST-REMOVED"] = [False, f"{type(error).__name__}: {error}"]
+        try:
+            assertions["H-LOCK-HOTPLUG"] = [True, lock_hotplug()]
+        except RuntimeError as error:
+            assertions["H-LOCK-HOTPLUG"] = [False, str(error)]
+        # Every connector unplugged at once, then plugged back (Mutter's
+        # meta_window_update_for_monitors_changed without, then with,
+        # logical monitors). The linear arrangement first, so the replug
+        # restores it whether the kernel's changes arrive together (the
+        # previous configuration) or one by one (the linear fallback).
+        label = "all unplugged"
+        plug(1, {0, 1}, f"{label}: plug {B}")
+        plug(2, {0, 1, 2}, f"{label}: plug {C}")
+        wa, wb = max_scale(A)[1], max_scale(B)[1]
+        apply([(A, 0, 1.0, True), (B, wa, 1.0, False), (C, wa + wb, 1.0, False)])
+        check(f"{label}: {A}, {B}, {C} in a row at scale 1", [A, B, C],
+              (f"{B} at x={wa}, {C} at x={wa + wb}",
+               lambda: [outputs().get(n, {}).get("rect", [None])[0] for n in (A, B, C)] == [0, wa, wa + wb]))
+        layout = {n: o["rect"] for n, o in outputs().items()}
+        before = {n: window(n)["rect"] for n in clients}
+        vkms.plug_all(False)
+        counts["hotplugs"] += 1
+        wait_for(f"{label}: no wl_output", lambda: state().get("outputs") == [])
+        wait_for(f"{label}: DisplayConfig lists no monitor",
+                 lambda: state().get("display_config", {}).get("monitors") == [])
+        colord_check(label, [])
+        # Unplugged in one rescan, no window moves at all; one by one,
+        # the windows of the first ones go to the primary first, as for
+        # any unplug, and stay where the last unplug found them.
+        unplugged = {n: window(n)["rect"] for n in clients}
+        rescans = [line for line in log_path.read_text().splitlines() if "drm: hotplug: connected [" in line]
+        at_once = set(rescans[-1].split("disconnected [", 1)[1].rstrip("]").split(", ")) == {A, B, C}
+        if at_once and unplugged != before:
+            raise RuntimeError(f"{label}: windows moved from {before} to {unplugged} with every output gone")
+        pointer = state().get("pointer_position")
+        for _ in range(5):
+            send("move 40 30")
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            alive()
+            if "ShellExited" in log_path.read_text():
+                raise RuntimeError(f"{label}: the shell exited")
+            for name, (home, process) in clients.items():
+                if process.poll() is not None:
+                    raise RuntimeError(f"{label}: client {name} exited with {process.returncode}")
+                w = window(name)
+                if not w or w["rect"] != unplugged[name] or min(w["rect"][2:]) <= 0:
+                    raise RuntimeError(f"{label}: client {name} is {w and w['rect']}, was {unplugged[name]}")
+                prefers = state().get("window_outputs", {}).get(str(w["id"]))
+                if prefers != home:
+                    raise RuntimeError(f"{label}: client {name} now prefers {prefers}, not {home}")
+            if state().get("pointer_position") != pointer:
+                raise RuntimeError(f"{label}: the pointer moved to {state().get('pointer_position')} "
+                                   f"from {pointer} with no output")
+            time.sleep(0.2)
+        steps.append({"step": label, "elapsed_s": round(time.monotonic() - start, 3), "at_once": at_once,
+                      "outputs": state().get("outputs"), "windows": unplugged})
+        vkms.plug_all(True)
+        counts["hotplugs"] += 1
+        check(f"{label}: replugged", [A, B, C],
+              ("the arrangement and every window back at its pre-unplug geometry",
+               lambda: {n: o["rect"] for n, o in outputs().items()} == layout
+               and all((window(n) or {}).get("rect") == before[n] for n in clients)))
+        overview()
+        point_into(B)
+        counts["all_unplugs"] += 1
+
         assertions["H-OUTPUTS"] = [True, f"{counts['hotplugs']} hotplugs; wl_outputs and DisplayConfig matched the connected set after each"]
         assertions["H-REHOME"] = [True, f"{len(clients)} windows on their own output when connected, else the primary, after every step"]
         assertions["H-CLIENTS"] = [True, f"{len(clients)} GTK 4 clients alive and drawing after every step"]
@@ -499,6 +921,10 @@ def run(args):
         assertions["H-STORED"] = [counts["stored_replugs"] > 0 or args.rounds < 2,
                                   f"{counts['stored_replugs']} replugs configured by a rewritten monitors.xml"]
         assertions["H-INPUT"] = [True, f"{counts['overview_toggles']} uinput overview toggles"]
+        assertions["H-ALL-UNPLUGGED"] = [counts["all_unplugs"] == 1,
+                                         f"{len(clients)} windows kept their geometry and output with no "
+                                         f"connector, then were back at it on {A}, {B}, {C}; overview and "
+                                         f"pointer input after the replug"]
         final = samples[-1]
         # Diagnostic limits for a bounded storm, as tuna-stress's.
         pss_limit = baseline["pss_kib"] * 1.25 + 65536
@@ -509,6 +935,9 @@ def run(args):
         assertions["H-LIVE"] = [compositor.poll() is None and "panicked" not in text
                                 and "ShellExited" not in text,
                                 "compositor alive without panic; the shell never exited"]
+        assertions["H-COLORD"] = [colord_steps[0] == len(steps),
+                                  f"{colord_steps[0]} steps: colord listed exactly one display device per connected "
+                                  f"output; replugs kept the device ids {dict(sorted(colord_ids.items()))}"]
     except Exception as error:
         assertions["H-HARNESS"] = [False, f"{type(error).__name__}: {error}"]
     finally:
@@ -533,9 +962,11 @@ def run(args):
             seatd.wait(timeout=5)
         if system_seatd:
             subprocess.run(["sudo", "systemctl", "start", "seatd"])
-        if dbus_pid:
+        for pid in (dbus_pid, system_bus_pid):
+            if not pid:
+                continue
             try:
-                os.kill(dbus_pid, 15)
+                os.kill(pid, 15)
             except ProcessLookupError:
                 pass
         for log in logs:

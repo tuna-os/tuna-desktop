@@ -1,5 +1,6 @@
 //! Real ext-session-lock clients; runtime PID/PAM policy is tested separately.
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
+use smithay::reexports::wayland_server::Resource;
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 use tuna_compositor::TestCompositor;
@@ -19,6 +20,8 @@ use wayland_protocols::ext::session_lock::v1::client::{
 #[derive(Default)]
 struct Client {
     globals: HashMap<String, (u32, u32)>,
+    /// Advertised wl_output global names, oldest first; a removal drops one.
+    outputs: Vec<u32>,
     events: Vec<(u32, bool)>,
     configured: Vec<(u32, u32)>,
 }
@@ -31,13 +34,19 @@ impl Dispatch<WlRegistry, ()> for Client {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        {
-            state.globals.insert(interface, (name, version));
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => {
+                if interface == "wl_output" {
+                    state.outputs.push(name);
+                }
+                state.globals.insert(interface, (name, version));
+            }
+            wl_registry::Event::GlobalRemove { name } => state.outputs.retain(|n| *n != name),
+            _ => (),
         }
     }
 }
@@ -371,4 +380,125 @@ fn unapproved_release_is_a_protocol_error_without_clearing_the_owner() {
     assert_eq!(comp.state.lock_surface_for("fixture").unwrap(), original);
     assert_eq!(comp.state.lock_surfaces(), vec![original]);
     assert!(!comp.state.take_client_unlock());
+}
+
+/// A connector plugged in as the DRM runtime does (`sync_drm_outputs`):
+/// a new `Output` with its own wl_output global, in the inventory.
+fn plug(comp: &mut TestCompositor, name: &str, size: (i32, i32)) {
+    let output = Output::new(
+        name.into(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Tuna Desktop".into(),
+            model: "Hotplug".into(),
+        },
+    );
+    output.change_current_state(
+        Some(Mode {
+            size: size.into(),
+            refresh: 60_000,
+        }),
+        None,
+        Some(Scale::Integer(1)),
+        Some((1000, 0).into()),
+    );
+    let global = output.create_global::<tuna_compositor::State>(&comp.display.handle());
+    comp.state.add_output(name, Some(output), size.0, size.1);
+    comp.state.note_output_global(name, global);
+}
+
+/// ext-session-lock-v1: the locker makes a lock surface for each new
+/// output; until it does the output shows nothing of the session, and a
+/// connector plugged in again is a new output that never shows the
+/// surface made for the one that left (Mutter's `make_output_inert`).
+#[test]
+fn output_plugged_while_locked_shows_only_its_own_lock_surface() {
+    let mut comp = compositor();
+    let mut peer = connect(&mut comp);
+    let qh = peer.queue.handle();
+    let manager: ExtSessionLockManagerV1 = peer.bind(1);
+    let lock = manager.lock(&qh, 30);
+    pump(&mut comp, &mut peer);
+    let pending = comp.state.take_lock_request().unwrap().0;
+    comp.state.resolve_lock_request(pending, true);
+    pump(&mut comp, &mut peer);
+    assert_eq!(peer.client.events, vec![(30, true)]);
+    let wl_compositor: WlCompositor = peer.bind(6);
+    let fixture: WlOutput = peer.bind(4);
+    let fixture_surface = wl_compositor.create_surface(&qh, ());
+    let _fixture_role = lock.get_lock_surface(&fixture_surface, &fixture, &qh, ());
+    pump(&mut comp, &mut peer);
+    assert_eq!(comp.state.lock_surface_outputs(), vec!["fixture"]);
+
+    // Plugged while locked: nothing until the locker covers it.
+    plug(&mut comp, "hot", (1280, 720));
+    pump(&mut comp, &mut peer);
+    assert!(comp.state.lock_surface_for("hot").is_none());
+    assert_eq!(comp.state.lock_surface_outputs(), vec!["fixture"]);
+    let first_global = *peer.client.outputs.last().unwrap();
+    let first: WlOutput = peer.registry.bind(first_global, 4, &qh, ());
+    let first_surface = wl_compositor.create_surface(&qh, ());
+    let first_role = lock.get_lock_surface(&first_surface, &first, &qh, ());
+    pump(&mut comp, &mut peer);
+    assert_eq!(peer.client.configured.last(), Some(&(1280, 720)));
+    assert_eq!(
+        comp.state
+            .lock_surface_for("hot")
+            .map(|s| s.id().protocol_id()),
+        Some(first_surface.id().protocol_id())
+    );
+    assert_eq!(comp.state.lock_surface_outputs(), vec!["fixture", "hot"]);
+
+    // Unplugged: its lock surface goes with it, though the locker has
+    // not destroyed it yet.
+    assert!(comp.state.remove_output("hot"));
+    pump(&mut comp, &mut peer);
+    assert!(!peer.client.outputs.contains(&first_global));
+    assert!(
+        comp.state.lock_surface_for("hot").is_none(),
+        "the removed output's lock surface stays registered"
+    );
+    assert_eq!(comp.state.lock_surface_outputs(), vec!["fixture"]);
+    first_role.destroy();
+    first_surface.destroy();
+    // A locker that has not yet heard of the removal covers the gone
+    // output again (its global is withdrawn, still bindable).
+    let stale_output: WlOutput = peer.registry.bind(first_global, 4, &qh, ());
+    let stale_surface = wl_compositor.create_surface(&qh, ());
+    let _stale_role = lock.get_lock_surface(&stale_surface, &stale_output, &qh, ());
+    pump(&mut comp, &mut peer);
+
+    // The same connector plugged in again, at another mode: a new
+    // output, shown with neither surface made for the old one.
+    plug(&mut comp, "hot", (1920, 1080));
+    pump(&mut comp, &mut peer);
+    assert!(
+        comp.state.lock_surface_for("hot").is_none(),
+        "a surface made for the removed output covers its replacement"
+    );
+    let second_global = *peer.client.outputs.last().unwrap();
+    assert_ne!(second_global, first_global);
+    let second: WlOutput = peer.registry.bind(second_global, 4, &qh, ());
+    let second_surface = wl_compositor.create_surface(&qh, ());
+    let _second_role = lock.get_lock_surface(&second_surface, &second, &qh, ());
+    pump(&mut comp, &mut peer);
+    assert_eq!(peer.client.configured.last(), Some(&(1920, 1080)));
+    assert_eq!(
+        comp.state
+            .lock_surface_for("hot")
+            .map(|s| s.id().protocol_id()),
+        Some(second_surface.id().protocol_id())
+    );
+    assert_eq!(comp.state.lock_surface_outputs(), vec!["fixture", "hot"]);
+    assert_eq!(comp.state.lock_surfaces().len(), 2);
+    assert!(peer.conn.protocol_error().is_none());
+
+    // Unlock still works afterwards.
+    assert!(!comp.state.take_client_unlock());
+    lock.unlock_and_destroy();
+    pump(&mut comp, &mut peer);
+    assert!(comp.state.take_client_unlock());
+    assert!(!comp.state.has_lock_surfaces());
+    assert!(comp.state.lock_surface_outputs().is_empty());
 }
