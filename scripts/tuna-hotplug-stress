@@ -518,13 +518,13 @@ def run(args):
 
             def exact():
                 last[0] = colord_displays()
-                return last[0] is not None and sorted(last[0]) == want and \
-                    all(len(ids) == 1 for ids in last[0].values()) and last[0]
+                return (last[0] is not None and sorted(last[0]) == want
+                        and all(len(ids) == 1 for ids in last[0].values()))
             try:
-                found = wait_for(f"H-COLORD: {label}: colord has one display device for each of {want}", exact)
+                wait_for(f"H-COLORD: {label}: colord has one display device for each of {want}", exact)
             except RuntimeError as error:
                 raise RuntimeError(f"{error}; colord lists {last[0]}") from None
-            for name, (device_id,) in found.items():
+            for name, (device_id,) in last[0].items():
                 if colord_ids.setdefault(name, device_id) != device_id:
                     raise RuntimeError(f"H-COLORD: {label}: {name}'s colord device is {device_id}, "
                                        f"was {colord_ids[name]}")
@@ -869,6 +869,7 @@ def run(args):
         wait_for(f"{label}: no wl_output", lambda: state().get("outputs") == [])
         wait_for(f"{label}: DisplayConfig lists no monitor",
                  lambda: state().get("display_config", {}).get("monitors") == [])
+        colord_check(label, [])
         # Unplugged in one rescan, no window moves at all; one by one,
         # the windows of the first ones go to the primary first, as for
         # any unplug, and stay where the last unplug found them.
