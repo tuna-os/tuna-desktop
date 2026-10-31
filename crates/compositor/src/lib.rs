@@ -135,6 +135,7 @@ pub mod sleep;
 pub mod slideshow;
 pub mod spring;
 pub mod state;
+mod state_snapshot;
 pub mod supervise;
 pub mod tablet;
 pub mod tablet_actions;

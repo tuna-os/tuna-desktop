@@ -918,9 +918,9 @@ pub struct Runtime {
     atspi_points: AtspiPoints,
     exit: bool,
     stats: RunStats,
-    /// `TUNA_COMPOSITOR_STATE` snapshot path (journeys only).
-    state_path: Option<std::path::PathBuf>,
-    state_last: String,
+    /// Owned, bounded-latest publisher for opt-in `TUNA_COMPOSITOR_STATE`.
+    /// Filesystem writes never run on the compositor thread.
+    state_publisher: Option<crate::state_snapshot::Publisher>,
     /// Opt-in synthetic touchpad phases for the nested proof harness.
     proof_swipe_last: String,
     /// The `sequence` of the last phase consumed, published in the state
@@ -1444,6 +1444,17 @@ impl Runtime {
         let privacy_screen_settings =
             hardware.then(|| crate::privacy_screen_settings::PrivacyScreenSettings::start(&wake));
         let loop_handle = event_loop.handle();
+        let state_path = std::env::var_os("TUNA_COMPOSITOR_STATE")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute());
+        let state_dir = state_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf);
+        let state_publisher = state_path
+            .map(crate::state_snapshot::Publisher::start)
+            .transpose()
+            .map_err(|error| RuntimeError::Loop(format!("state snapshot publisher: {error}")))?;
         let mut runtime = Runtime {
             display,
             state,
@@ -1565,17 +1576,14 @@ impl Runtime {
             atspi_points: AtspiPoints::default(),
             exit: false,
             stats: RunStats::default(),
-            state_path: std::env::var_os("TUNA_COMPOSITOR_STATE")
-                .map(std::path::PathBuf::from)
-                .filter(|p| p.is_absolute()),
-            state_last: String::new(),
+            state_publisher,
             proof_swipe_last: String::new(),
             proof_swipe_sequence: None,
             #[cfg(feature = "drm")]
             performance_trace: crate::performance_trace::Trace::from_env(),
         };
         runtime.animation_clock =
-            crate::animation_clock::AnimationClock::from_env(runtime.state_path.is_some());
+            crate::animation_clock::AnimationClock::from_env(runtime.state_publisher.is_some());
         runtime.wallpaper.set_wake(&runtime.wake);
         // Night Light (#339): D-Bus preview/clear/temp-disable
         // records ping the already-registered wake above; its no-op
@@ -1594,7 +1602,7 @@ impl Runtime {
         let started = runtime.animation_clock.now();
         runtime.overview_progress_at = started;
         runtime.strip_view_at = started;
-        runtime.proof_polling = runtime.state_path.is_some()
+        runtime.proof_polling = runtime.state_publisher.is_some()
             && [crate::animation_clock::CLOCK_ENV, "TUNA_PROOF_SWIPE_INPUT"]
                 .iter()
                 .any(|key| std::env::var_os(key).is_some());
@@ -1604,11 +1612,6 @@ impl Runtime {
         // tick itself rewrites there would wake the loop on its own
         // writes, so then the dir is not watched and the blank file is
         // read on every tick.
-        let state_dir = runtime
-            .state_path
-            .as_deref()
-            .and_then(std::path::Path::parent)
-            .map(std::path::Path::to_path_buf);
         if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|dir| state_dir.as_deref() != Some(std::path::Path::new(dir)))
         {
@@ -2514,11 +2517,11 @@ impl Runtime {
         Vec::new()
     }
 
-    /// Write the compositor-side state snapshot when it changed
-    /// (`TUNA_COMPOSITOR_STATE`, journeys only; #65). App ids and ids,
-    /// never titles.
+    /// Queue one coherent compositor-side state snapshot (`TUNA_COMPOSITOR_STATE`,
+    /// journeys only; #65). The owned writer atomically publishes the latest body
+    /// without making rendering wait on disk. App ids and ids, never titles.
     fn publish_state(&mut self) {
-        if self.state_path.is_none() {
+        if self.state_publisher.is_none() {
             return;
         }
         let mut keyboard = self.manager.keyboard_summary(&mut self.state);
@@ -2526,7 +2529,7 @@ impl Runtime {
             let saving = self.numlock.saving(self.manager.keyboard_num_lock());
             keyboard.insert("numlock_saving".into(), saving.into());
         }
-        let Some(path) = self.state_path.as_ref() else {
+        let Some(publisher) = self.state_publisher.as_ref() else {
             return;
         };
         let model = self.manager.model();
@@ -2877,19 +2880,7 @@ impl Runtime {
             doc["tablets"] = drm.tablets_introspect();
         }
         let doc = crate::grid_trace::operation(&self.state, "state_serialize", || doc.to_string());
-        if doc == self.state_last {
-            return;
-        }
-        let tmp = path.with_extension("tmp");
-        if crate::grid_trace::operation(&self.state, "state_write", || std::fs::write(&tmp, &doc))
-            .is_ok()
-            && crate::grid_trace::operation(&self.state, "state_rename", || {
-                std::fs::rename(&tmp, path)
-            })
-            .is_ok()
-        {
-            self.state_last = doc;
-        }
+        publisher.publish(doc);
     }
 
     /// The overview at rest on the primary output (#54): the window
@@ -3133,7 +3124,7 @@ impl Runtime {
     /// Each atomically replaced JSON file is consumed once; ordinary sessions
     /// never read it because state instrumentation is also required.
     fn proof_swipe_input(&mut self) {
-        if self.state_path.is_none() {
+        if self.state_publisher.is_none() {
             return;
         }
         let Some(path) = std::env::var_os("TUNA_PROOF_SWIPE_INPUT")
