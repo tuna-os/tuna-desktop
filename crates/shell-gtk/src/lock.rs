@@ -767,7 +767,7 @@ impl LockUi {
         bar.set_valign(gtk::Align::Start);
         overlay.add_overlay(&bar);
         // GNOME's NotificationsBox: the bottom of the column under the
-        // clock and the prompt.
+        // clock and the prompt, raising them when it is taller.
         let notifications = NotificationsBox::new();
         overlay.add_overlay(notifications.widget());
         // GNOME's keyboard box sits over the lock screen too: it opens
@@ -808,26 +808,37 @@ impl LockUi {
         // Vertical placement: GNOME puts the stack a third of the way
         // down (UnlockDialogLayout), which lands the 1280x800 clock at
         // y 275 and the prompt at y 205. The notifications take the
-        // bottom, never reaching up into the clock.
+        // bottom; taller than the room below the stack, they raise the
+        // stack up to a tenth of the height from the top, and only the
+        // rest of them scrolls.
         {
             let (clock_box, prompt) = (clock_box.clone(), prompt.clone());
             let scroller = notifications.widget().clone();
-            let last = Cell::new(-1);
+            let notes_height = notifications.natural_height();
+            let last = Cell::new((-1, -1));
             window.add_tick_callback(move |w, _| {
                 let height = w.height();
                 let (clock_top, prompt_top) = logic::lock_offsets(height);
-                if height != last.get() {
-                    last.set(height);
-                    clock_box.set_margin_top(clock_top);
-                    prompt.set_margin_top(prompt_top);
+                let stack_top = clock_top - logic::LOCK_CLOCK_MARGIN;
+                // GNOME's stack is as tall as the taller of the clock
+                // (with its top margin) and the prompt. Measures include
+                // margins, and may still hold the old ones for a frame:
+                // take each one's own height.
+                let own = |w: &gtk::Box| {
+                    let (_, natural, _, _) = w.measure(gtk::Orientation::Vertical, -1);
+                    natural - w.margin_top() - w.margin_bottom()
+                };
+                let stack = (logic::LOCK_CLOCK_MARGIN + own(&clock_box))
+                    .max(prompt_top - stack_top + own(&prompt));
+                let (rise, shown) =
+                    logic::lock_notifications_layout(height, stack_top, stack, notes_height());
+                if (height, rise) != last.get() {
+                    last.set((height, rise));
+                    clock_box.set_margin_top(clock_top - rise);
+                    prompt.set_margin_top(prompt_top - rise);
                 }
-                // The measure includes margins, and may still hold the old
-                // ones for a frame: take the clock's own height.
-                let (_, natural, _, _) = clock_box.measure(gtk::Orientation::Vertical, -1);
-                let clock = natural - clock_box.margin_top() - clock_box.margin_bottom();
-                let room = (height - clock_top - clock).max(0);
-                if scroller.max_content_height() != room {
-                    scroller.set_max_content_height(room);
+                if scroller.max_content_height() != shown {
+                    scroller.set_max_content_height(shown);
                 }
                 glib::ControlFlow::Continue
             });
