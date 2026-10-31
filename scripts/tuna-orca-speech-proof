@@ -410,6 +410,7 @@ sleep 4
 # between the two releases left Super last and Orca silent ("Not
 # speaking inserted string due to lack of cause"). Super stays down
 # until the lock holds the keyboard.
+heard="$(jq -r '.a11y_keyboard.normal_events' "$CSTATE")"
 mark lock
 xdotool keydown super key l
 if ! cstate '.locked == true and .a11y_keyboard.locked == true' "locked"; then
@@ -430,6 +431,12 @@ for _ in $(seq 1 100); do
     sleep 0.2
 done
 [ "$asked" = 1 ] || fail G-ORCA-SPEECH-LOCK "the unlock prompt never asked PAM's password question"
+# With Super held, only Super, L and L's release can reach Orca before
+# the lock, in that order; under the lock, keys not yet sent are dropped.
+# Two or more forwarded means Orca heard the L.
+forwarded=$(($(jq -r '.a11y_keyboard.normal_events' "$CSTATE") - heard))
+[ "$forwarded" -ge 2 ] ||
+    fail G-ORCA-SPEECH-LOCK "Orca's KeyboardMonitor got $forwarded of Super+L's keys before the lock, not the L: no printable last key for its typing echo"
 mark lock-type
 xdotool type --clearmodifiers --delay 200 "$UNLOCK_PASSWORD"
 bullets="$(printf '%s' "$UNLOCK_PASSWORD" | sed 's/./● /g')"
