@@ -136,8 +136,9 @@ Cleanup is automatic where it is safe:
   checkout's target alone unless given `--include-main`. `--watch
   [seconds]` repeats it (default every 600 s); on a shared host run it
   that way from a clean checkout of `main`;
-- any build recipe runs `just gc` and `just disk-guard` first when less
-  than `TUNA_MIN_FREE_GB` (40 GiB) is free.
+- any build recipe runs `just disk-guard` first (it only removes anything
+  below `TUNA_MIN_FREE_GB`, 40 GiB); automatic cleanup never calls `gc`,
+  whose merged-PR cleanup is not process-aware.
 
 VM lanes need KVM, so they run in CI's `marlin-vm` jobs or on a Corral
 VM, not through these recipes.

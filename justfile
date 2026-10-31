@@ -17,7 +17,7 @@ export CARGO_TARGET_DIR := env("TUNA_TARGET_DIR", justfile_directory() / "target
 # command runs, so a daemon it leaves behind can't keep holding the lock.
 lock := "flock -o " + env("TUNA_BUILD_LOCK", "/tmp/tuna-local-build.lock")
 proof_lock := "flock -o " + env("TUNA_PROOF_LOCK", "/tmp/tuna-local-proof.lock")
-# Below this much free disk (GiB), builds run `gc` and `disk-guard` first.
+# Below this much free disk (GiB), builds run `disk-guard` first.
 min_free_gb := env("TUNA_MIN_FREE_GB", "40")
 # Downloaded CI artifacts live here and expire after `artifact_ttl_min`.
 ci_artifacts := env("TUNA_CI_ARTIFACTS", "/tmp/tuna-ci-artifacts")
@@ -158,13 +158,6 @@ gc:
 disk-guard *args:
     TUNA_MIN_FREE_GB={{min_free_gb}} TUNA_CI_ARTIFACTS="{{ci_artifacts}}" "{{justfile_directory()}}/scripts/tuna-disk-guard" {{args}}
 
-# Run `gc` and `disk-guard` when free disk falls below `min_free_gb`.
+# Run the process-aware disk guard before builds; it checks the free-space threshold.
 _disk:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    free=$(df --output=avail -BG "{{justfile_directory()}}" | tail -1 | tr -dc '0-9')
-    if [ "$free" -lt {{min_free_gb}} ]; then
-        echo "only ${free}G free (< {{min_free_gb}}G); running gc and disk-guard" >&2
-        just --justfile "{{justfile()}}" gc
-        just --justfile "{{justfile()}}" disk-guard
-    fi
+    @just --justfile "{{justfile()}}" disk-guard

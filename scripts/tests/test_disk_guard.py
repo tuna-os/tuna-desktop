@@ -41,7 +41,7 @@ class DiskGuard(unittest.TestCase):
         git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
             "--allow-empty", "-m", "init", cwd=self.main)
         self.trees = {}
-        for name in ("idle", "fresh", "busy", "running"):
+        for name in ("idle", "fresh", "busy", "running", "argref"):
             wt = self.dir / "wt" / name
             git("worktree", "add", "-q", "-b", name, str(wt), cwd=self.main)
             self.trees[name] = wt
@@ -65,7 +65,14 @@ class DiskGuard(unittest.TestCase):
         shutil.copy2("/bin/sleep", exe)
         age(running, 120)
         idle = make_target(self.trees["idle"], 120)
-        fresh = make_target(self.trees["fresh"], 5)
+        fresh = make_target(self.trees["fresh"], 120)
+        deep = fresh / "debug/a/b/c/d"
+        deep.mkdir(parents=True)
+        recently_written = deep / "object"
+        recently_written.write_text("still building")
+        age(fresh, 120)
+        recently_written.touch()
+        argref = make_target(self.trees["argref"], 120)
         busy = make_target(self.trees["busy"], 120)
         old_proof = self.tmp / "tuna-proof-gtk-shell-proof.old"
         new_proof = self.tmp / "tuna-proof-gtk-shell-proof.new"
@@ -81,7 +88,9 @@ class DiskGuard(unittest.TestCase):
         # old proof dir, one executing a binary from an old target.
         live = [subprocess.Popen(["sleep", "60"], cwd=busy / "debug"),
                 subprocess.Popen(["sleep", "60"], cwd=held_proof),
-                subprocess.Popen(["tuna-sleep", "60"], executable=exe, cwd=self.dir)]
+                subprocess.Popen(["tuna-sleep", "60"], executable=exe, cwd=self.dir),
+                subprocess.Popen(["python3", "-c", "import time; time.sleep(60)",
+                                  f"--target-dir={argref}"], cwd=self.dir)]
         for p in live:
             self.addCleanup(p.wait)
             self.addCleanup(p.kill)
@@ -91,7 +100,7 @@ class DiskGuard(unittest.TestCase):
         self.assertFalse(idle.exists(), out)
         self.assertFalse(old_proof.exists(), out)
         self.assertFalse(old_ci.exists(), out)
-        for kept in (main_target, fresh, busy, running, new_proof, held_proof, other, new_ci):
+        for kept in (main_target, fresh, busy, running, argref, new_proof, held_proof, other, new_ci):
             self.assertTrue(kept.exists(), f"{kept} removed:\n{out}")
         self.assertIn(f"removed {idle}", out)
 
