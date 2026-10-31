@@ -382,6 +382,22 @@ impl Wallpaper {
         Self::default()
     }
 
+    /// Mutter's `invalidate_monitor_backgrounds` on `monitors-changed`:
+    /// what was drawn for the old layout is dropped and the new layout
+    /// draws on demand, so a scale or hotplug storm keeps one picture
+    /// per monitor rather than one per layout it went through. What is
+    /// on screen (`shown`) stays until its replacement is ready, so
+    /// nothing flashes; decoded source images stay too, like Mutter's
+    /// `MetaBackgroundImageCache`.
+    pub fn monitors_changed(&mut self) {
+        self.loaded.clear();
+        self.locked.clear();
+        self.animation_samples.clear();
+        if let Ok(mut placed) = self.image_cache.placed.lock() {
+            placed.clear();
+        }
+    }
+
     /// Counts only; benchmark observation must not start work or wait for it.
     #[cfg(feature = "drm")]
     pub(crate) fn card_counts(&self) -> (usize, usize) {
@@ -2591,5 +2607,55 @@ mod tests {
             false
         ));
         assert_eq!(shown.len(), 2);
+    }
+
+    #[test]
+    fn a_monitor_change_drops_the_old_layouts_pictures_but_not_the_one_on_screen() {
+        let output: Size<i32, Logical> = (64, 48).into();
+        let picture = |shade: u8| {
+            MemoryRenderBuffer::from_slice(
+                &[shade; 64 * 48 * 4],
+                Fourcc::Argb8888,
+                (64, 48),
+                1,
+                Transform::Normal,
+                None,
+            )
+        };
+        let mut wallpaper = Wallpaper::new();
+        // A scale storm: one decoded picture per layout it went through.
+        for (shade, scale) in [(10u8, "1.25"), (20, "1.5"), (30, "1.75"), (40, "1")] {
+            wallpaper.loaded.push(Loaded {
+                paint: None,
+                epoch: None,
+                uri: format!("test-image\n{scale}"),
+                size: Some(output),
+                pixels: Some(vec![shade; 64 * 48 * 4].into()),
+                buffer: Some(picture(shade)),
+                cards_prewarmed: true,
+            });
+        }
+        wallpaper
+            .locked
+            .push(("test-image\n1".into(), output, picture(5)));
+        present(
+            &mut wallpaper.shown,
+            output,
+            "test-image",
+            "test-image\n1",
+            Some(picture(40)),
+            std::time::Duration::ZERO,
+            true,
+        );
+        wallpaper.monitors_changed();
+        assert!(
+            wallpaper.loaded.is_empty() && wallpaper.locked.is_empty(),
+            "nothing drawn for an old layout is kept"
+        );
+        assert_eq!(
+            wallpaper.shown.len(),
+            1,
+            "the picture on screen stays until the new layout's is ready"
+        );
     }
 }

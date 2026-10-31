@@ -60,6 +60,7 @@ pub mod animation_clock;
 mod auth_owner;
 mod bell;
 pub mod capture_security;
+mod client_listener;
 pub mod color_manager;
 mod constraint_motion;
 pub mod control;
@@ -86,6 +87,7 @@ pub mod lock;
 pub mod lockdown;
 mod logind_session;
 pub mod magnifier;
+pub mod malloc;
 pub mod menu_close;
 pub mod minimize;
 pub mod modal_dim;
@@ -97,6 +99,7 @@ pub mod native_output;
 mod native_repaint;
 pub mod night_light;
 pub(crate) mod night_light_settings;
+pub mod nofile;
 pub mod numlock;
 mod occlusion;
 pub mod orca;
@@ -259,6 +262,9 @@ pub struct State {
     /// Client window-state requests awaiting the manager's next
     /// `reconcile` drain (002 window actions).
     pub(crate) window_requests: Vec<(wl_surface::WlSurface, WindowRequest)>,
+    /// Serial of the latest pointer button press sent to a client: Mutter's
+    /// `grab_serial`, which xdg_toplevel.show_window_menu must name.
+    pub(crate) pointer_press_serial: Option<Serial>,
     /// Exact native parent at role destruction, consumed on the next reconcile.
     /// Smithay clears role data immediately after `toplevel_destroyed` returns.
     pub(crate) closed_toplevel_parents:
@@ -581,13 +587,32 @@ impl XdgShellHandler for State {
 
     /// Queue a window-menu request (header-bar right click) for the
     /// manager drain; the shell draws GNOME's window menu there.
+    ///
+    /// Mutter (xdg_toplevel_show_window_menu) shows the menu only for the
+    /// serial of the latest press, with the pointer still on this surface
+    /// or one of its subsurfaces (meta_wayland_pointer_get_grab_info, not
+    /// requiring the button to be held: GTK asks on press and the release
+    /// may already be in). Anything else, such as a client with no input
+    /// at all, is ignored instead of opening a modal menu.
     fn show_window_menu(
         &mut self,
         surface: ToplevelSurface,
-        _seat: wl_seat::WlSeat,
-        _serial: Serial,
+        seat: wl_seat::WlSeat,
+        serial: Serial,
         location: smithay::utils::Point<i32, smithay::utils::Logical>,
     ) {
+        if !self.seat.owns(&seat) || self.pointer_press_serial != Some(serial) {
+            return;
+        }
+        let Some(mut focus) = self.seat.get_pointer().and_then(|p| p.current_focus()) else {
+            return;
+        };
+        while focus != *surface.wl_surface() {
+            let Some(parent) = smithay::wayland::compositor::get_parent(&focus) else {
+                return;
+            };
+            focus = parent;
+        }
         self.window_requests.push((
             surface.wl_surface().clone(),
             WindowRequest::Menu(location.x, location.y),
@@ -1021,6 +1046,7 @@ impl State {
             initial_outputs: std::collections::HashMap::new(),
             outputs: Vec::new(),
             window_requests: Vec::new(),
+            pointer_press_serial: None,
             closed_toplevel_parents: std::collections::HashMap::new(),
             protocols: protocols::Protocols::new(dh),
             frame_timing: frame_timing::FrameTiming::new(dh),

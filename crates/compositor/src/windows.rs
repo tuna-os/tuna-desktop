@@ -4103,10 +4103,14 @@ impl WindowManager {
                     pointer.current_focus().is_some()
                 );
             }
+            let serial = SERIAL_COUNTER.next_serial();
+            if pressed {
+                state.pointer_press_serial = Some(serial);
+            }
             pointer.button(
                 state,
                 &ButtonEvent {
-                    serial: SERIAL_COUNTER.next_serial(),
+                    serial,
                     time,
                     button,
                     state: if pressed {
@@ -4176,6 +4180,23 @@ impl WindowManager {
         pointer.frame(state);
     }
 
+    /// The lock lifted: give the keyboard back to what had it, as GNOME
+    /// Shell's `popModal` does (screenShield.js locks with a modal stage
+    /// grab, which revokes Mutter's Wayland popup grab without dismissing
+    /// it): the topmost popup of a grab that outlived the lock, else the
+    /// owner a popup grab hands back to (the parked overview, an
+    /// Exclusive layer, the focused window). Without this the keyboard
+    /// stayed on the destroyed lock surface until the next click.
+    pub fn refocus_after_lock(&mut self, state: &mut State) {
+        if let Some(top) = state.popup_grab.last().map(|p| p.wl_surface().clone()) {
+            if let Some(keyboard) = self.keyboard.clone() {
+                keyboard.set_focus(state, Some(top), SERIAL_COUNTER.next_serial());
+            }
+            return;
+        }
+        state.popup_refocus = true;
+    }
+
     /// Route one input event to the session-lock surface and nothing
     /// else (ext-session-lock-v1): keys go to it with keyboard focus
     /// held there, the pointer acts on it at the output origin, and no
@@ -4229,10 +4250,14 @@ impl WindowManager {
             } => {
                 if let Some(pointer) = self.pointer.clone() {
                     self.lock_pointer_enter(state, &pointer, surface, time);
+                    let serial = SERIAL_COUNTER.next_serial();
+                    if pressed {
+                        state.pointer_press_serial = Some(serial);
+                    }
                     pointer.button(
                         state,
                         &ButtonEvent {
-                            serial: SERIAL_COUNTER.next_serial(),
+                            serial,
                             time,
                             button,
                             state: if pressed {

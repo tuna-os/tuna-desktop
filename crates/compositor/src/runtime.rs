@@ -34,7 +34,7 @@ use smithay::{
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::wayland_server::Display,
     utils::{Logical, Point, Rectangle, Transform},
-    wayland::{seat::WaylandFocus, socket::ListeningSocketSource},
+    wayland::seat::WaylandFocus,
 };
 
 use crate::control::{ControlHub, PeerGate};
@@ -1174,22 +1174,24 @@ impl Runtime {
                 )
                 .map_err(|e| RuntimeError::Loop(e.to_string()))?;
         }
-        let socket = ListeningSocketSource::with_name(&session.socket_name)
-            .map_err(|e| RuntimeError::Socket(e.to_string()))?;
-        event_loop
-            .handle()
-            .insert_source(socket, |stream, _, runtime: &mut Runtime| {
+        // A failed accept (descriptors exhausted by a client flood) rests
+        // the socket instead of ending the session (#203).
+        crate::client_listener::listen(
+            &event_loop.handle(),
+            &session.socket_name,
+            |stream, runtime: &mut Runtime| {
                 let client_data = ClientState::native_connection(&stream);
-                if let Ok(client) = runtime
+                if runtime
                     .display
                     .handle()
                     .insert_client(stream, Arc::new(client_data))
+                    .is_ok()
                 {
-                    let _ = client;
                     runtime.stats.clients += 1;
                 }
-            })
-            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+            },
+        )
+        .map_err(|e| RuntimeError::Socket(e.to_string()))?;
 
         // The shell offers power actions only on a hardware session: in
         // the nested preview, logind's session is the host's, so Log Out
@@ -1912,6 +1914,7 @@ impl Runtime {
         self.control.set_locked(false);
         self.state.set_shortcut_inhibition_locked(false);
         self.overlay.hide();
+        self.manager.refocus_after_lock(&mut self.state);
     }
 
     /// logind's `Lock` signal (`loginctl lock-session`): `screenShield.js`
@@ -2742,6 +2745,15 @@ impl Runtime {
         doc["magnifier"] = self.magnifier.diagnostics();
         doc["screen_reader_pid"] = serde_json::json!(self.orca.pid());
         doc["screen_reader_state"] = serde_json::json!(self.orca.state());
+        // Shell supervision (#203's crash-loop stress): the supervised
+        // shell's PID, restarts spent from its budget, and whether the
+        // compositor's recovery overlay is up.
+        doc["shell"] = serde_json::json!({
+            "pid": self.shell.child_pid(),
+            "restarts_used": self.shell.restarts_used(),
+            "max_restarts": self.shell.policy().max_attempts,
+            "overlay_visible": self.overlay.visible,
+        });
         doc["a11y_keyboard"] = self
             .a11y_keyboard
             .as_ref()

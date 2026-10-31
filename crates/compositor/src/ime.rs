@@ -232,7 +232,7 @@ impl ImeBridge {
         };
         self.xim_address_probe = None;
         let Some(address) = address else { return };
-        match Command::new(bin)
+        match crate::nofile::restore_in_child(&mut Command::new(bin))
             .env("DISPLAY", format!(":{display}"))
             .env("WAYLAND_DISPLAY", &self.wayland_display)
             .env("IBUS_ADDRESS", address)
@@ -341,6 +341,7 @@ fn spawn(bin: &Path, wayland_display: &str, dh: &mut DisplayHandle) -> std::io::
     let (ours, theirs) = UnixStream::pair()?;
     let fd = theirs.as_raw_fd();
     let mut command = Command::new(bin);
+    crate::nofile::restore_in_child(&mut command);
     command
         .env("WAYLAND_SOCKET", fd.to_string())
         // IBus names its bus after the display.
