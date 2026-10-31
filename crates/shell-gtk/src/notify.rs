@@ -44,6 +44,9 @@ pub const BANNER_TIMEOUT: Duration = Duration::from_secs(4);
 pub const AWAY_AFTER: Duration = Duration::from_secs(1);
 /// How long a banner stays once an away user comes back.
 pub const BACK_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the pointer may be off a banner it held before the banner
+/// goes (messageTray.js `HIDE_TIMEOUT`).
+const BANNER_HIDE_TIMEOUT: Duration = Duration::from_millis(200);
 /// While the notifications name is not ours, how often to try again.
 const BUS_RETRY: Duration = Duration::from_secs(2);
 /// Without a user-active watch, how often to look for an away user's
@@ -91,6 +94,12 @@ impl BannerTimer {
     /// When the banner goes; `None` while it waits for an away user.
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+
+    /// Go at `at` instead (GNOME's `_updateNotificationTimeout(0)` once
+    /// the pointer has left the banner).
+    pub fn expire_at(&mut self, at: Instant) {
+        self.deadline = Some(at);
     }
 }
 
@@ -403,6 +412,15 @@ pub struct NotifyUi {
     /// across an in-place update, which then times out like any banner
     /// shown to an active user.
     user_active: Cell<bool>,
+    /// The banner the user expanded (its expand button, the pointer or
+    /// Super+N): it stays expanded when an update shows it again, as
+    /// GNOME updates the banner in place.
+    banner_expanded: Cell<Option<u64>>,
+    /// Expands (or collapses) the banner on screen, animated or not.
+    banner_expander: RefCell<Option<BannerExpander>>,
+    /// The pointer is on the banner (`_pointerInNotification`): it holds
+    /// the banner on screen.
+    pointer_in: Cell<bool>,
     /// The groups the user expanded, by source key.
     expanded: RefCell<HashSet<String>>,
     group_widgets: RefCell<HashMap<String, Rc<crate::group_animation::Group>>>,
@@ -441,12 +459,29 @@ pub struct NotifyUi {
 /// Told when Do Not Disturb turns on or off.
 type DndListener = Box<dyn Fn(bool)>;
 
+/// Sets the banner on screen expanded or not; the second argument
+/// animates it.
+type BannerExpander = Rc<dyn Fn(bool, bool)>;
+
+/// How many body lines an expanded message shows (messageList.js
+/// `DEFAULT_EXPAND_LINES`).
+const BANNER_EXPANDED_LINES: i32 = 6;
+
+/// A notification card's widgets.
+struct Card {
+    widget: gtk::Box,
+    close: gtk::Button,
+    summary: gtk::Label,
+    /// The body line, absent for an empty body.
+    body: Option<gtk::Label>,
+}
+
 /// One notification as GNOME 51 draws it (messageList.js
 /// NotificationMessage): a header with the source icon, app name, time
-/// and close button, then the title and body. Returns the card and its
-/// close button. Banner and list cards alike carry GNOME's message role
-/// (`Atk.Role.NOTIFICATION`, GTK's alert).
-fn card(n: &Notification) -> (gtk::Box, gtk::Button) {
+/// and close button, then the title and body. Banner and list cards
+/// alike carry GNOME's message role (`Atk.Role.NOTIFICATION`, GTK's
+/// alert).
+fn card(n: &Notification) -> Card {
     let card = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .accessible_role(gtk::AccessibleRole::Alert)
@@ -492,7 +527,7 @@ fn card(n: &Notification) -> (gtk::Box, gtk::Button) {
     summary.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     summary.set_max_width_chars(48);
     content.append(&summary);
-    if !n.body().is_empty() {
+    let body = (!n.body().is_empty()).then(|| {
         let body = gtk::Label::new(Some(n.body()));
         body.add_css_class("message-body");
         body.set_xalign(0.0);
@@ -500,13 +535,19 @@ fn card(n: &Notification) -> (gtk::Box, gtk::Button) {
         body.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         body.set_max_width_chars(48);
         content.append(&body);
-    }
+        body
+    });
     card.append(&content);
     card.update_property(&[gtk::accessible::Property::Label(n.summary())]);
     if !n.body().is_empty() {
         card.update_property(&[gtk::accessible::Property::Description(n.body())]);
     }
-    (card, close)
+    Card {
+        widget: card,
+        close,
+        summary,
+        body,
+    }
 }
 
 /// What a screen reader says when a banner arrives. GNOME's banner is an
@@ -681,6 +722,9 @@ impl NotifyUi {
             clear_bound: std::cell::Cell::new(false),
             timer: RefCell::new(None),
             user_active: Cell::new(false),
+            banner_expanded: Cell::new(None),
+            banner_expander: RefCell::new(None),
+            pointer_in: Cell::new(false),
             expanded: RefCell::new(HashSet::new()),
             group_widgets: RefCell::new(HashMap::new()),
             history_stale: Cell::new(false),
@@ -868,12 +912,16 @@ impl NotifyUi {
         self.dnd_changed.borrow_mut().push(Box::new(f));
     }
 
-    /// GNOME's Super+N gives the current banner keyboard focus: the
-    /// banner itself (messageList.js's focusable message), not its first
-    /// button.
+    /// GNOME's Super+N expands the current banner and gives it keyboard
+    /// focus (`_expandActiveNotification`): the banner itself
+    /// (messageList.js's focusable message), not its first button.
     pub fn focus_active(&self) {
         if !self.banner_window.is_visible() {
             return;
+        }
+        let expander = self.banner_expander.borrow().clone();
+        if let Some(expand) = expander {
+            expand(true, true);
         }
         self.banner_window
             .set_keyboard_mode(KeyboardMode::Exclusive);
@@ -1061,6 +1109,10 @@ impl NotifyUi {
             *timer = None;
             return Due::default();
         };
+        // The pointer on the banner holds it (`!_pointerInNotification`).
+        if self.pointer_in.get() {
+            return Due::default();
+        }
         // Ask for the idle time only while it decides: when the banner
         // has just dropped in to a user not yet seen active, or while it
         // waits for an away user.
@@ -1283,7 +1335,9 @@ impl NotifyUi {
             let card = match step {
                 TrayStep::Show(id) => center.banners().into_iter().find(|n| n.id == id).map(|n| {
                     let spoken = announcement(&source_of(n).0, n.summary(), n.body());
-                    (self.banner_card(n), spoken)
+                    let expanded =
+                        center.banner_opens_expanded(id) || self.banner_expanded.get() == Some(id);
+                    (self.banner_card(n, expanded), spoken)
                 }),
                 _ => None,
             };
@@ -1333,12 +1387,34 @@ impl NotifyUi {
         }
     }
 
-    /// One banner card, its buttons wired to the bus.
-    fn banner_card(self: &Rc<Self>, n: &Notification) -> gtk::Box {
-        let (c, close) = card(n);
+    /// One banner card, its buttons wired to the bus. Like GNOME's
+    /// `Message`, it is collapsed (a one-line title and body, no action
+    /// buttons) until expanded (the body up to six lines, the actions
+    /// below) by its expand button, the pointer coming onto it, Super+N,
+    /// or opening `expanded`.
+    fn banner_card(self: &Rc<Self>, n: &Notification, expanded: bool) -> gtk::Box {
+        let Card {
+            widget: c,
+            close,
+            summary,
+            body,
+        } = card(n);
         c.add_css_class("banner");
+        summary.set_wrap(false);
+        summary.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        summary.set_max_width_chars(48);
+        if let Some(body) = &body {
+            body.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        }
+        let expand = gtk::Button::from_icon_name("notification-expand-symbolic");
+        expand.add_css_class("message-expand-button");
+        expand.set_valign(gtk::Align::Center);
+        expand.update_property(&[gtk::accessible::Property::Label("Expand")]);
+        if let Some(header) = close.parent() {
+            expand.insert_before(&header, Some(&close));
+        }
         let has_default = n.actions().iter().any(|a| a.id == "default");
-        if n.actions().iter().any(|a| a.id != "default") {
+        let actions = n.actions().iter().any(|a| a.id != "default").then(|| {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             for action in n.actions().iter().filter(|a| a.id != "default") {
                 let button = gtk::Button::with_label(&action.label);
@@ -1358,8 +1434,121 @@ impl NotifyUi {
                 });
                 row.append(&button);
             }
-            c.append(&row);
+            // GNOME's action bin scales in under the body as it expands.
+            let revealer = gtk::Revealer::builder()
+                .transition_type(gtk::RevealerTransitionType::SlideDown)
+                .child(&row)
+                .build();
+            c.append(&revealer);
+            revealer
+        });
+        let set_expanded: Rc<dyn Fn(bool, bool)> = {
+            let (me, id, c, expand, body, actions) = (
+                Rc::downgrade(self),
+                n.id,
+                c.downgrade(),
+                expand.downgrade(),
+                body.as_ref().map(|b| b.downgrade()),
+                actions.as_ref().map(|r| r.downgrade()),
+            );
+            Rc::new(move |on, animate| {
+                let (Some(c), Some(expand)) = (c.upgrade(), expand.upgrade()) else {
+                    return;
+                };
+                if on {
+                    c.add_css_class("expanded");
+                } else {
+                    c.remove_css_class("expanded");
+                }
+                let body = body.as_ref().and_then(|b| b.upgrade());
+                if let Some(body) = &body {
+                    // LabelExpanderLayout: one line, or up to six.
+                    body.set_lines(if on { BANNER_EXPANDED_LINES } else { 1 });
+                }
+                let actions = actions.as_ref().and_then(|r| r.upgrade());
+                if let Some(actions) = &actions {
+                    let ms = if animate && crate::transient::motion_allowed() {
+                        crate::transient::BANNER_MS as u32
+                    } else {
+                        0
+                    };
+                    actions.set_transition_duration(ms);
+                    actions.set_reveal_child(on);
+                }
+                expand.update_state(&[gtk::accessible::State::Expanded(Some(on))]);
+                // `_updateExpandButton`: shown while there is more to see
+                // (an ellipsized body or actions) or it is expanded; it
+                // keeps its place either way. The body's layout is known
+                // once laid out, on the next frame.
+                let has_actions = actions.is_some();
+                expand.add_tick_callback(move |expand, _| {
+                    if body.as_ref().is_some_and(|b| b.width() == 0) {
+                        return glib::ControlFlow::Continue;
+                    }
+                    let ellipsized = body.as_ref().is_some_and(|b| b.layout().is_ellipsized());
+                    let can = has_actions || on || ellipsized;
+                    expand.set_opacity(if can { 1.0 } else { 0.0 });
+                    glib::ControlFlow::Break
+                });
+                if let Some(me) = me.upgrade() {
+                    me.banner_expanded.set(on.then_some(id));
+                }
+            })
+        };
+        set_expanded(expanded, false);
+        {
+            let (set_expanded, c) = (set_expanded.clone(), c.downgrade());
+            expand.connect_clicked(move |_| {
+                let on = c.upgrade().is_some_and(|c| c.has_css_class("expanded"));
+                set_expanded(!on, true);
+            });
         }
+        {
+            // `_onNotificationHoverChanged` and `_updateState`: the
+            // pointer on a shown banner holds it and expands it. One
+            // already under the pointer as it drops in waits for the
+            // pointer to come back onto it. The pointer gone for
+            // `HIDE_TIMEOUT`, the banner goes at once.
+            let motion = gtk::EventControllerMotion::new();
+            let (me, set_expanded, c_weak) =
+                (Rc::downgrade(self), set_expanded.clone(), c.downgrade());
+            motion.connect_enter(move |_, _, _| {
+                let Some(me) = me.upgrade() else {
+                    return;
+                };
+                if !matches!(me.tray.get(), TrayState::Shown) {
+                    return;
+                }
+                me.pointer_in.set(true);
+                if c_weak
+                    .upgrade()
+                    .is_some_and(|c| !c.has_css_class("expanded"))
+                {
+                    set_expanded(true, true);
+                }
+            });
+            let me = Rc::downgrade(self);
+            motion.connect_leave(move |motion| {
+                let (me, motion) = (me.clone(), motion.downgrade());
+                glib::timeout_add_local_once(BANNER_HIDE_TIMEOUT, move || {
+                    let Some(me) = me.upgrade() else {
+                        return;
+                    };
+                    let back = motion.upgrade().is_some_and(|m| m.contains_pointer());
+                    if back || !me.pointer_in.replace(false) {
+                        return;
+                    }
+                    let now = Instant::now();
+                    me.timer
+                        .borrow_mut()
+                        .get_or_insert_with(|| BannerTimer::new(now, None))
+                        .expire_at(now);
+                    me.update();
+                });
+            });
+            c.add_controller(motion);
+        }
+        *self.banner_expander.borrow_mut() = Some(set_expanded);
         {
             let (me, id) = (self.clone(), n.id);
             close.connect_clicked(move |_| {
@@ -1459,7 +1648,9 @@ impl NotifyUi {
                 [] => {}
                 // A group of one is just its card.
                 [n] => {
-                    let (c, close) = card(n);
+                    let Card {
+                        widget: c, close, ..
+                    } = card(n);
                     let item = crate::transient::MotionBin::new(&c);
                     let (me, id, weak) = (self.clone(), n.id, item.downgrade());
                     close.connect_clicked(move |_| {
@@ -1561,6 +1752,8 @@ impl NotifyUi {
             me.banner_bin.set_frame(crate::transient::Frame::REST);
             me.banner_bin.set_can_target(true);
             me.showing.set(None);
+            me.banner_expander.borrow_mut().take();
+            me.pointer_in.set(false);
             me.tray.set(TrayState::Hidden);
             me.update();
         };
@@ -1617,7 +1810,9 @@ impl NotifyUi {
     /// inset more and darker. Clicking expands it; closing the top card
     /// closes the whole group.
     fn collapsed_group(self: &Rc<Self>, key: &str, members: &[&Notification]) -> gtk::Button {
-        let (top, close) = card(members[0]);
+        let Card {
+            widget: top, close, ..
+        } = card(members[0]);
         let layout = stack_layout(members.len());
         let reveal = layout.last().map_or(0, |&(_, reach)| reach);
         top.set_margin_bottom(reveal);
@@ -1700,7 +1895,9 @@ impl NotifyUi {
         header.append(&collapse);
         group.append(&header);
         for n in members {
-            let (c, close) = card(n);
+            let Card {
+                widget: c, close, ..
+            } = card(n);
             let (me, id) = (self.clone(), n.id);
             close.connect_clicked(move |_| me.remove(&[id]));
             group.append(&c);
@@ -1939,6 +2136,23 @@ mod timer_tests {
         // No idle monitor: the user counts as active.
         let mut t = BannerTimer::new(t0, None);
         assert!(t.expired(t0 + s(4), None));
+    }
+
+    #[test]
+    fn a_banner_the_pointer_left_goes_at_once() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        // An away user's banner waits; the pointer leaving it after
+        // holding it (`_updateNotificationTimeout(0)`) sends it now.
+        let mut t = BannerTimer::new(t0, Some(s(30)));
+        t.expire_at(t0 + s(1));
+        assert_eq!(t.deadline(), Some(t0 + s(1)));
+        assert!(t.expired(t0 + s(1), Some(s(31))));
+        // An active user's four seconds are cut short the same way.
+        let mut t = BannerTimer::new(t0, None);
+        t.expire_at(t0 + Duration::from_millis(1500));
+        assert!(!t.expired(t0 + s(1), None));
+        assert!(t.expired(t0 + Duration::from_millis(1500), None));
     }
 
     #[test]
