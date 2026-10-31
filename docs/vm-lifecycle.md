@@ -45,6 +45,13 @@ Receipts are in `fresh-accounts-receipts.json`; frames per attempt and
 session. Only Arch/GDM 51 is covered here; pre-51 GDM is not exercised by
 this lane.
 
+The Debian package journey must retain the original beta package's
+`share/pam.d/tuna-lock` conffile bytes, including its comment. Run
+41151873648's `journey` failed on dpkg's conffile prompt before the
+upgrade could qualify. PR #930 restores those bytes;
+the fresh-account change must include that fix, not force a conffile
+answer or change PAM policy to bypass the upgrade failure.
+
 The Python lane.boot API keeps its original four-value return and original
 VM device profile by default. Lifecycle callers explicitly request
 `guest_agent=True` to add the QGA transport and receive its socket as a fifth
@@ -163,3 +170,79 @@ input/repaint and unchanged application identity remain mandatory. The prior
 native lifecycle qualification (#265) separately demonstrated locking from
 an unlocked session and two real suspend cycles on the preserved-resource VM
 profile; that evidence does not certify a later candidate automatically.
+
+### Date & Time restoration and published capability failures
+
+Published-flavor run 41151873652 observed the new Auckland panel time, then
+restored timedated to UTC without observing the panel's UTC repaint.
+`G-DATETIME-CLOCK-SET` immediately read the Auckland label after the manual
+clock jump (39,610 seconds from UTC), so that assertion did not have a
+restored-panel baseline.
+
+The timezone round trip now retains `panel_revert` dumps and
+`panel_revert_verified` in `lifecycle/datetime-evidence.json`, waiting within
+the existing ten-second repaint deadline. The clock timezone gate requires
+both outbound and return repaint. A failed restoration or dump remains
+visible in the probe error, fails the clock timezone gate, and prevents the
+manual-time probe from changing the clock against an unverified baseline.
+The polkit timezone probe runs after the manual-clock probe, so its own
+timezone round trip cannot invalidate that baseline.
+
+Both published panel-change assertions stay strict. A released image that
+cannot perform them is reported as unqualified/unsupported with its actual
+failure evidence, never converted to a pass or credited with another
+lane's result. No additional wait extends the capability deadline.
+
+## Locked password speech
+
+Run [41151873648, job 124396764753](https://github.com/tuna-os/tuna-desktop/actions/runs/41151873648/job/124396764753)
+passed eight speech gates, then failed `G-ORCA-SPEECH-LOCK`: the retained
+[`orca-speech` artifact 13025680053](https://github.com/tuna-os/tuna-desktop/actions/runs/41151873648/artifacts/13025680053)
+contains `Lock Screen`, `Password`, `password text.` followed by an empty
+`lock-type` speech section. Its sanitized state records an active password
+conversation, `locked: true`, and an owned, watched KeyboardMonitor. The
+AT-SPI registry was already active. This is not evidence of bus startup
+failure.
+
+The missing route was committed masked input to speech, not raw-key
+delivery. The compositor intentionally suppresses raw KeyboardMonitor
+events while locked. In the installed [Orca 50.3 insertion classifier](https://raw.githubusercontent.com/GNOME/orca/50.3/src/orca/ax_utilities_event.py),
+`_get_insertion_text_key_reason` relies on a last printable key/space to
+classify password insertion as typing echo. Without that cue,
+`_get_insertion_fallback_reason` can return `UNKNOWN` or an unpresentable
+auto-insertion reason; [the default insertion handler](https://raw.githubusercontent.com/GNOME/orca/50.3/src/orca/scripts/default.py)
+does not speak those insertions. The retained artifact does not contain
+Orca's internal event-reason trace, so no particular fallback branch is
+claimed as an observed runtime result.
+
+The native Orca consumer needs a package-level correction for the supported
+50.3 and 51 versions so committed masked password insertions are presented
+without raw locked-session keys. That correction and its package/runtime
+qualification are separate and pending; this change does not claim the
+masked-input speech failure is fixed. No shell-generated mask announcement
+or replacement for Orca's native text-event handling is included.
+
+`scripts/tuna-orca-speech-proof --artifacts orca-speech-artifacts` remains
+the end-to-end native nested proof: it physically types into the lock
+prompt, requires exactly one spoken mask per typed character, rejects
+plaintext speech, verifies that the locked raw-key event count does not
+advance, then unlocks through PAM. No injected Orca customization or
+relaxation of the bullet assertion is used. These changes still require a
+new native proof result; the failed run is not retroactively qualified.
+
+The native proof isolates `XDG_STATE_HOME` and `XDG_CACHE_HOME` under its
+artifact root as well as HOME/config/data. A local native attempt stopped
+before the speech gates because inherited state selected
+`~/.local/state/roost-shell` for upgrade, where the ownership/ancestor
+guard refused migration. `user_upgrade::pairs_from` and the shell's
+`xdg::state_home_from` prefer an absolute `XDG_STATE_HOME` over HOME;
+changing HOME alone does not isolate that route. The proof now exports
+private state/cache roots explicitly. It does not touch the real user
+paths or bypass the migration guard.
+
+The local full speech proof is blocked by host Orca 46.1, which does not
+satisfy the required KeyboardMonitor contract. A new Ubuntu 26.04 run with
+distribution Orca 50.3 must establish all speech gates against the native
+package correction. The original failed run's eight passing gates do not
+establish a nine-gate pass for this change, and a GTK auth-prompt regression
+does not qualify end-to-end Orca speech.

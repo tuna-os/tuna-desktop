@@ -1110,10 +1110,9 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     datetime_failed = []
     for line in datetime_result["assertions"]:
         gate, verdict, detail = (line.split(" ", 2) + ["", ""])[:3]
-        if published and gate == "G-DATETIME-CLOCK-TZ" and verdict != "pass":
-            record(gate, True, "published guest predates the panel clock's /etc/localtime monitor; "
-                               "proven by the current-build marlin-vm lane")
-            continue
+        if published and gate in ("G-DATETIME-CLOCK-TZ", "G-DATETIME-CLOCK-SET") and verdict != "pass":
+            detail = ("published panel capability unqualified/unsupported; an image that predates "
+                      "clock-change monitoring is not a pass: " + detail)
         record(gate, verdict == "pass", detail)
         if verdict != "pass":
             datetime_failed.append(gate)
