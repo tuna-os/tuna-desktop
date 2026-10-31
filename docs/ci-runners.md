@@ -65,6 +65,64 @@ remote-security, niri-parity) use the pods' rootless podman.
 Other workflows (`stress`, `fuzz`, `baseline`, …) still use GitHub-hosted
 runners; the same aliases can move them.
 
+## Queue supersession and closed pull requests
+
+Every PR-triggered workflow already has native workflow/ref (or PR-number)
+`concurrency`: a new push supersedes the older run for that PR without
+requiring an Actions write token in PR jobs. Keep those groups separate
+between workflows. The `ci` and measured-coverage workflows deliberately do
+not cancel an in-progress `main` run: successful main CI supplies the
+performance baseline. Native concurrency keeps at most one running and one
+pending run per group; it replaces older pending runs, not every main run
+finishing in order. Existing schedule, manual and performance concurrency
+policies remain unchanged.
+
+Closing a PR does not create a newer run in its concurrency group, so native
+supersession cannot retire its queued work. The repository-owned
+[`cleanup-closed-pr-runs.yml`](../.github/workflows/cleanup-closed-pr-runs.yml)
+runs every 15 minutes (subject to GitHub schedule delays), using
+[`scripts/ci-cleanup-closed-pr-runs`](../scripts/ci-cleanup-closed-pr-runs).
+It only cancels runs still `queued`, triggered by `pull_request`, with
+nonempty, explicit API PR associations **all confirmed closed**. Open PR
+heads, running jobs, push, scheduled, manual and performance-baseline
+schedule/dispatch runs are not cleanup targets. There is no age threshold,
+branch-name inference, force-cancel, local process reaper or semaphore here.
+Runs with absent/ambiguous PR associations are intentionally left alone.
+
+The sweep completes a bounded listing (maximum 1,000 filtered runs) and its
+candidate PR reads before any cancellation. Failed, incomplete or changing
+listings and invalid API responses fail closed. Each candidate run and its
+PR states are read again immediately before cancellation; started runs and
+reopened PRs are skipped. GitHub has no atomic conditional-cancel endpoint,
+so a run can still start or a PR reopen in the interval after that last read.
+An API/cancellation failure stops the pass; the next schedule can retry.
+
+Cleanup has one native concurrency owner on GitHub-hosted runners, a
+10-minute job limit, and only job-level `contents: read`, `actions: write`
+and `pull-requests: read`. It checks out the trusted default-branch event
+SHA, never PR code; manual dispatch on another branch is skipped. There is
+no `pull_request_target` trigger.
+
+Behavioral smoke checks (the first two are read-only):
+
+```sh
+python3 scripts/tests/test_ci_closed_pr_cleanup.py
+GH_TOKEN=$(gh auth token) GITHUB_REPOSITORY=tuna-os/tuna-desktop \
+  python3 scripts/ci-cleanup-closed-pr-runs
+gh workflow run cleanup-closed-pr-runs.yml --ref main
+# Explicit opt-in for a manual mutating pass (scheduled passes apply):
+gh workflow run cleanup-closed-pr-runs.yml --ref main -f apply=true
+```
+
+For an end-to-end queue check, push twice to a disposable open PR and inspect
+each workflow's runs: the newer head should supersede the older PR run while
+main/scheduled work keeps its existing policy. Close the disposable PR while
+one of its runs is queued, then dispatch cleanup and inspect its log and the
+run status. A dry run should only print `Would cancel`; an apply pass should
+cancel only the closed PR's queued run. The offline suite covers open heads,
+running/scheduled/manual work, reopened/shared PRs, missing associations and
+API/list failures without contacting GitHub.
+
 ## Security model
 
 The repository is public, so the controls assume a job can run arbitrary

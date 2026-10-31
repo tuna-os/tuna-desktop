@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Cancel only queued pull-request runs whose associated PRs are all closed.
+
+Read-only unless --apply is supplied. No age heuristic, branch-name matching,
+head-SHA fallback, or force-cancel endpoint is used.
+"""
+import argparse
+import os
+import re
+import urllib.request
+
+from lib import github_api
+
+
+MAX_RUNS = 1000  # GitHub's filtered workflow-run listing is capped at 1000.
+
+
+def associated_prs(run, repo):
+    """Unknown/empty associations are deliberately not cancellation evidence."""
+    associations = run.get("pull_requests")
+    if not isinstance(associations, list) or not associations:
+        return ()
+    numbers = []
+    for pr in associations:
+        number = pr.get("number")
+        if (type(number) is not int or number <= 0
+                or pr.get("url") != f"{github_api.API_ROOT}/repos/{repo}/pulls/{number}"):
+            return ()
+        numbers.append(number)
+    return tuple(sorted(set(numbers)))
+
+
+def queued_pr(run):
+    return run.get("event") == "pull_request" and run.get("status") == "queued"
+
+
+def list_queued(get):
+    """Require complete, consistent bounded pages before considering any writes."""
+    runs = []
+    total = None
+    page = 1
+    while total is None or len(runs) < total:
+        result = get(f"actions/runs?event=pull_request&status=queued&per_page=100&page={page}")
+        count = result.get("total_count")
+        batch = result.get("workflow_runs")
+        if (type(count) is not int or not 0 <= count <= MAX_RUNS
+                or not isinstance(batch, list) or len(batch) > 100
+                or (total is not None and count != total)):
+            raise ValueError("Incomplete or changing queued-run listing; refusing cleanup")
+        total = count
+        runs.extend(batch)
+        if len(runs) > total or (not batch and len(runs) < total):
+            raise ValueError("Incomplete queued-run page; refusing cleanup")
+        page += 1
+    ids = [run.get("id") for run in runs]
+    if any(type(run_id) is not int or run_id <= 0 for run_id in ids) or len(set(ids)) != total:
+        raise ValueError("Invalid or duplicate queued-run identities; refusing cleanup")
+    return runs
+
+
+def all_closed(numbers, get):
+    for number in numbers:
+        pr = get(f"pulls/{number}")
+        if pr.get("number") != number or pr.get("state") not in ("open", "closed"):
+            raise ValueError("Invalid pull-request response; refusing cleanup")
+        if pr["state"] != "closed":
+            return False
+    return True
+
+
+def eligible(run, repo, get):
+    numbers = associated_prs(run, repo)
+    return queued_pr(run) and bool(numbers) and all_closed(numbers, get)
+
+
+def cleanup(repo, get, cancel, apply=False):
+    # Finish listing and every candidate's PR reads before the first mutation.
+    candidates = [run for run in list_queued(get) if eligible(run, repo, get)]
+    for candidate in candidates:
+        run_id = candidate["id"]
+        # The queue can drain and a PR can reopen after listing. Re-read both
+        # immediately before cancellation, and never cancel a running run.
+        current = get(f"actions/runs/{run_id}")
+        if current.get("id") != run_id:
+            raise ValueError("Workflow-run identity changed; refusing cleanup")
+        if (associated_prs(current, repo) != associated_prs(candidate, repo)
+                or current.get("head_sha") != candidate.get("head_sha")
+                or not eligible(current, repo, get)):
+            continue
+        print(f"{'Cancel' if apply else 'Would cancel'} queued run {run_id}: all associated PRs closed", flush=True)
+        if apply:
+            cancel(run_id)
+
+
+def cancel_run(repo, run_id):
+    headers = github_api.headers()
+    request = urllib.request.Request(
+        f"{github_api.API_ROOT}/repos/{repo}/actions/runs/{run_id}/cancel",
+        data=b"", headers={key: value for key, value in headers.items() if key != "Authorization"},
+        method="POST")
+    request.add_unredirected_header("Authorization", headers["Authorization"])
+    # Do not retry mutations or use force-cancel. A conflict or API failure
+    # stops this pass, leaving any remaining work for the next scheduled pass.
+    with urllib.request.urlopen(request, timeout=20) as response:
+        if response.status != 202:
+            raise ValueError("Unexpected cancellation response")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--apply", action="store_true", help="perform cancellation (default: dry run)")
+    args = parser.parse_args()
+    repo = os.environ["GITHUB_REPOSITORY"]
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        raise ValueError("Invalid GITHUB_REPOSITORY")
+    cleanup(repo, lambda path: github_api.repo_json(repo, path),
+            lambda run_id: cancel_run(repo, run_id), apply=args.apply)
+
+
+if __name__ == "__main__":
+    main()
