@@ -5,8 +5,13 @@ import ast
 import json
 import os
 import pathlib
+import runpy
+import select
+import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import types
 from types import SimpleNamespace
 import unittest
@@ -39,6 +44,7 @@ class FakeGuest:
         self.logins = []
         self.submitted = []
         self.state_calls = []
+        self.trace_actions = []
 
     # QMP
     def keys(self, *names):
@@ -68,6 +74,11 @@ class FakeGuest:
         pass
 
     def run(self, action, *args):
+        if action in ("fresh-trace-start", "fresh-trace-stop"):
+            self.trace_actions.append((action, len(self.submitted)))
+            if self.faults.get("trace_error"):
+                raise RuntimeError("PRIVATE-DIAGNOSTIC-ERROR")
+            return {"ready": True} if action.endswith("start") else {"profile": "headers-only", "events": []}
         if action == "greeter":
             boot = self.boot if not self.faults.get("stale_boot") else 1
             return {"ready": self.logged_in is None, "boot_id": f"boot-{boot}"}
@@ -108,7 +119,7 @@ class FakeGuest:
         raise ValueError(action)
 
 
-def journey(guest):
+def journey(guest, gdm_trace=False):
     results = {}
     clock = [0.0]
 
@@ -118,7 +129,8 @@ def journey(guest):
     with tempfile.TemporaryDirectory() as out:
         run = fresh_accounts.Journey(guest, guest.connect, lambda greeter: greeter["ready"], out,
                                      lambda name, ok, detail: results.__setitem__(name, (ok, detail)),
-                                     sleep=sleep, clock=lambda: clock[0], login_timeout=5, greeter_timeout=5)
+                                     sleep=sleep, clock=lambda: clock[0], login_timeout=5, greeter_timeout=5,
+                                     gdm_trace=gdm_trace)
         try:
             passed = run.run()
             error = None
@@ -137,6 +149,37 @@ class JourneyTest(unittest.TestCase):
     def assertFailed(self, results, name):
         self.assertIn(name, results)
         self.assertFalse(results[name][0], results[name][1])
+
+    def test_trace_observes_only_first_standard_login(self):
+        guest = FakeGuest()
+        passed, results, error, receipts = journey(guest, gdm_trace=True)
+        self.assertTrue(passed, (results, error))
+        self.assertEqual(guest.trace_actions, [("fresh-trace-start", 0), ("fresh-trace-stop", 1)])
+        self.assertEqual(len(guest.submitted), 6)
+        self.assertEqual([step for step in steps(receipts) if "trace" in step],
+                         ["tunastd-first-trace-start", "tunastd-first-trace-stop"])
+
+    def test_trace_failure_does_not_change_physical_record_gate(self):
+        guest = FakeGuest(no_record=True, trace_error=True)
+        passed, results, error, receipts = journey(guest, gdm_trace=True)
+        self.assertFalse(passed)
+        self.assertFailed(results, "V-FRESH-RECORD-CREATED-tunastd")
+        self.assertEqual(guest.trace_actions, [("fresh-trace-start", 0), ("fresh-trace-stop", 1)])
+        self.assertNotIn("PRIVATE-DIAGNOSTIC-ERROR", json.dumps(receipts))
+
+    def test_trace_stops_before_existing_selection_retry(self):
+        guest = FakeGuest(reject_login=True)
+        passed, results, error, receipts = journey(guest, gdm_trace=True)
+        self.assertFalse(passed)
+        self.assertEqual(guest.trace_actions, [("fresh-trace-start", 0), ("fresh-trace-stop", 1)])
+        self.assertEqual(len(guest.submitted), len(fresh_accounts.SELECTIONS))
+
+    def test_trace_stops_on_keyboard_exception(self):
+        guest = FakeGuest()
+        with mock.patch.object(guest, "type_text", side_effect=RuntimeError("input failed")):
+            passed, results, error, receipts = journey(guest, gdm_trace=True)
+        self.assertFalse(passed)
+        self.assertEqual(guest.trace_actions, [("fresh-trace-start", 0), ("fresh-trace-stop", 0)])
 
     def test_positive_full_journey(self):
         guest = FakeGuest()
@@ -575,6 +618,120 @@ class GdmPolicyTest(unittest.TestCase):
         self.assertEqual(len(result["version"]["stdout"]), 256)
         self.assertTrue(result["version"]["truncated"])
         self.assertEqual(result["policy"], "legacy")
+
+
+TRACE_PATH = ROOT / "packaging/marlin/vm-lane/tuna-vm-gdm-trace"
+TRACE = SimpleNamespace(**runpy.run_path(str(TRACE_PATH)))
+
+
+class GdmHeaderTraceTest(unittest.TestCase):
+    def call(self, serial="7", member="SetSession", path=TRACE.OBJECT):
+        return f"mc\t1.000001\t{serial}\t:1.20\torg.freedesktop.Accounts\t{path}\t{TRACE.INTERFACE}\t{member}"
+
+    def test_only_target_setters_and_correlated_replies_survive(self):
+        headers = TRACE.Headers()
+        headers.add(self.call())
+        headers.add(self.call(path="/org/freedesktop/Accounts/User1002"))
+        headers.add(self.call(member="SetPassword"))
+        headers.add("mr\t1.000002\t91\t:1.3\t:1.99\t7")
+        headers.add("mr\t1.000003\t92\t:1.3\t:1.20\t7")
+        headers.add(self.call(serial="8", member="SetSessionType"))
+        headers.add("err\t1.000004\t93\t:1.3\t:1.20\t8")
+        self.assertEqual([event["kind"] for event in headers.events], ["call", "return", "call", "error"])
+        self.assertEqual([event["reply_serial"] for event in headers.events if "reply_serial" in event], [7, 8])
+        self.assertEqual(headers.pending, {})
+
+    def test_payload_lines_and_event_flood_are_discarded(self):
+        headers = TRACE.Headers()
+        for line in ('   string "PRIVATE-PASSWORD"', 'PRIVATE-ERROR-BODY', "method call payload"):
+            headers.add(line)
+        self.assertEqual(headers.events, [])
+        for number in range(TRACE.EVENT_BOUND + 10):
+            headers.add(self.call(serial=str(number)))
+        self.assertEqual(len(headers.events), TRACE.EVENT_BOUND)
+        self.assertNotIn("PRIVATE", json.dumps(headers.events))
+
+    def test_worker_marker_projection_never_enables_debug(self):
+        with tempfile.TemporaryDirectory() as root:
+            proc = pathlib.Path(root, "123")
+            proc.mkdir()
+            (proc / "comm").write_text("gdm-session-wor\n")
+            (proc / "cmdline").write_bytes(b"gdm-session-worker [pam/gdm-password]\0")
+            executable = pathlib.Path(root, "gdm-session-worker")
+            executable.touch()
+            (proc / "exe").symlink_to(executable)
+            private = "PRIVATE-CREDENTIAL"
+            lines = [
+                {"_PID": "123", "MESSAGE": "Gdm: GdmSessionWorker: saving account details for user tunastd"},
+                {"_PID": "123", "MESSAGE": f"GdmSessionWorker: session name set to tuna {private}"},
+                {"_PID": "999", "MESSAGE": "GdmSessionWorker: state SESSION_OPENED"},
+            ]
+            completed = (0, b"\n".join(json.dumps(row).encode() for row in lines))
+            real_path = pathlib.Path
+            run = mock.Mock(return_value=completed)
+            with mock.patch.dict(TRACE.worker_markers.__globals__,
+                                 {"pathlib": SimpleNamespace(Path=lambda path: real_path(root if path == "/proc" else path)),
+                                  "bounded_journal": run}):
+                result = TRACE.worker_markers(1000.0)
+            self.assertEqual(result["markers"], [{"pid": 123, "marker": "saving-account-details"}])
+            self.assertFalse(result["debug_enabled_by_probe"])
+            self.assertNotIn(private, json.dumps(result))
+            self.assertEqual(run.call_args.args[0][0], "journalctl")
+            self.assertEqual(run.call_count, 1)
+
+    def test_missing_worker_markers_are_inconclusive(self):
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.dict(TRACE.worker_markers.__globals__,
+                                 {"pathlib": SimpleNamespace(Path=lambda _: pathlib.Path(root))}):
+                result = TRACE.worker_markers(1000.0)
+        self.assertEqual(result["availability"], "unavailable-or-debug-disabled")
+        self.assertEqual(result["markers"], [])
+        self.assertFalse(result["debug_enabled_by_probe"])
+
+    def test_journal_output_is_bounded_before_parsing(self):
+        status, output = TRACE.bounded_journal([sys.executable, "-c", "print('PRIVATE' * 20000)"])
+        self.assertEqual((status, output), ("journal-output-bound", b""))
+
+    @unittest.skipUnless(all(shutil.which(name) for name in ("dbus-daemon", "dbus-monitor", "dbus-send")),
+                         "private D-Bus test needs dbus tools")
+    def test_real_profile_has_headers_and_correlated_error_but_no_argument(self):
+        # An isolated bus, never the host's system bus or real AccountsService.
+        daemon = subprocess.Popen(["dbus-daemon", "--session", "--nofork", "--print-address=1"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        monitor = None
+        try:
+            address = daemon.stdout.readline().strip()
+            monitor = subprocess.Popen(["dbus-monitor", "--address", address, "--profile", *TRACE.RULES],
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            data = b""
+            deadline = time.monotonic() + 3
+            while b"#type\t" not in data and time.monotonic() < deadline:
+                if select.select([monitor.stdout], [], [], 0.1)[0]:
+                    data += os.read(monitor.stdout.fileno(), 4096)
+            self.assertIn(b"#type\t", data)
+            subprocess.run(["dbus-send", f"--bus={address}", "--print-reply", "--reply-timeout=1000",
+                            "--dest=org.freedesktop.Accounts", TRACE.OBJECT,
+                            f"{TRACE.INTERFACE}.SetSession", "string:PRIVATE-SESSION-ARGUMENT"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2, check=False)
+            headers = TRACE.Headers()
+            deadline = time.monotonic() + 3
+            while not any(event["kind"] == "error" for event in headers.events) and time.monotonic() < deadline:
+                if select.select([monitor.stdout], [], [], 0.1)[0]:
+                    data += os.read(monitor.stdout.fileno(), 4096)
+                    headers = TRACE.Headers()
+                    for line in data.decode().splitlines():
+                        headers.add(line)
+            self.assertEqual([event["kind"] for event in headers.events], ["call", "error"])
+            self.assertNotIn(b"PRIVATE-SESSION-ARGUMENT", data)
+            self.assertNotIn(b"ServiceUnknown", data)  # No error name/body in profile mode.
+        finally:
+            if monitor is not None:
+                monitor.terminate()
+                monitor.wait(timeout=2)
+                monitor.stdout.close()
+            daemon.terminate()
+            daemon.wait(timeout=2)
+            daemon.stdout.close()
 
 
 if __name__ == "__main__":

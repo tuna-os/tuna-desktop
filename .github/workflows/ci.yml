@@ -1398,7 +1398,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: >-
           test -f /mnt/vm/disk.raw &&
-          scripts/tuna-vm-lane --fresh-accounts --disk /mnt/vm/disk.raw --out vm-lane-artifacts/fresh-accounts
+          scripts/tuna-vm-lane --fresh-accounts --fresh-gdm-trace --disk /mnt/vm/disk.raw --out vm-lane-artifacts/fresh-accounts
           --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
           --meta "commit=${{ github.sha }}"

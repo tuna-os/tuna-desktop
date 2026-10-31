@@ -139,12 +139,13 @@ class Journey:
     """
 
     def __init__(self, qmp, connect, greeter_ready, out, record, sleep=time.sleep,
-                 clock=time.monotonic, login_timeout=60, greeter_timeout=180):
+                 clock=time.monotonic, login_timeout=60, greeter_timeout=180, gdm_trace=False):
         self.qmp, self.connect, self.greeter_ready = qmp, connect, greeter_ready
         self.out, self.record, self.sleep, self.clock = out, record, sleep, clock
         self.login_timeout, self.greeter_timeout = login_timeout, greeter_timeout
         self.agent = None
         self.receipts = []
+        self.gdm_trace, self.trace_active = gdm_trace, False
 
     def _run(self, action, *args):
         if self.agent is None:
@@ -167,6 +168,19 @@ class Journey:
             state = {"user": user, "error": type(error).__name__}
         self._receipt(receipt, state)
 
+    def _trace(self, action):
+        """Non-gating diagnostics: never change login attempts or deadlines."""
+        try:
+            value = self._run(f"fresh-trace-{action}")
+        except (OSError, RuntimeError, ValueError) as error:
+            value = {"error": type(error).__name__}
+        self._receipt(f"tunastd-first-trace-{action}", value)
+
+    def _stop_trace(self):
+        if self.trace_active:
+            self.trace_active = False
+            self._trace("stop")
+
     def _greeter(self, step, not_boot=None):
         deadline = self.clock() + self.greeter_timeout
         while self.clock() < deadline:
@@ -185,6 +199,10 @@ class Journey:
         self.qmp.frame(os.path.join(self.out, f"{name}.png"))
 
     def _login(self, user, step):
+        tracing = self.gdm_trace and user == STANDARD and step == f"{STANDARD}-first"
+        if tracing:
+            self.trace_active = True
+            self._trace("start")
         for attempt, selection in enumerate(SELECTIONS, 1):
             self.qmp.keys("esc")
             self.sleep(2)
@@ -213,6 +231,9 @@ class Journey:
                         self._frame(f"{step}-session")
                         return ok, f"{detail} (selection attempt {attempt})"
                 self.sleep(1)
+            # The optional trace covers one ordinary attempt, never a retry.
+            if tracing:
+                self._stop_trace()
             if observed is not None and not no_session(observed):
                 self._receipt(f"{step}-session", observed)
                 return session_ok(observed)
@@ -232,7 +253,10 @@ class Journey:
     def _cycle(self, round_name):
         for user in JOURNEY_USERS:
             step = f"{user}-{round_name}"
-            ok, detail = self._login(user, step)
+            try:
+                ok, detail = self._login(user, step)
+            finally:
+                self._stop_trace()
             self.record(f"V-FRESH-LOGIN-{step}", ok, detail)
             if not ok:
                 self._diagnostic_state(f"{step}-failure-state", user)
@@ -261,6 +285,7 @@ class Journey:
         try:
             return self._run_journey()
         finally:
+            self._stop_trace()
             with open(os.path.join(self.out, "fresh-accounts-receipts.json"), "w") as stream:
                 json.dump(self.receipts, stream, indent=2)
             if self.agent is not None:

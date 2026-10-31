@@ -32,9 +32,9 @@ control `tunaseeded`, whose record is pre-seeded. `tunastd` and `tunaadmin`
 get no per-user AccountsService record, no per-user Session preselection
 and no autologin. This is distinct from the global AccountsService
 templates: on an installed GDM 51+ with `FallbackSession` support, their
-`[User]` group explicitly sets `Session=`. GDM chooses the configured
-`tuna` fallback and its stock session-setting call changes the inherited
-empty value to `tuna`, allowing AccountsService to persist a real record.
+`[User]` group explicitly sets `Session=`. GDM can launch the configured
+`tuna` fallback without propagating that name to the worker's persistent
+settings; empty templates alone have not qualified record creation.
 Older GDM retains global `Session=tuna`: it can prefer launchable GNOME
 even when that session has `NoDisplay=true`. An absent or unparseable GDM
 version must not opt into the empty-template policy. Neither policy edits
@@ -54,8 +54,9 @@ Run 41215443626 failed both native VM jobs with the AccountsService record
 still missing after a real record-free `tunastd` manual GDM login on
 GDM 51.1.1-1 / AccountsService 26.27.3-1. First login, standard-user sudo
 denial and logout passed; admin, second-login and reboot coverage aborted.
-The inherited global `Session=tuna` made GDM's stock `SetSession("tuna")`
-a same-value operation, which did not write the missing record. An empty
+The inherited global `Session=tuna` suggested a same-value setter might
+explain the missing write. Run 41237623922 disproved that as the remaining
+cause: even empty effective settings left the record absent. An empty
 global template is not itself proof that persistence is fixed: only the
 unchanged native gates above can qualify the fix. No setup script may
 create the fresh accounts' records or invoke a cache operation to do so.
@@ -91,6 +92,123 @@ setter, retries, or dumps other template keys, error messages or stderr.
 A record seen only after logout, `Saved=true` or an effective
 `Session=tuna` never substitutes for `V-FRESH-RECORD-CREATED-<user>` at
 the first session.
+
+### Observed GDM 51 persistence failure and bounded trace
+
+Run [41237623922](https://github.com/tuna-os/tuna-desktop/actions/runs/41237623922),
+head `f7208bba`, failed `V-FRESH-RECORD-CREATED-tunastd` in **both**
+native profiles. The receipts show UID 1001, a real `gdm-password` VT 2
+Wayland login running `tuna-compositor` and `tuna-shell-gtk`, successful
+standard-user sudo denial and logout, but no physical record during the
+session or after logout. The winning `/etc/accountsservice/user-templates/`
+standard and administrator templates each contain `Session=`; effective
+`Session` and `SessionType` are empty, `Saved=false`, `LocalAccount=true`.
+Packages are `gdm 51.1.1-1` and `accountsservice 26.27.3-1`. Administrator,
+second-login and reboot acceptance remains unexercised, not passed.
+The retained logs of jobs 124646121324 and 124646121372 contain none of the
+four allowlisted worker markers below and no session-setter call headers.
+This is an evidence gap, **not proof that saving was skipped**.
+
+For review before the next native campaign, add just `--fresh-gdm-trace`
+to its existing `scripts/tuna-vm-lane --fresh-accounts ...` command.
+The opt-in helper `tuna-vm-gdm-trace` runs only around the first ordinary
+`tunastd` login attempt, stops before any existing selection retry, and is
+stopped in `finally` on login/input/guest-agent failure. The observer has
+an independent 90-second lifetime, a 1 MiB header-input bound and 128-event
+bound; these add no login timeout, wait, retry, session or acceptance gate.
+Transient-service startup allows at most two seconds for observer readiness.
+Existing-marker queries additionally stop at 64 KiB or three seconds.
+The trace receipts are `tunastd-first-trace-{start,stop}` in the existing
+`fresh-accounts-receipts.json`; collection failure is explicit and non-gating.
+
+Privacy contract:
+
+- `dbus-monitor --system --profile`, **not** normal monitor/binary mode,
+  prints tab-separated message headers and no argument or error bodies.
+  Match rules select only `SetSession`, `SetSessionType`, `SetXSession`
+  calls on `/org/freedesktop/Accounts/User1001`. Return/error headers have
+  no path, so the observer consumes their metadata and retains only replies
+  correlated by call sender/serial and reply destination/reply-serial.
+  Unrelated headers are discarded in memory; no raw bus log is written.
+- Existing `gdm-password` worker journal entries are reduced to four fixed
+  labels: saving account details for `tunastd`, session name set to `tuna`,
+  save failed, and `SESSION_OPENED`. PID, time, method and reply metadata
+  are sufficient; usernames other than the fixture, journal text, setter
+  argument values, error names/bodies, PAM conversations and environment
+  values are not exported by this observer.
+- **Never enable GDM debug or send SIGUSR1.** The audited upstream
+  [worker source](https://github.com/GNOME/gdm/blob/51.1.1/daemon/gdm-session-worker.c#L757)
+  logs complete PAM query payloads at line 757, selected choice responses
+  at line 576 and PAM environment entries at line 1537. Filtering this
+  observer's output cannot make a broader journal/serial export safe.
+  Missing pre-existing markers are reported as
+  `unavailable-or-debug-disabled`; no conclusion about the save stage
+  follows from their absence.
+- No probe invokes `FindUserByName`, `CacheUser` or an AccountsService
+  setter, writes a per-user cache record, changes GDM configuration, or
+  offers a fake second desktop session.
+
+A matching setter error header proves an error reply, not its cause.
+A successful reply without a record points at persistence, not at missing
+session propagation. No setter observed with unavailable worker markers
+remains incomplete evidence. The physical-record gate is unchanged.
+
+### Root-fix candidate and actual Arch package boundary
+
+The upstream [GDM 51.1.1 normal-session open path](https://github.com/GNOME/gdm/blob/51.1.1/daemon/gdm-session.c#L2982)
+sends display mode and `XDG_SESSION_TYPE`, then `Open`; it does not send
+`SetSessionName`. Explicit selection does send
+`SetSessionName(get_session_name(self))`. With one offered Tuna session,
+[GNOME Shell 51.0 hides the session menu](https://github.com/GNOME/gnome-shell/blob/51.0/js/gdm/loginDialog.js#L543).
+The [settings save routine](https://github.com/GNOME/gdm/blob/51.1.1/daemon/gdm-session-settings.c#L369)
+can succeed with null session/type/language and, for a local account,
+without a setter or `CacheUser`. Registration is not this save trigger.
+**Inference:** fallback selection may never reach the worker's settings.
+The observed launch and empty settings support this candidate, but do not
+directly establish the worker's calls; no root patch is applied here.
+
+The native image gets GDM from Arch through `pacman`, not this repository's
+`packaging/arch/PKGBUILD` (which builds only Tuna Desktop).
+The canonical tunaOS `tunaos.toml` desktop package list requests plain
+`gdm`, without a Tuna GDM version/patch override. This lane starts from
+`ghcr.io/tuna-os/marlin:gnome`; both the preview Containerfile and VM
+fixture layer run `pacman -Syu`, so a future replacement must survive the
+final package transaction rather than being silently overwritten.
+The actual [Arch GDM PKGBUILD](https://gitlab.archlinux.org/archlinux/packaging/packages/gdm/-/blob/main/PKGBUILD)
+is split `pkgbase=gdm`, `pkgname=(gdm libgdm)`, version 51.1.1 release 1.
+Its source is the upstream version tag plus the Xsession ssh-agent patch;
+`prepare()` runs `git apply -3`, then `arch-meson`/`meson compile`,
+`meson test`, and split-package installation. There is no existing
+GDM fallback-persistence patch mechanism in this native fixture.
+
+If stronger worker evidence confirms the candidate, the narrow proposal
+is an Arch source patch in that `prepare()` pipeline: in
+`gdm_session_open_session()`, for non-program sessions only, queue the
+existing `gdm_dbus_worker_call_set_session_name()` with
+`get_session_name(self)` on the same worker connection **before `Open`**
+initiates account saving. Keep the resolver untouched so explicit, saved,
+configured fallback and automatic fallback choices retain their precedence;
+do not force `tuna`, modify registration, or write AccountsService from a
+root probe. Package the GDM/libgdm pair with a distinguishable release and
+record their installed provenance before repeating both complete native
+journeys. This proposal is unbuilt, unexercised and not a qualified fix.
+
+The proposed insertion, inside the existing non-null-conversation block
+immediately before `gdm_dbus_worker_call_open()`, is:
+
+```c
+if (!self->is_program_session)
+        gdm_dbus_worker_call_set_session_name (conversation->worker_proxy,
+                                               get_session_name (self),
+                                               conversation->worker_cancellable,
+                                               NULL, NULL);
+```
+
+An experiment would need an explicitly reviewed, pinned Arch source rebuild
+and package installation route; no such rebuild or replacement is enabled
+by this diagnostic. A fixture-only patched daemon would not establish that
+the published Marlin/Tuna flavor contains the fix.
+
 
 The Debian package journey must retain the original beta package's
 `share/pam.d/tuna-lock` conffile bytes, including its comment. Run

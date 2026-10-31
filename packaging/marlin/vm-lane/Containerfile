@@ -50,6 +50,7 @@ COPY --from=constraint-builder /usr/share/tuna-vm-constraints /usr/share/tuna-vm
 
 COPY packaging/marlin/vm-lane/tunaos /tmp/tunaos
 COPY packaging/marlin/vm-lane/tuna-vm-lifecycle /usr/libexec/tuna-vm-lifecycle
+COPY packaging/marlin/vm-lane/tuna-vm-gdm-trace /usr/libexec/tuna-vm-gdm-trace
 COPY scripts/lib/gnome-brightness-proof.py /usr/libexec/tuna-brightness-proof
 COPY scripts/lib/tuna-datetime-proof.py /usr/libexec/tuna-datetime-proof
 COPY packaging/marlin/vm-lane/tuna-vm-input /usr/libexec/tuna-vm-input

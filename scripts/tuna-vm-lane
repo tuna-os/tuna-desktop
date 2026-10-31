@@ -3666,7 +3666,7 @@ def fresh_accounts_lane(args):
     try:
         qmp = baseline.Qmp(qmp_path)
         journey = fresh_accounts.Journey(qmp, lambda: guest_agent.GuestAgent(agent_path), greeter_ready,
-                                         out, record)
+                                         out, record, gdm_trace=args.fresh_gdm_trace)
         try:
             journey.run()
         except (OSError, RuntimeError, ValueError, KeyError) as error:
@@ -3792,7 +3792,12 @@ def main():
     ap.add_argument("--fresh-accounts", action="store_true",
                     help="tunaOS#4092: run only the record-free standard/admin account GDM journey "
                          "(first login, logout, login, reboot, login), not the tuna-test lane")
+    ap.add_argument("--fresh-gdm-trace", action="store_true",
+                    help="observe only the first tunastd login: bounded AccountsService call/reply headers "
+                         "and pre-existing allowlisted worker markers; never enable GDM debug")
     a = ap.parse_args()
+    if a.fresh_gdm_trace and not a.fresh_accounts:
+        ap.error("--fresh-gdm-trace requires --fresh-accounts")
     if a.fresh_accounts:
         if a.tour or a.boots != 1 or a.soak or a.strip_image or a.published:
             ap.error("--fresh-accounts is its own single current-build boot")

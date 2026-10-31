@@ -2979,6 +2979,11 @@ print(json.dumps(result))
         if len(sys.argv) != 2:
             raise ValueError("gdm-policy takes no arguments")
         result = gdm_policy()
+    elif action in ("fresh-trace-start", "fresh-trace-stop"):
+        if len(sys.argv) != 2:
+            raise ValueError("fresh trace takes no arguments")
+        result = json.loads(call(sys.executable, "/usr/libexec/tuna-vm-gdm-trace",
+                                 action.removeprefix("fresh-trace-")))
     elif action in FRESH_ACTIONS:
         # tunaOS#4092: record-free accounts made by tuna-vm-fresh-accounts.
         # Only the fixed public fixture names are accepted.
