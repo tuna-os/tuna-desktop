@@ -509,6 +509,7 @@ impl XdgShellHandler for State {
     }
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {
+        self.pointer_scene_dirty = true;
         let before = self.popup_grab.len();
         self.popup_grab
             .retain(|p| p.wl_surface() != surface.wl_surface());

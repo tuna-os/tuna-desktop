@@ -307,6 +307,7 @@ impl WlrLayerShellHandler for State {
     }
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
+        self.pointer_scene_dirty = true;
         let gone = surface.wl_surface().clone();
         self.panel_surfaces.retain(|record| record.surface != gone);
         // Keep only the id (see `dead_layer_surfaces`): holding the
