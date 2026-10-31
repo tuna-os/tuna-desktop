@@ -297,7 +297,8 @@ pub struct DrmBackend {
     input_settings: tuna_shell_control::InputSettings,
     /// Drawing tablets and pads (P-IN-05).
     tablets: tablet::Tablets,
-    /// Bumped by every applied layout or reverted mode (#340).
+    /// Bumped by every applied layout, reverted mode or connector
+    /// hotplug (#340).
     layout_generation: u64,
     /// Mutter's privacy screen policy (#356).
     privacy: crate::privacy_screen::PrivacyScreens,
@@ -305,6 +306,23 @@ pub struct DrmBackend {
     privacy_read_pending: Option<bool>,
     /// A setting write the runtime owes GSettings (the hotkey).
     privacy_write: Option<bool>,
+    /// What lighting a newly connected connector needs (hotplug).
+    gbm: GbmDevice<DrmDeviceFd>,
+    render_formats: smithay::backend::allocator::format::FormatSet,
+    native_device: Option<u64>,
+}
+
+/// Connectors a hotplug rescan found connected or gone, by name.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ConnectorChanges {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+impl ConnectorChanges {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
 }
 
 /// Event sources the runtime installs on its loop.
@@ -379,6 +397,166 @@ pub fn clamp_to_outputs(
     best
 }
 
+/// The connected connectors of `outputs` with their modes.
+fn startup_connectors(outputs: &[DrmOutput]) -> Vec<crate::display_config::StartupConnector> {
+    outputs
+        .iter()
+        .map(|o| crate::display_config::StartupConnector {
+            name: o.name.clone(),
+            modes: o.modes.iter().map(|(spec, _)| *spec).collect(),
+            preferred: o.preferred_mode,
+        })
+        .collect()
+}
+
+/// The scale of a monitor without a stored configuration: `TUNA_SCALE`,
+/// else 1.
+pub fn fallback_scale() -> f64 {
+    std::env::var("TUNA_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(crate::runtime::clamp_scale)
+        .unwrap_or(1.0)
+}
+
+/// What lighting a connector needs from the device: at startup and on
+/// hotplug.
+struct Lighting<'a> {
+    gbm: &'a GbmDevice<DrmDeviceFd>,
+    render_formats: &'a smithay::backend::allocator::format::FormatSet,
+    native_device: Option<u64>,
+    resources: &'a control::ResourceHandles,
+}
+
+impl Lighting<'_> {
+    /// Light one connected connector at its preferred mode on a CRTC
+    /// not in `used`: Mutter's monitor modes, a GBM swapchain and the
+    /// wl_output it will be advertised as. `None` when it cannot be lit
+    /// (the reason is logged).
+    fn open(
+        &self,
+        drm: &mut DrmDevice,
+        handle: connector::Handle,
+        info: &connector::Info,
+        used: &[crtc::Handle],
+    ) -> Option<DrmOutput> {
+        // Mutter's monitor modes (#340): every connector mode,
+        // deduplicated and sorted; the output starts in the preferred
+        // one.
+        let crtc_modes: Vec<crate::display_config::CrtcMode> = info
+            .modes()
+            .iter()
+            .map(|m| crate::display_config::CrtcMode {
+                spec: mode_spec(m),
+                flags: m.flags().bits(),
+            })
+            .collect();
+        let kernel_preferred = info
+            .modes()
+            .iter()
+            .position(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED));
+        let listed = crate::display_config::monitor_modes(&crtc_modes, kernel_preferred)?;
+        let modes: Vec<(crate::display_config::ModeSpec, control::Mode)> = listed
+            .modes
+            .iter()
+            .map(|&i| (crtc_modes[i].spec, info.modes()[i]))
+            .collect();
+        let preferred_mode = listed.preferred;
+        let mode = modes[preferred_mode].1;
+        let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
+        let Some(crtc) = info
+            .encoders()
+            .iter()
+            .filter_map(|enc| drm.get_encoder(*enc).ok())
+            .flat_map(|enc| self.resources.filter_crtcs(enc.possible_crtcs()))
+            .find(|crtc| !used.contains(crtc))
+        else {
+            eprintln!("tuna-compositor: drm: skip connector {name}: no free CRTC");
+            return None;
+        };
+        let surface = match drm.create_surface(crtc, mode, &[handle]) {
+            Ok(surface) => surface,
+            Err(e) => {
+                eprintln!("tuna-compositor: drm: skip connector {name}: {e}");
+                return None;
+            }
+        };
+        let allocator = GbmAllocator::new(
+            self.gbm.clone(),
+            GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+        );
+        let surface = match GbmBufferedSurface::new(
+            surface,
+            allocator,
+            &[Fourcc::Argb8888, Fourcc::Xrgb8888],
+            self.render_formats.iter().copied(),
+        ) {
+            Ok(surface) => surface,
+            Err(e) => {
+                eprintln!("tuna-compositor: drm: skip connector {name}: {e}");
+                return None;
+            }
+        };
+        // A ramp or matrix a previous owner left must not stay.
+        let mut color = color::CrtcColor::new(drm, crtc);
+        color.reset(drm);
+        let edid = color::connector_edid(drm, handle);
+        let privacy = privacy::discover(drm, handle);
+        let (w, h) = mode.size();
+        let size: Size<i32, Physical> = (i32::from(w), i32::from(h)).into();
+        let (mm_w, mm_h) = info.size().unwrap_or((0, 0));
+        let output = Output::new(
+            name.clone(),
+            PhysicalProperties {
+                size: (mm_w as i32, mm_h as i32).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Tuna Desktop".to_owned(),
+                model: name.clone(),
+            },
+        );
+        let out_mode = Mode::from(mode);
+        output.change_current_state(Some(out_mode), None, None, None);
+        output.set_preferred(out_mode);
+        let native_owner = self.native_device.and_then(|device| {
+            crate::native_output::resolve(
+                std::path::Path::new("/sys"),
+                device,
+                &name,
+                u32::from(handle),
+            )
+            .ok()
+        });
+        Some(DrmOutput {
+            name,
+            crtc,
+            connector: handle,
+            native_owner,
+            surface,
+            output,
+            modes,
+            preferred_mode,
+            size_mm: (mm_w as i32, mm_h as i32),
+            size,
+            loc: (0, 0),
+            scale: 1.0,
+            transform: 0,
+            enabled: true,
+            mirror_of: None,
+            rollback_mode: None,
+            mode_reverted: false,
+            pending: false,
+            last_frame: None,
+            damage_tracker: None,
+            wake_trace: false,
+            color,
+            edid,
+            white_point: Default::default(),
+            privacy,
+            tint_fallback: false,
+        })
+    }
+}
+
 impl DrmBackend {
     pub fn native_outputs(&self) -> Vec<tuna_shell_control::NativeOutputInfo> {
         use std::os::fd::AsFd;
@@ -447,8 +625,7 @@ impl DrmBackend {
         let native_device = crate::native_output::device(drm.device_fd().as_fd())
             .ok()
             .filter(|device| *device == drm.device_id());
-        let mut used: Vec<crtc::Handle> = Vec::new();
-        let mut outputs = Vec::new();
+        let mut outputs: Vec<DrmOutput> = Vec::new();
         for handle in resources.connectors() {
             let Ok(info) = drm.get_connector(*handle, false) else {
                 continue;
@@ -456,123 +633,16 @@ impl DrmBackend {
             if info.state() != connector::State::Connected {
                 continue;
             }
-            // Mutter's monitor modes (#340): every connector mode,
-            // deduplicated and sorted; the session starts in the
-            // preferred one.
-            let crtc_modes: Vec<crate::display_config::CrtcMode> = info
-                .modes()
-                .iter()
-                .map(|m| crate::display_config::CrtcMode {
-                    spec: mode_spec(m),
-                    flags: m.flags().bits(),
-                })
-                .collect();
-            let kernel_preferred = info
-                .modes()
-                .iter()
-                .position(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED));
-            let Some(listed) = crate::display_config::monitor_modes(&crtc_modes, kernel_preferred)
-            else {
-                continue;
+            let used: Vec<crtc::Handle> = outputs.iter().map(|o| o.crtc).collect();
+            let lighting = Lighting {
+                gbm: &gbm,
+                render_formats: &render_formats,
+                native_device,
+                resources: &resources,
             };
-            let modes: Vec<(crate::display_config::ModeSpec, control::Mode)> = listed
-                .modes
-                .iter()
-                .map(|&i| (crtc_modes[i].spec, info.modes()[i]))
-                .collect();
-            let preferred_mode = listed.preferred;
-            let mode = modes[preferred_mode].1;
-            let crtc = info
-                .encoders()
-                .iter()
-                .filter_map(|enc| drm.get_encoder(*enc).ok())
-                .flat_map(|enc| resources.filter_crtcs(enc.possible_crtcs()))
-                .find(|crtc| !used.contains(crtc));
-            let Some(crtc) = crtc else {
-                continue;
-            };
-            let surface = match drm.create_surface(crtc, mode, &[*handle]) {
-                Ok(surface) => surface,
-                Err(e) => {
-                    eprintln!("tuna-compositor: drm: skip connector: {e}");
-                    continue;
-                }
-            };
-            let allocator = GbmAllocator::new(
-                gbm.clone(),
-                GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
-            );
-            let surface = match GbmBufferedSurface::new(
-                surface,
-                allocator,
-                &[Fourcc::Argb8888, Fourcc::Xrgb8888],
-                render_formats.iter().copied(),
-            ) {
-                Ok(surface) => surface,
-                Err(e) => {
-                    eprintln!("tuna-compositor: drm: skip connector: {e}");
-                    continue;
-                }
-            };
-            used.push(crtc);
-            // A ramp or matrix a previous session left must not stay.
-            let mut color = color::CrtcColor::new(&drm, crtc);
-            color.reset(&drm);
-            let edid = color::connector_edid(&drm, *handle);
-            let privacy = privacy::discover(&drm, *handle);
-            let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
-            let (w, h) = mode.size();
-            let size: Size<i32, Physical> = (i32::from(w), i32::from(h)).into();
-            let (mm_w, mm_h) = info.size().unwrap_or((0, 0));
-            let output = Output::new(
-                name.clone(),
-                PhysicalProperties {
-                    size: (mm_w as i32, mm_h as i32).into(),
-                    subpixel: Subpixel::Unknown,
-                    make: "Tuna Desktop".to_owned(),
-                    model: name.clone(),
-                },
-            );
-            let out_mode = Mode::from(mode);
-            output.change_current_state(Some(out_mode), None, None, None);
-            output.set_preferred(out_mode);
-            let native_owner = native_device.and_then(|device| {
-                crate::native_output::resolve(
-                    std::path::Path::new("/sys"),
-                    device,
-                    &name,
-                    u32::from(*handle),
-                )
-                .ok()
-            });
-            outputs.push(DrmOutput {
-                name,
-                crtc,
-                connector: *handle,
-                native_owner,
-                surface,
-                output,
-                modes,
-                preferred_mode,
-                size_mm: (mm_w as i32, mm_h as i32),
-                size,
-                loc: (0, 0),
-                scale: 1.0,
-                transform: 0,
-                enabled: true,
-                mirror_of: None,
-                rollback_mode: None,
-                mode_reverted: false,
-                pending: false,
-                last_frame: None,
-                damage_tracker: None,
-                wake_trace: false,
-                color,
-                edid,
-                white_point: Default::default(),
-                privacy,
-                tint_fallback: false,
-            });
+            if let Some(out) = lighting.open(&mut drm, *handle, &info, &used) {
+                outputs.push(out);
+            }
         }
         if outputs.is_empty() {
             return Err(DrmInitError(format!(
@@ -583,21 +653,10 @@ impl DrmBackend {
         // GNOME's configuration for exactly these connectors (#59,
         // #340): modes, scale, position, rotation, mirrors and switched
         // off monitors; the rest at TUNA_SCALE (or 1), left to right.
-        let names: Vec<String> = outputs.iter().map(|o| o.name.clone()).collect();
+        let connectors = startup_connectors(&outputs);
+        let names: Vec<String> = connectors.iter().map(|c| c.name.clone()).collect();
         let stored = crate::monitors::load(&names);
-        let fallback_scale = std::env::var("TUNA_SCALE")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .map(crate::runtime::clamp_scale)
-            .unwrap_or(1.0);
-        let connectors: Vec<crate::display_config::StartupConnector> = outputs
-            .iter()
-            .map(|o| crate::display_config::StartupConnector {
-                name: o.name.clone(),
-                modes: o.modes.iter().map(|(spec, _)| *spec).collect(),
-                preferred: o.preferred_mode,
-            })
-            .collect();
+        let fallback_scale = fallback_scale();
         let layouts =
             crate::display_config::startup_layouts(stored.as_ref(), &connectors, fallback_scale);
 
@@ -606,11 +665,6 @@ impl DrmBackend {
             .udev_assign_seat(&seat)
             .map_err(|()| DrmInitError(format!("libinput: cannot assign seat {seat}")))?;
         let input = LibinputInputBackend::new(libinput.clone());
-        let udev = smithay::backend::udev::UdevBackend::new(&seat)
-            .inspect_err(|e| {
-                eprintln!("tuna-compositor: drm: udev monitor unavailable: {e}; privacy screen hotkeys are not followed");
-            })
-            .ok();
         let mut backend = Self {
             session,
             drm,
@@ -637,6 +691,9 @@ impl DrmBackend {
             privacy: Default::default(),
             privacy_read_pending: None,
             privacy_write: None,
+            gbm,
+            render_formats,
+            native_device,
         };
         if let Err(error) = backend.apply_layout(&layouts) {
             // A stored mode the kernel refused: Mutter falls back to its
@@ -647,7 +704,46 @@ impl DrmBackend {
                 .apply_layout(&linear)
                 .map_err(|e| DrmInitError(format!("output layout: {e}")))?;
         }
-        for out in &backend.outputs {
+        backend.log_outputs();
+        let (first_w, first_h) = backend.outputs[0].logical_size();
+        let first_loc = backend.outputs[0].loc;
+        backend.pointer = (
+            f64::from(first_loc.0) + f64::from(first_w) / 2.0,
+            f64::from(first_loc.1) + f64::from(first_h) / 2.0,
+        )
+            .into();
+        // Connector hotplug arrives as a udev change of the DRM device,
+        // as Mutter's MetaUdev reports it (`hotplug` signal).
+        let udev = match smithay::backend::udev::UdevBackend::new(&seat) {
+            Ok(udev) => {
+                let device = backend.drm.device_id();
+                if !udev.device_list().any(|(id, _)| id == device) {
+                    eprintln!(
+                        "tuna-compositor: drm: {} is not a GPU of seat {seat}; connector hotplug is not followed",
+                        path.display()
+                    );
+                }
+                Some(udev)
+            }
+            Err(error) => {
+                eprintln!("tuna-compositor: drm: udev monitor: {error}; connector hotplug is not followed");
+                None
+            }
+        };
+        Ok((
+            backend,
+            DrmSources {
+                session: session_notifier,
+                drm: drm_notifier,
+                input,
+                udev,
+            },
+        ))
+    }
+
+    /// The lit outputs in the log, as the DRM smoke proof reads them.
+    pub fn log_outputs(&self) {
+        for out in &self.outputs {
             if !out.enabled {
                 eprintln!("tuna-compositor: drm: connector {} switched off", out.name);
                 continue;
@@ -667,22 +763,80 @@ impl DrmBackend {
                     .unwrap_or_default(),
             );
         }
-        let (first_w, first_h) = backend.outputs[0].logical_size();
-        let first_loc = backend.outputs[0].loc;
-        backend.pointer = (
-            f64::from(first_loc.0) + f64::from(first_w) / 2.0,
-            f64::from(first_loc.1) + f64::from(first_h) / 2.0,
-        )
-            .into();
-        Ok((
-            backend,
-            DrmSources {
-                session: session_notifier,
-                drm: drm_notifier,
-                input,
-                udev,
-            },
-        ))
+    }
+
+    /// Whether a udev change concerns this backend's DRM device.
+    pub fn is_device(&self, device_id: u64) -> bool {
+        self.drm.device_id() == device_id
+    }
+
+    /// The connected connectors with their modes, for choosing a
+    /// configuration.
+    pub fn startup_connectors(&self) -> Vec<crate::display_config::StartupConnector> {
+        startup_connectors(&self.outputs)
+    }
+
+    /// Connector hotplug (Mutter's `meta_kms_update_states_sync` after
+    /// udev's change event): every connector is probed again; outputs
+    /// whose connector went away are dropped (queued frames discarded,
+    /// their CRTC switched off and free again) and newly connected
+    /// connectors are lit at their preferred mode. The runtime then
+    /// configures the new monitor set. Nothing is probed off-seat:
+    /// activation rescans.
+    pub fn rescan_connectors(&mut self) -> ConnectorChanges {
+        let mut changes = ConnectorChanges::default();
+        if !self.active || !self.drm.is_active() {
+            return changes;
+        }
+        let resources = match self.drm.resource_handles() {
+            Ok(resources) => resources,
+            Err(error) => {
+                eprintln!("tuna-compositor: drm: hotplug: resources: {error}");
+                return changes;
+            }
+        };
+        let mut index = 0;
+        while index < self.outputs.len() {
+            let connected = self
+                .drm
+                .get_connector(self.outputs[index].connector, true)
+                .is_ok_and(|info| info.state() == connector::State::Connected);
+            if connected {
+                index += 1;
+                continue;
+            }
+            let mut gone = self.outputs.remove(index);
+            for mut feedback in gone.surface.discard_pending_frames() {
+                feedback.discarded();
+            }
+            changes.removed.push(gone.name.clone());
+        }
+        for handle in resources.connectors() {
+            if self.outputs.iter().any(|o| o.connector == *handle) {
+                continue;
+            }
+            let Ok(info) = self.drm.get_connector(*handle, true) else {
+                continue;
+            };
+            if info.state() != connector::State::Connected {
+                continue;
+            }
+            let used: Vec<crtc::Handle> = self.outputs.iter().map(|o| o.crtc).collect();
+            let lighting = Lighting {
+                gbm: &self.gbm,
+                render_formats: &self.render_formats,
+                native_device: self.native_device,
+                resources: &resources,
+            };
+            if let Some(out) = lighting.open(&mut self.drm, *handle, &info, &used) {
+                changes.added.push(out.name.clone());
+                self.outputs.push(out);
+            }
+        }
+        if !changes.is_empty() {
+            self.layout_generation += 1;
+        }
+        changes
     }
 
     /// Apply a layout (#340), all or nothing. Every new mode is tested

@@ -208,6 +208,85 @@ impl Runtime {
         self.publish_display_state();
     }
 
+    /// A connector was plugged in or unplugged (Mutter's
+    /// `meta_monitor_manager_reload`): the backend lights or drops the
+    /// outputs, the new monitor set is configured as
+    /// `meta_monitor_manager_ensure_configured` does (stored, then the
+    /// current or previous configuration that covers it, then linear),
+    /// and wl_outputs, windows and DisplayConfig follow.
+    #[cfg(feature = "drm")]
+    pub(super) fn on_drm_hotplug(&mut self) {
+        let live = self.display_state().live_config();
+        let Backend::Drm(drm) = &mut self.backend else {
+            return;
+        };
+        let changes = drm.rescan_connectors();
+        if changes.is_empty() {
+            return;
+        }
+        eprintln!(
+            "tuna-compositor: drm: hotplug: connected [{}], disconnected [{}]",
+            changes.added.join(", "),
+            changes.removed.join(", ")
+        );
+        self.display_configs.ensure_current(live);
+        let connectors = drm.startup_connectors();
+        if !connectors.is_empty() {
+            let names: Vec<String> = connectors.iter().map(|c| c.name.clone()).collect();
+            let stored = crate::monitors::load_exact(&names);
+            let existing: Vec<&MonitorsConfig> = [
+                self.display_configs.current(),
+                self.display_configs.previous(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let primary = self.state.primary_output_name();
+            let fallback = crate::drm::fallback_scale();
+            let mut layouts = display_config::hotplug_layouts(
+                stored.as_ref(),
+                &existing,
+                &connectors,
+                primary.as_deref(),
+                fallback,
+            );
+            // The sensor wins on unlocked built-in panels; the
+            // configured transform stays in manual_transforms.
+            for layout in &mut layouts {
+                if let Some(enabled) = &mut layout.enabled {
+                    self.manual_transforms
+                        .insert(layout.connector.clone(), enabled.transform);
+                    enabled.transform = self
+                        .orientation
+                        .effective(&layout.connector, enabled.transform);
+                }
+            }
+            if let Err(error) = drm.apply_layout(&layouts) {
+                eprintln!("tuna-compositor: drm: hotplug configuration not applied: {error}");
+                let linear = display_config::hotplug_layouts(
+                    None,
+                    &[],
+                    &connectors,
+                    primary.as_deref(),
+                    fallback,
+                );
+                if let Err(error) = drm.apply_layout(&linear) {
+                    eprintln!("tuna-compositor: drm: linear configuration not applied: {error}");
+                }
+            }
+        }
+        drm.log_outputs();
+        self.color.set_gamma_sizes(drm.gamma_sizes());
+        let primary_scale = drm.outputs.first().map(|o| o.scale);
+        self.sync_drm_outputs();
+        if let Some(scale) = primary_scale {
+            self.state.set_preferred_scale(scale);
+        }
+        let live = self.display_state().live_config();
+        self.display_configs.configured(live);
+        self.publish_display_state();
+    }
+
     /// Apply a configuration live, with GNOME's ScreenTransition: the
     /// old layout is pictured first when the layout changes.
     fn apply_monitors(&mut self, config: &MonitorsConfig) -> Result<(), String> {
@@ -317,16 +396,11 @@ impl Runtime {
             .filter(|name| !leaders.iter().any(|(leader, ..)| leader == name))
             .collect();
         let primary_before = self.state.primary_output_name();
-        let sizes_before: Vec<(String, (i32, i32))> = self
-            .state
-            .outputs
-            .iter()
-            .map(|entry| (entry.name.clone(), (entry.size.w, entry.size.h)))
-            .collect();
+        let before = self.state.output_slices();
         for name in &gone {
-            self.manager.migrate_output_windows(&mut self.state, name);
             self.state.remove_output(name);
         }
+        self.destroy_retired_output_globals_later();
         for (name, output, loc, (lw, lh)) in &leaders {
             let known = self.state.outputs.iter().any(|entry| &entry.name == name);
             self.state.add_output(name, Some(output.clone()), *lw, *lh);
@@ -339,17 +413,39 @@ impl Runtime {
         if let Some((primary, ..)) = leaders.first() {
             self.state.set_primary(primary);
         }
-        let resized = leaders.iter().any(|(name, _, _, logical)| {
-            sizes_before
-                .iter()
-                .any(|(known, size)| known == name && size != logical)
-        });
-        if resized || !gone.is_empty() || self.state.primary_output_name() != primary_before {
+        // Mutter re-homes every window when the monitors change
+        // (`meta_window_update_for_monitors_changed`).
+        let after = self.state.output_slices();
+        if after != before || self.state.primary_output_name() != primary_before {
+            eprintln!("tuna-compositor: outputs changed from {before:?} to {after:?}");
+            self.manager
+                .relocate_for_monitors_changed(&self.state, &before);
             self.manager.reapply_derived_layouts(&mut self.state);
         }
         // Anchored layer surfaces (the panel) follow a new mode now,
         // not on their next commit.
         crate::layer::arrange_after_commit(&self.state);
+    }
+
+    /// Destroy the withdrawn wl_output globals of removed outputs once
+    /// clients have long seen the removal: 10 seconds, as niri does
+    /// (`Niri::remove_output`, GPL-3.0-or-later). A client binding one
+    /// meanwhile gets an inert wl_output instead of a protocol error.
+    #[cfg(feature = "drm")]
+    fn destroy_retired_output_globals_later(&mut self) {
+        let retired = self.state.take_retired_output_globals();
+        if retired.is_empty() {
+            return;
+        }
+        let timer = calloop::timer::Timer::from_duration(Duration::from_secs(10));
+        if let Err(error) = self.loop_handle.insert_source(timer, move |_, _, rt| {
+            for global in &retired {
+                rt.state.dh.remove_global::<State>(global.clone());
+            }
+            calloop::timer::TimeoutAction::Drop
+        }) {
+            eprintln!("tuna-compositor: output global removal timer: {error}");
+        }
     }
 
     /// The display configuration for the proof state file: the serial,

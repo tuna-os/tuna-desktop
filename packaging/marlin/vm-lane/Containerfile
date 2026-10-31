@@ -34,12 +34,24 @@ ARG BASE_IMAGE=localhost/marlin-tuna-preview:ci
 FROM ${BASE_IMAGE} AS constraint-builder
 COPY packaging/marlin/vm-lane/tuna-vm-constraints.c /build/tuna-vm-constraints.c
 COPY packaging/marlin/vm-lane/tuna-vm-constraints-build /build/tuna-vm-constraints-build
-RUN pacman -S --needed --noconfirm gcc pkgconf wayland wayland-protocols wlr-protocols \
-    && TUNA_CI_ONLY=1 /build/tuna-vm-constraints-build
+COPY packaging/marlin/vm-lane/tuna-vm-sandbox-client.c /build/tuna-vm-sandbox-client.c
+COPY packaging/marlin/vm-lane/tuna-vm-flatpak-build /build/tuna-vm-flatpak-build
+RUN pacman -S --needed --noconfirm gcc pkgconf wayland wayland-protocols wlr-protocols flatpak ostree \
+    && TUNA_CI_ONLY=1 /build/tuna-vm-constraints-build \
+    && TUNA_CI_ONLY=1 /build/tuna-vm-flatpak-build
 
 FROM ${BASE_IMAGE}
 COPY --from=constraint-builder /usr/libexec/tuna-vm-constraints /usr/libexec/tuna-vm-constraints
 COPY --from=constraint-builder /usr/share/tuna-vm-constraints /usr/share/tuna-vm-constraints
+# V-PICKER / V-INTROSPECT fixtures: GTK file-chooser callers, the Introspect
+# ScreenSize subscriber, the root probe, and the sandbox client with its
+# local Flatpak repository (installed in the booted guest, not here).
+COPY --from=constraint-builder /usr/libexec/tuna-vm-sandbox-client /usr/libexec/tuna-vm-sandbox-client
+COPY --from=constraint-builder /usr/share/tuna-vm-sandbox /usr/share/tuna-vm-sandbox
+COPY --from=constraint-builder /usr/share/tuna-vm/flatpak-repo /usr/share/tuna-vm/flatpak-repo
+COPY packaging/marlin/vm-lane/tuna-vm-picker /usr/libexec/tuna-vm-picker
+COPY packaging/marlin/vm-lane/tuna-vm-introspect-watch /usr/libexec/tuna-vm-introspect-watch
+COPY packaging/marlin/vm-lane/tuna-vm-app-integration /usr/libexec/tuna-vm-app-integration
 
 COPY packaging/marlin/vm-lane/tunaos /tmp/tunaos
 COPY packaging/marlin/vm-lane/tuna-vm-lifecycle /usr/libexec/tuna-vm-lifecycle
@@ -87,6 +99,7 @@ RUN mkdir -p /usr/share/tuna-vm \
     && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test \
     && echo 'tuna-test:tuna' | chpasswd \
     && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-input /usr/libexec/tuna-vm-shell-focus \
+         /usr/libexec/tuna-vm-picker /usr/libexec/tuna-vm-introspect-watch /usr/libexec/tuna-vm-app-integration \
          /usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token \
     && printf 'TUNA_COMPOSITOR_STATE=/run/user/%s/tuna-vm-state.json\nTUNA_LOCK_TRACE=1\nTUNA_POINTER_TRACE=1\n' \
          "$(id -u tuna-test)" > /usr/share/tuna-vm/environment.conf \
