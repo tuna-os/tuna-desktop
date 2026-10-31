@@ -169,6 +169,7 @@ if len(sys.argv) > 1:
 
 path = pathlib.Path(os.environ["XDG_RUNTIME_DIR"], "tuna-vm-input.json")
 count = 0
+key_releases = 0
 buttons = {"1": 0, "2": 0, "3": 0}
 button_releases = {}
 event_count = 0
@@ -179,6 +180,7 @@ window = None
 def publish():
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps({"pid": os.getpid(), "count": count, "buttons": buttons,
+                                    "key_releases": key_releases,
                                     "button_releases": button_releases, "event_count": event_count,
                                     "motions": motions,
                                     "gtk_version": [Gtk.get_major_version(), Gtk.get_minor_version(),
@@ -205,6 +207,11 @@ def activate(app):
         publish()
         return True
     controller.connect("key-pressed", pressed)
+    def released(*_arguments):
+        global key_releases
+        key_releases += 1
+        publish()
+    controller.connect("key-released", released)
     window.add_controller(controller)
     clicks = Gtk.GestureClick()
     clicks.set_button(0)

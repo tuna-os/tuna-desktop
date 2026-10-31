@@ -32,10 +32,10 @@
 #   G-ORCA-SPEECH-SWITCHER Alt+Tab names each newly selected app and window
 #   G-ORCA-SPEECH-NOTIFY   a new banner is announced with its source, title
 #                         and body; Super+N focuses the banner itself
-#   G-ORCA-SPEECH-LOCK     the lock screen's password field is announced,
-#                         typing it speaks only bullets (no plaintext
-#                         letter or word) and it unlocks through PAM
-#                         (pam_wrapper)
+#   G-ORCA-SPEECH-LOCK     D-Bus lock after Escape and ordinary Super+L
+#                         each announce the password field and speak exactly
+#                         one bullet per character, never plaintext, then
+#                         unlock through real PAM (pam_wrapper)
 # Writes assertions.txt for the parity ledger.
 set -eu
 
@@ -423,38 +423,61 @@ pass G-ORCA-SPEECH-NOTIFY "arrival: 'Notification, Tuna Proof, Build finished, A
 sleep 4
 
 # ---- G-ORCA-SPEECH-LOCK
-# The curtain and then its unlock prompt, one step: Orca may name the
-# lock screen as it maps or once the prompt takes the focus.
-step lock super+l
-cstate '.locked == true' "locked" || fail G-ORCA-SPEECH-LOCK "Super+L did not lock the session"
-sleep 2
-xdotool key Return
-said G-ORCA-SPEECH-LOCK lock "Lock Screen" "Password" "password text."
-# PAM's password question reaches the prompt before typing, so no key
-# lands while the entry is still starting its conversation.
-asked=0
-for _ in $(seq 1 100); do
-    grep -q "lock auth query service=password" "$LOG" && { asked=1; break; }
-    sleep 0.2
+# Both last-key histories must work. No Super-hold workaround: the trusted
+# owned screen reader now hears all keys while locked, exactly as Mutter does.
+for variant in dbus super-l; do
+    lock_gate="G-ORCA-SPEECH-LOCK-$(printf '%s' "$variant" | tr '[:lower:]' '[:upper:]')"
+    lock_step="lock-$variant"
+    questions="$(grep -c 'lock auth query service=password' "$LOG" || true)"
+    heard="$(jq -r '.a11y_keyboard.normal_events' "$CSTATE")"
+    mark "$lock_step"
+    if [ "$variant" = dbus ]; then
+        xdotool key Escape
+        gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver \
+            --method org.gnome.ScreenSaver.Lock >/dev/null ||
+            fail "$lock_gate" "ScreenSaver.Lock failed"
+    else
+        xdotool key --clearmodifiers super+l
+    fi
+    cstate '.locked == true and .a11y_keyboard.locked == true' "locked" ||
+        fail "$lock_gate" "$variant did not lock the session"
+    sleep 2
+    xdotool key Return
+    said "$lock_gate" "$lock_step" "Lock Screen" "Password" "password text."
+    # A fresh PAM question, not the previous variant's log entry.
+    asked=0
+    for _ in $(seq 1 100); do
+        [ "$(grep -c 'lock auth query service=password' "$LOG" || true)" -gt "$questions" ] &&
+            { asked=1; break; }
+        sleep 0.2
+    done
+    [ "$asked" = 1 ] || fail "$lock_gate" "the unlock prompt never asked PAM's password question"
+    forwarded=$(($(jq -r '.a11y_keyboard.normal_events' "$CSTATE") - heard))
+    [ "$forwarded" -ge 4 ] ||
+        fail "$lock_gate" "Orca's KeyboardMonitor got only $forwarded lock/wake keys"
+    # Orca's own grabs still precede the lock surface, not merely its watcher.
+    step "$lock_step-learn" Insert+h
+    said "$lock_gate" "$lock_step-learn" "Entering learn mode."
+    step "$lock_step-learn-exit" Escape
+    said "$lock_gate" "$lock_step-learn-exit" "Exiting learn mode."
+    type_echo "$lock_gate" "$lock_step-type" "$UNLOCK_PASSWORD" "●"
+    bullets="$(printf '%s' "$UNLOCK_PASSWORD" | sed 's/./● /g')"
+    # shellcheck disable=SC2086
+    said "$lock_gate" "$lock_step-type" $bullets
+    "$PY" "$LIB" never "$SPOKEN" "$lock_step-type" "$UNLOCK_PASSWORD" 2>"$ARTIFACTS/leak.txt" ||
+        fail "$lock_gate" "Orca spoke the password: $(tr '\n' ' ' <"$ARTIFACTS/leak.txt")"
+    count="$("$PY" "$LIB" count "$SPOKEN" "$lock_step-type" "●")"
+    [ "$count" -eq "${#UNLOCK_PASSWORD}" ] ||
+        fail "$lock_gate" "$count bullets spoken for a ${#UNLOCK_PASSWORD}-character password"
+    step "$lock_step-unlock" Return
+    cstate '.locked == false' "unlocked" 20 ||
+        fail "$lock_gate" "the typed password did not unlock the session"
+    "$PY" "$LIB" never "$SPOKEN" "$lock_step-unlock" "$UNLOCK_PASSWORD" 2>"$ARTIFACTS/leak.txt" ||
+        fail "$lock_gate" "Orca spoke the password on unlock: $(tr '\n' ' ' <"$ARTIFACTS/leak.txt")"
+    pass "$lock_gate" "$variant: 'Lock Screen', 'Password', 'password text.'; $count characters spoke exactly $count bullets and no plaintext; Enter unlocked through PAM"
+    sleep 3
 done
-[ "$asked" = 1 ] || fail G-ORCA-SPEECH-LOCK "the unlock prompt never asked PAM's password question"
-mark lock-type
-xdotool type --clearmodifiers --delay 200 "$UNLOCK_PASSWORD"
-bullets="$(printf '%s' "$UNLOCK_PASSWORD" | sed 's/./● /g')"
-# shellcheck disable=SC2086
-said G-ORCA-SPEECH-LOCK lock-type $bullets
-"$PY" "$LIB" never "$SPOKEN" lock-type "$UNLOCK_PASSWORD" 2>"$ARTIFACTS/leak.txt" ||
-    fail G-ORCA-SPEECH-LOCK "Orca spoke the password: $(tr '\n' ' ' <"$ARTIFACTS/leak.txt")"
-count="$("$PY" "$LIB" count "$SPOKEN" lock-type "●")"
-[ "$count" -eq "${#UNLOCK_PASSWORD}" ] ||
-    fail G-ORCA-SPEECH-LOCK "$count bullets spoken for a ${#UNLOCK_PASSWORD}-character password"
-step lock-unlock Return
-cstate '.locked == false' "unlocked" 20 ||
-    fail G-ORCA-SPEECH-LOCK "the typed password did not unlock the session"
-"$PY" "$LIB" never "$SPOKEN" lock-unlock "$UNLOCK_PASSWORD" 2>"$ARTIFACTS/leak.txt" ||
-    fail G-ORCA-SPEECH-LOCK "Orca spoke the password on unlock: $(tr '\n' ' ' <"$ARTIFACTS/leak.txt")"
-pass G-ORCA-SPEECH-LOCK "'Lock Screen', 'Password', 'password text.'; typing $count characters spoke '●' $count times and no letter or word of the password; Enter unlocked through PAM"
-sleep 3
+pass G-ORCA-SPEECH-LOCK "D-Bus after Escape and Super+L both spoke one bullet per character with the same original reader"
 
 # ---- G-ORCA-SPEECH-TOGGLE (off)
 step toggle-off super+alt+s
