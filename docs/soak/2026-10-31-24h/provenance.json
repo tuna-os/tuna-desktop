@@ -1,0 +1,89 @@
+{
+  "user": "tuna-test",
+  "uid": 1000,
+  "source_revision": "d28578e590ff85a1616db7d6dcc0d7603bb86b31",
+  "boot_id": "52126499-521c-482f-a973-f1a64083007a",
+  "binaries_sha256": {
+    "tuna-compositor": "9d8de57edf1b43fd6ff9933ae53568d5cc04e8e15aae381309e10b2e372fcbd3",
+    "tuna-shell-gtk": "4578cf0282196cb73a48da424ee1fcce8298ded42b0ac1ac85c9f48034a3036a",
+    "tuna-shell-host": "36a1b9a84d40f12065fa81c7569d9e948ced805f46233a6eb1b36bfe8d6936b6",
+    "tuna-session": "f9b49e539cbfb7ce776e2b68f5b1231941bcfcbeba9c6cdf727721d1be72764a",
+    "tuna-ibus-bridge": "8446195e09b663d5783e399001b0a04e262b5c430ba0e4a05851c138812f1ad0"
+  },
+  "kernel": "7.2.11-arch1-1",
+  "cpu_count": 4,
+  "meminfo": "MemTotal:        5986716 kB\nMemFree:          320292 kB\nMemAvailable:    4836800 kB\nBuffers:           82748 kB\nCached:          4779604 kB\nSwapCached:            0 kB\nActive:           627540 kB\nInactive:        4620252 kB\nActive(anon):     627540 kB\nInactive(anon):        0 kB\nActive(file):          0 kB\nInactive(file):  4620252 kB\nUnevictable:       12336 kB\nMlocked:              16 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:               964 kB\nWriteback:             0 kB\nAnonPages:        397536 kB\nMapped:           246472 kB\nShmem:            242292 kB\nKReclaimable:     197808 kB\nSlab:             275008 kB\nSReclaimable:     197808 kB\nSUnreclaim:        77200 kB\nKernelStack:        7360 kB\nPageTables:        10832 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:     2993356 kB\nCommitted_AS:    2767912 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:       23480 kB\nVmallocChunk:          0 kB\nPercpu:            12352 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:    133120 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:      4096 kB\nFilePmdMapped:         0 kB\nCmaTotal:              0 kB\nCmaFree:               0 kB\nUnaccepted:            0 kB\nBalloon:               0 kB\nGPUActive:             0 kB\nGPUReclaim:            0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:      107424 kB\nDirectMap2M:     6115328 kB\nDirectMap1G:     2097152 kB\n",
+  "drm_drivers": {
+    "card0": "bochs-drm"
+  },
+  "bootc_status": {
+    "apiVersion": "org.containers.bootc/v1",
+    "kind": "BootcHost",
+    "metadata": {
+      "name": "host"
+    },
+    "spec": {
+      "bootOrder": "default",
+      "image": {
+        "image": "ghcr.io/tuna-os/marlin@sha256:ae6363c185015849701328fc38694f5ddcc0b4c804034a1d8d05577f1c70cf7d",
+        "transport": "registry"
+      }
+    },
+    "status": {
+      "booted": {
+        "cachedUpdate": null,
+        "composefs": {
+          "bootDigest": "76fa15177bfa64873fbaf4e4717713620bfe6a4605b65ee6cd022b39c503bbbe",
+          "bootType": "Bls",
+          "bootloader": "systemd",
+          "missingVerityAllowed": false,
+          "verity": "0e9515c703ce461084e70477e3a0a18a7a75b654854ac7e1355dfc7c0eb2d4b6ea7a5d471790beddde985e8ed9a1e49665122a1be4c4c84c0b8ddfdc22f104fe"
+        },
+        "downloadOnly": false,
+        "image": {
+          "architecture": "amd64",
+          "image": {
+            "image": "ghcr.io/tuna-os/marlin@sha256:ae6363c185015849701328fc38694f5ddcc0b4c804034a1d8d05577f1c70cf7d",
+            "transport": "registry"
+          },
+          "imageDigest": "sha256:a182a20b732b6f8954be4afd7c0b47fa67306143100b5377d0b015a873415beb",
+          "timestamp": "2026-10-29T21:46:44.447443488Z",
+          "version": null
+        },
+        "incompatible": false,
+        "ostree": null,
+        "pinned": false,
+        "softRebootCapable": false,
+        "store": null
+      },
+      "readOnly": false,
+      "rollback": null,
+      "rollbackQueued": false,
+      "staged": null,
+      "type": null,
+      "usrOverlay": null
+    }
+  },
+  "started_unix_s": 1793410695.562296,
+  "requested_duration_s": 86400,
+  "scope": "24-hour qualification candidate",
+  "interval_s": 60,
+  "warmup_s": 600,
+  "limits": {
+    "pss": "baseline * 1.5 + 16384 KiB",
+    "fds": "baseline * 1.5 + 32",
+    "processes": "baseline + 12"
+  },
+  "presentation_workload": {
+    "binary": "/var/lib/tuna-soak/tuna-frame-pacer",
+    "sha256": "a83dc288a566724a08ac30ba6a964f4223f91fc355010a681ea7f9658909506b",
+    "wayland_display": "tuna-nested-2525",
+    "size": [
+      320,
+      180
+    ],
+    "idle_policy": "Ordinary mapped client idle inhibitor; explicit lock is never bypassed.",
+    "duration_s": 86400,
+    "raw_output_budget_bytes": 4294967296
+  }
+}
