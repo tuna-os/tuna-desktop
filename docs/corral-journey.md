@@ -32,6 +32,9 @@ console frames for each step.
    background, quick settings and Night Light, the volume and brightness
    sliders, `notify-send` and a D-Bus `Notify`, the date menu, lock with
    Super+L, a refused wrong password, unlock, and log out back to GDM.
+   Native portal requesters also check frontend availability, actual Screenshot
+   delivery, and a ScreenCast PipeWire frame with caller isolation and bounded
+   withdrawal on the actual Super+L lock; no candidate desktop binaries are copied.
 5. Every step writes its frame, its guest-side checks, and the `tuna-*`
    journal lines it caused to `manifest.json` with timestamps. A step's
    result is `pass`, `fail` or `not-exercised` (with the reason). Then
@@ -65,6 +68,21 @@ start with `tuna-q-` (the default is `tuna-q-<date>`), so the script
 cannot name somebody else's VM. `--reuse` restarts a VM that is already
 built from the same digest. The exit status is nonzero when any step
 fails.
+
+For the all-variant install/GDM/session/portal/lock/unlock/logout
+subset, use `--qualification-only`; it omits the wider app/Settings/notification
+tour and records `scope: qualification-core` in the manifest. The default
+remains the full daily-driver journey. See the
+[digest-pinned variant matrix](v1-variant-qualification.md) for sequential
+orchestration and the distinction between portal availability and functional
+capture/consent qualification.
+The native Screenshot requester remains connected until the actual portal
+Response and retains a returned PNG, without app-ID or consent bypass. Its
+request-time console frame requires visual review; a successful PNG response
+does not by itself prove a consent prompt, ScreenCast stream or revocation.
+The separate ScreenCast requester consumes the real remote PipeWire stream and
+holds it until the actual Super+L step. Its existing two-second withdrawal
+observer is armed before the key, never replaced with explicit Session.Close.
 
 ## Limits
 

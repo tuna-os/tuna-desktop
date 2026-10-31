@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "observed": "2026-10-31",
+  "package_source": {
+    "repository": "tuna-os/tunaos-packages",
+    "revision": "c0998b94bd7b4fbc67360c239e439de6debf539b",
+    "recipe": "packages/tuna-desktop/package.yaml",
+    "source_tag": "v1.0.0-beta.2",
+    "desktop_revision": "1e6ce28f4d5dfd7918ac7340bd93454a9fcc211c",
+    "source_archive_sha256": "1e8abf38f4959a171007c3c61865057b76deaeb92aa7cbb79bcade830ec999b3",
+    "vendor_archive_sha256": "a428059d900ab8019314c302370d071c2bdd372343e584300129f078fa3eb8ad",
+    "recipe_version": "1.0.0~beta.2",
+    "recipe_release": 2
+  },
+  "gentoo_served_payload": {
+    "url": "https://repo.tunaos.org/gentoo/binpkgs/amd64/gui-wm/tuna-desktop/tuna-desktop-1.0.0_beta2-1.gpkg.tar",
+    "cpv": "gui-wm/tuna-desktop-1.0.0_beta2",
+    "sha256": "4a877c7b7e74234bbefb84a006e55e7cfef75faf1ffcd01003564ed1d088f5e7",
+    "sha1": "af0155f9a83d0401b524e7c8dce34ad6d01624d3",
+    "inspection": "Fetched archive; listed outer gpkg and nested image.tar.zst through tar. Signature verification not performed by this qualification lane.",
+    "observed_payload_entries": [
+      "image/usr/bin/tuna-greeter",
+      "image/usr/share/wayland-sessions/roost.desktop",
+      "image/usr/share/wayland-sessions/tuna.desktop",
+      "image/etc/pam.d/roost-lock",
+      "image/etc/pam.d/tuna-lock"
+    ],
+    "current_gdm_contract": "this older payload is blocked: obsolete tuna-greeter remains; subsequently published beta2-r1 is recorded below"
+  },
+  "gentoo_release2_served_payload": {
+    "url": "https://repo.tunaos.org/gentoo/binpkgs/amd64/gui-wm/tuna-desktop/tuna-desktop-1.0.0_beta2-r1-1.gpkg.tar",
+    "cpv": "gui-wm/tuna-desktop-1.0.0_beta2-r1",
+    "size": 17285120,
+    "sha256": "3e8467fde3aa86622406eef1dc9bc6f09740f47349e41cb5908ae9cd8437c6bf",
+    "index_sha1": "3ad806692be2c63a3fe6cbf40f64f1457448b8b6",
+    "inspection": "Directly fetched payload; nested usr/bin listing contains six current binaries, no tuna-greeter. Pipeline served-binhost signed-install verification passed.",
+    "binaries": ["tuna-compositor", "tuna-ibus-bridge", "tuna-session", "tuna-shell-gtk", "tuna-shell-host", "tuna-wallpaper-svg"],
+    "qualification": "package publication/served-install only; image and graphical runtime remain unqualified"
+  },
+  "publication_attempts": [
+    {
+      "repository": "tuna-os/tunaos-packages",
+      "workflow": "publish-tideforge-gentoo.yml",
+      "run": "https://github.com/tuna-os/tunaos-packages/actions/runs/41213265948",
+      "inputs": {"packages": "tuna-desktop", "arches": "amd64"},
+      "verdict": "success: build, signed publication and served-binhost installation verification passed"
+    },
+    {
+      "repository": "tuna-os/tunaos-packages",
+      "workflow": "publish-build-chain-rpms.yml",
+      "run": "https://github.com/tuna-os/tunaos-packages/actions/runs/41213268502",
+      "inputs": {"cells": "hummingbird-x86_64", "tiers": "local-00", "dry_run": false, "distribution": "r2", "runner": "hosted"},
+      "verdict": "pending; does not rebuild the separately blocked tuned provider"
+    },
+    {
+      "repository": "tuna-os/tunaOS",
+      "workflow": "build-wahoo.yml",
+      "run": "https://github.com/tuna-os/tunaOS/actions/runs/41213085155",
+      "inputs": {"flavor": "tuna"},
+      "verdict": "success: missing image published; immutable reference and limitations in wahoo-publication.json"
+    }
+  ]
+}

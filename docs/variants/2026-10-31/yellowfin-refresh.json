@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "old_image": "ghcr.io/tuna-os/yellowfin@sha256:355f66da7929059fc046527da6177e4958d97dab9546d62ca3d5ac53bc4daa4f",
+  "old_image_source": {
+    "revision": "2a35aac8f048973962cc5b1f1b89e211cc48a64b",
+    "committed": "2026-10-31T03:49:57Z",
+    "path": "tunaos.toml",
+    "actual_el10_pin": "tuna-desktop-1.0.0~beta.1-1.el10"
+  },
+  "cause": "Published image was built from source explicitly pinning beta1. Actual guest RPM agrees. Recent image creation date does not imply a newer desktop recipe; no cache/package-resolution defect inferred.",
+  "current_ready_package": {
+    "metadata_url": "https://repo.tunaos.org/repo/10/x86_64/repodata/8a08d8c508d25b2b8605364f2500ff5a9caaddd00e393c951d0daeae0123d642-primary.xml.gz",
+    "metadata_sha256": "8a08d8c508d25b2b8605364f2500ff5a9caaddd00e393c951d0daeae0123d642",
+    "packages": [
+      {
+        "version": {
+          "epoch": "0",
+          "ver": "1.0.0~beta.1",
+          "rel": "1.el10"
+        },
+        "checksum": "1bc76d04c2e0b1f3b52134f9208e6d91e4c00ba515adf561f7e4de2a7ab9886f",
+        "location": "tideforge/tuna-desktop-1.0.0~beta.1-1.el10.x86_64.rpm"
+      },
+      {
+        "version": {
+          "epoch": "0",
+          "ver": "1.0.0~beta.2",
+          "rel": "1.el10"
+        },
+        "checksum": "846426ccb12aeee014fc59f9ce05eaa5fb394bf262863dc1c798272b01072971",
+        "location": "tideforge/tuna-desktop-1.0.0~beta.2-1.el10.x86_64.rpm"
+      },
+      {
+        "version": {
+          "epoch": "0",
+          "ver": "1.0.0~beta.2",
+          "rel": "2.el10"
+        },
+        "checksum": "fc5318a26900d4c821f501488da5c60414cffd0784a1107fc1a192ce86309b35",
+        "location": "tideforge/tuna-desktop-1.0.0~beta.2-2.el10.x86_64.rpm"
+      }
+    ],
+    "chosen": "tuna-desktop-1.0.0~beta.2-2.el10.x86_64",
+    "rpm_sha256": "fc5318a26900d4c821f501488da5c60414cffd0784a1107fc1a192ce86309b35",
+    "rpm_check": "rpm -Kv accepted Header RSA/SHA512 signature key ID98c78b31 and all header/payload digests using existing local RPM keyring; no new trust root imported",
+    "payload": "Six current Tuna binaries present; tuna-greeter absent from actual rpm -qpl list"
+  },
+  "trusted_refresh": {
+    "run": "https://github.com/tuna-os/tunaOS/actions/runs/41221855489",
+    "workflow": "build-yellowfin.yml",
+    "ref": "main",
+    "inputs": {
+      "flavor": "tuna"
+    },
+    "verdict": "success",
+    "source_revision": "51e314eb9e231274d9c7c806e11f1a9feedf2228",
+    "published_image": "ghcr.io/tuna-os/yellowfin@sha256:64e7a29a9d832c0d021d3023ee825c07d37676d722dca59b31a2dfe492e5d0b0",
+    "created": "2026-10-31T17:04:18.344993126Z",
+    "labels": {
+      "containers.bootc": "1",
+      "io.bootc": "1",
+      "io.buildah.version": "1.42.1",
+      "org.opencontainers.image.title": "TunaOS yellowfin (tuna)",
+      "org.opencontainers.image.vendor": "tuna-os",
+      "org.opencontainers.image.version": "51e314e",
+      "ostree.bootable": "1"
+    }
+  }
+}
