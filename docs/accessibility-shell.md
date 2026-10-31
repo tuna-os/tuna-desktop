@@ -4,6 +4,12 @@ The GTK shell consumes `org.gnome.desktop.a11y always-show-universal-access-stat
 
 This implements menu settings and visibility. It does not implement AccessX, or compositor visual alerts. Those remain separately recorded capability gaps; a toggle state alone proves no functional assistive feature. Screen Reader (also Super+Alt+S) starts the distribution Orca in a hardware session, or in a nested one started with `--screen-reader`; what Orca says on the shell is gated by `scripts/tuna-orca-speech-proof` (P-A11Y-06).
 
+The Orca search proof waits for each character's actual speech-dispatcher
+utterance before sending the next character, then checks the complete ordered
+`s p e e c h` sequence. This tests character echo rather than typing speed:
+Orca cancels pending speech on each keypress, so a fixed input delay can drop
+letters when the speech sink is busy.
+
 ## Screen magnifier (#349)
 
 The shell mirrors `screen-magnifier-enabled` and every `org.gnome.desktop.a11y.magnifier` key into the session snapshot `$XDG_RUNTIME_DIR/tuna-magnifier.json` (see the `tuna-magnifier` crate), now and on every change. Super+Alt+8 (toggle, autorepeat ignored) and Super+Alt+=/- (factor plus/minus one, rounded) are media-keys schema keys: in the session gsd-media-keys handles them and flips the same settings; without it (the nested preview) the shell binds them itself. Key defaults and ranges match [gsettings-desktop-schemas 51.0](https://github.com/GNOME/gsettings-desktop-schemas/blob/51.0/schemas/org.gnome.desktop.a11y.magnifier.gschema.xml.in).
