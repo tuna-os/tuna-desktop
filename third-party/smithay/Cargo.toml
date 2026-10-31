@@ -159,6 +159,7 @@ xwayland = [
     "x11rb/composite",
     "x11rb/xfixes",
     "x11rb/randr",
+    "x11rb/xkb",
     "x11rb_event_source",
     "scopeguard",
 ]

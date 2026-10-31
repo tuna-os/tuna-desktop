@@ -2531,6 +2531,8 @@ impl Runtime {
             // Never emit key identities that could expose credential input.
             "seat_pressed_key_count": self.state.pressed_key_count(),
             "x11_ready": x11_ready,
+            "bell_rings": self.state.bell_rings(),
+            "bell_policy": self.state.protocols.bell.policy(),
             "idle_timeout_ms": self.lock.timeout_ms(),
             "idle_blank_alpha": self.blank_alpha(),
             "power_save_mode": self.power_save.mode(),
@@ -4513,7 +4515,7 @@ impl Runtime {
                 clock.saturating_sub(*start).as_secs_f64()
                     < 0.2 * self.input_settings.motion.slowdown()
             })
-            || self.state.protocols.bell.visual(now).is_some()
+            || self.state.protocols.bell.visual_active()
             || self.shell_swipe.is_some()
             || self.overlay.visible
             || !self.casts.is_empty()

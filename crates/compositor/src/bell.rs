@@ -1,4 +1,4 @@
-//! Native xdg bell consumers with live policy and bounded player lifetime.
+//! Native xdg and X11 bell consumers with live policy and bounded player lifetime.
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
@@ -12,8 +12,39 @@ pub(crate) struct Bell {
     policy: BellPolicy,
     policy_ready: bool,
     last_visual: Option<Instant>,
-    visual: Option<(Instant, u8, Option<WlSurface>)>,
+    visual: Option<Visual>,
     player: Option<(std::process::Child, Instant)>,
+    /// X server time of the last admitted X11 bell (Mutter's `last_bell_time`).
+    last_x11_time: u32,
+}
+
+struct Visual {
+    started: Instant,
+    pulses: u8,
+    leg: u8,
+    surface: Option<WlSurface>,
+}
+
+impl Visual {
+    fn sample(&mut self, now: Instant) -> Option<f32> {
+        let elapsed = now.saturating_duration_since(self.started);
+        let end = Duration::from_millis((u64::from(self.leg) + 1) * 50);
+        if elapsed >= end {
+            if self.leg == self.pulses {
+                return None;
+            }
+            // ClutterTimeline emits each leg's endpoint before reversing,
+            // carrying overflow into the next leg. Modulo wall time alone
+            // can miss every peak on a delayed frame, even the whole flash.
+            self.leg += 1;
+            return Some(if self.leg % 2 == 1 {
+                192.0 / 255.0
+            } else {
+                0.0
+            });
+        }
+        Some(opacity(elapsed, self.pulses))
+    }
 }
 
 fn flashes(last: Option<Instant>, now: Instant) -> u8 {
@@ -22,6 +53,15 @@ fn flashes(last: Option<Instant>, now: Instant) -> u8 {
         Some(gap) if gap < Duration::from_secs(3) => 1,
         _ => 2,
     }
+}
+
+/// Mutter's `XSERVER_TIME_IS_BEFORE`: wrapping X server timestamps, where 0
+/// is "never".
+fn xserver_time_is_before(time1: u32, time2: u32) -> bool {
+    time1 == 0
+        || (time2 != 0
+            && ((time1 < time2 && time2 - time1 < u32::MAX / 2)
+                || (time1 > time2 && time1 - time2 > u32::MAX / 2)))
 }
 
 /// A 50 ms quad-in leg followed by `repeats` alternating legs.
@@ -70,11 +110,12 @@ impl Bell {
             let pulses = flashes(self.last_visual, now);
             if pulses > 0 {
                 self.last_visual = Some(now);
-                self.visual = Some((
-                    now,
+                self.visual = Some(Visual {
+                    started: now,
                     pulses,
-                    self.policy.frame_flash.then_some(surface).flatten(),
-                ));
+                    leg: 0,
+                    surface: self.policy.frame_flash.then_some(surface).flatten(),
+                });
             }
         }
         if !self.audible_enabled()
@@ -126,19 +167,29 @@ impl Bell {
                 self.player = None;
             }
         }
-        if self.visual.as_ref().is_some_and(|(start, pulses, _)| {
-            now.saturating_duration_since(*start)
-                >= Duration::from_millis((u64::from(*pulses) + 1) * 50)
-        }) {
-            self.visual = None;
-        }
     }
-    pub fn visual(&self, now: Instant) -> Option<(f32, Option<&WlSurface>)> {
-        let (start, pulses, surface) = self.visual.as_ref()?;
-        Some((
-            opacity(now.saturating_duration_since(*start), *pulses),
-            surface.as_ref(),
-        ))
+    pub fn visual_active(&self) -> bool {
+        self.visual.is_some()
+    }
+    pub fn visual(&mut self, now: Instant) -> Option<(f32, Option<&WlSurface>)> {
+        let Some(alpha) = self.visual.as_mut()?.sample(now) else {
+            self.visual = None;
+            return None;
+        };
+        Some((alpha, self.visual.as_ref()?.surface.as_ref()))
+    }
+    /// The live policy, once the shell has sent it.
+    pub fn policy(&self) -> Option<&BellPolicy> {
+        self.policy_ready.then_some(&self.policy)
+    }
+    /// Mutter 51 `handle_other_xevent`: an X11 bell within 100 ms of the
+    /// last one it handled is dropped (X server time).
+    pub fn admit_x11(&mut self, time: u32) -> bool {
+        if !xserver_time_is_before(self.last_x11_time, time.wrapping_sub(100)) {
+            return false;
+        }
+        self.last_x11_time = time;
+        true
     }
     pub fn clear_visual(&mut self) {
         self.visual = None;
@@ -226,5 +277,75 @@ mod tests {
         });
         assert!(bell.visual(Instant::now()).is_none());
         assert_eq!(bell.rings, 1);
+    }
+    #[test]
+    fn delayed_frames_present_leg_endpoints_before_reversing() {
+        let started = Instant::now();
+        let mut visual = Visual {
+            started,
+            pulses: 2,
+            leg: 0,
+            surface: None,
+        };
+        let sample = |visual: &mut Visual, ms| visual.sample(started + Duration::from_millis(ms));
+        // The recorded X11 fullscreen failure sampled 22, 61, 83, 107
+        // and 130 ms. Modulo time never reached the required black peak.
+        assert_eq!(
+            sample(&mut visual, 22),
+            Some(opacity(Duration::from_millis(22), 2))
+        );
+        assert_eq!(sample(&mut visual, 61), Some(192.0 / 255.0));
+        assert_eq!(
+            sample(&mut visual, 83),
+            Some(opacity(Duration::from_millis(83), 2))
+        );
+        assert_eq!(sample(&mut visual, 107), Some(0.0));
+        assert_eq!(
+            sample(&mut visual, 130),
+            Some(opacity(Duration::from_millis(130), 2))
+        );
+        assert_eq!(sample(&mut visual, 150), None);
+    }
+
+    #[test]
+    fn a_frame_delayed_past_the_flash_still_shows_the_peak_and_restores() {
+        let mut bell = Bell::default();
+        bell.set_policy(BellPolicy {
+            audible: false,
+            visual: true,
+            ..Default::default()
+        });
+        bell.ring(None);
+        let started = bell.visual.as_ref().unwrap().started;
+        // Player housekeeping and wake queries must not consume a frame.
+        bell.tick(started + Duration::from_millis(200));
+        assert!(bell.visual_active());
+        assert_eq!(
+            bell.visual(started + Duration::from_millis(200)).unwrap().0,
+            192.0 / 255.0
+        );
+        assert_eq!(
+            bell.visual(started + Duration::from_millis(216)).unwrap().0,
+            0.0
+        );
+        assert!(bell.visual(started + Duration::from_millis(232)).is_none());
+        assert!(!bell.visual_active());
+    }
+
+    #[test]
+    fn x11_bells_within_100ms_of_the_last_handled_one_are_dropped() {
+        let mut bell = Bell::default();
+        assert!(bell.admit_x11(5_000));
+        assert!(!bell.admit_x11(5_050));
+        assert!(!bell.admit_x11(5_100));
+        assert!(bell.admit_x11(5_101));
+        // Dropped bells do not extend the window, as in Mutter.
+        assert!(!bell.admit_x11(5_150));
+        assert!(bell.admit_x11(5_202));
+        // The server clock wraps.
+        let mut bell = Bell::default();
+        assert!(bell.admit_x11(u32::MAX - 20));
+        assert!(!bell.admit_x11(30));
+        assert!(bell.admit_x11(120));
     }
 }

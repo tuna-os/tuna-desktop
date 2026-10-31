@@ -365,6 +365,10 @@
 #   G-SWITCHER  Alt+Tab shows the switcher with every app (GNOME's
 #               switch-applications; the three test windows are three apps), and
 #               releasing Alt focuses the highlighted one
+#   G-VISUAL-BELL, G-X11-BELL, G-XSETTINGS-SOUNDS, G-QS-VOLUME-FEEDBACK
+#               bells, input-feedback-sounds and slider feedback (#353);
+#               see scripts/lib/tuna-sound-alerts-proof.sh, which
+#               --sound-alerts-only runs alone
 # Frames and accessibility dumps land in the artifacts dir; assertions in
 # assertions.txt for the parity ledger.
 set -eu
@@ -380,6 +384,7 @@ HEIGHT=800
 INSTALLED_PACKAGE=0
 SCREENSHOT_KEYS_ONLY=0
 A11Y_FOCUS_ONLY=0
+SOUND_ALERTS_ONLY=0
 GRID_CANCEL_ONLY=0
 GRID_CANCEL_OLD_NEGATIVE=0
 GRID_CANCEL_ADMISSION=""
@@ -392,6 +397,7 @@ while [ $# -gt 0 ]; do
         --grid-cancel-admission) GRID_CANCEL_ADMISSION="$2"; shift 2 ;;
         --screenshot-keys-only) SCREENSHOT_KEYS_ONLY=1; shift ;;
         --a11y-focus-only) A11Y_FOCUS_ONLY=1; shift ;;
+        --sound-alerts-only) SOUND_ALERTS_ONLY=1; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --help|-h) sed -n '2,19p' "$0"; exit 0 ;;
@@ -399,7 +405,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 if [ "$GRID_CANCEL_ONLY" = 1 ]; then
-    if [ "$INSTALLED_PACKAGE" != 0 ] || [ "$SCREENSHOT_KEYS_ONLY" != 0 ] || [ "$A11Y_FOCUS_ONLY" != 0 ] || [ -z "$GRID_CANCEL_ADMISSION" ]; then
+    if [ "$INSTALLED_PACKAGE" != 0 ] || [ "$SCREENSHOT_KEYS_ONLY" != 0 ] || [ "$A11Y_FOCUS_ONLY" != 0 ] || [ "$SOUND_ALERTS_ONLY" != 0 ] || [ -z "$GRID_CANCEL_ADMISSION" ]; then
         echo "grid comparison requires an admitted source-mode tuple" >&2; exit 1
     fi
 elif [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || [ -n "$GRID_CANCEL_ADMISSION" ]; then
@@ -562,6 +568,9 @@ GSD_MEDIA_KEYS_PID=""
 GSD_BUS_PID=""
 MPRIS_PID=""
 PW_PULSE_PID=""
+SOUND_ALERTS_WL_PID=""
+SOUND_ALERTS_X11_PID=""
+GSD_XSETTINGS_PID=""
 cleanup() {
     if [ -n "$ICON_PID" ]; then kill "$ICON_PID" 2>/dev/null || true; fi
     if [ -n "$HINTS_PID" ]; then kill "$HINTS_PID" 2>/dev/null || true; fi
@@ -583,7 +592,7 @@ cleanup() {
     fi
     if [ -n "$SCREENSAVER_PID" ]; then kill "$SCREENSAVER_PID" 2>/dev/null || true; fi
     if [ -n "$CAL_PID" ]; then kill "$CAL_PID" 2>/dev/null || true; fi
-    for gsd_pid in $GSD_MEDIA_KEYS_PID $MPRIS_PID $GSD_BUS_PID $PW_PULSE_PID; do
+    for gsd_pid in $GSD_MEDIA_KEYS_PID $MPRIS_PID $GSD_BUS_PID $PW_PULSE_PID $GSD_XSETTINGS_PID $SOUND_ALERTS_WL_PID $SOUND_ALERTS_X11_PID; do
         kill "$gsd_pid" 2>/dev/null || true
     done
     if [ -n "$ACCEL_PID" ]; then kill "$ACCEL_PID" 2>/dev/null || true; fi
@@ -684,6 +693,7 @@ cstate() {
 
 . "$ROOT/scripts/lib/tuna-screenshot-keys-proof.sh"
 . "$ROOT/scripts/lib/tuna-a11y-focus-proof.sh"
+. "$ROOT/scripts/lib/tuna-sound-alerts-proof.sh"
 
 # Compositor-side state (overview, focus, previews) for app stages.
 CSTATE="$ARTIFACTS/compositor-state.json"
@@ -981,6 +991,13 @@ case "\$*" in
 esac
 "$PY" "$ROOT/scripts/lib/tuna-audio-fixture.py" "$ARTIFACTS" --event
 PW_CLI
+# libcanberra's player stand-in: every event sound the shell or compositor
+# plays (volume feedback, bell, notifications) is one line here.
+cat >"$ARTIFACTS/bin/canberra-gtk-play" <<CANBERRA
+#!/bin/sh
+printf '%s %s\n' "\$(date +%s%N)" "\$*" >>"$ARTIFACTS/canberra-calls"
+CANBERRA
+chmod +x "$ARTIFACTS/bin/canberra-gtk-play"
 chmod +x "$ARTIFACTS/bin/wpctl" "$ARTIFACTS/bin/pw-dump" "$ARTIFACTS/bin/pw-cli"
 PATH="$ARTIFACTS/bin:$PATH"
 export PATH
@@ -1093,6 +1110,7 @@ if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example icon-probe
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example shortcut-inhibit-client
     fi
+    cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example tuna-bell-client
 fi
 # The compositor and the shell share this log from one file description.
 # Truncate first (a fresh log each run, as before), then append: O_APPEND
@@ -1172,6 +1190,14 @@ fi
 # controls; that also proves the accessible tree.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel.json" 60 ||
     fail A11Y-PANEL "shell never registered on the accessibility bus"
+if [ "$SOUND_ALERTS_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "sound alerts desktop ready" ||
+        fail G-VISUAL-BELL "desktop never became ready"
+    # The startup cover must be gone before pixels are compared.
+    sleep 3
+    sound_alerts_proof
+    exit 0
+fi
 if [ "$SCREENSHOT_KEYS_ONLY" = 1 ]; then
     cstate '.active_workspace != null and .locked == false' "screenshot desktop ready" ||
         fail G-SCREENSHOT-KEYS "desktop never became ready"
@@ -11051,6 +11077,9 @@ for scenario in allow remembered-allow deny remembered-deny unknown; do
 done
 jq -e '."tuna-consent-allow.desktop" == ["GRANTED"] and ."tuna-consent-deny.desktop" == ["DENIED"] and (has("tuna-consent-unknown.desktop") | not)' "$ARTIFACTS/shortcut-permissions.json" >/dev/null || fail G-SHORTCUT-CONSENT "PermissionStore did not remember exactly the known apps"
 pass G-SHORTCUT-CONSENT "live requests require Allow, Deny stays inactive, known app decisions persist without prompting, unknown apps are not remembered, Super+Escape restores input"
+
+# Bells, input-feedback-sounds and the slider's feedback (#353).
+sound_alerts_proof
 
 # Every transient animation (#501) that ran with animations on played
 # for its full GNOME duration and settled: the OSD and its level, the
