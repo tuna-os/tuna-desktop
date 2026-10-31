@@ -5403,8 +5403,9 @@ impl Runtime {
 
     /// GNOME's focus policy (P-WM-09): install a completed settings read,
     /// then repick the pointer window (a crossing without motion) and run
-    /// the pointer-rest and auto-raise timers. Native reads stay on the
-    /// owned GIO worker; a missing schema keeps GNOME 51's defaults.
+    /// the pointer-rest and auto-raise timers. The same read carries the
+    /// Xwayland grab access rules. Native reads stay on the owned GIO
+    /// worker; a missing schema keeps GNOME 51's defaults.
     fn focus_policy_tick(&mut self) {
         let now = Instant::now();
         let raw = self.wm_preferences.poll(now);
@@ -5423,8 +5424,15 @@ impl Runtime {
         }
         if let Some(raw) = raw {
             let mut policy = self.manager.focus_policy();
-            policy.apply(&raw);
+            policy.apply(&raw.focus);
             self.manager.set_focus_policy(policy);
+            #[cfg(feature = "xwayland")]
+            self.state
+                .set_xwayland_grab_access_rules(crate::xwayland_grab::AccessRules::new(
+                    raw.xwayland_grab_access_rules
+                        .as_deref()
+                        .unwrap_or_default(),
+                ));
         }
         if !self.is_locked() {
             self.manager.repick_pointer_window(&mut self.state);

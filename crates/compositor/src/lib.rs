@@ -156,6 +156,8 @@ mod x11_icons;
 pub mod x11_interop;
 pub mod xdg_session;
 pub mod xwayland;
+#[cfg(feature = "xwayland")]
+pub mod xwayland_grab;
 
 /// One compositor-tracked output: protocol handle plus geometry.
 /// The first entry is the primary output; single-output sessions hold
