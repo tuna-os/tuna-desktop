@@ -305,6 +305,10 @@ sources into the output's `harness/` directory before starting any VM, recording
 their hashes. Subsequent worktree edits cannot mutate those long-running tests.
 Only test requester code is placed in the fixture user's runtime directory;
 the installed desktop/provider payload stays untouched.
+The dated `docs/variants/20xx-*` receipt trees retain source snapshots, native
+package payload paths and their hashes byte-for-byte, as the existing dated
+performance evidence does. The rename tool preserves these historical bytes;
+living variant documentation and current implementation code remain scanned.
 
 Earlier receipts identify their actual runner hash and do not gain new proof
 retroactively: Yellowfin's retained run predates the functional requesters.
