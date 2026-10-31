@@ -1693,7 +1693,10 @@ xdotool mouseup 1
 # GTK requests the move after its drag threshold. The compositor uses
 # the initiating press coordinates; retain the strict distance bounds
 # while checking the real asynchronous client and pointer journey.
-cstate ".windows[] | select(.app_id == \"tuna-test-beta\") | (.rect[0] - $bx) >= 75 and (.rect[0] - $bx) <= 150 and (.rect[1] - $by) >= 30 and (.rect[1] - $by) <= 60" "drag" ||
+# A bounded intermediate displacement can pass while later motions are still
+# queued. Observe the last pointer endpoint too before deriving the next
+# header target from this snapshot; otherwise that target can land on Gamma.
+cstate "(.pointer_position == [$((bx + 270)), $((by + 80))]) and (.windows[] | select(.app_id == \"tuna-test-beta\") | (.rect[0] - $bx) >= 75 and (.rect[0] - $bx) <= 150 and (.rect[1] - $by) >= 30 and (.rect[1] - $by) <= 60)" "drag and final pointer delivered" ||
     fail G-APP-DRAG "dragging Beta's header bar did not move it by the drag distance"
 pass G-APP-DRAG "dragging an app's header bar moves the window (#58)"
 
