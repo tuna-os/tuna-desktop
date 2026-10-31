@@ -494,12 +494,14 @@ also covers old comparison binaries whose preview occupies more than
 the nominal edge width; no guessed hint clipping is accepted.
 
 The edge-tiling-off restore gesture waits for the native move owner,
-`interactive_move_window`, before sending its restore motions. GTK's
-header gesture must request that grab while the pointer button is held;
-physical pointer delivery alone does not establish the client round trip.
-The final target is derived from the admitted pointer and window geometry.
-Admission, button release and work-area restoration share the original
-20-second restore budget. The owner observation is null while locked.
+`interactive_move_window`, and delivery of its seed motion before sending
+the restore motions. This excludes a stale grab from the preceding drag.
+GTK must request the move while the pointer button is held; physical
+pointer delivery alone does not establish the client round trip. The
+admission snapshot is retained, and the final target is derived from its
+pointer and window geometry. Admission, final pointer delivery, button
+release and work-area restoration share the original 20-second restore
+budget. The owner observation is null while locked.
 
 ## Frame cost
 

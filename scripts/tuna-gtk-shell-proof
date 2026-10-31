@@ -1770,14 +1770,16 @@ EOF2
     xdotool mousemove --window "$WID" $((nx + 151)) $((ny + 20))
     restore_wait=$((restore_end - $(date +%s)))
     if [ "$restore_wait" -lt 0 ] ||
-        ! cstate ".interactive_move_window == $restore_id" "Beta restore move admitted" "$restore_wait"; then
+        ! cstate ".interactive_move_window == $restore_id and .pointer_position == [$((nx + 151)), $((ny + 20))]" "Beta restore move admitted" "$restore_wait"; then
         fail G-EDGE-TILING-OFF "GTK never acquired Beta's native restore move"
     fi
-    restore_geometry="$(jq -er --argjson id "$restore_id" '
-        select(.interactive_move_window == $id) | .pointer_position as $p |
-        first(.windows[] | select(.id == $id)) |
+    cp "$CSTATE" "$ARTIFACTS/edge-tiling-restore-admission.json"
+    restore_geometry="$(jq -er --argjson id "$restore_id" \
+        --argjson x "$((nx + 151))" --argjson y "$((ny + 20))" '
+        select(.interactive_move_window == $id and .pointer_position == [$x, $y]) |
+        .pointer_position as $p | first(.windows[] | select(.id == $id)) |
         "\($p[0] | round) \($p[1] | round) \(.rect[0]) \(.rect[1])"
-        ' "$CSTATE")" ||
+        ' "$ARTIFACTS/edge-tiling-restore-admission.json")" ||
         fail G-EDGE-TILING-OFF "native restore move geometry changed before observation"
     read -r restore_px restore_py restore_wx restore_wy <<EOF2
 $restore_geometry
@@ -1789,7 +1791,7 @@ EOF2
     xdotool mouseup 1
     restore_wait=$((restore_end - $(date +%s)))
     if [ "$restore_wait" -lt 0 ] ||
-        ! cstate ".interactive_move_window == null and (.windows[] | select(.app_id == \"tuna-test-beta\") | .rect[0] >= 0 and .rect[1] >= 32)" "beta restored" "$restore_wait"; then
+        ! cstate ".interactive_move_window == null and .pointer_position == [$((restore_px + bx - restore_wx)), $((restore_py + by - restore_wy))] and (.windows[] | select(.app_id == \"tuna-test-beta\") | .rect[0] >= 0 and .rect[1] >= 32)" "beta restored" "$restore_wait"; then
         fail G-EDGE-TILING-OFF "could not drag the window back into the work area"
     fi
     gsettings reset org.gnome.mutter edge-tiling
