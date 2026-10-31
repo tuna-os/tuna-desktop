@@ -181,6 +181,71 @@ mod display_readiness_tests {
     }
 }
 
+/// Send the events a render queued (frame `done`, presentation feedback, fifo
+/// releases) to the clients' sockets now rather than at the next dispatch.
+fn flush_rendered_events(display: &mut Display<State>, state: &State) -> Result<(), RuntimeError> {
+    crate::grid_trace::event(state, "flush_begin", format_args!("site=post_render"));
+    let flushed = display.flush_clients();
+    crate::grid_trace::event(
+        state,
+        "flush_end",
+        format_args!("site=post_render ok={}", flushed.is_ok()),
+    );
+    flushed.map_err(|e| RuntimeError::Dispatch(e.to_string()))
+}
+
+#[cfg(test)]
+mod rendered_event_tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn frame_done_reaches_the_client_without_another_dispatch() {
+        let (mut compositor, mut wire, surface) = crate::grid_trace::tests::frame_client();
+        let output = smithay::output::Output::new(
+            "flush-test".into(),
+            smithay::output::PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: smithay::output::Subpixel::Unknown,
+                make: "test".into(),
+                model: "test".into(),
+            },
+        );
+        // The render path's sender: done is queued, not yet on the socket.
+        send_frames_surface_tree(
+            &surface,
+            &output,
+            Duration::ZERO,
+            Some(Duration::ZERO),
+            |_, _| Some(output.clone()),
+        );
+        let mut bytes = [0_u8; 4096];
+        assert!(
+            matches!(wire.read(&mut bytes), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "queued done must not reach the client before the render flush"
+        );
+        flush_rendered_events(&mut compositor.display, &compositor.state).unwrap();
+        let count = wire.read(&mut bytes).unwrap();
+        let words: Vec<u32> = bytes[..count]
+            .chunks_exact(4)
+            .map(|word| u32::from_ne_bytes(word.try_into().unwrap()))
+            .collect();
+        // wl_callback@5.done and @6.done (opcode 0, 12 bytes), each followed
+        // by wl_display.delete_id; no client request was dispatched between.
+        let mut done = Vec::new();
+        let mut at = 0;
+        while at + 1 < words.len() {
+            let (object, header) = (words[at], words[at + 1]);
+            let size = (header >> 16) as usize / 4;
+            if header & 0xffff == 0 && object != 1 && size == 3 {
+                done.push(object);
+            }
+            at += size.max(2);
+        }
+        assert_eq!(done, [5, 6]);
+    }
+}
+
 /// Default nested output size (physical pixels).
 const DEFAULT_WIDTH: i32 = 1280;
 const DEFAULT_HEIGHT: i32 = 800;
@@ -4631,14 +4696,21 @@ impl Runtime {
         self.display
             .dispatch_clients(&mut self.state)
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-        self.display
-            .flush_clients()
-            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        crate::grid_trace::event(&self.state, "flush_begin", format_args!("site=pre_render"));
+        let flushed = self.display.flush_clients();
+        crate::grid_trace::event(
+            &self.state,
+            "flush_end",
+            format_args!("site=pre_render ok={}", flushed.is_ok()),
+        );
+        flushed.map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         self.manager.reconcile(&mut self.state);
+        crate::grid_trace::stage(&self.state, "reconciled");
         self.state.window_sessions_mut().save_if_due(Instant::now());
         self.focus_policy_tick();
         self.tablet_settings_tick();
         self.poll_input_aids();
+        crate::grid_trace::stage(&self.state, "input_aids");
         #[cfg(feature = "xwayland")]
         // DISPLAY may be a reserved idle listener. An icon helper must not
         // connect and accidentally activate XWayland before a real client.
@@ -4652,6 +4724,7 @@ impl Runtime {
                 }
             }
         }
+        crate::grid_trace::stage(&self.state, "x11_icons");
         // A client's pointer warp moved the manager's pointer: the
         // drawn cursor follows (#89).
         // Not while coalesced motion is pending: the backend's pointer
@@ -4702,6 +4775,7 @@ impl Runtime {
                 .set_seat_touch_mode(drm.touch_mode().touch_mode());
         }
         let outcome = self.control.poll(self.manager.model_mut());
+        crate::grid_trace::stage(&self.state, "control_poll");
         for workspace in outcome.departed_workspaces.iter().copied() {
             self.manager.keep_departed_workspace_alive(workspace);
         }
@@ -4779,6 +4853,7 @@ impl Runtime {
         }
         let diagnostics_visible = !self.is_locked();
         let reader_changed = self.orca.poll(diagnostics_visible).is_some();
+        crate::grid_trace::stage(&self.state, "orca_poll");
         if reader_changed || outcome.screen_reader.is_some() {
             self.control
                 .queue_message(tuna_shell_control::Message::ScreenReader {
@@ -4917,6 +4992,7 @@ impl Runtime {
         for connection in outcome.auth_cancel {
             self.cancel_verification(connection);
         }
+        crate::grid_trace::stage(&self.state, "control_outcome");
         self.idle_monitor.tick();
         // Idle timeout from input timestamps: lock the untouched session.
         // A live idle inhibitor (video, presentation) counts as activity,
@@ -4963,6 +5039,7 @@ impl Runtime {
             ShellStatus::Waiting { delay_ms } => Some(delay_ms),
             _ => None,
         };
+        crate::grid_trace::stage(&self.state, "shell_poll");
         // While locked the overlay stays up with its empty list no
         // matter what the shell does: a shell restart while locked
         // keeps the lock screen up.
@@ -4985,6 +5062,7 @@ impl Runtime {
                 }
             }
         }
+        crate::grid_trace::stage(&self.state, "ime_overlay");
         // Only the supervised shell may hold a control session (#30):
         // between restarts nobody may.
         self.capture_authority
@@ -5010,6 +5088,7 @@ impl Runtime {
             self.finish_unlock(attempt);
         }
         self.poll_conversations();
+        crate::grid_trace::stage(&self.state, "conversations");
 
         for event in self.shell.drain_events() {
             eprintln!("tuna-compositor: shell supervision: {event:?}");
@@ -5071,9 +5150,11 @@ impl Runtime {
             };
             self.xwayland.tick(now, Some(&mut spawner));
         }
+        crate::grid_trace::stage(&self.state, "xwayland");
         self.stats.shell_restarts = self.shell.restarts_used();
         self.proof_swipe_input();
         self.animation_clock.poll();
+        crate::grid_trace::stage(&self.state, "animation_clock");
         // GNOME completes a flashing screenshot reply when its feedback ends.
         // Locking or disabling animations also ends pending feedback promptly.
         let now = self.animation_clock.now();
@@ -5093,12 +5174,17 @@ impl Runtime {
             self.state.primary_size().w,
             self.input_settings.motion,
         );
+        crate::grid_trace::stage(&self.state, "dynamic_workspaces");
         self.publish_state();
+        crate::grid_trace::stage(&self.state, "publish_state");
         self.publish_cast_outputs();
+        crate::grid_trace::stage(&self.state, "publish_cast_outputs");
         #[cfg(feature = "drm")]
         self.privacy_screen_tick();
         self.publish_display_state();
+        crate::grid_trace::stage(&self.state, "publish_display_state");
         self.publish_overview_previews();
+        crate::grid_trace::stage(&self.state, "publish_overview_previews");
         let strip_was_animating = self.manager.strip_animating();
         self.render()?;
         // Rendering advances the strip's springs. Publish the terminal frame
@@ -5115,14 +5201,11 @@ impl Runtime {
         // Send what this tick queued for the shell now, not at the next
         // wake, which may be far off (#503).
         self.control.flush(self.manager.model());
-        #[cfg(feature = "drm")]
-        if matches!(self.backend, Backend::Drm(_)) {
-            // Rendering queues callbacks only for a submitted scanout. Send
-            // those events now so a redraw need not wait for the next tick.
-            self.display
-                .flush_clients()
-                .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-        }
+        // Rendering queues frame callbacks (and presentation/fifo events) for
+        // the frame it produced. Send them now, on every backend: waiting for
+        // the next tick's pre-dispatch flush delayed the nested shell's next
+        // frame by a whole loop wake (#965). One flush per tick, no new wake.
+        flush_rendered_events(&mut self.display, &self.state)?;
         Ok(!self.exit)
     }
 
@@ -5468,6 +5551,7 @@ impl Runtime {
     /// show — no windows, no layer-shell chrome (panel, notifications),
     /// no wallpaper — over a dark lock background.
     fn render(&mut self) -> Result<(), RuntimeError> {
+        crate::grid_trace::event(&self.state, "render_begin", format_args!(""));
         let locked = self.is_locked();
         #[cfg(feature = "drm")]
         if locked {
@@ -5654,6 +5738,7 @@ impl Runtime {
             #[cfg(feature = "drm")]
             self.performance_trace.cancel();
             self.power_save_frame_beat();
+            crate::grid_trace::event(&self.state, "render_end", format_args!("reason=power_save"));
             return Ok(());
         }
         // Screen magnifier (#349): this frame's tracking points; the
@@ -5664,14 +5749,21 @@ impl Runtime {
         }
         let queued = match &mut self.backend {
             Backend::Winit(backend) => {
+                crate::grid_trace::event(&self.state, "nested_repaint_begin", format_args!(""));
                 backend.window().set_cursor_visible(false);
                 let size = backend.window_size();
                 let age = backend.buffer_age().unwrap_or(0);
                 let mut presented: PresentedFrame = None;
                 {
-                    let (renderer, mut framebuffer) = backend
-                        .bind()
-                        .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                    crate::grid_trace::event(&self.state, "nested_bind_begin", format_args!(""));
+                    let bound = backend.bind();
+                    crate::grid_trace::event(
+                        &self.state,
+                        "nested_bind_end",
+                        format_args!("ok={}", bound.is_ok()),
+                    );
+                    let (renderer, mut framebuffer) =
+                        bound.map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                     let view = View {
                         offset: (0, 0),
                         scale: self.scale,
@@ -5845,6 +5937,11 @@ impl Runtime {
                     if reset {
                         self.winit_tracker = None;
                     }
+                    crate::grid_trace::event(
+                        &self.state,
+                        "nested_repaint_decision",
+                        format_args!("present={present} pending_callbacks={timing} reset={reset}"),
+                    );
                     if present {
                         let tracker = self.winit_tracker.get_or_insert_with(|| {
                             smithay::backend::renderer::damage::OutputDamageTracker::new(
@@ -5943,9 +6040,18 @@ impl Runtime {
                                 drew
                             }
                         };
-                        let _ = frame
-                            .finish()
-                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        crate::grid_trace::event(
+                            &self.state,
+                            "nested_finish_begin",
+                            format_args!(""),
+                        );
+                        let finished = frame.finish();
+                        crate::grid_trace::event(
+                            &self.state,
+                            "nested_finish_end",
+                            format_args!("ok={}", finished.is_ok()),
+                        );
+                        let _ = finished.map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                         let cost = FrameCost::new(&drew, &elements.owners, &damage, size);
                         presented = Some((damage, cost, presented_cursor));
                     }
@@ -5953,9 +6059,14 @@ impl Runtime {
                 if let Some((damage, drawn, presented_cursor)) = presented {
                     self.frame_costs.insert("winit".to_owned(), drawn);
                     send_surface_scales(&self.state, &self.manager);
-                    backend
-                        .submit(Some(&damage))
-                        .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                    crate::grid_trace::event(&self.state, "nested_submit_begin", format_args!(""));
+                    let submitted = backend.submit(Some(&damage));
+                    crate::grid_trace::event(
+                        &self.state,
+                        "nested_submit_end",
+                        format_args!("ok={}", submitted.is_ok()),
+                    );
+                    submitted.map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                     if let Some(surface) = &presented_cursor {
                         crate::cursor::Cursor::frame_done(
                             &crate::cursor::Pointer::Surface(surface.clone()),
@@ -5974,6 +6085,11 @@ impl Runtime {
                     self.stats.frames += 1;
                     true
                 } else {
+                    crate::grid_trace::event(
+                        &self.state,
+                        "nested_repaint_skipped",
+                        format_args!("reason=no_repaint_required"),
+                    );
                     false
                 }
             }
@@ -6381,6 +6497,7 @@ impl Runtime {
             // let redraws outrun the display and keep the loop busy.
             send_frame_callbacks(&self.state, &self.manager, &throttled);
         }
+        crate::grid_trace::event(&self.state, "render_end", format_args!("queued={queued}"));
         // Hidden windows get theirs on a slow beat of their own, whether
         // or not anything was drawn.
         self.hidden_frame_beat(&throttled);
@@ -7760,9 +7877,7 @@ fn send_frame_callbacks(
         );
     }
     for (surface, _, _) in crate::layer::layer_layout(state) {
-        send_frames_surface_tree(&surface, &output, time, Some(Duration::ZERO), |_, _| {
-            Some(output.clone())
-        });
+        crate::grid_trace::send_layer_frames(state, &surface, &output, time);
     }
     // A drag's icon animates on frame callbacks too.
     if let Some(icon) = state.dnd_icon() {
