@@ -30,12 +30,18 @@ is a separate boot of the same disk (QEMU `-snapshot`) that passes the
 installer would: `tunastd` (standard), `tunaadmin` (`wheel`), and the
 control `tunaseeded`, whose record is pre-seeded. `tunastd` and `tunaadmin`
 get no AccountsService record, no Session preselection and no autologin.
+For this credential-only boot the fixture also sets GDM's own
+`org.gnome.login-screen disable-user-list=true` in the `gdm` dconf database,
+so the greeter asks for the user name. In run 41230684089 the old Tab count to
+"Not listed?" instead selected the listed `tunaseeded`, typed `tunastd` as
+its failed password, then authenticated `tunaseeded` with the fixture
+password. The setting does not create account records or select a session.
 
 | Gate | Actual operation and evidence |
 | --- | --- |
 | V-FRESH-RECORD-FREE-<user> | Before any login: account exists with a home, no `/var/lib/AccountsService/users/<user>`, no GDM automatic/timed login, `wheel` only for the admin |
 | V-FRESH-CONTROL | The same probe classifies the pre-seeded `tunaseeded` as NOT record-free |
-| V-FRESH-LOGIN-<user>-{first,second,reboot} | GDM "Not listed?" name and password typed through QMP; exactly one `gdm-password` VT session runs `tuna-compositor` and no `gnome-shell`/`gnome-session` |
+| V-FRESH-LOGIN-<user>-{first,second,reboot} | GDM's user-name prompt, then the password, typed through QMP; exactly one `gdm-password` VT session of that account runs `tuna-compositor` and no `gnome-shell`/`gnome-session` |
 | V-FRESH-SESSION-<user>-{first,second,reboot} | Read AccountsService's effective `Session` over the system bus: it must be `tuna`; if a cache record exists, any saved `Session` must also be `tuna` |
 | V-FRESH-SUDO-<user> | `sudo -S -k true` as the account with its password: admin succeeds, standard is refused by sudo policy |
 | V-FRESH-LOGOUT-<user>-<round> | logind ends the session and the greeter is ready again |

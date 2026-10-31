@@ -29,12 +29,11 @@ COMPOSITOR_COMM = "tuna-compositor"
 GNOME_DESKTOP = ("gnome-shell", "gnome-session-b", "gnome-session-s")
 LOGIN_SERVICE = "gdm-password"
 AUTOLOGIN_KEYS = ("automaticloginenable", "timedloginenable")
-# gnome-shell js/gdm/loginDialog.js: the user list holds key focus and Tab
-# reaches its "Not listed?" button, which opens the user-name entry. A
-# record-free account need not be in the list, so the journey always names
-# the account. A failed strategy never types a password for another account:
-# the password follows the account name in the same strategy.
-SELECTIONS = (("tab",), ("tab", "tab"))
+# The fresh-account boot sets GDM's org.gnome.login-screen disable-user-list
+# (tuna-vm-fresh-accounts): gnome-shell js/gdm/loginDialog.js then asks for
+# the user name itself, so the name typed is always the account
+# authenticated. Tab-counting through the user list was order-dependent and
+# could type the name as another listed account's password.
 
 
 def parse_record(text):
@@ -182,40 +181,32 @@ class Journey:
         self.qmp.frame(os.path.join(self.out, f"{name}.png"))
 
     def _login(self, user, step):
-        for attempt, selection in enumerate(SELECTIONS, 1):
-            self.qmp.keys("esc")
-            self.sleep(2)
-            for key in selection:
-                self.qmp.keys(key)
-                self.sleep(1)
-            self.qmp.keys("ret")
-            self.sleep(2)
-            self.qmp.type_text(user)
-            self.qmp.keys("ret")
-            self.sleep(2)
-            self._frame(f"{step}-attempt-{attempt}")
-            self.qmp.type_text(PASSWORD)
-            self.qmp.keys("ret")
-            deadline = self.clock() + self.login_timeout
-            observed = None
-            while self.clock() < deadline:
-                try:
-                    observed = self._run("fresh-session", user)
-                except (OSError, RuntimeError, ValueError):
-                    observed = None
-                if observed is not None and not no_session(observed):
-                    ok, detail = session_ok(observed)
-                    if ok or any(name in GNOME_DESKTOP for name in observed.get("desktop", [])):
-                        self._receipt(f"{step}-session", observed)
-                        self._frame(f"{step}-session")
-                        return ok, f"{detail} (selection attempt {attempt})"
-                self.sleep(1)
+        self.qmp.keys("esc")
+        self.sleep(2)
+        self.qmp.type_text(user)
+        self.qmp.keys("ret")
+        self.sleep(2)
+        self._frame(f"{step}-password")
+        self.qmp.type_text(PASSWORD)
+        self.qmp.keys("ret")
+        deadline = self.clock() + self.login_timeout
+        observed = None
+        while self.clock() < deadline:
+            try:
+                observed = self._run("fresh-session", user)
+            except (OSError, RuntimeError, ValueError):
+                observed = None
             if observed is not None and not no_session(observed):
-                self._receipt(f"{step}-session", observed)
-                return session_ok(observed)
-            self.qmp.keys("esc")
+                ok, detail = session_ok(observed)
+                if ok or any(name in GNOME_DESKTOP for name in observed.get("desktop", [])):
+                    self._receipt(f"{step}-session", observed)
+                    self._frame(f"{step}-session")
+                    return ok, detail
             self.sleep(1)
-        return False, f"{user}: no {LOGIN_SERVICE} session after {len(SELECTIONS)} GDM attempts"
+        if observed is not None and not no_session(observed):
+            self._receipt(f"{step}-session", observed)
+            return session_ok(observed)
+        return False, f"{user}: no {LOGIN_SERVICE} session after GDM name and password entry"
 
     def _logout(self, user, step):
         self._run("fresh-logout", user)
