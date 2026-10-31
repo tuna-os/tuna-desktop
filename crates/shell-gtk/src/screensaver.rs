@@ -15,6 +15,7 @@ const XML: &str = r#"<node><interface name="org.gnome.ScreenSaver">
   <method name="SetActive"><arg type="b" direction="in"/></method>
   <method name="GetActiveTime"><arg type="u" direction="out"/></method>
   <signal name="ActiveChanged"><arg type="b"/></signal>
+  <signal name="WakeUpScreen"/>
 </interface></node>"#;
 
 type Lock = Rc<dyn Fn() -> Result<(), &'static str>>;
@@ -41,6 +42,15 @@ impl Service {
                 "ActiveChanged",
                 Some(&(active,).to_variant()),
             );
+        }
+    }
+
+    /// shellDBus.js relays screenShield's `wake-up-screen` as
+    /// `WakeUpScreen`; gnome-settings-daemon's power plugin answers it by
+    /// keeping the display on for a while (`handle_wake_up_screen`).
+    pub fn wake_up_screen(&self) {
+        if let Some(conn) = self.conn.borrow().as_ref() {
+            let _ = conn.emit_signal(None, PATH, NAME, "WakeUpScreen", None);
         }
     }
 }
