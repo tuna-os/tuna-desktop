@@ -4631,9 +4631,14 @@ impl Runtime {
         self.display
             .dispatch_clients(&mut self.state)
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-        self.display
-            .flush_clients()
-            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        crate::grid_trace::event(&self.state, "flush_begin", format_args!("site=pre_render"));
+        let flushed = self.display.flush_clients();
+        crate::grid_trace::event(
+            &self.state,
+            "flush_end",
+            format_args!("site=pre_render ok={}", flushed.is_ok()),
+        );
+        flushed.map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         self.manager.reconcile(&mut self.state);
         self.state.window_sessions_mut().save_if_due(Instant::now());
         self.focus_policy_tick();
@@ -5119,9 +5124,25 @@ impl Runtime {
         if matches!(self.backend, Backend::Drm(_)) {
             // Rendering queues callbacks only for a submitted scanout. Send
             // those events now so a redraw need not wait for the next tick.
-            self.display
-                .flush_clients()
-                .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+            crate::grid_trace::event(
+                &self.state,
+                "flush_begin",
+                format_args!("site=post_render_drm"),
+            );
+            let flushed = self.display.flush_clients();
+            crate::grid_trace::event(
+                &self.state,
+                "flush_end",
+                format_args!("site=post_render_drm ok={}", flushed.is_ok()),
+            );
+            flushed.map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        }
+        if matches!(self.backend, Backend::Winit(_)) {
+            crate::grid_trace::event(
+                &self.state,
+                "tick_end",
+                format_args!("backend=nested post_render_flush=false"),
+            );
         }
         Ok(!self.exit)
     }
@@ -5468,6 +5489,7 @@ impl Runtime {
     /// show — no windows, no layer-shell chrome (panel, notifications),
     /// no wallpaper — over a dark lock background.
     fn render(&mut self) -> Result<(), RuntimeError> {
+        crate::grid_trace::event(&self.state, "render_begin", format_args!(""));
         let locked = self.is_locked();
         #[cfg(feature = "drm")]
         if locked {
@@ -5654,6 +5676,7 @@ impl Runtime {
             #[cfg(feature = "drm")]
             self.performance_trace.cancel();
             self.power_save_frame_beat();
+            crate::grid_trace::event(&self.state, "render_end", format_args!("reason=power_save"));
             return Ok(());
         }
         // Screen magnifier (#349): this frame's tracking points; the
@@ -5664,14 +5687,21 @@ impl Runtime {
         }
         let queued = match &mut self.backend {
             Backend::Winit(backend) => {
+                crate::grid_trace::event(&self.state, "nested_repaint_begin", format_args!(""));
                 backend.window().set_cursor_visible(false);
                 let size = backend.window_size();
                 let age = backend.buffer_age().unwrap_or(0);
                 let mut presented: PresentedFrame = None;
                 {
-                    let (renderer, mut framebuffer) = backend
-                        .bind()
-                        .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                    crate::grid_trace::event(&self.state, "nested_bind_begin", format_args!(""));
+                    let bound = backend.bind();
+                    crate::grid_trace::event(
+                        &self.state,
+                        "nested_bind_end",
+                        format_args!("ok={}", bound.is_ok()),
+                    );
+                    let (renderer, mut framebuffer) =
+                        bound.map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                     let view = View {
                         offset: (0, 0),
                         scale: self.scale,
@@ -5845,6 +5875,11 @@ impl Runtime {
                     if reset {
                         self.winit_tracker = None;
                     }
+                    crate::grid_trace::event(
+                        &self.state,
+                        "nested_repaint_decision",
+                        format_args!("present={present} pending_callbacks={timing} reset={reset}"),
+                    );
                     if present {
                         let tracker = self.winit_tracker.get_or_insert_with(|| {
                             smithay::backend::renderer::damage::OutputDamageTracker::new(
@@ -5943,9 +5978,18 @@ impl Runtime {
                                 drew
                             }
                         };
-                        let _ = frame
-                            .finish()
-                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        crate::grid_trace::event(
+                            &self.state,
+                            "nested_finish_begin",
+                            format_args!(""),
+                        );
+                        let finished = frame.finish();
+                        crate::grid_trace::event(
+                            &self.state,
+                            "nested_finish_end",
+                            format_args!("ok={}", finished.is_ok()),
+                        );
+                        let _ = finished.map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                         let cost = FrameCost::new(&drew, &elements.owners, &damage, size);
                         presented = Some((damage, cost, presented_cursor));
                     }
@@ -5953,9 +5997,14 @@ impl Runtime {
                 if let Some((damage, drawn, presented_cursor)) = presented {
                     self.frame_costs.insert("winit".to_owned(), drawn);
                     send_surface_scales(&self.state, &self.manager);
-                    backend
-                        .submit(Some(&damage))
-                        .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                    crate::grid_trace::event(&self.state, "nested_submit_begin", format_args!(""));
+                    let submitted = backend.submit(Some(&damage));
+                    crate::grid_trace::event(
+                        &self.state,
+                        "nested_submit_end",
+                        format_args!("ok={}", submitted.is_ok()),
+                    );
+                    submitted.map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                     if let Some(surface) = &presented_cursor {
                         crate::cursor::Cursor::frame_done(
                             &crate::cursor::Pointer::Surface(surface.clone()),
@@ -5974,6 +6023,11 @@ impl Runtime {
                     self.stats.frames += 1;
                     true
                 } else {
+                    crate::grid_trace::event(
+                        &self.state,
+                        "nested_repaint_skipped",
+                        format_args!("reason=no_repaint_required"),
+                    );
                     false
                 }
             }
@@ -6381,6 +6435,7 @@ impl Runtime {
             // let redraws outrun the display and keep the loop busy.
             send_frame_callbacks(&self.state, &self.manager, &throttled);
         }
+        crate::grid_trace::event(&self.state, "render_end", format_args!("queued={queued}"));
         // Hidden windows get theirs on a slow beat of their own, whether
         // or not anything was drawn.
         self.hidden_frame_beat(&throttled);
@@ -7760,9 +7815,7 @@ fn send_frame_callbacks(
         );
     }
     for (surface, _, _) in crate::layer::layer_layout(state) {
-        send_frames_surface_tree(&surface, &output, time, Some(Duration::ZERO), |_, _| {
-            Some(output.clone())
-        });
+        crate::grid_trace::send_layer_frames(state, &surface, &output, time);
     }
     // A drag's icon animates on frame callbacks too.
     if let Some(icon) = state.dnd_icon() {

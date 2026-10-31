@@ -561,6 +561,107 @@ fn trace_page_tick(clock_us: i64, previous: &Cell<Option<TickSample>>) {
     });
 }
 
+/// GDK phase observations for the grid's own surface, not protocol issue,
+/// flush, callback receipt, or presentation timestamps. The compositor's
+/// matching surface/callback records establish the server-side boundaries.
+pub fn observe_page_clock(window: &impl IsA<gtk::Window>) {
+    if !tracing() {
+        return;
+    }
+    let window: &gtk::Window = window.as_ref();
+    let observation = Rc::new(RefCell::new(None::<PageClockTrace>));
+    let realized = observation.clone();
+    window.connect_realize(move |window| {
+        let Some(clock) = window.frame_clock() else {
+            trace(
+                "page-clock",
+                format_args!("unavailable reason=no-frame-clock"),
+            );
+            return;
+        };
+        let surface_id = window
+            .surface()
+            .and_then(|surface| wayland_surface_id(&surface));
+        trace(
+            "page-clock",
+            format_args!(
+                "attach monotonic_us={} surface_id={surface_id:?}",
+                glib::monotonic_time()
+            ),
+        );
+        let record =
+            move |phase, clock: &gtk::gdk::FrameClock| {
+                trace(
+                    "page-clock",
+                    format_args!(
+                    "phase={phase} monotonic_us={} clock_us={} frame={} surface_id={surface_id:?}",
+                    glib::monotonic_time(), clock.frame_time(), clock.frame_counter()
+                ),
+                );
+            };
+        let handlers = vec![
+            clock.connect_before_paint(move |clock| record("before-paint", clock)),
+            clock.connect_update(move |clock| record("update", clock)),
+            clock.connect_layout(move |clock| record("layout", clock)),
+            clock.connect_paint(move |clock| record("paint", clock)),
+            clock.connect_after_paint(move |clock| record("after-paint", clock)),
+        ];
+        *realized.borrow_mut() = Some(PageClockTrace { clock, handlers });
+    });
+    window.connect_unrealize(move |_| {
+        observation.borrow_mut().take();
+    });
+}
+
+struct PageClockTrace {
+    clock: gtk::gdk::FrameClock,
+    handlers: Vec<glib::SignalHandlerId>,
+}
+
+impl Drop for PageClockTrace {
+    fn drop(&mut self) {
+        for handler in self.handlers.drain(..) {
+            self.clock.disconnect(handler);
+        }
+    }
+}
+
+/// Look up the native identity only on the traced realized grid. GTK keeps
+/// ownership of its surface/proxy; no protocol request or listener is changed.
+fn wayland_surface_id(surface: &gtk::gdk::Surface) -> Option<u32> {
+    type SurfaceType = unsafe extern "C" fn() -> glib::ffi::GType;
+    type NativeSurface = unsafe extern "C" fn(*mut libc::c_void) -> *mut libc::c_void;
+    type ProxyId = unsafe extern "C" fn(*mut libc::c_void) -> u32;
+    // SAFETY: these are the public GTK Wayland and libwayland-client ABI
+    // functions. Check all symbols and the GObject type before asking GTK
+    // for its borrowed wl_surface. The object stays alive throughout.
+    unsafe {
+        let surface_type =
+            libc::dlsym(libc::RTLD_DEFAULT, c"gdk_wayland_surface_get_type".as_ptr());
+        let native = libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"gdk_wayland_surface_get_wl_surface".as_ptr(),
+        );
+        let proxy_id = libc::dlsym(libc::RTLD_DEFAULT, c"wl_proxy_get_id".as_ptr());
+        if surface_type.is_null() || native.is_null() || proxy_id.is_null() {
+            return None;
+        }
+        let surface_type: SurfaceType = std::mem::transmute(surface_type);
+        if glib::gobject_ffi::g_type_check_instance_is_a(surface.as_ptr().cast(), surface_type())
+            == 0
+        {
+            return None;
+        }
+        let native: NativeSurface = std::mem::transmute(native);
+        let proxy = native(surface.as_ptr().cast());
+        if proxy.is_null() {
+            return None;
+        }
+        let proxy_id: ProxyId = std::mem::transmute(proxy_id);
+        Some(proxy_id(proxy))
+    }
+}
+
 /// One running animation per property set: a new start replaces it.
 #[derive(Default)]
 pub struct Slot {
@@ -1068,6 +1169,7 @@ mod gtk_zoom_tests {
             .default_height(128)
             .child(&widget)
             .build();
+        observe_page_clock(&window);
         window.present();
         let context = glib::MainContext::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);

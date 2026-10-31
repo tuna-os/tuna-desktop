@@ -418,6 +418,7 @@ impl OverviewUi {
             tuna_shell_control::APP_GRID_NAMESPACE,
             "tuna-overview-grid",
         );
+        crate::grid_animation::observe_page_clock(&grid);
         for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
             grid.set_anchor(edge, true);
         }
