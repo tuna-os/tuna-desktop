@@ -1758,19 +1758,40 @@ EOF2
     cstate ".windows[] | select(.app_id == \"tuna-test-beta\") | .rect[2] == $bw and .rect[3] == $bh and .rect[0] < $bx" "dropped floating" ||
         fail G-EDGE-TILING-OFF "the window tiled or resized with edge-tiling off"
     cp "$CSTATE" "$ARTIFACTS/edge-tiling-off.json"
-    # Drag it back where it was, for the journey's later header clicks.
-    read -r nx ny <<EOF2
-$(jq -r '.windows[] | select(.app_id == "tuna-test-beta") | .rect | "\(.[0]) \(.[1])"' "$CSTATE")
+    # GTK must request the native move while the button is still held.
+    # Sending the whole restore before that round trip can retire the
+    # implicit grab first. Admission and completion share the original 20s.
+    restore_end=$(($(date +%s) + 20))
+    read -r restore_id nx ny <<EOF2
+$(jq -r '.windows[] | select(.app_id == "tuna-test-beta") | "\(.id) \(.rect[0]) \(.rect[1])"' "$CSTATE")
 EOF2
     xdotool mousemove --window "$WID" $((nx + 140)) $((ny + 20))
     xdotool mousedown 1
+    xdotool mousemove --window "$WID" $((nx + 151)) $((ny + 20))
+    restore_wait=$((restore_end - $(date +%s)))
+    if [ "$restore_wait" -lt 0 ] ||
+        ! cstate ".interactive_move_window == $restore_id" "Beta restore move admitted" "$restore_wait"; then
+        fail G-EDGE-TILING-OFF "GTK never acquired Beta's native restore move"
+    fi
+    restore_geometry="$(jq -er --argjson id "$restore_id" '
+        select(.interactive_move_window == $id) | .pointer_position as $p |
+        first(.windows[] | select(.id == $id)) |
+        "\($p[0] | round) \($p[1] | round) \(.rect[0]) \(.rect[1])"
+        ' "$CSTATE")" ||
+        fail G-EDGE-TILING-OFF "native restore move geometry changed before observation"
+    read -r restore_px restore_py restore_wx restore_wy <<EOF2
+$restore_geometry
+EOF2
     for step in 1 2 3 4 5 6 7 8; do
-        xdotool mousemove --window "$WID" $((nx + 140 + (bx - nx) * step / 8)) $((ny + 20 + (by - ny) * step / 8))
+        xdotool mousemove --window "$WID" $((restore_px + (bx - restore_wx) * step / 8)) $((restore_py + (by - restore_wy) * step / 8))
         sleep 0.05
     done
     xdotool mouseup 1
-    cstate ".windows[] | select(.app_id == \"tuna-test-beta\") | .rect[0] >= 0 and .rect[1] >= 32" "beta restored" ||
+    restore_wait=$((restore_end - $(date +%s)))
+    if [ "$restore_wait" -lt 0 ] ||
+        ! cstate ".interactive_move_window == null and (.windows[] | select(.app_id == \"tuna-test-beta\") | .rect[0] >= 0 and .rect[1] >= 32)" "beta restored" "$restore_wait"; then
         fail G-EDGE-TILING-OFF "could not drag the window back into the work area"
+    fi
     gsettings reset org.gnome.mutter edge-tiling
     cstate '.multitasking.edge_tiling' "edge tiling restored" ||
         fail G-EDGE-TILING-OFF "resetting edge-tiling did not reach the compositor"

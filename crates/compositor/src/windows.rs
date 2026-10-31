@@ -3269,6 +3269,15 @@ impl WindowManager {
         self.grab.is_some()
     }
 
+    /// The window owning a native move, not a pending client request or resize.
+    pub(crate) fn interactive_move_window(&self) -> Option<u64> {
+        match self.grab? {
+            PointerGrab::Move { id, .. } => Some(id),
+            PointerGrab::StripMove { owner, .. } => Some(owner.id),
+            _ => None,
+        }
+    }
+
     /// The pointer cursor of an interactive grab (#342): move, or
     /// resize from these xdg edges.
     pub fn grab_cursor(&self) -> Option<smithay::input::pointer::CursorIcon> {
