@@ -4530,35 +4530,46 @@ class HealthProbeWindow(unittest.TestCase):
     HEALTH = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-health"
 
     def run_health(self, login_after_sleeps):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            stubs, runtime = root / "bin", root / "runtime"
-            stubs.mkdir()
-            runtime.mkdir()
-            stub = {
-                # Each sleep is a step of guest time; login creates the user
-                # bus after the given number, and the final loop ends later.
-                "sleep": f"""n=$(( $(cat "$STATE/sleeps" 2>/dev/null || echo 0) + 1 ))
-echo $n > "$STATE/sleeps"
-if [ $n -eq {login_after_sleeps} ]; then
-    python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$XDG_RUNTIME_DIR/bus"
-fi
-[ $n -le {login_after_sleeps + 200} ]""",
-                "timeout": 'shift; exec "$@"',
-                "gdbus": '[ -S "$XDG_RUNTIME_DIR/bus" ]',
-                "wpctl": "exit 1",
-                # No real /run/user/<uid>/bus on the test host can answer.
-                "id": "echo 4242424",
-            }
-            for name, body in stub.items():
-                (stubs / name).write_text("#!/bin/bash\n" + body + "\n")
-                (stubs / name).chmod(0o755)
-            env = {"PATH": f"{stubs}:/usr/bin:/bin", "XDG_RUNTIME_DIR": str(runtime), "STATE": str(root)}
-            return subprocess.run(["bash", str(self.HEALTH)], env=env, capture_output=True,
-                                  text=True, timeout=120).stdout
+        import socket
+        # Execute the shipped shell, but advance guest time using functions in
+        # that same process. Hundreds of sleep/cat stub processes used to make
+        # this fixture exceed 120 host seconds under load.
+        fixture = r'''
+sleeps=0
+sleep() {
+    # The final observation loop is outside the startup-window regression.
+    [[ "$1" == 1 ]] && return 1
+    sleeps=$((sleeps + 1))
+    if (( sleeps == LOGIN_AFTER_SLEEPS )); then
+        command mv "$XDG_RUNTIME_DIR/pending-bus" "$XDG_RUNTIME_DIR/bus"
+    fi
+}
+timeout() { shift; "$@"; }
+gdbus() { [[ -S "$XDG_RUNTIME_DIR/bus" ]]; }
+wpctl() {
+    # Establish audio immediately rather than exercising its 60-attempt loop.
+    [[ "$1" == inspect ]] && printf 'node.name = "alsa_output.fixture"\n'
+}
+source "$1"
+printf 'fixture: startup sleeps=%s\n' "$sleeps"
+'''
+        with tempfile.TemporaryDirectory() as directory, \
+                socket.socket(socket.AF_UNIX) as bus:
+            runtime = Path(directory)
+            # -S still observes a real socket. Login publishes it at the
+            # controlled guest-time boundary, using just one external rename.
+            bus.bind(str(runtime / "pending-bus"))
+            env = {"PATH": "/usr/bin:/bin", "XDG_RUNTIME_DIR": str(runtime),
+                   "LOGIN_AFTER_SLEEPS": str(login_after_sleeps)}
+            return subprocess.run(["bash", "-c", fixture, "health-probe-fixture", str(self.HEALTH)],
+                                  env=env, capture_output=True, text=True,
+                                  check=True, timeout=10).stdout
 
     def test_probe_window_starts_at_login_not_boot(self):
         output = self.run_health(login_after_sleeps=150)
+        # 150 two-second guest sleeps exceed the probes' 120-second budget;
+        # all five must nevertheless start with a fresh window after login.
+        self.assertIn("fixture: startup sleeps=150", output)
         for name in ("calendar", "portal", "portal-gnome", "portal-screenshot", "portal-screencast"):
             self.assertIn(f"tuna-vm-health: {name} ready", output)
         self.assertNotIn("failed", output)
