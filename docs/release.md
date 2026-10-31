@@ -168,7 +168,7 @@ Do not send a schema/example document as a handoff. Required identities are:
    `https://github.com/tuna-os/tuna-desktop/.github/workflows/vm-release.yml@refs/heads/main`,
    issuer `https://token.actions.githubusercontent.com`. Full transparency
    material and normal verification are required; there is no unsigned path.
-5. Native Linux amd64 (`ubuntu-26.04`), Linux ARM64 (`ubuntu-24.04-arm`),
+5. Native Linux amd64 (`ubuntu-24.04`), Linux ARM64 (`ubuntu-24.04-arm`),
    Intel macOS (`macos-15-intel`) and AppleSilicon macOS (`macos-15`) jobs run
    `scripts/lib/try_tuna_desktop.py qualify --artifact-dir DIR --evidence-dir OUT
    --platform PLATFORM`. Each receives the same signed `manifest.json`,
@@ -177,6 +177,10 @@ Do not send a schema/example document as a handoff. Required identities are:
    jobs deliberately use native `qemu-system-x86_64` with amd64 UEFI and explicit
    TCG, never native ARM guests, KVM or HVF. Host architecture does not select an
    alternate disk.
+   These are supported Playwright 1.58 host images. The initial pristine
+   diagnosis on Ubuntu 26.04 stopped at its explicit unsupported-host dependency
+   check (run `41254044292`); no browser/platform override or guest proof was
+   substituted.
 6. `finalize --output DIR --evidence-dir ROOT` admits the same signed bytes
    through the consumer's `inspect` command and requires each platform's
    `qualification.json`: exact manifest/disk/host-Corral/producer hashes and run,

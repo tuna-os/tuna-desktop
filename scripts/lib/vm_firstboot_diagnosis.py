@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import platform
 import selectors
+import signal
 import shutil
 import socket
 import subprocess
@@ -100,7 +101,7 @@ def diagnose(args):
         verification = run(["cosign", "verify", IMAGE + "@" + PLATFORM, "--certificate-identity", IMAGE_IDENTITY,
                             "--certificate-oidc-issuer", "https://token.actions.githubusercontent.com"])
         (output / "platform-signature.json").write_bytes(verification)
-        receipt["indexSignatureClaim"] = "unsigned index; membership bound separately, never claimed signed"
+        receipt["indexSignatureClaim"] = "no index-signature claim; immutable descriptor membership and the platform signature are verified separately"
         receipt["signedPlatformVerified"] = True
         url = "https://github.com/tuna-os/corral/releases/download/binaries/corral-linux-amd64"
         download(url, corral)
@@ -120,8 +121,21 @@ def diagnose(args):
         # This is the exact existing producer API, with empty SSHKey,
         # Customize and ProvisionScript. No image fixture is constructed.
         with (output / "disk-build.log").open("wb") as log:
-            subprocess.run(["go", "run", str(args.helper.resolve()), IMAGE + "@" + PLATFORM, str(raw)],
-                           cwd=args.corral_source, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=1800)
+            builder = subprocess.Popen(["go", "run", str(args.helper.resolve()), IMAGE + "@" + PLATFORM, str(raw)],
+                                       cwd=args.corral_source, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                need(builder.wait(timeout=1800) == 0, "keyless disk builder failed; see disk-build.log")
+            finally:
+                if builder.poll() is None:
+                    try:
+                        os.killpg(builder.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        builder.wait(timeout=20)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(builder.pid, signal.SIGKILL)
+                        builder.wait(timeout=10)
         pristine = work / "pristine.qcow2"
         run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2", raw, pristine], timeout=600)
         raw.unlink()
@@ -171,6 +185,16 @@ def diagnose(args):
         receipt["error"] = f"{type(caught).__name__}: {caught}"
     finally:
         cleanup_errors = []
+        # The reusable builder mounts precisely this private job's raw disk.
+        # Retire only containers with that exact mount, never by PID/name.
+        try:
+            for container_id in run(["sudo", "podman", "ps", "--all", "--quiet"]).decode().split():
+                container = json.loads(run(["sudo", "podman", "inspect", container_id]))[0]
+                if any(mount.get("Source") == str(work / "pristine.raw") and mount.get("Destination") == "/target.img"
+                       for mount in container.get("Mounts", [])):
+                    run(["sudo", "podman", "rm", "--force", "--ignore", container_id])
+        except Exception as caught:
+            cleanup_errors.append("owned builder retirement: " + str(caught))
         if console is not None:
             if console.poll() is None:
                 console.terminate()
