@@ -3927,6 +3927,68 @@ class FixtureLoginSession(unittest.TestCase):
         # Fixture setup policy only, not a genuine reader proof.
 
 
+class PublishedFixturePackages(unittest.TestCase):
+    """Run 41230683948: `pacman -Sy` before the fixture install pulled
+    core/python 3.14.9-1 over the shipped 3.14.8-1. The fixture resolves
+    against the image's own sync databases instead."""
+    LANE = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane"
+
+    def run_helper(self, *args):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # The helper's /etc paths are rewritten to these files below.
+            (root / "pacman.conf").write_text(
+                "[options]\nDBPath = /usr/lib/sysimage/lib/pacman/\n"
+                f"[core]\nInclude = {root}/mirrorlist\n"
+                f"[extra]\nInclude = {root}/mirrorlist\n"
+                "[tunaos]\nServer = https://repo.tunaos.org/pacman/arch/$arch\n")
+            (root / "mirrorlist").write_text("Server = https://fastly.mirror.pkgbuild.com/$repo/os/$arch\n")
+            stubs = root / "bin"
+            stubs.mkdir()
+            (stubs / "pacman").write_text(
+                "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CALL/args\"\n"
+                "cp \"$2\" \"$CALL/conf\"\n"
+                "cp \"$(sed -n 's/^Include = //p' \"$2\" | head -1)\" \"$CALL/mirrorlist\"\n")
+            (stubs / "pacman").chmod(0o755)
+            script = ((self.LANE / "tuna-vm-published-pacman").read_text()
+                      .replace("/etc/pacman.conf", str(root / "pacman.conf"))
+                      .replace("/etc/pacman.d/mirrorlist", str(root / "mirrorlist")))
+            result = subprocess.run(["bash", "-c", script, "tuna-vm-published-pacman", *args],
+                env={**os.environ, "CALL": str(root), "PATH": str(stubs) + os.pathsep + os.environ["PATH"]},
+                capture_output=True, text=True, timeout=10)
+            called = (root / "args").exists()
+            return (result, (root / "args").read_text().splitlines() if called else None,
+                    (root / "conf").read_text() if called else None,
+                    (root / "mirrorlist").read_text() if called else None)
+
+    def test_install_uses_shipped_databases_with_archive_backing(self):
+        result, args, conf, mirrors = self.run_helper("qemu-guest-agent", "python")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(args[2:], ["-S", "--needed", "--noconfirm", "qemu-guest-agent", "python"])
+        self.assertEqual(args[0], "--config")
+        self.assertIn("DBPath = /usr/lib/sysimage/lib/pacman/", conf)
+        self.assertEqual(conf.count("Include = "), 2)
+        self.assertEqual(mirrors.splitlines(), [
+            "Server = https://fastly.mirror.pkgbuild.com/$repo/os/$arch",
+            "Server = https://archive.archlinux.org/packages/.all"])
+
+    def test_pacman_options_are_refused(self):
+        for option in ("-y", "-Syu", "--refresh"):
+            with self.subTest(option=option):
+                result, args, _, _ = self.run_helper("python", option)
+                self.assertEqual(result.returncode, 2)
+                self.assertIsNone(args)
+
+    def test_containerfile_never_resyncs_before_the_version_gate(self):
+        containerfile = (self.LANE / "Containerfile.published").read_text()
+        self.assertNotRegex(containerfile, r"pacman\s+-S\w*y")
+        self.assertEqual(containerfile.count("tuna-vm-published-pacman gcc"), 1)
+        install = containerfile.index("/run/tuna-vm-published-pacman qemu-guest-agent")
+        self.assertLess(containerfile.index("pacman -Q > /usr/share/tuna-vm/shipped-packages.txt"), install)
+        self.assertLess(install, containerfile.index('"fixture installation changed shipped package versions"'))
+
+
+
 class GdmGreeterReadiness(unittest.TestCase):
     def gdm(self, **changes):
         greeter = {"manager": "gdm", "manager_active": True, "probe_uid": 0, "greeter_pids": ["812"],
