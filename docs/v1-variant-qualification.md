@@ -177,7 +177,7 @@ Neither `punjab` nor the independent soak VM was touched.
 | Variant(s) | Install / GDM / session | Portals | Lock/unlock | Qualification |
 |---|---|---|---|---|
 | yellowfin old `355f66…` (beta1) | pass in both retained runs | availability only; expanded run Screenshot Response 2 and ScreenCast Start timeout because generic Enter did not activate the visible Allow/Share controls | `LockedHint=no` fails; refusal/unlock pass | fail |
-| yellowfin refreshed `64e7a29…` | trusted refresh run [41221855489](https://github.com/tuna-os/tunaOS/actions/runs/41221855489) succeeded; guest reports beta2-2.el10; retained core run 10 pass/3 fail | retained capture failures were **locked-session denials**, not product capture defects; later untouched-image unlocked Screenshot and ScreenCast both deliver real frames | `LockedHint=no`; refusal/unlock/logout pass | not qualified; timed unlocked flow and lock-triggered withdrawal still require corrected matrix receipt |
+| yellowfin refreshed `64e7a29…` | trusted refresh run [41221855489](https://github.com/tuna-os/tunaOS/actions/runs/41221855489) succeeded; guest reports beta2-2.el10; retained core run 10 pass/3 fail | earlier capture failures were locked-session denials; later untouched-image unlocked Screenshot/ScreenCast deliver real frames, with lock withdrawal observed in 0.147 seconds | `LockedHint=no`; refusal/unlock/logout pass | not qualified; full corrected core matrix receipt and visual review remain separate |
 | marlin | existing exact beta2-2 journey passes these gates | not qualified by that daily-driver receipt | lock hint fails; refused password/unlock pass | fail, not a v1 pass |
 | albacore `b68a195…` | pass; actual beta1; subsequent retained core run 12 pass/1 fail | real Screenshot PNG and ScreenCast frame/caller isolation pass | `LockedHint=no`; withdrawal unproven because requester expired before host armed the unchanged 30-second handshake | not qualified; capture failures from the earlier Enter run are superseded, not product defects |
 | skipjack, wahoo, bonito, sailfin | expanded run: install/GDM/session pass | earlier receipts lack unlocked/timely-consent preconditions; not functional qualification | `LockedHint=no` | fail on retained receipts; corrected preconditions pending |
@@ -197,13 +197,18 @@ The refreshed Yellowfin run at 19:19–19:50 UTC retained a black Screenshot
 prompt frame and a ScreenCast prompt showing the lock password screen. It did
 not assert `ScreenSaver.GetActive=false` at request/consent time. Its Screenshot
 Response 0 with empty URI and ScreenCast Response 2 must **not** be attributed
-to broken capture. On the same untouched `64e7a29…` image, the independent
-InstalledSessionGaps receipt at `/tmp/isg/proof` records actual unlocked
+to broken capture. On the same untouched `64e7a29…` image, the retained
+[InstalledSessionGaps proof](variants/2026-10-31/unlocked-portals/README.md) records actual unlocked
 `GetActive=false` before/after timely Allow/Share: a real 1280×800 Screenshot
 file and a decoded ScreenCast frame from node 58. Explicit Session.Close
 removed that node in 0.013 seconds; that is not lock-triggered withdrawal.
 The deliberate locked negatives reproduce the earlier responses, with no new
 Screenshot image and no ScreenCast stream. Raw failed receipts remain unchanged.
+Its subsequent [corrected-harness subset](variants/2026-10-31/unlocked-portals/corrected-harness/manifest.json)
+also proves actual Super+L withdrawal in **0.147 seconds**, observer armed before
+the key under the unchanged two-second bound. Its separate lock check fails only
+`LockedHint=no`; unlock passes. This subset does not retroactively complete the
+full corrected image matrix.
 
 The [subsequent interrupted sequence](variants/2026-10-31/corrected-interrupted/matrix.json)
 completed Albacore and Skipjack before its coordinator stopped during Wahoo's
@@ -243,7 +248,8 @@ Exact admission/publication [gate snapshot](variants/2026-10-31/admission-gates.
   native `rpm-ostree` and `libcanberra` roots. Its first native build was cancelled
   by a later external commit, so no native closure result is claimed.
 
-Focused harness regressions: 8 tests pass, including prefix-collision cleanup.
+Focused regressions pass: 9 matrix tests, 9 unlocked-consent/ordering tests, and
+8 rename-scanner tests, including the actual CLI historical-vs-living-doc check.
 They are not runtime qualification.
 
 ## Reusable actual-image path
@@ -291,6 +297,10 @@ caller isolation, and holds its grant until the actual Super+L lock step.
 The unchanged two-second withdrawal observer is armed **before** the lock key,
 so remote transport latency cannot create a false pass. Actual response,
 requester logs, varied frame, hashes and the withdrawal snapshot are retained.
+Deferred frame geometry, pixel-variation and hash validation must all pass
+before the matrix calls ScreenCast functional; an active grant alone is not
+image proof. Requester exit/log diagnostics are retained even when an
+after-response unlocked precondition fails.
 Missing native Python/GObject/GStreamer/`pw-dump` tools remain explicit failures/prerequisites,
 not reasons to call the image unsupported or to install a replacement backend.
 

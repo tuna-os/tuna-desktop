@@ -186,6 +186,44 @@ package_target = "el10"
         self.assertEqual(deleted, [vm, vm + '-bootc-builder'])
         self.assertEqual(report['variants'][0]['runtime'], 'failed')
 
+    def test_deferred_frame_validation_is_required_for_functional_capture(self):
+        config = '''
+[variants.yellowfin]
+description = "test image"
+[[variants.yellowfin.flavors]]
+id = "tuna"
+build_image = true
+[tuna_rollout.yellowfin]
+status = "admitted"
+package_target = "el10"
+'''
+        source = {'content': base64.b64encode(config.encode()).decode()}
+        for validated in (None, False, True):
+            with self.subTest(frame_validated=validated), tempfile.TemporaryDirectory() as tmp:
+                def github(path):
+                    return {'sha': 'a' * 40} if path.endswith('commits/main') else source
+                def command(argv, timeout=120):
+                    if argv[0] == 'skopeo':
+                        return {'exit': 0, 'stdout': json.dumps({'Digest': 'sha256:' + 'b' * 64}), 'stderr': ''}
+                    directory = Path(argv[argv.index('--out') + 1])
+                    directory.mkdir()
+                    capture = {'lock_withdrawal_verified': True}
+                    if validated is not None:
+                        capture['frame_validated'] = validated
+                    (directory / 'manifest.json').write_text(json.dumps({
+                        'steps': [{'id': sid, 'result': 'pass'} for sid in
+                                  ('portal-availability', 'portal-screenshot', 'portal-screencast')],
+                        'portal_screencast': capture, 'cleanup': {'deleted': True}, 'image': {}
+                    }))
+                    return {'exit': 0, 'stdout': '', 'stderr': ''}
+                out = Path(tmp) / 'evidence'
+                with patch.object(module, 'github', side_effect=github), patch.object(module, 'command', side_effect=command), patch('sys.argv', [str(SCRIPT), '--out', str(out), '--run']), contextlib.redirect_stdout(io.StringIO()):
+                    module.main()
+                row = json.loads((out / 'matrix.json').read_text())['variants'][0]
+                expected = ('functional-capture-and-lock-revoke-proved; visual-review-required'
+                            if validated else 'screenshot-functional; screencast-unproven')
+                self.assertEqual(row['gates']['portals'], expected)
+
 
 if __name__ == '__main__':
     unittest.main()

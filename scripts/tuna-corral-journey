@@ -446,6 +446,7 @@ class Journey:
                 return stdout if code == 0 and stdout else None
             status = wait_for(completed, 100, 'native Screenshot proof exit')
             log = g.sh(f'cat {shlex.quote(log_path)}', user=True)[1:]
+            record.update(requester_exit=status, log=log)
             response_code, response_text, _ = g.sh(f'cat {shlex.quote(response_path)}', user=True)
             if response_code == 0:
                 self.receipt['portal_screenshot'] = json.loads(response_text)
@@ -468,7 +469,8 @@ class Journey:
             library = Path(__file__).with_name('lib')
             sources = {name: (library / name).read_bytes() for name in
                        ('tuna-portal-capture-client.py', 'tuna-pipewire-dump.py')}
-            record = {'requester_sha256': {name: hashlib.sha256(data).hexdigest() for name, data in sources.items()}}
+            record = {'requester_sha256': {name: hashlib.sha256(data).hexdigest() for name, data in sources.items()},
+                      'frame_validated': False}
             self.receipt['portal_screencast'] = record
             c.activity()
             require_portal_unlocked(g, record, 'before-request')
@@ -649,7 +651,7 @@ class Journey:
             c.key('Meta+v', wait=2000)
             check('date menu opened while the banner is up', True, 'GNOME 51 blocks the banner here (see frame)')
         self.step('date-menu', 'Super+V lists the notification', date_menu)
-        self.step('portal-screencast', 'Consume a real frontend stream before locking', portal_screencast)
+        self.step('portal-screencast', 'Start frontend stream before lock (frame validated during lock)', portal_screencast)
 
         def lock(check):
             pending = self.capture_pending
@@ -684,12 +686,13 @@ class Journey:
                 digest = g.out('sha256sum ' + shlex.quote(str(remote)), user=True).split()[0]
                 data = base64.b64decode(g.out('base64 ' + shlex.quote(str(remote)), user=True))
                 image = Image.open(io.BytesIO(data)).convert('RGB')
-                check('ScreenCast frame matches output geometry', image.size == (WIDTH, HEIGHT), image.size)
+                geometry_ok = check('ScreenCast frame matches output geometry', image.size == (WIDTH, HEIGHT), image.size)
                 extrema = image.getextrema()
-                check('ScreenCast frame contains varied desktop pixels',
-                      any(high - low >= 16 for low, high in extrema), extrema)
-                check('retained ScreenCast frame matches guest hash',
-                      hashlib.sha256(data).hexdigest() == digest, digest)
+                pixels_ok = check('ScreenCast frame contains varied desktop pixels',
+                                  any(high - low >= 16 for low, high in extrema), extrema)
+                hash_ok = check('retained ScreenCast frame matches guest hash',
+                                hashlib.sha256(data).hexdigest() == digest, digest)
+                record['frame_validated'] = bool(geometry_ok and pixels_ok and hash_ok)
                 (self.out / 'portal-screencast-frame.png').write_bytes(data)
                 record['retained_sha256'] = digest
         self.step('lock', 'Super+L locks the screen', lock)

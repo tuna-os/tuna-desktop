@@ -109,6 +109,32 @@ class PortalSessionTests(unittest.TestCase):
                                  arm_exit == 0)
                 self.assertEqual(dict(checks)['arm lock stream-withdrawal observation'], arm_exit == 0)
 
+    def test_screenshot_retains_native_failure_before_locked_response_precondition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            guest, console, receipt = Mock(), Mock(), {}
+            states = iter(('(false,)', '(true,)'))
+            def shell(cmd, **kwargs):
+                if 'ScreenSaver.GetActive' in cmd:
+                    return 0, next(states), ''
+                if cmd.startswith('cat ') and cmd.endswith('.exit'):
+                    return 0, '1', ''
+                if cmd.startswith('cat ') and cmd.endswith('.log'):
+                    return 0, 'native Screenshot denied', ''
+                if cmd.startswith('cat ') and cmd.endswith('.response.json'):
+                    return 0, '{"response":2,"results":{}}', ''
+                return 0, '', ''
+            guest.sh.side_effect = shell
+            guest.out.return_value = '1000'
+            console.grab.side_effect = lambda path: path.write_bytes(b'prompt-frame')
+            run = journey.Journey(SimpleNamespace(), guest, console, receipt, Path(tmp))
+            run.step = lambda sid, title, action: action(lambda name, ok, observed: ok) if sid == 'portal-screenshot' else None
+            with self.assertRaisesRegex(RuntimeError, 'after-response requires an unlocked session'):
+                run.run()
+            record = receipt['portal_request_console']
+            self.assertEqual(record['requester_exit'], '1')
+            self.assertEqual(record['log'], ('native Screenshot denied', ''))
+            self.assertEqual(record['session_state'][-1]['stdout'], '(true,)')
+
 
 class ConsentVisibilityTests(unittest.TestCase):
     def consent(self, active=False, error=None):

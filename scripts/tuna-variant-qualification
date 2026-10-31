@@ -162,11 +162,13 @@ def main():
                     row['portal_screencast'] = manifest.get('portal_screencast')
                     if steps.get('portal-screenshot') == 'pass':
                         row['gates']['portals'] = 'screenshot-functional; screencast-unproven'
-                    if steps.get('portal-screencast') == 'pass':
+                    capture_proved = (steps.get('portal-screencast') == 'pass'
+                                      and (row['portal_screencast'] or {}).get('frame_validated') is True)
+                    if capture_proved:
                         row['gates']['portals'] = ('functional-capture-proved; visual/lock-revoke-unproven'
                                                    if steps.get('portal-screenshot') == 'pass'
                                                    else 'screencast-functional; screenshot-unproven')
-                    if (steps.get('portal-screenshot') == steps.get('portal-screencast') == 'pass'
+                    if (steps.get('portal-screenshot') == 'pass' and capture_proved
                             and (row['portal_screencast'] or {}).get('lock_withdrawal_verified')):
                         row['gates']['portals'] = 'functional-capture-and-lock-revoke-proved; visual-review-required'
                 row['runtime'] = 'machine-journey-passed-needs-review' if result['exit'] == 0 else 'failed'
