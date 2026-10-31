@@ -26,6 +26,36 @@ use smithay::wayland::session_lock::{
 
 use crate::State;
 
+/// The runtime's decision on an ext-session-lock request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockVerdict {
+    Approved,
+    /// The supervised shell asked, but administrative lockdown (#357)
+    /// disabled the lock screen: no Wayland bypass of the policy.
+    RefusedByPolicy,
+    /// Not the supervised shell (or its pid is unknown).
+    RefusedForeign,
+}
+
+/// Only the supervised shell may lock: the requesting client's
+/// SO_PEERCRED pid must be the shell child the runtime spawned. An
+/// unknown pid on either side is never a match.
+pub fn lock_request_verdict(
+    client_pid: Option<i32>,
+    shell_pid: Option<u32>,
+    lock_screen_allowed: bool,
+) -> LockVerdict {
+    let ours = matches!(
+        (client_pid, shell_pid),
+        (Some(pid), Some(shell)) if u32::try_from(pid).ok() == Some(shell)
+    );
+    match (ours, lock_screen_allowed) {
+        (true, true) => LockVerdict::Approved,
+        (true, false) => LockVerdict::RefusedByPolicy,
+        (false, _) => LockVerdict::RefusedForeign,
+    }
+}
+
 /// Session-lock protocol state the handler and the runtime share.
 pub(crate) struct LockProtocol {
     pub(crate) state: SessionLockManagerState,
@@ -235,5 +265,68 @@ impl State {
     /// Whether the lock client asked to unlock since the last check.
     pub fn take_client_unlock(&mut self) -> bool {
         std::mem::take(&mut self.lock_protocol.client_unlocked)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lock_request_verdict, LockVerdict};
+
+    #[test]
+    fn only_the_supervised_shell_pid_may_lock() {
+        assert_eq!(
+            lock_request_verdict(Some(4242), Some(4242), true),
+            LockVerdict::Approved
+        );
+        assert_eq!(
+            lock_request_verdict(Some(4243), Some(4242), true),
+            LockVerdict::RefusedForeign,
+            "any other client is refused"
+        );
+    }
+
+    #[test]
+    fn an_unknown_pid_is_never_the_shell() {
+        // No SO_PEERCRED credentials, or no supervised shell running
+        // (crashed, being restarted): nobody may lock.
+        assert_eq!(
+            lock_request_verdict(None, Some(4242), true),
+            LockVerdict::RefusedForeign
+        );
+        assert_eq!(
+            lock_request_verdict(Some(4242), None, true),
+            LockVerdict::RefusedForeign
+        );
+        assert_eq!(
+            lock_request_verdict(None, None, true),
+            LockVerdict::RefusedForeign
+        );
+    }
+
+    #[test]
+    fn negative_pids_never_wrap_onto_the_shell_pid() {
+        // A bogus negative pid must not alias the shell's through an
+        // unsigned cast (-1 as u32 == u32::MAX).
+        assert_eq!(
+            lock_request_verdict(Some(-1), Some(u32::MAX), true),
+            LockVerdict::RefusedForeign
+        );
+        assert_eq!(
+            lock_request_verdict(Some(i32::MIN), Some(1 << 31), true),
+            LockVerdict::RefusedForeign
+        );
+    }
+
+    #[test]
+    fn lockdown_policy_refuses_even_the_shell_and_reports_why() {
+        assert_eq!(
+            lock_request_verdict(Some(4242), Some(4242), false),
+            LockVerdict::RefusedByPolicy
+        );
+        assert_eq!(
+            lock_request_verdict(Some(1), Some(4242), false),
+            LockVerdict::RefusedForeign,
+            "a foreign client is refused as foreign, not by policy"
+        );
     }
 }

@@ -93,6 +93,7 @@ struct Client {
     /// (keycode, pressed) in arrival order.
     keys: Vec<(u32, bool)>,
     keyboard_enters: Vec<Vec<u32>>,
+    keyboard_leaves: u32,
     keyboard_modifiers: Vec<(u32, u32, u32, u32)>,
     pointer_enters: u32,
     pointer_motions: u32,
@@ -330,6 +331,7 @@ impl Dispatch<WlKeyboard, ()> for Client {
                     .keyboard_modifiers
                     .push((mods_depressed, mods_latched, mods_locked, group));
             }
+            KeyEvent::Leave { .. } => state.keyboard_leaves += 1,
             _ => (),
         }
     }
@@ -6746,4 +6748,51 @@ fn secondary_output_windows_are_sticky_and_unstick_onto_the_active_workspace() {
     assert!(!entry.on_all_workspaces);
     assert_eq!(entry.workspace, home);
     assert_eq!(f.manager.model().window(f.id_a).unwrap().workspace, home);
+}
+
+/// The lock takes the keyboard as it engages, not at the first key: an
+/// application behind the lock gets wl_keyboard.leave at once, and with
+/// no lock surface up nobody holds focus. Unlock hands the keyboard back
+/// to the focused window without a click, as GNOME does (#729).
+#[test]
+fn lock_takes_the_keyboard_at_once_and_unlock_hands_it_back() {
+    let mut f = two_windows();
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+    let leaves = f.client_a.keyboard_leaves;
+    f.client_a.keyboard_enters.clear();
+    f.client_b.keyboard_enters.clear();
+
+    // Locked with no lock surface: the window loses the keyboard now.
+    f.manager.hold_lock_focus(&mut f.comp.state, None);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    assert_eq!(f.client_a.keyboard_leaves, leaves + 1, "leave at lock time");
+    // The lock surface (beta's surface stands in) takes it once up,
+    // and holding it again is no new enter.
+    let lock_surface = f.manager.surface_of(f.id_b).unwrap();
+    for _ in 0..2 {
+        f.manager
+            .hold_lock_focus(&mut f.comp.state, Some(&lock_surface));
+    }
+    sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+    assert_eq!(f.client_b.keyboard_enters.len(), 1);
+    assert_eq!(
+        f.manager.model().focused(),
+        Some(f.id_a),
+        "the lock does not change the window the session returns to"
+    );
+
+    // Unlock: the focused window gets the keyboard back without a click.
+    f.manager.restore_keyboard_owner(&mut f.comp.state);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+    assert_eq!(f.client_a.keyboard_enters.len(), 1);
+    assert!(f.client_a.keys.is_empty() && f.client_b.keys.is_empty());
+    press(&mut f.manager, &mut f.comp, R_KEYCODE);
+    release(&mut f.manager, &mut f.comp, R_KEYCODE);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+    assert_eq!(f.client_a.keys, [(R_KEYCODE, true), (R_KEYCODE, false)]);
+    assert!(f.client_b.keys.is_empty());
 }

@@ -1480,29 +1480,7 @@ impl WindowManager {
         state.refresh_ime_cursor_origins();
         // Never pull focus out from under a live grab.
         if state.take_popup_refocus() && !state.popup_grab_active() {
-            // The grab stole keyboard from whoever held it: hand it back
-            // to the same owner — the parked overview first, then an
-            // Exclusive layer surface (the panel holding Ctrl+Alt+Tab
-            // focus keeps its keyboard across its own menus), and only
-            // then the focused window. Handing an Exclusive hold back
-            // to a window (or nothing) strands the panel inactive with
-            // GTK focus intact but no keyboard (G-PANEL-FOCUS).
-            if let Some(held) = self.overview_held.clone() {
-                let serial = SERIAL_COUNTER.next_serial();
-                if let Some(keyboard) = self.keyboard.clone() {
-                    keyboard.set_focus(state, Some(held.clone()), serial);
-                }
-                state.sync_selection_focus(Some(&held));
-            } else if let Some(exclusive) = crate::layer::exclusive_keyboard_layer(state) {
-                let serial = SERIAL_COUNTER.next_serial();
-                if let Some(keyboard) = self.keyboard.clone() {
-                    keyboard.set_focus(state, Some(exclusive.clone()), serial);
-                }
-                state.sync_selection_focus(Some(&exclusive));
-            } else {
-                let focused = self.model.focused();
-                self.apply_focus(state, focused);
-            }
+            self.restore_keyboard_owner(state);
             // The grab held pointer focus wherever the pointer went:
             // re-deliver it where the pointer is now, so the surface it
             // left hears the leave (a panel button drops its hover).
@@ -4206,6 +4184,50 @@ impl WindowManager {
         });
         pointer.axis(state, frame);
         pointer.frame(state);
+    }
+
+    /// While locked, keyboard focus is the lock surface, or nobody when
+    /// none is up (ext-session-lock-v1: nothing behind the lock has
+    /// focus). Applications get wl_keyboard.leave as the session locks,
+    /// as GNOME's lock screen takes focus, instead of keeping it until
+    /// the first key press; [`Self::restore_keyboard_owner`] hands it
+    /// back on unlock.
+    pub fn hold_lock_focus(
+        &mut self,
+        state: &mut State,
+        surface: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    ) {
+        if let Some(keyboard) = self.keyboard.clone() {
+            if keyboard.current_focus().as_ref() != surface {
+                keyboard.set_focus(state, surface.cloned(), SERIAL_COUNTER.next_serial());
+            }
+        }
+    }
+
+    /// Hand the keyboard back to whoever owns it when nothing holds it
+    /// (after a popup grab, after unlock): the parked overview first,
+    /// then an Exclusive layer surface (the panel holding Ctrl+Alt+Tab
+    /// focus keeps its keyboard across its own menus), and only then the
+    /// focused window. Handing an Exclusive hold back to a window (or
+    /// nothing) strands the panel inactive with GTK focus intact but no
+    /// keyboard (G-PANEL-FOCUS).
+    pub fn restore_keyboard_owner(&mut self, state: &mut State) {
+        if let Some(held) = self.overview_held.clone() {
+            let serial = SERIAL_COUNTER.next_serial();
+            if let Some(keyboard) = self.keyboard.clone() {
+                keyboard.set_focus(state, Some(held.clone()), serial);
+            }
+            state.sync_selection_focus(Some(&held));
+        } else if let Some(exclusive) = crate::layer::exclusive_keyboard_layer(state) {
+            let serial = SERIAL_COUNTER.next_serial();
+            if let Some(keyboard) = self.keyboard.clone() {
+                keyboard.set_focus(state, Some(exclusive.clone()), serial);
+            }
+            state.sync_selection_focus(Some(&exclusive));
+        } else {
+            let focused = self.model.focused();
+            self.apply_focus(state, focused);
+        }
     }
 
     /// Route one input event to the session-lock surface and nothing
