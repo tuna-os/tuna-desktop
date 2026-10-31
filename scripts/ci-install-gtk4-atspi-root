@@ -1,0 +1,141 @@
+#!/bin/sh
+# CI-only GTK 4.14.5 Ubuntu dependency, with upstream GTK !10440/#8444.
+# GTK is LGPL-2.1-or-later; retain its COPYING, Debian copyright and patch.
+# Never replaces the host GTK: callers activate this staged runtime explicitly.
+set -eu
+: "${TUNA_GTK_DESTDIR:?a private staged installation root is required}"
+. /etc/os-release
+[ "$ID:$VERSION_ID" = ubuntu:24.04 ] || {
+    echo 'The pinned GTK AT-SPI regression dependency requires Ubuntu 24.04' >&2
+    exit 1
+}
+VERSION='4.14.5+ds-0ubuntu0.10+21d3eb76'
+ORIG_SHA='bd52b294cd18784339b105e2f25d2569e3db94411c64b9b141b23fe39118a0e5'
+DEBIAN_SHA='17692a86b96fa9bc930f744694c02a43f7a048abdfb1f9864fe2b9925f649d00'
+PATCH_REV='21d3eb76b68d6758122eddaf00b5823f9b2d7f34'
+PATCH_SHA='f2d4b12c7dcd5bd98cf20df429fac67ba764fb0dac42271f4d58eafb06840535'
+work="$(mktemp -d)"
+BUILD_STARTED="$(date +%s)"
+trap 'rm -rf "$work"' EXIT INT TERM
+fetch() {
+    curl --fail --location --silent --show-error --max-time 120 --output "$2" "$1"
+    printf '%s  %s\n' "$3" "$2" | sha256sum --check --status
+}
+fetch 'https://archive.ubuntu.com/ubuntu/pool/main/g/gtk4/gtk4_4.14.5+ds.orig.tar.xz' "$work/orig.tar.xz" "$ORIG_SHA"
+fetch 'https://archive.ubuntu.com/ubuntu/pool/main/g/gtk4/gtk4_4.14.5+ds-0ubuntu0.10.debian.tar.xz' "$work/debian.tar.xz" "$DEBIAN_SHA"
+# Vendored upstream patch, LGPL-2.1-or-later, attributed in its original header.
+# Keep bytes in-tree: generated remote patch responses are not stable artifacts.
+cat > "$work/root-child-index.patch" <<'UPSTREAM_PATCH'
+From 21d3eb76b68d6758122eddaf00b5823f9b2d7f34 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Luk=C3=A1=C5=A1=20Tyrychtr?= <ltyrycht@redhat.com>
+Date: Tue, 6 Oct 2026 15:29:33 +0200
+Subject: [PATCH] a11y: Return error for getChildAtIndex on the root
+
+Match the behavior of other AT SPI2 accessible interface implementations
+(e.g. the general one) and return an invalid index count when an invalid
+toplevel gets requested.
+
+Fixes #8444.
+
+Part-of: <https://gitlab.gnome.org/GNOME/gtk/-/merge_requests/10440>
+---
+ gtk/a11y/gtkatspiroot.c | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/gtk/a11y/gtkatspiroot.c b/gtk/a11y/gtkatspiroot.c
+index d8cb6fb0166..7ca2a288921 100644
+--- a/gtk/a11y/gtkatspiroot.c
++++ b/gtk/a11y/gtkatspiroot.c
+@@ -302,6 +302,7 @@ handle_accessible_method (GDBusConnection       *connection,
+       g_variant_get (parameters, "(i)", &idx);
+ 
+       GtkWidget *window = NULL;
++      GtkWidget *child = NULL;
+       guint n_toplevels = g_list_model_get_n_items (self->toplevels);
+       for (guint i = 0; i < n_toplevels; i++)
+         {
+@@ -313,15 +314,24 @@ handle_accessible_method (GDBusConnection       *connection,
+             continue;
+ 
+           if (real_idx == idx)
+-            break;
++            {
++              child = window;
++              break;
++            }
+ 
+           real_idx += 1;
+         }
+ 
+-      if (window == NULL)
+-        return;
++      if (child == NULL)
++        {
++          g_dbus_method_invocation_return_error (invocation,
++                                                 G_IO_ERROR,
++                                                 G_IO_ERROR_INVALID_ARGUMENT,
++                                                 "No child with index %d", idx);
++          return;
++        }
+ 
+-      GtkATContext *context = gtk_accessible_get_at_context (GTK_ACCESSIBLE (window));
++      GtkATContext *context = gtk_accessible_get_at_context (GTK_ACCESSIBLE (child));
+ 
+       const char *name = g_dbus_connection_get_unique_name (self->connection);
+       const char *path = gtk_at_spi_context_get_context_path (GTK_AT_SPI_CONTEXT (context));
+UPSTREAM_PATCH
+printf '%s  %s\n' "$PATCH_SHA" "$work/root-child-index.patch" | sha256sum --check --status
+tar -xJf "$work/orig.tar.xz" -C "$work"
+source="$work/gtk-4.14.5"
+tar -xJf "$work/debian.tar.xz" -C "$source"
+(cd "$source" && QUILT_PATCHES=debian/patches quilt push -a)
+(cd "$source" && patch --batch --forward -p1 < "$work/root-child-index.patch")
+meson setup "$work/build" "$source" --prefix=/usr/local --buildtype=release --wrap-mode=nofallback \
+    -Ddocumentation=false -Dman-pages=false -Dbuild-demos=false -Dbuild-examples=false \
+    -Dbuild-tests=false -Dbuild-testsuite=false -Dintrospection=disabled -Dvulkan=enabled
+ninja -C "$work/build"
+DESTDIR="$TUNA_GTK_DESTDIR" ninja -C "$work/build" install
+BUILD_SECONDS="$(( $(date +%s) - BUILD_STARTED ))"
+printf 'GTK-ATSPI-ROOT cold source install: %s seconds\n' "$BUILD_SECONDS"
+record="$TUNA_GTK_DESTDIR/usr/local/share/doc/tuna-ci-gtk4-atspi-root"
+mkdir -p "$record"
+cp "$source/COPYING" "$record/COPYING"
+cp "$source/debian/copyright" "$record/debian-copyright"
+cp "$work/root-child-index.patch" "$record/upstream-21d3eb76.patch"
+cp "$source/debian/patches/series" "$record/ubuntu-patch-series"
+cp "$work/build/meson-info/intro-buildoptions.json" "$record/build-options.json"
+cp "$work/build/meson-logs/meson-log.txt" "$record/meson-log.txt"
+export VERSION ORIG_SHA DEBIAN_SHA PATCH_REV PATCH_SHA BUILD_SECONDS
+/usr/bin/python3 - "$TUNA_GTK_DESTDIR" "$record" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+root, record = map(Path, sys.argv[1:])
+libraries = list((root / 'usr/local/lib').glob('**/libgtk-4.so.1.1400.5'))
+if len(libraries) != 1:
+    raise SystemExit('expected exactly one staged GTK runtime ELF')
+elf = libraries[0]
+notes = subprocess.check_output(['readelf', '-n', str(elf)], text=True, timeout=30)
+build_ids = [line.split('Build ID:', 1)[1].strip() for line in notes.splitlines() if 'Build ID:' in line]
+if len(build_ids) != 1:
+    raise SystemExit('missing unique staged GTK build ID')
+receipt = {
+    'scope': 'CI toolkit dependency only; no product qualification',
+    'version': os.environ['VERSION'],
+    'cold_install_seconds': int(os.environ['BUILD_SECONDS']),
+    'ubuntu_orig_sha256': os.environ['ORIG_SHA'],
+    'ubuntu_debian_sha256': os.environ['DEBIAN_SHA'],
+    'upstream_commit': os.environ['PATCH_REV'],
+    'upstream_patch_sha256': os.environ['PATCH_SHA'],
+    'runtime_relative_path': str(elf.relative_to(root)),
+    'runtime_sha256': hashlib.sha256(elf.read_bytes()).hexdigest(),
+    'runtime_build_id': build_ids[0],
+    'license': 'LGPL-2.1-or-later; staged COPYING and Debian copyright retained',
+    'compiler': subprocess.check_output(['cc', '--version'], text=True, timeout=10).splitlines()[0],
+    'native_platform': Path('/etc/os-release').read_text(),
+}
+(record / 'source-build-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+PY

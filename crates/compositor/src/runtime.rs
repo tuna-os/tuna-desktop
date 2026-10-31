@@ -2760,6 +2760,11 @@ impl Runtime {
             let pos = self.manager.pointer_pos();
             [pos.x, pos.y]
         }));
+        doc["interactive_move_window"] = serde_json::json!(if self.is_locked() {
+            None
+        } else {
+            self.manager.interactive_move_window()
+        });
         doc["input_aids"] = self.input_aids_summary();
         // What the on-screen keyboard follows (#349): the focused field's
         // content type only, never text; nothing while locked.

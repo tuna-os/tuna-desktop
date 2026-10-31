@@ -124,11 +124,14 @@ def clear_point(point, table, forbidden):
                 for a, b, w, h in forbidden if w > 0 and h > 0))
 
 
-def neutral_point(nodes, state, pid):
+def neutral_point(nodes, state, pid, source_nodes=None):
     layer, table, forbidden = grid_geometry(nodes, state, pid)
-    names = {n["name"] for n in nodes if n["showing"]}
-    if "Next Page" not in names or "Previous Page" in names or any(n in names for n in ("Next page preview", "Previous page preview")):
-        raise ValueError("source is not normal first page")
+    if source_nodes is not None:
+        validate_drag_page(nodes, state, pid, source_nodes)
+    else:
+        names = {n["name"] for n in nodes if n["showing"]}
+        if "Next Page" not in names or "Previous Page" in names or any(n in names for n in ("Next page preview", "Previous page preview")):
+            raise ValueError("source is not normal first page")
     tx, ty, tw, th = table
     def axis(start, extent, index):
         edges = sorted({start, start + extent, *(v[index] for v in forbidden),
@@ -156,11 +159,7 @@ def page_content(nodes, state, pid):
     return cells
 
 
-def validate_neutral(nodes, state, pid, point, source_nodes):
-    layer, table, forbidden = grid_geometry(nodes, state, pid)
-    if (not isinstance(point, list) or len(point) != 2 or
-            any(type(v) is not int for v in point)):
-        raise ValueError("invalid neutral pointer")
+def validate_drag_page(nodes, state, pid, source_nodes):
     # Arrow/preview actors alone do not establish the carousel page. Compare
     # its actual cells with the freshly admitted normal first-page tree.
     neutral_point(source_nodes, state, pid)
@@ -170,14 +169,24 @@ def validate_neutral(nodes, state, pid, point, source_nodes):
     if "Next page preview" not in names or any(n in names for n in
             ("Previous page preview", "Next Page", "Previous Page")):
         raise ValueError("active drag is not on first page")
-    if state.get("client_dnd_active") is not True or state.get("pointer_position") != point:
+    if state.get("client_dnd_active") is not True:
+        raise ValueError("no native drag on the active first page")
+
+
+def validate_neutral(nodes, state, pid, point, source_nodes):
+    layer, table, forbidden = grid_geometry(nodes, state, pid)
+    if (not isinstance(point, list) or len(point) != 2 or
+            any(type(v) is not int for v in point)):
+        raise ValueError("invalid neutral pointer")
+    validate_drag_page(nodes, state, pid, source_nodes)
+    if state.get("pointer_position") != point:
         raise ValueError("native drag pointer not delivered to neutral point")
     if not clear_point((point[0] - layer[0], point[1] - layer[1]), table, forbidden):
         raise ValueError("pointer overlaps actual tile or page hint")
 
 
 def main():
-    if len(sys.argv) in (7, 10) and sys.argv[1] in ("neutral", "neutral-check"):
+    if len(sys.argv) in (7, 8, 10) and sys.argv[1] in ("neutral", "active-neutral", "neutral-check"):
         mode, pid, start, tree, state = sys.argv[1:6]
         pid = int(pid)
         validate_live_tree(pid, start, Path(tree))
@@ -185,6 +194,12 @@ def main():
         if mode == "neutral" and len(sys.argv) == 7:
             point = neutral_point(nodes, snapshot, pid)
             output = Path(sys.argv[6])
+            result = point
+        elif mode == "active-neutral" and len(sys.argv) == 8:
+            validate_live_tree(pid, start, Path(sys.argv[6]))
+            source_nodes = json.loads(Path(sys.argv[6]).read_text())
+            point = neutral_point(nodes, snapshot, pid, source_nodes)
+            output = Path(sys.argv[7])
             result = point
         elif mode == "neutral-check" and len(sys.argv) == 10:
             point = [int(sys.argv[6]), int(sys.argv[7])]
@@ -199,7 +214,7 @@ def main():
             raise ValueError("invalid neutral command")
         validate_live_tree(pid, start, Path(tree))
         output.write_text(json.dumps(result) + "\n")
-        if mode == "neutral":
+        if mode in ("neutral", "active-neutral"):
             print(*point)
         return
     if len(sys.argv) == 5 and sys.argv[1] == "tree":

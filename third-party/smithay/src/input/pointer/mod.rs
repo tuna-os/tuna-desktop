@@ -445,6 +445,25 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
         self.inner.lock().unwrap().location
     }
 
+    /// Snapshot the physical position and latest compositor hit test, rather than
+    /// the focus retained by an implicit grab. The pointer lock is released
+    /// before a new DnD grab creates offers or sends initial target events.
+    #[cfg(feature = "wayland_frontend")]
+    pub(crate) fn pending_motion(
+        &self,
+        serial: Serial,
+    ) -> (Option<(D::PointerFocus, Point<f64, Logical>)>, MotionEvent) {
+        let inner = self.inner.lock().unwrap();
+        (
+            inner.pending_focus.clone(),
+            MotionEvent {
+                location: inner.location,
+                serial,
+                time: Clock::<Monotonic>::new().now().as_millis(),
+            },
+        )
+    }
+
     /// Update the current location of this pointer in the global space,
     /// without sending any event and without updating the focus.
     ///
