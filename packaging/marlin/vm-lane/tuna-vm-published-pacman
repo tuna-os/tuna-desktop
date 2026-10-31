@@ -1,0 +1,32 @@
+#!/bin/bash
+# pacman -S --needed against the published image's own package databases.
+#
+# The published marlin:tuna image ships the sync databases it was built from
+# (DBPath /usr/lib/sysimage/lib/pacman/sync). Resolving the CI fixtures against
+# them, never a fresh `pacman -Sy`, keeps every shipped package at its shipped
+# version: Arch moves on between the image build and this layer (core/python
+# 3.14.8-1 -> 3.14.9-1 in run 41230683948), and a re-synced transaction then
+# upgrades shipped packages that are fixture targets or dependencies of them.
+# Mirrors keep only the newest build of each package, so the Arch Linux
+# Archive's flat package tree backs them for the snapshot's older files.
+#
+# Usage: tuna-vm-published-pacman PACKAGE...
+set -euo pipefail
+
+(($#)) || { echo "usage: $0 PACKAGE..." >&2; exit 2; }
+for arg; do
+	[[ $arg != -* ]] || { echo "$0: packages only, not pacman options: $arg" >&2; exit 2; }
+done
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+grep -qx 'Include = /etc/pacman.d/mirrorlist' /etc/pacman.conf \
+	|| { echo "$0: /etc/pacman.conf no longer includes /etc/pacman.d/mirrorlist" >&2; exit 1; }
+sed "s|^Include = /etc/pacman.d/mirrorlist\$|Include = $work/mirrorlist|" /etc/pacman.conf >"$work/pacman.conf"
+{
+	cat /etc/pacman.d/mirrorlist
+	echo 'Server = https://archive.archlinux.org/packages/.all'
+} >"$work/mirrorlist"
+
+pacman --config "$work/pacman.conf" -S --needed --noconfirm "$@"

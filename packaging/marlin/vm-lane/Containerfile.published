@@ -3,13 +3,15 @@ ARG BASE_IMAGE
 # The hot-corner constraint client, built as in the current-build lane's
 # Containerfile, and the soak's native frame workload
 # (scripts/tuna-frame-pacer-build); the build toolchain stays out of the
-# booted fixture.
+# booted fixture. Both stages install from the image's own package databases
+# (tuna-vm-published-pacman), so the client builds against the shipped libraries.
 FROM ${BASE_IMAGE} AS constraint-builder
+COPY packaging/marlin/vm-lane/tuna-vm-published-pacman /build/tuna-vm-published-pacman
 COPY packaging/marlin/vm-lane/tuna-vm-constraints.c /build/tuna-vm-constraints.c
 COPY packaging/marlin/vm-lane/tuna-vm-constraints-build /build/tuna-vm-constraints-build
 COPY scripts/tuna-frame-pacer-build /build/soak/tuna-frame-pacer-build
 COPY scripts/lib/tuna-frame-pacer.c /build/soak/lib/tuna-frame-pacer.c
-RUN pacman -Sy --needed --noconfirm gcc pkgconf wayland wayland-protocols wlr-protocols \
+RUN bash /build/tuna-vm-published-pacman gcc pkgconf wayland wayland-protocols wlr-protocols \
     && TUNA_CI_ONLY=1 /build/tuna-vm-constraints-build \
     && bash /build/soak/tuna-frame-pacer-build /build/soak/out
 
@@ -38,7 +40,11 @@ COPY packaging/marlin/vm-lane/tuna-vm-health.service /usr/lib/systemd/system/tun
 # configuration and unit, and the greeter theme overlay. Build-time checks pin
 # GDM as the display manager with no automatic or timed login; which sessions
 # GDM offers is a qualification check (V-GREETER-LIST) on the booted image.
-RUN mkdir -p /usr/share/tuna-vm \
+# Fixture packages resolve against the image's own package databases
+# (tuna-vm-published-pacman, bind-mounted so it stays out of the fixture);
+# the closing assertion proves no shipped package changed version.
+RUN --mount=type=bind,source=packaging/marlin/vm-lane/tuna-vm-published-pacman,target=/run/tuna-vm-published-pacman \
+    mkdir -p /usr/share/tuna-vm \
     && pacman -Q tuna-desktop > /usr/share/tuna-vm/shipped-package.txt \
     && pacman -Q > /usr/share/tuna-vm/shipped-packages.txt \
     && sha256sum /usr/bin/tuna-session /usr/bin/tuna-compositor \
@@ -51,8 +57,7 @@ RUN mkdir -p /usr/share/tuna-vm \
          /usr/share/tunaos/gdm-theme/gnome-shell-*.css > /usr/share/tuna-vm/shipped-payload.sha256 \
     && test "$(readlink -f /etc/systemd/system/display-manager.service)" = /usr/lib/systemd/system/gdm.service \
     && ! grep -Eiq '^[[:space:]]*(AutomaticLoginEnable|TimedLoginEnable)[[:space:]]*=[[:space:]]*(true|yes|y|1)[[:space:]]*$' /etc/gdm/custom.conf \
-    && pacman -Sy --noconfirm \
-    && pacman -S --needed --noconfirm qemu-guest-agent python python-gobject grim wtype wayland-utils gnome-disk-utility gnome-system-monitor \
+    && bash /run/tuna-vm-published-pacman qemu-guest-agent python python-gobject grim wtype wayland-utils gnome-disk-utility gnome-system-monitor \
     && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test \
     && echo 'tuna-test:tuna' | chpasswd \
     && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-input \
