@@ -147,6 +147,16 @@ also checks immediate execution, literal script bytes and exit status;
 the existing session tests still assert socket fallback and password
 handling.
 
+The compositor's `control_readiness::tests::` cases run their socket fixtures
+in exact-test child processes. Concurrent tests can fork between socket
+creation and close, temporarily retaining the socket and its epoll interest
+until exec. Isolation preserves the strict wake/drain/no-wake-after-close
+contract without serializing the suite or allowing extra callbacks. The
+tests inspect only the owned epoll instance's `/proc/self/fdinfo` registrations
+and observe peer closure, not process-wide descriptor counts. A retained
+socket-duplicate negative control must keep both the registration and peer
+alive until the last reference closes.
+
 Cleanup is automatic where it is safe:
 
 - `just proof` runs each proof with a fresh `HOME` and XDG directories
