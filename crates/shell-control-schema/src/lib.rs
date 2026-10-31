@@ -15,6 +15,7 @@
 //! `docs/api-stability.md` in the repository.
 
 pub mod background;
+pub mod introspect;
 pub mod motion;
 pub use motion::{MotionLevel, MotionPolicy};
 

@@ -34,6 +34,7 @@ mod hotplug_sniffer;
 mod ibus_panel;
 mod ibus_property_menu;
 mod input_sources;
+mod introspect_forward;
 mod kbd_a11y;
 mod keybindings;
 mod live_apps;
