@@ -5,9 +5,9 @@ preview image built from source, then a CI-only fixture layer
 (`packaging/marlin/vm-lane/Containerfile`). The layer gives the image the
 published `marlin:tuna` login path: stock GDM with tunaOS's tuna-flavor GDM
 steps (`tunaos.toml` `[desktops.tuna]` `after_install`: greeter theme
-overlay, `FallbackSession=tuna` with `Session=tuna` account templates, every
-other session hidden), vendored byte-for-byte in
-`packaging/marlin/vm-lane/tunaos/` from tunaOS 193cc0ef, on the package's
+overlay, `FallbackSession=tuna` with version-appropriate global account
+templates, every other session hidden), vendored byte-for-byte in
+`packaging/marlin/vm-lane/tunaos/` from tunaOS d98ed1e09b61635a2a9b115ce559944e42f97d74, on the package's
 own `Tuna Desktop` session entry. The fixture account has no saved session.
 No autologin or initial session exists: the lane drives GDM's user list and
 types the fixture password exactly as the published-flavor nightly does
@@ -29,7 +29,16 @@ is a separate boot of the same disk (QEMU `-snapshot`) that passes the
 `tuna-vm-fresh-accounts.service` run `useradd -m` before GDM starts, as an
 installer would: `tunastd` (standard), `tunaadmin` (`wheel`), and the
 control `tunaseeded`, whose record is pre-seeded. `tunastd` and `tunaadmin`
-get no AccountsService record, no Session preselection and no autologin.
+get no per-user AccountsService record, no per-user Session preselection
+and no autologin. This is distinct from the global AccountsService
+templates: on an installed GDM 51+ with `FallbackSession` support, their
+`[User]` group explicitly sets `Session=`. GDM chooses the configured
+`tuna` fallback and its stock session-setting call changes the inherited
+empty value to `tuna`, allowing AccountsService to persist a real record.
+Older GDM retains global `Session=tuna`: it can prefer launchable GNOME
+even when that session has `NoDisplay=true`. An absent or unparseable GDM
+version must not opt into the empty-template policy. Neither policy edits
+existing per-user records or replaces a valid saved session choice.
 
 | Gate | Actual operation and evidence |
 | --- | --- |
@@ -41,9 +50,47 @@ get no AccountsService record, no Session preselection and no autologin.
 | V-FRESH-LOGOUT-<user>-<round> | logind ends the session and the greeter is ready again |
 | V-FRESH-REBOOT / V-FRESH-RECORD-KEPT-<user> | In-guest reboot (new `boot_id`), records survive, then both accounts log in again |
 
+Run 41215443626 failed both native VM jobs with the AccountsService record
+still missing after a real record-free `tunastd` manual GDM login on
+GDM 51.1.1-1 / AccountsService 26.27.3-1. First login, standard-user sudo
+denial and logout passed; admin, second-login and reboot coverage aborted.
+The inherited global `Session=tuna` made GDM's stock `SetSession("tuna")`
+a same-value operation, which did not write the missing record. An empty
+global template is not itself proof that persistence is fixed: only the
+unchanged native gates above can qualify the fix. No setup script may
+create the fresh accounts' records or invoke a cache operation to do so.
+
 Receipts are in `fresh-accounts-receipts.json`; frames per attempt and
-session. Only Arch/GDM 51 is covered here; pre-51 GDM is not exercised by
-this lane.
+session. Both native VM jobs must complete the standard and administrator
+first login, real record creation, sudo policy, logout, manual second
+login, reboot, record retention and post-reboot login gates. Only Arch/GDM
+51 is covered by this native lane; helper-execution tests also cover
+legacy GDM template policy, but do not constitute a pre-51 native proof.
+
+Run 41226473836 (desktop c3713c34) left the record absent after a real
+orca51 `tunastd` first login, and the helper's chosen policy unobserved.
+Two read-only diagnostics now record what happened; neither is a gate.
+The image build prints `tuna-vm-lifecycle gdm-policy`: the `gdm` the helper
+resolves and its realpath, bounded `--version` output/status and parse, the
+`daemon/FallbackSession` literal-probe status, the derived `empty`/`legacy`
+policy, `pacman -Q gdm libgdm accountsservice` and the binary's owner.
+Each `fresh-state` receipt adds an `accounts` block, collected in order:
+physical record presence, the global `standard`/`administrator` templates
+(candidate presence in `/run`, `/etc`, `/usr/local/share`, `/usr/share`
+precedence, the winner, and every `[User]` `Session`, `SessionType`,
+`XSession` and `SystemAccount` occurrence: `[]` is missing, `[""]` empty),
+`Properties.Get` without D-Bus activation of exactly `Session`,
+`SessionType`, `Saved` and `LocalAccount` on
+`/org/freedesktop/Accounts/User<uid>`, then record presence again.
+An unexported object, absent bus or wrong type is an explicit error
+(remote D-Bus error name or exception type only), never an empty Session or
+false `Saved`. Collection points: preflight, first session, after each
+first-round logout (before a missing-record abort), after reboot, and once
+when a login fails. Nothing calls `FindUserByName`, `CacheUser` or a
+setter, retries, or dumps other template keys, error messages or stderr.
+A record seen only after logout, `Saved=true` or an effective
+`Session=tuna` never substitutes for `V-FRESH-RECORD-CREATED-<user>` at
+the first session.
 
 The Debian package journey must retain the original beta package's
 `share/pam.d/tuna-lock` conffile bytes, including its comment. Run
@@ -239,9 +286,12 @@ changing HOME alone does not isolate that route. The proof now exports
 private state/cache roots explicitly. It does not touch the real user
 paths or bypass the migration guard.
 
-The local full speech proof is blocked by host Orca 46.1, which does not
-satisfy the required KeyboardMonitor contract. A new Ubuntu 26.04 run with
-distribution Orca 50.3 must establish all speech gates against the native
-package correction. The original failed run's eight passing gates do not
-establish a nine-gate pass for this change, and a GTK auth-prompt regression
-does not qualify end-to-end Orca speech.
+The first local attempt used host Orca 46.1, which could not satisfy the
+KeyboardMonitor contract. A later isolated Ubuntu 26.04 run with native
+Orca `50.3-0ubuntu0.1+tuna1` passed all 11 speech assertions in 141 seconds.
+It typed nine characters, observed nine spoken bullets without plaintext,
+unlocked through PAM, and confirmed that the toggle stopped Orca.
+[The retained report](https://github.com/tuna-os/tuna-desktop/pull/931#issuecomment-6545553530)
+records source `69e9a04fd20aa2bc38427c79aec043cb3174da3b` and the actual
+package and binary identities. This proves the nested speech path, not
+the separate GDM fresh-account journey or ISO installation.

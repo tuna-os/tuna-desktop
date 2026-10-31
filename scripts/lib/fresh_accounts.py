@@ -159,6 +159,14 @@ class Journey:
     def _receipt(self, step, value):
         self.receipts.append({"step": step, "value": value})
 
+    def _diagnostic_state(self, receipt, user):
+        """One fresh-state receipt that never gates nor aborts the journey."""
+        try:
+            state = self._run("fresh-state", user)
+        except (OSError, RuntimeError, ValueError) as error:
+            state = {"user": user, "error": type(error).__name__}
+        self._receipt(receipt, state)
+
     def _greeter(self, step, not_boot=None):
         deadline = self.clock() + self.greeter_timeout
         while self.clock() < deadline:
@@ -227,6 +235,7 @@ class Journey:
             ok, detail = self._login(user, step)
             self.record(f"V-FRESH-LOGIN-{step}", ok, detail)
             if not ok:
+                self._diagnostic_state(f"{step}-failure-state", user)
                 return False
             if round_name == "first":
                 state = self._run("fresh-state", user)
@@ -240,6 +249,10 @@ class Journey:
                 ok = ok and ok_sudo
             ok_out, detail = self._logout(user, step)
             self.record(f"V-FRESH-LOGOUT-{step}", ok_out, detail)
+            if round_name == "first":
+                # A record that appears only now is reported with this timing;
+                # V-FRESH-RECORD-CREATED above already judged the first session.
+                self._diagnostic_state(f"{step}-logout-state", user)
             if not (ok and ok_out):
                 return False
         return True
