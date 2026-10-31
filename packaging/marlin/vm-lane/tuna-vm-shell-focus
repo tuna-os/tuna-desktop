@@ -3,8 +3,10 @@
 
 Default observation has no text/value/description queries. The explicit controlled
 overview mode compares only the known five-character fixture query in scratch
-memory; no buffer is retained. No synthetic AT-SPI actions, focus changes or
-arbitrary names are recorded. Native QMP input performs every action.
+memory; no buffer is retained. The explicit end-session mode adds the power
+menu and end-session dialog controls and keeps only label names that are the
+dialog's fixed countdown sentence. No synthetic AT-SPI actions, focus changes
+or arbitrary names are recorded. Native QMP input performs every action.
 Primary API: https://gnome.pages.gitlab.gnome.org/at-spi2-core/libatspi/
 """
 import json
@@ -18,6 +20,13 @@ import time
 
 PUBLIC_LABELS = {"Search", "Disks", "Take Screenshot", "Settings", "Lock", "Power Off Menu", "Mute", "Volume"}
 PUBLIC_ROLES = {"entry", "text", "push button", "slider", "frame"}
+# The end-session mode (#589) adds the power menu's rows, the end-session
+# dialog's buttons and its countdown: GNOME Shell 51's fixed sentences
+# (endSessionDialog.js), public text naming no user data. Only that mode
+# reads label names, and keeps none but a countdown.
+END_SESSION_LABELS = {"Suspend", "Restart…", "Power Off…", "Log Out…", "Cancel", "Restart", "Power Off", "Log Out"}
+COUNTDOWN = re.compile(r"(?:The system will (?:restart|power off)|You will be logged out) "
+                       r"automatically in [0-9]{1,2} seconds?")
 
 FOCUS_OPERATIONS = {"arguments", "imports", "process-identity", "atspi-timeout",
                     "desktop-enumeration", "atspi-owner", "bus-connection", "bus-credentials",
@@ -33,8 +42,14 @@ def canonical_role(role):
     return "push button" if role == "button" else role
 
 
-def public_node(name, role, showing, focused, active):
-    if name not in PUBLIC_LABELS or role not in PUBLIC_ROLES or not showing:
+def public_node(name, role, showing, focused, active, end_session=False):
+    if not showing:
+        return None
+    if role == "label":
+        if not end_session or type(name) is not str or COUNTDOWN.fullmatch(name) is None:
+            return None
+    elif role not in PUBLIC_ROLES or (name not in PUBLIC_LABELS
+                                      and not (end_session and name in END_SESSION_LABELS)):
         return None
     return {"label": name, "role": role, "focused": bool(focused), "active": bool(active)}
 
@@ -129,7 +144,7 @@ def catalog_receipt(pid, uid, ticks):
             "sample_scope":"original-show-results","authentication_boundary":False}
 
 
-def observe(pid, ticks, executable, display, controlled=False):
+def observe(pid, ticks, executable, display, controlled=False, end_session=False):
     global FOCUS_OPERATION
     FOCUS_OPERATION = "imports"
     import gi
@@ -233,14 +248,14 @@ def observe(pid, ticks, executable, display, controlled=False):
             continue
         FOCUS_OPERATION = "tree-role"
         role = canonical_role(accessibility_query(node.get_role_name))
-        if role in PUBLIC_ROLES:
+        if role in PUBLIC_ROLES or (end_session and role == "label"):
             FOCUS_OPERATION = "tree-name"
             name = accessibility_query(node.get_name)
             FOCUS_OPERATION = "tree-state-flags"
             focused = states.contains(Atspi.StateType.FOCUSED)
             active = states.contains(Atspi.StateType.ACTIVE)
             FOCUS_OPERATION = "tree-public-control"
-            record = public_node(name, role, showing, focused, active)
+            record = public_node(name, role, showing, focused, active, end_session)
             if record is not None:
                 nodes.append(record)
             if controlled:
@@ -297,9 +312,11 @@ def observe(pid, ticks, executable, display, controlled=False):
 
 if __name__ == "__main__":
     try:
-        if len(sys.argv) not in (5,6) or (len(sys.argv)==6 and sys.argv[5]!="controlled-overview"):
+        modes = {"controlled-overview": (True, False), "end-session": (False, True)}
+        if len(sys.argv) not in (5,6) or (len(sys.argv)==6 and sys.argv[5] not in modes):
             raise ValueError("fixed observation mode")
-        receipt = observe(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4], len(sys.argv)==6)
+        controlled, end_session = modes[sys.argv[5]] if len(sys.argv) == 6 else (False, False)
+        receipt = observe(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4], controlled, end_session)
         FOCUS_OPERATION = "serialization"
         print(json.dumps(receipt))
     except Exception as error:

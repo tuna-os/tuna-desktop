@@ -370,6 +370,204 @@ def orca_logout_retirement(trace, pid):
     return found[0]
 
 
+# The power menu's session-ending rows on the installed image (#589). As
+# GNOME Shell 51's systemActions.js, Restart…, Power Off… and Log Out… ask
+# org.gnome.SessionManager for Reboot, Shutdown and Logout(0); the session
+# manager (the compositor here, gnome-session in GNOME) opens the shell's
+# EndSessionDialog with Open(type, 0, 60, inhibitors) (gsm-shell.c), whose
+# countdown shows 60 and then steps by ten (endSessionDialog.js). Physical
+# QMP keys drive the menu and the dialog; the shell's own AT-SPI tree, the
+# session and system buses and the compositor's layers only observe.
+END_SESSION_LAYER = "tuna-shell-end-session"
+END_SESSION_ROWS = ("Suspend", "Restart…", "Power Off…", "Log Out…")
+END_SESSION_CASES = {
+    "restart": {"row": "Restart…", "method": "Reboot", "args": [], "type": 2,
+                "countdown": "The system will restart automatically in {} seconds"},
+    "power-off": {"row": "Power Off…", "method": "Shutdown", "args": [], "type": 1,
+                  "countdown": "The system will power off automatically in {} seconds"},
+    "log-out": {"row": "Log Out…", "method": "Logout", "args": ["uint32 0"], "type": 0,
+                "countdown": "You will be logged out automatically in {} seconds"},
+}
+# gnome-session fails a cancelled request with G_IO_ERROR_CANCELLED, which
+# GDBus sends unmapped.
+END_SESSION_CANCELLED = "org.gtk.GDBus.UnmappedGError.Quark._g_2dio_2derror_2dquark.Code19"
+
+
+def shell_control(controls, label, role="push button"):
+    return next((node for node in controls if node["label"] == label and node["role"] == role), None)
+
+
+def await_shell_controls(agent, predicate, timeout, what):
+    """The shell's public controls once `predicate` holds, bounded."""
+    deadline = time.monotonic() + timeout
+    while True:
+        controls = agent.run("shell-controls")["public_controls"]
+        if predicate(controls):
+            return controls
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"the shell never showed {what}")
+        time.sleep(0.25)
+
+
+def press_shell_control(qmp, agent, label, limit=32):
+    """Physical Tab until the shell's own tree has `label` focused, then
+    physical Return: no guessed focus order."""
+    for _ in range(limit):
+        node = shell_control(agent.run("shell-controls")["public_controls"], label)
+        if node is not None and node["focused"]:
+            qmp.keys("ret")
+            return
+        qmp.keys("tab")
+    raise RuntimeError(f"bounded physical Tab did not focus {label}")
+
+
+def open_power_menu_row(qmp, agent, row):
+    """Super+S opens quick settings, Return on its Power Off Menu button
+    opens the power menu and Return on `row` chooses it."""
+    qmp.keys("meta_l", "s")
+    await_shell_controls(agent, lambda controls: shell_control(controls, "Power Off Menu") is not None,
+                         10, "quick settings")
+    press_shell_control(qmp, agent, "Power Off Menu")
+    await_shell_controls(agent, lambda controls: all(shell_control(controls, label) for label in END_SESSION_ROWS),
+                         10, "the power menu's rows")
+    press_shell_control(qmp, agent, row)
+
+
+def countdown_showing(controls, case, seconds):
+    return shell_control(controls, case["countdown"].format(seconds), "label") is not None
+
+
+def end_session_opened(observed, mark, case, compositor_pid):
+    """The shell's one request for `case` on org.gnome.SessionManager since
+    `mark`, which the compositor's manager answered with the shell's
+    Open(type, 0, 60, …) while the dialog layer is up; else None."""
+    shell, manager = observed["owners"]["shell"], observed["owners"]["session_manager"]
+    if shell is None or manager is None or manager[1] != compositor_pid or shell[1] == compositor_pid:
+        return None
+    requests = [request for request in observed["end_session"]
+                if request["index"] >= mark["session_count"] and request["member"] == case["method"]
+                and request["sender"] == shell[0] and request["args"] == case["args"]]
+    if len(requests) != 1:
+        return None
+    opened = [item for item in observed["dialog"]
+              if item["index"] > requests[0]["index"] and item["type"] == "method call"
+              and item["member"] == "Open" and item["sender"] == manager[0]
+              and item["destination"] in (shell[0], "org.gnome.Shell")
+              and item["args"] == [f"uint32 {case['type']}", "uint32 0", "uint32 60"]]
+    if not opened or END_SESSION_LAYER not in (observed["layers"] or []):
+        return None
+    return {"request": requests[0], "open": opened[0]}
+
+
+def end_session_reply(observed, opened):
+    """The manager's current reply to the opened request, else None."""
+    return next((request["reply"] for request in observed["end_session"]
+                 if request["index"] == opened["request"]["index"]), None)
+
+
+def logind_untouched(observed, mark):
+    """No logind power request or announcement since `mark`."""
+    return (not [request for request in observed["system"] if request["index"] >= mark["system_count"]]
+            and not [announced for announced in observed["prepare"] if announced["index"] >= mark["system_count"]]
+            and observed["preparing_for_shutdown"] is False)
+
+
+def end_session_menu_case(qmp, agent, name, identity, frame):
+    """Choose `name` from the shell's power menu by physical keys and judge
+    the end-session dialog it opens. Restart and Power Off are held past the
+    countdown's first step with the VM, session and logind untouched, then
+    cancelled by Return on the focused Cancel. Log Out is left to its
+    countdown; the caller awaits the greeter. Raises on any failure, after
+    Escape so no countdown is left running. Needs the power button fixture's
+    bus monitors."""
+    case = END_SESSION_CASES[name]
+    before = identity()
+    if len(before["compositor"]) != 1:
+        raise RuntimeError("one original compositor is required")
+    compositor_pid = before["compositor"][0][0]
+    mark = agent.run("power-button-observe")
+    if END_SESSION_LAYER in (mark["layers"] or []) or qmp.cmd("query-status")["status"] != "running":
+        raise RuntimeError(f"{case['row']} did not start from the plain running desktop")
+    result = {"case": name}
+    settled = False
+    try:
+        open_power_menu_row(qmp, agent, case["row"])
+        pressed = time.monotonic()
+        deadline = pressed + 15
+        while True:
+            observed = agent.run("power-button-observe")
+            opened = end_session_opened(observed, mark, case, compositor_pid)
+            if opened is not None:
+                break
+            if time.monotonic() >= deadline:
+                result["last"] = observed
+                raise RuntimeError(f"{case['row']} did not open the session manager's 60 s end-session dialog")
+            time.sleep(0.2)
+        result.update(opened=opened, opened_at=time.monotonic(), shown_after=round(time.monotonic() - pressed, 1))
+        # GNOME's countdown starts at 60 and Cancel holds the focus.
+        await_shell_controls(agent, lambda controls: countdown_showing(controls, case, 60)
+                             and (shell_control(controls, "Cancel") or {}).get("focused"),
+                             5, f"{case['row']}'s 60 s countdown with Cancel focused")
+        frame(f"end-session-{name}-dialog")
+        if name == "log-out":
+            # Logout(0) is answered once the dialog is up; its countdown, not
+            # the request, ends the session.
+            deadline = time.monotonic() + 5
+            while True:
+                reply = end_session_reply(agent.run("power-button-observe"), opened)
+                if reply is not None:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Logout(0) was not answered once the dialog opened")
+                time.sleep(0.2)
+            if reply["type"] != "method return":
+                raise RuntimeError(f"Logout(0) failed: {reply}")
+            if identity() != before:
+                raise RuntimeError("Log Out… ended the session before its countdown")
+            result["reply"] = reply
+            settled = True
+            return result
+        # Ten seconds on, the countdown steps to 50 and nothing has ended.
+        controls = await_shell_controls(agent, lambda controls: countdown_showing(controls, case, 50), 20,
+                                        f"{case['row']}'s countdown stepping to 50 seconds")
+        held = agent.run("power-button-observe")
+        result["held_after"] = round(time.monotonic() - pressed, 1)
+        if (qmp.cmd("query-status")["status"] != "running" or END_SESSION_LAYER not in (held["layers"] or [])
+                or not logind_untouched(held, mark) or end_session_reply(held, opened) is not None
+                or identity() != before):
+            raise RuntimeError(f"the {case['row']} dialog did not hold the running session")
+        if not (shell_control(controls, "Cancel") or {}).get("focused"):
+            raise RuntimeError(f"Cancel lost the focus in the {case['row']} dialog")
+        frame(f"end-session-{name}-held")
+        qmp.keys("ret")
+        settled = True
+    finally:
+        if not settled:
+            qmp.keys("esc")
+    deadline = time.monotonic() + 10
+    while True:
+        observed = agent.run("power-button-observe")
+        shell = observed["owners"]["shell"]
+        canceled = shell is not None and any(
+            item["type"] == "signal" and item["member"] == "Canceled" and item["sender"] == shell[0]
+            and item["index"] > opened["open"]["index"] for item in observed["dialog"])
+        reply = end_session_reply(observed, opened)
+        if (canceled and reply is not None and reply["type"] == "error"
+                and reply["error_name"] == END_SESSION_CANCELLED
+                and END_SESSION_LAYER not in (observed["layers"] or [])):
+            break
+        if time.monotonic() >= deadline:
+            result["last"] = observed
+            raise RuntimeError(f"Cancel did not cancel the {case['row']} request")
+        time.sleep(0.2)
+    frame(f"end-session-{name}-cancelled")
+    if (qmp.cmd("query-status")["status"] != "running" or not logind_untouched(observed, mark)
+            or identity() != before):
+        raise RuntimeError(f"cancelling the {case['row']} dialog disturbed the session")
+    result["reply"] = reply
+    return result
+
+
 def safe_navigation_diagnostic(value):
     """Finite failure summary only; full original FD/catalog receipts stay separate."""
     if type(value) is not dict or set(value) not in ({"known_query_matches","Disks_result","focused_role_classes"},
@@ -2647,6 +2845,45 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                f"dialog up after {power_button['cases']['interactive']['shown_after']} s, VM, compositor and session "
                f"unchanged at 5 s, Escape -> Canceled; nothing -> AcceleratorActivated only; image vm chassis -> "
                f"gsd PowerOffWithFlags(0) refused by a fixture block inhibitor; chassis and setting restored")
+    # Restart… and Power Off… from the shell's power menu by physical keys
+    # (#589): each opens the session manager's 60 s end-session dialog,
+    # which holds the running session until Cancel. Log Out… runs at logout
+    # below. The published build's shell predates the session manager.
+    menu_session = not published and not older_guest
+    menu_identities = []
+
+    def menu_identity():
+        value = inventory(f"end-session-identity-{len(menu_identities)}")
+        menu_identities.append(value["session"]["Id"])
+        return {"session": value["session"]["Id"],
+                "compositor": [(p["pid"], p["start_ticks"]) for p in value["processes"]
+                               if guest_role(p["executable"]) == "tuna-compositor"]}
+
+    if not menu_session:
+        for gate in ("V-RESTART-DIALOG", "V-POWER-OFF-DIALOG"):
+            record(gate, True, "guest predates the shell's session manager power menu; "
+                               "proven by the current-build marlin-vm lane")
+    else:
+        menu = {}
+        agent.run("power-button-start")
+        try:
+            for name, gate in (("restart", "V-RESTART-DIALOG"), ("power-off", "V-POWER-OFF-DIALOG")):
+                case = END_SESSION_CASES[name]
+                try:
+                    menu[name] = end_session_menu_case(qmp, agent, name, menu_identity, frame)
+                except RuntimeError as error:
+                    record(gate, False, f"shell menu {case['row']}: {error}")
+                    raise
+                record(gate, True,
+                       f"physical Super+S/Tab/Return on {case['row']}: the shell asks org.gnome.SessionManager."
+                       f"{case['method']}, the compositor's manager opens EndSessionDialog Open({case['type']}, 0, 60) "
+                       f"after {menu[name]['shown_after']} s, the dialog counts down from 60 with Cancel focused and "
+                       f"steps to 50 with VM, compositor and session unchanged and logind untouched; Return on "
+                       f"Cancel -> Canceled, {case['method']} failed as cancelled, dialog gone, logind untouched")
+        finally:
+            menu["stop"] = agent.run("power-button-stop")
+            with open(os.path.join(evidence, "end-session-menu.json"), "w") as stream:
+                json.dump(menu, stream, indent=2)
     if older_guest:
         departing_orca = None
         with open(os.path.join(evidence, "orca-before-logout.json"), "w") as stream:
@@ -2661,11 +2898,31 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         with open(os.path.join(evidence, "orca-before-logout.json"), "w") as stream:
             json.dump(departing_orca, stream, indent=2)
     logout_offset, logout_started = len(read_text(serial_path)), time.monotonic()
-    # The product's own Log Out; the published build predates the session
-    # manager and logs out through logind, as its shell did.
-    requested = agent.run("logout")["requested"]
-    product_logout = published or requested == "session manager logout"
-    deadline = time.monotonic() + 30
+    # The product's own Log Out. The current build logs out from its shell's
+    # power menu by physical keys (#589): Log Out… asks the session manager
+    # for Logout(0), whose 60 s end-session dialog confirms by counting down,
+    # so the session must outlive the countdown and then end. The published
+    # build predates the session manager and logs out through logind, as its
+    # shell did.
+    menu_logout = None
+    if menu_session:
+        agent.run("power-button-start")
+        try:
+            menu_logout = end_session_menu_case(qmp, agent, "log-out", menu_identity, frame)
+        except RuntimeError as error:
+            record("V-LOGOUT", False, f"shell menu Log Out…: {error}")
+            raise
+        finally:
+            stopped = agent.run("power-button-stop")
+            with open(os.path.join(evidence, "logout-menu.json"), "w") as stream:
+                json.dump({"case": menu_logout, "stop": stopped}, stream, indent=2)
+        # The countdown runs from the dialog's opening.
+        logout_started = menu_logout["opened_at"]
+        requested = "power menu Log Out…"
+    else:
+        requested = agent.run("logout")["requested"]
+        product_logout = published or requested == "session manager logout"
+    deadline = logout_started + (90 if menu_session else 30)
     greeter = {}
     greeter_visible = False
     # Both lanes keep the GDM greeter frame that preceded login. tunaOS's
@@ -2689,10 +2946,22 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     if not greeter_visible:
         frame("logout-timeout")
     greeter["logout_request"] = requested
+    greeter["greeter_after"] = round(time.monotonic() - logout_started, 1)
+    if menu_session:
+        greeter["dialog_shown_after"] = menu_logout["shown_after"]
+        # GNOME's countdown, not the request, ended the session.
+        product_logout = greeter["greeter_after"] >= 55
     with open(os.path.join(evidence, "greeter.json"), "w") as stream:
         json.dump(greeter, stream, indent=2)
+    if menu_session:
+        logout_how = (f"physical Super+S/Tab/Return on Log Out…: the shell asks org.gnome.SessionManager.Logout(0), "
+                      f"Open(0, 0, 60) after {menu_logout['shown_after']} s, the dialog counts down from 60 with "
+                      f"Cancel focused and its countdown confirms, greeter {greeter['greeter_after']} s after the "
+                      f"dialog opened")
+    else:
+        logout_how = requested
     record("V-LOGOUT", greeter_visible and product_logout,
-           f"product Log Out ({requested}) ends the session and returns to a painted GDM greeter surface "
+           f"product Log Out ({logout_how}) ends the session and returns to a painted GDM greeter surface "
            "under active GDM, with no original compositor")
     if older_guest:
         with open(os.path.join(evidence, "orca-after-logout.json"), "w") as stream:

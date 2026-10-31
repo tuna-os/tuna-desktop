@@ -28,8 +28,9 @@ starts), just enough of each daemon behind GNOME 51's quick settings:
   balanced, performance) and PerformanceDegraded, UPower name.
 - logind: session/auto SetBrightness, which writes BACKLIGHT_DIR's
   brightness file the way the kernel would; the Manager's Suspend,
-  Reboot and PowerOff. Power calls are appended to POWER_LOG,
-  and Suspend emits PrepareForSleep(true) first, as logind does.
+  SuspendWithFlags, Reboot and PowerOff. Power calls are appended to
+  POWER_LOG as "METHOD ARG pid=CALLER_PID", and a suspend emits
+  PrepareForSleep(true) first, as logind does.
 
 - polkit: the Authority's RegisterAuthenticationAgent, recording the
   agent's bus name and object path in $TUNA_STUB_POLKIT_LOG (one line,
@@ -167,6 +168,7 @@ XML = """
   </interface>
   <interface name="org.freedesktop.login1.Manager">
     <method name="Suspend"><arg type="b" direction="in"/></method>
+    <method name="SuspendWithFlags"><arg type="t" direction="in"/></method>
     <method name="Reboot"><arg type="b" direction="in"/></method>
     <method name="PowerOff"><arg type="b" direction="in"/></method>
     <signal name="PrepareForSleep"><arg type="b"/></signal>
@@ -463,13 +465,22 @@ def method_call(c, sender, path, iface, method, params, invocation):
         set_property(c, None, path, "org.bluez.Device1", "Connected",
                      GLib.Variant("b", method == "Connect"))
         invocation.return_value(None)
-    elif method in ("Suspend", "Reboot", "PowerOff"):
-        if method == "Suspend":
+    elif method in ("Suspend", "SuspendWithFlags", "Reboot", "PowerOff"):
+        if method.startswith("Suspend"):
             c.emit_signal(None, "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
                           "PrepareForSleep", GLib.Variant("(b)", (True,)))
         if POWER_LOG:
+            # The caller's process, so proofs see who asked logind (the
+            # session manager, not the shell, ends the session).
+            try:
+                pid = c.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                  "org.freedesktop.DBus", "GetConnectionUnixProcessID",
+                                  GLib.Variant("(s)", (sender,)), GLib.VariantType("(u)"),
+                                  Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+            except GLib.Error:
+                pid = 0
             with open(POWER_LOG, "a") as fh:
-                fh.write(method + "\n")
+                fh.write(f"{method} {params.unpack()[0]} pid={pid}\n")
         invocation.return_value(None)
     elif method == "RegisterAuthenticationAgent":
         _, _, agent_path = params.unpack()

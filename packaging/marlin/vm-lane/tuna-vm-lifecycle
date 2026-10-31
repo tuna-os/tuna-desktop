@@ -559,27 +559,31 @@ POWER_BUTTON_SYSTEM_LOG = pathlib.Path("/run/tuna-vm-power-button-system.log")
 POWER_BUTTON_LOG_BOUND = 64 << 20
 MEDIA_KEYS = "org.gnome.SettingsDaemon.MediaKeys"
 # gsd-media-keys' GrabAccelerators/AcceleratorActivated exchange with the
-# org.gnome.Shell key grabber, gnome-session's Shutdown entry point and the
+# org.gnome.Shell key grabber, gnome-session's Shutdown entry point (and the
+# power menu's Reboot and Logout, GNOME Shell 51 systemActions.js) and the
 # shell's EndSessionDialog. Method returns are matched to their calls by
 # (destination, reply_serial) because the replier's unique name is not
 # known when the monitor starts.
+END_SESSION_METHODS = ("Reboot", "Shutdown", "Logout")
 POWER_BUTTON_SESSION_RULES = (
     "type='method_call',interface='org.gnome.Shell',member='GrabAccelerators'",
     "type='method_return'",
     "type='error'",
     "type='signal',interface='org.gnome.Shell',member='AcceleratorActivated'",
-    "type='method_call',interface='org.gnome.SessionManager',member='Shutdown'",
+    *(f"type='method_call',interface='org.gnome.SessionManager',member='{member}'"
+      for member in END_SESSION_METHODS),
     "type='method_call',interface='org.gnome.SessionManager.EndSessionDialog'",
     "type='signal',interface='org.gnome.SessionManager.EndSessionDialog'")
 # logind power requests, their error replies and logind's own announcement
 # that it is about to act (gsd-media-keys' logind_power_action:
-# PowerOffWithFlags/SuspendWithFlags/HibernateWithFlags). gsd passes no reply
+# PowerOffWithFlags/SuspendWithFlags/HibernateWithFlags; the session
+# manager's Reboot/PowerOff once a dialog is confirmed). gsd passes no reply
 # callback, so GDBus sends these calls NO_REPLY_EXPECTED and logind answers
 # nothing, not even a refusal: a refused request shows as a call that
 # PrepareForShutdown/PrepareForSleep never follows while PreparingForShutdown
 # stays false.
-POWER_BUTTON_LOGIND_CALLS = ("PowerOff", "PowerOffWithFlags", "Suspend", "SuspendWithFlags",
-                             "Hibernate", "HibernateWithFlags")
+POWER_BUTTON_LOGIND_CALLS = ("PowerOff", "PowerOffWithFlags", "Reboot", "RebootWithFlags", "Suspend",
+                             "SuspendWithFlags", "Hibernate", "HibernateWithFlags")
 POWER_BUTTON_LOGIND_PREPARE = ("PrepareForShutdown", "PrepareForSleep")
 POWER_BUTTON_SYSTEM_RULES = tuple(
     f"type='method_call',interface='org.freedesktop.login1.Manager',member='{member}'"
@@ -798,10 +802,11 @@ def power_button_observe():
                     "action": int(m["args"][0].split()[1])}
                    for m in session if m["type"] == "signal" and m["member"] == "AcceleratorActivated"
                    and m["args"][:1] and m["args"][0].startswith("uint32 ")]
-    shutdowns = [{"index": m["index"], "sender": m["sender"], "destination": m["destination"],
-                  "reply": reply_of(session_replies, m)}
-                 for m in session if m["type"] == "method call"
-                 and m["interface"] == "org.gnome.SessionManager" and m["member"] == "Shutdown"]
+    end_session = [{"index": m["index"], "sender": m["sender"], "destination": m["destination"],
+                    "member": m["member"], "args": m["args"][:1], "reply": reply_of(session_replies, m)}
+                   for m in session if m["type"] == "method call"
+                   and m["interface"] == "org.gnome.SessionManager" and m["member"] in END_SESSION_METHODS]
+    shutdowns = [request for request in end_session if request["member"] == "Shutdown"]
     dialog = [{"index": m["index"], "type": m["type"], "sender": m["sender"], "destination": m["destination"],
                "member": m["member"], "args": m["args"][:3]}
               for m in session if m["interface"] == "org.gnome.SessionManager.EndSessionDialog"
@@ -815,7 +820,8 @@ def power_button_observe():
     saved = json.loads(POWER_BUTTON_STATE.read_text())
     layers = json.loads(STATE.read_text()).get("layers")
     return {"session_count": len(session), "system_count": len(system), "grabs": grabs,
-            "activations": activations, "shutdowns": shutdowns, "dialog": dialog, "system": power_calls,
+            "activations": activations, "end_session": end_session, "shutdowns": shutdowns, "dialog": dialog,
+            "system": power_calls,
             "media_keys": gsd_plugin_row("MediaKeys"), "inhibitors": logind_inhibitors(),
             "prepare": [{"index": m["index"], "member": m["member"], "args": m["args"][:1]}
                         for m in system if m["type"] == "signal"
@@ -1648,6 +1654,31 @@ def shell_navigation_focus(kind, original_pid=None, original_ticks=None, control
         if name in FOCUS_ERROR_TYPES:
             print(json.dumps({"focus_error_type": name, "focus_stage": focus_stage}))
         raise SystemExit(1) from None
+
+
+def shell_controls():
+    """The running shell's public controls from its own AT-SPI tree: the
+    power menu rows, the end-session dialog's buttons and its countdown
+    (#589). Observation only; QMP keys perform every action. Unlike the Orca
+    navigation receipts this needs no screen reader: GTK publishes the tree
+    to the session's accessibility bus by itself."""
+    if json.loads(STATE.read_text())["locked"]:
+        raise RuntimeError("locked accessibility trees are never queried")
+    shells = [p for p in inventory()["processes"]
+              if p["executable"] == "tuna-shell-gtk" and p["uid"] == OWNER.pw_uid]
+    if len(shells) != 1:
+        raise RuntimeError("one original shell is required")
+    shell = shells[0]
+    with open(f"/proc/{shell['pid']}/environ", "rb") as stream:
+        raw = stream.read(128 * 1024 + 1)
+    displays = [entry.split(b"=", 1)[1].decode() for entry in raw.split(b"\0")
+                if entry.startswith(b"WAYLAND_DISPLAY=")]
+    if len(raw) > 128 * 1024 or len(displays) != 1:
+        raise RuntimeError("the shell's Wayland display is not one bounded value")
+    receipt = json.loads(call("/usr/libexec/tuna-vm-shell-focus", str(shell["pid"]), str(shell["start_ticks"]),
+                              "tuna-shell-gtk", displays[0], "end-session", user=True))
+    return {"shell": {"pid": shell["pid"], "start_ticks": shell["start_ticks"]},
+            "public_controls": receipt["public_controls"]}
 
 
 def speech_capture_profile(name):
@@ -2693,10 +2724,12 @@ print(json.dumps(result))
         result = {"power-button-chassis": power_button_chassis, "power-button-action": power_button_action,
                   "power-button-block": power_button_block}[action](sys.argv[2])
     elif action == "logout":
-        # The product's Log Out: the compositor's org.gnome.SessionManager
+        # The published lane's Log Out: the compositor's org.gnome.SessionManager
         # Logout(1), no confirmation, which ends the compositor (the session
         # leader) as gnome-session ends a GNOME session. A guest predating
         # that manager logs out as its shell's Log Out did, through logind.
+        # The current build logs out through the shell's power menu, by
+        # physical keys (the lane's V-LOGOUT, #589).
         owned = call("gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
                      "--object-path", "/org/freedesktop/DBus",
                      "--method", "org.freedesktop.DBus.NameHasOwner", "org.gnome.SessionManager",
@@ -2709,6 +2742,8 @@ print(json.dumps(result))
         else:
             call("loginctl", "terminate-session", inventory()["session"]["Id"])
         result = {"requested": "session manager logout" if owned else "terminate session"}
+    elif action == "shell-controls":
+        result = shell_controls()
     elif action == "login-session":
         # Before Tuna Desktop writes its state snapshot: which desktop the
         # login actually started, by fixed process name only.
