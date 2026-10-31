@@ -63,11 +63,20 @@ ASSERTIONS="$ARTIFACTS/assertions.txt"
 
 OWNED_XVFB=""
 COMPOSITOR_PID=""
+OWNED_RUNTIME=""
 cleanup() {
     if [ -n "$COMPOSITOR_PID" ]; then kill "$COMPOSITOR_PID" 2>/dev/null || true; fi
     if [ -n "$OWNED_XVFB" ]; then kill "$OWNED_XVFB" 2>/dev/null || true; fi
+    if [ -n "$OWNED_RUNTIME" ]; then rm -rf "$OWNED_RUNTIME" || true; fi
 }
 trap cleanup EXIT INT TERM
+# The session's sockets and runtime files (wallpaper, control socket)
+# are fixed names below XDG_RUNTIME_DIR; a private one keeps concurrent
+# runs apart. Short path: Unix sockets cap at 108 bytes.
+OWNED_RUNTIME="$(mktemp -d /tmp/tuna-slow-portal-rt.XXXXXX)"
+chmod 0700 "$OWNED_RUNTIME"
+XDG_RUNTIME_DIR="$OWNED_RUNTIME"
+export XDG_RUNTIME_DIR
 pass() { echo "$1 pass $2" >>"$ASSERTIONS"; echo "tuna-slow-portal-proof: $1 pass: $2"; }
 fail() {
     echo "$1 fail $2" >>"$ASSERTIONS"
@@ -93,7 +102,7 @@ pass P-SLOW-PORTAL "activation of org.freedesktop.portal.Desktop hangs (probe ti
 
 [ -n "$DISPLAY_ARG" ] && DISPLAY="$DISPLAY_ARG" && export DISPLAY
 if ! xdotool getdisplaygeometry >/dev/null 2>&1; then
-    Xvfb -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" \
+    "$ROOT/scripts/lib/tuna-xvfb" -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp \
         3>"$ARTIFACTS/xvfb-display" >"$ARTIFACTS/xvfb.log" 2>&1 &
     OWNED_XVFB=$!
     for _ in $(seq 1 30); do [ -s "$ARTIFACTS/xvfb-display" ] && break; sleep 1; done

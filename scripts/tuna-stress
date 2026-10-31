@@ -180,7 +180,7 @@ def run(args):
         return value
 
     try:
-        launch(["Xvfb", "-displayfd", "1", "-screen", "0", "1280x800x24", "-nolisten", "tcp"], "xvfb")
+        launch([str(ROOT / "scripts/lib/tuna-xvfb"), "-displayfd", "1", "-screen", "0", "1280x800x24", "-nolisten", "tcp"], "xvfb")
         def display_number():
             return next((line for line in (out / "xvfb.log").read_text().splitlines()
                          if line.isdigit()), None)
