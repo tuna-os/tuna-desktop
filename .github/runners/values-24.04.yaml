@@ -66,8 +66,8 @@ template:
         emptyDir:
           medium: Memory
           sizeLimit: 2Gi
-      # Kubernetes owns each PVC with this pod; Delete reclaim removes its
-      # directory after the job. No PVC or cache is shared across jobs.
+      # Kubernetes owns each PVC with this pod. The static provisioner wipes
+      # its released slot before reuse; no writable job state is shared.
       - name: work
         ephemeral:
           volumeClaimTemplate:

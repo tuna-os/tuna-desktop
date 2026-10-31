@@ -1,11 +1,10 @@
-# Dedicated runner scratch storage; independent of k3s's default provisioner.
-# The mount and its marker must exist on karnataka before provisioning PVCs.
+# Dedicated static local volumes; only this namespace admits privileged host access.
+# Prepare all 42 bind mounts on karnataka before starting this DaemonSet.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: tuna-ci-storage
   labels:
-    # Only storage helpers here need hostPath; runner pods remain in tuna-ci.
     pod-security.kubernetes.io/enforce: privileged
 ---
 apiVersion: v1
@@ -14,55 +13,29 @@ metadata:
   name: tuna-ci-scratch-provisioner
   namespace: tuna-ci-storage
 ---
-# Helper pod lifecycle and configuration reads never need cross-namespace access.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: tuna-ci-scratch-provisioner
-  namespace: tuna-ci-storage
-rules:
-  - apiGroups: [""]
-    resources: [pods]
-    verbs: [get, list, create, delete]
-  - apiGroups: [""]
-    resources: [pods/log]
-    verbs: [get]
-  - apiGroups: [""]
-    resources: [configmaps]
-    # The upstream readiness probe lists ConfigMaps in its own namespace.
-    verbs: [get, list]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: tuna-ci-scratch-provisioner
-  namespace: tuna-ci-storage
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: tuna-ci-scratch-provisioner
-subjects:
-  - kind: ServiceAccount
-    name: tuna-ci-scratch-provisioner
-    namespace: tuna-ci-storage
----
+# No PVC, pod, Job, or ConfigMap API access: cleanup runs in process and
+# configuration is mounted by kubelet. Nodes are read only; taint removal is off.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: tuna-ci-scratch-provisioner
 rules:
   - apiGroups: [""]
-    resources: [nodes, persistentvolumeclaims]
-    verbs: [get, list, watch]
-  - apiGroups: [""]
     resources: [persistentvolumes]
-    verbs: [get, list, watch, create, patch, update, delete]
-  - apiGroups: [""]
-    resources: [events]
-    verbs: [create, patch]
+    verbs: [get, list, watch, create, delete]
   - apiGroups: [storage.k8s.io]
     resources: [storageclasses]
     verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [nodes]
+    resourceNames: [karnataka]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [watch]
+  - apiGroups: ["", events.k8s.io]
+    resources: [events]
+    verbs: [create, update, patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -83,60 +56,23 @@ metadata:
   name: tuna-ci-scratch-config
   namespace: tuna-ci-storage
 data:
-  config.json: |-
-    {
-      "nodePathMap": [
-        {
-          "node": "DEFAULT_PATH_FOR_NON_LISTED_NODES",
-          "paths": []
-        },
-        {
-          "node": "karnataka",
-          "paths": ["/var/lib/tuna-ci-scratch"]
-        }
-      ]
-    }
-  setup: |-
-    #!/bin/sh
-    set -eu
-    parent=${VOL_DIR%/*}
-    test "$parent" = /var/lib/tuna-ci-scratch
-    # This marker exists only on the mounted scratch LV, never on the root disk.
-    test -f "$parent/.nvme-scratch"
-    mkdir -m 0777 -p "$VOL_DIR"
-  teardown: |-
-    #!/bin/sh
-    set -eu
-    parent=${VOL_DIR%/*}
-    test "$parent" = /var/lib/tuna-ci-scratch
-    test -f "$parent/.nvme-scratch"
-    rm -rf -- "$VOL_DIR"
-  helperPod.yaml: |-
-    apiVersion: v1
-    kind: Pod
-    metadata:
-      name: tuna-ci-scratch-helper
-    spec:
-      automountServiceAccountToken: false
-      priorityClassName: system-node-critical
-      tolerations:
-        - key: node.kubernetes.io/disk-pressure
-          operator: Exists
-          effect: NoSchedule
-      containers:
-        - name: helper-pod
-          image: rancher/mirrored-library-busybox:1.37.0
-          imagePullPolicy: IfNotPresent
+  useJobForCleaning: "false"
+  minResyncPeriod: "5s"
+  storageClassMap: |
+    tuna-ci-scratch:
+      hostDir: /var/lib/tuna-ci-scratch/pool
+      mountDir: /var/lib/tuna-ci-scratch/pool
+      volumeMode: Filesystem
+      accessMode: ReadWriteOnce
+      fsType: ext4
+      namePattern: "slot-*"
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: tuna-ci-scratch-provisioner
   namespace: tuna-ci-storage
 spec:
-  replicas: 1
-  strategy:
-    type: Recreate
   selector:
     matchLabels:
       app: tuna-ci-scratch-provisioner
@@ -147,72 +83,67 @@ spec:
     spec:
       serviceAccountName: tuna-ci-scratch-provisioner
       nodeSelector:
+        kubernetes.io/os: linux
         kubernetes.io/hostname: karnataka
       containers:
         - name: provisioner
-          image: rancher/local-path-provisioner:v0.0.37
+          image: registry.k8s.io/sig-storage/local-volume-provisioner:v2.10.0
           imagePullPolicy: IfNotPresent
-          command:
-            - local-path-provisioner
-            - start
-            - --config
-            - /etc/config/config.json
-            - --provisioner-name
-            - rancher.io/tuna-ci-scratch
-            - --configmap-name
-            - tuna-ci-scratch-config
-            - --service-account-name
-            - tuna-ci-scratch-provisioner
-            - --helper-image
-            - rancher/mirrored-library-busybox:1.37.0
-          ports:
-            - name: health
-              containerPort: 8080
-              protocol: TCP
-          startupProbe:
-            httpGet:
-              path: /health
-              port: health
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            failureThreshold: 12
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: health
-            initialDelaySeconds: 10
-            periodSeconds: 10
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: health
-            initialDelaySeconds: 5
-            periodSeconds: 5
-          volumeMounts:
-            - name: config
-              mountPath: /etc/config/
-              readOnly: true
+          args:
+            - --discovery-period=5s
+          securityContext:
+            privileged: true
           env:
-            - name: POD_NAMESPACE
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: MY_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            - name: CONFIG_MOUNT_PATH
-              value: /etc/config/
-            - name: HEALTH_PORT
-              value: "8080"
+            - name: JOB_CONTAINER_IMAGE
+              value: registry.k8s.io/sig-storage/local-volume-provisioner:v2.10.0
+          ports:
+            - name: metrics
+              containerPort: 8080
+          # v2.10.0 helm/provisioner/values.yaml uses TCP liveness.
+          # cmd/local-volume-provisioner/main.go serves /metrics only:
+          # it has no /health or /ready endpoint. This checks HTTP serving,
+          # not whether every slot has been discovered or cleaned.
+          livenessProbe:
+            tcpSocket:
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 60
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/provisioner/config
+              readOnly: true
+            - name: pool
+              mountPath: /var/lib/tuna-ci-scratch/pool
+              mountPropagation: HostToContainer
       volumes:
         - name: config
           configMap:
             name: tuna-ci-scratch-config
+        - name: pool
+          hostPath:
+            path: /var/lib/tuna-ci-scratch/pool
+            type: Directory
 ---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: tuna-ci-scratch
-  annotations:
-    # local volumes support runner user namespaces; hostPath PVs do not.
-    defaultVolumeType: local
-provisioner: rancher.io/tuna-ci-scratch
+provisioner: kubernetes.io/no-provisioner
 volumeBindingMode: WaitForFirstConsumer
 reclaimPolicy: Delete

@@ -25,7 +25,7 @@ fi
 kubectl --context "$context" apply -f "$here/cluster.yaml"
 kubectl --context "$context" apply -f "$here/storage.yaml"
 kubectl --context "$context" -n tuna-ci-storage rollout status \
-  deployment/tuna-ci-scratch-provisioner --timeout=120s
+  daemonset/tuna-ci-scratch-provisioner --timeout=120s
 
 if ! $sets_only; then
   helm --kube-context "$context" upgrade --install arc "$charts/gha-runner-scale-set-controller" \
