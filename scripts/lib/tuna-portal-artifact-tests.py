@@ -11,6 +11,7 @@ import time
 import unittest
 from unittest.mock import patch
 from tuna_picker_geometry import application_id, committed_window, new_parent_window
+import tuna_picker_progress as progress
 
 spec = importlib.util.spec_from_file_location('finalizer', Path(__file__).with_name('tuna-portal-artifact-finalize.py'))
 f = importlib.util.module_from_spec(spec)
@@ -371,6 +372,84 @@ class PickerGeometryTests(unittest.TestCase):
         self.scene["focused"] = 18
         self.record["window_size"] = [0, 300]
         self.assertIsNone(self.ready())
+
+
+class PickerModalProgressTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 0.0
+        self.retained = []
+        self.before = dict(clicks=1, keys=1, sequence=6, pid=711)
+        self.baseline = dict(self.before, sequence=28)
+
+    def observe(self, advances, *, changed=None, focused=34, deadline=30):
+        reads = 0
+        def parent():
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                return dict(self.baseline)
+            return dict(self.baseline,
+                sequence=self.baseline["sequence"] + advances(self.now),
+                **(changed or {}))
+        def sleep(seconds):
+            self.now += seconds
+        with patch.object(progress.time, "monotonic", side_effect=lambda: self.now), \
+                patch.object(progress.time, "monotonic_ns", side_effect=lambda: int(self.now * 1e9)), \
+                patch.object(progress.time, "sleep", side_effect=sleep):
+            return progress.observe_modal_parent(parent, lambda: dict(focused=focused),
+                self.before, 34, deadline, self.retained.append)
+
+    def test_ten_real_post_injection_advances_pass_and_are_retained(self):
+        after, scene = self.observe(lambda elapsed: int(elapsed * 20))
+        self.assertEqual(after["sequence"], 38)
+        self.assertEqual(scene["focused"], 34)
+        receipt, = self.retained
+        self.assertEqual(receipt["before_input"]["sequence"], 6)
+        self.assertEqual(receipt["baseline_after_input"]["sequence"], 28)
+        self.assertEqual(receipt["required_advances"], 10)
+        self.assertEqual(receipt["inner_bound_seconds"], 2)
+        self.assertEqual(receipt["result"], "passed")
+        self.assertLess(receipt["elapsed_seconds"], 2)
+
+    def test_pre_injection_progress_cannot_satisfy_the_fresh_boundary(self):
+        # Old baseline 6 would accept the already-observed 28 as fresh.
+        # The post-injection baseline must still observe ten NEW callbacks.
+        with self.assertRaisesRegex(RuntimeError, "did not process fresh events"):
+            self.observe(lambda _: 0)
+        receipt, = self.retained
+        self.assertEqual(receipt["result"], "failed")
+        self.assertEqual(receipt["observations"][-1]["parent"]["sequence"], 28)
+        self.assertGreaterEqual(receipt["elapsed_seconds"], 2)
+        self.assertLess(receipt["elapsed_seconds"], 2.05)
+
+    def test_nine_advances_do_not_lower_the_floor_or_extend_two_seconds(self):
+        with self.assertRaisesRegex(RuntimeError, "did not process fresh events"):
+            self.observe(lambda elapsed: min(9, int(elapsed * 20)))
+        receipt, = self.retained
+        self.assertEqual(receipt["observations"][-1]["parent"]["sequence"], 37)
+        self.assertGreaterEqual(receipt["elapsed_seconds"], 2)
+        self.assertLess(receipt["elapsed_seconds"], 2.05)
+
+    def test_click_key_and_focus_leaks_remain_failures_even_with_progress(self):
+        for changed, focused in [({"clicks": 2}, 34), ({"keys": 2}, 34), ({}, 32)]:
+            with self.subTest(changed=changed, focused=focused):
+                with self.assertRaisesRegex(RuntimeError, "leaked input or stole dialog focus"):
+                    self.observe(lambda _: 10, changed=changed, focused=focused)
+                self.assertEqual(self.retained[-1]["result"], "failed")
+
+    def test_outer_deadline_can_only_shorten_the_existing_inner_bound(self):
+        with self.assertRaisesRegex(RuntimeError, "did not process fresh events"):
+            self.observe(lambda _: 0, deadline=.5)
+        self.assertLess(self.retained[-1]["elapsed_seconds"], .55)
+
+    def test_actual_ui_observes_after_the_sole_injection_and_retains_failures(self):
+        ui = Path(__file__).with_name("tuna-portal-filechooser-ui.py").read_text()
+        injection = ui.index('"click", "1"], check=True)')
+        self.assertLess(injection, ui.index("after, fresh = observe_modal_parent("))
+        self.assertIn('out.with_suffix(".parent-probe.json")', ui)
+        client = Path(__file__).with_name("tuna-portal-filechooser-client.py").read_text()
+        self.assertIn('"monotonic_ns": time.monotonic_ns()', client)
+        self.assertIn('"process_time_ns": time.process_time_ns()', client)
 
 
 if __name__ == '__main__':

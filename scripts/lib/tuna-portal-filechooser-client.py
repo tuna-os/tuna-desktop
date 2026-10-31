@@ -198,7 +198,9 @@ if parent_mode != "none":
         global parent_sequence
         parent_sequence += 1
         temporary = input_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"clicks": parent_clicks, "keys": parent_keys, "sequence": parent_sequence, "pid": os.getpid()}))
+        temporary.write_text(json.dumps({"clicks": parent_clicks, "keys": parent_keys,
+            "sequence": parent_sequence, "pid": os.getpid(),
+            "monotonic_ns": time.monotonic_ns(), "process_time_ns": time.process_time_ns()}))
         temporary.replace(input_path)
         return True
     GLib.timeout_add(50, record_parent_input)
