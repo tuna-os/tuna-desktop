@@ -5257,11 +5257,18 @@ cstate '.cursor.image_theme == "TunaProofSvg" and .cursor.image == [30, 30] and 
     fail G-CURSOR-SCALE "at 125% the scalable theme did not rasterize directly at 30 physical px: $(jq -c .cursor "$CSTATE")"
 "$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-scale-125-svg.png" 30 5 7.5 49,95,199 --tolerance 1 ||
     fail G-CURSOR-SCALE "the SVG cursor is not drawn as 30 physical px at its scaled hotspot"
+ripple_scale_probe_id="$(jq '.windows[] | select(.app_id == "tuna-cursor-probe") | .id' "$CSTATE")"
 kill "$CURSOR_PID" 2>/dev/null || true
 wait "$CURSOR_PID" 2>/dev/null || true
 CURSOR_PID=""
 cstate ".windows | length == $cursor_windows" "scale cursor probe closed" ||
     fail G-CURSOR-SCALE "the cursor probe did not close"
+# Unmapping removes the live window before its 150 ms destroy snapshot
+# disappears. Let that exact effect complete on the real clock before
+# ripple_pixels freezes time; otherwise the magenta ghost contaminates
+# BEFORE and vanishes when the ripple clock advances to 415 ms.
+cstate "(.animation_clock_manual | not) and (.window_lifecycle.history | any(.window == $ripple_scale_probe_id and .effect == \"destroy\" and .outcome == \"completed\"))" "scale cursor destroy completed" 5 ||
+    fail G-LOCATE-RIPPLE-PIXELS "the scale cursor's destroy effect did not finish before freezing the ripple baseline"
 gsettings set org.gnome.desktop.interface cursor-theme "$cursor_theme_before"
 gsettings set org.gnome.desktop.interface cursor-size "$cursor_size_before"
 pass G-CURSOR-SCALE "at 125% a size-24 cursor uses a 48px legacy image or a 30px SVG raster; both draw 30 physical px at the scaled hotspot"

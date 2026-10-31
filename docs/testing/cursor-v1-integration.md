@@ -78,6 +78,21 @@ left/up ray extents of 33 px and right/down extents of 32 px at 100%.
 Those archived pixels match the upstream curve. This diagnosis is not a
 fresh runtime qualification of the corrected proof.
 
+The subsequent [CI run 41193585314](https://github.com/tuna-os/tuna-desktop/actions/runs/41193585314),
+GTK job 124522031345, passed the 100% ripple and both fractional cursor pixel
+checks, but its 125% ripple baseline froze the just-unmapped cursor probe's
+150 ms destroy snapshot. The baseline still shows its translucent magenta
+rectangle; advancing the same animation clock to 415 ms removes that ghost.
+At `(640,455)`, 55 px below the ripple centre and outside its 40.078125 px
+radius, the archived baseline is `(156,54,161)` while both the ripple and
+settled captures are `(192,28,40)`. The lifecycle history records window 21
+destroy starting at 475523 ms and completing at 475960 ms after that advance.
+The proof now waits for that specific window's destroy-completed record
+under the real clock before freezing the baseline, not merely its removal
+from the live-window list. No pixel exclusions, fresh input, changed bounds
+or extra sleep replace the completion barrier; the analyzer is unchanged.
+This artifact diagnosis does not claim a fresh run of the corrected proof.
+
 
 ## Locked privacy and locate cache bounds
 

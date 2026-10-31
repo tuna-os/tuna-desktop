@@ -327,7 +327,11 @@ The pointer launcher also closes the inherited emulator FIFO writer (FD 7),
 so a running restarted compositor cannot prevent emulator EOF during cleanup.
 `scripts/tests/test_ci_install_vkms.py` contains launcher descriptor and
 coldplug/restart contract regressions; these do not qualify native device
-behavior. A fresh DRM smoke run must still pass the unchanged restart gate.
+behavior. [CI run 41193585314](https://github.com/tuna-os/tuna-desktop/actions/runs/41193585314/job/124520435500)
+passed the unchanged arrival, live, replug, restart and reset gates with
+libinput 1.25. The subsequent hot-corner proof requires
+`gsettings-desktop-schemas` for `org.gnome.desktop.interface`; the DRM lane
+installs that package explicitly alongside the Hebrew locale and GTK translations.
 
 ## Marlin VM lane
 
