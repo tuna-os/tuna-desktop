@@ -520,6 +520,11 @@ pub struct WindowManager {
     right_to_left: bool,
     workspace_outputs: Vec<crate::workspace_policy::OutputBounds>,
     floating_workareas: Vec<(String, crate::output_constraints::Rect)>,
+    /// The output layout in effect when the last output went away: the
+    /// windows' monitors stay valid while none is connected (Mutter
+    /// keeps `window->monitor` and `preferred_logical_monitor`), so the
+    /// next output change re-homes them from there.
+    unplugged_outputs: Vec<(String, Rectangle<i32, Logical>)>,
     workspace_tracker: crate::workspace_tracker::WorkspaceTracker,
     modal_dim: crate::modal_dim::ModalDim,
     icon_geometries: HashMap<u64, Rectangle<i32, Logical>>,
@@ -759,6 +764,7 @@ impl WindowManager {
             right_to_left: false,
             workspace_outputs: Vec::new(),
             floating_workareas: Vec::new(),
+            unplugged_outputs: Vec::new(),
             workspace_tracker: Default::default(),
             modal_dim: Default::default(),
             icon_geometries: Default::default(),
@@ -6043,8 +6049,17 @@ impl WindowManager {
     /// set the computed geometry, and advertise the new state.
     fn apply_layout(&mut self, state: &mut State, id: u64, layout: WindowLayout) -> bool {
         self.settle(id);
+        // No output, no work area to fit: the window keeps its geometry
+        // and takes the layout, fitted once an output returns
+        // (reapply_derived_layouts), as Mutter's constraints need a
+        // logical monitor (`meta_window_update_for_monitors_changed`).
+        let unplugged = state.outputs.is_empty() && layout != WindowLayout::Floating;
         let area = match layout {
             WindowLayout::Floating => return self.restore_window(id),
+            _ if unplugged => match self.windows.get(&id) {
+                Some(window) => window.geometry,
+                None => return false,
+            },
             WindowLayout::Maximized => Self::work_area(state),
             WindowLayout::Tiled(side) => Self::tile_area(state, side),
             WindowLayout::Fullscreen => Self::fullscreen_area(state),
@@ -6125,6 +6140,25 @@ impl WindowManager {
         before: &[(String, Rectangle<i32, Logical>)],
     ) -> usize {
         let after = state.output_slices();
+        // meta_window_update_for_monitors_changed with no logical
+        // monitor left: meta_window_find_monitor_from_id finds no target,
+        // so nothing moves and every window keeps its geometry, layout
+        // and preferred monitor. The rectangles of the monitors they were
+        // on are kept: the first outputs after the full unplug re-home
+        // the windows from there.
+        let unplugged = if after.is_empty() {
+            if !before.is_empty() {
+                self.unplugged_outputs = before.to_vec();
+            }
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.unplugged_outputs)
+        };
+        let before = if before.is_empty() {
+            unplugged.as_slice()
+        } else {
+            before
+        };
         let primary = state.primary_output_name();
         let find = |name: &str| after.iter().find(|(n, _)| n == name);
         // meta_window_find_monitor_from_id: the preferred output, else
@@ -6215,7 +6249,14 @@ impl WindowManager {
     /// when the primary changed, so no window keeps the dead
     /// primary's geometry. Floating windows are untouched (migration
     /// already placed them). Returns how many windows re-applied.
+    /// With no output connected nothing is re-applied: maximized, tiled
+    /// and strip windows keep their geometry and layout until an output
+    /// returns (Mutter keeps the tile mode and maximized state through
+    /// `meta_window_update_for_monitors_changed` without a monitor).
     pub fn reapply_derived_layouts(&mut self, state: &mut State) -> usize {
+        if state.outputs.is_empty() {
+            return 0;
+        }
         self.cancel_strip_pointer(state);
         let mut ids: Vec<u64> = self.windows.keys().copied().collect();
         ids.sort_unstable();

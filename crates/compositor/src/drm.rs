@@ -1390,7 +1390,11 @@ impl DrmBackend {
                     self.input_settings.right_to_left,
                     self.active && self.hot_corner_active && self.input_settings.hot_corners,
                 );
-                self.pointer = clamp_to_outputs(attempt, &rects);
+                // No output to move on: the pointer stays where it was
+                // instead of wandering off into space no output covers.
+                if !rects.is_empty() {
+                    self.pointer = clamp_to_outputs(attempt, &rects);
+                }
                 let mut inputs = vec![
                     ManagerInput::Motion {
                         pos: self.pointer,
@@ -1509,6 +1513,12 @@ impl DrmBackend {
             }
             other => {
                 let mut inputs = crate::windows::translate_input(other, self.primary_size());
+                // An absolute device (touchscreen, tablet in mouse mode)
+                // maps onto an output: with none lit there is nowhere to
+                // point, so the pointer holds as for relative motion.
+                if self.output_rects().is_empty() {
+                    inputs.retain(|input| !matches!(input, ManagerInput::Motion { .. }));
+                }
                 // Rotation (#345): absolute devices report panel-native
                 // pixels; remap them into the rotated logical frame the
                 // manager works in. Touch and absolute pointers arrive

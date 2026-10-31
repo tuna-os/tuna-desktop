@@ -5,7 +5,7 @@ Usage:
   scripts/tuna-hotplug-stress [--rounds N] [--out DIR]
 
 A vkms configfs instance (Linux 6.19+) with three CRTC/connector pipes is
-the hardware: connector 0 (A) stays connected, B and C are plugged and
+the hardware: connector 0 (A) starts connected, B and C are plugged and
 unplugged by writing their configfs `status`, which emits a real udev
 HOTPLUG change on the card. tuna-compositor runs `--backend drm` on it
 under a private seatd with the GTK shell, three real GTK 4 clients (one
@@ -14,7 +14,9 @@ keyboard. Each round plugs B and C, applies a DisplayConfig
 ApplyMonitorsConfig scale and arrangement change (method 1, temporary),
 sometimes unplugs the primary, sometimes rewrites monitors.xml with a
 stored configuration for the next replug, then unplugs C and B. After
-every step it gates on the compositor state (TUNA_COMPOSITOR_STATE):
+the rounds every connector, A included, is unplugged at once and plugged
+back. After every step it gates on the compositor state
+(TUNA_COMPOSITOR_STATE):
   H-OUTPUTS  wl_outputs and DisplayConfig monitors are the connected set
   H-REHOME   every window is on a live output: its own when connected,
              else the primary (Mutter's update_for_monitors_changed)
@@ -23,6 +25,10 @@ every step it gates on the compositor state (TUNA_COMPOSITOR_STATE):
   H-STORED   a monitors.xml written mid-session configures the replug
   H-INPUT    Super opens and Escape closes the overview every round
   H-GROWTH   compositor+shell PSS and fds stay bounded over the storm
+  H-ALL-UNPLUGGED  with every connector unplugged the compositor, shell
+             and clients live, windows keep their geometry and output
+             and the pointer holds; replugged, every window is back on
+             its own output at its pre-unplug geometry and input works
   H-LIVE     the compositor never exits or panics, the shell never exits
 Needs root (sudo) for modprobe, configfs, seatd and uinput.
 """
@@ -203,6 +209,11 @@ class Vkms:
     def plug(self, index, connected):
         sudo_sh(f'echo {1 if connected else 2} > "{self.path}/connectors/connector{index}/status"')
 
+    def plug_all(self, connected):
+        """Every connector at once, A included, in one shell."""
+        sudo_sh("\n".join(f'echo {1 if connected else 2} > "{self.path}/connectors/connector{i}/status"'
+                          for i in range(PIPES)))
+
     def destroy(self):
         if not self.path.exists():
             return
@@ -232,7 +243,7 @@ def run(args):
     logs, processes, samples, steps = [], [], [], []
     assertions = {}
     counts = {"hotplugs": 0, "scale_changes": 0, "stored_replugs": 0, "primary_unplugs": 0,
-              "overview_toggles": 0}
+              "overview_toggles": 0, "all_unplugs": 0}
     vkms = Vkms()
     system_seatd = subprocess.run(["systemctl", "is-active", "--quiet", "seatd"]).returncode == 0
     seatd = dbus_pid = seat = compositor = None
@@ -492,6 +503,67 @@ def run(args):
             print(f"tuna-hotplug-stress: round {r + 1}/{args.rounds} passed "
                   f"(PSS {value['pss_kib']} KiB, {value['fds']} fds)", flush=True)
 
+        # Every connector unplugged at once, then plugged back (Mutter's
+        # meta_window_update_for_monitors_changed without, then with,
+        # logical monitors). The linear arrangement first, so the replug
+        # restores it whether the kernel's changes arrive together (the
+        # previous configuration) or one by one (the linear fallback).
+        label = "all unplugged"
+        plug(1, {0, 1}, f"{label}: plug {B}")
+        plug(2, {0, 1, 2}, f"{label}: plug {C}")
+        wa, wb = max_scale(A)[1], max_scale(B)[1]
+        apply([(A, 0, 1.0, True), (B, wa, 1.0, False), (C, wa + wb, 1.0, False)])
+        check(f"{label}: {A}, {B}, {C} in a row at scale 1", [A, B, C],
+              (f"{B} at x={wa}, {C} at x={wa + wb}",
+               lambda: [outputs().get(n, {}).get("rect", [None])[0] for n in (A, B, C)] == [0, wa, wa + wb]))
+        layout = {n: o["rect"] for n, o in outputs().items()}
+        before = {n: window(n)["rect"] for n in clients}
+        vkms.plug_all(False)
+        counts["hotplugs"] += 1
+        wait_for(f"{label}: no wl_output", lambda: state().get("outputs") == [])
+        wait_for(f"{label}: DisplayConfig lists no monitor",
+                 lambda: state().get("display_config", {}).get("monitors") == [])
+        # Unplugged in one rescan, no window moves at all; one by one,
+        # the windows of the first ones go to the primary first, as for
+        # any unplug, and stay where the last unplug found them.
+        unplugged = {n: window(n)["rect"] for n in clients}
+        rescans = [line for line in log_path.read_text().splitlines() if "drm: hotplug: connected [" in line]
+        at_once = set(rescans[-1].split("disconnected [", 1)[1].rstrip("]").split(", ")) == {A, B, C}
+        if at_once and unplugged != before:
+            raise RuntimeError(f"{label}: windows moved from {before} to {unplugged} with every output gone")
+        pointer = state().get("pointer_position")
+        for _ in range(5):
+            send("move 40 30")
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            alive()
+            if "ShellExited" in log_path.read_text():
+                raise RuntimeError(f"{label}: the shell exited")
+            for name, (home, process) in clients.items():
+                if process.poll() is not None:
+                    raise RuntimeError(f"{label}: client {name} exited with {process.returncode}")
+                w = window(name)
+                if not w or w["rect"] != unplugged[name] or min(w["rect"][2:]) <= 0:
+                    raise RuntimeError(f"{label}: client {name} is {w and w['rect']}, was {unplugged[name]}")
+                prefers = state().get("window_outputs", {}).get(str(w["id"]))
+                if prefers != home:
+                    raise RuntimeError(f"{label}: client {name} now prefers {prefers}, not {home}")
+            if state().get("pointer_position") != pointer:
+                raise RuntimeError(f"{label}: the pointer moved to {state().get('pointer_position')} "
+                                   f"from {pointer} with no output")
+            time.sleep(0.2)
+        steps.append({"step": label, "elapsed_s": round(time.monotonic() - start, 3), "at_once": at_once,
+                      "outputs": state().get("outputs"), "windows": unplugged})
+        vkms.plug_all(True)
+        counts["hotplugs"] += 1
+        check(f"{label}: replugged", [A, B, C],
+              ("the arrangement and every window back at its pre-unplug geometry",
+               lambda: {n: o["rect"] for n, o in outputs().items()} == layout
+               and all((window(n) or {}).get("rect") == before[n] for n in clients)))
+        overview()
+        point_into(B)
+        counts["all_unplugs"] += 1
+
         assertions["H-OUTPUTS"] = [True, f"{counts['hotplugs']} hotplugs; wl_outputs and DisplayConfig matched the connected set after each"]
         assertions["H-REHOME"] = [True, f"{len(clients)} windows on their own output when connected, else the primary, after every step"]
         assertions["H-CLIENTS"] = [True, f"{len(clients)} GTK 4 clients alive and drawing after every step"]
@@ -499,6 +571,10 @@ def run(args):
         assertions["H-STORED"] = [counts["stored_replugs"] > 0 or args.rounds < 2,
                                   f"{counts['stored_replugs']} replugs configured by a rewritten monitors.xml"]
         assertions["H-INPUT"] = [True, f"{counts['overview_toggles']} uinput overview toggles"]
+        assertions["H-ALL-UNPLUGGED"] = [counts["all_unplugs"] == 1,
+                                         f"{len(clients)} windows kept their geometry and output with no "
+                                         f"connector, then were back at it on {A}, {B}, {C}; overview and "
+                                         f"pointer input after the replug"]
         final = samples[-1]
         # Diagnostic limits for a bounded storm, as tuna-stress's.
         pss_limit = baseline["pss_kib"] * 1.25 + 65536
