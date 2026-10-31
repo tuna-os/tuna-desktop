@@ -41,6 +41,8 @@
 set -eu
 unset CDPATH
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+# shellcheck source=scripts/lib/colord-startup.sh
+. "$ROOT/scripts/lib/colord-startup.sh"
 ARTIFACTS="$ROOT/drm-smoke-artifacts"
 SECONDS_UP=20
 while [ $# -gt 0 ]; do
@@ -76,7 +78,7 @@ cleanup() {
     if [ -n "$EMU_PID" ]; then wait "$EMU_PID" 2>/dev/null || true; fi
     if [ -n "$COMP_PID" ]; then kill "$COMP_PID" 2>/dev/null || true; fi
     if [ -n "$CALIBRATION_PID" ]; then kill "$CALIBRATION_PID" 2>/dev/null || true; fi
-    if [ -n "$COLORD_PID" ]; then sudo kill "$COLORD_PID" 2>/dev/null || true; fi
+    colord_stop
     if [ -n "$SYSTEM_BUS_PID" ]; then kill "$SYSTEM_BUS_PID" 2>/dev/null || true; fi
     if [ -n "$DBUS_PID" ]; then kill "$DBUS_PID" 2>/dev/null || true; fi
     if [ -n "$SEATD_PID" ]; then sudo kill "$SEATD_PID" 2>/dev/null || true; fi
@@ -470,19 +472,22 @@ SYSTEM_BUS_PID="$(sed -n 2p "$ARTIFACTS/dbus-system.txt")"
 # and the daemon runs as this user, so it trusts our calls as its own
 # (cd_main_sender_authenticated) without the host's polkit.
 sudo mkdir -p /var/lib/colord
-# shellcheck disable=SC2016,SC2024
-sudo unshare --mount --propagation private sh -c \
-    'mount -t tmpfs tmpfs /var/lib/colord && exec setpriv --reuid="$1" --regid="$2" --clear-groups env DBUS_SYSTEM_BUS_ADDRESS="$3" "$4" -v' \
-    sh "$(id -u)" "$(id -g)" "$SYSTEM_BUS" "$COLORD_BIN" >"$ARTIFACTS/colord.log" 2>&1 &
-COLORD_PID=$!
+colord_start
 cd_call() {
     gdbus call --address "$SYSTEM_BUS" --dest org.freedesktop.ColorManager "$@"
 }
 end=$(($(date +%s) + 30))
 until cd_call --object-path /org/freedesktop/ColorManager \
     --method org.freedesktop.ColorManager.GetDevices >/dev/null 2>&1; do
-    kill -0 "$COLORD_PID" 2>/dev/null || fail D-COLORD "colord exited: $(tail -5 "$ARTIFACTS/colord.log")"
-    [ "$(date +%s)" -le "$end" ] || fail D-COLORD "colord never served the private system bus"
+    if ! kill -0 "$COLORD_PID" 2>/dev/null; then
+        colord_reap
+        colord_failure_receipt
+        fail D-COLORD "colord wrapper exited with status $COLORD_WAIT_STATUS; see colord-startup.txt, colord-launch.log and colord.log"
+    fi
+    if [ "$(date +%s)" -gt "$end" ]; then
+        colord_failure_receipt
+        fail D-COLORD "colord never served the private system bus; see colord-startup.txt"
+    fi
     sleep 0.2
 done
 COLOR_LOG="$ARTIFACTS/compositor-color.log"
