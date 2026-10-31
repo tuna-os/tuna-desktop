@@ -33,7 +33,6 @@ concurrency:
 
 jobs:
   build:
-    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -136,7 +135,7 @@ jobs:
 
   manifest:
     needs: capture
-    if: false
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -162,80 +161,3 @@ jobs:
           name: visual-manifest
           path: visual-all/manifest.json
           retention-days: 90
-
-  old-elf-acquisition:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: tuna-ci-24.04
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    env:
-      PYTHONDONTWRITEBYTECODE: "1"
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target/ci-grid
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_INCREMENTAL: "0"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-          ref: 8eebec1308374d78b819c7f2fec48c03f7fc6d55
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
-        with:
-          toolchain: stable
-      - name: Install unchanged original build dependencies
-        run: |
-          /usr/bin/python3 - <<'PY'
-          from pathlib import Path
-          import subprocess
-          source = Path(".github/workflows/ci.yml").read_text()
-          block = source.split("\n  grid-cancel-comparison:", 1)[1].split("\n  gtk-shell:", 1)[0]
-          commands = [line.strip().removeprefix("- run: ") for line in block.splitlines()
-                      if line.strip().startswith("- run: sudo apt-get")]
-          assert len(commands) == 1
-          subprocess.run(commands[0], shell=True, check=True, timeout=600)
-          subprocess.run(["sudo", "apt-get", "install", "-y", "--no-install-recommends", "just"], check=True, timeout=120)
-          PY
-      - run: scripts/ci-install-gtk4-layer-shell
-      - name: Acquire exact old ELF without running any product or proof
-        run: |
-          /usr/bin/python3 - <<'PY'
-          import importlib.machinery, importlib.util, json, os, subprocess
-          from pathlib import Path
-          root = Path.cwd()
-          work = Path(os.environ["RUNNER_TEMP"]) / "old-elf-acquisition"
-          work.mkdir()
-          loader = importlib.machinery.SourceFileLoader("comparison", str(root / "scripts/tuna-grid-cancel-comparison"))
-          spec = importlib.util.spec_from_loader(loader.name, loader)
-          comparison = importlib.util.module_from_spec(spec)
-          loader.exec_module(comparison)
-          old = "da1b7c40c7cc69f5800970e61cffa3d4e95c3f65"
-          subprocess.run(["git", "fetch", "--no-tags", "origin", old], check=True, timeout=60)
-          source = work / "old-source"
-          subprocess.run(["git", "worktree", "add", "--detach", str(source), old], check=True, timeout=60)
-          _, admission, binaries = comparison.build(source, "old", work, {"scope": "compile-only original core identity acquisition; no runtime or qualification"})
-          binary = binaries / "tuna-shell-gtk"
-          notes = subprocess.check_output(["readelf", "-n", str(binary)], text=True, timeout=30)
-          (work / "elf-notes.txt").write_text(notes)
-          receipt = {"scope": "compile-only; no runtime/check/proof rerun", "admission": admission,
-                     "expected_sha256": "5c6cb70faefd22adda123b79328a46c576aae680555e14bcbe315458b6b752fe",
-                     "expected_core_build_id": "de1d2aae0ef79655a241a55a2c9af1b0268693d7",
-                     "sha256": comparison.contract.digest(binary)}
-          receipt["hash_matches_original"] = receipt["sha256"] == receipt["expected_sha256"]
-          receipt["build_id_matches_original_core"] = f'Build ID: {receipt["expected_core_build_id"]}' in notes
-          (work / "elf-receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
-          assert receipt["hash_matches_original"] and receipt["build_id_matches_original_core"], receipt
-          PY
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        if: always()
-        with:
-          name: exact-old-shell-ELF-NOT-ACCEPTANCE
-          path: |
-            ${{ runner.temp }}/old-elf-acquisition/bin-old/tuna-shell-gtk
-            ${{ runner.temp }}/old-elf-acquisition/elf-receipt.json
-            ${{ runner.temp }}/old-elf-acquisition/elf-notes.txt
-            ${{ runner.temp }}/old-elf-acquisition/admission-old.json
-            ${{ runner.temp }}/old-elf-acquisition/cargo-old-*.json
-          retention-days: 90
-      - if: always()
-        run: CARGO_TARGET_DIR="${CARGO_TARGET_DIR}/old" just clean
