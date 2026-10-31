@@ -1,0 +1,44 @@
+Rebuilding tuna-q-isg-mar1 from ghcr.io/tuna-os/tuna-desktop/marlin-tuna-preview@sha256:fd982116d87a978e795f462e412d7acab0d3d7d3af035285002979033a8e92a8
+  Stopping VM to free the disk...
+  Removing the old disk (tuna-q-isg-mar1-bootc-disk)...
+Building bootc disk from ghcr.io/tuna-os/tuna-desktop/marlin-tuna-preview@sha256:fd982116d87a978e795f462e412d7acab0d3d7d3af035285002979033a8e92a8
+  Disk:   pvc/tuna-q-isg-mar1-bootc-disk (40Gi, block mode)
+  Builder VM started — installing (this can take 20-40 min)...
+  [    0.285174] SELinux:  Initializing.
+  [    0.748279] NetLabel: Initializing
+  [    0.921495] pci 0000:00:03.6: bridge window [io  size 0x1000]: failed to assign
+  [    0.924564] pci 0000:00:03.7: bridge window [io  size 0x1000]: failed to assign
+  [    0.946694] pci 0000:00:02.1: bridge window [io  size 0x1000]: failed to assign
+  [    0.949746] pci 0000:00:02.0: bridge window [io  size 0x1000]: failed to assign
+  [    1.665620] drop_monitor: Initializing network drop monitor service
+  [    1.667266] Initializing XFRM netlink socket
+  [    2.000065] systemd[1]: Initializing machine ID from SMBIOS/DMI UUID.
+  [    3.614002] systemd[1]: Initializing machine ID from SMBIOS/DMI UUID.
+  [    3.943712] systemd[1]: Failed to populate /etc with preset unit settings, ignoring: Read-only file system
+  [  OK  ] Listening on systemd-bootctl.socket - Boot Entries Service Socket.
+  + echo CORRAL_BUILD_START
+  CORRAL_BUILD_START
+  [   10.680746] cloud-init[1021]: + echo CORRAL_BUILD_START
+  [   10.681351] cloud-init[1021]: CORRAL_BUILD_START
+  [   12.991431] cloud-init[1021]: tee: /dev/ttyS0: Input/output error
+  [   13.386854] cloud-init[1021]: + podman pull ghcr.io/tuna-os/tuna-desktop/marlin-tuna-preview@sha256:fd982116d87a978e795f462e412d7acab0d3d7d3af035285002979033a8e92a8
+  [  203.911987] cloud-init[1021]: + imghas /usr/lib/systemd/boot/efi/systemd-bootx64.efi
+  [  203.913240] cloud-init[1021]: + podman cp 13ece56acf4eac89fb1debbe41ad7f765c3c4856a9e01b31b1baaa98847e6707:/usr/lib/systemd/boot/efi/systemd-bootx64.efi -
+  [  204.123932] cloud-init[1021]: + echo CORRAL_BACKEND=composefs
+  [  204.124785] cloud-init[1021]: CORRAL_BACKEND=composefs
+  [  204.308935] cloud-init[1021]: + echo 'CORRAL_COMPOSEFS=1 FS=ext4'
+  [  204.309828] cloud-init[1021]: CORRAL_COMPOSEFS=1 FS=ext4
+  [  204.310608] cloud-init[1021]: + podman run --rm --privileged --pid=host --security-opt label=type:unconfined_t -v /var/lib/containers:/var/lib/containers -v /dev:/dev -v /root/buildkey.pub:/buildkey.pub:ro ghcr.io/tuna-os/tuna-desktop/marlin-tuna-preview@sha256:fd982116d87a978e795f462e412d7acab0d3d7d3af035285002979033a8e92a8 bootc install to-disk --composefs-backend --filesystem ext4 --wipe --root-ssh-authorized-keys /buildkey.pub /dev/disk/by-id/virtio-target
+  [  204.861348] cloud-init[1021]: Installing image: docker://ghcr.io/tuna-os/tuna-desktop/marlin-tuna-preview@sha256:fd982116d87a978e795f462e412d7acab0d3d7d3af035285002979033a8e92a8
+  [  205.480070] cloud-init[1021]: Creating root filesystem (ext4) on device /dev/vdc3 (size=41.9 GB)
+  [  411.130068] cloud-init[1021]: Bootloader: systemd
+  [  411.160654] cloud-init[1021]: Installing bootloader via systemd-boot
+  [  429.957646] cloud-init[1021]: Finalizing filesystem root
+  [  482.403474] cloud-init[1021]: + KVER=7.2.11-arch1-1
+  [  490.020935] cloud-init[1021]: + echo CORRAL_BUILD_OK
+  CORRAL_BUILD_OK
+  [  490.022061] cloud-init[1021]: CORRAL_BUILD_OK
+  [  490.022737] cloud-init[1021]: + echo CORRAL_BUILD_OK
+  Disk ready: pvc/tuna-q-isg-mar1-bootc-disk
+  Starting tuna-q-isg-mar1 on the new disk...
+VM "tuna-q-isg-mar1" rebuilt from ghcr.io/tuna-os/tuna-desktop/marlin-tuna-preview@sha256:fd982116d87a978e795f462e412d7acab0d3d7d3af035285002979033a8e92a8 and restarted
