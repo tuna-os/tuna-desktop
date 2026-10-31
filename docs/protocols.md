@@ -147,6 +147,14 @@ as niri does, so the stock portal works.
 | org.gnome.Mutter.IdleMonitor | GetIdletime, AddIdleWatch, AddUserActiveWatch, RemoveWatch, WatchFired | the session's idle time and watches, served by the compositor; gnome-settings-daemon dims and blanks on it, and banners wait for an away user |
 | org.gnome.Shell | ShowOSD, FocusSearch, ShowApplications, GrabAccelerator(s), UngrabAccelerator(s), AcceleratorActivated, AcceleratorDeactivated; Mode, OverviewActive, ShellVersion | served by the GTK shell: gnome-settings-daemon's media keys grab their keys here (the compositor keeps them from apps, in the action modes they ask for, the lock screen included) and show the volume and brightness OSD; GNOME's caller allowlist (Settings, media keys, the GNOME portal backend); a caller's grabs go when it leaves the bus. Grab flags `IGNORE_AUTOREPEAT` and `TRIGGER_RELEASE` are honoured (others refuse the grab): a held key's release reaches its caller as AcceleratorDeactivated, never across a lock or to a re-created grab. As Mutter's synchronous grab, a (un)grab call returns only once the compositor has installed the changed table (its `CommandResult`), so a key pressed after the reply meets it |
 
+Accelerator mutations are serialized: only their own request's
+`CommandResult` commits the proposed grab table and completes the D-Bus
+call. A denied or lost admission returns an error and cannot reappear in
+a subsequent table; a denied ungrab keeps the installed owner. Internal
+rebinding keeps the installed action callbacks until their replacement
+is acknowledged, accepting either generation's already-emitted events
+within the same control drain.
+
 ## Gaps against Mutter
 
 From the GNOME 51 capture. The globals not listed here are offered at
