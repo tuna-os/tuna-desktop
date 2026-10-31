@@ -216,8 +216,9 @@ keyboard_window_menu_proof() {
     sleep 0.6
     kr_dump "$ARTIFACTS/a11y-kr-wm-down.json" || fail G-WINDOW-MENU-KEYS "accessibility dump failed"
     kr_second="$(jq -r '[.[] | select(.showing and .focused)][0].name // empty' "$ARTIFACTS/a11y-kr-wm-down.json")"
-    [ -n "$kr_second" ] && [ "$kr_second" != "$kr_first" ] ||
+    if [ -z "$kr_second" ] || [ "$kr_second" = "$kr_first" ]; then
         fail G-WINDOW-MENU-KEYS "Down did not move from '$kr_first' to the next row"
+    fi
     xdotool key Up
     sleep 0.6
     kr_dump "$ARTIFACTS/a11y-kr-wm-up.json" || fail G-WINDOW-MENU-KEYS "accessibility dump failed"
