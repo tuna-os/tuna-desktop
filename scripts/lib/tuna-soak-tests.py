@@ -11,6 +11,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 loader = importlib.machinery.SourceFileLoader('soak', str(Path(__file__).resolve().parents[1] / 'tuna-vm-soak'))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -145,7 +146,93 @@ class ProcessFailures(unittest.TestCase):
                 soak.sample(os.getuid(), self.root)
 
 
+class UserHelpers(unittest.TestCase):
+    def setUp(self):
+        self.account = SimpleNamespace(pw_uid=1001, pw_gid=1002, pw_name='tuna-test',
+                                       pw_dir='/home/tuna-test')
+
+    def test_credentials_and_environment_do_not_inherit_root_state(self):
+        with patch.object(soak.os, 'getgrouplist', return_value=[1002, 1003]) as groups:
+            context = soak.user_context(self.account)
+        groups.assert_called_once_with('tuna-test', 1002)
+        self.assertEqual(context, {
+            'user': 1001, 'group': 1002, 'extra_groups': [1002, 1003],
+            'env': {'PATH': '/usr/bin:/bin', 'HOME': '/home/tuna-test',
+                    'USER': 'tuna-test', 'LOGNAME': 'tuna-test',
+                    'XDG_RUNTIME_DIR': '/run/user/1001',
+                    'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/run/user/1001/bus'}})
+        with patch.object(soak.os, 'getgrouplist', return_value=[1002, 1003]):
+            native = soak.user_context(self.account, 'tuna-nested-123')
+        self.assertEqual(native, context | {
+            'env': context['env'] | {'WAYLAND_DISPLAY': 'tuna-nested-123'}})
+
+    def test_all_health_calls_use_direct_credentials_without_pam_wrappers(self):
+        context = {'user': 1001, 'group': 1002, 'extra_groups': [1002], 'env': {}}
+        with patch.object(soak, 'call', side_effect=['(false,)', '()', '(<<uint32 0>>,)', '()']) as call:
+            replies = soak.session_health(context)
+        self.assertEqual(list(replies), ['lock_reply', 'calendar_reply', 'portal_reply', 'portal_gnome_reply'])
+        self.assertEqual(call.call_count, 4)
+        for invocation in call.call_args_list:
+            self.assertEqual(invocation.args[0][:3], ['gdbus', 'call', '--session'])
+            self.assertEqual(invocation.kwargs, {'context': context})
+            self.assertNotIn('runuser', invocation.args[0])
+
+    def test_failure_names_the_exact_endpoint_and_method(self):
+        with patch.object(soak, 'call', side_effect=[
+            '(false,)', '()', '(<<uint32 0>>,)', RuntimeError('health helper exceeded its deadline'),
+        ]):
+            with self.assertRaisesRegex(
+                RuntimeError, r'portal_gnome health check .*org.freedesktop.impl.portal.desktop.gnome, '
+                              r'org.freedesktop.DBus.Peer.Ping.*health helper exceeded its deadline',
+            ):
+                soak.session_health({})
+
+    def test_invalid_lock_reply_still_fails_closed(self):
+        with patch.object(soak, 'call', return_value='()') as call:
+            with self.assertRaisesRegex(RuntimeError, 'screen-saver health reply'):
+                soak.session_health({})
+        self.assertEqual(call.call_count, 1)
+
+    @unittest.skipUnless(os.geteuid() == 0, 'actual UID/GID drop requires root')
+    def test_real_child_drops_identity_and_groups_but_observer_stays_root(self):
+        account = soak.pwd.getpwnam('nobody')
+        context = soak.user_context(account)
+        code = ('import json,os; print(json.dumps(dict(uid=os.getuid(), euid=os.geteuid(), '
+                'gid=os.getgid(), groups=os.getgroups(), env=dict(os.environ), '
+                'session=os.getsid(0), pid=os.getpid())))')
+        with patch.object(soak.subprocess, 'Popen', wraps=soak.subprocess.Popen) as spawn:
+            result = json.loads(soak.call([sys.executable, '-I', '-c', code], context=context))
+        self.assertEqual(result['uid'], account.pw_uid)
+        self.assertEqual(result['euid'], account.pw_uid)
+        self.assertEqual(result['gid'], account.pw_gid)
+        self.assertEqual(sorted(result['groups']), sorted(context['extra_groups']))
+        self.assertNotIn(0, result['groups'])
+        for key, value in context['env'].items():
+            self.assertEqual(result['env'][key], value)
+        self.assertNotIn('SUDO_UID', result['env'])
+        self.assertEqual(result['session'], result['pid'])
+        self.assertEqual(os.geteuid(), 0)
+        self.assertEqual(spawn.call_args.args[0][0], sys.executable)
+        for key, value in context.items():
+            self.assertEqual(spawn.call_args.kwargs[key], value)
+
+
 class HelperFailures(unittest.TestCase):
+    def test_default_deadline_remains_ten_seconds_with_child_credentials(self):
+        from unittest.mock import Mock
+        process = Mock(pid=123, returncode=None)
+        process.poll.return_value = None
+        with patch.object(soak.subprocess, 'Popen', return_value=process) as spawn, \
+             patch.object(soak.time, 'monotonic', side_effect=[100, 110]), \
+             patch.object(soak.os, 'killpg') as kill:
+            context = {'user': 1001, 'group': 1002, 'extra_groups': [1002], 'env': {}}
+            with self.assertRaisesRegex(RuntimeError, 'deadline'):
+                soak.call(['gdbus'], context=context)
+        kill.assert_called_once_with(123, soak.signal.SIGKILL)
+        process.wait.assert_called_once()
+        for key, value in context.items():
+            self.assertEqual(spawn.call_args.kwargs[key], value)
+
     def test_output_budget_is_enforced_even_after_exit(self):
         with self.assertRaisesRegex(RuntimeError, 'output budget'):
             soak.call([sys.executable, '-c', 'print("x" * 65537)'])
