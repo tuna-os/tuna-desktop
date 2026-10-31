@@ -306,5 +306,38 @@ exec 7>&-
 
 
 
+class NativePointerMotion(unittest.TestCase):
+    def test_native_callback_does_not_rewind_the_pending_motion_accumulator(self):
+        runtime = (ROOT / "crates/compositor/src/runtime.rs").read_text()
+        callback = runtime.split(
+            ".insert_source(sources.input, |event, _, rt: &mut Runtime| {", 1)[1].split(
+                "if let Some(udev) = sources.udev", 1)[0]
+        # Every libinput callback runs before the frame may deliver motion to
+        # the manager. A later delta must start at DRM's accumulated position,
+        # not the stale manager position. Once drained, manager constraints win.
+        self.assertEqual(callback.count("drm.set_pointer("), 1)
+        self.assertRegex(
+            callback,
+            r"if !rt\.motion_queue\.pending\(\) \{\s*"
+            r"let pos = rt\.manager\.pointer_pos\(\);\s*"
+            r"if let Backend::Drm\(drm\) = &mut rt\.backend \{\s*"
+            r"drm\.set_pointer\(pos\);\s*\}\s*\}")
+        self.assertRegex(
+            runtime,
+            r"if !self\.motion_queue\.pending\(\) \{\s*"
+            r"drm\.set_pointer\(self\.manager\.pointer_pos\(\)\);\s*\}")
+
+    def test_hotcorner_parking_keeps_exact_motion_and_state_assertion(self):
+        corner = SMOKE.read_text().split("\ncorner_run() {\n", 1)[1].split(
+            "\n}\n", 1)[0]
+        parking = corner.split("# Park at (60, 60)", 1)[1].split('quiet "parking"', 1)[0]
+        self.assertIn(
+            "cm 0 400 1 0; cm 400 0 1 0; cm -3000 0 1 0; "
+            "cm 60 0 1 0; cm 0 -3000 1 0; cm 0 60 1 0", parking)
+        self.assertIn('at 60 60 || fail "$phase"', parking)
+        self.assertIn('state ".pointer_position == [$x, $2]" 5', corner)
+        self.assertNotIn("sleep", parking)
+
+
 if __name__ == "__main__":
     unittest.main()

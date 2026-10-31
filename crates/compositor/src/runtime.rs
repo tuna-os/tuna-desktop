@@ -1052,11 +1052,16 @@ impl Runtime {
                             rt.on_tablet_input(event);
                         }
                         rt.pad_osd_tick();
-                        // The window manager has the final say (a locked
-                        // pointer stays put): the drawn cursor follows it.
-                        let pos = rt.manager.pointer_pos();
-                        if let Backend::Drm(drm) = &mut rt.backend {
-                            drm.set_pointer(pos);
+                        // The manager has the final say (a locked pointer
+                        // stays put), but only after queued motion reaches it.
+                        // Until then DRM owns the accumulated position; using
+                        // the stale manager position would lose relative moves
+                        // delivered before the next frame.
+                        if !rt.motion_queue.pending() {
+                            let pos = rt.manager.pointer_pos();
+                            if let Backend::Drm(drm) = &mut rt.backend {
+                                drm.set_pointer(pos);
+                            }
                         }
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;

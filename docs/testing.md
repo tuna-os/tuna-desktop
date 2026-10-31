@@ -333,6 +333,19 @@ libinput 1.25. The subsequent hot-corner proof requires
 `gsettings-desktop-schemas` for `org.gnome.desktop.interface`; the DRM lane
 installs that package explicitly alongside the Hebrew locale and GTK translations.
 
+The next [native run 41202327855](https://github.com/tuna-os/tuna-desktop/actions/runs/41202327855/job/124540485483)
+again passed all pointer-settings gates, then failed `D-HOT-CORNER` parking:
+all six relative-motion events arrived, but the final pointer was
+`[400.0,460.0]` instead of `[60,60]`. The native input callback was copying
+the window manager's stale position back into DRM after each event while
+per-frame motion was still queued, losing accumulated relative motion.
+Like the tick path, the callback now reconciles DRM to the manager only
+after the queue drains; until then DRM retains the accumulated position.
+The six uinput commands, exact parking assertion, and pressure gates remain
+unchanged, without a timing delay workaround. The native script regressions
+cover the callback/tick ownership guards and preserve that parking sequence;
+a fresh native run is still required to qualify the fix.
+
 ## Marlin VM lane
 
 The `marlin-vm` job (#68) boots the real TunaOS Marlin image with Tuna Desktop
