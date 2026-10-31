@@ -355,8 +355,19 @@ have populated pending state, not their socket or client-issue time;
 `callback_drained` records actual callback identities removed by the unchanged
 Smithay sender with before/after-send times. It establishes `done` queued,
 not client receipt. Nested bind, render-finish, submit, no-repaint decisions and
-client-flush boundaries retain their real outcomes. The nested path's current
-lack of a post-render flush is recorded, not silently repaired by the observer.
+client-flush boundaries retain their real outcomes. `tick_stage` records split
+the loop between its pre-dispatch flush and repaint into named stages, each
+with the compositor main thread's runtime, runqueue wait and timeslices, so a
+stalled stage is classified as compositor CPU, runnable wait or off-CPU time.
+
+Run 41227591692 (head e39b95b2) retained a real sparse switch: the shell's
+frame-clock gaps were 137.958/226.450 ms with only ~2 ms CPU and no runqueue
+wait, while the compositor spent 106–112 ms between its client flush and
+repaint and then queued `done` without flushing until the next loop wake
+(~16 ms). The compositor now flushes the events a render queued on every
+backend, as native sessions already did (regression:
+`runtime::rendered_event_tests`). The in-tick delay is attributed by the stage
+records before any further fix.
 Disabled tracing performs no observer clock reads, allocation or surface walks.
 
 The installed `journey` qualification intentionally checks out the pull-request

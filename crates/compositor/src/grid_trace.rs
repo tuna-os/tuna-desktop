@@ -242,7 +242,7 @@ pub(crate) fn stage(state: &State, stage: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::{
         io::{Read, Write},
@@ -320,8 +320,9 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn observes_only_actual_callback_ids_removed_by_smithay() {
+    /// A real wire client with surface 4 holding frame callbacks 5 and 6
+    /// after one commit; the registry/bind replies are already drained.
+    pub(crate) fn frame_client() -> (crate::TestCompositor, UnixStream, WlSurface) {
         let mut compositor = crate::TestCompositor::new();
         let (server, mut wire) = UnixStream::pair().unwrap();
         wire.set_nonblocking(true).unwrap();
@@ -366,9 +367,17 @@ mod tests {
         bind.extend(words(&[4, (8 << 16) | 6])); // commit
         wire.write_all(&bind).unwrap();
         compositor.pump();
+        let mut stale = [0; 4096];
+        while wire.read(&mut stale).is_ok_and(|count| count > 0) {}
         let surface: WlSurface = client
             .object_from_protocol_id(&compositor.display.handle(), 4)
             .unwrap();
+        (compositor, wire, surface)
+    }
+
+    #[test]
+    fn observes_only_actual_callback_ids_removed_by_smithay() {
+        let (_compositor, _wire, surface) = frame_client();
         let before = snapshot(&surface);
         assert_eq!(
             before[0]

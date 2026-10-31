@@ -181,6 +181,71 @@ mod display_readiness_tests {
     }
 }
 
+/// Send the events a render queued (frame `done`, presentation feedback, fifo
+/// releases) to the clients' sockets now rather than at the next dispatch.
+fn flush_rendered_events(display: &mut Display<State>, state: &State) -> Result<(), RuntimeError> {
+    crate::grid_trace::event(state, "flush_begin", format_args!("site=post_render"));
+    let flushed = display.flush_clients();
+    crate::grid_trace::event(
+        state,
+        "flush_end",
+        format_args!("site=post_render ok={}", flushed.is_ok()),
+    );
+    flushed.map_err(|e| RuntimeError::Dispatch(e.to_string()))
+}
+
+#[cfg(test)]
+mod rendered_event_tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn frame_done_reaches_the_client_without_another_dispatch() {
+        let (mut compositor, mut wire, surface) = crate::grid_trace::tests::frame_client();
+        let output = smithay::output::Output::new(
+            "flush-test".into(),
+            smithay::output::PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: smithay::output::Subpixel::Unknown,
+                make: "test".into(),
+                model: "test".into(),
+            },
+        );
+        // The render path's sender: done is queued, not yet on the socket.
+        send_frames_surface_tree(
+            &surface,
+            &output,
+            Duration::ZERO,
+            Some(Duration::ZERO),
+            |_, _| Some(output.clone()),
+        );
+        let mut bytes = [0_u8; 4096];
+        assert!(
+            matches!(wire.read(&mut bytes), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "queued done must not reach the client before the render flush"
+        );
+        flush_rendered_events(&mut compositor.display, &compositor.state).unwrap();
+        let count = wire.read(&mut bytes).unwrap();
+        let words: Vec<u32> = bytes[..count]
+            .chunks_exact(4)
+            .map(|word| u32::from_ne_bytes(word.try_into().unwrap()))
+            .collect();
+        // wl_callback@5.done and @6.done (opcode 0, 12 bytes), each followed
+        // by wl_display.delete_id; no client request was dispatched between.
+        let mut done = Vec::new();
+        let mut at = 0;
+        while at + 1 < words.len() {
+            let (object, header) = (words[at], words[at + 1]);
+            let size = (header >> 16) as usize / 4;
+            if header & 0xffff == 0 && object != 1 && size == 3 {
+                done.push(object);
+            }
+            at += size.max(2);
+        }
+        assert_eq!(done, [5, 6]);
+    }
+}
+
 /// Default nested output size (physical pixels).
 const DEFAULT_WIDTH: i32 = 1280;
 const DEFAULT_HEIGHT: i32 = 800;
@@ -5136,30 +5201,11 @@ impl Runtime {
         // Send what this tick queued for the shell now, not at the next
         // wake, which may be far off (#503).
         self.control.flush(self.manager.model());
-        #[cfg(feature = "drm")]
-        if matches!(self.backend, Backend::Drm(_)) {
-            // Rendering queues callbacks only for a submitted scanout. Send
-            // those events now so a redraw need not wait for the next tick.
-            crate::grid_trace::event(
-                &self.state,
-                "flush_begin",
-                format_args!("site=post_render_drm"),
-            );
-            let flushed = self.display.flush_clients();
-            crate::grid_trace::event(
-                &self.state,
-                "flush_end",
-                format_args!("site=post_render_drm ok={}", flushed.is_ok()),
-            );
-            flushed.map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-        }
-        if matches!(self.backend, Backend::Winit(_)) {
-            crate::grid_trace::event(
-                &self.state,
-                "tick_end",
-                format_args!("backend=nested post_render_flush=false"),
-            );
-        }
+        // Rendering queues frame callbacks (and presentation/fifo events) for
+        // the frame it produced. Send them now, on every backend: waiting for
+        // the next tick's pre-dispatch flush delayed the nested shell's next
+        // frame by a whole loop wake (#965). One flush per tick, no new wake.
+        flush_rendered_events(&mut self.display, &self.state)?;
         Ok(!self.exit)
     }
 
