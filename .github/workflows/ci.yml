@@ -456,7 +456,17 @@ jobs:
       # FIFOs and sockets left by the proofs make the zipper warn
       # ENTRYNOTSUPPORTED and drop them (#484); list and remove them first.
       - if: always()
-        run: scripts/ci-prepare-artifacts journey-artifacts package-artifacts/installed
+        run: |
+          scripts/ci-prepare-artifacts journey-artifacts package-artifacts/installed
+          # The installed GTK proof is separate from tuna-journey. Keep its
+          # raw animation trace and matcher output in journey-shots as well,
+          # even if the proof failed before reaching its final assertions.
+          if [ -d package-artifacts/installed/controls ]; then
+            mkdir -p journey-artifacts/installed-controls
+            for diagnostic in package-artifacts/installed/controls/nested.log package-artifacts/installed/controls/grid-anim-samples-*.txt; do
+              [ ! -f "$diagnostic" ] || cp "$diagnostic" journey-artifacts/installed-controls/
+            done
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
