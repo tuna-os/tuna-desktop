@@ -485,7 +485,7 @@ impl shell_dbus::ShellActions for GnomeShellDbus {
     fn set_accelerator_grabs(
         &self,
         grabs: Vec<tuna_shell_control::AcceleratorGrab>,
-    ) -> Option<u64> {
+    ) -> Option<shell_dbus::AcceleratorRequest> {
         let mut shell = self.shell.borrow_mut();
         let control = shell.control.as_mut()?;
         let locked = control.locked();
@@ -504,7 +504,10 @@ impl shell_dbus::ShellActions for GnomeShellDbus {
                 locked,
             );
         }
-        result.ok()
+        result.ok().map(|id| shell_dbus::AcceleratorRequest {
+            generation: control.connection_generation(),
+            id,
+        })
     }
 }
 
@@ -3953,9 +3956,11 @@ fn build(app: &adw::Application) {
                 drop(shell);
                 // A hang-up or a redial changes what the views may trust
                 // (lock authority, input-method admission) without a frame.
-                if generation != before || closed {
-                    // Nothing sent on the old stream will be answered.
+                if closed {
                     gnome_shell.release_replies();
+                } else {
+                    // A send may have redialed between pump calls already.
+                    gnome_shell.control_changed(Some(generation));
                 }
                 if handled || generation != before || closed != was_closed {
                     sync(drained);

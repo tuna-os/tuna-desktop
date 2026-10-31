@@ -74,11 +74,18 @@ pub trait ShellActions {
     fn focus_search(&self);
     fn show_applications(&self);
     fn overview_active(&self) -> bool;
-    /// Hand the compositor the full set of grabs with their flags: the
-    /// request id its `CommandResult` will answer, or `None` when nothing
-    /// was sent (no compositor link).
-    fn set_accelerator_grabs(&self, grabs: Vec<tuna_shell_control::AcceleratorGrab>)
-        -> Option<u64>;
+    /// Hand the compositor the full set of grabs with their flags: its
+    /// connection generation and request id, or `None` if nothing was sent.
+    fn set_accelerator_grabs(
+        &self,
+        grabs: Vec<tuna_shell_control::AcceleratorGrab>,
+    ) -> Option<AcceleratorRequest>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcceleratorRequest {
+    pub generation: u64,
+    pub id: u64,
 }
 
 /// Parse a GNOME accelerator string (`<Super>p`, `XF86AudioRaiseVolume`)
@@ -236,14 +243,13 @@ pub const INTERNAL_BASE: u32 = 0x4000_0000;
 pub struct Service {
     conn: RefCell<Option<gio::DBusConnection>>,
     grabs: RefCell<Grabs>,
-    /// The shell's own keybindings, ids from [`INTERNAL_BASE`], with
-    /// their GNOME grab flags.
-    internal: RefCell<Vec<tuna_shell_control::AcceleratorGrab>>,
+    /// The desired shell generation and the one last acknowledged by the
+    /// compositor. Every outbound full table snapshots the desired Rc,
+    /// including tables sent for external callers.
+    internal: RefCell<Option<Rc<InternalGeneration>>>,
+    installed_internal: RefCell<Option<PendingInternal>>,
     /// Monotonic action identities; retired generations are never reused.
     next_internal: Cell<u32>,
-    internal_indices: RefCell<BTreeMap<u32, usize>>,
-    /// Runs an internal binding by its index.
-    on_internal: RefCell<Option<InternalRun>>,
     /// Replacements sent but not yet acknowledged. Until then an event
     /// may name either the installed table or one just applied remotely.
     pending_internal: RefCell<VecDeque<PendingInternal>>,
@@ -255,7 +261,6 @@ pub struct Service {
     calls: RefCell<VecDeque<GrabCall>>,
     pending_call: RefCell<Option<PendingCall>>,
     push_deferred: Cell<bool>,
-    deferred_internal: RefCell<Option<(BTreeMap<u32, usize>, InternalRun)>>,
     /// `/org/gnome/Shell/Introspect`, relayed to the compositor.
     introspect: RefCell<Option<crate::introspect_forward::Relay>>,
 }
@@ -281,7 +286,7 @@ enum GrabChange {
 }
 
 struct PendingCall {
-    request: u64,
+    request: AcceleratorRequest,
     sender: String,
     change: GrabChange,
     answer: glib::Variant,
@@ -289,21 +294,34 @@ struct PendingCall {
     cancelled: bool,
 }
 
-struct PendingInternal {
-    request: u64,
+struct InternalGeneration {
+    grabs: Vec<tuna_shell_control::AcceleratorGrab>,
     indices: BTreeMap<u32, usize>,
     run: InternalRun,
 }
 
+struct PendingInternal {
+    request: AcceleratorRequest,
+    generation: Option<Rc<InternalGeneration>>,
+}
+
 impl Service {
-    fn send_table(&self, change: Option<&GrabChange>) -> Option<u64> {
+    fn send_table(&self, change: Option<&GrabChange>) -> Option<AcceleratorRequest> {
         let grabs = self.grabs.borrow();
-        let internal = self.internal.borrow();
+        let internal = self.internal.borrow().clone();
         let additions = match change {
             Some(GrabChange::Add(additions)) => additions.len(),
             _ => 0,
         };
-        let mut typed = Vec::with_capacity(grabs.by_action.len() + additions + internal.len());
+        let internal_len = internal
+            .as_ref()
+            .map_or(0, |generation| generation.grabs.len());
+        let removed = match change {
+            Some(GrabChange::Remove(ids)) => ids.len(),
+            _ => 0,
+        };
+        let mut typed =
+            Vec::with_capacity(grabs.by_action.len() - removed + additions + internal_len);
         let mut append = |action, grab: &Grab| {
             typed.push(tuna_shell_control::AcceleratorGrab {
                 accelerator: tuna_shell_control::Accelerator {
@@ -326,13 +344,35 @@ impl Service {
                 append(*action, grab);
             }
         }
-        typed.extend(internal.iter().copied());
-        self.actions.set_accelerator_grabs(typed)
+        if let Some(generation) = internal.as_ref() {
+            typed.extend(generation.grabs.iter().copied());
+        }
+        let request = self.actions.set_accelerator_grabs(typed)?;
+        // A send can itself redial the control client. This path sends only
+        // without an external call in flight; retain no old-link callbacks.
+        self.pending_internal
+            .borrow_mut()
+            .retain(|table| table.request.generation == request.generation);
+        if self
+            .installed_internal
+            .borrow()
+            .as_ref()
+            .is_some_and(|table| table.request.generation != request.generation)
+        {
+            self.installed_internal.borrow_mut().take();
+        }
+        self.pending_internal
+            .borrow_mut()
+            .push_back(PendingInternal {
+                request,
+                generation: internal,
+            });
+        Some(request)
     }
 
     /// Do not let an internal refresh overwrite an in-flight external
     /// proposal, or include it in a later table before its admission.
-    fn push(&self) -> Option<u64> {
+    fn push(&self) -> Option<AcceleratorRequest> {
         if self.pending_call.borrow().is_some() {
             self.push_deferred.set(true);
             return None;
@@ -422,36 +462,29 @@ impl Service {
         if !self.push_deferred.replace(false) {
             return;
         }
-        if let Some(request) = self.push() {
-            if let Some((indices, run)) = self.deferred_internal.borrow_mut().take() {
-                self.pending_internal
-                    .borrow_mut()
-                    .push_back(PendingInternal {
-                        request,
-                        indices,
-                        run,
-                    });
-            }
-        }
+        let _ = self.push();
     }
 
     /// Match only this request's answer. An unrelated later success must
     /// not admit a denied, unanswered, or old-link table.
+    /// The compositor handles/writes results in request order on one socket.
+    /// Main dispatches a drain's accelerator events before its ordered
+    /// results, so both installed and pending snapshots remain resolvable
+    /// for those events until their own result retires the old generation.
     pub fn command_result(&self, id: u64, applied: bool) {
         let internal = {
             let mut pending = self.pending_internal.borrow_mut();
             pending
                 .iter()
-                .position(|table| table.request == id)
+                .position(|table| table.request.id == id)
                 .and_then(|i| pending.remove(i))
         };
         if let Some(table) = internal.filter(|_| applied) {
-            *self.internal_indices.borrow_mut() = table.indices;
-            *self.on_internal.borrow_mut() = Some(table.run);
+            *self.installed_internal.borrow_mut() = Some(table);
         }
         let call = {
             let mut pending = self.pending_call.borrow_mut();
-            if pending.as_ref().is_some_and(|call| call.request == id) {
+            if pending.as_ref().is_some_and(|call| call.request.id == id) {
                 pending.take()
             } else {
                 None
@@ -506,21 +539,60 @@ impl Service {
         }
     }
 
-    pub fn release_replies(&self) {
-        let call = self.pending_call.borrow_mut().take();
+    /// Observe the live stream on every pump, not only a generation change
+    /// within `poll`: an intervening write can already have redialed it.
+    /// New-link admissions survive; old-link proposals fail without commit.
+    pub fn control_changed(&self, generation: Option<u64>) {
+        let mut interrupted = false;
+        {
+            let mut pending = self.pending_internal.borrow_mut();
+            let before = pending.len();
+            pending.retain(|table| Some(table.request.generation) == generation);
+            interrupted |= before != pending.len();
+        }
+        {
+            let mut installed = self.installed_internal.borrow_mut();
+            if installed
+                .as_ref()
+                .is_some_and(|table| Some(table.request.generation) != generation)
+            {
+                installed.take();
+                interrupted = true;
+            }
+        }
+        let call = {
+            let mut pending = self.pending_call.borrow_mut();
+            if pending
+                .as_ref()
+                .is_some_and(|call| Some(call.request.generation) != generation)
+            {
+                pending.take()
+            } else {
+                None
+            }
+        };
         if let Some(call) = call {
+            interrupted = true;
             (call.reply)(Err(()));
         }
-        loop {
-            let call = self.calls.borrow_mut().pop_front();
-            let Some(call) = call else { break };
-            (call.reply)(Err(()));
+        if generation.is_none() {
+            loop {
+                let call = self.calls.borrow_mut().pop_front();
+                let Some(call) = call else { break };
+                (call.reply)(Err(()));
+            }
+            self.push_deferred.set(false);
+        } else if interrupted {
+            self.push_deferred.set(true);
+            if self.pending_call.borrow().is_none() {
+                self.flush_deferred();
+                self.start_next_call();
+            }
         }
-        self.pending_internal.borrow_mut().clear();
-        self.deferred_internal.borrow_mut().take();
-        self.push_deferred.set(false);
-        self.internal_indices.borrow_mut().clear();
-        *self.on_internal.borrow_mut() = None;
+    }
+
+    pub fn release_replies(&self) {
+        self.control_changed(None);
     }
 
     /// Bind the shell's own keys: `accelerators[i]` (accelerator, modes,
@@ -551,19 +623,12 @@ impl Service {
             }
         }
         self.grabs.borrow_mut().reserved = reserved;
-        *self.internal.borrow_mut() = list;
-        if let Some(request) = self.push() {
-            self.pending_internal
-                .borrow_mut()
-                .push_back(PendingInternal {
-                    request,
-                    indices,
-                    run,
-                });
-        } else {
-            *self.deferred_internal.borrow_mut() = Some((indices, run));
-            self.push_deferred.set(true);
-        }
+        *self.internal.borrow_mut() = Some(Rc::new(InternalGeneration {
+            grabs: list,
+            indices,
+            run,
+        }));
+        let _ = self.push();
     }
 
     /// A grabbed accelerator fired: one of the shell's own runs here;
@@ -585,19 +650,22 @@ impl Service {
             if released {
                 return;
             }
+            let find = |generation: &InternalGeneration| {
+                generation
+                    .indices
+                    .get(&action)
+                    .map(|index| (*index, generation.run.clone()))
+            };
             let handler = self
-                .internal_indices
+                .installed_internal
                 .borrow()
-                .get(&action)
-                .copied()
-                .zip(self.on_internal.borrow().clone())
+                .as_ref()
+                .and_then(|table| table.generation.as_deref().and_then(find))
                 .or_else(|| {
-                    self.pending_internal.borrow().iter().find_map(|table| {
-                        table
-                            .indices
-                            .get(&action)
-                            .map(|index| (*index, table.run.clone()))
-                    })
+                    self.pending_internal
+                        .borrow()
+                        .iter()
+                        .find_map(|table| table.generation.as_deref().and_then(find))
                 });
             if let Some((index, run)) = handler {
                 run(index, mode);
@@ -685,17 +753,15 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
     let service = Rc::new(Service {
         conn: RefCell::new(None),
         grabs: RefCell::new(Grabs::default()),
-        internal: RefCell::new(Vec::new()),
+        internal: RefCell::new(None),
         next_internal: Cell::new(INTERNAL_BASE),
-        internal_indices: RefCell::new(BTreeMap::new()),
-        on_internal: RefCell::new(None),
+        installed_internal: RefCell::new(None),
         pending_internal: RefCell::new(VecDeque::new()),
         actions: actions.clone(),
         watch: RefCell::new(None),
         calls: RefCell::new(VecDeque::new()),
         pending_call: RefCell::new(None),
         push_deferred: Cell::new(false),
-        deferred_internal: RefCell::new(None),
         introspect: RefCell::new(None),
     });
     let node = match gio::DBusNodeInfo::for_xml(XML) {
@@ -943,6 +1009,7 @@ mod tests {
         RefCell<Vec<tuna_shell_control::Accelerator>>,
         Cell<u64>,
         Cell<bool>,
+        Cell<u64>,
     );
 
     impl ShellActions for RecordedActions {
@@ -955,13 +1022,16 @@ mod tests {
         fn set_accelerator_grabs(
             &self,
             grabs: Vec<tuna_shell_control::AcceleratorGrab>,
-        ) -> Option<u64> {
+        ) -> Option<AcceleratorRequest> {
             self.1.set(self.1.get() + 1);
             if self.2.get() {
                 return None;
             }
             *self.0.borrow_mut() = grabs.into_iter().map(|g| g.accelerator).collect();
-            Some(self.1.get())
+            Some(AcceleratorRequest {
+                generation: self.3.get(),
+                id: self.1.get(),
+            })
         }
     }
 
@@ -969,17 +1039,15 @@ mod tests {
         Service {
             conn: RefCell::new(None),
             grabs: RefCell::new(Grabs::default()),
-            internal: RefCell::new(Vec::new()),
+            internal: RefCell::new(None),
             next_internal: Cell::new(INTERNAL_BASE),
-            internal_indices: RefCell::new(BTreeMap::new()),
-            on_internal: RefCell::new(None),
+            installed_internal: RefCell::new(None),
             pending_internal: RefCell::new(VecDeque::new()),
             actions,
             watch: RefCell::new(None),
             calls: RefCell::new(VecDeque::new()),
             pending_call: RefCell::new(None),
             push_deferred: Cell::new(false),
-            deferred_internal: RefCell::new(None),
             introspect: RefCell::new(None),
         }
     }
@@ -1147,6 +1215,74 @@ mod tests {
     }
 
     #[test]
+    fn external_table_snapshots_a_previously_denied_or_unsent_internal_generation() {
+        for unsent in [false, true] {
+            let actions = Rc::new(RecordedActions::default());
+            let service = test_service(actions.clone());
+            let old_calls = Rc::new(Cell::new(0));
+            let calls = old_calls.clone();
+            service.set_internal(
+                &[("<Super>n".into(), tuna_shell_control::MODE_NORMAL, 0)],
+                Rc::new(move |_, _| calls.set(calls.get() + 1)),
+            );
+            service.command_result(1, true);
+            let old = actions.0.borrow()[0].action;
+            let new_calls = Rc::new(Cell::new(0));
+            let calls = new_calls.clone();
+            actions.2.set(unsent);
+            service.set_internal(
+                &[("<Super>n".into(), tuna_shell_control::MODE_NORMAL, 0)],
+                Rc::new(move |_, _| calls.set(calls.get() + 1)),
+            );
+            if !unsent {
+                service.command_result(2, false);
+            }
+            actions.2.set(false);
+            let grab = queued(&service, play_grab());
+            assert!(grab.borrow().is_none());
+            let new = actions
+                .0
+                .borrow()
+                .iter()
+                .find(|a| a.action >= INTERNAL_BASE)
+                .unwrap()
+                .action;
+            let desired = service.internal.borrow().clone().unwrap();
+            let pending = service.pending_internal.borrow();
+            let snapshot = pending
+                .iter()
+                .find(|table| table.request.id == 3)
+                .and_then(|table| table.generation.as_ref())
+                .unwrap();
+            assert!(
+                Rc::ptr_eq(&desired, snapshot),
+                "outbound table copied or omitted its generation"
+            );
+            drop(pending);
+            // Control events are grouped before results in Drained, including
+            // an event from the just-applied table in the same socket drain.
+            service.accelerator_activated(new, 1, tuna_shell_control::MODE_NORMAL);
+            assert_eq!(
+                new_calls.get(),
+                1,
+                "new internal identity had no callback before its own ack (unsent={unsent})"
+            );
+            service.accelerator_activated(old, 2, tuna_shell_control::MODE_NORMAL);
+            assert_eq!(old_calls.get(), 1);
+            service.command_result(3, true);
+            assert!(grab.borrow().as_ref().unwrap().is_ok());
+            service.accelerator_activated(old, 3, tuna_shell_control::MODE_NORMAL);
+            assert_eq!(
+                old_calls.get(),
+                1,
+                "acknowledged replacement retained the old callback"
+            );
+            service.accelerator_activated(new, 4, tuna_shell_control::MODE_NORMAL);
+            assert_eq!(new_calls.get(), 2);
+        }
+    }
+
+    #[test]
     fn departed_caller_cannot_acquire_a_pending_grab() {
         let actions = Rc::new(RecordedActions::default());
         let service = test_service(actions.clone());
@@ -1161,6 +1297,92 @@ mod tests {
             "departed owner's remote proposal was not retired"
         );
         assert!(service.grabs.borrow().by_action.is_empty());
+    }
+
+    #[test]
+    fn redial_between_pumps_fails_old_admission_but_preserves_new_link_calls() {
+        let actions = Rc::new(RecordedActions::default());
+        let service = test_service(actions.clone());
+        service.set_internal(
+            &[("<Super>n".into(), tuna_shell_control::MODE_NORMAL, 0)],
+            Rc::new(|_, _| {}),
+        );
+        service.command_result(1, true);
+        let old_call = queued(&service, play_grab()); // request 2, generation 0
+        let new_call = queued(&service, GrabOperation::Grab("XF86AudioNext".into(), 1, 0));
+        // Another control command redials between pumps. The pump sees an
+        // already-new generation both before and after draining.
+        actions.3.set(1);
+        service.control_changed(Some(1));
+        assert!(old_call.borrow().as_ref().unwrap().is_err());
+        assert!(new_call.borrow().is_none());
+        let new_request = service.pending_call.borrow().as_ref().unwrap().request;
+        assert_eq!(
+            new_request,
+            AcceleratorRequest {
+                generation: 1,
+                id: 4
+            }
+        );
+        service.control_changed(Some(1));
+        assert!(
+            new_call.borrow().is_none(),
+            "new-link request was cancelled with the old one"
+        );
+        service.command_result(2, true);
+        assert!(
+            new_call.borrow().is_none(),
+            "old-link ack admitted the new request"
+        );
+        service.command_result(3, true); // internal restoration, not the external call
+        assert!(new_call.borrow().is_none());
+        service.command_result(4, true);
+        assert_eq!(
+            new_call
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get::<(u32,)>(),
+            Some((2,))
+        );
+        assert!(!service.grabs.borrow().by_action.contains_key(&1));
+        assert!(service.grabs.borrow().by_action.contains_key(&2));
+    }
+
+    #[test]
+    fn a_send_that_redials_snapshots_the_new_stream_before_the_next_pump() {
+        let actions = Rc::new(RecordedActions::default());
+        let service = test_service(actions.clone());
+        service.set_internal(
+            &[("<Super>n".into(), tuna_shell_control::MODE_NORMAL, 0)],
+            Rc::new(|_, _| {}),
+        );
+        service.command_result(1, true);
+        let calls = Rc::new(Cell::new(0));
+        let fired = calls.clone();
+        actions.3.set(1);
+        service.set_internal(
+            &[("<Super>n".into(), tuna_shell_control::MODE_NORMAL, 0)],
+            Rc::new(move |_, _| fired.set(fired.get() + 1)),
+        );
+        let new = actions.0.borrow()[0].action;
+        service.control_changed(Some(1));
+        assert_eq!(
+            actions.1.get(),
+            2,
+            "new-link snapshot was needlessly replayed"
+        );
+        service.accelerator_activated(new, 1, tuna_shell_control::MODE_NORMAL);
+        assert_eq!(
+            calls.get(),
+            1,
+            "new snapshot was cancelled before its own ack"
+        );
+        service.command_result(2, true);
+        service.accelerator_activated(new, 2, tuna_shell_control::MODE_NORMAL);
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]

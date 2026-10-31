@@ -153,7 +153,12 @@ call. A denied or lost admission returns an error and cannot reappear in
 a subsequent table; a denied ungrab keeps the installed owner. Internal
 rebinding keeps the installed action callbacks until their replacement
 is acknowledged, accepting either generation's already-emitted events
-within the same control drain.
+within the same control drain. Every full table, including one sent for
+an external grab, retains an `Rc` snapshot of its actual internal callback
+generation until its own result; maps are not copied per external call.
+Request identities also retain the local control-connection generation:
+if another send redials between GTK socket pumps, old-link calls fail,
+while admissions already sent on the new link remain pending normally.
 
 ## Gaps against Mutter
 
