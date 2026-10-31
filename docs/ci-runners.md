@@ -270,6 +270,65 @@ ssh karnataka 'sudo k3s ctr -n k8s.io images rm localhost/tuna-ci-runner:<old ta
 `values-24.04.yaml` and `values-26.04.yaml` differ only in the scale set
 name, image and min/max runners; change both together.
 
+### Preinstalled CI dependencies and image smoke checks
+
+The image preinstalls the common `ci.yml` compositor/shell development
+packages (seat/input/udev, DRM/GBM/EGL, Wayland, GTK4/libadwaita, GLib,
+PipeWire, font/rendering and PAM headers/wrapper) and the nested proof
+runtime (X11/XWayland, media, AT-SPI/Python, IBus, keyring and desktop
+portals). This moves repeated apt download/unpack work out of individual
+jobs, reducing contention on the node's disk; it does not add runner slots
+or a shared writable compiler cache. Each job still gets its own ephemeral
+pod and keeps its workflow apt steps for hosted-runner compatibility and
+package updates.
+
+Package versions come from the image's own Ubuntu release repositories.
+Only 26.04 preinstalls distro `libgtk4-layer-shell-dev`, Orca and
+speech-dispatcher for journey/orca-speech. 24.04 keeps the existing pinned
+`scripts/ci-install-gtk4-layer-shell` build in its jobs: that release has no
+distro package. Do not replace 26.04's distro library with a `/usr/local`
+build; its installed-package proofs require distro provenance.
+
+Build only when the node has disk-I/O headroom, not while tuning or running
+a heavily loaded queue. `build-image` already builds the releases
+sequentially, imports their images, and updates the two local values files;
+it does **not** deploy them. No rebuild or rollout is implied by changing
+the Containerfile. After review, build and smoke both imported tags before
+the separate rollout:
+
+```bash
+set -euo pipefail
+.github/runners/build-image karnataka
+# Offline library/package checks only: these do not register a runner.
+for ubuntu in 24.04 26.04; do
+  while read -r key ref; do
+    [[ "$key" == image: ]] || continue
+    ssh karnataka "sudo k3s ctr -n k8s.io run --rm '$ref' \
+      'tuna-runner-smoke-${ubuntu//./-}' /bin/sh -ec '
+        pkg-config --exists libseat libinput libudev gbm libdrm xkbcommon \
+          wayland-client gtk4 libadwaita-1 libpipewire-0.3
+        dpkg-query -W libpam0g-dev libpam-wrapper libgtk-4-dev \
+          libadwaita-1-dev libglib2.0-dev meson xwayland
+        test -x /opt/tuna-ci/job-started.sh
+        if [ \"$ubuntu\" = 26.04 ]; then
+          pkg-config --atleast-version=1.1 gtk4-layer-shell-0
+          dpkg-query -W libgtk4-layer-shell-dev orca speech-dispatcher
+        else
+          ! pkg-config --exists gtk4-layer-shell-0
+        fi
+      '"
+  done < ".github/runners/values-${ubuntu}.yaml"
+done
+# Deploy only after both smoke checks and review of the new image tags.
+.github/runners/deploy --sets-only
+```
+
+These checks are not full job qualification. After rollout, require passing
+`check`/`gtk-shell` (24.04) and `journey`/`orca-speech` (26.04) on the exact
+reviewed commit, including their existing package/proof assertions. Until
+the images have been built and these lanes pass, runtime compatibility and
+the reduction in apt time remain unverified.
+
 Images are node-local and `imagePullPolicy: Never`; if kubelet image garbage
 collection ever removes one (disk above 85%), pods fail with
 `ErrImageNeverPull`: rebuild.
