@@ -94,17 +94,23 @@ fail() {
     exit 1
 }
 cstate() {
-    # Query, optional label, optional timeout: a numeric second
-    # argument is a timeout, a label means the default 20 seconds.
+    # Query, optional label, optional timeout, optional readiness command:
+    # a numeric second argument is a timeout, a label defaults to 20 s.
+    # The readiness command shares the state query's deadline.
+    query=$1
     if [ $# -ge 3 ]; then timeout=$3
     elif [ "${2:-20}" -eq "${2:-20}" ] 2>/dev/null; then timeout=$2
     else timeout=20; fi
+    if [ $# -gt 3 ]; then shift 3; else set --; fi
     end=$(($(date +%s) + timeout))
     while [ "$(date +%s)" -le "$end" ]; do
         if [ -n "$COMPOSITOR_PID" ]; then
             kill -0 "$COMPOSITOR_PID" 2>/dev/null || return 1
         fi
-        [ -s "$CSTATE" ] && jq -e "$1" "$CSTATE" >/dev/null 2>&1 && return 0
+        if [ -s "$CSTATE" ] && jq -e "$query" "$CSTATE" >/dev/null 2>&1 &&
+            { [ $# -eq 0 ] || "$@"; }; then
+            return 0
+        fi
         sleep 0.1
     done
     cat "$CSTATE" >&2 2>/dev/null || true
@@ -299,9 +305,10 @@ cstate "$OSK_GONE" 1 || fail G-OSK-SHOW "enabling alone opened the keyboard"
 # text-input); the keyboard opens after KEYBOARD_REST_TIME (300 ms).
 press "$BX" "$BY" G-OSK-SHOW
 show_press="$PRESS_T"
-cstate "$OSK_MAPPED" 10 || fail G-OSK-SHOW "a click into entry b never showed the keyboard"
-show_t="$("$PY" "$LIB" first "$WATCH" "$show_press" 1)" ||
-    fail G-OSK-SHOW "no mapped keyboard in the watch log after the press"
+cstate "$OSK_MAPPED" "shown keyboard and watcher" 10 \
+    "$PY" "$LIB" first "$WATCH" "$show_press" 1 >"$ARTIFACTS/show-time.txt" ||
+    fail G-OSK-SHOW "a click into entry b never showed the keyboard or its watcher never recorded showing"
+show_t="$(cat "$ARTIFACTS/show-time.txt")"
 show_delay="$(elapsed "$show_press" "$show_t")"
 at_least "$show_delay" 0.299 || fail G-OSK-SHOW "the keyboard showed ${show_delay}s after the press, before GNOME's 300 ms rest time"
 at_most "$show_delay" 2.0 || fail G-OSK-SHOW "the keyboard took ${show_delay}s to show"
@@ -325,10 +332,11 @@ move_end="$(now)"
 # Focus leaving text: hidden after the 50 ms focus-out delay.
 press "$DX" "$DY" G-OSK-SHOW
 hide_press="$PRESS_T"
-cstate "$OSK_GONE" 10 || fail G-OSK-SHOW "focus on the button never hid the keyboard"
+cstate "$OSK_GONE" "hidden keyboard and watcher" 10 \
+    "$PY" "$LIB" first "$WATCH" "$hide_press" 0 >"$ARTIFACTS/hide-time.txt" ||
+    fail G-OSK-SHOW "focus on the button never hid the keyboard or its watcher never recorded hiding"
 [ "$(focus_of)" = "done" ] || fail G-OSK-SHOW "the probe's focus is $(focus_of), not the button"
-hide_t="$("$PY" "$LIB" first "$WATCH" "$hide_press" 0)" ||
-    fail G-OSK-SHOW "no unmapped keyboard in the watch log after the press"
+hide_t="$(cat "$ARTIFACTS/hide-time.txt")"
 hide_delay="$(elapsed "$hide_press" "$hide_t")"
 at_least "$hide_delay" 0.050 || fail G-OSK-SHOW "the keyboard hid ${hide_delay}s after focus left, before GNOME's 50 ms delay"
 at_most "$hide_delay" 2.0 || fail G-OSK-SHOW "the keyboard took ${hide_delay}s to hide"
@@ -386,11 +394,16 @@ pass G-OSK-SHIFT "Shift T then u typed 'Tu'; the long-press latch typed 'NA' unt
 cstate "$OSK_MAPPED" 5 || fail G-OSK-LOCK "the session keyboard was not up before locking"
 text_a="$(text_of a)"
 text_b="$(text_of b)"
+lock_since="$(now)"
 xdotool key --clearmodifiers super+l
 cstate '.locked == true' 15 || fail G-OSK-LOCK "Super+L did not lock the session"
-cstate "$OSK_GONE" 5 || fail G-OSK-LOCK "the session keyboard stayed mapped over the lock screen"
-lock_t="$(jq -rs 'map(select(.locked == true)) | first | .t' "$WATCH")"
-hidden_t="$(jq -rs --argjson l "$lock_t" 'map(select(.t >= $l and .osk == null)) | first | .t' "$WATCH")"
+# The compositor snapshot can lead its asynchronous watcher. Require
+# both within the same five-second hide deadline, then use the first
+# hidden sample so a later remap cannot move the assertion's start.
+cstate ".locked == true and $OSK_GONE" "locked keyboard and watcher" 5 \
+    "$PY" "$LIB" lock-times "$WATCH" "$lock_since" >"$ARTIFACTS/lock-times.txt" ||
+    fail G-OSK-LOCK "the session keyboard stayed mapped over the lock screen or its watcher never recorded hiding"
+read -r lock_t hidden_t <"$ARTIFACTS/lock-times.txt"
 sleep 1
 # A click lifts the curtain; the unlock prompt takes the focus and opens
 # the lock screen's own keyboard.
@@ -401,8 +414,10 @@ for letter in o s k p r o o f; do
 done
 cstate '.locked == true' 2 || fail G-OSK-LOCK "the session unlocked before Enter"
 tap "Lock Screen" 0 0 Enter G-OSK-LOCK
-cstate '(.locked | not)' 15 || fail G-OSK-LOCK "the password tapped on the lock keyboard did not unlock the session"
-unlock_t="$(jq -rs --argjson l "$lock_t" 'map(select(.t > $l and .locked == false)) | first | .t' "$WATCH")"
+cstate '(.locked | not)' "unlocked session and watcher" 15 \
+    "$PY" "$LIB" unlock-time "$WATCH" "$lock_t" >"$ARTIFACTS/unlock-time.txt" ||
+    fail G-OSK-LOCK "the password tapped on the lock keyboard did not unlock the session or its watcher never recorded unlocking"
+read -r unlock_t <"$ARTIFACTS/unlock-time.txt"
 "$PY" "$LIB" never "$WATCH" "$hidden_t" "$unlock_t" >"$ARTIFACTS/lock-session.txt" ||
     fail G-OSK-LOCK "the session keyboard mapped while locked: $(cat "$ARTIFACTS/lock-session.txt")"
 leaked="$(jq -rs --argjson a "$lock_t" --argjson b "$unlock_t" '[.[] | select(.text and .t >= $a and .t <= $b)] | length' "$PROBE_LOG")"
