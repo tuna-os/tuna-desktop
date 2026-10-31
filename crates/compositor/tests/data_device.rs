@@ -1569,14 +1569,16 @@ fn stationary_native_drag_case(same_surface: bool, source_less: bool) {
         }
     };
     if offer.is_some() {
+        // Flush the recipient's negotiation before the source's barrier:
+        // cross-client Action is queued only when B's requests are handled.
         sync_mapped(
             &mut comp,
-            &conn_a,
-            &mut queue_a,
-            &mut client_a,
             &conn_b,
             &mut queue_b,
             &mut client_b,
+            &conn_a,
+            &mut queue_a,
+            &mut client_a,
         );
         let target = if same_surface { &client_a } else { &client_b };
         assert_eq!(target.offer_actions, vec![DndAction::Move]);
@@ -1619,14 +1621,15 @@ fn stationary_native_drag_case(same_surface: bool, source_less: bool) {
     }
     if let Some(offer) = offer {
         offer.finish();
+        // Finish is a recipient request; drain B before observing A's reply.
         sync_mapped(
             &mut comp,
-            &conn_a,
-            &mut queue_a,
-            &mut client_a,
             &conn_b,
             &mut queue_b,
             &mut client_b,
+            &conn_a,
+            &mut queue_a,
+            &mut client_a,
         );
         assert_eq!(
             client_a.finished, 1,
