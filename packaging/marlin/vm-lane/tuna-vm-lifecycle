@@ -2100,6 +2100,81 @@ def soak_read(name, offset):
     return {"name": name, "offset": offset, "size": size, "data": base64.b64encode(data).decode()}
 
 
+# tunaOS#4092 fresh-account fixtures (tuna-vm-fresh-accounts): public names,
+# public password "tuna". tunaseeded is the negative control: its
+# AccountsService record is written before GDM starts.
+FRESH_USERS = ("tunastd", "tunaadmin", "tunaseeded")
+ACCOUNTS_RECORD_DIR = pathlib.Path("/var/lib/AccountsService/users")
+GDM_CUSTOM_CONF = pathlib.Path("/etc/gdm/custom.conf")
+FRESH_DESKTOP = ("tuna-session", COMPOSITOR_COMM, SHELL_GTK[:15], "gnome-shell", "gnome-session-b",
+                 "gnome-session-s")
+
+
+def fresh_state(name):
+    """Identity, groups and AccountsService record of a fixture account; the
+    record text is the public cache file (no secrets live there)."""
+    try:
+        entry = pwd.getpwnam(name)
+    except KeyError:
+        return {"user": name, "exists": False}
+    record = ACCOUNTS_RECORD_DIR / name
+    try:
+        text = record.read_text(errors="replace")[:4096]
+    except FileNotFoundError:
+        text = None
+    return {"user": name, "exists": True, "uid": entry.pw_uid,
+            "groups": call("id", "-nG", name).split(),
+            "home": entry.pw_dir, "home_exists": os.path.isdir(entry.pw_dir),
+            "record": text,
+            "custom_conf": GDM_CUSTOM_CONF.read_text(errors="replace")[:8192]}
+
+
+def fresh_session(name):
+    """The account's gdm-password sessions on a VT and the desktop processes
+    it runs, by fixed process name only."""
+    uid = pwd.getpwnam(name).pw_uid
+    sessions = []
+    for line in call("loginctl", "list-sessions", "--no-legend", "--no-pager").splitlines():
+        fields = line.split()
+        if len(fields) < 2 or fields[1] != str(uid):
+            continue
+        description = call("loginctl", "show-session", fields[0], "--property=Id", "--property=VTNr",
+                           "--property=User", "--property=Type", "--property=Service",
+                           "--property=Class", "--property=State", check=False)
+        properties = dict(item.split("=", 1) for item in description.splitlines() if "=" in item)
+        if properties.get("Class", "").startswith("manager"):
+            continue
+        sessions.append(properties)
+    return {"user": name, "uid": uid, "sessions": sessions,
+            "desktop": [proc for proc in FRESH_DESKTOP
+                        if call("pgrep", "-u", str(uid), "-x", proc, check=False)]}
+
+
+def fresh_sudo(name):
+    """Real sudo authentication as the account with its public password.
+    Only the exit status and a fixed policy-denial flag leave the guest."""
+    run = subprocess.run(["runuser", "-u", name, "--", "sudo", "-S", "-k", "-p", "", "/usr/bin/true"],
+                         input="tuna\n", capture_output=True, text=True, timeout=30, check=False)
+    denied = any(marker in run.stderr for marker in ("is not in the sudoers file", "is not allowed to run sudo",
+                                                     "may not run sudo"))
+    return {"user": name, "returncode": run.returncode, "policy_denied": denied,
+            "sudo_present": pathlib.Path("/usr/bin/sudo").exists()}
+
+
+def fresh_logout(name):
+    """Log the account out through logind, as the shell's Log Out falls back to."""
+    ended = []
+    for session in fresh_session(name)["sessions"]:
+        if session.get("Service") == LOGIN_SERVICE:
+            call("loginctl", "terminate-session", session["Id"])
+            ended.append(session["Id"])
+    return {"user": name, "terminated": ended}
+
+
+FRESH_ACTIONS = {"fresh-state": fresh_state, "fresh-session": fresh_session,
+                 "fresh-sudo": fresh_sudo, "fresh-logout": fresh_logout}
+
+
 def main():
     if sys.argv[1] == "background-user-diagnostics":
         print(json.dumps(background_user_diagnostics()))
@@ -2730,6 +2805,7 @@ print(json.dumps(result))
         # GDM's greeter is gnome-shell in a logind greeter-class session of
         # its own (dynamic) non-root user.
         result = {"manager": DISPLAY_MANAGER.resolve().stem,
+                  "boot_id": pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
                   "manager_active": call("systemctl", "is-active", "gdm.service",
                                          check=False) == "active",
                   "probe_uid": os.geteuid(),
@@ -2753,6 +2829,16 @@ print(json.dumps(result))
                    "fallback_session": gdm_fallback_session(),
                    "greeter_pids": greeter_pids,
                    "greeter_uids": [pathlib.Path(f"/proc/{pid}").stat().st_uid for pid in greeter_pids]}
+    elif action in FRESH_ACTIONS:
+        # tunaOS#4092: record-free accounts made by tuna-vm-fresh-accounts.
+        # Only the fixed public fixture names are accepted.
+        if len(sys.argv) != 3 or sys.argv[2] not in FRESH_USERS:
+            raise ValueError("fresh-account action takes one fixture account name")
+        result = FRESH_ACTIONS[action](sys.argv[2])
+    elif action == "reboot":
+        boot_id = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        call("systemctl", "reboot", "--no-block")
+        result = {"requested": "reboot", "boot_id": boot_id}
     elif action == "payload":
         payload = pathlib.Path("/usr/share/tuna-vm/shipped-payload.sha256")
         call("sha256sum", "--check", str(payload))

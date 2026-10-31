@@ -57,37 +57,19 @@ class DatetimePublishedQualification(unittest.TestCase):
     def setUp(self):
         self.records = []
 
-    def test_old_published_scopes_exactly_both_panel_follow_gates(self):
+    def test_failed_legacy_panel_clocks_are_recorded_false_and_raise(self):
         result = self.result(self.FOLLOW)
-        lane.record_datetime_gates(result, True, self.record)
+        with self.assertRaisesRegex(RuntimeError, ", ".join(self.FOLLOW)):
+            lane.record_datetime_gates(result, True, self.record)
         self.assertEqual(len(self.records), 10)
         for gate, passed, detail in self.records:
-            self.assertTrue(passed)
+            self.assertEqual(passed, gate not in self.FOLLOW)
             if gate in self.FOLLOW:
-                self.assertIn("predates", detail)
-                self.assertIn("current-build marlin-vm", detail)
-                self.assertIn(f"observed fail: raw-{gate}", detail)
+                self.assertIn("unqualified/unsupported", detail)
+                self.assertIn(f"raw-{gate}", detail)
             else:
                 self.assertEqual(detail, f"raw-{gate}")
         self.assertTrue(all(" fail " in line for line in result["assertions"][:2]))
-
-    def test_beta2_rebuild_is_scoped_only_on_published_and_only_for_follow(self):
-        version = "1.0.0beta.2-2"
-        lane.record_datetime_gates(self.result(self.FOLLOW, version), True, self.record)
-        for gate, passed, detail in self.records:
-            self.assertTrue(passed)
-            if gate in self.FOLLOW:
-                self.assertIn(version, detail)
-                self.assertIn(f"observed fail: raw-{gate}", detail)
-                self.assertIn("current-build marlin-vm", detail)
-            else:
-                self.assertEqual(detail, f"raw-{gate}")
-        for gate in (*self.FOLLOW, *self.OTHER):
-            with self.subTest(current_build=gate), self.assertRaisesRegex(RuntimeError, gate):
-                lane.record_datetime_gates(self.result((gate,), version), False, self.record)
-        for gate in self.OTHER:
-            with self.subTest(published=gate), self.assertRaisesRegex(RuntimeError, gate):
-                lane.record_datetime_gates(self.result((gate,), version), True, self.record)
 
     def test_current_build_failures_always_fail_even_with_old_rpm(self):
         for gate in self.FOLLOW:
@@ -95,27 +77,24 @@ class DatetimePublishedQualification(unittest.TestCase):
                 lane.record_datetime_gates(self.result((gate,)), False, self.record)
             self.assertIn((gate, False, f"raw-{gate}"), self.records)
 
-    def test_supported_or_unknown_published_versions_remain_strict(self):
-        for version in ("1.0.0beta.2-1", "1.0.0beta.2-3", "1.0.0beta.3-1",
-                        "1.0.0-1", None, "", "1.0.0beta.1-2"):
-            for gate in self.FOLLOW:
-                with self.subTest(version=version, gate=gate):
-                    with self.assertRaisesRegex(RuntimeError, gate):
-                        lane.record_datetime_gates(self.result((gate,), version), True, self.record)
-                    self.assertIn((gate, False, f"raw-{gate}"), self.records)
-        result = self.result(self.FOLLOW)
-        result["evidence"] = {}
-        with self.assertRaisesRegex(RuntimeError, self.FOLLOW[0]):
-            lane.record_datetime_gates(result, True, self.record)
+    def test_panel_failures_do_not_depend_on_package_metadata(self):
+        for evidence in ({"desktop_package_version": "different-package"}, {}):
+            with self.subTest(evidence=evidence):
+                self.records = []
+                result = self.result(self.FOLLOW)
+                result["evidence"] = evidence
+                with self.assertRaisesRegex(RuntimeError, ", ".join(self.FOLLOW)):
+                    lane.record_datetime_gates(result, True, self.record)
+                self.assertEqual([passed for _, passed, _ in self.records[:2]], [False, False])
 
     def test_unaffected_failures_remain_enforced_on_old_published(self):
         for gate in self.OTHER:
             with self.subTest(gate=gate), self.assertRaisesRegex(RuntimeError, gate):
-                lane.record_datetime_gates(self.result((*self.FOLLOW, gate)), True, self.record)
+                lane.record_datetime_gates(self.result((gate,)), True, self.record)
             self.assertIn((gate, False, f"raw-{gate}"), self.records)
 
-    def test_supported_passing_assertions_are_unchanged(self):
-        lane.record_datetime_gates(self.result(version="1.0.0beta.2-1"), True, self.record)
+    def test_valid_legacy_panel_clocks_preserve_actual_passes(self):
+        lane.record_datetime_gates(self.result(), True, self.record)
         self.assertEqual(self.records, [(gate, True, f"raw-{gate}")
                                        for gate in (*self.FOLLOW, *self.OTHER)])
 

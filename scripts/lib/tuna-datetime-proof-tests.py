@@ -368,6 +368,18 @@ class RoundTrip(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "timezone-revert-unverified"):
             self.run_trip(FakeTimedate1(revert_fail=True))
 
+    def test_restore_failure_is_visible_even_when_observation_also_fails(self):
+        record = {}
+
+        def broken_observer(_):
+            raise ValueError("panel-observation-failed")
+
+        with self.assertRaisesRegex(ValueError, "timezone-revert-unverified"):
+            self.run_trip(FakeTimedate1(revert_fail=True),
+                          observe=broken_observer, record=record)
+        self.assertFalse(record["revert_verified"])
+        self.assertIn("owner vanished", record["revert_error"])
+
     def test_evaluate_passes_only_verified_round_trips(self):
         good = {"timezone_round_trip": {"original": "Etc/UTC", "target": "Pacific/Auckland",
                                         "observed": "Pacific/Auckland", "revert_verified": True}}
@@ -609,7 +621,7 @@ class Polkit(unittest.TestCase):
 
 @unittest.skipUnless(has_zoneinfo(), "zoneinfo database unavailable")
 class PanelFollow(unittest.TestCase):
-    def bundle(self, **kwargs):
+    def bundle(self, panel=None, **kwargs):
         transport = FakeTimedate1(**kwargs)
         with patch.object(M.os, "readlink", return_value="/usr/share/zoneinfo/Etc/UTC"), \
              patch.object(M, "read_adjtime", return_value=""), \
@@ -618,7 +630,8 @@ class PanelFollow(unittest.TestCase):
              patch.object(M.time, "sleep"):
             ticks = iter(range(0, 10_000))
             bundle = M.collect(transport, desktop_user="tuna-test",
-                               monotonic=lambda: next(ticks))
+                               monotonic=lambda: next(ticks),
+                               dump=(lambda: panel(transport)) if panel is not None else None)
         return transport, bundle
 
     def test_a_following_panel_passes_both_gates(self):
@@ -627,6 +640,67 @@ class PanelFollow(unittest.TestCase):
             _, passed, detail = gate(bundle, gate_id)
             self.assertTrue(passed, f"{gate_id}: {detail}")
         self.assertEqual(len(bundle["timezone_round_trip"]["panel"]), 1)
+        self.assertTrue(bundle["timezone_round_trip"]["panel_revert_verified"])
+        self.assertEqual(len(bundle["timezone_round_trip"]["panel_revert"]), 1)
+
+    def test_manual_time_waits_for_actual_original_zone_panel_repaint(self):
+        pending = 2
+        observed_restore = False
+
+        def panel(transport):
+            nonlocal pending, observed_restore
+            restoring = transport.zone == transport.original and transport.panel_zone != transport.zone
+            if restoring:
+                self.assertNotIn("SetTime", transport.methods())
+                transport.follows = pending == 0
+                pending -= 1
+            snapshot = transport.panel()
+            if restoring and transport.follows:
+                observed_restore = True
+            return snapshot
+
+        transport, bundle = self.bundle(panel=panel)
+        self.assertTrue(observed_restore)
+        self.assertEqual(len(bundle["timezone_round_trip"]["panel_revert"]), 3)
+        self.assertTrue(gate(bundle, "G-DATETIME-CLOCK-TZ")[1])
+        self.assertTrue(gate(bundle, "G-DATETIME-CLOCK-SET")[1])
+        self.assertIn("SetTime", transport.methods())
+
+    def test_unrepainted_restore_remains_failed_and_blocks_manual_time(self):
+        def panel(transport):
+            if transport.zone == transport.original and transport.panel_zone != transport.zone:
+                transport.follows = False
+            return transport.panel()
+
+        transport, bundle = self.bundle(panel=panel)
+        trip = bundle["timezone_round_trip"]
+        self.assertTrue(trip["revert_verified"])
+        self.assertFalse(trip["panel_revert_verified"])
+        self.assertGreater(len(trip["panel_revert"]), 1)
+        self.assertIn("timezone-panel-revert-unverified", bundle["errors"]["timezone_round_trip"])
+        self.assertIn("restoration unverified", bundle["errors"]["manual_time"])
+        self.assertFalse(gate(bundle, "G-DATETIME-CLOCK-TZ")[1])
+        self.assertFalse(gate(bundle, "G-DATETIME-CLOCK-SET")[1])
+        self.assertNotIn("SetTime", transport.methods())
+
+    def test_restore_dump_exception_is_not_swallowed(self):
+        def panel(transport):
+            if transport.zone == transport.original and transport.panel_zone != transport.zone:
+                raise ValueError("restore-panel-bus-unavailable")
+            return transport.panel()
+
+        transport, bundle = self.bundle(panel=panel)
+        self.assertEqual(bundle["errors"]["timezone_round_trip"], "restore-panel-bus-unavailable")
+        self.assertFalse(bundle["timezone_round_trip"]["panel_revert_verified"])
+        self.assertFalse(gate(bundle, "G-DATETIME-CLOCK-TZ")[1])
+        self.assertNotIn("SetTime", transport.methods())
+
+    def test_unrestored_timedate1_state_blocks_manual_time(self):
+        transport, bundle = self.bundle(revert_fail=True)
+        self.assertFalse(bundle["timezone_round_trip"]["revert_verified"])
+        self.assertIn("timezone-revert-unverified", bundle["errors"]["timezone_round_trip"])
+        self.assertFalse(gate(bundle, "G-DATETIME-MANUAL")[1])
+        self.assertNotIn("SetTime", transport.methods())
 
     def test_a_panel_stuck_in_the_old_zone_fails_after_the_deadline(self):
         transport, bundle = self.bundle(follows=False)

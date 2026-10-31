@@ -24,6 +24,9 @@
 #     session's stderr (tuna-compositor:, tuna-shell-gtk:) reaches the
 #     QEMU serial log the lane asserts on. The serial login prompt is
 #     masked in this test layer so it cannot overwrite journal evidence.
+#   - tuna-vm-fresh-accounts (tunaOS#4092): only when the lane passes the
+#     tuna.vm.fresh-accounts credential, record-free standard and admin
+#     accounts made with useradd at boot, plus a pre-seeded control;
 #   - gdb, so the lane's startup watchdog (tuna-vm-lifecycle shell-stack)
 #     can record every shell thread's stack when startup stalls.
 #
@@ -54,6 +57,8 @@ COPY packaging/marlin/vm-lane/kargs.toml /usr/lib/bootc/kargs.d/90-tuna-vm-lane.
 
 COPY packaging/marlin/vm-lane/tuna-vm-health /usr/libexec/tuna-vm-health
 COPY packaging/marlin/vm-lane/tuna-vm-health.service /usr/lib/systemd/system/tuna-vm-health.service
+COPY packaging/marlin/vm-lane/tuna-vm-fresh-accounts /usr/libexec/tuna-vm-fresh-accounts
+COPY packaging/marlin/vm-lane/tuna-vm-fresh-accounts.service /usr/lib/systemd/system/tuna-vm-fresh-accounts.service
 
 # /home is a symlink to /var/home on bootc systems and /var is only
 # seeded at install time, so the home directory and the AccountsService
@@ -86,7 +91,7 @@ RUN mkdir -p /usr/share/tuna-vm \
     && grep -qx 'FallbackSession=tuna' /etc/gdm/custom.conf \
     && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test \
     && echo 'tuna-test:tuna' | chpasswd \
-    && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-input /usr/libexec/tuna-vm-shell-focus \
+    && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-fresh-accounts /usr/libexec/tuna-vm-input /usr/libexec/tuna-vm-shell-focus \
          /usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token \
     && printf 'TUNA_COMPOSITOR_STATE=/run/user/%s/tuna-vm-state.json\nTUNA_LOCK_TRACE=1\nTUNA_POINTER_TRACE=1\n' \
          "$(id -u tuna-test)" > /usr/share/tuna-vm/environment.conf \
@@ -98,7 +103,7 @@ RUN mkdir -p /usr/share/tuna-vm \
          '# Fixed public-query/catalog diagnostics only in this controlled CI session.' \
          'TUNA_VM_PUBLIC_SEARCH_DIAGNOSTICS=1' >> /usr/share/tuna-vm/environment.conf \
     && systemctl mask serial-getty@ttyS0.service \
-    && systemctl enable tuna-vm-health.service \
+    && systemctl enable tuna-vm-health.service tuna-vm-fresh-accounts.service \
     && systemctl add-wants multi-user.target qemu-guest-agent.service \
     && sha256sum --check /usr/share/tuna-vm/shipped-payload.sha256 \
     && pacman -Q > /usr/share/tuna-vm/fixture-packages.txt

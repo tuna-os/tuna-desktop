@@ -1,0 +1,32 @@
+#!/bin/sh
+# CI-only (tunaOS#4092): create the fresh-account fixtures the way an
+# installer does, with useradd, at boot. Runs only when the lane passes the
+# tuna.vm.fresh-accounts systemd credential (SMBIOS type 11), so the default
+# lanes' GDM user list is unchanged.
+#
+#   tunastd     standard account: no admin group
+#   tunaadmin   administrator: the distribution's admin group (wheel)
+#   tunaseeded  negative control: an AccountsService record is pre-seeded
+#
+# tunastd and tunaadmin get NO AccountsService record, NO Session
+# preselection and NO autologin: AccountsService and GDM create whatever
+# state they create on first login. Idempotent across reboots: an existing
+# account is never recreated, re-passworded or touched.
+set -eu
+create() {
+	name=$1
+	shift
+	if id -u "$name" >/dev/null 2>&1; then
+		return 0
+	fi
+	useradd -m -U -s /bin/bash "$@" "$name"
+	echo "$name:tuna" | chpasswd
+}
+create tunastd
+create tunaadmin -G wheel
+if ! id -u tunaseeded >/dev/null 2>&1; then
+	create tunaseeded
+	install -d -m 0700 /var/lib/AccountsService/users
+	printf '[User]\nSystemAccount=false\n' >/var/lib/AccountsService/users/tunaseeded
+	chmod 0600 /var/lib/AccountsService/users/tunaseeded
+fi
