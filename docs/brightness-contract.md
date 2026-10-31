@@ -69,6 +69,13 @@ dim → blank → unblank → undim sequence in the nested proof: the dim lowers
 the controlled backlight, the blank stops frames while the pointer moves,
 the unblank repaints and the undim restores the exact user baseline.
 
+The power-save proof waits for an in-flight idle-brightness transaction
+before both dimming and undimming. Only a
+`brightness update already pending` refusal permits another admission
+attempt, within the existing ten-second bound. Other errors fail immediately;
+an accepted call must still complete its own transaction and satisfy the
+unchanged backlight and scanout assertions.
+
 Issue #355 remains open for physical hardware, connector association on other
 backlight topologies, persistence across shell restart, cloned-monitor policy,
 ambient sensor integration, the hardware CRTC disable, a session
