@@ -1,0 +1,144 @@
+# Cluster-side guard rails for tuna-desktop self-hosted runners on karnataka.
+# Apply with: kubectl --context karnataka-k3s apply -f .github/runners/cluster.yaml
+# See docs/ci-runners.md.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tuna-ci
+  labels:
+    # Pod Security "baseline" would forbid CAP_SYS_ADMIN, which rootless
+    # podman needs inside the pod's own user namespace. The admission policy
+    # below enforces the stricter, runner-specific rules instead.
+    pod-security.kubernetes.io/enforce: privileged
+---
+# Every pod in tuna-ci must be a contained runner: its own user namespace
+# (root and CAP_SYS_ADMIN in the pod are an unprivileged uid range on the
+# node), no privileged containers, no host namespaces, ports or paths, only
+# emptyDir volumes, no service account token, no capability beyond
+# SYS_ADMIN. Devices come only from device plugins (KubeVirt's tun).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: tuna-ci-runner-pods
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: tuna-ci
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [pods, pods/ephemeralcontainers]
+  variables:
+    - name: containers
+      expression: >-
+        object.spec.containers
+        + (has(object.spec.initContainers) ? object.spec.initContainers : [])
+        + (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])
+  validations:
+    - expression: has(object.spec.hostUsers) && object.spec.hostUsers == false
+      message: runner pods must run in their own user namespace (hostUsers false)
+    - expression: >-
+        !(has(object.spec.hostNetwork) && object.spec.hostNetwork)
+        && !(has(object.spec.hostPID) && object.spec.hostPID)
+        && !(has(object.spec.hostIPC) && object.spec.hostIPC)
+      message: runner pods must not share host namespaces
+    - expression: has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false
+      message: runner pods must not mount a service account token
+    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir))"
+      message: runner pods may only use emptyDir volumes
+    - expression: >-
+        variables.containers.all(c,
+          !(has(c.securityContext) && has(c.securityContext.privileged) && c.securityContext.privileged)
+          && !(has(c.securityContext) && has(c.securityContext.capabilities) && has(c.securityContext.capabilities.add)
+               && c.securityContext.capabilities.add.exists(cap, cap != 'SYS_ADMIN'))
+          && !(has(c.ports) && c.ports.exists(p, has(p.hostPort) && p.hostPort != 0)))
+      message: runner containers must not be privileged, add capabilities other than SYS_ADMIN, or bind host ports
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: tuna-ci-runner-pods
+spec:
+  policyName: tuna-ci-runner-pods
+  validationActions: [Deny]
+---
+# Runner pods get no API credentials: no service account token is mounted
+# (enforced above) and the service accounts have no RoleBindings.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: tuna-ci
+automountServiceAccountToken: false
+---
+# Deny all ingress. Egress: cluster DNS plus the public internet only. The
+# private ranges cover the pod and service CIDRs (10.42/16, 10.43/16, so the
+# Kubernetes API Service and every other namespace), the node's LAN and
+# tailnet addresses (the API server on :6443, kubelet on :10250), podman's
+# 10.88/16 bridge, and link-local metadata.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: runners-internet-only
+  namespace: tuna-ci
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+---
+# Hard ceiling for all runner pods together, whatever the scale sets ask
+# for. karnataka has 28 CPU / 125 GiB allocatable; punjab is sized at
+# 12 cores / 24 GiB. Requests stop at 12 runners x 2 CPU / 6 GiB (24 CPU),
+# so the 14 pods the scale sets may ask for (10 + 4) never all schedule and
+# punjab and KubeVirt keep their room; they also preempt runners (below).
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: runner-ceiling
+  namespace: tuna-ci
+spec:
+  hard:
+    pods: "14"
+    requests.cpu: "24"
+    limits.cpu: "48"
+    requests.memory: 72Gi
+    limits.memory: 168Gi
+    requests.ephemeral-storage: 240Gi
+    limits.ephemeral-storage: 540Gi
+---
+# Runner pods yield to everything else: new KubeVirt VMs (punjab) and
+# cluster services preempt them; they never preempt anything.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: tuna-ci-runner
+value: -100
+preemptionPolicy: Never
+globalDefault: false
+description: tuna-desktop CI runners; lowest priority on karnataka.

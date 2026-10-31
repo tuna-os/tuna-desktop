@@ -1,0 +1,70 @@
+# gha-runner-scale-set values: tuna-desktop jobs that run on ubuntu-26.04
+# (Ubuntu 26.04 userland). Install/upgrade: see docs/ci-runners.md.
+githubConfigUrl: https://github.com/tuna-os
+githubConfigSecret: tuna-ci-github
+# Org runner group whose only selected repository is tuna-os/tuna-desktop.
+runnerGroup: tuna-desktop-karnataka
+runnerScaleSetName: tuna-ci-26.04
+minRunners: 0
+maxRunners: 4
+
+controllerServiceAccount:
+  namespace: arc-systems
+  name: arc-gha-rs-controller
+
+listenerTemplate:
+  spec:
+    containers:
+      - name: listener
+        resources:
+          requests: {cpu: 50m, memory: 64Mi}
+          limits: {memory: 256Mi}
+
+template:
+  spec:
+    # One job per pod: ARC registers each pod as an ephemeral JIT runner
+    # and deletes it when the job ends; nothing survives the pod.
+    restartPolicy: Never
+    # Root in the pod (sudo apt-get) is an unprivileged uid on the node.
+    hostUsers: false
+    priorityClassName: tuna-ci-runner
+    automountServiceAccountToken: false
+    enableServiceLinks: false
+    containers:
+      - name: runner
+        image: localhost/tuna-ci-runner:26.04-2.338.2-202610302054
+        imagePullPolicy: Never
+        command: ["/home/runner/run.sh"]
+        # ARC uses this as the runner's work folder: /home/runner/work, as on
+        # GitHub-hosted runners, so cached paths (and cache hits) match.
+        workingDir: /home/runner/work
+        securityContext:
+          # Rootless podman needs both to set up its nested user namespace;
+          # they hold only inside the pod's own user namespace
+          # (hostUsers: false), never on the node.
+          procMount: Unmasked
+          capabilities:
+            add: [SYS_ADMIN]
+        resources:
+          requests: {cpu: "2", memory: 6Gi, ephemeral-storage: 20Gi}
+          # /dev/net/tun (KubeVirt's device plugin) for podman's pasta
+          # networking; no host paths are mounted.
+          limits: {cpu: "4", memory: 14Gi, ephemeral-storage: 45Gi, devices.kubevirt.io/tun: "1"}
+        volumeMounts:
+          - name: dshm
+            mountPath: /dev/shm
+          # Container storage cannot be overlayfs on the image's overlayfs.
+          - name: containers-root
+            mountPath: /var/lib/containers
+          - name: containers-runner
+            mountPath: /home/runner/.local/share/containers
+    volumes:
+      # Chromium and GTK need more than the 64 MiB container default.
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+      - name: containers-root
+        emptyDir: {}
+      - name: containers-runner
+        emptyDir: {}

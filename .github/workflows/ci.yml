@@ -24,7 +24,11 @@ permissions:
 
 jobs:
   select-lanes:
-    runs-on: ubuntu-latest
+    # Runner choice (docs/ci-runners.md): this repository's own pushes,
+    # schedules, dispatches and branch pull requests run on the self-hosted
+    # karnataka scale sets; fork pull requests, and every job while the
+    # CI_RUNNERS repository variable is `hosted`, use GitHub-hosted runners.
+    runs-on: &runner-24 ${{ vars.CI_RUNNERS != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'tuna-ci-24.04' || 'ubuntu-latest' }}
     outputs:
       lanes: ${{ steps.lanes.outputs.lanes }}
     steps:
@@ -54,7 +58,7 @@ jobs:
           fi
 
   check:
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -93,6 +97,7 @@ jobs:
       - run: scripts/rename-to-tuna --check --no-cargo
       - run: python3 scripts/lib/tuna-soak-tests.py
       - run: python3 scripts/lib/vm-boot-tests.py
+      - run: python3 scripts/lib/ci-runner-guard-tests.py
       - run: python3 scripts/tests/test_vm_guest_agent_deadline.py
       - run: python3 scripts/tests/test_vm_strip_acceptance.py
       - run: python3 scripts/tests/test_vm_strip_fixture_owner.py
@@ -267,7 +272,7 @@ jobs:
 
   fprint-phase-proof:
     # Required measured transport phases; not a live UI/hardware qualification.
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'fprint-phase-proof')
     timeout-minutes: 45
@@ -313,7 +318,8 @@ jobs:
           retention-days: 14
 
   journey:
-    runs-on: ubuntu-26.04
+    # Same choice as select-lanes' runs-on, on the Ubuntu 26.04 runners.
+    runs-on: &runner-26 ${{ vars.CI_RUNNERS != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'tuna-ci-26.04' || 'ubuntu-26.04' }}
     needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'journey')
     timeout-minutes: 60
@@ -439,7 +445,7 @@ jobs:
           retention-days: 90
 
   app-content:
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'app-content')
     timeout-minutes: 25
@@ -475,7 +481,7 @@ jobs:
           retention-days: 14
 
   scroll-proof:
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'scroll-proof')
     timeout-minutes: 25
@@ -565,7 +571,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
     # Source-only real headed old/fixed comparison; the full GTK journey stays required.
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'grid-cancel-comparison')
     permissions:
@@ -634,7 +640,7 @@ jobs:
     # GTK4/libadwaita shell (ADR 0006) in the nested session: panel,
     # calendar and quick-settings popovers (xdg popups on a layer
     # surface), and the AT-SPI tree a screen reader sees (#71).
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     # Authentication callback admission requires this run's successful check.
     needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'gtk-shell')
@@ -942,7 +948,7 @@ jobs:
     # (GNOME's KeyboardMonitor) and speech-dispatcher on Ubuntu 26.04,
     # against the nested session that owns the screen reader. Ubuntu
     # 24.04's Orca 46 predates the KeyboardMonitor.
-    runs-on: ubuntu-26.04
+    runs-on: *runner-26
     needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'orca-speech')
     timeout-minutes: 45
@@ -981,7 +987,7 @@ jobs:
   portal-security:
     needs: [select-lanes, arch-package]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'portal-security')
-    runs-on: ubuntu-26.04
+    runs-on: *runner-26
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1015,7 +1021,7 @@ jobs:
   remote-security:
     needs: [select-lanes, arch-package]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'remote-security')
-    runs-on: ubuntu-26.04
+    runs-on: *runner-26
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1044,7 +1050,7 @@ jobs:
           retention-days: 90
 
   niri-parity:
-    runs-on: ubuntu-26.04
+    runs-on: *runner-26
     needs: [select-lanes, arch-package]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'niri-parity')
     timeout-minutes: 30
@@ -1324,7 +1330,7 @@ jobs:
     # GNOME 51 parity ledger gate (#66): every row marked pass must cite
     # tests, and every cited cargo test / journey assertion must have
     # passed in this run.
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     needs: [select-lanes, check, journey, gtk-shell, orca-speech, drm-smoke, marlin-vm]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'parity-ledger')
     steps:
@@ -1374,7 +1380,7 @@ jobs:
           --assertions ledger-in/marlin-vm/assertions.txt
 
   docs-shots:
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     needs: [select-lanes, journey, app-content, scroll-proof]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'docs-shots')
     steps:
@@ -1412,7 +1418,7 @@ jobs:
     # skipped, any failed or cancelled job fails the gate.
     if: always()
     needs: [select-lanes, check, fprint-phase-proof, journey, app-content, scroll-proof, drm-smoke, grid-cancel-comparison, gtk-shell, orca-speech, portal-security, remote-security, niri-parity, arch-package, marlin-image, marlin-vm, parity-ledger, docs-shots]
-    runs-on: ubuntu-latest
+    runs-on: *runner-24
     steps:
       - env:
           RESULTS: ${{ toJSON(needs) }}

@@ -6,6 +6,11 @@ verification layer must prove, see [the test strategy](test-strategy.md).
 Install the packages listed under [Prerequisites](development.md#prerequisites)
 first; each proof below names anything extra it needs.
 
+Most lanes run on self-hosted runners for this repository's own branches
+and on GitHub-hosted runners for forks; the steps and assertions are the
+same on both. See [CI runners](ci-runners.md) for what runs where and the
+switch back to GitHub-hosted runners.
+
 ## Which lanes a pull request runs
 
 Every push to `main`, the nightly schedule and `workflow_dispatch` run
