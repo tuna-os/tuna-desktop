@@ -1,7 +1,7 @@
 //! Actual runtimes, supervised control peer and a controlled delayed PAM
 //! module (libpam_wrapper): outer ownership, lock epochs and private PAM
 //! helper retirement. Not GTK UI, installed DRM, logind or S3.
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -22,6 +22,15 @@ fn wait(mut ready: impl FnMut() -> bool) {
     }
 }
 fn connect() -> ControlConn {
+    let display = std::env::var_os("WAYLAND_DISPLAY").expect("supervised private display");
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
+    assert!(
+        std::fs::metadata(Path::new(&runtime).join(display))
+            .unwrap()
+            .file_type()
+            .is_socket(),
+        "supervised client must receive the private Wayland socket"
+    );
     let path = std::env::var_os("TUNA_CONTROL_SOCKET").unwrap();
     let mut conn = ControlConn::new(UnixStream::connect(path).unwrap()).unwrap();
     conn.write_frame(&Message::Hello {

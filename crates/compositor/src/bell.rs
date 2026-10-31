@@ -14,6 +14,7 @@ pub(crate) struct Bell {
     last_visual: Option<Instant>,
     visual: Option<(Instant, u8, Option<WlSurface>)>,
     player: Option<(std::process::Child, Instant)>,
+    wayland_display: Option<String>,
 }
 
 fn flashes(last: Option<Instant>, now: Instant) -> u8 {
@@ -41,6 +42,18 @@ fn opacity(elapsed: Duration, pulses: u8) -> f32 {
 }
 
 impl Bell {
+    pub(crate) fn set_wayland_display(&mut self, display: &str) {
+        self.wayland_display = Some(display.to_owned());
+    }
+
+    fn player_command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new("canberra-gtk-play");
+        if let Some(display) = &self.wayland_display {
+            command.env("WAYLAND_DISPLAY", display);
+        }
+        command
+    }
+
     pub(crate) fn player_deadline(&self) -> Option<Instant> {
         self.player.as_ref().map(|(_, start)| {
             let deadline = *start + Duration::from_secs(5);
@@ -87,7 +100,7 @@ impl Bell {
             "canberra.xdg-theme.name={}",
             self.policy.theme.chars().take(256).collect::<String>()
         );
-        let mut command = std::process::Command::new("canberra-gtk-play");
+        let mut command = self.player_command();
         let parent = std::process::id() as libc::pid_t;
         unsafe {
             command.pre_exec(move || {
@@ -162,6 +175,18 @@ impl Drop for Bell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn player_uses_private_display_without_changing_process_environment() {
+        let ambient = std::env::var_os("WAYLAND_DISPLAY");
+        let mut bell = Bell::default();
+        bell.set_wayland_display("tuna-private-bell");
+        let command = bell.player_command();
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "WAYLAND_DISPLAY" && value == Some(std::ffi::OsStr::new("tuna-private-bell"))
+        }));
+        assert_eq!(std::env::var_os("WAYLAND_DISPLAY"), ambient);
+    }
+
     #[test]
     fn global_rate_limit_and_double_pulse_threshold() {
         let now = Instant::now();

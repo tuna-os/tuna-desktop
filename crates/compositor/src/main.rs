@@ -2,8 +2,8 @@
 //!
 //! Starts one isolated nested Wayland session on a private socket and
 //! drives it until the window closes. The host display session is never
-//! touched: `WAYLAND_DISPLAY` is set in this process only, and shutdown
-//! restores the previous value.
+//! touched: child services receive `WAYLAND_DISPLAY` explicitly, and
+//! the compositor process environment remains unmutated.
 
 use std::process::ExitCode;
 
@@ -112,8 +112,8 @@ fn main() -> ExitCode {
                 println!("from logind or seatd). --width/--height apply to nested runs.");
                 println!("The shell binary (default: TUNA_SHELL_BIN, else the");
                 println!("tuna-shell-host sibling) is spawned supervised with a");
-                println!("finite restart budget; WAYLAND_DISPLAY is set for this");
-                println!("process only and restored on shutdown.");
+                println!("finite restart budget; WAYLAND_DISPLAY is configured for");
+                println!("supervised children without mutating process environment.");
                 println!("--startup-overview opens the overview at start, as GNOME");
                 println!("does at login (tuna-session passes it).");
                 println!("--screen-reader lets a nested session own the screen");
