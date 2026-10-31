@@ -6,10 +6,27 @@ import subprocess
 from pathlib import Path
 import time
 import pyatspi
-from gi.repository import GLib
+from gi.repository import Gio, GLib
 out, decision = sys.argv[1:3]
 remote = len(sys.argv) > 3 and sys.argv[3] == "remote"
 external_capture = "--external-capture" in sys.argv[3:]
+
+def require_visible_session():
+    # AT-SPI's STATE_SHOWING describes the dialog's own widget tree, not
+    # whether the compositor's lock curtain covers it. In a real installed
+    # session, never activate a consent control hidden behind that curtain.
+    if not external_capture:
+        return
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    active = bus.call_sync(
+        "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver",
+        "org.gnome.ScreenSaver", "GetActive", None, None,
+        Gio.DBusCallFlags.NONE, 5000, None).unpack()
+    print("portal session before consent: " + json.dumps({"locked": active != (False,)}),
+          flush=True)
+    if active != (False,):
+        raise RuntimeError("portal consent is hidden by a locked session")
+
 def walk(acc, nodes, controls):
     try:
         showing = acc.getState().contains(pyatspi.STATE_SHOWING)
@@ -75,6 +92,7 @@ while time.monotonic() < deadline:
                     except Exception: pass
         if button.getState().contains(pyatspi.STATE_SENSITIVE):
             button_name = button.name
+            require_visible_session()
             button.queryAction().doAction(0)
             print("actual portal picker: " + button_name)
             sys.exit(0)

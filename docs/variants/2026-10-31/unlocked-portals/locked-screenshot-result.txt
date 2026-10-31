@@ -1,0 +1,1 @@
+(0, '(true,)\nlocked: documented false screenshot completed with no URI/image\nrequester_exit=0\n{\n  "response": 0,\n  "results": {\n    "uri": ""\n  }\n}{\n  "/var/home/tuna-test/Pictures/Screenshots/Screenshot From 2026-10-31 20-39-11.png": "f9dc77c6f9d3bf1a243d1c02f04321567afac0f84daf5fc85f2e30ecdc36cebe"\n}(true,)', '')

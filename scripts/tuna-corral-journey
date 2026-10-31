@@ -175,6 +175,13 @@ class Console:
     def wait(self, ms):
         self.page.wait_for_timeout(ms)
 
+    def activity(self):
+        """Real pointer motion keeps an unlocked session active, never unlocks it."""
+        box = self.page.locator('#vnc-canvas').bounding_box()
+        for x in (10, 11):
+            self.page.mouse.move(box['x'] + x * box['width'] / WIDTH,
+                                 box['y'] + (HEIGHT - 10) * box['height'] / HEIGHT)
+
     def close(self):
         self.browser.close()
 
@@ -190,6 +197,19 @@ def start_console(vm):
         proc.wait(timeout=30)
         raise RuntimeError(f'corral console exited {proc.returncode} before it printed a URL')
     return proc, json.loads(line)
+
+
+def require_portal_unlocked(guest, record, phase):
+    """Do not attribute a locked-session denial to a broken capture provider."""
+    code, stdout, stderr = guest.sh(
+        'gdbus call --session --dest org.gnome.ScreenSaver '
+        '--object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive',
+        user=True)
+    observed = {'phase': phase, 'at': now(), 'exit': code,
+                'stdout': stdout, 'stderr': stderr}
+    record.setdefault('session_state', []).append(observed)
+    if code != 0 or stdout != '(false,)':
+        raise RuntimeError(f'portal {phase} requires an unlocked session: {observed}')
 
 
 def wait_for(predicate, timeout, what, interval=5):
@@ -350,6 +370,7 @@ class Journey:
             session = wait_for(g.seat_session, 90, 'user session')
             wait_for(lambda: g.sh(f'pgrep -u {USER} -x tuna-shell-gtk')[0] == 0, 90, 'tuna-shell-gtk')
             c.wait(6000)
+            c.activity()
             check('logind session via gdm-password', session.get('Service') == 'gdm-password', session)
             procs = g.out(f'ps -u {USER} -o comm= | sort -u').split()
             check('Tuna compositor and shell run', {'tuna-compositor', 'tuna-shell-gtk'} <= set(procs),
@@ -369,18 +390,18 @@ class Journey:
                 ('screencast', 'org.freedesktop.DBus.Properties.Get org.freedesktop.portal.ScreenCast AvailableSourceTypes'),
             ]
             for name, method in probes:
+                c.activity()
                 code, stdout, stderr = g.sh(
                     'timeout 30s gdbus call --session --dest org.freedesktop.portal.Desktop '
                     '--object-path /org/freedesktop/portal/desktop --method ' + method, user=True)
                 check(name + ' portal responds', code == 0, {'exit': code, 'stdout': stdout, 'stderr': stderr})
         self.step('portal-availability', 'Published portal interfaces respond (not capture consent)', portals)
 
-        def consent(record, kind):
+        def consent(record, kind, uid):
             # Activate the visible GNOME Allow/Share control through the existing
             # AT-SPI consent helper. Corral already retained the console frame, so
             # the helper skips its X11-only scrot capture.
             helper = (Path(__file__).with_name('lib') / 'tuna-portal-consent.py').read_bytes()
-            uid = g.out(f'id -u {USER}')
             tree = f'/run/user/{uid}/tuna-variant-consent-{kind}-{time.monotonic_ns()}.json'
             launch = 'exec(__import__("base64").b64decode(' + repr(base64.b64encode(helper).decode()) + '))'
             code, stdout, stderr = g.sh(f'timeout 60 python3 -c {shlex.quote(launch)} {shlex.quote(tree)} grant '
@@ -397,6 +418,9 @@ class Journey:
             # backend or a one-shot gdbus sender that disconnects before Response.
             source = Path(__file__).with_name('lib') / 'tuna-portal-screenshot-client.py'
             payload = source.read_bytes()
+            record = self.receipt['portal_request_console'] = {}
+            c.activity()
+            require_portal_unlocked(g, record, 'before-request')
             uid = g.out(f'id -u {USER}')
             remote = Path(f'/run/user/{uid}/tuna-variant-screenshot-{time.monotonic_ns()}.png')
             waiting, response_path = str(remote.with_suffix('.waiting')), str(remote.with_suffix('.response.json'))
@@ -412,13 +436,11 @@ class Journey:
                                  user=True)[0] == 0, 45, 'portal consent wait or requester exit')
             prompt = self.out / 'portal-screenshot-prompt.png'
             c.grab(prompt)
-            self.receipt['portal_request_console'] = {
-                'frame': prompt.name, 'sha256': hashlib.sha256(prompt.read_bytes()).hexdigest(),
-                'meaning': 'console after request; prompt visibility requires visual review'}
+            record.update(frame=prompt.name, sha256=hashlib.sha256(prompt.read_bytes()).hexdigest(),
+                          meaning='console after request; prompt visibility requires visual review')
             if g.sh(f'test -f {shlex.quote(exit_path)}', user=True)[0] != 0:
                 check('actual portal consent control activated',
-                      consent(self.receipt['portal_request_console'], 'screenshot'),
-                      self.receipt['portal_request_console'].get('input'))
+                      consent(record, 'screenshot', uid), record.get('input'))
             def completed():
                 code, stdout, _ = g.sh(f'cat {shlex.quote(exit_path)}', user=True)
                 return stdout if code == 0 and stdout else None
@@ -427,6 +449,7 @@ class Journey:
             response_code, response_text, _ = g.sh(f'cat {shlex.quote(response_path)}', user=True)
             if response_code == 0:
                 self.receipt['portal_screenshot'] = json.loads(response_text)
+            require_portal_unlocked(g, record, 'after-response')
             if not check('native consent and image proof exits successfully', status == '0', log):
                 return
             result = self.receipt['portal_screenshot']
@@ -445,6 +468,10 @@ class Journey:
             library = Path(__file__).with_name('lib')
             sources = {name: (library / name).read_bytes() for name in
                        ('tuna-portal-capture-client.py', 'tuna-pipewire-dump.py')}
+            record = {'requester_sha256': {name: hashlib.sha256(data).hexdigest() for name, data in sources.items()}}
+            self.receipt['portal_screencast'] = record
+            c.activity()
+            require_portal_unlocked(g, record, 'before-request')
             uid = g.out(f'id -u {USER}')
             root = Path(f'/run/user/{uid}/tuna-variant-capture-{time.monotonic_ns()}')
             remote = root / 'frame.png'
@@ -458,8 +485,6 @@ class Journey:
             code, stdout, stderr = g.sh(
                 f'(python3 -c {shlex.quote(setup)}; printf "%s" "$?" >{shlex.quote(exit_path)}) '
                 f'</dev/null >{shlex.quote(log_path)} 2>&1 & echo $!', user=True)
-            record = {'requester_sha256': {name: hashlib.sha256(data).hexdigest() for name, data in sources.items()}}
-            self.receipt['portal_screencast'] = record
             check('native ScreenCast requester launched', code == 0, {'exit': code, 'pid': stdout, 'stderr': stderr})
             wait_for(lambda: g.sh(f'test -f {shlex.quote(ready)} || test -f {shlex.quote(exit_path)}',
                                  user=True)[0] == 0, 200, 'ScreenCast Start request or requester exit')
@@ -468,28 +493,34 @@ class Journey:
             record.update(frame=prompt.name, frame_sha256=hashlib.sha256(prompt.read_bytes()).hexdigest(),
                           meaning='console at Start; consent visibility requires visual review')
             if g.sh(f'test -f {shlex.quote(exit_path)}', user=True)[0] != 0:
-                check('actual portal consent control activated', consent(record, 'screencast'),
+                check('actual portal consent control activated', consent(record, 'screencast', uid),
                       record.get('input'))
             active_path = str(remote.with_suffix('.active'))
             wait_for(lambda: g.sh(f'test -f {shlex.quote(active_path)} || test -f {shlex.quote(exit_path)}',
                                  user=True)[0] == 0, 100, 'active ScreenCast grant or requester exit')
             active = g.sh(f'test -f {shlex.quote(active_path)}', user=True)[0] == 0
-            record['log'] = g.sh(f'cat {shlex.quote(log_path)}', user=True)[1:]
-            response_code, response_text, _ = g.sh(f'cat {shlex.quote(response_path)}', user=True)
-            if response_code == 0:
-                record['response'] = json.loads(response_text)
+            if not active:
+                record['log'] = g.sh(f'cat {shlex.quote(log_path)}', user=True)[1:]
+                response_code, response_text, _ = g.sh(f'cat {shlex.quote(response_path)}', user=True)
+                if response_code == 0:
+                    record['response'] = json.loads(response_text)
             if not check('native frame and caller isolation reached active grant', active, record):
                 return
-            digest = g.out('sha256sum ' + shlex.quote(str(remote)), user=True).split()[0]
-            data = base64.b64decode(g.out('base64 ' + shlex.quote(str(remote)), user=True))
-            image = Image.open(io.BytesIO(data)).convert('RGB')
-            check('ScreenCast frame matches output geometry', image.size == (WIDTH, HEIGHT), image.size)
-            extrema = image.getextrema()
-            check('ScreenCast frame contains varied desktop pixels', any(high - low >= 16 for low, high in extrema), extrema)
-            check('retained ScreenCast frame matches guest hash', hashlib.sha256(data).hexdigest() == digest, digest)
-            (self.out / 'portal-screencast-frame.png').write_bytes(data)
-            record['retained_sha256'] = digest
-            self.capture_pending = {'remote': remote, 'exit': exit_path, 'log': log_path, 'record': record}
+            require_portal_unlocked(g, record, 'after-response')
+            self.capture_pending = {'remote': remote, 'exit': exit_path, 'log': log_path,
+                                    'response': response_path, 'record': record}
+            # The native client holds its active grant for 30 seconds. Do not
+            # spend that budget copying PNGs or collecting step journals first.
+            # Arm the unchanged two-second observer, then send the actual lock
+            # key now; the following lock step collects and validates receipts.
+            c.key('Escape', wait=0)
+            marker = str(remote.with_suffix('.revoke'))
+            code, stdout, stderr = g.sh('touch ' + shlex.quote(marker), user=True)
+            armed = check('arm lock stream-withdrawal observation', code == 0,
+                          {'exit': code, 'stdout': stdout, 'stderr': stderr})
+            record['lock_input'] = {'method': 'real noVNC Super+L', 'at': now(),
+                                    'observer_armed': armed}
+            c.key('Meta+l', wait=0)
 
         def desktop(check):
             c.key('Escape', wait=3000)
@@ -621,16 +652,11 @@ class Journey:
         self.step('portal-screencast', 'Consume a real frontend stream before locking', portal_screencast)
 
         def lock(check):
-            c.key('Escape', wait=6000)
             pending = self.capture_pending
             self.capture_pending = None
-            if pending:
-                # Arm the unchanged two-second observer BEFORE sending the lock
-                # key: remote transport latency cannot create a false pass.
-                marker = str(pending['remote'].with_suffix('.revoke'))
-                code, stdout, stderr = g.sh('touch ' + shlex.quote(marker), user=True)
-                check('arm lock stream-withdrawal observation', code == 0, {'exit': code, 'stdout': stdout, 'stderr': stderr})
-            c.key('Meta+l', wait=4000)
+            if not pending:
+                c.key('Escape', wait=6000)
+                c.key('Meta+l', wait=4000)
             active = g.out('gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver '
                            '--method org.gnome.ScreenSaver.GetActive', user=True)
             check('ScreenSaver.GetActive is true', active == '(true,)', active)
@@ -643,11 +669,29 @@ class Journey:
                 status = wait_for(completed, 100, 'lock-triggered PipeWire withdrawal proof')
                 record = pending['record']
                 record.update(requester_exit=status, log=g.sh('cat ' + shlex.quote(pending['log']), user=True)[1:])
-                verified = check('lock withdraws the real portal stream within the existing bound', status == '0', record)
+                verified = check('lock withdraws the real portal stream within the existing bound',
+                                 status == '0' and record['lock_input']['observer_armed'], record)
                 record['lock_withdrawal_verified'] = verified
                 if verified:
                     revoked = g.out('cat ' + shlex.quote(str(pending['remote'].with_suffix('.revoked.json'))), user=True)
                     (self.out / 'portal-screencast-revoked.json').write_text(revoked + '\n')
+                response_code, response_text, _ = g.sh('cat ' + shlex.quote(pending['response']), user=True)
+                if response_code == 0:
+                    record['response'] = json.loads(response_text)
+                check('ScreenCast Start returned a stream', record.get('response', {}).get('response') == 0,
+                      record.get('response'))
+                remote = pending['remote']
+                digest = g.out('sha256sum ' + shlex.quote(str(remote)), user=True).split()[0]
+                data = base64.b64decode(g.out('base64 ' + shlex.quote(str(remote)), user=True))
+                image = Image.open(io.BytesIO(data)).convert('RGB')
+                check('ScreenCast frame matches output geometry', image.size == (WIDTH, HEIGHT), image.size)
+                extrema = image.getextrema()
+                check('ScreenCast frame contains varied desktop pixels',
+                      any(high - low >= 16 for low, high in extrema), extrema)
+                check('retained ScreenCast frame matches guest hash',
+                      hashlib.sha256(data).hexdigest() == digest, digest)
+                (self.out / 'portal-screencast-frame.png').write_bytes(data)
+                record['retained_sha256'] = digest
         self.step('lock', 'Super+L locks the screen', lock)
 
         def wrong_password(check):

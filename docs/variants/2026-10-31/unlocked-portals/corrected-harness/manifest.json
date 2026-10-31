@@ -1,0 +1,1143 @@
+{
+  "scope": "focused existing installed-session capture/lock/unlock; NOT entire variant qualification",
+  "image": {
+    "ref": "ghcr.io/tuna-os/yellowfin@sha256:64e7a29a9d832c0d021d3023ee825c07d37676d722dca59b31a2dfe492e5d0b0"
+  },
+  "vm": "tuna-q-isg-yf1",
+  "steps": [
+    {
+      "id": "portal-screencast",
+      "title": "Consume a real frontend stream before locking",
+      "started": "2026-10-31T21:50:37+00:00",
+      "checks": [
+        {
+          "name": "native ScreenCast requester launched",
+          "ok": true,
+          "observed": {
+            "exit": 0,
+            "pid": "18563",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "actual portal consent control activated",
+          "ok": true,
+          "observed": {
+            "method": "AT-SPI action on the visible GNOME portal consent control",
+            "helper_sha256": "1872c601c54e5167ec14a939b19205e1769c13ee152dff511bbf6c1f4e4868e3",
+            "exit": 0,
+            "stdout": "portal session before consent: {\"locked\": false}\nactual portal picker: Share",
+            "stderr": "",
+            "accessible_tree": [
+              {
+                "role": "application",
+                "name": "xdg-desktop-portal-gnome",
+                "showing": false
+              },
+              {
+                "role": "frame",
+                "name": "Share Screen",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "grouping",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "scroll pane",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "grouping",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "An app wants to share your screen. Choose what you'd like to share.",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "grouping",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "_Entire Screen",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "toggle button",
+                "name": "Virtual-1",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "Virtual-1",
+                "showing": true
+              },
+              {
+                "role": "grouping",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "grouping",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "button",
+                "name": "Cancel",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "Cancel",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "Share Screen",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "button",
+                "name": "Share",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "Share",
+                "showing": true
+              },
+              {
+                "role": "grouping",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              }
+            ]
+          }
+        },
+        {
+          "name": "native frame and caller isolation reached active grant",
+          "ok": true,
+          "observed": {
+            "requester_sha256": {
+              "tuna-portal-capture-client.py": "6a3e82bdbf988153feae702fb927f867ff435a56558aef392b382c5d94c15c3c",
+              "tuna-pipewire-dump.py": "a63c93d72b90be6b649909b034d3a241e79eea9daae3b1b64f9f05ba3db05b4f"
+            },
+            "session_state": [
+              {
+                "phase": "before-request",
+                "at": "2026-10-31T21:50:48+00:00",
+                "exit": 0,
+                "stdout": "(false,)",
+                "stderr": ""
+              },
+              {
+                "phase": "after-response",
+                "at": "2026-10-31T21:51:32+00:00",
+                "exit": 0,
+                "stdout": "(false,)",
+                "stderr": ""
+              }
+            ],
+            "frame": "portal-screencast-prompt.png",
+            "frame_sha256": "58b531d4d3ea8946e6a9af4e9536c11a947bba230a36d6f7b79ba61af5776e8f",
+            "meaning": "console at Start; consent visibility requires visual review",
+            "input": {
+              "method": "AT-SPI action on the visible GNOME portal consent control",
+              "helper_sha256": "1872c601c54e5167ec14a939b19205e1769c13ee152dff511bbf6c1f4e4868e3",
+              "exit": 0,
+              "stdout": "portal session before consent: {\"locked\": false}\nactual portal picker: Share",
+              "stderr": "",
+              "accessible_tree": [
+                {
+                  "role": "application",
+                  "name": "xdg-desktop-portal-gnome",
+                  "showing": false
+                },
+                {
+                  "role": "frame",
+                  "name": "Share Screen",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "scroll pane",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "An app wants to share your screen. Choose what you'd like to share.",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "_Entire Screen",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "toggle button",
+                  "name": "Virtual-1",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "Virtual-1",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "button",
+                  "name": "Cancel",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "Cancel",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "Share Screen",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "button",
+                  "name": "Share",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "Share",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                }
+              ]
+            },
+            "lock_input": {
+              "method": "real noVNC Super+L",
+              "at": "2026-10-31T21:51:38+00:00",
+              "observer_armed": true
+            },
+            "requester_exit": "0",
+            "log": [
+              "grant consumed frame from node 59; lock removed PipeWire node in 0.147s",
+              ""
+            ],
+            "lock_withdrawal_verified": true,
+            "response": {
+              "mode": "revoke",
+              "response": 0,
+              "results": {
+                "streams": [
+                  [
+                    59,
+                    {
+                      "id": "0",
+                      "source_type": 1,
+                      "position": [
+                        0,
+                        0
+                      ],
+                      "size": [
+                        1280,
+                        800
+                      ]
+                    }
+                  ]
+                ]
+              }
+            },
+            "retained_sha256": "45bc0deb8d4e3ce4fb270f90c6477be9dd65448c20e415fb1572afb7ac6a0e43"
+          }
+        },
+        {
+          "name": "arm lock stream-withdrawal observation",
+          "ok": true,
+          "observed": {
+            "exit": 0,
+            "stdout": "",
+            "stderr": ""
+          }
+        }
+      ],
+      "result": "pass",
+      "frame": "01-portal-screencast.png",
+      "frame_sha256": "afd65916489eb9dda913cd0abdfdd326ab920a4d6c2c7021e99d84f0720dba5d",
+      "journal": [
+        "tuna-compositor: screen cast 5: Unconnected -> Connecting",
+        "tuna-compositor: window 6 unmapped",
+        "tuna-compositor: screen cast 5: Connecting -> Paused",
+        "tuna-compositor: screen cast 5: Paused -> Streaming",
+        "tuna-compositor: screen cast 5: Streaming -> Paused",
+        "tuna-compositor: cycle chord near-miss: sym=Some(65307) mods=0",
+        "tuna-compositor: screen cast 5: Paused -> Unconnected",
+        "tuna-compositor: display power save mode 3",
+        "tuna-compositor: display power save mode 0"
+      ],
+      "finished": "2026-10-31T21:51:49+00:00"
+    },
+    {
+      "id": "lock",
+      "title": "Super+L locks the screen",
+      "started": "2026-10-31T21:51:49+00:00",
+      "checks": [
+        {
+          "name": "ScreenSaver.GetActive is true",
+          "ok": true,
+          "observed": "(true,)"
+        },
+        {
+          "name": "logind LockedHint is yes",
+          "ok": false,
+          "observed": "no"
+        },
+        {
+          "name": "lock withdraws the real portal stream within the existing bound",
+          "ok": true,
+          "observed": {
+            "requester_sha256": {
+              "tuna-portal-capture-client.py": "6a3e82bdbf988153feae702fb927f867ff435a56558aef392b382c5d94c15c3c",
+              "tuna-pipewire-dump.py": "a63c93d72b90be6b649909b034d3a241e79eea9daae3b1b64f9f05ba3db05b4f"
+            },
+            "session_state": [
+              {
+                "phase": "before-request",
+                "at": "2026-10-31T21:50:48+00:00",
+                "exit": 0,
+                "stdout": "(false,)",
+                "stderr": ""
+              },
+              {
+                "phase": "after-response",
+                "at": "2026-10-31T21:51:32+00:00",
+                "exit": 0,
+                "stdout": "(false,)",
+                "stderr": ""
+              }
+            ],
+            "frame": "portal-screencast-prompt.png",
+            "frame_sha256": "58b531d4d3ea8946e6a9af4e9536c11a947bba230a36d6f7b79ba61af5776e8f",
+            "meaning": "console at Start; consent visibility requires visual review",
+            "input": {
+              "method": "AT-SPI action on the visible GNOME portal consent control",
+              "helper_sha256": "1872c601c54e5167ec14a939b19205e1769c13ee152dff511bbf6c1f4e4868e3",
+              "exit": 0,
+              "stdout": "portal session before consent: {\"locked\": false}\nactual portal picker: Share",
+              "stderr": "",
+              "accessible_tree": [
+                {
+                  "role": "application",
+                  "name": "xdg-desktop-portal-gnome",
+                  "showing": false
+                },
+                {
+                  "role": "frame",
+                  "name": "Share Screen",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "scroll pane",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "An app wants to share your screen. Choose what you'd like to share.",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "_Entire Screen",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "toggle button",
+                  "name": "Virtual-1",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "Virtual-1",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "button",
+                  "name": "Cancel",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "Cancel",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "Share Screen",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "button",
+                  "name": "Share",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "Share",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                }
+              ]
+            },
+            "lock_input": {
+              "method": "real noVNC Super+L",
+              "at": "2026-10-31T21:51:38+00:00",
+              "observer_armed": true
+            },
+            "requester_exit": "0",
+            "log": [
+              "grant consumed frame from node 59; lock removed PipeWire node in 0.147s",
+              ""
+            ],
+            "lock_withdrawal_verified": true,
+            "response": {
+              "mode": "revoke",
+              "response": 0,
+              "results": {
+                "streams": [
+                  [
+                    59,
+                    {
+                      "id": "0",
+                      "source_type": 1,
+                      "position": [
+                        0,
+                        0
+                      ],
+                      "size": [
+                        1280,
+                        800
+                      ]
+                    }
+                  ]
+                ]
+              }
+            },
+            "retained_sha256": "45bc0deb8d4e3ce4fb270f90c6477be9dd65448c20e415fb1572afb7ac6a0e43"
+          }
+        },
+        {
+          "name": "ScreenCast Start returned a stream",
+          "ok": true,
+          "observed": {
+            "mode": "revoke",
+            "response": 0,
+            "results": {
+              "streams": [
+                [
+                  59,
+                  {
+                    "id": "0",
+                    "source_type": 1,
+                    "position": [
+                      0,
+                      0
+                    ],
+                    "size": [
+                      1280,
+                      800
+                    ]
+                  }
+                ]
+              ]
+            }
+          }
+        },
+        {
+          "name": "ScreenCast frame matches output geometry",
+          "ok": true,
+          "observed": [
+            1280,
+            800
+          ]
+        },
+        {
+          "name": "ScreenCast frame contains varied desktop pixels",
+          "ok": true,
+          "observed": [
+            [
+              0,
+              255
+            ],
+            [
+              0,
+              255
+            ],
+            [
+              0,
+              255
+            ]
+          ]
+        },
+        {
+          "name": "retained ScreenCast frame matches guest hash",
+          "ok": true,
+          "observed": "45bc0deb8d4e3ce4fb270f90c6477be9dd65448c20e415fb1572afb7ac6a0e43"
+        }
+      ],
+      "result": "fail",
+      "frame": "02-lock.png",
+      "frame_sha256": "852d322e60ae7e22b2a0daa7dd3fe5526a7b933de4c9cca0cda2250aca92eec6",
+      "crosscheck": {
+        "identical": true,
+        "corral_png_sha256": "40bfa3d470b82f4a92828eaa6a2cf2ed5bfd9c61fad7d8ec25631cfa27adab87"
+      },
+      "journal": [],
+      "finished": "2026-10-31T21:53:45+00:00"
+    },
+    {
+      "id": "unlock",
+      "title": "The right password unlocks",
+      "started": "2026-10-31T21:53:45+00:00",
+      "checks": [
+        {
+          "name": "ScreenSaver.GetActive is false",
+          "ok": true,
+          "observed": "(false,)"
+        }
+      ],
+      "result": "pass",
+      "frame": "03-unlock.png",
+      "frame_sha256": "388033115698b7666bb2c2067942b3cd0bc0219c4a77dcf17ea978a61e7a7f00",
+      "journal": [
+        "tuna-compositor: display power save mode 0",
+        "tuna-ibus-bridge: text field focused",
+        "tuna-ibus-bridge: text field left"
+      ],
+      "finished": "2026-10-31T21:54:07+00:00"
+    }
+  ],
+  "harness_sha256": "2e1b77bebfa27c5077b197c8e47a4d81f5c2faf81adeee9c03d9a24b17263e01",
+  "portal_screencast": {
+    "requester_sha256": {
+      "tuna-portal-capture-client.py": "6a3e82bdbf988153feae702fb927f867ff435a56558aef392b382c5d94c15c3c",
+      "tuna-pipewire-dump.py": "a63c93d72b90be6b649909b034d3a241e79eea9daae3b1b64f9f05ba3db05b4f"
+    },
+    "session_state": [
+      {
+        "phase": "before-request",
+        "at": "2026-10-31T21:50:48+00:00",
+        "exit": 0,
+        "stdout": "(false,)",
+        "stderr": ""
+      },
+      {
+        "phase": "after-response",
+        "at": "2026-10-31T21:51:32+00:00",
+        "exit": 0,
+        "stdout": "(false,)",
+        "stderr": ""
+      }
+    ],
+    "frame": "portal-screencast-prompt.png",
+    "frame_sha256": "58b531d4d3ea8946e6a9af4e9536c11a947bba230a36d6f7b79ba61af5776e8f",
+    "meaning": "console at Start; consent visibility requires visual review",
+    "input": {
+      "method": "AT-SPI action on the visible GNOME portal consent control",
+      "helper_sha256": "1872c601c54e5167ec14a939b19205e1769c13ee152dff511bbf6c1f4e4868e3",
+      "exit": 0,
+      "stdout": "portal session before consent: {\"locked\": false}\nactual portal picker: Share",
+      "stderr": "",
+      "accessible_tree": [
+        {
+          "role": "application",
+          "name": "xdg-desktop-portal-gnome",
+          "showing": false
+        },
+        {
+          "role": "frame",
+          "name": "Share Screen",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "grouping",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "scroll pane",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "grouping",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "An app wants to share your screen. Choose what you'd like to share.",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "grouping",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "_Entire Screen",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "toggle button",
+          "name": "Virtual-1",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "Virtual-1",
+          "showing": true
+        },
+        {
+          "role": "grouping",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "grouping",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "button",
+          "name": "Cancel",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "Cancel",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "Share Screen",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "button",
+          "name": "Share",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "Share",
+          "showing": true
+        },
+        {
+          "role": "grouping",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        }
+      ]
+    },
+    "lock_input": {
+      "method": "real noVNC Super+L",
+      "at": "2026-10-31T21:51:38+00:00",
+      "observer_armed": true
+    },
+    "requester_exit": "0",
+    "log": [
+      "grant consumed frame from node 59; lock removed PipeWire node in 0.147s",
+      ""
+    ],
+    "lock_withdrawal_verified": true,
+    "response": {
+      "mode": "revoke",
+      "response": 0,
+      "results": {
+        "streams": [
+          [
+            59,
+            {
+              "id": "0",
+              "source_type": 1,
+              "position": [
+                0,
+                0
+              ],
+              "size": [
+                1280,
+                800
+              ]
+            }
+          ]
+        ]
+      }
+    },
+    "retained_sha256": "45bc0deb8d4e3ce4fb270f90c6477be9dd65448c20e415fb1572afb7ac6a0e43"
+  }
+}

@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/run/user/1000/isg/tuna-portal-screenshot-client.py", line 68, in <module>
+    raise RuntimeError("Screenshot grant failed: " + str(code))
+RuntimeError: Screenshot grant failed: 2

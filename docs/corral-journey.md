@@ -83,6 +83,29 @@ does not by itself prove a consent prompt, ScreenCast stream or revocation.
 The separate ScreenCast requester consumes the real remote PipeWire stream and
 holds it until the actual Super+L step. Its existing two-second withdrawal
 observer is armed before the key, never replaced with explicit Session.Close.
+Once the native requester reports a consumed frame and caller isolation, the
+journey checks that the session is still unlocked, arms that observer and sends
+Super+L immediately, before collecting per-step screenshots/journals. The lock
+step then validates withdrawal and retrieves the response, PNG and hashes. This
+keeps host SSH/PNG transfer overhead out of the requester's unchanged 30-second
+active-grant wait as well as its unchanged two-second withdrawal deadline.
+
+Capture probes require `org.gnome.ScreenSaver.GetActive=false` before the
+request and after its response; both replies are retained in `session_state`.
+Real pointer motion between slow guest probes keeps an unlocked session
+active without changing any idle/lock setting or unlocking a locked session.
+The external-capture AT-SPI helper checks ScreenSaver again immediately before
+activating Allow/Share: a widget can report `STATE_SHOWING` while the compositor
+lock curtain covers it. A locked or unreadable state fails the precondition,
+not the capture-provider gate. No portal request, response or withdrawal
+deadline is increased.
+
+The [installed Yellowfin boundary receipts](variants/2026-10-31/unlocked-portals/README.md)
+show why this distinction matters: the unchanged published payload returns
+a real Screenshot URI and PipeWire frame when unlocked, but denies capture
+when locked. GNOME's backend translates the locked Shell Screenshot
+`(false, "")` into portal Response 0 with an empty URI; that is not an image
+delivery. AT-SPI activation behind the curtain is not visible user consent.
 
 ## Limits
 
