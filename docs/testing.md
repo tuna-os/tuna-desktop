@@ -308,6 +308,10 @@ one key can execute four serialized `wpctl` subprocesses with five-second
 production timeouts, plus callback dispatch. It still requires accepted
 tokens to finish successfully and the actual scheduler to be idle; a
 fixture volume write alone never proves completion.
+The power-save proof admits both dim and undim after live idle-brightness
+writes finish: only the explicit pending-transaction reply waits, for at
+most ten seconds. Other errors still fail immediately, and exact backlight
+readbacks remain required before blanking and fixture teardown.
 
 `scripts/tuna-drm-smoke` loads a kernel module and starts seatd as root.
 Run it in a VM or a disposable machine rather than your desktop session.

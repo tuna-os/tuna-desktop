@@ -9949,9 +9949,21 @@ power_save_get() {
         org.gnome.Mutter.DisplayConfig PowerSaveMode
 }
 shell_dimming() {
-    gdbus call --session --dest org.gnome.Shell.Brightness \
+    # A live idle-brightness change owns an asynchronous write/readback.
+    # Like the undim boundary, admit this request only after that owner
+    # completes; every error other than its explicit busy reply is fatal.
+    dim_deadline=$(($(date +%s) + 10))
+    until dim_error="$(gdbus call --session --dest org.gnome.Shell.Brightness \
         --object-path /org/gnome/Shell/Brightness \
-        --method org.gnome.Shell.Brightness.SetDimming "$1" >/dev/null
+        --method org.gnome.Shell.Brightness.SetDimming "$1" 2>&1 >/dev/null)"; do
+        case "$dim_error" in
+            *"brightness update already pending"*) ;;
+            *) fail G-POWER-SAVE-MODE "SetDimming($1) refused: $dim_error" ;;
+        esac
+        [ "$(date +%s)" -le "$dim_deadline" ] ||
+            fail G-POWER-SAVE-MODE "SetDimming($1) stayed pending"
+        sleep 0.2
+    done
 }
 # The monitor-key cycle above wrapped the primary to its hardware floor and
 # the slider kept its zero ratio (CI 40815468357: tuna-bl 10/1010), so only
@@ -10026,20 +10038,9 @@ if ! { [ "$(cat "$power_other/brightness")" = "$power_restored_other" ] &&
     [ "$(cat "$BACKLIGHT/brightness")" = "$power_restored_primary" ]; }; then
     fail G-POWER-SAVE-MODE "restoring idle-brightness $power_idle did not clip to $power_restored_primary/$power_restored_other"
 fi
-# The idle transaction may still be completing its readback; the shell refuses
-# a concurrent request as pending, and its reply comes only after its own
-# transaction completes, so an accepted undim leaves no write in flight.
-end=$(($(date +%s) + 10))
-until power_undim_error="$(gdbus call --session --dest org.gnome.Shell.Brightness \
-    --object-path /org/gnome/Shell/Brightness \
-    --method org.gnome.Shell.Brightness.SetDimming false 2>&1 >/dev/null)"; do
-    case "$power_undim_error" in
-        *"brightness update already pending"*) ;;
-        *) fail G-POWER-SAVE-MODE "SetDimming(false) refused: $power_undim_error" ;;
-    esac
-    [ "$(date +%s)" -le "$end" ] || fail G-POWER-SAVE-MODE "SetDimming(false) stayed pending"
-    sleep 0.2
-done
+# The reply completes its own write/readback, so no write remains in
+# flight when the controlled second output is removed below.
+shell_dimming false || fail G-POWER-SAVE-MODE "SetDimming(false) refused"
 if ! { [ "$(cat "$BACKLIGHT/brightness")" = "$power_baseline" ] &&
     [ "$(cat "$power_other/brightness")" = "$power_other_baseline" ]; }; then
     fail G-POWER-SAVE-MODE "undimming did not restore the user baseline $power_baseline/$power_other_baseline"
