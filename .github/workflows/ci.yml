@@ -901,6 +901,7 @@ jobs:
               ('popup-submenu', 'TUNA_REQUIRE_MENU_MOTION=1', 'transient::gtk_menu_tests::actual_gtk_popup_submenus_ease_open_and_closed', 'POPUP-SUBMENU pass ', 'actual GTK widgets, frame clock and GLib timers under private X11 (PopupSubMenu height and arrow, #501); the NetworkManager and IBus menus holding them are not driven by a proof'),
               ('lock-curtain', 'TUNA_REQUIRE_LOCK_CURTAIN=1', 'lock_curtain::gtk_curtain_tests::actual_gtk_curtain_pages_follow_progress_and_policy', 'LOCK-CURTAIN pass ', 'actual GTK widget allocation, focus and frame clock under private X11; the session-lock surface, real input and frozen-clock frames are proven by G-LOCK-CURTAIN-CLOCK, G-LOCK-CURTAIN-POLICY and G-LOCK-CURTAIN-DRAG'),
               ('grid-zoom', 'TUNA_REQUIRE_GRID_ZOOM=1', 'grid_animation::gtk_zoom_tests::actual_gtk_zoom_applies_all_properties_including_terminal_frame', 'GRID-ZOOM pass ', 'actual GTK Zoom setters apply translation, scale and opacity together, including a delayed terminal frame and drag scale/fade restoration; native folder drag is G-FOLDER-DND'),
+              ('grid-page-dots', 'TUNA_REQUIRE_GRID_ZOOM=1', 'overview::gtk_page_dot_tests::actual_gtk_page_dot_samples_observe_stored_look', 'GRID-PAGE-DOTS pass ', 'actual GTK page indicator samples read stored Zoom scale/opacity after simultaneous updates, including hover and pressed looks; callback coverage is G-GRID-PAGE-ANIM'),
           ]
           for name, admit, test, marker, scope in proofs:
               artifacts = pathlib.Path('gtk-shell-artifacts') / name
