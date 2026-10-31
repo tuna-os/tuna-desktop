@@ -100,7 +100,7 @@ impl Runtime {
             self.apply_aid_effects(effects);
         }
         if self.input_aids.pointer.active() {
-            let pointer = self.manager.pointer_pos();
+            let pointer = self.pointer_pos_now();
             let effects = self.input_aids.pointer.poll(now, pointer);
             self.apply_pointer_effects(effects);
         }
@@ -152,7 +152,7 @@ impl Runtime {
                     self.apply_aid_effects(bells);
                 }
                 AidEffect::PointerMove { dx, dy, time } => {
-                    let pos = self.manager.pointer_pos();
+                    let pos = self.pointer_pos_now();
                     let pos = self.clamp_to_outputs(pos.x + dx, pos.y + dy);
                     self.route_pointer_aids(ManagerInput::Motion {
                         pos: pos.into(),
