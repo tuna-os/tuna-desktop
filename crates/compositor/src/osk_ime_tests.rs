@@ -23,6 +23,7 @@ use wayland_protocols::{
     },
 };
 use wayland_protocols_misc::zwp_input_method_v2::client::{
+    zwp_input_method_keyboard_grab_v2::{self, ZwpInputMethodKeyboardGrabV2},
     zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
     zwp_input_method_v2::{self, ZwpInputMethodV2},
 };
@@ -53,6 +54,7 @@ struct Client {
     im_manager: Option<ZwpInputMethodManagerV2>,
     serial: u32,
     input: Vec<Input>,
+    grab_keys: usize,
 }
 impl Dispatch<WlRegistry, ()> for Client {
     fn event(
@@ -144,6 +146,20 @@ impl Dispatch<ZwpInputMethodV2, ()> for Client {
     ) {
         if let zwp_input_method_v2::Event::Done = event {
             state.serial = state.serial.wrapping_add(1);
+        }
+    }
+}
+impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &ZwpInputMethodKeyboardGrabV2,
+        event: zwp_input_method_keyboard_grab_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwp_input_method_keyboard_grab_v2::Event::Key { .. } = event {
+            state.grab_keys += 1;
         }
     }
 }
@@ -291,6 +307,8 @@ fn virtual_fallback_requests_stay_ordered_once_and_cannot_cross_focus_or_lock() 
     let _top = xdg.get_toplevel(&qh, ());
     surface.commit();
     settle(&mut comp, &mut manager, &mut app, &mut bridge);
+    let _grab = im.grab_keyboard(&bridge.queue.handle(), ());
+    settle(&mut comp, &mut manager, &mut app, &mut bridge);
     let epoch = bridge.state.serial;
     assert!(epoch > 0);
     app.state.input.clear();
@@ -311,7 +329,23 @@ fn virtual_fallback_requests_stay_ordered_once_and_cannot_cross_focus_or_lock() 
             Input::Key(21, false)
         ]
     );
+    assert_eq!(
+        bridge.state.grab_keys, 0,
+        "fallback must not recurse into IBus"
+    );
     app.state.input.clear();
+    // The original grab must still receive subsequent physical keys.
+    manager.keyboard_key(&mut comp.state, 30, true, 1);
+    manager.keyboard_key(&mut comp.state, 30, false, 2);
+    settle(&mut comp, &mut manager, &mut app, &mut bridge);
+    assert_eq!(
+        bridge.state.grab_keys, 2,
+        "fallback must restore the IM grab"
+    );
+    assert!(
+        app.state.input.is_empty(),
+        "physical keys still belong to the IM grab"
+    );
     comp.state.set_shortcut_inhibition_locked(true);
     osk.unhandled(epoch, u32::from('z'));
     settle(&mut comp, &mut manager, &mut app, &mut bridge);
