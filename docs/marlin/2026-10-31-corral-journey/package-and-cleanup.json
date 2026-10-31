@@ -1,0 +1,17 @@
+{
+  "image": "ghcr.io/tuna-os/marlin@sha256:d0e65bce0ac55cb6c58bcf3739e30d6372fe4be978e6ea7c0c1310b3962bdfa5",
+  "amd64_manifest": "sha256:9706311b7850d4dfcbf312b996a98793f9f0581d200fbe08c1c344924d49b691",
+  "package": "tuna-desktop 1.0.0beta.2-2",
+  "inspection_vm": "tuna-q-beta2-20261031c",
+  "command": "pacman -Q tuna-desktop; if test -e /usr/bin/tuna-greeter || test -L /usr/bin/tuna-greeter; then echo TUNA_GREETER_PRESENT; exit 1; fi; pacman -Ql tuna-desktop; echo TUNA_GREETER_ABSENT",
+  "observed_marker": "TUNA_GREETER_ABSENT",
+  "packaged_binaries": ["tuna-compositor", "tuna-ibus-bridge", "tuna-session", "tuna-shell-gtk", "tuna-shell-host", "tuna-wallpaper-svg"],
+  "cleanup": {
+    "first_attempt": "manifest.json records successful corral delete --wait",
+    "remaining_vms_deleted": ["tuna-q-beta2-20261031b", "tuna-q-beta2-20261031c"],
+    "removed_for_each": ["virtualmachine", "virtualmachineinstance", "persistentvolumeclaim"],
+    "command": "corral --json delete tuna-q-beta2-20261031b tuna-q-beta2-20261031c -f --wait --timeout 8m",
+    "final_command": "corral --json list --prefix tuna-q-beta2-20261031",
+    "final_result": []
+  }
+}
