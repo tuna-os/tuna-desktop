@@ -837,13 +837,14 @@ impl PropertyMenu {
                     parent.append(&gtk::Separator::new(gtk::Orientation::Horizontal))
                 }
                 Kind::Menu => {
-                    let expander = gtk::Expander::new(Some(&p.label));
-                    expander.set_sensitive(p.sensitive);
-                    expander.set_tooltip_text(Some(&p.tooltip));
+                    // keyboard.js:1107's PopupSubMenuMenuItem for a property
+                    // menu: the submenu grows open and its arrow turns.
                     let child = gtk::Box::new(gtk::Orientation::Vertical, 4);
                     self.rows(&child, &p.children);
-                    expander.set_child(Some(&child));
-                    parent.append(&expander);
+                    let submenu = crate::transient::PopupSubmenu::new(&p.label, &child);
+                    submenu.set_sensitive(p.sensitive);
+                    submenu.header().set_tooltip_text(Some(&p.tooltip));
+                    parent.append(&submenu);
                 }
                 Kind::Toggle | Kind::Radio => {
                     let button = gtk::CheckButton::with_label(&p.label);

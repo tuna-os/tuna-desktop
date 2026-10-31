@@ -171,7 +171,7 @@ class FixtureRetirementTests(unittest.TestCase):
     def test_real_child_exit_is_awaited(self):
         child = self.start_child('import signal,time\n'
             'signal.signal(signal.SIGTERM, lambda *_: (time.sleep(.15), exit(0)))\n'
-            'print("ready", flush=True)\nwhile True: time.sleep(.01)')
+            'print("ready", flush=True)\ntime.sleep(60)\nexit("no SIGTERM within 60 s")')
         start = time.monotonic()
         r.retire(os.getpid(), [child.pid], timeout=2)
         self.assertGreaterEqual(time.monotonic() - start, .1)
@@ -212,15 +212,21 @@ class FixtureRetirementTests(unittest.TestCase):
         supervisor = '''import pathlib,signal,subprocess,sys,time
 root=pathlib.Path(sys.argv[1])
 writer=subprocess.Popen([sys.executable,'-c',
-    'import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); '
-    'exec("while True:\\n (p/\\".tuna-wallpaper.tmp\\").write_text(\\"pixels\\"); (p/\\".tuna-wallpaper.tmp\\").replace(p/\\"tuna-wallpaper\\"); time.sleep(.001)")',str(root)])
+    'import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); end=time.monotonic()+60; '
+    'exec("while time.monotonic()<end:\\n (p/\\".tuna-wallpaper.tmp\\").write_text(\\"pixels\\"); (p/\\".tuna-wallpaper.tmp\\").replace(p/\\"tuna-wallpaper\\"); time.sleep(.001)"); '
+    'sys.exit("writer not terminated within 60 s")',str(root)])
 stopping=False
 def stop(*_):
     global stopping
     stopping=True
 signal.signal(signal.SIGTERM,stop)
 (root/'ready').write_text('ready')
-while not stopping: time.sleep(.01)
+end=time.monotonic()+60
+while not stopping:
+    if time.monotonic()>end:
+        writer.kill()
+        raise SystemExit('no SIGTERM within 60 s')
+    time.sleep(.01)
 time.sleep(.15)
 writer.terminate()
 writer.wait()
@@ -235,7 +241,7 @@ if (root/'x-retired').exists(): raise RuntimeError('X server retired before comp
                     'root=pathlib.Path(sys.argv[1])\n'
                     'signal.signal(signal.SIGTERM, lambda *_: ((root/"x-retired").write_text("done"), exit(0)))\n'
                     '(root/"x-ready").write_text("ready")\n'
-                    'while True: time.sleep(.01)\n')
+                    'time.sleep(60)\nexit("no SIGTERM within 60 s")\n')
                 wrapper = (self.ROOT / 'tests/portal-reference' / name).read_text()
                 cleanup = wrapper[wrapper.index('cleanup() {'):wrapper.index('trap cleanup EXIT')]
                 cleanup = cleanup.replace('/repo/', str(self.ROOT) + '/').replace('/out/', str(root) + '/')

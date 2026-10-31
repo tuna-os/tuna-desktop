@@ -2,7 +2,8 @@
 """Helpers for scripts/tuna-osk-proof (#349).
 
   tuna-osk-proof.py watch STATE OUT
-      Poll the compositor state snapshot every 5 ms until killed and
+      Poll the compositor state snapshot every 5 ms until killed (exit 1
+      after 1800 s so an orphaned sampler cannot run forever) and
       append one JSON line to OUT whenever what the proof follows
       changes: {"t": CLOCK_MONOTONIC seconds, "osk": [x, y, w, h] of the
       mapped tuna-osk layer or null, "locked", "text_input",
@@ -48,13 +49,15 @@ def sample(path):
 
 def watch(state, out):
     last = None
-    while True:
+    end = time.monotonic() + 1800
+    while time.monotonic() < end:
         now = sample(state)
         if now is not None and now != last:
             with open(out, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(dict(now, t=time.monotonic())) + "\n")
             last = now
         time.sleep(0.005)
+    sys.exit("watch: not stopped within 1800 s")
 
 
 def key(dump, window, ox, oy, name):

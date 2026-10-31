@@ -128,6 +128,7 @@ settings local builds need (`just` lists the recipes):
 | `just proof <name> [args]` | `scripts/tuna-<name> --artifacts <tmp>`, e.g. `just proof gtk-shell-proof` |
 | `just ci-artifacts <run> [name]` | downloads a CI run's artifacts and prints the directory |
 | `just clean` / `just gc` | deletes this worktree's target / frees disk (below) |
+| `just disk-guard [--watch [s]]` | frees disk now, or keeps checking every `s` seconds (below) |
 
 Every build uses its own checkout's `target/` (an inherited
 `CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one),
@@ -151,8 +152,19 @@ Cleanup is automatic where it is safe:
   or closed, removes those worktrees when they have no uncommitted
   changes, and expires `just ci-artifacts` downloads after six hours. It
   never touches the main checkout or the worktree it runs from;
-- any build recipe runs `just gc` first when less than 20 GiB of disk is
-  free (`TUNA_MIN_FREE_GB`).
+- `just disk-guard` (`scripts/tuna-disk-guard`), when less than 40 GiB
+  is free on the repository's filesystem (`TUNA_MIN_FREE_GB`), deletes
+  the `target/` of each of this repository's worktrees that no running
+  process references (by working directory, executable, arguments or
+  environment) and that nothing touched for 45 minutes
+  (`TUNA_IDLE_MINUTES`), plus `/tmp/tuna-proof-*` and `just ci-artifacts`
+  entries older than 90 minutes. It logs each removal and leaves the main
+  checkout's target alone unless given `--include-main`. `--watch
+  [seconds]` repeats it (default every 600 s); on a shared host run it
+  that way from a clean checkout of `main`;
+- any build recipe runs `just disk-guard` first (it only removes anything
+  below `TUNA_MIN_FREE_GB`, 40 GiB); automatic cleanup never calls `gc`,
+  whose merged-PR cleanup is not process-aware.
 
 VM lanes need KVM, so they run in CI's `marlin-vm` jobs or on a Corral
 VM, not through these recipes.
@@ -192,11 +204,34 @@ status; a compiled test or cache hit is not a substitute for these cases.
 Run one crate with `cargo test -p <package>` (package names are in each
 crate's `README.md`, for example `cargo test -p tuna-compositor`).
 
+Native resource observation regressions live in
+`crates/wallpaper-svg/src/resource.rs`. Select `resource::tests::` in the native
+test invocation when checking these cases separately.
+
+The concurrent membership regression adds `new.conf` after the first directory
+inventory and must reject that observation without sleeps or timestamp advances:
+directory size, mtime and ctime can all remain equal across a member addition.
+The observer compares two bounded, sorted raw-name inventories through the same
+opened directory, then retains the descriptor/pathname identity guards. The
+rescan-bound regression also requires an over-limit second inventory to fail.
+These are nonrecursive observations, not atomic filesystem snapshots or proof
+against mutations after the final guard; native file hashing and symlink
+following retain their separate coverage.
+
 Desktop-entry launch coverage lives in `tuna-shell-host`:
 `cargo test --locked -p tuna-shell-host --lib apps::`.
 It checks quoted multiword and empty arguments, field-code expansion after
 argument grouping, and literal `$HOME` handling. Desktop `Exec` commands are
 parsed as an argument vector, never evaluated by a shell.
+
+`scripts/lib/tuna-perf-repeatability-tests.py` uses POSIX-shell logging-only
+stubs for `sudo`, `truncate`, and `rm`, avoiding 96 unnecessary Python startups
+per full paired scenario; its arity-prefixed NUL argv journal preserves empty
+arguments, newlines, and non-UTF-8 bytes without shell re-parsing.
+The Python VM stub still exercises real `Popen`/`Handoff` termination and
+reaping rather than creating guests.
+This fixture optimization does not replace the twelve real guest acquisitions
+or change production measurement windows.
 
 ## Nested proofs
 
@@ -294,6 +329,14 @@ both interfaces, so `tuna-portals.conf` routes them to a working backend),
 under `repeat-NN/`; `repeat-manifest.json` records every boot, while the
 root `assertions.txt` aggregates results for the parity ledger.
 
+The installed strip gate validates both PNG and PPM pixels against the same
+owned window geometry. A transient obstruction or an unpresented frame may
+retry for at most 10 seconds, within the existing 120-second strip deadline.
+The first rejected image pair is retained as `*-not-ready.{png,ppm}`; the
+receipt records capture attempts. Window identity/geometry drift, malformed
+images and QMP failures remain terminal. A retry never qualifies pixels from
+the rejected frame or claims presentation latency.
+
 The artifact (`marlin-vm`) holds `serial.log`, `tuna-lines.log` (every
 `tuna-*` line), the boot frames, `V-OVERVIEW.png` (the login overview),
 `V-SESSION.png` (the desktop), and `manifest.json`.
@@ -365,6 +408,14 @@ Proof `G-ANIMATION-CLOCK` samples the overview this way at 125 and 250 ms
 in both directions. `G-ANIMATIONS-OFF` and `G-INTROSPECT-MOTION` check the
 live motion policy: animations off snaps everything, Reduced Motion
 (fade-only) snaps overview and strip motion but keeps the idle-shield fade.
+
+The shell's Alt+Tab fades read the same clock (`crates/shell-gtk/src/anim_clock.rs`),
+and the compositor state lists `switcher_thumbnail_alphas`, the opacity each
+switcher window image is drawn at. `G-SWITCHER-FADE` freezes the clock and
+samples them at 0, 50 and 100 ms of the thumbnails' fade in and 50 ms into
+the fade out (Alt+Escape, which cancels without moving focus), where GNOME's
+ease-out quad gives 0, 191/255 and 1, then 64/255. The grid-cancel comparison
+slice skips the sampling: its old binaries predate the published alphas.
 
 ## Frame cost
 

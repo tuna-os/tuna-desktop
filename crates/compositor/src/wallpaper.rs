@@ -2461,9 +2461,12 @@ mod tests {
             .unwrap()
             .sample(100.0, [8, 8])
             .unwrap();
+        // Replace owned fixture files so identity changes even within one timestamp tick.
+        let replacement_picture = dir.path().join("replacement.png");
         image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 240, 255]))
-            .save(&picture)
+            .save(&replacement_picture)
             .unwrap();
+        std::fs::rename(&replacement_picture, &picture).unwrap();
         let changed = SourceObservation::observe(&uri);
         assert_eq!(original.identity, changed.identity);
         assert_ne!(
@@ -2483,7 +2486,13 @@ mod tests {
             .is_none(),
             "stale source worker cannot publish old image identity"
         );
-        std::fs::write(&xml, document.replace("<duration>4", "<duration>8")).unwrap();
+        let replacement_xml = dir.path().join("replacement.xml");
+        std::fs::write(
+            &replacement_xml,
+            document.replace("<duration>4", "<duration>8"),
+        )
+        .unwrap();
+        std::fs::rename(&replacement_xml, &xml).unwrap();
         assert!(
             load_animation_wallpaper(
                 &uri,

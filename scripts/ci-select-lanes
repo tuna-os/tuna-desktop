@@ -114,6 +114,7 @@ OWNED = [
     ("docs/nested-session.md", ["arch-package"]),
     ("packaging/marlin/*", ["marlin-image", "marlin-vm"]),
     ("scripts/tuna-vm-lane", ["marlin-vm"]),
+    ("scripts/lib/vm_strip_*", ["marlin-vm"]),
     ("scripts/tuna-ledger", ["parity-ledger"]),
     ("docs/parity-ledger.md", ["parity-ledger"]),
     ("scripts/tuna-docs-shots", ["docs-shots"]),
