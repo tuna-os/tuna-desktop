@@ -1,0 +1,149 @@
+# Dedicated static local volumes; only this namespace admits privileged host access.
+# Prepare all 42 bind mounts on karnataka before starting this DaemonSet.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tuna-ci-storage
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tuna-ci-scratch-provisioner
+  namespace: tuna-ci-storage
+---
+# No PVC, pod, Job, or ConfigMap API access: cleanup runs in process and
+# configuration is mounted by kubelet. Nodes are read only; taint removal is off.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tuna-ci-scratch-provisioner
+rules:
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [nodes]
+    resourceNames: [karnataka]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [watch]
+  - apiGroups: ["", events.k8s.io]
+    resources: [events]
+    verbs: [create, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tuna-ci-scratch-provisioner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tuna-ci-scratch-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: tuna-ci-scratch-provisioner
+    namespace: tuna-ci-storage
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tuna-ci-scratch-config
+  namespace: tuna-ci-storage
+data:
+  useJobForCleaning: "false"
+  minResyncPeriod: "5s"
+  storageClassMap: |
+    tuna-ci-scratch:
+      hostDir: /var/lib/tuna-ci-scratch/pool
+      mountDir: /var/lib/tuna-ci-scratch/pool
+      volumeMode: Filesystem
+      accessMode: ReadWriteOnce
+      fsType: ext4
+      namePattern: "slot-*"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tuna-ci-scratch-provisioner
+  namespace: tuna-ci-storage
+spec:
+  selector:
+    matchLabels:
+      app: tuna-ci-scratch-provisioner
+  template:
+    metadata:
+      labels:
+        app: tuna-ci-scratch-provisioner
+    spec:
+      serviceAccountName: tuna-ci-scratch-provisioner
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/hostname: karnataka
+      containers:
+        - name: provisioner
+          image: registry.k8s.io/sig-storage/local-volume-provisioner:v2.10.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --discovery-period=5s
+          securityContext:
+            privileged: true
+          env:
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: MY_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: JOB_CONTAINER_IMAGE
+              value: registry.k8s.io/sig-storage/local-volume-provisioner:v2.10.0
+          ports:
+            - name: metrics
+              containerPort: 8080
+          # v2.10.0 helm/provisioner/values.yaml uses TCP liveness.
+          # cmd/local-volume-provisioner/main.go serves /metrics only:
+          # it has no /health or /ready endpoint. This checks HTTP serving,
+          # not whether every slot has been discovered or cleaned.
+          livenessProbe:
+            tcpSocket:
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 60
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/provisioner/config
+              readOnly: true
+            - name: pool
+              mountPath: /var/lib/tuna-ci-scratch/pool
+              mountPropagation: HostToContainer
+      volumes:
+        - name: config
+          configMap:
+            name: tuna-ci-scratch-config
+        - name: pool
+          hostPath:
+            path: /var/lib/tuna-ci-scratch/pool
+            type: Directory
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: tuna-ci-scratch
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
