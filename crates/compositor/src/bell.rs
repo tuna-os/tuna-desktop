@@ -309,16 +309,14 @@ mod tests {
 
     #[test]
     fn a_frame_delayed_past_the_flash_still_shows_the_peak_and_restores() {
-        let started = Instant::now();
-        let mut bell = Bell {
-            visual: Some(Visual {
-                started,
-                pulses: 2,
-                leg: 0,
-                surface: None,
-            }),
+        let mut bell = Bell::default();
+        bell.set_policy(BellPolicy {
+            audible: false,
+            visual: true,
             ..Default::default()
-        };
+        });
+        bell.ring(None);
+        let started = bell.visual.as_ref().unwrap().started;
         // Player housekeeping and wake queries must not consume a frame.
         bell.tick(started + Duration::from_millis(200));
         assert!(bell.visual_active());
