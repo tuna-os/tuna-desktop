@@ -98,6 +98,7 @@ jobs:
       - run: python3 scripts/tests/test_vm_strip_fixture_owner.py
       - run: python3 scripts/tests/test_vm_strip_image.py
       - run: python3 scripts/tests/test_vm_strip_stationary_edge.py
+      - run: python3 scripts/tests/test_fresh_accounts.py
       - run: python3 scripts/lib/keyring-owner-proof-tests.py
       - run: python3 scripts/lib/tray-absence-proof-tests.py
       - run: python3 scripts/lib/ledger-tests.py
@@ -1294,6 +1295,18 @@ jobs:
           --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
           --meta "tuna_package=$(basename arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)"
+          --meta "commit=${{ github.sha }}"
+      # tunaOS#4092: record-free standard/admin accounts (useradd at boot, no
+      # AccountsService record, no Session preselection, no autologin) through
+      # first GDM login, logout, login, reboot and login. Separate from the
+      # session-less tuna-test case above; -snapshot leaves the disk pristine.
+      - name: Fresh-account GDM journey (record-free standard and admin)
+        if: ${{ !cancelled() }}
+        run: >-
+          test -f /mnt/vm/disk.raw &&
+          scripts/tuna-vm-lane --fresh-accounts --disk /mnt/vm/disk.raw --out vm-lane-artifacts/fresh-accounts
+          --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
+          --meta "test_image_id=$(cat /mnt/vm/image-id)"
           --meta "commit=${{ github.sha }}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()

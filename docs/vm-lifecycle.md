@@ -20,6 +20,31 @@ serial port. The fixture's session environment comes from `environment.d`,
 which gdm-wayland-session imports from the user manager; the per-login Orca
 test secret comes from a user environment generator.
 
+## Record-free fresh accounts (tunaOS#4092)
+
+`tuna-test` above has a session-less AccountsService record, so it proves
+GDM's `FallbackSession` path only. `scripts/tuna-vm-lane --fresh-accounts`
+is a separate boot of the same disk (QEMU `-snapshot`) that passes the
+`tuna.vm.fresh-accounts` systemd credential (SMBIOS type 11). Only then does
+`tuna-vm-fresh-accounts.service` run `useradd -m` before GDM starts, as an
+installer would: `tunastd` (standard), `tunaadmin` (`wheel`), and the
+control `tunaseeded`, whose record is pre-seeded. `tunastd` and `tunaadmin`
+get no AccountsService record, no Session preselection and no autologin.
+
+| Gate | Actual operation and evidence |
+| --- | --- |
+| V-FRESH-RECORD-FREE-<user> | Before any login: account exists with a home, no `/var/lib/AccountsService/users/<user>`, no GDM automatic/timed login, `wheel` only for the admin |
+| V-FRESH-CONTROL | The same probe classifies the pre-seeded `tunaseeded` as NOT record-free |
+| V-FRESH-LOGIN-<user>-{first,second,reboot} | GDM "Not listed?" name and password typed through QMP; exactly one `gdm-password` VT session runs `tuna-compositor` and no `gnome-shell`/`gnome-session` |
+| V-FRESH-RECORD-CREATED-<user> | After the first login AccountsService wrote the record; any saved `Session` is `tuna` |
+| V-FRESH-SUDO-<user> | `sudo -S -k true` as the account with its password: admin succeeds, standard is refused by sudo policy |
+| V-FRESH-LOGOUT-<user>-<round> | logind ends the session and the greeter is ready again |
+| V-FRESH-REBOOT / V-FRESH-RECORD-KEPT-<user> | In-guest reboot (new `boot_id`), records survive, then both accounts log in again |
+
+Receipts are in `fresh-accounts-receipts.json`; frames per attempt and
+session. Only Arch/GDM 51 is covered here; pre-51 GDM is not exercised by
+this lane.
+
 The Python lane.boot API keeps its original four-value return and original
 VM device profile by default. Lifecycle callers explicitly request
 `guest_agent=True` to add the QGA transport and receive its socket as a fifth

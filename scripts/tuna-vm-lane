@@ -74,6 +74,7 @@ _guest_spec = importlib.util.spec_from_loader("vm_guest_agent", _guest_loader)
 guest_agent = importlib.util.module_from_spec(_guest_spec)
 _guest_loader.exec_module(guest_agent)
 import soak_report  # noqa: E402  (scripts/lib, on sys.path above)
+import fresh_accounts  # noqa: E402  (scripts/lib, on sys.path above)
 
 WIDTH, HEIGHT = baseline.WIDTH, baseline.HEIGHT
 DRM_RE = re.compile(r"tuna-compositor: drm: output (\S+) (\d+)x(\d+)")
@@ -3591,7 +3592,7 @@ def run_soak(qmp, vm, agent_path, out, record, seconds, warmup, interval, revisi
 
 
 def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, native_relative_mouse=False,
-         observer_records=None):
+         observer_records=None, credentials=()):
     ovmf = next((p for p in OVMF if os.path.exists(p)), None)
     if not ovmf:
         sys.exit("tuna-vm-lane: OVMF firmware not found (install ovmf)")
@@ -3617,6 +3618,10 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
             "-nic", "user,model=virtio-net-pci"]
     if native_relative_mouse:
         qemu.extend(["-device", "virtio-mouse-pci,id=tuna-relative-mouse"])
+    for credential in credentials:
+        # systemd imports SMBIOS type 11 io.systemd.credential: strings as
+        # system credentials (ConditionCredential=).
+        qemu.extend(["-smbios", f"type=11,value=io.systemd.credential:{credential}"])
     if guest_agent:
         qemu.extend(["-device", "virtio-serial-pci",
                      "-chardev", f"socket,path={agent_path},server=on,wait=off,id=tuna-qga",
@@ -3634,6 +3639,58 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
     log(f"booting {disk} (kvm={kvm})")
     result = subprocess.Popen(qemu), qmp_path, serial, kvm
     return (*result, agent_path) if guest_agent else result
+
+
+def fresh_accounts_lane(args):
+    """tunaOS#4092: one boot (with an in-guest reboot) of the record-free
+    standard/admin account journey; distinct from the default lane's
+    session-less tuna-test fixture. -snapshot keeps the disk pristine for
+    the other lanes while guest reboots keep this run's state."""
+    out = os.path.abspath(args.out)
+    scratch = os.path.join(out, ".scratch")
+    os.makedirs(scratch, exist_ok=True)
+    results = {}
+
+    def record(test_id, ok, desc):
+        results[test_id] = (ok, desc)
+        log(f"{test_id} {'pass' if ok else 'FAIL'}: {desc}")
+
+    vm, qmp_path, serial_path, kvm, agent_path = boot(
+        os.path.abspath(args.disk), out, scratch, args.timeout, args.require_kvm, guest_agent=True,
+        credentials=("tuna.vm.fresh-accounts=1",))
+    try:
+        qmp = baseline.Qmp(qmp_path)
+        journey = fresh_accounts.Journey(qmp, lambda: guest_agent.GuestAgent(agent_path), greeter_ready,
+                                         out, record)
+        try:
+            journey.run()
+        except (OSError, RuntimeError, ValueError, KeyError) as error:
+            record("V-FRESH-JOURNEY", False, str(error))
+    finally:
+        vm.terminate()
+        try:
+            vm.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            vm.kill()
+    if "V-FRESH-JOURNEY" not in results:
+        record("V-FRESH-JOURNEY", all(ok for ok, _ in results.values()) and "V-FRESH-LOGOUT-tunaadmin-reboot" in results,
+               "first login, logout, second login and post-reboot login for tunastd and tunaadmin")
+    with open(os.path.join(out, "assertions.txt"), "w") as fh:
+        for test_id, (ok, desc) in results.items():
+            fh.write(f"{test_id} {'pass' if ok else 'fail'} {desc}\n")
+    manifest = {"lane": "marlin-vm-fresh-accounts", "kvm": kvm, "disk": os.path.basename(args.disk),
+                "captured_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "assertions": {k: {"pass": v[0], "detail": v[1]} for k, v in results.items()}}
+    for kv in args.meta:
+        key, _, value = kv.partition("=")
+        manifest[key] = value
+    with open(os.path.join(out, "manifest.json"), "w") as fh:
+        json.dump(manifest, fh, indent=2)
+    shutil.rmtree(scratch, ignore_errors=True)
+    failed = sorted(k for k, (ok, _) in results.items() if not ok)
+    if failed:
+        sys.exit(f"tuna-vm-lane: FAILED {', '.join(failed)}")
+    log(f"OK: record-free fresh-account journey passed; artifacts in {out}")
 
 
 def repeat_boots(args):
@@ -3727,7 +3784,15 @@ def main():
     ap.add_argument("--soak-interval", type=int, default=60, metavar="SECONDS")
     ap.add_argument("--soak-revision", metavar="COMMIT",
                     help="the shipped payload's exact 40-digit source commit (deployment record)")
+    ap.add_argument("--fresh-accounts", action="store_true",
+                    help="tunaOS#4092: run only the record-free standard/admin account GDM journey "
+                         "(first login, logout, login, reboot, login), not the tuna-test lane")
     a = ap.parse_args()
+    if a.fresh_accounts:
+        if a.tour or a.boots != 1 or a.soak or a.strip_image or a.published:
+            ap.error("--fresh-accounts is its own single current-build boot")
+        fresh_accounts_lane(a)
+        return
     if a.soak:
         if a.tour or a.boots != 1:
             ap.error("--soak is its own single pristine boot, without --tour")
