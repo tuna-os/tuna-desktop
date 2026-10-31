@@ -265,10 +265,37 @@ def tree(root_pid):
         children = expanded
 
 
+def mapping_kind(name):
+    if not name:
+        return "anon"
+    if name.startswith(("memfd:", "/memfd:", "/dev/shm/", "/SYSV")):
+        return "shm"
+    if name.startswith("/dev/dri/"):
+        return "gpu"
+    if name.startswith("["):
+        return name.strip("[]").split(":")[0]
+    return "file"
+
+
+def process_memory(pid):
+    """PSS by mapping kind, so growth names its owner: heap, shm pools, GPU or files."""
+    kinds, name = {}, ""
+    for line in Path(f"/proc/{pid}/smaps").read_text().splitlines():
+        head = line.split(None, 1)[0]
+        if not head.endswith(":"):
+            fields = line.split(None, 5)
+            name = fields[5].strip() if len(fields) > 5 else ""
+        elif head == "Pss:":
+            kind = mapping_kind(name)
+            kinds[kind] = kinds.get(kind, 0) + int(line.split()[1])
+    return kinds
+
+
 def metrics(root_pid):
     pss, rss, fds, maps = 0, 0, 0, 0
     processes = tree(root_pid)
     compositor_fds = 0
+    per_process = {}
     for pid in processes:
         proc = Path(f"/proc/{pid}")
         try:
@@ -279,6 +306,8 @@ def metrics(root_pid):
                     values[parts[0]] = int(parts[1])
             count = len(list((proc / "fd").iterdir()))
             mappings = (proc / "maps").read_text().count("\n")
+            comm = (proc / "comm").read_text().strip()
+            kinds = process_memory(pid)
         except (FileNotFoundError, ProcessLookupError):
             continue
         pss += values.get("Pss:", 0)
@@ -287,8 +316,11 @@ def metrics(root_pid):
         maps += mappings
         if pid == root_pid:
             compositor_fds = count
+        per_process[f"{comm}:{pid}"] = {"pss_kib": values.get("Pss:", 0), "fds": count,
+                                        "maps": mappings, "pss_by_kind_kib": kinds}
     return {"elapsed_s": time.monotonic(), "pss_kib": pss, "rss_kib": rss, "fds": fds,
-            "maps": maps, "compositor_fds": compositor_fds, "processes": len(processes)}
+            "maps": maps, "compositor_fds": compositor_fds, "processes": len(processes),
+            "per_process": per_process}
 
 
 def owned_pids(runtime_dir):
@@ -328,6 +360,7 @@ class Stress:
         os.chmod(self.private, 0o700)
         self.logs, self.processes, self.samples = [], [], []
         self.assertions = {}
+        self.phase = "start"
         self.started_at = time.monotonic()
         self.password = "stress-" + secrets.token_hex(6)
         self.compositor = None
@@ -406,7 +439,7 @@ class Stress:
     def sample(self):
         if self.compositor.poll() is not None:
             raise Failure("compositor exited during stress")
-        value = metrics(self.compositor.pid)
+        value = {"phase": self.phase, **metrics(self.compositor.pid)}
         value["elapsed_s"] = round(value["elapsed_s"] - self.started_at, 3)
         self.samples.append(value)
         with (self.out / "metrics.jsonl").open("a") as stream:
@@ -1337,6 +1370,26 @@ class Stress:
                     "then the recovery overlay, whose relaunch restored it; a client survived and kept input")
         self.sample()
 
+    def largest_rise(self):
+        """The phase whose end sample rose most over its start, with the process and kind."""
+        def by_kind(sample):
+            totals = {}
+            for key, process in sample["per_process"].items():
+                comm = key.rsplit(":", 1)[0]
+                for kind, kib in process["pss_by_kind_kib"].items():
+                    totals[(comm, kind)] = totals.get((comm, kind), 0) + kib
+            return totals
+        starts = {s["phase"].removesuffix(":start"): s for s in self.samples if s["phase"].endswith(":start")}
+        ends = {s["phase"]: s for s in self.samples if s["phase"] in starts}
+        rises = [(ends[p]["pss_kib"] - starts[p]["pss_kib"], p) for p in ends]
+        if not rises:
+            return "no phase samples"
+        rise, phase = max(rises)
+        before, after = by_kind(starts[phase]), by_kind(ends[phase])
+        parts = sorted(((after.get(k, 0) - before.get(k, 0), k) for k in after | before), reverse=True)[:3]
+        return f"{phase} +{rise >> 10} MiB (" + ", ".join(
+            f"{comm} {kind} {delta >> 10:+} MiB" for delta, (comm, kind) in parts) + ")"
+
     # -- run --
 
     def run(self):
@@ -1347,19 +1400,26 @@ class Stress:
                 self.churn_round(f"warmup-{index}")
             self.input_path()
             time.sleep(2)
+            self.phase = "baseline"
             baseline = self.sample()
             for phase in self.args.phases:
+                self.phase = f"{phase}:start"
+                self.sample()
+                self.phase = phase
                 getattr(self, f"phase_{phase}")()
+            self.phase = "final"
             time.sleep(5)
             final = self.sample()
             # Diagnostic limits for this bounded workload, not GNOME performance targets.
             pss_limit = baseline["pss_kib"] * 1.25 + 65536
             fd_limit = baseline["fds"] + 32
             map_limit = baseline["maps"] * 1.25 + 1024
-            self.assertions["S-GROWTH"] = [
-                final["pss_kib"] <= pss_limit and final["fds"] <= fd_limit and final["maps"] <= map_limit,
-                f"PSS {final['pss_kib']}/{int(pss_limit)} KiB; fds {final['fds']}/{fd_limit}; "
-                f"mappings {final['maps']}/{int(map_limit)}"]
+            ok = final["pss_kib"] <= pss_limit and final["fds"] <= fd_limit and final["maps"] <= map_limit
+            detail = (f"PSS {final['pss_kib']}/{int(pss_limit)} KiB; fds {final['fds']}/{fd_limit}; "
+                      f"mappings {final['maps']}/{int(map_limit)}")
+            if not ok:
+                detail += f"; largest phase rise: {self.largest_rise()}"
+            self.assertions["S-GROWTH"] = [ok, detail]
             text = (self.out / "nested.log").read_text(errors="replace")
             self.assertions["S-LIVE"] = [self.compositor.poll() is None and "panicked" not in text,
                                          "compositor remained alive without panic"]
