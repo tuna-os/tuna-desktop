@@ -59,7 +59,10 @@ impl Runtime {
         }
         match input {
             OskInput::Keyval { keysym, pressed } => self.osk_keyval(keysym, pressed),
-            OskInput::Commit { text, modifiers } => {
+            OskInput::Commit {
+                mut text,
+                modifiers,
+            } => {
                 // Modified shortcuts and X11 retain the physical path.
                 // Native fields ask the supervised context which source owns
                 // text; a persistent keyboard grab is not source identity.
@@ -76,9 +79,10 @@ impl Runtime {
                         .focus(focus.as_ref())
                         .is_some()
                 {
-                    if self.state.protocols.osk_ime.send(&self.state, &text) {
-                        return;
-                    }
+                    text = match self.state.protocols.osk_ime.send(&self.state, text) {
+                        Ok(()) => return,
+                        Err(text) => text,
+                    };
                     // Without IBus, keep native direct commit. A configured
                     // but unavailable context takes GNOME's raw-key fallback
                     // below, for the current focus only (never queued/replayed).

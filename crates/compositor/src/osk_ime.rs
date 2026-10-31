@@ -29,19 +29,20 @@ impl OskIme {
         }
     }
 
-    /// No bridge (or an unrelated input method): retain native direct commit.
-    pub(crate) fn send(&self, state: &State, text: &str) -> bool {
+    /// Transfer owned text to the authorized active context, or return it for
+    /// the caller's native/no-context raw fallback without copying.
+    pub(crate) fn send(&self, state: &State, text: String) -> Result<(), String> {
         let Some(bridge) = self.bridge.as_ref().filter(|b| b.is_alive()) else {
-            return false;
+            return Err(text);
         };
         let Some(client) = bridge.client() else {
-            return false;
+            return Err(text);
         };
         let Some(serial) = state.seat.input_method().instance_serial(&client) else {
-            return false;
+            return Err(text);
         };
-        bridge.text(serial, text.to_owned());
-        true
+        bridge.text(serial, text);
+        Ok(())
     }
 
     pub(crate) fn current(&self, state: &State, serial: u32) -> bool {

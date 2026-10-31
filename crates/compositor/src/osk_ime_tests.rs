@@ -254,7 +254,7 @@ fn virtual_text_is_private_even_when_an_ordinary_client_guesses_the_global() {
     );
 }
 #[test]
-fn declined_or_error_fallbacks_stay_ordered_once_and_cannot_cross_focus_or_lock() {
+fn virtual_fallback_requests_stay_ordered_once_and_cannot_cross_focus_or_lock() {
     let mut comp = TestCompositor::new();
     comp.state.set_output_size(1280, 800);
     let mut manager = comp.window_manager();

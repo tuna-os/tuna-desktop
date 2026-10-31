@@ -229,6 +229,15 @@ fn ibus_connection() -> Result<gio::DBusConnection, Box<dyn std::error::Error>> 
     Err("ibus-daemon did not come up".into())
 }
 
+/// A consumed press stays consumed even if only its release failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtualKeyOutcome {
+    Declined,
+    Unavailable,
+    Consumed,
+    ReleaseFailed,
+}
+
 /// The bridge's IBus input context.
 struct IbusContext {
     bus: gio::DBusConnection,
@@ -312,7 +321,7 @@ impl IbusContext {
     }
 
     /// The source currently installed on this input context.
-    fn engine(&self) -> Option<String> {
+    fn engine_requires_ibus(&self) -> Option<bool> {
         let reply = self
             .bus
             .call_sync(
@@ -332,12 +341,28 @@ impl IbusContext {
         if engine.child_value(0).str() != Some("IBusEngineDesc") {
             return None;
         }
-        engine.child_value(2).str().map(str::to_owned)
+        engine
+            .child_value(2)
+            .str()
+            .map(|name| !name.starts_with("xkb:"))
     }
 
     fn process_key(&self, keyval: u32, keycode: u32, state: u32) -> bool {
         self.try_process_key(keyval, keycode, state)
             .unwrap_or(false)
+    }
+
+    fn virtual_key(&self, keysym: u32) -> VirtualKeyOutcome {
+        match self.try_process_key(keysym, 0, 0) {
+            Some(true) => {}
+            Some(false) => return VirtualKeyOutcome::Declined,
+            None => return VirtualKeyOutcome::Unavailable,
+        }
+        if self.try_process_key(keysym, 0, RELEASE).is_none() {
+            VirtualKeyOutcome::ReleaseFailed
+        } else {
+            VirtualKeyOutcome::Consumed
+        }
     }
 
     fn try_process_key(&self, keyval: u32, keycode: u32, state: u32) -> Option<bool> {
@@ -545,11 +570,11 @@ impl Bridge {
         if !self.active || serial != self.serial {
             return;
         }
-        let engine = self.context.as_ref().and_then(IbusContext::engine);
-        if engine
-            .as_deref()
-            .is_some_and(|name| name.starts_with("xkb:"))
-        {
+        let engine = self
+            .context
+            .as_ref()
+            .and_then(IbusContext::engine_requires_ibus);
+        if engine == Some(false) {
             if let Some(im) = &self.im {
                 im.commit_string(text);
                 im.commit(serial);
@@ -561,28 +586,24 @@ impl Bridge {
             if keysym == 0 {
                 continue;
             }
-            let handled = self
+            let outcome = self
                 .context
                 .as_ref()
                 .filter(|_| engine.is_some())
-                .and_then(|context| context.try_process_key(keysym, 0, 0));
+                .map_or(VirtualKeyOutcome::Unavailable, |context| {
+                    context.virtual_key(keysym)
+                });
             if debug() {
-                eprintln!("tuna-ibus-bridge: OSK IBus took it: {handled:?}");
+                eprintln!("tuna-ibus-bridge: OSK outcome: {outcome:?}");
             }
+            // Commit/preedit signals precede the next character's result.
             self.apply_incoming();
-            match handled {
-                Some(true) => {
-                    // GNOME only sends a release after a handled press.
-                    if let Some(context) = &self.context {
-                        if context.try_process_key(keysym, 0, RELEASE).is_none() {
-                            // The press was already consumed. Replaying it
-                            // after a release failure would duplicate text.
-                            eprintln!("tuna-ibus-bridge: OSK release failed after consumed press");
-                        }
-                    }
-                    self.apply_incoming();
+            match outcome {
+                VirtualKeyOutcome::Consumed => {}
+                VirtualKeyOutcome::ReleaseFailed => {
+                    eprintln!("tuna-ibus-bridge: OSK release failed after consumed press");
                 }
-                Some(false) | None => {
+                VirtualKeyOutcome::Declined | VirtualKeyOutcome::Unavailable => {
                     if let Some(osk) = &self.osk {
                         osk.unhandled(serial, keysym);
                     }
@@ -1094,3 +1115,7 @@ mod tests {
         assert_eq!(value.get::<(u32, u32)>(), Some((8, 2048)));
     }
 }
+
+#[cfg(test)]
+#[path = "tuna-ibus-bridge/virtual_key_tests.rs"]
+mod virtual_key_tests;
