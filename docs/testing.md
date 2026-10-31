@@ -174,6 +174,13 @@ native ownership and private PAM retirement cases. Its PID readiness
 markers are published only after complete PID contents are written.
 Artifacts retain supervised test-client panics and early compositor exit
 status; a compiled test or cache hit is not a substitute for these cases.
+The native probe keeps a libc `getenv` reader running across launch and
+teardown and asserts the compositor's `WAYLAND_DISPLAY` never changes.
+The real supervised control client still receives the private display.
+This guards the startup race seen in #919: changing process environment
+after GIO workers start can free the `environ` array while native
+`getenv` traverses it. Child commands, including the bell player, receive
+their display explicitly; no startup or teardown environment rewrite is safe.
 
 Run one crate with `cargo test -p <package>` (package names are in each
 crate's `README.md`, for example `cargo test -p tuna-compositor`).

@@ -13,7 +13,6 @@
 //! Layer-shell is served from [`State`](crate::State) (see [`crate::layer`])
 //! so the supervised panel attaches over this same display.
 
-use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -574,25 +573,6 @@ impl std::fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
-/// Apply nested-session environment hygiene (ADR 0003): point
-/// `WAYLAND_DISPLAY` at our private socket for this process and its
-/// children. The parent host environment is never touched — this runs in
-/// our own process — and the previous value is returned so shutdown can
-/// restore it.
-pub fn apply_nested_env(socket_name: &str) -> Option<OsString> {
-    let prev = std::env::var_os("WAYLAND_DISPLAY");
-    std::env::set_var("WAYLAND_DISPLAY", socket_name);
-    prev
-}
-
-/// Undo [`apply_nested_env`].
-pub fn restore_env(prev: Option<OsString>) {
-    match prev {
-        Some(value) => std::env::set_var("WAYLAND_DISPLAY", value),
-        None => std::env::remove_var("WAYLAND_DISPLAY"),
-    }
-}
-
 /// AT-SPI focus and caret for the magnifier (#349): the arrival number
 /// last taken and where it landed, global logical. Extents convert
 /// once, on arrival, as GNOME's handlers do.
@@ -937,6 +917,7 @@ impl Runtime {
             Display::new().map_err(|e| RuntimeError::Loop(e.to_string()))?;
         let dh = display.handle();
         let mut state = State::new(&dh);
+        state.protocols.bell.set_wayland_display(&session.socket_name);
         if let Some(path) = crate::xdg_session::default_store_path() {
             state.window_sessions_mut().attach_store(path);
         }
@@ -7814,10 +7795,9 @@ fn send_frame_callbacks(
 /// Run a nested session to shutdown: drive the loop and report run
 /// statistics.
 ///
-/// Environment hygiene ([`apply_nested_env`]) is applied only after the
-/// backend exists: the winit backend prefers Wayland when
-/// `WAYLAND_DISPLAY` is set, so setting it first would point winit at our
-/// own not-yet-existing socket.
+/// Supervised child services receive `WAYLAND_DISPLAY` explicitly for the
+/// child command; the compositor process environment remains unmutated
+/// so concurrent background threads (GIO, D-Bus) never race on `environ`.
 pub fn run(session: &NestedSession) -> Result<RunStats, RuntimeError> {
     run_loop(session, |_| None)
 }
@@ -7871,7 +7851,6 @@ fn run_loop(
     mut probe: impl FnMut(&mut AuthOwnerProbe<'_>) -> Option<Duration>,
 ) -> Result<RunStats, RuntimeError> {
     let (mut runtime, mut event_loop) = Runtime::launch(session)?;
-    let prev_env = apply_nested_env(&session.socket_name);
     #[cfg(feature = "drm")]
     let _session_services = if matches!(runtime.backend, Backend::Drm(_)) {
         Some(crate::session_services::publish(&session.socket_name))
@@ -7952,7 +7931,6 @@ fn run_loop(
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             runtime.shutdown_colord();
-            restore_env(prev_env);
             return Ok(runtime.stats);
         }
         let dispatched = event_loop
@@ -7997,7 +7975,6 @@ fn run_loop(
             }
             done => {
                 runtime.shutdown_colord();
-                restore_env(prev_env);
                 return done.map(|_| runtime.stats);
             }
         }

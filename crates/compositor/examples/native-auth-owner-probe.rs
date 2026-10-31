@@ -26,7 +26,32 @@ fn main() -> ExitCode {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut injected = false;
     let mut synced = false;
+    // Native getenv does not take Rust's environment lock. Keep a reader live
+    // across launch, authentication and teardown; the runtime must configure
+    // child environments without changing its own (startup SIGSEGV #919).
+    let ambient_display = std::env::var_os("WAYLAND_DISPLAY");
+    let expected_display = ambient_display.clone();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_stop = stop.clone();
+    let (ready, started) = std::sync::mpsc::sync_channel(0);
+    let reader = std::thread::spawn(move || {
+        let key = c"XDG_DATA_DIRS";
+        // SAFETY: a static NUL-terminated key; the returned borrowed pointer is
+        // not retained. No thread in this fixture writes the process environment.
+        unsafe { libc::getenv(key.as_ptr()) };
+        ready.send(()).unwrap();
+        while !reader_stop.load(std::sync::atomic::Ordering::Acquire) {
+            unsafe { libc::getenv(key.as_ptr()) };
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
     run_auth_owner_probe(&session, move |probe| {
+        assert_eq!(
+            std::env::var_os("WAYLAND_DISPLAY"),
+            expected_display,
+            "runtime must not mutate environ while native getenv readers run"
+        );
         assert!(
             Instant::now() < deadline,
             "bounded auth runtime driver deadline"
@@ -85,5 +110,9 @@ fn main() -> ExitCode {
         Some(Duration::from_millis(20))
     })
     .expect("actual runtime probe loop");
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    reader.join().expect("native getenv reader retired");
+    assert_eq!(std::env::var_os("WAYLAND_DISPLAY"), ambient_display);
+    eprintln!("auth owner runtime environment preserved with concurrent libc getenv");
     ExitCode::SUCCESS
 }
