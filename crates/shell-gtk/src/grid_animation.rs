@@ -18,6 +18,7 @@ use gtk::subclass::prelude::*;
 use gtk4 as gtk;
 use gtk4::glib;
 use std::cell::{Cell, RefCell};
+use std::io::{Read, Seek};
 use std::rc::Rc;
 
 /// The shell's motion policy (#493): `allows_motion` for zooms, slides
@@ -423,6 +424,127 @@ pub fn trace(name: &str, what: std::fmt::Arguments) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SchedTimes {
+    run_ns: u64,
+    wait_ns: u64,
+}
+
+fn parse_schedstat(bytes: &[u8]) -> Option<SchedTimes> {
+    let mut fields = std::str::from_utf8(bytes).ok()?.split_ascii_whitespace();
+    let run_ns = fields.next()?.parse().ok()?;
+    let wait_ns = fields.next()?.parse().ok()?;
+    fields.next()?.parse::<u64>().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(SchedTimes { run_ns, wait_ns })
+}
+
+/// Open only on a traced page tick, once per GTK thread. Reads reuse the
+/// proc handle and a stack buffer; no per-frame path or String allocation.
+struct ThreadSched {
+    file: Option<std::fs::File>,
+    wait_enabled: &'static str,
+}
+
+impl ThreadSched {
+    fn open() -> Self {
+        let mut enabled = [0_u8; 4];
+        let wait_enabled = match std::fs::File::open("/proc/sys/kernel/sched_schedstats")
+            .and_then(|mut file| file.read(&mut enabled))
+        {
+            Ok(2) if &enabled[..2] == b"1\n" => "enabled",
+            Ok(2) if &enabled[..2] == b"0\n" => "disabled",
+            _ => "unknown",
+        };
+        Self {
+            file: std::fs::File::open("/proc/thread-self/schedstat").ok(),
+            wait_enabled,
+        }
+    }
+
+    fn read(&mut self) -> Result<SchedTimes, &'static str> {
+        let file = self.file.as_mut().ok_or("open")?;
+        file.rewind().map_err(|_| "seek")?;
+        let mut bytes = [0_u8; 128];
+        let count = file.read(&mut bytes).map_err(|_| "read")?;
+        if count == bytes.len() {
+            return Err("truncated");
+        }
+        parse_schedstat(&bytes[..count]).ok_or("parse")
+    }
+}
+
+thread_local! {
+    static THREAD_SCHED: RefCell<ThreadSched> = RefCell::new(ThreadSched::open());
+}
+
+#[derive(Clone, Copy)]
+struct TickSample {
+    monotonic_us: i64,
+    sched: SchedTimes,
+}
+
+impl TickSample {
+    fn since(self, previous: Self) -> Option<(i64, u64, u64)> {
+        let wall_us = self.monotonic_us.checked_sub(previous.monotonic_us)?;
+        if wall_us < 0 {
+            return None;
+        }
+        Some((
+            wall_us,
+            self.sched.run_ns.checked_sub(previous.sched.run_ns)?,
+            self.sched.wait_ns.checked_sub(previous.sched.wait_ns)?,
+        ))
+    }
+}
+
+fn trace_page_tick(clock_us: i64, previous: &Cell<Option<TickSample>>) {
+    let monotonic_us = glib::monotonic_time();
+    THREAD_SCHED.with(|reader| {
+        let mut reader = reader.borrow_mut();
+        match reader.read() {
+            Ok(sched) => {
+                let current = TickSample {
+                    monotonic_us,
+                    sched,
+                };
+                let delta = previous.get().and_then(|before| current.since(before));
+                previous.set(Some(current));
+                let observation_us = glib::monotonic_time() - monotonic_us;
+                if let Some((wall_us, run_ns, wait_ns)) = delta {
+                    trace(
+                        "page-switch",
+                        format_args!(
+                            "tick clock_us={clock_us} monotonic_us={monotonic_us} run_ns={} wait_ns={} schedstats={} wall_delta_us={wall_us} run_delta_ns={run_ns} wait_delta_ns={wait_ns} observation_us={observation_us}",
+                            sched.run_ns, sched.wait_ns, reader.wait_enabled
+                        ),
+                    );
+                } else {
+                    trace(
+                        "page-switch",
+                        format_args!(
+                            "tick clock_us={clock_us} monotonic_us={monotonic_us} run_ns={} wait_ns={} schedstats={} delta=baseline-or-reset observation_us={observation_us}",
+                            sched.run_ns, sched.wait_ns, reader.wait_enabled
+                        ),
+                    );
+                }
+            }
+            Err(reason) => {
+                previous.set(None);
+                trace(
+                    "page-switch",
+                    format_args!(
+                        "tick clock_us={clock_us} monotonic_us={monotonic_us} schedstat=unavailable reason={reason} observation_us={}",
+                        glib::monotonic_time() - monotonic_us
+                    ),
+                );
+            }
+        }
+    });
+}
+
 /// One running animation per property set: a new start replaces it.
 #[derive(Default)]
 pub struct Slot {
@@ -467,6 +589,8 @@ impl Slot {
             format_args!("start ms={total_ms:.0} motion={}", motion().level.as_str()),
         );
         let started = Cell::new(None::<i64>);
+        let observe_ticks = name == "page-switch" && tracing();
+        let previous_tick = Cell::new(None);
         let done = RefCell::new(Some(done));
         let weak = Rc::downgrade(self);
         let id = widget.add_tick_callback(move |_, clock| {
@@ -474,6 +598,9 @@ impl Slot {
             let start = *started.get().get_or_insert(now);
             started.set(Some(start));
             let elapsed = (now - start) as f64 / 1000.0;
+            if observe_ticks {
+                trace_page_tick(now, &previous_tick);
+            }
             step(elapsed);
             if elapsed < total_ms {
                 return glib::ControlFlow::Continue;
@@ -908,6 +1035,63 @@ mod gtk_zoom_tests {
         assert_eq!(zoom.alpha(), 0.3, "opacity-only look update");
         println!("GRID-ZOOM pass simultaneous translation/scale/opacity, delayed terminal frame and drag look updates");
     }
+
+    #[test]
+    #[ignore = "requires owned Xvfb/private D-Bus and explicit grid zoom admission"]
+    fn actual_gtk_page_tick_trace_records_real_clock_and_thread_scheduler() {
+        assert_eq!(std::env::var("TUNA_REQUIRE_GRID_ZOOM").as_deref(), Ok("1"));
+        assert!(std::env::var_os("WAYLAND_DISPLAY").is_none());
+        // This exact test runs alone in its admitted process, before GTK
+        // or the trace's lazy environment reader starts.
+        std::env::set_var("TUNA_GRID_TRACE", "1");
+        assert!(tracing());
+        gtk::init().expect("actual GTK display required");
+        let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let window = gtk::Window::builder()
+            .default_width(128)
+            .default_height(128)
+            .child(&widget)
+            .build();
+        window.present();
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !widget.is_mapped() {
+            context.iteration(false);
+            assert!(std::time::Instant::now() < deadline, "GTK widget never mapped");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let ticks = Rc::new(Cell::new(0));
+        let done = Rc::new(Cell::new(false));
+        let slot = Rc::new(Slot::default());
+        let seen = ticks.clone();
+        let finished = done.clone();
+        slot.start(
+            &widget,
+            "page-switch",
+            PAGE_SWITCH.duration_ms,
+            move |_| seen.set(seen.get() + 1),
+            move || finished.set(true),
+        );
+        while !done.get() {
+            context.iteration(false);
+            assert!(std::time::Instant::now() < deadline, "GTK ticks never finished");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(ticks.get() >= 2, "initial and terminal samples required");
+        THREAD_SCHED.with(|reader| {
+            let mut reader = reader.borrow_mut();
+            let observed = reader.read().expect("real Linux main-thread scheduler observation");
+            assert!(observed.run_ns > 0);
+            println!(
+                "GRID-TICK-TRACE pass actual GTK ticks={} run_ns={} wait_ns={} schedstats={}",
+                ticks.get(),
+                observed.run_ns,
+                observed.wait_ns,
+                reader.wait_enabled
+            );
+        });
+        window.close();
+    }
 }
 
 #[cfg(test)]
@@ -922,6 +1106,43 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn scheduler_samples_require_all_fields_and_never_invent_zero() {
+        assert_eq!(
+            parse_schedstat(b"123456 789 12\n"),
+            Some(SchedTimes {
+                run_ns: 123456,
+                wait_ns: 789,
+            })
+        );
+        for bytes in [
+            &b""[..],
+            &b"1 2"[..],
+            &b"1 nope 3"[..],
+            &b"1 2 3 4"[..],
+            &b"-1 2 3"[..],
+            &b"18446744073709551616 2 3"[..],
+        ] {
+            assert_eq!(parse_schedstat(bytes), None);
+        }
+        let sample = TickSample {
+            monotonic_us: 400,
+            sched: SchedTimes {
+                run_ns: 200,
+                wait_ns: 100,
+            },
+        };
+        let next = TickSample {
+            monotonic_us: 700,
+            sched: SchedTimes {
+                run_ns: 450,
+                wait_ns: 120,
+            },
+        };
+        assert_eq!(next.since(sample), Some((300, 250, 20)));
+        assert_eq!(sample.since(next), None);
     }
 
     #[test]

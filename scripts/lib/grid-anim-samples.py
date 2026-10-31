@@ -31,6 +31,7 @@ FRAME = re.compile(
     r'grid-anim page-switch frame elapsed=' + NUMBER + r' position=' + NUMBER
     + r' from=' + NUMBER + r' to=' + NUMBER + r' ms=' + NUMBER)
 DOTS = re.compile(r'grid-anim page-dots position=' + NUMBER + r' dots=(\S+)')
+TICK = re.compile(r'grid-anim page-switch tick (.*)$')
 
 
 def out_cubic(t):
@@ -173,9 +174,13 @@ def switch_diagnostics(frames, dots, start, end):
                     for f in frames)
         lines.append(f'maximum GNOME position error: {error:.9f} page '
                      f'(tolerance {TOLERANCE:.9f})')
-    lines.append('trace scope: callback samples, not presentation or scheduler evidence; '
+    lines.append('trace scope: page positions are callback samples, not presentation; '
                  'elapsed=0 includes initialization and the first tick')
     return lines
+
+
+def tick_diagnostics(text):
+    return [match.group(1) for line in text.splitlines() if (match := TICK.search(line))]
 
 
 def main(argv=None):
@@ -204,6 +209,15 @@ def main(argv=None):
     if not args.instant:
         for line in switch_diagnostics(frames, dots, args.start, args.end):
             print(f'grid-anim-samples: {line}')
+        ticks = tick_diagnostics(text)
+        if ticks:
+            for tick in ticks:
+                print(f'grid-anim-samples: tick observation: {tick}')
+            print('grid-anim-samples: scheduler scope: thread CPU includes observer work; '
+                  'runqueue wait is meaningful only with schedstats=enabled; '
+                  'blocked time alone does not identify compositor or presentation delay')
+        else:
+            print('grid-anim-samples: main-thread scheduler observations unavailable in this trace')
     for error in errors:
         print(f'grid-anim-samples: {error}', file=sys.stderr)
     return 1 if errors else 0
