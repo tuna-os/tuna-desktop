@@ -917,7 +917,10 @@ impl Runtime {
             Display::new().map_err(|e| RuntimeError::Loop(e.to_string()))?;
         let dh = display.handle();
         let mut state = State::new(&dh);
-        state.protocols.bell.set_wayland_display(&session.socket_name);
+        state
+            .protocols
+            .bell
+            .set_wayland_display(&session.socket_name);
         if let Some(path) = crate::xdg_session::default_store_path() {
             state.window_sessions_mut().attach_store(path);
         }

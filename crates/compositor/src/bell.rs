@@ -201,8 +201,14 @@ mod tests {
         assert_eq!(opacity(Duration::ZERO, 2), 0.0);
         assert_eq!(opacity(Duration::from_millis(50), 2), 192.0 / 255.0);
         assert_eq!(opacity(Duration::from_millis(100), 2), 0.0);
-        assert_eq!(opacity(Duration::from_millis(25), 2), (192.0 / 255.0) * 0.25);
-        assert_eq!(opacity(Duration::from_millis(125), 2), (192.0 / 255.0) * 0.25);
+        assert_eq!(
+            opacity(Duration::from_millis(25), 2),
+            (192.0 / 255.0) * 0.25
+        );
+        assert_eq!(
+            opacity(Duration::from_millis(125), 2),
+            (192.0 / 255.0) * 0.25
+        );
         assert_eq!(opacity(Duration::from_millis(150), 2), 0.0);
         assert_eq!(opacity(Duration::from_millis(200), 2), 0.0);
         assert_eq!(opacity(Duration::from_millis(100), 1), 0.0);
