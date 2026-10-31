@@ -179,10 +179,16 @@ def session(artifacts, patched):
                 if status != -signal.SIGSEGV:
                     raise RuntimeError(f'unpatched negative control did not reproduce SIGSEGV: {status}')
                 receipt['unpatched_signal'] = 'SIGSEGV'
-                critical = (artifacts / 'application.stderr').read_text()
-                if 'g_variant_new_object_path' not in critical or 'CRITICAL' not in critical:
+                # PyGObject relays GLib criticals as Python warnings, so match
+                # the assertion text itself rather than a log-level prefix.
+                assertions = [line.strip() for line in
+                              (artifacts / 'application.stderr').read_text().splitlines()
+                              if "assertion 'string != NULL' failed" in line
+                              or "assertion 'g_variant_is_object_path (object_path)' failed" in line]
+                if not any('g_variant_is_object_path:' in line for line in assertions) or \
+                        not any('g_variant_new_object_path:' in line for line in assertions):
                     raise RuntimeError('stock negative control lacks the actual NULL object-path critical')
-                receipt['unpatched_critical'] = critical
+                receipt['unpatched_critical'] = assertions
             else:
                 receipt['hidden_tail_invalid'] = invalid(3)
                 receipt['valid_after_first_error'] = children()
