@@ -214,8 +214,8 @@ def main(argv=None):
             for tick in ticks:
                 print(f'grid-anim-samples: tick observation: {tick}')
             print('grid-anim-samples: scheduler scope: thread CPU includes observer work; '
-                  'runqueue wait is meaningful only with schedstats=enabled; '
-                  'blocked time alone does not identify compositor or presentation delay')
+                  'populated, monotonic per-thread schedstat counters measure runnable wait independently of kernel.sched_schedstats; '
+                  'remaining off-CPU time alone does not identify compositor or presentation delay')
         else:
             print('grid-anim-samples: main-thread scheduler observations unavailable in this trace')
     for error in errors:

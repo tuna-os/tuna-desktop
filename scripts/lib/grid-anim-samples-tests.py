@@ -145,9 +145,9 @@ class DiagnosticTests(unittest.TestCase):
     def test_tick_observations_preserve_counters_and_explicit_unavailability(self):
         observed = (
             'clock_us=1000 monotonic_us=1010 run_ns=2000 wait_ns=3000 '
-            'schedstats=enabled delta=baseline-or-reset observation_us=4',
+            'timeslices=2 schedstat=available delta=baseline-or-reset observation_us=4',
             'clock_us=18000 monotonic_us=18012 run_ns=5000 wait_ns=9000 '
-            'schedstats=enabled wall_delta_us=17002 run_delta_ns=3000 '
+            'timeslices=3 schedstat=available wall_delta_us=17002 run_delta_ns=3000 '
             'wait_delta_ns=6000 observation_us=3',
             'clock_us=35000 monotonic_us=35010 schedstat=unavailable reason=read observation_us=5',
         )
