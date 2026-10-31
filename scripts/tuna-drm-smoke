@@ -10,6 +10,8 @@
 # minus real hardware. Asserts on state, not pixels:
 #   D-OUTPUT   the backend lit the vkms connector
 #   D-SHELL    the shell connected over the control socket (introspection)
+#   D-SYNCOBJ  explicit sync stays unadvertised on vkms, which has no
+#              timeline syncobjs (Mutter's check, P-SY-09)
 #   D-IDLE     an unchanged scene stops redundant scanout submissions
 #   D-FRAMES   a real active Wayland client receives 240 page-flip presentations
 #   D-SCALE    a GNOME monitors.xml giving the connector scale 2 is
@@ -237,6 +239,12 @@ until [ -s "$STATE" ] && jq -e '.revision != null' "$STATE" >/dev/null 2>&1; do
     sleep 0.2
 done
 pass D-SHELL "shell connected (revision $(jq .revision "$STATE"))"
+# Explicit sync (P-SY-09): the renderer on vkms has no timeline syncobjs,
+# so, as Mutter, the compositor creates no wp_linux_drm_syncobj_manager_v1
+# and logs why. The global itself is the cargo gating test's concern.
+grep -q 'tuna-compositor: explicit sync disabled: ' "$LOG" ||
+    fail D-SYNCOBJ "no explicit-sync verdict, or explicit sync enabled on vkms"
+pass D-SYNCOBJ "$(grep -m1 'explicit sync disabled: ' "$LOG" | sed 's/.*tuna-compositor: //')"
 
 sleep 2
 [ -s "$CSTATE" ] || fail D-IDLE "missing compositor frame counter"

@@ -7,7 +7,8 @@ advertises. Ledger row P-SY-06 tracks the gaps.
 Shell 51.0 / Mutter 51.0 (Fedora 45, headless, 1280x800):
 `tests/protocols/gnome51-wayland-info.txt`, made by
 `scripts/tuna-gnome-wayland-info`. Three globals do not appear headless
-(the DRM lease and syncobj managers need the native KMS backend; the
+(the DRM lease manager needs the native KMS backend, the syncobj manager a
+renderer device with timeline syncobjs; the
 Xwayland keyboard grab is offered to Xwayland only). They are listed from
 the interfaces built into the same `libmutter-51.so`, marked `source` in
 `tests/protocols/gnome51-globals.tsv`. This is upstream GNOME 51 in a
@@ -37,7 +38,9 @@ against the nested Tuna Desktop session (saved as the `wayland-info.txt`
 artifact) and `scripts/tuna-wayland-info-compare` checks it against
 `tests/protocols/gnome51-globals.tsv`. Every global marked `match` must
 be present at GNOME's version or newer, and every `min:` global at least
-at the version given. Known gaps are reported and do not fail the stage.
+at the version given. A `cond:` global is capability-gated in Mutter too:
+it may be absent, but when offered it must be at GNOME's version. Known
+gaps are reported and do not fail the stage.
 
 The same stage additionally compares against the native Marlin TSV,
 retaining `wayland-info-marlin-compare.txt`. Every native captured global
@@ -63,6 +66,7 @@ and this page together.
 | zxdg_output_manager_v1 | 3 | |
 | zwlr_layer_shell_v1 | 4 | Tuna Desktop's own shell draws through it |
 | zwp_linux_dmabuf_v1 | 5 | only when the renderer reports formats; as Mutter, version 5 when the renderer's EGL device names a render node (else its DRM node), with default feedback naming that device and one tranche of the renderer's formats, and version 3 without one; no scanout tranche, since every surface is composited |
+| wp_linux_drm_syncobj_manager_v1 | 1 | explicit sync, offered only where Mutter offers it; see below. Not in the golden headless list: the test compositor has no renderer |
 | xdg_activation_v1 | 1 | focus policy below |
 | wp_viewporter | 1 | |
 | wp_fractional_scale_manager_v1 | 1 | preferred scale 1 until #59 |
@@ -100,6 +104,59 @@ A valid request focuses the window and raises it unless
 these as `META_CLIENT_TYPE_APPLICATION`). This is Mutter's
 focus-stealing prevention in its simplest form: a background app cannot
 mint its way to the front.
+
+### Explicit sync
+
+`wp_linux_drm_syncobj_manager_v1` follows Mutter 51's
+`meta-wayland-linux-drm-syncobj.c` (`crates/compositor/src/explicit_sync.rs`):
+
+- **When it is advertised.** Once the renderer exists, on the DRM backend
+  and nested alike (Mutter runs the same check for whatever renderer its
+  backend has, with no environment or debug switch), in
+  `meta_wayland_drm_syncobj_manager_new`'s order: the EGL display has
+  `EGL_ANDROID_native_fence_sync`; the renderer's EGL device names a DRM
+  render node, else its DRM node; that node opens read-write; it has
+  `DRM_CAP_SYNCOBJ_TIMELINE`; `drmSyncobjEventfd` exists (a probe on
+  handle 0 fails with `ENOENT`). The first missing piece is logged as
+  `tuna-compositor: explicit sync disabled: <Mutter's reason>`; success as
+  `tuna-compositor: explicit sync (linux-drm-syncobj v1) on <node>`.
+  Software rendering and KMS-only devices have no timeline syncobjs: vkms,
+  bochs and vgem report `DRM_CAP_SYNCOBJ_TIMELINE` 0 and
+  `drmSyncobjEventfd` `EOPNOTSUPP` (checked locally). The drm-smoke stage
+  D-SYNCOBJ asserts the global stays absent on vkms, where Mesa's software
+  renderer already fails the first check (no
+  `EGL_ANDROID_native_fence_sync`).
+- **Errors.** `surface_exists` for a second syncobj surface,
+  `invalid_timeline` for a syncobj fd the device cannot import, `no_surface`
+  after the `wl_surface` is gone. At commit, in Mutter's order: a buffer
+  that is not a dmabuf is `unsupported_buffer`, points or not; a dmabuf
+  needs an acquire point (`no_acquire_point`) and a release point
+  (`no_release_point`); on one timeline the acquire point must be below
+  the release point (`conflicting_points`); a point with no buffer (or a
+  null one) is `no_buffer`. The vendored Smithay carries this check
+  (`third-party/smithay/DRM-SYNCOBJ-PATCH.diff`).
+- **Acquire and release.** A commit is held until its acquire point
+  signals, through the point's eventfd on the event loop (Mutter's
+  transaction waits the same way); a point already signalled applies at
+  once. The release point is signalled when the compositor lets go of the
+  buffer.
+- **Deviations.** Mutter posts `surface_exists` on the `wl_surface`; Tuna
+  Desktop posts it on the manager, as the protocol defines the error. Mutter
+  signals the release point with the GPU fence of the last frame that read
+  the buffer; Tuna Desktop signals it from the CPU once the renderer has
+  dropped the buffer. An invalid commit disconnects the client in both, but
+  Mutter also skips applying it.
+- **Not exercised without a GPU.** CI and the local machines have no
+  timeline-capable device, so the advertised path, a real timeline import,
+  the acquire wait and the release signal run only on hardware. To verify
+  on a GPU session (Mesa radeonsi/iris, or NVIDIA 555 or newer): the
+  compositor log shows `explicit sync (linux-drm-syncobj v1) on
+  /dev/dri/renderD*`; `wayland-info` lists
+  `wp_linux_drm_syncobj_manager_v1` v1; a Vulkan client through Mesa 24.1
+  or newer's WSI (`vkcube`) or an X11 app under Xwayland 24.1 or newer
+  animates without stalls or corruption, and `WAYLAND_DEBUG=1` shows
+  `set_acquire_point` and `set_release_point` before each buffer commit,
+  with no protocol error.
 
 ### Frame timing
 
@@ -162,7 +219,6 @@ GNOME's version.
 | zwp_text_input_manager_v3 | 2 | 1 | Smithay 0.7 implements v1 only; bumps with Smithay (#60) |
 | xdg_toplevel_drag_manager_v1 | 1 | missing | not in Smithay 0.7: a window attached to a drag-and-drop operation and moved with it (detachable browser tabs) (#89) |
 | wp_color_manager_v1 (v2), wp_color_representation_manager_v1 | 2, 1 | missing | not in Smithay 0.7: needs a colour-managed renderer (ICC/HDR, YUV conversion); the GLES path is sRGB only (#89) |
-| wp_linux_drm_syncobj_manager_v1 | source-derived floor 1; absent in this VM capture | missing | explicit sync needs the DRM backend's syncobj import; GPU-capable native acceptance remains open (#68, #89) |
 | zwp_xwayland_keyboard_grab_manager_v1 (Xwayland only; from source) | — | missing | only rootful Xwayland with `-host-grab` uses it, and Mutter allows grabs only per `xwayland-grab-access-rules`; Tuna Desktop runs rootless Xwayland (#89) |
 | zwp_linux_dmabuf_feedback_v1 scanout tranches | per-surface feedback adds a scanout tranche for a direct-scanout candidate (`meta_wayland_dma_buf_surface_feedback`) | default feedback only | Tuna Desktop has no direct scanout of client buffers: every surface is composited, so a scanout tranche would point clients at planes nothing uses; it comes with direct scanout (perf lane) |
 | gtk_shell1 | 7 | missing | not planned: GTK4 needs none of it on a GNOME session |
