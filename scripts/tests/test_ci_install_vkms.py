@@ -338,6 +338,40 @@ class NativePointerMotion(unittest.TestCase):
         self.assertIn('state ".pointer_position == [$x, $2]" 5', corner)
         self.assertNotIn("sleep", parking)
 
+    def test_rtl_return_accounts_for_pressure_clamping_to_the_top_edge(self):
+        corner = SMOKE.read_text().split("\ncorner_run() {\n", 1)[1].split(
+            "\n}\n", 1)[0]
+        marker = "# No barrier at the top-left:"
+        opposite_corner = marker + corner.split(marker, 1)[1].split("\n    fi", 1)[0]
+        # Execute the real shell route with flat, mirrored relative-motion
+        # doubles and output-edge clamping. This tests fixture arithmetic,
+        # not libinput delivery or the native pressure implementation.
+        result = subprocess.run(
+            ["/bin/sh", "-ec", r'''
+W=819
+H=614
+SIGN=-1
+px=$((W - 1 - 60))
+py=60
+phase=D-HOT-CORNER-RTL
+cm() {
+    index=0
+    while [ "$index" -lt "$3" ]; do
+        px=$((px + SIGN * $1))
+        py=$((py + $2))
+        if [ "$px" -lt 0 ]; then px=0; elif [ "$px" -ge "$W" ]; then px=$((W - 1)); fi
+        if [ "$py" -lt 0 ]; then py=0; elif [ "$py" -ge "$H" ]; then py=$((H - 1)); fi
+        index=$((index + 1))
+    done
+}
+at() { [ "$px" -eq "$((W - 1 - $1))" ] && [ "$py" -eq "$2" ]; }
+quiet() { :; }
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+''' + opposite_corner + "\nprintf '%s %s\\n' \"$px\" \"$py\"\n"],
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "758 60\n")
+
 
 if __name__ == "__main__":
     unittest.main()

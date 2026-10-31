@@ -343,8 +343,22 @@ Like the tick path, the callback now reconciles DRM to the manager only
 after the queue drains; until then DRM retains the accumulated position.
 The six uinput commands, exact parking assertion, and pressure gates remain
 unchanged, without a timing delay workaround. The native script regressions
-cover the callback/tick ownership guards and preserve that parking sequence;
-a fresh native run is still required to qualify the fix.
+cover the callback/tick ownership guards and preserve that parking sequence.
+[Native run 41207208893](https://github.com/tuna-os/tuna-desktop/actions/runs/41207208893/job/124563361107)
+then passed the exact parking assertion and the full left-to-right
+`D-HOT-CORNER` pressure, sliding, held-barrier and fullscreen checks at scale 1.25.
+
+That run next exposed an RTL-only fixture error after its opposite-corner
+negative control. The pointer reached `[758,55]`, with 132 relative-motion
+events delivered, RTL enabled, the overview closed and two prior successful
+pressure ripples. The negative control starts at y=5, but pushing upward
+against the unguarded top-left clamps to y=0. Its return route incorrectly
+added only 55 px while requiring y=60. The route now explicitly checks y=0
+after pressure and moves 60 px down; the exact final-position assertion,
+negative control and remaining pressure gates are retained. A shell-route
+regression covers this mirrored/clamped arithmetic without timing sleeps.
+Fresh native evidence is still required for that RTL route correction and
+the remainder of the DRM lane.
 
 ## Marlin VM lane
 

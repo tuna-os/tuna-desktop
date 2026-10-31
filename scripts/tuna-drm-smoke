@@ -1032,8 +1032,10 @@ corner_run() {
         cm 3000 0 1 0; cm -60 0 1 0; cm 0 -3000 1 0; cm 0 5 1 0; cm 50 0 1 0
         at $((W - 11)) 5 || fail "$phase" "the pointer did not reach the top-left"
         cm 0 -10 12 20
+        at $((W - 11)) 0 || fail "$phase" "the pointer did not clamp to the unguarded top-left edge"
         quiet "pressure at the top-left in right-to-left"
-        cm -50 0 1 0; cm 0 55 1 0; cm 3000 0 1 0; cm -3000 0 1 0; cm 60 0 1 0
+        # Pressure moved from y=5 to y=0; return 60 px down, not 55.
+        cm -50 0 1 0; cm 0 60 1 0; cm 3000 0 1 0; cm -3000 0 1 0; cm 60 0 1 0
         at 60 60 || fail "$phase" "the pointer did not return to the corner side"
     fi
 
