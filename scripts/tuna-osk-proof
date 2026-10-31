@@ -419,6 +419,30 @@ jq -e 'any(.[]; .showing and (.name // "" | contains("你好")))' "$ARTIFACTS/ib
 scrot "$ARTIFACTS/ibus-preedit.png" >/dev/null
 session_tap Space G-OSK-IBUS
 expect_text b "TuNAs你好" G-OSK-IBUS
+
+# The real engine must consume repeated BackSpace while composing. Once its
+# preedit is empty, declined synthetic repeats must not edit committed text:
+# ordinary wl_keyboard clients already own their native repeat clock.
+repeat_start="$(now)"
+for letter in n i h a o; do session_tap "$letter" G-OSK-IBUS-REPEAT; done
+jq -es --argjson t "$repeat_start" 'any(.[]; .t >= $t and .field == "b" and (.preedit // "" | length) > 0)' "$PROBE_LOG" >/dev/null ||
+    fail G-OSK-IBUS-REPEAT "real composition was not active before held delete"
+# shellcheck disable=SC2046
+set -- $(osk_rect)
+# shellcheck disable=SC2046
+set -- $(key_xy "On-Screen Keyboard" "$1" "$2" Backspace G-OSK-IBUS-REPEAT)
+hold_start="$(now)"
+xdotool mousemove --window "$WID" "$1" "$2" mousedown 1
+for _ in $(seq 1 80); do
+    jq -es --argjson t "$hold_start" '[.[] | select(.t >= $t and .field == "b" and has("preedit"))] | last | .preedit == ""' "$PROBE_LOG" >/dev/null && break
+    sleep 0.1
+done
+xdotool mouseup 1
+jq -es --argjson t "$hold_start" '[.[] | select(.t >= $t and .field == "b" and has("preedit"))] | last | .preedit == ""' "$PROBE_LOG" >/dev/null ||
+    fail G-OSK-IBUS-REPEAT "held Backspace stopped after one preedit edit"
+expect_text b "TuNAs你好" G-OSK-IBUS-REPEAT
+pass G-OSK-IBUS-REPEAT "held OSK Backspace cleared real libpinyin composition without deleting committed text"
+
 # A declined key when not composing must arrive once, not twice or not at all.
 session_tap "?123" G-OSK-IBUS
 decline_start="$(now)"

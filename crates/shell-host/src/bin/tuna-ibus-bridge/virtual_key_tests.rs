@@ -57,6 +57,15 @@ impl FaultContext {
                         }
                         let (keysym, code, state) = parameters.get::<(u32, u32, u32)>().unwrap();
                         recorded.lock().unwrap().push((keysym, code, state));
+                        if keysym == u32::from('z') {
+                            // A real delayed D-Bus reply exposes generation
+                            // races; no replacement composition engine here.
+                            glib::MainContext::ref_thread_default().spawn_local(async move {
+                                glib::timeout_future(Duration::from_millis(250)).await;
+                                invocation.return_value(Some(&(true,).to_variant()));
+                            });
+                            return;
+                        }
                         if keysym == u32::from('b') || (keysym == UNICODE && state == RELEASE) {
                             invocation.return_dbus_error(
                                 "org.freedesktop.IBus.Error.Failed",
@@ -106,6 +115,7 @@ impl FaultContext {
             bus,
             path: "/context".into(),
             _subscription: subscription,
+            incoming: Rc::default(),
         };
         Self {
             daemon,
@@ -168,4 +178,110 @@ fn dbus_press_errors_forward_once_but_consumed_release_errors_never_replay() {
         (u32::from('d'), 0, 0), (u32::from('d'), 0, RELEASE),
         (u32::from('e'), 0, 0), (u32::from('e'), 0, RELEASE),
     ], "declined/error presses have no release; consumed Unicode is exact and has no physical keycode");
+}
+
+#[test]
+fn retired_repeat_reply_cannot_complete_the_new_held_key() {
+    let fixture = FaultContext::start();
+    let mut repeat = KeyRepeat::default();
+    let now = Instant::now();
+    repeat.info(20, 0);
+    repeat.key(14, true, true, true, now);
+    repeat.request(&fixture.context, u32::from('a'), 0, now);
+    let until = Instant::now() + Duration::from_secs(2);
+    while !fixture
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call.0 == u32::from('a'))
+        && Instant::now() < until
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(fixture
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call.0 == u32::from('a')));
+    repeat.key(14, false, true, true, now);
+    repeat.key(21, true, true, true, now);
+    repeat.request(&fixture.context, u32::from('z'), 0, now);
+    let pump = |duration| {
+        let until = Instant::now() + duration;
+        let main = glib::MainContext::default();
+        while Instant::now() < until {
+            while main.pending() {
+                main.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    pump(Duration::from_millis(100));
+    assert_eq!(
+        repeat.due(now + Duration::from_secs(1)),
+        None,
+        "the retired key's reply cannot release the new key's in-flight guard"
+    );
+    pump(Duration::from_millis(250));
+    assert_eq!(repeat.due(now + Duration::from_secs(1)), Some(21));
+    repeat.cancel();
+    assert_eq!(repeat.due(now + Duration::from_secs(2)), None);
+}
+
+#[test]
+fn physical_grab_uses_xkb_repeatability_not_keysym_guesses() {
+    let fixture = FaultContext::start();
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let keymap = xkb::Keymap::new_from_names(
+        &context,
+        "evdev",
+        "pc105",
+        "us",
+        "",
+        None,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )
+    .unwrap();
+    let state = xkb::State::new(&keymap);
+    let bus = fixture.context.bus.clone();
+    let subscription = bus.subscribe_to_signal(
+        None,
+        Some(CONTEXT),
+        None,
+        Some("/context"),
+        None,
+        gio::DBusSignalFlags::NONE,
+        |_| {},
+    );
+    let input_context = IbusContext {
+        bus,
+        path: "/context".into(),
+        _subscription: subscription,
+        incoming: Rc::default(),
+    };
+    let mut bridge = Bridge {
+        active: true,
+        context: Some(input_context),
+        xkb: Some((keymap, state)),
+        ..Default::default()
+    };
+    bridge.repeat.info(20, 0);
+    bridge.key(1, 42, true); // Shift is nonrepeating in the actual keymap.
+    assert_eq!(
+        bridge.repeat.due(Instant::now() + Duration::from_secs(1)),
+        None
+    );
+    bridge.key(2, 42, false);
+    bridge.key(3, 14, true);
+    assert_eq!(
+        bridge.repeat.due(Instant::now() + Duration::from_secs(1)),
+        Some(14)
+    );
+    bridge.key(4, 14, false);
+    assert_eq!(
+        bridge.repeat.due(Instant::now() + Duration::from_secs(1)),
+        None
+    );
 }

@@ -69,6 +69,41 @@ Modifier-free native text follows GNOME 51's [`KeyboardController.commit`](https
 
 Focus retirement destroys the old IBus context and its owned signal subscription while retaining the keyboard grab. Delayed old-context output cannot acquire the next field's epoch. The compositor rejects stale fallback epochs and locked or no-longer-focused fields. `INPUT-METHOD-EPOCH-API-PATCH.diff` records the additive Smithay owner-checked serial accessor. Actual Wayland consumers cover ordinary-client discovery/bind denial, interleaved raw/commit ordering, non-recursive fallback with grab restoration, and focus/lock rejection. The bridge's private-D-Bus fault test covers GetEngine failure, declined/error presses, exact Unicode/keycode-zero calls and consumed presses whose release fails; those fixtures do not establish real composition.
 
+Held raw keys, including OSK BackSpace during preedit, use the IM-grab's
+advertised `repeat_info` delay/rate. The bridge excludes keys for which the
+active XKB keymap disables repeat, and cancels on release, field/context
+retirement, replacement keymap, or repeat disabling. Repeat requests are
+asynchronous and single-flight; canceled generations cannot complete a later
+hold. Queued Wayland releases and focus changes are dispatched before a due
+repeat, including input that arrived during a synchronous initial key call.
+Context-specific signal queues prevent already dispatched old-context
+callbacks from reaching a new field. Live repeat settings and replacement
+keymaps/modifiers are broadcast to the existing IM grab, recorded in
+`INPUT-METHOD-REPEAT-API-PATCH.diff`.
+
+This follows Mutter 51's
+[`meta-seat-impl.c` native repeat clock](https://gitlab.gnome.org/GNOME/mutter/-/blob/51.0/src/backends/native/meta-seat-impl.c#L694)
+and [`meta-wayland-keyboard.c` repeated-event forwarding](https://gitlab.gnome.org/GNOME/mutter/-/blob/51.0/src/wayland/meta-wayland-keyboard.c#L278).
+The seat exposes `wl_keyboard` versions below 10: a synthetic repeat is offered
+to IBus, but an explicitly declined repeat is **not** forwarded as another
+virtual-keyboard press. Ordinary clients already repeat the original declined
+physical press themselves. This avoids duplicate native repeats without
+bypassing composition with surrounding-text deletion or clearing preedit.
+
+Focused evidence: the bridge's 10-test suite includes real private-D-Bus
+delayed-reply retirement and actual XKB repeatability; all seven Wayland input
+protocol tests pass, including live repeat settings and usable replacement
+keymaps. A separate headless real-Wayland consumer with the production bridge
+and distribution libpinyin observed successive held-BackSpace engine edits
+(`你好` → `你哈` → `你和` → `你` → `年` → empty), partial-composition release stop,
+modifier exclusion, native declined press/release edges only, and focus
+retirement. No graphical session ran for that smoke. The graphical
+G-OSK-IBUS-REPEAT extension now holds the real OSK key against GTK preedit and
+requires committed text to remain intact, but still requires exact-head CI
+qualification alongside G-OSK-IBUS/G-OSK-LOCK. No installed-session or hardware
+claim is added.
+
+
 On the lock screen each lock window embeds its own keyboard, opened by the unlock prompt's focus, that edits only that prompt; the compositor reports no text-input focus and refuses `OskInput` while locked, and the session keyboard is hidden.
 
 Proof (`scripts/tuna-osk-proof`, nested winit session, real xdotool clicks through the nested window on a GTK 4 probe with two entries and on the keys the shell's AT-SPI tree names): G-OSK-SHOW (with `screen-keyboard-enabled` off a click into an entry shows nothing; on, the click shows the keyboard no sooner than the 300 ms rest time, focus moving between entries keeps it up through the 50 ms focus-out delay, and focus on a button hides it no sooner than that delay), G-OSK-TYPE (tapped keys reach the client's entry, which keeps the focus), G-OSK-SHIFT (shift types one uppercase letter; the long-press caps latch types uppercase until tapped off) and G-OSK-LOCK (locked, the session keyboard is hidden and never maps, the lock screen's keyboard taps the password into the unlock prompt and unlocks through PAM, and the session's entries see no change).

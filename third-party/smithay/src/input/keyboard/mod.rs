@@ -20,6 +20,8 @@ pub use xkbcommon::xkb::{self, keysyms, Keycode, Keysym};
 use super::{GrabStatus, Seat, SeatHandler};
 
 #[cfg(feature = "wayland_frontend")]
+use wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2;
+#[cfg(feature = "wayland_frontend")]
 use wayland_server::{Resource, Weak};
 #[cfg(feature = "wayland_frontend")]
 mod keymap_file;
@@ -358,6 +360,10 @@ pub(crate) struct KbdRc<D: SeatHandler> {
     pub(crate) keymap: Mutex<KeymapFile>,
     #[cfg(feature = "wayland_frontend")]
     pub(crate) known_kbds: Mutex<Vec<Weak<wayland_server::protocol::wl_keyboard::WlKeyboard>>>,
+    /// The seat has at most one input-method keyboard grab. It must hear live
+    /// repeat/keymap changes just like wl_keyboard consumers do.
+    #[cfg(feature = "wayland_frontend")]
+    pub(crate) known_im_grab: Mutex<Option<Weak<ZwpInputMethodKeyboardGrabV2>>>,
     #[cfg(feature = "wayland_frontend")]
     pub(crate) last_enter: Mutex<Option<Serial>>,
     pub(crate) span: tracing::Span,
@@ -379,6 +385,7 @@ impl<D: SeatHandler> fmt::Debug for KbdRc<D> {
             .field("internal", &self.internal)
             .field("keymap", &self.keymap)
             .field("known_kbds", &self.known_kbds)
+            .field("known_im_grab", &self.known_im_grab)
             .field("last_enter", &self.last_enter)
             .finish()
     }
@@ -729,6 +736,8 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
                 #[cfg(feature = "wayland_frontend")]
                 known_kbds: Mutex::new(Vec::new()),
                 #[cfg(feature = "wayland_frontend")]
+                known_im_grab: Mutex::new(None),
+                #[cfg(feature = "wayland_frontend")]
                 last_enter: Mutex::new(None),
                 #[cfg(feature = "wayland_frontend")]
                 active_keymap: RwLock::new(active_keymap),
@@ -791,6 +800,28 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
                     "Failed to send keymap to client"
                 );
             }
+        }
+        let grab = self
+            .arc
+            .known_im_grab
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|grab| grab.upgrade().ok());
+        if let Some(grab) = grab {
+            if let Err(error) = keymap_file.with_fd(false, |fd, size| {
+                grab.keymap(KeymapFormat::XkbV1, fd.as_fd(), size as u32);
+            }) {
+                warn!(err = ?error, "Failed to send keymap to input method");
+            }
+            let serialized = mods.serialized;
+            grab.modifiers(
+                SERIAL_COUNTER.next_serial().into(),
+                serialized.depressed,
+                serialized.latched,
+                serialized.locked,
+                serialized.layout_effective,
+            );
         }
 
         // Send updated modifiers.
@@ -1241,6 +1272,19 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
             };
             if kbd.version() >= 4 {
                 kbd.repeat_info(rate, delay);
+            }
+        }
+        #[cfg(feature = "wayland_frontend")]
+        {
+            let grab = self
+                .arc
+                .known_im_grab
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|grab| grab.upgrade().ok());
+            if let Some(grab) = grab {
+                grab.repeat_info(rate, delay);
             }
         }
     }

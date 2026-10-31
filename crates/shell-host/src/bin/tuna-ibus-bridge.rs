@@ -68,6 +68,10 @@ mod osk_protocol {
 }
 use osk_protocol::tuna_osk_input_v1::{self, TunaOskInputV1};
 
+#[path = "tuna-ibus-bridge/repeat.rs"]
+mod repeat;
+use repeat::KeyRepeat;
+
 const IBUS: &str = "org.freedesktop.IBus";
 const IBUS_PATH: &str = "/org/freedesktop/IBus";
 const CONTEXT: &str = "org.freedesktop.IBus.InputContext";
@@ -134,8 +138,7 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let bus = ibus_connection()?;
-    let incoming: Rc<RefCell<VecDeque<FromIbus>>> = Rc::default();
-    let context = IbusContext::create(bus.clone(), incoming.clone())?;
+    let context = IbusContext::create(bus.clone())?;
 
     let conn = Connection::connect_to_env()?;
     let mut queue: EventQueue<Bridge> = conn.new_event_queue();
@@ -144,7 +147,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut bridge = Bridge {
         ibus: Some(bus),
         context: Some(context),
-        incoming,
         ..Bridge::default()
     };
     queue.roundtrip(&mut bridge)?;
@@ -175,11 +177,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &wayland_fd,
                 rustix::event::PollFlags::IN,
             )];
+            let now = Instant::now();
+            let wait = bridge
+                .repeat
+                .deadline(now)
+                .map_or(Duration::from_millis(50), |at| {
+                    at.saturating_duration_since(now)
+                })
+                .min(Duration::from_millis(50));
             rustix::event::poll(
                 &mut fds,
                 Some(&rustix::event::Timespec {
                     tv_sec: 0,
-                    tv_nsec: 50_000_000,
+                    tv_nsec: wait.as_nanos() as i64,
                 }),
             )?;
             if fds[0].revents().contains(rustix::event::PollFlags::IN) {
@@ -191,6 +201,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // moving a parent must update IBus without another text edit.
         bridge.sync_cursor();
         bridge.apply_incoming();
+        let now = Instant::now();
+        if bridge.repeat.deadline(now).is_some_and(|at| at <= now) {
+            // Like Mutter's native repeat callback, serve queued input first.
+            // A synchronous initial key call may have let its release/focus-out
+            // arrive on the socket before the repeat deadline was checked.
+            loop {
+                let Some(guard) = queue.prepare_read() else {
+                    queue.dispatch_pending(&mut bridge)?;
+                    continue;
+                };
+                let fd = guard.connection_fd();
+                let mut ready = [rustix::event::PollFd::new(
+                    &fd,
+                    rustix::event::PollFlags::IN,
+                )];
+                rustix::event::poll(
+                    &mut ready,
+                    Some(&rustix::event::Timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    }),
+                )?;
+                if !ready[0].revents().contains(rustix::event::PollFlags::IN) {
+                    break;
+                }
+                let _ = guard.read();
+                queue.dispatch_pending(&mut bridge)?;
+                bridge.apply_incoming();
+            }
+        }
+        bridge.repeat_keys();
         if bridge.gone {
             return Ok(());
         }
@@ -243,13 +284,13 @@ struct IbusContext {
     bus: gio::DBusConnection,
     path: String,
     _subscription: gio::SignalSubscription,
+    /// Each context owns its queue: even an already dispatched old signal
+    /// callback cannot enqueue an event into a later field's context.
+    incoming: Rc<RefCell<VecDeque<FromIbus>>>,
 }
 
 impl IbusContext {
-    fn create(
-        bus: gio::DBusConnection,
-        incoming: Rc<RefCell<VecDeque<FromIbus>>>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    fn create(bus: gio::DBusConnection) -> Result<Self, Box<dyn std::error::Error>> {
         let reply = bus.call_sync(
             Some(IBUS),
             IBUS_PATH,
@@ -266,6 +307,8 @@ impl IbusContext {
             .str()
             .ok_or("CreateInputContext returned no path")?
             .to_owned();
+        let incoming: Rc<RefCell<VecDeque<FromIbus>>> = Rc::default();
+        let received = incoming.clone();
         let subscription = bus.subscribe_to_signal(
             None,
             Some(CONTEXT),
@@ -275,7 +318,7 @@ impl IbusContext {
             gio::DBusSignalFlags::NONE,
             move |signal| {
                 if let Some(event) = ibus_event(signal.signal_name, signal.parameters) {
-                    incoming.borrow_mut().push_back(event);
+                    received.borrow_mut().push_back(event);
                 }
             },
         );
@@ -283,6 +326,7 @@ impl IbusContext {
             bus,
             path,
             _subscription: subscription,
+            incoming,
         };
         context.send("SetCapabilities", Some((CAPABILITIES,).to_variant()));
         eprintln!("tuna-ibus-bridge: input context {}", context.path);
@@ -511,7 +555,7 @@ struct Bridge {
     osk: Option<TunaOskInputV1>,
     ibus: Option<gio::DBusConnection>,
     context: Option<IbusContext>,
-    incoming: Rc<RefCell<VecDeque<FromIbus>>>,
+    repeat: KeyRepeat,
     /// `done` events so far: the serial a commit names.
     serial: u32,
     /// Activation pending the next `done`, and the applied one.
@@ -540,8 +584,12 @@ impl Bridge {
         while main.pending() {
             main.iteration(false);
         }
-        let events: Vec<FromIbus> = self.incoming.borrow_mut().drain(..).collect();
-        for event in events {
+        loop {
+            let event = self
+                .context
+                .as_ref()
+                .and_then(|context| context.incoming.borrow_mut().pop_front());
+            let Some(event) = event else { break };
             self.apply(event);
         }
     }
@@ -614,6 +662,17 @@ impl Bridge {
 
     /// One grabbed key: IBus first, then the app if IBus passes.
     fn key(&mut self, time: u32, key: u32, pressed: bool) {
+        let repeatable = self
+            .xkb
+            .as_ref()
+            .is_some_and(|(keymap, _)| keymap.key_repeats((key + 8).into()));
+        self.repeat.key(
+            key,
+            pressed,
+            repeatable,
+            self.active && self.context.is_some(),
+            Instant::now(),
+        );
         let keyval = self.xkb.as_ref().map_or(0, |(_, state)| {
             state.key_get_one_sym((key + 8).into()).raw()
         });
@@ -647,6 +706,28 @@ impl Bridge {
         if !handled {
             self.forward(time, key, pressed);
         }
+    }
+
+    fn repeat_keys(&mut self) {
+        let now = Instant::now();
+        let Some(key) = self.repeat.due(now) else {
+            return;
+        };
+        if !self.active {
+            self.repeat.cancel();
+            return;
+        }
+        let Some(context) = self.context.as_ref() else {
+            self.repeat.cancel();
+            return;
+        };
+        let Some((_, xkb_state)) = &self.xkb else {
+            self.repeat.cancel();
+            return;
+        };
+        let keyval = xkb_state.key_get_one_sym((key + 8).into()).raw();
+        let modifiers = self.ibus_state();
+        self.repeat.request(context, keyval, modifiers, now);
     }
 
     fn forward(&self, time: u32, key: u32, pressed: bool) {
@@ -784,12 +865,14 @@ impl Bridge {
     /// physical keys can arrive between those requests. Inactive contexts
     /// forward keys directly instead of sending them through IBus.
     fn activate(&mut self, active: bool, qh: &QueueHandle<Self>) {
-        if active == self.active {
+        if !active && !self.active {
             return;
+        }
+        if active && self.active {
+            self.retire_context();
         }
         self.active = active;
         self.preedit_active = false;
-        self.incoming.borrow_mut().clear();
         // A new field: what IBus heard about the last one is stale.
         self.surrounding = None;
         self.sent_cursor_rect = None;
@@ -799,26 +882,22 @@ impl Bridge {
         );
         if active {
             if self.context.is_none() {
-                self.context = self.ibus.as_ref().and_then(|bus| {
-                    match IbusContext::create(bus.clone(), self.incoming.clone()) {
-                        Ok(context) => Some(context),
-                        Err(error) => {
-                            eprintln!("tuna-ibus-bridge: create focused context: {error}");
-                            None
-                        }
-                    }
-                });
+                self.context =
+                    self.ibus
+                        .as_ref()
+                        .and_then(|bus| match IbusContext::create(bus.clone()) {
+                            Ok(context) => Some(context),
+                            Err(error) => {
+                                eprintln!("tuna-ibus-bridge: create focused context: {error}");
+                                None
+                            }
+                        });
             }
             if let Some(context) = &self.context {
                 context.send("FocusIn", None);
             }
-        } else if let Some(context) = self.context.take() {
-            // Retire the object path and its owned signal subscription.
-            // Delayed engine output from this field can never be stamped with
-            // the next field's input-method serial.
-            context.send("Reset", None);
-            context.send("FocusOut", None);
-            context.send_to("org.freedesktop.IBus.Service", "Destroy", None);
+        } else {
+            self.retire_context();
         }
         // Every focused field goes through IBus, including keyboard layouts.
         // Retain the supervised connection's grab across field changes and
@@ -826,6 +905,15 @@ impl Bridge {
         // Connection teardown releases the grab if the bridge exits.
         if active && self.grab.is_none() {
             self.grab = self.im.as_ref().map(|im| im.grab_keyboard(qh, ()));
+        }
+    }
+
+    fn retire_context(&mut self) {
+        self.repeat.cancel();
+        if let Some(context) = self.context.take() {
+            context.send("Reset", None);
+            context.send("FocusOut", None);
+            context.send_to("org.freedesktop.IBus.Service", "Destroy", None);
         }
     }
 }
@@ -910,6 +998,8 @@ impl Dispatch<ZwpInputMethodV2, ()> for Bridge {
             zwp_input_method_v2::Event::Done => state.done(qh),
             zwp_input_method_v2::Event::Unavailable => {
                 eprintln!("tuna-ibus-bridge: another input method is active");
+                state.retire_context();
+                state.active = false;
                 state.gone = true;
             }
             _ => {}
@@ -963,10 +1053,11 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for Bridge {
     ) {
         match event {
             zwp_input_method_keyboard_grab_v2::Event::Keymap { format, fd, size } => {
-                if let Some(keymap) = load_keymap(&fd, size) {
+                state.repeat.cancel();
+                state.xkb = load_keymap(&fd, size).map(|keymap| {
                     let xkb_state = xkb::State::new(&keymap);
-                    state.xkb = Some((keymap, xkb_state));
-                }
+                    (keymap, xkb_state)
+                });
                 if let (Some(vk), WEnum::Value(format)) = (&state.vk, format) {
                     vk.keymap(format as u32, fd.as_fd(), size);
                     state.vk_keymap = true;
@@ -997,6 +1088,9 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for Bridge {
                 if let (Some(vk), true) = (&state.vk, state.vk_keymap) {
                     vk.modifiers(mods_depressed, mods_latched, mods_locked, group);
                 }
+            }
+            zwp_input_method_keyboard_grab_v2::Event::RepeatInfo { rate, delay } => {
+                state.repeat.info(rate, delay);
             }
             _ => {}
         }

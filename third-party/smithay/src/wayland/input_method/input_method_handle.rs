@@ -299,6 +299,7 @@ where
                 keyboard.grab = Some(instance.clone());
                 keyboard.text_input_handle = data.text_input_handle.clone();
                 let guard = data.keyboard_handle.arc.internal.lock().unwrap();
+                *data.keyboard_handle.arc.known_im_grab.lock().unwrap() = Some(instance.downgrade());
                 instance.repeat_info(guard.repeat_rate, guard.repeat_delay);
                 let keymap_file = data.keyboard_handle.arc.keymap.lock().unwrap();
                 let res = keymap_file.with_fd(false, |fd, size| {
