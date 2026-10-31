@@ -149,9 +149,10 @@ keyboard_notification_proof() {
     kr_until 'any(.[]; .name == "Delete Proof Banner" and .showing)' 5 "$ARTIFACTS/a11y-kr-banner.json" ||
         fail G-NOTIFICATION-KEYS "no banner to focus"
     xdotool key super+n
-    sleep 0.5
-    kr_dump "$ARTIFACTS/a11y-kr-banner-focus.json" || fail G-NOTIFICATION-KEYS "accessibility dump failed"
-    jq -e 'any(.[]; .showing and .focused)' "$ARTIFACTS/a11y-kr-banner-focus.json" >/dev/null ||
+    # Layer activation and AT-SPI focus arrive asynchronously; wait for
+    # the exact card, without sending the focus chord a second time.
+    kr_until 'any(.[]; .name == "Delete Proof Banner" and .showing and .focused)' 5 \
+        "$ARTIFACTS/a11y-kr-banner-focus.json" ||
         fail G-NOTIFICATION-KEYS "Super+N did not focus the banner"
     xdotool key Delete
     kr_until 'any(.[]; .name == "Delete Proof Banner" and .showing) | not' 5 "$ARTIFACTS/a11y-kr-banner-deleted.json" ||
@@ -161,7 +162,9 @@ keyboard_notification_proof() {
     kr_until 'any(.[]; .name == "Escape Proof Banner" and .showing)' 5 "$ARTIFACTS/a11y-kr-banner2.json" ||
         fail G-NOTIFICATION-KEYS "no second banner to focus"
     xdotool key super+n
-    sleep 0.5
+    kr_until 'any(.[]; .name == "Escape Proof Banner" and .showing and .focused)' 5 \
+        "$ARTIFACTS/a11y-kr-banner2-focus.json" ||
+        fail G-NOTIFICATION-KEYS "Super+N did not focus the second banner"
     xdotool key Escape
     kr_until 'any(.[]; .name == "Escape Proof Banner" and .showing) | not' 5 "$ARTIFACTS/a11y-kr-banner-expired.json" ||
         fail G-NOTIFICATION-KEYS "Escape did not expire the focused banner"

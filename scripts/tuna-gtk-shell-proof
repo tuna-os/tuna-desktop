@@ -10049,9 +10049,11 @@ for _attempt in 1 2 3 4 5 6 7 8 9 10; do
 done
 showing "$ARTIFACTS/a11y-notification-focus-before.json" "Focus Proof Banner" || fail G-NOTIFICATION-FOCUS-KEY "no active banner to focus"
 fkey_tap Super_L ffc3 || fail G-NOTIFICATION-FOCUS-KEY "Super+F6 tap failed"
-sleep 0.5
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-notification-focus.json" 20 || fail G-NOTIFICATION-FOCUS-KEY "a11y dump failed"
-jq -e '.[] | select(.showing and .focused and .name == "Focus Proof Banner")' "$ARTIFACTS/a11y-notification-focus.json" >/dev/null || fail G-NOTIFICATION-FOCUS-KEY "the banner did not get keyboard focus"
+# The layer keyboard-enter and AT-SPI focus events can trail presentation
+# under load. Observe the exact card rather than assuming a fixed delay.
+kr_until 'any(.[]; .showing and .focused and .name == "Focus Proof Banner")' 5 \
+    "$ARTIFACTS/a11y-notification-focus.json" ||
+    fail G-NOTIFICATION-FOCUS-KEY "the banner did not get keyboard focus"
 xdotool key Escape
 gsettings reset org.gnome.shell.keybindings focus-active-notification
 pass G-NOTIFICATION-FOCUS-KEY "the rebound key focuses the active banner; Escape restores client input"

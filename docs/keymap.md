@@ -104,7 +104,10 @@ key; where GNOME has no keyboard route the row is parity, not a gap.
 Proof gates are in `scripts/tuna-gtk-shell-proof` (the P-A11Y-02 ones
 in `scripts/lib/tuna-keyboard-routes-proof.sh`, also run alone with
 `--keyboard-routes-only`); each drives real X11 keys through the
-nested session and reads the AT-SPI tree or the bus back.
+nested session and reads the AT-SPI tree or the bus back. Banner-focus
+gates wait up to five seconds for the exact banner's showing/focused
+state after one chord; they do not repeat the key or accept another
+focused control.
 
 | Surface | Pointer action | Tuna keyboard route | GNOME 51 route | Evidence | State |
 |---|---|---|---|---|---|
