@@ -254,16 +254,19 @@ new native proof result; the failed run is not retroactively qualified.
 The native proof isolates `XDG_STATE_HOME` and `XDG_CACHE_HOME` under its
 artifact root as well as HOME/config/data. A local native attempt stopped
 before the speech gates because inherited state selected
-`~/.local/state/roost-shell` for upgrade, where the ownership/ancestor
+`~/.local/state/roost-shell` for upgrade, where the ownership/ancestor <!-- tuna-rename: keep -->
 guard refused migration. `user_upgrade::pairs_from` and the shell's
 `xdg::state_home_from` prefer an absolute `XDG_STATE_HOME` over HOME;
 changing HOME alone does not isolate that route. The proof now exports
 private state/cache roots explicitly. It does not touch the real user
 paths or bypass the migration guard.
 
-The local full speech proof is blocked by host Orca 46.1, which does not
-satisfy the required KeyboardMonitor contract. A new Ubuntu 26.04 run with
-distribution Orca 50.3 must establish all speech gates against the native
-package correction. The original failed run's eight passing gates do not
-establish a nine-gate pass for this change, and a GTK auth-prompt regression
-does not qualify end-to-end Orca speech.
+The first local attempt used host Orca 46.1, which could not satisfy the
+KeyboardMonitor contract. A later isolated Ubuntu 26.04 run with native
+Orca `50.3-0ubuntu0.1+tuna1` passed all 11 speech assertions in 141 seconds.
+It typed nine characters, observed nine spoken bullets without plaintext,
+unlocked through PAM, and confirmed that the toggle stopped Orca.
+[The retained report](https://github.com/tuna-os/tuna-desktop/pull/931#issuecomment-6545553530)
+records source `69e9a04fd20aa2bc38427c79aec043cb3174da3b` and the actual
+package and binary identities. This proves the nested speech path, not
+the separate GDM fresh-account journey or ISO installation.
