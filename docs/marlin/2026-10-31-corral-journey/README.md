@@ -107,4 +107,8 @@ removed with `corral delete --wait`, including their VMIs and PVCs.
 Dispatched [main run 41199130139](https://github.com/tuna-os/tuna-desktop/actions/runs/41199130139)
 with the exact index digest above (`digest` input), at desktop source
 `83bf62fc71870ef84162d411cdd8630a43e280cd`.
-The final per-gate results are recorded with this PR's run report.
+At handoff, image resolution and fixture installation passed. **Real shipped
+GDM PAM login, semantic tour and lifecycle failed.** The bounded soak is
+still in progress; per-check publication and artifact uploads are pending.
+The nightly is therefore not a passing gate result. Its final soak result
+and finer-grained failure diagnostics are not yet available.
