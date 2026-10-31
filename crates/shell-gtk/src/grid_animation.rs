@@ -420,7 +420,11 @@ pub fn tracing() -> bool {
 
 pub fn trace(name: &str, what: std::fmt::Arguments) {
     if tracing() {
-        eprintln!("tuna-shell-gtk: grid-anim {name} {what}");
+        // Formatting directly into stderr can split a record around another
+        // process's writes to the same proof pipe. Buffer each short record,
+        // as media diagnostics do, so its text and newline travel together.
+        let line = format!("tuna-shell-gtk: grid-anim {name} {what}\n");
+        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
     }
 }
 
