@@ -63,7 +63,8 @@ reap() {
     if awk -v d="$dir" 'index($0, d) { found = 1; exit } END { exit !found }' "$held"; then
         return 0
     fi
-    [ -z "$(find "$dir" -mmin "-$minutes" -print -quit 2>/dev/null)" ] || return 0
+    recent=$(find "$dir" -mmin "-$minutes" -print -quit 2>/dev/null) || return 0
+    [ -z "$recent" ] || return 0
     rm -rf "$dir"
     log "removed $dir"
 }
