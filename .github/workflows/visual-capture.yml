@@ -206,7 +206,7 @@ jobs:
           subprocess.run(["sudo", "apt-get", "install", "-y", "--no-install-recommends", "gdb", "just"], check=True, timeout=120)
           PY
       - run: immutable-harness/scripts/ci-install-gtk4-layer-shell
-      - name: Observe exact old startup and launch under passive external debugger
+      - name: Diagnose source-pinned launch prefix with passive bounded core capture
         run: /usr/bin/python3 scripts/notify348-old-launch-diagnostic.py immutable-harness "$RUNNER_TEMP/old-launch-diagnostic"
       - if: always()
         run: immutable-harness/scripts/ci-prepare-artifacts "$RUNNER_TEMP/old-launch-diagnostic/runtime"
@@ -216,8 +216,9 @@ jobs:
           name: old-launch-diagnostic-NOT-ACCEPTANCE
           path: |
             ${{ runner.temp }}/old-launch-diagnostic/diagnostic-receipt.json
-            ${{ runner.temp }}/old-launch-diagnostic/debugger.txt
-            ${{ runner.temp }}/old-launch-diagnostic/shell.core
+            ${{ runner.temp }}/old-launch-diagnostic/standalone-launch-prefix.sh
+            ${{ runner.temp }}/old-launch-diagnostic/prefix.diff
+            ${{ runner.temp }}/old-launch-diagnostic/retained-core*
             ${{ runner.temp }}/old-launch-diagnostic/proof-output.txt
             ${{ runner.temp }}/old-launch-diagnostic/admission-old.json
             ${{ runner.temp }}/old-launch-diagnostic/cargo-old-*.json

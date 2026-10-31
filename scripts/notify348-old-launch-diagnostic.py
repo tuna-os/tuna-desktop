@@ -1,13 +1,16 @@
 #!/usr/bin/python3
-"""Temporary diagnostic only: passive debugger overhead invalidates acceptance."""
+"""Temporary source-pinned launch prefix; diagnostic only, never acceptance."""
 import ctypes
+import difflib
 import hashlib
 import importlib.machinery
 import importlib.util
 import json
 import os
 from pathlib import Path
-import signal
+import resource
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -29,7 +32,7 @@ subprocess.run(['git', 'worktree', 'add', '--detach', str(source), OLD], cwd=ROO
 assert comparison.contract.source_tuple(source)['sha'] == OLD
 admission_path, admission, binaries = comparison.build(source, 'old', WORK, {
     'diagnostic_only': True, 'original_run': 41210529702, 'original_job': 124571621678,
-    'original_harness': HARNESS, 'observer': 'external sudo gdb attach; not acceptance',
+    'original_harness': HARNESS, 'observer': 'passive bounded core capture; not acceptance',
 })
 assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
 home = WORK / 'home'
@@ -47,22 +50,59 @@ for name in ('DISPLAY', 'WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'TUNA_PROOF_SHELL_B
              'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR'):
     env.pop(name, None)
 output = WORK / 'proof-output.txt'
-record = {'scope': 'DIAGNOSTIC ONLY; debugger observer overhead; not GRID acceptance',
+record = {'scope': 'STANDALONE DIAGNOSTIC PREFIX ONLY; not comparison execution, admission or acceptance',
           'source': admission['source'], 'harness': admission['harness'],
           'original_failed_run': 41210529702, 'original_failed_job': 124571621678,
           'original_failed_receipt_retained_at': '/tmp/brightness973-failures/grid-cancel-comparison/receipt-old.json'}
-debugger = None
+original_script = ROOT / 'scripts/tuna-gtk-shell-proof'
+original = original_script.read_text()
+lines = original.splitlines(keepends=True)
+assert lines[2160].startswith('pass G-OV-LAUNCH ')
+assert lines[374].startswith('ROOT=')
+assert ''.join(lines[400:407]).startswith('if [ "$GRID_CANCEL_ONLY" = 1 ]; then')
+prefix_lines = lines[:2161]
+# Standalone diagnostic extraction, not a comparison/admission entrypoint.
+# Preserve the original grid-only control-flow through the launch boundary.
+prefix_lines[382] = 'GRID_CANCEL_ONLY=1 # diagnostic prefix selects original grid-only setup only\n'
+prefix_lines[374] = 'ROOT=' + shlex.quote(str(ROOT)) + '\n'
+prefix_lines[400:407] = ['# No comparison flags/admission are executed by this standalone diagnostic.\n']
+extracted = ''.join(prefix_lines) + '\nexit 0\n'
+prefix = WORK / 'standalone-launch-prefix.sh'
+prefix.write_text(extracted)
+prefix.chmod(0o700)
+(WORK / 'prefix.diff').write_text(''.join(difflib.unified_diff(
+    original.splitlines(keepends=True), extracted.splitlines(keepends=True),
+    fromfile='immutable-8eebec13-full-proof', tofile='standalone-diagnostic-launch-prefix')))
+record['extraction'] = {
+    'source_path': str(original_script), 'source_sha256': hashlib.sha256(original.encode()).hexdigest(),
+    'original_lines_inclusive': [1, 2161], 'boundary': lines[2160].strip(),
+    'extracted_sha256': hashlib.sha256(extracted.encode()).hexdigest(),
+    'differences': ['explicit pinned ROOT for relocated artifact', 'select original grid-only setup',
+                    'remove comparison argument/admission guard; no comparison API or accepted tuple call',
+                    'truncate after unchanged G-OV-LAUNCH assertion/pass; standalone exit'],
+}
+soft, hard = resource.getrlimit(resource.RLIMIT_CORE)
+core_limit = 256 * 1024 * 1024
+if hard != resource.RLIM_INFINITY:
+    core_limit = min(core_limit, hard)
+resource.setrlimit(resource.RLIMIT_CORE, (core_limit, hard))
+record['core_capture'] = {'prior_limit': [soft, hard], 'active_limit': [core_limit, hard],
+                          'core_pattern': Path('/proc/sys/kernel/core_pattern').read_text(),
+                          'host_sysctl_modified': False, 'ptrace_used': False}
+before_cores = set(ROOT.glob('core*'))
 child = None
 boundary = None
 try:
-    with output.open('w') as out, (WORK / 'debugger.txt').open('w') as debug_out:
-        child = subprocess.Popen([str(ROOT / 'scripts/tuna-gtk-shell-proof'), '--artifacts', str(WORK / 'runtime')],
-                                 cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=out,
-                                 stderr=subprocess.STDOUT, start_new_session=True)
+    with output.open('w') as out:
+        argv = [str(prefix), '--artifacts', str(WORK / 'runtime')]
+        record['runtime_argv'] = argv
+        record['runtime_cwd'] = str(ROOT)
+        child = subprocess.Popen(argv, cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
+                                 stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
         deadline = time.monotonic() + 600
         expected = (binaries / 'tuna-shell-gtk').resolve()
         while child.poll() is None and time.monotonic() < deadline:
-            if debugger is None:
+            if 'observed_shell' not in record:
                 for pid, start in comparison.owned_processes(token):
                     proc = Path('/proc') / str(pid)
                     try:
@@ -76,14 +116,6 @@ try:
                     except (FileNotFoundError, ProcessLookupError, PermissionError):
                         continue
                     record['observed_shell'] = {'pid': pid, 'start': start, 'sha256': digest}
-                    args = ['sudo', '-n', 'gdb', '--nx', '--batch', '-ex', 'set pagination off',
-                            '-ex', 'set print thread-events off', '-ex', 'set debuginfod enabled off',
-                            '-ex', 'handle SIGPIPE nostop noprint pass', '-ex', f'attach {pid}',
-                            '-ex', 'continue', '-ex', 'info program', '-ex', 'thread apply all bt',
-                            '-ex', f'generate-core-file {WORK / "shell.core"}', '-ex', 'detach']
-                    debugger = subprocess.Popen(args, stdout=debug_out, stderr=subprocess.STDOUT,
-                                                stdin=subprocess.DEVNULL, start_new_session=True)
-                    record['debugger_argv'] = args
                     break
             text = output.read_text(errors='replace')
             boundary = next((line for line in text.splitlines() if 'G-OV-LAUNCH pass:' in line or 'G-OV-LAUNCH FAIL:' in line), None)
@@ -93,21 +125,20 @@ try:
         record['proof_exit_before_cleanup'] = child.poll()
         record['boundary'] = boundary
         record['runtime_deadline_reached'] = time.monotonic() >= deadline
-        if debugger is not None and debugger.poll() is None:
-            os.killpg(debugger.pid, signal.SIGINT)
-            try:
-                debugger.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(debugger.pid, signal.SIGTERM)
-                try:
-                    debugger.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    os.killpg(debugger.pid, signal.SIGKILL)
-                    debugger.wait(timeout=3)
-        record['debugger_exit'] = debugger.returncode if debugger else None
 finally:
     if child is not None:
         record['owned_cleanup'] = comparison.cleanup_owned(child, token)
+    record['retained_cores'] = []
+    for core in sorted(set(ROOT.glob('core*')) - before_cores):
+        if core.is_file() and core.stat().st_size <= core_limit:
+            saved = WORK / ('retained-' + core.name)
+            shutil.copy2(core, saved)
+            record['retained_cores'].append({'path': saved.name, 'sha256': comparison.contract.digest(saved)})
+            with (WORK / (saved.name + '.backtrace.txt')).open('w') as trace:
+                subprocess.run(['gdb', '--nx', '--batch', '-ex', 'set pagination off',
+                                '-ex', 'info program', '-ex', 'thread apply all bt',
+                                str(binaries / 'tuna-shell-gtk'), str(saved)],
+                               stdout=trace, stderr=subprocess.STDOUT, timeout=30)
     for name, item in admission['files'].items():
         assert comparison.contract.digest(item['admitted_executable']) == item['sha256'], name
     record['proof_output_sha256'] = comparison.contract.digest(output)
