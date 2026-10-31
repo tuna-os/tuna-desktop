@@ -12,9 +12,9 @@ their first login. packaging/marlin/vm-lane/tuna-vm-fresh-accounts creates
 
 and the journey drives real GDM password logins for tunastd and tunaadmin:
 first login, logout, second login, logout, reboot, login, logout. Each login
-must start the Tuna Desktop compositor and no GNOME session; AccountsService
-must have written each record after the first login; the administrator must
-authenticate through sudo and the standard account must be refused.
+must start the Tuna Desktop compositor and no GNOME session. AccountsService's
+effective Session must remain tuna, whether supplied by its account template
+or a saved record; admin sudo must authenticate and standard sudo be refused.
 """
 import configparser
 import json
@@ -80,16 +80,21 @@ def record_free(state, admin):
                   "no Session preselection, no autologin")
 
 
-def record_created(state):
-    """(ok, detail): AccountsService wrote the account's record, and any
-    Session it saved is Tuna Desktop."""
+def session_state(state):
+    """(ok, detail): the effective session and any saved choice are Tuna.
+
+    AccountsService 26.27.3 loads templates without writing a cache file,
+    and GDM 51 only saves selected/nonempty account properties. The stock
+    GNOME reference also leaves record-free accounts record-free on login.
+    See docs/vm-lifecycle.md for the direct reference receipt and sources.
+    """
+    user = state.get("user")
+    if state.get("effective_session") != "tuna":
+        return False, f"AccountsService effective Session={state.get('effective_session')!r} for {user}"
     keys = parse_record(state.get("record"))
-    if keys is None:
-        return False, f"no AccountsService record for {state.get('user')} after GDM login"
-    session = keys.get("Session")
-    if session not in (None, "tuna"):
-        return False, f"AccountsService saved Session={session!r} for {state.get('user')}"
-    return True, f"AccountsService record for {state.get('user')}: {keys}"
+    if keys is not None and keys.get("Session") not in (None, "tuna"):
+        return False, f"AccountsService saved Session={keys['Session']!r} for {user}"
+    return True, f"AccountsService effective Session=tuna for {user}; cache record: {keys}"
 
 
 def session_ok(observed):
@@ -228,11 +233,11 @@ class Journey:
             self.record(f"V-FRESH-LOGIN-{step}", ok, detail)
             if not ok:
                 return False
+            state = self._run("fresh-state", user)
+            self._receipt(f"{step}-state", state)
+            ok, detail = session_state(state)
+            self.record(f"V-FRESH-SESSION-{step}", ok, detail)
             if round_name == "first":
-                state = self._run("fresh-state", user)
-                self._receipt(f"{step}-state", state)
-                ok, detail = record_created(state)
-                self.record(f"V-FRESH-RECORD-CREATED-{user}", ok, detail)
                 result = self._run("fresh-sudo", user)
                 self._receipt(f"{step}-sudo", result)
                 ok_sudo, detail = sudo_ok(result, user == ADMIN)
@@ -281,8 +286,8 @@ class Journey:
         states = {user: self._run("fresh-state", user) for user in JOURNEY_USERS}
         self._receipt("reboot-state", states)
         for user in JOURNEY_USERS:
-            ok, detail = record_created(states[user])
-            self.record(f"V-FRESH-RECORD-KEPT-{user}", ok, detail)
+            ok, detail = session_state(states[user])
+            self.record(f"V-FRESH-SESSION-RELOADED-{user}", ok, detail)
             if not ok:
                 return False
         return self._cycle("reboot")

@@ -2111,8 +2111,9 @@ FRESH_DESKTOP = ("tuna-session", COMPOSITOR_COMM, SHELL_GTK[:15], "gnome-shell",
 
 
 def fresh_state(name):
-    """Identity, groups and AccountsService record of a fixture account; the
-    record text is the public cache file (no secrets live there)."""
+    """Identity, effective AccountsService session and optional cache record.
+    FindUserByName is a read, not CacheUser: loading a template need not
+    create a file in /var/lib/AccountsService/users."""
     try:
         entry = pwd.getpwnam(name)
     except KeyError:
@@ -2122,10 +2123,17 @@ def fresh_state(name):
         text = record.read_text(errors="replace")[:4096]
     except FileNotFoundError:
         text = None
+    account = json.loads(call("busctl", "--system", "--json=short", "call",
+                              "org.freedesktop.Accounts", "/org/freedesktop/Accounts",
+                              "org.freedesktop.Accounts", "FindUserByName", "s", name))["data"][0]
+    session = json.loads(call("busctl", "--system", "--json=short", "get-property",
+                              "org.freedesktop.Accounts", account,
+                              "org.freedesktop.Accounts.User", "Session"))["data"]
     return {"user": name, "exists": True, "uid": entry.pw_uid,
             "groups": call("id", "-nG", name).split(),
             "home": entry.pw_dir, "home_exists": os.path.isdir(entry.pw_dir),
             "record": text,
+            "effective_session": session,
             "custom_conf": GDM_CUSTOM_CONF.read_text(errors="replace")[:8192]}
 
 
