@@ -5765,6 +5765,9 @@ cstate '.input_aids.mouse' "mouse keys on" || fail G-A11Y-MOUSEKEYS "mousekeys-e
 xdotool keydown KP_Right
 sleep 0.8
 xdotool keyup KP_Right
+# xdotool has sent the release, not waited for the compositor to process it.
+# Match the disabled-keypad settling interval before taking the stop baseline.
+sleep 0.3
 cstate ".pointer_position[0] >= $((a11y_cx + 60)) and .pointer_position[1] == $a11y_cy" "pointer moved right" ||
     fail G-A11Y-MOUSEKEYS "holding keypad 6 did not accelerate the pointer right"
 moved="$(jq -c '.pointer_position' "$CSTATE")"
