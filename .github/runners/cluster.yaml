@@ -114,9 +114,10 @@ spec:
 ---
 # Hard ceiling for all runner pods together, whatever the scale sets ask
 # for. karnataka has 28 CPU / 125 GiB allocatable; punjab is sized at
-# 12 cores / 24 GiB. Requests stop at 12 runners x 2 CPU / 6 GiB (24 CPU),
-# so the 14 pods the scale sets may ask for (10 + 4) never all schedule and
-# punjab and KubeVirt keep their room; they also preempt runners (below).
+# 12 cores / 24 GiB. Requests allow up to 14 runners x 1.5 CPU / 5 GiB (21 CPU /
+# 70 GiB requests + 7 CPU / 12 GiB burst buffer up to 28 CPU / 82 GiB),
+# so all 14 pods across the scale sets (10 on 24.04 + 4 on 26.04) can schedule concurrently
+# while punjab and KubeVirt keep headroom; they also preempt runners (below).
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -125,12 +126,12 @@ metadata:
 spec:
   hard:
     pods: "14"
-    requests.cpu: "24"
-    limits.cpu: "48"
-    requests.memory: 72Gi
-    limits.memory: 168Gi
-    requests.ephemeral-storage: 240Gi
-    limits.ephemeral-storage: 540Gi
+    requests.cpu: "28"
+    limits.cpu: "56"
+    requests.memory: 82Gi
+    limits.memory: 196Gi
+    requests.ephemeral-storage: 280Gi
+    limits.ephemeral-storage: 630Gi
 ---
 # Runner pods yield to everything else: new KubeVirt VMs (punjab) and
 # cluster services preempt them; they never preempt anything.

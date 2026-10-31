@@ -107,10 +107,10 @@ code as root inside its pod.
    address), the kubelet, other namespaces' pods and Services (corral-web,
    punjab, KubeVirt) and link-local metadata are unreachable.
 5. **Headroom.** ResourceQuota `runner-ceiling` caps the namespace at 14 pods,
-   48 CPU / 168 GiB limits, 24 CPU / 72 GiB requests: at most 12 runners
+   56 CPU / 196 GiB limits, 28 CPU / 82 GiB requests: up to 14 runners
    run at once (karnataka: 28 CPU / 125 GiB allocatable; punjab is sized at
    12 cores / 24 GiB). Each runner asks for
-   2 CPU / 6 GiB and is limited to 4 CPU / 14 GiB / 45 GiB disk. Runner pods
+   1.5 CPU / 5 GiB and is limited to 4 CPU / 14 GiB / 45 GiB disk. Runner pods
    use PriorityClass `tuna-ci-runner` (-100, never preempts): new VMs and
    cluster services preempt them, and the kubelet evicts them first under
    memory pressure.
@@ -219,7 +219,7 @@ page), then run `.github/runners/deploy`: it upgrades the controller first.
 
 `minRunners` (idle, pre-registered pods) and `maxRunners` live in the values
 files: 24.04 is 1–10, 26.04 is 0–4. Keep `maxRunners` of both sets within the
-quota's 14 pods (12 run at once by CPU requests); change the quota in `cluster.yaml` only together with a look
+quota's 14 pods (all 14 run concurrently with 1.5 CPU / 5 GiB requests); change the quota in `cluster.yaml` only together with a look
 at punjab's and KubeVirt's needs (`kubectl describe node karnataka`). Apply
 with `.github/runners/deploy --sets-only`. A temporary change without editing
 files applies the same `--set` to both sets:
