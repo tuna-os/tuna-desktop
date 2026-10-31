@@ -125,6 +125,7 @@ jobs:
       - run: |
           python3 scripts/tests/test_auth_no_replay_contract.py
           python3 scripts/tests/test_auth_proof_identity.py
+          python3 scripts/tests/test_github_api.py
           python3 scripts/tests/test_auth_proof_process.py
       - run: python3 scripts/tests/test_minimize_ci_freeze.py
       - run: python3 scripts/tests/test_minimize_brightness_controls.py
