@@ -48,6 +48,16 @@ source-only floor is never described as a measured native version.
 list and versions below. Adding or dropping a protocol updates the test
 and this page together.
 
+The compositor additionally advertises `tuna_osk_input_v1` version 1 only to
+its supervised IBus bridge, never ordinary clients. This private virtual-text
+transport shares the bridge's input-method-v2 event order and owner-checked
+done epoch; stale fallback replies cannot type into a new field or the locked
+session. It does not extend the public shell control schema or grant virtual
+keyboard access to another client (`crates/compositor/src/osk_ime.rs`,
+`crates/compositor/protocols/tuna-osk-input-v1.xml`). The ordinary-client
+global golden therefore remains unchanged; real socket tests additionally
+reject a guessed private-global bind.
+
 ## Advertised by Tuna Desktop
 
 | Global | Version | Notes |
