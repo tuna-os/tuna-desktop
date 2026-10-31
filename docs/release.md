@@ -68,11 +68,44 @@ package versions are mapped so the final `X.Y.Z` always upgrades over them:
 |---|---|---|---|
 | `v1.0.0-beta.1` | `1.0.0-beta.1` | `1.0.0~beta.1` | `1.0.0beta.1` |
 | `v1.0.0-beta.2` | `1.0.0-beta.2` | `1.0.0~beta.2` | `1.0.0beta.2` |
+| `v1.0.0-beta.3` | `1.0.0-beta.3` | `1.0.0~beta.3` | `1.0.0beta.3` |
 | `v1.0.0` | `1.0.0` | `1.0.0` | `1.0.0` |
 
 Publish it as a GitHub prerelease (`gh release create vX.Y.Z-beta.N
 --prerelease`) and list every open release gate under "Known limitations":
 a beta does not claim the gates in the [roadmap](roadmap.md#global-decision-gates).
+
+### Limited beta.3 bootstrap authorization
+
+The project owner approved a limited `v1.0.0-beta.3` release from
+`release/beta3-bootstrap`, rooted at the main ancestor
+`d65e35f27237576c6708978cb8be6c0d9e048768`, instead of waiting for the
+latest main to become green. This is a source-explicit exception to the
+**branch** in checklist step 1, not to qualification. That ancestor includes
+the `/etc/localtime` monitor absent from the published beta.2 desktop.
+Necessary fixture/dependency fixes must be recorded as explicit backports;
+unrelated newer feature stacks are not part of this limited source.
+
+Before tagging or publishing, the final release head must have new successful
+selected CI, `check` and `ci-gate` results, completed visual review, and real
+installed-package/control evidence bound to that head and package hash.
+Historical successes on an equivalent tree are context, not qualification.
+No assertion, threshold, timeout, or dependency floor may be relaxed to
+qualify it. A selected fresh-account proof must exercise its required
+behavior; absent proof is not a pass. Review and notes must retain the open
+release gates: this limited beta is not v1 or roadmap #577 completion.
+
+For the untagged candidate, declare beta.3 in Arch's `_semver` and build the
+Debian package with `scripts/tuna-release --candidate-version 1.0.0-beta.3`.
+Both installed packages must report the intended beta.3 version rather than
+the nearest older tag. Candidate mode refuses an exact release-tagged HEAD;
+after tagging, use the ordinary tag-derived command and review gate.
+
+After qualification, use the normal new-tag/prerelease, deterministic vendor,
+signed package factory, served-package verification and trusted Marlin image
+publication paths. Then qualify the new immutable image digest with the
+strict published clock proof; an older preview or an exemption for the old
+published package cannot stand in for the new image's result.
 
 ## Upgrade and uninstall
 

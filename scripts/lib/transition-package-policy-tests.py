@@ -2,9 +2,9 @@
 # tuna-rename: keep-file
 """Real .deb archive/checker regressions for the exact two-file transition.
 
-Uses native cc, dpkg-deb, ldd and desktop-file-validate. Only the release-builder
-staging regression controls cargo, git and dpkg-shlibdeps, with native ELF
-fixture binaries; the production builder and archive/checker tools stay real.
+Uses native cc, dpkg-deb, ldd and desktop-file-validate. Release-builder
+control-flow/staging regressions control cargo, git and dpkg-shlibdeps; staging
+uses native ELF fixtures and real production builder/archive/checker tools.
 These are package-content, release-staging and staged-Arch tests, not full
 release, installed upgrade, native PAM, GDM, old-compositor unlock, pacman
 replacement or Marlin qualification.
@@ -89,6 +89,110 @@ def replace(entries, name, replacement=None):
     if replacement is not None:
         result.append(replacement)
     return result
+
+
+class ReleaseVersionSelection(unittest.TestCase):
+    """Exercise real CLI/control flow, stopping at the controlled Cargo call."""
+
+    def release(self, args, *, exact_tag='', dirty='', review=None):
+        with tempfile.TemporaryDirectory(prefix='tuna-release-version-') as temp:
+            work = Path(temp)
+            delegates = work / 'delegates'
+            delegates.mkdir()
+            trace = work / 'trace'
+            commands = {
+                'git': '''printf 'git %s\\n' "$*" >>"$TRACE"
+case "$*" in
+    'status --porcelain') printf '%s' "$DIRTY" ;;
+    'describe --tags --exact-match --match v[0-9]* HEAD')
+        test -n "$EXACT_TAG" || exit 1
+        printf '%s\\n' "$EXACT_TAG" ;;
+    'describe --tags --match v[0-9]*') printf '%s\\n' v0.1.0-beta.2-7-gabcdef ;;
+    *) exit 2 ;;
+esac
+''',
+                'cargo': '''printf 'cargo version=%s\\n' "$TUNA_VERSION" >>"$TRACE"
+exit 91
+''',
+            }
+            for name, body in commands.items():
+                path = delegates / name
+                path.write_text('#!/bin/sh\nset -eu\n' + body)
+                path.chmod(0o755)
+            if review is not None:
+                path = work / 'docs/reviews' / f'{exact_tag}.md'
+                path.parent.mkdir(parents=True)
+                path.write_text(review)
+            result = subprocess.run([str(RELEASE_SCRIPT), *args], cwd=work,
+                env=dict(os.environ, PATH=str(delegates) + os.pathsep + os.environ['PATH'],
+                         TRACE=str(trace), EXACT_TAG=exact_tag, DIRTY=dirty,
+                         TUNA_VERSION='ambient-version-must-not-win'),
+                text=True, capture_output=True, timeout=10)
+            return result, trace.read_text() if trace.exists() else ''
+
+    def test_help_documents_explicit_candidate_and_clean_tree_policy(self):
+        result, trace = self.release(['--help'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--candidate-version SEMVER', result.stdout)
+        self.assertIn('Candidates still require a clean tree', result.stdout)
+        self.assertEqual(trace, '')
+
+    def test_candidate_overrides_nearest_beta2_tag_and_ambient_stamp(self):
+        for version in ('0.1.0-beta.3', '1.2.3', '1.2.3-rc.1+build.7', '1.2.3+build-with-hyphen'):
+            with self.subTest(version=version):
+                result, trace = self.release(['--candidate-version', version])
+                self.assertEqual(result.returncode, 91, result.stderr)
+                self.assertIn(f'cargo version={version}\n', trace)
+                self.assertIn('git status --porcelain\n', trace)
+                self.assertNotIn('git describe --tags --match', trace)
+
+    def test_candidate_rejects_missing_empty_and_malformed_semver_before_build(self):
+        cases = [[], [''], ['v0.1.0-beta.3'], ['0.1'], ['01.2.3'], ['1.02.3'],
+                 ['1.2.03'], ['1.2.3-01'], ['1.2.3-beta.03'], ['1.2.3-'],
+                 ['1.2.3+'], ['1.2.3-beta..3'], ['1.2.3 beta.3'],
+                 ['1.2.3\n0.1.0-beta.3'], ['--allow-dirty']]
+        for value in cases:
+            with self.subTest(value=value):
+                result, trace = self.release(['--candidate-version', *value])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('--candidate-version requires', result.stderr)
+                self.assertEqual(trace, '')
+
+    def test_candidate_is_refused_on_any_exact_release_tag_even_allow_dirty(self):
+        for tag in ('v0.1.0-beta.2', 'v0.1.0-beta.3', 'v1.2.3'):
+            for flags in ([], ['--allow-dirty']):
+                with self.subTest(tag=tag, flags=flags):
+                    result, trace = self.release(
+                        ['--candidate-version', '0.1.0-beta.3', *flags], exact_tag=tag)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('not allowed on an exact release tag', result.stderr)
+                    self.assertNotIn('cargo version=', trace)
+
+    def test_candidate_keeps_dirty_tree_refusal_unless_explicitly_allowed(self):
+        result, trace = self.release(['--candidate-version', '0.1.0-beta.3'], dirty=' M tracked\n')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('working tree is dirty', result.stderr)
+        self.assertNotIn('cargo version=', trace)
+        result, trace = self.release(
+            ['--candidate-version', '0.1.0-beta.3', '--allow-dirty'], dirty=' M tracked\n')
+        self.assertEqual(result.returncode, 91, result.stderr)
+        self.assertIn('cargo version=0.1.0-beta.3\n', trace)
+
+    def test_normal_tagged_release_keeps_tag_stamp_and_required_review(self):
+        for review, error in ((None, 'missing visual review'), ('TBD\n', 'still has TBD')):
+            with self.subTest(review=review):
+                result, trace = self.release([], exact_tag='v0.1.0-beta.3', review=review)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(error, result.stderr)
+                self.assertNotIn('cargo version=', trace)
+        result, trace = self.release([], exact_tag='v0.1.0-beta.3', review='Recorded visual review\n')
+        self.assertEqual(result.returncode, 91, result.stderr)
+        self.assertIn('cargo version=0.1.0-beta.3\n', trace)
+
+    def test_existing_allow_dirty_nearest_tag_stamp_is_unchanged(self):
+        result, trace = self.release(['--allow-dirty'])
+        self.assertEqual(result.returncode, 91, result.stderr)
+        self.assertIn('cargo version=0.1.0-beta.2\n', trace)
 
 
 class GenuineTransitionPackages(unittest.TestCase):
@@ -234,6 +338,10 @@ printf '%s\\n' 'shlibs:Depends=libc6 (>= 2.34)'
                 self.assertTrue(item.isfile())
                 self.assertEqual((item.mode, item.uid, item.gid), (0o644, 0, 0))
         self.assertEqual(control['conffiles'][1].decode(), CONFFILES)
+        for name, (item, _) in data.items():
+            if name.startswith('usr/share/tuna-desktop/') and (item.isdir() or item.isfile()):
+                with self.subTest(cursor_member=name):
+                    self.assertEqual(item.mode, 0o755 if item.isdir() else 0o644)
         self.assertEqual({name for name in data if 'roost' in name.lower()}, {OLD_SESSION, OLD_PAM})
         for name in BINS:
             self.assertEqual(data['usr/bin/' + name][1][:4], b'\x7fELF')
@@ -241,6 +349,70 @@ printf '%s\\n' 'shlibs:Depends=libc6 (>= 2.34)'
             text=True, capture_output=True, timeout=30, umask=0o002)
         self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
         self.assertIn('OK (version 0.1.0~beta.1)', checked.stdout)
+
+    def test_actual_candidate_builder_stamps_beta3_binaries_and_debian_control(self):
+        """Controlled Cargo/ABI delegates, but real staging, ELF and .deb tools."""
+        for index, (version, deb_version) in enumerate((
+                ('0.1.0-beta.3', '0.1.0~beta.3'),
+                ('1.2.3+build-with-hyphen', '1.2.3+build-with-hyphen'))):
+            with self.subTest(version=version):
+                work = self.root / f'candidate-builder-{index}'
+                target = work / 'target/release'
+                target.mkdir(parents=True)
+                source = work / 'version.c'
+                source.write_text((self.root / 'version.c').read_text().replace('0.1.0-beta.1', version))
+                elf = work / 'native-version'
+                subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', str(source), '-o', str(elf)],
+                               check=True, capture_output=True, timeout=120)
+                for name in BINS:
+                    shutil.copyfile(elf, target / name)
+                for name in ('share', 'packaging', 'scripts'):
+                    (work / name).symlink_to(ROOT / name, target_is_directory=True)
+                delegates = work / 'delegates'
+                delegates.mkdir()
+                commands = {
+                    'cargo': '''test "$*" = 'build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host'
+test "$TUNA_VERSION" = "$EXPECTED_VERSION"
+''',
+                    'git': '''case "$*" in
+    'status --porcelain') exit 0 ;;
+    'describe --tags --exact-match --match v[0-9]* HEAD') exit 1 ;;
+    'describe --tags --match v[0-9]*') printf '%s\\n' v0.1.0-beta.2-7-gabcdef ;;
+    *) exit 2 ;;
+esac
+''',
+                    'dpkg-shlibdeps': '''test "$*" = '-O -eusr/bin/tuna-compositor -eusr/bin/tuna-session -eusr/bin/tuna-shell-gtk -eusr/bin/tuna-shell-host -eusr/bin/tuna-ibus-bridge -eusr/bin/tuna-wallpaper-svg'
+printf '%s\\n' 'shlibs:Depends=libc6 (>= 2.34)'
+''',
+                }
+                for name, body in commands.items():
+                    path = delegates / name
+                    path.write_text('#!/bin/sh\nset -eu\n' + body)
+                    path.chmod(0o755)
+                result = subprocess.run(
+                    [str(RELEASE_SCRIPT), '--candidate-version', version, '--out', str(work / 'dist')],
+                    cwd=work, env=dict(os.environ,
+                        PATH=str(delegates) + os.pathsep + os.environ['PATH'],
+                        EXPECTED_VERSION=version, TUNA_VERSION='0.1.0-beta.2'),
+                    text=True, capture_output=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                package = work / f'dist/tuna-desktop_{deb_version}_amd64.deb'
+                self.assertTrue(package.is_file(), result.stdout)
+                control_version = subprocess.check_output(
+                    ['dpkg-deb', '-f', str(package), 'Version'], text=True, timeout=30).strip()
+                self.assertEqual(control_version, deb_version)
+                extracted = work / 'extracted'
+                subprocess.run(['dpkg-deb', '-x', str(package), str(extracted)],
+                               check=True, capture_output=True, timeout=30)
+                for name in BINS:
+                    reported = subprocess.check_output(
+                        [str(extracted / 'usr/bin' / name), '--version'], text=True, timeout=10)
+                    self.assertEqual(reported, f'{name} {version}\n')
+                if version == '0.1.0-beta.3':
+                    checked = subprocess.run([str(SCRIPT), str(package)],
+                        text=True, capture_output=True, timeout=30)
+                    self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+                    self.assertIn('OK (version 0.1.0~beta.3)', checked.stdout)
 
     def test_actual_loader_rejects_a_version_spoofing_shell_script(self):
         path = 'usr/bin/tuna-shell-gtk'

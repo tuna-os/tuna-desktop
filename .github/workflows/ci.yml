@@ -381,7 +381,17 @@ jobs:
       - run: python3 scripts/lib/deb-clean-install-tests.py
       - run: python3 scripts/lib/transition-package-policy-tests.py
       - run: python3 scripts/lib/legacy-upgrade-evidence-tests.py
-      - run: scripts/tuna-release --allow-dirty --out package-artifacts && scripts/check-release-package package-artifacts/*.deb
+      - name: Build coherent pre-tag Debian candidate
+        run: |
+          # Arch and Debian qualify the same declared release version before
+          # any tag/publication. A tagged build keeps its tag-derived version.
+          if git describe --tags --exact-match --match 'v[0-9]*' HEAD >/dev/null 2>&1; then
+            scripts/tuna-release --allow-dirty --out package-artifacts
+          else
+            version=$(sed -n 's/^_semver=//p' packaging/arch/PKGBUILD)
+            scripts/tuna-release --candidate-version "$version" --allow-dirty --out package-artifacts
+          fi
+          scripts/check-release-package package-artifacts/*.deb
       # Install with declared dependencies in a clean distro image; runner
       # development libraries must not conceal missing package dependencies.
       - run: scripts/check-deb-clean-install package-artifacts/*.deb ubuntu:26.04

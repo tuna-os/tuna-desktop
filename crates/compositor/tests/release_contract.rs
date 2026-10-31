@@ -74,6 +74,44 @@ fn release_script_stages_layout_and_metadata_from_the_stamp() {
 }
 
 #[test]
+fn pretag_candidates_use_an_explicit_validated_stamp_without_weakening_release_gates() {
+    let body = read_workspace("scripts/tuna-release");
+    for token in [
+        "--candidate-version SEMVER",
+        "--candidate-version)",
+        "--candidate-version requires a valid SemVer version",
+        "--candidate-version is not allowed on an exact release tag",
+        "git describe --tags --exact-match --match 'v[0-9]*' HEAD",
+        "VERSION=\"$CANDIDATE_VERSION\"",
+        "export TUNA_VERSION=\"$VERSION\"",
+        "if [ \"$ALLOW_DIRTY\" != \"yes\" ]; then",
+        "git status --porcelain",
+        "docs/reviews/$RELEASE_TAG.md",
+        "if [ \"$REPORTED\" != \"$VERSION\" ]; then",
+        "Version: $DEB_VERSION",
+    ] {
+        assert!(
+            body.contains(token),
+            "candidate release contract keeps {token}"
+        );
+    }
+    let behavior = read_workspace("scripts/lib/transition-package-policy-tests.py");
+    for test in [
+        "test_candidate_overrides_nearest_beta2_tag_and_ambient_stamp",
+        "test_candidate_rejects_missing_empty_and_malformed_semver_before_build",
+        "test_candidate_is_refused_on_any_exact_release_tag_even_allow_dirty",
+        "test_candidate_keeps_dirty_tree_refusal_unless_explicitly_allowed",
+        "test_normal_tagged_release_keeps_tag_stamp_and_required_review",
+        "test_actual_candidate_builder_stamps_beta3_binaries_and_debian_control",
+    ] {
+        assert!(
+            behavior.contains(test),
+            "candidate behavior coverage keeps {test}"
+        );
+    }
+}
+
+#[test]
 fn debian_archive_is_root_owned_and_ships_the_gtk_shell() {
     // #476: system files must not keep the build user's uid/gid.
     let release = read_workspace("scripts/tuna-release");
