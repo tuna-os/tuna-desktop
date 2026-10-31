@@ -1019,7 +1019,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          factory_commit=c0998b94bd7b4fbc67360c239e439de6debf539b
+          factory_commit=01d74f3c354fe8219ccf21acd4122273b6984588
           factory=$(mktemp -d "$RUNNER_TEMP/orca-factory.XXXXXX")
           artifacts="$GITHUB_WORKSPACE/orca-speech-artifacts"
           mkdir -p "$artifacts"
