@@ -134,7 +134,7 @@ state records its state observation next to its stills and clips.
 | P-ST-05 | Administrative lockdown | `missing-product` | No adequate capture | no lockdown consumer |
 | P-ST-06 | Remote desktop and RDP flows | `unsupported-in-nested` | No adequate capture | portal input nonvisual in CI; RDP sharing/control/login need Corral |
 | P-ST-07 | Date/time, NTP, time zone on image | `unsupported-in-nested` | No adequate capture | week-start visuals in CI proofs; timedate1/NTP/Geoclue need installed-image Corral |
-| P-ST-08 | Background modes, shading, slideshows | stage:settings-a11y `partial` | No adequate capture | static wallpaper captured; placement modes, shading, XML slideshows unproven |
+| P-ST-08 | Background modes, shading, slideshows | stage:settings-a11y `partial` | No adequate capture | static wallpaper captured; placement/shading/XML pixels are CI portal proofs (run 38878636595) and a 2026-10-30 Corral VM run with main sideloaded; no paired GNOME or multi-output capture |
 | P-ST-09 | Apps panel: permissions, defaults, media | `unsupported-in-nested` | No adequate capture | Apps-panel journeys need installed-image Corral |
 | P-ST-10 | Service-backed Settings panels on image | `unsupported-in-nested` | No adequate capture | network/BT/accounts/printers/sharing/users/region/updates need installed-image Corral item-by-item |
 | P-ST-11 | Legacy/app-owned settings classified | `nonvisual` | No adequate capture | inventory disposition, checked by scripts/tuna-settings-inventory-check |
