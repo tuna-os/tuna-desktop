@@ -66,6 +66,28 @@ remote-security, niri-parity) use the pods' rootless podman.
 Other workflows (`stress`, `fuzz`, `baseline`, …) still use GitHub-hosted
 runners; the same aliases can move them.
 
+## Private GTK AT-SPI comparison dependency
+
+`grid-cancel-comparison` stages Ubuntu GTK `4.14.5+ds-0ubuntu0.10` with
+upstream commit `21d3eb76b68d6758122eddaf00b5823f9b2d7f34` using the existing
+workflow-owned `ci-tool` action. The installer checks both Ubuntu source
+archive hashes and the patch hash; it retains the license, Ubuntu patch
+series, build options, compiler identity and runtime ELF hash/build ID.
+The host GTK and runner image are not replaced. Only this job activates the
+private library through `LD_LIBRARY_PATH`, identically for the unchanged old
+and fixed product roles. Cache publication remains restricted to trusted main.
+
+Before either product role runs, `gtk-atspi-root-proof` uses separate private
+D-Bus/Xvfb sessions to require stock GTK's actual SIGSEGV negative control and
+the repaired runtime's real AT-SPI behavior: named visible children resolve,
+an invisible-tail index and an index with all windows hidden return remote
+InvalidArgument, and valid children remain queryable after remapping.
+The proof checks the mapped patched ELF against the source-build receipt.
+Its receipts and build provenance accompany the comparison artifact; core
+dumps are disabled for this dependency fixture. This toolkit regression proof
+is not product acceptance: the old-negative/fixed-positive Escape comparison
+and all selected exact-head lanes must still pass.
+
 ## Queue supersession and closed pull requests
 
 Every PR-triggered workflow already has native workflow/ref (or PR-number)
