@@ -445,9 +445,9 @@ The nested backend has one fixed output, so hotplug runs on real DRM: the
 `workflow_dispatch`, and on pull requests touching
 `scripts/tuna-hotplug-stress` or the workflow). `scripts/tuna-hotplug-stress`
 creates a vkms configfs instance (Linux 6.19 or newer; the job pins
-`ubuntu-26.04`) with three CRTC/connector pipes. Connector A stays
-connected; writing a connector's configfs `status` plugs or unplugs B and
-C and makes the kernel send a real udev `HOTPLUG=1` change for the card.
+`ubuntu-26.04`) with three CRTC/connector pipes. Connector A starts
+connected; writing a connector's configfs `status` plugs or unplugs any of
+them and makes the kernel send a real udev `HOTPLUG=1` change for the card.
 `tuna-compositor --backend drm` runs on that card under a private seatd
 and session bus with the GTK shell. Three GTK 4 clients animate every
 frame; each is placed on its own output by moving a uinput mouse there,
@@ -471,6 +471,13 @@ show:
   rewritten `monitors.xml`, reach the outputs;
 - `H-INPUT`, `H-LIVE`: the overview answers the keyboard, the compositor
   never exits or panics and the shell never exits.
+- `H-ALL-UNPLUGGED`: after the rounds, A, B and C in a row at scale 1 are
+  all unplugged at once. With no connector the compositor, shell and
+  clients stay alive, every window keeps its geometry and its own output
+  and the pointer holds (Mutter's `meta_window_update_for_monitors_changed`
+  finds no monitor and moves nothing). Plugged back, the arrangement and
+  every window's pre-unplug geometry return, the clients draw again and
+  the overview and pointer answer.
 
 `H-GROWTH` bounds the compositor and shell as the churn lane does: final
 PSS within round-0 PSS × 1.25 + 64 MiB and fds within round-0 + 32.
