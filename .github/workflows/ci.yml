@@ -24,6 +24,7 @@ permissions:
 
 jobs:
   select-lanes:
+    timeout-minutes: 10
     # Runner choice (docs/ci-runners.md): this repository's own pushes,
     # schedules, dispatches and branch pull requests run on the self-hosted
     # karnataka scale sets; fork pull requests, and every job while the
@@ -58,6 +59,8 @@ jobs:
           fi
 
   check:
+    # Typically 10 min, slowest seen 16; a hung test must not hold a runner 6 h.
+    timeout-minutes: 45
     runs-on: *runner-24
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1327,6 +1330,7 @@ jobs:
           retention-days: 14
 
   parity-ledger:
+    timeout-minutes: 15
     # GNOME 51 parity ledger gate (#66): every row marked pass must cite
     # tests, and every cited cargo test / journey assertion must have
     # passed in this run.
@@ -1380,6 +1384,7 @@ jobs:
           --assertions ledger-in/marlin-vm/assertions.txt
 
   docs-shots:
+    timeout-minutes: 20
     runs-on: *runner-24
     needs: [select-lanes, journey, app-content, scroll-proof]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'docs-shots')
@@ -1414,6 +1419,7 @@ jobs:
           retention-days: 90
 
   ci-gate:
+    timeout-minutes: 10
     # One stable status for the run: lanes the selection skipped report
     # skipped, any failed or cancelled job fails the gate.
     if: always()
