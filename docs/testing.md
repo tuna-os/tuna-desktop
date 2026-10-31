@@ -143,6 +143,26 @@ settings local builds need (`just` lists the recipes):
 | `just clean` / `just gc` | deletes this worktree's target / frees disk (below) |
 | `just disk-guard [--watch [s]]` | frees disk now, or keeps checking every `s` seconds (below) |
 
+The real-client native DnD regressions in
+`crates/compositor/tests/data_device.rs` run with
+`cargo test -p tuna-compositor --test data_device native_`. They cover a valid
+press serial followed by held-button motion to another client before
+`start_drag`, plus same-surface and source-less starts. With no subsequent input
+motion, protocol barriers must already deliver target-local Enter/Motion and,
+when a source exists, its MIME offer and actions. Wrong-client events, invalid
+serial acceptance, and cross-client source-less offers are rejected; the initial
+offer must still negotiate a valid drop and Finish. Existing cancellation,
+source/icon lifetime, and touch controls remain in the same test target.
+This matches Mutter 51's initial-focus path:
+[attaching the drag handler immediately invalidates focus](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-input.c#L288-L325),
+and [drag focus sends the destination its offer while restricting source-less drags to the origin client](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-data-device.c#L337-L397).
+
+`scripts/tuna-gtk-shell-proof --grid-hover-only --artifacts DIR` runs the same
+held-button hover and persisted reorder assertions as the full GTK proof,
+without the unrelated earlier gates. It adds no target motion or timing
+relaxation. CI runs this slice with its freshly built compositor and shell;
+the no-post-start-motion wire tests establish the precise protocol ordering.
+
 Every build uses its own checkout's `target/` (an inherited
 `CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one),
 two jobs, no incremental state, and waits on one machine-wide lock

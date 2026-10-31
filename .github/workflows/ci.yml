@@ -931,6 +931,15 @@ jobs:
           TUNA_REQUIRE_IBUS: "1"
           TUNA_REQUIRE_WAYLAND_INFO: "1"
           TUNA_REQUIRE_GSD_MEDIA_KEYS: "1"
+      # Initial DnD target focus must not wait for another physical motion.
+      # Run the unchanged shared hover/reorder assertions independently of
+      # unrelated full-suite assertions, using this job's just-built binaries.
+      - name: Stationary-start native DnD grid hover
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: scripts/tuna-gtk-shell-proof --grid-hover-only --artifacts gtk-shell-artifacts/grid-hover
       # Native/X11 geometry and physical input at all required virtual scales.
       - run: |
           for scale in 1 1.25 1.5 2; do

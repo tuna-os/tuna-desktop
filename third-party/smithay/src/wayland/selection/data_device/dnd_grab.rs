@@ -134,12 +134,27 @@ where
     D: SeatHandler,
     D: 'static,
 {
+    /// Initialize only pointer drags from the physical position and hit test.
+    /// This runs before installation, without holding the pointer's grab lock.
+    pub(crate) fn with_initial_pointer_focus(
+        mut self,
+        focus: Option<(D::PointerFocus, Point<f64, Logical>)>,
+        event: &MotionEvent,
+    ) -> Self
+    where
+        D::PointerFocus: WaylandFocus,
+    {
+        self.update_focus(focus, event.location, event.serial, event.time, true);
+        self
+    }
+
     fn update_focus<F: WaylandFocus>(
         &mut self,
         focus: Option<(F, Point<f64, Logical>)>,
         location: Point<f64, Logical>,
         serial: Serial,
         time: u32,
+        initial_motion: bool,
     ) {
         let seat_data = self
             .seat
@@ -175,7 +190,8 @@ where
                 Err(_) => return,
             };
             let (x, y) = (location - *surface_location).into();
-            if self.current_focus.is_none() {
+            let entered = self.current_focus.is_none();
+            if entered {
                 // We entered a new surface, send the data offer if appropriate
                 if let Some(ref source) = self.data_source {
                     let offer_data = Arc::new(Mutex::new(OfferData {
@@ -229,13 +245,15 @@ where
                     }
                 }
                 self.current_focus = Some(surface.into_owned());
-            } else {
-                // make a move
-                if self.data_source.is_some() || self.origin.id().same_client_as(&surface.id()) {
-                    for device in seat_data.known_data_devices() {
-                        if device.id().same_client_as(&surface.id()) {
-                            device.motion(time, x, y);
-                        }
+            }
+            // Only pointer-grab installation needs motion alongside its initial
+            // Enter. Ordinary transitions and touch retain their event sequence.
+            if (!entered || initial_motion)
+                && (self.data_source.is_some() || self.origin.id().same_client_as(&surface.id()))
+            {
+                for device in seat_data.known_data_devices() {
+                    if device.id().same_client_as(&surface.id()) {
+                        device.motion(time, x, y);
                     }
                 }
             }
@@ -302,7 +320,9 @@ where
         // no more buttons are pressed, release the grab
         if let Some(ref surface) = self.current_focus {
             for device in seat_data.known_data_devices() {
-                if device.id().same_client_as(&surface.id()) {
+                if device.id().same_client_as(&surface.id())
+                    && (self.data_source.is_some() || self.origin.id().same_client_as(&surface.id()))
+                {
                     device.leave();
                 }
             }
@@ -327,7 +347,7 @@ where
         // While the grab is active, no client has pointer focus
         handle.motion(data, None, event);
 
-        self.update_focus(focus, event.location, event.serial, event.time);
+        self.update_focus(focus, event.location, event.serial, event.time, false);
     }
 
     fn relative_motion(
@@ -481,7 +501,13 @@ where
             return;
         }
 
-        self.update_focus(focus, event.location, SERIAL_COUNTER.next_serial(), event.time);
+        self.update_focus(
+            focus,
+            event.location,
+            SERIAL_COUNTER.next_serial(),
+            event.time,
+            false,
+        );
     }
 
     fn frame(

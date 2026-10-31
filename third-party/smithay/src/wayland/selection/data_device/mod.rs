@@ -190,6 +190,11 @@ pub trait ClientDndGrabHandler: SeatHandler + Sized {
     /// * `icon` - The icon the client requested to be used to be associated with the cursor icon
     ///   during the drag'n'drop.
     /// * `seat` - The seat on which the DnD operation was started
+    ///
+    /// For pointer drags, the grab's initial target is established after this
+    /// callback, before installation completes, from the latest compositor hit
+    /// test and physical pointer position. This is independent of the implicit
+    /// grab's retained pointer focus and does not require another input motion.
     fn started(&mut self, source: Option<WlDataSource>, icon: Option<WlSurface>, seat: Seat<Self>) {}
 
     /// The drag'n'drop action was finished by the user releasing the buttons
