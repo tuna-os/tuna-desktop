@@ -49,6 +49,65 @@ pub struct AppEntry {
     /// Desktop-entry categories (`Utility`, `X-GNOME-Utilities`), which
     /// GNOME's app folders group by.
     pub categories: Vec<String>,
+    /// What the desktop file says about opening another window.
+    pub new_window: NewWindow,
+}
+
+/// What gnome-shell 51's `shell_app_can_open_new_window` and
+/// `shell_app_open_new_window` (src/shell-app.c:574-700) read from the
+/// desktop file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewWindow {
+    /// `SingleMainWindow`, else GNOME's older `X-GNOME-SingleWindow`,
+    /// read as `g_desktop_app_info_get_boolean` reads it (anything but
+    /// `true` or `1` is false); `None` when the file has neither key.
+    pub single_main_window: Option<bool>,
+    /// `Actions` lists `new-window`: its `[Desktop Action new-window]`
+    /// `Exec` argument vector, empty when it has no usable `Exec` (GLib
+    /// then launches nothing).
+    pub action_argv: Option<Vec<OsString>>,
+}
+
+impl AppEntry {
+    /// `shell_app_can_open_new_window` for a running app
+    /// (src/shell-app.c:631-700): the desktop file's `SingleMainWindow`
+    /// (then `X-GNOME-SingleWindow`) decides, else a `new-window` action
+    /// says yes, else GNOME errs on the side of compatibility and says
+    /// yes. GNOME first asks the running app's exported `app.new-window`
+    /// action and last whether it is a unique GtkApplication; the shell
+    /// sees neither, so those two steps are not taken.
+    pub fn can_open_new_window(&self) -> bool {
+        match self.new_window.single_main_window {
+            Some(single) => !single,
+            None => true,
+        }
+    }
+}
+
+/// GLib's `g_key_file_parse_value_as_boolean`: `true` or `1`, trailing
+/// whitespace ignored; anything else reads as false.
+fn glib_bool(value: &str) -> bool {
+    matches!(value.trim_end(), "true" | "1")
+}
+
+fn new_window_hints(entry: &CrateEntry) -> NewWindow {
+    let single_main_window = entry
+        .desktop_entry("SingleMainWindow")
+        .or_else(|| entry.desktop_entry("X-GNOME-SingleWindow"))
+        .map(glib_bool);
+    let listed = entry
+        .actions()
+        .is_some_and(|actions| actions.iter().any(|a| a.trim() == "new-window"));
+    let action_argv = listed.then(|| {
+        entry
+            .action_exec("new-window")
+            .and_then(|exec| exec_argv(entry, exec))
+            .unwrap_or_default()
+    });
+    NewWindow {
+        single_main_window,
+        action_argv,
+    }
 }
 
 impl AppEntry {
@@ -175,8 +234,8 @@ fn from_crate_entry(entry: &CrateEntry) -> Option<AppEntry> {
 // Since 0.8.4, the desktop-entry decoder unescapes Exec values itself.
 // Only tokenize here: decoding a second time drops quoting backslashes or
 // rejects valid commands containing escaped quotes, dollars or backslashes.
-fn exec_argv(entry: &CrateEntry) -> Option<Vec<OsString>> {
-    let words = gio::glib::shell_parse_argv(entry.exec()?).ok()?;
+fn exec_argv(entry: &CrateEntry, exec: &str) -> Option<Vec<OsString>> {
+    let words = gio::glib::shell_parse_argv(exec).ok()?;
     let mut argv = Vec::with_capacity(words.len());
     for word in words {
         match word.to_str()? {
@@ -216,7 +275,7 @@ fn from_crate_entry_for_launch(entry: &CrateEntry, allow_no_display: bool) -> Op
     if entry.hidden() || (!allow_no_display && entry.no_display()) {
         return None;
     }
-    let argv = exec_argv(entry)?;
+    let argv = exec_argv(entry, entry.exec()?)?;
     let app_id = entry.id().to_owned();
     let name = entry
         .name::<&str>(&[])
@@ -252,6 +311,7 @@ fn from_crate_entry_for_launch(entry: &CrateEntry, allow_no_display: bool) -> Op
             .unwrap_or_default(),
         argv,
         icon: entry.icon().map(str::to_owned),
+        new_window: new_window_hints(entry),
     })
 }
 
@@ -415,8 +475,24 @@ pub fn application_launch_context() -> gio::AppLaunchContext {
 }
 
 pub fn launch(entry: &AppEntry) -> io::Result<Launched> {
-    let (program, args) = entry
-        .argv
+    spawn(&entry.app_id, &entry.argv)
+}
+
+/// `shell_app_open_new_window` (gnome-shell 51 src/shell-app.c:574-623):
+/// the desktop file's `new-window` action when it lists one, else launch
+/// the app again (for most apps, a second process or IPC that opens a
+/// window). GNOME's middle step, a running app's exported
+/// `app.new-window` action, needs the app's D-Bus action group, which
+/// the shell does not track.
+pub fn open_new_window(entry: &AppEntry) -> io::Result<Launched> {
+    match &entry.new_window.action_argv {
+        Some(argv) => spawn(&entry.app_id, argv),
+        None => launch(entry),
+    }
+}
+
+fn spawn(app_id: &str, argv: &[OsString]) -> io::Result<Launched> {
+    let (program, args) = argv
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty Exec argv"))?;
     let child = application_command(program)
@@ -426,7 +502,7 @@ pub fn launch(entry: &AppEntry) -> io::Result<Launched> {
         .stderr(Stdio::null())
         .spawn()?;
     Ok(Launched {
-        app_id: entry.app_id.clone(),
+        app_id: app_id.to_owned(),
         pid: child.id(),
         child: Some(child),
         started_at: Instant::now(),
@@ -780,9 +856,103 @@ Type=Application
             argv: vec![OsString::from("/nonexistent-tuna-binary-xyz")],
             icon: None,
             categories: Vec::new(),
+            new_window: Default::default(),
         };
         let mut tracker = LaunchTracker::new();
         assert!(tracker.launch(&entry).is_err());
         assert!(tracker.is_empty(), "failed spawns track nothing");
+    }
+
+    fn new_window_entry(body: &str) -> AppEntry {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_entry(
+            dir.path(),
+            "probe.desktop",
+            &format!("[Desktop Entry]\nName=Probe\nExec=/bin/true main\nType=Application\n{body}"),
+        );
+        discover(&[dir.path().to_owned()])
+            .into_iter()
+            .next()
+            .expect("probe entry")
+    }
+
+    #[test]
+    fn can_open_new_window_reads_the_desktop_file_like_shell_app() {
+        // No key and no action: GNOME errs on the side of compatibility.
+        let plain = new_window_entry("");
+        assert_eq!(plain.new_window, NewWindow::default());
+        assert!(plain.can_open_new_window());
+        // SingleMainWindow decides, as GLib reads booleans.
+        for (value, single) in [
+            ("true", true),
+            ("1", true),
+            ("false", false),
+            ("yes", false),
+        ] {
+            let entry = new_window_entry(&format!("SingleMainWindow={value}\n"));
+            assert_eq!(entry.new_window.single_main_window, Some(single), "{value}");
+            assert_eq!(entry.can_open_new_window(), !single, "{value}");
+        }
+        // The older GNOME key counts only without SingleMainWindow.
+        let gnome = new_window_entry("X-GNOME-SingleWindow=true\n");
+        assert!(!gnome.can_open_new_window());
+        let both = new_window_entry("SingleMainWindow=false\nX-GNOME-SingleWindow=true\n");
+        assert!(both.can_open_new_window());
+        // SingleMainWindow is asked before the new-window action.
+        let single_with_action = new_window_entry(
+            "SingleMainWindow=true\nActions=new-window;\n\n[Desktop Action new-window]\nName=New Window\nExec=/bin/true --new-window\n",
+        );
+        assert!(!single_with_action.can_open_new_window());
+    }
+
+    #[test]
+    fn the_new_window_action_is_parsed_like_exec() {
+        let entry = new_window_entry(
+            "Actions=quit;new-window;\n\n[Desktop Action new-window]\nName=New Window\nExec=/bin/true \"--new window\" %U\n",
+        );
+        assert_eq!(
+            entry.new_window.action_argv,
+            Some(vec![
+                OsString::from("/bin/true"),
+                OsString::from("--new window")
+            ])
+        );
+        assert!(entry.can_open_new_window());
+        // A group without the Actions key listing it is not an action.
+        let unlisted = new_window_entry(
+            "\n[Desktop Action new-window]\nName=New Window\nExec=/bin/true --new-window\n",
+        );
+        assert_eq!(unlisted.new_window.action_argv, None);
+        // Listed without an Exec: GLib launches nothing.
+        let empty = new_window_entry("Actions=new-window;\n");
+        assert_eq!(empty.new_window.action_argv, Some(Vec::new()));
+        assert_eq!(
+            open_new_window(&empty).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn open_new_window_runs_the_action_else_launches_again() {
+        let marker = tempfile::tempdir().expect("tempdir");
+        let wait = |path: &Path| {
+            let start = std::time::Instant::now();
+            while start.elapsed() < Duration::from_secs(20) && !path.exists() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            path.exists()
+        };
+        let action = marker.path().join("action");
+        let main = marker.path().join("main");
+        let entry = new_window_entry(&format!(
+            "Actions=new-window;\n\n[Desktop Action new-window]\nName=New Window\nExec=touch {}\n",
+            action.display()
+        ));
+        open_new_window(&entry).expect("spawn the action");
+        assert!(wait(&action), "the new-window action ran");
+        let mut relaunch = new_window_entry("");
+        relaunch.argv = vec![OsString::from("touch"), main.clone().into_os_string()];
+        open_new_window(&relaunch).expect("launch again");
+        assert!(wait(&main), "without an action the app launches again");
     }
 }
