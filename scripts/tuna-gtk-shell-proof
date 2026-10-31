@@ -2540,14 +2540,17 @@ for step in $(seq 1 6); do
     sleep 0.05
 done
 # Keep the actual button held, but leave timed page hints and tile hover
-# targets before slow AT-SPI/screenshot/state acquisition. GTK shows the
-# hint once it hears the drag: poll the bound child's tree, no fixed sleep.
+# targets before slow AT-SPI/screenshot/state acquisition. Preview creation
+# precedes the normal arrow's fade-out: wait for both sides of that transition
+# before admitting the active first-page tree, within the same preview budget.
 xdotool mousemove --window "$WID" "$grid_neutral_x" "$grid_neutral_y"
 grid_peek_end=$(($(date +%s) + 10))
 until grid_cancel_dump "$ARTIFACTS/a11y-folder-page-peek.json" &&
-    showing "$ARTIFACTS/a11y-folder-page-peek.json" "Next page preview"; do
+    showing "$ARTIFACTS/a11y-folder-page-peek.json" "Next page preview" &&
+    ! showing "$ARTIFACTS/a11y-folder-page-peek.json" "Next Page" &&
+    ! showing "$ARTIFACTS/a11y-folder-page-peek.json" "Previous Page"; do
     [ "$(date +%s)" -lt "$grid_peek_end" ] ||
-        fail G-GRID-DRAG-CANCEL "real local folder drag has no neighboring-page hint"
+        fail G-GRID-DRAG-CANCEL "real local folder drag did not replace its page arrow with a neighboring-page hint"
     sleep 0.1
 done
 scrot "$ARTIFACTS/11h-folder-page-peek.png" >/dev/null
