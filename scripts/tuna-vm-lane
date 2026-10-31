@@ -1025,7 +1025,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                                                         restored_middle, restored_wheel),
                                    label="pointer-live-restored")
             pointer_live.append({"restored": restored["state"]["input_devices"]})
-            # GNOME's custom acceleration curve (protocol 0.47). A current
+            # GNOME's custom acceleration curve (protocol 0.48). A current
             # build reports per-device availability. The curve reaches
             # libinput as the custom profile; a curve libinput rejects leaves
             # the device default (Mutter's set_device_accel_profile); a curve
@@ -1034,16 +1034,20 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
             custom_reported = any("accel_custom_available" in d for d in devices_now)
             if not published and not custom_reported:
                 raise RuntimeError("current build does not report custom acceleration availability")
-            custom_mice = {d["name"] for d in devices_now
-                           if d.get("accel_custom_available") and d["kind"] == "pointer"
-                           and not d.get("trackball") and not d.get("pointing_stick")}
-            if custom_mice:
+            def custom_mice(devices):
+                # Names are not unique: QEMU's relative and absolute VMMouse
+                # share one, but only the relative device offers acceleration.
+                return [d for d in devices
+                        if d.get("accel_custom_available") and d["kind"] == "pointer"
+                        and not d.get("trackball") and not d.get("pointing_stick")]
+            custom_names = sorted(d["name"] for d in custom_mice(devices_now))
+            if custom_names:
                 def custom_profile(expect_custom):
                     def matches(value):
-                        mice = [d for d in value["state"].get("input_devices", [])
-                                if d["name"] in custom_mice]
-                        return bool(mice) and all((d["accel_profile"] == "custom") is expect_custom
-                                                  for d in mice)
+                        mice = custom_mice(value["state"].get("input_devices", []))
+                        return (sorted(d["name"] for d in mice) == custom_names
+                                and all((d["accel_profile"] == "custom") is expect_custom
+                                        for d in mice))
                     return matches
                 curve = agent.run("mouse-custom-accel", "0.5", "0.0,0.5,1.0,2.0")
                 custom_available = curve["available"]
@@ -1086,7 +1090,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                 gaps.append("guest mouse schema lacks GNOME 51 scroll-wheel emulation keys")
             if not custom_reported:
                 gaps.append("published guest predates custom-acceleration reporting")
-            elif not custom_mice:
+            elif not custom_names:
                 gaps.append("guest libinput offers no custom acceleration profile")
             elif not custom_available:
                 gaps.append("guest mouse schema lacks custom-accel-config")

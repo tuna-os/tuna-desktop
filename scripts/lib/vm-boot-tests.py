@@ -2576,6 +2576,59 @@ class InterleavedShellStartup(unittest.TestCase):
         self.assertFalse(bool(shell) and lane.EXHAUSTED not in text)
 
 
+class CustomAccelerationCohort(unittest.TestCase):
+    def policy(self, baseline):
+        source = Path(lane.__file__)
+        tree = ast.parse(source.read_text())
+        helpers = [next(node for node in ast.walk(tree)
+                        if isinstance(node, ast.FunctionDef) and node.name == name)
+                   for name in ("custom_mice", "custom_profile")]
+        scope = {}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), str(source), "exec"), scope)
+        scope["custom_names"] = sorted(d["name"] for d in scope["custom_mice"](baseline))
+        return scope["custom_profile"]
+
+    def devices(self, profile):
+        # Both failed run 41147696888 jobs expose these same-name devices.
+        return [
+            {"name": "QEMU Virtio Mouse", "kind": "pointer",
+             "accel_custom_available": True, "accel_profile": profile},
+            {"name": "VirtualPS/2 VMware VMMouse", "kind": "pointer",
+             "accel_custom_available": True, "accel_profile": profile},
+            {"name": "VirtualPS/2 VMware VMMouse", "kind": "pointer",
+             "accel_custom_available": False, "accel_profile": None},
+        ]
+
+    def test_shared_name_does_not_include_absolute_device(self):
+        policy = self.policy(self.devices("adaptive"))
+        for profile, expect_custom in (("custom", True), ("adaptive", False)):
+            with self.subTest(profile=profile):
+                self.assertTrue(policy(expect_custom)(
+                    {"state": {"input_devices": self.devices(profile)}}))
+
+    def test_every_capable_mouse_must_reach_expected_profile(self):
+        devices = self.devices("custom")
+        policy = self.policy(devices)
+        devices[1]["accel_profile"] = "adaptive"
+        self.assertFalse(policy(True)({"state": {"input_devices": devices}}))
+        self.assertFalse(policy(False)({"state": {"input_devices": devices}}))
+
+    def test_disappearing_or_unavailable_mouse_cannot_pass(self):
+        baseline = self.devices("custom")
+        policy = self.policy(baseline)
+        for devices in ([], baseline[:1], self.devices("custom")):
+            if len(devices) == 3:
+                devices[1]["accel_custom_available"] = False
+            with self.subTest(devices=devices):
+                self.assertFalse(policy(True)({"state": {"input_devices": devices}}))
+
+    def test_replacement_mouse_does_not_stand_in_for_baseline_cohort(self):
+        devices = self.devices("custom")
+        policy = self.policy(devices)
+        devices[1]["name"] = "another custom-capable mouse"
+        self.assertFalse(policy(True)({"state": {"input_devices": devices}}))
+
+
 class PointerEvidenceRetention(unittest.TestCase):
     def test_aggregate_does_not_overwrite_last_live_inventory(self):
         tree = ast.parse((Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text())

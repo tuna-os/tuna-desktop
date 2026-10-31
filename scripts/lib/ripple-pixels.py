@@ -4,11 +4,12 @@
 GNOME Shell 51's locatePointer.js plays ripples.js's three rings of
 `.ripple-pointer-location` (a 50 px disc with a 2 px glow, the accent
 lightened) centred on the pointer. Given a capture BEFORE the tap and one
-DURING the ripples at a frozen animation time, the outermost changed pixel
-along each of the four rays from the centre must sit at the largest ring's
-radius (RADIUS physical pixels, within TOLERANCE), the disc must move the
-scene towards its fill, and nothing may change beyond it. With --settled,
-a capture after the ripples ended must match BEFORE.
+DURING the ripples at a frozen animation time of 415 ms, the outermost
+changed pixel along each of the four rays from the centre must sit at
+the largest ring's radius (32.0625 logical pixels times SCALE, within
+TOLERANCE), the disc must move the scene towards its fill, and nothing
+may change beyond it. With --settled, a capture after the ripples ended
+must match BEFORE.
 """
 import argparse
 import colorsys
@@ -20,6 +21,11 @@ from PIL import Image
 CHANGED = 6
 # GNOME's default accent (blue, #3584e4).
 ACCENT = (0x35, 0x84, 0xe4)
+# ripples.js: at 415/830 of the first ring's duration, EASE_OUT_QUAD
+# has progressed 0.75 of the way from scale 0.25 to 1.5, not to scale
+# 1.375. Include the disc's 2 px glow on each side in the base radius.
+RADIUS_AT_415_MS = (50 + 2 * 2) / 2 * (
+    0.25 + (1.5 - 0.25) * (1 - (1 - 415 / 830) ** 2))
 
 
 def lighten(rgb, amount):
@@ -76,17 +82,18 @@ if __name__ == "__main__":
     parser.add_argument("during", type=Path)
     parser.add_argument("cx", type=int)
     parser.add_argument("cy", type=int)
-    parser.add_argument("radius", type=float)
+    parser.add_argument("scale", type=float, help="physical pixels per logical pixel")
     parser.add_argument("tolerance", type=float)
     parser.add_argument("--settled", type=Path)
     args = parser.parse_args()
+    radius = RADIUS_AT_415_MS * args.scale
     with Image.open(args.before) as b, Image.open(args.during) as d:
         before, during = b.convert("RGB"), d.convert("RGB")
-    receipt = {"centre": [args.cx, args.cy], "radius": args.radius, "tolerance": args.tolerance,
-               "edges": verify(before, during, args.cx, args.cy, args.radius, args.tolerance)}
+    receipt = {"centre": [args.cx, args.cy], "radius": radius, "tolerance": args.tolerance,
+               "edges": verify(before, during, args.cx, args.cy, radius, args.tolerance)}
     if args.settled:
         with Image.open(args.settled) as s:
-            settled(before, s.convert("RGB"), args.cx, args.cy, args.radius, args.tolerance)
+            settled(before, s.convert("RGB"), args.cx, args.cy, radius, args.tolerance)
         receipt["settled"] = True
     args.during.with_suffix(".ripple.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps(receipt))

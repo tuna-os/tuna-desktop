@@ -92,7 +92,11 @@ cleanup() {
     if [ -n "$EMU_PID" ]; then wait "$EMU_PID" 2>/dev/null || true; fi
     exec 7>&- 2>/dev/null || true
     if [ -n "$POINTER_EMU_PID" ]; then wait "$POINTER_EMU_PID" 2>/dev/null || true; fi
-    if [ -e "$POINTER_UDEV_RULE" ]; then sudo rm -f "$POINTER_UDEV_RULE" && sudo udevadm control --reload || true; fi
+    if [ -e "$POINTER_UDEV_RULE" ]; then
+        if sudo rm -f "$POINTER_UDEV_RULE"; then
+            sudo udevadm control --reload || true
+        fi
+    fi
     if [ -n "$COMP_PID" ]; then kill "$COMP_PID" 2>/dev/null || true; fi
     if [ -n "$CALIBRATION_PID" ]; then kill "$CALIBRATION_PID" 2>/dev/null || true; fi
     if [ -n "$COLORD_PID" ]; then sudo kill "$COLORD_PID" 2>/dev/null || true; fi

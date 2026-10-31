@@ -139,7 +139,7 @@
 #   G-LOCATE-POINTER with locate-pointer on, a lone Ctrl tap draws GNOME's
 #                  ripples at the pointer; off, it draws nothing
 #   G-LOCATE-RIPPLE-PIXELS the ripples' actual pixels on the frozen clock
-#                  (locatePointer.js, ripples.js): the first ring's 1.375x
+#                  (locatePointer.js, ripples.js): the first ring's 1.1875x
 #                  radius at 415 ms, towards the lightened accent, at 100%
 #                  and 125%, and no residue once they end
 #   G-CURSOR-SCALE at 125% (a temporary DisplayConfig change) a size-24
@@ -5184,9 +5184,10 @@ cstate '.cursor.locate_pointer.active | not' "ripples finished" 5 ||
 
 # Actual ripple pixels (gnome-shell 51 locatePointer.js, ripples.js) on
 # the frozen animation clock: 415 ms after the tap the first ring is at
-# out-quad scale 1.375 of its 54 px (disc plus glow), i.e. a radius of
-# 37.125 logical px; at 1400 ms all three rings are gone without residue.
-# ripple_pixels SCALE RADIUS: at the output centre, RADIUS physical px.
+# out-quad scale 0.25 + (1.5 - 0.25) * 0.75 = 1.1875 of its 54 px
+# (disc plus glow), i.e. a radius of 32.0625 logical px; at 1400 ms all
+# three rings are gone without residue.
+# ripple_pixels SCALE: at the output centre, radii derived from GNOME's curve.
 ripple_pixels() {
     xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
     locate_count="$(jq '.cursor.locate_pointer.count' "$CSTATE")"
@@ -5212,7 +5213,7 @@ ripple_pixels() {
     sleep 0.5
     scrot -o "$ARTIFACTS/ripple-$1-settled.png" >/dev/null
     "$PY" "$ROOT/scripts/lib/ripple-pixels.py" "$ARTIFACTS/ripple-$1-before.png" "$ARTIFACTS/ripple-$1-415ms.png" \
-        $((WIDTH / 2)) $((HEIGHT / 2)) "$2" 3 --settled "$ARTIFACTS/ripple-$1-settled.png" \
+        $((WIDTH / 2)) $((HEIGHT / 2)) "$1" 3 --settled "$ARTIFACTS/ripple-$1-settled.png" \
         >"$ARTIFACTS/ripple-$1.log" 2>&1 ||
         fail G-LOCATE-RIPPLE-PIXELS "the drawn ripples at scale $1 are not GNOME's: $(tail -1 "$ARTIFACTS/ripple-$1.log")"
     real_clock || fail G-LOCATE-RIPPLE-PIXELS "removing the clock file did not resume real time"
@@ -5234,7 +5235,7 @@ cursor_scale() {
     # GNOME's screen transition (250 ms hold, 500 ms fade) settles first.
     sleep 1.5
 }
-ripple_pixels 1 37.125
+ripple_pixels 1
 
 # Mutter 51's cursor renderer at 125%: the sprite loads at the ceiled
 # scale (the theme's 48px image for size 24) and draws at the theme size,
@@ -5264,9 +5265,9 @@ cstate ".windows | length == $cursor_windows" "scale cursor probe closed" ||
 gsettings set org.gnome.desktop.interface cursor-theme "$cursor_theme_before"
 gsettings set org.gnome.desktop.interface cursor-size "$cursor_size_before"
 pass G-CURSOR-SCALE "at 125% a size-24 cursor loads the theme's 48px legacy or SVG image and draws 30 physical px at the scaled hotspot"
-ripple_pixels 1.25 46.40625
+ripple_pixels 1.25
 cursor_scale 1 "$WIDTH"
-pass G-LOCATE-RIPPLE-PIXELS "locate-pointer ripples draw GNOME's 1.375x first ring at 415 ms (37 px at 100%, 46 px at 125%) towards the lightened accent and leave no residue"
+pass G-LOCATE-RIPPLE-PIXELS "locate-pointer ripples draw GNOME's 1.1875x first ring at 415 ms (32 px at 100%, 40 px at 125%) towards the lightened accent and leave no residue"
 gsettings set org.gnome.desktop.interface locate-pointer false
 pass G-LOCATE-POINTER "a Ctrl tap ripples at the pointer with locate-pointer on, nothing with it off"
 

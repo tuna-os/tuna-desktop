@@ -42,6 +42,22 @@ acknowledgment, and writes PNG plus pixel receipt for each case. It rejects
 cropped, displaced and incorrectly colored fixtures in four focused tests.
 Animated fixture assertions additionally capture a second real frame without pointer input for legacy and SVG themes. All assertions await a fresh native CI journey on this port; fractional-output pixels, multiple physical outputs and hardware measurements remain separate qualification.
 
+`G-LOCATE-RIPPLE-PIXELS` captures locate-pointer at 415 ms on the frozen
+animation clock and after all rings end. GNOME Shell 51's
+[ripples.js](https://github.com/GNOME/gnome-shell/blob/51.0/js/ui/ripples.js)
+eases the first ring from scale 0.25 to 1.5 over 830 ms with `EASE_OUT_QUAD`.
+At half duration its scale is `0.25 + (1.5 - 0.25) * 0.75 = 1.1875`;
+the 54 px disc-plus-glow therefore has radius 32.0625 logical px
+(40.078125 physical px at 125%). The pixel checker derives its expected
+radius from that curve and the output scale, keeping the 3 px edge tolerance,
+lightened-accent checks and no-residue assertion.
+
+The previous 1.375x / 37.125 px expectation was an arithmetic error in the
+proof, not the renderer: CI run 41147696888, GTK job 124385584993, captured
+left/up ray extents of 33 px and right/down extents of 32 px at 100%.
+Those archived pixels match the upstream curve. This diagnosis is not a
+fresh runtime qualification of the corrected proof.
+
 
 ## Locked privacy and locate cache bounds
 
