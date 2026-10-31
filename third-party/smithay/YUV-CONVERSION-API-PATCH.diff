@@ -1,0 +1,214 @@
+diff --git a/src/backend/egl/display.rs b/src/backend/egl/display.rs
+index f4e6637b..8a09be3a 100644
+--- a/src/backend/egl/display.rs
++++ b/src/backend/egl/display.rs
+@@ -723,6 +723,19 @@ impl EGLDisplay {
+     #[instrument(level = "trace", skip(self), parent = &self.span, err)]
+     #[profiling::function]
+     pub fn create_image_from_dmabuf(&self, dmabuf: &Dmabuf) -> Result<EGLImage, Error> {
++        self.create_image_from_dmabuf_with_conversion(dmabuf, None)
++    }
++
++    /// Imports a [`Dmabuf`] as an [`EGLImage`], asking for `conversion`
++    /// when the image is sampled as YCbCr (`EGL_YUV_COLOR_SPACE_HINT_EXT`,
++    /// `EGL_SAMPLE_RANGE_HINT_EXT`; RGB formats ignore the hints).
++    #[instrument(level = "trace", skip(self), parent = &self.span, err)]
++    #[profiling::function]
++    pub fn create_image_from_dmabuf_with_conversion(
++        &self,
++        dmabuf: &Dmabuf,
++        conversion: Option<super::YuvConversion>,
++    ) -> Result<EGLImage, Error> {
+         if !self.extensions.iter().any(|s| s == "EGL_KHR_image_base")
+             && !self
+                 .extensions
+@@ -812,6 +825,22 @@ impl EGLDisplay {
+             }
+         }
+ 
++        if let Some(conversion) = conversion {
++            out.extend([
++                ffi::egl::YUV_COLOR_SPACE_HINT_EXT as i32,
++                match conversion.color_space {
++                    super::YuvColorSpace::Rec601 => ffi::egl::ITU_REC601_EXT,
++                    super::YuvColorSpace::Rec709 => ffi::egl::ITU_REC709_EXT,
++                    super::YuvColorSpace::Rec2020 => ffi::egl::ITU_REC2020_EXT,
++                } as i32,
++                ffi::egl::SAMPLE_RANGE_HINT_EXT as i32,
++                match conversion.range {
++                    super::YuvRange::Full => ffi::egl::YUV_FULL_RANGE_EXT,
++                    super::YuvRange::Narrow => ffi::egl::YUV_NARROW_RANGE_EXT,
++                } as i32,
++            ]);
++        }
++
+         out.push(ffi::egl::NONE as i32);
+ 
+         unsafe {
+diff --git a/src/backend/egl/mod.rs b/src/backend/egl/mod.rs
+index b2576663..1c18d535 100644
+--- a/src/backend/egl/mod.rs
++++ b/src/backend/egl/mod.rs
+@@ -57,6 +57,44 @@ use std::ffi::CString;
+ #[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
+ use std::sync::Arc;
+ 
++/// The YCbCr-to-RGB matrix an imported dmabuf is sampled with
++/// (`EGL_YUV_COLOR_SPACE_HINT_EXT`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub enum YuvColorSpace {
++    /// ITU-R BT.601
++    Rec601,
++    /// ITU-R BT.709
++    Rec709,
++    /// ITU-R BT.2020
++    Rec2020,
++}
++
++/// The quantization range of an imported YCbCr dmabuf
++/// (`EGL_SAMPLE_RANGE_HINT_EXT`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub enum YuvRange {
++    /// Full range
++    Full,
++    /// Narrow (limited) range
++    Narrow,
++}
++
++/// How a YCbCr dmabuf is converted to RGB when it is imported.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub struct YuvConversion {
++    /// The conversion matrix
++    pub color_space: YuvColorSpace,
++    /// The quantization range
++    pub range: YuvRange,
++}
++
++/// Surface data (in a surface's `data_map`) asking the GLES renderer to
++/// import the surface's YCbCr dmabufs with this conversion. Without it,
++/// or with `None`, the EGL implementation's default applies.
++#[cfg(feature = "wayland_frontend")]
++#[derive(Debug, Default)]
++pub struct YuvConversionHint(pub std::sync::Mutex<Option<YuvConversion>>);
++
+ /// Error that can happen on optional EGL features
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct EglExtensionNotSupportedError(pub &'static [&'static str]);
+diff --git a/src/backend/renderer/gles/mod.rs b/src/backend/renderer/gles/mod.rs
+index 3ed0e507..68b74337 100644
+--- a/src/backend/renderer/gles/mod.rs
++++ b/src/backend/renderer/gles/mod.rs
+@@ -301,6 +301,8 @@ pub struct GlesRenderer {
+     // caches
+     buffers: Vec<GlesBuffer>,
+     dmabuf_cache: HashMap<WeakDmabuf, GlesTexture>,
++    /// The YCbCr conversion each cached dmabuf was imported with, when set.
++    dmabuf_conversions: HashMap<WeakDmabuf, crate::backend::egl::YuvConversion>,
+     vbos: [ffi::types::GLuint; 2],
+     vertices: Vec<f32>,
+     non_opaque_damage: Vec<Rectangle<i32, Physical>>,
+@@ -635,6 +637,7 @@ impl GlesRenderer {
+ 
+             buffers: Vec::new(),
+             dmabuf_cache: std::collections::HashMap::new(),
++            dmabuf_conversions: std::collections::HashMap::new(),
+             vertices: Vec::with_capacity(6 * 16),
+             non_opaque_damage: Vec::with_capacity(16),
+             opaque_damage: Vec::with_capacity(16),
+@@ -709,6 +712,7 @@ impl GlesRenderer {
+     #[profiling::function]
+     fn cleanup(&mut self) {
+         self.dmabuf_cache.retain(|entry, _tex| !entry.is_gone());
++        self.dmabuf_conversions.retain(|entry, _| !entry.is_gone());
+         // Free outdated buffer resources
+         // TODO: Replace with `drain_filter` once it lands
+         let mut i = 0;
+@@ -1197,6 +1201,45 @@ impl ImportDma for GlesRenderer {
+         &mut self,
+         buffer: &Dmabuf,
+         _damage: Option<&[Rectangle<i32, BufferCoord>]>,
++    ) -> Result<GlesTexture, GlesError> {
++        self.import_dmabuf_converted(buffer, None)
++    }
++
++    fn dmabuf_formats(&self) -> FormatSet {
++        self.egl.dmabuf_texture_formats().clone()
++    }
++
++    fn has_dmabuf_format(&self, format: Format) -> bool {
++        self.egl.dmabuf_texture_formats().contains(&format)
++    }
++}
++
++impl GlesRenderer {
++    /// Import a dmabuf as [`ImportDma::import_dmabuf`] does, sampling
++    /// external (YCbCr) formats with `conversion`. A buffer imported
++    /// before with another conversion is imported anew.
++    #[instrument(level = "trace", parent = &self.span, skip(self))]
++    #[profiling::function]
++    pub fn import_dmabuf_with_conversion(
++        &mut self,
++        buffer: &Dmabuf,
++        conversion: Option<crate::backend::egl::YuvConversion>,
++    ) -> Result<GlesTexture, GlesError> {
++        let weak = buffer.weak();
++        if self.dmabuf_conversions.get(&weak).copied() != conversion {
++            self.dmabuf_cache.remove(&weak);
++            match conversion {
++                Some(conversion) => self.dmabuf_conversions.insert(weak, conversion),
++                None => self.dmabuf_conversions.remove(&weak),
++            };
++        }
++        self.import_dmabuf_converted(buffer, conversion)
++    }
++
++    fn import_dmabuf_converted(
++        &mut self,
++        buffer: &Dmabuf,
++        conversion: Option<crate::backend::egl::YuvConversion>,
+     ) -> Result<GlesTexture, GlesError> {
+         use crate::backend::allocator::Buffer;
+         if !self.extensions.iter().any(|ext| ext == "GL_OES_EGL_image") {
+@@ -1208,7 +1251,7 @@ impl ImportDma for GlesRenderer {
+             let image = self
+                 .egl
+                 .display()
+-                .create_image_from_dmabuf(buffer)
++                .create_image_from_dmabuf_with_conversion(buffer, conversion.filter(|_| is_external))
+                 .map_err(GlesError::BindBufferEGLError)?;
+ 
+             let tex = self.import_egl_image(image, is_external, None)?;
+@@ -1232,18 +1275,24 @@ impl ImportDma for GlesRenderer {
+             Ok(texture)
+         })
+     }
+-
+-    fn dmabuf_formats(&self) -> FormatSet {
+-        self.egl.dmabuf_texture_formats().clone()
+-    }
+-
+-    fn has_dmabuf_format(&self, format: Format) -> bool {
+-        self.egl.dmabuf_texture_formats().contains(&format)
+-    }
+ }
+ 
+ #[cfg(feature = "wayland_frontend")]
+-impl ImportDmaWl for GlesRenderer {}
++impl ImportDmaWl for GlesRenderer {
++    fn import_dma_buffer(
++        &mut self,
++        buffer: &wayland_server::protocol::wl_buffer::WlBuffer,
++        surface: Option<&crate::wayland::compositor::SurfaceData>,
++        _damage: &[Rectangle<i32, BufferCoord>],
++    ) -> Result<GlesTexture, GlesError> {
++        let dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
++            .expect("import_dma_buffer without checking buffer type?");
++        let conversion = surface
++            .and_then(|states| states.data_map.get::<crate::backend::egl::YuvConversionHint>())
++            .and_then(|hint| *hint.0.lock().unwrap());
++        self.import_dmabuf_with_conversion(dmabuf, conversion)
++    }
++}
+ 
+ impl GlesRenderer {
+     #[profiling::function]

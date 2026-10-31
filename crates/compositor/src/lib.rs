@@ -60,7 +60,10 @@ pub mod animation_clock;
 mod auth_owner;
 mod bell;
 pub mod capture_security;
+pub mod color_management;
 pub mod color_manager;
+pub(crate) mod color_render;
+pub mod color_state;
 mod constraint_motion;
 pub mod control;
 mod control_readiness;
@@ -618,6 +621,7 @@ impl CompositorHandler for State {
         self.pointer_scene_dirty = true;
         self.initial_outputs.remove(surface);
         self.window_icons.remove(surface);
+        self.protocols.color.surface_destroyed(surface);
     }
 
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -668,6 +672,8 @@ impl CompositorHandler for State {
     fn commit(&mut self, surface: &wl_surface::WlSurface) {
         self.pointer_scene_dirty = true;
         on_commit_buffer_handler::<State>(surface);
+        crate::color_management::damage_changed(surface);
+        self.check_color_representation(surface);
         self.window_icons.commit(surface);
         self.popups.commit(surface);
         if let Some(smithay::desktop::PopupKind::Xdg(popup)) = self.popups.find_popup(surface) {
@@ -1128,6 +1134,7 @@ impl State {
             self.dh.remove_global::<State>(id);
         }
         self.outputs.remove(index);
+        self.protocols.color.output_removed(name);
         if was_primary {
             if let Some(first) = self.outputs.first_mut() {
                 first.primary = true;
@@ -1398,6 +1405,7 @@ impl TestCompositor {
     /// actions instead of blocking on either side.
     pub fn pump(&mut self) {
         self.display.dispatch_clients(&mut self.state).unwrap();
+        self.state.send_color_information();
         self.display.flush_clients().unwrap();
     }
 

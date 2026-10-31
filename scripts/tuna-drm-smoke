@@ -36,7 +36,10 @@
 #              keybinding actions, strip keybindings, the pad OSD in the
 #              GTK shell (help button, org.gnome.Shell.Wacom.PadOsd),
 #              hotplug, and nothing reaching the client while locked
-# and captures a scanout screenshot with ffmpeg kmsgrab when possible.
+#   D-COLOR-PIXEL a fullscreen client tagged BT.2020/PQ through
+#              wp_color_manager_v1 is scanned out (kmsgrab) as Mutter 51's
+#              transform to the SDR output, not as its raw code values
+# and captures a scanout screenshot with ffmpeg kmsgrab.
 # Needs root (sudo) for modprobe, seatd and uinput. Exits nonzero on any failure.
 set -eu
 unset CDPATH
@@ -47,7 +50,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --seconds) SECONDS_UP="$2"; shift 2 ;;
-        --help|-h) sed -n '2,30p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,34p' "$0"; exit 0 ;;
         *) echo "tuna-drm-smoke: unknown argument $1" >&2; exit 1 ;;
     esac
 done
@@ -68,6 +71,7 @@ SYSTEM_BUS_PID=""
 CALIBRATION_PID=""
 EMU_PID=""
 CLIENT_PID=""
+COLOR_PID=""
 
 cleanup() {
     if [ -n "$CLIENT_PID" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
@@ -75,6 +79,7 @@ cleanup() {
     exec 8>&- 2>/dev/null || true
     if [ -n "$EMU_PID" ]; then wait "$EMU_PID" 2>/dev/null || true; fi
     if [ -n "$COMP_PID" ]; then kill "$COMP_PID" 2>/dev/null || true; fi
+    if [ -n "$COLOR_PID" ]; then kill "$COLOR_PID" 2>/dev/null || true; fi
     if [ -n "$CALIBRATION_PID" ]; then kill "$CALIBRATION_PID" 2>/dev/null || true; fi
     if [ -n "$COLORD_PID" ]; then sudo kill "$COLORD_PID" 2>/dev/null || true; fi
     if [ -n "$SYSTEM_BUS_PID" ]; then kill "$SYSTEM_BUS_PID" 2>/dev/null || true; fi
@@ -158,6 +163,9 @@ echo "tuna-drm-smoke: vkms at $CARD"
 
 echo "tuna-drm-smoke: building"
 cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-host -p tuna-shell-gtk
+# `--example` alone would build only the example, so it is a second build.
+cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor \
+    --example tuna-color-pixel-client
 "$ROOT/scripts/tuna-frame-pacer-build" "$ARTIFACTS/frame-pacer"
 
 # seatd always serves /run/seatd.sock (and removes a leftover one), so a
@@ -243,13 +251,56 @@ with open(sys.argv[2], "rb") as stream:
     print(result)
 PYCODE
 pass D-ENDURANCE "real feedback, batch rollover and requested 16-second completion"
-if command -v ffmpeg >/dev/null 2>&1; then
-    sudo ffmpeg -loglevel error -y -device "$CARD" -f kmsgrab -i - -frames:v 1 \
-        -vf 'hwdownload,format=bgr0' "$ARTIFACTS/scanout.png" 2>"$ARTIFACTS/kmsgrab.log" &&
-        sudo chown "$(id -u):$(id -g)" "$ARTIFACTS/scanout.png" &&
-        echo "tuna-drm-smoke: scanout captured" ||
-        echo "tuna-drm-smoke: kmsgrab unavailable (see kmsgrab.log); state assertions still gate"
+# vkms scans out ARGB8888: kmsgrab hands over BGRA frames.
+grab() {
+    sudo ffmpeg -loglevel error -y -device "$CARD" -f kmsgrab -i - -frames:v 1 "$@" \
+        2>>"$ARTIFACTS/kmsgrab.log"
+}
+grab -vf 'hwdownload,format=bgra' "$ARTIFACTS/scanout.png" ||
+    fail D-COLOR-PIXEL "kmsgrab failed (see kmsgrab.log)"
+sudo chown "$(id -u):$(id -g)" "$ARTIFACTS/scanout.png"
+echo "tuna-drm-smoke: scanout captured"
+
+# Colour management end to end (P-DS-03, #341): a fullscreen window of one
+# BT.2020/PQ code value, tagged with that image description. Its centre
+# pixel on the CRTC must be the transformed colour.
+env -u WAYLAND_SOCKET XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY=tuna-drm-smoke \
+    "$ROOT/target/debug/examples/tuna-color-pixel-client" >"$ARTIFACTS/color-pixel.txt" \
+    2>"$ARTIFACTS/color-pixel.stderr" &
+COLOR_PID=$!
+end=$(($(date +%s) + 15))
+until grep -q '^READY' "$ARTIFACTS/color-pixel.txt"; do
+    kill -0 "$COLOR_PID" 2>/dev/null || fail D-COLOR-PIXEL "colour client exited (see color-pixel.stderr)"
+    [ "$(date +%s)" -le "$end" ] || fail D-COLOR-PIXEL "colour client never presented"
+    sleep 0.2
+done
+# READY code_r code_g code_b expected_r expected_g expected_b
+read -r _ code_r code_g code_b want_r want_g want_b <"$ARTIFACTS/color-pixel.txt"
+got=""
+matched=""
+for _ in $(seq 1 20); do
+    got="$(grab -vf 'hwdownload,format=bgra,crop=1:1:iw/2:ih/2,format=rgb24' -f rawvideo - |
+        od -An -tu1 | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')"
+    if [ -n "$got" ] && awk -v want="$want_r $want_g $want_b" -v got="$got" 'BEGIN {
+            split(want, w, " "); split(got, g, " ")
+            for (i = 1; i <= 3; i++) { d = w[i] - g[i]; if (d > 2 || d < -2) exit 1 }
+        }'; then
+        matched=1
+        break
+    fi
+    sleep 0.25
+done
+if grab -vf 'hwdownload,format=bgra' "$ARTIFACTS/color-pixel.png"; then
+    sudo chown "$(id -u):$(id -g)" "$ARTIFACTS/color-pixel.png"
 fi
+kill "$COLOR_PID" 2>/dev/null || true
+wait "$COLOR_PID" 2>/dev/null || true
+COLOR_PID=""
+[ -n "$matched" ] ||
+    fail D-COLOR-PIXEL "BT.2020/PQ code $code_r $code_g $code_b scanned out as '$got', expected $want_r $want_g $want_b"
+[ "$code_r $code_g $code_b" != "$want_r $want_g $want_b" ] ||
+    fail D-COLOR-PIXEL "the transform must change the code values"
+pass D-COLOR-PIXEL "BT.2020/PQ code $code_r $code_g $code_b scanned out as $got (Mutter transform: $want_r $want_g $want_b)"
 
 kill -TERM "$COMP_PID"
 wait "$COMP_PID" || true

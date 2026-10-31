@@ -3402,6 +3402,7 @@ impl Runtime {
             Backend::Drm(drm) => &mut drm.renderer,
         };
         let color_effect = crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, None);
+        let colors = crate::color_render::ColorFrame::new(renderer, &mut self.state, None);
         // Surface-local origin such that the window geometry (inside any
         // client-side shadow) starts at the buffer's corner.
         let geo = crate::popup::window_geometry_loc(&surface);
@@ -3443,6 +3444,7 @@ impl Runtime {
                     scale,
                     blank_alpha: 0.0,
                     tint: color_effect.as_ref(),
+                    colors: &colors,
                 },
                 &[],
                 &[],
@@ -3594,6 +3596,8 @@ impl Runtime {
             }
         };
         let color_effect = crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, None);
+        let colors =
+            crate::color_render::ColorFrame::new(renderer, &mut self.state, Some(&output_name));
         let buffer_size = (size.w, size.h).into();
         let mut texture: smithay::backend::renderer::gles::GlesTexture =
             renderer.create_buffer(fourcc, buffer_size).ok()?;
@@ -3683,6 +3687,7 @@ impl Runtime {
                                 scale: view.scale,
                                 blank_alpha,
                                 tint: color_effect.as_ref(),
+                                colors: &colors,
                             },
                             &decor,
                             &previews,
@@ -3721,6 +3726,7 @@ impl Runtime {
                         // Captures stay untinted, like GNOME's (gamma
                         // applies past the framebuffer).
                         tint: color_effect.as_ref(),
+                        colors: &colors,
                     },
                     &decor,
                     &previews,
@@ -4631,6 +4637,7 @@ impl Runtime {
         self.display
             .dispatch_clients(&mut self.state)
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        self.state.send_color_information();
         self.display
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
@@ -5562,6 +5569,9 @@ impl Runtime {
             wellbeing,
             night_gains.filter(|_| tint_needed),
         );
+        // Every output has the same colour state (Mutter's default colour
+        // mode), so one resolution serves all of them.
+        let colors = crate::color_render::ColorFrame::new(renderer, &mut self.state, None);
         // Outputs whose CRTC carries the white point draw untinted.
         #[cfg(feature = "drm")]
         let plain_tint = match night_gains {
@@ -5894,6 +5904,7 @@ impl Runtime {
                                             scale: view.scale,
                                             blank_alpha,
                                             tint: night_tint.as_ref(),
+                                            colors: &colors,
                                         },
                                         &decor,
                                         &previews,
@@ -5934,6 +5945,7 @@ impl Runtime {
                                         scale: view.scale,
                                         blank_alpha,
                                         tint: night_tint.as_ref(),
+                                        colors: &colors,
                                     },
                                     &decor,
                                     &previews,
@@ -6256,6 +6268,7 @@ impl Runtime {
                                         scale: view.scale,
                                         blank_alpha,
                                         tint: output_tint,
+                                        colors: &colors,
                                     },
                                     &decor,
                                     &previews,
@@ -6301,6 +6314,7 @@ impl Runtime {
                                         scale: view.scale,
                                         blank_alpha,
                                         tint: output_tint,
+                                        colors: &colors,
                                     },
                                     &decor,
                                     &previews,
@@ -7295,6 +7309,8 @@ struct Target<'a> {
     blank_alpha: f32,
     /// Scene wellbeing effect and output temperature; captures use unity temperature.
     tint: Option<&'a FrameColor>,
+    /// Surfaces drawn through their colour transform (P-DS-03).
+    colors: &'a crate::color_render::ColorFrame,
 }
 
 fn draw_scene(
@@ -7316,6 +7332,7 @@ fn draw_scene(
         scale,
         blank_alpha,
         tint,
+        colors,
     } = target;
     let recolor = |color| tint.map_or(color, |tint| tint.color(color));
     let background = recolor(background);
@@ -7406,15 +7423,22 @@ fn draw_scene(
     }
     // Surfaces carry logical sizes: draw them at the output scale. The
     // wallpaper above is already sized in physical pixels.
-    set_tint(frame, 1.0);
-    draw_planned::<GlesRenderer, _>(frame, scale, previews, &previews_plan).map_err(error)?;
-    frame.clear_tex_program_override();
-    draw_slots(frame, scale, scene, &under, &under_plan, tint).map_err(error)?;
+    crate::color_render::draw_planned(
+        frame,
+        scale,
+        previews,
+        &previews_plan,
+        colors,
+        tint,
+        1.0,
+        None,
+    )
+    .map_err(error)?;
+    draw_slots(frame, scale, scene, &under, &under_plan, tint, colors).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, tile, &tile_plan).map_err(error)?;
-    draw_slots(frame, scale, scene, &over, &over_plan, tint).map_err(error)?;
-    set_tint(frame, 1.0);
-    draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan).map_err(error)?;
-    frame.clear_tex_program_override();
+    draw_slots(frame, scale, scene, &over, &over_plan, tint, colors).map_err(error)?;
+    crate::color_render::draw_planned(frame, scale, &scene.top, &top_plan, colors, tint, 1.0, None)
+        .map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, &fullscreen_bell, &bell_plan).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.effects.textures, &effect_textures_plan)
         .map_err(error)?;
@@ -7573,6 +7597,7 @@ fn draw_slots(
     slots: &[SceneSlot],
     plan: &[Vec<Rectangle<i32, smithay::utils::Physical>>],
     tint: Option<&FrameColor>,
+    colors: &crate::color_render::ColorFrame,
 ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
     use crate::occlusion::draw_planned;
     for (slot, visible) in slots.iter().zip(plan).rev() {
@@ -7599,11 +7624,15 @@ fn draw_slots(
             }
         }
         let result = match *slot {
-            SceneSlot::Element(index) => draw_planned::<GlesRenderer, _>(
+            SceneSlot::Element(index) => crate::color_render::draw_planned(
                 frame,
                 scale,
                 std::slice::from_ref(&scene.elements[index]),
                 visible,
+                colors,
+                tint,
+                brightness,
+                scene.dim_program.as_ref(),
             ),
             SceneSlot::Bell(k) => draw_planned::<GlesRenderer, _>(
                 frame,
