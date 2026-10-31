@@ -442,7 +442,12 @@ show:
 - `H-SCALE` and `H-STORED`: the applied scale and arrangement, and the
   rewritten `monitors.xml`, reach the outputs;
 - `H-INPUT`, `H-LIVE`: the overview answers the keyboard, the compositor
-  never exits or panics and the shell never exits.
+  never exits or panics and the shell never exits;
+- `H-COLORD`: the real colord, on a private system bus as in
+  `tuna-drm-smoke`'s D-COLORD, lists exactly one display device per
+  connected output (`GetDevices`, `Kind` and `XRANDR_name`), and a
+  replugged output gets its device id back (Mutter's
+  `meta_color_manager_monitors_changed` → `update_devices`).
 
 `H-GROWTH` bounds the compositor and shell as the churn lane does: final
 PSS within round-0 PSS × 1.25 + 64 MiB and fds within round-0 + 32.
@@ -450,7 +455,7 @@ Pull requests and dispatches run 4 rounds, nightly 30. The artifacts keep
 the compositor, shell and client logs, every step's outputs and window
 rectangles (`report.json`), the metrics and the state at a failure.
 
-To run it on a host with Linux 6.19+ and sudo, after building
+To run it on a host with Linux 6.19+, colord and sudo, after building
 `tuna-compositor` and `tuna-shell-gtk`:
 
 ```sh
@@ -463,8 +468,7 @@ configuration for exactly the connected monitors, else the current or
 previous configuration covering them, else a linear one with the primary
 kept first. Unlike Mutter, which reads `monitors.xml` once at startup,
 the stored configuration is read from the file at each hotplug. Real
-panels, EDIDs, colord device registration on hotplug and multiple GPUs
-are not covered.
+panels, EDIDs and multiple GPUs are not covered.
 
 ## When a run fails
 

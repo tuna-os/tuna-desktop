@@ -24,7 +24,11 @@ every step it gates on the compositor state (TUNA_COMPOSITOR_STATE):
   H-INPUT    Super opens and Escape closes the overview every round
   H-GROWTH   compositor+shell PSS and fds stay bounded over the storm
   H-LIVE     the compositor never exits or panics, the shell never exits
-Needs root (sudo) for modprobe, configfs, seatd and uinput.
+  H-COLORD   colord (real, on a private system bus) lists exactly one
+             display device per connected output after every step, and a
+             replugged output gets its device id back (Mutter's
+             meta_color_manager_monitors_changed)
+Needs root (sudo) for modprobe, configfs, seatd and uinput, and colord.
 """
 import argparse
 import json
@@ -41,6 +45,20 @@ INSTANCE = "tuna-hotplug"
 SOCKET = "tuna-hotplug"
 PIPES = 3
 APP_PREFIX = "org.tuna.HotplugStress."
+SYSTEM_BUS_CONF = """<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>system</type>
+  <listen>unix:path={socket}</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow user="*"/>
+    <allow own="*"/>
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow receive_sender="*"/>
+  </policy>
+</busconfig>
+"""
 
 
 def client_worker(name):
@@ -235,7 +253,7 @@ def run(args):
               "overview_toggles": 0}
     vkms = Vkms()
     system_seatd = subprocess.run(["systemctl", "is-active", "--quiet", "seatd"]).returncode == 0
-    seatd = dbus_pid = seat = compositor = None
+    seatd = dbus_pid = system_bus_pid = seat = compositor = None
     start = time.monotonic()
 
     def launch(command, name, child_env=None, **kwargs):
@@ -283,6 +301,49 @@ def run(args):
         bus = subprocess.check_output(["dbus-daemon", "--session", "--fork", "--print-address=1",
                                        "--print-pid=1"], text=True).splitlines()
         env["DBUS_SESSION_BUS_ADDRESS"], dbus_pid = bus[0], int(bus[1])
+        # H-COLORD: the real colord on a private system bus, as
+        # tuna-drm-smoke's D-COLORD. Its databases live on a private
+        # tmpfs and it runs as this user, so it trusts the compositor's
+        # calls as its own (cd_main_sender_authenticated) without polkit.
+        colord_bin = next((p for p in ("/usr/libexec/colord", "/usr/lib/colord/colord")
+                           if os.access(p, os.X_OK)), None)
+        if colord_bin is None:
+            raise RuntimeError("H-COLORD: colord is not installed")
+        (out / "system-bus.conf").write_text(SYSTEM_BUS_CONF.format(socket=private / "system_bus_socket"))
+        system_bus = subprocess.check_output(["dbus-daemon", f"--config-file={out / 'system-bus.conf'}", "--fork",
+                                              "--print-address=1", "--print-pid=1"], text=True).splitlines()
+        env["DBUS_SYSTEM_BUS_ADDRESS"], system_bus_pid = system_bus[0], int(system_bus[1])
+        subprocess.run(["sudo", "mkdir", "-p", "/var/lib/colord"], check=True)
+        launch(["sudo", "unshare", "--mount", "--propagation", "private", "sh", "-c",
+                'mount -t tmpfs tmpfs /var/lib/colord && exec setpriv --reuid="$1" --regid="$2" --clear-groups '
+                'env DBUS_SYSTEM_BUS_ADDRESS="$3" "$4" -v',
+                "sh", str(os.getuid()), str(os.getgid()), env["DBUS_SYSTEM_BUS_ADDRESS"], colord_bin], "colord")
+        from gi.repository import Gio, GLib
+        system = Gio.DBusConnection.new_for_address_sync(
+            env["DBUS_SYSTEM_BUS_ADDRESS"],
+            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+            None, None)
+
+        def colord_displays():
+            """colord's display devices by XRANDR_name: {connector: [DeviceId, ...]}."""
+            def call(path, interface, method, args, reply):
+                return system.call_sync("org.freedesktop.ColorManager", path, interface, method, args,
+                                        GLib.VariantType.new(reply), Gio.DBusCallFlags.NONE, 5000, None).unpack()
+            try:
+                found = {}
+                for path in call("/org/freedesktop/ColorManager", "org.freedesktop.ColorManager",
+                                 "GetDevices", None, "(ao)")[0]:
+                    props = call(path, "org.freedesktop.DBus.Properties", "GetAll",
+                                 GLib.Variant("(s)", ("org.freedesktop.ColorManager.Device",)), "(a{sv})")[0]
+                    if props.get("Kind") == "display":
+                        found.setdefault(props.get("Metadata", {}).get("XRANDR_name", ""), []).append(
+                            props.get("DeviceId"))
+                return found
+            except GLib.Error:
+                # Not up yet, or a device went away between the calls.
+                return None
+
+        wait_for("H-COLORD: colord on the private system bus", lambda: colord_displays() is not None, 30)
 
         compositor = launch([str(ROOT / "target/debug/tuna-compositor"), "--backend", "drm",
                              "--socket", SOCKET, "--shell-bin", str(ROOT / "target/debug/tuna-shell-gtk")],
@@ -392,6 +453,27 @@ def run(args):
             target = home if home in outs else primary
             return bool(w and target and contains(outs[target]["rect"], w))
 
+        colord_ids, colord_steps = {}, [0]
+
+        def colord_check(label, want):
+            """H-COLORD: exactly one colord display device per connected
+            output; a connector's device id never changes across replugs."""
+            last = [None]
+
+            def exact():
+                last[0] = colord_displays()
+                return last[0] is not None and sorted(last[0]) == want and \
+                    all(len(ids) == 1 for ids in last[0].values()) and last[0]
+            try:
+                found = wait_for(f"H-COLORD: {label}: colord has one display device for each of {want}", exact)
+            except RuntimeError as error:
+                raise RuntimeError(f"{error}; colord lists {last[0]}") from None
+            for name, (device_id,) in found.items():
+                if colord_ids.setdefault(name, device_id) != device_id:
+                    raise RuntimeError(f"H-COLORD: {label}: {name}'s colord device is {device_id}, "
+                                       f"was {colord_ids[name]}")
+            colord_steps[0] += 1
+
         def check(label, connected, extra=None):
             """Gate one storm step."""
             alive()
@@ -399,6 +481,7 @@ def run(args):
             wait_for(f"{label}: wl_outputs are {want}", lambda: sorted(outputs()) == want)
             wait_for(f"{label}: DisplayConfig lists {want}",
                      lambda: sorted(m["connector"] for m in state().get("display_config", {}).get("monitors", [])) == want)
+            colord_check(label, want)
             if extra:
                 wait_for(f"{label}: {extra[0]}", extra[1])
             for name in clients:
@@ -509,6 +592,9 @@ def run(args):
         assertions["H-LIVE"] = [compositor.poll() is None and "panicked" not in text
                                 and "ShellExited" not in text,
                                 "compositor alive without panic; the shell never exited"]
+        assertions["H-COLORD"] = [colord_steps[0] == len(steps),
+                                  f"{colord_steps[0]} steps: colord listed exactly one display device per connected "
+                                  f"output; replugs kept the device ids {dict(sorted(colord_ids.items()))}"]
     except Exception as error:
         assertions["H-HARNESS"] = [False, f"{type(error).__name__}: {error}"]
     finally:
@@ -533,9 +619,11 @@ def run(args):
             seatd.wait(timeout=5)
         if system_seatd:
             subprocess.run(["sudo", "systemctl", "start", "seatd"])
-        if dbus_pid:
+        for pid in (dbus_pid, system_bus_pid):
+            if not pid:
+                continue
             try:
-                os.kill(dbus_pid, 15)
+                os.kill(pid, 15)
             except ProcessLookupError:
                 pass
         for log in logs:
