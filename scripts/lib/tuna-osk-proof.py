@@ -114,7 +114,7 @@ def lock_times(path, since):
         if change["locked"] is not True:
             return 1
         if change["osk"] is None:
-            print(f"{locked:.6f} {change['t']:.6f}")
+            print(f"{locked!r} {change['t']!r}")
             return 0
     return 1
 
@@ -123,7 +123,7 @@ def unlock_time(path, locked):
     locked = float(locked)
     for change in changes(path):
         if change["t"] > locked and change["locked"] is False:
-            print(f"{change['t']:.6f}")
+            print(repr(change["t"]))
             return 0
     return 1
 

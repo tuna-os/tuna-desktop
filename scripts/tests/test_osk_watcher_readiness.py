@@ -78,7 +78,7 @@ class OskWatcherReadiness(unittest.TestCase):
         self.assertEqual(self.call("lock-times", LOCKED - 0.1), (1, ""))
         self.append(change(HIDDEN, True, None))
         self.assertEqual(self.call("lock-times", LOCKED - 0.1),
-                         (0, f"{LOCKED + 0.1:.6f} {HIDDEN:.6f}\n"))
+                         (0, f"{LOCKED + 0.1!r} {HIDDEN!r}\n"))
 
     def test_unlock_before_hidden_cannot_be_replaced_by_another_lock(self):
         self.append(change(LOCKED, True, MAPPED),
@@ -89,7 +89,7 @@ class OskWatcherReadiness(unittest.TestCase):
     def test_one_sample_can_record_both_lock_and_hide(self):
         self.append(change(HIDDEN, True, None))
         self.assertEqual(self.call("lock-times", LOCKED),
-                         (0, f"{HIDDEN:.6f} {HIDDEN:.6f}\n"))
+                         (0, f"{HIDDEN!r} {HIDDEN!r}\n"))
 
     def test_real_remap_is_not_hidden_by_a_later_hidden_sample(self):
         remap = HIDDEN + 0.1
@@ -107,6 +107,30 @@ class OskWatcherReadiness(unittest.TestCase):
         status, failure = self.call("never", hidden_t, float(stamp))
         self.assertEqual(status, 1)
         self.assertIn(f"mapped at {remap:.6f}", failure)
+
+    def test_submicrosecond_remaps_at_interval_boundaries_are_rejected(self):
+        intervals = (
+            ("after hiding", HIDDEN + 0.0000006, HIDDEN + 0.0000007, UNLOCKED),
+            ("before unlocking", HIDDEN, UNLOCKED + 0.0000003, UNLOCKED + 0.0000004),
+        )
+        locked = LOCKED + 0.0000004
+        for boundary, hidden, remap, unlocked in intervals:
+            with self.subTest(boundary=boundary):
+                self.watch.write_text("", encoding="utf-8")
+                self.append(change(locked, True, MAPPED),
+                            change(hidden, True, None),
+                            change(remap, True, MAPPED),
+                            change(unlocked, False, None))
+                status, times = self.call("lock-times", LOCKED - 0.1)
+                self.assertEqual(status, 0)
+                lock_t, hidden_t = map(float, times.split())
+                self.assertEqual((lock_t, hidden_t), (locked, hidden))
+                status, stamp = self.call("unlock-time", lock_t)
+                self.assertEqual(status, 0)
+                self.assertEqual(float(stamp), unlocked)
+                status, failure = self.call("never", hidden_t, float(stamp))
+                self.assertEqual(status, 1)
+                self.assertIn(f"mapped at {remap:.6f}", failure)
 
     def test_prior_unlock_does_not_qualify_current_unlock(self):
         self.append(change(LOCKED - 1, False, None),
