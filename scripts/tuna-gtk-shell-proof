@@ -2556,8 +2556,31 @@ until grid_cancel_dump "$ARTIFACTS/a11y-folder-page-peek.json" &&
         fail G-GRID-DRAG-CANCEL "real local folder drag did not replace its page arrow with a neighboring-page hint"
     sleep 0.1
 done
+# A source-tree gap can be covered by the real preview after drag begins
+# (the old comparison binary allocates a much wider hint). Re-select from
+# the active allocation, keeping the same owner and first-page contents.
+grid_neutral_wait=$((grid_peek_end - $(date +%s)))
+if [ "$grid_neutral_wait" -lt 0 ] ||
+    ! cstate '.client_dnd_active == true and .overview_open and .overview_app_grid and (.locked == false)' "real folder drag active" "$grid_neutral_wait"; then
+    fail G-GRID-DRAG-CANCEL "native client drag never acquired grab"
+fi
+neutral_coordinates="$("$PY" "$ROOT/scripts/lib/tuna_grid_cancel_proof.py" active-neutral \
+    "$grid_cancel_pid" "$grid_cancel_start" "$ARTIFACTS/a11y-folder-page-peek.json" \
+    "$CSTATE" "$ARTIFACTS/a11y-folder-page-source.json" \
+    "$ARTIFACTS/grid-cancel-active-neutral-point.json")" ||
+    fail G-GRID-DRAG-CANCEL "no actual neutral region in the active first page"
+read -r grid_neutral_x grid_neutral_y <<EOF
+$neutral_coordinates
+EOF
+xdotool mousemove --window "$WID" "$grid_neutral_x" "$grid_neutral_y"
+grid_neutral_wait=$((grid_peek_end - $(date +%s)))
+if [ "$grid_neutral_wait" -lt 0 ] ||
+    ! cstate ".client_dnd_active == true and .overview_open and .overview_app_grid and (.locked == false) and (.pointer_position == [$grid_neutral_x, $grid_neutral_y])" "real folder drag active at observed neutral point" "$grid_neutral_wait"; then
+    fail G-GRID-DRAG-CANCEL "native drag never reached the active neutral point"
+fi
+grid_cancel_dump "$ARTIFACTS/a11y-folder-page-peek.json" ||
+    fail G-GRID-DRAG-CANCEL "active neutral dump failed"
 scrot "$ARTIFACTS/11h-folder-page-peek.png" >/dev/null
-cstate ".client_dnd_active == true and .overview_open and .overview_app_grid and (.locked == false) and (.pointer_position == [$grid_neutral_x, $grid_neutral_y])" "real folder drag active at observed neutral point" || fail G-GRID-DRAG-CANCEL "native client drag never acquired grab"
 cp "$CSTATE" "$ARTIFACTS/grid-cancel-before-escape.json"
 "$PY" "$ROOT/scripts/lib/tuna_grid_cancel_proof.py" neutral-check \
     "$grid_cancel_pid" "$grid_cancel_start" "$ARTIFACTS/a11y-folder-page-peek.json" \
