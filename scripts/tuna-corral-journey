@@ -45,6 +45,10 @@ POINTS = {
     'gdm-user': (640, 349),             # GDM user list, the only row
 }
 CROSSCHECK = {'greeter-user-list', 'session-is-tuna', 'lock'}
+QUALIFICATION_CORE = {
+    'greeter-user-list', 'greeter-password', 'session-is-tuna', 'portal-availability', 'portal-screenshot',
+    'desktop', 'lock', 'unlock-refused', 'unlock', 'power-menu', 'logout-dialog', 'logout',
+}
 # Ready means: boot finished, GDM active, its greeter session on seat0, and
 # something painted on the console.
 GREETER = 'loginctl list-sessions --no-legend | awk \'$6=="greeter" && $4=="seat0"\' | grep -q .'
@@ -258,6 +262,8 @@ class Journey:
         self.args, self.guest, self.console, self.receipt, self.out = args, guest, console, receipt, out
 
     def step(self, sid, title, action):
+        if self.args.qualification_only and sid not in QUALIFICATION_CORE:
+            return
         record = {'id': sid, 'title': title, 'started': now(), 'checks': [], 'result': 'fail'}
         self.receipt['steps'].append(record)
         cursor = self.guest.cursor()
@@ -366,6 +372,52 @@ class Journey:
                     '--object-path /org/freedesktop/portal/desktop --method ' + method, user=True)
                 check(name + ' portal responds', code == 0, {'exit': code, 'stdout': stdout, 'stderr': stderr})
         self.step('portal-availability', 'Published portal interfaces respond (not capture consent)', portals)
+
+        def portal_screenshot(check):
+            # Keep the requester connected until the actual asynchronous portal
+            # Response. A one-shot gdbus sender exits too early to prove this.
+            source = Path(__file__).with_name('lib') / 'tuna-published-screenshot-probe.py'
+            payload = source.read_bytes()
+            uid = g.out(f'id -u {USER}')
+            request_id = time.monotonic_ns()
+            result_path = f'/run/user/{uid}/tuna-variant-screenshot-{request_id}.json'
+            log_path = f'/run/user/{uid}/tuna-variant-screenshot-{request_id}.log'
+            launch = 'exec(__import__("base64").b64decode(' + repr(base64.b64encode(payload).decode()) + '))'
+            code, stdout, stderr = g.sh(
+                f'python3 -c {shlex.quote(launch)} {shlex.quote(result_path)} '
+                f'</dev/null >{shlex.quote(log_path)} 2>&1 & echo $!', user=True)
+            check('native requester launched', code == 0, {'exit': code, 'pid': stdout, 'stderr': stderr})
+            self.receipt['portal_requester_sha256'] = hashlib.sha256(payload).hexdigest()
+            c.wait(2000)
+            prompt = self.out / 'portal-screenshot-prompt.png'
+            c.grab(prompt)
+            self.receipt['portal_request_console'] = {
+                'frame': prompt.name, 'sha256': hashlib.sha256(prompt.read_bytes()).hexdigest(),
+                'meaning': 'console after request; prompt visibility requires visual review'}
+            if g.sh(f'test -f {shlex.quote(result_path)}', user=True)[0] != 0:
+                # This is a real key on the real console, never a consent or
+                # app-ID bypass. A rejected/default-cancel response remains fail.
+                self.receipt['portal_request_console']['input'] = 'Enter on the real console'
+                c.key('Enter', wait=2000)
+            def completed():
+                code, stdout, _ = g.sh(f'cat {shlex.quote(result_path)}', user=True)
+                return stdout if code == 0 and stdout else None
+            try:
+                result = json.loads(wait_for(completed, 150, 'portal Screenshot Response'))
+            except RuntimeError:
+                check('portal Screenshot Response arrived', False, g.sh(f'cat {shlex.quote(log_path)}', user=True)[1:])
+                return
+            self.receipt['portal_screenshot'] = result
+            if not check('successful portal Response returns PNG', result.get('response') == 0
+                         and 'sha256' in result and 'error' not in result, result):
+                return
+            encoded = g.out('base64 ' + shlex.quote(result['path']), user=True)
+            data = base64.b64decode(encoded)
+            Image.open(io.BytesIO(data)).verify()
+            check('retained portal PNG matches guest hash', hashlib.sha256(data).hexdigest() == result['sha256'],
+                  hashlib.sha256(data).hexdigest())
+            (self.out / 'portal-captured.png').write_bytes(data)
+        self.step('portal-screenshot', 'Request Screenshot through the actual published frontend', portal_screenshot)
 
         def desktop(check):
             c.key('Escape', wait=3000)
@@ -558,6 +610,8 @@ def main():
     p.add_argument('--disk', default='40Gi')
     p.add_argument('--reuse', action='store_true', help='VM already built from --image; restart it instead')
     p.add_argument('--keep', action='store_true', help='leave the VM and its disk in place')
+    p.add_argument('--qualification-only', action='store_true',
+                   help='real GDM/session/portal availability/lock/unlock/logout only; not the full daily-driver tour')
     args = p.parse_args()
     if not re.fullmatch(r'[^@\s]+@sha256:[0-9a-f]{64}', args.image):
         p.error('--image must be pinned by digest (REPO@sha256:...)')
@@ -569,6 +623,7 @@ def main():
 
     receipt = {'schema': 2, 'started': now(), 'runner': 'scripts/tuna-corral-journey',
                'runner_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+               'scope': 'qualification-core' if args.qualification_only else 'daily-driver',
                'corral': run(['corral', 'version']).stdout.strip(),
                'image': {'ref': args.image},
                'vm': {'name': args.vm, 'namespace': args.namespace, 'backend': 'kubevirt',

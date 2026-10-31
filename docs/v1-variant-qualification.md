@@ -173,6 +173,12 @@ other inventory rows. The only node accepted by this lane is `karnataka`.
 Only newly owned `tuna-q-variant-*` VMs/disks are created/deleted. Existing
 `punjab` and the independent soak VM are never named.
 
+The default runtime scope is the required real-GDM/session/portal/
+lock/unlock/logout core, using the journey's explicit `--qualification-only`
+mode. `--full-journey` also runs its app, Settings and notification tour.
+Neither mode upgrades portal availability into functional portal qualification.
+The matrix stops rather than creating another VM if owned cleanup is unproven.
+
 ```sh
 ~/.cache/tuna-journey-venv/bin/python scripts/tuna-variant-qualification \
   --out /tmp/tuna-variants-NEW --run --variant grouper --variant flounder
@@ -186,9 +192,20 @@ canvas, retains frame hashes, and deletes its VM/disks. Failure manifests also
 attempt a Corral framebuffer capture before deletion. No candidate compositor,
 shell or session payload is copied into the published-image test.
 
-The portal step checks real frontend Settings, Screenshot and ScreenCast
-interface replies in the logged-in published session. It is explicitly
-**availability-only**, not consent/capture/stream/revocation qualification.
-Unreviewed frames and those interface probes never become a v1 pass. Functional
-portal and visual evidence must be supplied against the same digest, and every
-required gate must pass. Registry errors remain errors, not unsupported waivers.
+The portal availability step checks real frontend Settings, Screenshot and
+ScreenCast interface replies in the logged-in published session. Those probes
+alone remain **availability-only**. A separate persistent native Gio requester
+then calls the actual Screenshot portal, awaits its asynchronous Response, and
+retains/validates the returned PNG and its guest/host hashes. It neither spoofs
+an app ID nor installs a backend or candidate desktop code. If the request has
+not completed, the real console receives Enter; rejection, missing native
+Python/GObject support and timeout remain failures. The retained request-time
+console frame needs visual review to establish whether a consent UI appeared;
+PNG success by itself is not proof that a prompt was displayed.
+
+Earlier receipts identify the actual runner hash and do not gain new proof
+retroactively: Yellowfin's retained run predates the functional Screenshot
+requester. Functional ScreenCast streaming and consent/revocation behavior
+are still separate required evidence, never inferred from Screenshot success.
+Unreviewed frames, interface availability or an incomplete portal flow do not
+become a v1 pass. Registry errors remain errors, not unsupported waivers.

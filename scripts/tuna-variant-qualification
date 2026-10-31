@@ -37,6 +37,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', required=True, type=Path, help='new evidence directory')
     parser.add_argument('--run', action='store_true', help='install and exercise published images; default probes registry only')
+    parser.add_argument('--full-journey', action='store_true', help='also exercise the daily-driver Settings/app/notification tour')
     parser.add_argument('--variant', action='append', help='limit runtime journeys, not inventory or registry discovery')
     parser.add_argument('--node', default='karnataka')
     args = parser.parse_args()
@@ -111,7 +112,8 @@ def main():
             save(receipt, report)
             try:
                 result = command([sys.executable, str(runner), '--image', row['image'], '--vm', vm,
-                                  '--node', args.node, '--out', str(directory)], timeout=7200)
+                                  '--node', args.node, '--out', str(directory)]
+                                 + ([] if args.full_journey else ['--qualification-only']), timeout=7200)
                 save(args.out / f'{name}-runner.json', result)
                 row['runner_exit'] = result['exit']
                 manifest_path = directory / 'manifest.json'
@@ -130,6 +132,9 @@ def main():
                         'portals': 'availability-only' if steps.get('portal-availability') == 'pass' else steps.get('portal-availability', 'not-run'),
                         'lock-unlock': 'pass' if all(steps.get(s) == 'pass' for s in ('lock', 'unlock-refused', 'unlock')) else 'not-proven',
                     })
+                    row['portal_screenshot'] = manifest.get('portal_screenshot')
+                    if steps.get('portal-screenshot') == 'pass':
+                        row['gates']['portals'] = 'screenshot-functional; screencast-unproven'
                 row['runtime'] = 'machine-journey-passed-needs-review' if result['exit'] == 0 else 'failed'
                 if not (row.get('cleanup') or {}).get('deleted'):
                     row['runtime'] = 'failed'

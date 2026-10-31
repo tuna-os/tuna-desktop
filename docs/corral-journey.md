@@ -66,6 +66,18 @@ cannot name somebody else's VM. `--reuse` restarts a VM that is already
 built from the same digest. The exit status is nonzero when any step
 fails.
 
+For the all-variant install/GDM/session/portal/lock/unlock/logout
+subset, use `--qualification-only`; it omits the wider app/Settings/notification
+tour and records `scope: qualification-core` in the manifest. The default
+remains the full daily-driver journey. See the
+[digest-pinned variant matrix](v1-variant-qualification.md) for sequential
+orchestration and the distinction between portal availability and functional
+capture/consent qualification.
+The native Screenshot requester remains connected until the actual portal
+Response and retains a returned PNG, without app-ID or consent bypass. Its
+request-time console frame requires visual review; a successful PNG response
+does not by itself prove a consent prompt, ScreenCast stream or revocation.
+
 ## Limits
 
 - The pointer coordinates in `POINTS` match the 1280x800 output and
