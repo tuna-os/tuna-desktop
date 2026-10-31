@@ -888,6 +888,7 @@ mod session_tests {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
 
     const PASSWORD: &str = "s3cret-admin-pw";
 
@@ -962,15 +963,29 @@ mod session_tests {
 
     /// A fake setuid helper: logs its argv and stdin lines to `log`.
     fn fake_helper(dir: &Path, body: &str) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
+        // Never open the executable for writing in this multithreaded test
+        // process: a concurrent fork can retain that fd even after we close
+        // it, making exec fail with ETXTBSY. Only the writer child opens the
+        // inode, and it must exit before any caller executes the fixture.
         let log = dir.join("helper.log");
         let path = dir.join("helper");
         let script = format!(
             "#!/bin/sh\necho \"argv:$*\" >> '{log}'\n{body}\n",
             log = log.display()
         );
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "fake-helper-writer"])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success(), "helper writer failed");
         (path, log)
     }
 
@@ -978,6 +993,35 @@ mod session_tests {
         echo 'PAM_PROMPT_ECHO_OFF Password: '\n\
         read p; echo \"pw:$p\" >> \"$(dirname \"$0\")/helper.log\"\n\
         if [ \"$p\" = s3cret-admin-pw ]; then echo SUCCESS; else echo FAILURE; fi";
+
+    #[test]
+    fn fake_helpers_are_ready_to_execute_under_parallel_process_creation() {
+        const WORKERS: usize = 4;
+        let start = std::sync::Barrier::new(WORKERS);
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..16 {
+                        let dir = tempfile::tempdir().unwrap();
+                        let (helper, log) = fake_helper(
+                            dir.path(),
+                            "printf '%s\\n' 'literal $(not-expanded) \\backslash %s'; exit 7",
+                        );
+                        assert!(!log.exists(), "the writer must not execute the helper");
+                        // Other workers keep spawning while fixtures are
+                        // written. Every execution must work on its first try.
+                        let output = Command::new(helper).arg("alice").output().unwrap();
+                        assert_eq!(output.status.code(), Some(7));
+                        assert_eq!(output.stdout, b"literal $(not-expanded) \\backslash %s\n");
+                        assert!(output.stderr.is_empty());
+                        assert_eq!(std::fs::read_to_string(log).unwrap(), "argv:alice\n");
+                    }
+                });
+            }
+        });
+    }
 
     #[test]
     fn socket_comes_first_and_speaks_polkits_wire_protocol() {

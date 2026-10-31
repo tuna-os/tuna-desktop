@@ -110,6 +110,17 @@ two jobs, no incremental state, and waits on one machine-wide lock
 (`/tmp/tuna-local-build.lock`), so builds from parallel worktrees queue
 instead of exhausting memory.
 
+The polkit unit tests can be run with
+`timeout 15m just test -p tuna-shell-gtk polkit`. Their fake executable
+helpers are written and made executable by a dedicated child process,
+which exits before the helper is launched. Do not write those executables
+in the multithreaded test process: a concurrent fork can inherit the
+writable file descriptor and make execution fail with `ETXTBSY`, even
+after the parent closes it or renames the file. A parallel fixture test
+also checks immediate execution, literal script bytes and exit status;
+the existing session tests still assert socket fallback and password
+handling.
+
 Cleanup is automatic where it is safe:
 
 - `just proof` runs each proof with a fresh `HOME` and XDG directories
