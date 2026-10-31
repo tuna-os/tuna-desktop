@@ -19,6 +19,11 @@
 
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
+    /* Podman may launch the fixture with stdin closed. Reserve its standard
+     * descriptor before creating protocol/ack sockets and dup2'ing the child. */
+    int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (input < 0 || dup2(input, STDIN_FILENO) < 0) return 2;
+    if (input != STDIN_FILENO) close(input);
     int result = 1, status = 0, acknowledge[2], receipt[2];
     pid_t child = -1;
     struct eis *eis = eis_new(NULL);
@@ -48,7 +53,7 @@ int main(int argc, char **argv) {
     while (eis_now(eis) < deadline) {
         struct pollfd fds[] = {
             {.fd = eis_get_fd(eis), .events = POLLIN},
-            {.fd = receipt[0], .events = sent ? 0 : POLLIN},
+            {.fd = sent ? -1 : receipt[0], .events = POLLIN},
         };
         REQUIRE(poll(fds, 2, 50) >= 0);
         if (!sent && (fds[1].revents & (POLLIN | POLLHUP))) {
@@ -125,7 +130,8 @@ int main(int argc, char **argv) {
             deadline = eis_now(eis) + 2000000;
         }
     }
-    fprintf(stderr, "EIS lifetime delivery/disconnect deadline expired\n");
+    fprintf(stderr, "EIS lifetime delivery/disconnect deadline expired: sent=%d acknowledged=%d keys=%u buttons=%u absolute=%u frames=%u\n",
+            sent, acknowledged, keys, buttons, absolute, frames);
 cleanup:
     if (child > 0) {
         kill(child, SIGKILL);
