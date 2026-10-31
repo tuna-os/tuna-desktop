@@ -15,7 +15,16 @@
 //! full-screen layer with the 60-second countdown (shown in steps of ten
 //! until the last ten seconds), the applications whose logout inhibitors
 //! the manager passed ("Some applications are busy or have unsaved
-//! work"), Cancel, and the action. The manager opens it for the menu and
+//! work"), for Restart and Power Off the other users' logind sessions
+//! ("Other users are logged in", greeter, closing and this session left
+//! out), Cancel, and the action. Log Out names the user by their
+//! AccountsService real name. When gnome-software has an offline update
+//! prepared or scheduled, Restart and Power Off offer "Install pending
+//! software updates" (a scheduled one turns Restart into "Restart &
+//! Install Updates"), and with the battery discharging below 30 % the
+//! dialog warns to plug in first. Holding Alt on Restart shows "Boot
+//! Options" where logind can reboot into the boot loader menu. The
+//! manager opens it for the menu and
 //! for gnome-settings-daemon's power, logout, reboot and shutdown keys.
 //! As in GNOME, Cancel emits `Canceled` then `Closed`, a confirmation or
 //! the countdown's end emits `ConfirmedShutdown`, `ConfirmedReboot` or
@@ -55,6 +64,194 @@ const INHIBITOR_IFACE: &str = "org.gnome.SessionManager.Inhibitor";
 const INHIBIT_LOGOUT: u32 = 1;
 /// GNOME's application section title (endSessionDialog.js).
 pub const BUSY_APPLICATIONS: &str = "Some applications are busy or have unsaved work";
+/// GNOME's session section title (endSessionDialog.js `_sessionSection`).
+pub const OTHER_USERS: &str = "Other users are logged in";
+/// endSessionDialog.js `MAX_USERS_IN_SESSION_DIALOG`.
+const MAX_USERS_IN_SESSION_DIALOG: usize = 5;
+/// endSessionDialog.js `LOW_BATTERY_THRESHOLD` (percent).
+pub const LOW_BATTERY_THRESHOLD: f64 = 30.0;
+/// endSessionDialog.js `_batteryWarning`.
+pub const LOW_BATTERY_WARNING: &str = "Low battery power: please plug in before installing updates";
+/// endSessionDialog.js `checkBoxText` of Restart and Power Off.
+pub const INSTALL_UPDATES: &str = "Install pending software updates";
+/// The Restart button's Alt alternative (endSessionDialog.js `_updateButtons`).
+pub const BOOT_OPTIONS: &str = "Boot Options";
+/// loginManager.js `setRebootToBootLoaderMenu`: show the menu for 60 s.
+const BOOT_LOADER_MENU_TIMEOUT_US: u64 = 60_000_000;
+const ACCOUNTS: &str = "org.freedesktop.Accounts";
+const UPOWER: &str = "org.freedesktop.UPower";
+const DISPLAY_DEVICE: &str = "/org/freedesktop/UPower/devices/DisplayDevice";
+/// gnome-software's offline updates (endSessionDialog.js
+/// `SoftwareOfflineUpdatesProxy`).
+const SOFTWARE: &str = "org.gnome.Software";
+const OFFLINE_UPDATES_PATH: &str = "/org/gnome/Software/OfflineUpdates";
+const OFFLINE_UPDATES_IFACE: &str = "org.gnome.Software.OfflineUpdates";
+
+/// UPower's DisplayDevice as endSessionDialog.js `_isBatteryLow` reads
+/// it: present, neither charging (1) nor fully charged (4), and below
+/// [`LOW_BATTERY_THRESHOLD`].
+pub fn battery_low(present: bool, state: u32, percentage: f64) -> bool {
+    present && state != 1 && state != 4 && percentage < LOW_BATTERY_THRESHOLD
+}
+
+/// gnome-software's `GetState` answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateState {
+    None,
+    Prepared,
+    Scheduled,
+}
+
+impl UpdateState {
+    pub fn parse(state: &str) -> Self {
+        match state {
+            "prepared" => Self::Prepared,
+            "scheduled" => Self::Scheduled,
+            _ => Self::None,
+        }
+    }
+
+    fn pending(self) -> bool {
+        self != Self::None
+    }
+}
+
+/// What one open dialog shows, endSessionDialog.js `DialogContent` with
+/// the offline-update state it was opened with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Content {
+    pub action: Action,
+    /// `DialogType.UPDATE_RESTART`.
+    pub update_restart: bool,
+    /// gnome-software's state; `None` when it is not running.
+    pub updates: Option<UpdateState>,
+}
+
+impl Content {
+    /// Whether "Install pending software updates" shows (`OpenAsync`).
+    pub fn checkbox_visible(self) -> bool {
+        matches!(self.action, Action::Restart | Action::PowerOff)
+            && !self.update_restart
+            && self.updates.is_some_and(UpdateState::pending)
+    }
+
+    /// `_shouldShowLowBatteryWarning`.
+    pub fn battery_warning(self, low: bool, checked: bool) -> bool {
+        self.action != Action::LogOut
+            && low
+            && (checked || self.updates == Some(UpdateState::Scheduled))
+    }
+
+    /// `showOtherSessions`.
+    pub fn shows_other_sessions(self) -> bool {
+        matches!(self.action, Action::Restart | Action::PowerOff)
+    }
+
+    /// Title, countdown sentence and confirm label (`_sync`, with the
+    /// user's real name once AccountsService has loaded it).
+    pub fn text(
+        self,
+        checked: bool,
+        real_name: Option<&str>,
+        seconds: u32,
+    ) -> (String, String, &'static str) {
+        let unit = if seconds == 1 { "second" } else { "seconds" };
+        match (self.action, real_name) {
+            (Action::Restart, _) if self.update_restart => (
+                "Restart & Install Updates".into(),
+                format!(
+                    "The system will automatically restart and install updates in {seconds} {unit}"
+                ),
+                "Restart & Install",
+            ),
+            (Action::Restart, _) if checked => (
+                "Install Updates & Restart".into(),
+                self.action.countdown_text(seconds),
+                "Restart",
+            ),
+            (Action::PowerOff, _) if checked => (
+                "Install Updates & Power Off".into(),
+                self.action.countdown_text(seconds),
+                "Power Off",
+            ),
+            (Action::LogOut, Some(name)) => (
+                format!("Log Out {name}"),
+                format!("{name} will be logged out automatically in {seconds} {unit}"),
+                "Log Out",
+            ),
+            (action, _) => (
+                action.title().into(),
+                action.countdown_text(seconds),
+                action.title(),
+            ),
+        }
+    }
+}
+
+/// What a confirmation tells gnome-software first (endSessionDialog.js
+/// `_confirm`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostUpdate {
+    Nothing,
+    /// `SetAction(action)`.
+    SetAction(&'static str),
+    /// `SetAction("shutdown")`; when it takes, reboot to install instead.
+    ShutdownAfterInstall,
+    /// `Cancel()`: the prepared update is declined.
+    Cancel,
+}
+
+pub fn post_update(content: Content, checked: bool, signal: &str) -> PostUpdate {
+    if content.checkbox_visible() {
+        if !checked {
+            return PostUpdate::Cancel;
+        }
+        return match signal {
+            "ConfirmedReboot" => PostUpdate::SetAction("reboot"),
+            "ConfirmedShutdown" => PostUpdate::ShutdownAfterInstall,
+            _ => PostUpdate::Nothing,
+        };
+    }
+    if content.update_restart && content.updates.is_some_and(UpdateState::pending) {
+        return PostUpdate::SetAction("reboot");
+    }
+    PostUpdate::Nothing
+}
+
+/// libaccountsservice `act_user_get_real_name`: `RealName`, or the user
+/// name when it is empty.
+pub fn real_name(real: &str, user_name: &str) -> String {
+    if real.is_empty() {
+        user_name.to_owned()
+    } else {
+        real.to_owned()
+    }
+}
+
+/// Whether endSessionDialog.js `_loadSessions` lists a logind session:
+/// a user session (no greeter), not closing, and not this one.
+pub fn lists_session(class: &str, state: &str, id: &str, own: &str) -> bool {
+    class == "user" && state != "closing" && id != own
+}
+
+/// A listed session's title (`_loadSessions`): the real name (else the
+/// user name) marked remote or console, and otherwise the user name
+/// itself, as GNOME 51 labels it.
+pub fn session_label(user_name: &str, real_name: Option<&str>, remote: bool, kind: &str) -> String {
+    let display = real_name.unwrap_or(user_name);
+    if remote {
+        format!("{display} (remote)")
+    } else if kind == "tty" {
+        format!("{display} (console)")
+    } else {
+        user_name.to_owned()
+    }
+}
+
+/// loginManager.js `canRebootToBootLoaderMenu`: `yes` or `challenge`.
+pub fn boot_loader_menu_available(answer: &str) -> bool {
+    matches!(answer, "yes" | "challenge")
+}
 
 /// The seconds the countdown shows with `left` of `total` remaining:
 /// endSessionDialog.js `_roundSecondsToInterval(total, left, 10)`, which
@@ -94,15 +291,22 @@ const END_SESSION_DIALOG_XML: &str = r#"<node>
 
 /// The action an `Open` dialog type asks for: gnome-session's
 /// `GsmShellEndSessionDialogType` (0 log out, 1 shutdown, 2 restart).
-/// GNOME Shell's type 3 is its own offline-update restart, which it
-/// derives from a restart when gnome-software has an update scheduled;
-/// Tuna has no offline updates, so it is an unknown type here.
+/// GNOME Shell's own type 3, the offline-update restart, is
+/// [`open_type`]'s.
 pub fn dialog_action(kind: u32) -> Option<Action> {
     match kind {
         0 => Some(Action::LogOut),
         1 => Some(Action::PowerOff),
         2 => Some(Action::Restart),
         _ => None,
+    }
+}
+
+/// An `Open` type and whether it is GNOME Shell's `UPDATE_RESTART` (3).
+pub fn open_type(kind: u32) -> Option<(Action, bool)> {
+    match kind {
+        3 => Some((Action::Restart, true)),
+        kind => dialog_action(kind).map(|action| (action, false)),
     }
 }
 
@@ -332,6 +536,266 @@ async fn inhibiting_app(
     Some((app, reason))
 }
 
+/// One D-Bus call with a 5 s timeout.
+async fn call(
+    bus: &gio::DBusConnection,
+    name: &str,
+    path: &str,
+    iface: &str,
+    method: &str,
+    args: Option<glib::Variant>,
+    flags: gio::DBusCallFlags,
+) -> Result<glib::Variant, glib::Error> {
+    bus.call_future(
+        Some(name),
+        path,
+        iface,
+        method,
+        args.as_ref(),
+        None,
+        flags,
+        5000,
+    )
+    .await
+}
+
+/// Every property of `iface` on `path`.
+async fn properties(
+    bus: &gio::DBusConnection,
+    name: &str,
+    path: &str,
+    iface: &str,
+) -> Option<glib::VariantDict> {
+    let all = call(
+        bus,
+        name,
+        path,
+        "org.freedesktop.DBus.Properties",
+        "GetAll",
+        Some((iface,).to_variant()),
+        gio::DBusCallFlags::NONE,
+    )
+    .await
+    .ok()?;
+    Some(glib::VariantDict::new(Some(&all.child_value(0))))
+}
+
+fn dict_string(dict: &glib::VariantDict, key: &str) -> String {
+    dict.lookup::<String>(key)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// gnome-software's offline update state (endSessionDialog.js
+/// `_getUpdateState`), or `None` when gnome-software is not running
+/// (it is never started for the dialog).
+async fn offline_update_state(bus: &gio::DBusConnection) -> Option<UpdateState> {
+    let state = call(
+        bus,
+        SOFTWARE,
+        OFFLINE_UPDATES_PATH,
+        OFFLINE_UPDATES_IFACE,
+        "GetState",
+        None,
+        gio::DBusCallFlags::NO_AUTO_START,
+    )
+    .await;
+    match state {
+        Ok(state) => Some(UpdateState::parse(
+            &state.child_value(0).get::<String>().unwrap_or_default(),
+        )),
+        Err(e)
+            if e.matches(gio::DBusError::ServiceUnknown)
+                || e.matches(gio::DBusError::NameHasNoOwner) =>
+        {
+            None
+        }
+        Err(e) => {
+            // GNOME keeps the proxy and treats the state as neither.
+            eprintln!("tuna-shell-gtk: Failed to get update info from gnome-software: {e}");
+            Some(UpdateState::None)
+        }
+    }
+}
+
+/// Tell gnome-software what follows the offline update
+/// (`_setPostUpdateAction`); whether it took.
+async fn set_post_update_action(bus: &gio::DBusConnection, action: &str) -> bool {
+    let set = call(
+        bus,
+        SOFTWARE,
+        OFFLINE_UPDATES_PATH,
+        OFFLINE_UPDATES_IFACE,
+        "SetAction",
+        Some((action,).to_variant()),
+        gio::DBusCallFlags::NO_AUTO_START,
+    )
+    .await;
+    if let Err(e) = &set {
+        eprintln!("tuna-shell-gtk: offline update SetAction({action}): {e}");
+    }
+    set.is_ok()
+}
+
+/// `_triggerOfflineUpdateCancel`.
+async fn cancel_offline_update(bus: &gio::DBusConnection) {
+    if let Err(e) = call(
+        bus,
+        SOFTWARE,
+        OFFLINE_UPDATES_PATH,
+        OFFLINE_UPDATES_IFACE,
+        "Cancel",
+        None,
+        gio::DBusCallFlags::NO_AUTO_START,
+    )
+    .await
+    {
+        eprintln!("tuna-shell-gtk: offline update Cancel: {e}");
+    }
+}
+
+/// A user as AccountsService knows them: the real name
+/// (`act_user_get_real_name`) and the avatar file, or `None` while the
+/// user is not loaded (AccountsService absent or the user unknown).
+async fn account(
+    system: &gio::DBusConnection,
+    user_name: &str,
+) -> Option<(String, Option<String>)> {
+    let path = call(
+        system,
+        ACCOUNTS,
+        "/org/freedesktop/Accounts",
+        ACCOUNTS,
+        "FindUserByName",
+        Some((user_name,).to_variant()),
+        gio::DBusCallFlags::NONE,
+    )
+    .await
+    .ok()?
+    .child_value(0);
+    let path = path.str()?.to_owned();
+    let user = properties(system, ACCOUNTS, &path, "org.freedesktop.Accounts.User").await?;
+    let name = dict_string(&user, "UserName");
+    let icon =
+        Some(dict_string(&user, "IconFile")).filter(|icon| std::path::Path::new(icon).is_file());
+    Some((
+        real_name(
+            &dict_string(&user, "RealName"),
+            if name.is_empty() { user_name } else { &name },
+        ),
+        icon,
+    ))
+}
+
+/// This process's logind session id (loginManager.js
+/// `getCurrentSessionProxy`): `XDG_SESSION_ID`, else the session of
+/// this PID.
+async fn own_session_id(system: &gio::DBusConnection) -> Option<String> {
+    if let Some(id) = std::env::var("XDG_SESSION_ID")
+        .ok()
+        .filter(|id| !id.is_empty())
+    {
+        return Some(id);
+    }
+    let path = call(
+        system,
+        LOGIND,
+        MANAGER_PATH,
+        MANAGER_IFACE,
+        "GetSessionByPID",
+        Some((std::process::id(),).to_variant()),
+        gio::DBusCallFlags::NONE,
+    )
+    .await
+    .ok()?
+    .child_value(0);
+    let session = properties(
+        system,
+        LOGIND,
+        path.str()?,
+        "org.freedesktop.login1.Session",
+    )
+    .await?;
+    Some(dict_string(&session, "Id"))
+}
+
+/// The other users' sessions, titled and with their avatars
+/// (endSessionDialog.js `_loadSessions`), at most
+/// [`MAX_USERS_IN_SESSION_DIALOG`].
+async fn other_sessions(system: &gio::DBusConnection) -> Vec<(String, Option<String>)> {
+    let Some(own) = own_session_id(system).await else {
+        return Vec::new();
+    };
+    let Ok(list) = call(
+        system,
+        LOGIND,
+        MANAGER_PATH,
+        MANAGER_IFACE,
+        "ListSessions",
+        None,
+        gio::DBusCallFlags::NONE,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+    let mut listed = Vec::new();
+    for entry in list.child_value(0).iter() {
+        let user_name = entry.child_value(2).get::<String>().unwrap_or_default();
+        let Some(path) = entry.child_value(4).str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(session) =
+            properties(system, LOGIND, &path, "org.freedesktop.login1.Session").await
+        else {
+            continue;
+        };
+        if !lists_session(
+            &dict_string(&session, "Class"),
+            &dict_string(&session, "State"),
+            &dict_string(&session, "Id"),
+            &own,
+        ) {
+            continue;
+        }
+        let remote = session
+            .lookup::<bool>("Remote")
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+        let (real, icon) = account(system, &user_name).await.unzip();
+        let label = session_label(
+            &user_name,
+            real.as_deref(),
+            remote,
+            &dict_string(&session, "Type"),
+        );
+        listed.push((label, icon.flatten()));
+        if listed.len() == MAX_USERS_IN_SESSION_DIALOG {
+            break;
+        }
+    }
+    listed
+}
+
+/// loginManager.js `canRebootToBootLoaderMenu`.
+async fn can_reboot_to_boot_loader_menu(system: &gio::DBusConnection) -> bool {
+    call(
+        system,
+        LOGIND,
+        MANAGER_PATH,
+        MANAGER_IFACE,
+        "CanRebootToBootLoaderMenu",
+        None,
+        gio::DBusCallFlags::NONE,
+    )
+    .await
+    .ok()
+    .and_then(|answer| answer.child_value(0).get::<String>())
+    .is_some_and(|answer| boot_loader_menu_available(&answer))
+}
+
 /// The power surfaces: the menu rows for quick settings, the dialog.
 pub struct PowerUi {
     nested: bool,
@@ -341,22 +805,47 @@ pub struct PowerUi {
     title: gtk::Label,
     body: gtk::Label,
     confirm: gtk::Button,
+    /// Restart's Alt alternative, "Boot Options" (`_rebootButtonAlt`).
+    boot_options: gtk::Button,
+    /// "Install pending software updates" (`_checkBox`).
+    updates_check: gtk::CheckButton,
+    /// `_batteryWarning`.
+    battery_warning: gtk::Label,
     /// "Some applications are busy or have unsaved work" and its list.
     applications: gtk::Box,
     application_list: gtk::Box,
+    /// "Other users are logged in" and its list (`_sessionSection`).
+    sessions: gtk::Box,
+    session_list: gtk::Box,
+    /// The open dialog's content.
+    content: Cell<Content>,
+    /// The user's AccountsService real name, once loaded.
+    real_name: RefCell<Option<String>>,
+    /// logind can reboot into the boot loader menu (`_canRebootToBootLoaderMenu`).
+    can_boot_menu: Cell<bool>,
+    /// Alt swaps Restart for Boot Options (`_altCapture.enabled`).
+    alt_capture: Cell<bool>,
     /// Inhibitors still listed or loading (`_applications.length`).
     inhibitors: Cell<usize>,
     pending: Cell<Option<Action>>,
+    /// A confirmed dialog whose service call has not yet completed.
+    /// Close still owes its waiting manager a Closed signal.
+    confirming: Cell<bool>,
     /// The open dialog is the nested preview's own (no manager waits on
     /// its answer; it acts itself).
     local: Cell<bool>,
-    /// Counts dialogs opened, so a stale inhibitor load is dropped.
+    /// Invalidates asynchronous loads and confirmations when a request
+    /// is replaced, canceled or closed.
     serial: Cell<u64>,
     total: Cell<u32>,
     left: Cell<u32>,
     timer: RefCell<Option<glib::SourceId>>,
     /// The session bus, where the dialog's D-Bus signals go.
     bus: RefCell<Option<gio::DBusConnection>>,
+    /// The system bus: logind, AccountsService.
+    system: RefCell<Option<gio::DBusConnection>>,
+    /// UPower's DisplayDevice (`_powerProxy`).
+    upower: RefCell<Option<gio::DBusProxy>>,
 }
 
 impl PowerUi {
@@ -394,6 +883,19 @@ impl PowerUi {
         body.set_justify(gtk::Justification::Center);
         content.append(&title);
         content.append(&body);
+        // MessageDialogContent's check box and battery warning.
+        let updates_check = gtk::CheckButton::with_label(INSTALL_UPDATES);
+        updates_check.set_halign(gtk::Align::Center);
+        updates_check.set_visible(false);
+        let battery_warning = gtk::Label::new(Some(LOW_BATTERY_WARNING));
+        battery_warning.add_css_class("end-session-dialog-battery-warning");
+        battery_warning.set_wrap(true);
+        battery_warning.set_max_width_chars(1);
+        battery_warning.set_hexpand(true);
+        battery_warning.set_justify(gtk::Justification::Center);
+        battery_warning.set_visible(false);
+        content.append(&updates_check);
+        content.append(&battery_warning);
         let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         buttons.add_css_class("modal-dialog-button-box");
         buttons.set_homogeneous(true);
@@ -401,31 +903,19 @@ impl PowerUi {
         cancel.add_css_class("modal-dialog-button");
         let confirm = gtk::Button::with_label("");
         confirm.add_css_class("modal-dialog-button");
+        let boot_options = gtk::Button::with_label(BOOT_OPTIONS);
+        boot_options.add_css_class("modal-dialog-button");
+        boot_options.set_visible(false);
         buttons.append(&cancel);
         buttons.append(&confirm);
-        // endSessionDialog.js `_applicationSection`: a Dialog.ListSection
-        // under the message, shown while inhibitors are listed.
-        let applications = gtk::Box::new(gtk::Orientation::Vertical, 18);
-        applications.add_css_class("dialog-list");
-        let applications_title = gtk::Label::new(Some(BUSY_APPLICATIONS));
-        applications_title.add_css_class("dialog-list-title");
-        applications_title.set_wrap(true);
-        applications_title.set_max_width_chars(1);
-        applications_title.set_hexpand(true);
-        applications_title.set_justify(gtk::Justification::Center);
-        let application_list = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        application_list.add_css_class("dialog-list-box");
-        let scroll = gtk::ScrolledWindow::new();
-        scroll.add_css_class("dialog-list-scrollview");
-        scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
-        scroll.set_propagate_natural_height(true);
-        scroll.set_max_content_height(200);
-        scroll.set_child(Some(&application_list));
-        applications.append(&applications_title);
-        applications.append(&scroll);
-        applications.set_visible(false);
+        buttons.append(&boot_options);
+        // endSessionDialog.js `_applicationSection` and `_sessionSection`:
+        // Dialog.ListSections under the message, shown while listing.
+        let (applications, application_list) = list_section(BUSY_APPLICATIONS);
+        let (sessions, session_list) = list_section(OTHER_USERS);
         card.append(&content);
         card.append(&applications);
+        card.append(&sessions);
         card.append(&buttons);
         dialog.set_child(Some(&card));
 
@@ -436,16 +926,32 @@ impl PowerUi {
             title,
             body,
             confirm,
+            boot_options,
+            updates_check,
+            battery_warning,
             applications,
             application_list,
+            sessions,
+            session_list,
+            content: Cell::new(Content {
+                action: Action::LogOut,
+                update_restart: false,
+                updates: None,
+            }),
+            real_name: RefCell::new(None),
+            can_boot_menu: Cell::new(false),
+            alt_capture: Cell::new(false),
             inhibitors: Cell::new(0),
             pending: Cell::new(None),
+            confirming: Cell::new(false),
             local: Cell::new(false),
             serial: Cell::new(0),
             total: Cell::new(0),
             left: Cell::new(0),
             timer: RefCell::new(None),
             bus: RefCell::new(None),
+            system: RefCell::new(None),
+            upower: RefCell::new(None),
         });
         {
             let me = ui.clone();
@@ -453,22 +959,39 @@ impl PowerUi {
         }
         {
             let me = ui.clone();
-            ui.confirm.connect_clicked(move |_| me.run_pending());
+            ui.confirm.connect_clicked(move |_| me.run_pending(false));
         }
         {
-            // Escape cancels, as in GNOME.
+            let me = ui.clone();
+            ui.boot_options
+                .connect_clicked(move |_| me.run_pending(true));
+        }
+        {
+            // The check box re-syncs the title and warning (`clicked`).
+            let me = ui.clone();
+            ui.updates_check.connect_toggled(move |_| me.sync());
+        }
+        {
+            // Escape cancels, as in GNOME; Alt swaps Restart for Boot
+            // Options while held (`_onKeyCaptured`).
             let keys = gtk::EventControllerKey::new();
+            keys.set_propagation_phase(gtk::PropagationPhase::Capture);
             let me = ui.clone();
             keys.connect_key_pressed(move |_, key, _, _| {
                 if key == gtk::gdk::Key::Escape {
                     me.cancel();
                     return glib::Propagation::Stop;
                 }
+                me.alt_held(key, true);
                 glib::Propagation::Proceed
             });
+            let me = ui.clone();
+            keys.connect_key_released(move |_, key, _, _| me.alt_held(key, false));
             ui.dialog.add_controller(keys);
         }
-        // System bus: the before-sleep lock.
+        // System bus: the before-sleep lock, the boot loader menu check
+        // (`_getCanRebootToBootLoaderMenu`) and UPower's display device.
+        let weak = Rc::downgrade(&ui);
         gio::bus_get(
             gio::BusType::System,
             None::<&gio::Cancellable>,
@@ -476,6 +999,15 @@ impl PowerUi {
                 let Ok(conn) = conn else {
                     return;
                 };
+                if let Some(me) = weak.upgrade() {
+                    *me.system.borrow_mut() = Some(conn.clone());
+                    me.watch_battery(&conn);
+                    let (me, conn) = (me.clone(), conn.clone());
+                    glib::spawn_future_local(async move {
+                        me.can_boot_menu
+                            .set(can_reboot_to_boot_loader_menu(&conn).await);
+                    });
+                }
                 let sub = conn.subscribe_to_signal(
                     Some(LOGIND),
                     Some(MANAGER_IFACE),
@@ -550,39 +1082,61 @@ impl PowerUi {
                 eprintln!(
                     "tuna-shell-gtk: power menu: the session manager is not this compositor's; {action:?} stays local"
                 );
-                me.ask_for(action, COUNTDOWN_S, Vec::new(), true);
+                let content = Content {
+                    action,
+                    update_restart: false,
+                    updates: None,
+                };
+                me.ask_for(content, COUNTDOWN_S, Vec::new(), true);
             }
         });
     }
 
-    /// Open the dialog for `action` with a fresh countdown of `seconds`
+    /// Open the dialog for `content` with a fresh countdown of `seconds`
     /// (`Open`'s `seconds_to_stay_open`), listing the applications behind
-    /// `inhibitors`; `local` when the nested preview opens it itself.
+    /// `inhibitors` and, for Restart and Power Off, the other users'
+    /// sessions; `local` when the nested preview opens it itself.
     /// A Log Out, Restart or Power Off request while `disable-log-out`
     /// denies never opens (live read per open, so no stale path can
     /// bypass it). Whether it opened.
     fn ask_for(
         self: &Rc<Self>,
-        action: Action,
+        content: Content,
         seconds: u32,
         inhibitors: Vec<String>,
         local: bool,
     ) -> bool {
+        let action = content.action;
         if !action_allowed(action, crate::lockdown::read().entry_visibility().log_out) {
             return false;
         }
         self.stop_timer();
         let serial = self.serial.get() + 1;
         self.serial.set(serial);
+        self.confirming.set(false);
         self.pending.set(Some(action));
+        self.content.set(content);
         self.local.set(local);
         self.total.set(seconds);
         self.left.set(seconds);
-        self.title.set_text(action.title());
-        self.confirm.set_label(action.title());
-        self.body
-            .set_text(&action.countdown_text(display_seconds(seconds, seconds)));
+        // `OpenAsync`: the check box shows with an update pending and
+        // starts checked unless the battery is low.
+        self.updates_check.set_visible(content.checkbox_visible());
+        self.updates_check
+            .set_active(content.checkbox_visible() && !self.battery_is_low());
+        // `_updateButtons`: Boot Options backs ConfirmedReboot where
+        // logind can reboot into the boot loader menu.
+        self.alt_capture.set(
+            !local
+                && self.can_boot_menu.get()
+                && confirmed_signal(action) == Some("ConfirmedReboot"),
+        );
+        self.confirm.set_visible(true);
+        self.boot_options.set_visible(false);
         self.list_inhibitors(inhibitors, serial);
+        self.list_sessions(content, serial);
+        self.load_real_name(content, serial);
+        self.sync();
         self.fade.present();
         // Cancel holds the focus when the dialog opens, as in GNOME.
         if let Some(cancel) = self.confirm.prev_sibling().and_downcast::<gtk::Button>() {
@@ -592,19 +1146,155 @@ impl PowerUi {
         let id = glib::timeout_add_local(Duration::from_secs(1), move || {
             let left = me.left.get().saturating_sub(1);
             me.left.set(left);
-            if let Some(action) = me.pending.get() {
-                me.body
-                    .set_text(&action.countdown_text(display_seconds(me.total.get(), left)));
-            }
+            me.sync();
             if left == 0 {
                 me.timer.borrow_mut().take();
-                me.run_pending();
+                me.run_pending(false);
                 return glib::ControlFlow::Break;
             }
             glib::ControlFlow::Continue
         });
         *self.timer.borrow_mut() = Some(id);
         true
+    }
+
+    /// endSessionDialog.js `_sync`: title, countdown, confirm label and
+    /// battery warning from the open dialog's state.
+    fn sync(&self) {
+        if self.pending.get().is_none() {
+            return;
+        }
+        let content = self.content.get();
+        let checked = self.updates_check.is_visible() && self.updates_check.is_active();
+        let seconds = display_seconds(self.total.get(), self.left.get());
+        let (title, body, confirm) =
+            content.text(checked, self.real_name.borrow().as_deref(), seconds);
+        self.title.set_text(&title);
+        self.body.set_text(&body);
+        self.confirm.set_label(confirm);
+        self.battery_warning
+            .set_visible(content.battery_warning(self.battery_is_low(), checked));
+    }
+
+    /// `_isBatteryLow`, from UPower's cached DisplayDevice properties.
+    fn battery_is_low(&self) -> bool {
+        let Some(proxy) = self.upower.borrow().clone() else {
+            return false;
+        };
+        let get = |name: &str| proxy.cached_property(name);
+        battery_low(
+            get("IsPresent")
+                .and_then(|v| v.get::<bool>())
+                .unwrap_or(false),
+            get("State").and_then(|v| v.get::<u32>()).unwrap_or(0),
+            get("Percentage")
+                .and_then(|v| v.get::<f64>())
+                .unwrap_or(100.0),
+        )
+    }
+
+    /// `_powerProxy`: UPower's DisplayDevice, re-syncing on changes.
+    fn watch_battery(self: &Rc<Self>, system: &gio::DBusConnection) {
+        let weak = Rc::downgrade(self);
+        gio::DBusProxy::new(
+            system,
+            gio::DBusProxyFlags::DO_NOT_AUTO_START,
+            None,
+            Some(UPOWER),
+            DISPLAY_DEVICE,
+            "org.freedesktop.UPower.Device",
+            None::<&gio::Cancellable>,
+            move |proxy| {
+                let (Ok(proxy), Some(me)) = (proxy, weak.upgrade()) else {
+                    return;
+                };
+                let weak = Rc::downgrade(&me);
+                proxy.connect_local("g-properties-changed", false, move |_| {
+                    if let Some(me) = weak.upgrade() {
+                        me.sync();
+                    }
+                    None
+                });
+                *me.upower.borrow_mut() = Some(proxy);
+                me.sync();
+            },
+        );
+    }
+
+    /// The user's real name for Log Out (`this._user.get_real_name()`),
+    /// fetched from AccountsService for each Log Out dialog.
+    fn load_real_name(self: &Rc<Self>, content: Content, serial: u64) {
+        if content.action != Action::LogOut {
+            return;
+        }
+        let Some(system) = self.system.borrow().clone() else {
+            return;
+        };
+        let me = self.clone();
+        glib::spawn_future_local(async move {
+            let name = account(&system, &glib::user_name().to_string_lossy())
+                .await
+                .map(|(name, _)| name);
+            if me.serial.get() == serial {
+                *me.real_name.borrow_mut() = name;
+                me.sync();
+            }
+        });
+    }
+
+    /// Fill "Other users are logged in" (`_loadSessions`), for Restart
+    /// and Power Off.
+    fn list_sessions(self: &Rc<Self>, content: Content, serial: u64) {
+        while let Some(row) = self.session_list.first_child() {
+            self.session_list.remove(&row);
+        }
+        self.sessions.set_visible(false);
+        if !content.shows_other_sessions() {
+            return;
+        }
+        let Some(system) = self.system.borrow().clone() else {
+            return;
+        };
+        let me = self.clone();
+        glib::spawn_future_local(async move {
+            let sessions = other_sessions(&system).await;
+            if me.serial.get() != serial {
+                return;
+            }
+            for (label, icon) in &sessions {
+                me.add_session(label, icon.as_deref());
+            }
+            me.sessions.set_visible(!sessions.is_empty());
+        });
+    }
+
+    /// One session's Dialog.ListSectionItem: the user's 64 px avatar
+    /// (UserWidget.Avatar) and title.
+    fn add_session(&self, label: &str, icon: Option<&str>) {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        row.add_css_class("dialog-list-item");
+        let avatar = icon.map_or_else(
+            || gtk::Image::from_icon_name("avatar-default-symbolic"),
+            gtk::Image::from_file,
+        );
+        avatar.set_pixel_size(64);
+        let title = gtk::Label::new(Some(label));
+        title.add_css_class("dialog-list-item-title");
+        title.set_xalign(0.0);
+        title.set_valign(gtk::Align::Center);
+        row.append(&avatar);
+        row.append(&title);
+        self.session_list.append(&row);
+    }
+
+    /// `_onKeyCaptured`: while Alt is held, Boot Options stands in for
+    /// Restart.
+    fn alt_held(&self, key: gtk::gdk::Key, pressed: bool) {
+        if !self.alt_capture.get() || !matches!(key, gtk::gdk::Key::Alt_L | gtk::gdk::Key::Alt_R) {
+            return;
+        }
+        self.confirm.set_visible(!pressed);
+        self.boot_options.set_visible(pressed);
     }
 
     /// Fill the application section from the manager's inhibitors
@@ -690,8 +1380,10 @@ impl PowerUi {
     }
 
     fn cancel(&self) {
+        self.serial.set(self.serial.get() + 1);
         self.stop_timer();
-        let open = self.pending.take().is_some();
+        let confirming = self.confirming.replace(false);
+        let open = self.pending.take().is_some() || confirming;
         self.fade.hide();
         if open {
             self.emit("Canceled");
@@ -701,8 +1393,10 @@ impl PowerUi {
 
     /// `Close`: dismiss without an answer.
     fn close(&self) {
+        self.serial.set(self.serial.get() + 1);
         self.stop_timer();
-        let open = self.pending.take().is_some();
+        let confirming = self.confirming.replace(false);
+        let open = self.pending.take().is_some() || confirming;
         self.fade.hide();
         if open {
             self.emit("Closed");
@@ -718,29 +1412,124 @@ impl PowerUi {
         }
     }
 
-    fn run_pending(&self) {
+    /// Confirm the open dialog (endSessionDialog.js `_confirm`), through
+    /// Boot Options when `boot_menu` (`_confirmRebootToBootLoaderMenu`):
+    /// logind is told to show the boot loader menu, gnome-software what
+    /// follows a pending update, and then the confirmation goes out.
+    fn run_pending(self: &Rc<Self>, boot_menu: bool) {
         self.stop_timer();
         self.fade.hide();
-        if let Some(action) = self.pending.take() {
-            // Re-check at fire time: an action denied since the dialog
-            // opened must not end the session (gnome-session refuses
-            // `end_phase` from Running while locked down).
-            if !action_allowed(action, crate::lockdown::read().entry_visibility().log_out) {
-                eprintln!("tuna-shell-gtk: {action:?} refused by administrator policy");
-                self.emit("Canceled");
-                self.emit("Closed");
+        self.alt_capture.set(false);
+        let Some(action) = self.pending.take() else {
+            return;
+        };
+        // Re-check at fire time: an action denied since the dialog
+        // opened must not end the session (gnome-session refuses
+        // `end_phase` from Running while locked down).
+        if !action_allowed(action, crate::lockdown::read().entry_visibility().log_out) {
+            eprintln!("tuna-shell-gtk: {action:?} refused by administrator policy");
+            self.emit("Canceled");
+            self.emit("Closed");
+            return;
+        }
+        // The manager ends the session on the confirmation; only the
+        // nested preview's own dialog acts here.
+        if self.local.get() {
+            perform_local(action);
+            return;
+        }
+        let Some(mut signal) = confirmed_signal(action) else {
+            return;
+        };
+        let (Some(bus), system) = (self.bus.borrow().clone(), self.system.borrow().clone()) else {
+            return;
+        };
+        let checked = self.updates_check.is_visible() && self.updates_check.is_active();
+        let plan = post_update(self.content.get(), checked, signal);
+        let serial = self.serial.get();
+        self.confirming.set(true);
+        let me = self.clone();
+        glib::spawn_future_local(async move {
+            if let (true, Some(system)) = (boot_menu, system.as_ref()) {
+                // Awaited, so logind holds the flag before the manager
+                // asks it to reboot.
+                if let Err(e) = call(
+                    system,
+                    LOGIND,
+                    MANAGER_PATH,
+                    MANAGER_IFACE,
+                    "SetRebootToBootLoaderMenu",
+                    Some((BOOT_LOADER_MENU_TIMEOUT_US,).to_variant()),
+                    gio::DBusCallFlags::NONE,
+                )
+                .await
+                {
+                    eprintln!("tuna-shell-gtk: SetRebootToBootLoaderMenu: {e}");
+                }
+            }
+            if me.serial.get() != serial {
                 return;
             }
-            if let Some(signal) = confirmed_signal(action) {
-                self.emit(signal);
+            match plan {
+                PostUpdate::Nothing => {}
+                PostUpdate::SetAction(action) => {
+                    set_post_update_action(&bus, action).await;
+                }
+                PostUpdate::ShutdownAfterInstall => {
+                    // Installing reboots, and gnome-software powers off
+                    // once the update is in.
+                    if set_post_update_action(&bus, "shutdown").await {
+                        signal = "ConfirmedReboot";
+                    }
+                }
+                PostUpdate::Cancel => cancel_offline_update(&bus).await,
             }
-            // The manager ends the session on the confirmation; only the
-            // nested preview's own dialog acts here.
-            if self.local.get() {
-                perform_local(action);
+            // A newer Open or Close invalidates a confirmation whose
+            // logind/software call was still in flight. Signals carry
+            // no request id: a stale one would answer the new request.
+            if me.serial.get() != serial {
+                return;
             }
-        }
+            me.confirming.set(false);
+            if !action_allowed(action, crate::lockdown::read().entry_visibility().log_out) {
+                me.emit("Canceled");
+                me.emit("Closed");
+                return;
+            }
+            let _ = bus.emit_signal(
+                None,
+                END_SESSION_DIALOG_PATH,
+                END_SESSION_DIALOG_IFACE,
+                signal,
+                None,
+            );
+        });
     }
+}
+
+/// A Dialog.ListSection: its title over a scrolled list, hidden until
+/// something is listed.
+fn list_section(title: &str) -> (gtk::Box, gtk::Box) {
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    section.add_css_class("dialog-list");
+    let heading = gtk::Label::new(Some(title));
+    heading.add_css_class("dialog-list-title");
+    heading.set_wrap(true);
+    heading.set_max_width_chars(1);
+    heading.set_hexpand(true);
+    heading.set_justify(gtk::Justification::Center);
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    list.add_css_class("dialog-list-box");
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.add_css_class("dialog-list-scrollview");
+    scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+    scroll.set_propagate_natural_height(true);
+    scroll.set_max_content_height(200);
+    scroll.set_child(Some(&list));
+    section.append(&heading);
+    section.append(&scroll);
+    section.set_visible(false);
+    (section, list)
 }
 
 /// Export the dialog as GNOME Shell does, on the shared session
@@ -785,7 +1574,7 @@ fn serve_end_session_dialog(ui: &Rc<PowerUi>) {
                                 );
                                 return;
                             };
-                            let Some(action) = dialog_action(kind) else {
+                            let Some((action, update_restart)) = open_type(kind) else {
                                 // endSessionDialog.js ModalDialogError.UNKNOWN_TYPE.
                                 invocation.return_dbus_error(
                                     "org.gnome.Shell.ModalDialog.Error.UnknownType",
@@ -793,18 +1582,52 @@ fn serve_end_session_dialog(ui: &Rc<PowerUi>) {
                                 );
                                 return;
                             };
-                            if ui.ask_for(action, seconds, inhibitors, false) {
-                                eprintln!(
-                                    "tuna-shell-gtk: end-session dialog: {} opened over D-Bus",
-                                    action.title()
-                                );
-                                invocation.return_value(None);
-                            } else {
-                                invocation.return_dbus_error(
-                                    "org.freedesktop.DBus.Error.AccessDenied",
-                                    "Ending the session is disabled by the administrator",
-                                );
-                            }
+                            // Reserve the request before any await.
+                            // Close and a newer Open invalidate this
+                            // load as well as any older confirmation.
+                            let serial = ui.serial.get() + 1;
+                            ui.serial.set(serial);
+                            ui.stop_timer();
+                            ui.pending.set(None);
+                            ui.confirming.set(false);
+                            ui.alt_capture.set(false);
+                            ui.fade.hide();
+                            // `OpenAsync` asks gnome-software first; a
+                            // scheduled update turns Restart into
+                            // `UPDATE_RESTART`.
+                            let bus = ui.bus.borrow().clone();
+                            glib::spawn_future_local(async move {
+                                let updates = match &bus {
+                                    Some(bus) => offline_update_state(bus).await,
+                                    None => None,
+                                };
+                                if ui.serial.get() != serial {
+                                    invocation.return_dbus_error(
+                                        "org.freedesktop.DBus.Error.Cancelled",
+                                        "The end-session dialog request was superseded",
+                                    );
+                                    return;
+                                }
+                                let content = Content {
+                                    action,
+                                    update_restart: update_restart
+                                        || (action == Action::Restart
+                                            && updates == Some(UpdateState::Scheduled)),
+                                    updates,
+                                };
+                                if ui.ask_for(content, seconds, inhibitors, false) {
+                                    eprintln!(
+                                        "tuna-shell-gtk: end-session dialog: {} opened over D-Bus (updates {updates:?})",
+                                        action.title()
+                                    );
+                                    invocation.return_value(None);
+                                } else {
+                                    invocation.return_dbus_error(
+                                        "org.freedesktop.DBus.Error.AccessDenied",
+                                        "Ending the session is disabled by the administrator",
+                                    );
+                                }
+                            });
                         }
                         "Close" => {
                             ui.close();
@@ -1007,5 +1830,182 @@ mod tests {
             manager_call(Action::LogOut),
             ("Logout", Some((0u32,).to_variant()))
         );
+    }
+
+    #[test]
+    fn other_sessions_are_filtered_and_titled_like_gnome_51() {
+        // _loadSessions: user sessions only, none closing, not our own.
+        assert!(lists_session("user", "active", "c2", "c1"));
+        assert!(lists_session("user", "online", "c3", "c1"));
+        assert!(!lists_session("greeter", "active", "c5", "c1"));
+        assert!(!lists_session("user", "closing", "c6", "c1"));
+        assert!(!lists_session("user", "active", "c1", "c1"));
+        // Remote and console sessions carry the real name; a graphical
+        // one shows the user name (GNOME 51's `userLabelText = userName`).
+        assert_eq!(session_label("carol", None, true, "tty"), "carol (remote)");
+        assert_eq!(
+            session_label("bob", Some("Bob Builder"), false, "tty"),
+            "Bob Builder (console)"
+        );
+        assert_eq!(
+            session_label("alice", Some("Alice Liddell"), false, "wayland"),
+            "alice"
+        );
+    }
+
+    #[test]
+    fn log_out_names_the_user_by_real_name_like_gnome_51() {
+        let logout = Content {
+            action: Action::LogOut,
+            update_restart: false,
+            updates: None,
+        };
+        assert_eq!(
+            logout.text(false, Some("Proof Person"), 60),
+            (
+                "Log Out Proof Person".to_owned(),
+                "Proof Person will be logged out automatically in 60 seconds".to_owned(),
+                "Log Out"
+            )
+        );
+        // Not loaded: the plain strings.
+        assert_eq!(
+            logout.text(false, None, 1),
+            (
+                "Log Out".to_owned(),
+                "You will be logged out automatically in 1 second".to_owned(),
+                "Log Out"
+            )
+        );
+        // act_user_get_real_name: an empty RealName falls back to the user name.
+        assert_eq!(real_name("", "proof"), "proof");
+        assert_eq!(real_name("Proof Person", "proof"), "Proof Person");
+        // Restart and Power Off never name the user.
+        let restart = Content {
+            action: Action::Restart,
+            ..logout
+        };
+        assert_eq!(restart.text(false, Some("Proof Person"), 60).0, "Restart");
+    }
+
+    #[test]
+    fn low_battery_warning_follows_gnome_51() {
+        // _isBatteryLow: present, discharging, below 30 %.
+        assert!(battery_low(true, 2, 29.9));
+        assert!(!battery_low(true, 2, 30.0));
+        assert!(!battery_low(true, 1, 10.0), "charging");
+        assert!(!battery_low(true, 4, 10.0), "fully charged");
+        assert!(!battery_low(false, 2, 10.0), "no battery");
+        let scheduled = Content {
+            action: Action::PowerOff,
+            update_restart: false,
+            updates: Some(UpdateState::Scheduled),
+        };
+        // Shown when updates are to install: checked or already scheduled.
+        assert!(scheduled.battery_warning(true, false));
+        assert!(!scheduled.battery_warning(false, true));
+        let prepared = Content {
+            updates: Some(UpdateState::Prepared),
+            ..scheduled
+        };
+        assert!(prepared.battery_warning(true, true));
+        assert!(!prepared.battery_warning(true, false));
+        // No updates, no warning; Log Out never warns.
+        assert!(!Content {
+            updates: None,
+            ..scheduled
+        }
+        .battery_warning(true, false));
+        assert!(!Content {
+            action: Action::LogOut,
+            ..scheduled
+        }
+        .battery_warning(true, true));
+    }
+
+    #[test]
+    fn offline_updates_shape_the_dialog_like_gnome_51() {
+        assert_eq!(UpdateState::parse("prepared"), UpdateState::Prepared);
+        assert_eq!(UpdateState::parse("scheduled"), UpdateState::Scheduled);
+        assert_eq!(UpdateState::parse("none"), UpdateState::None);
+        assert_eq!(open_type(3), Some((Action::Restart, true)));
+        assert_eq!(open_type(2), Some((Action::Restart, false)));
+        assert_eq!(open_type(4), None);
+        let restart = Content {
+            action: Action::Restart,
+            update_restart: false,
+            updates: Some(UpdateState::Prepared),
+        };
+        assert!(restart.checkbox_visible());
+        assert!(!Content {
+            updates: Some(UpdateState::None),
+            ..restart
+        }
+        .checkbox_visible());
+        assert!(!Content {
+            updates: None,
+            ..restart
+        }
+        .checkbox_visible());
+        assert_eq!(restart.text(true, None, 60).0, "Install Updates & Restart");
+        let poweroff = Content {
+            action: Action::PowerOff,
+            ..restart
+        };
+        assert_eq!(
+            poweroff.text(true, None, 60).0,
+            "Install Updates & Power Off"
+        );
+        let update_restart = Content {
+            update_restart: true,
+            updates: Some(UpdateState::Scheduled),
+            ..restart
+        };
+        assert!(!update_restart.checkbox_visible());
+        assert_eq!(
+            update_restart.text(false, None, 60),
+            (
+                "Restart & Install Updates".to_owned(),
+                "The system will automatically restart and install updates in 60 seconds"
+                    .to_owned(),
+                "Restart & Install"
+            )
+        );
+        // _confirm.
+        assert_eq!(
+            post_update(restart, true, "ConfirmedReboot"),
+            PostUpdate::SetAction("reboot")
+        );
+        assert_eq!(
+            post_update(poweroff, true, "ConfirmedShutdown"),
+            PostUpdate::ShutdownAfterInstall
+        );
+        assert_eq!(
+            post_update(restart, false, "ConfirmedReboot"),
+            PostUpdate::Cancel
+        );
+        assert_eq!(
+            post_update(update_restart, false, "ConfirmedReboot"),
+            PostUpdate::SetAction("reboot")
+        );
+        assert_eq!(
+            post_update(
+                Content {
+                    updates: None,
+                    ..restart
+                },
+                false,
+                "ConfirmedReboot"
+            ),
+            PostUpdate::Nothing
+        );
+    }
+
+    #[test]
+    fn boot_options_need_logind_yes_or_challenge() {
+        assert!(boot_loader_menu_available("yes"));
+        assert!(boot_loader_menu_available("challenge"));
+        assert!(!boot_loader_menu_available("no"));
+        assert!(!boot_loader_menu_available("na"));
     }
 }

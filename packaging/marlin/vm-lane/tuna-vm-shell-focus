@@ -4,9 +4,9 @@
 Default observation has no text/value/description queries. The explicit controlled
 overview mode compares only the known five-character fixture query in scratch
 memory; no buffer is retained. The explicit end-session mode adds the power
-menu and end-session dialog controls and keeps only label names that are the
-dialog's fixed countdown sentence. No synthetic AT-SPI actions, focus changes
-or arbitrary names are recorded. Native QMP input performs every action.
+menu and end-session dialog controls. Personalized Log Out labels are compared
+with AccountsService in scratch memory and canonicalized before recording; no
+user name is retained. Native QMP input performs every action.
 Primary API: https://gnome.pages.gitlab.gnome.org/at-spi2-core/libatspi/
 """
 import json
@@ -20,10 +20,9 @@ import time
 
 PUBLIC_LABELS = {"Search", "Disks", "Take Screenshot", "Settings", "Lock", "Power Off Menu", "Mute", "Volume"}
 PUBLIC_ROLES = {"entry", "text", "push button", "slider", "frame"}
-# The end-session mode (#589) adds the power menu's rows, the end-session
-# dialog's buttons and its countdown: GNOME Shell 51's fixed sentences
-# (endSessionDialog.js), public text naming no user data. Only that mode
-# reads label names, and keeps none but a countdown.
+# End-session mode alone reads countdown/title labels. GNOME 51 personalizes
+# Log Out using AccountsService; accept only that account's exact name and
+# canonicalize it to the generic vocabulary so receipts contain no user data.
 END_SESSION_LABELS = {"Suspend", "Restart…", "Power Off…", "Log Out…", "Cancel", "Restart", "Power Off", "Log Out"}
 COUNTDOWN = re.compile(r"(?:The system will (?:restart|power off)|You will be logged out) "
                        r"automatically in [0-9]{1,2} seconds?")
@@ -32,7 +31,7 @@ FOCUS_OPERATIONS = {"arguments", "imports", "process-identity", "atspi-timeout",
                     "desktop-enumeration", "atspi-owner", "bus-connection", "bus-credentials",
                     "tree-cache", "tree-state", "tree-role", "tree-name", "tree-children",
                     "controlled-query", "catalog-receipt", "final-principal", "serialization",
-                    "tree-state-flags", "tree-public-control"}
+                    "tree-state-flags", "tree-public-control", "accounts-service"}
 FOCUS_OPERATION = "arguments"
 
 
@@ -42,11 +41,39 @@ def canonical_role(role):
     return "push button" if role == "button" else role
 
 
-def public_node(name, role, showing, focused, active, end_session=False):
+def accounts_logout_name(query, username):
+    """Independent AccountsService expectation, not a name read from the UI.
+
+    `query` returns None only when the system service cannot answer. Like the
+    shell/libaccountsservice, empty RealName uses UserName, then the login name.
+    """
+    found = query("/org/freedesktop/Accounts", "org.freedesktop.Accounts",
+                  "FindUserByName", "(s)", (username,))
+    if found is None:
+        return None
+    properties = query(found[0], "org.freedesktop.DBus.Properties", "GetAll",
+                       "(s)", ("org.freedesktop.Accounts.User",))
+    if properties is None:
+        return None
+    values = properties[0]
+    return values.get("RealName", "") or values.get("UserName", "") or username
+
+
+def public_node(name, role, showing, focused, active, end_session=False, logout_name=None):
     if not showing:
         return None
     if role == "label":
-        if not end_session or type(name) is not str or COUNTDOWN.fullmatch(name) is None:
+        if not end_session or type(name) is not str:
+            return None
+        title = "Log Out" if logout_name is None else f"Log Out {logout_name}"
+        prefix = "You" if logout_name is None else logout_name
+        logout = re.fullmatch(re.escape(prefix) + r" will be logged out automatically in "
+                             r"([0-9]{1,2}) (seconds?)", name)
+        if name == title:
+            name = "Log Out"
+        elif logout is not None:
+            name = f"You will be logged out automatically in {logout[1]} {logout[2]}"
+        elif COUNTDOWN.fullmatch(name) is None or name.startswith("You will be logged out"):
             return None
     elif role not in PUBLIC_ROLES or (name not in PUBLIC_LABELS
                                       and not (end_session and name in END_SESSION_LABELS)):
@@ -189,6 +216,24 @@ def observe(pid, ticks, executable, display, controlled=False, end_session=False
         remaining_budget()
         return result
 
+    logout_name = None
+    if end_session:
+        import pwd
+        FOCUS_OPERATION = "accounts-service"
+        try:
+            system = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        except GLib.Error:
+            system = None
+        def accounts_query(path, interface, method, signature, arguments):
+            if system is None:
+                return None
+            try:
+                return bus_query(system, "org.freedesktop.Accounts", path, interface, method,
+                                 GLib.Variant(signature, arguments), None).unpack()
+            except GLib.Error:
+                return None
+        logout_name = accounts_logout_name(accounts_query, pwd.getpwuid(uid).pw_name)
+
     FOCUS_OPERATION = "desktop-enumeration"
     desktop = accessibility_query(Atspi.get_desktop, 0)
     count = accessibility_query(desktop.get_child_count)
@@ -255,7 +300,7 @@ def observe(pid, ticks, executable, display, controlled=False, end_session=False
             focused = states.contains(Atspi.StateType.FOCUSED)
             active = states.contains(Atspi.StateType.ACTIVE)
             FOCUS_OPERATION = "tree-public-control"
-            record = public_node(name, role, showing, focused, active, end_session)
+            record = public_node(name, role, showing, focused, active, end_session, logout_name)
             if record is not None:
                 nodes.append(record)
             if controlled:

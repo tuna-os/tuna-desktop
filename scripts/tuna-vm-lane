@@ -434,7 +434,11 @@ def open_power_menu_row(qmp, agent, row):
 
 
 def countdown_showing(controls, case, seconds):
-    return shell_control(controls, case["countdown"].format(seconds), "label") is not None
+    # The guest observer compares personalized Log Out text against the
+    # original user's AccountsService record before canonicalizing it. Require
+    # both the independently matched title and exact countdown, never a suffix.
+    return (shell_control(controls, case["countdown"].format(seconds), "label") is not None
+            and (case["type"] != 0 or shell_control(controls, "Log Out", "label") is not None))
 
 
 def end_session_opened(observed, mark, case, compositor_pid):

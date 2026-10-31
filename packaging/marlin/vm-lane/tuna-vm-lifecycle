@@ -1570,7 +1570,7 @@ FOCUS_OPERATIONS = {"arguments", "imports", "process-identity", "atspi-timeout",
                     "desktop-enumeration", "atspi-owner", "bus-connection", "bus-credentials",
                     "tree-cache", "tree-state", "tree-role", "tree-name", "tree-children",
                     "controlled-query", "catalog-receipt", "final-principal", "serialization",
-                    "tree-state-flags", "tree-public-control"}
+                    "tree-state-flags", "tree-public-control", "accounts-service"}
 
 
 def shell_navigation_focus(kind, original_pid=None, original_ticks=None, controlled=False):
@@ -1657,11 +1657,11 @@ def shell_navigation_focus(kind, original_pid=None, original_ticks=None, control
 
 
 def shell_controls():
-    """The running shell's public controls from its own AT-SPI tree: the
-    power menu rows, the end-session dialog's buttons and its countdown
-    (#589). Observation only; QMP keys perform every action. Unlike the Orca
-    navigation receipts this needs no screen reader: GTK publishes the tree
-    to the session's accessibility bus by itself."""
+    """The running shell's controls from its own AT-SPI tree: power menu
+    rows, end-session buttons, title and countdown (#589). The non-root
+    observer independently compares Log Out with AccountsService and returns
+    canonical labels, never the real name. Observation only; QMP keys perform
+    every action. GTK publishes the tree without requiring a screen reader."""
     if json.loads(STATE.read_text())["locked"]:
         raise RuntimeError("locked accessibility trees are never queried")
     shells = [p for p in inventory()["processes"]
