@@ -29,6 +29,7 @@ def children_named(marker: str) -> list[int]:
 class Reaper(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix="reaper-test."))
+        self.tag = "tuna-" + self.dir.name
         self.addCleanup(subprocess.run, ["rm", "-rf", str(self.dir)])
         self.env = dict(os.environ,
                         TUNA_BUILD_SLOT_BASE=str(self.dir / "build.slot"),
@@ -57,9 +58,9 @@ class Reaper(unittest.TestCase):
         self.fail(f"{tag} never started")
 
     def test_stuck_holder_is_stopped_fresh_one_kept(self):
-        stuck = self.hold("build.slot", "tuna-reaper-test-stuck")
-        fresh = self.hold("build.slot", "tuna-reaper-test-fresh")
-        proof = self.hold("proof.slot", "tuna-reaper-test-proof")
+        stuck = self.hold("build.slot", self.tag + "-stuck")
+        fresh = self.hold("build.slot", self.tag + "-fresh")
+        proof = self.hold("proof.slot", self.tag + "-proof")
         # The first holder took slot .0: backdate it past 60 + 15 minutes.
         old = time.time() - 80 * 60
         os.utime(self.dir / "build.slot.0", (old, old))
@@ -72,12 +73,30 @@ class Reaper(unittest.TestCase):
 
         self.assertIn(f"held {self.dir}/build.slot.0", out)
         stuck.wait(timeout=5)
-        self.assertEqual(children_named("tuna-reaper-test-stuck"), [], out)
+        self.assertEqual(children_named(self.tag + "-stuck"), [], out)
         # Its work ran in tuna-timeout's own process group; that went too.
         self.assertFalse(alive(stuck.child), out)
         for kept in (fresh, proof):
             self.assertTrue(alive(kept.pid), out)
             self.assertTrue(alive(kept.child), out)
+
+    def test_detached_proof_marker_is_reaped(self):
+        self.env["TUNA_PROOF_RUN"] = str(self.dir / "owned-proof")
+        holder = self.hold("proof.slot", self.tag + "-marked")
+        detached = subprocess.Popen(
+            ["sleep", "600"], env=self.env, start_new_session=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(detached.wait)
+        self.addCleanup(detached.kill)
+        old = time.time() - 65 * 60  # proof's 45 min timeout + 15 min grace
+        os.utime(self.dir / "proof.slot.0", (old, old))
+        reaper_env = dict(self.env)
+        del reaper_env["TUNA_PROOF_RUN"]
+        out = subprocess.run([str(REAPER)], env=reaper_env, check=True,
+                             capture_output=True, text=True, timeout=60).stdout
+        holder.wait(timeout=5)
+        detached.wait(timeout=5)
+        self.assertFalse(alive(detached.pid), out)
 
     def test_nothing_held_nothing_done(self):
         out = subprocess.run([str(REAPER)], env=self.env, check=True,

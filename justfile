@@ -169,7 +169,7 @@ proof name *args: _disk _sccache
     timeout_min="{{proof_timeout_min}}"
     if [ -z "$timeout_min" ]; then
         timeout_min=$(awk -v s="scripts/tuna-{{name}}" '
-            /^  [A-Za-z0-9_-]+:[ \t]*$/ { job = $1 }
+            /^  [A-Za-z0-9_-]+:[ \t]*$/ { job = FILENAME ":" $1 }
             /^    timeout-minutes:/ { limit[job] = $2 }
             { i = index($0, s); c = substr($0, i + length(s), 1) }
             i && c !~ /[A-Za-z0-9_-]/ { used[job] = 1 }
