@@ -143,10 +143,8 @@ impl Reader {
     /// session's reader.
     pub fn shutdown(&mut self) {
         if let Some(receipt) = self.retire() {
-            use std::io::Write;
             // The VM lane requires this receipt before the compositor exits.
-            // Teardown never panics on a closed stderr.
-            let _ = writeln!(std::io::stderr(), "{receipt}");
+            eprintln!("{receipt}");
         }
     }
     fn retire(&mut self) -> Option<Receipt> {

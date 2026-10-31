@@ -4247,10 +4247,7 @@ mod tests {
         });
         let bytes = format!("FPRINT-PHASE {record}\n");
         // Diagnostic write errors must fail this specifically requested receipt.
-        std::io::stderr()
-            .lock()
-            .write_all(bytes.as_bytes())
-            .expect("phase receipt");
+        crate::stderr_record(&bytes).expect("phase receipt");
     }
 
     // A full socket can be transient while the relay has not run yet. Only
