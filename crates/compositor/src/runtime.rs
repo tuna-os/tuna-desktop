@@ -227,8 +227,10 @@ mod rendered_event_tests {
         flush_rendered_events(&mut compositor.display, &compositor.state).unwrap();
         let count = wire.read(&mut bytes).unwrap();
         let words: Vec<u32> = bytes[..count]
-            .chunks_exact(4)
-            .map(|word| u32::from_ne_bytes(word.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_ne_bytes(*word))
             .collect();
         // wl_callback@5.done and @6.done (opcode 0, 12 bytes), each followed
         // by wl_display.delete_id; no client request was dispatched between.
