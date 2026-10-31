@@ -416,7 +416,7 @@ session_tap "?123" G-OSK-IBUS
 decline_start="$(now)"
 session_tap "1" G-OSK-IBUS
 expect_text b "TuNAs你好1" G-OSK-IBUS
-grep -q 'OSK IBus took it: Some(false)' "$LOG" ||
+grep -q 'OSK outcome: Declined' "$LOG" ||
     fail G-OSK-IBUS "the once-only character was not actually declined by the engine"
 jq -es --argjson t "$decline_start" '[.[] | select(.t >= $t and .key == 49 and .pressed == true)] | length == 1' "$PROBE_LOG" >/dev/null ||
     fail G-OSK-IBUS "declined digit did not produce exactly one client key press"
