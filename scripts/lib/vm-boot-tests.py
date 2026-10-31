@@ -4790,14 +4790,9 @@ class InventoryProcessRaces(unittest.TestCase):
         self.assertTrue(lane.guest_agent.valid_inventory_error(record))
 
     def test_partially_written_state_file_fails_closed_at_parse_stage(self):
-        # The compositor publishes the snapshot by write-temp + rename, so a
-        # reader never sees a partial file; one would be a writer bug, so the
-        # probe fails with a typed stage instead of retrying past it.
-        runtime = (Path(__file__).resolve().parents[2] / "crates/compositor/src/runtime.rs").read_text()
-        publish = runtime[runtime.index("fn publish_state(&mut self)"):]
-        publish = publish[:publish.index("\n    }\n") + 6]
-        self.assertIn('let tmp = path.with_extension("tmp");', publish)
-        self.assertIn("std::fs::write(&tmp, &doc).is_ok() && std::fs::rename(&tmp, path).is_ok()", publish)
+        # Readers reject malformed snapshots rather than retrying past them.
+        # The publisher's real filesystem/concurrency tests cover atomic
+        # visibility; this test exercises the runtime consumer's typed failure.
         record = self.failure(self.guest(state=json.dumps(self.STATE)[:17]), json.JSONDecodeError)
         self.assertEqual({key: record[key] for key in ("stage", "exception_type", "code")},
                          {"stage": "state-parse", "exception_type": "JSONDecodeError",
