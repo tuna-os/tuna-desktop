@@ -831,7 +831,8 @@ pub struct PowerUi {
     /// The open dialog is the nested preview's own (no manager waits on
     /// its answer; it acts itself).
     local: Cell<bool>,
-    /// Counts dialogs opened, so a stale inhibitor load is dropped.
+    /// Invalidates asynchronous loads and confirmations when a request
+    /// is replaced, canceled or closed.
     serial: Cell<u64>,
     total: Cell<u32>,
     left: Cell<u32>,
@@ -1374,6 +1375,7 @@ impl PowerUi {
     }
 
     fn cancel(&self) {
+        self.serial.set(self.serial.get() + 1);
         self.stop_timer();
         let open = self.pending.take().is_some();
         self.fade.hide();
@@ -1385,6 +1387,7 @@ impl PowerUi {
 
     /// `Close`: dismiss without an answer.
     fn close(&self) {
+        self.serial.set(self.serial.get() + 1);
         self.stop_timer();
         let open = self.pending.take().is_some();
         self.fade.hide();
@@ -1436,6 +1439,8 @@ impl PowerUi {
         };
         let checked = self.updates_check.is_visible() && self.updates_check.is_active();
         let plan = post_update(self.content.get(), checked, signal);
+        let serial = self.serial.get();
+        let me = self.clone();
         glib::spawn_future_local(async move {
             if let (true, Some(system)) = (boot_menu, system.as_ref()) {
                 // Awaited, so logind holds the flag before the manager
@@ -1454,6 +1459,9 @@ impl PowerUi {
                     eprintln!("tuna-shell-gtk: SetRebootToBootLoaderMenu: {e}");
                 }
             }
+            if me.serial.get() != serial {
+                return;
+            }
             match plan {
                 PostUpdate::Nothing => {}
                 PostUpdate::SetAction(action) => {
@@ -1467,6 +1475,17 @@ impl PowerUi {
                     }
                 }
                 PostUpdate::Cancel => cancel_offline_update(&bus).await,
+            }
+            // A newer Open or Close invalidates a confirmation whose
+            // logind/software call was still in flight. Signals carry
+            // no request id: a stale one would answer the new request.
+            if me.serial.get() != serial {
+                return;
+            }
+            if !action_allowed(action, crate::lockdown::read().entry_visibility().log_out) {
+                me.emit("Canceled");
+                me.emit("Closed");
+                return;
             }
             let _ = bus.emit_signal(
                 None,
@@ -1554,6 +1573,15 @@ fn serve_end_session_dialog(ui: &Rc<PowerUi>) {
                                 );
                                 return;
                             };
+                            // Reserve the request before any await.
+                            // Close and a newer Open invalidate this
+                            // load as well as any older confirmation.
+                            let serial = ui.serial.get() + 1;
+                            ui.serial.set(serial);
+                            ui.stop_timer();
+                            ui.pending.set(None);
+                            ui.alt_capture.set(false);
+                            ui.fade.hide();
                             // `OpenAsync` asks gnome-software first; a
                             // scheduled update turns Restart into
                             // `UPDATE_RESTART`.
@@ -1563,6 +1591,13 @@ fn serve_end_session_dialog(ui: &Rc<PowerUi>) {
                                     Some(bus) => offline_update_state(bus).await,
                                     None => None,
                                 };
+                                if ui.serial.get() != serial {
+                                    invocation.return_dbus_error(
+                                        "org.freedesktop.DBus.Error.Cancelled",
+                                        "The end-session dialog request was superseded",
+                                    );
+                                    return;
+                                }
                                 let content = Content {
                                     action,
                                     update_restart: update_restart
