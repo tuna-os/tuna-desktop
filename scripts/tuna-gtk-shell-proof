@@ -4904,11 +4904,13 @@ window_a="$(jq '.focused' "$CSTATE")"
 cstate '.keyboard.layout == "German"' "German before per-window" ||
     fail G-INPUT-PER-WINDOW "the two-source list did not keep German active"
 xdotool key super+space
-cstate '.keyboard.layout == "English (US)"' "window A tap" ||
-    fail G-INPUT-PER-WINDOW "Super+Space did not switch in window A"
+cstate '.keyboard.layout == "English (US)" and (.layers | all(.namespace != "tuna-input-source-switcher"))' "window A tap and modal retired" ||
+    fail G-INPUT-PER-WINDOW "Super+Space did not switch in window A and retire its modal"
 xdotool key super+space
-cstate '.keyboard.layout == "German"' "window A on German" ||
-    fail G-INPUT-PER-WINDOW "window A did not switch back to German"
+# Source activation and the popup's Wayland unmap arrive over different
+# connections. A new source alone does not prove normal shortcuts own keys.
+cstate '.keyboard.layout == "German" and (.layers | all(.namespace != "tuna-input-source-switcher"))' "window A on German and modal retired" ||
+    fail G-INPUT-PER-WINDOW "window A did not switch back to German and retire its modal"
 xdotool key alt+Tab
 cstate ".focused != $window_a and .focused != null" "window B focused" ||
     fail G-INPUT-PER-WINDOW "Alt+Tab did not focus another window"
