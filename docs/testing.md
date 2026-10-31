@@ -333,6 +333,37 @@ libinput 1.25. The subsequent hot-corner proof requires
 `gsettings-desktop-schemas` for `org.gnome.desktop.interface`; the DRM lane
 installs that package explicitly alongside the Hebrew locale and GTK translations.
 
+At source `cabda3ce35683a093603278e37c96b3c254ec9fd`,
+[native CI run 41212048699](https://github.com/tuna-os/tuna-desktop/actions/runs/41212048699/job/124573106333)
+again passes defaults, live keys, replug, restart and reset on libinput 1.25.
+That library qualifies custom acceleration and the timeout drag-lock fallback,
+not sticky drag lock or the configurable typing timeout.
+
+A separate **headless production-consumer** receipt at that source qualifies
+the newer calls against privately staged
+[libinput 1.31.0](https://gitlab.freedesktop.org/libinput/libinput/-/tree/1.31.0),
+commit `659967488e1e66d7fb7210c6b86860c8e1e5bed4`. A small Rust consumer includes
+the production `crates/compositor/src/drm/libinput.rs` unchanged (SHA256
+`e46829cf007bced49018b9b67e746c5b31a5b1df18392215acbab33488aad6b2`) and calls
+`apply` and `device_state` on a private libinput path context with ephemeral
+uinput mouse and RMI4 touchpad devices. Both devices accept a custom curve,
+fall back to the device profile when libinput rejects negative speeds, accept
+Mutter's step-zero fallback curve, and restore their original profiles on
+reset. The touchpad reads back **sticky** drag lock and typing timeouts
+**500 → 1500 → 500 ms**, with availability required rather than skipped.
+The consumer exits 0 and retains `/proc/self/maps`, confirming the loaded
+private `libinput.so.10.13.0` (SHA256
+`262a263bb6f9347fd4766fdc9ef0aea6425d70c6a32538135a37c7b548332f29`).
+The source/binary identities, consumer source and lockfile, observations and
+stderr are retained in
+`tuna-915-cabda3ce-libinput131-headless-evidence.tar.gz` (SHA256
+`1f74b79e4bf631101e4f1dbca0d2996ae68eec3e011cd9bd68a5df8e5c146311`).
+Only generated Python caches dirtied the checkout during this receipt; tracked
+sources were unchanged. Devices are closed in `finally`; no host library,
+kernel or udev policy is installed or changed. This is an emulated,
+headless consumer test, **not** a new native graphical session, installed-image
+qualification, physical-device test or timing measurement.
+
 The next [native run 41202327855](https://github.com/tuna-os/tuna-desktop/actions/runs/41202327855/job/124540485483)
 again passed all pointer-settings gates, then failed `D-HOT-CORNER` parking:
 all six relative-motion events arrived, but the final pointer was
