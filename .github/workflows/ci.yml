@@ -951,10 +951,10 @@ jobs:
           retention-days: 14
 
   orca-speech:
-    # What Orca says on the shell (P-A11Y-06): the distribution Orca 50+
-    # (GNOME's KeyboardMonitor) and speech-dispatcher on Ubuntu 26.04,
+    # What Orca says on the shell (P-A11Y-06): native Ubuntu Orca 50
+    # with Tuna's package-owned password correction and speech-dispatcher,
     # against the nested session that owns the screen reader. Ubuntu
-    # 24.04's Orca 46 predates the KeyboardMonitor.
+    # 24.04's Orca 46 predates GNOME's KeyboardMonitor.
     runs-on: *runner-26
     needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'orca-speech')
@@ -976,7 +976,50 @@ jobs:
         with:
           key: ${{ steps.cache-platform.outputs.distro }}
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool jq dbus dbus-x11 libglib2.0-bin xwayland at-spi2-core python3-gi gir1.2-gtk-4.0 libnotify-bin fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libwayland-dev wayland-protocols libpam-wrapper libpam0g-dev libgtk4-layer-shell-dev gsettings-desktop-schemas libclang-dev orca speech-dispatcher
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool jq dbus dbus-x11 libglib2.0-bin xwayland at-spi2-core python3-gi python3-yaml gir1.2-gtk-4.0 libnotify-bin fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libwayland-dev wayland-protocols libpam-wrapper libpam0g-dev libgtk4-layer-shell-dev gsettings-desktop-schemas libclang-dev speech-dispatcher
+      - name: Build and install pinned native Orca
+        shell: bash
+        run: |
+          set -euo pipefail
+          factory_commit=c0998b94bd7b4fbc67360c239e439de6debf539b
+          factory=$(mktemp -d "$RUNNER_TEMP/orca-factory.XXXXXX")
+          artifacts="$GITHUB_WORKSPACE/orca-speech-artifacts"
+          mkdir -p "$artifacts"
+          receipt="$artifacts/native-orca-package.txt"
+          GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c core.askPass= clone --no-checkout \
+            https://github.com/tuna-os/tunaos-packages.git "$factory/source"
+          git -C "$factory/source" checkout --detach "$factory_commit"
+          test "$(git -C "$factory/source" rev-parse HEAD)" = "$factory_commit"
+          source_date_epoch=$(git -C "$factory/source" log -1 --format=%at -- packages/orca)
+          [[ "$source_date_epoch" =~ ^[0-9]+$ ]]
+          printf 'factory_commit=%s\nSOURCE_DATE_EPOCH=%s\n' \
+            "$factory_commit" "$source_date_epoch" > "$receipt"
+          (
+            cd "$factory/source"
+            env CELL_ID=tideforge-orca-ubuntu-amd64 ENGINE=tideforge TARGET=ubuntu \
+              ARCHITECTURE=amd64 FORMAT=deb RECIPE=packages/orca/package.yaml \
+              IMAGE=docker.io/library/ubuntu:26.04 OUT_DIR="$factory/output" \
+              SOURCE_DATE_EPOCH="$source_date_epoch" scripts/run-package-factory-cell.sh
+          ) 2>&1 | tee "$artifacts/native-orca-factory.log"
+          shopt -s nullglob
+          debs=("$factory/output/artifacts"/orca_*_all.deb)
+          test "${#debs[@]}" -eq 1
+          deb="${debs[0]}"
+          test "$(dpkg-deb -f "$deb" Package)" = orca
+          test "$(dpkg-deb -f "$deb" Version)" = 50.3-0ubuntu0.1+tuna1
+          test "$(dpkg-deb -f "$deb" Architecture)" = all
+          sha256sum "$deb" >> "$receipt"
+          dpkg-deb -f "$deb" Package Version Architecture >> "$receipt"
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 \
+            -o Acquire::https::Timeout=20 install -y --no-install-recommends "$deb"
+          test "$(dpkg-query -W -f='${Status}' orca)" = 'install ok installed'
+          test "$(dpkg-query -W -f='${Version}' orca)" = 50.3-0ubuntu0.1+tuna1
+          app_script=/usr/lib/python3/dist-packages/orca/scripts/apps/tuna-shell-gtk/script.py
+          test -f "$app_script"
+          ownership=$(dpkg-query -S "$app_script")
+          test "$ownership" = "orca: $app_script"
+          dpkg-query -W -f='${Package} ${Version} ${Architecture} ${Status}\n' orca >> "$receipt"
+          printf '%s\n' "$ownership" >> "$receipt"
       # orca --version initialises AT-SPI's X11 device and segfaults
       # without a display; the proof records it once Xvfb is up.
       - run: pkg-config --atleast-version=1.1 gtk4-layer-shell-0 && dpkg-query -W orca speech-dispatcher

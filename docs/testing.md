@@ -45,6 +45,19 @@ wait for their producing proof jobs.
 selected job fails or is cancelled. Only unselected proof lanes may be
 skipped. To run every lane on a branch, dispatch `ci` on it.
 
+## Native Orca speech proof
+
+The `orca-speech` CI job builds Ubuntu Orca with Tuna's package-owned password
+feedback correction before running the unchanged `scripts/tuna-orca-speech-proof`.
+It uses the canonical `tuna-os/tunaos-packages` factory at immutable commit
+`c0998b94bd7b4fbc67360c239e439de6debf539b`, in a fresh `RUNNER_TEMP` checkout
+with full history for the recipe's `SOURCE_DATE_EPOCH`. Native APT installs the
+built `orca_50.3-0ubuntu0.1+tuna1_all.deb`; there is no published-package fallback.
+The existing `orca-speech` artifact retains `native-orca-factory.log` and
+`native-orca-package.txt` (factory commit, source epoch, DEB SHA-256, installed
+version and application-script package ownership). This is nested speech-proof
+evidence, not package or image qualification.
+
 ## Dependency caches
 
 Rust caches remain job-specific; no cache hit skips Cargo, executable
