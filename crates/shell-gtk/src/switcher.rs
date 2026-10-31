@@ -178,12 +178,16 @@ fn log_fade(name: &str, animated: Option<bool>) {
 /// Ease `widget`'s opacity to `to` (instantly when the motion policy
 /// drops fades),
 /// then run `done`. A newer fade or [`stop`] on the same `generation`
-/// cancels it. `name` labels the log lines the shell proof reads.
+/// cancels it. `name` labels the log lines the shell proof reads. Time is
+/// the proof's animation clock ([`crate::anim_clock`]), so a frozen clock
+/// holds the fade where it stands; `step` runs after each animated frame
+/// (the compositor draws the window images at the frames' opacity).
 fn fade(
     widget: &impl IsA<gtk::Widget>,
     to: f64,
     generation: &Rc<Cell<u64>>,
     name: &'static str,
+    step: Option<Rc<dyn Fn()>>,
     done: impl FnOnce() + 'static,
 ) {
     let current = generation.get().wrapping_add(1);
@@ -204,24 +208,38 @@ fn fade(
         return;
     }
     let generation = generation.clone();
-    let started = Instant::now();
+    let started = crate::anim_clock::now();
     let mut done = Some(done);
     gtk::glib::timeout_add_local(Duration::from_millis(16), move || {
         if generation.get() != current {
             return gtk::glib::ControlFlow::Break;
         }
-        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        let elapsed = crate::anim_clock::now()
+            .saturating_sub(started)
+            .as_secs_f64()
+            * 1000.0;
         let t = ease_progress(elapsed, duration.min(fade_ms(crate::motion::current())));
         widget.set_opacity(from + (to - from) * t);
         if t < 1.0 {
+            if let Some(step) = &step {
+                step();
+            }
             return gtk::glib::ControlFlow::Continue;
         }
         log_fade(name, None);
         if let Some(done) = done.take() {
             done();
         }
+        if let Some(step) = &step {
+            step();
+        }
         gtk::glib::ControlFlow::Break
     });
+}
+
+/// A GTK opacity as Clutter's 0–255 actor opacity, for the compositor.
+fn wire_opacity(opacity: f64) -> u8 {
+    (opacity.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 /// Cancel a running fade and show `widget` fully opaque.
@@ -250,9 +268,13 @@ pub struct SwitcherUi {
     /// The popup's and the thumbnails' running fades.
     popup_fade: Rc<Cell<u64>>,
     thumbs_fade: Rc<Cell<u64>>,
-    /// The frames last laid out, for the compositor to draw into.
-    frames: RefCell<Vec<(u64, gtk::Box)>>,
+    /// The frames last laid out, for the compositor to draw into. Kept
+    /// while the strip fades out, the windows fading with it.
+    frames: Rc<RefCell<Vec<(u64, gtk::Box)>>>,
     window_frames: RefCell<Vec<(u64, gtk::Box)>>,
+    /// Whether the popup last shown lists windows (their frames sit in
+    /// the popup itself and fade with it).
+    window_mode: Cell<bool>,
     /// When the selected app was selected (for the popup delay).
     selected_since: Cell<Option<(u64, Instant)>>,
     /// The tiles by representative window, to place the thumbnails.
@@ -326,6 +348,7 @@ impl SwitcherUi {
             thumbs_fade: Default::default(),
             frames: Default::default(),
             window_frames: Default::default(),
+            window_mode: Cell::new(false),
             selected_since: Cell::new(None),
             tiles: Default::default(),
             frame_hook: RefCell::new(None),
@@ -360,7 +383,8 @@ impl SwitcherUi {
         };
         if *self.shown.borrow() != now {
             if now.items.is_empty() {
-                // switcherPopup.js fadeAndDestroy: 100 ms to transparent.
+                // switcherPopup.js fadeAndDestroy: 100 ms to transparent,
+                // the window images in it fading along.
                 if self.window.is_visible() {
                     let window = self.window.clone();
                     fade(
@@ -368,6 +392,7 @@ impl SwitcherUi {
                         0.0,
                         &self.popup_fade,
                         "popup-out",
+                        self.frame_hook.borrow().clone(),
                         move || {
                             window.set_visible(false);
                             window.set_opacity(1.0);
@@ -484,30 +509,37 @@ impl SwitcherUi {
     }
 
     fn rebuild_thumbnails(&self, thumbs: &Thumbs) {
-        self.frames.borrow_mut().clear();
         self.scroll_target.set(None);
         self.scroll_generation
             .set(self.scroll_generation.get().wrapping_add(1));
         if thumbs.windows.is_empty() {
-            // altTab.js _destroyThumbnails: fade out, then go. The
-            // compositor stops drawing the windows at once.
-            let (window, row) = (self.thumbs_window.clone(), self.thumbs_row.clone());
+            // altTab.js _destroyThumbnails: fade out, then go, the window
+            // images fading with their frames.
+            let (window, row, frames) = (
+                self.thumbs_window.clone(),
+                self.thumbs_row.clone(),
+                self.frames.clone(),
+            );
             if window.is_visible() {
                 fade(
                     &self.thumbs_window,
                     0.0,
                     &self.thumbs_fade,
                     "thumbnails-out",
+                    self.frame_hook.borrow().clone(),
                     move || {
                         window.set_visible(false);
+                        frames.borrow_mut().clear();
                         clear(&row);
                     },
                 );
             } else {
+                frames.borrow_mut().clear();
                 clear(&row);
             }
             return;
         }
+        self.frames.borrow_mut().clear();
         clear(&self.thumbs_row);
         let frame_height = self.frame_height.get();
         for (id, title) in &thumbs.windows {
@@ -544,6 +576,7 @@ impl SwitcherUi {
             1.0,
             &self.thumbs_fade,
             "thumbnails-in",
+            self.frame_hook.borrow().clone(),
             || {},
         );
     }
@@ -706,9 +739,13 @@ impl SwitcherUi {
     }
 
     /// Where the thumbnails' frames sit on screen, once laid out (none
-    /// while hidden): what the compositor draws the windows into.
+    /// while hidden), and how opaque they are: what the compositor draws
+    /// the windows into. Frames stay while their surface fades out, so the
+    /// window images fade with them (GNOME's clones are children of the
+    /// thumbnail list, itself inside the popup).
     pub fn thumbnail_frames(&self) -> Vec<SwitcherThumbnail> {
-        if self.window.is_visible() && self.shown.borrow().all_windows {
+        if self.window.is_visible() && self.window_mode.get() {
+            let opacity = wire_opacity(self.window.opacity());
             let geometry = gtk::gdk::Display::default()
                 .and_then(|d| d.monitors().item(0))
                 .and_downcast::<gtk::gdk::Monitor>()
@@ -732,14 +769,15 @@ impl SwitcherUi {
                         y: y0 + p.y() as i32,
                         width: frame.width(),
                         height: frame.height(),
+                        opacity,
                     })
                 })
                 .collect();
         }
-        // Nothing once the switcher closes, while its surfaces fade.
-        if !self.thumbs_window.is_visible() || self.shown.borrow().items.is_empty() {
+        if !self.thumbs_window.is_visible() {
             return Vec::new();
         }
+        let opacity = wire_opacity(self.thumbs_window.opacity());
         let x0 = self.thumbs_window.margin(Edge::Left);
         let y0 = self.thumbs_window.margin(Edge::Top);
         let view = self.thumbs_scroller.width();
@@ -764,6 +802,7 @@ impl SwitcherUi {
                     y: y0 + p.y() as i32,
                     width: frame.width(),
                     height: frame.height(),
+                    opacity,
                 })
             })
             .collect()
@@ -777,6 +816,7 @@ impl SwitcherUi {
         }
         self.tiles.borrow_mut().clear();
         self.window_frames.borrow_mut().clear();
+        self.window_mode.set(now.all_windows);
         let apps = self.apps.get();
         let width = gtk::gdk::Display::default()
             .and_then(|d| d.monitors().item(0))
@@ -956,6 +996,19 @@ mod tests {
         assert_eq!(right.x + right.width, 1280 - LIST_MARGIN);
         let centred = strip_layout((1280, 800), 475, 640, 600, OVERHEAD);
         assert_eq!(centred.x, 340);
+    }
+
+    #[test]
+    fn window_images_take_their_frames_opacity_as_clutter_does() {
+        // Clutter's actor opacity is 0-255: the compositor draws the
+        // window images at the GTK frame's opacity on that scale.
+        assert_eq!(wire_opacity(0.0), 0);
+        assert_eq!(wire_opacity(1.0), 255);
+        assert_eq!(wire_opacity(0.5), 128);
+        // 50 ms into a 100 ms ease-out-quad fade in.
+        assert_eq!(wire_opacity(ease_progress(50.0, 100.0)), 191);
+        assert_eq!(wire_opacity(1.5), 255);
+        assert_eq!(wire_opacity(-0.2), 0);
     }
 
     #[test]

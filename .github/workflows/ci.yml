@@ -849,6 +849,7 @@ jobs:
           proofs = [
               ('osd-fade', 'TUNA_REQUIRE_OSD_FADE=1', 'osd::gtk_fade_tests::actual_gtk_show_during_fade_out_lets_the_fade_complete', 'OSD-FADE-OUT pass ', 'actual GTK widgets, frame clock and GLib timers under private X11; Wayland layer-shell and the compositor-drawn close are proven by G-TRANSIENT-CLOSE-CLOCK'),
               ('menu-motion', 'TUNA_REQUIRE_MENU_MOTION=1', 'transient::gtk_menu_tests::actual_gtk_menus_close_at_once_and_switch_fade_only', 'MENU-MOTION pass ', 'actual GTK widgets, frame clock and GLib timers under private X11; Wayland layer-shell and the compositor-drawn close are proven by G-TRANSIENT-CLOSE-CLOCK'),
+              ('popup-submenu', 'TUNA_REQUIRE_MENU_MOTION=1', 'transient::gtk_menu_tests::actual_gtk_popup_submenus_ease_open_and_closed', 'POPUP-SUBMENU pass ', 'actual GTK widgets, frame clock and GLib timers under private X11 (PopupSubMenu height and arrow, #501); the NetworkManager and IBus menus holding them are not driven by a proof'),
               ('lock-curtain', 'TUNA_REQUIRE_LOCK_CURTAIN=1', 'lock_curtain::gtk_curtain_tests::actual_gtk_curtain_pages_follow_progress_and_policy', 'LOCK-CURTAIN pass ', 'actual GTK widget allocation, focus and frame clock under private X11; the session-lock surface, real input and frozen-clock frames are proven by G-LOCK-CURTAIN-CLOCK, G-LOCK-CURTAIN-POLICY and G-LOCK-CURTAIN-DRAG'),
           ]
           for name, admit, test, marker, scope in proofs:

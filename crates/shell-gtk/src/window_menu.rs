@@ -3,9 +3,13 @@
 //! Maximize or Restore, Move, Resize, Always on Top, Always on Visible
 //! Workspace, Move to Workspace Left/Right (not for a window on every
 //! workspace), Close. Drawn as GNOME's popup
-//! menu 7px under the click, first item focused.
+//! menu 7px under the click, first item focused. It opens with
+//! BoxPointer's fade alone (`menu.open({fadeOnly: true})`,
+//! `windowMenu.js:239`) and closes with its full close (fade, 6px rise,
+//! shrink to 96% about the top centre; `PopupMenu.close`, `boxpointer.js:
+//! 132-181`), 150 ms ease-out quad, as [`crate::transient`] plays them.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk4 as gtk;
@@ -13,6 +17,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
+use crate::transient::{menu_close, menu_open, Frame, MotionBin, Player, MENU_MS};
 use tuna_shell_control::WindowAction;
 use tuna_shell_host::control::WindowMenuRequest;
 
@@ -100,7 +105,9 @@ pub struct WindowMenu {
     window: gtk::Window,
     fixed: gtk::Fixed,
     run: Run,
-    shown: RefCell<Option<gtk::Box>>,
+    shown: RefCell<Option<MotionBin>>,
+    player: Player,
+    closing: Cell<bool>,
 }
 
 impl WindowMenu {
@@ -124,6 +131,8 @@ impl WindowMenu {
             fixed,
             run,
             shown: RefCell::new(None),
+            player: Player::new("window-menu"),
+            closing: Cell::new(false),
         });
         // A click anywhere but the menu, or Escape, closes it.
         let click = gtk::GestureClick::new();
@@ -163,9 +172,7 @@ impl WindowMenu {
 
     /// Open GNOME's menu for `req`.
     pub fn open(self: &Rc<Self>, req: &WindowMenuRequest) {
-        if let Some(old) = self.shown.borrow_mut().take() {
-            self.fixed.remove(&old);
-        }
+        self.drop_shown();
         let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
         menu.add_css_class("popup-menu-content");
         let mut first: Option<gtk::Button> = None;
@@ -224,19 +231,67 @@ impl WindowMenu {
             .unwrap_or((1280, 800));
         let x = req.x.min(screen.0 - w).max(0);
         let y = (req.y + 7).min(screen.1 - h).max(0);
-        self.fixed.put(&menu, f64::from(x), f64::from(y));
-        *self.shown.borrow_mut() = Some(menu);
+        let bin = MotionBin::box_pointer(&menu);
+        bin.set_frame(Frame {
+            opacity: 0.0,
+            ..Frame::REST
+        });
+        self.fixed.put(&bin, f64::from(x), f64::from(y));
+        *self.shown.borrow_mut() = Some(bin.clone());
+        self.closing.set(false);
+        self.window.set_keyboard_mode(KeyboardMode::Exclusive);
         self.window.present();
+        // Clicks anywhere reach the menu again (a close emptied them).
+        if let Some(surface) = self.window.surface() {
+            surface.set_input_region(None);
+        }
         if let Some(first) = first {
             first.grab_focus();
         }
+        // windowMenu.js:239: menu.open({fadeOnly: true}).
+        bin.animate(
+            &self.player,
+            MENU_MS,
+            |_, t| menu_open(t).without_motion(),
+            || {},
+        );
     }
 
-    fn close(&self) {
+    fn drop_shown(&self) {
         if let Some(old) = self.shown.borrow_mut().take() {
             self.fixed.remove(&old);
         }
-        self.window.set_visible(false);
+    }
+
+    /// `PopupMenu.close`: closed at once for input (keyboard and clicks
+    /// pass on, as BoxPointer mutes its input), drawn closing over
+    /// [`MENU_MS`] from where it stands, then gone.
+    fn close(self: &Rc<Self>) {
+        let Some(bin) = self.shown.borrow().clone() else {
+            self.window.set_visible(false);
+            return;
+        };
+        if self.closing.replace(true) {
+            return;
+        }
+        self.window.set_keyboard_mode(KeyboardMode::None);
+        if let Some(surface) = self.window.surface() {
+            surface.set_input_region(Some(&gtk::cairo::Region::create()));
+        }
+        let from = bin.frame();
+        let weak = Rc::downgrade(self);
+        bin.animate(
+            &self.player,
+            MENU_MS,
+            move |_, t| menu_close(from, t),
+            move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.drop_shown();
+                    ui.closing.set(false);
+                    ui.window.set_visible(false);
+                }
+            },
+        );
     }
 }
 

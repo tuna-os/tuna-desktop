@@ -208,9 +208,15 @@ impl ProtocolVersion {
     /// `0.46` appends compositor-to-shell `SeatTouchMode` (the seat's
     /// touch-mode, which picks the unlock dialog's hint text, #502).
     /// Positional postcard peers must ship together.
+    /// `0.47` appends `opacity` to `SwitcherThumbnail` (the switcher's
+    /// window images fade with their GTK frame, altTab.js 51
+    /// THUMBNAIL_FADE_TIME and switcherPopup.js POPUP_FADE_OUT_TIME) and
+    /// the shell-to-compositor `CloseMenuUnanimated` command (panelMenu.js
+    /// 51 `vfunc_hide`: a hidden panel button's menu closes without
+    /// BoxPointer's close). Positional postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 46,
+        minor: 47,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -496,6 +502,13 @@ pub enum CommandKind {
     /// Since 0.45: the shown pad OSD closed; the compositor stops routing
     /// pad events to the shell.
     PadOsdClosed { pad: u32 },
+    /// Since 0.47: the panel menu closing now closes without animation
+    /// (`PanelMenu.Button.vfunc_hide` calls `menu.close({animate:
+    /// false})`, gnome-shell 51 `js/ui/panelMenu.js:149-154`): its button
+    /// was hidden under it. Sent before the menu's popup goes; the
+    /// compositor draws no BoxPointer close for the panel popup that goes
+    /// next (or drops the one it just started).
+    CloseMenuUnanimated,
 }
 
 /// One on-screen keyboard action (gnome-shell 51 `KeyboardController`).
@@ -733,6 +746,16 @@ pub struct SwitcherThumbnail {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    /// Since 0.47: how opaque the window image is drawn, as Clutter's
+    /// 0–255 actor opacity: the thumbnail's frame and its window clone
+    /// fade together (altTab.js THUMBNAIL_FADE_TIME, switcherPopup.js
+    /// POPUP_FADE_OUT_TIME). Older JSON peers mean fully opaque.
+    #[serde(default = "opaque")]
+    pub opacity: u8,
+}
+
+fn opaque() -> u8 {
+    u8::MAX
 }
 
 /// GNOME's window-menu actions (windowMenu.js) the compositor carries out.
@@ -2484,8 +2507,11 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_46() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 46));
+    fn current_version_is_0_47() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 47));
+        // A 0.46 shell still negotiates; a newer minor does not.
+        assert!(ProtocolVersion::new(0, 46).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 48).is_compatible_with(&CURRENT_VERSION));
     }
 
     #[test]
@@ -3836,5 +3862,57 @@ mod tablet_osd_wire_order_tests {
         );
         let bytes = postcard::to_slice(&touch, &mut buffer).unwrap();
         assert_eq!(postcard::from_bytes::<Message>(bytes).unwrap(), touch);
+    }
+}
+
+#[cfg(test)]
+mod switcher_fade_and_menu_close_wire_tests {
+    use super::*;
+
+    #[test]
+    fn switcher_thumbnail_opacity_rides_last_and_round_trips() {
+        let mut buffer = [0_u8; 128];
+        for opacity in [0, 128, u8::MAX] {
+            let thumbnail = SwitcherThumbnail {
+                window: 7,
+                x: 10,
+                y: 20,
+                width: 256,
+                height: 160,
+                opacity,
+            };
+            let body = postcard::to_slice(&thumbnail, &mut buffer).unwrap();
+            // Appended after the 0.19 fields: the old prefix is untouched.
+            assert_eq!(body.last(), Some(&opacity));
+            let decoded: SwitcherThumbnail = postcard::from_bytes(body).unwrap();
+            assert_eq!(decoded, thumbnail);
+            let command = Message::Command {
+                id: 1,
+                kind: CommandKind::SetSwitcherThumbnails {
+                    thumbnails: vec![thumbnail],
+                },
+            };
+            let frame = encode_frame(&command);
+            assert_eq!(decode_frame(&frame).unwrap(), command);
+        }
+        assert_eq!(opaque(), 255);
+    }
+
+    #[test]
+    fn close_menu_unanimated_follows_pad_osd_closed() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 64];
+        let closed =
+            tag(postcard::to_slice(&CommandKind::PadOsdClosed { pad: 1 }, &mut buffer).unwrap());
+        assert_eq!(
+            tag(postcard::to_slice(&CommandKind::CloseMenuUnanimated, &mut buffer).unwrap()),
+            closed + 1
+        );
+        let command = Message::Command {
+            id: 9,
+            kind: CommandKind::CloseMenuUnanimated,
+        };
+        let frame = encode_frame(&command);
+        assert_eq!(decode_frame(&frame).unwrap(), command);
     }
 }
