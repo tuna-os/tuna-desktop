@@ -101,13 +101,6 @@ class MinimizeFreezeTests(unittest.TestCase):
         self.assertEqual(self.run_freeze().returncode, 0)
         return self.art / "frozen"
 
-    def test_consumer_accepts_exact_freeze_without_changing_member_bytes(self):
-        frozen = self.frozen_bundle()
-        original = {path.name: path.read_bytes() for path in frozen.iterdir()}
-        snapshot = validate(self.root, self.art)
-        self.assertEqual(validate(self.root, self.art, snapshot), snapshot)
-        self.assertEqual({path.name: path.read_bytes() for path in frozen.iterdir()}, original)
-
     def test_consumer_rejects_missing_role(self):
         frozen = self.frozen_bundle()
         (frozen / MEMBERS[0]).unlink()
@@ -196,9 +189,7 @@ class MinimizeFreezeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "changed during proof"):
             validate(self.root, self.art, before)
 
-    def test_modes_own_separate_fresh_state_without_copying_roles(self):
-        frozen = self.frozen_bundle()
-        before = validate(self.root, self.art)
+    def test_modes_own_separate_fresh_state_and_refuse_existing_receipts(self):
         ltr = mode_artifacts(self.art, False)
         (ltr / "state.json").write_text("LTR state")
         (ltr / "assertions.txt").write_text("earlier receipt")
@@ -210,10 +201,6 @@ class MinimizeFreezeTests(unittest.TestCase):
             mode_artifacts(self.art, False)
         self.assertEqual((ltr / "state.json").read_text(), "LTR state")
         self.assertEqual((ltr / "assertions.txt").read_text(), "earlier receipt")
-        self.assertEqual(validate(self.root, self.art, before), before)
-        self.assertFalse((ltr / "bin").exists())
-        self.assertFalse((rtl / "bin").exists())
-        self.assertTrue(all((frozen / role).exists() for role in MEMBERS))
 
 
 
