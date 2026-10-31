@@ -81,6 +81,10 @@ cleanup() {
     if [ -n "$CLIENT_PID" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
     if [ -n "$COMPOSITOR_PID" ]; then kill "$COMPOSITOR_PID" 2>/dev/null || true; fi
     if [ -n "$OWNED_XVFB" ]; then kill "$OWNED_XVFB" 2>/dev/null || true; fi
+    if [ -n "${SOCKET_NAME:-}" ]; then
+        env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET WAYLAND_DISPLAY="$SOCKET_NAME" \
+            ibus exit >/dev/null 2>&1 || true
+    fi
     if [ -n "$COMPOSITOR_PID" ]; then wait "$COMPOSITOR_PID" 2>/dev/null || true; fi
     rm -rf "$RUN_PRIV"
 }
@@ -227,13 +231,13 @@ fi
 # The private HOME below hides the real toolchain config; point the
 # build at the invoking user's cargo/rustup homes explicitly.
 RUSTUP_HOME="${RUSTUP_HOME:-$ORIG_HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$ORIG_HOME/.cargo}" \
-    cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-gtk
+    cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-gtk -p tuna-shell-host --bin tuna-compositor --bin tuna-shell-gtk --bin tuna-ibus-bridge
 {
     echo "source $(git -C "$ROOT" rev-parse HEAD) $(git -C "$ROOT" status --short | head -c 200)"
-    sha256sum "$BIN_DIR/tuna-compositor" "$BIN_DIR/tuna-shell-gtk"
+    sha256sum "$BIN_DIR/tuna-compositor" "$BIN_DIR/tuna-shell-gtk" "$BIN_DIR/tuna-ibus-bridge"
 } >"$ARTIFACTS/manifest.txt" 2>&1 || fail G-OSK-SHOW "build identity failed"
 gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled false
-RUST_BACKTRACE=1 LD_PRELOAD="$PAM_WRAPPER_LIB" PAM_WRAPPER=1 \
+TUNA_IBUS_DEBUG=1 RUST_BACKTRACE=1 LD_PRELOAD="$PAM_WRAPPER_LIB" PAM_WRAPPER=1 \
     PAM_WRAPPER_SERVICE_DIR="$ARTIFACTS/pam/services" \
     "$BIN_DIR/tuna-compositor" --backend winit --socket "tuna-osk-proof-$$" \
     --width "$WIDTH" --height "$HEIGHT" --shell-bin "$BIN_DIR/tuna-shell-gtk" >"$LOG" 2>&1 &
@@ -382,8 +386,64 @@ expect_text b "TuNAs" G-OSK-SHIFT
 [ "$(text_of a)" = tuna ] || fail G-OSK-SHIFT "entry a changed to '$(text_of a)'"
 pass G-OSK-SHIFT "Shift T then u typed 'Tu'; the long-press latch typed 'NA' until tapped off; entry b reads '$(text_of b)'"
 
+# ---- G-OSK-IBUS: distro libpinyin, never the fixture engine.
+# The current IBus context's engine, rather than an XKB grab or the shell's
+# layout list, owns virtual text. All letters below are actual OSK taps.
+ibus_private() {
+    env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET WAYLAND_DISPLAY="$SOCKET_NAME" ibus "$@"
+}
+for _ in $(seq 1 40); do grep -q "tuna-ibus-bridge: ready" "$LOG" && break; sleep 0.5; done
+grep -q "tuna-ibus-bridge: ready" "$LOG" || fail G-OSK-IBUS "supervised IBus bridge never became ready"
+ibus_private list-engine >"$ARTIFACTS/ibus-engines.txt"
+grep -q 'libpinyin' "$ARTIFACTS/ibus-engines.txt" ||
+    fail G-OSK-IBUS "distro ibus-libpinyin engine is required"
+ibus_private engine libpinyin || fail G-OSK-IBUS "cannot activate real libpinyin"
+[ "$(ibus_private engine)" = libpinyin ] || fail G-OSK-IBUS "libpinyin is not current"
+ime_start="$(now)"
+for letter in n i h a o; do session_tap "$letter" G-OSK-IBUS; done
+expect_text b "TuNAs" G-OSK-IBUS
+jq -es --argjson t "$ime_start" 'any(.[]; .t >= $t and .field == "b" and (.preedit // "" | length) > 0)' "$PROBE_LOG" >/dev/null ||
+    fail G-OSK-IBUS "GTK never observed engine preedit from OSK letters"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/ibus-candidates.json" 20 >/dev/null 2>&1 ||
+    fail G-OSK-IBUS "candidate AT-SPI tree unavailable"
+jq -e 'any(.[]; .showing and (.name // "" | contains("你好")))' "$ARTIFACTS/ibus-candidates.json" >/dev/null ||
+    fail G-OSK-IBUS "real engine candidates did not show 你好"
+scrot "$ARTIFACTS/ibus-preedit.png" >/dev/null
+session_tap Space G-OSK-IBUS
+expect_text b "TuNAs你好" G-OSK-IBUS
+# A declined key when not composing must arrive once, not twice or not at all.
+session_tap "?123" G-OSK-IBUS
+decline_start="$(now)"
+session_tap "1" G-OSK-IBUS
+expect_text b "TuNAs你好1" G-OSK-IBUS
+grep -q 'OSK outcome: Declined' "$LOG" ||
+    fail G-OSK-IBUS "the once-only character was not actually declined by the engine"
+jq -es --argjson t "$decline_start" '[.[] | select(.t >= $t and .key == 49 and .pressed == true)] | length == 1' "$PROBE_LOG" >/dev/null ||
+    fail G-OSK-IBUS "declined digit did not produce exactly one client key press"
+session_tap "ABC" G-OSK-IBUS
+# Retiring the field resets unfinished composition, never commits it into a.
+ime_a_before="$(text_of a)"
+session_tap n G-OSK-IBUS
+press "$AX" "$AY" G-OSK-IBUS
+for letter in n i h a o; do session_tap "$letter" G-OSK-IBUS; done
+session_tap Space G-OSK-IBUS
+expect_text b "TuNAs你好1" G-OSK-IBUS
+expect_text a "${ime_a_before}你好" G-OSK-IBUS
+# Restore the ordinary XKB source and check direct native text after IBus.
+ibus_private engine xkb:us::eng || fail G-OSK-IBUS "cannot restore XKB engine"
+xdotool key --clearmodifiers ctrl+a BackSpace
+expect_text a "" G-OSK-IBUS
+xkb_start="$(now)"
+session_tap x G-OSK-IBUS
+expect_text a x G-OSK-IBUS
+jq -es --argjson t "$xkb_start" 'all(.[]; .t < $t or .key != 120 or .pressed != true)' "$PROBE_LOG" >/dev/null ||
+    fail G-OSK-IBUS "confirmed XKB text used raw keys instead of native commit"
+pass G-OSK-IBUS "real libpinyin OSK preedit/candidates and Space→你好; declined 1 exactly once; focus retirement and XKB native commit"
+
 # ---- G-OSK-LOCK
 cstate "$OSK_MAPPED" 5 || fail G-OSK-LOCK "the session keyboard was not up before locking"
+ibus_private engine libpinyin || fail G-OSK-LOCK "cannot activate libpinyin before lock"
+session_tap n G-OSK-LOCK
 text_a="$(text_of a)"
 text_b="$(text_of b)"
 xdotool key --clearmodifiers super+l
