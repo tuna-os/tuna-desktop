@@ -25,7 +25,7 @@ class Selection(unittest.TestCase):
     def test_shared_inputs_run_every_lane(self):
         for path in (".github/workflows/ci.yml", "Cargo.lock", "Cargo.toml",
                      "third-party/smithay/src/lib.rs", "scripts/ci-select-lanes",
-                     "scripts/tuna-nested"):
+                     "scripts/tuna-nested", ".github/actions/ci-tool/action.yml"):
             self.assertEqual(pr("docs/x.md", path), m.LANES, path)
 
     def test_docs_only_runs_no_lane(self):

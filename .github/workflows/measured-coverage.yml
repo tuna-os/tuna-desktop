@@ -1,10 +1,10 @@
 name: Measured test coverage
 on:
   pull_request:
-    paths: ['crates/**', 'Cargo.*', 'tests/coverage-floors.json', 'scripts/tuna-coverage-report', 'scripts/tuna-security-artifacts', 'scripts/tuna-test-strategy', 'scripts/lib/tuna-coverage-tests.py', 'scripts/lib/tuna-security-artifact-tests.py', '.github/workflows/measured-coverage.yml']
+    paths: ['crates/**', 'Cargo.*', 'tests/coverage-floors.json', 'scripts/tuna-coverage-report', 'scripts/tuna-security-artifacts', 'scripts/tuna-test-strategy', 'scripts/lib/tuna-coverage-tests.py', 'scripts/lib/tuna-security-artifact-tests.py', '.github/workflows/measured-coverage.yml', '.github/actions/ci-tool/**', 'scripts/ci-install-gtk4-layer-shell']
   push:
     branches: [main]
-    paths: ['crates/**', 'Cargo.*', 'tests/coverage-floors.json', 'scripts/tuna-coverage-report', 'scripts/tuna-security-artifacts', 'scripts/tuna-test-strategy', 'scripts/lib/tuna-coverage-tests.py', 'scripts/lib/tuna-security-artifact-tests.py', '.github/workflows/measured-coverage.yml']
+    paths: ['crates/**', 'Cargo.*', 'tests/coverage-floors.json', 'scripts/tuna-coverage-report', 'scripts/tuna-security-artifacts', 'scripts/tuna-test-strategy', 'scripts/lib/tuna-coverage-tests.py', 'scripts/lib/tuna-security-artifact-tests.py', '.github/workflows/measured-coverage.yml', '.github/actions/ci-tool/**', 'scripts/ci-install-gtk4-layer-shell']
   workflow_dispatch:
 permissions:
   contents: read
@@ -37,10 +37,27 @@ jobs:
         run: |
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
           sudo apt-get install -y libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev pkg-config libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libpam-wrapper libpam0g-dev meson ninja-build libwayland-dev wayland-protocols
-          scripts/ci-install-gtk4-layer-shell
+      - name: Check out workflow-owned CI tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          path: .ci-workflow-tools
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.github/actions/ci-tool/
+            /scripts/ci-install-gtk4-layer-shell
+      - uses: ./.ci-workflow-tools/.github/actions/ci-tool
+        with:
+          tool: gtk4-layer-shell
+          version: 4867d7b85cdf1e829fc1fd6f1d5f04c42cc99389
       - run: python3 scripts/lib/tuna-coverage-tests.py
       - run: python3 scripts/lib/tuna-security-artifact-tests.py
-      - run: cargo install cargo-llvm-cov --version 0.9.1 --locked
+      - uses: ./.ci-workflow-tools/.github/actions/ci-tool
+        with:
+          tool: cargo-llvm-cov
+          version: 0.9.1
       - name: Record environment and exact reproduction command
         run: |
           mkdir coverage-artifacts
