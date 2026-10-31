@@ -147,6 +147,27 @@ said() {
     sleep 1
 }
 
+# These ASCII fixtures test every character echo, not typing speed. Orca
+# cancels pending speech on each press (KeyboardEvent._present); a fixed
+# xdotool delay races speech-dispatcher/sd_generic under load. Run 41148163143
+# lost s/p/e/e/c this way. Acknowledge each actual utterance before the next
+# key can cancel it, retaining the full ordered assertion and exact counts.
+type_echo() {
+    gate="$1"
+    name="$2"
+    text="$3"
+    echo_as="$4"
+    mark "$name"
+    wanted=""
+    for character in $(printf '%s' "$text" | fold -w 1); do
+        xdotool type --clearmodifiers --delay 0 "$character"
+        wanted="$wanted ${echo_as:-$character}"
+        # shellcheck disable=SC2086
+        "$PY" "$LIB" expect "$SPOKEN" "$name" 30 $wanted >/dev/null 2>"$ARTIFACTS/said.err" ||
+            fail "$gate" "$(tr '\n' ' ' <"$ARTIFACTS/said.err")"
+    done
+}
+
 # The lock screen's password goes through a real PAM stack: pam_wrapper
 # serves the compositor's tuna-lock service from a private password file.
 PAM_WRAPPER_LIB=/usr/lib/x86_64-linux-gnu/libpam_wrapper.so
@@ -310,8 +331,7 @@ step search super
 cstate '.overview_open == true' "overview open" ||
     fail G-ORCA-SPEECH-SEARCH "Super did not open the overview"
 said G-ORCA-SPEECH-SEARCH search "Search" "entry" "Type to search."
-mark search-type
-xdotool type --delay 150 speech
+type_echo G-ORCA-SPEECH-SEARCH search-type speech ""
 said G-ORCA-SPEECH-SEARCH search-type s p e e c h
 step search-result Down
 said G-ORCA-SPEECH-SEARCH search-result "Speech Probe" "button."
