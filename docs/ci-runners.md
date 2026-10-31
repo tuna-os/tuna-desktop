@@ -65,6 +65,64 @@ remote-security, niri-parity) use the pods' rootless podman.
 Other workflows (`stress`, `fuzz`, `baseline`, …) still use GitHub-hosted
 runners; the same aliases can move them.
 
+## Queue supersession and closed pull requests
+
+Every PR-triggered workflow already has native workflow/ref (or PR-number)
+`concurrency`: a new push supersedes the older run for that PR without
+requiring an Actions write token in PR jobs. Keep those groups separate
+between workflows. The `ci` and measured-coverage workflows deliberately do
+not cancel an in-progress `main` run: successful main CI supplies the
+performance baseline. Native concurrency keeps at most one running and one
+pending run per group; it replaces older pending runs, not every main run
+finishing in order. Existing schedule, manual and performance concurrency
+policies remain unchanged.
+
+Closing a PR does not create a newer run in its concurrency group, so native
+supersession cannot retire its queued work. The repository-owned
+[`cleanup-closed-pr-runs.yml`](../.github/workflows/cleanup-closed-pr-runs.yml)
+runs every 15 minutes (subject to GitHub schedule delays), using
+[`scripts/ci-cleanup-closed-pr-runs`](../scripts/ci-cleanup-closed-pr-runs).
+It only cancels runs still `queued`, triggered by `pull_request`, with
+nonempty, explicit API PR associations **all confirmed closed**. Open PR
+heads, running jobs, push, scheduled, manual and performance-baseline
+schedule/dispatch runs are not cleanup targets. There is no age threshold,
+branch-name inference, force-cancel, local process reaper or semaphore here.
+Runs with absent/ambiguous PR associations are intentionally left alone.
+
+The sweep completes a bounded listing (maximum 1,000 filtered runs) and its
+candidate PR reads before any cancellation. Failed, incomplete or changing
+listings and invalid API responses fail closed. Each candidate run and its
+PR states are read again immediately before cancellation; started runs and
+reopened PRs are skipped. GitHub has no atomic conditional-cancel endpoint,
+so a run can still start or a PR reopen in the interval after that last read.
+An API/cancellation failure stops the pass; the next schedule can retry.
+
+Cleanup has one native concurrency owner on GitHub-hosted runners, a
+10-minute job limit, and only job-level `contents: read`, `actions: write`
+and `pull-requests: read`. It checks out the trusted default-branch event
+SHA, never PR code; manual dispatch on another branch is skipped. There is
+no `pull_request_target` trigger.
+
+Behavioral smoke checks (the first two are read-only):
+
+```sh
+python3 scripts/tests/test_ci_closed_pr_cleanup.py
+GH_TOKEN=$(gh auth token) GITHUB_REPOSITORY=tuna-os/tuna-desktop \
+  python3 scripts/ci-cleanup-closed-pr-runs
+gh workflow run cleanup-closed-pr-runs.yml --ref main
+# Explicit opt-in for a manual mutating pass (scheduled passes apply):
+gh workflow run cleanup-closed-pr-runs.yml --ref main -f apply=true
+```
+
+For an end-to-end queue check, push twice to a disposable open PR and inspect
+each workflow's runs: the newer head should supersede the older PR run while
+main/scheduled work keeps its existing policy. Close the disposable PR while
+one of its runs is queued, then dispatch cleanup and inspect its log and the
+run status. A dry run should only print `Would cancel`; an apply pass should
+cancel only the closed PR's queued run. The offline suite covers open heads,
+running/scheduled/manual work, reopened/shared PRs, missing associations and
+API/list failures without contacting GitHub.
+
 ## Security model
 
 The repository is public, so the controls assume a job can run arbitrary
@@ -107,13 +165,18 @@ code as root inside its pod.
    address), the kubelet, other namespaces' pods and Services (corral-web,
    punjab, KubeVirt) and link-local metadata are unreachable.
 5. **Headroom.** ResourceQuota `runner-ceiling` caps the namespace at 14 pods,
-   48 CPU / 168 GiB limits, 24 CPU / 72 GiB requests: at most 12 runners
+   56 CPU / 196 GiB limits, 28 CPU / 82 GiB requests: up to 14 runners
    run at once (karnataka: 28 CPU / 125 GiB allocatable; punjab is sized at
    12 cores / 24 GiB). Each runner asks for
-   2 CPU / 6 GiB and is limited to 4 CPU / 14 GiB / 45 GiB disk. Runner pods
+   1.5 CPU / 5 GiB and is limited to 4 CPU / 14 GiB / 45 GiB disk. Runner pods
    use PriorityClass `tuna-ci-runner` (-100, never preempts): new VMs and
    cluster services preempt them, and the kubelet evicts them first under
    memory pressure.
+   All 14 new pods reserve 21 CPU / 70 GiB together; the request quota allows
+   older pods during rollout. The scheduler also accounts for VM reservations.
+   Aggregate memory limits exceed node capacity: they are not a guarantee that
+   every runner can peak at once. Check memory pressure and disk latency before
+   raising concurrency further.
 
 The ARC listener uses the GitHub credential in secret `tuna-ci-github`
 (`tuna-ci` namespace, copied by the controller to `arc-systems`). Runner
@@ -207,6 +270,65 @@ ssh karnataka 'sudo k3s ctr -n k8s.io images rm localhost/tuna-ci-runner:<old ta
 `values-24.04.yaml` and `values-26.04.yaml` differ only in the scale set
 name, image and min/max runners; change both together.
 
+### Preinstalled CI dependencies and image smoke checks
+
+The image preinstalls the common `ci.yml` compositor/shell development
+packages (seat/input/udev, DRM/GBM/EGL, Wayland, GTK4/libadwaita, GLib,
+PipeWire, font/rendering and PAM headers/wrapper) and the nested proof
+runtime (X11/XWayland, media, AT-SPI/Python, IBus, keyring and desktop
+portals). This moves repeated apt download/unpack work out of individual
+jobs, reducing contention on the node's disk; it does not add runner slots
+or a shared writable compiler cache. Each job still gets its own ephemeral
+pod and keeps its workflow apt steps for hosted-runner compatibility and
+package updates.
+
+Package versions come from the image's own Ubuntu release repositories.
+Only 26.04 preinstalls distro `libgtk4-layer-shell-dev`, Orca and
+speech-dispatcher for journey/orca-speech. 24.04 keeps the existing pinned
+`scripts/ci-install-gtk4-layer-shell` build in its jobs: that release has no
+distro package. Do not replace 26.04's distro library with a `/usr/local`
+build; its installed-package proofs require distro provenance.
+
+Build only when the node has disk-I/O headroom, not while tuning or running
+a heavily loaded queue. `build-image` already builds the releases
+sequentially, imports their images, and updates the two local values files;
+it does **not** deploy them. No rebuild or rollout is implied by changing
+the Containerfile. After review, build and smoke both imported tags before
+the separate rollout:
+
+```bash
+set -euo pipefail
+.github/runners/build-image karnataka
+# Offline library/package checks only: these do not register a runner.
+for ubuntu in 24.04 26.04; do
+  while read -r key ref; do
+    [[ "$key" == image: ]] || continue
+    ssh karnataka "sudo k3s ctr -n k8s.io run --rm '$ref' \
+      'tuna-runner-smoke-${ubuntu//./-}' /bin/sh -ec '
+        pkg-config --exists libseat libinput libudev gbm libdrm xkbcommon \
+          wayland-client gtk4 libadwaita-1 libpipewire-0.3
+        dpkg-query -W libpam0g-dev libpam-wrapper libgtk-4-dev \
+          libadwaita-1-dev libglib2.0-dev meson xwayland
+        test -x /opt/tuna-ci/job-started.sh
+        if [ \"$ubuntu\" = 26.04 ]; then
+          pkg-config --atleast-version=1.1 gtk4-layer-shell-0
+          dpkg-query -W libgtk4-layer-shell-dev orca speech-dispatcher
+        else
+          ! pkg-config --exists gtk4-layer-shell-0
+        fi
+      '"
+  done < ".github/runners/values-${ubuntu}.yaml"
+done
+# Deploy only after both smoke checks and review of the new image tags.
+.github/runners/deploy --sets-only
+```
+
+These checks are not full job qualification. After rollout, require passing
+`check`/`gtk-shell` (24.04) and `journey`/`orca-speech` (26.04) on the exact
+reviewed commit, including their existing package/proof assertions. Until
+the images have been built and these lanes pass, runtime compatibility and
+the reduction in apt time remain unverified.
+
 Images are node-local and `imagePullPolicy: Never`; if kubelet image garbage
 collection ever removes one (disk above 85%), pods fail with
 `ErrImageNeverPull`: rebuild.
@@ -219,10 +341,12 @@ page), then run `.github/runners/deploy`: it upgrades the controller first.
 
 `minRunners` (idle, pre-registered pods) and `maxRunners` live in the values
 files: 24.04 is 1–10, 26.04 is 0–4. Keep `maxRunners` of both sets within the
-quota's 14 pods (12 run at once by CPU requests); change the quota in `cluster.yaml` only together with a look
-at punjab's and KubeVirt's needs (`kubectl describe node karnataka`). Apply
-with `.github/runners/deploy --sets-only`. A temporary change without editing
-files applies the same `--set` to both sets:
+quota's 14 pods; the scheduler can still withhold slots for VM reservations.
+Change the quota in `cluster.yaml` only after checking punjab and KubeVirt
+(`kubectl describe node karnataka`). Apply guard rails with
+`kubectl --context karnataka-k3s apply -f .github/runners/cluster.yaml`, then
+runner values with `.github/runners/deploy --sets-only`. A temporary change
+without editing files applies the same `--set` to both sets:
 
 ```
 .github/runners/deploy --sets-only -- --set maxRunners=2

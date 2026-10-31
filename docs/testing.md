@@ -306,6 +306,14 @@ both interfaces, so `tuna-portals.conf` routes them to a working backend),
 under `repeat-NN/`; `repeat-manifest.json` records every boot, while the
 root `assertions.txt` aggregates results for the parity ledger.
 
+The installed strip gate validates both PNG and PPM pixels against the same
+owned window geometry. A transient obstruction or an unpresented frame may
+retry for at most 10 seconds, within the existing 120-second strip deadline.
+The first rejected image pair is retained as `*-not-ready.{png,ppm}`; the
+receipt records capture attempts. Window identity/geometry drift, malformed
+images and QMP failures remain terminal. A retry never qualifies pixels from
+the rejected frame or claims presentation latency.
+
 The artifact (`marlin-vm`) holds `serial.log`, `tuna-lines.log` (every
 `tuna-*` line), the boot frames, `V-OVERVIEW.png` (the login overview),
 `V-SESSION.png` (the desktop), and `manifest.json`.
@@ -377,6 +385,14 @@ Proof `G-ANIMATION-CLOCK` samples the overview this way at 125 and 250 ms
 in both directions. `G-ANIMATIONS-OFF` and `G-INTROSPECT-MOTION` check the
 live motion policy: animations off snaps everything, Reduced Motion
 (fade-only) snaps overview and strip motion but keeps the idle-shield fade.
+
+The shell's Alt+Tab fades read the same clock (`crates/shell-gtk/src/anim_clock.rs`),
+and the compositor state lists `switcher_thumbnail_alphas`, the opacity each
+switcher window image is drawn at. `G-SWITCHER-FADE` freezes the clock and
+samples them at 0, 50 and 100 ms of the thumbnails' fade in and 50 ms into
+the fade out (Alt+Escape, which cancels without moving focus), where GNOME's
+ease-out quad gives 0, 191/255 and 1, then 64/255. The grid-cancel comparison
+slice skips the sampling: its old binaries predate the published alphas.
 
 ## Frame cost
 

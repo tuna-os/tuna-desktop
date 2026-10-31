@@ -164,8 +164,9 @@ Each interface checks its caller itself. The main policies:
 |---|---|---|
 | `org.gnome.Mutter.ScreenCast`, `.RemoteDesktop`, `org.gnome.Shell.Screenshot`, `org.tuna.Screenshot` | compositor | Shell PID or authenticated installed portal. Denied while locked. |
 | `org.gnome.Mutter.ServiceChannel` | compositor | Same-user caller. Typed connections require the installed provider for that type. |
-| `org.gnome.Shell.Introspect` | compositor | Portal only. `TUNA_INTROSPECT_UNRESTRICTED=1` (test/development "unsafe mode") allows metadata only while unlocked (`introspect.rs:1-23`). |
-| `org.gnome.Shell` (OSD, search, app grid) | GTK shell | Caller must own `org.gnome.Settings`, `org.gnome.SettingsDaemon.MediaKeys` or the GNOME portal name, as GNOME's `DBusSenderChecker`. `TUNA_SHELL_DBUS_UNRESTRICTED=1` disables this for harnesses (`shell-gtk/src/shell_dbus.rs:25-29`, `372-376`). |
+| `org.gnome.Shell.Introspect` | compositor | Shell PID or authenticated installed portal (`capture_security::Authority::admit`). Denied while locked. `TUNA_INTROSPECT_UNRESTRICTED=1` (test/development "unsafe mode") allows metadata only while unlocked (`introspect.rs`). |
+| `/org/gnome/Shell/Introspect` on `org.gnome.Shell` | GTK shell relays to the compositor | The shell holds no window data and decides nothing: it forwards each call to the compositor's `org.tuna.Introspect` with the original caller's unique name. The compositor answers only when the relay is the supervised shell's PID and the original caller passes the `org.gnome.Shell.Introspect` rule above (`Authority::admit_forwarded`; `shell-gtk/src/introspect_forward.rs`). |
+| `org.gnome.Shell` (OSD, search, app grid) | GTK shell | Caller must own `org.gnome.Settings`, `org.gnome.SettingsDaemon.MediaKeys` or the GNOME portal name, as GNOME's `DBusSenderChecker`. `TUNA_SHELL_DBUS_UNRESTRICTED=1` disables this for harnesses (`shell-gtk/src/shell_dbus.rs:27-31`, `374-378`). |
 | `org.gnome.Shell.NetworkAgent` (system bus) | GTK shell | Only NetworkManager's current unique owner ([network agent](network-agent.md)). |
 | `org.freedesktop.impl.portal.Access` | shell (`org.freedesktop.impl.portal.desktop.tuna`) | Always answers "cancelled", so the requester is refused (`shell-host/src/lockdown.rs:66-83`). |
 

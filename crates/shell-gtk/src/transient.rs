@@ -33,6 +33,12 @@ const MENU_SCALE: f64 = 0.96;
 /// `quickSettings.js` POPUP_ANIMATION_TIME: a submenu opens in two
 /// halves, height then fade (closing: fade then height).
 pub const SUBMENU_MS: f64 = 400.0;
+/// `PopupSubMenu.open` and `close` (`popupMenu.js:1292,1326` at gnome-shell
+/// 51.0): a popup submenu's height and its arrow ease over 250 ms.
+pub const POPUP_SUBMENU_MS: f64 = 250.0;
+/// `PopupSubMenuMenuItem`'s triangle turns about (0.5, 0.6)
+/// (`popupMenu.js:1428`).
+const SUBMENU_ARROW_PIVOT: (f64, f64) = (0.5, 0.6);
 
 /// Whether transient animations play at all: the motion policy (#493)
 /// allows fades unless animations are off. (GTK's enable-animations
@@ -61,6 +67,18 @@ pub fn ease_out_back(t: f64) -> f64 {
     }
     let p = t.min(1.0) - 1.0;
     p * p * ((S + 1.0) * p + S) + 1.0
+}
+
+/// Clutter's EASE_OUT_EXPO (`clutter/clutter/clutter-easing.c:171-175`
+/// at mutter 51.0): `1 - 2^(-10t)`, exactly 1 at the end.
+pub fn ease_out_expo(t: f64) -> f64 {
+    if t >= 1.0 {
+        1.0
+    } else if t <= 0.0 {
+        0.0
+    } else {
+        1.0 - 2f64.powf(-10.0 * t)
+    }
 }
 
 /// Linear progress through a `duration_ms` animation; complete at once
@@ -197,6 +215,65 @@ pub fn menu_open(t: f64) -> Frame {
     }
 }
 
+/// A panel or window menu closing (`BoxPointer.close`, `PopupAnimation.FULL`,
+/// arrow on top, `boxpointer.js:132-181`): from wherever it stands it
+/// fades out while rising [`MENU_RISE`] and shrinking to 96% about its top
+/// centre, all ease-out quad.
+pub fn menu_close(from: Frame, t: f64) -> Frame {
+    let e = ease_out_quad(t);
+    Frame {
+        opacity: lerp(from.opacity, 0.0, e),
+        dy: lerp(from.dy, -MENU_RISE, e),
+        scale: lerp(from.scale, MENU_SCALE, e),
+        extent: 1.0,
+    }
+}
+
+/// The submenu arrow's resting angle: it turns to point down when open,
+/// the other way round in right-to-left text (`popupMenu.js:1290`).
+pub fn submenu_arrow_angle(open: bool, rtl: bool) -> f64 {
+    match (open, rtl) {
+        (false, _) => 0.0,
+        (true, false) => 90.0,
+        (true, true) => -90.0,
+    }
+}
+
+/// `PopupSubMenu._needsScrollbar` (`popupMenu.js:1241-1248`): the top
+/// menu has a max height and its natural height reaches it. GNOME then
+/// opens and closes the submenu without animation (`popupMenu.js:1285-1288,
+/// 1322-1324`).
+pub fn needs_scrollbar(top_natural: i32, top_max: i32) -> bool {
+    top_max >= 0 && top_natural >= top_max
+}
+
+/// A popup submenu's motion: the share of its height it shows and its
+/// arrow's rotation in degrees.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SubmenuFrame {
+    pub extent: f64,
+    pub angle: f64,
+}
+
+impl SubmenuFrame {
+    pub const CLOSED: SubmenuFrame = SubmenuFrame {
+        extent: 0.0,
+        angle: 0.0,
+    };
+}
+
+/// A popup submenu `t` (linear) of the way from `from`, wherever it stood
+/// (a reversal mid-way starts from the drawn frame), to open or closed:
+/// height and arrow both ease out expo (`PopupSubMenu.open`/`close`,
+/// `popupMenu.js:1265-1342`).
+pub fn popup_submenu(from: SubmenuFrame, open: bool, rtl: bool, t: f64) -> SubmenuFrame {
+    let e = ease_out_expo(t);
+    SubmenuFrame {
+        extent: lerp(from.extent, if open { 1.0 } else { 0.0 }, e),
+        angle: lerp(from.angle, submenu_arrow_angle(open, rtl), e),
+    }
+}
+
 /// A plain ease-out-quad fade from `from` to `to` (OSD, modals, menus).
 pub fn fade(from: f64, to: f64, t: f64) -> f64 {
     lerp(from, to, ease_out_quad(t))
@@ -290,6 +367,14 @@ mod imp {
         pub dy: Cell<f64>,
         pub scale: Cell<f64>,
         pub extent: Cell<f64>,
+        /// Degrees about the pivot (a submenu's arrow).
+        pub rotation: Cell<f64>,
+        /// The scale and rotation pivot, as a fraction of the child's
+        /// size (Clutter's `pivot_point`).
+        pub pivot: Cell<(f64, f64)>,
+        /// Clip to the bin while it moves (off for a BoxPointer, whose
+        /// rise and shrink stay inside its surface).
+        pub clip: Cell<bool>,
     }
 
     impl Default for MotionBin {
@@ -298,6 +383,9 @@ mod imp {
                 dy: Cell::new(0.0),
                 scale: Cell::new(1.0),
                 extent: Cell::new(1.0),
+                rotation: Cell::new(0.0),
+                pivot: Cell::new((0.5, 0.5)),
+                clip: Cell::new(true),
             }
         }
     }
@@ -340,14 +428,17 @@ mod imp {
             // share shrinks; the bin clips the rest.
             let (_, natural, _, _) = child.measure(gtk::Orientation::Vertical, width);
             let child_height = height.max(natural);
-            // Scale about the centre, as GNOME's pivot (0.5, 0.5).
-            let (cx, cy) = (f64::from(width) / 2.0, f64::from(child_height) / 2.0);
+            // Scale and turn about the pivot (GNOME's pivot_point,
+            // the centre unless set).
+            let (fx, fy) = self.pivot.get();
+            let (cx, cy) = (f64::from(width) * fx, f64::from(child_height) * fy);
             let scale = self.scale.get().max(0.0) as f32;
             let transform = gtk::gsk::Transform::new()
                 .translate(&gtk::graphene::Point::new(
                     cx as f32,
                     (cy + self.dy.get()) as f32,
                 ))
+                .rotate(self.rotation.get() as f32)
                 .scale(scale, scale)
                 .translate(&gtk::graphene::Point::new(-cx as f32, -cy as f32));
             child.allocate(width, child_height, -1, Some(transform));
@@ -369,6 +460,28 @@ impl MotionBin {
         bin
     }
 
+    /// A BoxPointer's bin (arrow on top): it scales about its top centre
+    /// (`boxpointer.js:93-95`) and never clips its own rise or shrink.
+    pub fn box_pointer(child: &impl IsA<gtk::Widget>) -> Self {
+        let bin = Self::new(child);
+        bin.imp().pivot.set((0.5, 0.0));
+        bin.imp().clip.set(false);
+        bin
+    }
+
+    /// Turn the child `degrees` about `pivot` (fractions of its size).
+    pub fn set_rotation(&self, degrees: f64, pivot: (f64, f64)) {
+        let imp = self.imp();
+        imp.pivot.set(pivot);
+        if imp.rotation.replace(degrees) != degrees {
+            self.queue_allocate();
+        }
+    }
+
+    pub fn rotation(&self) -> f64 {
+        self.imp().rotation.get()
+    }
+
     /// The frame the bin shows now.
     pub fn frame(&self) -> Frame {
         let imp = self.imp();
@@ -386,8 +499,8 @@ impl MotionBin {
         imp.dy.set(frame.dy);
         imp.scale.set(frame.scale);
         let resized = imp.extent.replace(frame.extent) != frame.extent;
-        // Clip only while something is moving.
-        self.set_overflow(if frame == Frame::REST {
+        // Clip only while something is moving, and only where asked.
+        self.set_overflow(if frame == Frame::REST || !imp.clip.get() {
             gtk::Overflow::Visible
         } else {
             gtk::Overflow::Hidden
@@ -499,6 +612,21 @@ pub fn open_fade_only(others_mapped: usize, closed_this_turn: bool) -> bool {
 thread_local! {
     static MENUS_MAPPED: Cell<usize> = const { Cell::new(0) };
     static MENU_CLOSED_THIS_TURN: Cell<bool> = const { Cell::new(false) };
+    static UNANIMATED_CLOSE: RefCell<Option<Rc<dyn Fn()>>> = RefCell::new(None);
+}
+
+/// What tells the compositor that the panel menu closing now goes without
+/// BoxPointer's close (`CloseMenuUnanimated`): run as a panel button is
+/// hidden under its open menu, before GTK drops the menu's popup.
+pub fn on_unanimated_menu_close(hook: impl Fn() + 'static) {
+    UNANIMATED_CLOSE.with(|h| *h.borrow_mut() = Some(Rc::new(hook)));
+}
+
+/// `PanelMenu.Button.vfunc_hide` (`panelMenu.js:149-154`): a menu whose
+/// button is no longer mapped closes with `animate: false`. Hiding the
+/// button unmaps it before GTK unmaps its popover.
+pub fn closes_unanimated(button_mapped: Option<bool>) -> bool {
+    button_mapped == Some(false)
 }
 
 mod menu_imp {
@@ -509,6 +637,8 @@ mod menu_imp {
         pub player: Player,
         /// Whether the last open played BoxPointer's rise (tests).
         pub opened_with_motion: Cell<Option<bool>>,
+        /// Whether the last close went unanimated (tests).
+        pub closed_unanimated: Cell<bool>,
     }
 
     impl Default for MenuPopover {
@@ -517,6 +647,7 @@ mod menu_imp {
                 frame: Cell::new(Frame::REST),
                 player: Player::new("menu"),
                 opened_with_motion: Cell::new(None),
+                closed_unanimated: Cell::new(false),
             }
         }
     }
@@ -542,13 +673,35 @@ mod menu_imp {
         }
 
         /// The close itself is the compositor's (`menu_close.rs`): GTK
-        /// has already closed the menu logically when this runs.
+        /// has already closed the menu logically when this runs. A hidden
+        /// button's menu closes unanimated (`PanelMenu.Button.vfunc_hide`).
         fn unmap(&self) {
+            let hidden = closes_unanimated(self.obj().parent().map(|b| b.is_mapped()));
+            self.closed_unanimated.set(hidden);
+            if hidden {
+                trace("menu", format_args!("close unanimated (button hidden)"));
+                let hook = UNANIMATED_CLOSE.with(|h| h.borrow().clone());
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
             MENUS_MAPPED.with(|n| n.set(n.get().saturating_sub(1)));
             if !MENU_CLOSED_THIS_TURN.with(|c| c.replace(true)) {
                 glib::idle_add_local_once(|| MENU_CLOSED_THIS_TURN.with(|c| c.set(false)));
             }
             self.parent_unmap();
+            if hidden {
+                // GNOME's menu is closed for good: GTK would map the
+                // still-visible popover again with its button.
+                let popover = self.obj().downgrade();
+                glib::idle_add_local_once(move || {
+                    if let Some(popover) = popover.upgrade() {
+                        if popover.is_visible() && !popover.is_mapped() {
+                            popover.popdown();
+                        }
+                    }
+                });
+            }
         }
 
         fn snapshot(&self, snapshot: &gtk::Snapshot) {
@@ -692,6 +845,264 @@ impl Submenu {
                 }
             },
         );
+    }
+}
+
+mod popup_submenu_imp {
+    use super::*;
+
+    pub struct PopupSubmenu {
+        pub header: gtk::Button,
+        pub label: gtk::Label,
+        pub arrow: MotionBin,
+        pub bin: RefCell<Option<MotionBin>>,
+        pub player: Player,
+        pub open: Cell<bool>,
+        /// Whether the last open or close animated (tests).
+        pub animated: Cell<Option<bool>>,
+    }
+
+    impl Default for PopupSubmenu {
+        fn default() -> Self {
+            let label = gtk::Label::new(None);
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            // arrowIcon(St.Side.RIGHT), turned as the submenu opens.
+            let arrow = MotionBin::new(&gtk::Image::from_icon_name("pan-end-symbolic"));
+            arrow.add_css_class("popup-submenu-arrow");
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            line.append(&label);
+            line.append(&arrow);
+            let header = gtk::Button::builder().child(&line).build();
+            header.add_css_class("popup-submenu-menu-item");
+            Self {
+                header,
+                label,
+                arrow,
+                bin: RefCell::new(None),
+                player: Player::new("popup-submenu"),
+                open: Cell::new(false),
+                animated: Cell::new(None),
+            }
+        }
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for PopupSubmenu {
+        const NAME: &'static str = "TunaPopupSubmenu";
+        type Type = super::PopupSubmenu;
+        type ParentType = gtk::Box;
+    }
+
+    impl ObjectImpl for PopupSubmenu {
+        fn constructed(&self) {
+            self.parent_constructed();
+            let obj = self.obj();
+            obj.set_orientation(gtk::Orientation::Vertical);
+            obj.append(&self.header);
+        }
+    }
+
+    impl WidgetImpl for PopupSubmenu {}
+    impl BoxImpl for PopupSubmenu {}
+}
+
+glib::wrapper! {
+    /// GNOME's `PopupSubMenuMenuItem` with its `PopupSubMenu`
+    /// (`popupMenu.js:1216-1484`): an item that expands its submenu in
+    /// place, the height and the arrow easing out expo over 250 ms.
+    pub struct PopupSubmenu(ObjectSubclass<popup_submenu_imp::PopupSubmenu>)
+        @extends gtk::Box, gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget,
+            gtk::Orientable;
+}
+
+impl PopupSubmenu {
+    /// An item labelled `label` whose submenu is `content`, closed.
+    pub fn new(label: &str, content: &impl IsA<gtk::Widget>) -> Self {
+        // A group holding the item and its submenu, so assistive
+        // technology finds the submenu's rows beside the item they belong
+        // to. The item alone carries the name.
+        let menu: Self = glib::Object::builder()
+            .property("accessible-role", gtk::AccessibleRole::Group)
+            .build();
+        let imp = menu.imp();
+        imp.label.set_text(label);
+        imp.header
+            .update_property(&[gtk::accessible::Property::Label(label)]);
+        let bin = MotionBin::new(content);
+        bin.add_css_class("popup-sub-menu");
+        bin.set_frame(Frame {
+            extent: 0.0,
+            ..Frame::REST
+        });
+        bin.set_visible(false);
+        menu.append(&bin);
+        *imp.bin.borrow_mut() = Some(bin.clone());
+        menu.sync_state();
+        let weak = menu.downgrade();
+        imp.header.connect_clicked(move |_| {
+            if let Some(menu) = weak.upgrade() {
+                menu.set_open(!menu.is_open(), true);
+            }
+        });
+        // Right on the item opens the submenu and moves into it
+        // (`popupMenu.js:1393-1400`).
+        let keys = gtk::EventControllerKey::new();
+        let weak = menu.downgrade();
+        keys.connect_key_pressed(move |_, key, _, _| match weak.upgrade() {
+            Some(menu) if key == gtk::gdk::Key::Right => {
+                menu.set_open(true, true);
+                if let Some(bin) = menu.bin() {
+                    bin.child_focus(gtk::DirectionType::TabForward);
+                }
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        });
+        imp.header.add_controller(keys);
+        // Left inside closes it and returns to the item
+        // (`PopupSubMenu._onKeyPress`, `popupMenu.js:1344-1354`).
+        let keys = gtk::EventControllerKey::new();
+        let weak = menu.downgrade();
+        keys.connect_key_pressed(move |_, key, _, _| match weak.upgrade() {
+            Some(menu) if key == gtk::gdk::Key::Left => menu.close_to_item(),
+            _ => glib::Propagation::Proceed,
+        });
+        bin.add_controller(keys);
+        // syncSensitive: an insensitive item hides its arrow and closes.
+        menu.connect_sensitive_notify(|menu| {
+            let sensitive = menu.is_sensitive();
+            menu.imp().arrow.set_visible(sensitive);
+            if !sensitive {
+                menu.set_open(false, true);
+            }
+        });
+        menu
+    }
+
+    fn bin(&self) -> Option<MotionBin> {
+        self.imp().bin.borrow().clone()
+    }
+
+    /// The item that opens and closes the submenu.
+    pub fn header(&self) -> gtk::Button {
+        self.imp().header.clone()
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.imp().open.get()
+    }
+
+    /// Left inside an open submenu: close it and focus its item.
+    pub fn close_to_item(&self) -> glib::Propagation {
+        if !self.is_open() {
+            return glib::Propagation::Proceed;
+        }
+        self.set_open(false, true);
+        self.imp().header.grab_focus();
+        glib::Propagation::Stop
+    }
+
+    /// What the submenu shows now: a hidden one shows nothing.
+    pub fn submenu_frame(&self) -> SubmenuFrame {
+        SubmenuFrame {
+            extent: self
+                .bin()
+                .filter(|bin| bin.is_visible())
+                .map_or(0.0, |bin| bin.frame().extent),
+            angle: self.imp().arrow.rotation(),
+        }
+    }
+
+    /// The expanded state, for screen readers (`Atk.StateType.EXPANDED`)
+    /// and the `:open` style.
+    fn sync_state(&self) {
+        let imp = self.imp();
+        let open = imp.open.get();
+        imp.header
+            .update_state(&[gtk::accessible::State::Expanded(Some(open))]);
+        if open {
+            imp.header.add_css_class("open");
+        } else {
+            imp.header.remove_css_class("open");
+        }
+    }
+
+    /// `_needsScrollbar` against the scrolled menu holding the submenu:
+    /// its max height and its natural height with the submenu open.
+    fn needs_scrollbar_now(&self) -> bool {
+        let Some(scroll) = self
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .and_downcast::<gtk::ScrolledWindow>()
+        else {
+            return false;
+        };
+        let (Some(child), Some(bin)) = (scroll.child(), self.bin()) else {
+            return false;
+        };
+        let for_width = |w: i32| if w > 0 { w } else { -1 };
+        let natural = child
+            .measure(gtk::Orientation::Vertical, for_width(scroll.width()))
+            .1;
+        let shown = bin
+            .measure(gtk::Orientation::Vertical, for_width(bin.width()))
+            .1;
+        let full = bin.first_child().map_or(0, |c| {
+            c.measure(gtk::Orientation::Vertical, for_width(bin.width()))
+                .1
+        });
+        needs_scrollbar(natural - shown + full, scroll.max_content_height())
+    }
+
+    /// `PopupSubMenu.open`/`close`: height and arrow ease out expo over
+    /// [`POPUP_SUBMENU_MS`] from where they stand, then a closed submenu
+    /// hides. No animation when asked for none or when the menu must
+    /// scroll. GNOME eases the height whatever Reduced Motion says
+    /// (`popupMenu.js:1265-1342` never reads it; `adjustAnimationTime`
+    /// only zeroes durations with animations off,
+    /// `misc/animationUtils.js:23-33`), so only animations off lands it
+    /// at once here (through [`Player::play`]).
+    pub fn set_open(&self, open: bool, animate: bool) {
+        let imp = self.imp();
+        let Some(bin) = self.bin() else { return };
+        if imp.open.replace(open) == open {
+            return;
+        }
+        self.sync_state();
+        let from = self.submenu_frame();
+        if open {
+            bin.set_visible(true);
+        }
+        let animate = animate && !self.needs_scrollbar_now();
+        imp.animated.set(Some(animate));
+        let rtl = self.direction() == gtk::TextDirection::Rtl;
+        let (step_bin, arrow) = (bin.downgrade(), imp.arrow.downgrade());
+        let step = move |t: f64| {
+            let f = popup_submenu(from, open, rtl, t);
+            if let Some(bin) = step_bin.upgrade() {
+                bin.set_frame(Frame {
+                    extent: f.extent,
+                    ..Frame::REST
+                });
+            }
+            if let Some(arrow) = arrow.upgrade() {
+                arrow.set_rotation(f.angle, SUBMENU_ARROW_PIVOT);
+            }
+        };
+        let done_bin = bin.downgrade();
+        let done = move || {
+            if let Some(bin) = done_bin.upgrade().filter(|_| !open) {
+                bin.set_visible(false);
+            }
+        };
+        if animate {
+            imp.player.play(self, POPUP_SUBMENU_MS, step, done);
+        } else {
+            imp.player.stop();
+            step(1.0);
+            done();
+        }
     }
 }
 
@@ -874,6 +1285,120 @@ mod tests {
         assert_eq!(fade(0.4, 0.0, 1.0), 0.0);
         assert_eq!(fade(0.5, 1.0, 0.5), 0.875);
     }
+
+    #[test]
+    fn ease_out_expo_matches_clutter() {
+        // clutter-easing.c: -2^(-10 t/d) + 1, exactly 1 at t == d.
+        assert_eq!(ease_out_expo(0.0), 0.0);
+        assert!(close(ease_out_expo(0.5), 1.0 - 2f64.powi(-5)));
+        assert!(close(ease_out_expo(0.1), 0.5));
+        assert_eq!(ease_out_expo(1.0), 1.0);
+        assert_eq!(ease_out_expo(3.0), 1.0);
+    }
+
+    #[test]
+    fn popup_submenus_grow_and_turn_their_arrow_over_250_ms_out_expo() {
+        assert_eq!(POPUP_SUBMENU_MS, 250.0);
+        let open = |t| popup_submenu(SubmenuFrame::CLOSED, true, false, t);
+        assert_eq!(open(0.0), SubmenuFrame::CLOSED);
+        // Height and arrow share the curve: half the way 25 ms in.
+        let early = open(0.1);
+        assert!(close(early.extent, 0.5) && close(early.angle, 45.0));
+        let mid = open(0.5);
+        assert!(close(mid.extent, ease_out_expo(0.5)));
+        assert!(close(mid.angle, 90.0 * ease_out_expo(0.5)));
+        assert_eq!(
+            open(1.0),
+            SubmenuFrame {
+                extent: 1.0,
+                angle: 90.0
+            }
+        );
+        // Right to left the arrow turns the other way.
+        assert_eq!(
+            popup_submenu(SubmenuFrame::CLOSED, true, true, 1.0).angle,
+            -90.0
+        );
+        assert_eq!(submenu_arrow_angle(false, true), 0.0);
+        // Closing shrinks back to nothing and turns the arrow back.
+        let shown = open(1.0);
+        assert_eq!(popup_submenu(shown, false, false, 0.0), shown);
+        assert!(close(popup_submenu(shown, false, false, 0.1).extent, 0.5));
+        assert_eq!(
+            popup_submenu(shown, false, false, 1.0),
+            SubmenuFrame::CLOSED
+        );
+    }
+
+    #[test]
+    fn a_reversed_popup_submenu_starts_from_its_drawn_frame() {
+        // Closed 40 ms into opening: the close starts where it stood.
+        let drawn = popup_submenu(SubmenuFrame::CLOSED, true, false, 40.0 / 250.0);
+        let back = popup_submenu(drawn, false, false, 0.0);
+        assert_eq!(back, drawn);
+        // Every frame on the way back lies between the drawn one and shut.
+        for i in 0..=20 {
+            let f = popup_submenu(drawn, false, false, f64::from(i) / 20.0);
+            assert!(f.extent <= drawn.extent && f.extent >= 0.0);
+            assert!(f.angle <= drawn.angle && f.angle >= 0.0);
+        }
+        // Reopened mid-close: it grows on from there.
+        let again = popup_submenu(back, true, false, 0.0);
+        assert_eq!(again, drawn);
+    }
+
+    #[test]
+    fn popup_submenus_skip_the_animation_when_the_menu_scrolls() {
+        // _needsScrollbar: a max height the natural height reaches.
+        assert!(!needs_scrollbar(400, -1));
+        assert!(!needs_scrollbar(400, 600));
+        assert!(needs_scrollbar(600, 600));
+        assert!(needs_scrollbar(900, 600));
+    }
+
+    #[test]
+    fn popup_submenus_keep_their_motion_under_reduced_motion() {
+        // GNOME never reads reducedMotion here: only animations off (a
+        // zero duration in adjustAnimationTime) lands the submenu at once.
+        let at = |enable, reduced, slowdown| {
+            let policy = crate::motion::derive(Some(enable), Some(reduced), slowdown);
+            progress(
+                125.0,
+                policy.adjust_ms(POPUP_SUBMENU_MS),
+                policy.allows_fades(),
+            )
+        };
+        assert_eq!(at(true, "no-preference", None), 0.5);
+        assert_eq!(at(true, "reduce", None), 0.5);
+        assert_eq!(at(false, "no-preference", None), 1.0);
+        assert_eq!(at(true, "no-preference", Some("2")), 0.25);
+    }
+
+    #[test]
+    fn menus_close_as_boxpointer_from_where_they_stand() {
+        // BoxPointer.close, FULL with the arrow on top: fade out, rise
+        // 6px and shrink to 96%, all ease-out quad.
+        assert_eq!(menu_close(Frame::REST, 0.0), Frame::REST);
+        let mid = menu_close(Frame::REST, 0.5);
+        assert!(close(mid.opacity, 0.25) && close(mid.dy, -4.5) && close(mid.scale, 0.97));
+        let end = menu_close(Frame::REST, 1.0);
+        assert!(close(end.opacity, 0.0) && close(end.dy, -MENU_RISE) && close(end.scale, 0.96));
+        // Closed while still fading in: from that opacity, no jump.
+        let opening = menu_open(0.3).without_motion();
+        assert_eq!(menu_close(opening, 0.0), opening);
+        // Reduced Motion keeps only the fade.
+        let faded = menu_close(Frame::REST, 0.5).gated(false);
+        assert_eq!((faded.dy, faded.scale), (0.0, 1.0));
+        assert!(close(faded.opacity, 0.25));
+    }
+
+    #[test]
+    fn a_hidden_buttons_menu_closes_unanimated() {
+        // panelMenu.js:149-154: only a button no longer mapped.
+        assert!(closes_unanimated(Some(false)));
+        assert!(!closes_unanimated(Some(true)));
+        assert!(!closes_unanimated(None));
+    }
 }
 
 #[cfg(test)]
@@ -899,7 +1424,9 @@ mod gtk_menu_tests {
     /// Real GTK popovers: a panel menu closes logically at once (hidden,
     /// `closed` emitted, button released) so the compositor alone draws
     /// the close; a menu opened in the same turn another closes, or while
-    /// another is up, opens fade-only, and a later open rises again.
+    /// another is up, opens fade-only, and a later open rises again. A
+    /// button hidden under its open menu closes it unanimated, once, and
+    /// for good (`PanelMenu.Button.vfunc_hide`).
     #[test]
     #[ignore = "requires owned Xvfb/private D-Bus and explicit menu admission"]
     fn actual_gtk_menus_close_at_once_and_switch_fade_only() {
@@ -958,9 +1485,141 @@ mod gtk_menu_tests {
         clock.popup();
         assert!(pump_until(Duration::from_secs(5), || clock_menu.is_mapped()));
         assert_eq!(clock_menu.imp().opened_with_motion.get(), Some(true));
+        assert!(!clock_menu.imp().closed_unanimated.get());
+        // PanelMenu.Button.vfunc_hide: hiding the button closes its menu
+        // with animate: false, telling the compositor first.
+        let unanimated = Rc::new(Cell::new(0));
+        {
+            let unanimated = unanimated.clone();
+            on_unanimated_menu_close(move || unanimated.set(unanimated.get() + 1));
+        }
         clock.popdown();
+        assert_eq!(unanimated.get(), 0, "an ordinary close animates");
+        assert!(pump_until(Duration::from_secs(1), || {
+            !MENU_CLOSED_THIS_TURN.with(Cell::get)
+        }));
+        clock.popup();
+        assert!(pump_until(Duration::from_secs(5), || clock_menu.is_mapped()));
+        clock.set_visible(false);
+        assert!(!clock_menu.is_mapped(), "hiding the button unmaps its menu");
+        assert_eq!(unanimated.get(), 1);
+        assert!(clock_menu.imp().closed_unanimated.get());
+        assert!(pump_until(Duration::from_secs(1), || !clock_menu.is_visible()));
+        clock.set_visible(true);
+        assert!(pump_until(Duration::from_secs(5), || clock.is_mapped()));
+        assert!(!pump_until(Duration::from_millis(300), || clock_menu.is_mapped()));
+        assert!(!clock_menu.is_visible(), "the closed menu stays closed");
         assert_eq!(MENUS_MAPPED.with(Cell::get), 0);
+        UNANIMATED_CLOSE.with(|h| h.borrow_mut().take());
         window.close();
-        println!("MENU-MOTION pass actual GTK menus close at once (closed/visibility/button immediate); takeover opens fade-only; later open rises");
+        println!("MENU-MOTION pass actual GTK menus close at once (closed/visibility/button immediate); takeover opens fade-only; later open rises; a hidden button closes its menu unanimated and for good");
+    }
+
+    /// Real GTK popup submenus (`PopupSubMenu`): height and arrow ease out
+    /// expo over 250 ms from where they stand, a reversal mid-way starts
+    /// from the drawn frame, a scrolling menu opens them at once, Reduced
+    /// Motion keeps the height, animations off land it, and Left closes
+    /// back to the item with the expanded state following.
+    #[test]
+    #[ignore = "requires owned Xvfb/private D-Bus and explicit menu admission"]
+    fn actual_gtk_popup_submenus_ease_open_and_closed() {
+        use tuna_shell_control::{MotionLevel, MotionPolicy};
+        assert_eq!(
+            std::env::var("TUNA_REQUIRE_MENU_MOTION").as_deref(),
+            Ok("1")
+        );
+        assert!(std::env::var_os("WAYLAND_DISPLAY").is_none());
+        gtk::init().expect("actual GTK display required");
+        crate::motion::set(MotionPolicy::default());
+        let rows = || {
+            let rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            for label in ["Wired 1", "Wired 2", "Turn Off"] {
+                rows.append(&gtk::Button::with_label(label));
+            }
+            rows
+        };
+        let submenu = PopupSubmenu::new("Ethernet (enp1s0)", &rows());
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        column.append(&submenu);
+        let window = gtk::Window::new();
+        window.set_child(Some(&column));
+        window.present();
+        assert!(pump_until(Duration::from_secs(5), || submenu.is_mapped()));
+        let bin = submenu.bin().unwrap();
+        assert!(!bin.is_visible() && !submenu.is_open());
+        let shut = SubmenuFrame::CLOSED;
+        let open = SubmenuFrame {
+            extent: 1.0,
+            angle: 90.0,
+        };
+        // Opening: frames strictly between shut and open on the way.
+        let started = Instant::now();
+        submenu.set_open(true, true);
+        assert_eq!(submenu.imp().animated.get(), Some(true));
+        assert_eq!(submenu.submenu_frame(), shut);
+        let mut between = 0;
+        assert!(pump_until(Duration::from_secs(5), || {
+            let f = submenu.submenu_frame();
+            if f.extent > 0.0 && f.extent < 1.0 {
+                assert!(f.angle > 0.0 && f.angle < 90.0, "{f:?}");
+                between += 1;
+            }
+            f == open
+        }));
+        let took = started.elapsed();
+        assert!(between > 0, "no intermediate frame");
+        assert!(took >= Duration::from_millis(240), "{took:?}");
+        assert!(bin.height() > 0);
+        // Reversed mid-opening: the close starts from the drawn frame.
+        submenu.set_open(false, true);
+        assert!(pump_until(Duration::from_secs(5), || !bin.is_visible()));
+        submenu.set_open(true, true);
+        assert!(pump_until(Duration::from_secs(5), || {
+            submenu.submenu_frame().extent > 0.3
+        }));
+        let drawn = submenu.submenu_frame();
+        assert!(drawn.extent < 1.0);
+        submenu.set_open(false, true);
+        assert_eq!(submenu.submenu_frame(), drawn, "the reversal jumped");
+        assert!(pump_until(Duration::from_secs(5), || !bin.is_visible()));
+        assert_eq!(submenu.submenu_frame(), shut);
+        // Left inside an open submenu closes it and focuses its item.
+        submenu.set_open(true, false);
+        assert_eq!(submenu.submenu_frame(), open);
+        assert_eq!(submenu.close_to_item(), glib::Propagation::Stop);
+        assert!(!submenu.is_open());
+        assert!(pump_until(Duration::from_secs(5), || submenu
+            .header()
+            .has_focus()));
+        assert_eq!(submenu.close_to_item(), glib::Propagation::Proceed);
+        assert!(pump_until(Duration::from_secs(5), || !bin.is_visible()));
+        // Reduced Motion: GNOME still eases the height.
+        crate::motion::set(MotionPolicy::new(MotionLevel::FadeOnly, 1.0));
+        submenu.set_open(true, true);
+        assert_eq!(submenu.submenu_frame(), shut);
+        assert!(pump_until(Duration::from_secs(5), || submenu
+            .submenu_frame()
+            == open));
+        // Animations off: it lands at once.
+        crate::motion::set(MotionPolicy::new(MotionLevel::Off, 1.0));
+        submenu.set_open(false, true);
+        assert_eq!(submenu.submenu_frame(), shut);
+        assert!(!bin.is_visible());
+        crate::motion::set(MotionPolicy::default());
+        // A menu that must scroll opens it without animation.
+        let scrolled = PopupSubmenu::new("Input Mode", &rows());
+        let scroll = gtk::ScrolledWindow::builder()
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .propagate_natural_height(true)
+            .max_content_height(20)
+            .child(&scrolled)
+            .build();
+        column.append(&scroll);
+        assert!(pump_until(Duration::from_secs(5), || scrolled.is_mapped()));
+        scrolled.set_open(true, true);
+        assert_eq!(scrolled.imp().animated.get(), Some(false));
+        assert_eq!(scrolled.submenu_frame(), open);
+        window.close();
+        println!("POPUP-SUBMENU pass actual GTK popup submenus ease height and arrow out-expo over 250 ms, reverse from the drawn frame, skip motion when scrolling, keep it under Reduced Motion, land with animations off, Left returns to the item");
     }
 }

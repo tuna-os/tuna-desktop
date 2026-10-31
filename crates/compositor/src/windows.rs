@@ -7097,9 +7097,18 @@ impl WindowManager {
                             | K::CycleGroupBackward
                     ) {
                         if self.switcher_open {
-                            self.push_switcher(SwitcherAction::Cancel);
+                            // The open popup holds the keyboard (pushModal
+                            // leaves no NORMAL action mode), so the cycle
+                            // keybinding never fires: the popup's handler
+                            // passes the action on and only Escape or Tab
+                            // dismiss it (switcherPopup.js:211-219). GNOME's
+                            // default cycle-windows, Alt+Escape, cancels.
+                            if matches!(keycode, ESCAPE_KEYCODE | TAB_KEYCODE) {
+                                self.switcher_open = false;
+                                self.push_switcher(SwitcherAction::Cancel);
+                            }
+                            return;
                         }
-                        self.switcher_open = false;
                         self.push_switcher(SwitcherAction::Cycle {
                             forward: matches!(kind, K::CycleWindows | K::CycleGroup),
                             group: matches!(kind, K::CycleGroup | K::CycleGroupBackward),
