@@ -1444,7 +1444,7 @@ fn read_identity(expected: &FileIdentity, limit: u64) -> Option<Vec<u8>> {
     (bytes.len() as u64 == expected.metadata.bytes
         && FileMetadata::from_metadata(&file.metadata().ok()?) == Some(expected.metadata)
         && <[u8; 32]>::from(Sha256::digest(&bytes)) == expected.sha256)
-    .then_some(bytes)
+        .then_some(bytes)
 }
 fn load_animation_wallpaper(
     uri: &str,
