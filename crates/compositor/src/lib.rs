@@ -87,6 +87,7 @@ pub mod lock;
 pub mod lockdown;
 mod logind_session;
 pub mod magnifier;
+pub mod malloc;
 pub mod menu_close;
 pub mod minimize;
 pub mod modal_dim;

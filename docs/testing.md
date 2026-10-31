@@ -493,7 +493,10 @@ Phases, in order (`--phases` runs a subset):
 
 Every phase ends by proving the input path (Escape and Super change the
 overview). PSS/RSS, fd and mapping counts for the compositor and its
-descendants are sampled after each phase; final PSS must stay within
+descendants are sampled before and after each phase, per process and with
+PSS split by mapping kind (heap, anonymous, shared memory, GPU, files), in
+`metrics.jsonl`; a failing growth gate names the phase that grew most and
+the process and kind that grew. Final PSS must stay within
 warmup × 1.25 + 64 MiB, fds within warmup + 32 and mappings within
 warmup × 1.25 + 1024. These diagnostic bounds catch unbounded growth;
 they are separate from the GNOME performance targets in #73. A panic,

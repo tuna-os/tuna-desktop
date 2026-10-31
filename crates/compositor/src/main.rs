@@ -37,6 +37,11 @@ fn main() -> ExitCode {
         }
         return tuna_compositor::pam_helper::entry();
     }
+    // Before any thread starts: full-screen pixel buffers go back to the
+    // kernel when dropped (see tuna_compositor::malloc).
+    if !tuna_compositor::malloc::pin_mmap_threshold() {
+        eprintln!("tuna-compositor: malloc mmap threshold left to the C library");
+    }
     // Client connections are descriptors: start from the hard limit, as
     // Mutter does; spawned processes get the original back.
     match tuna_compositor::nofile::raise() {
