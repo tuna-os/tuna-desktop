@@ -92,7 +92,7 @@ where
                     }
                 }
                 if let Some(touch) = seat.get_touch() {
-                    if touch.has_grab(serial) {
+                    if let Some(start_data) = touch.sequence_start_data(serial) {
                         if let Some(ref icon) = icon {
                             if compositor::give_role(icon, DND_ICON_ROLE).is_err() {
                                 resource.post_error(
@@ -102,9 +102,9 @@ where
                                 return;
                             }
                         }
-                        // The StartDrag is in response to a touch implicit grab, all is good
+                        // The StartDrag is in response to a live touch sequence
+                        // (any finger's, as Mutter allows), all is good
                         handler.started(source.clone(), icon.clone(), seat.clone());
-                        let start_data = touch.grab_start_data().unwrap();
                         touch.set_grab(
                             handler,
                             dnd_grab::DnDGrab::new_touch(dh, start_data, source, origin, seat, icon),

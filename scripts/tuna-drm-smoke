@@ -36,6 +36,28 @@
 #              keybinding actions, strip keybindings, the pad OSD in the
 #              GTK shell (help button, org.gnome.Shell.Wacom.PadOsd),
 #              hotplug, and nothing reaching the client while locked
+#   D-TOUCH    an emulated (uinput) multitouch touchscreen (P-DS-04): mapped
+#              to the built-in panel automatically, to the monitor named by
+#              GNOME's per-device output key, back to the panel for an
+#              unknown monitor; a fullscreen GTK 4 client's presses at the
+#              touched point, upright and on the rotated panel; hotplug,
+#              the seat's touch capability following it
+#   D-TOUCH-EVENTS  the client gets wl_touch, as from mutter: GDK touch
+#              events from a touchscreen at the touched point, no pointer
+#   D-TOUCH-MULTI  two fingers are two sequences; GtkGestureZoom scales up
+#   D-TOUCH-CANCEL  GNOME Shell's three-finger workspace swipe and
+#              bottom-edge keyboard drag claim the touches: the client's
+#              sequences are cancelled, the compositor counts the gestures
+#   D-ORIENT   a mock iio-sensor-proxy on a private system bus: tablet mode
+#              makes DisplayConfig's PanelOrientationManaged true and the
+#              accelerometer is claimed; the sensor rotates the built-in
+#              panel; orientation-lock releases it and holds the rotation,
+#              unlocking claims again and follows the sensor
+#   G-AUTOROTATE  GNOME Shell's Auto Rotate quick-settings toggle (AT-SPI):
+#              shown only while the orientation is managed, checked while
+#              unlocked, pressing it flips orientation-lock
+#   G-TOUCH-SHELL  a touch on the GTK shell panel's System button opens
+#              quick settings (layer surfaces get wl_touch)
 # and captures a scanout screenshot with ffmpeg kmsgrab when possible.
 # Needs root (sudo) for modprobe, seatd and uinput. Exits nonzero on any failure.
 set -eu
@@ -47,7 +69,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --seconds) SECONDS_UP="$2"; shift 2 ;;
-        --help|-h) sed -n '2,30p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,61p' "$0"; exit 0 ;;
         *) echo "tuna-drm-smoke: unknown argument $1" >&2; exit 1 ;;
     esac
 done
@@ -68,16 +90,24 @@ SYSTEM_BUS_PID=""
 CALIBRATION_PID=""
 EMU_PID=""
 CLIENT_PID=""
+SENSOR_PID=""
+SYSBUS_PID=""
+AT_SPI_PID=""
 
 cleanup() {
     if [ -n "$CLIENT_PID" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
     # The emulator (root) exits when its command pipe closes.
     exec 8>&- 2>/dev/null || true
     if [ -n "$EMU_PID" ]; then wait "$EMU_PID" 2>/dev/null || true; fi
+    # So does the mock sensor; it is ours, so make sure.
+    exec 9>&- 2>/dev/null || true
+    if [ -n "$SENSOR_PID" ]; then kill "$SENSOR_PID" 2>/dev/null || true; fi
     if [ -n "$COMP_PID" ]; then kill "$COMP_PID" 2>/dev/null || true; fi
     if [ -n "$CALIBRATION_PID" ]; then kill "$CALIBRATION_PID" 2>/dev/null || true; fi
     if [ -n "$COLORD_PID" ]; then sudo kill "$COLORD_PID" 2>/dev/null || true; fi
     if [ -n "$SYSTEM_BUS_PID" ]; then kill "$SYSTEM_BUS_PID" 2>/dev/null || true; fi
+    if [ -n "$AT_SPI_PID" ]; then kill "$AT_SPI_PID" 2>/dev/null || true; fi
+    if [ -n "$SYSBUS_PID" ]; then kill "$SYSBUS_PID" 2>/dev/null || true; fi
     if [ -n "$DBUS_PID" ]; then kill "$DBUS_PID" 2>/dev/null || true; fi
     if [ -n "$SEATD_PID" ]; then sudo kill "$SEATD_PID" 2>/dev/null || true; fi
     # Put a stopped system seatd back exactly as we found it.
@@ -699,14 +729,15 @@ mkfifo "$ARTIFACTS/tablet-emulator.fifo"
 sudo python3 "$ROOT/scripts/lib/tuna-uinput-tablet.py" <"$ARTIFACTS/tablet-emulator.fifo" >"$EMU_OUT" 2>&1 &
 EMU_PID=$!
 exec 8>"$ARTIFACTS/tablet-emulator.fifo"
+emu_gate=D-TABLET
 emu_sent=0
 emu() {
     echo "$*" >&8
     emu_sent=$((emu_sent + 1))
     end=$(($(date +%s) + 10))
     until [ "$(grep -c '^ok$' "$EMU_OUT")" -ge "$emu_sent" ]; do
-        grep -q '^error' "$EMU_OUT" && fail D-TABLET "emulator: $(grep '^error' "$EMU_OUT" | tail -1)"
-        [ "$(date +%s)" -le "$end" ] || fail D-TABLET "emulator did not answer '$*'"
+        grep -q '^error' "$EMU_OUT" && fail "$emu_gate" "emulator: $(grep '^error' "$EMU_OUT" | tail -1)"
+        [ "$(date +%s)" -le "$end" ] || fail "$emu_gate" "emulator did not answer '$*'"
         sleep 0.05
     done
     sleep 0.1
@@ -733,7 +764,7 @@ env -u DISPLAY XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY=tuna-drm-tablet GDK_BA
     python3 "$ROOT/scripts/lib/tuna-tablet-client.py" >"$CLIENT_LOG" 2>"$ARTIFACTS/tablet-client.stderr" &
 CLIENT_PID=$!
 # client PYTHON [SECONDS]: a client record since the last mark satisfies
-# PYTHON (r is the record, W and H the window size).
+# PYTHON (r is the record, W and H the window's latest size).
 client_mark=0
 mark() { client_mark=$(wc -l <"$CLIENT_LOG"); }
 client() {
@@ -741,8 +772,8 @@ client() {
     until python3 - "$CLIENT_LOG" "$client_mark" "$1" <<'PY'
 import json, sys
 lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
-ready = [json.loads(l) for l in lines if '"ready"' in l]
-W, H = (ready[0]["width"], ready[0]["height"]) if ready else (0, 0)
+sizes = [json.loads(l) for l in lines if '"ready"' in l or '"configure"' in l]
+W, H = (sizes[-1]["width"], sizes[-1]["height"]) if sizes else (0, 0)
 records = [json.loads(l) for l in lines[int(sys.argv[2]):]]
 sys.exit(0 if any(eval(sys.argv[3], {}, {"r": r, "W": W, "H": H}) for r in records) else 1)
 PY
@@ -801,15 +832,19 @@ client "abs(r['x'] - W * 0.6 * (477 / 269) / (W / H)) <= 4 and abs(r['y'] - H * 
     fail D-TABLET "keep-aspect did not stretch the pen to the display's aspect: $(tail -1 "$CLIENT_LOG")"
 emu tool out
 tset keep-aspect false
-gdbus call --session --dest org.gnome.Mutter.DisplayConfig --object-path /org/gnome/Mutter/DisplayConfig \
-    --method org.gnome.Mutter.DisplayConfig.GetCurrentState >"$ARTIFACTS/tablet-display.txt"
-EDID="$(python3 - "$ARTIFACTS/tablet-display.txt" "$CONNECTOR" <<'PY'
+# monitor_spec OUT: the connector's [vendor, product, serial] as
+# DisplayConfig's GetCurrentState reports it (OUT keeps the reply).
+monitor_spec() {
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig --object-path /org/gnome/Mutter/DisplayConfig \
+        --method org.gnome.Mutter.DisplayConfig.GetCurrentState >"$1" || return 1
+    python3 - "$1" "$CONNECTOR" <<'PY'
 import re, sys
 text = open(sys.argv[1], encoding="utf-8").read()
 spec = re.search(r"\(\('%s', '([^']*)', '([^']*)', '([^']*)'\)" % re.escape(sys.argv[2]), text)
 print("['%s', '%s', '%s']" % spec.groups())
 PY
-)" || fail D-TABLET "no monitor identity for $CONNECTOR"
+}
+EDID="$(monitor_spec "$ARTIFACTS/tablet-display.txt")" || fail D-TABLET "no monitor identity for $CONNECTOR"
 tset output "$EDID"
 state ".tablets.tablets[0].output == \"$CONNECTOR\"" || fail D-TABLET "output $EDID did not map the tablet to $CONNECTOR"
 tset output "['', '', '']"
@@ -944,5 +979,515 @@ kill -TERM "$COMP_PID"
 wait "$COMP_PID" || true
 COMP_PID=""
 if grep -q panicked "$TABLET_LOG"; then fail D-NOPANIC "panic in the tablet session"; fi
+
+# Touchscreens and panel orientation (P-DS-04, #345), emulated per ADR
+# 0008: a uinput touchscreen and tablet-mode switch, a mock
+# iio-sensor-proxy on a private system bus, GNOME 51's touchscreen
+# settings in a private keyfile, a GTK 4 client, and the GTK shell over
+# AT-SPI. The vkms connector stands in for the laptop's built-in panel.
+kill "$DBUS_PID" 2>/dev/null || true
+DBUS_PID=""
+TOUCH_LOG="$ARTIFACTS/compositor-touch.log"
+CSTATE="$ARTIFACTS/compositor-state-touch.json"
+CLIENT_LOG="$ARTIFACTS/touch-client.jsonl"
+EMU_OUT="$ARTIFACTS/touch-emulator.log"
+SENSOR_OUT="$ARTIFACTS/sensor-proxy.log"
+mkdir -p "$ARTIFACTS/config-touch" "$ARTIFACTS/schemas-touch"
+cp "$ROOT/tests/settings/gnome51-peripherals-touchscreen.gschema.xml" "$ARTIFACTS/schemas-touch/"
+glib-compile-schemas "$ARTIFACTS/schemas-touch"
+GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas-touch:$GSETTINGS_SCHEMA_DIR"
+XDG_CONFIG_HOME="$ARTIFACTS/config-touch"
+export GSETTINGS_SCHEMA_DIR XDG_CONFIG_HOME
+dbus-daemon --session --fork --print-address=1 --print-pid=1 >"$ARTIFACTS/dbus-touch.txt"
+DBUS_SESSION_BUS_ADDRESS="$(sed -n 1p "$ARTIFACTS/dbus-touch.txt")"
+DBUS_PID="$(sed -n 2p "$ARTIFACTS/dbus-touch.txt")"
+export DBUS_SESSION_BUS_ADDRESS
+# The "system" bus where iio-sensor-proxy lives: private, and only the
+# compositor and the mock are told about it.
+dbus-daemon --session --fork --print-address=1 --print-pid=1 >"$ARTIFACTS/dbus-system-touch.txt"
+SYSBUS_ADDRESS="$(sed -n 1p "$ARTIFACTS/dbus-system-touch.txt")"
+SYSBUS_PID="$(sed -n 2p "$ARTIFACTS/dbus-system-touch.txt")"
+LOG="$TOUCH_LOG"
+
+# The shell's accessibility bus, up before the shell starts.
+[ -x /usr/libexec/at-spi-bus-launcher ] ||
+    fail G-AUTOROTATE "the AT-SPI bus launcher is required (at-spi2-core)"
+/usr/libexec/at-spi-bus-launcher --launch-immediately >"$ARTIFACTS/atspi-touch.log" 2>&1 &
+AT_SPI_PID=$!
+AT_SPI_BUS_ADDRESS="$(python3 - <<'PY'
+import time
+from gi.repository import Gio
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+end = time.monotonic() + 10
+while True:
+    try:
+        reply = bus.call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress",
+                              None, None, Gio.DBusCallFlags.NO_AUTO_START, 2000, None)
+        print(reply.unpack()[0])
+        break
+    except Exception:
+        if time.monotonic() >= end:
+            raise
+        time.sleep(0.1)
+PY
+)" || fail G-AUTOROTATE "the accessibility bus never came up: $(tail -3 "$ARTIFACTS/atspi-touch.log")"
+export AT_SPI_BUS_ADDRESS
+
+# The mock sensor (accelerometer present, upright) is there before the
+# compositor, as iio-sensor-proxy is at boot. It answers one line per
+# command on its pipe and logs every claim and release.
+mkfifo "$ARTIFACTS/sensor-proxy.fifo"
+DBUS_SYSTEM_BUS_ADDRESS="$SYSBUS_ADDRESS" python3 "$ROOT/scripts/lib/tuna-mock-sensor-proxy.py" \
+    <"$ARTIFACTS/sensor-proxy.fifo" >"$SENSOR_OUT" 2>&1 &
+SENSOR_PID=$!
+exec 9>"$ARTIFACTS/sensor-proxy.fifo"
+end=$(($(date +%s) + 10))
+until grep -q '^ready$' "$SENSOR_OUT"; do
+    kill -0 "$SENSOR_PID" 2>/dev/null || fail D-ORIENT "the mock sensor exited: $(tail -3 "$SENSOR_OUT")"
+    [ "$(date +%s)" -le "$end" ] || fail D-ORIENT "the mock sensor never owned net.hadess.SensorProxy"
+    sleep 0.1
+done
+sensor_sent=0
+sensor() {
+    echo "$*" >&9
+    sensor_sent=$((sensor_sent + 1))
+    end=$(($(date +%s) + 10))
+    until [ "$(grep -c '^ok$' "$SENSOR_OUT")" -ge "$sensor_sent" ]; do
+        grep -q '^error' "$SENSOR_OUT" && fail D-ORIENT "mock sensor: $(grep '^error' "$SENSOR_OUT" | tail -1)"
+        [ "$(date +%s)" -le "$end" ] || fail D-ORIENT "mock sensor did not answer '$*'"
+        sleep 0.05
+    done
+}
+# sensor_count PATTERN: the mock's log lines matching PATTERN.
+sensor_count() { grep -c "$1" "$SENSOR_OUT" || true; }
+# sensor_wait PATTERN N: at least N such lines within 5 seconds.
+sensor_wait() {
+    end=$(($(date +%s) + 5))
+    until [ "$(sensor_count "$1")" -ge "$2" ]; do
+        [ "$(date +%s)" -le "$end" ] || return 1
+        sleep 0.1
+    done
+}
+
+env -u DISPLAY -u WAYLAND_DISPLAY \
+    XDG_RUNTIME_DIR="$RUNTIME" XDG_STATE_HOME="$ARTIFACTS/state" XDG_DATA_HOME="$ARTIFACTS/data" \
+    LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD" TUNA_COMPOSITOR_STATE="$CSTATE" \
+    TUNA_PROOF_BUILTIN_CONNECTOR="$CONNECTOR" DBUS_SYSTEM_BUS_ADDRESS="$SYSBUS_ADDRESS" \
+    "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-touch \
+    --shell-bin "$ROOT/target/debug/tuna-shell-gtk" >"$TOUCH_LOG" 2>&1 &
+COMP_PID=$!
+state '.display_config.serial >= 1 and (.layers | length > 0)' 30 ||
+    fail D-TOUCH "the touch session never lit its output"
+state '.layers | any(.namespace == "tuna-panel")' 30 || fail D-TOUCH "the GTK shell never mapped its panel"
+MONITOR=".display_config.monitors[] | select(.connector == \"$CONNECTOR\")"
+state "$MONITOR | .builtin" ||
+    fail D-ORIENT "TUNA_PROOF_BUILTIN_CONNECTOR did not make $CONNECTOR the built-in panel: $(jq -c "$MONITOR" "$CSTATE")"
+state '.orientation.sensor_present and .orientation.sensor == "normal"' ||
+    fail D-ORIENT "the compositor never read the mock accelerometer: $(jq -c .orientation "$CSTATE")"
+# touch_log TEXT: the session log says TEXT within 5 seconds.
+touch_log() {
+    end=$(($(date +%s) + 5))
+    until grep -qF "$1" "$TOUCH_LOG"; do
+        [ "$(date +%s)" -le "$end" ] || return 1
+        sleep 0.1
+    done
+}
+# hold T SECONDS: the panel keeps transform T for SECONDS.
+hold() {
+    end=$(($(date +%s) + $2))
+    while [ "$(date +%s)" -le "$end" ]; do
+        transform="$(jq -r "$MONITOR | .transform" "$CSTATE" 2>/dev/null)" || transform=""
+        [ -z "$transform" ] || [ "$transform" = "$1" ] || return 1
+        sleep 0.2
+    done
+}
+# managed_prop: DisplayConfig's PanelOrientationManaged as gdbus prints it.
+managed_prop() {
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig --object-path /org/gnome/Mutter/DisplayConfig \
+        --method org.freedesktop.DBus.Properties.Get org.gnome.Mutter.DisplayConfig PanelOrientationManaged
+}
+LOCK_SCHEMA=org.gnome.settings-daemon.peripherals.touchscreen
+# lock_is VALUE: orientation-lock reads VALUE within 5 seconds.
+lock_is() {
+    end=$(($(date +%s) + 5))
+    until [ "$(gsettings get "$LOCK_SCHEMA" orientation-lock)" = "$1" ]; do
+        [ "$(date +%s)" -le "$end" ] || return 1
+        sleep 0.1
+    done
+}
+
+# The touchscreen (up to ten fingers by slot, batched frames, normalized
+# panel coordinates: see the emulator's docstring) and the tablet-mode
+# switch, off.
+mkfifo "$ARTIFACTS/touch-emulator.fifo"
+# shellcheck disable=SC2024
+sudo python3 "$ROOT/scripts/lib/tuna-uinput-touchscreen.py" <"$ARTIFACTS/touch-emulator.fifo" >"$EMU_OUT" 2>&1 &
+EMU_PID=$!
+exec 8>"$ARTIFACTS/touch-emulator.fifo"
+emu_gate=D-TOUCH
+emu_sent=0
+TS_PATH=/org/gnome/desktop/peripherals/touchscreens/1234:5678/
+TS='first(.touchscreens[] | select(.name == "Tuna Proof Touchscreen"))'
+tsset() { gsettings set "org.gnome.desktop.peripherals.touchscreen:$TS_PATH" output "$1"; }
+
+# Mutter's input mapper: nothing configured and nothing matching by EDID
+# name or size, the touchscreen goes to the built-in panel (score 0).
+state "$TS | .path == \"$TS_PATH\" and .vendor == 4660 and .product == 22136" 15 ||
+    fail D-TOUCH "the emulated touchscreen did not appear at $TS_PATH: $(jq -c .touchscreens "$CSTATE")"
+state "$TS | .output == \"$CONNECTOR\" and .score == 0" ||
+    fail D-TOUCH "automatic mapping did not fall back to the built-in $CONNECTOR: $(jq -c "$TS" "$CSTATE")"
+# The output key names the monitor (an exact EDID match, score 32); an
+# unknown monitor falls back to the built-in panel; reset is automatic.
+EDID="$(monitor_spec "$ARTIFACTS/touch-display.txt")" || fail D-TOUCH "no monitor identity for $CONNECTOR"
+tsset "$EDID"
+state "$TS | .output == \"$CONNECTOR\" and .score == 32" ||
+    fail D-TOUCH "output $EDID did not map the touchscreen to $CONNECTOR by EDID: $(jq -c "$TS" "$CSTATE")"
+tsset "['Tuna', 'No Such Monitor', '0000']"
+state "$TS | .output == \"$CONNECTOR\" and .score == 0" ||
+    fail D-TOUCH "an unknown monitor did not fall back to the built-in panel: $(jq -c "$TS" "$CSTATE")"
+tsset "$EDID"
+state "$TS | .score == 32" || fail D-TOUCH "output $EDID did not map by EDID again"
+gsettings reset "org.gnome.desktop.peripherals.touchscreen:$TS_PATH" output
+state "$TS | .output == \"$CONNECTOR\" and .score == 0" ||
+    fail D-TOUCH "resetting the output key did not return to automatic mapping: $(jq -c "$TS" "$CSTATE")"
+pass D-TOUCH "touchscreen 1234:5678 at $TS_PATH; automatic -> built-in $CONNECTOR (score 0), output $EDID -> $CONNECTOR (score 32), unknown monitor -> built-in, reset -> automatic"
+
+env -u DISPLAY XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY=tuna-drm-touch GDK_BACKEND=wayland \
+    python3 "$ROOT/scripts/lib/tuna-touch-client.py" >"$CLIENT_LOG" 2>"$ARTIFACTS/touch-client.stderr" &
+CLIENT_PID=$!
+client_mark=0
+client 'r["event"] == "ready" and W > 0' 20 || fail D-TOUCH "the GTK client never mapped: $(tail -3 "$ARTIFACTS/touch-client.stderr")"
+client "r['event'] == 'ready' and W == $MODE_W" || fail D-TOUCH "the client is not fullscreen on the ${MODE_W}px output"
+SIZE0="$(jq -rs '[.[] | select(.event == "ready")][0] | "\(.width) \(.height)"' "$CLIENT_LOG")"
+W0="${SIZE0% *}"
+H0="${SIZE0#* }"
+# tap NX NY X Y: a touch at the panel point presses and releases the
+# client at (X, Y) (Python over the window size W, H).
+tap() {
+    mark
+    emu down "$1" "$2"
+    emu up
+    client "r['event'] == 'pressed' and $(near "$3" "$4")" || return 1
+    client "r['event'] == 'released' and $(near "$3" "$4")"
+}
+# records PYTHON [SECONDS]: the client's records since the last mark
+# satisfy PYTHON, evaluated once over all of them: rs (oldest first), raw
+# (the "raw" ones), W and H (the window's latest size), seqs(TYPE) (the
+# sequence ids of raw records of TYPE, in order), at(TYPE, X, Y) (the set
+# of those within 3 px of (X, Y), as near), cancelled(SEQ) (a raw
+# touch-cancel or gesture-cancel for SEQ came, and no raw touch-update or
+# touch-end for SEQ after it). Negative predicates hold at once: check
+# them after the positive ones.
+records() {
+    end=$(($(date +%s) + ${2:-5}))
+    until python3 - "$CLIENT_LOG" "$client_mark" "$1" <<'PY'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+sizes = [json.loads(l) for l in lines if '"ready"' in l or '"configure"' in l]
+W, H = (sizes[-1]["width"], sizes[-1]["height"]) if sizes else (0, 0)
+rs = [json.loads(l) for l in lines[int(sys.argv[2]):]]
+raw = [r for r in rs if r["event"] == "raw"]
+
+
+def seqs(kind):
+    return [r["seq"] for r in raw if r["type"] == kind]
+
+
+def at(kind, x, y):
+    return {r["seq"] for r in raw if r["type"] == kind and r["x"] is not None
+            and abs(r["x"] - x) <= 3 and abs(r["y"] - y) <= 3}
+
+
+def cancelled(seq):
+    marks = [i for i, r in enumerate(rs) if r.get("seq") == seq
+             and (r.get("type") == "touch-cancel" or r["event"] == "gesture-cancel")]
+    return bool(marks) and not any(r.get("seq") == seq and r.get("type") in ("touch-update", "touch-end")
+                                   for r in rs[marks[0]:])
+
+
+# Parenthesized, so a predicate may span lines.
+sys.exit(0 if eval("(" + sys.argv[3] + "\n)", {"rs": rs, "raw": raw, "W": W, "H": H, "seqs": seqs,
+                                              "at": at, "cancelled": cancelled}) else 1)
+PY
+    do
+        [ "$(date +%s)" -le "$end" ] || return 1
+        sleep 0.1
+    done
+}
+# What GDK reports of pointer devices: none of it may come from a touch.
+POINTER_EVENTS="not any(r['type'] in ('button-press', 'button-release', 'motion-notify') for r in raw)"
+# raw_tail: the client's latest raw and gesture records, for failures.
+raw_tail() { grep -v '"event": "\(ready\|configure\)"' "$CLIENT_LOG" | tail -n 8 | tr '\n' ' '; }
+state "$MONITOR | .transform == 0" || fail D-TOUCH "the upright panel is not at transform 0"
+TOUCH_START=$(wc -l <"$CLIENT_LOG")
+tap 0.25 0.75 'W * 0.25' 'H * 0.75' ||
+    fail D-TOUCH "a touch at (0.25, 0.75) did not press the client at (0.25 W, 0.75 H): $(tail -3 "$CLIENT_LOG")"
+tap 0.8 0.2 'W * 0.8' 'H * 0.2' ||
+    fail D-TOUCH "a touch at (0.8, 0.2) did not press the client at (0.8 W, 0.2 H): $(tail -3 "$CLIENT_LOG")"
+pass D-TOUCH "transform 0: touches at (0.25, 0.75) and (0.8, 0.2) pressed and released the ${W0}x${H0} GTK client at the touched points"
+
+# Real wl_touch, as mutter sends Wayland clients: GDK gets touch events
+# from a touchscreen device, and no button or motion events at all.
+state '.touch.capability' || fail D-TOUCH-EVENTS "the seat does not advertise touch with a touchscreen present: $(jq -c .touch "$CSTATE")"
+mark
+emu down 0.4 0.6
+emu up
+records "len(seqs('touch-end')) >= 1" ||
+    fail D-TOUCH-EVENTS "a tap at (0.4, 0.6) reached the client as no GDK touch-end: $(raw_tail)"
+records "len(seqs('touch-begin')) == 1 and seqs('touch-end') == seqs('touch-begin') and None not in seqs('touch-begin')
+         and at('touch-begin', W * 0.4, H * 0.6) == at('touch-end', W * 0.4, H * 0.6) == set(seqs('touch-begin'))
+         and all(r['source'] == 'touchscreen' for r in raw if r['type'].startswith('touch-'))" 1 ||
+    fail D-TOUCH-EVENTS "a tap at (0.4, 0.6) was not one touchscreen sequence beginning and ending at (0.4 W, 0.6 H): $(raw_tail)"
+client_mark=$TOUCH_START
+records "$POINTER_EVENTS" 1 ||
+    fail D-TOUCH-EVENTS "touches reached the client as pointer events: $(grep -E '"type": "(button-press|button-release|motion-notify)"' "$CLIENT_LOG" | head -n 3 | tr '\n' ' ')"
+pass D-TOUCH-EVENTS "a tap at (0.4, 0.6) was one touchscreen sequence, touch-begin and touch-end at (0.4 W, 0.6 H); no button or motion events from the taps"
+
+# Two fingers, moved apart together (one frame per step), then lifted.
+mark
+emu frame down 0 0.4 0.5 down 1 0.6 0.5
+emu frame move 0 0.37 0.5 move 1 0.63 0.5
+emu frame move 0 0.34 0.5 move 1 0.66 0.5
+emu frame move 0 0.3 0.5 move 1 0.7 0.5
+emu frame up 0 up 1
+records "len(seqs('touch-end')) >= 2 and any(r['event'] == 'zoom-end' for r in rs)" ||
+    fail D-TOUCH-MULTI "two lifted fingers did not end two touches and the zoom: $(raw_tail)"
+records "len(seqs('touch-begin')) == 2 and None not in seqs('touch-begin')
+         and len(a := at('touch-begin', W * 0.4, H * 0.5)) == 1 and len(b := at('touch-begin', W * 0.6, H * 0.5)) == 1
+         and a != b and a <= at('touch-update', W * 0.3, H * 0.5) and b <= at('touch-update', W * 0.7, H * 0.5)
+         and a == at('touch-end', W * 0.3, H * 0.5) and b == at('touch-end', W * 0.7, H * 0.5)
+         and all(r['source'] == 'touchscreen' for r in raw if r['type'].startswith('touch-'))" 1 ||
+    fail D-TOUCH-MULTI "two fingers were not two touchscreen sequences from (0.4, 0.5) and (0.6, 0.5) updated and ended at (0.3, 0.5) and (0.7, 0.5): $(raw_tail)"
+records "any(r['event'] == 'zoom-begin' for r in rs) and max([r['scale'] for r in rs if r['event'] == 'zoom-scale'], default=0) > 1.5
+         and any(r['event'] == 'zoom-end' for r in rs) and not any(r['event'] == 'zoom-cancel' for r in rs)" 1 ||
+    fail D-TOUCH-MULTI "GtkGestureZoom did not begin, scale past 1.5 and end: $(grep '"zoom-' "$CLIENT_LOG" | tail -n 3 | tr '\n' ' ')"
+pass D-TOUCH-MULTI "two sequences, (0.4, 0.5) -> (0.3, 0.5) and (0.6, 0.5) -> (0.7, 0.5), began, updated and ended; GtkGestureZoom began, scaled to $(jq -rs '[.[] | select(.event == "zoom-scale") | .scale] | max' "$CLIENT_LOG") and ended"
+
+# GNOME Shell's three-finger horizontal swipe (Clutter.PanGesture, 16 px)
+# claims the touches from the client, which gets wl_touch.cancel. Fingers
+# moving right at the first workspace have nowhere to go: it snaps back.
+swipes=$(jq -r '.touch.gestures.workspace_swipe' "$CSTATE")
+cancels=$(jq -r '.touch.client_cancels' "$CSTATE")
+workspace=$(jq -r '.active_workspace' "$CSTATE")
+mark
+emu frame down 0 0.3 0.5 down 1 0.4 0.5 down 2 0.5 0.4
+records "len(set(seqs('touch-begin'))) == 3" ||
+    fail D-TOUCH-CANCEL "three fingers down did not begin three client sequences: $(raw_tail)"
+emu frame move 0 0.34 0.5 move 1 0.44 0.5 move 2 0.54 0.4
+emu frame move 0 0.38 0.5 move 1 0.48 0.5 move 2 0.58 0.4
+emu frame move 0 0.42 0.5 move 1 0.52 0.5 move 2 0.62 0.4
+emu frame move 0 0.46 0.5 move 1 0.56 0.5 move 2 0.66 0.4
+emu frame move 0 0.5 0.5 move 1 0.6 0.5 move 2 0.7 0.4
+state ".touch.gestures.workspace_swipe > $swipes and .touch.client_cancels > $cancels and .touch.last_gesture == \"workspace-swipe\"" ||
+    fail D-TOUCH-CANCEL "a three-finger horizontal swipe was not recognized as GNOME's workspace swipe with the client cancelled: $(jq -c .touch "$CSTATE")"
+emu frame up 0 up 1 up 2
+state '.touch.sequences == 0' || fail D-TOUCH-CANCEL "touch sequences stayed live after lifting three fingers: $(jq -c .touch "$CSTATE")"
+state ".active_workspace == $workspace" ||
+    fail D-TOUCH-CANCEL "the swipe past the first workspace did not snap back to workspace $workspace: $(jq -c .active_workspace "$CSTATE")"
+records "len(set(seqs('touch-begin'))) == 3 and all(cancelled(s) for s in set(seqs('touch-begin')))" ||
+    fail D-TOUCH-CANCEL "the client's three sequences were not cancelled, or touch events followed the cancel: $(raw_tail)"
+client_mark=$TOUCH_START
+records "$POINTER_EVENTS" 1 ||
+    fail D-TOUCH-EVENTS "multi-touch or gestures reached the client as pointer events: $(grep -E '"type": "(button-press|button-release|motion-notify)"' "$CLIENT_LOG" | head -n 3 | tr '\n' ' ')"
+pass D-TOUCH-CANCEL "three fingers moved 0.2 of the width: workspace swipe recognized ($swipes -> $(jq -r '.touch.gestures.workspace_swipe' "$CSTATE")), client cancels $cancels -> $(jq -r '.touch.client_cancels' "$CSTATE"), all three client sequences cancelled with nothing after; snapped back to workspace $workspace"
+pass D-TOUCH-EVENTS "no button or motion events reached the client through the taps, the two-finger zoom and the swipe"
+
+# Mutter's orientation manager: tablet mode makes the built-in panel's
+# orientation managed (touch mode, an accelerometer, a built-in panel),
+# and the accelerometer claimed.
+emu tabletmode 1
+state '.orientation.touch_mode and .orientation.managed' ||
+    fail D-ORIENT "tablet mode did not make the panel orientation managed: $(jq -c .orientation "$CSTATE")"
+[ "$(managed_prop)" = "(<true>,)" ] ||
+    fail D-ORIENT "DisplayConfig's PanelOrientationManaged is $(managed_prop 2>&1), not true"
+sensor_wait '^claim ' 1 || fail D-ORIENT "the accelerometer was never claimed: $(cat "$SENSOR_OUT")"
+mark
+sensor orientation left-up
+state "$MONITOR | .transform == 1" ||
+    fail D-ORIENT "left-up did not rotate $CONNECTOR to transform 1: $(jq -c "$MONITOR" "$CSTATE")"
+touch_log "tuna-compositor: orientation: $CONNECTOR rotated to transform 1" ||
+    fail D-ORIENT "no rotation logged for $CONNECTOR"
+pass D-ORIENT "tablet mode: PanelOrientationManaged true, accelerometer claimed; left-up rotated $CONNECTOR to transform 1"
+
+# Touch follows the rotation: Mutter's device matrix for transform 1 maps
+# the panel point (nx, ny) to (1 - ny, nx) of the rotated monitor.
+client "r['event'] == 'configure' and r['width'] == $H0 and r['height'] == $W0" 10 ||
+    fail D-TOUCH "the fullscreen client was not resized to the rotated ${H0}x${W0}: $(tail -2 "$CLIENT_LOG")"
+tap 0.25 0.1 'W * 0.9' 'H * 0.25' ||
+    fail D-TOUCH "on the rotated panel a touch at (0.25, 0.1) did not press at (0.9 W, 0.25 H): $(tail -3 "$CLIENT_LOG")"
+tap 0.7 0.6 'W * 0.4' 'H * 0.7' ||
+    fail D-TOUCH "on the rotated panel a touch at (0.7, 0.6) did not press at (0.4 W, 0.7 H): $(tail -3 "$CLIENT_LOG")"
+pass D-TOUCH "transform 1: the client became ${H0}x${W0}; touches at (0.25, 0.1) and (0.7, 0.6) pressed at (0.9 W, 0.25 H) and (0.4 W, 0.7 H)"
+
+# orientation-lock releases the accelerometer and keeps the rotation;
+# unlocking claims it again and follows the sensor.
+releases=$(sensor_count '^release ')
+gsettings set "$LOCK_SCHEMA" orientation-lock true
+state '.orientation.locked' || fail D-ORIENT "orientation-lock did not reach the compositor"
+sensor_wait '^release ' $((releases + 1)) || fail D-ORIENT "locking did not release the accelerometer: $(cat "$SENSOR_OUT")"
+sensor orientation right-up
+hold 1 2 || fail D-ORIENT "the locked panel rotated: $(jq -c "$MONITOR" "$CSTATE")"
+claims=$(sensor_count '^claim ')
+gsettings set "$LOCK_SCHEMA" orientation-lock false
+state '.orientation.locked | not' || fail D-ORIENT "unlocking did not reach the compositor"
+sensor_wait '^claim ' $((claims + 1)) || fail D-ORIENT "unlocking did not claim the accelerometer again: $(cat "$SENSOR_OUT")"
+state "$MONITOR | .transform == 3" ||
+    fail D-ORIENT "unlocking did not follow the sensor's right-up to transform 3: $(jq -c "$MONITOR" "$CSTATE")"
+touch_log "tuna-compositor: orientation: $CONNECTOR rotated to transform 3" ||
+    fail D-ORIENT "no rotation to transform 3 logged"
+pass D-ORIENT "locked: accelerometer released, right-up held transform 1 for 2 s; unlocked: claimed again, transform 3"
+
+# Out of tablet mode the orientation is not managed and the sensor no
+# longer rotates the panel. With a tablet-mode switch present it decides
+# touch mode; should touch mode stay on, the unmanaged checks do not apply.
+emu tabletmode 0
+if state '.orientation.touch_mode == false' 5; then
+    state '.orientation.managed == false' ||
+        fail D-ORIENT "tablet mode off left the orientation managed: $(jq -c .orientation "$CSTATE")"
+    [ "$(managed_prop)" = "(<false>,)" ] ||
+        fail D-ORIENT "DisplayConfig's PanelOrientationManaged is $(managed_prop 2>&1) out of tablet mode"
+    sensor orientation bottom-up
+    hold 3 2 || fail D-ORIENT "the sensor rotated an unmanaged panel: $(jq -c "$MONITOR" "$CSTATE")"
+    unmanaged="tablet mode off: unmanaged, bottom-up held transform 3"
+else
+    echo "tuna-drm-smoke: D-ORIENT note: seat touch-mode stayed on out of tablet mode; unmanaged checks skipped"
+    sensor orientation bottom-up
+    unmanaged="tablet mode off kept touch mode (unmanaged checks skipped)"
+fi
+emu tabletmode 1
+state '.orientation.managed' || fail D-ORIENT "tablet mode on again did not manage the orientation"
+sensor orientation normal
+state "$MONITOR | .transform == 0" ||
+    fail D-ORIENT "back in tablet mode, normal did not return $CONNECTOR to transform 0: $(jq -c "$MONITOR" "$CSTATE")"
+pass D-ORIENT "$unmanaged; tablet mode and normal again: transform 0"
+
+# GNOME Shell's bottom-edge drag (ShellEdgeDragGesture, BOTTOM) on the
+# upright panel, after the rotations so the keyboard it raises does not
+# meet them: one finger from the bottom 20 px up past 80 px within the
+# 200 ms edge timeout, one 20 ms frame per step. The client first gets
+# the touch, then wl_touch.cancel once the drag leaves the edge zone.
+client "r['event'] == 'configure' and r['width'] == $W0 and r['height'] == $H0" 10 ||
+    fail D-TOUCH-CANCEL "the fullscreen client did not return to ${W0}x${H0} at transform 0: $(tail -2 "$CLIENT_LOG")"
+state '.layers | all(.namespace != "tuna-osk")' ||
+    fail D-TOUCH-CANCEL "the on-screen keyboard is already mapped, which blocks the bottom-edge drag"
+edge_drags=$(jq -r '.touch.gestures.osk_edge_drag' "$CSTATE")
+mark
+emu "down 0 0.5 0.995 ; move 0 0.5 0.97 ; move 0 0.5 0.94 ; move 0 0.5 0.91 ; move 0 0.5 0.88 ; move 0 0.5 0.84 ; move 0 0.5 0.8"
+state ".touch.gestures.osk_edge_drag > $edge_drags and .touch.last_gesture == \"osk-edge-drag\"" ||
+    fail D-TOUCH-CANCEL "a drag from (0.5, 0.995) up to (0.5, 0.8) was not recognized as the bottom-edge OSK drag: $(jq -c .touch "$CSTATE")"
+emu up 0
+state '.touch.sequences == 0' || fail D-TOUCH-CANCEL "the edge drag's sequence stayed live after lifting: $(jq -c .touch "$CSTATE")"
+records "len(seqs('touch-begin')) == 1 and at('touch-begin', W * 0.5, H * 0.995) == set(seqs('touch-begin'))
+         and all(cancelled(s) for s in seqs('touch-begin')) and $POINTER_EVENTS" ||
+    fail D-TOUCH-CANCEL "the client's touch at (0.5 W, 0.995 H) was not cancelled by the edge drag, or events followed the cancel: $(raw_tail)"
+pass D-TOUCH-CANCEL "bottom-edge drag (0.5, 0.995) -> (0.5, 0.8): recognized ($edge_drags -> $(jq -r '.touch.gestures.osk_edge_drag' "$CSTATE")), last gesture osk-edge-drag, the client's sequence cancelled with nothing after"
+kill "$CLIENT_PID" 2>/dev/null || true
+CLIENT_PID=""
+
+# GNOME Shell's Auto Rotate toggle (autoRotate.js), driven over AT-SPI as
+# a screen reader would: quick settings opens from the panel's System
+# button.
+A11Y_DUMP="$ROOT/scripts/lib/tuna-a11y-dump.py"
+# a11y_wait OUT JQ [SECONDS]: a dump of the shell satisfies JQ in time.
+a11y_wait() {
+    a11y_end=$(($(date +%s) + ${3:-10}))
+    until python3 "$A11Y_DUMP" tuna-shell-gtk "$1" 20 >/dev/null 2>&1 && jq -e "$2" "$1" >/dev/null 2>&1; do
+        [ "$(date +%s)" -lt "$a11y_end" ] || return 1
+        sleep 0.3
+    done
+}
+ROTATE='.name == "Auto Rotate" and .role == "toggle button" and .showing'
+
+# The GTK shell's layer surfaces get wl_touch: a tap on the panel's System
+# button opens quick settings. The touchscreen covers the upright panel,
+# so the button's centre (AT-SPI bounds within the panel layer, plus the
+# layer's origin) over the client's fullscreen size is the panel point.
+state "$MONITOR | .transform == 0" || fail G-TOUCH-SHELL "the panel is not upright for the tap: $(jq -c "$MONITOR" "$CSTATE")"
+python3 "$A11Y_DUMP" tuna-shell-gtk "$ARTIFACTS/a11y-touch-shell.json" 60 ||
+    fail G-TOUCH-SHELL "could not dump the GTK shell over AT-SPI"
+panel_rect="$(jq -c 'first(.layers[] | select(.namespace == "tuna-panel")) | .rect' "$CSTATE")"
+system_point="$(jq -r --argjson p "$panel_rect" --argjson w "$W0" --argjson h "$H0" \
+    'first(.[] | select(.name == "System" and .showing and .bounds != null and .bounds[2] > 0 and .bounds[3] > 0
+                       and .bounds[1] + .bounds[3] <= $p[3]))
+     | .bounds as $b | "\(($p[0] + $b[0] + $b[2] / 2) / $w) \(($p[1] + $b[1] + $b[3] / 2) / $h)"' \
+    "$ARTIFACTS/a11y-touch-shell.json")"
+[ -n "$system_point" ] ||
+    fail G-TOUCH-SHELL "no showing System button within the panel layer $panel_rect: $(jq -c '[.[] | select(.name == "System")]' "$ARTIFACTS/a11y-touch-shell.json")"
+emu_gate=G-TOUCH-SHELL
+emu down "${system_point% *}" "${system_point#* }"
+emu up
+emu_gate=D-TOUCH
+a11y_wait "$ARTIFACTS/a11y-touch-shell-open.json" "any(.[]; $ROTATE)" ||
+    fail G-TOUCH-SHELL "a tap at the System button's panel point ($system_point) did not open quick settings (no Auto Rotate toggle showing)"
+# Closed again the way G-AUTOROTATE opens it, which expects it closed.
+python3 "$A11Y_DUMP" tuna-shell-gtk "$ARTIFACTS/a11y-touch-shell-close.json" 20 --press System ||
+    fail G-TOUCH-SHELL "could not press the System button over AT-SPI to close quick settings"
+a11y_wait "$ARTIFACTS/a11y-touch-shell-closed.json" 'any(.[]; .name == "Auto Rotate" and .showing) | not' ||
+    fail G-TOUCH-SHELL "quick settings did not close"
+pass G-TOUCH-SHELL "a touch at the panel System button's centre ($system_point of the panel) opened quick settings"
+
+python3 "$A11Y_DUMP" tuna-shell-gtk "$ARTIFACTS/a11y-touch-panel.json" 60 --press System ||
+    fail G-AUTOROTATE "could not press the panel's System button over AT-SPI"
+a11y_wait "$ARTIFACTS/a11y-autorotate.json" "any(.[]; $ROTATE and .checked)" ||
+    fail G-AUTOROTATE "quick settings shows no checked Auto Rotate toggle while managed and unlocked: $(jq -c '[.[] | select(.name == "Auto Rotate")]' "$ARTIFACTS/a11y-autorotate.json" 2>&1)"
+python3 "$A11Y_DUMP" tuna-shell-gtk "$ARTIFACTS/a11y-autorotate-lock.json" 20 --press "Auto Rotate" ||
+    fail G-AUTOROTATE "could not press Auto Rotate"
+lock_is true || fail G-AUTOROTATE "pressing Auto Rotate did not set orientation-lock: $(gsettings get "$LOCK_SCHEMA" orientation-lock)"
+state '.orientation.locked' || fail G-AUTOROTATE "the toggle's lock did not reach the compositor"
+a11y_wait "$ARTIFACTS/a11y-autorotate-locked.json" "any(.[]; $ROTATE and (.checked | not))" ||
+    fail G-AUTOROTATE "Auto Rotate still shows checked while locked"
+python3 "$A11Y_DUMP" tuna-shell-gtk "$ARTIFACTS/a11y-autorotate-unlock.json" 20 --press "Auto Rotate" ||
+    fail G-AUTOROTATE "could not press Auto Rotate again"
+lock_is false || fail G-AUTOROTATE "pressing Auto Rotate again did not clear orientation-lock"
+a11y_wait "$ARTIFACTS/a11y-autorotate-unlocked.json" "any(.[]; $ROTATE and .checked)" ||
+    fail G-AUTOROTATE "Auto Rotate does not show checked again once unlocked"
+# No accelerometer, no managed orientation: the toggle hides, and comes
+# back with the accelerometer.
+sensor accel 0
+state '.orientation.sensor_present == false and .orientation.managed == false' ||
+    fail G-AUTOROTATE "losing the accelerometer did not unmanage the orientation: $(jq -c .orientation "$CSTATE")"
+a11y_wait "$ARTIFACTS/a11y-autorotate-hidden.json" 'any(.[]; .name == "Auto Rotate" and .showing) | not' ||
+    fail G-AUTOROTATE "Auto Rotate still shows while the orientation is not managed"
+sensor accel 1
+state '.orientation.managed' || fail G-AUTOROTATE "the accelerometer's return did not manage the orientation again"
+a11y_wait "$ARTIFACTS/a11y-autorotate-back.json" "any(.[]; $ROTATE)" ||
+    fail G-AUTOROTATE "Auto Rotate did not come back with the managed orientation"
+# Quick settings stays open: nothing below needs the panel.
+pass G-AUTOROTATE "Auto Rotate shown and checked while managed and unlocked; pressing it locked (unchecked) and unlocked (checked) orientation-lock; hidden while unmanaged"
+
+# Hotplug: unplugged and back, mapped as before; the seat's touch
+# capability goes and comes with the only touchscreen, as mutter's does.
+emu unplug
+state '[.touchscreens[] | select(.name == "Tuna Proof Touchscreen")] | length == 0' ||
+    fail D-TOUCH "unplugging left the touchscreen behind: $(jq -c .touchscreens "$CSTATE")"
+state '.touch.capability == false' ||
+    fail D-TOUCH "the seat still advertises touch with no touchscreen: $(jq -c .touch "$CSTATE")"
+emu plug
+state "$TS | .path == \"$TS_PATH\" and .output == \"$CONNECTOR\"" 15 ||
+    fail D-TOUCH "replugging did not bring the touchscreen back on $CONNECTOR: $(jq -c .touchscreens "$CSTATE")"
+state '.touch.capability' || fail D-TOUCH "the seat did not advertise touch again after replugging: $(jq -c .touch "$CSTATE")"
+pass D-TOUCH "unplugged and replugged, mapped to $CONNECTOR again; the seat's touch capability followed"
+
+# The compositor, shell and AT-SPI inherited the pipes' write ends, so
+# closing ours is no EOF while they live: tell the emulator to quit and
+# stop the mock directly.
+echo quit >&8
+exec 8>&-
+wait "$EMU_PID" 2>/dev/null || true
+EMU_PID=""
+exec 9>&-
+kill "$SENSOR_PID" 2>/dev/null || true
+wait "$SENSOR_PID" 2>/dev/null || true
+SENSOR_PID=""
+kill -TERM "$COMP_PID"
+wait "$COMP_PID" || true
+COMP_PID=""
+kill "$AT_SPI_PID" 2>/dev/null || true
+AT_SPI_PID=""
+kill "$SYSBUS_PID" 2>/dev/null || true
+SYSBUS_PID=""
+kill "$DBUS_PID" 2>/dev/null || true
+DBUS_PID=""
+if grep -q panicked "$TOUCH_LOG"; then fail D-NOPANIC "panic in the touch session"; fi
 
 echo "tuna-drm-smoke: OK, artifacts in $ARTIFACTS"

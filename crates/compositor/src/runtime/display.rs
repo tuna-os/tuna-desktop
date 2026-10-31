@@ -210,7 +210,7 @@ impl Runtime {
 
     /// Apply a configuration live, with GNOME's ScreenTransition: the
     /// old layout is pictured first when the layout changes.
-    fn apply_monitors(&mut self, config: &MonitorsConfig) -> Result<(), String> {
+    pub(super) fn apply_monitors(&mut self, config: &MonitorsConfig) -> Result<(), String> {
         let before = (self.state.hot_corner_outputs(), self.scale.to_bits());
         let snapshots = if self.transitions.wants_screen_snapshot() {
             self.screen_snapshots()
@@ -265,23 +265,9 @@ impl Runtime {
             }
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => {
-                let mut layouts = display_config::output_layouts(config);
-                // The sensor wins on unlocked built-in panels; the
-                // configured transform stays in manual_transforms.
-                for layout in &mut layouts {
-                    if let Some(enabled) = &mut layout.enabled {
-                        enabled.transform = self
-                            .orientation
-                            .effective(&layout.connector, enabled.transform);
-                    }
-                }
-                drm.apply_layout(&layouts)?;
-            }
-        }
-        for logical in &config.logical {
-            for monitor in &logical.monitors {
-                self.manual_transforms
-                    .insert(monitor.spec.connector.clone(), logical.transform);
+                // A configuration applies as given; the sensor rotates
+                // the built-in panel on its next change, as in Mutter.
+                drm.apply_layout(&display_config::output_layouts(config))?;
             }
         }
         #[cfg(feature = "drm")]
@@ -378,6 +364,8 @@ impl Runtime {
                         .find(|(name, _)| *name == m.spec.connector)
                         .and_then(|(_, mode)| mode.clone()),
                     "scale": logical.map(|l| l.scale),
+                    "transform": logical.map(|l| l.transform),
+                    "builtin": m.builtin,
                     "position": logical.map(|l| [l.x, l.y]),
                     "mirrors": logical
                         .filter(|l| l.monitors.first() != Some(&m.spec.connector))

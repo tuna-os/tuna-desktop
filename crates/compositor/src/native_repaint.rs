@@ -324,10 +324,12 @@ pub(crate) fn scanout_damage(
 /// KMS damage clips in scanout-buffer pixels (#345): `repainted`
 /// damage from [`damage_region`] is in pre-transform output space,
 /// which matches the buffer only when unrotated. Under rotation each
-/// rect maps into the buffer through the output transform (Smithay
-/// `Transform::transform_rect_in`, the logical-to-buffer direction
-/// also used for `RecordArea` capture); unrotated outputs pass
-/// through exactly as [`scanout_damage`] does.
+/// rect maps into the buffer through the inverted output transform,
+/// as the frame renders (`render_transform`) and as Smithay's
+/// `DrmCompositor` places planes (vendored
+/// `third-party/smithay/src/backend/drm/compositor/mod.rs`: "the output
+/// transform we are passed is already inverted"); unrotated outputs
+/// pass through exactly as [`scanout_damage`] does.
 pub(crate) fn scanout_damage_rotated(
     repainted: &[Rectangle<i32, Physical>],
     transform: Transform,
@@ -337,9 +339,10 @@ pub(crate) fn scanout_damage_rotated(
         return scanout_damage(repainted);
     }
     let area = smithay::utils::Size::<i32, smithay::utils::Physical>::from(logical);
+    let to_buffer = transform.invert();
     repainted
         .iter()
-        .map(|rect| transform.transform_rect_in(*rect, &area))
+        .map(|rect| to_buffer.transform_rect_in(*rect, &area))
         .collect()
 }
 
@@ -606,10 +609,16 @@ mod tests {
             scanout_damage_rotated(&full, Transform::_90, (2, 4)),
             vec![r(0, 0, 4, 2)]
         );
-        // A logical corner rect rotates with the content it covers.
+        // A logical corner rect rotates with the content it covers: a
+        // 90° panel shows its logical top-left at the buffer's
+        // bottom-left, as the inverted render transform draws it.
         let corner = vec![r(0, 0, 1, 1)];
         assert_eq!(
             scanout_damage_rotated(&corner, Transform::_90, (2, 4)),
+            vec![r(0, 1, 1, 1)]
+        );
+        assert_eq!(
+            scanout_damage_rotated(&corner, Transform::_270, (2, 4)),
             vec![r(3, 0, 1, 1)]
         );
         // 180° and the flip map to their own buffer corners.

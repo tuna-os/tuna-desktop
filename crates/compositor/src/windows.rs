@@ -354,9 +354,36 @@ struct GrabRaise {
     distance: f64,
 }
 
+/// One eased window move of the keyboard's slide (`_animateWindow`).
+#[derive(Debug, Clone, Copy)]
+struct OskSlideMove {
+    id: u64,
+    from: i32,
+    to: i32,
+    start: std::time::Duration,
+    duration: std::time::Duration,
+}
+
 pub struct WindowManager {
     /// Active interactive move/resize, if any (#58).
     grab: Option<PointerGrab>,
+    /// Where the grab's pointer or touch point is: the pointer position,
+    /// or the touch point driving a move begun from a touch.
+    grab_pos: Point<f64, Logical>,
+    /// The touch slot driving `grab` (a header-bar drag begun by touch,
+    /// or a Super+touch move); `None` while the pointer drives it.
+    touch_grab: Option<u32>,
+    /// Touch slots whose begin a popup dismissal, modal dialog or
+    /// window-move press consumed: the rest of the sequence goes nowhere.
+    touch_swallowed: std::collections::HashSet<u32>,
+    /// `wl_touch.cancel` rounds sent to clients (state file).
+    touch_cancels: u64,
+    /// Where each touch point the manager follows is now, by slot.
+    touch_points: HashMap<u32, Point<f64, Logical>>,
+    /// GNOME Shell's keyboard window slide (#349): which window the
+    /// keyboard moved up, and its moves in flight.
+    osk_slide: crate::osk::WindowSlide,
+    osk_slide_moves: Vec<OskSlideMove>,
     /// Window focused before it had a surface to focus (an X11 window
     /// mapped before association): the seat follows once it does.
     focus_awaits_surface: Option<u64>,
@@ -386,6 +413,9 @@ pub struct WindowManager {
     cascade: i32,
     keyboard: Option<KeyboardHandle<State>>,
     pointer: Option<PointerHandle<State>>,
+    /// Present while a touchscreen is (Mutter advertises the seat's
+    /// touch capability only then).
+    touch: Option<smithay::input::touch::TouchHandle<State>>,
     pointer_pos: Point<f64, Logical>,
     /// org.gnome.Shell accelerator grabs (GrabAccelerators), as plain
     /// accelerators for the wm-key ownership check and traces.
@@ -713,6 +743,7 @@ impl WindowManager {
             cascade: 0,
             keyboard,
             pointer,
+            touch: None,
             pointer_pos: (0.0, 0.0).into(),
             accelerators: Vec::new(),
             accelerator_grabs: Vec::new(),
@@ -733,6 +764,13 @@ impl WindowManager {
             focus_awaits_surface: None,
             x11_input_focus: None,
             grab: None,
+            grab_pos: Point::default(),
+            touch_grab: None,
+            touch_swallowed: Default::default(),
+            touch_cancels: 0,
+            touch_points: HashMap::new(),
+            osk_slide: crate::osk::WindowSlide::default(),
+            osk_slide_moves: Vec::new(),
             mode: SessionMode::Gnome,
             strip_offset: 0.0,
             strip_shown: 0.0,
@@ -2415,22 +2453,27 @@ impl WindowManager {
                 WindowRequest::Unfullscreen => {
                     self.set_fullscreen(state, id, false);
                 }
-                WindowRequest::Move(serial, origin) => {
-                    if self.grab.is_none()
-                        && state.seat.get_pointer().is_some_and(|p| p.has_grab(serial))
-                    {
+                WindowRequest::Move(serial, origin) if self.grab.is_none() => {
+                    if let Some(slot) = state.touch_press(serial).map(|press| press.slot) {
+                        self.begin_touch_grab(state, slot, |manager, state| {
+                            manager.begin_move_owned(state, id, origin, None);
+                        });
+                    } else if state.seat.get_pointer().is_some_and(|p| p.has_grab(serial)) {
                         self.begin_move_from(state, id, origin);
                         self.grab_motion(state, self.pointer_pos);
                     }
                 }
-                WindowRequest::Resize(edges, serial, origin) => {
-                    if self.grab.is_none()
-                        && state.seat.get_pointer().is_some_and(|p| p.has_grab(serial))
-                    {
+                WindowRequest::Resize(edges, serial, origin) if self.grab.is_none() => {
+                    if let Some(slot) = state.touch_press(serial).map(|press| press.slot) {
+                        self.begin_touch_grab(state, slot, |manager, state| {
+                            manager.begin_resize_owned(state, id, edges, origin, None);
+                        });
+                    } else if state.seat.get_pointer().is_some_and(|p| p.has_grab(serial)) {
                         self.begin_resize_from(state, id, edges, origin);
                         self.grab_motion(state, self.pointer_pos);
                     }
                 }
+                WindowRequest::Move(..) | WindowRequest::Resize(..) => {}
                 WindowRequest::Activate => {
                     // xdg-activation is META_CLIENT_TYPE_APPLICATION:
                     // Mutter raises it only with raise-on-click.
@@ -3034,6 +3077,7 @@ impl WindowManager {
         button: Option<u32>,
     ) {
         self.settle(id);
+        self.let_go_osk_slide(id);
         if self.mode == SessionMode::Scroll {
             if let Some(owner) = self.strip_pointer_owner(state, id, button) {
                 let geometry_start = self.shifted(id, self.windows[&id].geometry);
@@ -3089,9 +3133,19 @@ impl WindowManager {
         } else {
             self.grab_raise = Some(GrabRaise {
                 id,
-                start: self.pointer_pos,
+                start: self.grab_point(),
                 distance: 0.0,
             });
+        }
+    }
+
+    /// Where the point driving the grab is: the touch point of a grab
+    /// begun by touch, else the pointer.
+    fn grab_point(&self) -> Point<f64, Logical> {
+        if self.touch_grab.is_some() {
+            self.grab_pos
+        } else {
+            self.pointer_pos
         }
     }
 
@@ -3124,6 +3178,7 @@ impl WindowManager {
         button: Option<u32>,
     ) {
         self.settle(id);
+        self.let_go_osk_slide(id);
         if self.mode == SessionMode::Scroll {
             let Some(edges) = self.strip_resize_edges(id, edges) else {
                 return;
@@ -3387,9 +3442,11 @@ impl WindowManager {
     /// End the grab on button release. A move dropped at the top edge
     /// maximizes; at a side edge it tiles that half (GNOME snapping).
     fn end_grab(&mut self, state: &mut State) {
+        let point = self.grab_point();
         let Some(grab) = self.grab.take() else {
             return;
         };
+        self.touch_grab = None;
         if let Some(raise) = self.grab_raise.take() {
             if self.focus_policy.grab_raises_at_end(raise.distance)
                 && self.windows.contains_key(&raise.id)
@@ -3421,7 +3478,7 @@ impl WindowManager {
             if !self.workspace_policy.edge_tiling {
                 return;
             }
-            match snap_target(self.pointer_pos, state.primary_size().w) {
+            match snap_target(point, state.primary_size().w) {
                 Some(Snap::Maximize) => {
                     self.set_maximized(state, id, true);
                 }
@@ -3506,7 +3563,7 @@ impl WindowManager {
         let Some(PointerGrab::Move { id, .. }) = self.grab else {
             return None;
         };
-        let rect = match snap_target(self.pointer_pos, state.primary_size().w)? {
+        let rect = match snap_target(self.grab_point(), state.primary_size().w)? {
             Snap::Maximize => Self::work_area(state),
             Snap::Tile(side) => Self::tile_area(state, side),
         };
@@ -3586,8 +3643,9 @@ impl WindowManager {
         };
         let travelled = (pos.x - self.pointer_pos.x).hypot(pos.y - self.pointer_pos.y);
         self.pointer_pos = pos;
-        // An interactive move/resize owns the pointer until release.
-        if self.grab_motion(state, pos) {
+        // An interactive move/resize owns the pointer until release
+        // (unless a touch point drives it).
+        if self.touch_grab.is_none() && self.grab_motion(state, pos) {
             return;
         }
         self.sticky_motion(state, travelled);
@@ -3956,6 +4014,7 @@ impl WindowManager {
         // Dropping it pinned pointer focus to the dragged window for
         // good, so the panel never saw another click (#97).
         if !pressed
+            && self.touch_grab.is_none()
             && self.grab.is_some_and(|grab| {
                 Self::strip_grab_owner(grab).is_none_or(|owner| owner.button == button)
             })
@@ -4060,35 +4119,7 @@ impl WindowManager {
             return;
         }
         if pressed && !on_popup {
-            let pos = self.pointer_pos;
-            if let Some((surface, _)) =
-                crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
-            {
-                if !self.overview_open && crate::layer::surface_takes_keyboard_on_press(&surface) {
-                    let serial = SERIAL_COUNTER.next_serial();
-                    if let Some(keyboard) = self.keyboard.clone() {
-                        keyboard.set_focus(state, Some(surface.clone()), serial);
-                    }
-                    state.sync_selection_focus(Some(&surface));
-                }
-            } else if self.overview_open {
-                // Overview presses are the runtime's (preview hits).
-            } else if let Some(id) = self.window_at(pos) {
-                // A lock or on-demand layer can own the keyboard while the
-                // model still names this window. A click must restore actual
-                // seat focus even when the model's focused ID is unchanged.
-                let keyboard_matches = self
-                    .keyboard
-                    .as_ref()
-                    .is_none_or(|keyboard| keyboard.current_focus() == self.surface_of(id));
-                if self.model.focused() != Some(id) || !keyboard_matches {
-                    self.apply_focus_raise(state, Some(id), press_raise);
-                } else if press_raise && self.mode == SessionMode::Gnome {
-                    // Pointer focus leaves windows focused beneath others:
-                    // every raise-on-click press raises, focused or not.
-                    self.raise_family(id);
-                }
-            }
+            self.press_focus(state, self.pointer_pos, press_raise);
         }
         // Mapping, closing or restacking a surface can change what lies
         // under a stationary pointer. Refresh enter/focus before the press;
@@ -4120,6 +4151,473 @@ impl WindowManager {
             // frame boundary (GTK4 drops unframed clicks).
             pointer.frame(state);
         }
+    }
+
+    /// A primary press (or touch begin) at `pos` takes focus: a layer
+    /// surface that wants the keyboard on press gets it (unless the
+    /// overview park owns it, or the surface asked for no keyboard, as
+    /// IBus's candidate window does), so panel menus take keys; a window
+    /// is focused, and raised with `raise`. Overview presses are the
+    /// runtime's (preview hits).
+    fn press_focus(&mut self, state: &mut State, pos: Point<f64, Logical>, raise: bool) {
+        if let Some((surface, _)) =
+            crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
+        {
+            if !self.overview_open && crate::layer::surface_takes_keyboard_on_press(&surface) {
+                let serial = SERIAL_COUNTER.next_serial();
+                if let Some(keyboard) = self.keyboard.clone() {
+                    keyboard.set_focus(state, Some(surface.clone()), serial);
+                }
+                state.sync_selection_focus(Some(&surface));
+            }
+        } else if self.overview_open {
+            // Overview presses are the runtime's (preview hits).
+        } else if let Some(id) = self.window_at(pos) {
+            // A lock or on-demand layer can own the keyboard while the
+            // model still names this window. A click must restore actual
+            // seat focus even when the model's focused ID is unchanged.
+            let keyboard_matches = self
+                .keyboard
+                .as_ref()
+                .is_none_or(|keyboard| keyboard.current_focus() == self.surface_of(id));
+            if self.model.focused() != Some(id) || !keyboard_matches {
+                self.apply_focus_raise(state, Some(id), raise);
+            } else if raise && self.mode == SessionMode::Gnome {
+                // Pointer focus leaves windows focused beneath others:
+                // every raise-on-click press raises, focused or not.
+                self.raise_family(id);
+            }
+        }
+    }
+
+    /// The seat's touch capability follows the touchscreens (Mutter's
+    /// `lookup_device_capabilities`): advertised only while one is
+    /// present, so toolkits bind `wl_touch` then.
+    pub fn set_touch_capability(&mut self, state: &mut State, present: bool) {
+        if present == self.touch.is_some() {
+            return;
+        }
+        if present {
+            self.touch =
+                Some(state.seat_mut().add_touch_with_default_grab(|| {
+                    Box::new(crate::touch_grab::SequenceDefaultGrab)
+                }));
+        } else {
+            self.cancel_touch(state);
+            state.seat_mut().remove_touch();
+            self.touch = None;
+        }
+    }
+
+    /// What a touch point at `pos` lands on, as Mutter picks the actor
+    /// under each touch point when it begins: popups over layer surfaces
+    /// over windows. In the overview, windows are compositor-drawn
+    /// previews and take no touch, as they take no pointer focus; an
+    /// attached modal dialog blocks its parent.
+    fn touch_target(
+        &self,
+        state: &State,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        if let Some(popup) = self.popup_at(state, pos) {
+            return Some((popup.surface, popup.origin.to_f64()));
+        }
+        if let Some((surface, (ox, oy))) =
+            crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
+        {
+            return Some((surface, (f64::from(ox), f64::from(oy)).into()));
+        }
+        if self.overview_open {
+            return None;
+        }
+        let id = self
+            .window_at(pos)
+            .filter(|id| self.modal_target(*id) == *id)?;
+        let window = self.windows.get(&id)?;
+        let surface = window.surface.wl_surface()?.into_owned();
+        let origin = crate::popup::surface_origin(&surface, window.geometry.loc);
+        Some((surface, origin.to_f64()))
+    }
+
+    /// A touch begin is a primary press for focus
+    /// (`meta_window_handle_ungrabbed_event` treats `CLUTTER_TOUCH_BEGIN`
+    /// as button 1): it focuses and raises, and with the window-action
+    /// modifier held starts a move. Returns whether the press was
+    /// consumed (a popup dismissal, a blocked modal parent, a move).
+    fn touch_begin_focus(
+        &mut self,
+        state: &mut State,
+        slot: u32,
+        pos: Point<f64, Logical>,
+    ) -> bool {
+        let on_popup = self.popup_at(state, pos).is_some();
+        // The xdg-shell grab rule, as for a press: a touch on another
+        // client's surface (or nothing) dismisses the grabbed popups and
+        // is consumed.
+        if !on_popup && state.popup_grab_active() {
+            let target = self
+                .surface_for_click(state, pos)
+                .and_then(|s| s.client())
+                .map(|c| c.id());
+            if target.is_none() || target != state.popup_grab_owner() {
+                state.dismiss_popup_grab();
+                return true;
+            }
+        }
+        if on_popup {
+            return false;
+        }
+        let mut raise = self.focus_policy.raise_on_click;
+        let layer =
+            crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32);
+        if !self.overview_open && layer.is_none() && self.grab.is_none() {
+            if let Some(id) = self.window_at(pos) {
+                if self.modal_target(id) != id {
+                    self.apply_focus_raise(state, Some(id), raise);
+                    return true;
+                }
+                if let Some(frame) = self.windows.get(&id).map(|w| self.shifted(id, w.geometry)) {
+                    let decision = self.focus_policy.press(
+                        self.held_mods(),
+                        crate::tablet::BTN_LEFT,
+                        state.shortcuts_inhibited(),
+                        (frame.loc.x, frame.loc.y, frame.size.w, frame.size.h),
+                        (pos.x, pos.y),
+                    );
+                    match decision {
+                        crate::focus_policy::Press::Focus { raise: r } => raise = r,
+                        crate::focus_policy::Press::Move => {
+                            self.apply_focus_raise(state, Some(id), false);
+                            self.begin_touch_grab(state, slot, |manager, state| {
+                                manager.begin_move_owned(state, id, pos, None);
+                            });
+                            return true;
+                        }
+                        crate::focus_policy::Press::Resize { edges } => {
+                            self.apply_focus_raise(state, Some(id), false);
+                            self.begin_touch_grab(state, slot, |manager, state| {
+                                manager.begin_resize_owned(state, id, edges, pos, None);
+                            });
+                            return true;
+                        }
+                        crate::focus_policy::Press::Menu { raise } => {
+                            self.apply_focus_raise(state, Some(id), raise);
+                            self.menu_requests.push((
+                                id,
+                                pos.x.round() as i32,
+                                pos.y.round() as i32,
+                            ));
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        self.press_focus(state, pos, raise);
+        false
+    }
+
+    /// Start a window move or resize driven by touch point `slot`. The
+    /// grab takes the touch away from the client, which Mutter reports
+    /// as `wl_touch.cancel` (a grab moves the sprite's focus).
+    fn begin_touch_grab(
+        &mut self,
+        state: &mut State,
+        slot: u32,
+        begin: impl FnOnce(&mut Self, &mut State),
+    ) {
+        let pos = self
+            .touch_points
+            .get(&slot)
+            .copied()
+            .or_else(|| state.touch_presses.get(&slot).map(|press| press.location));
+        let Some(pos) = pos else {
+            return;
+        };
+        self.touch_grab = Some(slot);
+        self.grab_pos = pos;
+        begin(self, state);
+        if self.grab.is_none() {
+            self.touch_grab = None;
+            return;
+        }
+        self.cancel_client_touches(state);
+        self.grab_motion(state, pos);
+    }
+
+    /// A touch point began at `pos`.
+    pub fn touch_down(
+        &mut self,
+        state: &mut State,
+        slot: u32,
+        pos: Point<f64, Logical>,
+        time: u32,
+    ) {
+        let Some(touch) = self.touch.clone() else {
+            return;
+        };
+        self.touch_swallowed.remove(&slot);
+        if !pos.x.is_finite() || !pos.y.is_finite() {
+            self.touch_swallowed.insert(slot);
+            return;
+        }
+        self.touch_points.insert(slot, pos);
+        if self.touch_begin_focus(state, slot, pos) {
+            if self.touch_grab != Some(slot) {
+                self.touch_swallowed.insert(slot);
+            }
+            return;
+        }
+        let focus = self.touch_target(state, pos);
+        let serial = SERIAL_COUNTER.next_serial();
+        match &focus {
+            Some((surface, _)) => {
+                state.touch_presses.insert(
+                    slot,
+                    crate::TouchPress {
+                        slot,
+                        serial,
+                        surface: surface.clone(),
+                        location: pos,
+                    },
+                );
+            }
+            None => {
+                state.touch_presses.remove(&slot);
+            }
+        }
+        touch.down(
+            state,
+            focus,
+            &smithay::input::touch::DownEvent {
+                slot: Some(slot).into(),
+                location: pos,
+                serial,
+                time,
+            },
+        );
+    }
+
+    /// A touch point moved: it stays with the surface it began on (the
+    /// implicit grab), or drives the window move it started.
+    pub fn touch_motion(
+        &mut self,
+        state: &mut State,
+        slot: u32,
+        pos: Point<f64, Logical>,
+        time: u32,
+    ) {
+        if !pos.x.is_finite() || !pos.y.is_finite() {
+            return;
+        }
+        if let Some(point) = self.touch_points.get_mut(&slot) {
+            *point = pos;
+        }
+        if self.touch_grab == Some(slot) {
+            self.grab_pos = pos;
+            self.grab_motion(state, pos);
+            return;
+        }
+        if self.touch_swallowed.contains(&slot) {
+            return;
+        }
+        if let Some(touch) = self.touch.clone() {
+            // The sequence stays with the surface it began on; the surface
+            // under the point is for a touch drag-and-drop, whose target
+            // follows the finger (`meta_wayland_drag_grab` on touch).
+            let under = self.touch_target(state, pos);
+            touch.motion(
+                state,
+                under,
+                &smithay::input::touch::MotionEvent {
+                    slot: Some(slot).into(),
+                    location: pos,
+                    time,
+                },
+            );
+        }
+    }
+
+    /// A touch point lifted.
+    pub fn touch_up(&mut self, state: &mut State, slot: u32, time: u32) {
+        self.touch_points.remove(&slot);
+        state.touch_presses.remove(&slot);
+        if self.touch_grab == Some(slot) {
+            self.end_grab(state);
+            return;
+        }
+        if self.touch_swallowed.remove(&slot) {
+            return;
+        }
+        if let Some(touch) = self.touch.clone() {
+            touch.up(
+                state,
+                &smithay::input::touch::UpEvent {
+                    slot: Some(slot).into(),
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time,
+                },
+            );
+        }
+    }
+
+    /// One hardware frame of touch events ended (`wl_touch.frame`).
+    pub fn touch_frame(&mut self, state: &mut State) {
+        if let Some(touch) = self.touch.clone() {
+            touch.frame(state);
+        }
+    }
+
+    /// The compositor claimed every touch sequence (a shell gesture, a
+    /// grab): each client holding one gets `wl_touch.cancel` and hears
+    /// nothing more of them (`meta_wayland_touch_cancel`). The fingers'
+    /// later events go nowhere until they lift.
+    pub fn cancel_client_touches(&mut self, state: &mut State) {
+        let Some(touch) = self.touch.clone() else {
+            return;
+        };
+        if !state.touch_presses.is_empty() {
+            self.touch_cancels += 1;
+        }
+        state.touch_presses.clear();
+        touch.cancel(state);
+        for slot in self.touch_points.keys() {
+            if self.touch_grab != Some(*slot) {
+                self.touch_swallowed.insert(*slot);
+            }
+        }
+    }
+
+    /// The device cancelled every touch (`CLUTTER_TOUCH_CANCEL`): clients
+    /// get `wl_touch.cancel` and a touch-driven move ends.
+    pub fn cancel_touch(&mut self, state: &mut State) {
+        if self.touch_grab.is_some() {
+            self.end_grab(state);
+        }
+        self.cancel_client_touches(state);
+        self.touch_points.clear();
+        self.touch_swallowed.clear();
+    }
+
+    /// Whether a touch at `pos` would reach a client surface.
+    pub fn touch_lands_on_client(&self, state: &State, pos: Point<f64, Logical>) -> bool {
+        self.touch_target(state, pos).is_some()
+    }
+
+    /// The seat's touch state for the compositor state file.
+    pub fn touch_introspect(&self, state: &State) -> serde_json::Value {
+        serde_json::json!({
+            "capability": self.touch.is_some(),
+            "sequences": state.touch_presses.len(),
+            "client_cancels": self.touch_cancels,
+            "grab": self.touch_grab.is_some(),
+        })
+    }
+
+    /// gnome-shell 51 `Keyboard.setCursorLocation` and `_animateWindow`:
+    /// with the keyboard at `keyboard` and the focused field's cursor at
+    /// `cursor`, slide the field's window up out of the keyboard's way
+    /// or back where it started, easing over `duration`
+    /// (`KEYBOARD_ANIMATION_TIME`, EASE_OUT_QUAD) and ending in a real
+    /// move (`_windowSlideAnimationComplete`). Only a floating window
+    /// moves: Mutter's constraints hold maximized, tiled and fullscreen
+    /// frames in place.
+    pub fn osk_slide(
+        &mut self,
+        keyboard: Option<crate::osk::KeyboardBox>,
+        cursor: Option<crate::osk::FieldCursor>,
+        now: std::time::Duration,
+        duration: std::time::Duration,
+    ) {
+        if let Some(id) = self.osk_slide.window() {
+            if !self.windows.contains_key(&id) {
+                self.let_go_osk_slide(id);
+            }
+        }
+        let windows = &self.windows;
+        let moves = self.osk_slide.update(keyboard, cursor, |id| {
+            windows
+                .get(&id)
+                .filter(|window| window.layout == WindowLayout::Floating)
+                .map(|window| window.geometry.loc.y)
+        });
+        for (id, to) in moves {
+            let Some(window) = self.windows.get(&id) else {
+                continue;
+            };
+            self.osk_slide_moves.retain(|slide| slide.id != id);
+            let from = window.geometry.loc.y;
+            if duration.is_zero() {
+                self.osk_slide_set_y(id, to);
+            } else {
+                self.osk_slide_moves.push(OskSlideMove {
+                    id,
+                    from,
+                    to,
+                    start: now,
+                    duration,
+                });
+            }
+        }
+    }
+
+    /// Advance the keyboard's window slides to `now`.
+    pub fn step_osk_slide(&mut self, now: std::time::Duration) {
+        let moves = std::mem::take(&mut self.osk_slide_moves);
+        for slide in moves {
+            let t = now.saturating_sub(slide.start).as_secs_f64() / slide.duration.as_secs_f64();
+            let eased = crate::transitions::ease_out_quad(t);
+            let y = f64::from(slide.from) + f64::from(slide.to - slide.from) * eased;
+            if t >= 1.0 {
+                self.osk_slide_set_y(slide.id, slide.to);
+            } else {
+                self.osk_slide_set_y(slide.id, y.round() as i32);
+                self.osk_slide_moves.push(slide);
+            }
+        }
+    }
+
+    /// Whether a keyboard window slide is easing.
+    pub fn osk_slide_running(&self) -> bool {
+        !self.osk_slide_moves.is_empty()
+    }
+
+    /// The window the keyboard slid up, for the state file.
+    pub fn osk_slide_window(&self) -> Option<u64> {
+        self.osk_slide.window()
+    }
+
+    /// The focused field's cursor in global coordinates: `rect` is local
+    /// to `surface`, a window's toplevel surface (mutter's input focus
+    /// reports the cursor in stage coordinates).
+    pub fn field_cursor(
+        &self,
+        surface: &WlSurface,
+        rect: (i32, i32, i32, i32),
+    ) -> Option<crate::osk::FieldCursor> {
+        let (id, window) = self
+            .windows
+            .iter()
+            .find(|(_, window)| window.surface.wl_surface().as_deref() == Some(surface))?;
+        let origin = crate::popup::surface_origin(surface, window.geometry.loc);
+        Some(crate::osk::FieldCursor {
+            window: *id,
+            y: origin.y + rect.1,
+            height: rect.3,
+        })
+    }
+
+    fn osk_slide_set_y(&mut self, id: u64, y: i32) {
+        if let Some(window) = self.windows.get_mut(&id) {
+            window.geometry.loc.y = y;
+        }
+    }
+
+    /// `_onFocusWindowMoving`: a window the user grabs is let go where
+    /// it is, and its slide stops.
+    fn let_go_osk_slide(&mut self, id: u64) {
+        self.osk_slide.let_go(id);
+        self.osk_slide_moves.retain(|slide| slide.id != id);
     }
 
     /// Scroll the client under the pointer. Wheel notches arrive in v120
@@ -4308,6 +4806,34 @@ impl WindowManager {
                     pointer.frame(state);
                 }
             }
+            // Touch reaches only the lock surface too, at the output
+            // origin like the pointer.
+            ManagerInput::TouchDown { slot, pos, time } => {
+                let Some(touch) = self.touch.clone() else {
+                    return;
+                };
+                if !pos.x.is_finite() || !pos.y.is_finite() {
+                    return;
+                }
+                self.touch_swallowed.remove(&slot);
+                self.touch_points.insert(slot, pos);
+                touch.down(
+                    state,
+                    Some((surface.clone(), (0.0, 0.0).into())),
+                    &smithay::input::touch::DownEvent {
+                        slot: Some(slot).into(),
+                        location: pos,
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time,
+                    },
+                );
+            }
+            ManagerInput::TouchMotion { slot, pos, time } => {
+                self.touch_motion(state, slot, pos, time)
+            }
+            ManagerInput::TouchUp { slot, time } => self.touch_up(state, slot, time),
+            ManagerInput::TouchFrame { .. } => self.touch_frame(state),
+            ManagerInput::TouchCancel { .. } => self.cancel_touch(state),
             _ => {}
         }
     }
@@ -6612,6 +7138,32 @@ pub enum ManagerInput {
         cancelled: bool,
         time: u32,
     },
+    /// Touchscreen contacts (P-DS-04, #345), in logical coordinates:
+    /// delivered as `wl_touch` to the surface under each point when it
+    /// began, never as pointer events (Mutter emulates no pointer for
+    /// Wayland clients). `slot` is the device's touch slot.
+    TouchDown {
+        slot: u32,
+        pos: Point<f64, Logical>,
+        time: u32,
+    },
+    TouchMotion {
+        slot: u32,
+        pos: Point<f64, Logical>,
+        time: u32,
+    },
+    TouchUp {
+        slot: u32,
+        time: u32,
+    },
+    /// The end of one hardware frame of touch events (`wl_touch.frame`).
+    TouchFrame {
+        time: u32,
+    },
+    /// The device cancelled every contact (`wl_touch.cancel`).
+    TouchCancel {
+        time: u32,
+    },
 }
 
 /// What a finished three-finger touchpad swipe does (GNOME 51).
@@ -6803,6 +7355,10 @@ impl TriggerState {
         let corner = matches!(input, ManagerInput::Motion { pos, .. }
             if (0.0..HOT_CORNER_PX).contains(&pos.x)
                 && (0.0..HOT_CORNER_PX).contains(&pos.y));
+        let pointer = match *input {
+            ManagerInput::TouchDown { pos, .. } => pos,
+            _ => pointer,
+        };
         let strip = (0.0..ACTIVITIES_STRIP_PX).contains(&pointer.y)
             && (0.0..ACTIVITIES_WIDTH_PX).contains(&pointer.x);
         self.feed_regions(input, overview_open, corner, strip)
@@ -6819,6 +7375,11 @@ impl TriggerState {
         pointer: Point<f64, Logical>,
         outputs: impl Iterator<Item = (Rectangle<i32, Logical>, bool)> + Clone,
     ) -> TriggerAction {
+        // A touch begins where it lands, not where the pointer is.
+        let pointer = match *input {
+            ManagerInput::TouchDown { pos, .. } => pos,
+            _ => pointer,
+        };
         let outputs = outputs
             .filter(|(rect, _)| rect.size.w > 0 && rect.size.h > 0)
             .enumerate();
@@ -6920,10 +7481,23 @@ impl TriggerState {
                     TriggerAction::None
                 }
             }
+            // A touch begin acts as the primary press it is for focus.
+            ManagerInput::TouchDown { .. } => {
+                self.super_armed = false;
+                if strip {
+                    TriggerAction::Toggle
+                } else {
+                    TriggerAction::None
+                }
+            }
             ManagerInput::RelativeMotion { .. }
             | ManagerInput::SwipeBegin { .. }
             | ManagerInput::SwipeUpdate { .. }
-            | ManagerInput::SwipeEnd { .. } => TriggerAction::None,
+            | ManagerInput::SwipeEnd { .. }
+            | ManagerInput::TouchMotion { .. }
+            | ManagerInput::TouchUp { .. }
+            | ManagerInput::TouchFrame { .. }
+            | ManagerInput::TouchCancel { .. } => TriggerAction::None,
         }
     }
 }
@@ -7276,6 +7850,13 @@ impl WindowManager {
                     pointer.frame(state);
                 }
             }
+            ManagerInput::TouchDown { slot, pos, time } => self.touch_down(state, slot, pos, time),
+            ManagerInput::TouchMotion { slot, pos, time } => {
+                self.touch_motion(state, slot, pos, time)
+            }
+            ManagerInput::TouchUp { slot, time } => self.touch_up(state, slot, time),
+            ManagerInput::TouchFrame { .. } => self.touch_frame(state),
+            ManagerInput::TouchCancel { .. } => self.cancel_touch(state),
         }
     }
 
@@ -8039,41 +8620,13 @@ fn origin_cascade(
     (x, y).into()
 }
 
-/// Translate a winit backend [`InputEvent`] into [`ManagerInput`].
-/// Returns `None` for device add/remove and other unconsumed kinds.
-/// Button code synthesized for touch contacts: the shell gates tile,
-/// dock, and banner presses on left-click, and clients expect balanced
-/// press/release pairs, so a tap must arrive as a left press to act.
-const TOUCH_BUTTON: u32 = 0x110;
-
-/// One touch contact as pointer inputs: move to the contact, then press.
-/// Motion must precede the press because press handlers act at the last
-/// motion position, not at any position the button event carries.
-/// Pure so unit tests pin the pairing without backend event types.
-fn touch_press(pos: (f64, f64), time: u32) -> [ManagerInput; 2] {
-    [
-        ManagerInput::Motion {
-            pos: pos.into(),
-            time,
-        },
-        ManagerInput::Button {
-            button: TOUCH_BUTTON,
-            pressed: true,
-            time,
-        },
-    ]
+/// The `wl_touch` id of a backend touch slot (`-1`, a device without
+/// slots, wraps to `u32::MAX` and back).
+pub fn touch_slot(slot: smithay::backend::input::TouchSlot) -> u32 {
+    i32::from(slot) as u32
 }
 
-/// End of one touch contact: release the synthesized press so no
-/// button sticks down. Cancel releases too: a cancelled contact must
-/// never leave a press behind either.
-fn touch_release(time: u32) -> ManagerInput {
-    ManagerInput::Button {
-        button: TOUCH_BUTTON,
-        pressed: false,
-        time,
-    }
-}
+use smithay::backend::input::TouchEvent as _;
 
 /// Pixels per wheel notch, as Mutter scrolls.
 pub const WHEEL_STEP_PX: f64 = 15.0;
@@ -8083,17 +8636,16 @@ pub fn is_v120_wheel(amount: f64) -> bool {
     amount.fract() == 0.0 && (amount as i64) % 120 == 0
 }
 
-/// Translate one backend event into manager inputs. Touch contacts
-/// emulate a left-button pointer (down moves then presses, motion
-/// moves, up/cancel releases) so touchscreens act instead of dropping
-/// silently. Multi-touch overlaps may interleave presses — there is no
-/// per-slot tracking here — but every release still balances.
+/// Translate one backend event into manager inputs. Touch contacts stay
+/// touch (`wl_touch`), per slot, as Mutter delivers them to Wayland
+/// clients: no pointer is emulated.
 ///
 /// Generic over the backend (nested winit or hardware libinput): every
 /// backend reports XKB keycodes (evdev + 8) and absolute positions are
 /// scaled into `area`, the logical size the event's device maps onto
-/// (the nested window, or the primary output on hardware). Relative
-/// pointer motion is backend-owned and yields nothing here.
+/// (the nested window). The hardware backend maps touch contacts and
+/// absolute pointers itself (`drm::touch`, Mutter's input mapper) and
+/// owns relative pointer motion, which yields nothing here.
 pub fn translate_input<B: InputBackend>(
     event: InputEvent<B>,
     area: Size<i32, Logical>,
@@ -8152,17 +8704,30 @@ pub fn translate_input<B: InputBackend>(
         }
         InputEvent::TouchDown { event } => {
             let pos = event.position_transformed(area);
-            touch_press((pos.x, pos.y), (event.time() / 1000) as u32).into()
-        }
-        InputEvent::TouchMotion { event } => {
-            let pos = event.position_transformed(area);
-            vec![ManagerInput::Motion {
+            vec![ManagerInput::TouchDown {
+                slot: touch_slot(event.slot()),
                 pos: (pos.x, pos.y).into(),
                 time: (event.time() / 1000) as u32,
             }]
         }
-        InputEvent::TouchUp { event } => vec![touch_release((event.time() / 1000) as u32)],
-        InputEvent::TouchCancel { event } => vec![touch_release((event.time() / 1000) as u32)],
+        InputEvent::TouchMotion { event } => {
+            let pos = event.position_transformed(area);
+            vec![ManagerInput::TouchMotion {
+                slot: touch_slot(event.slot()),
+                pos: (pos.x, pos.y).into(),
+                time: (event.time() / 1000) as u32,
+            }]
+        }
+        InputEvent::TouchUp { event } => vec![ManagerInput::TouchUp {
+            slot: touch_slot(event.slot()),
+            time: (event.time() / 1000) as u32,
+        }],
+        InputEvent::TouchFrame { event } => vec![ManagerInput::TouchFrame {
+            time: (event.time() / 1000) as u32,
+        }],
+        InputEvent::TouchCancel { event } => vec![ManagerInput::TouchCancel {
+            time: (event.time() / 1000) as u32,
+        }],
         _ => Vec::new(),
     }
 }
@@ -8299,41 +8864,6 @@ mod tests {
             pressed,
             time: 0,
         }
-    }
-
-    #[test]
-    fn touch_press_moves_then_presses_left() {
-        let [motion, press] = touch_press((1263.0, 16.0), 7);
-        assert!(
-            matches!(motion, ManagerInput::Motion { pos, time: 7 } if pos.x == 1263.0 && pos.y == 16.0),
-            "tap must move first, presses act at the last motion position: {motion:?}"
-        );
-        assert!(
-            matches!(
-                press,
-                ManagerInput::Button {
-                    button: 0x110,
-                    pressed: true,
-                    time: 7
-                }
-            ),
-            "tap must arrive as a left press or the shell ignores it: {press:?}"
-        );
-    }
-
-    #[test]
-    fn touch_release_balances_with_left_release() {
-        assert!(
-            matches!(
-                touch_release(9),
-                ManagerInput::Button {
-                    button: 0x110,
-                    pressed: false,
-                    time: 9
-                }
-            ),
-            "lift and cancel must release the synthesized press"
-        );
     }
 
     #[test]

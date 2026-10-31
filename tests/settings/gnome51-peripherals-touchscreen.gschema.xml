@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- GNOME 51 touchscreen settings as Tuna's compositor and shell read them:
+     gsettings-desktop-schemas 51.0's per-device touchscreen schema
+     (schemas/org.gnome.desktop.peripherals.gschema.xml.in; relocatable,
+     Mutter places it at /org/gnome/desktop/peripherals/touchscreens/VVVV:PPPP/)
+     and gnome-settings-daemon 51's orientation lock
+     (data/org.gnome.settings-daemon.peripherals.gschema.xml.in), which
+     Mutter's orientation manager and GNOME Shell's Auto Rotate toggle use. -->
+<schemalist>
+  <schema id="org.gnome.desktop.peripherals.touchscreen">
+    <key name="output" type="as">
+      <default>["", "", ""]</default>
+      <summary>Touchscreen output mapping</summary>
+      <description>EDID information of the output the touchscreen is mapped to. Must be in the format [vendor, product, serial]. ["","",""] relies on automatic mapping.</description>
+    </key>
+  </schema>
+  <schema id="org.gnome.settings-daemon.peripherals.touchscreen" path="/org/gnome/settings-daemon/peripherals/touchscreen/">
+    <key name="orientation-lock" type="b">
+      <default>false</default>
+      <summary>Whether the tablet’s orientation is locked, or rotated automatically.</summary>
+    </key>
+  </schema>
+</schemalist>

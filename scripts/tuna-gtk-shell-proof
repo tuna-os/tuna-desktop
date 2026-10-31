@@ -77,6 +77,7 @@
 #   G-QS-POWER       the Power Mode tile switches to power saver
 #   G-QS-DARK        the Dark Style tile writes GNOME's color-scheme key
 #   G-QS-EXTERNAL-SYNC  Dark Style / Night Light follow keys written by gsettings
+#   G-QS-AUTOROTATE-HIDDEN  no built-in panel: the Auto Rotate toggle stays hidden
 #   G-QS-DIM-OPAQUE  an open toggle menu dims the grid; the panel stays opaque
 #   G-QS-BRIGHTNESS  the brightness slider sets the backlight via logind
 #   G-QS-VOLUME      the volume slider sets the PipeWire sink volume
@@ -3744,6 +3745,18 @@ qs_tile_checked "$ARTIFACTS/a11y-qs-external-b.json" "Night Light" false ||
 [ "$(gsettings get org.gnome.desktop.interface color-scheme)" = "'prefer-dark'" ] ||
     fail G-QS-EXTERNAL-SYNC "following the key wrote it back"
 pass G-QS-EXTERNAL-SYNC "Dark Style and Night Light follow color-scheme and night-light-enabled written outside the tile"
+# GNOME 51 autoRotate.js: Auto Rotate shows only while DisplayConfig's
+# PanelOrientationManaged is true (built-in panel + accelerometer + touch
+# mode). The nested output is no built-in panel, so even with the
+# touchscreen schema installed the toggle must not show.
+gsettings list-keys org.gnome.settings-daemon.peripherals.touchscreen 2>/dev/null |
+    grep -qx orientation-lock ||
+    echo "G-QS-AUTOROTATE-HIDDEN: touchscreen schema not installed; checking hidden anyway" >&2
+if jq -e 'any(.[]; .name == "Auto Rotate" and .role == "toggle button" and .showing)' \
+    "$ARTIFACTS/a11y-qs-external-b.json" >/dev/null; then
+    fail G-QS-AUTOROTATE-HIDDEN "Auto Rotate shows without a managed built-in panel"
+fi
+pass G-QS-AUTOROTATE-HIDDEN "without a built-in panel the Auto Rotate toggle stays hidden, as GNOME's does"
 # GNOME Settings' slider path: write the key, then NightLightPreview
 # forces it even though Night Light is off. The compositor's own
 # org.gnome.SettingsDaemon.Color must ease the applied Temperature

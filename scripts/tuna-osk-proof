@@ -17,6 +17,11 @@
 #              entry, read back from the client; focus stays there
 #   G-OSK-SHIFT shift types one uppercase letter, then lowercase; the
 #              long-press caps latch types uppercase until tapped off
+#   G-OSK-SLIDE an entry the keyboard would cover slides its window up by
+#              the keyboard's height as it shows, the entry above the
+#              keyboard (gnome-shell keyboard.js `setCursorLocation`,
+#              `_animateWindow`), and back down as it hides; entries the
+#              keyboard leaves clear move nothing
 #   G-OSK-LOCK  locked, the session keyboard is hidden and never maps; the
 #              lock screen's keyboard types the password into the unlock
 #              prompt alone (it unlocks through PAM, pam_wrapper) and no
@@ -381,6 +386,50 @@ session_tap s G-OSK-SHIFT
 expect_text b "TuNAs" G-OSK-SHIFT
 [ "$(text_of a)" = tuna ] || fail G-OSK-SHIFT "entry a changed to '$(text_of a)'"
 pass G-OSK-SHIFT "Shift T then u typed 'Tu'; the long-press latch typed 'NA' until tapped off; entry b reads '$(text_of b)'"
+
+# ---- G-OSK-SLIDE
+# Entries clear of the keyboard: nothing moves.
+cstate "$OSK_MAPPED and .osk_window_slide == null" 5 ||
+    fail G-OSK-SLIDE "a window slid for an entry the keyboard leaves clear"
+[ "$(wrect | cut -d' ' -f2)" -eq "$WY" ] || fail G-OSK-SLIDE "the probe moved to $(wrect) with entry b clear of the keyboard"
+# shellcheck disable=SC2046
+set -- $(osk_rect); SKY=$2 SKH=$4
+press "$DX" "$DY" G-OSK-SLIDE
+cstate "$OSK_GONE" 10 || fail G-OSK-SLIDE "focus on the button never hid the keyboard"
+# Super+drag the probe down until entry b sits 40 px under the keyboard's top.
+dy=$((SKY + 40 - BY))
+xdotool mousemove --window "$WID" $((WX + 300)) $((WY + 250)) keydown Super_L mousedown 1
+xdotool mousemove_relative -- 0 "$dy"
+xdotool mouseup 1 keyup Super_L
+low=$((WY + dy))
+cstate ".windows | any(.app_id == \"tuna-osk-probe\" and .rect[1] == $low)" 5 ||
+    fail G-OSK-SLIDE "the Super+drag left the probe at $(wrect), not y $low"
+sleep 0.5
+press "$BX" $((BY + dy)) G-OSK-SLIDE
+cstate "$OSK_MAPPED" 10 || fail G-OSK-SLIDE "a click into the covered entry b never showed the keyboard"
+osk_settled G-OSK-SLIDE
+up=$((low - SKH))
+cstate ".osk_window_slide.easing == false and (.windows | any(.app_id == \"tuna-osk-probe\" and .rect[1] == $up))" 5 ||
+    fail G-OSK-SLIDE "the probe is at $(wrect), not slid up by the keyboard's ${SKH} px to y $up"
+b_bottom="$(jq -rs 'map(select(.bounds)) | last | .bounds.b | .[1] + .[3]' "$PROBE_LOG")"
+[ $((up + b_bottom)) -le "$SKY" ] || fail G-OSK-SLIDE "entry b ends at y $((up + b_bottom)), under the keyboard at $SKY"
+[ "$(focus_of)" = b ] || fail G-OSK-SLIDE "the probe's focus is $(focus_of), not entry b"
+# Focus leaving text hides the keyboard: the window slides back down.
+press "$DX" $((DY + dy - SKH)) G-OSK-SLIDE
+cstate "$OSK_GONE and .osk_window_slide == null and (.windows | any(.app_id == \"tuna-osk-probe\" and .rect[1] == $low))" 10 ||
+    fail G-OSK-SLIDE "after the keyboard hid the probe is at $(wrect), not back at y $low"
+# Put the probe back for the lock gate, its keyboard up over entry b.
+xdotool mousemove --window "$WID" $((WX + 300)) $((low + 250)) keydown Super_L mousedown 1
+xdotool mousemove_relative -- 0 $((-dy))
+xdotool mouseup 1 keyup Super_L
+cstate ".windows | any(.app_id == \"tuna-osk-probe\" and .rect[1] == $WY)" 5 ||
+    fail G-OSK-SLIDE "the probe never went back to y $WY"
+sleep 0.5
+press "$BX" "$BY" G-OSK-SLIDE
+cstate "$OSK_MAPPED" 10 || fail G-OSK-SLIDE "a click into entry b never showed the keyboard again"
+osk_settled G-OSK-SLIDE
+cstate '.osk_window_slide == null' 2 || fail G-OSK-SLIDE "the clear entry b slid its window"
+pass G-OSK-SLIDE "covered entry b slid the probe up ${SKH} px (y $low -> $up, entry ends at $((up + b_bottom)) above the keyboard at $SKY) and back on hide; clear entries moved nothing"
 
 # ---- G-OSK-LOCK
 cstate "$OSK_MAPPED" 5 || fail G-OSK-LOCK "the session keyboard was not up before locking"

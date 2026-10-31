@@ -67,7 +67,9 @@ mod auth;
 mod color;
 mod display;
 mod motion;
+mod orientation;
 mod osk;
+mod touch;
 
 /// Display-rate loop pacing: while anything moves, dispatch blocks at
 /// most this long, so animations step near 60 Hz and the loop never
@@ -705,6 +707,7 @@ pub struct Runtime {
     motion_queue: crate::motion_coalesce::MotionCoalescer,
     /// Keys GNOME's on-screen keyboard holds down (#349).
     osk: osk::RuntimeOsk,
+    touch: touch::RuntimeTouch,
     /// An Escape press cancelled a client drag; its repeats and release
     /// belong to that cancel, not to the overview or a client.
     dnd_escape_held: bool,
@@ -746,9 +749,6 @@ pub struct Runtime {
     /// hardware session only, #356).
     #[cfg(feature = "drm")]
     privacy_screen_settings: Option<crate::privacy_screen_settings::PrivacyScreenSettings>,
-    /// Configured transform per connector (Settings/monitors.xml):
-    /// the sensor overrides these live but never rewrites them.
-    manual_transforms: std::collections::HashMap<String, u32>,
     /// What org.gnome.Mutter.DisplayConfig reports (#340), shared with
     /// the D-Bus thread, and the key it was last published at.
     display_share: std::sync::Arc<crate::display_config::DisplayShare>,
@@ -1003,11 +1003,6 @@ impl Runtime {
                             && crate::layer::exclusive_popup_keyboard_layer(&rt.state).is_none();
                         let corner_layout = rt.state.hot_corner_outputs();
                         rt.triggers.set_pressure_only(true);
-                        let touch = matches!(
-                            event,
-                            smithay::backend::input::InputEvent::TouchDown { .. }
-                                | smithay::backend::input::InputEvent::TouchMotion { .. }
-                        );
                         let inputs = match &mut rt.backend {
                             Backend::Drm(drm) => {
                                 drm.set_hot_corner_active(corners_active);
@@ -1016,7 +1011,7 @@ impl Runtime {
                             Backend::Winit(_) => Vec::new(),
                         };
                         for input in inputs {
-                            let input = if touch { rt.unzoom_touch(input) } else { input };
+                            let input = rt.unzoom_touch(input);
                             if let ManagerInput::Button {
                                 button,
                                 pressed: false,
@@ -1043,7 +1038,7 @@ impl Runtime {
                         let tablet_events = match &mut rt.backend {
                             Backend::Drm(drm) => {
                                 rt.tablet_settings
-                                    .want(drm.tablet_settings_wanted(), Instant::now());
+                                    .want(drm.peripheral_settings_wanted(), Instant::now());
                                 drm.take_tablet_events()
                             }
                             Backend::Winit(_) => Vec::new(),
@@ -1052,6 +1047,9 @@ impl Runtime {
                             rt.on_tablet_input(event);
                         }
                         rt.pad_osd_tick();
+                        // Touch mode follows hotplug and the tablet-mode
+                        // switch; Mutter's managed panel follows it.
+                        rt.sync_orientation_seat();
                         // The window manager has the final say (a locked
                         // pointer stays put): the drawn cursor follows it.
                         let pos = rt.manager.pointer_pos();
@@ -1459,6 +1457,7 @@ impl Runtime {
             input_aids: aids::RuntimeAids::default(),
             motion_queue: crate::motion_coalesce::MotionCoalescer::new(),
             osk: osk::RuntimeOsk::default(),
+            touch: touch::RuntimeTouch::default(),
             dnd_escape_held: false,
             orca: crate::orca::Reader::new(&session.socket_name, a11y_keyboard.clone()),
             a11y_keyboard,
@@ -1473,7 +1472,6 @@ impl Runtime {
             night_light: crate::night_light::NightLightController::new(night_light_share.clone()),
             color: color_share.clone(),
             colord,
-            manual_transforms: Default::default(),
             display_share,
             display_published: None,
             display_configs: Default::default(),
@@ -1614,17 +1612,12 @@ impl Runtime {
                     #[cfg(feature = "drm")]
                     Backend::Drm(_) => return,
                 };
-                let touch = matches!(
-                    event,
-                    smithay::backend::input::InputEvent::TouchDown { .. }
-                        | smithay::backend::input::InputEvent::TouchMotion { .. }
-                );
                 for input in translate_input(event, area) {
-                    let input = if touch {
-                        self.unzoom_touch(input)
-                    } else {
-                        input
-                    };
+                    if matches!(input, ManagerInput::TouchDown { .. }) {
+                        // winit cannot list devices: a touch proves one.
+                        self.manager.set_touch_capability(&mut self.state, true);
+                    }
+                    let input = self.unzoom_touch(input);
                     self.on_backend_input(input);
                 }
             }
@@ -1633,20 +1626,28 @@ impl Runtime {
     }
 
     /// A touch point lands on what the screen magnifier shows under the
-    /// finger (#349), and the zoom holds still under it rather than
-    /// chasing the pointer the touch moves. Pointer devices stay in
-    /// unmagnified coordinates, as in GNOME: their sprite is drawn
-    /// where the position maps, so clicks already hit what it shows.
-    fn unzoom_touch(&mut self, input: ManagerInput) -> ManagerInput {
+    /// finger (#349). Pointer devices stay in unmagnified coordinates, as
+    /// in GNOME: their sprite is drawn where the position maps, so clicks
+    /// already hit what it shows.
+    fn unzoom_touch(&self, input: ManagerInput) -> ManagerInput {
+        if !self.magnifier.config().active() {
+            return input;
+        }
+        let unzoom = |magnifier: &crate::magnifier::MagnifierState, pos: Point<f64, Logical>| {
+            let (x, y) = magnifier.unzoom((pos.x, pos.y));
+            Point::from((x, y))
+        };
         match input {
-            ManagerInput::Motion { pos, time } if self.magnifier.config().active() => {
-                let (x, y) = self.magnifier.unzoom((pos.x, pos.y));
-                self.magnifier.hold_pointer((x, y));
-                ManagerInput::Motion {
-                    pos: (x, y).into(),
-                    time,
-                }
-            }
+            ManagerInput::TouchDown { slot, pos, time } => ManagerInput::TouchDown {
+                slot,
+                pos: unzoom(&self.magnifier, pos),
+                time,
+            },
+            ManagerInput::TouchMotion { slot, pos, time } => ManagerInput::TouchMotion {
+                slot,
+                pos: unzoom(&self.magnifier, pos),
+                time,
+            },
             other => other,
         }
     }
@@ -1708,6 +1709,7 @@ impl Runtime {
         #[cfg(feature = "drm")]
         self.performance_trace.cancel();
         self.reset_input_aid_ownership();
+        self.reset_touch_ownership();
         // Nothing the session's keyboard held stays down under the lock.
         self.release_osk_keys();
         if let Some(monitor) = &self.a11y_keyboard {
@@ -1905,6 +1907,7 @@ impl Runtime {
     fn release_lock(&mut self) {
         self.flush_motion();
         self.reset_input_aid_ownership();
+        self.reset_touch_ownership();
         if let Some(monitor) = &self.a11y_keyboard {
             monitor.set_locked(false);
         }
@@ -2119,6 +2122,11 @@ impl Runtime {
                 .locate
                 .feed_matched(&input, matches_key, self.manager.pointer_pos(), now);
         }
+        // GNOME Shell's stage gestures see every touch first (capture
+        // phase); one that recognizes owns the fingers until they lift.
+        if self.touch_gesture_input(&input) {
+            return;
+        }
         if self.is_locked() {
             // The lock takes the keyboard: a held Escape's release
             // never comes back to the drag cancel below.
@@ -2180,6 +2188,11 @@ impl Runtime {
             return;
         }
         if !self.overlay.visible {
+            // Compositor-drawn overview previews take touch as Shell
+            // actors do.
+            if self.touch_overview_input(&input) {
+                return;
+            }
             if let ManagerInput::Key {
                 keycode: ESCAPE_KEYCODE,
                 pressed: true,
@@ -2723,6 +2736,8 @@ impl Runtime {
         // GNOME Settings' display configuration (#340): modes, the
         // kernel's CRTC modes on hardware, pending confirmation.
         doc["display_config"] = self.display_config_diagnostics();
+        doc["orientation"] = self.orientation_diagnostics();
+        doc["touch"] = self.touch_diagnostics();
         doc["color"] = self.color_diagnostics();
         let motion = self.input_settings.motion;
         doc["motion_policy"] = serde_json::json!(motion.level.as_str());
@@ -2780,6 +2795,16 @@ impl Runtime {
                     |field| serde_json::json!({ "purpose": field.purpose, "hints": field.hints }),
                 )
         };
+        // gnome-shell's keyboard window slide (#349): which window the
+        // keyboard moved up, by id and frame, for the OSK proof.
+        doc["osk_window_slide"] = match self.manager.osk_slide_window() {
+            Some(id) if !self.is_locked() => serde_json::json!({
+                "window": id,
+                "y": self.manager.geometry(id).map(|g| g.loc.y),
+                "easing": self.manager.osk_slide_running(),
+            }),
+            _ => serde_json::Value::Null,
+        };
         // Owned proof diagnostics only: no credentials, prompts or typed input.
         doc["auth_owner"] = if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
             serde_json::json!({ "outer_pending": self.unlock_worker.is_some(),
@@ -2808,6 +2833,7 @@ impl Runtime {
         #[cfg(feature = "drm")]
         if let Backend::Drm(drm) = &self.backend {
             doc["tablets"] = drm.tablets_introspect();
+            doc["touchscreens"] = drm.touchscreens_introspect();
         }
         let doc = doc.to_string();
         if doc == self.state_last {
@@ -4139,11 +4165,8 @@ impl Runtime {
             crate::mutter::ToLoop::SensorSample {
                 present,
                 orientation,
-            } => {
-                self.orientation.sensor_present = present;
-                self.orientation.sensor = orientation;
-                self.apply_orientation_policy();
-            }
+                claimed,
+            } => self.on_sensor_sample(present, orientation, claimed),
             crate::mutter::ToLoop::ApplyMonitors {
                 config,
                 method,
@@ -4288,60 +4311,10 @@ impl Runtime {
         if let Backend::Drm(drm) = &mut self.backend {
             drm.apply_input_settings(&settings);
         }
-        // Orientation lock (#345): stop sensor rotation live (and tell
-        // the sensor thread to release its claim, as mutter does).
-        if self.orientation.lock != settings.orientation_lock {
-            self.orientation.lock = settings.orientation_lock;
-            self.orientation_share
-                .set_inhibited(settings.orientation_lock);
-            self.apply_orientation_policy();
-        }
+        // Orientation lock (#345): tracking stops (the sensor thread
+        // releases its claim, as mutter does); the rotation stays.
+        self.set_orientation_lock(settings.orientation_lock);
         self.input_settings = settings;
-    }
-
-    /// Recompute sensor management and rotate unlocked built-in panels
-    /// to the accelerometer reading (live only: manual transforms in
-    /// monitors.xml are never rewritten). Called on every sensor
-    /// sample and every orientation-lock change.
-    fn apply_orientation_policy(&mut self) {
-        let entries = self.state.output_entries();
-        let has_builtin = entries
-            .iter()
-            .any(|(name, _, _, _)| crate::orientation::is_builtin_panel(name));
-        self.orientation_share
-            .set_managed(self.orientation.managed(has_builtin));
-        #[cfg(feature = "drm")]
-        {
-            let wants: Vec<(String, u32)> = entries
-                .iter()
-                .filter(|(name, _, _, _)| crate::orientation::is_builtin_panel(name))
-                .map(|(name, _, _, _)| {
-                    let manual = self.manual_transforms.get(name).copied().unwrap_or(0);
-                    (name.clone(), self.orientation.effective(name, manual))
-                })
-                .collect();
-            if let Backend::Drm(drm) = &mut self.backend {
-                for (name, want) in wants {
-                    let Some(out) = drm.outputs.iter_mut().find(|o| o.name == name) else {
-                        continue;
-                    };
-                    if out.transform == want {
-                        continue;
-                    }
-                    out.transform = want;
-                    out.output.change_current_state(
-                        None,
-                        Some(crate::orientation::smithay_transform(want)),
-                        None,
-                        None,
-                    );
-                    let (lw, lh) = out.logical_size();
-                    self.state
-                        .add_output(&name, Some(out.output.clone()), lw, lh);
-                    eprintln!("tuna-compositor: orientation: {name} rotated to transform {want}");
-                }
-            }
-        }
     }
 
     /// Each output's current picture (`None`: the nested window), for
@@ -4499,6 +4472,7 @@ impl Runtime {
             || self.manager.workspace_slide().running()
             || self.manager.strip_animating()
             || self.manager.size_changes().in_flight()
+            || self.manager.osk_slide_running()
             || self.manager.window_lifecycle().running()
             || self.manager.modal_dim().running()
             || self.cursor.animating(clock)
@@ -5176,7 +5150,7 @@ impl Runtime {
         }
         #[cfg(feature = "drm")]
         if let (Some(snapshot), Backend::Drm(drm)) = (snapshot, &mut self.backend) {
-            drm.set_tablet_settings(snapshot);
+            drm.set_peripheral_settings(snapshot);
             self.pad_osd_tick();
         }
     }
@@ -8016,7 +7990,12 @@ fn input_time(input: &ManagerInput) -> u64 {
         | ManagerInput::Axis { time, .. }
         | ManagerInput::SwipeBegin { time, .. }
         | ManagerInput::SwipeUpdate { time, .. }
-        | ManagerInput::SwipeEnd { time, .. } => u64::from(time),
+        | ManagerInput::SwipeEnd { time, .. }
+        | ManagerInput::TouchDown { time, .. }
+        | ManagerInput::TouchMotion { time, .. }
+        | ManagerInput::TouchUp { time, .. }
+        | ManagerInput::TouchFrame { time }
+        | ManagerInput::TouchCancel { time } => u64::from(time),
         ManagerInput::RelativeMotion { utime, .. } => utime / 1000,
     }
 }
