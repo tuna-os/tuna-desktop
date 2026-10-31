@@ -65,7 +65,7 @@ flock /tmp/tuna-v1-build-and-freeze.lock bash -c '
      "${CARGO_TARGET_DIR:-target}/debug/tuna-shell-gtk" /tmp/tuna-window-binaries/
 '
 dbus-run-session -- scripts/tuna-window-lifecycle-proof \
-  --bin-dir /tmp/tuna-window-binaries --display :95 --artifacts /tmp/tuna-window-lifecycle
+  --bin-dir /tmp/tuna-window-binaries --artifacts /tmp/tuna-window-lifecycle
 ```
 
 The runtime proof owns a private X server, settings and 0700 runtime directory.
