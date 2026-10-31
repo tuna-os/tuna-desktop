@@ -1911,6 +1911,9 @@ impl Runtime {
         self.lock.unlock(self.lock_now_ms());
         self.control.set_locked(false);
         self.state.set_shortcut_inhibition_locked(false);
+        // This is the sole authoritative locked -> unlocked transition.
+        // Quarantine lock-origin holds before the restored owner's enter.
+        self.manager.unlock_input(&mut self.state);
         self.overlay.hide();
     }
 
@@ -2118,6 +2121,15 @@ impl Runtime {
             self.cursor
                 .locate
                 .feed_matched(&input, matches_key, self.manager.pointer_pos(), now);
+        }
+        // Trusted AT already received the genuine event above. Session
+        // shortcuts, grabs and clients must not see a lock-origin hold.
+        if !self.is_locked()
+            && self
+                .manager
+                .discard_quarantined_key_input(&mut self.state, &input)
+        {
+            return;
         }
         if self.is_locked() {
             // The lock takes the keyboard: a held Escape's release

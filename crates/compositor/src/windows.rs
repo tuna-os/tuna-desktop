@@ -58,7 +58,7 @@ use smithay::{
     },
     desktop::{Window, WindowSurface},
     input::{
-        keyboard::{FilterResult, KeyboardHandle, ModifiersState, XkbConfig},
+        keyboard::{FilterResult, KeyboardHandle, Keycode, ModifiersState, XkbConfig},
         pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerHandle},
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
@@ -404,6 +404,8 @@ pub struct WindowManager {
     accel_fired: Vec<(u32, u32, u32)>,
     /// Input is going to the session-lock surface.
     lock_input_active: bool,
+    /// Physical holds quarantined at unlock, until their genuine keyup.
+    unlock_quarantined: HashSet<Keycode>,
     /// A touchpad swipe began on the session-lock surface and has not
     /// ended: only its updates and end follow it there.
     lock_swipe: bool,
@@ -721,6 +723,7 @@ impl WindowManager {
             accel_released: Vec::new(),
             accel_fired: Vec::new(),
             lock_input_active: false,
+            unlock_quarantined: HashSet::new(),
             lock_swipe: false,
             tablet: tablet_input::TabletFocus::default(),
             menu_requests: Vec::new(),
@@ -4176,6 +4179,54 @@ impl WindowManager {
         pointer.frame(state);
     }
 
+    /// The authoritative lock-to-session handoff, never a per-frame focus sync.
+    /// Clear client-visible holds before entering any session surface, but keep
+    /// physical/XKB state until real keyup. Trusted AT runs before this filter.
+    pub fn unlock_input(&mut self, state: &mut State) {
+        if let Some(keyboard) = &self.keyboard {
+            self.unlock_quarantined.extend(keyboard.pressed_keys());
+            keyboard.clear_forwarded_pressed_keys();
+            // Even without a mapped shield the session may retain focus and
+            // a pre-lock client-visible hold. A leave balances that client's
+            // state before its genuine release becomes quarantined.
+            keyboard.set_focus(state, None, SERIAL_COUNTER.next_serial());
+        }
+        // A popup grab is a logical owner, not a Smithay keyboard grab.
+        // Lock input moved actual focus away; restore its deepest surface
+        // without dismissing it or stealing focus for the underlying window.
+        let owner = state
+            .popup_grab_surface()
+            .cloned()
+            .or_else(|| self.overview_held.clone())
+            .or_else(|| crate::layer::exclusive_keyboard_layer(state));
+        if let Some(surface) = owner {
+            if let Some(keyboard) = self.keyboard.clone() {
+                keyboard.set_focus(state, Some(surface.clone()), SERIAL_COUNTER.next_serial());
+            }
+            state.sync_selection_focus(Some(&surface));
+        } else {
+            self.apply_focus_raise(state, self.model.focused(), false);
+        }
+    }
+
+    /// Consume a quarantined physical hold after the trusted AT has seen it.
+    /// Releases clear real seat state too, even if another route consumes them.
+    pub fn discard_quarantined_key_input(
+        &mut self,
+        state: &mut State,
+        input: &ManagerInput,
+    ) -> bool {
+        let ManagerInput::Key { keycode, .. } = input else {
+            return false;
+        };
+        let code = keycode.saturating_add(XKB_X11_OFFSET).into();
+        if !self.unlock_quarantined.contains(&code) {
+            return false;
+        }
+        self.discard_key_input(state, input);
+        true
+    }
+
     /// Route one input event to the session-lock surface and nothing
     /// else (ext-session-lock-v1): keys go to it with keyboard focus
     /// held there, the pointer acts on it at the output origin, and no
@@ -4351,6 +4402,24 @@ impl WindowManager {
         let Some(keyboard) = self.keyboard.clone() else {
             return false;
         };
+        if self.lock_input_active && !pressed {
+            // A second lock may own the genuine keyup of a hold quarantined
+            // by the previous unlock. Do not poison a later fresh press.
+            self.unlock_quarantined
+                .remove(&keycode.saturating_add(XKB_X11_OFFSET).into());
+        }
+        if !self.lock_input_active
+            && self.discard_quarantined_key_input(
+                state,
+                &ManagerInput::Key {
+                    keycode,
+                    pressed,
+                    time,
+                },
+            )
+        {
+            return true;
+        }
         if pressed && keycode == ESCAPE_KEYCODE && self.cancel_strip_pointer(state) {
             keyboard.input_discard(
                 state,
@@ -6396,14 +6465,20 @@ impl WindowManager {
         else {
             return false;
         };
-        self.a11y_shadow.key(
+        let grabbed = self.a11y_shadow.key(
             &keyboard,
             state,
             self.keymap_generation,
             monitor,
             (*keycode, *pressed),
             self.repeat.1,
-        )
+        );
+        if grabbed {
+            // AT grants can change while an ordinary lock-origin hold is
+            // quarantined. Still retire that seat hold on its genuine keyup.
+            self.discard_quarantined_key_input(state, input);
+        }
+        grabbed
     }
 
     /// Keep physical modifier holds current even when a lock, blanking shield
@@ -6429,6 +6504,8 @@ impl WindowManager {
         ) = (self.keyboard.clone(), input)
         {
             if !*pressed {
+                self.unlock_quarantined
+                    .remove(&keycode.saturating_add(XKB_X11_OFFSET).into());
                 self.accel_held.retain(|held| held.keycode != *keycode);
             }
             keyboard.input_discard(
@@ -7048,6 +7125,9 @@ impl WindowManager {
     /// Alt+F4 asks the focused client to close (cancelling an open
     /// switcher with it); its press is consumed too.
     pub fn on_input(&mut self, state: &mut State, input: ManagerInput) {
+        if self.discard_quarantined_key_input(state, &input) {
+            return;
+        }
         match input {
             ManagerInput::Key {
                 keycode,

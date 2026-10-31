@@ -18,7 +18,7 @@ state. There is no password redaction and no restriction to keys whose focused
 surface is the lock prompt. Its watches and grabs, including Orca-modifier
 commands and `GrabKeyboard`, remain effective across lock/unlock. This is not
 permission to send input to an ordinary session client: the separate lock
-surface route and post-unlock held-key refusal are unchanged.
+surface route and post-unlock held-key quarantine enforce that boundary.
 
 This follows the **51.1 source**, not an inference from a Tuna speech result:
 
@@ -51,6 +51,31 @@ custom modifiers. Lock itself is no longer a transport reset. The AT can
 read these secrets because it is the user's own trusted screen reader,
 exactly as in Mutter; they are not broadcast to other bus listeners, logged,
 or delivered to session surfaces.
+
+### Unlock focus and held-key quarantine (#939)
+
+The authoritative compositor unlock transition calls
+`WindowManager::unlock_input` once to hand keyboard focus back to the actual
+session keyboard owner. The handoff uses the normal focus policy without
+raising a window: overview, exclusive layer surfaces and popup grabs retain
+their priority over the ordinary focused window. It does not wait for a later
+pointer motion or ordinary key to repair seat focus.
+
+Every seat key physically held at that transition is quarantined from ordinary
+session input until its genuine release. Quarantined keys are removed from the
+forwarded pressed-key set before focus is restored, so the new owner's keyboard
+enter cannot disclose lock-held keys. Physical pressed state and XKB state are
+preserved; unlock does not invent releases or reset held modifiers. Repeated
+presses and the eventual release cannot reach session clients or trigger
+ordinary session shortcuts. A subsequent fresh press is eligible for normal
+routing again.
+
+Trusted AT interception remains first, before ordinary-session quarantine
+filtering, including runtime repeat/release filtering. The admitted screen
+reader therefore receives genuine lock keys and genuine held-key releases,
+even when the session must suppress those events. This quarantine is not an
+AT transport reset or a change to the GNOME 51.1 trust policy described above.
+These are routing requirements, not an additional test or CI receipt.
 
 `G-ORCA-SPEECH-LOCK-DBUS` locks after Escape through `ScreenSaver.Lock`;
 `G-ORCA-SPEECH-LOCK-SUPER-L` uses the ordinary complete chord. Each requires

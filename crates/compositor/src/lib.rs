@@ -883,6 +883,11 @@ impl State {
         !self.popup_grab.is_empty()
     }
 
+    /// Keyboard owner at the deepest surviving level of an explicit grab.
+    pub(crate) fn popup_grab_surface(&self) -> Option<&wl_surface::WlSurface> {
+        self.popup_grab.last().map(|popup| popup.wl_surface())
+    }
+
     /// Whether `surface` is a popup holding (part of) the explicit grab.
     pub(crate) fn popup_grabbed(&self, surface: &wl_surface::WlSurface) -> bool {
         self.popup_grab.iter().any(|p| p.wl_surface() == surface)

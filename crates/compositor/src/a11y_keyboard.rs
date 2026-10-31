@@ -218,7 +218,7 @@ impl Monitor {
         });
     }
     /// Snapshot mirror only: lock does not change trusted AT delivery or grabs.
-    /// Ordinary client isolation is enforced by Runtime's separate lock route.
+    /// Ordinary isolation (including unlock hold quarantine) runs after AT.
     pub fn set_locked(&self, locked: bool) {
         let mut inner = self.inner.lock().unwrap();
         inner.locked = locked;
@@ -824,6 +824,61 @@ pub(crate) mod tests {
         assert_eq!(count, 8);
         assert!(emitter.modifiers.is_empty());
         assert_eq!(m.snapshot()["reset_events"], 0);
+    }
+    #[test]
+    fn unlock_quarantine_preserves_trusted_at_holds_and_genuine_releases() {
+        use crate::windows::ManagerInput;
+        let mut compositor = crate::TestCompositor::new();
+        let mut manager = compositor.window_manager();
+        let (monitor, events) = monitor(vec![], vec![(0xffc5, 0)]); // F8
+        let held = |keycode, pressed| ManagerInput::Key {
+            keycode,
+            pressed,
+            time: 1,
+        };
+        monitor.set_locked(true);
+        // An ungrabbed F4 enters real seat state with no lock surface, while
+        // grabbed F8 belongs only to AT and never enters ordinary seat state.
+        let ordinary = held(62, true);
+        assert!(!manager.accessibility_input(&mut compositor.state, &monitor, &ordinary));
+        manager.discard_key_input(&mut compositor.state, &ordinary);
+        assert!(manager.accessibility_input(&mut compositor.state, &monitor, &held(66, true)));
+        monitor.set_locked(false);
+        manager.unlock_input(&mut compositor.state);
+        // Runtime's AT-first ordering is essential: quarantine consumes the
+        // ordinary repeat/release only after the watch saw their real payload.
+        for pressed in [true, false] {
+            let input = held(62, pressed);
+            assert!(!manager.accessibility_input(&mut compositor.state, &monitor, &input));
+            assert!(manager.discard_quarantined_key_input(&mut compositor.state, &input));
+        }
+        assert!(manager.accessibility_input(&mut compositor.state, &monitor, &held(66, false)));
+        let delivered: Vec<_> = events
+            .try_iter()
+            .map(|event| {
+                assert_eq!(event.owner, ":1.23");
+                let key = event.key.unwrap();
+                (key.keycode, key.released)
+            })
+            .collect();
+        assert_eq!(
+            delivered,
+            [
+                (70, false),
+                (74, false),
+                (70, false),
+                (70, true),
+                (74, true)
+            ]
+        );
+        assert!(compositor
+            .state
+            .seat
+            .get_keyboard()
+            .unwrap()
+            .pressed_keys()
+            .is_empty());
+        assert_eq!(monitor.snapshot()["reset_events"], 0);
     }
     #[test]
     fn locked_watch_and_grab_updates_keep_the_same_selection_policy() {
