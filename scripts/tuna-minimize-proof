@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """Actual native minimize/unminimize rendering proof; requires built binaries + Xvfb.
 
-Run under dbus-run-session. --bin-dir points to a source-identified frozen bundle.
+Run under dbus-run-session. --bundle-root owns frozen/ and fresh ltr/rtl evidence.
 Uses a private display, settings, runtime directory, and manual animation clock.
 This is local rendering evidence, not a GNOME paired benchmark or v1 verdict.
 """
@@ -11,11 +11,8 @@ import os
 from pathlib import Path
 import subprocess
 import shutil
-import hashlib
 import signal
 import select
-import gi
-from gi.repository import Gio, GLib
 import time
 from PIL import Image
 import sys
@@ -24,15 +21,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from minimize_body_pixel import (unobscured_body_point, require_rgb, require_restore_bracket,
                                  wait_clear_restore, clear_capture, require_destroy_bracket,
                                  wait_clock_frames, minimize_quarter, minimize_capture)
+from minimize_bundle import digest, mode_artifacts, validate
 p = argparse.ArgumentParser(description=__doc__)
-p.add_argument("--bin-dir", type=Path, required=True)
-p.add_argument("--artifacts", type=Path, required=True)
+p.add_argument("--bundle-root", type=Path, required=True)
 p.add_argument("--display", default=":95")
 p.add_argument("--rtl",action="store_true")
 a = p.parse_args()
 root = Path(__file__).resolve().parent.parent
-art = a.artifacts.resolve()
-art.mkdir(parents=True, exist_ok=True)
+bundle_root = a.bundle_root.resolve()
+frozen = bundle_root / "frozen"
+bundle_snapshot = validate(root, bundle_root)
+art = mode_artifacts(bundle_root, a.rtl)
+import gi
+from gi.repository import Gio, GLib
 runtime = art / "runtime"
 runtime.mkdir(mode=0o700, exist_ok=True)
 os.chmod(runtime, 0o700)
@@ -60,34 +61,22 @@ applications.mkdir(parents=True,exist_ok=True)
     "[Desktop Entry]\nType=Application\nName=Animation Proof\nExec=/usr/bin/true\nIcon="+str(icon_path)+"\nStartupWMClass=tuna-modal-dim-proof\n")
 clock_shift=0
 nominal_clock=0
-# Freeze the tested binaries so another worktree's build cannot change this run.
-frozen = art / "bin"
-frozen.mkdir(exist_ok=True)
-def digest(path):
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream,"sha256").hexdigest()
-binaries = {}
-for name in ("tuna-compositor","tuna-shell-gtk","tuna-modal-dim-client"):
-    source = a.bin_dir.resolve() / name
-    dest = frozen / name
-    shutil.copy2(source,dest)
-    binaries[name] = {"source_path":str(source),"sha256":digest(dest)}
+# Both modes execute the single owned, validated freeze directly.
+binaries = {name: {"source_path":str(frozen / name), "sha256":bundle_snapshot["sha256"][name]}
+            for name in ("tuna-compositor","tuna-shell-gtk","tuna-modal-dim-client")}
 manifest = {
-    "source_revision":subprocess.check_output(["git","rev-parse","HEAD"],cwd=root,text=True).strip(),
-    "source_dirty":bool(subprocess.check_output(["git","status","--porcelain"],cwd=root,text=True).strip()),
+    "source_revision":bundle_snapshot["source_commit"],
+    "source_dirty":False,
     "binaries":binaries,
-    "binary_source_revision":(a.bin_dir / "SOURCE_COMMIT").read_text().strip(),
+    "binary_source_revision":bundle_snapshot["source_commit"],
+    "frozen_manifest_sha256":bundle_snapshot["sha256"]["manifest.json"],
+    "bundle_validator_sha256":digest(root / "scripts/lib/minimize_bundle.py"),
     "proof_sha256":digest(Path(__file__).resolve()),
     "client_sha256":digest(root / "crates/compositor/examples/tuna-modal-dim-client.rs"),
     "pixel_helper_sha256":digest(root / "scripts/lib/minimize_body_pixel.py"),
     "backend":"winit/Xvfb/llvmpipe", "gnome_comparison":False,"direction_fixture":"GTK_DEBUG=invert-text-dir" if a.rtl else "default",
 }
-freeze_manifest=json.loads((a.bin_dir / "manifest.json").read_text())
-assert manifest["source_revision"]==manifest["binary_source_revision"]==freeze_manifest["source_commit"]
-assert not manifest["source_dirty"],"proof must use clean source"
-for name,record in binaries.items(): assert record["sha256"]==freeze_manifest["sha256"][name]
-manifest["cargo_lock_sha256"] = digest(root / "Cargo.lock")
-assert manifest["cargo_lock_sha256"] == digest(a.bin_dir / "Cargo.lock") == freeze_manifest["cargo_lock_sha256"]
+manifest["cargo_lock_sha256"] = bundle_snapshot["sha256"]["Cargo.lock"]
 (art / "manifest.json").write_text(json.dumps(manifest,indent=2))
 processes = []
 logs = []
@@ -597,6 +586,7 @@ finally:
         log.close()
 
 require_owned_cleanup(manifest["owned_cleanup"])
+validate(root, bundle_root, expected=bundle_snapshot)
 if success:
     (art / "assertions.txt").write_text("MN-NATIVE pass real xdg minimize and GTK switcher activation\nMN-FALLBACK pass monitor corner transform plus fade\nMN-RESTORE pass opaque full-motion live restore\nMN-DASH pass actual GTK published 64px icon target\nMN-MOTION pass GTK reduced/Off consumers\nMN-FULLSCREEN pass monitor-sized actors only fade\nMN-INTERRUPTED-MAP pass prior effects reset before live minimize\nMN-LIVE-CONTENT pass native buffer update during minimize\nMN-DEAD-ACTOR pass independent retained texture continues original clock\nMN-FAMILY-DIM pass live parent brightness during minimize\nMN-FAMILY-DIM-HIDDEN pass independently minimized managed modal retains dim until actual unset-modal brightness control\nMN-DEADLINE pass surface death after deadline does not restart destroy\nMN-FAMILY pass real attached modal inherited hiding and ancestor restore\nMN-FAMILY-OWN pass independent child minimize survives parent restore\nMN-FAMILY-HIDDEN pass hidden child map/close cannot restore parent\nMN-RESTORE-CLOSE pass actual frozen restore presentation survives native surface death without full-size jump\nMN-CLEANUP pass private session owned process cleanup\n")
     print(f"native minimize proof passed: {art}")
