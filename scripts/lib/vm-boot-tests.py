@@ -4662,6 +4662,293 @@ printf 'fixture: startup sleeps=%s\n' "$sleeps"
         for name in ("calendar", "portal", "portal-gnome", "portal-screenshot", "portal-screencast"):
             self.assertIn(f"tuna-vm-health: {name} ready", output)
         self.assertNotIn("failed", output)
+class FakeEndSessionGuest:
+    """A guest whose shell, session manager and logind answer the lane's
+    physical keys the way #589 requires, unless `fault` breaks one link.
+    It is the lane's QMP, guest agent and clock at once."""
+    SHELL = [":1.20", 2000]
+    MANAGER = [":1.5", 1000]
+    QUICK = ["Take Screenshot", "Settings", "Lock", "Power Off Menu"]
+    ROWS = ["Suspend", "Restart…", "Power Off…", "Log Out…"]
+    TYPES = {"restart": 2, "power-off": 1, "log-out": 0}
+    METHODS = {"restart": "Reboot", "power-off": "Shutdown", "log-out": "Logout"}
+    ROW_CASE = {"Restart…": "restart", "Power Off…": "power-off", "Log Out…": "log-out"}
+    TITLES = {"restart": "Restart", "power-off": "Power Off", "log-out": "Log Out"}
+    COUNTDOWN = {"restart": "The system will restart automatically in {} seconds",
+                 "power-off": "The system will power off automatically in {} seconds",
+                 "log-out": "You will be logged out automatically in {} seconds"}
+
+    def __init__(self, fault=None):
+        self.fault, self.clock, self.pressed, self.frames = fault, 100.0, [], []
+        self.quick = self.menu = False
+        self.focus = 0
+        self.messages, self.requests, self.system = [], [], []
+        self.dialog = None
+        self.compositor = 1000
+
+    # The lane's clock.
+    def monotonic(self):
+        return self.clock
+
+    def sleep(self, seconds):
+        self.clock += seconds
+        self.tick()
+
+    # QMP.
+    def cmd(self, name, **_):
+        assert name == "query-status"
+        return {"status": "shutdown" if self.fault == "vm-stopped" and self.dialog else "running"}
+
+    def keys(self, *names, **_):
+        self.pressed.append(names)
+        self.clock += 0.2
+        controls = self.focusable()
+        if names == ("meta_l", "s"):
+            self.quick, self.focus = True, 0
+        elif names == ("tab",) and controls:
+            self.focus = (self.focus + 1) % len(controls)
+        elif names == ("esc",):
+            if self.dialog:
+                self.answer("Cancel")
+            self.quick = self.menu = False
+        elif names == ("ret",) and controls:
+            label = self.dialog["focus"] if self.dialog else controls[self.focus]
+            if self.dialog:
+                self.answer(label)
+            elif label == "Power Off Menu":
+                self.menu = True
+            elif label in self.ROW_CASE:
+                self.quick = self.menu = False
+                self.ask(self.ROW_CASE[label])
+
+    # The shell, its session manager and logind.
+    def message(self, **fields):
+        fields["index"] = len(self.messages)
+        self.messages.append(fields)
+        return fields
+
+    def ask(self, case):
+        sender = ":1.99" if self.fault == "request-not-from-shell" else self.SHELL[0]
+        request = self.message(kind="request", sender=sender, destination="org.gnome.SessionManager",
+                               member=self.METHODS[case], args=["uint32 0"] if case == "log-out" else [],
+                               reply=None)
+        self.requests.append(request)
+        if self.fault == "no-dialog":
+            return
+        seconds = 30 if self.fault == "short-countdown" else 60
+        self.message(kind="dialog", type="method call", sender=self.MANAGER[0], destination="org.gnome.Shell",
+                     member="Open", args=[f"uint32 {self.TYPES[case]}", "uint32 0", f"uint32 {seconds}"])
+        self.dialog = {"case": case, "opened": self.clock,
+                       "focus": self.TITLES[case] if self.fault == "cancel-unfocused" else "Cancel"}
+        if case == "log-out":
+            request["reply"] = ({"type": "error", "error_name": "org.freedesktop.DBus.Error.Failed"}
+                                if self.fault == "logout-refused" else {"type": "method return", "error_name": None})
+
+    def answer(self, label):
+        case = self.dialog["case"]
+        if label == "Cancel" and self.fault != "cancel-confirms":
+            self.message(kind="dialog", type="signal", sender=self.SHELL[0], destination=None,
+                         member="Canceled", args=[])
+            if case != "log-out":
+                self.requests[-1]["reply"] = {"type": "error", "error_name": lane.END_SESSION_CANCELLED}
+        else:
+            self.message(kind="dialog", type="signal", sender=self.SHELL[0], destination=None,
+                         member="ConfirmedReboot", args=[])
+            self.requests[-1]["reply"] = {"type": "method return", "error_name": None}
+            self.system.append({"index": len(self.system), "member": "Reboot", "sender": self.MANAGER[0]})
+        if self.fault == "session-replaced":
+            self.compositor = 1001
+        self.dialog = None
+
+    def tick(self):
+        if (self.fault == "logind-during-countdown" and self.dialog
+                and self.clock - self.dialog["opened"] >= 5 and not self.system):
+            self.system.append({"index": 0, "member": "RebootWithFlags", "sender": ":1.99"})
+
+    def shown(self):
+        # endSessionDialog.js: 60 for the first ten seconds, then steps of ten.
+        if self.fault == "frozen-countdown":
+            return 60
+        left = 60 - int(self.clock - self.dialog["opened"])
+        return left if left <= 10 else min(60, (left + 9) - (left + 9) % 10)
+
+    def focusable(self):
+        if self.dialog:
+            return ["Cancel", self.TITLES[self.dialog["case"]]]
+        if self.quick:
+            rows = [row for row in self.ROWS if not (self.fault == "no-restart-row" and row == "Restart…")]
+            return self.QUICK + (rows if self.menu else [])
+        return []
+
+    # The guest agent.
+    def run(self, action, *arguments):
+        self.clock += 0.3
+        self.tick()
+        if action == "shell-controls":
+            focusable = self.focusable()
+            focused = self.dialog["focus"] if self.dialog else (focusable[self.focus] if focusable else None)
+            controls = [{"label": label, "role": "push button", "focused": label == focused, "active": True}
+                        for label in focusable]
+            if self.dialog and self.fault != "no-countdown-label":
+                controls.append({"label": self.COUNTDOWN[self.dialog["case"]].format(self.shown()),
+                                 "role": "label", "focused": False, "active": True})
+            return {"public_controls": controls}
+        assert action == "power-button-observe", action
+        manager = [self.MANAGER[0], 3000] if self.fault == "manager-not-compositor" else self.MANAGER
+        strip = lambda m: {key: value for key, value in m.items() if key != "kind"}
+        return {"session_count": len(self.messages), "system_count": len(self.system),
+                "end_session": [strip(m) for m in self.messages if m["kind"] == "request"],
+                "dialog": [strip(m) for m in self.messages if m["kind"] == "dialog"],
+                "system": list(self.system), "prepare": [], "preparing_for_shutdown": False,
+                "owners": {"shell": self.SHELL, "session_manager": manager},
+                "layers": ["tuna-shell-panel"] + ([lane.END_SESSION_LAYER] if self.dialog else [])}
+
+    def identity(self):
+        return {"session": "2", "compositor": [(self.compositor, 77)]}
+
+    def frame(self, label):
+        self.frames.append(label)
+
+
+class ShellMenuEndSession(unittest.TestCase):
+    """#589 on the installed image: Restart…, Power Off… and Log Out… from
+    the shell's own power menu by physical keys, judged against the session
+    manager's 60 s end-session dialog (V-RESTART-DIALOG, V-POWER-OFF-DIALOG,
+    V-LOGOUT)."""
+
+    def drive(self, name, fault=None):
+        guest = FakeEndSessionGuest(fault)
+        with patch.object(lane, "time", guest):
+            result = lane.end_session_menu_case(guest, guest, name, guest.identity, guest.frame)
+        return guest, result
+
+    def fails(self, name, fault, message):
+        guest = FakeEndSessionGuest(fault)
+        with patch.object(lane, "time", guest), self.assertRaisesRegex(RuntimeError, message):
+            lane.end_session_menu_case(guest, guest, name, guest.identity, guest.frame)
+        return guest
+
+    def test_restart_and_power_off_open_the_60_s_dialog_hold_and_cancel(self):
+        for name, method, kind in (("restart", "Reboot", 2), ("power-off", "Shutdown", 1)):
+            with self.subTest(name=name):
+                guest, result = self.drive(name)
+                self.assertEqual(guest.pressed[0], ("meta_l", "s"))
+                self.assertEqual(guest.pressed[-1], ("ret",), "Return on the focused Cancel")
+                self.assertNotIn(("esc",), guest.pressed)
+                self.assertEqual(result["opened"]["request"]["member"], method)
+                self.assertEqual(result["opened"]["open"]["args"], [f"uint32 {kind}", "uint32 0", "uint32 60"])
+                self.assertGreaterEqual(result["held_after"], 10, "held past the countdown's first step")
+                self.assertEqual(result["reply"]["error_name"], lane.END_SESSION_CANCELLED)
+                self.assertEqual(guest.system, [], "logind never asked")
+                self.assertEqual(guest.frames, [f"end-session-{name}-dialog", f"end-session-{name}-held",
+                                                f"end-session-{name}-cancelled"])
+
+    def test_log_out_opens_the_dialog_and_is_left_to_its_countdown(self):
+        guest, result = self.drive("log-out")
+        self.assertEqual(result["opened"]["request"]["args"], ["uint32 0"])
+        self.assertEqual(result["opened"]["open"]["args"], ["uint32 0", "uint32 0", "uint32 60"])
+        self.assertEqual(result["reply"]["type"], "method return")
+        self.assertIsNotNone(guest.dialog, "the countdown keeps running")
+        self.assertNotIn(("esc",), guest.pressed)
+        self.assertTrue(0 <= result["opened_at"] - guest.dialog["opened"] < 1)
+
+    def test_every_broken_link_fails_and_leaves_no_countdown_running(self):
+        for name, fault, message in (
+                ("restart", "no-restart-row", "power menu's rows"),
+                ("restart", "no-dialog", "did not open"),
+                ("restart", "short-countdown", "did not open"),
+                ("power-off", "request-not-from-shell", "did not open"),
+                ("power-off", "manager-not-compositor", "did not open"),
+                ("restart", "no-countdown-label", "60 s countdown"),
+                ("power-off", "cancel-unfocused", "Cancel focused"),
+                ("restart", "frozen-countdown", "stepping to 50"),
+                ("power-off", "logind-during-countdown", "did not hold"),
+                ("restart", "vm-stopped", "did not hold"),
+                ("log-out", "logout-refused", "Logout\\(0\\) failed"),
+                ("log-out", "no-countdown-label", "60 s countdown")):
+            with self.subTest(fault=fault):
+                guest = self.fails(name, fault, message)
+                self.assertEqual(guest.pressed[-1], ("esc",), "Escape on every failure")
+                self.assertIsNone(guest.dialog, "no countdown left running")
+
+    def test_cancel_that_confirms_or_replaces_the_session_fails(self):
+        guest = self.fails("restart", "cancel-confirms", "Cancel did not cancel")
+        self.assertEqual(guest.system[0]["member"], "Reboot")
+        self.fails("power-off", "session-replaced", "disturbed the session")
+
+    def test_agent_observation_feeds_the_lane_from_dbus_monitor_text(self):
+        """The guest agent's own power_button_observe parses dbus-monitor
+        output into the end-session records the lane judges."""
+        import pathlib
+        source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+        wanted = {"dbus_monitor_messages", "power_button_observe", "END_SESSION_METHODS",
+                  "POWER_BUTTON_LOGIND_CALLS", "POWER_BUTTON_LOGIND_PREPARE"}
+        body = [node for node in ast.parse(source.read_text()).body
+                if (isinstance(node, ast.FunctionDef) and node.name in wanted)
+                or (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id in wanted
+                                                         for target in node.targets))]
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            session, system = temp / "session.log", temp / "system.log"
+            state, saved = temp / "state.json", temp / "saved.json"
+            state.write_text(json.dumps({"layers": [{"namespace": lane.END_SESSION_LAYER}]}))
+            saved.write_text(json.dumps({"session_monitor": os.getpid(), "system_monitor": os.getpid()}))
+            system.write_text("")
+            session.write_text(
+                "method call time=1.0 sender=:1.20 -> destination=org.gnome.SessionManager serial=12 "
+                "path=/org/gnome/SessionManager; interface=org.gnome.SessionManager; member=Reboot\n"
+                "method call time=1.1 sender=:1.5 -> destination=org.gnome.Shell serial=40 "
+                "path=/org/gnome/SessionManager/EndSessionDialog; "
+                "interface=org.gnome.SessionManager.EndSessionDialog; member=Open\n"
+                "   uint32 2\n   uint32 0\n   uint32 60\n   array [\n   ]\n"
+                "method return time=1.2 sender=:1.20 -> destination=:1.5 serial=41 reply_serial=40\n"
+                "signal time=9.0 sender=:1.20 -> destination=(null destination) serial=42 "
+                "path=/org/gnome/SessionManager/EndSessionDialog; "
+                "interface=org.gnome.SessionManager.EndSessionDialog; member=Canceled\n"
+                f"error time=9.1 sender=:1.5 -> destination=:1.20 error_name={lane.END_SESSION_CANCELLED} "
+                "reply_serial=12\n   string \"Operation was cancelled\"\n")
+            owners = {"org.gnome.Shell": [":1.20", 2000], "org.gnome.SessionManager": [":1.5", 1000]}
+            scope = {"json": json, "pathlib": pathlib, "POWER_BUTTON_SESSION_LOG": session,
+                     "POWER_BUTTON_SYSTEM_LOG": system, "POWER_BUTTON_STATE": saved, "STATE": state,
+                     "power_button_log": lambda path: scope["dbus_monitor_messages"](path.read_text()),
+                     "system_bus_pid": lambda name: None, "gsd_plugin_row": lambda plugin: {"ok": True},
+                     "logind_inhibitors": lambda: [], "logind_preparing_for_shutdown": lambda: False,
+                     "bus_owner": owners.get, "OWNER": SimpleNamespace(pw_name="tuna-test", pw_uid=1000)}
+            exec(compile(ast.Module(body=body, type_ignores=[]), str(source), "exec"), scope)
+            observed = scope["power_button_observe"]()
+        case = lane.END_SESSION_CASES["restart"]
+        mark = {"session_count": 0, "system_count": 0}
+        opened = lane.end_session_opened(observed, mark, case, 1000)
+        self.assertIsNotNone(opened)
+        self.assertEqual(lane.end_session_reply(observed, opened)["error_name"], lane.END_SESSION_CANCELLED)
+        self.assertEqual(observed["shutdowns"], [], "the power key's Shutdown records stay separate")
+        # Controls: another case, a compositor that is not the manager and a
+        # mark after the request all see nothing.
+        self.assertIsNone(lane.end_session_opened(observed, mark, lane.END_SESSION_CASES["power-off"], 1000))
+        self.assertIsNone(lane.end_session_opened(observed, mark, case, 999))
+        self.assertIsNone(lane.end_session_opened(observed, {"session_count": 1, "system_count": 0}, case, 1000))
+
+    def test_focus_helper_reports_countdown_labels_only_in_end_session_mode(self):
+        path = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-shell-focus"
+        loader = importlib.machinery.SourceFileLoader("end_session_focus_policy", str(path))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        countdown = "The system will restart automatically in 60 seconds"
+        self.assertEqual(module.public_node(countdown, "label", True, False, True, end_session=True),
+                         {"label": countdown, "role": "label", "focused": False, "active": True})
+        self.assertIsNotNone(module.public_node("You will be logged out automatically in 1 second", "label",
+                                                True, False, True, end_session=True))
+        self.assertIsNotNone(module.public_node("Restart…", "push button", True, True, True, end_session=True))
+        # Controls: the default mode, private label text, a hidden dialog and
+        # another role keep nothing.
+        self.assertIsNone(module.public_node(countdown, "label", True, False, True))
+        self.assertIsNone(module.public_node("Restart…", "push button", True, True, True))
+        self.assertIsNone(module.public_node("Meeting notes from Alice", "label", True, False, True,
+                                             end_session=True))
+        self.assertIsNone(module.public_node(countdown + ". Unsaved: diary.txt", "label", True, False, True,
+                                             end_session=True))
+        self.assertIsNone(module.public_node(countdown, "label", False, False, True, end_session=True))
+        self.assertIsNone(module.public_node(countdown, "push button", True, False, True, end_session=True))
 
 
 if __name__ == "__main__":

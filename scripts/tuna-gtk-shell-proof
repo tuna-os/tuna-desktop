@@ -215,6 +215,18 @@
 #   G-POWER-DIALOG Power Off… opens the 60 s end-session dialog, and
 #                  Cancel closes it with nothing done
 #   G-POWER-OFF    confirming the dialog asks logind to power off
+#   G-END-SESSION-RESTART, G-END-SESSION-POWEROFF, G-END-SESSION-LOGOUT
+#                  Restart…, Power Off… and Log Out… ask
+#                  org.gnome.SessionManager (the compositor's) for Reboot,
+#                  Shutdown and Logout(0) as GNOME Shell 51's
+#                  systemActions.js; the manager opens the shell's
+#                  EndSessionDialog (type, 0, 60, inhibitors), which lists
+#                  the application holding a logout inhibitor and counts
+#                  down from 60 in GNOME's ten-second steps; Cancel leaves
+#                  the session and logind untouched; confirming reaches the
+#                  manager, which asks the logind stub itself (Reboot,
+#                  PowerOff) or, for Log Out (last), ends the compositor
+#                  through its orderly shutdown (#589)
 #   G-LOCKDOWN-LOG-OUT disable-log-out flipped live removes Log Out…,
 #                  Restart… and Power Off… from the open power menu,
 #                  keeps Suspend, and restores them (#357)
@@ -557,6 +569,8 @@ HOT_CORNER_PID=""
 OCCLUSION_PIDS=""
 A11Y_INPUT_PID=""
 CURSOR_PID=""
+END_INHIBITOR_PID=""
+END_MONITOR_PID=""
 IME_PIDS=""
 GSD_MEDIA_KEYS_PID=""
 GSD_BUS_PID=""
@@ -572,6 +586,7 @@ cleanup() {
     if [ -n "$HOT_CORNER_PID" ]; then kill "$HOT_CORNER_PID" 2>/dev/null || true; fi
     if [ -n "$A11Y_INPUT_PID" ]; then kill "$A11Y_INPUT_PID" 2>/dev/null || true; fi
     if [ -n "$CURSOR_PID" ]; then kill "$CURSOR_PID" 2>/dev/null || true; fi
+    for end_pid in $END_INHIBITOR_PID $END_MONITOR_PID; do kill "$end_pid" 2>/dev/null || true; done
     # shellcheck disable=SC2086
     if [ -n "$OCCLUSION_PIDS" ]; then kill $OCCLUSION_PIDS 2>/dev/null || true; fi
     # shellcheck disable=SC2086
@@ -10160,6 +10175,148 @@ until grep -q PowerOff "$POWER_LOG" 2>/dev/null || [ "$(date +%s)" -gt "$end" ];
 grep -q PowerOff "$POWER_LOG" || fail G-POWER-OFF "logind never got PowerOff"
 pass G-POWER-OFF "confirming the dialog asks logind to power off"
 
+# End session through org.gnome.SessionManager (#589, P-SY-07). As GNOME
+# Shell 51's systemActions.js, Restart…, Power Off… and Log Out… ask the
+# session manager (here the compositor's) for Reboot, Shutdown and
+# Logout(0); the manager opens the shell's EndSessionDialog with the 60 s
+# countdown and its logout inhibitors, and carries the confirmed end of the
+# session out itself. dbus-monitor records the session bus traffic, and the
+# logind stub records which process asked it.
+bus_owner() {
+    gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.GetNameOwner "$1" 2>/dev/null | sed -n "s/^('\(.*\)',)$/\1/p"
+}
+bus_pid() {
+    gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.GetConnectionUnixProcessID "$1" 2>/dev/null |
+        sed -n 's/^(uint32 \([0-9]*\),)$/\1/p'
+}
+# Poll the shell's tree until the jq filter holds: the dialog opens after
+# the session manager's round trip.
+end_dump_until() {
+    end_until=$(($(date +%s) + $3))
+    while :; do
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-$1.json" 5 >/dev/null 2>&1 &&
+            jq -e "$2" "$ARTIFACTS/a11y-$1.json" >/dev/null && return 0
+        [ "$(date +%s)" -gt "$end_until" ] && return 1
+        sleep 0.5
+    done
+}
+end_bus() {
+    "$PY" "$ROOT/scripts/lib/tuna-end-session-bus.py" "$END_BUS_LOG" "$end_bus_mark" \
+        "$END_SHELL" "$END_MANAGER" "$@" 2>>"$ARTIFACTS/end-session-bus-checks.log"
+}
+end_monitor() {
+    END_BUS_LOG="$ARTIFACTS/end-session-bus-$1.log"
+    dbus-monitor --session "type='method_call',interface='org.gnome.SessionManager'" \
+        "type='method_call',interface='org.gnome.SessionManager.EndSessionDialog'" \
+        "type='signal',interface='org.gnome.SessionManager.EndSessionDialog'" \
+        "type='method_return'" "type='error'" >"$END_BUS_LOG" 2>&1 &
+    END_MONITOR_PID=$!
+    sleep 1
+}
+END_MANAGER=$(bus_owner org.gnome.SessionManager)
+END_SHELL=$(bus_owner org.gnome.Shell)
+MANAGER_PID=$(bus_pid "$END_MANAGER")
+if [ -z "$MANAGER_PID" ] || [ "$(cat "/proc/$MANAGER_PID/comm" 2>/dev/null)" != tuna-compositor ]; then
+    fail G-END-SESSION-RESTART "org.gnome.SessionManager is not the compositor's (pid '${MANAGER_PID}')"
+fi
+[ "$MANAGER_PID" != "$(bus_pid "$END_SHELL")" ] ||
+    fail G-END-SESSION-RESTART "the shell owns org.gnome.SessionManager"
+# An installed application holds a logout inhibitor (listed), a service a
+# logout inhibitor and the application an idle one (both left out, as
+# endSessionDialog.js _onInhibitorLoaded).
+printf '[Desktop Entry]\nName=Proof Editor\nExec=true\nIcon=text-editor\nType=Application\n' \
+    >"$XDG_DATA_HOME/applications/tuna-end-session-editor.desktop"
+"$PY" -c '
+from gi.repository import Gio, GLib
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+for app, reason, flags in (("tuna-end-session-editor", "Unsaved document", 1),
+                           ("tuna-end-session-sync", "Background sync", 1),
+                           ("tuna-end-session-editor", "Playing video", 8)):
+    bus.call_sync("org.gnome.SessionManager", "/org/gnome/SessionManager",
+                  "org.gnome.SessionManager", "Inhibit",
+                  GLib.Variant("(susu)", (app, 0, reason, flags)), None, 0, 5000, None)
+print("ready", flush=True)
+GLib.MainLoop().run()
+' >"$ARTIFACTS/end-session-inhibitors.log" 2>&1 &
+END_INHIBITOR_PID=$!
+for _ in $(seq 1 20); do grep -q ready "$ARTIFACTS/end-session-inhibitors.log" && break; sleep 0.3; done
+grep -q ready "$ARTIFACTS/end-session-inhibitors.log" ||
+    fail G-END-SESSION-RESTART "the inhibiting application did not inhibit: $(cat "$ARTIFACTS/end-session-inhibitors.log")"
+end_monitor dialogs
+# $1 gate, $2 tag, $3 menu row, $4 manager method, $5 Open type, $6 the
+# countdown's verb phrase, $7 the confirm button (empty: Cancel only).
+end_session_gate() {
+    end_bus_mark=$(($(wc -l <"$END_BUS_LOG") + 1))
+    power_mark=$(wc -l <"$POWER_LOG")
+    open_power_menu "end-$2" || fail "$1" "could not open the power menu"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-$2-press.json" 20 \
+        --press "$3" || fail "$1" "could not press $3"
+    end_dump_until "end-$2-open" "any(.[]; .showing and (.name | test(\"$6 automatically in 60 seconds\")))" 10 ||
+        fail "$1" "$3 showed no 60 s countdown"
+    end_dump_until "end-$2-apps" 'any(.[]; .showing and .name == "Some applications are busy or have unsaved work")
+        and any(.[]; .showing and .name == "Proof Editor") and any(.[]; .showing and .name == "Unsaved document")' 10 ||
+        fail "$1" "the dialog does not list the inhibiting application"
+    for left_out in "Background sync" "Playing video"; do
+        hidden "$ARTIFACTS/a11y-end-$2-apps.json" "$left_out" ||
+            fail "$1" "the dialog lists '$left_out', which inhibits no logout of an application"
+    done
+    end_bus open "$4" "$5" some ||
+        fail "$1" "$3 did not reach $4 on org.gnome.SessionManager and its Open($5, 0, 60, inhibitors)"
+    # GNOME shows the countdown in steps of ten until the last ten seconds.
+    end_dump_until "end-$2-50" "any(.[]; .showing and (.name | test(\"$6 automatically in 50 seconds\")))" 15 ||
+        fail "$1" "the countdown did not step from 60 to 50 seconds"
+    scrot "$ARTIFACTS/22-end-session-$2.png" >/dev/null
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-$2-cancel.json" 20 \
+        --press "Cancel" || fail "$1" "could not press Cancel"
+    end_dump_until "end-$2-cancelled" '(any(.[]; .showing and (.name | test("automatically in"))) | not)' 5 ||
+        fail "$1" "the dialog stayed open after Cancel"
+    end_bus signal Canceled || fail "$1" "Cancel emitted no Canceled"
+    if [ "$4" = Logout ]; then
+        end_bus returned Logout || fail "$1" "Logout(0) was not answered once the dialog opened"
+    else
+        end_bus cancelled "$4" || fail "$1" "the manager did not fail $4 as cancelled"
+    fi
+    sleep 1
+    [ "$(wc -l <"$POWER_LOG")" = "$power_mark" ] || fail "$1" "Cancel still reached logind: $(tail -n 1 "$POWER_LOG")"
+    kill -0 "$COMPOSITOR_PID" 2>/dev/null || fail "$1" "Cancel ended the session"
+    [ "$(bus_owner org.gnome.SessionManager)" = "$END_MANAGER" ] || fail "$1" "the session manager left after Cancel"
+    [ -n "$7" ] || return 0
+    end_bus_mark=$(($(wc -l <"$END_BUS_LOG") + 1))
+    open_power_menu "end-$2-again" || fail "$1" "could not reopen the power menu"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-$2-press-again.json" 20 \
+        --press "$3" || fail "$1" "could not press $3 again"
+    end_dump_until "end-$2-reopened" "any(.[]; .showing and (.name | test(\"$6 automatically in\")))" 10 ||
+        fail "$1" "$3 did not reopen the dialog"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-$2-confirm.json" 20 \
+        --press "$7" || fail "$1" "could not press $7"
+}
+
+end_session_gate G-END-SESSION-RESTART restart "Restart…" Reboot 2 "will restart" Restart
+end=$(($(date +%s) + 10))
+until grep -q "^Reboot True pid=$MANAGER_PID$" "$POWER_LOG" || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
+grep -q "^Reboot True pid=$MANAGER_PID$" "$POWER_LOG" ||
+    fail G-END-SESSION-RESTART "the session manager never asked logind to reboot: $(cat "$POWER_LOG")"
+end_bus signal ConfirmedReboot || fail G-END-SESSION-RESTART "Restart emitted no ConfirmedReboot"
+end_bus returned Reboot || fail G-END-SESSION-RESTART "the manager did not answer Reboot once confirmed"
+pass G-END-SESSION-RESTART "Restart… asks org.gnome.SessionManager.Reboot, whose dialog lists the inhibiting app and counts down from 60; Cancel leaves the session, Restart has the manager ask logind Reboot(true)"
+
+end_session_gate G-END-SESSION-POWEROFF poweroff "Power Off…" Shutdown 1 "will power off" "Power Off"
+end=$(($(date +%s) + 10))
+until grep -q "^PowerOff True pid=$MANAGER_PID$" "$POWER_LOG" || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
+grep -q "^PowerOff True pid=$MANAGER_PID$" "$POWER_LOG" ||
+    fail G-END-SESSION-POWEROFF "the session manager never asked logind to power off: $(cat "$POWER_LOG")"
+end_bus signal ConfirmedShutdown || fail G-END-SESSION-POWEROFF "Power Off emitted no ConfirmedShutdown"
+end_bus returned Shutdown || fail G-END-SESSION-POWEROFF "the manager did not answer Shutdown once confirmed"
+pass G-END-SESSION-POWEROFF "Power Off… asks org.gnome.SessionManager.Shutdown, whose dialog lists the inhibiting app and counts down from 60; Cancel leaves the session, Power Off has the manager ask logind PowerOff(true)"
+
+# Log Out…'s confirmation ends the session, so it runs last (below).
+end_session_gate G-END-SESSION-LOGOUT logout "Log Out…" Logout 0 "logged out" ""
+kill "$END_INHIBITOR_PID" 2>/dev/null || true
+kill "$END_MONITOR_PID" 2>/dev/null || true
+rm -f "$XDG_DATA_HOME/applications/tuna-end-session-editor.desktop"
+
 # Administrative lockdown (#357, P-ST-05): GNOME 51's org.gnome.desktop.lockdown
 # keys flipped live, the shell's real behaviour observed, then restored.
 lockdown_dump() {
@@ -10329,6 +10486,10 @@ open_power_menu power-menu-3 || fail G-SUSPEND-LOCK "could not reopen the power 
 end=$(($(date +%s) + 10))
 until grep -q Suspend "$POWER_LOG" 2>/dev/null || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
 grep -q Suspend "$POWER_LOG" || fail G-SUSPEND-LOCK "logind never got Suspend"
+# GNOME Shell 51 suspends through org.gnome.SessionManager.Suspend, which
+# asks logind SuspendWithFlags(SD_LOGIND_SKIP_INHIBITORS) (#589).
+grep -q "^SuspendWithFlags 16 pid=$MANAGER_PID$" "$POWER_LOG" ||
+    fail G-SUSPEND-LOCK "Suspend did not reach logind through the session manager: $(cat "$POWER_LOG")"
 cstate '.locked' "locked" 10 || fail G-SUSPEND-LOCK "PrepareForSleep did not lock the session"
 cstate 'has("pointer_position") and has("pointer_fullscreen_blocked") and .pointer_position == null and .pointer_fullscreen_blocked == null and has("cursor") and .cursor == null' "locked pointer diagnostics redacted" ||
     fail G-POINTER-TRACE-PRIVATE "credential input retained pointer diagnostics"
@@ -11131,10 +11292,36 @@ if [ "$INSTALLED_PACKAGE" = 1 ]; then
     pass G-INSTALLED-RECOVERY "original installed compositor recovers with a new package-owned GTK shell"
 fi
 
+# G-END-SESSION-LOGOUT, last: confirming Log Out… has the session manager
+# end the compositor, the session leader, through its orderly shutdown,
+# as gnome-session's exit ends a GNOME session (#589).
+end_monitor logout-confirm
+end_bus_mark=1
+END_SHELL=$(bus_owner org.gnome.Shell)
+logout_mark=$(log_mark)
+open_power_menu end-logout-final || fail G-END-SESSION-LOGOUT "could not open the power menu to log out"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-logout-final.json" 20 \
+    --press "Log Out…" || fail G-END-SESSION-LOGOUT "could not press Log Out…"
+end_dump_until end-logout-final-open 'any(.[]; .showing and (.name | test("logged out automatically in 60 seconds")))' 10 ||
+    fail G-END-SESSION-LOGOUT "Log Out… showed no 60 s countdown"
+end_bus open Logout 0 none || fail G-END-SESSION-LOGOUT "Log Out… did not reach Logout(0) and Open(0, 0, 60, [])"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-logout-confirm.json" 20 \
+    --press "Log Out" >/dev/null 2>&1 || true
+end=$(($(date +%s) + 20))
+while kill -0 "$COMPOSITOR_PID" 2>/dev/null && [ "$(date +%s)" -le "$end" ]; do sleep 0.3; done
+kill -0 "$COMPOSITOR_PID" 2>/dev/null && fail G-END-SESSION-LOGOUT "confirming Log Out did not end the session"
+wait "$COMPOSITOR_PID" || fail G-END-SESSION-LOGOUT "the compositor did not exit gracefully on Log Out"
+COMPOSITOR_PID=""
+kill "$END_MONITOR_PID" 2>/dev/null || true
+end_bus signal ConfirmedLogout || fail G-END-SESSION-LOGOUT "Log Out emitted no ConfirmedLogout"
+log_wait "$logout_mark" "session manager: Logout confirmed" 1 ||
+    fail G-END-SESSION-LOGOUT "the session manager never took the confirmation"
+log_wait "$logout_mark" "session manager: ending the session" 1 ||
+    fail G-END-SESSION-LOGOUT "the session manager did not end the session"
+pass G-END-SESSION-LOGOUT "Log Out… asks org.gnome.SessionManager.Logout(0), answered once its dialog opens (listing the inhibiting app, counting down from 60); Cancel leaves the session; Log Out has the manager end the compositor gracefully"
+
 if [ -n "${x11_display:-}" ]; then
-    kill "$COMPOSITOR_PID"
-    wait "$COMPOSITOR_PID" || fail G-X11-CLEANUP "compositor did not exit gracefully"
-    COMPOSITOR_PID=""
+    # Log Out above ended the compositor through its orderly shutdown.
     display_number="${x11_display#:}"
     if [ -e "/tmp/.X11-unix/X$display_number" ] || [ -e "/tmp/.X$display_number-lock" ]; then
         fail G-X11-CLEANUP "owned socket or display lock survived shutdown"
