@@ -1629,6 +1629,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                             else:
                                 held.discard(name)
 
+                        restore_input()
                         before_hold = agent.run("orca-read")
                         try:
                             physical("insert", True)
@@ -1641,32 +1642,75 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                             # above. This follows primary source, not a GNOME VM comparison.
                             agent.run("lock")
                             await_state(lambda state: state["state"]["locked"])
-                            locked = await_keyboard("locked-reset-delivered", lambda keyboard:
-                                keyboard["locked"] and keyboard["reset_events"] > disclosed["keyboard"]["reset_events"])
-                            # Baseline follows the successful serialized reset. Subsequent
-                            # private input is measured only by anonymous delivery counts.
+                            locked = await_keyboard("locked-at-still-ready", lambda keyboard:
+                                keyboard["locked"])
                             baseline_count = locked["keyboard"]["normal_events"]
+                            client_before = agent.run("input-key-events")
+                            # Like Mutter, locking neither clears a11y grabs nor
+                            # fabricates a modifier release. Hold an AT-grabbed
+                            # F4 across unlock; its release must still be
+                            # consumed before ordinary SESSION surface routing.
+                            if locked["keyboard"]["reset_events"] != disclosed["keyboard"]["reset_events"]:
+                                raise RuntimeError("lock fabricated an accessibility modifier reset")
                             physical("f4", True)
-                            # F4 already lifts the lock curtain. Another initial Return
-                            # would submit an empty password and disable the entry while
-                            # authentication runs; retain real typing/submission below.
-                            pam_unlock(wake=False)
-                            resumed = await_keyboard("authenticated-ready", lambda keyboard:
-                                not keyboard["locked"] and keyboard["resume_state"] == "ready")
-                            if resumed["keyboard"]["normal_events"] != baseline_count or resumed["frames"] <= locked["frames"]:
-                                raise RuntimeError("private lock/PAM keys reached Orca or native frames stopped")
+                            await_keyboard("locked-custom-chord", lambda keyboard:
+                                keyboard["normal_events"] == baseline_count + 1)
                             physical("insert", False)
+                            before_password = await_keyboard("locked-custom-release", lambda keyboard:
+                                keyboard["normal_events"] == baseline_count + 2)
+                            # F4 was AT-grabbed, so it did not lift the curtain.
+                            # Release Insert before real wake/password input.
+                            pam_unlock()
+                            resumed = await_keyboard("authenticated-ready", lambda keyboard:
+                                not keyboard["locked"] and keyboard["resume_state"] == "ready"
+                                and keyboard["normal_events"] >= before_password["keyboard"]["normal_events"] + 16)
+                            # Wake Enter (2), Ctrl+A (4), four characters (8),
+                            # submit Enter (2), separate from Insert/F4 above.
+                            if resumed["keyboard"]["normal_events"] != before_password["keyboard"]["normal_events"] + 16:
+                                raise RuntimeError("wake/PAM typing did not forward exactly sixteen AT events")
+                            if resumed["frames"] <= locked["frames"]:
+                                raise RuntimeError("active-reader PAM cycle stopped native frames")
+                            if agent.run("input-key-events") != client_before:
+                                raise RuntimeError("lock/PAM keys reached the ordinary session client")
                             physical("f4", False)
-                            time.sleep(0.3)
-                            released = await_keyboard("protected-held-releases", lambda keyboard:
-                                keyboard["resume_state"] == "ready")
-                            if released["keyboard"]["normal_events"] != baseline_count:
-                                raise RuntimeError("protected held-key release reached Orca after unlock")
-                            fresh = native_command("orca-postunlock-command", "V-ORCA-POSTUNLOCK-COMMAND", baseline_count)
+                            released = await_keyboard("postunlock-grabbed-release", lambda keyboard:
+                                keyboard["normal_events"] == resumed["keyboard"]["normal_events"] + 1)
+                            # Positive FIFO receipt from the same client:
+                            # acknowledge fresh F9 press/release after F4 up.
+                            # Retain the original baseline and reject overshoot,
+                            # including any delayed leak during the settle window.
+                            qmp.keys("f9")
+                            target = {"pid": client_before["pid"],
+                                      "count": client_before["count"] + 1,
+                                      "key_releases": client_before["key_releases"] + 1}
+                            deadline = time.monotonic() + 15
+                            stable_since = None
+                            while time.monotonic() < deadline:
+                                client_after = agent.run("input-key-events")
+                                if (client_after["pid"] != target["pid"]
+                                        or client_after["count"] > target["count"]
+                                        or client_after["key_releases"] > target["key_releases"]):
+                                    raise RuntimeError("lock-origin held-key event reached the session client")
+                                if client_after == target:
+                                    stable_since = stable_since or time.monotonic()
+                                    if time.monotonic() - stable_since >= 1:
+                                        break
+                                else:
+                                    stable_since = None
+                                time.sleep(0.1)
+                            else:
+                                raise RuntimeError("original session client did not acknowledge fresh F9 press/release")
+                            if agent.run("inventory")["state"]["focused"] != input_window:
+                                raise RuntimeError("postunlock input receipt changed the original focused client")
+                            fresh = native_command("orca-postunlock-command", "V-ORCA-POSTUNLOCK-COMMAND",
+                                                   released["keyboard"]["normal_events"])
                             privacy.append({"stage": "fresh-command", "identity": original,
-                                            "keyboard": fresh["keyboard"], "frames": fresh["frames"]})
+                                            "keyboard": fresh["keyboard"], "frames": fresh["frames"],
+                                            "session_client_before": client_before,
+                                            "session_client_after_public_f9_sync": client_after,
+                                            "public_sync_expected": target})
                             record("V-ORCA-LOCK-PRIVACY", True,
-                                   "same genuine reader survives real PAM unlock; disclosed custom reset succeeds, private held keys/releases cause no normal delivery, fresh spoken command works")
+                                   "same genuine trusted AT hears lock/PAM keys and held release as in Mutter; ordinary session client receives neither; fresh spoken command works")
                         finally:
                             with open(os.path.join(evidence, "orca-lock-privacy.json"), "w") as stream:
                                 json.dump({"observations": privacy, "comparative_gnome_vm": False,

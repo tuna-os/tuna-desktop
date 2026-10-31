@@ -1147,6 +1147,15 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
         });
     }
 
+    /// Forget client-visible holds without changing physical or XKB state.
+    ///
+    /// Use at a security boundary before changing focus, so keys forwarded to
+    /// the previous owner cannot appear in the next owner's enter event.
+    /// The compositor must separately consume their repeats and real releases.
+    pub fn clear_forwarded_pressed_keys(&self) {
+        self.arc.internal.lock().unwrap().forwarded_pressed_keys.clear();
+    }
+
     /// Return the key codes of the currently pressed keys.
     pub fn pressed_keys(&self) -> HashSet<Keycode> {
         let guard = self.arc.internal.lock().unwrap();

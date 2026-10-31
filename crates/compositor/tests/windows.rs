@@ -56,7 +56,8 @@ use wayland_protocols::xdg::foreign::zv2::client::{
     zxdg_importer_v2::ZxdgImporterV2,
 };
 use wayland_protocols::xdg::shell::client::{
-    xdg_surface::XdgSurface, xdg_toplevel::XdgToplevel, xdg_wm_base::XdgWmBase,
+    xdg_popup::XdgPopup, xdg_positioner::XdgPositioner, xdg_surface::XdgSurface,
+    xdg_toplevel::XdgToplevel, xdg_wm_base::XdgWmBase,
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1},
@@ -93,6 +94,8 @@ struct Client {
     /// (keycode, pressed) in arrival order.
     keys: Vec<(u32, bool)>,
     keyboard_enters: Vec<Vec<u32>>,
+    keyboard_enter_surfaces: Vec<WlSurface>,
+    popup_done: bool,
     keyboard_modifiers: Vec<(u32, u32, u32, u32)>,
     pointer_enters: u32,
     pointer_motions: u32,
@@ -262,6 +265,105 @@ impl Dispatch<XdgSurface, ()> for Client {
     }
 }
 
+#[test]
+fn unlock_restores_newest_grabbed_popup_without_dismissing_it() {
+    use wayland_protocols::xdg::shell::client::xdg_positioner::{Anchor as PopupAnchor, Gravity};
+    let mut f = two_windows();
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    let mut parent = f.client_a.xdg_surface.clone().unwrap();
+    let mut popups = Vec::new();
+    for _ in 0..2 {
+        let qh = f.queue_a.handle();
+        let base = f.client_a.xdg_base.as_ref().unwrap();
+        let positioner = base.create_positioner(&qh, ());
+        positioner.set_size(100, 50);
+        positioner.set_anchor_rect(10, 10, 1, 1);
+        positioner.set_anchor(PopupAnchor::TopLeft);
+        positioner.set_gravity(Gravity::BottomRight);
+        let surface = f
+            .client_a
+            .compositor
+            .as_ref()
+            .unwrap()
+            .create_surface(&qh, ());
+        let xdg = base.get_xdg_surface(&surface, &qh, surface.clone());
+        let popup = xdg.get_popup(Some(&parent), &positioner, &qh, ());
+        popup.grab(f.client_a.seat.as_ref().unwrap(), 1);
+        surface.commit();
+        sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+        sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+        parent = xdg;
+        popups.push((surface, popup));
+    }
+    assert!(f.comp.state.popup_grab_active());
+    assert!(!f.client_a.popup_done);
+    let lock_surface = f.manager.surface_of(f.id_b).unwrap();
+    f.manager.lock_input(
+        &mut f.comp.state,
+        &lock_surface,
+        ManagerInput::Key {
+            keycode: R_KEYCODE,
+            pressed: true,
+            time: 5000,
+        },
+    );
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+    f.client_a.keyboard_enters.clear();
+    f.client_a.keyboard_enter_surfaces.clear();
+    f.client_a.keys.clear();
+    f.client_b.keys.clear();
+    f.manager.unlock_input(&mut f.comp.state);
+    press(&mut f.manager, &mut f.comp, KEY_A);
+    release(&mut f.manager, &mut f.comp, KEY_A);
+    press(&mut f.manager, &mut f.comp, R_KEYCODE);
+    release(&mut f.manager, &mut f.comp, R_KEYCODE);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+    assert_eq!(f.client_a.keyboard_enter_surfaces, [popups[1].0.clone()]);
+    assert_eq!(f.client_a.keyboard_enters, [Vec::<u32>::new()]);
+    assert_eq!(f.client_a.keys, [(KEY_A, true), (KEY_A, false)]);
+    assert!(f.client_b.keys.is_empty());
+    assert!(f.comp.state.popup_grab_active());
+    assert!(!f.client_a.popup_done);
+    assert_eq!(f.comp.state.pressed_key_count(), 0);
+}
+
+impl Dispatch<XdgSurface, WlSurface> for Client {
+    fn event(
+        _: &mut Self,
+        xdg_surface: &XdgSurface,
+        event: <XdgSurface as wayland_client::Proxy>::Event,
+        surface: &WlSurface,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wayland_protocols::xdg::shell::client::xdg_surface::Event::Configure { serial } =
+            event
+        {
+            xdg_surface.ack_configure(serial);
+            surface.commit();
+        }
+    }
+}
+
+impl Dispatch<XdgPopup, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &XdgPopup,
+        event: <XdgPopup as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wayland_protocols::xdg::shell::client::xdg_popup::Event::PopupDone = event {
+            state.popup_done = true;
+        }
+    }
+}
+
+wayland_client::delegate_noop!(Client: ignore XdgPositioner);
+
 impl Dispatch<XdgToplevel, ()> for Client {
     fn event(
         state: &mut Self,
@@ -306,7 +408,8 @@ impl Dispatch<WlKeyboard, ()> for Client {
                 key,
                 matches!(key_state, WEnum::Value(ClientKeyState::Pressed)),
             )),
-            KeyEvent::Enter { keys, .. } => {
+            KeyEvent::Enter { keys, surface, .. } => {
+                state.keyboard_enter_surfaces.push(surface);
                 let (chunks, remainder) = keys.as_chunks::<4>();
                 assert!(
                     remainder.is_empty(),
@@ -4023,6 +4126,226 @@ fn same_focused_window_click_restores_keyboard_after_lock_ownership() {
         "the former lock owner hears no unlocked keys"
     );
     assert_eq!(f.manager.model().focused(), Some(f.id_a));
+}
+
+#[test]
+fn unlock_restores_keyboard_without_raising_and_quarantines_lock_origin_keys() {
+    for mapped_lock in [true, false] {
+        let mut f = two_windows();
+        // Leave beta above alpha: restoring keyboard ownership must not raise.
+        assert!(f.manager.focus(&mut f.comp.state, Some(f.id_b)));
+        f.manager.set_focus_policy(policy(FocusMode::Sloppy));
+        f.manager
+            .pointer_motion(&mut f.comp.state, alpha_only(), 4999);
+        assert_eq!(f.manager.model().focused(), Some(f.id_a));
+        assert_eq!(top(&f), Some(f.id_b));
+        f.manager.set_focus_policy(policy(FocusMode::Click));
+        sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+        sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+        f.client_a.keys.clear();
+        f.client_b.keys.clear();
+        f.client_a.keyboard_enters.clear();
+        let held = ManagerInput::Key {
+            keycode: R_KEYCODE,
+            pressed: true,
+            time: 5000,
+        };
+        if mapped_lock {
+            let lock_surface = f.manager.surface_of(f.id_b).unwrap();
+            f.manager.lock_input(&mut f.comp.state, &lock_surface, held);
+        } else {
+            f.manager.discard_key_input(&mut f.comp.state, &held);
+        }
+        assert_eq!(f.comp.state.pressed_key_count(), 1);
+        sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+        assert_eq!(
+            f.client_b.keys,
+            if mapped_lock {
+                vec![(R_KEYCODE, true)]
+            } else {
+                vec![]
+            },
+            "only a mapped lock owner hears the lock-origin press"
+        );
+        f.client_b.keys.clear();
+
+        // No click, refocus, reconcile, or timer tick rescues ownership.
+        f.manager.unlock_input(&mut f.comp.state);
+        assert_eq!(f.manager.model().focused(), Some(f.id_a));
+        assert_eq!(top(&f), Some(f.id_b), "unlock must not raise alpha");
+        assert_eq!(f.comp.state.pressed_key_count(), 1);
+        sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+        if mapped_lock {
+            assert_eq!(f.client_a.keyboard_enters, [Vec::<u32>::new()]);
+        }
+        press(&mut f.manager, &mut f.comp, KEY_A);
+        release(&mut f.manager, &mut f.comp, KEY_A);
+        // Exercise both normal manager dispatch and direct keyboard delivery.
+        press(&mut f.manager, &mut f.comp, R_KEYCODE);
+        f.manager
+            .keyboard_key(&mut f.comp.state, R_KEYCODE, true, 5001);
+        sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+        sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+        assert_eq!(f.client_a.keys, [(KEY_A, true), (KEY_A, false)]);
+        assert!(f.client_b.keys.is_empty(), "unlock never forwards to beta");
+        assert_eq!(f.comp.state.pressed_key_count(), 1);
+
+        // A later enter must still omit the physically held quarantined key.
+        assert!(f.manager.focus(&mut f.comp.state, None));
+        f.client_a.keyboard_enters.clear();
+        assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+        sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+        assert_eq!(f.client_a.keyboard_enters, [Vec::<u32>::new()]);
+        if mapped_lock {
+            release(&mut f.manager, &mut f.comp, R_KEYCODE);
+        } else {
+            f.manager
+                .keyboard_key(&mut f.comp.state, R_KEYCODE, false, 5002);
+        }
+        assert_eq!(f.comp.state.pressed_key_count(), 0);
+        sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+        sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+        assert_eq!(f.client_a.keys, [(KEY_A, true), (KEY_A, false)]);
+        assert!(
+            f.client_b.keys.is_empty(),
+            "held release must not reach beta"
+        );
+        press(&mut f.manager, &mut f.comp, R_KEYCODE);
+        release(&mut f.manager, &mut f.comp, R_KEYCODE);
+        sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+        sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+        assert_eq!(
+            f.client_a.keys,
+            [
+                (KEY_A, true),
+                (KEY_A, false),
+                (R_KEYCODE, true),
+                (R_KEYCODE, false)
+            ]
+        );
+        assert!(f.client_b.keys.is_empty());
+        assert_eq!(f.comp.state.pressed_key_count(), 0);
+    }
+}
+
+#[test]
+fn unlock_without_lock_surface_resets_prelock_client_visible_held_key() {
+    let mut f = two_windows();
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    press(&mut f.manager, &mut f.comp, R_KEYCODE);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    assert_eq!(f.client_a.keys, [(R_KEYCODE, true)]);
+    f.client_a.keys.clear();
+    f.client_a.keyboard_enters.clear();
+    // The shield never mapped a surface or received another input event.
+    f.manager.unlock_input(&mut f.comp.state);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    assert_eq!(f.client_a.keyboard_enters, [Vec::<u32>::new()]);
+    assert_eq!(f.comp.state.pressed_key_count(), 1);
+    press(&mut f.manager, &mut f.comp, R_KEYCODE);
+    release(&mut f.manager, &mut f.comp, R_KEYCODE);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    assert!(f.client_a.keys.is_empty());
+    assert_eq!(f.comp.state.pressed_key_count(), 0);
+    press(&mut f.manager, &mut f.comp, R_KEYCODE);
+    release(&mut f.manager, &mut f.comp, R_KEYCODE);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+    assert_eq!(f.client_a.keys, [(R_KEYCODE, true), (R_KEYCODE, false)]);
+    assert!(f.client_b.keys.is_empty());
+}
+
+#[test]
+fn relock_release_clears_unlock_quarantine_for_the_next_session() {
+    let mut f = two_windows();
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    let lock_surface = f.manager.surface_of(f.id_b).unwrap();
+    f.manager.lock_input(
+        &mut f.comp.state,
+        &lock_surface,
+        ManagerInput::Key {
+            keycode: R_KEYCODE,
+            pressed: true,
+            time: 5000,
+        },
+    );
+    f.manager.unlock_input(&mut f.comp.state);
+    assert_eq!(f.comp.state.pressed_key_count(), 1);
+    // A second shield takes ownership before the first shield's key is up.
+    f.manager.lock_input(
+        &mut f.comp.state,
+        &lock_surface,
+        ManagerInput::Key {
+            keycode: R_KEYCODE,
+            pressed: false,
+            time: 5001,
+        },
+    );
+    assert_eq!(f.comp.state.pressed_key_count(), 0);
+    f.manager.unlock_input(&mut f.comp.state);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+    assert!(f.client_a.keys.is_empty());
+    f.client_b.keys.clear();
+    press(&mut f.manager, &mut f.comp, R_KEYCODE);
+    release(&mut f.manager, &mut f.comp, R_KEYCODE);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+    assert_eq!(f.client_a.keys, [(R_KEYCODE, true), (R_KEYCODE, false)]);
+    assert!(f.client_b.keys.is_empty());
+    assert_eq!(f.comp.state.pressed_key_count(), 0);
+}
+
+#[test]
+fn unlock_restores_shell_keyboard_owner_before_desktop_windows() {
+    for (namespace, keyboard, overview) in [
+        (OVERVIEW_NAMESPACE, KeyboardInteractivity::None, true),
+        (OVERVIEW_NAMESPACE, KeyboardInteractivity::Exclusive, true),
+        (
+            tuna_shell_control::SCREENSHOT_NAMESPACE,
+            KeyboardInteractivity::Exclusive,
+            false,
+        ),
+    ] {
+        let mut f = two_windows();
+        assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+        let (conn, mut queue, mut client, _surface, _layer) =
+            shell_layer(&mut f.comp, namespace, keyboard);
+        f.manager.set_overview_open(overview);
+        f.manager.reconcile(&mut f.comp.state);
+        let focused = f.manager.model().focused();
+        let lock_surface = f.manager.surface_of(f.id_b).unwrap();
+        f.manager.lock_input(
+            &mut f.comp.state,
+            &lock_surface,
+            ManagerInput::Key {
+                keycode: R_KEYCODE,
+                pressed: true,
+                time: 5000,
+            },
+        );
+        sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+        sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+        sync_client(&mut f.comp, &conn, &mut queue, &mut client);
+        f.client_a.keys.clear();
+        f.client_b.keys.clear();
+        client.keys.clear();
+        client.keyboard_enters.clear();
+        f.manager.unlock_input(&mut f.comp.state);
+        assert_eq!(f.manager.model().focused(), focused);
+        press(&mut f.manager, &mut f.comp, KEY_A);
+        release(&mut f.manager, &mut f.comp, KEY_A);
+        press(&mut f.manager, &mut f.comp, R_KEYCODE);
+        release(&mut f.manager, &mut f.comp, R_KEYCODE);
+        sync_client(&mut f.comp, &conn, &mut queue, &mut client);
+        sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+        sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+        assert_eq!(client.keyboard_enters, [Vec::<u32>::new()]);
+        assert_eq!(client.keys, [(KEY_A, true), (KEY_A, false)]);
+        assert!(f.client_a.keys.is_empty());
+        assert!(f.client_b.keys.is_empty());
+        assert_eq!(f.comp.state.pressed_key_count(), 0);
+    }
 }
 
 /// A lock surface mapped under a pointer that has not moved since (Super+L

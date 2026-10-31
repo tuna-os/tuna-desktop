@@ -82,6 +82,9 @@ impl SessionLockHandler for State {
     }
 
     fn unlock(&mut self) {
+        // This is protocol-resource cleanup, not the security transition.
+        // Runtime::release_lock has already quarantined physical holds and
+        // restored the session keyboard owner before permitting this request.
         self.lock_protocol.client_unlocked = true;
         self.lock_protocol.owner = None;
         self.lock_protocol.approved_lock = None;

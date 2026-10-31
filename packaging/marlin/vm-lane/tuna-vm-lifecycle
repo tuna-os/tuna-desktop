@@ -2608,12 +2608,14 @@ print(json.dumps(result))
             result = {"available": True,
                       "stored": call("gsettings", "get", "org.gnome.desktop.peripherals.mouse", "scroll-wheel-emulation-button", user=True) == button
                       and call("gsettings", "get", "org.gnome.desktop.peripherals.mouse", "scroll-wheel-emulation-button-lock", user=True) == lock}
-    elif action in ("input-count", "input-ready", "input-buttons"):
+    elif action in ("input-count", "input-key-events", "input-ready", "input-buttons"):
         result = json.loads(pathlib.Path(RUNTIME, "tuna-vm-input.json").read_text())
         if pathlib.Path(f"/proc/{result['pid']}").stat().st_uid != OWNER.pw_uid:
             raise RuntimeError("input probe has the wrong owner")
         if action == "input-count":
             result = {key: result[key] for key in ("pid", "count")}
+        elif action == "input-key-events":
+            result = {key: result[key] for key in ("pid", "count", "key_releases")}
         elif action == "input-buttons":
             result = {key: result[key] for key in
                       ("pid", "buttons", "button_releases", "event_count", "motions", "gtk_version")}
