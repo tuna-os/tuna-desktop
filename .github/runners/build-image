@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Build the tuna-desktop runner images on the k3s node and import them into
+# k3s' containerd, so the cluster needs no registry or pull credentials.
+#
+#   .github/runners/build-image [NODE]          # default node: karnataka
+#
+# Points values-24.04.yaml / values-26.04.yaml at the new tags; roll them out
+# with .github/runners/deploy --sets-only.
+set -euo pipefail
+
+node=${1:-karnataka}
+here=$(cd "$(dirname "$0")" && pwd)
+runner_version=${RUNNER_VERSION:-$(gh api repos/actions/runner/releases/latest --jq '.tag_name | ltrimstr("v")')}
+stamp=$(date -u +%Y%m%d%H%M)
+remote_dir=$(ssh "$node" mktemp -d)
+trap 'ssh "$node" rm -rf "$remote_dir"' EXIT
+scp -q "$here"/image/* "$node:$remote_dir/"
+
+for ubuntu in 24.04 26.04; do
+  ref="localhost/tuna-ci-runner:${ubuntu}-${runner_version}-${stamp}"
+  # shellcheck disable=SC2029 # expanded locally on purpose
+  ssh "$node" "set -euo pipefail
+    sudo podman build --pull=always -f '$remote_dir/Containerfile' \
+      --build-arg UBUNTU=$ubuntu --build-arg IMAGE_OS=ubuntu${ubuntu%%.*} \
+      --build-arg RUNNER_VERSION=$runner_version -t '$ref' '$remote_dir'
+    sudo podman save '$ref' | sudo k3s ctr -n k8s.io images import -
+    sudo podman rmi '$ref' >/dev/null"
+  sed -i "s|image: localhost/tuna-ci-runner:${ubuntu}-.*|image: ${ref}|" "$here/values-${ubuntu}.yaml"
+  echo "$ref"
+done

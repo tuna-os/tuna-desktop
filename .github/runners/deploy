@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Apply the guard rails and install/upgrade the ARC controller and both runner
+# scale sets on karnataka from the files next to this script.
+#
+#   .github/runners/deploy                 # everything
+#   .github/runners/deploy --sets-only     # just the two scale sets
+#
+# Extra arguments after `--` go to both scale-set `helm upgrade` calls, e.g.
+#   .github/runners/deploy --sets-only -- --set minRunners=0 --set maxRunners=0
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+context=${KUBE_CONTEXT:-karnataka-k3s}
+chart_version=${ARC_CHART_VERSION:-0.15.1}
+charts=oci://ghcr.io/actions/actions-runner-controller-charts
+
+sets_only=false
+if [[ ${1:-} == --sets-only ]]; then
+  sets_only=true
+  shift
+fi
+[[ ${1:-} == -- ]] && shift
+
+if ! $sets_only; then
+  kubectl --context "$context" apply -f "$here/cluster.yaml"
+  helm --kube-context "$context" upgrade --install arc "$charts/gha-runner-scale-set-controller" \
+    --namespace arc-systems --create-namespace --version "$chart_version" \
+    --set flags.watchSingleNamespace=tuna-ci
+fi
+
+for ubuntu in 24 26; do
+  helm --kube-context "$context" upgrade --install "tuna-ci-$ubuntu-04" "$charts/gha-runner-scale-set" \
+    --namespace tuna-ci --version "$chart_version" -f "$here/values-$ubuntu.04.yaml" "$@"
+done
+kubectl --context "$context" -n tuna-ci get autoscalingrunnersets

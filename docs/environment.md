@@ -184,7 +184,8 @@ The script's header documents its options; they all start with `TRY_TUNA_`:
 | `TUNA_PROOF_SLOT_BASE` | `/tmp/tuna-local-proof.slot` | Prefix of the nested proofs' slot lock files. |
 | `TUNA_PROOF_LOCK` | `/tmp/tuna-local-proof.lock` | Lock file that serializes proofs of machine-wide state (vkms, seatd, uinput, sudo). |
 | `TUNA_PROOF_TIMEOUT` | `45` | Minutes before `just proof` stops a proof and everything it started. |
-| `TUNA_MIN_FREE_GB` | `20` | Builds run `just gc` first when less disk than this is free. |
+| `TUNA_MIN_FREE_GB` | `40` | Below this many GiB free on the repository's filesystem, `tuna-disk-guard` removes idle worktree targets and stale scratch. Build recipes run this guard first. |
+| `TUNA_IDLE_MINUTES` | `45` | How long a worktree target must be untouched before `tuna-disk-guard` may remove it; running-process references always protect it. |
 | `TUNA_CI_ARTIFACTS` | `/tmp/tuna-ci-artifacts` | Where `just ci-artifacts` downloads to. |
 | `TUNA_CI_ARTIFACT_TTL_MIN` | `360` | Minutes before `just gc` deletes a download. |
 | `CARGO_BUILD_JOBS` | half the CPUs | Parallel compile jobs per build. |
