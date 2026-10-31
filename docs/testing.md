@@ -293,6 +293,118 @@ is rejected, and the existing five-second polling budget must still obtain
 a valid tree. Persistent transport errors, wrong owners and incomplete trees
 cannot satisfy the gate.
 
+For folder-drag diagnosis, `just proof gtk-shell-proof --folder-dnd-only`
+runs panel readiness and the same `G-FOLDER-DND` journey/assertions as the
+full proof, then checks shell stability and exits. It creates a folder by
+dragging one app onto another, opens it, and requires dragging the second
+app onto the shade to remove exactly that app. This slice does not qualify
+the rest of the GTK journey or installed-image behavior.
+
+The GTK CI lane also runs
+`grid_animation::gtk_zoom_tests::actual_gtk_zoom_applies_all_properties_including_terminal_frame`
+on its admitted test binary under private Xvfb/D-Bus with
+`TUNA_REQUIRE_GRID_ZOOM=1`. It checks combined translation/scale/opacity
+updates, including a frame jumping past the 200 ms folder ease, and
+combined drag scale/fade updates. Each property is applied before deciding
+whether to queue damage: a changed translation must not short-circuit the
+scale or opacity writes, including on the last animation tick. This is
+widget-state coverage, not a frame-scheduling latency guarantee.
+
+The same admitted GTK binary also runs
+`overview::gtk_page_dot_tests::actual_gtk_page_dot_samples_observe_stored_look`
+under that admission flag. Its `grid-page-dots` output and receipt cover the
+page indicator's actual stored scale/opacity through page, hover and pressed
+updates. The per-frame page-dot trace reads these stored drawing properties,
+not the requested setter inputs; it emits no sample for a disposed drawing.
+
+The admitted `grid-tick-trace` case runs a real GTK frame clock and reads
+Linux main-thread scheduler counters. With `TUNA_GRID_TRACE` only, page
+ticks also retain frame-clock and monotonic timestamps, cumulative CPU/runqueue
+counters and their deltas, per-thread accounting availability, and time spent
+reading the observation. The proc handle is opened once per traced thread;
+subsequent reads use a fixed stack buffer. Without tracing, no proc files or
+clock observations are read. Unreadable, malformed, unpopulated (zero runtime
+or timeslices), or regressing counters are explicitly unavailable, never guessed
+zeros. A populated thread's runqueue wait can legitimately remain zero.
+
+The matcher repeats these tick observations from the same log offset.
+`run_delta_ns` includes shell work and prior observer/logging overhead.
+`wait_delta_ns` measures runnable wait from populated, monotonic per-thread
+`/proc/thread-self/schedstat` counters (`schedstat=available`), not the unrelated
+`kernel.sched_schedstats` switch for extended scheduler statistics. The kernel's
+[per-task proc implementation](https://github.com/torvalds/linux/blob/v6.8/fs/proc/base.c#L479-L495)
+reads runtime and `CONFIG_SCHED_INFO` run-delay/timeslice counters; its
+[accounting updates](https://github.com/torvalds/linux/blob/v6.8/kernel/sched/stats.h#L208-L292)
+do not depend on that switch. No host-wide sysctl is changed for this observer.
+Low CPU/runqueue deltas alone cannot identify a compositor, renderer, protocol
+or presentation stall. These observations attribute callback gaps only within
+their measured scope and do not replace the unchanged frame/dot coverage gate.
+
+With tracing enabled, the grid window also records its GDK before-paint,
+update, layout, paint and after-paint phases with monotonic/frame-clock times,
+frame counter and native Wayland surface ID (explicitly unavailable on X11).
+Handlers are attached only to the traced realized grid and disconnected on
+unrealize. These are toolkit phase observations, **not** client protocol issue,
+flush, callback receipt or presentation timestamps. Server-side request-arrival,
+applied-commit, callback-drain and flush observations must establish those
+separate boundaries before attributing a gap to compositor scheduling.
+Compositor records use `tuna-grid-compositor:` and the same CLOCK_MONOTONIC
+microseconds. `commit_arrival` is the server precommit hook after frame requests
+have populated pending state, not their socket or client-issue time;
+`commit_applied` reports current state, possibly including older callbacks.
+`callback_drained` records actual callback identities removed by the unchanged
+Smithay sender with before/after-send times. It establishes `done` queued,
+not client receipt. Nested bind, render-finish, submit, no-repaint decisions and
+client-flush boundaries retain their real outcomes. `tick_stage` records split
+the loop between its pre-dispatch flush and repaint into named stages, each
+with the compositor main thread's runtime, runqueue wait and timeslices, so a
+stalled stage is classified as compositor CPU, runnable wait or off-CPU time.
+Consecutive stage gaps include the preceding observer write, so they alone
+cannot distinguish a blocked trace sink from the named operation. Attribution
+run 41249875435 therefore bracketed snapshot serialization, write and rename
+with direct `operation` clocks and checked scheduler-counter deltas, with no
+trace output inside the measured interval. Serialization still has that direct
+observer; file operations now belong to the snapshot worker rather than the
+compositor thread.
+
+Run 41227591692 (head e39b95b2) retained a real sparse switch: the shell's
+callback monotonic gaps were 137.958/226.450 ms with only ~2 ms CPU and almost
+no runqueue wait, while the compositor spent 106–112 ms between its client flush and
+repaint and then queued `done` without flushing until the next loop wake
+(~16 ms). The compositor now flushes the events a render queued on every
+backend, as native sessions already did (regression:
+`runtime::rendered_event_tests`).
+This render-then-flush order also matches
+[Niri's `refresh_and_flush_clients`](https://github.com/niri-wm/niri/blob/main/src/niri.rs#L825-L840).
+Disabled tracing performs no observer clock reads, allocation or surface walks.
+
+Run 41249875435's merge-source installed evidence
+(`4850b19cdc70d3c217dd5e1c3082d090a190ab13`) then isolated the larger delay:
+`controls/nested.log:693850` records `state_rename` taking 217.082 ms wall time,
+0.510131 ms CPU and zero runnable wait; line 693738 records 209.122 ms wall,
+0.460597 ms CPU and zero runnable wait. No logger write occurred inside either
+measurement. Across 21,408 samples, write took at most 3.041 ms and serialization
+at most 0.200 ms. This is filesystem blocking on the compositor's publication
+path, not shell CPU, runnable starvation, or an attributed rendering fence.
+
+`TUNA_COMPOSITOR_STATE` now uses one owned background writer with one replaceable
+latest waiting body. It atomically publishes complete producer snapshots without
+mixing clocks, geometry or actual `rendered_frames`; intermediate snapshots may
+coalesce, but the unchanged frame/evidence floors still apply. Only successful
+write-and-rename updates the worker's deduplication baseline. Failure is surfaced
+by the worker and an unchanged body remains eligible on the next submission,
+without an autonomous retry loop. Graceful shutdown drains the latest body and
+joins the writer, so terminal publication does not require another input/tick
+and no old writer can publish afterward. Real filesystem, concurrent reader,
+failure, bounded-latest and shutdown regressions live in `state_snapshot::tests`;
+the VM inventory consumer still fails closed on malformed JSON. No source-text
+assertion substitutes for these behaviors.
+
+The installed `journey` qualification intentionally checks out the pull-request
+merge commit. Its companion receipt records that actual `git rev-parse HEAD`
+alongside the pull-request head SHA, so merge-source installed evidence remains
+distinct from the exact-head native GTK proof.
+
 | CI job | Command | Extra packages | What it asserts |
 |---|---|---|---|
 | `journey` | `scripts/tuna-journey --artifacts journey-artifacts` | `xvfb xdotool x11-apps scrot jq dbus`, Mesa EGL (`libegl1 libgl1-mesa-dri`) | Overview, search, launch from search, Escape, workspace switch, Alt+Tab; writes `assertions.txt` |
@@ -306,6 +418,28 @@ cannot satisfy the gate.
 
 `app-content` and `scroll-proof` download Playwright and Chromium into a
 temporary venv on every run, so they need network access.
+
+`G-GRID-PAGE-ANIM` keeps the raw frame and page-dot trace in `nested.log`
+and the matcher's combined output (including mismatch stderr) in
+`grid-anim-samples-{next,off,next-again}.txt`. On mismatch the proof also
+prints that output and its actual artifact path to stderr, without changing
+the assertion or its exit status. The `gtk-shell` upload retains these files
+at its root. In the `journey` job the installed GTK proof writes them under
+`package-artifacts/installed/controls` (`tuna-deb-installed-proof`); the
+always-run artifact preparation also copies just these diagnostics into
+`journey-shots/installed-controls`, including on an early proof failure.
+
+Each animated-switch report also gives the source byte offset, intermediate
+page/dot counts against the unchanged minimum of two, the largest logged
+frame-clock gap, repeated frame times, and maximum error against GNOME's
+curve. This distinguishes missing intermediate samples from wrong sampled
+positions; **either still fails**. Two zero-time records are normal:
+initialization and the first tick. A sparse callback trace alone cannot
+attribute a gap to shell work, compositor delivery, runner scheduling or
+presentation. Correct sampled endpoints are not proof of smooth presentation.
+The shared `Zoom::set_look` setter does control page-dot drawing, so its
+combined scale/opacity fix is required for accurate indicators; it does not
+control the pager's frame callback cadence.
 
 **Start `tuna-gtk-shell-proof` from a fresh artifacts directory.** The
 script points `XDG_STATE_HOME` at `gtk-shell-artifacts/state`, and the

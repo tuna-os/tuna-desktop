@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """No GUI: the app grid's trace samples checked against GNOME 51's curves."""
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
+
+import yaml
 
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location(
@@ -13,6 +17,9 @@ samples = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(samples)
 
 PREFIX = 'tuna-shell-gtk: grid-anim '
+ROOT = Path(__file__).resolve().parents[2]
+PROOF = (ROOT / 'scripts/tuna-gtk-shell-proof').read_text()
+GRID_SAMPLES = 'grid_samples() {' + PROOF.split('grid_samples() {', 1)[1].split('\n}', 1)[0] + '\n}'
 
 
 def dots_line(position, n=2, hover=(), pressed=(), skew=0.0):
@@ -91,6 +98,65 @@ class SwitchTests(unittest.TestCase):
         self.assertEqual(check(log), [])
 
 
+class DiagnosticTests(unittest.TestCase):
+    def test_sparse_correct_samples_still_fail_coverage_not_the_curve(self):
+        # Installed journey 41181908245 / aee02d6, second page switch.
+        text = switch_log(times=(0.0, 0.0, 100.002, 319.017))
+        frames, dots = samples.parse(text)
+        self.assertEqual(samples.check_switch(frames, dots, 0.0, 1.0), [
+            '1 frames between the pages, fewer than 2',
+            '1 page-dots samples between the pages, fewer than 2',
+        ])
+        report = '\n'.join(samples.switch_diagnostics(frames, dots, 0.0, 1.0))
+        self.assertIn('1/2 required intermediate page frames', report)
+        self.assertIn('1/2 required intermediate page-dot updates', report)
+        self.assertIn('219.015 ms (100.002 -> 319.017 ms)', report)
+        self.assertIn('repeated frame times: 1', report)
+        self.assertIn('callback samples, not presentation', report)
+
+    def test_a_jump_remains_a_failure_even_with_correct_endpoints(self):
+        frames, dots = samples.parse(switch_log(times=(0.0, 0.0, 333.340)))
+        self.assertEqual(samples.check_switch(frames, dots, 0.0, 1.0), [
+            '0 frames between the pages, fewer than 2',
+            '0 page-dots samples between the pages, fewer than 2',
+        ])
+        report = '\n'.join(samples.switch_diagnostics(frames, dots, 0.0, 1.0))
+        self.assertIn('0/2 required intermediate page frames', report)
+        self.assertIn('333.340 ms (0.000 -> 333.340 ms)', report)
+        self.assertIn('maximum GNOME position error: 0.000000000 page', report)
+
+    def test_wrong_curve_is_reported_independently_of_ample_coverage(self):
+        frames, dots = samples.parse(switch_log(curve=lambda e: min(e / 300.0, 1.0)))
+        self.assertTrue(any('ease-out-cubic' in error
+                            for error in samples.check_switch(frames, dots, 0.0, 1.0)))
+        report = '\n'.join(samples.switch_diagnostics(frames, dots, 0.0, 1.0))
+        self.assertIn('4/2 required intermediate page frames', report)
+        self.assertIn('maximum GNOME position error: 0.375000000 page', report)
+
+    def test_empty_or_stalled_clock_does_not_invent_a_gap(self):
+        for times in ((), (0.0, 0.0)):
+            frames, dots = samples.parse(switch_log(times=times))
+            self.assertTrue(samples.check_switch(frames, dots, 0.0, 1.0))
+            report = '\n'.join(samples.switch_diagnostics(frames, dots, 0.0, 1.0))
+            self.assertIn('no advancing frame-time samples', report)
+            self.assertNotIn('largest logged frame-time gap', report)
+
+
+    def test_tick_observations_preserve_counters_and_explicit_unavailability(self):
+        observed = (
+            'clock_us=1000 monotonic_us=1010 run_ns=2000 wait_ns=3000 '
+            'timeslices=2 schedstat=available delta=baseline-or-reset observation_us=4',
+            'clock_us=18000 monotonic_us=18012 run_ns=5000 wait_ns=9000 '
+            'timeslices=3 schedstat=available wall_delta_us=17002 run_delta_ns=3000 '
+            'wait_delta_ns=6000 observation_us=3',
+            'clock_us=35000 monotonic_us=35010 schedstat=unavailable reason=read observation_us=5',
+        )
+        text = switch_log() + '\n'.join(PREFIX + 'page-switch tick ' + line for line in observed)
+        self.assertEqual(samples.tick_diagnostics(text), list(observed))
+        self.assertEqual(check(text), [])
+        self.assertEqual(samples.tick_diagnostics(switch_log()), [])
+
+
 class InstantTests(unittest.TestCase):
     def test_off_jumps(self):
         frames, dots = samples.parse(dots_line(0.0) + '\n')
@@ -114,6 +180,85 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(samples.main(['--log', log.name, '--offset', str(offset),
                                        '--from', '0', '--to', '1']), 0)
         Path(log.name).unlink()
+
+
+class RetentionTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        (self.root / 'scripts').symlink_to(ROOT / 'scripts', target_is_directory=True)
+        self.jobs = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())['jobs']
+
+    def run_samples(self, artifacts, text):
+        artifacts.mkdir(parents=True, exist_ok=True)
+        log = artifacts / 'nested.log'
+        log.write_text(text)
+        result = subprocess.run(
+            ['sh', '-ec', GRID_SAMPLES + '\ngrid_samples 0 next-again --from 0 --to 1\n'
+             'echo proof-continued'],
+            env={**os.environ, 'ROOT': str(ROOT), 'PY': sys.executable,
+                 'ARTIFACTS': str(artifacts), 'LOG': str(log)},
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(log.read_text(), text)
+        return result
+
+    def prepare_journey(self):
+        step = next(step for step in self.jobs['journey']['steps']
+                    if step.get('run', '').startswith('scripts/ci-prepare-artifacts '))
+        self.assertEqual(step['if'], 'always()')
+        result = subprocess.run(['sh', '-ec', step['run']], cwd=self.root,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def upload_root(self, job, name):
+        step = next(step for step in self.jobs[job]['steps']
+                    if step.get('with', {}).get('name') == name)
+        self.assertEqual(step['if'], 'always()')
+        return self.root / step['with']['path']
+
+    def test_failed_matcher_preserves_output_trace_and_status_in_both_uploads(self):
+        text = switch_log(times=(0.0, 300.0))
+        for directory in ('package-artifacts/installed/controls', 'gtk-shell-artifacts'):
+            artifacts = self.root / directory
+            result = self.run_samples(artifacts, text)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertNotIn('proof-continued', result.stdout)
+            output = artifacts / 'grid-anim-samples-next-again.txt'
+            self.assertIn(str(output), result.stderr)
+            self.assertIn(str(artifacts / 'nested.log'), result.stderr)
+            self.assertIn('fewer than 2', output.read_text())
+            self.assertIn('source ' + str(artifacts / 'nested.log'), output.read_text())
+            self.assertIn('byte offset 0', output.read_text())
+            self.assertIn('0/2 required intermediate page frames', output.read_text())
+            self.assertIn('largest logged frame-time gap: 300.000 ms', output.read_text())
+            self.assertIn('frame 300.000 ms', output.read_text())
+            self.assertIn(output.read_text(), result.stderr)
+
+        # An early failure has no assertions.txt, final screenshot or other
+        # sample outputs. Only existing animation diagnostics are duplicated.
+        controls = self.root / 'package-artifacts/installed/controls'
+        (controls / 'private-state.txt').write_text('unrelated fixture state')
+        os.mkfifo(controls / 'audio-events')
+        self.prepare_journey()
+        journey = self.upload_root('journey', 'journey-shots') / 'installed-controls'
+        self.assertEqual({p.name for p in journey.iterdir()},
+                         {'nested.log', 'grid-anim-samples-next-again.txt'})
+        for name in ('nested.log', 'grid-anim-samples-next-again.txt'):
+            self.assertEqual((journey / name).read_bytes(), (controls / name).read_bytes())
+            gtk = self.upload_root('gtk-shell', 'gtk-shell')
+            self.assertTrue((gtk / name).is_file())
+        self.assertFalse((controls / 'audio-events').exists())
+
+    def test_successful_matcher_remains_successful_and_quiet(self):
+        result = self.run_samples(self.root / 'gtk-shell-artifacts', switch_log())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, '')
+        self.assertEqual(result.stdout, 'proof-continued\n')
+
+    def test_failure_before_installed_proof_creates_no_diagnostics(self):
+        self.prepare_journey()
+        self.assertFalse((self.root / 'journey-artifacts/installed-controls').exists())
 
 
 if __name__ == '__main__':

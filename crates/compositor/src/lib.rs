@@ -76,6 +76,7 @@ pub(crate) mod focus_caret;
 pub mod focus_policy;
 pub mod fprintd;
 pub mod frame_timing;
+mod grid_trace;
 pub mod icc;
 pub mod idle_monitor;
 pub mod ime;
@@ -134,6 +135,7 @@ pub mod sleep;
 pub mod slideshow;
 pub mod spring;
 pub mod state;
+mod state_snapshot;
 pub mod supervise;
 pub mod tablet;
 pub mod tablet_actions;
@@ -653,6 +655,7 @@ impl CompositorHandler for State {
         smithay::wayland::compositor::add_pre_commit_hook::<State, _>(
             surface,
             |state, _dh, surface| {
+                crate::grid_trace::commit(state, surface, true);
                 if state.dead_layer_surfaces.contains(&surface.id()) {
                     smithay::wayland::compositor::with_states(surface, |states| {
                         let mut cached = states
@@ -666,6 +669,7 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &wl_surface::WlSurface) {
+        crate::grid_trace::commit(self, surface, false);
         self.pointer_scene_dirty = true;
         on_commit_buffer_handler::<State>(surface);
         self.window_icons.commit(surface);
