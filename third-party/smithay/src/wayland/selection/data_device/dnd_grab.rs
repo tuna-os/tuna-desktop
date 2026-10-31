@@ -244,7 +244,7 @@ where
                         }
                     }
                 }
-                self.current_focus = Some(surface.into_owned());
+                self.current_focus = Some(surface.clone().into_owned());
             }
             // Only pointer-grab installation needs motion alongside its initial
             // Enter. Ordinary transitions and touch retain their event sequence.
