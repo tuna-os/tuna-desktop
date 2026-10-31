@@ -974,7 +974,11 @@ mod session_tests {
             log = log.display()
         );
         let mut writer = Command::new("/bin/sh")
-            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "fake-helper-writer"])
+            .args([
+                "-c",
+                "cat > \"$1\" && chmod 755 \"$1\"",
+                "fake-helper-writer",
+            ])
             .arg(&path)
             .stdin(Stdio::piped())
             .spawn()
