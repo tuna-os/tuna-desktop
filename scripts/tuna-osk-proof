@@ -305,9 +305,10 @@ cstate "$OSK_GONE" 1 || fail G-OSK-SHOW "enabling alone opened the keyboard"
 # text-input); the keyboard opens after KEYBOARD_REST_TIME (300 ms).
 press "$BX" "$BY" G-OSK-SHOW
 show_press="$PRESS_T"
-cstate "$OSK_MAPPED" 10 || fail G-OSK-SHOW "a click into entry b never showed the keyboard"
-show_t="$("$PY" "$LIB" first "$WATCH" "$show_press" 1)" ||
-    fail G-OSK-SHOW "no mapped keyboard in the watch log after the press"
+cstate "$OSK_MAPPED" "shown keyboard and watcher" 10 \
+    "$PY" "$LIB" first "$WATCH" "$show_press" 1 >"$ARTIFACTS/show-time.txt" ||
+    fail G-OSK-SHOW "a click into entry b never showed the keyboard or its watcher never recorded showing"
+show_t="$(cat "$ARTIFACTS/show-time.txt")"
 show_delay="$(elapsed "$show_press" "$show_t")"
 at_least "$show_delay" 0.299 || fail G-OSK-SHOW "the keyboard showed ${show_delay}s after the press, before GNOME's 300 ms rest time"
 at_most "$show_delay" 2.0 || fail G-OSK-SHOW "the keyboard took ${show_delay}s to show"
@@ -331,10 +332,11 @@ move_end="$(now)"
 # Focus leaving text: hidden after the 50 ms focus-out delay.
 press "$DX" "$DY" G-OSK-SHOW
 hide_press="$PRESS_T"
-cstate "$OSK_GONE" 10 || fail G-OSK-SHOW "focus on the button never hid the keyboard"
+cstate "$OSK_GONE" "hidden keyboard and watcher" 10 \
+    "$PY" "$LIB" first "$WATCH" "$hide_press" 0 >"$ARTIFACTS/hide-time.txt" ||
+    fail G-OSK-SHOW "focus on the button never hid the keyboard or its watcher never recorded hiding"
 [ "$(focus_of)" = "done" ] || fail G-OSK-SHOW "the probe's focus is $(focus_of), not the button"
-hide_t="$("$PY" "$LIB" first "$WATCH" "$hide_press" 0)" ||
-    fail G-OSK-SHOW "no unmapped keyboard in the watch log after the press"
+hide_t="$(cat "$ARTIFACTS/hide-time.txt")"
 hide_delay="$(elapsed "$hide_press" "$hide_t")"
 at_least "$hide_delay" 0.050 || fail G-OSK-SHOW "the keyboard hid ${hide_delay}s after focus left, before GNOME's 50 ms delay"
 at_most "$hide_delay" 2.0 || fail G-OSK-SHOW "the keyboard took ${hide_delay}s to hide"

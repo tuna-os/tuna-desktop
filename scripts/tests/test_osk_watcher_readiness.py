@@ -43,6 +43,26 @@ class OskWatcherReadiness(unittest.TestCase):
             status = PROOF.main([str(HELPER), command, str(self.watch), *map(str, args)])
         return status, out.getvalue()
 
+    def test_show_and_hide_wait_for_post_press_watcher_samples(self):
+        self.append(change(10.0, False, None))
+        self.state.write_text(json.dumps({"locked": False, "layers": [
+            {"namespace": PROOF.NAMESPACE, "rect": MAPPED}]}), encoding="utf-8")
+        # A mapped compositor snapshot cannot replace the missing show sample.
+        self.assertEqual(PROOF.sample(self.state)["osk"], MAPPED)
+        self.assertEqual(self.call("first", 11.0, 1), (1, ""))
+        self.append(change(11.3, False, MAPPED))
+        status, shown = self.call("first", 11.0, 1)
+        self.assertEqual(status, 0)
+        self.assertEqual(float(shown), 11.3)
+        self.state.write_text(json.dumps({"locked": False, "layers": []}), encoding="utf-8")
+        # The earlier hidden sample must not qualify this press's hide interval.
+        self.assertIsNone(PROOF.sample(self.state)["osk"])
+        self.assertEqual(self.call("first", 12.0, 0), (1, ""))
+        self.append(change(12.05, False, None))
+        status, hidden = self.call("first", 12.0, 0)
+        self.assertEqual(status, 0)
+        self.assertEqual(float(hidden), 12.05)
+
     def test_hidden_compositor_waits_for_delayed_watcher_sample(self):
         self.state.write_text(json.dumps({"locked": True, "layers": []}), encoding="utf-8")
         self.append(change(LOCKED - 2, False, None),

@@ -194,10 +194,10 @@ review. CI shellchecks each script before running it.
 
 Magnifier focus checks wait for the probe's focused entry to have allocated
 widget bounds before comparing its GTK geometry with the live AT-SPI extent.
-The OSK lock check waits for its asynchronous watcher to record the locked,
-hidden transition before using that timestamp for the no-remap interval.
-Both readiness conditions use the existing gate deadlines; missing geometry
-or watcher transitions remain failures, not skipped assertions.
+The OSK show/hide and lock checks wait for their asynchronous watcher to
+record the corresponding transition before using its timestamp for timing or
+no-remap assertions. These readiness conditions use the existing gate deadlines;
+missing geometry or watcher transitions remain failures, not skipped assertions.
 
 The native grid-drag cancellation proof holds the pointer button until both
 the compositor reports cancellation and a fresh, complete, owner-bound AT-SPI
