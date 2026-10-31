@@ -1,0 +1,194 @@
+# TunaOS variant qualification for Tuna Desktop v1
+
+**No all-variant v1 qualification is claimed.** Package publication, an enabled
+image build, and an image boot gate are not real-GDM/session/portal/lock proof.
+The [v1 checklist](v1.md) and [ADR 0008](adr/0008-v1-beta-track-and-release-scope.md)
+remain unchanged. Marlin remains the GNOME 51 comparison target; the other
+variants still need their own immutable-image runtime evidence.
+
+## Current source inventory
+
+The primary inventory is [TunaOS `tunaos.toml` at
+`124cc32623ce084580a2ef888350be07bd83508d`](https://github.com/tuna-os/tunaOS/blob/124cc32623ce084580a2ef888350be07bd83508d/tunaos.toml).
+It declares **14 variants**, eleven admitted amd64 Tuna image cells and three
+source-declared unsupported rows. No arm64 Tuna cell is enabled. All eleven
+Tuna cells have `build_iso=false`, `build_qcow2=false`, and `luks_e2e=false`;
+this matrix does not invent ISO/LUKS acceptance cells.
+
+The native package inventory is [tunaos-packages
+`c0998b94bd7b4fbc67360c239e439de6debf539b`](https://github.com/tuna-os/tunaos-packages/tree/c0998b94bd7b4fbc67360c239e439de6debf539b).
+Its Tuna recipe/spec target **beta.2 release 2**, source desktop tag
+`v1.0.0-beta.2`, commit `1e6ce28f4d5dfd7918ac7340bd93454a9fcc211c`.
+That is not current desktop main. Recipe and vendor archive digests, actual
+Gentoo payload evidence, and publication attempts are recorded in
+[package-evidence.json](variants/2026-10-31/package-evidence.json).
+
+| Variant | Base | Package target / format | Support and integration state |
+|---|---|---|---|
+| yellowfin | AlmaLinux Kitten 10 | `el10` / RPM | admitted; published image, not v1-qualified |
+| albacore | AlmaLinux 10 | `el10` / RPM | admitted; published image, not v1-qualified |
+| skipjack | CentOS Stream 10 | `el10` / RPM | admitted; published image, not v1-qualified |
+| wahoo | Fedora ELN / EL11 preview | `eln` / RPM | admitted, experimental; missing Tuna tag repaired through existing signed workflow; runtime still required |
+| bonito | Fedora 44 | `fedora` / RPM | admitted; published image, not v1-qualified |
+| bonito-rawhide | Fedora Rawhide | `rawhide` / RPM | admitted; published as `bonito:tuna-rawhide`, not a separate registry repository |
+| sailfin | openSUSE Tumbleweed | rollout label `opensuse`, recipe target `opensuse-tumbleweed` / RPM | admitted; published image, not v1-qualified |
+| grouper | Ubuntu 26.04 Resolute | `ubuntu` / DEB | admitted; source retains a portal session-start blocker note; needs actual digest-specific verdict |
+| marlin | Arch Linux | `arch` / pacman | admitted; real published-image journey has failures, below |
+| flounder | Debian 13 Trixie | `trixie` / DEB | admitted; source retains a portal session-start blocker note; needs actual digest-specific verdict |
+| flounder-sid | Debian Sid | `debian` / DEB | admitted; published as `flounder:tuna-sid`; same portal-note qualification limit |
+| hummingbird | Fedora Hummingbird | native Hummingbird build chain / RPM | **not admitted on main; not an accepted package-unavailable waiver**; native package implementation exists; current served beta1 and power-provider closure block strict admission |
+| guppy | Gentoo | `gentoo` / gpkg, amd64 | **not admitted on main; not an accepted package-unavailable waiver**; signed beta2-r1 publication and served-install verification now pass; image admission/runtime remain open |
+| gurnard | Ubuntu 24.04 Noble | `noble` / no implemented Tuna target | source-backed unsupported: no native target, Rust >=1.92 required, current Noble-updates search exposes only rustc-1.91 in the 1.9 series; no vendored-toolchain substitution |
+
+### Unsupported reasons are evidence, not a scope shortcut
+
+TunaOS main still says Hummingbird/Guppy await Tuna package publication. Those
+reasons are stale: both have native implementations, and Gentoo's new revision
+was actually published during this qualification. They must not be counted as
+satisfied unsupported exceptions merely because the old strings remain in TOML.
+
+Existing admission branches were repaired rather than creating competing PRs:
+
+- [TunaOS #3883](https://github.com/tuna-os/tunaOS/pull/3883): current-main
+  integration, `brltty[python]` closure for Orca, and exact published
+  `=gui-wm/tuna-desktop-1.0.0_beta2-r1::tunaos` pin. Signed package
+  [run 41213265948](https://github.com/tuna-os/tunaos-packages/actions/runs/41213265948)
+  passed build, publication and pristine served-binhost installation checks.
+  Direct payload inspection finds the six current binaries without
+  `tuna-greeter`. This is not a boot/login qualification.
+- [TunaOS #3885](https://github.com/tuna-os/tunaOS/pull/3885): current-main
+  integration and removal of unavailable redundant `liberation-fonts`, retaining
+  Noto/DejaVu, strict GDM-only checks and the power-provider requirement.
+  Observed native beta1 RPM includes the obsolete greeter and lacks
+  `tuna-wallpaper-svg`. The native TuneD 2.28 RPM additionally requires
+  `(rpm-ostree if bootc)` with no enabled `rpm-ostree` provider. Dropping the
+  provider gate or inventing a `Provides` would hide the actual failure; neither
+  was done. Targeted beta2 publication does not rebuild TuneD.
+
+Both branches retain their manual workflow-path merge fence and promotion hold.
+Neither was merged or bypassed. Noble's missing target is tracked in
+[packages #834](https://github.com/tuna-os/tunaos-packages/issues/834).
+The current public [Noble-updates package search](https://packages.ubuntu.com/search?keywords=rustc-1.9&searchon=names&suite=noble-updates&section=all)
+returns `rustc-1.91` version `1.91.1+dfsg~24.04-0ubuntu0.24.04.3`;
+[the Noble rustc-1.92 search](https://packages.ubuntu.com/search?keywords=rustc-1.92&searchon=names&suite=noble&section=all)
+returns no results. These observations do not claim an exhaustive archive audit.
+
+## Published immutable subjects
+
+The complete [registry receipt](variants/2026-10-31/registry-matrix.json) records
+source revision, exact resolver command/output, image creation time and labels.
+An image's `org.opencontainers.image.version` is an image-source label, not the
+installed desktop package version. Native guest package queries and binary
+hashes belong in each runtime manifest.
+
+All references below use `ghcr.io/tuna-os/`; digest prefixes are **not**
+truncated. The registry receipt predates the successful Wahoo publication, which
+has its own [publication receipt](variants/2026-10-31/wahoo-publication.json).
+
+| Variant | Repository and immutable digest |
+|---|---|
+| yellowfin | `yellowfin@sha256:355f66da7929059fc046527da6177e4958d97dab9546d62ca3d5ac53bc4daa4f` |
+| albacore | `albacore@sha256:b68a195dbc6e079bbab6b330086e6420d860f5364d1f2232e5f377bc6cdf2a13` |
+| skipjack | `skipjack@sha256:30811ab4a8c8dbb4ee3cb1b77ef99fd312ec4835d05a7b40a3ed1aa410b7e5c3` |
+| wahoo | `wahoo@sha256:865ec5320f25ae368316f07b4d3b49b5e0600308e5bc50b973ace90a5b53a46d` |
+| bonito | `bonito@sha256:e9a58bb671a71b3eaad4efe7c80de35eb62847bf721bc08ef37168d028273c65` |
+| bonito-rawhide | `bonito@sha256:dd2bc06ea05ea73fc06c7f208ac3ea2c7107cc4125024362a7d4a9ddfe18c2b3` |
+| sailfin | `sailfin@sha256:cbfba99f07a74a099de7366d5de2a2552d768a677cba9000476dacf0d7486605` |
+| grouper | `grouper@sha256:8cebaff1fbfe7d8f5076b0d09c7988cce804bbe193b12af733180f2eee3ef6fa` |
+| marlin | `marlin@sha256:d0e65bce0ac55cb6c58bcf3739e30d6372fe4be978e6ea7c0c1310b3962bdfa5` |
+| flounder | `flounder@sha256:03a4224a791370669f5bf96228097397298fa5e39b566cd3c3d1c1fd11481e2e` |
+| flounder-sid | `flounder@sha256:81570c4609ad406ffa4ce5ac453c64f43708e74285ffc00aba7fc4006883cbc8` |
+| hummingbird, guppy, gurnard | no admitted Tuna image subject in the source inventory; no image pass inferred from native packages |
+
+### Existing Marlin runtime verdict is not a v1 pass
+
+The retained [2026-10-31 real-GDM journey](marlin/2026-10-31-corral-journey/README.md)
+for the Marlin digest above installed `tuna-desktop 1.0.0beta.2-2` and recorded
+**24 pass, 3 fail**. Install, real-GDM login, session, refused wrong password,
+correct unlock and logout were exercised. Raw failures remain unchanged:
+absent VM backlight, `notify-send` missing `GetServerInformation`, and
+`LockedHint=no` while locked. Visual findings include the incorrect Dark Style
+tile, banner covering the date menu, and translucent power popover. These are
+published beta2 observations, not claims about later current source.
+
+## Actual Yellowfin runtime, 2026-10-31
+
+The [complete immutable-image manifest](variants/2026-10-31/yellowfin/manifest.json)
+ran 14:53:24–15:29:24 UTC through Corral `76b6dd52d35d`, with 4 vCPUs,
+6 GiB RAM, a 40 GiB disk, bochs-drm 1280×800 and real GDM on `karnataka`.
+The booted index matches `355f66…`; the booted amd64 manifest is
+`sha256:de704153960289d73a58e509d2f00d3713c8d5ee6f7ac23278b21e53cb85f120`.
+**The actual installed desktop is `1.0.0~beta.1-1.el10`, not the beta2
+release2 recipe now on main.** GDM is 47.0, GNOME Shell 49.5 and Settings
+47.7. No current-source qualification is inferred from a recent image date.
+
+Raw result: **20 pass, 7 fail, 1 not exercised**; all 28 noVNC canvas frames,
+hashes and guest checks are retained. The deleted VM/VMI/PVC and empty
+post-delete inventory are recorded in the manifest.
+
+| Required gate | Actual Yellowfin result |
+|---|---|
+| Install and booted-image identity | pass for the exact published digest, bootc disk install |
+| Real GDM login | pass; GDM greeter on seat0, password login through `gdm-password` |
+| Tuna session | pass; compositor and GTK shell run, no user GNOME Shell |
+| Portals | frontend Settings.Read, Screenshot version and ScreenCast source types respond; **functional consent/capture/revocation not qualified** |
+| Lock/unlock | lock gate fails: ScreenSaver active true but `LockedHint=no`; wrong password refusal and correct unlock pass |
+| Visual review | reviewed GDM, session, failed Settings-launch and lock frames; not a complete visual pass |
+
+Direct frame review:
+[GDM](variants/2026-10-31/yellowfin/01-greeter-user-list.png),
+[Tuna session](variants/2026-10-31/yellowfin/03-session-is-tuna.png),
+[Settings attempt](variants/2026-10-31/yellowfin/10-launch-settings.png),
+[lock curtain](variants/2026-10-31/yellowfin/23-lock.png).
+The Settings attempt visibly contains repeated trailing `s` characters in the
+search field, not a Settings window. Consequently its timeout and downstream
+style/wallpaper checks are retained as failed journey observations, **not
+independent proof that Settings itself cannot start**. Other raw failures are
+Night Light false/no Color owner, `notify-send` missing `GetServerInformation`,
+and the lock hint. Sliders are not exercised because this VM has no relevant
+hardware device. An automated “settings-appearance” pass only records a key/
+pointer action; the reviewed frame does not prove that UI appeared.
+
+The subsequent Albacore attempt was interrupted by the outer 3600-second
+command deadline while Corral API reads were timing out. The
+[interrupted matrix](variants/2026-10-31/interrupted-runtime-matrix.json)
+is intentionally not a completed matrix or a passing Albacore run. Host
+Tailscale/SSH and authenticated API `/livez` responded; Corral's default
+5-second read timeout tripped its 15-second circuit breaker. This is access/
+orchestration evidence, not a guest crash or an unsupported-variant reason.
+The [access and cleanup receipt](variants/2026-10-31/interruption-cleanup.json)
+records successful deletion of only the interrupted Albacore VM/VMI/PVC and an
+empty post-delete inventory after using the documented
+`CORRAL_KUBECTL_TIMEOUT=30s` management budget. No cluster or desktop acceptance
+threshold was changed. Remaining journeys resumed sequentially with that
+transport setting; the original failure receipt is unchanged.
+
+## Reusable actual-image path
+
+`python3 scripts/tuna-variant-qualification --out NEW_DIRECTORY` snapshots
+current primary configuration and resolves every admitted Tuna publication.
+`--run` additionally installs and exercises each reachable image **sequentially**
+through `tuna-corral-journey`; `--variant NAME` limits runtime work, never hides
+other inventory rows. The only node accepted by this lane is `karnataka`.
+Only newly owned `tuna-q-variant-*` VMs/disks are created/deleted. Existing
+`punjab` and the independent soak VM are never named.
+
+```sh
+~/.cache/tuna-journey-venv/bin/python scripts/tuna-variant-qualification \
+  --out /tmp/tuna-variants-NEW --run --variant grouper --variant flounder
+```
+
+Requirements and console behavior follow [the Corral journey runbook](corral-journey.md):
+Corral bootc plugin/KubeVirt access, `gh`, `skopeo`, Python 3.11+, Pillow and
+Playwright Chromium. The script uses native pacman/RPM/dpkg package queries,
+retains booted digest/package/binary provenance, drives the VM's own noVNC
+canvas, retains frame hashes, and deletes its VM/disks. Failure manifests also
+attempt a Corral framebuffer capture before deletion. No candidate compositor,
+shell or session payload is copied into the published-image test.
+
+The portal step checks real frontend Settings, Screenshot and ScreenCast
+interface replies in the logged-in published session. It is explicitly
+**availability-only**, not consent/capture/stream/revocation qualification.
+Unreviewed frames and those interface probes never become a v1 pass. Functional
+portal and visual evidence must be supplied against the same digest, and every
+required gate must pass. Registry errors remain errors, not unsupported waivers.

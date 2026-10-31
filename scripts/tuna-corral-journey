@@ -233,7 +233,13 @@ def provision(args, guest, receipt):
     if booted['image']['image'] != args.image:
         raise RuntimeError(f"booted {booted['image']['image']}, not {args.image}")
     receipt['guest'] = {
-        'packages': guest.out('pacman -Q tuna-desktop gdm gnome-shell gnome-control-center nautilus libnotify').splitlines(),
+        'packages': guest.out(
+            'if command -v pacman >/dev/null; then pacman -Q tuna-desktop gdm gnome-shell gnome-control-center nautilus; '
+            'elif command -v rpm >/dev/null; then rpm -q tuna-desktop gdm gnome-shell gnome-control-center nautilus; '
+            'elif command -v dpkg-query >/dev/null; then dpkg-query -W tuna-desktop gdm3 gnome-shell gnome-control-center nautilus; '
+            'else echo "no supported native package query" >&2; exit 1; fi').splitlines(),
+        'tuna_payload_sha256': guest.out(
+            'sha256sum /usr/bin/tuna-session /usr/bin/tuna-compositor /usr/bin/tuna-shell-gtk /usr/bin/tuna-ibus-bridge').splitlines(),
         'kernel': guest.out('uname -r'),
         'drm_driver': guest.out('basename "$(readlink /sys/class/drm/card0/device/driver)"'),
         'modes': guest.out('cat /sys/class/drm/card0-*/modes | head -3').splitlines(),
@@ -345,6 +351,21 @@ class Journey:
                         ' | grep -E "^XDG_(SESSION_DESKTOP|CURRENT_DESKTOP|SESSION_TYPE)="')
             check('session desktop is tuna', 'XDG_SESSION_DESKTOP=tuna' in env, env.splitlines())
         self.step('session-is-tuna', 'Password login starts Tuna Desktop (lands in the overview)', login)
+
+        def portals(check):
+            # Availability is not a successful capture/consent flow. Keep the
+            # distinction in the receipt and in the variant qualification report.
+            probes = [
+                ('settings', 'org.freedesktop.portal.Settings.Read org.freedesktop.appearance color-scheme'),
+                ('screenshot', 'org.freedesktop.DBus.Properties.Get org.freedesktop.portal.Screenshot version'),
+                ('screencast', 'org.freedesktop.DBus.Properties.Get org.freedesktop.portal.ScreenCast AvailableSourceTypes'),
+            ]
+            for name, method in probes:
+                code, stdout, stderr = g.sh(
+                    'timeout 30s gdbus call --session --dest org.freedesktop.portal.Desktop '
+                    '--object-path /org/freedesktop/portal/desktop --method ' + method, user=True)
+                check(name + ' portal responds', code == 0, {'exit': code, 'stdout': stdout, 'stderr': stderr})
+        self.step('portal-availability', 'Published portal interfaces respond (not capture consent)', portals)
 
         def desktop(check):
             c.key('Escape', wait=3000)
@@ -564,6 +585,20 @@ def main():
             console.open()
             Journey(args, guest, console, receipt, out).run()
             console.close()
+    except Exception as error:
+        receipt['error'] = f'{type(error).__name__}: {error}'
+        # A failed install/readiness gate must retain its console evidence too.
+        # Do not turn inability to obtain a frame into a passing readiness gate.
+        try:
+            frame = out / 'failure-console.png'
+            capture = run(['corral', 'screenshot', args.vm, '-o', str(frame)], timeout=90, check=False)
+            receipt['failure_capture'] = {'exit': capture.returncode, 'stderr': capture.stderr}
+            if capture.returncode == 0:
+                receipt['failure_capture'].update(
+                    frame=frame.name, sha256=hashlib.sha256(frame.read_bytes()).hexdigest())
+        except Exception as capture_error:
+            receipt['failure_capture'] = {'error': f'{type(capture_error).__name__}: {capture_error}'}
+        raise
     finally:
         if console_proc:
             console_proc.terminate()

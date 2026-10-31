@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "variant": "wahoo",
+  "before": {
+    "reference": "ghcr.io/tuna-os/wahoo:tuna",
+    "receipt": "registry-matrix.json",
+    "result": "manifest unknown"
+  },
+  "publication": {
+    "workflow": "tuna-os/tunaOS/.github/workflows/build-wahoo.yml",
+    "run": "https://github.com/tuna-os/tunaOS/actions/runs/41213085155",
+    "source_revision": "124cc32623ce084580a2ef888350be07bd83508d",
+    "inputs": {"flavor": "tuna"},
+    "conclusion": "success",
+    "observed_green_jobs": ["tuna / linux-amd64", "tuna / Desktop contract", "tuna / Gate", "tuna / Sign", "tuna / Promote"],
+    "qualification_limit": "Publishing/build boot gate is not per-digest real-GDM/session/portal/lock qualification. No current desktop-source behavior inferred from image version label."
+  },
+  "after": {
+    "reference": "ghcr.io/tuna-os/wahoo@sha256:865ec5320f25ae368316f07b4d3b49b5e0600308e5bc50b973ace90a5b53a46d",
+    "image_created": "2026-10-31T15:18:15.601813829Z",
+    "architecture": "amd64",
+    "os": "linux",
+    "image_version_label": "124cc32",
+    "resolver": "skopeo inspect --no-tags --override-arch amd64 docker://ghcr.io/tuna-os/wahoo:tuna"
+  }
+}

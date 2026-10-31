@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Discover the current TunaOS inventory, pin published images, and run Corral journeys.
+
+No image rebuild, package installation, source overlay, tag mutation or support
+waiver occurs here. A successful machine journey still needs visual review and
+functional portal consent/capture evidence before it qualifies for v1.
+"""
+import argparse
+import base64
+import datetime
+import hashlib
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tomllib
+
+
+def command(argv, timeout=120):
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    return {'argv': argv, 'exit': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}
+
+
+def github(path):
+    result = command(['gh', 'api', path])
+    if result['exit']:
+        raise RuntimeError(json.dumps(result))
+    return json.loads(result['stdout'])
+
+
+def save(path, report):
+    path.write_text(json.dumps(report, indent=2) + '\n')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--out', required=True, type=Path, help='new evidence directory')
+    parser.add_argument('--run', action='store_true', help='install and exercise published images; default probes registry only')
+    parser.add_argument('--variant', action='append', help='limit runtime journeys, not inventory or registry discovery')
+    parser.add_argument('--node', default='karnataka')
+    args = parser.parse_args()
+    if args.node != 'karnataka':
+        parser.error('this qualification lane is restricted to karnataka')
+    args.out.mkdir(parents=True, exist_ok=False)
+    started = datetime.datetime.now(datetime.timezone.utc)
+    report = {'schema': 1, 'started': started.isoformat(), 'variants': [],
+              'qualification': 'No v1 pass inferred from registry/package availability or unreviewed frames.'}
+    report['runner_sha256'] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    receipt = args.out / 'matrix.json'
+    save(receipt, report)
+    try:
+        sha = github('repos/tuna-os/tunaOS/commits/main')['sha']
+        source = github(f'repos/tuna-os/tunaOS/contents/tunaos.toml?ref={sha}')
+        raw = base64.b64decode(source['content'])
+        config = tomllib.loads(raw.decode())
+        (args.out / 'tunaos.toml').write_bytes(raw)
+        report['source'] = {'repository': 'tuna-os/tunaOS', 'revision': sha, 'path': 'tunaos.toml',
+                            'sha256': hashlib.sha256(raw).hexdigest()}
+        if set(config['variants']) != set(config['tuna_rollout']):
+            raise RuntimeError('variant inventory and Tuna rollout keys differ')
+        unknown = set(args.variant or []) - set(config['variants'])
+        if unknown:
+            raise RuntimeError(f'unknown runtime variants: {sorted(unknown)}')
+        for name, variant in config['variants'].items():
+            rollout = config['tuna_rollout'][name]
+            row = {'variant': name, 'base': variant['description'], 'rollout': rollout,
+                   'qualification': 'not-qualified', 'runtime': 'not-run'}
+            row['gates'] = dict.fromkeys(('install', 'gdm-login', 'session', 'portals', 'lock-unlock', 'visual-review'), 'not-run')
+            report['variants'].append(row)
+            flavors = [f for f in variant['flavors'] if f['id'] == 'tuna']
+            row['flavors'] = flavors
+            if rollout['status'] == 'unsupported':
+                if not rollout.get('reason') or flavors:
+                    raise RuntimeError(f'inconsistent unsupported declaration for {name}')
+                row['qualification'] = 'source-declared-unsupported'
+                save(receipt, report)
+                continue
+            if len(flavors) != 1 or not flavors[0].get('build_image'):
+                raise RuntimeError(f'admitted variant {name} has no enabled Tuna image')
+            repo = variant.get('publish_name', name)
+            tag = 'tuna' + ('-' + variant['tag_suffix'] if variant.get('tag_suffix') else '')
+            ref = f'ghcr.io/tuna-os/{repo}:{tag}'
+            row['published_tag'] = ref
+            try:
+                probe = command(['skopeo', 'inspect', '--no-tags', '--override-arch', 'amd64', 'docker://' + ref], timeout=180)
+                row['registry'] = probe
+                if probe['exit']:
+                    row['runtime'] = 'blocked-registry'
+                    continue
+                image = json.loads(probe['stdout'])
+                digest = image['Digest']
+                if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+                    raise RuntimeError(f'invalid registry digest {digest!r}')
+                row['image'] = f'ghcr.io/tuna-os/{repo}@{digest}'
+                row['image_metadata'] = image
+            except (subprocess.TimeoutExpired, OSError, ValueError, KeyError) as error:
+                row['runtime'] = 'failed'
+                row['error'] = f'{type(error).__name__}: {error}'
+            finally:
+                save(receipt, report)
+        # Finish the full publication inventory before spending VM resources.
+        for row in report['variants']:
+            name = row['variant']
+            if not args.run or 'image' not in row or (args.variant and name not in args.variant):
+                continue
+            vm = f'tuna-q-variant-{name}-{started.strftime("%m%d%H%M%S")}'
+            directory = args.out / name
+            runner = Path(__file__).resolve().with_name('tuna-corral-journey')
+            row['runtime'] = 'running'
+            save(receipt, report)
+            try:
+                result = command([sys.executable, str(runner), '--image', row['image'], '--vm', vm,
+                                  '--node', args.node, '--out', str(directory)], timeout=7200)
+                save(args.out / f'{name}-runner.json', result)
+                row['runner_exit'] = result['exit']
+                manifest_path = directory / 'manifest.json'
+                if manifest_path.exists():
+                    manifest = json.loads(manifest_path.read_text())
+                    row['manifest'] = str(manifest_path.relative_to(args.out))
+                    row['manifest_sha256'] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+                    row['steps'] = {s['id']: s['result'] for s in manifest['steps']}
+                    row['cleanup'] = manifest.get('cleanup')
+                    row['guest'] = manifest.get('guest')
+                    steps = row['steps']
+                    row['gates'].update({
+                        'install': 'pass' if manifest.get('image', {}).get('booted') == row['image'] else 'not-proven',
+                        'gdm-login': 'pass' if all(steps.get(s) == 'pass' for s in ('greeter-user-list', 'greeter-password', 'session-is-tuna')) else 'not-proven',
+                        'session': steps.get('session-is-tuna', 'not-run'),
+                        'portals': 'availability-only' if steps.get('portal-availability') == 'pass' else steps.get('portal-availability', 'not-run'),
+                        'lock-unlock': 'pass' if all(steps.get(s) == 'pass' for s in ('lock', 'unlock-refused', 'unlock')) else 'not-proven',
+                    })
+                row['runtime'] = 'machine-journey-passed-needs-review' if result['exit'] == 0 else 'failed'
+                if not (row.get('cleanup') or {}).get('deleted'):
+                    row['runtime'] = 'failed'
+                    row['error'] = 'owned VM/disk cleanup unproven; refusing to create another VM'
+                    raise RuntimeError(row['error'])
+            except (subprocess.TimeoutExpired, OSError, ValueError, KeyError) as error:
+                row['runtime'] = 'failed'
+                row['error'] = f'{type(error).__name__}: {error}'
+                cleanup = command(['corral', '--json', 'delete', vm, '-f', '--wait', '--timeout', '10m'], timeout=900)
+                row['emergency_cleanup'] = cleanup
+                inventory = command(['corral', '--json', 'list', '--prefix', vm], timeout=120)
+                row['emergency_cleanup_inventory'] = inventory
+                deleted = json.loads(cleanup['stdout']) if cleanup['exit'] == 0 else []
+                absent = json.loads(inventory['stdout']) == [] if inventory['exit'] == 0 else False
+                if not deleted or not all(item.get('deleted') for item in deleted) or not absent:
+                    raise RuntimeError('owned VM/disk cleanup unproven; refusing to create another VM')
+            finally:
+                save(receipt, report)
+    finally:
+        report['finished'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        save(receipt, report)
+    print(receipt)
+    # Source-declared unsupported is visible, never silently counted as a pass.
+    return 1 if any(r['runtime'] in ('failed', 'blocked-registry') for r in report['variants']) else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
