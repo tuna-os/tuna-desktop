@@ -1,0 +1,71 @@
+name: Cached exact CI tool
+description: Restore isolated tool installations; only trusted main may publish them.
+inputs:
+  tool:
+    description: cargo-audit, cargo-llvm-cov or gtk4-layer-shell
+    required: true
+  version:
+    description: Exact Cargo version or gtk4-layer-shell source revision
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Exclude private workflow tooling from candidate scans
+      shell: bash
+      run: |
+        set -euo pipefail
+        exclude=$(git -C "$GITHUB_WORKSPACE" rev-parse --path-format=absolute --git-path info/exclude)
+        printf '\n/.ci-workflow-tools/\n' >> "$exclude"
+    - name: Identify exact tool environment
+      id: identity
+      shell: bash
+      env:
+        TOOL: ${{ inputs.tool }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "$TOOL:$VERSION" in
+          cargo-audit:0.22.2|cargo-llvm-cov:0.9.1|gtk4-layer-shell:4867d7b85cdf1e829fc1fd6f1d5f04c42cc99389) ;;
+          *) echo 'Unsupported exact CI tool pin' >&2; exit 1 ;;
+        esac
+        identity=$({ cat /etc/os-release; uname -m; rustc -vV; cargo -V; printf '%s\n' "target=${CARGO_BUILD_TARGET:-host}" "rustflags=${RUSTFLAGS:-}" "encoded-rustflags=${CARGO_ENCODED_RUSTFLAGS:-}"; dpkg-query -W -f='${binary:Package}=${Version}\n' | LC_ALL=C sort; } | sha256sum | cut -d' ' -f1)
+        content=$(cat "$GITHUB_ACTION_PATH/action.yml" "$GITHUB_ACTION_PATH/../../../scripts/ci-install-gtk4-layer-shell" | sha256sum | cut -d' ' -f1)
+        echo "key=ci-tool-v1-$TOOL-$VERSION-$identity-$content" >> "$GITHUB_OUTPUT"
+        echo "path=$RUNNER_TEMP/ci-tool-$TOOL" >> "$GITHUB_OUTPUT"
+    - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      id: cache
+      with:
+        path: ${{ steps.identity.outputs.path }}
+        key: ${{ steps.identity.outputs.key }}
+    - name: Install exact tool on cache miss
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        TOOL: ${{ inputs.tool }}
+        VERSION: ${{ inputs.version }}
+        TOOL_ROOT: ${{ steps.identity.outputs.path }}
+      run: |
+        set -euo pipefail
+        if [[ "$TOOL" == gtk4-layer-shell ]]; then
+          TUNA_GTK_DESTDIR="$TOOL_ROOT" "$GITHUB_ACTION_PATH/../../../scripts/ci-install-gtk4-layer-shell"
+        else
+          cargo install "$TOOL" --version "=$VERSION" --locked --root "$TOOL_ROOT"
+        fi
+    - name: Activate exact tool
+      shell: bash
+      env:
+        TOOL: ${{ inputs.tool }}
+        TOOL_ROOT: ${{ steps.identity.outputs.path }}
+      run: |
+        set -euo pipefail
+        if [[ "$TOOL" == gtk4-layer-shell ]]; then
+          sudo cp -a --no-preserve=ownership "$TOOL_ROOT/usr/local/." /usr/local/
+          sudo ldconfig
+        else
+          echo "$TOOL_ROOT/bin" >> "$GITHUB_PATH"
+        fi
+    - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      if: steps.cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+      with:
+        path: ${{ steps.identity.outputs.path }}
+        key: ${{ steps.identity.outputs.key }}
