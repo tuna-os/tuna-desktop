@@ -536,8 +536,9 @@ fn source_of(n: &Notification) -> (String, Option<gio::Icon>) {
     }
 }
 
-/// The installed app a `desktop-entry` hint names, if any.
-fn desktop_app(id: &str) -> Option<tuna_shell_host::apps::AppEntry> {
+/// The installed app a desktop id names, if any (a `desktop-entry` hint,
+/// a media player's `DesktopEntry`).
+pub(crate) fn desktop_app(id: &str) -> Option<tuna_shell_host::apps::AppEntry> {
     tuna_shell_host::apps::default_app_dirs()
         .into_iter()
         .map(|dir| dir.join(format!("{id}.desktop")))
@@ -547,7 +548,7 @@ fn desktop_app(id: &str) -> Option<tuna_shell_host::apps::AppEntry> {
 
 /// A `Notify` app_icon as GNOME reads it: a file URI, an absolute path,
 /// or an icon name.
-fn source_icon(icon: &str) -> Option<gio::Icon> {
+pub(crate) fn source_icon(icon: &str) -> Option<gio::Icon> {
     if icon.is_empty() {
         None
     } else if icon.starts_with("file://") {

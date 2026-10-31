@@ -25,6 +25,11 @@
 #                        the locked screen at once; unlocking takes the
 #                        list away and the queued banners, with their
 #                        sound, follow
+#   G-NOTIFY-LOCK-MEDIA  an MPRIS player that can play lists above the
+#                        sources with its app name, track and artists
+#                        (MediaMessage); Play reaches it while locked and
+#                        turns to Pause; its app's show-in-lock-screen
+#                        and leaving the bus take it away
 #   G-NOTIFY-SOUND       a banner plays its sound-name (else sound-file)
 #                        through the event-sound player as it shows,
 #                        unless enable-sound-alerts or event-sounds is off
@@ -252,6 +257,47 @@ notify_lock_proof() {
         fail G-NOTIFY-LOCK-LIVE "the global show-in-lock-screen on did not bring the sources back"
     [ "$(nl_sounds)" = "$nl_sounds_locked" ] ||
         fail G-NOTIFY-LOCK-LIVE "a notification sound played while locked"
+
+    # Media players list above the sources (mpris.js, MediaMessage).
+    printf '[Desktop Entry]\nName=Tuna Proof Music\nExec=true\nType=Application\n' \
+        >"$nl_desktop_dir/tuna-proof-player.desktop"
+    : >"$ARTIFACTS/lock-mpris-calls"
+    "$PY" "$ROOT/scripts/lib/tuna-mpris-player-stub.py" "$ARTIFACTS/lock-mpris-calls" 120 tunalock \
+        >"$ARTIFACTS/lock-mpris.log" 2>&1 &
+    nl_player=$!
+    nl_until media '[.[] | select(.showing)] | (any(.name == "Tuna Proof Track") and any(.name == "Tuna Proof Artist") and any(.name == "Tuna Proof Music"))' G-NOTIFY-LOCK-MEDIA ||
+        fail G-NOTIFY-LOCK-MEDIA "the locked screen does not list the player's track, artist and app"
+    button_showing "$nl_tree" "Play" || fail G-NOTIFY-LOCK-MEDIA "the paused player shows no Play control"
+    button_showing "$nl_tree" "Next" || fail G-NOTIFY-LOCK-MEDIA "the player shows no Next control"
+    nl_shot media
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-notify-media-press.json" 20 \
+        --press "Play" || fail G-NOTIFY-LOCK-MEDIA "could not press Play"
+    nl_end=$(($(date +%s) + 5))
+    until grep -q '^call PlayPause ' "$ARTIFACTS/lock-mpris-calls"; do
+        [ "$(date +%s)" -lt "$nl_end" ] || fail G-NOTIFY-LOCK-MEDIA "Play on the lock screen did not reach the player"
+        sleep 0.3
+    done
+    nl_until media-playing 'any(.[]; .showing and .name == "Pause" and (.role == "push button" or .role == "button"))' G-NOTIFY-LOCK-MEDIA ||
+        fail G-NOTIFY-LOCK-MEDIA "the control did not turn to Pause once the player played"
+    gsettings get "$NL_SCHEMA" application-children | grep -q "'tuna-proof-player'" ||
+        fail G-NOTIFY-LOCK-MEDIA "the player's app was not registered in application-children"
+    gsettings set "$(nl_app tuna-proof-player)" show-in-lock-screen false
+    nl_until media-off '(any(.[]; .showing and .name == "Tuna Proof Track")) | not' G-NOTIFY-LOCK-MEDIA ||
+        fail G-NOTIFY-LOCK-MEDIA "the app's show-in-lock-screen off left the player on the lock screen"
+    gsettings set "$(nl_app tuna-proof-player)" show-in-lock-screen true
+    nl_until media-on 'any(.[]; .showing and .name == "Tuna Proof Track")' G-NOTIFY-LOCK-MEDIA ||
+        fail G-NOTIFY-LOCK-MEDIA "the app's show-in-lock-screen on did not bring the player back"
+    kill "$nl_player" 2>/dev/null || true
+    wait "$nl_player" 2>/dev/null || true
+    nl_until media-gone '(any(.[]; .showing and .name == "Tuna Proof Track")) | not' G-NOTIFY-LOCK-MEDIA ||
+        fail G-NOTIFY-LOCK-MEDIA "the player stayed on the lock screen after leaving the bus"
+    cstate '.locked' "still locked after the media controls" 2 ||
+        fail G-NOTIFY-LOCK-MEDIA "the media controls unlocked the session"
+    for nl_key in show-in-lock-screen application-id; do
+        gsettings reset "$(nl_app tuna-proof-player)" "$nl_key"
+    done
+    rm -f "$nl_desktop_dir/tuna-proof-player.desktop"
+    pass G-NOTIFY-LOCK-MEDIA "a player that can play lists above the sources with its app, track and artist; its controls drive it while locked; its app's show-in-lock-screen and leaving the bus take it away"
     xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT * 3 / 4)) click 1
     sleep 1
     xdotool type --delay 30 "$UNLOCK_PASSWORD"
