@@ -2670,15 +2670,27 @@ class TourRecorderTests(unittest.TestCase):
     def test_success_cancels_watchdog_before_next_command(self):
         import socket
         import threading
-        import time
+        # Advance watchdog time explicitly; socket/thread scheduling must not
+        # consume the 80 ms window that this regression previously relied on.
+        class ControlledTimer(threading.Timer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.deadline_reached = threading.Event()
+                timers.append(self)
+
+            def run(self):
+                self.deadline_reached.wait(self.interval)
+                if not self.finished.is_set():
+                    self.function(*self.args, **self.kwargs)
+                self.finished.set()
+
+            def cancel(self):
+                super().cancel()
+                self.deadline_reached.set()
+
         left, right = socket.socketpair()
-        right.settimeout(1)
+        right.settimeout(10)
         timers, errors = [], []
-        timer_class = threading.Timer
-        def timer(*args, **kwargs):
-            instance = timer_class(*args, **kwargs)
-            timers.append(instance)
-            return instance
         def server():
             try:
                 with right.makefile("rw") as stream:
@@ -2695,10 +2707,17 @@ class TourRecorderTests(unittest.TestCase):
         qmp = lane.baseline.Qmp.__new__(lane.baseline.Qmp)
         qmp.sock, qmp.file = left, left.makefile("rw")
         try:
-            with tempfile.TemporaryDirectory() as directory, patch.object(lane.threading, "Timer", timer):
-                recorder = lane.Recorder(qmp, directory, timeout=0.08)
+            with tempfile.TemporaryDirectory() as directory, patch.object(lane.threading, "Timer", ControlledTimer):
+                recorder = lane.Recorder(qmp, directory, timeout=10)
                 recorder.still("intro")
-                time.sleep(0.1)  # Beyond the canceled first watchdog's deadline.
+                self.assertEqual(len(timers), 1)
+                self.assertGreater(timers[0].interval, 0)
+                self.assertLessEqual(timers[0].interval, recorder.timeout)
+                self.assertTrue(timers[0].finished.is_set())
+                self.assertFalse(timers[0].is_alive())
+                # The first deadline has elapsed before input resumes. A
+                # canceled, joined callback cannot retire the shared socket.
+                timers[0].deadline_reached.set()
                 self.assertEqual(qmp.cmd("send-key"), {})
                 recorder.close()
                 self.assertEqual(len(timers), 2)

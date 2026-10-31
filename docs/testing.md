@@ -102,6 +102,7 @@ settings local builds need (`just` lists the recipes):
 | `just proof <name> [args]` | `scripts/tuna-<name> --artifacts <tmp>`, e.g. `just proof gtk-shell-proof` |
 | `just ci-artifacts <run> [name]` | downloads a CI run's artifacts and prints the directory |
 | `just clean` / `just gc` | deletes this worktree's target / frees disk (below) |
+| `just disk-guard [--watch [s]]` | frees disk now, or keeps checking every `s` seconds (below) |
 
 Every build uses its own checkout's `target/` (an inherited
 `CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one),
@@ -125,8 +126,19 @@ Cleanup is automatic where it is safe:
   or closed, removes those worktrees when they have no uncommitted
   changes, and expires `just ci-artifacts` downloads after six hours. It
   never touches the main checkout or the worktree it runs from;
-- any build recipe runs `just gc` first when less than 20 GiB of disk is
-  free (`TUNA_MIN_FREE_GB`).
+- `just disk-guard` (`scripts/tuna-disk-guard`), when less than 40 GiB
+  is free on the repository's filesystem (`TUNA_MIN_FREE_GB`), deletes
+  the `target/` of each of this repository's worktrees that no running
+  process references (by working directory, executable, arguments or
+  environment) and that nothing touched for 45 minutes
+  (`TUNA_IDLE_MINUTES`), plus `/tmp/tuna-proof-*` and `just ci-artifacts`
+  entries older than 90 minutes. It logs each removal and leaves the main
+  checkout's target alone unless given `--include-main`. `--watch
+  [seconds]` repeats it (default every 600 s); on a shared host run it
+  that way from a clean checkout of `main`;
+- any build recipe runs `just disk-guard` first (it only removes anything
+  below `TUNA_MIN_FREE_GB`, 40 GiB); automatic cleanup never calls `gc`,
+  whose merged-PR cleanup is not process-aware.
 
 VM lanes need KVM, so they run in CI's `marlin-vm` jobs or on a Corral
 VM, not through these recipes.
@@ -140,6 +152,10 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+The SVG helper checks a bounded inventory of raw directory names twice through
+the same open descriptor. A membership change rejects the receipt even when
+directory timestamps do not change. This is not an atomic filesystem snapshot.
 
 Clippy runs with `-D warnings`, so any warning fails CI.
 
@@ -268,6 +284,14 @@ both interfaces, so `tuna-portals.conf` routes them to a working backend),
 under `repeat-NN/`; `repeat-manifest.json` records every boot, while the
 root `assertions.txt` aggregates results for the parity ledger.
 
+The installed strip gate validates both PNG and PPM pixels against the same
+owned window geometry. A transient obstruction or an unpresented frame may
+retry for at most 10 seconds, within the existing 120-second strip deadline.
+The first rejected image pair is retained as `*-not-ready.{png,ppm}`; the
+receipt records capture attempts. Window identity/geometry drift, malformed
+images and QMP failures remain terminal. A retry never qualifies pixels from
+the rejected frame or claims presentation latency.
+
 The artifact (`marlin-vm`) holds `serial.log`, `tuna-lines.log` (every
 `tuna-*` line), the boot frames, `V-OVERVIEW.png` (the login overview),
 `V-SESSION.png` (the desktop), and `manifest.json`.
@@ -339,6 +363,14 @@ Proof `G-ANIMATION-CLOCK` samples the overview this way at 125 and 250 ms
 in both directions. `G-ANIMATIONS-OFF` and `G-INTROSPECT-MOTION` check the
 live motion policy: animations off snaps everything, Reduced Motion
 (fade-only) snaps overview and strip motion but keeps the idle-shield fade.
+
+The shell's Alt+Tab fades read the same clock (`crates/shell-gtk/src/anim_clock.rs`),
+and the compositor state lists `switcher_thumbnail_alphas`, the opacity each
+switcher window image is drawn at. `G-SWITCHER-FADE` freezes the clock and
+samples them at 0, 50 and 100 ms of the thumbnails' fade in and 50 ms into
+the fade out (Alt+Escape, which cancels without moving focus), where GNOME's
+ease-out quad gives 0, 191/255 and 1, then 64/255. The grid-cancel comparison
+slice skips the sampling: its old binaries predate the published alphas.
 
 ## Frame cost
 

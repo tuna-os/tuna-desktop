@@ -785,6 +785,17 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// Tell the compositor the panel menu closing now goes unanimated
+    /// (`PanelMenu.Button.vfunc_hide`): draw no BoxPointer close for it.
+    pub fn close_menu_unanimated(&mut self) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::CloseMenuUnanimated,
+        })?;
+        Ok(id)
+    }
+
     /// Carry out one of GNOME's window-menu actions. Returns the request id.
     pub fn window_action(
         &mut self,
@@ -2032,6 +2043,19 @@ mod tests {
             Message::Command {
                 id: second,
                 kind: CommandKind::PadOsdClosed { pad: 3 },
+            }
+        );
+    }
+
+    #[test]
+    fn unanimated_menu_close_reaches_the_compositor() {
+        let (mut client, mut peer) = handshook();
+        let id = client.close_menu_unanimated().expect("sent");
+        assert_eq!(
+            server_read(&mut peer),
+            Message::Command {
+                id,
+                kind: CommandKind::CloseMenuUnanimated,
             }
         );
     }

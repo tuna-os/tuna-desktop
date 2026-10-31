@@ -54,7 +54,14 @@ try:
     }
     (artifacts / "owned-accessibility.json").write_text(json.dumps(identity, indent=2) + "\n")
     (artifacts / "guard-ready").write_text("ready\n")
+    # Bounded: a harness that died without writing guard-stop must not leave
+    # this guard (and the services it owns) running on the host forever.
+    stop_deadline = time.monotonic() + 1800
+    stop_missed = False
     while not (artifacts / "guard-stop").exists():
+        if time.monotonic() >= stop_deadline:
+            stop_missed = True
+            break
         time.sleep(.05)
     # A live DBus connection must not keep the daemon open during shutdown.
     connection.close_sync(None)
@@ -69,6 +76,8 @@ try:
                 raise RuntimeError(f"owned service did not exit: {name} pid={pid}")
     identity["exit_verified"] = True
     (artifacts / "owned-accessibility.json").write_text(json.dumps(identity, indent=2) + "\n")
+    if stop_missed:
+        raise RuntimeError("guard-stop did not appear within 1800 s; retired owned services")
 finally:
     for _, _, fd in owned:
         os.close(fd)

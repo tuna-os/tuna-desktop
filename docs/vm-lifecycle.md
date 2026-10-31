@@ -51,7 +51,6 @@ The Debian package journey must retain the original beta package's
 upgrade could qualify. PR #930 restores those bytes;
 the fresh-account change must include that fix, not force a conffile
 answer or change PAM policy to bypass the upgrade failure.
-
 The Python lane.boot API keeps its original four-value return and original
 VM device profile by default. Lifecycle callers explicitly request
 `guest_agent=True` to add the QGA transport and receive its socket as a fifth

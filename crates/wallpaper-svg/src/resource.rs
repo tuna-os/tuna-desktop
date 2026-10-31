@@ -4,7 +4,10 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{Metadata, OpenOptions},
     io::Read,
-    os::unix::{ffi::OsStrExt, fs::MetadataExt, fs::OpenOptionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::{ffi::OsStrExt, fs::MetadataExt, fs::OpenOptionsExt},
+    },
     path::Path,
 };
 
@@ -98,7 +101,6 @@ fn observe_with(
             // The /proc fd binds enumeration to the opened directory, even if
             // its configured pathname is concurrently replaced. No recursive
             // walk and no following member symlinks is needed for membership.
-            use std::os::fd::AsRawFd;
             for entry in std::fs::read_dir(format!("/proc/self/fd/{}", file.as_raw_fd()))? {
                 let name = entry?.file_name();
                 members.push(name.as_bytes().to_vec());
@@ -117,6 +119,21 @@ fn observe_with(
         }
     };
     after_read();
+    if matches!(kind, Kind::FontConfigDirectory) {
+        // Directory timestamps and size can collide across a member change.
+        // Compare a second bounded inventory of the same opened directory.
+        let mut current_members = Vec::with_capacity(members.len());
+        for entry in std::fs::read_dir(format!("/proc/self/fd/{}", file.as_raw_fd()))? {
+            current_members.push(entry?.file_name().as_bytes().to_vec());
+            if current_members.len() > limits.members {
+                return Err("FontConfig directory member bound".into());
+            }
+        }
+        current_members.sort();
+        if members != current_members {
+            return Err("native resource changed during observation".into());
+        }
+    }
     if identity(&before) != identity(&file.metadata()?)
         || identity(&before) != identity(&path.metadata()?)
     {
@@ -203,6 +220,19 @@ mod tests {
             std::fs::rename(replacement, &file).unwrap();
         })
         .is_err());
+    }
+
+    #[test]
+    fn concurrent_directory_rescan_retains_member_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["one.conf", "two.conf"] {
+            std::fs::write(temp.path().join(name), b"").unwrap();
+        }
+        let error = observe_with(temp.path(), Kind::FontConfigDirectory, limits(), || {
+            std::fs::write(temp.path().join("three.conf"), b"").unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "FontConfig directory member bound");
     }
     #[test]
     fn directory_retains_raw_member_names_and_native_file_symlinks() {
