@@ -433,10 +433,11 @@ jobs:
           sudo install -d -m0755 /usr/libexec/tuna-deb-proof
           sudo install -m0755 target/release/examples/icon-probe target/release/examples/shortcut-inhibit-client /usr/libexec/tuna-deb-proof/
           python3 - <<'PY'
-          import hashlib, json, os
+          import hashlib, json, os, subprocess
           from pathlib import Path
           root = Path('target/release/examples')
-          value = {'commit': os.environ['GITHUB_SHA'], 'files': {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in ('icon-probe', 'shortcut-inhibit-client')}}
+          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          value = {'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'pr_head': event.get('pull_request', {}).get('head', {}).get('sha'), 'files': {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in ('icon-probe', 'shortcut-inhibit-client')}}
           Path('package-artifacts/installed/companions.json').write_text(json.dumps(value) + '\n')
           PY
           sudo install -m0644 package-artifacts/installed/companions.json /usr/libexec/tuna-deb-proof/provenance.json
@@ -926,6 +927,8 @@ jobs:
               (artifacts / 'receipt.json').write_text(json.dumps({'build_admission': admission, 'argv': argv, 'exit_status': exit_status, 'executable_unchanged_after': unchanged, 'output_sha256': hashlib.sha256((artifacts / 'output.txt').read_bytes()).hexdigest(), 'scope': scope}, indent=2) + '\n')
               if exit_status != 0 or not unchanged or '1 passed; 0 failed; 0 ignored' not in text or marker not in text:
                   raise RuntimeError(f'actual admitted {name} test did not pass')
+              if name == 'grid-tick-trace' and any(required not in text for required in ('grid-anim page-switch tick ', 'schedstat=available', 'grid-anim page-clock phase=before-paint ', 'grid-anim page-clock phase=after-paint ')):
+                  raise RuntimeError('grid tick/paint observer did not emit actual clock and populated scheduler observations')
           PY
       - name: Prove real MediaKeys callback completion and forced clamp interleave
         run: |

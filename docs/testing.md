@@ -340,6 +340,30 @@ Low CPU/runqueue deltas alone cannot identify a compositor, renderer, protocol
 or presentation stall. These observations attribute callback gaps only within
 their measured scope and do not replace the unchanged frame/dot coverage gate.
 
+With tracing enabled, the grid window also records its GDK before-paint,
+update, layout, paint and after-paint phases with monotonic/frame-clock times,
+frame counter and native Wayland surface ID (explicitly unavailable on X11).
+Handlers are attached only to the traced realized grid and disconnected on
+unrealize. These are toolkit phase observations, **not** client protocol issue,
+flush, callback receipt or presentation timestamps. Server-side request-arrival,
+applied-commit, callback-drain and flush observations must establish those
+separate boundaries before attributing a gap to compositor scheduling.
+Compositor records use `tuna-grid-compositor:` and the same CLOCK_MONOTONIC
+microseconds. `commit_arrival` is the server precommit hook after frame requests
+have populated pending state, not their socket or client-issue time;
+`commit_applied` reports current state, possibly including older callbacks.
+`callback_drained` records actual callback identities removed by the unchanged
+Smithay sender with before/after-send times. It establishes `done` queued,
+not client receipt. Nested bind, render-finish, submit, no-repaint decisions and
+client-flush boundaries retain their real outcomes. The nested path's current
+lack of a post-render flush is recorded, not silently repaired by the observer.
+Disabled tracing performs no observer clock reads, allocation or surface walks.
+
+The installed `journey` qualification intentionally checks out the pull-request
+merge commit. Its companion receipt records that actual `git rev-parse HEAD`
+alongside the pull-request head SHA, so merge-source installed evidence remains
+distinct from the exact-head native GTK proof.
+
 | CI job | Command | Extra packages | What it asserts |
 |---|---|---|---|
 | `journey` | `scripts/tuna-journey --artifacts journey-artifacts` | `xvfb xdotool x11-apps scrot jq dbus`, Mesa EGL (`libegl1 libgl1-mesa-dri`) | Overview, search, launch from search, Escape, workspace switch, Alt+Tab; writes `assertions.txt` |
