@@ -6391,7 +6391,8 @@ wb_press_banner() {
             fail "$wbpb_gate" "keep-alive failed"
         wbpb_step=$((wbpb_step + 1))
         sleep 0.5
-        if wb_a11y_dump "$wbpb_out" 20 --when-showing "$wbpb_title" >/dev/null 2>&1; then
+        if wb_a11y_dump "$wbpb_out" 20 >/dev/null 2>&1 &&
+            jq -e --arg title "$wbpb_title" 'any(.[]; .showing and .name == $title)' "$wbpb_out" >/dev/null; then
             xdotool key super+n || fail "$wbpb_gate" "could not expand the due banner"
             sleep 0.3
         fi

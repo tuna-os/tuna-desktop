@@ -65,9 +65,11 @@ WID=1 WIDTH=1280 HEIGHT=800
 sleep() { :; }
 fail() { exit 1; }
 xdotool() { if [ "$1" = key ]; then printf 'key:%s\\n' "$2"; fi; }
+jq() { :; }
 wb_a11y_dump() {
     case " $* " in
         *" --press "*) printf 'press\\n' >&3 ;;
+        *" --when-showing "*) return 2 ;; # The real dumper requires --press.
         *) printf 'observe\\n' >&3 ;;
     esac
 }
