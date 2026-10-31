@@ -14,8 +14,8 @@ metadata:
 # Every pod in tuna-ci must be a contained runner: its own user namespace
 # (root and CAP_SYS_ADMIN in the pod are an unprivileged uid range on the
 # node), no privileged containers, no host namespaces, ports or paths, only
-# emptyDir volumes, no service account token, no capability beyond
-# SYS_ADMIN. Devices come only from device plugins (KubeVirt's tun).
+# emptyDir or job-owned scratch volumes, no service account token, no
+# capability beyond SYS_ADMIN. Devices come only from device plugins (KubeVirt's tun).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -47,8 +47,16 @@ spec:
       message: runner pods must not share host namespaces
     - expression: has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false
       message: runner pods must not mount a service account token
-    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir))"
-      message: runner pods may only use emptyDir volumes
+    - expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(v,
+          has(v.emptyDir) ||
+          (has(v.ephemeral) && has(v.ephemeral.volumeClaimTemplate)
+           && has(v.ephemeral.volumeClaimTemplate.spec.storageClassName)
+           && v.ephemeral.volumeClaimTemplate.spec.storageClassName == 'tuna-ci-scratch'
+           && !has(v.ephemeral.volumeClaimTemplate.spec.dataSource)
+           && !has(v.ephemeral.volumeClaimTemplate.spec.dataSourceRef)
+           && !has(v.ephemeral.volumeClaimTemplate.spec.volumeName)))
+      message: runner pods may only use emptyDir or fresh generic ephemeral tuna-ci-scratch volumes
     - expression: >-
         variables.containers.all(c,
           !(has(c.securityContext) && has(c.securityContext.privileged) && c.securityContext.privileged)

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Apply the guard rails and install/upgrade the ARC controller and both runner
-# scale sets on karnataka from the files next to this script.
+# Apply the guard rails and storage, then install/upgrade the ARC controller
+# and both runner scale sets on karnataka from the files next to this script.
 #
 #   .github/runners/deploy                 # everything
-#   .github/runners/deploy --sets-only     # just the two scale sets
+#   .github/runners/deploy --sets-only     # policy, storage and both scale sets
 #
 # Extra arguments after `--` go to both scale-set `helm upgrade` calls, e.g.
 #   .github/runners/deploy --sets-only -- --set minRunners=0 --set maxRunners=0
@@ -21,8 +21,13 @@ if [[ ${1:-} == --sets-only ]]; then
 fi
 [[ ${1:-} == -- ]] && shift
 
+# Both modes must admit scratch PVCs before updating the runner templates.
+kubectl --context "$context" apply -f "$here/cluster.yaml"
+kubectl --context "$context" apply -f "$here/storage.yaml"
+kubectl --context "$context" -n tuna-ci-storage rollout status \
+  deployment/tuna-ci-scratch-provisioner --timeout=120s
+
 if ! $sets_only; then
-  kubectl --context "$context" apply -f "$here/cluster.yaml"
   helm --kube-context "$context" upgrade --install arc "$charts/gha-runner-scale-set-controller" \
     --namespace arc-systems --create-namespace --version "$chart_version" \
     --set flags.watchSingleNamespace=tuna-ci

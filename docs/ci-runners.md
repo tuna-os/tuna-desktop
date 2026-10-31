@@ -18,7 +18,8 @@ v4), `gh` logged in as an org admin, and `ssh karnataka` with sudo.
 | Scale set `tuna-ci-26.04` | namespace `tuna-ci`, release `tuna-ci-26-04` | [values](../.github/runners/values-26.04.yaml); jobs that use `ubuntu-26.04` on GitHub |
 | Runner image | node-local containerd, `localhost/tuna-ci-runner:<ubuntu>-<runner>-<stamp>` | [Containerfile](../.github/runners/image/Containerfile), built by [build-image](../.github/runners/build-image) |
 | Guard rails | [cluster.yaml](../.github/runners/cluster.yaml) | namespace, admission policy, NetworkPolicy, quota, priority class |
-| Scripts | [.github/runners](../.github/runners) | `build-image` (images), `deploy` (guard rails + Helm releases) |
+| Scratch storage | namespace `tuna-ci-storage`, StorageClass `tuna-ci-scratch` | [storage.yaml](../.github/runners/storage.yaml); dedicated local-path provisioner on `vg1/tuna_ci_scratch` (nvme1n1) |
+| Scripts | [.github/runners](../.github/runners) | `build-image` (images), `deploy` (guard rails + scratch provisioner + Helm releases) |
 | GitHub side | org `tuna-os` | runner group `tuna-desktop-karnataka` (only repository: `tuna-os/tuna-desktop`), secret `tuna-ci-github` in `tuna-ci` |
 
 Both chart releases use the same chart version (0.15.1 at install).
@@ -146,14 +147,20 @@ code as root inside its pod.
      workflows run for **all** outside contributors' pull requests
      (Settings → Actions → General → "Require approval for all external
      contributors").
-2. **One job per pod, nothing persists.** ARC registers each pod as an
-   ephemeral just-in-time runner; the runner exits after one job and the pod,
-   with its emptyDir volumes, is deleted. There is no shared cache volume.
+2. **One job per pod, nothing is reused.** ARC registers each pod as an
+   ephemeral just-in-time runner; the runner exits after one job and the pod
+   is deleted. Kubernetes owns its generic ephemeral PVCs and deletes them
+   with the pod; the scratch StorageClass's `Delete` reclaim policy removes
+   their PV directories. Cleanup is asynchronous; no subsequent job mounts
+   a previous job's directory. There is no shared cache volume.
 3. **The pod cannot become the node.** The admission policy
    `tuna-ci-runner-pods` rejects any pod in `tuna-ci` that is not in its own
    user namespace (`hostUsers: false`), is privileged, shares host
-   namespaces, binds host ports, mounts anything but emptyDir, mounts a
-   service account token, or adds a capability other than `SYS_ADMIN`. Root
+   namespaces, binds host ports, mounts anything but emptyDir or fresh generic
+   ephemeral `tuna-ci-scratch` volumes, mounts a service account token, or
+   adds a capability other than `SYS_ADMIN`. Existing PVC references,
+   hostPath, other storage classes, pre-bound volumes and data sources are
+   forbidden. Root
    and `CAP_SYS_ADMIN` in the pod (needed for `sudo apt-get` and rootless
    podman's nested user namespace) map to an unprivileged 65536-uid range on
    the node. No host paths are mounted; `/dev/net/tun` (podman's network)
@@ -168,9 +175,11 @@ code as root inside its pod.
    56 CPU / 196 GiB limits, 28 CPU / 82 GiB requests: up to 14 runners
    run at once (karnataka: 28 CPU / 125 GiB allocatable; punjab is sized at
    12 cores / 24 GiB). Each runner asks for
-   1.5 CPU / 5 GiB and is limited to 4 CPU / 14 GiB / 45 GiB disk. Runner pods
-   use PriorityClass `tuna-ci-runner` (-100, never preempts): new VMs and
-   cluster services preempt them, and the kubelet evicts them first under
+   1.5 CPU / 5 GiB and is limited to 4 CPU / 14 GiB. The 45 GiB
+   ephemeral-storage limit covers the container writable layer/logs, **not**
+   the separate scratch PVCs (see below). Runner pods use PriorityClass
+   `tuna-ci-runner` (-100, never preempts): new VMs and cluster services
+   preempt them, and the kubelet evicts them first under
    memory pressure.
    All 14 new pods reserve 21 CPU / 70 GiB together; the request quota allows
    older pods during rollout. The scheduler also accounts for VM reservations.
@@ -181,6 +190,69 @@ code as root inside its pod.
 The ARC listener uses the GitHub credential in secret `tuna-ci-github`
 (`tuna-ci` namespace, copied by the controller to `arc-systems`). Runner
 pods never mount it and cannot reach the API to read it.
+
+### Dedicated runner scratch (nvme1n1)
+
+`/home/runner/work` (including Cargo targets and rust-cache restore),
+`/var/lib/containers`, and `/home/runner/.local/share/containers` are three
+fresh generic ephemeral volumes per runner, requesting 40 / 10 / 10 GiB.
+`/dev/shm` remains a 2 GiB memory emptyDir. All 14 runners request 840 GiB
+on the 900 GiB ext4 LV `vg1/tuna_ci_scratch`, mounted at
+`/var/lib/tuna-ci-scratch` on nvme1n1; nvme0n1 still holds the unchanged
+kubelet/containerd roots and unrelated workloads.
+
+The directory-backed local-path provisioner **does not enforce PVC size
+limits**. The requests are capacity planning, not write quotas. Monitor
+`df -h /var/lib/tuna-ci-scratch`; allow headroom for filesystem overhead and
+asynchronous deletion, and reduce concurrency before the filesystem fills.
+There is no persistent compiler cache and no extra access from runner pods.
+Only the provisioner/helper pods in `tuna-ci-storage` can mount the host
+scratch path. The k3s-managed `local-path` addon and existing PVCs are unchanged.
+
+On this bootc/ostree host, install the persistent mount unit in writable
+`/etc`, not a modified OS image. Initial setup (only for the confirmed empty
+VG on nvme1n1; never format an existing LV):
+
+```sh
+ssh karnataka 'sudo pvs; sudo vgs; sudo lvs; sudo lsblk -f'
+ssh karnataka 'sudo lvcreate -L 900G -n tuna_ci_scratch vg1 &&
+  sudo mkfs.ext4 -m 0 -L tuna-ci-scratch /dev/vg1/tuna_ci_scratch &&
+  sudo mkdir -p /var/lib/tuna-ci-scratch'
+scp .github/runners/scratch.mount karnataka:/tmp/tuna-ci-scratch.mount
+ssh karnataka 'unit=$(systemd-escape --path --suffix=mount /var/lib/tuna-ci-scratch) &&
+  sudo install -m 0644 /tmp/tuna-ci-scratch.mount "/etc/systemd/system/$unit" &&
+  sudo systemctl daemon-reload &&
+  sudo systemctl enable --now "$unit" &&
+  sudo restorecon /var/lib/tuna-ci-scratch &&
+  sudo touch /var/lib/tuna-ci-scratch/.nvme-scratch'
+ssh karnataka 'findmnt /var/lib/tuna-ci-scratch; sudo lvs -o lv_name,vg_name,devices'
+.github/runners/deploy --sets-only
+```
+
+The mount is ordered before k3s on future boots; **do not restart k3s,
+containerd, kubelet or unrelated pods** to deploy it. Helpers require the
+`.nvme-scratch` marker on the mounted LV, so an absent mount fails
+provisioning rather than silently falling back to nvme0n1. Never create
+that marker on the underlying unmounted directory. Both deploy modes apply
+guard rails and storage resources before updating runner templates; running
+jobs keep their old volumes until completion.
+
+To verify a rollout, inspect a newly created runner's PVC ownerReferences,
+its PV's `local.path`, and `findmnt -T /home/runner/work` inside that pod.
+Compare pod `metadata.creationTimestamp` with the runner container's
+`state.running.startedAt` before/after, including provisioning time; observe
+both disks' `/sys/block/nvme*n1/stat` counters over the same interval while
+a real CI `check` job runs. Check that deleted pods' PVCs, PVs and directories
+disappear, and that shared pods retain their UIDs/restart counts.
+
+For storage rollback, first use the hosted-runner switch below and drain
+the scale sets. Do not delete the provisioner while its PVCs/PVs still need
+reclaim: wait for all `tuna-ci-scratch` claims and PVs to disappear, then
+`kubectl --context karnataka-k3s delete -f .github/runners/storage.yaml`.
+Only then disable/unmount the mount unit if needed. Leave the LV intact
+until explicitly deciding to destroy its data. A Helm rollback to pre-scratch
+values also restores the old per-pod writable-layer/emptyDir paths for new
+jobs without restarting shared workloads, but restores nvme0n1 contention.
 
 ### Node prerequisite: NetworkPolicy enforcement
 
@@ -209,6 +281,7 @@ ssh karnataka "sudo journalctl -u k3s --since -10min | grep -c 'Aborting sync'" 
 
 ```
 # 1. Guard rails (namespace, admission policy, NetworkPolicy, quota, priority).
+#    Prepare the dedicated scratch LV/mount as above before deploying runners.
 kubectl --context karnataka-k3s apply -f .github/runners/cluster.yaml
 
 # 2. GitHub runner group restricted to this repository.
@@ -385,6 +458,8 @@ Full removal:
 ```
 helm --kube-context karnataka-k3s uninstall tuna-ci-24-04 tuna-ci-26-04 -n tuna-ci
 helm --kube-context karnataka-k3s uninstall arc -n arc-systems
+# After all scratch claims/PVs have reclaimed (keep the provisioner until then):
+kubectl --context karnataka-k3s delete -f .github/runners/storage.yaml
 kubectl --context karnataka-k3s delete -f .github/runners/cluster.yaml
 kubectl --context karnataka-k3s delete namespace arc-systems
 gh api -X DELETE orgs/tuna-os/actions/runner-groups/<id>
@@ -417,5 +492,6 @@ across branches.
 | Pod rejected | `kubectl -n tuna-ci get events` (admission policy message names the rule) |
 | `refused this job` in "Set up job" | the job-started hook: fork, foreign repository or disallowed event |
 | A step misses a tool GitHub's image has | add it to the Containerfile's package list, rebuild, roll |
-| Nested podman/docker errors | needs `/dev/net/tun` (tun resource), the emptyDir storage mounts and `SYS_ADMIN`, all in the values files |
+| Nested podman/docker errors | needs `/dev/net/tun` (tun resource), the ephemeral scratch storage mounts and `SYS_ADMIN`, all in the values files |
 | Controller cannot get a registration token | credential expired or lacks org runner permission; replace the secret |
+| Scratch PVC stays Pending | `kubectl -n tuna-ci-storage logs deployment/tuna-ci-scratch-provisioner`; check the mount/marker on karnataka and scratch free space; do not fall back to the OS disk |
