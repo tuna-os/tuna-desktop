@@ -4,7 +4,7 @@
 # images: passwordless sudo, git, jq, python3, rustup with stable, podman,
 # shellcheck, xvfb and the usual build tools. Jobs still apt-get install
 # their own dependencies. Build with .github/runners/build-image.
-ARG UBUNTU=24.04
+ARG UBUNTU=26.04
 FROM docker.io/library/ubuntu:${UBUNTU}
 
 ARG RUNNER_VERSION
