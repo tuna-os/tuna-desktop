@@ -102,6 +102,7 @@ settings local builds need (`just` lists the recipes):
 | `just proof <name> [args]` | `scripts/tuna-<name> --artifacts <tmp>`, e.g. `just proof gtk-shell-proof` |
 | `just ci-artifacts <run> [name]` | downloads a CI run's artifacts and prints the directory |
 | `just clean` / `just gc` | deletes this worktree's target / frees disk (below) |
+| `just disk-guard [--watch [s]]` | frees disk now, or keeps checking every `s` seconds (below) |
 
 Every build uses its own checkout's `target/` (an inherited
 `CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one),
@@ -125,8 +126,19 @@ Cleanup is automatic where it is safe:
   or closed, removes those worktrees when they have no uncommitted
   changes, and expires `just ci-artifacts` downloads after six hours. It
   never touches the main checkout or the worktree it runs from;
-- any build recipe runs `just gc` first when less than 20 GiB of disk is
-  free (`TUNA_MIN_FREE_GB`).
+- `just disk-guard` (`scripts/tuna-disk-guard`), when less than 40 GiB
+  is free on the repository's filesystem (`TUNA_MIN_FREE_GB`), deletes
+  the `target/` of each of this repository's worktrees that no running
+  process references (by working directory, executable, arguments or
+  environment) and that nothing touched for 45 minutes
+  (`TUNA_IDLE_MINUTES`), plus `/tmp/tuna-proof-*` and `just ci-artifacts`
+  entries older than 90 minutes. It logs each removal and leaves the main
+  checkout's target alone unless given `--include-main`. `--watch
+  [seconds]` repeats it (default every 600 s); on a shared host run it
+  that way from a clean checkout of `main`;
+- any build recipe runs `just disk-guard` first (it only removes anything
+  below `TUNA_MIN_FREE_GB`, 40 GiB); automatic cleanup never calls `gc`,
+  whose merged-PR cleanup is not process-aware.
 
 VM lanes need KVM, so they run in CI's `marlin-vm` jobs or on a Corral
 VM, not through these recipes.

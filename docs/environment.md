@@ -180,7 +180,8 @@ The script's header documents its options; they all start with `TRY_TUNA_`:
 | `TUNA_TARGET_DIR` | `target/` in the checkout | Cargo target directory for every recipe. An inherited `CARGO_TARGET_DIR` is ignored. |
 | `TUNA_BUILD_LOCK` | `/tmp/tuna-local-build.lock` | Lock file that serializes builds across worktrees. |
 | `TUNA_PROOF_LOCK` | `/tmp/tuna-local-proof.lock` | Lock file that serializes `just proof` runs. |
-| `TUNA_MIN_FREE_GB` | `20` | Builds run `just gc` first when less disk than this is free. |
+| `TUNA_MIN_FREE_GB` | `40` | Below this many GiB free on the repository's filesystem, `tuna-disk-guard` removes idle worktree targets and stale scratch. Build recipes run this guard first. |
+| `TUNA_IDLE_MINUTES` | `45` | How long a worktree target must be untouched before `tuna-disk-guard` may remove it; running-process references always protect it. |
 | `TUNA_CI_ARTIFACTS` | `/tmp/tuna-ci-artifacts` | Where `just ci-artifacts` downloads to. |
 | `TUNA_CI_ARTIFACT_TTL_MIN` | `360` | Minutes before `just gc` deletes a download. |
 | `CARGO_BUILD_JOBS` | `2` | Parallel compile jobs. |
