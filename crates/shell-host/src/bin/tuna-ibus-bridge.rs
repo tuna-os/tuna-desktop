@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use gio::glib;
 use gio::prelude::*;
+use tuna_shell_host::eprintln;
 use tuna_shell_host::ibus::{
     address as ibus_address, debug, text as ibus_text, text_variant as ibus_text_variant,
 };
