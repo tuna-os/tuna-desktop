@@ -77,4 +77,6 @@ The separate G-OSK-IBUS runtime gate in the same script requires the distributio
 
 The probe observes `GtkText::preedit-changed` through each entry's editable delegate; `GtkEntry` itself does not expose that signal. Source `9b81bf24` run `41234070381` stopped before the probe mapped because it connected the signal to the entry. That run therefore established none of the real-engine composition, candidate, commit, field-recreation or lock-retirement assertions; its socket/private-bus results are not a substitute.
 
+Source `8840a74e` run `41247262911` passed SHOW/TYPE/SHIFT but stopped at engine selection: the `ibus engine NAME` CLI also attempts XKB layout setup, returning failure silently for libpinyin's `default` layout. A real private-daemon witness reproduced exit 1 with empty diagnostics while independent engine readback was already `libpinyin`. The proof now calls private-bus `SetGlobalEngine` directly and checks the selected engine independently; it neither ignores a failed selection nor configures the outer X server.
+
 Open: auto-capitalisation from surrounding text, word-wise delete, shifting the focused window above the keyboard, and GNOME's bottom-edge touch drag. The IBus route's graphical qualification is the required G-OSK-IBUS runtime gate above, separate from the socket and fault-boundary tests.

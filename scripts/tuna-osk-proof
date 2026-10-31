@@ -392,12 +392,20 @@ pass G-OSK-SHIFT "Shift T then u typed 'Tu'; the long-press latch typed 'NA' unt
 ibus_private() {
     env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET WAYLAND_DISPLAY="$SOCKET_NAME" ibus "$@"
 }
+# `ibus engine NAME` also runs setxkbmap after selecting the engine. With
+# libpinyin's "default" layout it exits 1 silently even when selection succeeds;
+# an XKB source would instead try the intentionally absent outer DISPLAY.
+ibus_select() {
+    gdbus call --address "$(ibus_private address)" --dest org.freedesktop.IBus \
+        --object-path /org/freedesktop/IBus \
+        --method org.freedesktop.IBus.SetGlobalEngine "$1" >/dev/null
+}
 for _ in $(seq 1 40); do grep -q "tuna-ibus-bridge: ready" "$LOG" && break; sleep 0.5; done
 grep -q "tuna-ibus-bridge: ready" "$LOG" || fail G-OSK-IBUS "supervised IBus bridge never became ready"
 ibus_private list-engine >"$ARTIFACTS/ibus-engines.txt"
 grep -q 'libpinyin' "$ARTIFACTS/ibus-engines.txt" ||
     fail G-OSK-IBUS "distro ibus-libpinyin engine is required"
-ibus_private engine libpinyin || fail G-OSK-IBUS "cannot activate real libpinyin"
+ibus_select libpinyin || fail G-OSK-IBUS "cannot activate real libpinyin"
 [ "$(ibus_private engine)" = libpinyin ] || fail G-OSK-IBUS "libpinyin is not current"
 ime_start="$(now)"
 for letter in n i h a o; do session_tap "$letter" G-OSK-IBUS; done
@@ -430,7 +438,7 @@ session_tap Space G-OSK-IBUS
 expect_text b "TuNAs你好1" G-OSK-IBUS
 expect_text a "${ime_a_before}你好" G-OSK-IBUS
 # Restore the ordinary XKB source and check direct native text after IBus.
-ibus_private engine xkb:us::eng || fail G-OSK-IBUS "cannot restore XKB engine"
+ibus_select xkb:us::eng || fail G-OSK-IBUS "cannot restore XKB engine"
 xdotool key --clearmodifiers ctrl+a BackSpace
 expect_text a "" G-OSK-IBUS
 xkb_start="$(now)"
@@ -442,7 +450,7 @@ pass G-OSK-IBUS "real libpinyin OSK preedit/candidates and Space→你好; decli
 
 # ---- G-OSK-LOCK
 cstate "$OSK_MAPPED" 5 || fail G-OSK-LOCK "the session keyboard was not up before locking"
-ibus_private engine libpinyin || fail G-OSK-LOCK "cannot activate libpinyin before lock"
+ibus_select libpinyin || fail G-OSK-LOCK "cannot activate libpinyin before lock"
 session_tap n G-OSK-LOCK
 text_a="$(text_of a)"
 text_b="$(text_of b)"
