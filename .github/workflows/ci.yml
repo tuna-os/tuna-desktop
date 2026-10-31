@@ -101,6 +101,7 @@ jobs:
       - run: python3 scripts/lib/tuna-soak-tests.py
       - run: python3 scripts/lib/vm-boot-tests.py
       - run: python3 scripts/lib/ci-runner-guard-tests.py
+      - run: python3 scripts/tests/test_ci_closed_pr_cleanup.py
       - run: python3 scripts/tests/test_vm_guest_agent_deadline.py
       - run: python3 scripts/tests/test_disk_guard.py
       - run: python3 scripts/tests/test_vm_strip_acceptance.py
