@@ -47,6 +47,7 @@ POINTS = {
 CROSSCHECK = {'greeter-user-list', 'session-is-tuna', 'lock'}
 QUALIFICATION_CORE = {
     'greeter-user-list', 'greeter-password', 'session-is-tuna', 'portal-availability', 'portal-screenshot',
+    'portal-screencast',
     'desktop', 'lock', 'unlock-refused', 'unlock', 'power-menu', 'logout-dialog', 'logout',
 }
 # Ready means: boot finished, GDM active, its greeter session on seat0, and
@@ -260,6 +261,7 @@ def provision(args, guest, receipt):
 class Journey:
     def __init__(self, args, guest, console, receipt, out):
         self.args, self.guest, self.console, self.receipt, self.out = args, guest, console, receipt, out
+        self.capture_pending = None
 
     def step(self, sid, title, action):
         if self.args.qualification_only and sid not in QUALIFICATION_CORE:
@@ -374,50 +376,103 @@ class Journey:
         self.step('portal-availability', 'Published portal interfaces respond (not capture consent)', portals)
 
         def portal_screenshot(check):
-            # Keep the requester connected until the actual asynchronous portal
-            # Response. A one-shot gdbus sender exits too early to prove this.
-            source = Path(__file__).with_name('lib') / 'tuna-published-screenshot-probe.py'
+            # Reuse the existing strict native consent client, not a replacement
+            # backend or a one-shot gdbus sender that disconnects before Response.
+            source = Path(__file__).with_name('lib') / 'tuna-portal-screenshot-client.py'
             payload = source.read_bytes()
             uid = g.out(f'id -u {USER}')
-            request_id = time.monotonic_ns()
-            result_path = f'/run/user/{uid}/tuna-variant-screenshot-{request_id}.json'
-            log_path = f'/run/user/{uid}/tuna-variant-screenshot-{request_id}.log'
+            remote = Path(f'/run/user/{uid}/tuna-variant-screenshot-{time.monotonic_ns()}.png')
+            waiting, response_path = str(remote.with_suffix('.waiting')), str(remote.with_suffix('.response.json'))
+            exit_path, log_path = str(remote.with_suffix('.exit')), str(remote.with_suffix('.log'))
             launch = 'exec(__import__("base64").b64decode(' + repr(base64.b64encode(payload).decode()) + '))'
             code, stdout, stderr = g.sh(
-                f'python3 -c {shlex.quote(launch)} {shlex.quote(result_path)} '
+                f'(python3 -c {shlex.quote(launch)} {shlex.quote(str(remote))} allow; '
+                f'printf "%s" "$?" >{shlex.quote(exit_path)}) '
                 f'</dev/null >{shlex.quote(log_path)} 2>&1 & echo $!', user=True)
             check('native requester launched', code == 0, {'exit': code, 'pid': stdout, 'stderr': stderr})
             self.receipt['portal_requester_sha256'] = hashlib.sha256(payload).hexdigest()
-            c.wait(2000)
+            wait_for(lambda: g.sh(f'test -f {shlex.quote(waiting)} || test -f {shlex.quote(exit_path)}',
+                                 user=True)[0] == 0, 45, 'portal consent wait or requester exit')
             prompt = self.out / 'portal-screenshot-prompt.png'
             c.grab(prompt)
             self.receipt['portal_request_console'] = {
                 'frame': prompt.name, 'sha256': hashlib.sha256(prompt.read_bytes()).hexdigest(),
                 'meaning': 'console after request; prompt visibility requires visual review'}
-            if g.sh(f'test -f {shlex.quote(result_path)}', user=True)[0] != 0:
-                # This is a real key on the real console, never a consent or
-                # app-ID bypass. A rejected/default-cancel response remains fail.
+            if g.sh(f'test -f {shlex.quote(exit_path)}', user=True)[0] != 0:
+                # Actual console input, never an app-ID or consent bypass.
                 self.receipt['portal_request_console']['input'] = 'Enter on the real console'
                 c.key('Enter', wait=2000)
             def completed():
-                code, stdout, _ = g.sh(f'cat {shlex.quote(result_path)}', user=True)
+                code, stdout, _ = g.sh(f'cat {shlex.quote(exit_path)}', user=True)
                 return stdout if code == 0 and stdout else None
-            try:
-                result = json.loads(wait_for(completed, 150, 'portal Screenshot Response'))
-            except RuntimeError:
-                check('portal Screenshot Response arrived', False, g.sh(f'cat {shlex.quote(log_path)}', user=True)[1:])
+            status = wait_for(completed, 100, 'native Screenshot proof exit')
+            log = g.sh(f'cat {shlex.quote(log_path)}', user=True)[1:]
+            response_code, response_text, _ = g.sh(f'cat {shlex.quote(response_path)}', user=True)
+            if response_code == 0:
+                self.receipt['portal_screenshot'] = json.loads(response_text)
+            if not check('native consent and image proof exits successfully', status == '0', log):
                 return
-            self.receipt['portal_screenshot'] = result
-            if not check('successful portal Response returns PNG', result.get('response') == 0
-                         and 'sha256' in result and 'error' not in result, result):
-                return
-            encoded = g.out('base64 ' + shlex.quote(result['path']), user=True)
-            data = base64.b64decode(encoded)
+            result = self.receipt['portal_screenshot']
+            check('portal Response is successful', result.get('response') == 0, result)
+            digest = g.out('sha256sum ' + shlex.quote(str(remote)), user=True).split()[0]
+            data = base64.b64decode(g.out('base64 ' + shlex.quote(str(remote)), user=True))
             Image.open(io.BytesIO(data)).verify()
-            check('retained portal PNG matches guest hash', hashlib.sha256(data).hexdigest() == result['sha256'],
-                  hashlib.sha256(data).hexdigest())
+            check('retained portal PNG matches guest hash', hashlib.sha256(data).hexdigest() == digest, digest)
+            result['retained_sha256'] = digest
             (self.out / 'portal-captured.png').write_bytes(data)
         self.step('portal-screenshot', 'Request Screenshot through the actual published frontend', portal_screenshot)
+
+        def portal_screencast(check):
+            # Reuse the installed-frontend proof, including its real PipeWire
+            # FD, frame consumption, caller isolation and bounded lock withdrawal.
+            library = Path(__file__).with_name('lib')
+            sources = {name: (library / name).read_bytes() for name in
+                       ('tuna-portal-capture-client.py', 'tuna-pipewire-dump.py')}
+            uid = g.out(f'id -u {USER}')
+            root = Path(f'/run/user/{uid}/tuna-variant-capture-{time.monotonic_ns()}')
+            remote = root / 'frame.png'
+            ready, response_path = str(remote.with_suffix('.ready')), str(remote.with_suffix('.response.json'))
+            exit_path, log_path = str(root.with_suffix('.exit')), str(root.with_suffix('.log'))
+            setup = f'import base64,pathlib,runpy,sys; root=pathlib.Path({str(root)!r}); root.mkdir(); '
+            for name, data in sources.items():
+                setup += f'(root/{name!r}).write_bytes(base64.b64decode({base64.b64encode(data).decode()!r})); '
+            setup += (f'sys.argv=[str(root/"tuna-portal-capture-client.py"),{str(remote)!r},"revoke"]; '
+                      'runpy.run_path(sys.argv[0],run_name="__main__")')
+            code, stdout, stderr = g.sh(
+                f'(python3 -c {shlex.quote(setup)}; printf "%s" "$?" >{shlex.quote(exit_path)}) '
+                f'</dev/null >{shlex.quote(log_path)} 2>&1 & echo $!', user=True)
+            record = {'requester_sha256': {name: hashlib.sha256(data).hexdigest() for name, data in sources.items()}}
+            self.receipt['portal_screencast'] = record
+            check('native ScreenCast requester launched', code == 0, {'exit': code, 'pid': stdout, 'stderr': stderr})
+            wait_for(lambda: g.sh(f'test -f {shlex.quote(ready)} || test -f {shlex.quote(exit_path)}',
+                                 user=True)[0] == 0, 200, 'ScreenCast Start request or requester exit')
+            prompt = self.out / 'portal-screencast-prompt.png'
+            c.grab(prompt)
+            record.update(frame=prompt.name, frame_sha256=hashlib.sha256(prompt.read_bytes()).hexdigest(),
+                          meaning='console at Start; consent visibility requires visual review')
+            if g.sh(f'test -f {shlex.quote(exit_path)}', user=True)[0] != 0:
+                record['input'] = 'Enter on the real console'
+                c.key('Enter', wait=2000)
+            active_path = str(remote.with_suffix('.active'))
+            wait_for(lambda: g.sh(f'test -f {shlex.quote(active_path)} || test -f {shlex.quote(exit_path)}',
+                                 user=True)[0] == 0, 100, 'active ScreenCast grant or requester exit')
+            active = g.sh(f'test -f {shlex.quote(active_path)}', user=True)[0] == 0
+            record['log'] = g.sh(f'cat {shlex.quote(log_path)}', user=True)[1:]
+            response_code, response_text, _ = g.sh(f'cat {shlex.quote(response_path)}', user=True)
+            if response_code == 0:
+                record['response'] = json.loads(response_text)
+            if not check('native frame and caller isolation reached active grant', active, record):
+                return
+            digest = g.out('sha256sum ' + shlex.quote(str(remote)), user=True).split()[0]
+            data = base64.b64decode(g.out('base64 ' + shlex.quote(str(remote)), user=True))
+            image = Image.open(io.BytesIO(data)).convert('RGB')
+            check('ScreenCast frame matches output geometry', image.size == (WIDTH, HEIGHT), image.size)
+            extrema = image.getextrema()
+            check('ScreenCast frame contains varied desktop pixels', any(high - low >= 16 for low, high in extrema), extrema)
+            check('retained ScreenCast frame matches guest hash', hashlib.sha256(data).hexdigest() == digest, digest)
+            (self.out / 'portal-screencast-frame.png').write_bytes(data)
+            record['retained_sha256'] = digest
+            self.capture_pending = {'remote': remote, 'exit': exit_path, 'log': log_path, 'record': record}
 
         def desktop(check):
             c.key('Escape', wait=3000)
@@ -546,15 +601,36 @@ class Journey:
             c.key('Meta+v', wait=2000)
             check('date menu opened while the banner is up', True, 'GNOME 51 blocks the banner here (see frame)')
         self.step('date-menu', 'Super+V lists the notification', date_menu)
+        self.step('portal-screencast', 'Consume a real frontend stream before locking', portal_screencast)
 
         def lock(check):
             c.key('Escape', wait=6000)
+            pending = self.capture_pending
+            self.capture_pending = None
+            if pending:
+                # Arm the unchanged two-second observer BEFORE sending the lock
+                # key: remote transport latency cannot create a false pass.
+                marker = str(pending['remote'].with_suffix('.revoke'))
+                code, stdout, stderr = g.sh('touch ' + shlex.quote(marker), user=True)
+                check('arm lock stream-withdrawal observation', code == 0, {'exit': code, 'stdout': stdout, 'stderr': stderr})
             c.key('Meta+l', wait=4000)
             active = g.out('gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver '
                            '--method org.gnome.ScreenSaver.GetActive', user=True)
             check('ScreenSaver.GetActive is true', active == '(true,)', active)
             hint = (g.seat_session() or {}).get('LockedHint')
             check('logind LockedHint is yes', hint == 'yes', hint)
+            if pending:
+                def completed():
+                    code, stdout, _ = g.sh('cat ' + shlex.quote(pending['exit']), user=True)
+                    return stdout if code == 0 and stdout else None
+                status = wait_for(completed, 100, 'lock-triggered PipeWire withdrawal proof')
+                record = pending['record']
+                record.update(requester_exit=status, log=g.sh('cat ' + shlex.quote(pending['log']), user=True)[1:])
+                verified = check('lock withdraws the real portal stream within the existing bound', status == '0', record)
+                record['lock_withdrawal_verified'] = verified
+                if verified:
+                    revoked = g.out('cat ' + shlex.quote(str(pending['remote'].with_suffix('.revoked.json'))), user=True)
+                    (self.out / 'portal-screencast-revoked.json').write_text(revoked + '\n')
         self.step('lock', 'Super+L locks the screen', lock)
 
         def wrong_password(check):

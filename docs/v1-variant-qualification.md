@@ -163,6 +163,49 @@ empty post-delete inventory after using the documented
 threshold was changed. Remaining journeys resumed sequentially with that
 transport setting; the original failure receipt is unchanged.
 
+## Final observed disposition
+
+The [resumed discovery/interruption receipt](variants/2026-10-31/resumed-interrupted-matrix.json)
+resolved all admitted publications, including a later Skipjack digest
+`sha256:36889e650e35893e4d3779deba2ddce7ce375f65a36271f86b77ca90d0c8e924`.
+The resumed Albacore attempt did not produce a runtime/readiness manifest
+before interruption. No later variant VM was created by that sequence.
+The [final disposition](variants/2026-10-31/final-disposition.json) records
+deletion of that owned Albacore VM/PVC and an empty `tuna-q-variant-` inventory.
+Neither `punjab` nor the independent soak VM was touched.
+
+| Variant(s) | Install / GDM / session | Portals | Lock/unlock | Qualification |
+|---|---|---|---|---|
+| yellowfin | pass on retained exact beta1 digest | availability only; functional flow not exercised in this receipt | lock hint fails; wrong-password refusal and unlock pass | fail, not a v1 pass |
+| marlin | existing exact beta2-2 journey passes these gates | not qualified by that daily-driver receipt | lock hint fails; refused password/unlock pass | fail, not a v1 pass |
+| albacore | interrupted, no completed verdict | unproven | unproven | not qualified; interruption is not an unsupported waiver |
+| skipjack, wahoo, bonito, bonito-rawhide, sailfin, grouper, flounder, flounder-sid | publications resolved; runtime not run in the stopped sequence | unproven | unproven | not qualified; no unsupported exception invented |
+| hummingbird, guppy | admission branches remain open; no admitted immutable-image runtime proof | unproven | unproven | not qualified; stale package-unavailable reasons rejected |
+| gurnard | no native Tuna target | unproven | unproven | source-backed unsupported prerequisite, not a runtime pass |
+
+Exact admission/publication [gate snapshot](variants/2026-10-31/admission-gates.json):
+
+- Guppy PR #3883 head `b1150929473ead1316427b8eae48f76832cf65d1`.
+  Earlier run `41215956243` selected no Guppy job because the migrated selector
+  omitted it; **that run is not Guppy evidence**. The selector is repaired.
+  [Run 41219478905](https://github.com/tuna-os/tunaOS/actions/runs/41219478905)
+  selected Guppy successfully and its actual image job was in progress at the
+  snapshot; the Albacore sibling failed. No overall green result is claimed.
+- Hummingbird PR #3885 head `0de95641bfdd350e1f148b7f0b1eb600acf58913`.
+  [Exact-head run 41213419115](https://github.com/tuna-os/tunaOS/actions/runs/41213419115)
+  failed the native TuneD transaction before desktop/boot gates. The font
+  repair does not resolve the missing `(rpm-ostree if bootc)` provider.
+- Native Hummingbird package [run 41213268502](https://github.com/tuna-os/tunaos-packages/actions/runs/41213268502)
+  built successfully from packages `c0998b94…`; publication was still in progress.
+  Served release-2 publication/verification is not claimed from a green build.
+  Remote workflows were left running, not cancelled.
+
+The final frozen-harness functional Screenshot/ScreenCast/lock-revocation
+integration is implemented using existing native requesters, but **was not
+exercised by the completed Yellowfin receipt**. It requires main-agent
+verification and actual remaining digest-specific runs; code alone closes no
+runtime gate. Local unit tests/builds/linters were not run in this slice.
+
 ## Reusable actual-image path
 
 `python3 scripts/tuna-variant-qualification --out NEW_DIRECTORY` snapshots
@@ -194,18 +237,37 @@ shell or session payload is copied into the published-image test.
 
 The portal availability step checks real frontend Settings, Screenshot and
 ScreenCast interface replies in the logged-in published session. Those probes
-alone remain **availability-only**. A separate persistent native Gio requester
-then calls the actual Screenshot portal, awaits its asynchronous Response, and
-retains/validates the returned PNG and its guest/host hashes. It neither spoofs
-an app ID nor installs a backend or candidate desktop code. If the request has
-not completed, the real console receives Enter; rejection, missing native
-Python/GObject support and timeout remain failures. The retained request-time
-console frame needs visual review to establish whether a consent UI appeared;
-PNG success by itself is not proof that a prompt was displayed.
+alone remain **availability-only**. The functional Screenshot step reuses
+`scripts/lib/tuna-portal-screenshot-client.py`: a persistent native Gio
+requester that rejects a screenshot returned before a picker decision,
+awaits the actual Response, and validates real varied 1280×800 image pixels.
+The host retains that PNG and verifies its guest/host hashes. No app ID is
+spoofed and no backend or candidate desktop code is installed.
 
-Earlier receipts identify the actual runner hash and do not gain new proof
-retroactively: Yellowfin's retained run predates the functional Screenshot
-requester. Functional ScreenCast streaming and consent/revocation behavior
-are still separate required evidence, never inferred from Screenshot success.
-Unreviewed frames, interface availability or an incomplete portal flow do not
-become a v1 pass. Registry errors remain errors, not unsupported waivers.
+The ScreenCast step reuses `tuna-portal-capture-client.py` and
+`tuna-pipewire-dump.py`. It creates/selects/starts the real frontend session,
+opens its actual PipeWire FD, consumes a frame with native GStreamer, checks
+caller isolation, and holds its grant until the actual Super+L lock step.
+The unchanged two-second withdrawal observer is armed **before** the lock key,
+so remote transport latency cannot create a false pass. Actual response,
+requester logs, varied frame, hashes and the withdrawal snapshot are retained.
+Missing native Python/GObject/GStreamer/`pw-dump` tools remain explicit failures/prerequisites,
+not reasons to call the image unsupported or to install a replacement backend.
+
+At a pending decision, the actual console receives Enter. Rejection and
+timeouts remain failures. Request-time console frames need visual review to
+establish which consent UI appeared and whether the default action selected
+the intended source; no pixel judgment is fabricated.
+
+New matrix runs freeze the host journey and its three native requester/parser
+sources into the output's `harness/` directory before starting any VM, recording
+their hashes. Subsequent worktree edits cannot mutate those long-running tests.
+Only test requester code is placed in the fixture user's runtime directory;
+the installed desktop/provider payload stays untouched.
+
+Earlier receipts identify their actual runner hash and do not gain new proof
+retroactively: Yellowfin's retained run predates the functional requesters.
+Full visual consent decisions remain required, never inferred from a successful
+frame. Lock-triggered withdrawal must be observed, not substituted with explicit
+Session.Close. Unreviewed frames, interface availability or incomplete portal
+flows do not become a v1 pass. Registry errors remain errors, not waivers.

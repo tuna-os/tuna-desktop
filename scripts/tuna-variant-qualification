@@ -51,6 +51,18 @@ def main():
     receipt = args.out / 'matrix.json'
     save(receipt, report)
     try:
+        # Freeze the host test harness before a long matrix run. Later worktree
+        # edits must not change helpers midway through a published-image journey.
+        harness = args.out / 'harness'
+        source_root = Path(__file__).resolve().parent
+        report['harness_sha256'] = {}
+        for name in ('tuna-corral-journey', 'lib/tuna-portal-screenshot-client.py',
+                     'lib/tuna-portal-capture-client.py', 'lib/tuna-pipewire-dump.py'):
+            data = (source_root / name).read_bytes()
+            target = harness / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            report['harness_sha256'][name] = hashlib.sha256(data).hexdigest()
         sha = github('repos/tuna-os/tunaOS/commits/main')['sha']
         source = github(f'repos/tuna-os/tunaOS/contents/tunaos.toml?ref={sha}')
         raw = base64.b64decode(source['content'])
@@ -107,7 +119,7 @@ def main():
                 continue
             vm = f'tuna-q-variant-{name}-{started.strftime("%m%d%H%M%S")}'
             directory = args.out / name
-            runner = Path(__file__).resolve().with_name('tuna-corral-journey')
+            runner = harness / 'tuna-corral-journey'
             row['runtime'] = 'running'
             save(receipt, report)
             try:
@@ -133,8 +145,16 @@ def main():
                         'lock-unlock': 'pass' if all(steps.get(s) == 'pass' for s in ('lock', 'unlock-refused', 'unlock')) else 'not-proven',
                     })
                     row['portal_screenshot'] = manifest.get('portal_screenshot')
+                    row['portal_screencast'] = manifest.get('portal_screencast')
                     if steps.get('portal-screenshot') == 'pass':
                         row['gates']['portals'] = 'screenshot-functional; screencast-unproven'
+                    if steps.get('portal-screencast') == 'pass':
+                        row['gates']['portals'] = ('functional-capture-proved; visual/lock-revoke-unproven'
+                                                   if steps.get('portal-screenshot') == 'pass'
+                                                   else 'screencast-functional; screenshot-unproven')
+                    if (steps.get('portal-screenshot') == steps.get('portal-screencast') == 'pass'
+                            and (row['portal_screencast'] or {}).get('lock_withdrawal_verified')):
+                        row['gates']['portals'] = 'functional-capture-and-lock-revoke-proved; visual-review-required'
                 row['runtime'] = 'machine-journey-passed-needs-review' if result['exit'] == 0 else 'failed'
                 if not (row.get('cleanup') or {}).get('deleted'):
                     row['runtime'] = 'failed'
