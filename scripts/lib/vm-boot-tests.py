@@ -47,7 +47,7 @@ class DatetimePublishedQualification(unittest.TestCase):
              "G-DATETIME-POLKIT", "G-DATETIME-NTP-ABSENT")
 
     def result(self, failures=(), version="1.0.0beta.1-1"):
-        return {"evidence": {"desktop_rpm_version": version},
+        return {"evidence": {"desktop_package_version": version},
                 "assertions": [f"{gate} {'fail' if gate in failures else 'pass'} raw-{gate}"
                                for gate in (*self.FOLLOW, *self.OTHER)]}
 
@@ -105,6 +105,28 @@ class DatetimePublishedQualification(unittest.TestCase):
         result["assertions"] = []
         with self.assertRaisesRegex(RuntimeError, "no assertions"):
             lane.record_datetime_gates(result, True, self.record)
+
+
+class DatetimeGuestPackageReadback(unittest.TestCase):
+    def test_native_package_readback_and_fail_closed_results(self):
+        source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+        tree = ast.parse(source.read_text())
+        helper = next(node for node in tree.body
+                      if isinstance(node, ast.FunctionDef) and node.name == "desktop_package_version")
+        for status, stdout, expected in (
+                (0, "tuna-desktop 1.0.0beta.1-1\n", "1.0.0beta.1-1"),
+                (0, "tuna-desktop 1.0.0beta.2-1\n", "1.0.0beta.2-1"),
+                (1, "", None), (0, "", None),
+                (0, "other 1.0.0beta.1-1\n", None),
+                (0, "tuna-desktop 1.0.0beta.1-1 extra\n", None)):
+            with self.subTest(status=status, stdout=stdout):
+                run = unittest.mock.Mock(return_value=SimpleNamespace(
+                    returncode=status, stdout=stdout))
+                scope = {"subprocess": SimpleNamespace(run=run), "PACKAGE": "tuna-desktop"}
+                exec(compile(ast.Module(body=[helper], type_ignores=[]), str(source), "exec"), scope)
+                self.assertEqual(scope["desktop_package_version"](), expected)
+                run.assert_called_once_with(["pacman", "-Q", "tuna-desktop"],
+                                            capture_output=True, text=True, timeout=10)
 
 
 class AudioAmplificationDiagnostics(unittest.TestCase):

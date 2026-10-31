@@ -517,9 +517,9 @@ def guest_role(executable):
 
 
 def record_datetime_gates(result, published, record):
-    """Scope only the two panel-follow proofs on the known pre-wall-clock RPM."""
+    """Scope only the two panel-follow proofs on the known pre-wall-clock package."""
     old_panel = (published and
-                 result["evidence"].get("desktop_rpm_version") == "1.0.0beta.1-1")
+                 result["evidence"].get("desktop_package_version") == "1.0.0beta.1-1")
     failed = []
     for line in result["assertions"]:
         gate, verdict, detail = (line.split(" ", 2) + ["", ""])[:3]
