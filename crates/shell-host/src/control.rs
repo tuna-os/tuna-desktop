@@ -141,6 +141,10 @@ pub enum Handled {
         show: bool,
         touch_auto: bool,
     },
+    /// The focused text input asked to hide the input panel (0.47,
+    /// mutter's input-panel OFF); follows the `OnScreenKeyboard` update it
+    /// belongs to.
+    HideInputPanel,
     /// A pointer accessibility timeout started or stopped (pie timer).
     PointerTimeout {
         kind: tuna_shell_control::PointerTimeoutKind,
@@ -1209,6 +1213,7 @@ impl ControlClient {
                 show,
                 touch_auto,
             }),
+            Message::HideInputPanel => Ok(Handled::HideInputPanel),
             Message::PointerTimeout {
                 kind,
                 duration_ms,
@@ -1486,6 +1491,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::KeyboardAidToggled { .. } => "KeyboardAidToggled",
         Message::DwellClickType { .. } => "DwellClickType",
         Message::OnScreenKeyboard { .. } => "OnScreenKeyboard",
+        Message::HideInputPanel => "HideInputPanel",
         Message::PointerTimeout { .. } => "PointerTimeout",
         Message::ShowOsd { .. } => "ShowOsd",
         Message::ShowPadOsd(..) => "ShowPadOsd",
@@ -2006,6 +2012,36 @@ mod tests {
             server_write(&mut peer, &message);
             assert_eq!(client.poll().expect("poll"), expected);
         }
+        assert_eq!(client.revision(), Some(7), "UI messages keep the revision");
+    }
+
+    #[test]
+    fn input_panel_off_follows_its_keyboard_update() {
+        let (mut client, mut peer) = handshook();
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().expect("snapshot");
+        let focus = Some(tuna_shell_control::TextFieldFocus {
+            purpose: 0,
+            hints: 0,
+        });
+        server_write(
+            &mut peer,
+            &Message::OnScreenKeyboard {
+                focus,
+                show: false,
+                touch_auto: false,
+            },
+        );
+        server_write(&mut peer, &Message::HideInputPanel);
+        assert_eq!(
+            client.poll().expect("update"),
+            Handled::OnScreenKeyboard {
+                focus,
+                show: false,
+                touch_auto: false,
+            }
+        );
+        assert_eq!(client.poll().expect("hide"), Handled::HideInputPanel);
         assert_eq!(client.revision(), Some(7), "UI messages keep the revision");
     }
 

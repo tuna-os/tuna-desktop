@@ -44,6 +44,7 @@ use tuna_shell_control::{
 };
 
 use crate::lockdown::{LockdownPolicy, RestrictedAction};
+use crate::osk::InputPanel;
 use crate::state::{StateChange, StateModel, TokenPolicy, TokenStore, WindowEntry};
 
 /// How soon the hub wants another [`ControlHub::poll`] while a handshake
@@ -660,16 +661,22 @@ impl<'a> Session<'a> {
     }
 
     /// Send what GNOME's on-screen keyboard follows (#349). Peers older
-    /// than 0.43 cannot decode it and receive nothing.
+    /// than 0.43 cannot decode it and receive nothing; an input-panel OFF
+    /// request follows the update as `HideInputPanel`, only to peers of
+    /// 0.47 and newer.
     pub fn send_on_screen_keyboard(&mut self, osk: OskBroadcast) -> Result<(), ControlError> {
         if self.peer_minor < 43 {
             return Ok(());
         }
         self.conn.write_frame(&Message::OnScreenKeyboard {
             focus: osk.focus,
-            show: osk.show,
+            show: osk.panel == Some(InputPanel::On),
             touch_auto: osk.touch_auto,
-        })
+        })?;
+        if osk.panel == Some(InputPanel::Off) && self.peer_minor >= 47 {
+            self.conn.write_frame(&Message::HideInputPanel)?;
+        }
+        Ok(())
     }
 
     /// Send mutter's seat touch-mode (#502), which picks the unlock
@@ -1266,6 +1273,7 @@ impl<'a> Session<'a> {
             | Message::KeyboardAidToggled { .. }
             | Message::DwellClickType { .. }
             | Message::OnScreenKeyboard { .. }
+            | Message::HideInputPanel
             | Message::PointerTimeout { .. }
             | Message::ShortcutConsent { .. }
             | Message::ConfirmDisplayChange { .. }
@@ -1329,6 +1337,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::DwellClickType { .. } => "DwellClickType",
         Message::PointerTimeout { .. } => "PointerTimeout",
         Message::OnScreenKeyboard { .. } => "OnScreenKeyboard",
+        Message::HideInputPanel => "HideInputPanel",
         Message::ShowOsd { .. } => "ShowOsd",
         Message::ShowPadOsd(_) => "ShowPadOsd",
         Message::PadOsdLabels { .. } => "PadOsdLabels",
@@ -1604,8 +1613,8 @@ pub struct PollOutcome {
 pub struct OskBroadcast {
     /// The field holding input-method focus (none while locked).
     pub focus: Option<tuna_shell_control::TextFieldFocus>,
-    /// An input-panel ON request not yet delivered.
-    pub show: bool,
+    /// An input-panel request not yet delivered.
+    pub panel: Option<InputPanel>,
     /// Touch-mode auto-show.
     pub touch_auto: bool,
 }
@@ -2058,17 +2067,19 @@ impl ControlHub {
     }
 
     /// Refresh what the on-screen keyboard follows (#349); the next
-    /// [`poll`](Self::poll) broadcasts a change. `show` queues one
-    /// input-panel ON request, dropped if focus is gone by then.
+    /// [`poll`](Self::poll) broadcasts a change. `panel` queues one
+    /// input-panel request, replacing an undelivered one as mutter's
+    /// later `set_input_panel_state` does; it is dropped if focus is gone
+    /// by then.
     pub fn set_on_screen_keyboard(
         &mut self,
         focus: Option<tuna_shell_control::TextFieldFocus>,
-        show: bool,
+        panel: Option<InputPanel>,
         touch_auto: bool,
     ) {
         self.osk.focus = focus;
         self.osk.touch_auto = touch_auto;
-        self.osk.show = (self.osk.show || show) && focus.is_some();
+        self.osk.panel = panel.or(self.osk.panel).filter(|_| focus.is_some());
     }
 
     /// Refresh mutter's seat touch-mode (#502); the next
@@ -2576,7 +2587,7 @@ impl ControlHub {
             }
             if all_sent {
                 // The input-panel request is an edge: sent once.
-                self.osk.show = false;
+                self.osk.panel = None;
                 self.osk_sent = Some(self.osk);
             }
         }
@@ -2695,7 +2706,7 @@ impl ControlHub {
                     let _ = session.send_overview_previews(&self.previews.0, self.previews.1);
                 }
                 let osk = OskBroadcast {
-                    show: false,
+                    panel: None,
                     ..self.osk
                 };
                 if osk != OskBroadcast::default() {

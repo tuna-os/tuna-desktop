@@ -1365,6 +1365,28 @@ impl State {
             .find(|entry| entry.primary)
             .and_then(|entry| entry.output.clone())
     }
+
+    /// What the shell's on-screen keyboard follows (#349): the text field
+    /// holding input-method focus and the input-panel request its client
+    /// committed since the last call, taken. While `locked` neither leaves
+    /// the session, so nothing about it reaches the lock screen.
+    pub fn on_screen_keyboard(
+        &mut self,
+        locked: bool,
+    ) -> (
+        Option<tuna_shell_control::TextFieldFocus>,
+        Option<osk::InputPanel>,
+    ) {
+        let focus = self.seat.get_keyboard().and_then(|k| k.current_focus());
+        let inputs = &mut self.protocols.text_inputs;
+        let panel = inputs.take_panel(focus.as_ref()).filter(|_| !locked);
+        let field = if locked {
+            None
+        } else {
+            inputs.focus(focus.as_ref())
+        };
+        (field, panel)
+    }
 }
 
 impl TestCompositor {

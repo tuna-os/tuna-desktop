@@ -83,7 +83,7 @@ const EXPECTED: &[(&str, u32)] = &[
     ("zwp_primary_selection_device_manager_v1", 1),
     ("zwp_relative_pointer_manager_v1", 1),
     ("zwp_tablet_manager_v2", 2),
-    ("zwp_text_input_manager_v3", 1),
+    ("zwp_text_input_manager_v3", 2),
     ("zxdg_exporter_v1", 1),
     ("zxdg_exporter_v2", 1),
     ("zxdg_importer_v1", 1),

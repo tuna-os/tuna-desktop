@@ -159,13 +159,20 @@ struct Drained {
     dwell_click: Option<tuna_shell_control::DwellClick>,
     /// Pointer accessibility timeouts for the pie timer, in order.
     pointer_timeouts: Vec<PointerTimeout>,
-    /// The compositor's on-screen keyboard updates, in order: focus, the
-    /// input-panel request, touch-mode auto-show.
-    osk: Vec<(Option<tuna_shell_control::TextFieldFocus>, bool, bool)>,
+    /// The compositor's on-screen keyboard messages, in order.
+    osk: Vec<OskUpdate>,
     /// Drawing-tablet OSD messages, in arrival order.
     tablet: Vec<TabletUi>,
     /// Mutter's seat touch-mode, when the compositor changed it.
     touch_mode: Option<bool>,
+}
+
+/// One compositor message for the on-screen keyboard.
+enum OskUpdate {
+    /// Focus, the input-panel ON request, touch-mode auto-show (0.43).
+    State(Option<tuna_shell_control::TextFieldFocus>, bool, bool),
+    /// The input-panel OFF request (0.47).
+    HidePanel,
 }
 
 /// One compositor request for the tablet OSDs (wire 0.45).
@@ -266,7 +273,8 @@ fn drain(
                 focus,
                 show,
                 touch_auto,
-            } => out.osk.push((focus, show, touch_auto)),
+            } => out.osk.push(OskUpdate::State(focus, show, touch_auto)),
+            Handled::HideInputPanel => out.osk.push(OskUpdate::HidePanel),
             Handled::PointerTimeout {
                 kind,
                 duration_ms,
@@ -3701,8 +3709,13 @@ fn build(app: &adw::Application) {
                 screensaver.sync(locked);
                 // The session keyboard never shows over the lock screen.
                 osk.set_locked(locked);
-                for (focus, show, touch_auto) in osk_updates {
-                    osk.update(focus, show, touch_auto);
+                for update in osk_updates {
+                    match update {
+                        OskUpdate::State(focus, show, touch_auto) => {
+                            osk.update(focus, show, touch_auto);
+                        }
+                        OskUpdate::HidePanel => osk.hide_panel(),
+                    }
                 }
                 if locked {
                     shortcut_consent.dismiss();

@@ -207,9 +207,13 @@ impl ProtocolVersion {
     /// `0.46` appends compositor-to-shell `SeatTouchMode` (the seat's
     /// touch-mode, which picks the unlock dialog's hint text, #502).
     /// Positional postcard peers must ship together.
+    /// `0.47` appends text-input-v3 version 2's input-panel OFF request:
+    /// compositor-to-shell `HideInputPanel`, sent after the
+    /// `OnScreenKeyboard` update it belongs to. Positional postcard peers
+    /// must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 46,
+        minor: 47,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -1043,8 +1047,9 @@ pub enum Message {
     /// Since 0.43: what GNOME's on-screen keyboard follows (#349).
     /// `focus` is the enabled text input of the client holding keyboard
     /// focus (none while locked); `show` marks an update carrying the
-    /// input-panel ON request (a focused text input enabled again, GTK's
-    /// click into its field, as mutter treats text-input-v3 version 1);
+    /// input-panel ON request (a focused version-1 text input enabled
+    /// again, GTK's click into its field, or version 2's
+    /// `show_input_panel`, as mutter's text_input_commit_state);
     /// `touch_auto` is `KeyboardManager`'s auto-enable: seat touch-mode
     /// with a touchscreen as the last pointing device. Sent on change and
     /// after each handshake snapshot, only to peers advertising minor >= 43.
@@ -1085,6 +1090,13 @@ pub enum Message {
     /// and in each handshake snapshot, only to peers advertising
     /// minor >= 46.
     SeatTouchMode { touch_mode: bool },
+    /// Since 0.47: the focused text input asked to hide the input panel
+    /// (text-input-v3 version 2 `hide_input_panel`; mutter's
+    /// `clutter_input_focus_set_input_panel_state (OFF)`). Follows the
+    /// `OnScreenKeyboard` update it belongs to; GNOME's keyboard closes at
+    /// once (`_onKeyboardStateChanged`). Sent only to peers advertising
+    /// minor >= 47.
+    HideInputPanel,
 }
 
 /// The click a hover (dwell) makes: GNOME's dwell click types.
@@ -2209,6 +2221,7 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
         | Message::DwellClickType { .. }
         | Message::PointerTimeout { .. }
         | Message::OnScreenKeyboard { .. }
+        | Message::HideInputPanel
         | Message::ShortcutConsent { .. }
         | Message::Command { .. }
         | Message::CommandResult { .. }
@@ -2483,8 +2496,8 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_46() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 46));
+    fn current_version_is_0_47() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 47));
     }
 
     #[test]
@@ -3835,5 +3848,31 @@ mod tablet_osd_wire_order_tests {
         );
         let bytes = postcard::to_slice(&touch, &mut buffer).unwrap();
         assert_eq!(postcard::from_bytes::<Message>(bytes).unwrap(), touch);
+    }
+}
+
+#[cfg(test)]
+mod input_panel_wire_tests {
+    use super::*;
+
+    #[test]
+    fn hide_input_panel_follows_the_0_46_touch_mode_and_round_trips() {
+        let mut buffer = [0_u8; 64];
+        let touch = postcard::to_slice(&Message::SeatTouchMode { touch_mode: false }, &mut buffer)
+            .unwrap()[0];
+        let frame = encode_frame(&Message::HideInputPanel);
+        // A bare variant tag after the length prefix: nothing else rides.
+        assert_eq!(&frame[4..], &[touch + 1]);
+        assert_eq!(decode_frame(&frame).unwrap(), Message::HideInputPanel);
+        // The 0.43 update keeps its positional shape for older shells.
+        let update = Message::OnScreenKeyboard {
+            focus: Some(TextFieldFocus {
+                purpose: 8,
+                hints: 0x400,
+            }),
+            show: false,
+            touch_auto: true,
+        };
+        assert_eq!(decode_frame(&encode_frame(&update)).unwrap(), update);
     }
 }
