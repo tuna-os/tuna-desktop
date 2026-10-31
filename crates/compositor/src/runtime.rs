@@ -79,9 +79,9 @@ const FRAME_BUDGET: Duration = Duration::from_millis(16);
 /// served at least this often.
 const IDLE_WAKE: Duration = Duration::from_millis(500);
 
-/// Display-rate ticks continue this long after the last queued frame or
-/// input event (#503): an animation whose first steps draw nothing new
-/// still advances.
+/// Display-rate ticks continue this long after the last input event or
+/// power-on (#503): an animation whose first steps draw nothing new still
+/// advances. A queued frame alone does not extend it.
 const ACTIVITY_LINGER: Duration = Duration::from_millis(500);
 
 /// Administrative lockdown (#357): how often the tick polls the live
@@ -793,7 +793,7 @@ pub struct Runtime {
     hidden_beat: Option<Instant>,
     /// Hidden windows hold frame callbacks for the next beat (#503).
     hidden_waiting: bool,
-    /// The last queued frame or input event; see [`ACTIVITY_LINGER`].
+    /// The last input event or power-on; see [`ACTIVITY_LINGER`].
     active_at: Instant,
     /// Whether an idle inhibitor was live at the last tick (#503).
     idle_inhibited: bool,
@@ -5696,7 +5696,7 @@ impl Runtime {
                         view.scale,
                         Rectangle::from_size(size),
                     );
-                    use crate::native_repaint::{FrameSignature, Tracked};
+                    use crate::native_repaint::{Cover, FrameSignature, Tracked};
                     // Tracked damage, like the native path: one damage
                     // computation over front-to-back passes, then draw
                     // and submit only that region. An unchanged
@@ -5704,10 +5704,11 @@ impl Runtime {
                     // their cadence instead of repainting every tick.
                     let [cursor_images, cursor_surface] =
                         crate::cursor::tracked(&cursor, view.scale, Rectangle::from_size(size));
+                    let cover = Cover::new(&elements.elements, view.scale);
                     let passes = [
                         Tracked::pass(&paper, 1.0),
                         Tracked::pass(&previews, view.scale),
-                        Tracked::pass(&elements.elements, view.scale),
+                        Tracked::covered_pass(&elements.elements, view.scale, &cover),
                         Tracked::pass(&elements.tile, 1.0),
                         Tracked::pass(&elements.top, view.scale),
                         elements
@@ -6044,14 +6045,16 @@ impl Runtime {
                         zoom_inputs,
                         accent,
                     );
-                    use crate::native_repaint::{FrameSignature, Tracked};
+                    use crate::native_repaint::{Cover, FrameSignature, Tracked};
                     let [cursor_images, cursor_surface] =
                         crate::cursor::tracked(&cursor, view.scale, Rectangle::from_size(logical));
+                    // Windows and layers damage only what shows (#503).
+                    let cover = Cover::new(&elements.elements, view.scale);
                     // Bottom to top, each pass at the scale it draws with.
                     let passes = [
                         Tracked::pass(&paper, 1.0),
                         Tracked::pass(&previews, view.scale),
-                        Tracked::pass(&elements.elements, view.scale),
+                        Tracked::covered_pass(&elements.elements, view.scale, &cover),
                         Tracked::pass(&elements.tile, 1.0),
                         Tracked::pass(&elements.top, view.scale),
                         elements
@@ -6293,7 +6296,10 @@ impl Runtime {
                         crate::cursor::Cursor::frame_done(&cursor_what, cursor_now);
                     }
                     self.stats.frames += 1;
-                    self.active_at = Instant::now();
+                    // A queued frame is no activity of its own (#503): its
+                    // page flip, the clients' next commits and the running
+                    // animations wake the loop, as Mutter's frame clock
+                    // idles between a client's frames.
                 }
                 queued
             }
