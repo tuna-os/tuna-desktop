@@ -183,6 +183,8 @@ pub(crate) struct OutputEntry {
 
 /// Compositor dispatch state: protocol states plus their handlers.
 pub struct State {
+    /// Surface commits/destruction invalidate the pointer's scene pick.
+    pub(crate) pointer_scene_dirty: bool,
     pub(crate) window_icons: window_icons::WindowIcons,
     compositor_state: CompositorState,
     shm_state: ShmState,
@@ -507,6 +509,7 @@ impl XdgShellHandler for State {
     }
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {
+        self.pointer_scene_dirty = true;
         let before = self.popup_grab.len();
         self.popup_grab
             .retain(|p| p.wl_surface() != surface.wl_surface());
@@ -612,6 +615,7 @@ impl State {
 
 impl CompositorHandler for State {
     fn destroyed(&mut self, surface: &wl_surface::WlSurface) {
+        self.pointer_scene_dirty = true;
         self.initial_outputs.remove(surface);
         self.window_icons.remove(surface);
     }
@@ -662,6 +666,7 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &wl_surface::WlSurface) {
+        self.pointer_scene_dirty = true;
         on_commit_buffer_handler::<State>(surface);
         self.window_icons.commit(surface);
         self.popups.commit(surface);
@@ -1018,6 +1023,7 @@ impl State {
             popup_grab: Vec::new(),
             popup_refocus: false,
             window_origins: std::collections::HashMap::new(),
+            pointer_scene_dirty: true,
             initial_outputs: std::collections::HashMap::new(),
             outputs: Vec::new(),
             window_requests: Vec::new(),

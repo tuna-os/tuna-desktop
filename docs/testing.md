@@ -159,6 +159,13 @@ Clippy runs with `-D warnings`, so any warning fails CI.
 (`hundred_fault_runs_keep_apps_alive_and_resync` in
 `crates/compositor/tests/recovery.rs`) and needs no display or GPU.
 
+The real Wayland-wire pointer tests in `crates/compositor/tests/move_resize.rs`
+cover a window mapping beneath a stationary pointer (#425). The scene repick
+must send `wl_pointer.enter` before any press, the first click must arrive
+without replay, and closing the window must re-enter the window beneath.
+The existing press-time refresh remains a separate regression; releases
+keep Smithay's implicit grab ownership.
+
 The lock-screen PAM test (`crates/compositor/tests/pam_unlock.rs`) needs
 `pam_wrapper` (`libpam-wrapper` on Ubuntu). Without it the test prints
 `pam_unlock: pam_wrapper not installed, skipped` and passes. CI sets
