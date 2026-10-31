@@ -69,9 +69,10 @@ fails.
 ## Limits
 
 - The pointer coordinates in `POINTS` match the 1280x800 output and
-  the Tuna Desktop 1.0.0 beta layout. The run fails at its first step
-  when the console reports another size. A layout change means updating
-  that table.
+  the Tuna Desktop 1.0.0-beta.2 layout. Night Light is row 2, right.
+  The beta.1 coordinate now hits Wired and disconnects the VM's network.
+  The run fails at its first step when the console reports another size.
+  A layout change means updating that table.
 - The script needs a Corral that has `corral console`, `corral wait`,
   `corral delete --wait`, `corral info --json` and `bootc create --user`
   (tuna-os/corral main after
