@@ -320,16 +320,22 @@ not the requested setter inputs; it emits no sample for a disposed drawing.
 The admitted `grid-tick-trace` case runs a real GTK frame clock and reads
 Linux main-thread scheduler counters. With `TUNA_GRID_TRACE` only, page
 ticks also retain frame-clock and monotonic timestamps, cumulative CPU/runqueue
-counters and their deltas, scheduler-statistics availability, and time spent
+counters and their deltas, per-thread accounting availability, and time spent
 reading the observation. The proc handle is opened once per traced thread;
 subsequent reads use a fixed stack buffer. Without tracing, no proc files or
-clock observations are read. Unreadable/malformed observations are explicitly
-unavailable, never guessed zeros.
+clock observations are read. Unreadable, malformed, unpopulated (zero runtime
+or timeslices), or regressing counters are explicitly unavailable, never guessed
+zeros. A populated thread's runqueue wait can legitimately remain zero.
 
 The matcher repeats these tick observations from the same log offset.
 `run_delta_ns` includes shell work and prior observer/logging overhead.
-`wait_delta_ns` measures runnable wait only when `schedstats=enabled`; disabled
-or unknown kernel accounting cannot establish absence of scheduler pressure.
+`wait_delta_ns` measures runnable wait from populated, monotonic per-thread
+`/proc/thread-self/schedstat` counters (`schedstat=available`), not the unrelated
+`kernel.sched_schedstats` switch for extended scheduler statistics. The kernel's
+[per-task proc implementation](https://github.com/torvalds/linux/blob/v6.8/fs/proc/base.c#L479-L495)
+reads runtime and `CONFIG_SCHED_INFO` run-delay/timeslice counters; its
+[accounting updates](https://github.com/torvalds/linux/blob/v6.8/kernel/sched/stats.h#L208-L292)
+do not depend on that switch. No host-wide sysctl is changed for this observer.
 Low CPU/runqueue deltas alone cannot identify a compositor, renderer, protocol
 or presentation stall. These observations attribute callback gaps only within
 their measured scope and do not replace the unchanged frame/dot coverage gate.

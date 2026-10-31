@@ -432,39 +432,39 @@ pub fn trace(name: &str, what: std::fmt::Arguments) {
 struct SchedTimes {
     run_ns: u64,
     wait_ns: u64,
+    timeslices: u64,
 }
 
 fn parse_schedstat(bytes: &[u8]) -> Option<SchedTimes> {
     let mut fields = std::str::from_utf8(bytes).ok()?.split_ascii_whitespace();
     let run_ns = fields.next()?.parse().ok()?;
     let wait_ns = fields.next()?.parse().ok()?;
-    fields.next()?.parse::<u64>().ok()?;
-    if fields.next().is_some() {
+    let timeslices = fields.next()?.parse().ok()?;
+    // Kernels without active per-task accounting can expose three zeros.
+    // A zero wait is valid, but nonzero runtime and timeslices establish
+    // that these are populated task counters, not an unavailable sentinel.
+    if fields.next().is_some() || run_ns == 0 || timeslices == 0 {
         return None;
     }
-    Some(SchedTimes { run_ns, wait_ns })
+    Some(SchedTimes {
+        run_ns,
+        wait_ns,
+        timeslices,
+    })
 }
 
 /// Open only on a traced page tick, once per GTK thread. Reads reuse the
 /// proc handle and a stack buffer; no per-frame path or String allocation.
 struct ThreadSched {
     file: Option<std::fs::File>,
-    wait_enabled: &'static str,
+    previous: Option<SchedTimes>,
 }
 
 impl ThreadSched {
     fn open() -> Self {
-        let mut enabled = [0_u8; 4];
-        let wait_enabled = match std::fs::File::open("/proc/sys/kernel/sched_schedstats")
-            .and_then(|mut file| file.read(&mut enabled))
-        {
-            Ok(2) if &enabled[..2] == b"1\n" => "enabled",
-            Ok(2) if &enabled[..2] == b"0\n" => "disabled",
-            _ => "unknown",
-        };
         Self {
             file: std::fs::File::open("/proc/thread-self/schedstat").ok(),
-            wait_enabled,
+            previous: None,
         }
     }
 
@@ -476,7 +476,16 @@ impl ThreadSched {
         if count == bytes.len() {
             return Err("truncated");
         }
-        parse_schedstat(&bytes[..count]).ok_or("parse")
+        let current = parse_schedstat(&bytes[..count]).ok_or("unpopulated-or-malformed")?;
+        let previous = self.previous.replace(current);
+        if previous.is_some_and(|before| {
+            current.run_ns < before.run_ns
+                || current.wait_ns < before.wait_ns
+                || current.timeslices < before.timeslices
+        }) {
+            return Err("non-monotonic");
+        }
+        Ok(current)
     }
 }
 
@@ -496,6 +505,9 @@ impl TickSample {
         if wall_us < 0 {
             return None;
         }
+        self.sched
+            .timeslices
+            .checked_sub(previous.sched.timeslices)?;
         Some((
             wall_us,
             self.sched.run_ns.checked_sub(previous.sched.run_ns)?,
@@ -521,16 +533,16 @@ fn trace_page_tick(clock_us: i64, previous: &Cell<Option<TickSample>>) {
                     trace(
                         "page-switch",
                         format_args!(
-                            "tick clock_us={clock_us} monotonic_us={monotonic_us} run_ns={} wait_ns={} schedstats={} wall_delta_us={wall_us} run_delta_ns={run_ns} wait_delta_ns={wait_ns} observation_us={observation_us}",
-                            sched.run_ns, sched.wait_ns, reader.wait_enabled
+                            "tick clock_us={clock_us} monotonic_us={monotonic_us} run_ns={} wait_ns={} timeslices={} schedstat=available wall_delta_us={wall_us} run_delta_ns={run_ns} wait_delta_ns={wait_ns} observation_us={observation_us}",
+                            sched.run_ns, sched.wait_ns, sched.timeslices
                         ),
                     );
                 } else {
                     trace(
                         "page-switch",
                         format_args!(
-                            "tick clock_us={clock_us} monotonic_us={monotonic_us} run_ns={} wait_ns={} schedstats={} delta=baseline-or-reset observation_us={observation_us}",
-                            sched.run_ns, sched.wait_ns, reader.wait_enabled
+                            "tick clock_us={clock_us} monotonic_us={monotonic_us} run_ns={} wait_ns={} timeslices={} schedstat=available delta=baseline-or-reset observation_us={observation_us}",
+                            sched.run_ns, sched.wait_ns, sched.timeslices
                         ),
                     );
                 }
@@ -1094,12 +1106,13 @@ mod gtk_zoom_tests {
                 .read()
                 .expect("real Linux main-thread scheduler observation");
             assert!(observed.run_ns > 0);
+            assert!(observed.timeslices > 0);
             println!(
-                "GRID-TICK-TRACE pass actual GTK ticks={} run_ns={} wait_ns={} schedstats={}",
+                "GRID-TICK-TRACE pass actual GTK ticks={} run_ns={} wait_ns={} timeslices={} schedstat=available",
                 ticks.get(),
                 observed.run_ns,
                 observed.wait_ns,
-                reader.wait_enabled
+                observed.timeslices
             );
         });
         window.close();
@@ -1127,10 +1140,14 @@ mod tests {
             Some(SchedTimes {
                 run_ns: 123456,
                 wait_ns: 789,
+                timeslices: 12,
             })
         );
         for bytes in [
             &b""[..],
+            &b"0 0 0\n"[..],
+            &b"0 1 2\n"[..],
+            &b"1 2 0\n"[..],
             &b"1 2"[..],
             &b"1 nope 3"[..],
             &b"1 2 3 4"[..],
@@ -1144,6 +1161,7 @@ mod tests {
             sched: SchedTimes {
                 run_ns: 200,
                 wait_ns: 100,
+                timeslices: 2,
             },
         };
         let next = TickSample {
@@ -1151,10 +1169,36 @@ mod tests {
             sched: SchedTimes {
                 run_ns: 450,
                 wait_ns: 120,
+                timeslices: 3,
             },
         };
         assert_eq!(next.since(sample), Some((300, 250, 20)));
         assert_eq!(sample.since(next), None);
+        for sched in [
+            SchedTimes {
+                run_ns: 199,
+                ..sample.sched
+            },
+            SchedTimes {
+                wait_ns: 99,
+                ..sample.sched
+            },
+            SchedTimes {
+                timeslices: 1,
+                ..sample.sched
+            },
+        ] {
+            assert_eq!(TickSample { sched, ..next }.since(sample), None);
+        }
+        assert_eq!(
+            parse_schedstat(b"123456 0 12\n"),
+            Some(SchedTimes {
+                run_ns: 123456,
+                wait_ns: 0,
+                timeslices: 12
+            }),
+            "a populated thread need not have waited on the runqueue"
+        );
     }
 
     #[test]
