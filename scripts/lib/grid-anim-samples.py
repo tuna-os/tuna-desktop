@@ -145,6 +145,39 @@ def check_instant(frames, dots, end):
     return errors
 
 
+def switch_diagnostics(frames, dots, start, end):
+    """Describe available samples, without changing the gate's verdict.
+
+    A correct curve at sparse callback times is not proof of smooth
+    presentation, nor evidence of which process delayed those callbacks.
+    """
+    middle = sum(0.0 < f['elapsed'] < PAGE_SWITCH_MS
+                 and between(f['position'], start, end) for f in frames)
+    moving_dots = sum(between(d['position'], start, end) for d in dots)
+    lines = [
+        f'sample coverage: {middle}/{MIN_INTERMEDIATE} required intermediate page frames; '
+        f'{moving_dots}/{MIN_INTERMEDIATE} required intermediate page-dot updates',
+    ]
+    gaps = [(after['elapsed'] - before['elapsed'], before['elapsed'], after['elapsed'])
+            for before, after in zip(frames, frames[1:])]
+    positive = [gap for gap in gaps if gap[0] > 0.0]
+    repeated = sum(gap[0] == 0.0 for gap in gaps)
+    if positive:
+        gap, before, after = max(positive)
+        lines.append(f'largest logged frame-time gap: {gap:.3f} ms '
+                     f'({before:.3f} -> {after:.3f} ms); repeated frame times: {repeated}')
+    else:
+        lines.append(f'no advancing frame-time samples; repeated frame times: {repeated}')
+    if frames:
+        error = max(abs(f['position'] - expected_position(start, end, f['elapsed']))
+                    for f in frames)
+        lines.append(f'maximum GNOME position error: {error:.9f} page '
+                     f'(tolerance {TOLERANCE:.9f})')
+    lines.append('trace scope: callback samples, not presentation or scheduler evidence; '
+                 'elapsed=0 includes initialization and the first tick')
+    return lines
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--log', required=True)
@@ -163,10 +196,14 @@ def main(argv=None):
         parser.error('--from is required unless --instant')
     else:
         errors = check_switch(frames, dots, args.start, args.end)
+    print(f'grid-anim-samples: source {args.log}, byte offset {args.offset}')
     print(f'grid-anim-samples: {len(frames)} page-switch frames, {len(dots)} page-dots samples')
     for frame in frames:
         print(f"  frame {frame['elapsed']:.3f} ms position {frame['position']:.6f} "
               f"(GNOME {expected_position(frame['from'], frame['to'], frame['elapsed']):.6f})")
+    if not args.instant:
+        for line in switch_diagnostics(frames, dots, args.start, args.end):
+            print(f'grid-anim-samples: {line}')
     for error in errors:
         print(f'grid-anim-samples: {error}', file=sys.stderr)
     return 1 if errors else 0
