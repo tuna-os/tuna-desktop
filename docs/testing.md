@@ -487,7 +487,11 @@ disappeared. GTK creates the preview before its arrow fade finishes, so
 preview presence alone is not a settled first-page tree. This transition
 uses the existing 10-second preview budget; the owner-bound geometry,
 neutral pointer, unchanged page contents and pre-release cancellation
-checks remain mandatory.
+checks remain mandatory. A gap chosen before the drag is provisional:
+the proof selects again from the live preview allocation, moves the held
+pointer there within the same budget, then validates a fresh tree. This
+also covers old comparison binaries whose preview occupies more than
+the nominal edge width; no guessed hint clipping is accepted.
 
 ## Frame cost
 
