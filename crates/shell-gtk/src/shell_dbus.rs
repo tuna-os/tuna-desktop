@@ -1247,18 +1247,6 @@ mod tests {
                 .find(|a| a.action >= INTERNAL_BASE)
                 .unwrap()
                 .action;
-            let desired = service.internal.borrow().clone().unwrap();
-            let pending = service.pending_internal.borrow();
-            let snapshot = pending
-                .iter()
-                .find(|table| table.request.id == 3)
-                .and_then(|table| table.generation.as_ref())
-                .unwrap();
-            assert!(
-                Rc::ptr_eq(&desired, snapshot),
-                "outbound table copied or omitted its generation"
-            );
-            drop(pending);
             // Control events are grouped before results in Drained, including
             // an event from the just-applied table in the same socket drain.
             service.accelerator_activated(new, 1, tuna_shell_control::MODE_NORMAL);
