@@ -506,26 +506,43 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         transport.command('send-key', keys=[{'type': 'qcode', 'data': key} for key in keys], **{'hold-time': 80})
 
     def capture(label, sample, role='alpha'):
-        found = windows(sample, original, edge=edge)
         png = destination / (label + '.png')
         ppm = destination / (label + '.ppm')
         if png.exists() or ppm.exists():
             raise RuntimeError('refuse reused framebuffer capture path')
-        transport.command('screendump', filename=str(png), format='png')
-        transport.command('screendump', filename=str(ppm), format='ppm')
-        actual_image = read_ppm(str(ppm))
-        if actual_image[:2] != (1280, 800):
-            raise RuntimeError('actual framebuffer dimensions differ from admitted viewport')
-        colored_frame(actual_image, found[role]['rect'], COLORS[role])
-        # QMP PNG and PPM are separate acquisitions. Validate both actual
-        # images; an earlier unvalidated PNG is not a qualified walkthrough.
-        from PIL import Image
-        with Image.open(png) as frame:
-            if frame.format != 'PNG' or frame.size != (1280, 800):
-                raise RuntimeError('actual PNG framebuffer format/dimensions differ')
-            png_image = frame.convert('RGB')
-            colored_frame((png_image.width, png_image.height, png_image.tobytes()),
-                          found[role]['rect'], COLORS[role])
+        capture_deadline = min(deadline, time.monotonic() + 10.0)
+        last_error = None
+        while time.monotonic() < capture_deadline:
+            found = windows(sample, original, edge=edge)
+            transport.command('screendump', filename=str(png), format='png')
+            transport.command('screendump', filename=str(ppm), format='ppm')
+            actual_image = read_ppm(str(ppm))
+            if actual_image[:2] != (1280, 800):
+                png.unlink(missing_ok=True)
+                ppm.unlink(missing_ok=True)
+                raise RuntimeError('actual framebuffer dimensions differ from admitted viewport')
+            try:
+                colored_frame(actual_image, found[role]['rect'], COLORS[role])
+                # QMP PNG and PPM are separate acquisitions. Validate both actual
+                # images; an earlier unvalidated PNG is not a qualified walkthrough.
+                from PIL import Image
+                with Image.open(png) as frame:
+                    if frame.format != 'PNG' or frame.size != (1280, 800):
+                        raise RuntimeError('actual PNG framebuffer format/dimensions differ')
+                    png_image = frame.convert('RGB')
+                    colored_frame((png_image.width, png_image.height, png_image.tobytes()),
+                                  found[role]['rect'], COLORS[role])
+                break
+            except NotReady as error:
+                last_error = error
+                png.unlink(missing_ok=True)
+                ppm.unlink(missing_ok=True)
+                time.sleep(min(0.25, max(0.05, capture_deadline - time.monotonic())))
+                sample = read(capture_deadline)
+        else:
+            if last_error is not None:
+                raise last_error
+            raise TimeoutError('installed framebuffer capture exceeded deadline')
         after = read(deadline)
         if time.monotonic() >= deadline:
             raise TimeoutError('installed framebuffer validation exceeded absolute deadline')
