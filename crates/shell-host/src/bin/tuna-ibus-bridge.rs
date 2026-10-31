@@ -56,6 +56,18 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
 };
 use xkbcommon::xkb;
 
+#[allow(dead_code, unused_imports, non_camel_case_types, clippy::all)]
+mod osk_protocol {
+    use wayland_client;
+    pub mod __interfaces {
+        use wayland_client::backend as wayland_backend;
+        wayland_scanner::generate_interfaces!("../compositor/protocols/tuna-osk-input-v1.xml");
+    }
+    use self::__interfaces::*;
+    wayland_scanner::generate_client_code!("../compositor/protocols/tuna-osk-input-v1.xml");
+}
+use osk_protocol::tuna_osk_input_v1::{self, TunaOskInputV1};
+
 const IBUS: &str = "org.freedesktop.IBus";
 const IBUS_PATH: &str = "/org/freedesktop/IBus";
 const CONTEXT: &str = "org.freedesktop.IBus.InputContext";
@@ -78,6 +90,7 @@ enum FromIbus {
     },
     HidePreedit,
     Forward {
+        keyval: u32,
         keycode: u32,
         state: u32,
     },
@@ -295,8 +308,36 @@ impl IbusContext {
         }
     }
 
-    /// Whether IBus takes this key.
+    /// The source currently installed on this input context.
+    fn engine(&self) -> Option<String> {
+        let reply = self
+            .bus
+            .call_sync(
+                Some(IBUS),
+                &self.path,
+                CONTEXT,
+                "GetEngine",
+                None,
+                glib::VariantTy::new("(v)").ok(),
+                gio::DBusCallFlags::NONE,
+                CALL_TIMEOUT_MS,
+                None::<&gio::Cancellable>,
+            )
+            .ok()?;
+        let engine = reply.child_value(0).as_variant()?;
+        // IBusEngineDesc: type, attachments, name, ... (libibus serialization).
+        if engine.child_value(0).str() != Some("IBusEngineDesc") {
+            return None;
+        }
+        engine.child_value(2).str().map(str::to_owned)
+    }
+
     fn process_key(&self, keyval: u32, keycode: u32, state: u32) -> bool {
+        self.try_process_key(keyval, keycode, state)
+            .unwrap_or(false)
+    }
+
+    fn try_process_key(&self, keyval: u32, keycode: u32, state: u32) -> Option<bool> {
         match self.bus.call_sync(
             Some(IBUS),
             &self.path,
@@ -308,10 +349,10 @@ impl IbusContext {
             CALL_TIMEOUT_MS,
             None::<&gio::Cancellable>,
         ) {
-            Ok(reply) => reply.child_value(0).get::<bool>().unwrap_or(false),
+            Ok(reply) => reply.child_value(0).get::<bool>(),
             Err(e) => {
                 eprintln!("tuna-ibus-bridge: ProcessKeyEvent: {e}");
-                false
+                None
             }
         }
     }
@@ -328,6 +369,7 @@ fn ibus_event(member: &str, params: &glib::Variant) -> Option<FromIbus> {
         }),
         "HidePreeditText" => Some(FromIbus::HidePreedit),
         "ForwardKeyEvent" => Some(FromIbus::Forward {
+            keyval: params.child_value(0).get::<u32>()?,
             keycode: params.child_value(1).get::<u32>()?,
             state: params.child_value(2).get::<u32>()?,
         }),
@@ -438,6 +480,7 @@ struct Bridge {
     _popup: Option<(wl_surface::WlSurface, ZwpInputPopupSurfaceV2)>,
     vk: Option<ZwpVirtualKeyboardV1>,
     grab: Option<ZwpInputMethodKeyboardGrabV2>,
+    osk: Option<TunaOskInputV1>,
     context: Option<IbusContext>,
     incoming: Rc<RefCell<VecDeque<FromIbus>>>,
     /// `done` events so far: the serial a commit names.
@@ -490,6 +533,56 @@ impl Bridge {
         .into_iter()
         .filter(|(name, _)| active(name))
         .fold(0, |bits, (_, bit)| bits | bit)
+    }
+
+    /// GNOME handleVirtualKey: source identity comes from this exact IBus
+    /// context, not the presence of its persistent physical keyboard grab.
+    fn virtual_text(&mut self, serial: u32, text: String) {
+        if !self.active || serial != self.serial {
+            return;
+        }
+        let Some(context) = &self.context else { return };
+        let Some(engine) = context.engine() else {
+            // An unavailable context cannot authorize either a direct commit
+            // or an engine-declined fallback. Never fabricate composition.
+            return;
+        };
+        if engine.starts_with("xkb:") {
+            if let Some(im) = &self.im {
+                im.commit_string(text);
+                im.commit(serial);
+            }
+            return;
+        }
+        for character in text.chars() {
+            let keysym = xkb::utf32_to_keysym(u32::from(character)).raw();
+            if keysym == 0 {
+                continue;
+            }
+            let handled = self
+                .context
+                .as_ref()
+                .and_then(|context| context.try_process_key(keysym, 0, 0));
+            if debug() {
+                eprintln!("tuna-ibus-bridge: OSK IBus took it: {handled:?}");
+            }
+            self.apply_incoming();
+            match handled {
+                Some(true) => {
+                    // GNOME only sends a release after a handled press.
+                    if let Some(context) = &self.context {
+                        context.try_process_key(keysym, 0, RELEASE);
+                    }
+                    self.apply_incoming();
+                }
+                Some(false) => {
+                    if let Some(osk) = &self.osk {
+                        osk.unhandled(serial, keysym);
+                    }
+                }
+                None => return,
+            }
+        }
     }
 
     /// One grabbed key: IBus first, then the app if IBus passes.
@@ -573,8 +666,21 @@ impl Bridge {
                 im.set_preedit_string(String::new(), 0, 0);
                 im.commit(self.serial);
             }
-            FromIbus::Forward { keycode, state } => {
-                self.forward(0, keycode, state & RELEASE == 0);
+            FromIbus::Forward {
+                keyval,
+                keycode,
+                state,
+            } => {
+                if keycode == 0 {
+                    // Virtual ProcessKeyEvent uses no physical keycode.
+                    if state & RELEASE == 0 {
+                        if let Some(osk) = &self.osk {
+                            osk.unhandled(self.serial, keyval);
+                        }
+                    }
+                } else {
+                    self.forward(0, keycode, state & RELEASE == 0);
+                }
             }
             FromIbus::DeleteSurrounding { offset, nchars } => {
                 let lengths = self
@@ -656,6 +762,7 @@ impl Bridge {
         }
         self.active = active;
         self.preedit_active = false;
+        self.incoming.borrow_mut().clear();
         // A new field: what IBus heard about the last one is stale.
         self.surrounding = None;
         self.sent_cursor_rect = None;
@@ -664,6 +771,9 @@ impl Bridge {
             if active { "focused" } else { "left" }
         );
         if let Some(context) = &self.context {
+            if !active {
+                context.send("Reset", None);
+            }
             context.send(if active { "FocusIn" } else { "FocusOut" }, None);
         }
         // Every focused field goes through IBus, including keyboard layouts.
@@ -703,6 +813,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Bridge {
                 }
                 "wl_compositor" if state.compositor.is_none() => {
                     state.compositor = Some(registry.bind(name, version.min(4), qh, ()));
+                }
+                "tuna_osk_input_v1" => {
+                    state.osk = Some(registry.bind(name, 1, qh, ()));
                 }
                 _ => {}
             }
@@ -777,6 +890,21 @@ impl Dispatch<ZwpInputPopupSurfaceV2, ()> for Bridge {
         } = event
         {
             state.cursor_rect = Some((x, y, width, height));
+        }
+    }
+}
+
+impl Dispatch<TunaOskInputV1, ()> for Bridge {
+    fn event(
+        state: &mut Self,
+        _: &TunaOskInputV1,
+        event: tuna_osk_input_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let tuna_osk_input_v1::Event::Text { serial, text } = event {
+            state.virtual_text(serial, text);
         }
     }
 }

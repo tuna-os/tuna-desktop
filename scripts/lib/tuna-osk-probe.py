@@ -77,8 +77,10 @@ def build(loop):
     def texts(_entry):
         log({"text": {name: entry.get_text() for name, entry in entries.items()}})
 
-    for entry in entries.values():
+    for name, entry in entries.items():
         entry.connect("changed", texts)
+        entry.connect("preedit-changed", lambda _entry, text, field=name:
+                      log({"preedit": text, "field": field}))
 
     def focus(*_):
         widget = win.get_focus()

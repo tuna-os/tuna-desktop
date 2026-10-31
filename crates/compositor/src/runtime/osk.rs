@@ -60,9 +60,9 @@ impl Runtime {
         match input {
             OskInput::Keyval { keysym, pressed } => self.osk_keyval(keysym, pressed),
             OskInput::Commit { text, modifiers } => {
-                // `KeyboardController.commit`: without input-method focus
-                // (X11 clients) or with modifiers latched, raw keys;
-                // otherwise the input method commits the string.
+                // Modified shortcuts and X11 retain the physical path.
+                // Native fields ask the supervised context which source owns
+                // text; a persistent keyboard grab is not source identity.
                 let focus = self
                     .state
                     .seat
@@ -73,8 +73,22 @@ impl Runtime {
                         .state
                         .protocols
                         .text_inputs
-                        .commit(focus.as_ref(), &text)
+                        .focus(focus.as_ref())
+                        .is_some()
                 {
+                    if self.state.protocols.osk_ime.send(&self.state, &text) {
+                        return;
+                    }
+                    // A configured bridge that is starting/restarting cannot
+                    // tell us which engine owns this text. Drop, never replay
+                    // it or silently turn a composition into literal letters.
+                    // Sessions without IBus retain native direct commit.
+                    if self.ime.is_none() {
+                        self.state
+                            .protocols
+                            .text_inputs
+                            .commit(focus.as_ref(), &text);
+                    }
                     return;
                 }
                 for modifier in &modifiers {
