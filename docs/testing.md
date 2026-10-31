@@ -404,6 +404,38 @@ To drive the published image through GDM in a KubeVirt VM with keyboard
 and pointer input and save a console frame for every step, see
 [Published-image journey through Corral](corral-journey.md).
 
+## Pointer motion barriers and input aids
+
+Backend motion is coalesced once per output frame, but a raw non-motion
+input ends the run **before** accessibility filtering. Mouse Keys consumes
+its keypad release without forwarding a key to the window manager; it
+must still deliver any pending synthesized motion first. Otherwise a
+timer move can arrive a frame after release. Empty barriers do not touch
+the delivery clock, and consecutive absolute/relative motion remains
+coalesced with relative deltas summed.
+
+The `motion_coalesce::tests` unit tests cover a consumed keypad release
+with a pending timer move, all manager non-motion input kinds, empty
+barriers, and preservation of motion batching. For the actual nested
+backend → accessibility aids → client wire path, run:
+
+```sh
+PATH=/usr/bin:$PATH just build -p tuna-compositor -p tuna-shell-gtk
+PATH=/usr/bin:$PATH timeout 240 just proof motion-barriers-proof
+```
+
+This focused proof needs Xvfb, xdotool, a session bus, and Python GTK4
+bindings. It stops the compositor while queueing host motion, a Mouse Keys
+press/release, and another motion, so they reach the same backend dispatch.
+The real GTK client must see three exact positions and three pointer
+frames, with no leaked keypad keys. A second batch of 25 uninterrupted
+motions must still produce just its final position and one frame.
+`--bin-dir /absolute/path/to/old/target/debug` selects an old build without
+altering the assertions: the pre-fix runtime fails because it delivers only
+the final position, losing the consumed release's motion boundary.
+Processes are resumed, terminated, and reaped on exit; failed proof
+artifacts retain `barriers.json`, the compositor state, and the wire log.
+
 ## Animation clock and motion policy
 
 Compositor animations (the overview transition, the scroll-strip springs and
