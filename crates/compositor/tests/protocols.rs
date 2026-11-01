@@ -70,7 +70,6 @@ const EXPECTED: &[(&str, u32)] = &[
     ("xdg_wm_dialog_v1", 1),
     ("zwlr_layer_shell_v1", 4),
     ("zwp_idle_inhibit_manager_v1", 1),
-    ("zwp_input_method_manager_v2", 1),
     ("zwp_keyboard_shortcuts_inhibit_manager_v1", 1),
     ("zwp_pointer_constraints_v1", 1),
     ("zwp_pointer_gestures_v1", 3),

@@ -70,7 +70,7 @@ and this page together.
 | wp_cursor_shape_manager_v1 | 2 | shapes accepted; the compositor cursor is still the default arrow |
 | zwp_idle_inhibit_manager_v1 | 1 | a live inhibitor holds off the idle lock |
 | zwp_text_input_manager_v3 | 1 | text fields reach the input method (#60) |
-| zwp_input_method_manager_v2 | 1 | IMEs such as fcitx5; candidate popups are tracked like any popup |
+| zwp_input_method_manager_v2 | 1 | private to the compositor-supervised IBus connection, using the same server-owned transport authorization as virtual keyboard; ordinary applications cannot discover or force-bind it. This is not a public GNOME IME API. One exact live input-method resource owns the seat; unavailable objects and their inert child IDs cannot type, observe surrounding text, reserve popup roles, take grabs or retire the owner |
 | zwp_pointer_gestures_v1 | 3 | swipes reach apps; three-finger swipes are the shell's (overview, workspaces) |
 | zwp_relative_pointer_manager_v1 | 1 | raw motion from the DRM backend |
 | zwp_tablet_manager_v2 | 2 | tablets, tools (pressure, tilt, distance, buttons, tool cursors) and pads (buttons, rings, strips, mode groups, application labels shown on the pad OSD) from libinput on the DRM backend; the vendored Smithay adds pads, labels and version 2 (`third-party/smithay/TABLET-PAD-API-PATCH.diff`); pad dials need libinput 1.26 (the `input` crate's `libinput_1_26` feature), newer than Ubuntu 24.04's 1.25 (#344) |

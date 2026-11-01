@@ -1393,6 +1393,16 @@ impl TestCompositor {
             .unwrap()
     }
 
+    /// Attach the private server-owned input-method connection in native
+    /// protocol fixtures. Public clients must use `add_client`; executable
+    /// names, PIDs and application metadata do not grant this authority.
+    pub fn add_ime_bridge_client(&mut self, stream: UnixStream) -> Client {
+        self.display
+            .handle()
+            .insert_client(stream, Arc::new(ClientState::ime_bridge()))
+            .unwrap()
+    }
+
     /// Dispatch pending client requests and flush replies. Drives the
     /// display without an event loop; tests interleave this with client
     /// actions instead of blocking on either side.

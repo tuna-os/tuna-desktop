@@ -162,8 +162,13 @@ impl Protocols {
             _tablet_manager: TabletManagerState::new::<State>(dh),
             _idle_inhibit: IdleInhibitManagerState::new::<State>(dh),
             _text_input: TextInputManagerState::new::<State>(dh),
-            // Any client may become the input method, as on GNOME.
-            _input_method: InputMethodManagerState::new::<State, _>(dh, |_client| true),
+            // Only the compositor-supervised connection may observe text or
+            // own the seat's input method, just as for its virtual keyboard.
+            _input_method: InputMethodManagerState::new::<State, _>(dh, |client| {
+                client
+                    .get_data::<crate::ClientState>()
+                    .is_some_and(|data| data.ime_bridge)
+            }),
             bridge_cursor_popup: None,
             _gestures: PointerGesturesState::new::<State>(dh),
             _relative_pointer: RelativePointerManagerState::new::<State>(dh),

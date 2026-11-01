@@ -41,8 +41,10 @@ use wayland_protocols::xdg::shell::client::{
     xdg_wm_base::{self, XdgWmBase},
 };
 use wayland_protocols_misc::zwp_input_method_v2::client::{
+    zwp_input_method_keyboard_grab_v2::{self, ZwpInputMethodKeyboardGrabV2},
     zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
     zwp_input_method_v2::{self, ZwpInputMethodV2},
+    zwp_input_popup_surface_v2::{self, ZwpInputPopupSurfaceV2},
 };
 
 use wayland_protocols_wlr::layer_shell::v1::client::{
@@ -59,6 +61,7 @@ struct Client {
     wm: Option<XdgWmBase>,
     text_input_manager: Option<ZwpTextInputManagerV3>,
     input_method_manager: Option<ZwpInputMethodManagerV2>,
+    input_method_name: Option<u32>,
     relative_manager: Option<ZwpRelativePointerManagerV1>,
     constraints: Option<ZwpPointerConstraintsV1>,
     pointer: Option<WlPointer>,
@@ -68,6 +71,13 @@ struct Client {
     /// input-method: activations and `done` count (the commit serial).
     ime_active: bool,
     ime_done: u32,
+    ime_unavailable: bool,
+    preedits: Vec<String>,
+    text_leaves: usize,
+    text_enters: usize,
+    ime_grab_events: usize,
+    ime_keys: usize,
+    ime_popup_events: usize,
     /// Relative motion received (dx, dy).
     relative: Vec<(f64, f64)>,
     pointer_entered: bool,
@@ -103,6 +113,7 @@ impl Dispatch<WlRegistry, ()> for Client {
                     state.text_input_manager = Some(registry.bind(name, 1, qh, ()))
                 }
                 "zwp_input_method_manager_v2" => {
+                    state.input_method_name = Some(name);
                     state.input_method_manager = Some(registry.bind(name, 1, qh, ()))
                 }
                 "zwp_relative_pointer_manager_v1" => {
@@ -212,12 +223,17 @@ impl Dispatch<ZwpTextInputV3, ()> for Client {
             zwp_text_input_v3::Event::Enter { .. } => {
                 // A focused text field: ask for input.
                 state.text_entered = true;
+                state.text_enters += 1;
                 text_input.enable();
                 text_input.commit();
             }
             zwp_text_input_v3::Event::CommitString { text: Some(text) } => {
                 state.committed.push(text)
             }
+            zwp_text_input_v3::Event::PreeditString {
+                text: Some(text), ..
+            } => state.preedits.push(text),
+            zwp_text_input_v3::Event::Leave { .. } => state.text_leaves += 1,
             _ => {}
         }
     }
@@ -236,11 +252,40 @@ impl Dispatch<ZwpInputMethodV2, ()> for Client {
             zwp_input_method_v2::Event::Activate => state.ime_active = true,
             zwp_input_method_v2::Event::Deactivate => state.ime_active = false,
             zwp_input_method_v2::Event::Done => state.ime_done += 1,
+            zwp_input_method_v2::Event::Unavailable => state.ime_unavailable = true,
             _ => {}
         }
     }
 }
 
+impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &ZwpInputMethodKeyboardGrabV2,
+        event: zwp_input_method_keyboard_grab_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        state.ime_grab_events += 1;
+        if matches!(event, zwp_input_method_keyboard_grab_v2::Event::Key { .. }) {
+            state.ime_keys += 1;
+        }
+    }
+}
+
+impl Dispatch<ZwpInputPopupSurfaceV2, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &ZwpInputPopupSurfaceV2,
+        _: zwp_input_popup_surface_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        state.ime_popup_events += 1;
+    }
+}
 impl Dispatch<ZwpRelativePointerV1, ()> for Client {
     fn event(
         state: &mut Self,
@@ -331,18 +376,32 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for Client {
 
 struct Peer {
     _conn: Connection,
+    registry: WlRegistry,
     queue: EventQueue<Client>,
     client: Client,
 }
 
 fn connect(comp: &mut TestCompositor) -> Peer {
+    connect_with_admission(comp, false)
+}
+
+fn connect_ime_bridge(comp: &mut TestCompositor) -> Peer {
+    connect_with_admission(comp, true)
+}
+
+fn connect_with_admission(comp: &mut TestCompositor, ime_bridge: bool) -> Peer {
     let (server, stream) = UnixStream::pair().unwrap();
-    comp.add_client(server);
+    if ime_bridge {
+        comp.add_ime_bridge_client(server);
+    } else {
+        comp.add_client(server);
+    }
     let conn = Connection::from_socket(stream).unwrap();
     let queue = conn.new_event_queue();
-    conn.display().get_registry(&queue.handle(), ());
+    let registry = conn.display().get_registry(&queue.handle(), ());
     Peer {
         _conn: conn,
+        registry,
         queue,
         client: Client::default(),
     }
@@ -392,10 +451,10 @@ fn an_input_method_types_into_the_focused_text_field() {
     comp.state.set_output_size(1280, 800);
     let mut manager = comp.window_manager();
     let mut app = connect(&mut comp);
-    let mut ime = connect(&mut comp);
+    let mut ime = connect_ime_bridge(&mut comp);
     pump(&mut comp, &mut manager, &mut [&mut app, &mut ime]);
 
-    // The IME binds first, as fcitx5 does at login.
+    // The server-owned bridge binds first, before an application maps.
     let qh = ime.queue.handle();
     let im = ime
         .client
@@ -952,4 +1011,468 @@ fn layer_constraints_use_actual_origin_and_commit_regions_before_activation() {
             pump(&mut comp, &mut manager, &mut [&mut app]);
         }
     }
+}
+
+#[test]
+fn unavailable_input_methods_cannot_inject_or_retire_the_live_resource() {
+    let mut comp = TestCompositor::new();
+    comp.state.set_output_size(1280, 800);
+    let mut manager = comp.window_manager();
+    let mut owner = connect_ime_bridge(&mut comp);
+    let mut app = connect(&mut comp);
+    let mut foreign = connect_ime_bridge(&mut comp);
+    pump(
+        &mut comp,
+        &mut manager,
+        &mut [&mut app, &mut owner, &mut foreign],
+    );
+    let im = owner
+        .client
+        .input_method_manager
+        .as_ref()
+        .unwrap()
+        .get_input_method(
+            owner.client.seat.as_ref().unwrap(),
+            &owner.queue.handle(),
+            (),
+        );
+    let text = app
+        .client
+        .text_input_manager
+        .as_ref()
+        .unwrap()
+        .get_text_input(app.client.seat.as_ref().unwrap(), &app.queue.handle(), ());
+    let _surface = window(&mut app);
+    text.enable();
+    text.commit();
+    pump(
+        &mut comp,
+        &mut manager,
+        &mut [&mut app, &mut owner, &mut foreign],
+    );
+    let epoch = owner.client.ime_done;
+    assert!(epoch > 0);
+    let enters = app.client.text_enters;
+    let rejected = foreign
+        .client
+        .input_method_manager
+        .as_ref()
+        .unwrap()
+        .get_input_method(
+            foreign.client.seat.as_ref().unwrap(),
+            &foreign.queue.handle(),
+            (),
+        );
+    pump(
+        &mut comp,
+        &mut manager,
+        &mut [&mut app, &mut owner, &mut foreign],
+    );
+    assert!(
+        foreign.client.ime_unavailable,
+        "the newcomer, not the live owner, is unavailable"
+    );
+    assert_eq!(
+        app.client.text_enters, enters,
+        "unavailable creation must not re-enter the live field"
+    );
+    assert!(!owner.client.ime_unavailable);
+    assert_eq!(
+        owner.client.ime_done, epoch,
+        "a newcomer cannot reset the live done epoch"
+    );
+    app.client.committed.clear();
+    app.client.preedits.clear();
+    let leaves = app.client.text_leaves;
+    rejected.commit_string("foreign".into());
+    rejected.set_preedit_string("foreign".into(), 0, 0);
+    rejected.delete_surrounding_text(1, 1);
+    rejected.commit(epoch);
+    pump(
+        &mut comp,
+        &mut manager,
+        &mut [&mut app, &mut owner, &mut foreign],
+    );
+    assert!(app.client.committed.is_empty());
+    assert!(app.client.preedits.is_empty());
+    rejected.destroy();
+    pump(
+        &mut comp,
+        &mut manager,
+        &mut [&mut app, &mut owner, &mut foreign],
+    );
+    assert_eq!(
+        app.client.text_leaves, leaves,
+        "foreign destruction cannot retire the live field"
+    );
+    im.commit_string("owner".into());
+    im.commit(epoch);
+    pump(
+        &mut comp,
+        &mut manager,
+        &mut [&mut app, &mut owner, &mut foreign],
+    );
+    assert_eq!(app.client.committed, ["owner"]);
+
+    // Resource identity, not merely connection identity, owns the seat.
+    let duplicate = owner
+        .client
+        .input_method_manager
+        .as_ref()
+        .unwrap()
+        .get_input_method(
+            owner.client.seat.as_ref().unwrap(),
+            &owner.queue.handle(),
+            (),
+        );
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert!(owner.client.ime_unavailable);
+    assert_eq!(
+        app.client.text_enters, enters,
+        "same-client unavailable creation must not re-enter the field"
+    );
+    app.client.committed.clear();
+    duplicate.commit_string("same-client impostor".into());
+    duplicate.commit(epoch);
+    duplicate.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert!(app.client.committed.is_empty());
+    assert_eq!(app.client.text_leaves, leaves);
+    im.commit_string("still owner".into());
+    im.commit(epoch);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert_eq!(app.client.committed, ["still owner"]);
+
+    // A real owner's destruction releases the seat for a fresh resource.
+    im.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    owner.client.ime_unavailable = false;
+    owner.client.ime_done = 0;
+    let replacement = owner
+        .client
+        .input_method_manager
+        .as_ref()
+        .unwrap()
+        .get_input_method(
+            owner.client.seat.as_ref().unwrap(),
+            &owner.queue.handle(),
+            (),
+        );
+    text.enable();
+    text.commit();
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert!(!owner.client.ime_unavailable);
+    app.client.committed.clear();
+    replacement.commit_string("replacement".into());
+    replacement.commit(owner.client.ime_done);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert_eq!(app.client.committed, ["replacement"]);
+}
+
+#[test]
+fn inert_input_method_new_ids_have_no_role_events_or_grab_side_effects() {
+    for same_client in [false, true] {
+        let mut comp = TestCompositor::new();
+        comp.state.set_output_size(1280, 800);
+        let mut manager = comp.window_manager();
+        let mut owner = connect_ime_bridge(&mut comp);
+        let mut app = connect(&mut comp);
+        let mut foreign = connect_ime_bridge(&mut comp);
+        pump(
+            &mut comp,
+            &mut manager,
+            &mut [&mut app, &mut owner, &mut foreign],
+        );
+        let im = owner
+            .client
+            .input_method_manager
+            .as_ref()
+            .unwrap()
+            .get_input_method(
+                owner.client.seat.as_ref().unwrap(),
+                &owner.queue.handle(),
+                (),
+            );
+        let text = app
+            .client
+            .text_input_manager
+            .as_ref()
+            .unwrap()
+            .get_text_input(app.client.seat.as_ref().unwrap(), &app.queue.handle(), ());
+        let _surface = window(&mut app);
+        text.enable();
+        text.commit();
+        pump(
+            &mut comp,
+            &mut manager,
+            &mut [&mut app, &mut owner, &mut foreign],
+        );
+        let _owner_grab = im.grab_keyboard(&owner.queue.handle(), ());
+        pump(
+            &mut comp,
+            &mut manager,
+            &mut [&mut app, &mut owner, &mut foreign],
+        );
+        assert!(owner.client.ime_grab_events > 0);
+        let grab_events = owner.client.ime_grab_events;
+        let leaves = app.client.text_leaves;
+        let target = if same_client {
+            &mut owner
+        } else {
+            &mut foreign
+        };
+        let rejected = target
+            .client
+            .input_method_manager
+            .as_ref()
+            .unwrap()
+            .get_input_method(
+                target.client.seat.as_ref().unwrap(),
+                &target.queue.handle(),
+                (),
+            );
+        let surface = target
+            .client
+            .compositor
+            .as_ref()
+            .unwrap()
+            .create_surface(&target.queue.handle(), ());
+        let popup = rejected.get_input_popup_surface(&surface, &target.queue.handle(), ());
+        let inert_grab = rejected.grab_keyboard(&target.queue.handle(), ());
+        pump(
+            &mut comp,
+            &mut manager,
+            &mut [&mut app, &mut owner, &mut foreign],
+        );
+        assert_eq!(
+            owner.client.ime_grab_events, grab_events,
+            "inert children must emit no keymap/repeat/modifiers"
+        );
+        assert_eq!(foreign.client.ime_grab_events, 0);
+        assert_eq!(
+            owner.client.ime_popup_events + foreign.client.ime_popup_events,
+            0
+        );
+        assert_eq!(app.client.text_leaves, leaves);
+        inert_grab.release();
+        popup.destroy();
+        rejected.destroy();
+        pump(
+            &mut comp,
+            &mut manager,
+            &mut [&mut app, &mut owner, &mut foreign],
+        );
+        let keys = owner.client.ime_keys;
+        manager.keyboard_key(&mut comp.state, 30, true, 1);
+        manager.keyboard_key(&mut comp.state, 30, false, 2);
+        pump(
+            &mut comp,
+            &mut manager,
+            &mut [&mut app, &mut owner, &mut foreign],
+        );
+        assert_eq!(
+            owner.client.ime_keys,
+            keys + 2,
+            "inert child destruction must leave the real grab installed"
+        );
+        assert_eq!(foreign.client.ime_keys, 0);
+        assert_eq!(app.client.text_leaves, leaves);
+        im.commit_string("still owned".into());
+        im.commit(owner.client.ime_done);
+        pump(
+            &mut comp,
+            &mut manager,
+            &mut [&mut app, &mut owner, &mut foreign],
+        );
+        assert_eq!(app.client.committed, ["still owned"]);
+        // Ignoring the popup request did not reserve its surface's role.
+        let target = if same_client {
+            &mut owner
+        } else {
+            &mut foreign
+        };
+        let xdg = target.client.wm.as_ref().unwrap().get_xdg_surface(
+            &surface,
+            &target.queue.handle(),
+            (),
+        );
+        let _top = xdg.get_toplevel(&target.queue.handle(), ());
+        surface.commit();
+        pump(
+            &mut comp,
+            &mut manager,
+            &mut [&mut app, &mut owner, &mut foreign],
+        );
+    }
+}
+
+#[test]
+fn ordinary_and_spoofed_clients_cannot_discover_or_force_bind_an_input_method() {
+    for spoof_identity in [false, true] {
+        let mut comp = TestCompositor::new();
+        let mut manager = comp.window_manager();
+        let mut app = connect(&mut comp);
+        pump(&mut comp, &mut manager, &mut [&mut app]);
+        assert!(app.client.input_method_manager.is_none());
+        assert!(
+            app.client.input_method_name.is_none(),
+            "hidden before any bridge claims the seat"
+        );
+        if spoof_identity {
+            let surface = app
+                .client
+                .compositor
+                .as_ref()
+                .unwrap()
+                .create_surface(&app.queue.handle(), ());
+            let xdg =
+                app.client
+                    .wm
+                    .as_ref()
+                    .unwrap()
+                    .get_xdg_surface(&surface, &app.queue.handle(), ());
+            let top = xdg.get_toplevel(&app.queue.handle(), ());
+            top.set_app_id("tuna-ibus-bridge".into());
+            top.set_title("tuna-ibus-bridge".into());
+            surface.commit();
+            pump(&mut comp, &mut manager, &mut [&mut app]);
+            assert!(
+                app.client.input_method_manager.is_none(),
+                "application metadata cannot confer transport authority"
+            );
+        }
+        // Both connections originate from this same executable and PID.
+        // Only the server-owned private connection is authorized.
+        let mut bridge = connect_ime_bridge(&mut comp);
+        pump(&mut comp, &mut manager, &mut [&mut app, &mut bridge]);
+        let name = bridge
+            .client
+            .input_method_name
+            .expect("authorized bridge sees the manager");
+        let _forced: ZwpInputMethodManagerV2 = app.registry.bind(name, 1, &app.queue.handle(), ());
+        let mut denied = false;
+        for _ in 0..ROUNDS {
+            let _ = app.queue.flush();
+            comp.pump();
+            if let Some(guard) = app.queue.prepare_read() {
+                let _ = guard.read();
+            }
+            let _ = app.queue.dispatch_pending(&mut app.client);
+            if app._conn.backend().last_error().is_some() {
+                denied = true;
+                break;
+            }
+        }
+        assert!(
+            denied,
+            "knowing the private global name must not bypass forced-bind admission"
+        );
+        // libwayland can expose wl_display.invalid_object (code zero) as a
+        // terminal I/O error. Check connection death, not its error variant.
+        assert!(app._conn.backend().last_error().is_some());
+        assert!(
+            bridge._conn.backend().last_error().is_none(),
+            "denial does not retire the admitted connection"
+        );
+        let _owner = bridge
+            .client
+            .input_method_manager
+            .as_ref()
+            .unwrap()
+            .get_input_method(
+                bridge.client.seat.as_ref().unwrap(),
+                &bridge.queue.handle(),
+                (),
+            );
+        pump(&mut comp, &mut manager, &mut [&mut bridge]);
+        assert!(
+            !bridge.client.ime_unavailable,
+            "denied public client never wins first ownership"
+        );
+    }
+}
+
+#[test]
+fn a_copied_helper_on_a_public_connection_cannot_claim_input_method_authority() {
+    if let Some(name) = std::env::var_os("TUNA_TEST_IM_DENIAL_GLOBAL") {
+        let connection = Connection::connect_to_env().expect("inherited ordinary socket");
+        let mut queue = connection.new_event_queue::<Client>();
+        let registry = connection.display().get_registry(&queue.handle(), ());
+        let mut client = Client::default();
+        queue.roundtrip(&mut client).unwrap();
+        assert!(
+            client.input_method_manager.is_none(),
+            "copy sees no privileged global"
+        );
+        let name = name.to_str().unwrap().parse::<u32>().unwrap();
+        let _forced: ZwpInputMethodManagerV2 = registry.bind(name, 1, &queue.handle(), ());
+        assert!(
+            queue.roundtrip(&mut client).is_err(),
+            "copy cannot force-bind a known private global"
+        );
+        assert!(connection.backend().last_error().is_some());
+        return;
+    }
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    let mut bridge = connect_ime_bridge(&mut comp);
+    pump(&mut comp, &mut manager, &mut [&mut bridge]);
+    let name = bridge.client.input_method_name.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let copy = directory.path().join("tuna-ibus-bridge");
+    std::fs::copy(std::env::current_exe().unwrap(), &copy).unwrap();
+    let (server, stream) = UnixStream::pair().unwrap();
+    comp.add_client(server);
+    // Same executable bytes under a spoofed helper name, in a distinct real
+    // process. Only this public connection is passed; no trusted marker is.
+    let mut child = std::process::Command::new(copy)
+        .args([
+            "--exact",
+            "a_copied_helper_on_a_public_connection_cannot_claim_input_method_authority",
+            "--nocapture",
+        ])
+        .env("TUNA_TEST_IM_DENIAL_GLOBAL", name.to_string())
+        .env("WAYLAND_SOCKET", "0")
+        .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+            stream,
+        )))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        comp.pump();
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "copied helper missed its deadline: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "copied helper failed its denial checks:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _owner = bridge
+        .client
+        .input_method_manager
+        .as_ref()
+        .unwrap()
+        .get_input_method(
+            bridge.client.seat.as_ref().unwrap(),
+            &bridge.queue.handle(),
+            (),
+        );
+    pump(&mut comp, &mut manager, &mut [&mut bridge]);
+    assert!(!bridge.client.ime_unavailable);
 }
