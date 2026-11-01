@@ -198,7 +198,7 @@ struct PendingAcquires(Mutex<Vec<DrmSyncPointBlocker>>);
 fn acquire_failure(state: &State, surface: &WlSurface, message: String) {
     reject_pending_commit(surface);
     if let Some(client) = surface.client() {
-        client.kill(&state.dh, smithay::reexports::wayland_server::backend::ProtocolError {
+        client.kill(&state.dh, smithay::reexports::wayland_server::backend::protocol::ProtocolError {
             code: smithay::reexports::wayland_server::protocol::wl_display::Error::Implementation as u32,
             object_id: 1,
             object_interface: "wl_display".into(),
