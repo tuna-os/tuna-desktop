@@ -63,6 +63,9 @@ use wayland_protocols::xdg::toplevel_tag::v1::client::xdg_toplevel_tag_manager_v
 #[path = "support/background_effect_boundaries.rs"]
 mod background_effect_boundaries;
 
+#[path = "support/xdg_version_boundaries.rs"]
+mod xdg_version_boundaries;
+
 const ROUNDS: usize = 10;
 
 /// What a feedback object (by its tag) was told.
@@ -86,6 +89,8 @@ struct Client {
     background_effects: Option<u32>,
     /// What the drag-and-drop objects heard (xdg-toplevel-drag tests).
     drag: DragLog,
+    /// Actual configure arrays and terminating surface serials, by object.
+    xdg_configures: xdg_version_boundaries::ConfigureLog,
 }
 
 impl Dispatch<WlCallback, ()> for Client {
@@ -151,7 +156,7 @@ impl Dispatch<XdgWmBase, ()> for Client {
 
 impl Dispatch<XdgSurface, ()> for Client {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         surface: &XdgSurface,
         event: xdg_surface::Event,
         _: &(),
@@ -159,6 +164,7 @@ impl Dispatch<XdgSurface, ()> for Client {
         _: &QueueHandle<Self>,
     ) {
         if let xdg_surface::Event::Configure { serial } = event {
+            xdg_version_boundaries::record_surface_configure(state, surface, serial);
             surface.ack_configure(serial);
         }
     }
@@ -308,7 +314,6 @@ impl Dispatch<ExtBackgroundEffectManagerV1, ()> for Client {
 wayland_client::delegate_noop!(Client: ignore WlCompositor);
 wayland_client::delegate_noop!(Client: ignore WlSurface);
 wayland_client::delegate_noop!(Client: ignore WlSeat);
-wayland_client::delegate_noop!(Client: ignore XdgToplevel);
 wayland_client::delegate_noop!(Client: ignore WpFifoManagerV1);
 wayland_client::delegate_noop!(Client: ignore WpFifoV1);
 wayland_client::delegate_noop!(Client: ignore ZwpKeyboardShortcutsInhibitManagerV1);
