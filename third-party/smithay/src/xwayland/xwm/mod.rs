@@ -173,6 +173,7 @@ mod atoms {
             _NET_WM_NAME,
             _NET_WM_MOVERESIZE,
             _NET_WM_PID,
+            _NET_WM_ICON_GEOMETRY,
             _NET_WM_WINDOW_TYPE,
             _NET_WM_WINDOW_TYPE_DESKTOP,
             _NET_WM_WINDOW_TYPE_DOCK,

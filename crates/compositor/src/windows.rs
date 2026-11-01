@@ -1134,8 +1134,37 @@ impl WindowManager {
             .get(&id)
             .is_some_and(|w| w.layout == WindowLayout::Fullscreen)
     }
+    /// Shell-published dash icon bounds for `id`.
     pub fn icon_geometry(&self, id: u64) -> Option<Rectangle<i32, Logical>> {
         self.icon_geometries.get(&id).copied()
+    }
+    /// The client's own minimize target: X11 `_NET_WM_ICON_GEOMETRY`, as
+    /// Mutter's `meta_window_get_icon_geometry` reports it (Wayland clients
+    /// have no such request).
+    pub fn client_icon_geometry(&self, id: u64) -> Option<Rectangle<i32, Logical>> {
+        match self.windows.get(&id)?.surface.underlying_surface() {
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(surface) => surface.icon_geometry(),
+            _ => None,
+        }
+    }
+    /// Published dash icon bounds as `[window, x, y, w, h]`, by window id.
+    pub fn icon_geometries_json(&self) -> serde_json::Value {
+        let mut rows: Vec<_> = self
+            .icon_geometries
+            .iter()
+            .map(|(id, r)| {
+                [
+                    *id as i64,
+                    r.loc.x.into(),
+                    r.loc.y.into(),
+                    r.size.w.into(),
+                    r.size.h.into(),
+                ]
+            })
+            .collect();
+        rows.sort_unstable();
+        serde_json::json!(rows)
     }
     /// Replace trusted shell-published global logical dash icon bounds.
     pub fn set_icon_geometries(&mut self, geometries: Vec<(u64, Rectangle<i32, Logical>)>) {
@@ -2195,6 +2224,11 @@ impl WindowManager {
                 X11ManagerEvent::Fullscreen(id, on) => {
                     if let Some(model) = self.x11_index.get(&id).copied() {
                         self.set_fullscreen(state, model, on);
+                    }
+                }
+                X11ManagerEvent::Minimize(id) => {
+                    if let Some(model) = self.x11_index.get(&id).copied() {
+                        self.minimize(state, model);
                     }
                 }
             }
@@ -8587,15 +8621,22 @@ mod resize_tests {
     }
 }
 
+/// The main surface's buffer size in logical pixels: the extent GNOME's
+/// `meta_window_get_buffer_rect` covers, client-side shadows included.
+/// `None` before the first buffer.
+pub(crate) fn buffer_size(
+    surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+) -> Option<Size<i32, Logical>> {
+    smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| s.surface_size())
+        .flatten()
+}
+
 /// The size a client committed for its window: its xdg window geometry,
 /// else its buffer's size. `None` before the first buffer.
 pub(crate) fn committed_size(
     surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
 ) -> Option<Size<i32, Logical>> {
-    let buffer = smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
-        s.surface_size()
-    })
-    .flatten()?;
+    let buffer = buffer_size(surface)?;
     let geometry = smithay::wayland::compositor::with_states(surface, |states| {
         states
             .cached_state
