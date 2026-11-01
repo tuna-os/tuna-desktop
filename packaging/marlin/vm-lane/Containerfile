@@ -64,6 +64,8 @@ COPY packaging/marlin/vm-lane/tuna-vm-health /usr/libexec/tuna-vm-health
 COPY packaging/marlin/vm-lane/tuna-vm-health.service /usr/lib/systemd/system/tuna-vm-health.service
 COPY packaging/marlin/vm-lane/tuna-vm-fresh-accounts /usr/libexec/tuna-vm-fresh-accounts
 COPY packaging/marlin/vm-lane/tuna-vm-fresh-accounts.service /usr/lib/systemd/system/tuna-vm-fresh-accounts.service
+# Configure the global image role, not individual fresh accounts or probes.
+COPY --chown=0:0 --chmod=0755 packaging/marlin/vm-lane/tuna-vm-admin-policy /tmp/tuna-vm-admin-policy
 
 # /home is a symlink to /var/home on bootc systems and /var is only
 # seeded at install time, so the home directory and the AccountsService
@@ -124,6 +126,10 @@ RUN mkdir -p /usr/share/tuna-vm \
     && systemctl add-wants multi-user.target qemu-guest-agent.service \
     && sha256sum --check /usr/share/tuna-vm/shipped-payload.sha256 \
     && pacman -Q > /usr/share/tuna-vm/fixture-packages.txt
+
+# The real helper proves ordered unique policy inclusion and extends, never
+# regenerates, the receipt before later Orca/GDM upgrades must preserve it.
+RUN python3 /tmp/tuna-vm-admin-policy && rm /tmp/tuna-vm-admin-policy
 
 LABEL org.opencontainers.image.title="marlin-tuna-vm-lane" \
       org.opencontainers.image.description="CI-only Marlin Tuna Desktop test layer: stock GDM with tunaOS's tuna-flavor login path, real lifecycle probes, journal on serial"

@@ -263,6 +263,107 @@ No source, function or package check counts as runtime acceptance.
 The source PR stays unmerged.
 This fixture does not sign packages, publish a repository or change production pins.
 
+### Actual candidate campaign 41255271531
+
+[Run 41255271531](https://github.com/tuna-os/tuna-desktop/actions/runs/41255271531)
+used desktop source `31bf6bb30ee9949918b161a3a6035e906c2efb79`.
+It built package source `7b52bdf34be22bc60fef62b157be64b589b13f6a` once.
+The factory build and staged verifier passed.
+Both containers reported 8 GiB memory, zero swap and CPU quota 200%.
+Cleanup completed.
+
+These are the CI hashes of the package archives, not the local hashes above:
+
+| Package | SHA256 |
+| --- | --- |
+| gdm 51.1.1-1.1 x86_64 | `8c67e6be0e707f157cd901d319dd2af522f9666c352af42958d4a8bbaca62f66` |
+| libgdm 51.1.1-1.1 x86_64 | `a559fae8e6d3166294c6d11ff76b39258ed0ca2c5e62f4e9ccdd5bc5d24f9af4` |
+
+Both profiles installed that exact pair after all upgrades.
+Their metadata, owners and installed bytes matched its manifest.
+Both checks left the shipped-payload manifest unchanged.
+Both profiles passed the ordinary hardware-session lane.
+
+| Profile | Final immutable image |
+| --- | --- |
+| distribution | `sha256:92de3d18015d68e81e4fc769154ac5f130bfa719f3ed70043a0fb8ca6cd90491` |
+| upstream Orca 51 | `sha256:6a00f62d298ad8e3f79f5b9bfde0247f65976cc474a8d0c931f60c8f2a6ec3f4` |
+
+Both profiles began with no physical record for UID1001.
+Both passed its first real `gdm-password` login.
+Both saw a physical record with `Session=tuna` during that session.
+That record also survived logout.
+The Orca profile passed the same first-record guard for UID1002.
+These results cover those logins, not the complete journey.
+
+The Orca observer saw a `SetSession` call and its successful reply.
+It retained only headers.
+The distribution trace covered its first try.
+Its standard login succeeded on the second try, after the trace stopped.
+Missing headers do not prove a missing setter.
+Worker markers: unavailable; debug off.
+
+Sudo refused the standard user in both profiles.
+The admin did not log in on the distribution profile after two tries.
+The admin login and record checks passed on the Orca profile.
+Sudo refused that wheel administrator by policy, with exit status 1.
+The evidence does not establish the inherited contents of sudoers.
+Second-login and reboot acceptance did not run.
+
+Both fresh journeys remain **failed**, not qualified.
+Neither the persistence evidence nor the package provenance satisfies the missing gates.
+No production publication, image pin or merge follows from this run.
+
+### Private image and input corrections
+
+The old controller used one or two forward Tabs.
+[Each user has a focusable button](https://github.com/GNOME/gnome-shell/blob/51.0/js/gdm/loginDialog.js#L67-L137).
+Hover can also move focus.
+The number of Tabs depends on the list and current focus.
+The retained run does not reveal where the UI had focus.
+
+The corrected input parks the pointer outside the list.
+Both Escapes share the original two-second budget.
+Five Up presses reach the first item without vertical wrap.
+Two backward Tabs then reach `Not listed?` through the bottom accessibility button.
+The fixture has at most four human accounts and those two buttons.
+The old per-Tab sleeps are gone.
+
+[GNOME's focus handler](https://github.com/GNOME/gnome-shell/blob/51.0/src/st/st-focus-manager.c#L102-L140)
+lets backward Tabs wrap, but not Up by default.
+The controller still allows at most two login tries.
+Its 60-second login deadline and 90-second trace bound stay unchanged.
+Real UI qualification still needs the complete native journeys.
+
+The [pinned installer](https://github.com/tuna-os/bootc-installer/blob/9f582fe0ecc19561be1115dfef64a59e91ea5072/bootc_installer/defaults/user.py#L16-L17)
+gives administrators the wheel group.
+Its [user setup](https://github.com/tuna-os/fisherman/blob/d349c31e47b1c05ef82d67811d5f4f9e77a62e2a/internal/post/user.go)
+does not grant sudo authorization.
+The result shows a gap in authorization for the administrator.
+It does not establish the inherited sudoers bytes.
+
+The shared image uses `tuna-vm-admin-policy` for its global wheel role.
+Its rule is `%wheel ALL=(ALL:ALL) PASSWD: ALL`.
+It names no test account or probe command.
+The installed file has owner `0:0` and mode `0440`.
+The account helper and sudo probe remain unchanged.
+Standard accounts outside wheel must still fail by policy.
+
+An explicit include precedes inherited rules.
+The `.conf` suffix prevents a second include through `@includedir`.
+This order keeps exceptions for specific commands, such as bootc upgrade.
+The image uses real `visudo` to check syntax and effective inclusion.
+
+The `cvtsudoers` tree proves the role is first and unique.
+It rejects alternate or indirect duplicate includes.
+Setup keeps one explicit include.
+Tests parse the actual role with sudo's tools, without PAM or privileges.
+
+The image appends hashes for the policy and root sudoers file.
+It does not regenerate the existing GDM payload entries.
+Later Orca and GDM layers must preserve that complete receipt.
+These source and parser checks do not qualify the runtime gates.
+
 
 The Debian package journey must retain the original beta package's
 `share/pam.d/tuna-lock` conffile bytes, including its comment. Run

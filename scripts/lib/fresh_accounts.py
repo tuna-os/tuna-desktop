@@ -31,12 +31,17 @@ COMPOSITOR_COMM = "tuna-compositor"
 GNOME_DESKTOP = ("gnome-shell", "gnome-session-b", "gnome-session-s")
 LOGIN_SERVICE = "gdm-password"
 AUTOLOGIN_KEYS = ("automaticloginenable", "timedloginenable")
-# gnome-shell js/gdm/loginDialog.js: the user list holds key focus and Tab
-# reaches its "Not listed?" button, which opens the user-name entry. A
-# record-free account need not be in the list, so the journey always names
-# the account. A failed strategy never types a password for another account:
-# the password follows the account name in the same strategy.
-SELECTIONS = (("tab",), ("tab", "tab"))
+MAX_LOGIN_ATTEMPTS = 2
+# Stock GNOME 51: loginDialog.js UserListItem/UserList put focus on user
+# actors (hover can move it), followed by NotListed and the A11y button;
+# _showUserList hides authMenu. With the four fixture users there are at
+# most six actors. st-focus-manager.c leaves Up nonwrapping by default
+# (st-widget.c ST_KEYNAV_FLAG_NONE), but Shift+Tab always wraps. Parking
+# the pointer, five Up presses and two Shift+Tabs therefore reach NotListed
+# regardless of cached-user count or the initially hovered actor.
+# https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/gdm/loginDialog.js
+# https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/src/st/st-focus-manager.c
+# https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/src/st/st-widget.c
 
 NATIVE_CANDIDATE_ENV = "TUNA_VM_GDM_NATIVE_CANDIDATE"
 NATIVE_SOURCE_ENV = "TUNA_VM_GDM_NATIVE_SOURCE_SHA"
@@ -297,12 +302,19 @@ class Journey:
         if tracing:
             self.trace_active = True
             self._trace("start")
-        for attempt, selection in enumerate(SELECTIONS, 1):
+        for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
+            self.qmp.cmd("input-send-event", events=[
+                {"type": "abs", "data": {"axis": "x", "value": 0}},
+                {"type": "abs", "data": {"axis": "y", "value": 0}}])
+            # A password prompt can unwind through the username prompt.
             self.qmp.keys("esc")
-            self.sleep(2)
-            for key in selection:
-                self.qmp.keys(key)
-                self.sleep(1)
+            self.sleep(1)
+            self.qmp.keys("esc")
+            self.sleep(1)
+            for _ in range(5):
+                self.qmp.keys("up")
+            self.qmp.keys("shift", "tab")
+            self.qmp.keys("shift", "tab")
             self.qmp.keys("ret")
             self.sleep(2)
             self.qmp.type_text(user)
@@ -333,7 +345,7 @@ class Journey:
                 return session_ok(observed)
             self.qmp.keys("esc")
             self.sleep(1)
-        return False, f"{user}: no {LOGIN_SERVICE} session after {len(SELECTIONS)} GDM attempts"
+        return False, f"{user}: no {LOGIN_SERVICE} session after {MAX_LOGIN_ATTEMPTS} GDM attempts"
 
     def _logout(self, user, step):
         self._run("fresh-logout", user)

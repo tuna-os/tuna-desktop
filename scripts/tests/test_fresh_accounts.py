@@ -2,6 +2,7 @@
 simulated guest, plus the guest probe's record detection and its read-only
 GDM/AccountsService diagnostics."""
 import ast
+import hashlib
 import json
 import os
 import pathlib
@@ -22,6 +23,7 @@ sys.path.insert(0, str(ROOT / "scripts/lib"))
 import fresh_accounts  # noqa: E402
 
 GUEST = ROOT / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+ADMIN_POLICY = runpy.run_path(str(ROOT / "packaging/marlin/vm-lane/tuna-vm-admin-policy"))
 CONF = "[daemon]\nFallbackSession=tuna\n"
 NATIVE_SOURCE = "7b52bdf34be22bc60fef62b157be64b589b13f6a"
 
@@ -50,21 +52,23 @@ def candidate_policy():
 
 
 class FakeGuest:
-    """A guest whose GDM logs an account in after the QMP keyboard typed its
-    name and password, and whose AccountsService writes the record then."""
+    """Stock GNOME 51 root focus ring and username/password prompts, plus
+    guest observations. Group membership and sudo authorization are separate."""
 
     def __init__(self, **faults):
         self.faults = faults
         self.boot = 1
         self.records = {"tunaseeded": "[User]\nSystemAccount=false\n"}
         self.records.update(faults.get("records", {}))
-        self.groups = {"tunastd": ["tunastd"], "tunaadmin": ["tunaadmin", "wheel"],
-                       "tunaseeded": ["tunaseeded"]}
+        self.groups = {"tuna-test": ["tuna-test"], "tunastd": ["tunastd"],
+                       "tunaadmin": ["tunaadmin", "wheel"], "tunaseeded": ["tunaseeded"]}
         self.groups.update(faults.get("groups", {}))
-        self.uids = {"tunastd": 1001, "tunaadmin": 1002, "tunaseeded": 1003}
+        self.uids = {"tuna-test": 1000, "tunastd": 1001, "tunaadmin": 1002, "tunaseeded": 1003}
+        self.sudo_allowed = set(faults.get("sudo_allowed", ("tunaadmin",)))
         self.logged_in = None
         self.logged_out = None
         self.typed = []
+        self.auth_attempts = []
         self.logins = []
         self.submitted = []
         self.state_calls = []
@@ -72,25 +76,97 @@ class FakeGuest:
         self.actions = []
         self.input_calls = 0
         self.policy_calls = []
+        self.key_calls = []
+        self.pointer_events = []
+        self.pointer_times = []
+        self.root_views = []
+        self.sleeps = []
+        self.session_polls = []
+        self.trace_times = []
+        self.settle = lambda seconds: None
+        self.clock = lambda: 0.0
+        self.pointer_parked = False
+        fixtures = ("tuna-test", "tunaseeded", "tunastd", "tunaadmin")
+        self.initial_cached = fixtures[:faults.get("cached_users", 2)]
+        self._show_list()
+        self.mode = faults.get("initial_mode", "list")
+        self.selected_user = "tuna-test" if self.mode == "password" else None
+        self.manual_username = self.mode == "password"
+
+    @property
+    def focus_ring(self):
+        users = tuple(user for user in ("tuna-test", "tunaseeded", "tunastd", "tunaadmin")
+                      if user in self.initial_cached
+                      or (user in fresh_accounts.JOURNEY_USERS and user in self.records))
+        return (*users, "not-listed", "a11y")
+
+    def _hover(self):
+        if not self.pointer_parked:
+            self.focus = self.faults.get("hover_focus", 0) % len(self.focus_ring)
+
+    def _show_list(self):
+        self.mode, self.entry, self.focus = "list", "", 0
+        self._hover()
+        self.root_views.append(self.focus_ring)
 
     # QMP
+    def cmd(self, command, **args):
+        self.input_calls += 1
+        if command != "input-send-event" or args != {"events": [
+                {"type": "abs", "data": {"axis": "x", "value": 0}},
+                {"type": "abs", "data": {"axis": "y", "value": 0}}]}:
+            raise AssertionError("expected pointer parking without a click")
+        self.pointer_events.append((command, args))
+        self.pointer_times.append(self.clock())
+        self.pointer_parked = True
+
     def keys(self, *names):
         self.input_calls += 1
-        if names == ("ret",) and len(self.typed) >= 2:
-            user, password = self.typed[-2], self.typed[-1]
+        self.key_calls.append(names)
+        # tuna-baseline.Qmp.keys settles each chord, including text characters.
+        self.settle(0.15)
+        if self.mode == "list":
+            self._hover()
+        if names == ("esc",):
+            if self.mode == "password" and self.manual_username:
+                self.mode, self.entry = "username", ""
+            elif self.mode in ("username", "password", "a11y"):
+                self._show_list()
+        elif self.mode == "list":
+            if names == ("up",):
+                self.focus = max(0, self.focus - 1)
+            elif names in (("tab",), ("shift", "tab")):
+                delta = -1 if names == ("shift", "tab") else 1
+                self.focus = (self.focus + delta) % len(self.focus_ring)
+            elif names == ("ret",):
+                actor = self.focus_ring[self.focus]
+                self.entry = ""
+                if actor == "not-listed":
+                    self.mode, self.manual_username = "username", True
+                elif actor == "a11y":
+                    self.mode = "a11y"
+                else:
+                    self.mode, self.selected_user, self.manual_username = "password", actor, False
+        elif names == ("ret",) and self.mode == "username":
+            self.selected_user, self.entry, self.mode = self.entry, "", "password"
+        elif names == ("ret",) and self.mode == "password":
+            user, password = self.selected_user, self.entry
+            self.auth_attempts.append((user, password))
+            self.entry = ""
             if password == "tuna" and user in self.uids:
                 self.submitted.append(user)
-            if (password == "tuna" and user in self.uids and self.logged_in is None
-                    and not self.faults.get("reject_login")):
-                self.logged_in, self.logged_out = user, None
-                self.logins.append((self.boot, user))
-                if not (self.faults.get("no_record") or self.faults.get("record_on_logout")):
-                    self.records[user] = self.faults.get("saved", "[User]\nSession=tuna\nSystemAccount=false\n")
-            self.typed = []
+                if self.logged_in is None and not self.faults.get("reject_login"):
+                    self.logged_in, self.logged_out, self.mode = user, None, "desktop"
+                    self.logins.append((self.boot, user))
+                    if not (self.faults.get("no_record") or self.faults.get("record_on_logout")):
+                        self.records[user] = self.faults.get("saved", "[User]\nSession=tuna\nSystemAccount=false\n")
 
     def type_text(self, text):
         self.input_calls += 1
-        self.typed.append(text)
+        self.typed.append((self.mode, text))
+        self.settle(0.15 * len(text))
+        if self.mode in ("username", "password"):
+            self.entry += text
 
     def frame(self, path):
         pass
@@ -111,6 +187,7 @@ class FakeGuest:
             return self.faults.get("policy", candidate_policy())
         if action in ("fresh-trace-start", "fresh-trace-stop"):
             self.trace_actions.append((action, len(self.submitted)))
+            self.trace_times.append((action, self.clock()))
             if self.faults.get("trace_error"):
                 raise RuntimeError("PRIVATE-DIAGNOSTIC-ERROR")
             return {"ready": True} if action.endswith("start") else {"profile": "headers-only", "events": []}
@@ -129,6 +206,7 @@ class FakeGuest:
                     "custom_conf": self.faults.get("custom_conf", CONF)}
         if action == "fresh-session":
             user = args[0]
+            self.session_polls.append((user, self.clock()))
             sessions = desktop = []
             if self.logged_in == user:
                 sessions = [{"Id": "3", "VTNr": "2", "User": str(self.uids[user]),
@@ -137,7 +215,7 @@ class FakeGuest:
             return {"user": user, "uid": self.uids[user], "sessions": sessions, "desktop": desktop}
         if action == "fresh-sudo":
             user = args[0]
-            allowed = "wheel" in self.groups[user] or self.faults.get("std_sudo")
+            allowed = user in self.sudo_allowed or self.faults.get("std_sudo")
             return {"user": user, "returncode": 0 if allowed else 1, "policy_denied": not allowed,
                     "sudo_present": True}
         if action == "fresh-logout":
@@ -145,11 +223,13 @@ class FakeGuest:
                 self.records[args[0]] = "[User]\nSession=tuna\nSystemAccount=false\n"
             if not self.faults.get("stuck_session"):
                 self.logged_in, self.logged_out = None, args[0]
+                self._show_list()
             return {"user": args[0]}
         if action == "reboot":
             before = f"boot-{self.boot}"
             self.boot += 1
             self.logged_in = self.logged_out = None
+            self._show_list()
             return {"boot_id": before}
         raise ValueError(action)
 
@@ -158,8 +238,14 @@ def journey(guest, gdm_trace=False, candidate_env=None):
     results = {}
     clock = [0.0]
 
-    def sleep(seconds):
+    def settle(seconds):
         clock[0] += seconds
+
+    def sleep(seconds):
+        guest.sleeps.append(seconds)
+        settle(seconds)
+
+    guest.settle, guest.clock = settle, lambda: clock[0]
 
     environment = dict(os.environ)
     for name in ("TUNA_VM_GDM_NATIVE_CANDIDATE", "TUNA_VM_GDM_NATIVE_SOURCE_SHA"):
@@ -168,7 +254,7 @@ def journey(guest, gdm_trace=False, candidate_env=None):
     with tempfile.TemporaryDirectory() as out, mock.patch.dict(os.environ, environment, clear=True):
         run = fresh_accounts.Journey(guest, guest.connect, lambda greeter: greeter["ready"], out,
                                      lambda name, ok, detail: results.__setitem__(name, (ok, detail)),
-                                     sleep=sleep, clock=lambda: clock[0], login_timeout=5, greeter_timeout=5,
+                                     sleep=sleep, clock=guest.clock, greeter_timeout=5,
                                      gdm_trace=gdm_trace)
         try:
             passed = run.run()
@@ -177,6 +263,7 @@ def journey(guest, gdm_trace=False, candidate_env=None):
             passed, error = False, str(exc)
         path = pathlib.Path(out) / "fresh-accounts-receipts.json"
         receipts = json.loads(path.read_text()) if path.exists() else None
+        guest.elapsed = clock[0]
     return passed, results, error, receipts
 
 
@@ -211,7 +298,7 @@ class JourneyTest(unittest.TestCase):
         passed, results, error, receipts = journey(guest, gdm_trace=True)
         self.assertFalse(passed)
         self.assertEqual(guest.trace_actions, [("fresh-trace-start", 0), ("fresh-trace-stop", 1)])
-        self.assertEqual(len(guest.submitted), len(fresh_accounts.SELECTIONS))
+        self.assertEqual(len(guest.submitted), fresh_accounts.MAX_LOGIN_ATTEMPTS)
 
     def test_trace_stops_on_keyboard_exception(self):
         guest = FakeGuest()
@@ -219,6 +306,118 @@ class JourneyTest(unittest.TestCase):
             passed, results, error, receipts = journey(guest, gdm_trace=True)
         self.assertFalse(passed)
         self.assertEqual(guest.trace_actions, [("fresh-trace-start", 0), ("fresh-trace-stop", 0)])
+
+    def test_focus_ring_clamps_up_and_wraps_backward(self):
+        guest = FakeGuest(cached_users=4, hover_focus=5)
+        self.assertEqual(guest.focus_ring[guest.focus], "a11y")
+        guest.cmd("input-send-event", events=[
+            {"type": "abs", "data": {"axis": "x", "value": 0}},
+            {"type": "abs", "data": {"axis": "y", "value": 0}}])
+        for _ in range(5):
+            guest.keys("up")
+        self.assertEqual(guest.focus, 0)
+        guest.keys("up")
+        self.assertEqual(guest.focus, 0)  # Up must not wrap to A11y.
+        guest.keys("shift", "tab")
+        self.assertEqual(guest.focus_ring[guest.focus], "a11y")
+        guest.keys("shift", "tab")
+        self.assertEqual(guest.focus_ring[guest.focus], "not-listed")
+
+    def test_all_cached_counts_hover_positions_and_prompt_modes_complete_six_logins(self):
+        expected = [(1, "tunastd"), (1, "tunaadmin"), (1, "tunastd"), (1, "tunaadmin"),
+                    (2, "tunastd"), (2, "tunaadmin")]
+        for count in range(1, 5):
+            for hover in range(count + 2):
+                for mode in ("list", "username", "password"):
+                    with self.subTest(cached_users=count, hover=hover, mode=mode):
+                        guest = FakeGuest(cached_users=count, hover_focus=hover, initial_mode=mode)
+                        passed, results, error, _ = journey(guest)
+                        self.assertTrue(passed, (results, error))
+                        self.assertEqual(guest.logins, expected)
+                        self.assertEqual(guest.auth_attempts, [(user, "tuna") for _, user in expected])
+                        self.assertEqual(guest.typed, [item for _, user in expected
+                                                      for item in (("username", user), ("password", "tuna"))])
+                        self.assertEqual(len(guest.pointer_events), 6)
+                        self.assertEqual(max(len(ring) for ring in guest.root_views), min(4, count + 2) + 2)
+
+    def test_cached_list_grows_after_each_first_login_record(self):
+        guest = FakeGuest(cached_users=2)
+        passed, results, error, _ = journey(guest)
+        self.assertTrue(passed, (results, error))
+        self.assertEqual([len(ring) - 2 for ring in guest.root_views], [2, 3, 4, 4, 4, 4, 4, 4])
+        self.assertEqual(guest.root_views[0], ("tuna-test", "tunaseeded", "not-listed", "a11y"))
+        self.assertIn("tunastd", guest.root_views[1])
+        self.assertIn("tunaadmin", guest.root_views[2])
+
+    def test_unparked_hover_can_defeat_keyboard_navigation(self):
+        guest = FakeGuest(cached_users=4, hover_focus=3)
+        with mock.patch.object(guest, "cmd", return_value=None):
+            passed, results, _, _ = journey(guest)
+        self.assertFalse(passed)
+        self.assertFailed(results, "V-FRESH-LOGIN-tunastd-first")
+        self.assertNotEqual(guest.auth_attempts[0], ("tunastd", "tuna"))
+
+    def test_legacy_tab_attempts_fail_real_focus_ring_for_each_role(self):
+        # Substitute only the historical traversal; keep the actual Journey,
+        # prompts, session/record/sudo gates and two-attempt limit.
+        for count, failed_user in ((3, "tunastd"), (1, "tunaadmin")):
+            with self.subTest(cached_users=count, failed_user=failed_user):
+                guest = FakeGuest(cached_users=count)
+                keys = guest.keys
+                backward_tabs, attempt = 0, 0
+                previous_logout = None
+
+                def legacy_keys(*names):
+                    nonlocal backward_tabs, attempt, previous_logout
+                    if names == ("up",):
+                        return
+                    if names == ("shift", "tab"):
+                        backward_tabs += 1
+                        if backward_tabs % 2 == 0:
+                            if guest.logged_out != previous_logout:
+                                attempt, previous_logout = 0, guest.logged_out
+                            attempt += 1
+                            for _ in range(attempt):
+                                keys("tab")
+                        return
+                    keys(*names)
+
+                with mock.patch.object(guest, "keys", side_effect=legacy_keys):
+                    passed, results, _, _ = journey(guest)
+                self.assertFalse(passed)
+                self.assertFailed(results, f"V-FRESH-LOGIN-{failed_user}-first")
+                if failed_user == "tunaadmin":
+                    self.assertTrue(results["V-FRESH-LOGIN-tunastd-first"][0])
+                self.assertIn(("password", failed_user), guest.typed)
+                self.assertNotEqual(guest.logins[-1][1], failed_user)
+
+    def test_success_preserves_sleep_budget_including_qmp_chord_settles(self):
+        guest = FakeGuest()
+        passed, results, error, _ = journey(guest)
+        self.assertTrue(passed, (results, error))
+        self.assertEqual(guest.sleeps, [1, 1, 2, 2] * 4 + [10] + [1, 1, 2, 2] * 2)
+        self.assertEqual(guest.key_calls.count(("up",)), 30)
+        self.assertEqual(guest.key_calls.count(("shift", "tab")), 12)
+        self.assertNotIn(("tab",), guest.key_calls)
+        self.assertAlmostEqual(guest.elapsed, 67.6)
+
+    def test_rejected_login_keeps_two_sixty_second_attempts_and_ninety_second_trace(self):
+        guest = FakeGuest(reject_login=True)
+        passed, results, error, _ = journey(guest, gdm_trace=True)
+        self.assertFalse(passed)
+        self.assertIsNone(error)
+        self.assertEqual(fresh_accounts.MAX_LOGIN_ATTEMPTS, 2)
+        self.assertEqual(guest.auth_attempts, [("tunastd", "tuna")] * 2)
+        self.assertEqual(len(guest.pointer_events), 2)
+        self.assertEqual(len(guest.session_polls), 120)
+        self.assertEqual(guest.sleeps, ([1, 1, 2, 2] + [1] * 60 + [1]) * 2)
+        self.assertAlmostEqual(guest.elapsed, 141.2)
+        self.assertEqual(TRACE.SECONDS, 90)
+        start, stop = [when for _, when in guest.trace_times]
+        self.assertAlmostEqual(stop - start, 69.45)
+        self.assertLess(stop - start, TRACE.SECONDS)
+        self.assertLess(stop, guest.pointer_times[1])
+        self.assertIn("after 2 GDM attempts", results["V-FRESH-LOGIN-tunastd-first"][1])
 
     def test_positive_full_journey(self):
         guest = FakeGuest()
@@ -304,7 +503,7 @@ class JourneyTest(unittest.TestCase):
         passed, results, _, receipts = journey(guest)
         self.assertFalse(passed)
         self.assertFailed(results, "V-FRESH-LOGIN-tunastd-first")
-        self.assertEqual(guest.submitted, ["tunastd"] * len(fresh_accounts.SELECTIONS))
+        self.assertEqual(guest.submitted, ["tunastd"] * fresh_accounts.MAX_LOGIN_ATTEMPTS)
         self.assertEqual(guest.state_calls, ["tunastd", "tunaadmin", "tunaseeded", "tunastd"])
         self.assertEqual(steps(receipts)[-1], "tunastd-first-failure-state")
 
@@ -355,6 +554,19 @@ class JourneyTest(unittest.TestCase):
         passed, results, _, _ = journey(FakeGuest(std_sudo=True))
         self.assertFalse(passed)
         self.assertFailed(results, "V-FRESH-SUDO-tunastd")
+
+    def test_wheel_admin_denied_by_policy_fails_full_journey(self):
+        guest = FakeGuest(sudo_allowed=())
+        passed, results, error, receipts = journey(guest)
+        self.assertFalse(passed)
+        self.assertIsNone(error)
+        self.assertIn("wheel", guest.groups["tunaadmin"])
+        self.assertTrue(results["V-FRESH-LOGIN-tunaadmin-first"][0])
+        self.assertFailed(results, "V-FRESH-SUDO-tunaadmin")
+        sudo = next(receipt["value"] for receipt in receipts if receipt["step"] == "tunaadmin-first-sudo")
+        self.assertEqual(sudo, {"user": "tunaadmin", "returncode": 1,
+                                "policy_denied": True, "sudo_present": True})
+        self.assertNotIn("V-FRESH-LOGIN-tunastd-second", results)
 
     def test_admin_without_sudo_fails(self):
         self.assertFalse(fresh_accounts.sudo_ok({"user": "tunaadmin", "returncode": 1, "policy_denied": True,
@@ -1078,6 +1290,137 @@ class GdmHeaderTraceTest(unittest.TestCase):
             daemon.terminate()
             daemon.wait(timeout=2)
             daemon.stdout.close()
+
+
+class AdminImagePolicyTest(unittest.TestCase):
+    """Exercise the actual image helper and real parsers without PAM or root."""
+
+    def setUp(self):
+        self.assertIsNotNone(shutil.which("visudo"), "sudo's visudo is required for image-policy checks")
+        self.assertIsNotNone(shutil.which("cvtsudoers"), "sudo's cvtsudoers is required for image-policy checks")
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+        self.policy = self.root / "wheel-role.conf"
+        self.sudoers = self.root / "sudoers"
+        self.sudoers.write_bytes(b"# inherited configuration\nroot ALL=(ALL:ALL) ALL\n")
+        ADMIN_POLICY["write_role"](self.policy)
+
+    def rules(self, path):
+        return ADMIN_POLICY["parse_policy"](path)["User_Specs"]
+
+    def assert_password_role(self, rule):
+        self.assertEqual(rule["User_List"], [{"usergroup": "wheel"}])
+        self.assertEqual(rule["Host_List"], [{"hostname": "ALL"}])
+        self.assertEqual(len(rule["Cmnd_Specs"]), 1)
+        commands = rule["Cmnd_Specs"][0]
+        self.assertEqual(commands["runasusers"], [{"username": "ALL"}])
+        self.assertEqual(commands["runasgroups"], [{"usergroup": "ALL"}])
+        self.assertIn({"authenticate": True}, commands["Options"])
+        self.assertNotIn({"authenticate": False}, commands["Options"])
+        self.assertEqual(commands["Commands"], [{"command": "ALL"}])
+
+    def test_actual_image_role_is_global_wheel_with_required_password(self):
+        rules = self.rules(self.policy)
+        self.assertEqual(len(rules), 1)
+        self.assert_password_role(rules[0])
+        self.assertEqual(self.policy.stat().st_mode & 0o7777, 0o440)
+
+    def test_earlier_role_preserves_a_later_inherited_bootc_exception(self):
+        # The inherited rule is a parser fixture, not an assertion about the
+        # prior guest's unobserved sudoers bytes.
+        inherited = self.root / "inherited-bootc"
+        inherited.write_text("%wheel ALL=(ALL) NOPASSWD: /usr/bin/bootc upgrade\n")
+        self.sudoers.write_text(f"@include {json.dumps(str(inherited))}\n")
+        rules = ADMIN_POLICY["include_role"](self.policy, self.sudoers)["User_Specs"]
+        self.assertEqual(len(rules), 2)
+        self.assert_password_role(rules[0])
+        self.assertEqual(rules[1]["User_List"], [{"usergroup": "wheel"}])
+        command = rules[1]["Cmnd_Specs"][0]
+        self.assertIn({"authenticate": False}, command["Options"])
+        self.assertEqual(command["Commands"], [{"command": "/usr/bin/bootc upgrade"}])
+
+    def test_include_is_idempotent_and_preserves_inherited_bytes(self):
+        original = self.sudoers.read_bytes()
+        ADMIN_POLICY["include_role"](self.policy, self.sudoers)
+        first = self.sudoers.read_bytes()
+        ADMIN_POLICY["include_role"](self.policy, self.sudoers)
+        self.assertEqual(self.sudoers.read_bytes(), first)
+        self.assertTrue(first.endswith(original))
+        rules = self.rules(self.sudoers)
+        self.assertEqual(rules.count(self.rules(self.policy)[0]), 1)
+        self.assert_password_role(rules[0])
+
+    def test_misordered_explicit_include_is_rejected_without_rewrite(self):
+        self.sudoers.write_text(f"root ALL=(ALL:ALL) ALL\n@include {json.dumps(str(self.policy))}\n")
+        original = self.sudoers.read_bytes()
+        with self.assertRaisesRegex(ValueError, "order"):
+            ADMIN_POLICY["include_role"](self.policy, self.sudoers)
+        self.assertEqual(self.sudoers.read_bytes(), original)
+
+    def test_duplicate_explicit_include_is_rejected(self):
+        directive = f"@include {json.dumps(str(self.policy))}\n"
+        self.sudoers.write_text(directive * 2)
+        with self.assertRaisesRegex(ValueError, "duplicates"):
+            ADMIN_POLICY["include_role"](self.policy, self.sudoers)
+
+    def test_legacy_include_duplicate_is_rejected_by_effective_parser(self):
+        self.sudoers.write_text(f"#include {self.policy}\n")
+        with self.assertRaisesRegex(ValueError, "first and unique"):
+            ADMIN_POLICY["include_role"](self.policy, self.sudoers)
+        # Real parsers expose both effective rules even though visudo's file
+        # diagnostics track one filename. No source-text or log-count oracle.
+        self.assertEqual(self.rules(self.sudoers).count(self.rules(self.policy)[0]), 2)
+
+    def test_indirect_include_duplicate_is_rejected_by_effective_parser(self):
+        bridge = self.root / "inherited-policy"
+        bridge.write_text(f"@include {json.dumps(str(self.policy))}\n")
+        self.sudoers.write_text(f"@include {json.dumps(str(bridge))}\n")
+        with self.assertRaisesRegex(ValueError, "first and unique"):
+            ADMIN_POLICY["include_role"](self.policy, self.sudoers)
+        self.assertEqual(self.rules(self.sudoers).count(self.rules(self.policy)[0]), 2)
+
+    def test_role_writer_refuses_symlink(self):
+        target = self.root / "unchanged"
+        target.write_bytes(b"unchanged")
+        self.policy.unlink()
+        self.policy.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            ADMIN_POLICY["write_role"](self.policy)
+        self.assertEqual(target.read_bytes(), b"unchanged")
+
+    def receipt(self):
+        payload = self.root / "gdm-payload"
+        payload.write_bytes(b"original GDM payload")
+        digest = hashlib.sha256(payload.read_bytes()).hexdigest().encode()
+        receipt = self.root / "shipped-payload.sha256"
+        receipt.write_bytes(digest + b"  " + str(payload).encode() + b"\n")
+        ADMIN_POLICY["include_role"](self.policy, self.sudoers)
+        return payload, receipt
+
+    def test_receipt_extension_is_idempotent_and_refuses_changed_policy(self):
+        _, receipt = self.receipt()
+        original = receipt.read_bytes()
+        ADMIN_POLICY["record_policy"](receipt, self.policy, self.sudoers)
+        first = receipt.read_bytes()
+        self.assertTrue(first.startswith(original))
+        ADMIN_POLICY["record_policy"](receipt, self.policy, self.sudoers)
+        self.assertEqual(receipt.read_bytes(), first)
+        self.sudoers.write_bytes(self.sudoers.read_bytes() + b"# external change\n")
+        with self.assertRaisesRegex(ValueError, "recorded administrator policy changed"):
+            ADMIN_POLICY["record_policy"](receipt, self.policy, self.sudoers)
+        self.assertEqual(receipt.read_bytes(), first)
+
+    def test_original_gdm_payload_change_cannot_be_hidden(self):
+        payload, receipt = self.receipt()
+        ADMIN_POLICY["record_policy"](receipt, self.policy, self.sudoers)
+        original = receipt.read_bytes()
+        payload.write_bytes(b"changed GDM payload")
+        with self.assertRaises(subprocess.CalledProcessError):
+            ADMIN_POLICY["record_policy"](receipt, self.policy, self.sudoers)
+        self.assertEqual(receipt.read_bytes(), original)
+
+
 
 
 if __name__ == "__main__":
