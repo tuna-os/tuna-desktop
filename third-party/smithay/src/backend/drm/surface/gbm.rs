@@ -276,6 +276,32 @@ where
         Ok((slot.export()?, slot.age()))
     }
 
+    /// Test the pending mode and connector encoding with the actual next
+    /// swapchain framebuffer, rather than an unrelated 8-bit dumb buffer.
+    pub fn test_next_buffer(&mut self) -> Result<(), Error<A::Error>> {
+        self.next_buffer()?;
+        let slot = self.next_fb.as_ref().unwrap();
+        let fb = slot.userdata().get::<GbmFramebuffer>().unwrap();
+        let (w, h) = self.pending_mode().size();
+        self.drm
+            .test_state(
+                [PlaneState {
+                    handle: self.drm.plane(),
+                    config: Some(PlaneConfig {
+                        src: Rectangle::from_size((i32::from(w), i32::from(h)).into()).to_f64(),
+                        dst: Rectangle::from_size((i32::from(w), i32::from(h)).into()),
+                        transform: Transform::Normal,
+                        alpha: 1.0,
+                        damage_clips: None,
+                        fb: *fb.as_ref(),
+                        fence: None,
+                    }),
+                }],
+                true,
+            )
+            .map_err(Error::DrmError)
+    }
+
     /// Queues the current buffer for rendering.
     ///
     /// Returns [`Error::NoBuffer`] in case [`GbmBufferedSurface::next_buffer`] has not been called
@@ -507,6 +533,8 @@ where
         self.drm.use_mode(mode).map_err(Error::DrmError)?;
         let (w, h) = mode.size();
         self.swapchain.resize(w as _, h as _);
+        // An acquired but unqueued buffer belongs to the old dimensions.
+        self.next_fb = None;
         Ok(())
     }
 

@@ -222,11 +222,14 @@ fn calibration_session_admission_follows_mutter() {
         .is_err());
     // With colord connected, a device must have finished its setup.
     share.set_status(ColordStatus::Connected);
-    share.set_devices(vec![DeviceSnapshot {
-        connector: "DP-1".to_owned(),
-        ready: false,
-        ..Default::default()
-    }]);
+    share.set_devices(
+        0,
+        vec![DeviceSnapshot {
+            connector: "DP-1".to_owned(),
+            ready: false,
+            ..Default::default()
+        }],
+    );
     assert_eq!(
         share.start_calibration("DP-1", ":1.7").unwrap_err(),
         "Device is not ready"
@@ -766,6 +769,116 @@ fn colord_client_registers_devices_profiles_and_follows_assignment() {
     let s = fake.0.lock().unwrap();
     assert!(s.deleted.contains(&device_path), "{:?}", s.deleted);
     assert!(s.devices.is_empty(), "devices left: {:?}", s.devices);
+}
+
+#[test]
+fn superseded_monitor_publications_cannot_restore_a_revoked_sink() {
+    let share = Arc::new(ColorShare::default());
+    let stale = DeviceSnapshot {
+        connector: "DP-1".to_owned(),
+        device_id: "old-sink".to_owned(),
+        ready: true,
+        ..Default::default()
+    };
+    share.set_devices(0, vec![stale.clone()]);
+    share.set_gamma_sizes([("DP-1".to_owned(), 4)]);
+    let session = share.start_calibration("DP-1", ":1.9").unwrap();
+    let acquired = Arc::new(std::sync::Barrier::new(2));
+    let revoked = Arc::new(std::sync::Barrier::new(2));
+    let worker = {
+        let share = share.clone();
+        let acquired = acquired.clone();
+        let revoked = revoked.clone();
+        std::thread::spawn(move || {
+            // An old worker event already read its ready/assigned state,
+            // then blocked in colord while discovery replaced the sink.
+            let generation = share.monitor_generation();
+            acquired.wait();
+            revoked.wait();
+            share.set_devices(generation, vec![stale]);
+            share.update_device(generation, "DP-1", |_| {
+                panic!("stale registration completed")
+            });
+        })
+    };
+    acquired.wait();
+    let replacement = ColordMonitor {
+        identity: MonitorIdentity::new("DP-1", None, true, (0, 0), |_| None),
+        gamma_lut_size: 4,
+    };
+    let generation = share.begin_monitor_update(&[replacement], &[]);
+    revoked.wait();
+    worker.join().unwrap();
+    assert!(share.device("DP-1").is_none());
+    assert!(share.calibration_for("DP-1").is_none());
+    assert!(share
+        .set_calibration_lut(&session.object_path, generate_gamma_lut(None, 6500, 4))
+        .is_err());
+    share.set_devices(
+        generation,
+        vec![DeviceSnapshot {
+            connector: "DP-1".to_owned(),
+            device_id: "replacement".to_owned(),
+            ..Default::default()
+        }],
+    );
+    share.update_device(generation, "DP-1", |device| device.ready = true);
+    assert!(share.device("DP-1").unwrap().ready);
+}
+
+#[test]
+fn hotplug_preserves_unchanged_assignment_and_revokes_removed_calibration() {
+    let bus = TestBus::spawn();
+    let (_fake, _connection) = serve_fake(&bus);
+    let directory = tempfile::tempdir().unwrap();
+    let monitor = |connector, primary| ColordMonitor {
+        identity: MonitorIdentity::new(connector, None, primary, (0, 0), |_| None),
+        gamma_lut_size: 4,
+    };
+    let dp = monitor("DP-1", true);
+    let hdmi = monitor("HDMI-A-1", false);
+    let share = Arc::new(ColorShare::default());
+    share.set_gamma_sizes([("DP-1".to_owned(), 4)]);
+    let mut client = ColordClient::start(
+        share.clone(),
+        vec![dp.clone()],
+        Bus::Address(bus.address.clone()),
+        Some(directory.path().to_owned()),
+    );
+    wait_for("initial assignment", || {
+        share
+            .device("DP-1")
+            .is_some_and(|device| device.ready && device.assigned.is_some())
+    });
+    let before = share.device("DP-1").unwrap();
+    let session = share.start_calibration("DP-1", ":1.22").unwrap();
+    let ramp = generate_gamma_lut(None, 6500, 4);
+    share
+        .set_calibration_lut(&session.object_path, ramp.clone())
+        .unwrap();
+    client.update_monitors(&share, vec![dp.clone(), hdmi.clone()]);
+    wait_for("second monitor registered", || {
+        share.device("HDMI-A-1").is_some_and(|device| device.ready)
+    });
+    let unchanged = share.device("DP-1").unwrap();
+    assert_eq!(unchanged.object_path, before.object_path);
+    assert_eq!(unchanged.assigned, before.assigned);
+    assert_eq!(share.calibration_for("DP-1"), Some(Some(ramp.clone())));
+    client.update_monitors(&share, vec![hdmi]);
+    assert!(share.calibration_for("DP-1").is_none());
+    assert!(share.device("DP-1").is_none());
+    assert!(share
+        .set_calibration_lut(&session.object_path, ramp.clone())
+        .is_err());
+    client.update_monitors(&share, vec![dp]);
+    wait_for("reconnected sink registered", || {
+        share.devices().len() == 1 && share.device("DP-1").is_some_and(|device| device.ready)
+    });
+    assert!(share.calibration_for("DP-1").is_none());
+    assert!(share
+        .set_calibration_lut(&session.object_path, ramp)
+        .is_err());
+    client.shutdown();
 }
 
 #[test]

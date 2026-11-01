@@ -308,6 +308,7 @@ struct ShareState {
     devices: Vec<DeviceSnapshot>,
     gamma_sizes: HashMap<String, usize>,
     sessions: Vec<CalibrationSession>,
+    monitor_generation: u64,
 }
 
 /// State shared between the colord thread, the D-Bus thread and the
@@ -366,8 +367,16 @@ impl ColorShare {
         self.changed();
     }
 
-    fn update_device(&self, connector: &str, update: impl FnOnce(&mut DeviceSnapshot)) {
+    fn update_device(
+        &self,
+        generation: u64,
+        connector: &str,
+        update: impl FnOnce(&mut DeviceSnapshot),
+    ) {
         if let Ok(mut s) = self.state.lock() {
+            if s.monitor_generation != generation {
+                return;
+            }
             if let Some(device) = s.devices.iter_mut().find(|d| d.connector == connector) {
                 update(device);
             }
@@ -375,8 +384,11 @@ impl ColorShare {
         self.changed();
     }
 
-    fn set_devices(&self, devices: Vec<DeviceSnapshot>) {
+    fn set_devices(&self, generation: u64, devices: Vec<DeviceSnapshot>) {
         if let Ok(mut s) = self.state.lock() {
+            if s.monitor_generation != generation {
+                return;
+            }
             s.devices = devices;
         }
         self.changed();
@@ -388,6 +400,34 @@ impl ColorShare {
         if let Ok(mut s) = self.state.lock() {
             s.gamma_sizes = sizes.into_iter().collect();
         }
+    }
+
+    /// A disconnected or replaced sink cannot keep controlling a new
+    /// device which later happens to use its connector name.
+    fn begin_monitor_update(&self, monitors: &[ColordMonitor], unchanged: &[&str]) -> u64 {
+        let mut state = self.state.lock().unwrap();
+        state.monitor_generation = state.monitor_generation.wrapping_add(1);
+        state.gamma_sizes = monitors
+            .iter()
+            .map(|monitor| (monitor.identity.connector.clone(), monitor.gamma_lut_size))
+            .collect();
+        state
+            .sessions
+            .retain(|session| unchanged.contains(&session.connector.as_str()));
+        state
+            .devices
+            .retain(|device| unchanged.contains(&device.connector.as_str()));
+        let generation = state.monitor_generation;
+        drop(state);
+        self.changed();
+        generation
+    }
+
+    fn monitor_generation(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|state| state.monitor_generation)
+            .unwrap_or_default()
     }
 
     pub fn sessions(&self) -> Vec<CalibrationSession> {
@@ -614,10 +654,21 @@ impl WhitePoint {
 
 /// A monitor the colord thread registers, with its CRTC gamma size
 /// (Mutter generates an sRGB fallback profile only with a gamma LUT).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColordMonitor {
     pub identity: MonitorIdentity,
     pub gamma_lut_size: usize,
+}
+
+impl ColordMonitor {
+    fn same_device(&self, other: &Self) -> bool {
+        self.gamma_lut_size == other.gamma_lut_size
+            && self.identity.connector == other.identity.connector
+            && self.identity.edid_md5 == other.identity.edid_md5
+            && self.identity.vendor == other.identity.vendor
+            && self.identity.product == other.identity.product
+            && self.identity.serial == other.identity.serial
+    }
 }
 
 /// `g_get_user_data_dir ()/icc`.
@@ -782,6 +833,7 @@ pub enum Bus {
 enum Event {
     DeviceChanged(String),
     ColordOwner(bool),
+    MonitorsChanged(u64, Vec<ColordMonitor>),
     Shutdown,
 }
 
@@ -791,6 +843,7 @@ enum Event {
 pub struct ColordClient {
     events: std::sync::mpsc::Sender<Event>,
     thread: Option<std::thread::JoinHandle<()>>,
+    monitors: Vec<ColordMonitor>,
 }
 
 impl ColordClient {
@@ -804,11 +857,34 @@ impl ColordClient {
     ) -> Self {
         let (events, rx) = std::sync::mpsc::channel();
         let tx = events.clone();
+        let initial = monitors.clone();
         let thread = std::thread::Builder::new()
             .name("tuna-colord".into())
             .spawn(move || run(share, monitors, bus, icc_dir, rx, tx))
             .ok();
-        Self { events, thread }
+        Self {
+            events,
+            thread,
+            monitors: initial,
+        }
+    }
+
+    /// Reconcile actual connector discovery without disturbing unchanged
+    /// colord assignments or recreating the worker on every layout change.
+    pub fn update_monitors(&mut self, share: &ColorShare, monitors: Vec<ColordMonitor>) {
+        if self.monitors == monitors {
+            return;
+        }
+        let unchanged: Vec<_> = monitors
+            .iter()
+            .filter(|monitor| self.monitors.iter().any(|old| old.same_device(monitor)))
+            .map(|monitor| monitor.identity.connector.as_str())
+            .collect();
+        let generation = share.begin_monitor_update(&monitors, &unchanged);
+        let _ = self
+            .events
+            .send(Event::MonitorsChanged(generation, monitors.clone()));
+        self.monitors = monitors;
     }
 
     /// Stop the thread, deleting what it registered (`meta_color_device_dispose`).
@@ -834,6 +910,7 @@ struct Colord {
     /// Store files already registered, with (len, mtime) when seen.
     store_seen: HashMap<PathBuf, (u64, Option<std::time::SystemTime>)>,
     devices: Vec<Registered>,
+    monitor_generation: u64,
 }
 
 fn error_name(e: &zbus::Error) -> Option<&str> {
@@ -887,6 +964,7 @@ fn run(
         icc_dir,
         owned_profiles: HashMap::new(),
         store_seen: HashMap::new(),
+        monitor_generation: 0,
         devices: monitors
             .into_iter()
             .map(|monitor| Registered {
@@ -906,6 +984,9 @@ fn run(
     loop {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Event::DeviceChanged(path)) => colord.device_changed(&path),
+            Ok(Event::MonitorsChanged(generation, monitors)) => {
+                colord.update_monitors(generation, monitors)
+            }
             Ok(Event::ColordOwner(true)) => {
                 // colord restarted: every temp-scope object is gone.
                 eprintln!("tuna-compositor: colour: colord restarted, registering again");
@@ -976,6 +1057,7 @@ fn spawn_signal_forwarders(conn: &zbus::blocking::Connection, tx: std::sync::mps
 impl Colord {
     fn publish_initial(&self) {
         self.share.set_devices(
+            self.monitor_generation,
             self.devices
                 .iter()
                 .map(|r| DeviceSnapshot {
@@ -985,6 +1067,68 @@ impl Colord {
                 })
                 .collect(),
         );
+    }
+
+    fn update_monitors(&mut self, generation: u64, monitors: Vec<ColordMonitor>) {
+        if self.share.monitor_generation() != generation {
+            return;
+        }
+        self.monitor_generation = generation;
+        let mut old = std::mem::take(&mut self.devices);
+        let old_snapshots = self.share.devices();
+        let mut snapshots = Vec::with_capacity(monitors.len());
+        for monitor in monitors {
+            let connector = &monitor.identity.connector;
+            if let Some(index) = old
+                .iter()
+                .position(|registered| registered.monitor.same_device(&monitor))
+            {
+                let mut registered = old.remove(index);
+                let snapshot = old_snapshots
+                    .iter()
+                    .find(|snapshot| &snapshot.connector == connector);
+                if snapshot.is_none() {
+                    // Discovery can revoke a sink while an older event
+                    // is still queued. Re-read its existing colord
+                    // registration rather than publishing an unready
+                    // placeholder indefinitely.
+                    registered.device_path = None;
+                }
+                snapshots.push(snapshot.cloned().unwrap_or_else(|| DeviceSnapshot {
+                    connector: connector.clone(),
+                    device_id: monitor.identity.colord_device_id(),
+                    ..Default::default()
+                }));
+                registered.monitor = monitor;
+                self.devices.push(registered);
+            } else {
+                snapshots.push(DeviceSnapshot {
+                    connector: connector.clone(),
+                    device_id: monitor.identity.colord_device_id(),
+                    ..Default::default()
+                });
+                self.devices.push(Registered {
+                    monitor,
+                    device_path: None,
+                });
+            }
+        }
+        // Remove old registrations before registering a replacement with
+        // the same connector/device id. The persistent colord mapping is
+        // retained by colord, just as it is across a compositor restart.
+        for registered in old {
+            if let Some(path) = registered.device_path {
+                if let Ok(object) = zbus::zvariant::ObjectPath::try_from(path.as_str()) {
+                    let _ = self.call(CD_PATH, CD_SERVICE, "DeleteDevice", &(object,));
+                }
+            }
+        }
+        self.share.set_devices(self.monitor_generation, snapshots);
+        for index in 0..self.devices.len() {
+            if self.devices[index].device_path.is_none() {
+                self.register(index);
+            }
+        }
     }
 
     fn call<B>(
@@ -1084,25 +1228,30 @@ impl Colord {
         };
         self.devices[index].device_path = Some(path.clone());
         self.share
-            .update_device(&connector, |d| d.object_path = Some(path.clone()));
+            .update_device(self.monitor_generation, &connector, |d| {
+                d.object_path = Some(path.clone())
+            });
         let device_profile = self.ensure_device_profile(&monitor);
         let error = device_profile.as_ref().err().cloned();
-        self.share.update_device(&connector, |d| {
-            d.device_profile = device_profile.ok().flatten();
-            d.error = error;
-        });
+        self.share
+            .update_device(self.monitor_generation, &connector, |d| {
+                d.device_profile = device_profile.ok().flatten();
+                d.error = error;
+            });
         self.update_assigned(index);
-        self.share.update_device(&connector, |d| d.ready = true);
+        self.share
+            .update_device(self.monitor_generation, &connector, |d| d.ready = true);
         eprintln!("tuna-compositor: colour: device {device_id} ({connector}) registered at {path}");
     }
 
     fn fail(&self, connector: &str, error: String) {
         eprintln!("tuna-compositor: colour: {error}");
         // notify_ready (FALSE) still marks the device ready.
-        self.share.update_device(connector, |d| {
-            d.error = Some(error);
-            d.ready = true;
-        });
+        self.share
+            .update_device(self.monitor_generation, connector, |d| {
+                d.error = Some(error);
+                d.ready = true;
+            });
     }
 
     /// `meta_color_store_ensure_device_profile`: generate, save and
@@ -1238,10 +1387,11 @@ impl Colord {
             .property(&path, CD_DEVICE, "Profiles")
             .unwrap_or_default();
         let Some(default) = profiles.first().map(|p| p.to_string()) else {
-            self.share.update_device(&connector, |d| {
-                d.assigned = None;
-                d.calibration = None;
-            });
+            self.share
+                .update_device(self.monitor_generation, &connector, |d| {
+                    d.assigned = None;
+                    d.calibration = None;
+                });
             return;
         };
         if self
@@ -1284,20 +1434,22 @@ impl Colord {
                         ""
                     }
                 );
-                self.share.update_device(&connector, |d| {
-                    d.assigned = Some(info);
-                    d.calibration = calibration;
-                });
+                self.share
+                    .update_device(self.monitor_generation, &connector, |d| {
+                        d.assigned = Some(info);
+                        d.calibration = calibration;
+                    });
             }
             Err(e) => {
                 // ensure_default_profile_cb: the warning keeps a NULL
                 // assigned profile.
                 eprintln!("tuna-compositor: colour: Failed to create color profile from colord profile: {e}");
-                self.share.update_device(&connector, |d| {
-                    d.assigned = None;
-                    d.calibration = None;
-                    d.error = Some(e);
-                });
+                self.share
+                    .update_device(self.monitor_generation, &connector, |d| {
+                        d.assigned = None;
+                        d.calibration = None;
+                        d.error = Some(e);
+                    });
             }
         }
     }

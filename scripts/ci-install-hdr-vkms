@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Build/run the qualification-only EMULATED HDR10 KMS sink, never stock VKMS.
+
+Requires Linux 6.8 and /lib/modules/$(uname -r)/build matching that exact kernel,
+make, a C compiler, kmod, pkg-config, and libdrm-dev. On a newer host use
+ci-hdr-vkms-guest: it boots its own pinned Noble guest without host kernel changes.
+
+  python3 scripts/ci-install-hdr-vkms build --build-dir /tmp/hdr-module
+  sudo python3 scripts/ci-install-hdr-vkms run --build-dir /tmp/hdr-module \
+      --state-dir /tmp/hdr-endpoint -- COMMAND ARG...
+  # Add --unsupported before -- to expose the SDR negative control instead.
+
+COMMAND receives CARD, TUNA_HDR_CARD, TUNA_HDR_SINK, TUNA_HDR_EDID_SHA256,
+TUNA_HDR_ENDPOINT, TUNA_HDR_PROBE, TUNA_HDR_CONNECTED_CONTROL. It owns its seat (e.g. seatd-launch); no
+system seatd/display manager is stopped. run unloads only tuna_hdr_vkms, never
+vkms, on success/failure/signals. A busy module is an error, never force-unloaded.
+The endpoint JSON records real module/kernel/card/EDID identity, not proof of
+HDR pixels; use TUNA_HDR_PROBE and the native compositor/capture proofs for that.
+Write 0/1 to TUNA_HDR_CONNECTED_CONTROL as root to unplug/replug the same
+emulated sink/EDID through real connector detection and DRM hotplug uevents;
+`$TUNA_HDR_PROBE connection \"$CARD\" JSON` records actual connector state.
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+SOURCE = ROOT / 'tests/color-hdr-vkms'
+MODULE = 'tuna_hdr_vkms'
+
+
+def run(args, **kwargs):
+    return subprocess.run([str(v) for v in args], check=True, **kwargs)
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def kernel_headers(receipt=None):
+    kernel = os.uname().release
+    headers = Path('/lib/modules') / kernel / 'build'
+    texts = {}
+    evidence = {'kernel': kernel, 'headers': str(headers),
+                'resolved_headers': str(headers.resolve()), 'files': {}}
+    for name, pattern in (
+        ('Makefile', r'^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)\s*='),
+        ('include/generated/utsrelease.h', r'^#define UTS_'),
+        ('include/config/kernel.release', r'.'),
+        ('.config', r'^(CONFIG_(VERSION_SIGNATURE|LOCALVERSION|LOCALVERSION_AUTO)=|# CONFIG_LOCALVERSION_AUTO )'),
+    ):
+        try:
+            data = (headers / name).read_bytes()
+            texts[name] = data.decode()
+            lines = [line[:512] for line in texts[name].splitlines() if re.match(pattern, line)]
+            evidence['files'][name] = {'sha256': hashlib.sha256(data).hexdigest(),
+                                       'identity_lines': lines[:16]}
+        except OSError as error:
+            evidence['files'][name] = {'error': str(error)}
+    # Ubuntu's top-level kernelrelease target without M= recomputes the upstream
+    # base (e.g. 6.8.12), not its packaged ABI (e.g. 6.8.0-147-generic).
+    # External-module Kbuild reads kernel.release; module vermagic uses UTS_RELEASE.
+    releases = re.findall(r'^#define UTS_RELEASE "([^"\n]+)"$',
+                          texts.get('include/generated/utsrelease.h', ''), re.MULTILINE)
+    configured_release = texts.get('include/config/kernel.release', '').strip()
+    error = None
+    if not re.fullmatch(r'6\.8\.\d+[-.A-Za-z0-9]*', kernel):
+        error = f'pinned v6.8 driver requires Linux 6.8; running {kernel}; use ci-hdr-vkms-guest'
+    elif 'Makefile' not in texts:
+        error = f'missing exact running-kernel headers: {headers}'
+    elif releases != [kernel] or configured_release != kernel:
+        error = (f'header ABI mismatch: generated UTS_RELEASE={releases!r}, '
+                 f'include/config/kernel.release={configured_release!r}, running={kernel!r}')
+    evidence['header_abi_matches_running_kernel'] = error is None
+    if receipt:
+        # Retain bounded native package/source facts even when the ABI guard fails.
+        packages = ['linux-image-' + kernel, 'linux-headers-' + kernel,
+                    'linux-headers-' + kernel.rsplit('-', 1)[0]]
+        result = subprocess.run(
+            ['dpkg-query', '-W', '-f=${binary:Package}\t${Version}\t${source:Package}\t'
+             '${source:Version}\t${db:Status-Status}\n', *packages],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        evidence['native_packages'] = {
+            'columns': ['package', 'version', 'source_package', 'source_version', 'status'],
+            'query_exit': result.returncode, 'records': result.stdout.splitlines(),
+            'stderr': result.stderr[:4096]}
+        evidence['limit'] = 'Header/package identity only; not module build/load, selftest or native HDR qualification.'
+        Path(receipt).write_text(json.dumps(evidence, indent=2) + '\n')
+    if error:
+        raise RuntimeError(error)
+    return kernel, headers
+
+
+def module_vermagic(module, kernel):
+    name = subprocess.check_output(['modinfo', '-F', 'name', str(module)], text=True).strip()
+    vermagic = subprocess.check_output(['modinfo', '-F', 'vermagic', str(module)], text=True).strip()
+    if name != MODULE or not vermagic.split() or vermagic.split()[0] != kernel:
+        raise RuntimeError(f'module name/vermagic mismatch: {name!r}, {vermagic!r}, running={kernel!r}')
+    return vermagic
+
+
+def build(args):
+    kernel, headers = kernel_headers(args.header_receipt)
+    manifest = json.loads((SOURCE / 'provenance.json').read_text())
+    dest = Path(args.build_dir).resolve()
+    dest.mkdir(parents=True, exist_ok=False)
+    for name, digest in manifest['adapted_sha256'].items():
+        src = SOURCE / name
+        if sha(src) != digest:
+            raise RuntimeError(f'exact-source integrity mismatch: {src}')
+        shutil.copyfile(src, dest / name)
+    run(['make', '-C', headers, f'M={dest}', f'-j{args.jobs}', 'modules'])
+    module = dest / f'{MODULE}.ko'
+    vermagic = module_vermagic(module, kernel)
+    flags = subprocess.check_output(['pkg-config', '--cflags', '--libs', 'libdrm'], text=True).split()
+    run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', dest / 'probe.c', '-o', dest / 'tuna-hdr-probe', *flags])
+    info = {'kernel': kernel, 'module_sha256': sha(module), 'module_vermagic': vermagic,
+            'source_commit': manifest['upstream_commit'], 'source_sha256': sha(SOURCE / 'provenance.json')}
+    (dest / 'build.json').write_text(json.dumps(info, indent=2) + '\n')
+    print(json.dumps(info))
+
+
+def card_nodes():
+    return {p for p in Path('/sys/class/drm').glob('card[0-9]*') if re.fullmatch(r'card\d+', p.name)}
+
+
+def endpoint(args):
+    if os.geteuid() != 0:
+        raise RuntimeError('run requires root in an owned privileged CI guest/runner')
+    if not args.command:
+        raise RuntimeError('run requires a proof command after --')
+    command = args.command[1:] if args.command[0] == '--' else args.command
+    if not command:
+        raise RuntimeError('empty proof command')
+    dest = Path(args.build_dir).resolve()
+    module = dest / f'{MODULE}.ko'
+    built = json.loads((dest / 'build.json').read_text())
+    if built['kernel'] != os.uname().release or built['module_sha256'] != sha(module):
+        raise RuntimeError('module build identity no longer matches this running kernel/file')
+    module_vermagic(module, os.uname().release)
+    state_dir = Path(args.state_dir).absolute()
+    state_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
+    lock_path = Path('/run/lock/tuna-hdr-vkms.lock')
+    with lock_path.open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if Path(f'/sys/module/{MODULE}').exists():
+            raise RuntimeError('refusing to adopt or unload an existing tuna_hdr_vkms module')
+        previous = card_nodes()
+        sink = 'unsupported-sdr' if args.unsupported else 'hdr10'
+        fixture = bytes.fromhex((SOURCE / f'{sink}.edid.hex').read_text())
+        if len(fixture) != 256 or any(sum(fixture[n:n+128]) % 256 for n in (0,128)):
+            raise RuntimeError('invalid exact EDID fixture')
+        # Load dependencies only; never install/replace/unload stock vkms.
+        run(['modprobe', 'drm_shmem_helper'])
+        loaded = False
+        child = None
+        record = {'emulated': True, 'sink': sink, 'kernel': os.uname().release,
+                  'module': MODULE, 'module_sha256': sha(module), 'build': built,
+                  'edid_sha256': hashlib.sha256(fixture).hexdigest(), 'status': 'loading'}
+        record_path = state_dir / 'endpoint.json'
+        try:
+            run(['insmod', module, f'hdr_sink={0 if args.unsupported else 1}',
+                 'enable_cursor=1', 'enable_overlay=0', 'enable_writeback=1'])
+            loaded = True
+            # The upstream platform_device is deliberately unbound (no platform
+            # driver); device's exact sysfs name identifies this separate module.
+            cards = []
+            for _ in range(100):
+                cards = [p for p in card_nodes() - previous
+                         if (p / 'device').resolve().name == MODULE]
+                if len(cards) == 1:
+                    break
+                time.sleep(0.05)
+            if len(cards) != 1:
+                raise RuntimeError(f'expected one new {MODULE} card, found {cards}')
+            card = Path('/dev/dri') / cards[0].name
+            # GETCONNECTOR forces EDID probing; then compare actual kernel blob.
+            run([dest / 'tuna-hdr-probe', 'identity', card, state_dir / 'identity.json'])
+            edids = list(Path('/sys/class/drm').glob(f'{card.name}-Virtual-*/edid'))
+            if len(edids) != 1 or edids[0].read_bytes() != fixture:
+                raise RuntimeError('actual kernel connector EDID differs from pinned fixture')
+            control = f'/sys/module/{MODULE}/parameters/connected'
+            if not Path(control).is_file():
+                raise RuntimeError('module lacks the real emulated connector control')
+            record.update(card=str(card), connector=edids[0].parent.name,
+                          connected_control=control, status='running')
+            record_path.write_text(json.dumps(record, indent=2) + '\n')
+            env = dict(os.environ, CARD=str(card), TUNA_HDR_CARD=str(card),
+                       TUNA_HDR_SINK=sink, TUNA_HDR_EDID_SHA256=record['edid_sha256'],
+                       TUNA_HDR_ENDPOINT=str(record_path), TUNA_HDR_PROBE=str(dest / 'tuna-hdr-probe'),
+                       TUNA_HDR_CONNECTED_CONTROL=control)
+            child = subprocess.Popen(command, env=env, start_new_session=True)
+            status = child.wait()
+            record['command_exit'] = status
+            if status:
+                raise subprocess.CalledProcessError(status, command)
+        finally:
+            if child is not None and child.poll() is None:
+                os.killpg(child.pid, signal.SIGTERM)
+                try:
+                    child.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    os.killpg(child.pid, signal.SIGKILL)
+                    child.wait()
+            if loaded:
+                # No force, no deletion of module files, no stock-module changes.
+                run(['rmmod', MODULE])
+            record['status'] = 'unloaded' if loaded else 'load-failed'
+            record_path.write_text(json.dumps(record, indent=2) + '\n')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest='action', required=True)
+    b = sub.add_parser('build')
+    b.add_argument('--build-dir', required=True)
+    b.add_argument('--jobs', type=int, default=2)
+    b.add_argument('--header-receipt', help='retain generated-header ABI and native package/source facts, including on ABI failure')
+    r = sub.add_parser('run')
+    r.add_argument('--build-dir', required=True)
+    r.add_argument('--state-dir', required=True)
+    r.add_argument('--unsupported', action='store_true')
+    r.add_argument('command', nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    try:
+        (build if args.action == 'build' else endpoint)(args)
+    except (OSError, RuntimeError, subprocess.CalledProcessError, KeyboardInterrupt) as error:
+        print(f'ci-install-hdr-vkms: {error}', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

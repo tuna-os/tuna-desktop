@@ -1477,6 +1477,7 @@ impl WindowManager {
             .into_iter()
             .filter_map(|(w, g)| w.wl_surface().map(|s| (s.into_owned(), g.loc)))
             .collect();
+        state.refresh_color_preferences();
         state.refresh_ime_cursor_origins();
         // Never pull focus out from under a live grab.
         if state.take_popup_refocus() && !state.popup_grab_active() {

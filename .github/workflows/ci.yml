@@ -253,6 +253,9 @@ jobs:
           TUNA_REQUIRE_PAM_WRAPPER: "1"
           # The lockdown round trip (#357) needs the installed schema.
           TUNA_REQUIRE_LOCKDOWN_SCHEMA: "1"
+          # Colour output proof must render/read real EGL pixels, never
+          # silently pass by skipping missing emulated GPU support.
+          TUNA_REQUIRE_COLOR_GL: "1"
       - name: Prove private PAM helper conversations and retirement
         id: private-pam-helper-proof
         run: |
@@ -587,14 +590,139 @@ jobs:
         with:
           tool: gtk4-layer-shell
           version: 4867d7b85cdf1e829fc1fd6f1d5f04c42cc99389
+      - name: Install real colour capture consumers
+        run: sudo apt-get install -y libegl-dev libgles-dev gdb xvfb xdotool pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good python3-pil gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0
       - run: shellcheck scripts/ci-install-vkms scripts/tuna-drm-smoke scripts/tuna-frame-pacer-build
       - run: scripts/ci-install-vkms
+      # Installer/helper qualification above deliberately uses the merge ref.
+      # Pixel receipts below must instead name the exact candidate commit.
+      - name: Freeze exact candidate source for native colour pixel consumers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          clean: false
       - run: scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts
+      - name: Classify independent native R8 DMA-BUF sampling
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          art=drm-smoke-artifacts
+          IFS= read -r card < "$art/color-drm-device.txt"
+          cp tests/color-dmabuf/r8-import.c "$art/r8-import.c"
+          cp LICENSE "$art/r8-import.LICENSE"
+          cc -std=c11 -Wall -Wextra -Werror -O0 -g "$art/r8-import.c" \
+            -o "$art/r8-import" $(pkg-config --cflags --libs gbm egl glesv2 libdrm)
+          {
+            git rev-parse HEAD
+            uname -a
+            cat /etc/os-release
+            cc --version
+            pkg-config --modversion gbm egl glesv2 libdrm
+            dpkg-query -W libgbm1 libegl-mesa0 libgl1-mesa-dri libgles2 linux-libc-dev
+            sha256sum "$art/r8-import.c" "$art/r8-import" "$art/r8-import.LICENSE"
+          } > "$art/r8-import-identity.txt"
+          timeout --signal=TERM --kill-after=5s 60s \
+            sudo env -u DISPLAY -u WAYLAND_DISPLAY prlimit --core=0:0 -- \
+            gdb --batch --return-child-result -ex 'set pagination off' \
+            -ex 'set print elements 16' -ex 'set print max-depth 3' \
+            -ex run -ex 'thread apply all bt full 32' -ex 'info sharedlibrary' \
+            --args "$art/r8-import" --device "$card" --dma-heap /dev/dma_heap/system \
+            > "$art/r8-import.log" 2>&1
+      - name: Retain privileged colour failure artifacts as runner-owned files
+        if: always()
+        run: |
+          if [ -d drm-smoke-artifacts ]; then
+            sudo chown -R "$(id -u):$(id -g)" drm-smoke-artifacts
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: drm-smoke
           path: drm-smoke-artifacts/
+          retention-days: 14
+
+  colour-native:
+    # P-DS-03: actual emulated HDR KMS and independently signed native
+    # Marlin GNOME comparison. No physical HDR claim or host-kernel changes.
+    # Executables also run inside the pinned Noble guest: build against its
+    # glibc/system-library baseline, not a migrating newer ubuntu-latest ABI.
+    runs-on: ubuntu-24.04
+    needs: [select-lanes]
+    if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'drm-smoke')
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: colour-native-ubuntu24
+          save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+      - name: Install native colour proof prerequisites
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils ovmf gnupg podman skopeo python3-pil libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libpipewire-0.3-dev libclang-dev pkg-config libegl1 libgl1-mesa-dri libfontconfig1-dev librsvg2-common
+      - name: Freeze exact colour executables and source payload
+        id: colour_build
+        run: |
+          cargo build --locked -p tuna-compositor --bin tuna-compositor --example tuna-color-pixel-client --example tuna-color-yuv-client --example tuna-color-cast-client --message-format=json > "$RUNNER_TEMP/colour-build.json"
+          payload="$RUNNER_TEMP/colour-payload"
+          mkdir -p "$payload" colour-native-artifacts
+          git archive HEAD | tar -xf - -C "$payload"
+          mkdir -p "$payload/target/debug/examples"
+          cp target/debug/tuna-compositor "$payload/target/debug/"
+          cp target/debug/examples/tuna-color-pixel-client target/debug/examples/tuna-color-yuv-client target/debug/examples/tuna-color-cast-client "$payload/target/debug/examples/"
+          PAYLOAD="$payload" python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path.cwd()
+          payload = pathlib.Path(os.environ["PAYLOAD"])
+          paths = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+          paths = [p for p in paths if p and (p.startswith(("crates/compositor/", "third-party/smithay/", "scripts/tuna-color-", "scripts/lib/tuna-color-")) or p in ("Cargo.toml", "Cargo.lock"))]
+          paths += ["target/debug/tuna-compositor", *[f"target/debug/examples/{name}" for name in ("tuna-color-pixel-client", "tuna-color-yuv-client", "tuna-color-cast-client")]]
+          receipt = {
+              "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "worktree_status": subprocess.check_output(["git", "status", "--porcelain=v1"], text=True),
+              "files": {p: hashlib.sha256((payload / p).read_bytes()).hexdigest() for p in paths if (payload / p).is_file()},
+          }
+          (payload / "source.json").write_text(json.dumps(receipt, indent=2) + "\n")
+          pathlib.Path("colour-native-artifacts/source.json").write_text(json.dumps(receipt, indent=2) + "\n")
+          PY
+          cp "$RUNNER_TEMP/colour-build.json" colour-native-artifacts/
+          tar -cf "$RUNNER_TEMP/colour-payload.tar" -C "$payload" .
+      - name: Prove admitted HDR scanout signaling and negotiated capture on an emulated KMS sink
+        run: |
+          python3 scripts/ci-hdr-vkms-guest --work-dir "$RUNNER_TEMP/colour-hdr-vm" --artifacts "$(pwd)/colour-native-artifacts/hdr" --payload-tar "$RUNNER_TEMP/colour-payload.tar" --prepare-command 'sudo apt-get install -y python3-pil gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-pipewire gstreamer1.0-plugins-good' --guest-command 'python3 scripts/tuna-color-capture-proof --backend drm --hdr --hdr-consumer target/debug/examples/tuna-color-cast-client --compositor target/debug/tuna-compositor --color-client target/debug/examples/tuna-color-pixel-client --source-receipt source.json --artifacts "$ARTIFACTS/colour-hdr"' --negative-command 'python3 scripts/tuna-color-capture-proof --backend drm --expect-unsupported-hdr --compositor target/debug/tuna-compositor --color-client target/debug/examples/tuna-color-pixel-client --source-receipt source.json --artifacts "$ARTIFACTS/colour-unsupported"'
+      - name: Retain only bounded known guest assertion files
+        run: |
+          python3 - <<'PY'
+          import pathlib, tarfile
+          root = pathlib.Path("colour-native-artifacts/hdr")
+          with tarfile.open(root / "guest-artifacts.tar.gz") as archive:
+              for name, target in [("artifacts/colour-hdr/assertions.txt", "capture-assertions.txt"), ("artifacts/colour-unsupported/assertions.txt", "unsupported-assertions.txt")]:
+                  member = archive.getmember(name)
+                  assert member.isfile() and member.size <= 1048576, name
+                  (root / target).write_bytes(archive.extractfile(member).read())
+          PY
+      - name: Compare real GNOME 51 native colour pixels from the independently verified Marlin image
+        if: ${{ !cancelled() && steps.colour_build.outcome == 'success' }}
+        run: sudo env PATH="$PATH" scripts/tuna-color-gnome-reference-ci --color-client "$(pwd)/target/debug/examples/tuna-color-pixel-client" --artifacts "$(pwd)/colour-native-artifacts/gnome"
+      - name: Restore ownership of this job's proof artifacts
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" colour-native-artifacts
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: colour-native
+          path: colour-native-artifacts/
           retention-days: 14
 
   grid-cancel-comparison:
@@ -932,6 +1060,12 @@ jobs:
           TUNA_REQUIRE_IBUS: "1"
           TUNA_REQUIRE_WAYLAND_INFO: "1"
           TUNA_REQUIRE_GSD_MEDIA_KEYS: "1"
+      - name: Prove real colour screenshot and PipeWire consumers
+        if: ${{ !cancelled() }}
+        run: |
+          sudo apt-get install -y gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0
+          cargo build --locked -p tuna-compositor --bin tuna-compositor --example tuna-color-pixel-client
+          /usr/bin/python3 scripts/tuna-color-capture-proof --compositor target/debug/tuna-compositor --color-client target/debug/examples/tuna-color-pixel-client --artifacts gtk-shell-artifacts/colour
       # Native/X11 geometry and physical input at all required virtual scales.
       - run: |
           for scale in 1 1.25 1.5 2; do
@@ -1179,7 +1313,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
-      - run: pacman -Syu --noconfirm --needed base-devel git rust pkgconf clang pipewire gtk4 gtk4-layer-shell libadwaita libsecret libcanberra sound-theme-freedesktop libxkbcommon libxkbcommon-x11 mesa wayland dbus glib2 gnome-settings-daemon gnome-session seatd libinput systemd-libs libdrm librsvg glycin gdk-pixbuf2 fontconfig adwaita-fonts namcap
+      - run: pacman -Syu --noconfirm --needed base-devel git rust pkgconf clang pipewire gtk4 gtk4-layer-shell libadwaita libsecret libcanberra sound-theme-freedesktop libxkbcommon libxkbcommon-x11 mesa wayland dbus glib2 gnome-settings-daemon gnome-session colord gnome-color-manager seatd libinput systemd-libs libdrm librsvg glycin gdk-pixbuf2 fontconfig adwaita-fonts namcap
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
@@ -1433,7 +1567,7 @@ jobs:
     # tests, and every cited cargo test / journey assertion must have
     # passed in this run.
     runs-on: *runner-24
-    needs: [select-lanes, check, journey, gtk-shell, orca-speech, drm-smoke, marlin-vm]
+    needs: [select-lanes, check, journey, gtk-shell, orca-speech, drm-smoke, colour-native, marlin-vm]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'parity-ledger')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1467,6 +1601,10 @@ jobs:
         with:
           name: marlin-vm
           path: ledger-in/marlin-vm
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: colour-native
+          path: ledger-in/colour-native
       - run: >-
           scripts/tuna-ledger check --tests ledger-in/test-list.txt
           --assertions ledger-in/journey/assertions.txt
@@ -1477,9 +1615,14 @@ jobs:
           --assertions ledger-in/gtk-shell/session-restore/assertions.txt
           --assertions ledger-in/gtk-shell/osk/assertions.txt
           --assertions ledger-in/gtk-shell/lock-auth/assertions.txt
+          --assertions ledger-in/gtk-shell/colour/assertions.txt
           --assertions ledger-in/orca-speech/assertions.txt
           --assertions ledger-in/drm-smoke/assertions.txt
           --assertions ledger-in/marlin-vm/assertions.txt
+          --assertions ledger-in/colour-native/hdr/assertions.txt
+          --assertions ledger-in/colour-native/hdr/capture-assertions.txt
+          --assertions ledger-in/colour-native/hdr/unsupported-assertions.txt
+          --assertions ledger-in/colour-native/gnome/assertions.txt
 
   docs-shots:
     timeout-minutes: 20
@@ -1521,7 +1664,7 @@ jobs:
     # One stable status for the run: lanes the selection skipped report
     # skipped, any failed or cancelled job fails the gate.
     if: always()
-    needs: [select-lanes, check, fprint-phase-proof, journey, app-content, scroll-proof, drm-smoke, grid-cancel-comparison, gtk-shell, orca-speech, portal-security, remote-security, niri-parity, arch-package, marlin-image, marlin-vm, parity-ledger, docs-shots]
+    needs: [select-lanes, check, fprint-phase-proof, journey, app-content, scroll-proof, drm-smoke, colour-native, grid-cancel-comparison, gtk-shell, orca-speech, portal-security, remote-security, niri-parity, arch-package, marlin-image, marlin-vm, parity-ledger, docs-shots]
     runs-on: *runner-24
     steps:
       - env:

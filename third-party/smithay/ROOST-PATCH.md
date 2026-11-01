@@ -139,3 +139,149 @@ meta_x11_display_set_input_focus does; enter/leave are unchanged. The
 nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
 The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
 version stays 0.7.0.
+
+Issue #341 (wp_color_management_v1 / wp_color_representation_v1) adds two
+small APIs. RendererSurfaceState::invalidate_buffer
+(src/backend/renderer/utils/wayland.rs) drops the cached textures and marks
+the whole buffer damaged, so a surface whose image description or colour
+representation changed on commit repaints without new client damage, as
+Mutter redraws an actor whose colour state changed. The isolated diff is
+retained in COLOR-DAMAGE-API-PATCH.diff.
+
+The same issue adds EGL YCbCr conversion hints at dmabuf import
+(src/backend/egl, src/backend/renderer/gles). EGLDisplay::create_image_from_dmabuf
+takes an optional YuvConversion (EGL_YUV_COLOR_SPACE_HINT_EXT and
+EGL_SAMPLE_RANGE_HINT_EXT, BT.601/709/2020 at full or narrow range), a
+YuvConversionHint in a surface's data_map selects it for that surface's
+buffers, and the GLES renderer's dmabuf cache re-imports a buffer when its
+conversion changes. Without a hint the driver default applies, as before,
+only for ordinary imports; identity YCbCr never uses that converted result.
+The isolated diff is retained in YUV-CONVERSION-API-PATCH.diff; the pinned
+version stays 0.7.0.
+
+Identity YCbCr additionally uses the isolated RAW-YUV-PLANES-API-PATCH.diff:
+Dmabuf::flags exposes interlacing/orientation metadata,
+GlesRenderer::import_dmabuf_raw imports a single RGB component view only
+when EGL advertises non-external sampling for its exact format/modifier,
+and GlesFrame::with_texture_bindings holds the additional textures' read
+locks through the draw, waits for uploads, retains texture lifetimes and
+uses the existing per-frame/shared-context read-fence policy. It allocates
+no per-draw binding/lock vectors. EGL/GL view-import errors are returned,
+never retried through a driver YUV conversion. These APIs are independently
+implemented Smithay plumbing under the retained MIT license, not copied
+Mutter shader code. The pinned version remains 0.7.0.
+
+The compositor builds zero-copy views using duplicated dma-buf descriptors,
+original plane offsets/strides and explicit linear layout; it never copies
+production pixels to the CPU. Representable layouts are NV12/NV21,
+NV16/NV61, NV24/NV42, P010/P012/P016/P210, 8-bit three-plane YUV/YVU
+410/411/420/422/444, AYUV/XYUV8888 and packed YUYV/YVYU/UYVY/VYUY.
+R16/GR1616 views preserve normalized high-bit-depth samples as Mutter does,
+provided the EGL driver actually advertises and accepts those views.
+Opaque/implicit modifiers, auxiliary compression planes, interlacing,
+unsupported packed/tiled layouts, and unsupported raw RGB views are
+refused with a representation pixel-format error and are not drawn through
+a guessed default conversion. Explicitly linear, subsampling-aligned sizes
+are required; this deliberately does not claim every advertised original
+YUV modifier is separately importable as RGB component planes.
+
+Layout/source evidence is Mutter 51.0 commit
+138a14fbeef09d49ebf5be8a0cb83b042dd5c841 from the official GNOME GitLab
+repository: src/compositor/meta-multi-texture-format.c:34-43,346-608 and
+src/common/meta-cogl-drm-formats.h:72-75. The former is GPL-2.0-or-later,
+Copyright 2018 Barco NV, authored by Niels De Graef. Compositor shader/layout
+sources retain that attribution and select GPL-3.0-or-later; the upstream
+identity-limited shader's unmatched parentheses are not reproduced.
+Limited identity expands each distinct raw Y/U/V channel independently as
+`(sample - 16/255) * (255/219)` before alpha and colour transforms.
+
+GPU regressions in color_render/raw_tests.rs cover every sampling layout,
+distinct out-of-neutral channels, full/limited boundaries and transparent
+AYUV. An opt-in real dma-buf qualification test uses Linux DMA-heap
+allocation plus DMA_BUF_IOCTL_SYNC and hardware GBM/EGL imports:
+set TUNA_COLOR_DMABUF_HEAP to an accessible DMA heap and
+TUNA_COLOR_DRM_RENDER_NODE to the intended DRM render node, then run
+real_dmabuf_identity_component_import_qualification with the drm feature.
+Explicit qualification fails if any required raw view cannot be imported;
+without those environment variables it reports a skip, not qualification.
+No execution of these added regressions is asserted by this patch record.
+
+The independent native producer example tuna-color-yuv-client exercises
+the complete wl_buffer import and colour-representation commit path with
+real DMA-heap storage. It supports NV12/P010/AYUV, identity and
+BT.601/709/2020 at both ranges, and an unset-coefficients BT.709-limited
+control. It refuses an original YUV format not advertised with explicit
+LINEAR; no fallback to SHM, memfd or another coefficient matrix exists.
+The READY line contains independently calculated expected RGB, not a
+producer-side rendering result. The capture proof's external-yuv mode can
+consume it as --color-client target/debug/examples/tuna-color-yuv-client;
+select formats/coefficients through TUNA_COLOR_YUV_FORMAT and
+TUNA_COLOR_YUV_COEFFICIENTS (or the example's --format/--coeff options).
+
+A concrete headless positive-qualification invocation is:
+`TUNA_COLOR_DMABUF_HEAP=/dev/dma_heap/system TUNA_COLOR_DRM_RENDER_NODE=/dev/dri/renderD128 cargo test -p tuna-compositor --features drm real_dmabuf_identity_component_import_qualification -- --nocapture`.
+The selected GBM device needs no connected monitor. A primary card such as
+/dev/dri/card0 can be supplied instead of a render node; the code does not
+require a DRM render-node type. However vkms/swrast alone does not establish
+positive YUV capability: the active EGL driver must advertise and accept
+the original YUV format and its non-external RGB component views, and the
+kernel must expose an accessible real DMA heap. Missing capabilities are
+reported failures/skips, not a successful pixel qualification. A native
+compositor using that device can run the producer with, for example,
+`TUNA_COLOR_DMABUF_HEAP=/dev/dma_heap/system TUNA_COLOR_YUV_FORMAT=p010 TUNA_COLOR_YUV_COEFFICIENTS=identity-limited target/debug/examples/tuna-color-yuv-client`;
+the consumer must compare actual scanout/captured pixels to READY.
+
+Native FP16 composition also requires the default Smithay copy shader to
+preserve extended-range texture samples. The isolated
+FP16-SAMPLER-PRECISION-PATCH.diff changes only the sampler2D and
+samplerExternalOES precision qualifiers in
+src/backend/renderer/gles/shaders/implicit/texture.frag to highp where
+GL_FRAGMENT_PRECISION_HIGH is available. GLES2 implementations without
+fragment highp retain the original SDR sampler declarations; native HDR
+admission separately rejects insufficient fragment precision.
+This independently implemented MIT-licensed shader qualifier change does
+not change ordinary normalized SDR sampling or the pinned version.
+
+## Native HDR connector transactions
+
+`NATIVE-HDR-API-PATCH.diff` extends the existing atomic DRM surface, rather
+than issuing independent HDR property writes. `ConnectorColorState` is
+staged in pending state, included in the real-framebuffer atomic test and
+modesetting commit, and promoted to current state only on success. It
+programs discovered `Colorspace`, `max bpc` and `HDR_OUTPUT_METADATA`
+properties together; blob ID zero clears HDR on the SDR transition.
+Callers retain metadata blob ownership until both states release it.
+
+`GbmBufferedSurface::test_next_buffer` tests the actual negotiated GBM
+framebuffer, including ten-bit format/modifier allocation. Buffer resets
+do not pretend to renegotiate precision: the compositor keeps a negotiated
+ten-bit swapchain for both SDR and HDR on capable connectors. Mode-change
+rollback retains the old committed mode blob until the real atomic commit
+succeeds and releases superseded pending mode blobs.
+
+The implementation reuses this vendored Smithay backend. Behavioral source
+references are official Mutter 51.0 commit
+`138a14fbeef09d49ebf5be8a0cb83b042dd5c841`:
+`meta-output-kms.c:547-600`, `meta-output.c:536-575` and
+`meta-kms-impl-device-atomic.c:229-292`. This is a local patch, not a claim
+of upstream acceptance or physical HDR display qualification. The
+compositor's `color_output` regression exercises real EGL FP16 blending,
+ten-bit PQ rendering and pixel readback; `TUNA_REQUIRE_COLOR_GL=1` makes
+missing GPU capabilities fail the selected qualification lane.
+
+VT activation re-reads each surface's current KMS state, invalidating the
+cached connector encoding even if the EDID and property capabilities are
+unchanged. The next framebuffer therefore commits the retained pending
+HDR properties instead of issuing a plain page flip with another VT's
+signaling. Replaced current-state mode blobs are released unless pending
+still owns them.
+
+Discovery independently probes actual EGL renderability for every
+negotiated GBM target. A failed ten-bit candidate is destroyed before
+creating and testing a fresh eight-bit surface; disabling HDR never
+retains a known-unrenderable target as an SDR fallback. FP16/shader
+qualification remains a separate gate. Hotplug teardown also releases
+the CRTC calibration gamma/CTM blobs using an independently retained DRM
+FD. Focused regressions cover candidate release/fallback, connector
+encoding state/request transitions and exactly-once calibration cleanup;
+no execution is asserted here.

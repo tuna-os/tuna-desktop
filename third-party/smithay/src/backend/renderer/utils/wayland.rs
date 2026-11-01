@@ -317,6 +317,17 @@ impl RendererSurfaceState {
         self.buffer.as_ref()
     }
 
+    /// Damage the whole attached buffer and drop its imported textures,
+    /// although the client sent nothing new: the buffer reads differently
+    /// now (e.g. its colour state or YCbCr conversion changed), so the
+    /// next draw imports it anew. Without a buffer this does nothing.
+    pub fn invalidate_buffer(&mut self) {
+        if let Some(size) = self.buffer_dimensions {
+            self.damage.add([Rectangle::from_size(size)]);
+            self.textures.clear();
+        }
+    }
+
     /// Gets a reference to the texture for the specified renderer context
     pub fn texture<T>(&self, id: ContextId<T>) -> Option<&T>
     where

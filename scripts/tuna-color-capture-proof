@@ -1,0 +1,658 @@
+#!/usr/bin/python3
+"""Real colour capture consumer proof; named emulated HDR is not physical HDR.
+
+Runs production Screenshot/ScreenshotWindow and monitor/window/area ScreenCast
+against fullscreen wp_color_manager clients on isolated Xvfb/EGL, D-Bus and
+PipeWire. The exact --shell-bin supervised PID is the authorized shell-role
+consumer, as in tuna-screenshot-flash-proof; no portal-name spoof or policy
+bypass. Screenshots must contain real gAMA/cHRM chunks and expected pixels.
+Casts must negotiate full-range BGRx/BT.709/gamma22 and deliver expected bytes.
+The nested compositor starts against the real Xvfb host without a Wayland
+client socket override; only its clients receive the new private socket.
+
+Prerequisites: built compositor and tuna-color-pixel-client, Xvfb, xdotool,
+dbus-daemon, pipewire, wireplumber, python3-gi, python3-pil,
+gir1.2-gstreamer-1.0, gir1.2-gst-plugins-base-1.0, gstreamer1.0-pipewire,
+and a usable EGL renderer. This script does not build or install anything.
+Use --mode external-yuv with a real tuna-color-yuv-client and its DMA-heap/GPU
+prerequisites; repeat --client-arg=VALUE for its format/representation options.
+The raw cast buffers and negotiated caps are retained; generated cast previews
+are only viewing aids, not producer PNG metadata evidence.
+An explicit --host-wayland-socket /absolute/socket instead nests only the
+compositor into an existing actual Wayland host, preserving that host's GPU.
+It neither starts Xvfb nor uses X11 focus/pointer tools. All clients and capture
+consumers still use the newly created private compositor socket and unchanged
+pixel, geometry, authorization and negotiated-media oracles.
+
+--backend drm uses an externally owned seat and TUNA_DRM_DEVICE. --hdr also
+requires the real TUNA_HDR_PROBE endpoint helper and --hdr-consumer compiled
+from tuna-color-cast-client. It selects supported HDR through DisplayConfig,
+checks real connector metadata/ten-bit scanout, compares active primary GEM
+pixels, and consumes actual negotiated ten-bit PipeWire frames. No forced
+HDR capability or 8-bit HDR proxy is accepted. --expect-unsupported-hdr checks that
+an unsupported device rejects the same HDR request. --source-receipt accepts
+builder-observed revision/worktree_status/files SHA256 evidence for payloads
+without .git, validating every listed file against this payload tree.
+The native HDR phase also uses the owned emulator's real connected sysfs
+control: kernel GETCONNECTOR, DisplayConfig and output inventory must
+disappear and return, saved HDR must be requalified in the same compositor,
+and fresh clients must deliver new GEM/capture pixels after replug. Optional
+wayland-info observations are independent registry snapshots, not held-client
+GlobalRemove events. Live colord profile/provider lifecycle is not claimed.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import select
+import re
+import struct
+import signal
+import shutil
+import subprocess
+import tempfile
+import time
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--compositor', type=Path, required=True)
+parser.add_argument('--color-client', type=Path, required=True)
+parser.add_argument('--artifacts', type=Path, required=True)
+parser.add_argument('--mode', choices=('all', 'pq', 'sdr', 'unmanaged', 'external-yuv'), default='all')
+parser.add_argument('--client-arg', action='append', default=[])
+parser.add_argument('--backend', choices=('winit', 'drm'), default='winit')
+parser.add_argument('--hdr', action='store_true')
+parser.add_argument('--expect-unsupported-hdr', action='store_true')
+parser.add_argument('--hdr-consumer', type=Path)
+parser.add_argument('--source-receipt', type=Path)
+parser.add_argument('--host-wayland-socket', type=Path,
+                    help='explicit actual host Wayland socket for the nested compositor only; no Xvfb')
+args = parser.parse_args()
+compositor, color_client = args.compositor.resolve(), args.color_client.resolve()
+consumer = Path(__file__).resolve().parent / 'lib' / 'tuna-color-capture-shell.py'
+assert not (args.hdr and args.expect_unsupported_hdr), 'choose HDR or unsupported-SDR qualification'
+assert not (args.hdr or args.expect_unsupported_hdr) or args.backend == 'drm', 'HDR requires a real native backend'
+assert not args.hdr or args.mode == 'all', 'HDR qualification requires highlight, SDR-white and unmanaged controls'
+hdr_consumer = args.hdr_consumer.resolve() if args.hdr_consumer else None
+assert not args.hdr or hdr_consumer is not None, '--hdr requires --hdr-consumer'
+host_socket = args.host_wayland_socket
+if host_socket is not None:
+    import stat
+    assert args.backend == 'winit' and host_socket.is_absolute(), 'absolute host socket requires winit'
+    assert stat.S_ISSOCK(host_socket.stat().st_mode), 'host endpoint is not a Wayland socket'
+binaries = [compositor, color_client]
+if hdr_consumer is not None:
+    binaries.append(hdr_consumer)
+for binary in (*binaries, consumer):
+    assert binary.is_file() and os.access(binary, os.X_OK), str(binary)
+root = Path(__file__).resolve().parent.parent
+if args.source_receipt:
+    receipt_path = args.source_receipt.resolve()
+    source = json.loads(receipt_path.read_text())
+    assert re.fullmatch(r'[0-9a-f]{40}', source['revision']), 'invalid builder revision'
+    assert isinstance(source['worktree_status'], str), 'missing actual builder worktree status'
+    assert isinstance(source['files'], dict) and source['files'], 'missing builder source hashes'
+    for relative, expected in source['files'].items():
+        path = Path(relative)
+        assert not path.is_absolute() and '..' not in path.parts, relative
+        resolved = (root / path).resolve()
+        assert resolved.is_relative_to(root) and resolved.is_file(), relative
+        assert re.fullmatch(r'[0-9a-f]{64}', expected), relative
+        assert hashlib.sha256(resolved.read_bytes()).hexdigest() == expected, relative
+    source['provenance'] = 'builder-observed-source-identity'
+    source['receipt_sha256'] = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+else:
+    source = {
+        'provenance': 'repository-git-observed-source-identity',
+        'revision': subprocess.check_output(
+            ['git', '-c', 'safe.directory=' + str(root), '-C', str(root), 'rev-parse', 'HEAD'],
+            text=True).strip(),
+        'worktree_status': subprocess.check_output(
+            ['git', '-c', 'safe.directory=' + str(root), '-C', str(root),
+             'status', '--porcelain=v1'], text=True),
+    }
+art = args.artifacts.resolve()
+art.mkdir(mode=0o700, parents=True, exist_ok=False)
+private_runtime = tempfile.TemporaryDirectory(prefix='tuna-color-')
+runtime = Path(private_runtime.name)
+env = os.environ.copy()
+for key in ('DISPLAY', 'WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'DBUS_SESSION_BUS_ADDRESS',
+            'DBUS_SYSTEM_BUS_ADDRESS', 'AT_SPI_BUS_ADDRESS', 'PIPEWIRE_REMOTE',
+            'PIPEWIRE_RUNTIME_DIR', 'TUNA_ANIMATION_CLOCK', 'TUNA_FRAME_CLOCK',
+            'TUNA_INTROSPECT_FILE'):
+    env.pop(key, None)
+env.update(XDG_RUNTIME_DIR=str(runtime), PIPEWIRE_RUNTIME_DIR=str(runtime),
+           HOME=str(art / 'home'), XDG_CONFIG_HOME=str(art / 'config'),
+           XDG_DATA_HOME=str(art / 'data'), XDG_STATE_HOME=str(art / 'state'),
+           XDG_CACHE_HOME=str(art / 'cache'), GSETTINGS_BACKEND='memory',
+           TUNA_XWAYLAND='0', TUNA_COMPOSITOR_STATE=str(art / 'compositor-state.json'),
+           TUNA_COLOR_CAPTURE_ARTIFACTS=str(art))
+if args.backend == 'drm':
+    env['TUNA_DRM_DEVICE'] = env.get('TUNA_DRM_DEVICE') or env.get('TUNA_HDR_CARD') or env.get('CARD', '')
+    assert env['TUNA_DRM_DEVICE'], 'native proof requires an actual DRM device'
+if hdr_consumer is not None:
+    env['TUNA_HDR_CAPTURE_CONSUMER'] = str(hdr_consumer)
+if args.hdr:
+    assert env.get('TUNA_HDR_PROBE'), 'native HDR requires the actual endpoint snapshot helper'
+    assert env.get('TUNA_HDR_CONNECTED_CONTROL'), 'native HDR requires the owned emulator hotplug control'
+for directory in ('home', 'config', 'data', 'state', 'cache'):
+    (art / directory).mkdir(mode=0o700)
+children, identities, logs = [], [], []
+core = None
+report = {'scope': __doc__, 'mode': args.mode, 'backend': args.backend, 'hdr': args.hdr,
+          'cases': {}, 'passed': False,
+          'source': source,
+          'binaries': {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                       for path in binaries},
+          'scripts': {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                      for path in (Path(__file__).resolve(), consumer)}}
+if host_socket is not None:
+    report['host_fixture'] = {
+        'kind': 'actual-host-wayland-not-Xvfb', 'socket': str(host_socket),
+        'device': host_socket.stat().st_dev, 'inode': host_socket.stat().st_ino,
+        'nested_renderer_identity': {'observed': False,
+                                     'scope': 'not inferred from the host or independent unit context'},
+        'scope': 'host compositor identity/source/package is retained by the native guest runner'}
+
+
+def spawn(command, name, launch_env=None, **options):
+    log = (art / (name + '.log')).open('wb')
+    logs.append(log)
+    process = subprocess.Popen(command, env=env if launch_env is None else launch_env,
+                               stdout=log, stderr=log,
+                               start_new_session=True, **options)
+    children.append(process)
+    identities.append((process.pid, os.pidfd_open(process.pid)))
+    return process
+
+
+def wait(predicate, label, seconds=20):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if core is not None and core.poll() is not None:
+            raise RuntimeError('compositor exited: see compositor.log')
+        try:
+            value = predicate()
+            if value:
+                return value
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+            pass
+        time.sleep(.02)
+    raise RuntimeError('timed out: ' + label)
+
+
+def read_json(path):
+    return json.loads(path.read_text())
+
+
+def run(command):
+    return subprocess.check_output(command, env=env, text=True,
+                                   stderr=subprocess.STDOUT, timeout=5).strip()
+
+
+def terminate(process):
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+
+
+def assert_untrusted_denied(destination, path, method, parameters):
+    result = subprocess.run(
+        ['gdbus', 'call', '--session', '--dest', destination, '--object-path', path,
+         '--method', method, *parameters], env=env, capture_output=True,
+        text=True, timeout=10)
+    assert result.returncode != 0 and 'AccessDenied' in result.stderr, result
+    return {'returncode': result.returncode, 'stderr': result.stderr.strip()}
+
+
+def request_capture(payload, seconds=100):
+    request = art / 'capture-request.json'
+    temporary = request.with_suffix('.tmp')
+    temporary.write_text(json.dumps(payload))
+    temporary.replace(request)
+
+    def response():
+        value = read_json(art / 'capture-response.json')
+        return value if value['id'] == payload['id'] else None
+
+    answer = wait(response, payload['id'] + ' capture consumer', seconds)
+    assert 'error' not in answer, answer
+    return answer['evidence']
+
+
+def native_snapshot(mode, expected):
+    metadata_path = art / (mode + '-native-scanout.json')
+    raw_path = art / (mode + '-native-scanout.rgb10')
+
+    def presented():
+        subprocess.run([env['TUNA_HDR_PROBE'], 'snapshot', env['TUNA_DRM_DEVICE'],
+                        str(metadata_path), str(raw_path)], env=env,
+                       capture_output=True, text=True, timeout=5, check=True)
+        value = read_json(metadata_path)
+        assert (value['format'], value['fourcc']) in {
+            ('XR30', 0x30335258), ('AR30', 0x30335241)}, value
+        assert value['colorspace'] == 'BT2020_RGB' and value['max_bpc'] >= 10, value
+        assert value['pixels'] == 'active-primary-GEM-not-writeback', value
+        metadata = bytes.fromhex(value['active_hdr_metadata_hex'])
+        assert len(metadata) == 32 and metadata[4] == 2, value
+        raw = raw_path.read_bytes()
+        centre = (value['height'] // 2) * value['stride'] + (value['width'] // 2) * 4
+        word = struct.unpack_from('<I', raw, centre)[0]
+        actual = [(word >> 20) & 1023, (word >> 10) & 1023, word & 1023]
+        if not all(abs(a - b) <= 4 for a, b in zip(actual, expected)):
+            return None
+        return {**value, 'centre_rgb10': actual, 'expected_rgb10': expected,
+                'raw_path': str(raw_path), 'raw_sha256': hashlib.sha256(raw).hexdigest()}
+
+    return wait(presented, mode + ' actual ten-bit scanout')
+
+
+def config_files():
+    return {str(path.relative_to(art)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted((art / 'config').rglob('*.xml'))}
+
+
+def start_core(label):
+    global core, consumer_descriptor, current_lifecycle
+    for name in ('consumer-ready.json', 'capture-request.json', 'capture-response.json',
+                 'compositor-state.json', 'stop-consumer'):
+        (art / name).unlink(missing_ok=True)
+    socket_name = 'tuna-color-capture'
+    # The host endpoint is used ONLY by this compositor launch. Supervised
+    # consumers receive the new private socket after backend initialization.
+    env.pop('WAYLAND_DISPLAY', None)
+    for endpoint in (runtime / socket_name,
+                     runtime / ('tuna-' + socket_name + '.control')):
+        endpoint.unlink(missing_ok=True)
+    command = [str(compositor), '--backend', args.backend, '--socket',
+               socket_name, '--shell-bin', str(consumer)]
+    if args.backend == 'winit':
+        command.extend(['--width', '1280', '--height', '800'])
+    if host_socket is not None:
+        core = spawn(command, 'compositor-' + label,
+                     launch_env={**env, 'WAYLAND_DISPLAY': str(host_socket)})
+    else:
+        core = spawn(command, 'compositor-' + label)
+    env['WAYLAND_DISPLAY'] = socket_name
+    ready = wait(lambda: read_json(art / 'consumer-ready.json'), 'supervised capture consumer')
+    consumer_descriptor = os.pidfd_open(ready['pid'])
+    identities.append((ready['pid'], consumer_descriptor))
+    current_lifecycle = label
+    report.setdefault('lifecycles', {})[label] = {
+        'pid': core.pid, 'supervised_shell_pid': ready['pid'], 'control_hello': ready['control_hello']}
+    if args.hdr:
+        assert ready['control_hello'] is not None, 'missing actual supervised control handshake'
+    wait((runtime / env['WAYLAND_DISPLAY']).exists, 'native display socket')
+    if args.backend == 'winit' and host_socket is None:
+        window = wait(lambda: run(['xdotool', 'search', '--pid', str(core.pid), '--name', 'Smithay']),
+                      'nested compositor window')
+        assert len(window.splitlines()) == 1, window
+        run(['xdotool', 'windowfocus', '--sync', window])
+        run(['xdotool', 'mousemove', '--window', window, '1200', '750'])
+    wait(lambda: not read_json(art / 'compositor-state.json')['transitions']['startup']['active'],
+         'startup reveal completion')
+
+
+def verify_core():
+    assert core.poll() is None, 'original compositor exited'
+    assert hashlib.sha256(Path('/proc', str(core.pid), 'exe').read_bytes()).hexdigest() == report['binaries'][str(compositor)]
+    assert not select.select([consumer_descriptor], [], [], 0)[0], 'original supervised consumer exited'
+    report['lifecycles'][current_lifecycle]['original_identities_verified'] = True
+
+
+def finish_core():
+    global core
+    verify_core()
+    report['lifecycles'][current_lifecycle]['config_files'] = config_files()
+    (art / (current_lifecycle + '-final-state.json')).write_bytes(
+        (art / 'compositor-state.json').read_bytes())
+    terminate(core)
+    if not select.select([consumer_descriptor], [], [], 3)[0]:
+        signal.pidfd_send_signal(consumer_descriptor, signal.SIGTERM)
+    assert select.select([consumer_descriptor], [], [], 3)[0], 'supervised child survived compositor restart'
+    report['lifecycles'][current_lifecycle]['owned_processes_exited_before_restart'] = True
+    core = None
+
+
+def kernel_mode(connector, mode, unsupported=False):
+    def active():
+        for output in read_json(art / 'compositor-state.json')['color']['crtcs']:
+            if output['connector'] != connector or output['color_mode'] != mode:
+                continue
+            encoding = output['connector_encoding']
+            if mode == 1:
+                assert output['fp16_composition'] and '2101010' in output['scanout_format'], output
+                assert output['sink_bt2020_rgb'] and output['sink_pq'] and output['sink_static_metadata_type1'], output
+                assert encoding['max_bpc'] >= 10 and encoding['colorspace'] != 0, output
+                assert encoding['hdr_metadata_blob'] > 0 and encoding['hdr_metadata_bytes'][4] == 2, output
+            else:
+                assert not output['fp16_composition'], output
+                assert encoding is None or encoding['hdr_metadata_blob'] in (None, 0), output
+                assert encoding is None or encoding['colorspace'] in (None, 0), output
+            if unsupported:
+                assert 1 not in output['supported_color_modes'], output
+            return output
+        return None
+    return wait(active, 'actual native colour mode ' + str(mode))
+
+
+def run_cases(prefix, hdr_active):
+    names = []
+    modes = ('pq', 'sdr', 'unmanaged') if args.mode == 'all' else (args.mode,)
+    for mode in modes:
+        name = prefix + '-' + mode if prefix else mode
+        names.append(name)
+        command = [str(color_client)]
+        if mode in ('sdr', 'unmanaged'):
+            command.append('--' + mode)
+        if args.hdr and mode == 'pq':
+            command.append('--highlight')
+        elif args.hdr and mode == 'sdr':
+            command.append('--white')
+        command.extend(args.client_arg)
+        client = spawn(command, 'client-' + name)
+        try:
+            def presented():
+                if client.poll() is not None:
+                    raise RuntimeError('colour client exited: client-' + name + '.log')
+                lines = (art / ('client-' + name + '.log')).read_text().splitlines()
+                return next((line for line in lines if line.startswith('READY ')), None)
+            ready_line = wait(presented, 'presented ' + name)
+            assert hashlib.sha256(Path('/proc', str(client.pid), 'exe').read_bytes()).hexdigest() == report['binaries'][str(color_client)]
+            numbers = [int(value) for value in ready_line.split()[1:]]
+            assert len(numbers) == 6 and all(0 <= value <= 255 for value in numbers), ready_line
+            code, expected = numbers[:3], numbers[3:]
+            if mode == 'pq':
+                assert any(abs(a - b) > 4 for a, b in zip(code, expected)), numbers
+            elif mode in ('sdr', 'unmanaged'):
+                assert code == expected, numbers
+            payload = {'id': name, 'expected': expected}
+            if hdr_active:
+                hdr_line = next(line for line in (art / ('client-' + name + '.log')).read_text().splitlines()
+                                if line.startswith('HDR-EXPECTED10 '))
+                hdr_expected = [int(value) for value in hdr_line.split()[1:]]
+                assert len(hdr_expected) == 3 and all(0 <= value <= 1023 for value in hdr_expected)
+                payload['expected_hdr10'] = hdr_expected
+                scanout = native_snapshot(name, hdr_expected)
+            evidence = request_capture(payload)
+            report['cases'][name] = {'ready': ready_line, **evidence}
+            if hdr_active:
+                report['cases'][name]['native_scanout'] = scanout
+        finally:
+            terminate(client)
+    if hdr_active:
+        pq = prefix + '-pq' if prefix else 'pq'
+        sdr = prefix + '-sdr' if prefix else 'sdr'
+        highlight = report['cases'][pq]['casts']['hdr-monitor']['centre_rgb10']
+        white = report['cases'][sdr]['casts']['hdr-monitor']['centre_rgb10']
+        assert all(h > w + 100 for h, w in zip(highlight, white)), (highlight, white)
+    return names
+
+
+def registry_snapshot(label, output_count):
+    binary = shutil.which('wayland-info')
+    if binary is None:
+        return {'observed': False, 'reason': 'wayland-info is not installed',
+                'scope': 'no held-client registry event claim'}
+    result = subprocess.run([binary], env={**env, 'LC_ALL': 'C'},
+                            capture_output=True, text=True, timeout=15, check=True)
+    path = art / (label + '-wayland-info.txt')
+    path.write_text(result.stdout)
+    names = re.findall(
+        r"^interface: 'wl_output',\s+version:\s+\d+,\s+name:\s+(\d+)",
+        result.stdout, re.MULTILINE)
+    assert len(names) == output_count, (label, names, output_count)
+    return {'observed': True, 'scope': 'independent registry snapshot, not held-client events',
+            'wl_output_global_names': [int(name) for name in names], 'path': str(path),
+            'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+            'observer_binary_sha256': hashlib.sha256(Path(binary).read_bytes()).hexdigest()}
+
+
+def connection_snapshot(label):
+    path = art / (label + '-kernel-connection.json')
+    subprocess.run([env['TUNA_HDR_PROBE'], 'connection', env['TUNA_DRM_DEVICE'], str(path)],
+                   env=env, capture_output=True, text=True, timeout=5, check=True)
+    value = read_json(path)
+    assert value['emulated'] is True and value['driver'] == 'tuna_hdr_vkms', value
+    return value
+
+
+def observe_inventory(label, output_count):
+    sequence = 0
+
+    def observed():
+        nonlocal sequence
+        sequence += 1
+        value = request_capture({
+            'id': label + '-' + str(sequence), 'action': 'observe-outputs'}, seconds=15)
+        color = read_json(art / 'compositor-state.json')['color']
+        if len(value['monitors']) != output_count or len(color['crtcs']) != output_count:
+            return None
+        assert len(value['logical']) == output_count, value
+        return {'display_config': value, 'runtime_color': color}
+
+    return wait(observed, label + ' actual output inventory')
+
+
+def live_hotplug(connector):
+    control = Path(env['TUNA_HDR_CONNECTED_CONTROL']).resolve()
+    assert control == Path('/sys/module/tuna_hdr_vkms/parameters/connected'), control
+    verify_core()
+    original_pid = core.pid
+    before = connection_snapshot('hotplug-before')
+    assert before['connected'] and before['mode_count'] > 0 and before['edid_present'], before
+    evidence = {
+        'scope': 'live output/encoding removal-return and fresh-client pixels; no colord profile lifecycle or held-client event claim',
+        'same_compositor_pid': original_pid,
+        'before': {'kernel': before, 'inventory': observe_inventory('hotplug-before', 1),
+                   'registry': registry_snapshot('hotplug-before', 1)},
+        'saved_config_files': config_files()}
+    report['hotplug'] = evidence
+    unplugged = False
+    try:
+        control.write_text('0\n')
+        unplugged = True
+        removed = observe_inventory('hotplug-removed', 0)
+        assert not any(device['connector'] == connector
+                       for device in removed['runtime_color']['devices']), removed
+
+        def disconnected():
+            value = connection_snapshot('hotplug-removed')
+            if value['connected'] or value['mode_count'] != 0 or value['edid_present'] or value['crtc_id'] != 0:
+                return None
+            assert value['connector_id'] == before['connector_id'], value
+            return value
+
+        evidence['disconnected'] = {
+            'kernel': wait(disconnected, 'kernel connector/mode/EDID withdrawal'),
+            'inventory': removed, 'registry': registry_snapshot('hotplug-removed', 0)}
+        assert core.pid == original_pid
+        verify_core()
+        control.write_text('1\n')
+        unplugged = False
+        returned = observe_inventory('hotplug-returned', 1)
+
+        def connected():
+            value = connection_snapshot('hotplug-returned')
+            if not value['connected'] or value['mode_count'] == 0 or not value['edid_present']:
+                return None
+            assert value['connector_id'] == before['connector_id'], value
+            assert value['edid_hex'] == before['edid_hex'], value
+            return value
+
+        evidence['replugged'] = {
+            'kernel': wait(connected, 'same actual connector and EDID after replug'),
+            'inventory': returned, 'registry': registry_snapshot('hotplug-returned', 1),
+            'requalified_encoding': kernel_mode(connector, 1),
+            'display_config': request_capture({
+                'id': 'hotplug-observe-hdr', 'action': 'observe-mode', 'expected_mode': 1})}
+        assert core.pid == original_pid
+        verify_core()
+        evidence['fresh_client_cases'] = run_cases('replug-hdr', True)
+        evidence['same_supervised_identity_verified'] = True
+        return evidence
+    finally:
+        if unplugged:
+            control.write_text('1\n')
+
+
+def interrupted(signum, _frame):
+    # Unwind through the owned-process cleanup instead of abandoning detached
+    # children that keep the emulated DRM endpoint busy during cancellation.
+    signal.signal(signum, signal.SIG_IGN)
+    raise InterruptedError('colour proof interrupted by signal ' + str(signum))
+
+
+try:
+    signal.signal(signal.SIGTERM, interrupted)
+    bus_path = runtime / 'bus'
+    spawn(['dbus-daemon', '--session', '--nofork', '--address=unix:path=' + str(bus_path)], 'dbus')
+    wait(bus_path.exists, 'private D-Bus')
+    env['DBUS_SESSION_BUS_ADDRESS'] = 'unix:path=' + str(bus_path)
+    # Never send startup probes to the host's system bus.
+    env['DBUS_SYSTEM_BUS_ADDRESS'] = env['DBUS_SESSION_BUS_ADDRESS']
+    spawn(['pipewire'], 'pipewire')
+    wait((runtime / 'pipewire-0').exists, 'private PipeWire')
+    spawn(['wireplumber'], 'wireplumber')
+    if args.backend == 'winit' and host_socket is None:
+        read_fd, write_fd = os.pipe()
+        try:
+            spawn(['Xvfb', '-displayfd', str(write_fd), '-screen', '0', '1280x800x24',
+                   '-nolisten', 'tcp', '-noreset'], 'xvfb', pass_fds=(write_fd,))
+        finally:
+            os.close(write_fd)
+        try:
+            number = b''
+            deadline = time.monotonic() + 10
+            while not number.endswith(b'\n'):
+                assert select.select([read_fd], [], [], max(0, deadline - time.monotonic()))[0]
+                block = os.read(read_fd, 32)
+                assert block, 'Xvfb closed before readiness'
+                number += block
+                assert len(number) <= 32
+            assert number.strip().isdigit(), number
+            env['DISPLAY'] = ':' + number.decode().strip()
+        finally:
+            os.close(read_fd)
+    start_core('initial')
+    if args.hdr or args.expect_unsupported_hdr:
+        action = 'enable-hdr' if args.hdr else 'reject-hdr'
+        report['native_mode'] = request_capture({
+            'id': 'native-mode', 'action': action, 'persistent': args.hdr})
+        connector = report['native_mode']['connector']
+        if args.hdr:
+            report['native_kernel_state'] = kernel_mode(connector, 1)
+        else:
+            report['unsupported_kernel_state'] = kernel_mode(connector, 0, unsupported=True)
+    report['untrusted'] = {
+        'screenshot': assert_untrusted_denied(
+            'org.gnome.Shell.Screenshot', '/org/gnome/Shell/Screenshot',
+            'org.gnome.Shell.Screenshot.Screenshot',
+            ['false', 'false', str(art / 'untrusted.png')]),
+        'screencast': assert_untrusted_denied(
+            'org.gnome.Mutter.ScreenCast', '/org/gnome/Mutter/ScreenCast',
+            'org.gnome.Mutter.ScreenCast.CreateSession', ['{}'])}
+    assert not (art / 'untrusted.png').exists()
+    report['initial_cases'] = run_cases('', args.hdr)
+    if args.hdr:
+        report['hdr_highlights_exceed_sdr_reference_white'] = True
+        report['hotplug'] = live_hotplug(connector)
+        hdr_files = config_files()
+        assert hdr_files, 'confirmed HDR mode did not persist a monitor configuration'
+        finish_core()
+        start_core('restart-hdr')
+        assert config_files() == hdr_files, 'restart must use the same persisted configuration'
+        restored = request_capture({'id': 'observe-restarted-hdr', 'action': 'observe-mode', 'expected_mode': 1})
+        report['restarted_hdr'] = {
+            'display_config': restored, 'kernel_state': kernel_mode(connector, 1),
+            'cases': run_cases('restart-hdr', True)}
+        transition_pid = core.pid
+        changed = request_capture({
+            'id': 'transition-to-sdr', 'action': 'disable-hdr', 'persistent': True})
+        assert core.pid == transition_pid, 'mode transition replaced the compositor'
+        report['same_process_sdr_transition'] = {
+            'pid': transition_pid, 'display_config': changed,
+            'kernel_state': kernel_mode(connector, 0),
+            'cases': run_cases('transition-sdr', False)}
+        sdr_files = config_files()
+        assert sdr_files and sdr_files != hdr_files, 'confirmed SDR mode did not replace the persisted HDR configuration'
+        finish_core()
+        start_core('restart-sdr')
+        assert config_files() == sdr_files, 'SDR restart must reuse the same persisted configuration'
+        restored = request_capture({'id': 'observe-restarted-sdr', 'action': 'observe-mode', 'expected_mode': 0})
+        report['restarted_sdr'] = {
+            'display_config': restored, 'kernel_state': kernel_mode(connector, 0),
+            'cases': run_cases('restart-sdr', False)}
+        report['restart_capture_checked'] = True
+    verify_core()
+    report['running_compositor_identity_verified'] = True
+    report['original_supervised_identity_alive'] = True
+    report['passed'] = True
+except Exception as error:
+    report['error'] = repr(error)
+    raise
+finally:
+    (art / 'stop-consumer').touch()
+    for pid, descriptor in reversed(identities):
+        if not select.select([descriptor], [], [], 0)[0]:
+            try:
+                signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    for pid, descriptor in identities:
+        if not select.select([descriptor], [], [], 3)[0]:
+            signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+        assert select.select([descriptor], [], [], 3)[0], str(pid) + ' survived'
+        os.close(descriptor)
+    for process in children:
+        process.wait(timeout=3)
+    # Retire only bus-activated descendants in this private runtime, never
+    # matching a generic process name or touching a user's real session.
+    marker = ('XDG_RUNTIME_DIR=' + str(runtime)).encode()
+    activated = []
+    for path in Path('/proc').iterdir():
+        if not path.name.isdecimal() or int(path.name) == os.getpid():
+            continue
+        try:
+            if marker not in (path / 'environ').read_bytes().split(b'\0'):
+                continue
+            descriptor = os.pidfd_open(int(path.name))
+            if marker not in (path / 'environ').read_bytes().split(b'\0'):
+                os.close(descriptor)
+                continue
+            activated.append((int(path.name), descriptor))
+            signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+        except OSError:
+            pass
+    for pid, descriptor in activated:
+        if not select.select([descriptor], [], [], 2)[0]:
+            signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+        assert select.select([descriptor], [], [], 2)[0], str(pid) + ' survived'
+        os.close(descriptor)
+    for log in logs:
+        log.close()
+    private_runtime.cleanup()
+    report['cleanup'] = {'owned_processes_exited': True,
+                         'activated_pids': [pid for pid, _ in activated],
+                         'runtime_removed': not runtime.exists()}
+    (art / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
+if report['passed']:
+    (art / 'assertions.txt').write_text(
+        'D-COLOR-CAPTURE pass real screenshot PNG chunks/pixels and PipeWire '
+        'monitor/window/area negotiated SDR bytes; controls=' + ','.join(report['cases']) + '; '
+        'untrusted caller denial; exact supervised identity; owned cleanup\n')
+    if args.hdr:
+        with (art / 'assertions.txt').open('a') as assertions:
+            assertions.write('D-COLOR-HDR-CAPTURE pass admitted native HDR connector, active primary GEM pixels, real negotiated ten-bit BT2020/PQ monitor frames and SDR screenshot/window/area controls\n')
+            assert report['restart_capture_checked']
+            assertions.write('D-COLOR-HDR-RESTART pass actual shell-confirmed persistent HDR restart, same-process HDR-to-SDR persistent transition, SDR restart, kernel metadata and real capture consumers at every phase\n')
+            assert report['hotplug']['fresh_client_cases']
+            assertions.write('D-COLOR-HDR-HOTPLUG pass live kernel connector/EDID and output inventory removal-return, saved HDR requalification, same owned compositor and fresh-client GEM/HDR capture pixels; no live colord profile or held-client event claim\n')
+    if args.expect_unsupported_hdr:
+        with (art / 'assertions.txt').open('a') as assertions:
+            assertions.write('D-COLOR-HDR-REJECT pass actual unsupported connector denies mode1, no active HDR metadata, real SDR capture pixels\n')
+    print(json.dumps(report))

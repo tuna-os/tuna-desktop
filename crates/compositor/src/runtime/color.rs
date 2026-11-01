@@ -5,6 +5,16 @@
 use super::{Backend, Runtime};
 
 impl Runtime {
+    #[cfg(feature = "drm")]
+    pub(super) fn refresh_colord_monitors(&mut self) {
+        let Backend::Drm(drm) = &self.backend else {
+            return;
+        };
+        if let Some(client) = &mut self.colord {
+            client.update_monitors(&self.color, drm.colord_monitors());
+        }
+    }
+
     /// Program the CRTC white points for `temperature` (Kelvin) and
     /// return whether this frame still needs the renderer's Night Light
     /// tint (nested outputs, or a CRTC that takes neither LUT nor CTM).

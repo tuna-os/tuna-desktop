@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "device": "Tuna EMULATED HDR10 qualification sink; not physical hardware or a shipping kernel module",
+  "upstream_repository": "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
+  "upstream_tag": "v6.8",
+  "upstream_commit": "e8f897f4afef0031fe618a8e94127a0934896aba",
+  "upstream_directory": "drivers/gpu/drm/vkms",
+  "upstream_sha256": {
+    "Makefile": "3ec777a65df0a86fd1c1de0249d2ef42b4139f11cbb219632a47b7005e13a4ed",
+    "vkms_drv.c": "a8a2f2862c4c0ba0fe9492270f2b94361673ea1044cbf825b76e49690d0d4a38",
+    "vkms_drv.h": "0c0d0863072152c503944015920aecf551f2780ed737418c434368a82f1351b9",
+    "vkms_plane.c": "4a2b489109d72bbf537f0558f3c181dc31eac38f2a900ce35be044c1c57eb35a",
+    "vkms_output.c": "90ee1e33c17d43f511666979cc0d32d2a74d504c084b3e9981688507c22c3df3",
+    "vkms_formats.c": "130a52e8493c6576d23a4e7b6dcbf669e157686e7239ef15e81b7dc5ede27810",
+    "vkms_formats.h": "4f6740ec9a49b7834ccd22ad553f56880a05fe585336121750963049577f9475",
+    "vkms_crtc.c": "83a33428a9cd339b6fa7673d05f59cda9ad2da3e4f9dd22e4d00e8ec58e32166",
+    "vkms_composer.c": "9e66d814b67c8c65d085a0a8ed2318341d1c92f2a2f2782925c1fc52b347d04d",
+    "vkms_writeback.c": "b060e3eb2727ca8cb6cd5e2982766ddb3fd1a78188d973cdb6147e0ab561c33f"
+  },
+  "adaptation_patch": "upstream-adaptation.patch",
+  "adaptation_patch_sha256": "f610d6967628e48caf2edbee4630f02c595e59e743e2094d130f7b8317d1c138",
+  "adapted_sha256": {
+    "Makefile": "b71ae9fa7e3a45d88776d9d5709c3ad92efeb79dad91b4391908530a901d6574",
+    "vkms_drv.c": "e29dd2cd357e9d5f3b5a0c07d534761c2b0d6478db38c4c98ea3b1c96a1aade9",
+    "vkms_drv.h": "0c0d0863072152c503944015920aecf551f2780ed737418c434368a82f1351b9",
+    "vkms_plane.c": "c199d5903b3445a29900dcee60b782ef726b455d0fa199b612243b4c55cb9b89",
+    "vkms_output.c": "b55d06a48d7de92f7ed134d1ff87cb1e81a11d9ab58e6a791f2096053238af8b",
+    "vkms_formats.c": "77e611cb6ddde616eed2a20205aadec23cfe4ae1f9341e7ade0f721949dc5a65",
+    "vkms_formats.h": "4f6740ec9a49b7834ccd22ad553f56880a05fe585336121750963049577f9475",
+    "vkms_crtc.c": "83a33428a9cd339b6fa7673d05f59cda9ad2da3e4f9dd22e4d00e8ec58e32166",
+    "vkms_composer.c": "9e66d814b67c8c65d085a0a8ed2318341d1c92f2a2f2782925c1fc52b347d04d",
+    "vkms_writeback.c": "6776998e4303b1b400f767bd8433bbeaf6102ace6d82ba107e2f74105d454490",
+    "tuna_hdr.c": "9c727e00711d23cdb240d508534267d0963155649b8833b99167263bc34bf67f",
+    "tuna_hdr.h": "0b817eeba62d77c26bec03cd65ddf872c8fc23c854e41c3a1beb8aec7cd94011",
+    "tuna_edid.h": "c2fc9cd119ad3d712ab2e9711e7562485ba51282c5bc7944ce1a7c5308f664b4",
+    "probe.c": "e88a74d2297d9847e1153cfd68a229a210153ffcae3a3100f9e42ef580af7a1a",
+    "hdr10.edid.hex": "a7fdf0d4d162eb02eadaf8f59d4be75a16da222e677149f20979bb55b43b820d",
+    "unsupported-sdr.edid.hex": "8cc423225a68ec32626615f0b90bd79935669b439ebfe15b9c813beb2aaf2341",
+    "COPYING": "fb5a425bd3b3cd6071a3a9aff9909a859e7c1158d54d32e07658398cd67eb6a0",
+    "GPL-2.0": "f6b78c087c3ebdf0f3c13415070dd480a3f35d8fc76f3d02180a407c1c812f79",
+    "Linux-syscall-note": "8e378ab93586eb55135d3bc119cce787f7324f48394777d00c34fa3d0be3303f"
+  },
+  "licensing": "Upstream per-file SPDX GPL-2.0+ retained; Makefile GPL-2.0-only. Added driver/probe GPL-2.0+. Complete upstream GPL-2.0 and Linux-syscall-note retained with COPYING.",
+  "scope": [
+    "Separate module/platform/DRM name tuna_hdr_vkms; stock vkms is never replaced or unloaded",
+    "Exact synthetic EDID explicitly names TUNA EMU HDR / TUNA EMU SDR",
+    "Real upstream GEM shmem/atomic/vblank/frameflip/u16 composition/writeback",
+    "Real XR30 and AR30 ten-bit read and write conversions; no eight-bit truncation",
+    "HDR admission in kernel requires active ten-bit primary, BT2020_RGB, max requested bpc10 and PQ/type1 metadata",
+    "Root connected sysfs parameter models a real virtual cable; connector detect plus canonical single-connector HPD helper updates kernel connection status/epoch and emits actual DRM hotplug uevents; lifetime mutex prevents events against torn-down device",
+    "Unplug/replug keeps the same registered connector and exact EDID; no compositor state overrides; kernel mode/EDID cache clearing follows normal master reprobe",
+    "No fake compositor flags, capability overrides or policy relaxation",
+    "FBdev console registration removed so emulated qualification module does not take host consoles"
+  ],
+  "fixtures": {
+    "hdr10": {
+      "sha256": "541e4a1529c9757658ed668a11e288e974e05f43aa74a8e62918796b37d09801",
+      "manufacturer": "TUN",
+      "product_code": 341,
+      "serial": 3,
+      "mode": "1024x768@60Hz"
+    },
+    "unsupported-sdr": {
+      "sha256": "82562e2fdc4d1f98494f741902f0b0d34f0e4c43304747c71cd3083653916969",
+      "manufacturer": "TUN",
+      "product_code": 341,
+      "serial": 4,
+      "mode": "1024x768@60Hz"
+    }
+  },
+  "runtime_recipe": {
+    "installer": "scripts/ci-install-hdr-vkms",
+    "guest_wrapper": "scripts/ci-hdr-vkms-guest",
+    "cloud_image_url": "https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-amd64.img",
+    "cloud_image_sha256": "04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94",
+    "checksum_signing_fingerprint": "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81",
+    "signature_reference": "https://documentation.ubuntu.com/public-images/public-images-how-to/verify-image-checksum",
+    "authenticated_manifest_sha256": "78d7da6ab1556daa6c0f685bf4e0e3da36395f170e8fad411d7ba032f14d08c2",
+    "observed_source_identity_receipt": "image-source-receipt.json",
+    "image_kernel": "6.8.0-147-generic",
+    "image_kernel_package_version": "6.8.0-147.147",
+    "headers": "Exact running kernel headers, present in pinned official cloud image. Both generated UTS_RELEASE and include/config/kernel.release must equal the running kernel before external-module build; actual built module name/vermagic are checked immediately after build and again before load. No host kernel replacement or ABI override.",
+    "guest_prerequisite_archive": "https://snapshot.ubuntu.com/ubuntu/20261018T000000Z/",
+    "guest_prerequisite_archive_reference": "https://snapshot.ubuntu.com/",
+    "guest_prerequisite_coherence": "Immutable official archive matching the authenticated image era, including Noble updates/security/backports. Noble APT normally uses By-Hash but can fall back to mutable index filenames even with force; snapshot paths remove that mirror-sync race. No acquisition retry, ignored update error, disabled signature/hash/Valid-Until check, kernel replacement, or relaxed ABI guard.",
+    "observed_live_archive_failure": {
+      "ci_run": "41260450590",
+      "ci_job": "124713050332",
+      "source_commit": "982ce93d01263f097c5bf654bdca1d8c95751cc9",
+      "artifact": "colour-native/hdr/guest-prepare.log",
+      "lines": "24-48,65-73",
+      "sequence": "Ign for noble-updates/main and universe Packages, then fallback to mutable http://archive.ubuntu.com/ubuntu/dists/noble-updates/main/binary-amd64/Packages.xz",
+      "expected_sha256": "4256541ef9cef4aad23676069633e7bfc2629e5fab4c2f91cbfec26d94912bb4",
+      "expected_bytes": 1407748,
+      "received_bytes": 1407696,
+      "release_created": "Sun, 01 Nov 2026 00:29:46 +0000",
+      "failure_stage": "APT metadata acquisition; package installation and module build were not reached",
+      "limit": "The log demonstrates fallback and a mutable-index coherence failure, not the reason the initial by-hash request was unavailable. Snapshot signature acceptance, complete package installation and exact kernel/header/module closure require actual guest execution; source research alone is not qualification."
+    },
+    "observed_header_abi_failure": {
+      "ci_run": "41266067418",
+      "source_commit": "bdbb5d3e9d70ebd0e786ab899204aaee510bd0fc",
+      "artifact": "colour-native/hdr/guest-prepare.log",
+      "lines": "1199-1254",
+      "sequence": "Immutable signed 20261018T000000Z APT prerequisites installed successfully; the installer then rejected standalone make kernelrelease output 6.8.12 against actual running kernel 6.8.0-147-generic before module compilation.",
+      "running_kernel": "6.8.0-147-generic",
+      "rejected_standalone_make_kernelrelease": "6.8.12",
+      "retained_package_receipt": "guest-artifacts.tar.gz:artifacts/guest-packages.tsv",
+      "retained_packages": {
+        "linux-image-6.8.0-147-generic": "6.8.0-147.147",
+        "linux-headers-6.8.0-147": "6.8.0-147.147",
+        "linux-headers-6.8.0-147-generic": "6.8.0-147.147",
+        "linux-modules-extra-6.8.0-147-generic": "6.8.0-147.147"
+      },
+      "cause": "Ubuntu's packaged Makefile VERSION/PATCHLEVEL/SUBLEVEL describe upstream base 6.8.12, not Ubuntu ABI 6.8.0-147-generic. Without M=, kernelrelease calls scripts/setlocalversion and recomputes that upstream base. External-module Kbuild instead reads the packaged include/config/kernel.release, while generated UTS_RELEASE supplies module vermagic.",
+      "limit": "The failed guest retained package identities and running kernel but not generated-header contents. Matching local packaged headers were researched read-only; their contents are not represented as direct guest evidence. The earlier reported localhost preflight and this failed guest preparation were not rerun to confirm them."
+    },
+    "readonly_matching_packaged_header_evidence": {
+      "scope": "Read-only local Ubuntu 6.8.0-147.147 package/source inspection; not guest execution, compilation, load or HDR proof",
+      "headers": "/usr/src/linux-headers-6.8.0-147-generic",
+      "include/generated/utsrelease.h": "#define UTS_RELEASE \"6.8.0-147-generic\"; #define UTS_UBUNTU_RELEASE_ABI 147",
+      "include/config/kernel.release": "6.8.0-147-generic",
+      ".config": "CONFIG_VERSION_SIGNATURE=\"Ubuntu 6.8.0-147.147-generic 6.8.12\"; CONFIG_LOCALVERSION=\"\"; CONFIG_LOCALVERSION_AUTO is not set",
+      "/proc/version_signature": "Ubuntu 6.8.0-147.147-generic 6.8.12",
+      "native_source_identity": "dpkg-query: linux-headers-6.8.0-147 and linux-headers-6.8.0-147-generic are installed version 6.8.0-147.147 from source linux 6.8.0-147.147; linux-image-6.8.0-147-generic is installed version 6.8.0-147.147 from source linux-signed 6.8.0-147.147",
+      "packaged_makefile_authority": "Makefile:2-5 sets upstream 6.8.12; :365-368 reads KERNELRELEASE from include/config/kernel.release separately from KERNELVERSION; :1187-1195 recomputes release for non-external builds; :1791-1800 preserves packaged KERNELRELEASE for external modules; :2059-2060 dispatches kernelrelease to the selected computation"
+    },
+    "guest_fixture_delta_receipts": "Retained guest-artifacts.tar.gz contains apt/fixture-delta.json (original/effective sources and APT config, actual kernel), apt/packages-before.tsv, guest-packages.tsv after preparation even on failure, apt/*InRelease and apt/index-targets.txt. The installer now writes artifacts/kernel-headers.json before an ABI rejection: running/resolved header paths, bounded generated/config/Makefile identity lines and file hashes, plus native image/header package versions, source package versions and installed status. Existing endpoint/build receipts retain actual module/source identity and full built module vermagic; source authentication or header matching is not a runtime pass.",
+    "acceleration": "KVM if accessible, otherwise explicitly recorded TCG; both execute actual guest kernel DRM ioctls",
+    "root_assertion": "D-COLOR-HDR-KMS only after actual kernel selftest JSON/raw retention, command success, unsupported connector identity and isolated module/QEMU/disk/key cleanup; does not claim native compositor/capture qualification",
+    "native_capture_assertion": "Separate payload-owned D-COLOR-HDR-CAPTURE; a default guest-command=true must not satisfy native capture qualification",
+    "clean_native_start": "Module unloaded/reloaded between kernel selftest and native compositor; no stale selftest metadata/framebuffer can satisfy production output assertions"
+  },
+  "proof_commands": {
+    "identity": "$TUNA_HDR_PROBE identity \"$CARD\" \"$ARTIFACTS/identity.json\"",
+    "kernel_writeback": "$TUNA_HDR_PROBE selftest \"$CARD\" \"$ARTIFACTS/kernel-selftest.json\" \"$ARTIFACTS/kernel-writeback.xr30\"",
+    "active_compositor_scanout": "$TUNA_HDR_PROBE snapshot \"$CARD\" \"$ARTIFACTS/snapshot.json\" \"$ARTIFACTS/snapshot.xr30\"",
+    "live_connection": "$TUNA_HDR_PROBE connection \"$CARD\" \"$ARTIFACTS/connection.json\"",
+    "unplug": "printf 0 > \"$TUNA_HDR_CONNECTED_CONTROL\"",
+    "replug": "printf 1 > \"$TUNA_HDR_CONNECTED_CONTROL\""
+  },
+  "evidence_limits": [
+    "No module compilation, module load, VM boot, tests or graphical qualification was executed by this ABI-repair worker. Read-only matching local headers distinguish the Ubuntu ABI from the upstream 6.8.12 base; both generated-header and packaged kernel.release equality guards are mandatory, and built module name/vermagic must still match the running kernel. Corrected guest receipts, actual module build/load, kernel selftest and native HDR/capture remain unobserved until parent verification and CI.",
+    "identity operation and property presence alone are not proof of HDR production output.",
+    "selftest proves real kernel XR30 pageflip/writeback/metadata and invalid-commit rejection; native compositor FP16 render, display configuration, screencast, restart and unsupported-output journeys must run separately inside the same endpoint.",
+    "snapshot reads actual active primary GEM, not composed writeback; kernel selftest separately proves the writeback path.",
+    "Live hotplug source/control/probe are implemented; actual native output/global/calibration removal, return and new-frame evidence must be observed in the pinned guest proof, not inferred from a sysfs write or fabricated unknown state.",
+    "Virtual HDR code values and metadata cannot qualify physical panel or link fidelity. Physical qualification is outside EMULATED device claims."
+  ]
+}

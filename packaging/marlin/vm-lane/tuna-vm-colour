@@ -1,0 +1,420 @@
+#!/usr/bin/python3
+"""DEV-only finite typed colour actions; never execute caller-supplied commands.
+
+The worker owns all long consumer work; QGA actions only observe/start/ACK it.
+Original native session and other VMs are never modified or signalled.
+"""
+import base64
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import resource
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
+import tarfile
+
+ROOT = Path('/run/tuna-colour-proof')
+PAYLOAD = Path('/usr/share/tuna-colour')
+ELF = Path('/usr/libexec/tuna-colour')
+COEFFICIENTS = ('identity-full', 'identity-limited', 'bt601-full', 'bt601-limited',
+                'bt709-full', 'bt709-limited', 'bt2020-full', 'bt2020-limited', 'unset')
+CASES = ('unit', 'pixel') + tuple(f'{fmt}-{coeff}' for fmt in ('nv12', 'p010') for coeff in COEFFICIENTS)
+SCHEMAS = {'init': {'nonce', 'pid', 'start_ticks', 'uid', 'sha256'},
+           'start': {'nonce', 'case'}, 'state': {'nonce'}, 'finish': {'nonce'},
+           'cleanup': {'nonce'}, 'ack': {'nonce', 'case', 'attempt', 'sha256'},
+           'file': {'nonce', 'case', 'name', 'offset'}}
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+def process(pid):
+    path = Path('/proc', str(pid))
+    return {'pid': pid, 'start_ticks': int((path / 'stat').read_text().rsplit(')', 1)[1].split()[19]),
+            'uid': path.stat().st_uid, 'executable': os.readlink(path / 'exe'),
+            'sha256': digest(path / 'exe')}
+
+def save(directory, state):
+    temporary = directory / 'state.pending'
+    temporary.write_text(json.dumps(state))
+    temporary.chmod(0o600)
+    temporary.replace(directory / 'state.json')
+
+def load(directory):
+    return json.loads((directory / 'state.json').read_text())
+
+def secure(path):
+    value = path.lstat()
+    if not stat.S_ISDIR(value.st_mode) or value.st_uid != 0 or stat.S_IMODE(value.st_mode) != 0o700:
+        raise RuntimeError('exact private root-owned fixture directory required')
+
+def owner_alive(state):
+    owner = state['compositor']
+    fd = os.pidfd_open(owner['pid'])
+    try:
+        if select.select([fd], [], [], 0)[0] or process(owner['pid']) != owner:
+            raise RuntimeError('original native session compositor changed')
+        command = Path('/proc', str(owner['pid']), 'cmdline').read_bytes().split(b'\0')
+        if b'--backend=drm' not in command and not any(command[i:i+2] == [b'--backend', b'drm'] for i in range(len(command)-1)):
+            raise RuntimeError('original session is not the actual DRM host')
+        socket_info = Path(state['host_socket']).stat()
+        if (not stat.S_ISSOCK(socket_info.st_mode) or socket_info.st_ino != state['host_socket_inode']
+                or socket_info.st_uid != owner['uid']
+                or Path(state['render_node']).stat().st_rdev != state['render_rdev']
+                or select.select([fd], [], [], 0)[0]):
+            raise RuntimeError('actual original host endpoint/render-node identity changed')
+    finally:
+        os.close(fd)
+
+def parse(action, raw):
+    if action not in SCHEMAS or len(raw.encode()) > 4096:
+        raise ValueError('bounded fixed action required')
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate key')
+            result[key] = value
+        return result
+    value = json.loads(raw, object_pairs_hook=unique)
+    if type(value) is not dict or set(value) != SCHEMAS[action]:
+        raise ValueError('exact action schema required')
+    if type(value['nonce']) is not str or re.fullmatch('[0-9a-f]{32}', value['nonce']) is None:
+        raise ValueError('host-owned nonce required')
+    if 'case' in value and (type(value['case']) is not str or value['case'] not in CASES):
+        raise ValueError('fixed positive case required')
+    if action == 'init' and any(type(value[key]) is not int or value[key] <= 0 for key in ('pid', 'uid', 'start_ticks')):
+        raise ValueError('original non-root native session identity required')
+    for key, count in (('sha256', 64), ('attempt', 32)):
+        if key in value and (type(value[key]) is not str or re.fullmatch(f'[0-9a-f]{{{count}}}', value[key]) is None):
+            raise ValueError('exact digest/attempt required')
+    if action == 'file' and (type(value['offset']) is not int or not 0 <= value['offset'] <= 268435456
+                             or type(value['name']) is not str or value['name'] != 'artifacts.tar'):
+        raise ValueError('fixed bounded artifact required')
+    return value
+
+def initialize(value, directory):
+    ROOT.mkdir(mode=0o700, exist_ok=True)
+    secure(ROOT)
+    directory.mkdir(mode=0o700)
+    source = json.loads((PAYLOAD / 'source.json').read_text())
+    for name, expected in source['files'].items():
+        path = Path(name)
+        if path.is_absolute() or '..' in path.parts or digest(PAYLOAD / path) != expected:
+            raise RuntimeError('source payload differs from builder receipt')
+    source_files_sha256 = hashlib.sha256(
+        json.dumps(source['files'], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    if source_files_sha256 != source['source_files_sha256']:
+        raise RuntimeError('source inventory digest differs from native builder receipt')
+    for name in ('unit', 'pixel', 'yuv', 'cast'):
+        if digest(ELF / name) != source['elf_sha256'][name]:
+            raise RuntimeError('ELF differs from same-source build receipt')
+    owner = process(value['pid'])
+    if any(owner[key] != value[key] for key in ('pid', 'uid', 'start_ticks', 'sha256')) or owner['executable'] != '/usr/bin/tuna-compositor':
+        raise RuntimeError('original installed compositor differs from admission')
+    runtime = Path('/run/user', str(owner['uid']))
+    environment = dict(part.split(b'=', 1) for part in Path('/proc', str(owner['pid']), 'environ').read_bytes().split(b'\0') if b'=' in part)
+    sockets = [p for p in runtime.glob('wayland-*') if stat.S_ISSOCK(p.stat().st_mode)]
+    nodes = list(Path('/dev/dri').glob('renderD*'))
+    if len(sockets) != 1 or len(nodes) != 1 or not Path('/dev/dma_heap/system').is_char_device():
+        raise RuntimeError('one real host Wayland socket/render node and actual system DMA heap required')
+    if any(key in environment for key in (b'LIBGL_ALWAYS_SOFTWARE', b'GALLIUM_DRIVER',
+            b'MESA_LOADER_DRIVER_OVERRIDE', b'GBM_BACKEND', b'DRI_PRIME', b'LD_PRELOAD')):
+        raise RuntimeError('native host driver overrides are forbidden')
+    node = nodes[0]
+    state = {'schema': 1, 'nonce': value['nonce'], 'compositor': owner,
+             'host_backend': 'drm',
+             'host_socket': str(sockets[0]), 'host_socket_inode': sockets[0].stat().st_ino,
+             'render_node': str(node), 'render_rdev': node.stat().st_rdev,
+             'render_driver': str((Path('/sys/class/drm') / node.name / 'device/driver').resolve()),
+             'kernel': os.uname()._asdict() if hasattr(os.uname(), '_asdict') else list(os.uname()),
+             'source': {key: source[key] for key in
+                        ('revision', 'event_head', 'worktree_status', 'compiler', 'cargo',
+                         'rustflags', 'encoded_rustflags', 'rustdocflags', 'encoded_rustdocflags',
+                         'build_target', 'primary_compositor_build_sha256', 'tuna_version',
+                         'rustup_toolchain', 'cargo_home', 'cargo_target_dir', 'cargo_profile',
+                         'features', 'build_os', 'elf_sha256')},
+             'source_receipt_sha256': digest(PAYLOAD / 'source.json'),
+             'source_files_sha256': source_files_sha256,
+             'guest_helper_sha256': digest(__file__), 'cases': {}, 'active': None,
+             'deadline': time.monotonic() + 330, 'complete': False,
+             'ordinary_delta': 'DEV-only proof payload, private runtime/buses/PipeWire/nested compositor; original session unchanged',
+             'installed_signed_release_qualified': False}
+    owner_alive(state)
+    save(directory, state)
+    return state
+
+def worker(directory, case, attempt, gate, ready):
+    child = None
+    child_fd = None
+    owner_fd = None
+    target = directory / case
+    result = {'attempt': attempt, 'finished': False, 'client_reaped': False}
+    def interrupted(signum, frame):
+        raise InterruptedError('owned worker cancelled')
+    signal.signal(signal.SIGTERM, interrupted)
+    try:
+        os.write(ready, b'R')
+        os.close(ready)
+        if os.read(gate, 1) != b'1':
+            raise RuntimeError('ownership gate failed')
+        os.close(gate)
+        state = load(directory)
+        if state['active']['worker'] != process(os.getpid()):
+            raise RuntimeError('worker reservation changed')
+        owner_alive(state)
+        owner_fd = os.pidfd_open(state['compositor']['pid'])
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        # Only this worker writes its case directory.
+        target.mkdir(mode=0o700)
+        env = {k: v for k, v in os.environ.items() if k not in {
+            'DISPLAY', 'WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'LIBGL_ALWAYS_SOFTWARE',
+            'GALLIUM_DRIVER', 'MESA_LOADER_DRIVER_OVERRIDE', 'GBM_BACKEND', 'DRI_PRIME',
+            'LD_PRELOAD', 'LD_LIBRARY_PATH'}}
+        env.update(TUNA_REQUIRE_COLOR_GL='1', TUNA_COLOR_DMABUF_HEAP='/dev/dma_heap/system',
+                   TUNA_COLOR_DRM_RENDER_NODE=state['render_node'])
+        if case == 'unit':
+            argv = [str(ELF / 'unit'), '--exact',
+                    'color_render::raw_tests::real_dmabuf_identity_component_import_qualification', '--nocapture']
+        else:
+            argv = ['/usr/bin/python3', str(PAYLOAD / 'scripts/tuna-color-capture-proof'),
+                    '--compositor', '/usr/bin/tuna-compositor', '--color-client',
+                    str(ELF / ('pixel' if case == 'pixel' else 'yuv')),
+                    '--artifacts', str(target / 'capture'), '--source-receipt', str(PAYLOAD / 'source.json'),
+                    '--host-wayland-socket', state['host_socket']]
+            if case != 'pixel':
+                fmt, coeff = case.split('-', 1)
+                argv += ['--mode', 'external-yuv', '--client-arg=--format', '--client-arg=' + fmt,
+                         '--client-arg=--coeff', '--client-arg=' + coeff]
+        with (target / 'consumer.log').open('xb') as log:
+            child = subprocess.Popen(argv, env=env, stdout=log, stderr=log, start_new_session=True)
+            child_fd = os.pidfd_open(child.pid)
+            result['client'] = process(child.pid)
+            while child.poll() is None:
+                if select.select([owner_fd], [], [], 0)[0]:
+                    raise RuntimeError('original native host compositor departed')
+                if time.monotonic() >= state['active']['deadline']:
+                    raise TimeoutError('owned colour positive case deadline')
+                time.sleep(.02)
+        if child.returncode:
+            raise RuntimeError('real colour case failed: ' + case)
+        if case == 'unit':
+            if 'test result: ok. 1 passed; 0 failed; 0 ignored;' not in (target / 'consumer.log').read_text():
+                raise RuntimeError('actual required unit did not execute')
+            result['evidence_sha256'] = digest(target / 'consumer.log')
+            log_text = (target / 'consumer.log').read_text()
+            result['gl_identity'] = dict(re.findall(r'^YUV-QUAL GL (vendor|renderer|version)=(.+)$',
+                                                    log_text, re.MULTILINE))
+            if set(result['gl_identity']) != {'vendor', 'renderer', 'version'}:
+                raise RuntimeError('actual unit EGL context identity missing')
+        else:
+            receipt = target / 'capture/receipt.json'
+            evidence = json.loads(receipt.read_text())
+            if not evidence['passed'] or not evidence['cleanup']['owned_processes_exited'] or not evidence['cleanup']['runtime_removed']:
+                raise RuntimeError('production consumer or cleanup failed')
+            result['evidence_sha256'] = digest(receipt)
+    except BaseException as error:
+        result['failure'] = type(error).__name__ + ': ' + str(error)
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            if child is not None:
+                if child.poll() is None:
+                    # SIGINT runs Python capture-proof's finally; SIGTERM does not.
+                    signal.pidfd_send_signal(child_fd, signal.SIGINT)
+                    child.wait(timeout=15)
+                result['exit_code'] = child.returncode
+                result['client_reaped'] = True
+            else:
+                result['client_reaped'] = True
+        except BaseException as error:
+            if child_fd is not None and child.poll() is None:
+                signal.pidfd_send_signal(child_fd, signal.SIGKILL)
+                child.wait(timeout=2)
+            result['cleanup_failure'] = type(error).__name__ + ': ' + str(error)
+        finally:
+            if child_fd is not None:
+                os.close(child_fd)
+            if owner_fd is not None:
+                os.close(owner_fd)
+        try:
+            if target.is_dir():
+                with tarfile.open(target / 'artifacts.tar', 'w:gz') as archive:
+                    total = 0
+                    paths = [target / 'consumer.log']
+                    if (target / 'capture').is_dir():
+                        paths += sorted((target / 'capture').iterdir())
+                    for path in paths:
+                        # Only the consumer's top-level evidence types are
+                        # exportable. Never recurse into private HOME/config,
+                        # sockets, keys or core files.
+                        if path.suffix not in {'.log', '.json', '.png', '.bgrx', '.txt', '.rgb10'}:
+                            continue
+                        info = path.lstat()
+                        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                            raise RuntimeError('consumer evidence must be a single regular file')
+                        total += path.stat().st_size
+                        if total > 267386880:
+                            raise RuntimeError('raw consumer artifact bound exceeded')
+                        archive.add(path, arcname=str(path.relative_to(target)), recursive=False)
+                result['archive_sha256'] = digest(target / 'artifacts.tar')
+        except BaseException as error:
+            result['cleanup_failure'] = type(error).__name__ + ': ' + str(error)
+        result['finished'] = True
+        lock = os.open(directory / 'lock', os.O_RDWR)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            state = load(directory)
+            state['cases'][case] = result
+            save(directory, state)
+        finally:
+            os.close(lock)
+
+def start(directory, state, case):
+    if state['active'] is not None or state.get('failure') or len(state['cases']) >= len(CASES) or case != CASES[len(state['cases'])] or time.monotonic() >= state['deadline']:
+        raise RuntimeError('positive cases run exactly once in fixed order')
+    attempt = os.urandom(16).hex()
+    state['cases'][case] = {'attempt': attempt, 'finished': False}
+    state['active'] = {'case': case, 'attempt': attempt, 'deadline': min(state['deadline'], time.monotonic() + 120)}
+    gate_r, gate_w = os.pipe()
+    ready_r, ready_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.setsid()
+        null = os.open('/dev/null', os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        for name in os.listdir('/proc/self/fd'):
+            fd = int(name)
+            if fd > 2 and fd not in (gate_r, ready_w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        try:
+            worker(directory, case, attempt, gate_r, ready_w)
+        finally:
+            os._exit(0)
+    os.close(gate_r)
+    os.close(ready_w)
+    try:
+        state['active']['worker'] = process(pid)
+        save(directory, state)
+        if not select.select([ready_r], [], [], 1)[0] or os.read(ready_r, 1) != b'R':
+            raise RuntimeError('worker readiness failed')
+        os.write(gate_w, b'1')
+    except BaseException:
+        fd = os.pidfd_open(pid)
+        signal.pidfd_send_signal(fd, signal.SIGKILL)
+        os.close(fd)
+        os.waitpid(pid, 0)
+        raise
+    finally:
+        os.close(gate_w)
+        os.close(ready_r)
+    return state
+
+def departed(owner):
+    try:
+        fd = os.pidfd_open(owner['pid'])
+    except ProcessLookupError:
+        return True
+    try:
+        if select.select([fd], [], [], 0)[0]:
+            return True
+        if process(owner['pid']) != owner:
+            raise RuntimeError('owned worker PID identity changed')
+        return False
+    finally:
+        os.close(fd)
+
+def dispatch(action, value):
+    directory = ROOT / value['nonce']
+    if action == 'init':
+        return initialize(value, directory)
+    secure(ROOT)
+    secure(directory)
+    fd = os.open(directory / 'lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        end = time.monotonic() + 1
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= end:
+                    raise TimeoutError('finite colour state-lock deadline')
+                time.sleep(.001)
+        state = load(directory)
+        if action not in ('cleanup', 'file'):
+            owner_alive(state)
+        if action == 'start':
+            return start(directory, state, value['case'])
+        active = state['active']
+        if action == 'cleanup' and active is not None and not departed(active['worker']):
+            worker_fd = os.pidfd_open(active['worker']['pid'])
+            try:
+                signal.pidfd_send_signal(worker_fd, signal.SIGTERM)
+            finally:
+                os.close(worker_fd)
+            return state  # Host polls finite state until worker publishes retirement.
+        if action in ('finish', 'cleanup') and active is not None:
+            row = state['cases'][active['case']]
+            if row.get('finished') and not departed(active['worker']):
+                return state
+            if not row.get('finished') or not departed(active['worker']) or not row.get('client_reaped') or row.get('cleanup_failure'):
+                raise RuntimeError('owned worker/consumer retirement unconfirmed')
+            row['worker_departed'] = True
+            if action == 'finish' and not row.get('acknowledged'):
+                raise RuntimeError('host has not acknowledged exact real consumer evidence')
+            if row.get('failure') or row.get('exit_code') != 0:
+                state['failure'] = row.get('failure', 'colour consumer failed')
+            state['active'] = None
+            state['complete'] = len(state['cases']) == len(CASES) and not state.get('failure')
+            save(directory, state)
+        if action == 'ack':
+            row = state['cases'].get(value['case'], {})
+            if not active or active['case'] != value['case'] or row.get('attempt') != value['attempt'] or not row.get('finished') or row.get('evidence_sha256') != value['sha256']:
+                raise RuntimeError('no matching completed real evidence')
+            row['acknowledged'] = True
+            save(directory, state)
+        if action == 'file':
+            if state['active'] is not None:
+                raise RuntimeError('artifacts require worker retirement')
+            row = state['cases'].get(value['case'], {})
+            if not row.get('archive_sha256') or not row.get('worker_departed'):
+                raise RuntimeError('artifact is not in the retired owned case manifest')
+            case_fd = os.open(directory / value['case'], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                archive_fd = os.open('artifacts.tar', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                     dir_fd=case_fd)
+            finally:
+                os.close(case_fd)
+            with os.fdopen(archive_fd, 'rb') as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise RuntimeError('owned artifact must be a single regular non-symlink file')
+                size = os.fstat(stream.fileno()).st_size
+                if size > 268435456:
+                    raise RuntimeError('raw artifact archive exceeds bound')
+                stream.seek(value['offset'])
+                return {'size': size, 'data': base64.b64encode(stream.read(32768)).decode()}
+        return state
+    finally:
+        os.close(fd)
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 3:
+        raise RuntimeError('fixed root typed operation and bounded JSON required')
+    os.umask(0o077)
+    action, raw = sys.argv[1:]
+    print(json.dumps(dispatch(action, parse(action, raw))))
+
+if __name__ == '__main__':
+    main()

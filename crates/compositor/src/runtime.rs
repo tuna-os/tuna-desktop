@@ -712,6 +712,16 @@ pub struct Runtime {
     pipewire: Option<crate::screencast::PipeWire>,
     /// Running screen casts.
     casts: Vec<crate::screencast::Cast>,
+    /// Per-monitor, size-qualified HDR capture targets; `None` caches a
+    /// failed readback qualification instead of retrying every frame.
+    #[cfg(feature = "drm")]
+    capture_hdr: std::collections::HashMap<
+        String,
+        (
+            smithay::utils::Size<i32, smithay::utils::Physical>,
+            Option<crate::screencast::HdrCapture>,
+        ),
+    >,
     /// Monitor list the Mutter D-Bus side serves.
     cast_outputs: crate::mutter::Outputs,
     /// Orientation lock plus the latest accelerometer sample (#345).
@@ -1464,6 +1474,8 @@ impl Runtime {
             a11y_keyboard,
             pipewire: None,
             casts: Vec::new(),
+            #[cfg(feature = "drm")]
+            capture_hdr: Default::default(),
             cast_outputs,
             orientation: Default::default(),
             orientation_share,
@@ -3402,6 +3414,7 @@ impl Runtime {
             Backend::Drm(drm) => &mut drm.renderer,
         };
         let color_effect = crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, None);
+        let colors = crate::color_render::ColorFrame::for_capture(renderer, &mut self.state);
         // Surface-local origin such that the window geometry (inside any
         // client-side shadow) starts at the buffer's corner.
         let geo = crate::popup::window_geometry_loc(&surface);
@@ -3443,6 +3456,7 @@ impl Runtime {
                     scale,
                     blank_alpha: 0.0,
                     tint: color_effect.as_ref(),
+                    colors: &colors,
                 },
                 &[],
                 &[],
@@ -3529,7 +3543,10 @@ impl Runtime {
 
     /// Render one output's current scene (the primary, or `connector`)
     /// offscreen and read it back in `fourcc` byte order (Abgr8888 is
-    /// RGBA in memory, Xrgb8888 is BGRx). Never while locked. When the
+    /// RGBA in memory, Xrgb8888 is BGRx). Screenshots and SDR consumers
+    /// always target BT.709/gamma 2.2, independently of monitor ICC/HDR.
+    /// Abgr2101010 is the negotiated HDR monitor consumer's BT.2020/PQ.
+    /// Never while locked. When the
     /// screen magnifier is on (#349), the frame goes through the same
     /// zoom passes as the display, so screenshots and casts show the
     /// zoom region as seen (without the pointer sprite).
@@ -3542,6 +3559,11 @@ impl Runtime {
         #[cfg(not(feature = "drm"))]
         let _ = connector;
         if self.is_locked() {
+            return None;
+        }
+        let hdr_requested = fourcc == crate::screencast::CaptureFormat::Hdr10.fourcc();
+        #[cfg(not(feature = "drm"))]
+        if hdr_requested {
             return None;
         }
         let blank_alpha = self.blank_alpha();
@@ -3594,9 +3616,29 @@ impl Runtime {
             }
         };
         let color_effect = crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, None);
+        #[cfg(feature = "drm")]
+        let mut hdr_capture = if hdr_requested {
+            Some(self.capture_hdr.get_mut(&output_name)?.1.as_mut()?)
+        } else {
+            None
+        };
+        #[cfg(feature = "drm")]
+        let colors = match hdr_capture.as_ref() {
+            Some(capture) => crate::color_render::ColorFrame::for_target(
+                renderer,
+                &mut self.state,
+                capture.scene.blending.clone(),
+            ),
+            None => crate::color_render::ColorFrame::for_capture(renderer, &mut self.state),
+        };
+        #[cfg(not(feature = "drm"))]
+        let colors = crate::color_render::ColorFrame::for_capture(renderer, &mut self.state);
         let buffer_size = (size.w, size.h).into();
-        let mut texture: smithay::backend::renderer::gles::GlesTexture =
-            renderer.create_buffer(fourcc, buffer_size).ok()?;
+        let mut texture: Option<smithay::backend::renderer::gles::GlesTexture> = if hdr_requested {
+            None
+        } else {
+            Some(renderer.create_buffer(fourcc, buffer_size).ok()?)
+        };
         let mut elements = scene_elements(
             renderer,
             &self.manager,
@@ -3643,6 +3685,7 @@ impl Runtime {
             None,
         );
         let full = Rectangle::from_size(size);
+        self.zoom_targets.set_hdr(&output_name, hdr_requested);
         let zoom_plan = self.magnifier.plan_for(
             crate::magnifier::OutputFrame {
                 name: &output_name,
@@ -3683,6 +3726,7 @@ impl Runtime {
                                 scale: view.scale,
                                 blank_alpha,
                                 tint: color_effect.as_ref(),
+                                colors: &colors,
                             },
                             &decor,
                             &previews,
@@ -3694,7 +3738,14 @@ impl Runtime {
             }
             None => None,
         };
-        let mut target = renderer.bind(&mut texture).ok()?;
+        #[cfg(feature = "drm")]
+        let scene_texture = match hdr_capture.as_mut() {
+            Some(capture) => &mut capture.scene.texture,
+            None => texture.as_mut()?,
+        };
+        #[cfg(not(feature = "drm"))]
+        let scene_texture = texture.as_mut()?;
+        let mut target = renderer.bind(scene_texture).ok()?;
         {
             let mut frame = renderer.render(&mut target, size, Transform::Normal).ok()?;
             if let Some((plan, scene, zoom)) = zoomed {
@@ -3721,6 +3772,7 @@ impl Runtime {
                         // Captures stay untinted, like GNOME's (gamma
                         // applies past the framebuffer).
                         tint: color_effect.as_ref(),
+                        colors: &colors,
                     },
                     &decor,
                     &previews,
@@ -3728,6 +3780,26 @@ impl Runtime {
                 .ok()?;
             }
             let _ = frame.finish().ok()?;
+        }
+        #[cfg(feature = "drm")]
+        if hdr_requested {
+            // Encode after the full scene, effects and magnifier have
+            // blended in FP16; never quantize through an SDR intermediate.
+            drop(target);
+            let capture = hdr_capture.as_mut()?;
+            let mut encoded = renderer.bind(&mut capture.output).ok()?;
+            {
+                let mut frame = renderer
+                    .render(&mut encoded, size, Transform::Normal)
+                    .ok()?;
+                capture.scene.present(&mut frame).ok()?;
+                frame.finish().ok()?.wait().ok()?;
+            }
+            let mapping = renderer
+                .copy_framebuffer(&encoded, Rectangle::from_size(buffer_size), fourcc)
+                .ok()?;
+            let bytes = renderer.map_texture(&mapping).ok()?.to_vec();
+            return Some((size.w, size.h, bytes));
         }
         let mapping = renderer
             .copy_framebuffer(&target, Rectangle::from_size(buffer_size), fourcc)
@@ -3844,6 +3916,48 @@ impl Runtime {
         Some(((f64::from(frame.loc.x), f64::from(frame.loc.y)), pid, false))
     }
 
+    /// Mutter 51 only offers HDR formats for an actively HDR monitor.
+    /// Qualify this renderer's exact capture/readback path independently
+    /// before promising that encoding to a PipeWire consumer.
+    fn hdr_capture_available(&mut self, target: &crate::mutter::CastTarget) -> bool {
+        #[cfg(not(feature = "drm"))]
+        {
+            let _ = target;
+            false
+        }
+        #[cfg(feature = "drm")]
+        {
+            let crate::mutter::CastTarget::Monitor(name) = target else {
+                return false;
+            };
+            let Backend::Drm(drm) = &mut self.backend else {
+                return false;
+            };
+            let Some(output) = drm.outputs.iter().find(|output| &output.name == name) else {
+                return false;
+            };
+            if output.color_mode != crate::display_config::ColorMode::Bt2100 {
+                return false;
+            }
+            let size = output.size;
+            if let Some((qualified_size, buffer)) = self.capture_hdr.get(name) {
+                if *qualified_size == size {
+                    return buffer.is_some();
+                }
+            }
+            let buffer = match crate::screencast::HdrCapture::new(&mut drm.renderer, size) {
+                Ok(buffer) => Some(buffer),
+                Err(error) => {
+                    eprintln!("tuna-compositor: HDR capture unavailable on {name}: {error}");
+                    None
+                }
+            };
+            let available = buffer.is_some();
+            self.capture_hdr.insert(name.clone(), (size, buffer));
+            available
+        }
+    }
+
     /// Screen-cast work for this tick (#61): start and stop casts the
     /// D-Bus side asked for, and feed every streaming cast a frame.
     fn screencast_tick(&mut self) {
@@ -3857,6 +3971,8 @@ impl Runtime {
             }
             self.casts.clear();
             self.cast_grants.clear();
+            #[cfg(feature = "drm")]
+            self.capture_hdr.clear();
             return;
         }
         // A cast window that closed ends its session, as in Mutter.
@@ -3879,13 +3995,16 @@ impl Runtime {
         });
         // Window casts follow their window's size.
         for index in 0..self.casts.len() {
+            let target = self.casts[index].target.clone();
+            let hdr_available = self.hdr_capture_available(&target);
+            self.casts[index].set_hdr_available(hdr_available);
             if let CastTarget::Window(id) = self.casts[index].target {
                 if let Some(((w, h), _)) = self.window_pixel_size(id) {
                     self.casts[index].resize(w, h);
                 }
             }
         }
-        let wanted: Vec<(usize, CastTarget, (i32, i32))> = self
+        let wanted: Vec<(usize, CastTarget, crate::screencast::CaptureFrame)> = self
             .casts
             .iter()
             .enumerate()
@@ -3894,10 +4013,11 @@ impl Runtime {
                     .map(|size| (i, cast.target.clone(), size))
             })
             .collect();
-        let xrgb = smithay::backend::allocator::Fourcc::Xrgb8888;
-        for (index, target, size) in wanted {
+        for (index, target, negotiated) in wanted {
+            let size = negotiated.size;
+            let fourcc = negotiated.format.fourcc();
             let frame = match &target {
-                CastTarget::Window(id) => self.render_window_pixels(*id, Some(size), xrgb),
+                CastTarget::Window(id) => self.render_window_pixels(*id, Some(size), fourcc),
                 CastTarget::Monitor(connector) => {
                     #[cfg(not(feature = "drm"))]
                     let _ = connector;
@@ -3906,7 +4026,7 @@ impl Runtime {
                         #[cfg(feature = "drm")]
                         Backend::Drm(_) => Some(connector.as_str()),
                     };
-                    self.render_pixels(output, xrgb)
+                    self.render_pixels(output, fourcc)
                 }
                 CastTarget::Area(connector, area) => {
                     let output = match &self.backend {
@@ -3916,7 +4036,7 @@ impl Runtime {
                     };
                     #[cfg(not(feature = "drm"))]
                     let _ = connector;
-                    self.render_pixels(output, xrgb).and_then(|(w, h, pixels)| {
+                    self.render_pixels(output, fourcc).and_then(|(w, h, pixels)| {
                         let cropped = crate::screencast::crop(&pixels, (w, h), *area);
                         if cropped.is_none() {
                             eprintln!(
@@ -3934,6 +4054,10 @@ impl Runtime {
             if let Some(cast) = self.casts.get_mut(index) {
                 cast.send_frame(w, h, &bgrx);
             }
+        }
+        #[cfg(feature = "drm")]
+        if self.casts.is_empty() {
+            self.capture_hdr.clear();
         }
     }
 
@@ -4124,10 +4248,11 @@ impl Runtime {
                     signal.session_closed(session_id);
                     return;
                 };
+                let hdr_available = self.hdr_capture_available(&target);
                 let Some(pw) = self.pipewire.as_ref() else {
                     return;
                 };
-                match pw.start_cast(session_id, target, width, height, signal) {
+                match pw.start_cast(session_id, target, width, height, hdr_available, signal) {
                     Some(cast) => self.casts.push(cast),
                     None => eprintln!("tuna-compositor: screen cast: stream failed to start"),
                 }
@@ -4631,6 +4756,7 @@ impl Runtime {
         self.display
             .dispatch_clients(&mut self.state)
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        self.state.send_color_information();
         self.display
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
@@ -5664,6 +5790,8 @@ impl Runtime {
         }
         let queued = match &mut self.backend {
             Backend::Winit(backend) => {
+                let colors =
+                    crate::color_render::ColorFrame::new(backend.renderer(), &mut self.state, None);
                 backend.window().set_cursor_visible(false);
                 let size = backend.window_size();
                 let age = backend.buffer_age().unwrap_or(0);
@@ -5894,6 +6022,7 @@ impl Runtime {
                                             scale: view.scale,
                                             blank_alpha,
                                             tint: night_tint.as_ref(),
+                                            colors: &colors,
                                         },
                                         &decor,
                                         &previews,
@@ -5934,6 +6063,7 @@ impl Runtime {
                                         scale: view.scale,
                                         blank_alpha,
                                         tint: night_tint.as_ref(),
+                                        colors: &colors,
                                     },
                                     &decor,
                                     &previews,
@@ -6015,6 +6145,25 @@ impl Runtime {
                         continue;
                     }
                     let size = out.size;
+                    let hdr = out.color_mode == crate::display_config::ColorMode::Bt2100;
+                    self.zoom_targets.set_hdr(&out.name, hdr);
+                    let colors = if hdr {
+                        let buffer = out
+                            .hdr_buffer
+                            .as_ref()
+                            .expect("HDR admission requires FP16 target");
+                        crate::color_render::ColorFrame::for_target(
+                            renderer,
+                            &mut self.state,
+                            buffer.blending.clone(),
+                        )
+                    } else {
+                        crate::color_render::ColorFrame::new(
+                            renderer,
+                            &mut self.state,
+                            Some(&out.name),
+                        )
+                    };
                     let output_tint = if out.tint_fallback {
                         night_tint.as_ref()
                     } else {
@@ -6224,7 +6373,7 @@ impl Runtime {
                     )
                     .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                     // A magnified frame repaints whole.
-                    let damage = if zoom_plan.is_some() {
+                    let damage = if zoom_plan.is_some() || hdr {
                         vec![Rectangle::from_size(logical)]
                     } else {
                         damage
@@ -6256,6 +6405,7 @@ impl Runtime {
                                         scale: view.scale,
                                         blank_alpha,
                                         tint: output_tint,
+                                        colors: &colors,
                                     },
                                     &decor,
                                     &previews,
@@ -6266,9 +6416,12 @@ impl Runtime {
                     };
                     let cost;
                     let sync = {
-                        let mut target = renderer
-                            .bind(&mut dmabuf)
-                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        let mut target = if hdr {
+                            renderer.bind(&mut out.hdr_buffer.as_mut().expect("HDR target").texture)
+                        } else {
+                            renderer.bind(&mut dmabuf)
+                        }
+                        .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                         let mut frame = renderer
                             .render(
                                 &mut target,
@@ -6301,6 +6454,7 @@ impl Runtime {
                                         scale: view.scale,
                                         blank_alpha,
                                         tint: output_tint,
+                                        colors: &colors,
                                     },
                                     &decor,
                                     &previews,
@@ -6316,6 +6470,27 @@ impl Runtime {
                         frame
                             .finish()
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?
+                    };
+                    let sync = if hdr {
+                        // The whole scene, shell and cursor have blended in
+                        // extended sRGB FP16. Encode once, after blending, into
+                        // the negotiated ten-bit BT.2020/PQ scanout framebuffer.
+                        let mut target = renderer
+                            .bind(&mut dmabuf)
+                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        let mut frame = renderer
+                            .render(&mut target, size, Transform::Normal)
+                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        out.hdr_buffer
+                            .as_ref()
+                            .expect("HDR target")
+                            .present(&mut frame)
+                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        frame
+                            .finish()
+                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?
+                    } else {
+                        sync
                     };
                     let feedback = crate::frame_timing::take_feedback(&mine, &out.output);
                     if let Err(e) = out.surface.queue_buffer(
@@ -7295,6 +7470,8 @@ struct Target<'a> {
     blank_alpha: f32,
     /// Scene wellbeing effect and output temperature; captures use unity temperature.
     tint: Option<&'a FrameColor>,
+    /// Surfaces drawn through their colour transform (P-DS-03).
+    colors: &'a crate::color_render::ColorFrame,
 }
 
 fn draw_scene(
@@ -7316,6 +7493,7 @@ fn draw_scene(
         scale,
         blank_alpha,
         tint,
+        colors,
     } = target;
     let recolor = |color| tint.map_or(color, |tint| tint.color(color));
     let background = recolor(background);
@@ -7406,15 +7584,22 @@ fn draw_scene(
     }
     // Surfaces carry logical sizes: draw them at the output scale. The
     // wallpaper above is already sized in physical pixels.
-    set_tint(frame, 1.0);
-    draw_planned::<GlesRenderer, _>(frame, scale, previews, &previews_plan).map_err(error)?;
-    frame.clear_tex_program_override();
-    draw_slots(frame, scale, scene, &under, &under_plan, tint).map_err(error)?;
+    crate::color_render::draw_planned(
+        frame,
+        scale,
+        previews,
+        &previews_plan,
+        colors,
+        tint,
+        1.0,
+        None,
+    )
+    .map_err(error)?;
+    draw_slots(frame, scale, scene, &under, &under_plan, tint, colors).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, tile, &tile_plan).map_err(error)?;
-    draw_slots(frame, scale, scene, &over, &over_plan, tint).map_err(error)?;
-    set_tint(frame, 1.0);
-    draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan).map_err(error)?;
-    frame.clear_tex_program_override();
+    draw_slots(frame, scale, scene, &over, &over_plan, tint, colors).map_err(error)?;
+    crate::color_render::draw_planned(frame, scale, &scene.top, &top_plan, colors, tint, 1.0, None)
+        .map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, &fullscreen_bell, &bell_plan).map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.effects.textures, &effect_textures_plan)
         .map_err(error)?;
@@ -7573,6 +7758,7 @@ fn draw_slots(
     slots: &[SceneSlot],
     plan: &[Vec<Rectangle<i32, smithay::utils::Physical>>],
     tint: Option<&FrameColor>,
+    colors: &crate::color_render::ColorFrame,
 ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
     use crate::occlusion::draw_planned;
     for (slot, visible) in slots.iter().zip(plan).rev() {
@@ -7599,11 +7785,15 @@ fn draw_slots(
             }
         }
         let result = match *slot {
-            SceneSlot::Element(index) => draw_planned::<GlesRenderer, _>(
+            SceneSlot::Element(index) => crate::color_render::draw_planned(
                 frame,
                 scale,
                 std::slice::from_ref(&scene.elements[index]),
                 visible,
+                colors,
+                tint,
+                brightness,
+                scene.dim_program.as_ref(),
             ),
             SceneSlot::Bell(k) => draw_planned::<GlesRenderer, _>(
                 frame,
