@@ -68,6 +68,9 @@ struct Client {
     /// input-method: activations and `done` count (the commit serial).
     ime_active: bool,
     ime_done: u32,
+    ime_unavailable: bool,
+    preedits: Vec<String>,
+    text_leaves: usize,
     /// Relative motion received (dx, dy).
     relative: Vec<(f64, f64)>,
     pointer_entered: bool,
@@ -218,6 +221,8 @@ impl Dispatch<ZwpTextInputV3, ()> for Client {
             zwp_text_input_v3::Event::CommitString { text: Some(text) } => {
                 state.committed.push(text)
             }
+            zwp_text_input_v3::Event::PreeditString { text: Some(text), .. } => state.preedits.push(text),
+            zwp_text_input_v3::Event::Leave { .. } => state.text_leaves += 1,
             _ => {}
         }
     }
@@ -236,6 +241,7 @@ impl Dispatch<ZwpInputMethodV2, ()> for Client {
             zwp_input_method_v2::Event::Activate => state.ime_active = true,
             zwp_input_method_v2::Event::Deactivate => state.ime_active = false,
             zwp_input_method_v2::Event::Done => state.ime_done += 1,
+            zwp_input_method_v2::Event::Unavailable => state.ime_unavailable = true,
             _ => {}
         }
     }
@@ -952,4 +958,85 @@ fn layer_constraints_use_actual_origin_and_commit_regions_before_activation() {
             pump(&mut comp, &mut manager, &mut [&mut app]);
         }
     }
+}
+
+#[test]
+fn unavailable_input_methods_cannot_inject_or_retire_the_live_resource() {
+    let mut comp = TestCompositor::new();
+    comp.state.set_output_size(1280, 800);
+    let mut manager = comp.window_manager();
+    let mut owner = connect(&mut comp);
+    let mut app = connect(&mut comp);
+    let mut foreign = connect(&mut comp);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner, &mut foreign]);
+    let im = owner.client.input_method_manager.as_ref().unwrap().get_input_method(
+        owner.client.seat.as_ref().unwrap(), &owner.queue.handle(), (),
+    );
+    let text = app.client.text_input_manager.as_ref().unwrap().get_text_input(
+        app.client.seat.as_ref().unwrap(), &app.queue.handle(), (),
+    );
+    let _surface = window(&mut app);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner, &mut foreign]);
+    let epoch = owner.client.ime_done;
+    assert!(epoch > 0);
+    let rejected = foreign.client.input_method_manager.as_ref().unwrap().get_input_method(
+        foreign.client.seat.as_ref().unwrap(), &foreign.queue.handle(), (),
+    );
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner, &mut foreign]);
+    assert!(foreign.client.ime_unavailable, "the newcomer, not the live owner, is unavailable");
+    assert!(!owner.client.ime_unavailable);
+    assert_eq!(owner.client.ime_done, epoch, "a newcomer cannot reset the live done epoch");
+    app.client.committed.clear();
+    app.client.preedits.clear();
+    let leaves = app.client.text_leaves;
+    rejected.commit_string("foreign".into());
+    rejected.set_preedit_string("foreign".into(), 0, 0);
+    rejected.delete_surrounding_text(1, 1);
+    rejected.commit(epoch);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner, &mut foreign]);
+    assert!(app.client.committed.is_empty());
+    assert!(app.client.preedits.is_empty());
+    rejected.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner, &mut foreign]);
+    assert_eq!(app.client.text_leaves, leaves, "foreign destruction cannot retire the live field");
+    im.commit_string("owner".into());
+    im.commit(epoch);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner, &mut foreign]);
+    assert_eq!(app.client.committed, ["owner"]);
+
+    // Resource identity, not merely connection identity, owns the seat.
+    let duplicate = owner.client.input_method_manager.as_ref().unwrap().get_input_method(
+        owner.client.seat.as_ref().unwrap(), &owner.queue.handle(), (),
+    );
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert!(owner.client.ime_unavailable);
+    app.client.committed.clear();
+    duplicate.commit_string("same-client impostor".into());
+    duplicate.commit(epoch);
+    duplicate.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert!(app.client.committed.is_empty());
+    assert_eq!(app.client.text_leaves, leaves);
+    im.commit_string("still owner".into());
+    im.commit(epoch);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert_eq!(app.client.committed, ["still owner"]);
+
+    // A real owner's destruction releases the seat for a fresh resource.
+    im.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    owner.client.ime_unavailable = false;
+    owner.client.ime_done = 0;
+    let replacement = owner.client.input_method_manager.as_ref().unwrap().get_input_method(
+        owner.client.seat.as_ref().unwrap(), &owner.queue.handle(), (),
+    );
+    text.enable();
+    text.commit();
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert!(!owner.client.ime_unavailable);
+    app.client.committed.clear();
+    replacement.commit_string("replacement".into());
+    replacement.commit(owner.client.ime_done);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert_eq!(app.client.committed, ["replacement"]);
 }

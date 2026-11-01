@@ -57,9 +57,8 @@ pub struct InputMethodHandle {
 impl InputMethodHandle {
     pub(super) fn add_instance(&self, instance: &ZwpInputMethodV2) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(instance) = inner.instance.as_mut() {
-            instance.serial = 0;
-            instance.object.unavailable();
+        if inner.instance.is_some() {
+            instance.unavailable();
         } else {
             inner.instance = Some(Instance {
                 object: instance.clone(),
@@ -204,6 +203,12 @@ where
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
     ) {
+        // An unavailable object is not the seat's input method, even if it
+        // belongs to the same client as the live one.
+        if !data.handle.inner.lock().unwrap().instance.as_ref()
+            .is_some_and(|instance| instance.object == *seat) {
+            return;
+        }
         match request {
             zwp_input_method_v2::Request::CommitString { text } => {
                 data.text_input_handle.with_active_text_input(|ti, _surface| {
@@ -323,10 +328,14 @@ where
     fn destroyed(
         _state: &mut D,
         _client: ClientId,
-        _input_method: &ZwpInputMethodV2,
+        input_method: &ZwpInputMethodV2,
         data: &InputMethodUserData<D>,
     ) {
-        data.handle.inner.lock().unwrap().instance = None;
-        data.text_input_handle.leave();
+        let mut inner = data.handle.inner.lock().unwrap();
+        if inner.instance.as_ref().is_some_and(|instance| instance.object == *input_method) {
+            inner.instance = None;
+            drop(inner);
+            data.text_input_handle.leave();
+        }
     }
 }
