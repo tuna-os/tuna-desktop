@@ -91,8 +91,8 @@ def number(value):
 
 
 
-def run(args, *, cwd=None, env=None, timeout=1800):
-    return subprocess.check_output([str(x) for x in args], cwd=cwd, env=env, timeout=timeout)
+def run(args, *, cwd=None, env=None, timeout=1800, stderr=None):
+    return subprocess.check_output([str(x) for x in args], cwd=cwd, env=env, timeout=timeout, stderr=stderr)
 
 
 def gh(path):
@@ -583,14 +583,14 @@ def boot(args):
     evidence = out / "producer-boot"
     evidence.mkdir()
     name = "tuna-release-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
-    ref = "//local/" + name
+    ref = "qemu//local/" + name
     # Corral consumes a copy; the read-only shipping disk is never booted.
     with tempfile.TemporaryDirectory(prefix="tuna-release-boot-") as work:
         copy = Path(work) / "boot.qcow2"
         shutil.copyfile(pristine, copy)
         created = False
         try:
-            run([corral, "--backend", "qemu", "create", name, "--qcow", copy, "--firmware", "uefi", "--arch", "amd64"])
+            run([corral, "--backend", "qemu", "create", name, "--qcow", copy, "--firmware", "uefi", "--arch", "amd64", "--loopback"])
             created = True
             run([corral, "start", ref])
             deadline = time.monotonic() + 900

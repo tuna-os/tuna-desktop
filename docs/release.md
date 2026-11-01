@@ -194,6 +194,12 @@ Do not send a schema/example document as a handoff. Required identities are:
    output and early QEMU logs, use the real user-manager HOME with an
    exclusively reserved VM directory, and obtain process identity from the
    Linux QMP socket's kernel peer credentials rather than a PID file.
+   Run `41256571645` preserved the actual start error: the supplied
+   `//local/NAME` selector omitted the backend and did not identify an
+   instance. Corral's existing canonical form is `qemu//local/NAME`
+   (`backend/context/namespace/name`). All producer, diagnosis and native
+   consumer CLI callers use that form; console HTTP namespace paths are
+   unchanged. The earlier failure does not establish a systemd/HOME cause.
 6. `finalize --output DIR --evidence-dir ROOT` admits the same signed bytes
    through the consumer's `inspect` command and requires each platform's
    `qualification.json`: exact manifest/disk/host-Corral/producer hashes and run,

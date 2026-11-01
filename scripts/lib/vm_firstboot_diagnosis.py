@@ -46,10 +46,19 @@ def process_identity(pid):
 
 
 def qmp_process_identity(directory):
-    with socket.socket(socket.AF_UNIX) as peer:
-        peer.settimeout(10)
-        peer.connect(str(directory / "qmp.sock"))
-        pid, uid, _gid = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+    deadline = time.monotonic() + 30
+    while True:
+        with socket.socket(socket.AF_UNIX) as peer:
+            peer.settimeout(5)
+            try:
+                peer.connect(str(directory / "qmp.sock"))
+            except (FileNotFoundError, ConnectionRefusedError):
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(.1)
+                continue
+            pid, uid, _gid = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+            break
     need(uid == os.getuid(), "QMP peer belongs to a different user")
     identity = process_identity(pid)
     need(identity is not None and identity["state"] != "Z", "kernel-identified QMP process is not live")
@@ -100,7 +109,7 @@ def diagnose(args):
     home = Path.home()
     corral = work / "corral-linux-amd64"
     name = "tuna-pristine-" + uuid.uuid4().hex[:16]
-    ref = "//local/" + name
+    ref = "qemu//local/" + name
     command_index = 0
     def cli(*values, timeout=120):
         nonlocal command_index
@@ -108,7 +117,7 @@ def diagnose(args):
         argv = [corral, "--backend", "qemu", *values]
         record = {"argv": [str(value) for value in argv]}
         try:
-            result = run(argv, env=env, timeout=timeout)
+            result = run(argv, env=env, timeout=timeout, stderr=subprocess.PIPE)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as caught:
             record.update({"returncode": getattr(caught, "returncode", None),
                            "error": type(caught).__name__,
@@ -165,7 +174,7 @@ def diagnose(args):
                         os.killpg(builder.pid, signal.SIGKILL)
                         builder.wait(timeout=10)
         pristine = work / "pristine.qcow2"
-        run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2", raw, pristine], timeout=600)
+        run(["qemu-img", "convert", "-c", "-f", "raw", "-O", "qcow2", raw, pristine], timeout=3600)
         raw.unlink()
         before = sha256(pristine)
         receipt["pristineDiskSha256"] = before
@@ -215,6 +224,8 @@ def diagnose(args):
         receipt["error"] = f"{type(caught).__name__}: {caught}"
     finally:
         cleanup_errors = []
+        if isinstance(error, subprocess.TimeoutExpired):
+            cleanup_errors.append("timed-out command has no complete child-retirement proof; retain its owned state")
         # The reusable builder mounts precisely this private job's raw disk.
         # Retire only containers with that exact mount, never by PID/name.
         try:
