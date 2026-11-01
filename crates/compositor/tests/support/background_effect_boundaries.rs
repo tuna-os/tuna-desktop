@@ -7,23 +7,6 @@ use wayland_client::Proxy;
 wayland_client::delegate_noop!(Client: ignore WlSubcompositor);
 wayland_client::delegate_noop!(Client: ignore WlSubsurface);
 
-fn connect_with_wire(comp: &mut TestCompositor, manager: &mut WindowManager) -> (Peer, UnixStream) {
-    let (server, stream) = UnixStream::pair().unwrap();
-    let wire = stream.try_clone().unwrap();
-    comp.add_client(server);
-    let conn = Connection::from_socket(stream).unwrap();
-    let queue = conn.new_event_queue();
-    let registry = conn.display().get_registry(&queue.handle(), ());
-    let mut peer = Peer {
-        _conn: conn,
-        queue,
-        registry,
-        client: Client::default(),
-    };
-    pump(comp, manager, &mut [&mut peer]);
-    (peer, wire)
-}
-
 fn raw_region(wire: &mut UnixStream, effect: &ExtBackgroundEffectSurfaceV1, region: u32) {
     // ext_background_effect_surface_v1.set_blur_region: opcode 1, 12 bytes.
     // Raw wire is essential: the typed API rejects foreign/stale proxies itself.
@@ -51,12 +34,12 @@ fn background_effect_foreign_region_id_is_rejected_without_touching_owner() {
     foreign.add(0, 0, 40, 40);
     pump(&mut comp, &mut manager, &mut [&mut owner]);
 
-    let (mut attacker, mut wire) = connect_with_wire(&mut comp, &mut manager);
+    let mut attacker = connect(&mut comp, &mut manager);
     let (surface, _top) = window(&mut attacker, "foreign region attacker");
     let effects: ExtBackgroundEffectManagerV1 = attacker.bind(1);
     let effect = effects.get_background_effect(&surface, &attacker.qh(), ());
     pump(&mut comp, &mut manager, &mut [&mut attacker]);
-    raw_region(&mut wire, &effect, foreign.id().protocol_id());
+    raw_region(&mut attacker.socket, &effect, foreign.id().protocol_id());
     let error = pump_to_error(&mut comp, &mut manager, &mut attacker);
     assert_eq!(error.object_interface, "wl_display");
     assert_eq!(
@@ -72,7 +55,7 @@ fn background_effect_foreign_region_id_is_rejected_without_touching_owner() {
 #[test]
 fn background_effect_stale_region_id_is_rejected_at_socket_boundary() {
     let (mut comp, mut manager) = compositor();
-    let (mut peer, mut wire) = connect_with_wire(&mut comp, &mut manager);
+    let mut peer = connect(&mut comp, &mut manager);
     let (surface, _top) = window(&mut peer, "stale region attacker");
     let effects: ExtBackgroundEffectManagerV1 = peer.bind(1);
     let compositor: WlCompositor = peer.bind(6);
@@ -83,7 +66,7 @@ fn background_effect_stale_region_id_is_rejected_at_socket_boundary() {
     region.destroy();
     // Do not allocate any new object after delete_id, so this remains stale.
     pump(&mut comp, &mut manager, &mut [&mut peer]);
-    raw_region(&mut wire, &effect, stale);
+    raw_region(&mut peer.socket, &effect, stale);
     let error = pump_to_error(&mut comp, &mut manager, &mut peer);
     assert_eq!(error.object_interface, "wl_display");
     assert_eq!(
