@@ -51,7 +51,7 @@ copy. Normal GDM must then enter Tuna, including visible application search,
 with wheel membership and password-required sudo; logout/login and reboot
 must preserve that account and user data. RFB connection alone means
 browser/transport readiness, never successful guest boot or Tuna login.
-Terminal cancellation, stop, failed browser launch and failed acquisition
+Terminal cancellation (SIGINT, SIGTERM or SIGHUP), stop, failed browser launch and failed acquisition
 must retire owned processes/listeners/locks without touching an unrelated
 VM. Normal launch preserves writable user data; qualification explicitly
 deletes only its own disposable copies after retirement.

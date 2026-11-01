@@ -785,6 +785,7 @@ def main():
         CANCELLED = True
     signal.signal(signal.SIGINT, cancel)
     signal.signal(signal.SIGTERM, cancel)
+    signal.signal(signal.SIGHUP, cancel)
     try:
         if options.command == "stop":
             stop(options.state_dir)

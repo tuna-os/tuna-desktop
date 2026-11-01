@@ -42,6 +42,7 @@ def browser_process(url):
             process.send_signal(signum)
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
     if requested_stop is not None:
         raise SystemExit(128 + requested_stop)
     process = subprocess.Popen([executable, "--headless=new", "--no-first-run", "--no-default-browser-check", "--no-sandbox",
@@ -288,6 +289,7 @@ def qualify(options):
         launcher.CANCELLED = True
     signal.signal(signal.SIGINT, cancel)
     signal.signal(signal.SIGTERM, cancel)
+    signal.signal(signal.SIGHUP, cancel)
     launcher.require(launcher.host_platform() == options.platform, "qualification platform is not the actual native host")
     output = options.evidence_dir.resolve()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -321,16 +323,20 @@ def qualify(options):
         endpoint = launcher.read_event(child, 900)
         launcher.require(endpoint.get("event") == "console-listening", "native CLI did not hand off its actual console")
         return endpoint, profile
-    def finish(expected=0, cancel=False):
-        if cancel:
-            child.send_signal(signal.SIGTERM)
+    def finish(expected=0, cancel_signal=None):
+        if cancel_signal is not None:
+            launcher.require(child.poll() is None, "native CLI exited before the cancellation signal")
+            child.send_signal(cancel_signal)
         else:
             launcher.run([sys.executable, CONSUMER, "stop", "--state-dir", state], timeout=180)
         child.wait(timeout=180)
-        launcher.require(child.returncode == expected if not cancel else child.returncode in (0, 1, 130, 143), "native CLI returned unexpected lifecycle status")
+        launcher.require(child.returncode == expected if cancel_signal is None else child.returncode in (0, 1, 128 + cancel_signal), "native CLI returned unexpected lifecycle status")
         value = json.loads((state / "receipt.json").read_text())
         launcher.require(value["cleanupComplete"] is True and value["diskLockReleased"] is True
                          and value["userDataRetained"] is True and Path(value["userDataPath"]).is_file(), "actual lifecycle cleanup/data retention failed")
+        if cancel_signal is not None:
+            value["qualificationCancellationSignal"] = signal.Signals(cancel_signal).name
+            value["qualificationCliReturncode"] = child.returncode
         known_records.append(value["vm"])
         launcher.atomic_json(output / ("lifecycle-" + str(len(known_records)) + ".json"), value)
         if guard:
@@ -443,8 +449,9 @@ def qualify(options):
         finish()
         checks["stopCleanup"] = True
         checks["diskLockReleased"] = True
-        start()
-        finish(cancel=True)
+        for cancel_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            start()
+            finish(cancel_signal=cancel_signal)
         checks["cancellationCleanup"] = True
         start(browser=False)
         child.wait(timeout=180)
