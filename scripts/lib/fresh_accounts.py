@@ -19,6 +19,8 @@ authenticate through sudo and the standard account must be refused.
 import configparser
 import json
 import os
+import re
+import stat
 import time
 
 PASSWORD = "tuna"  # Public fixture value (tuna-vm-fresh-accounts).
@@ -35,6 +37,98 @@ AUTOLOGIN_KEYS = ("automaticloginenable", "timedloginenable")
 # the account. A failed strategy never types a password for another account:
 # the password follows the account name in the same strategy.
 SELECTIONS = (("tab",), ("tab", "tab"))
+
+NATIVE_CANDIDATE_ENV = "TUNA_VM_GDM_NATIVE_CANDIDATE"
+NATIVE_SOURCE_ENV = "TUNA_VM_GDM_NATIVE_SOURCE_SHA"
+NATIVE_SOURCE_SHA = "7b52bdf34be22bc60fef62b157be64b589b13f6a"
+NATIVE_VERSION = "51.1.1-1.1"
+NATIVE_MANIFEST_BOUND = 16 * 1024
+NATIVE_MEMBERS = {"/usr/bin/gdm": "gdm", "/usr/lib/gdm-session-worker": "gdm",
+                  "/usr/lib/libgdm.so.1.0.0": "libgdm"}
+
+
+def _exact_fields(value, fields):
+    if type(value) is not dict or set(value) != set(fields):
+        raise ValueError("invalid candidate fields")
+
+
+def _unique_fields(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate candidate field")
+        value[key] = item
+    return value
+
+
+def _invalid_constant(value):
+    raise ValueError("invalid candidate JSON constant")
+
+
+def _file_identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def native_candidate():
+    """Load only an explicitly paired, pinned CI identity; never package paths
+    or arbitrary environment/guest data. The manifest is a bounded stable
+    regular file, not a symlink, and every nested field is allowlisted."""
+    path, expected = os.environ.get(NATIVE_CANDIDATE_ENV), os.environ.get(NATIVE_SOURCE_ENV)
+    if path is None and expected is None:
+        return None
+    if not path or expected != NATIVE_SOURCE_SHA:
+        raise ValueError("candidate manifest and pinned expected source are required together")
+    before = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= NATIVE_MANIFEST_BOUND:
+        raise ValueError("candidate manifest must be a bounded regular file")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(fd, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if _file_identity(before) != _file_identity(opened):
+            raise ValueError("candidate manifest changed before reading")
+        data = stream.read(NATIVE_MANIFEST_BOUND + 1)
+        after = os.fstat(stream.fileno())
+    if (len(data) != before.st_size or _file_identity(before) != _file_identity(after)
+            or _file_identity(before) != _file_identity(os.stat(path, follow_symlinks=False))):
+        raise ValueError("candidate manifest changed while reading")
+    value = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_fields,
+                       parse_constant=_invalid_constant)
+    _exact_fields(value, ("schema", "source_repository", "source_commit", "architecture", "packages", "members"))
+    if (type(value["schema"]) is not int or value["schema"] != 1
+            or value["source_repository"] != "tuna-os/tunaos-packages"
+            or value["source_commit"] != expected or value["architecture"] != "x86_64"):
+        raise ValueError("candidate source, schema or architecture does not match")
+    _exact_fields(value["packages"], ("gdm", "libgdm"))
+    for name, package in value["packages"].items():
+        _exact_fields(package, ("file", "version", "sha256"))
+        if (package["file"] != f"{name}-{NATIVE_VERSION}-x86_64.pkg.tar.zst"
+                or package["version"] != NATIVE_VERSION
+                or type(package["sha256"]) is not str or re.fullmatch("[0-9a-f]{64}", package["sha256"]) is None):
+            raise ValueError("candidate package identity does not match")
+    _exact_fields(value["members"], NATIVE_MEMBERS)
+    for path, package in NATIVE_MEMBERS.items():
+        member = value["members"][path]
+        _exact_fields(member, ("package", "sha256"))
+        if (member["package"] != package or type(member["sha256"]) is not str
+                or re.fullmatch("[0-9a-f]{64}", member["sha256"]) is None):
+            raise ValueError("candidate member identity does not match")
+    return value
+
+
+def native_installed_pair(policy):
+    """Admit only complete successful pacman -Q receipts for the exact pair.
+    Other gdm-policy diagnostics are neither admission evidence nor retained."""
+    if type(policy) is not dict or type(policy.get("packages")) is not dict:
+        raise ValueError("missing installed candidate package pair")
+    versions = {}
+    for name in ("gdm", "libgdm"):
+        package = policy["packages"].get(name)
+        _exact_fields(package, ("returncode", "stdout", "truncated"))
+        if (type(package["returncode"]) is not int or package["returncode"] != 0
+                or package["truncated"] is not False or package["stdout"] != f"{name} {NATIVE_VERSION}\n"):
+            raise ValueError("installed candidate package pair does not match")
+        versions[name] = NATIVE_VERSION
+    return versions
 
 
 def parse_record(text):
@@ -292,8 +386,31 @@ class Journey:
                 self.agent.close()
                 self.agent = None
 
+    def _native_preflight(self):
+        try:
+            candidate = native_candidate()
+        except (OSError, ValueError, RecursionError) as error:
+            self.record("V-FRESH-GDM-NATIVE-CANDIDATE", False,
+                        f"invalid private GDM candidate admission ({type(error).__name__})")
+            return False
+        if candidate is None:
+            return True
+        self._receipt("preflight-gdm-native-candidate", candidate)
+        try:
+            versions = native_installed_pair(self._run("gdm-policy"))
+        except (OSError, RuntimeError, ValueError) as error:
+            self.record("V-FRESH-GDM-NATIVE-CANDIDATE", False,
+                        f"private GDM installed pair not proven ({type(error).__name__})")
+            return False
+        self._receipt("preflight-gdm-native-installed", versions)
+        self.record("V-FRESH-GDM-NATIVE-CANDIDATE", True,
+                    f"private GDM candidate {NATIVE_SOURCE_SHA}: gdm and libgdm {NATIVE_VERSION}")
+        return True
+
     def _run_journey(self):
         self._greeter("preflight")
+        if not self._native_preflight():
+            return False
         self._frame("fresh-greeter")
         states = {user: self._run("fresh-state", user) for user in (*JOURNEY_USERS, SEEDED)}
         self._receipt("preflight-state", states)

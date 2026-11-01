@@ -164,8 +164,13 @@ The [settings save routine](https://github.com/GNOME/gdm/blob/51.1.1/daemon/gdm-
 can succeed with null session/type/language and, for a local account,
 without a setter or `CacheUser`. Registration is not this save trigger.
 **Inference:** fallback selection may never reach the worker's settings.
-The observed launch and empty settings support this candidate, but do not
-directly establish the worker's calls; no root patch is applied here.
+
+Run [41245509890](https://github.com/tuna-os/tuna-desktop/actions/runs/41245509890)
+had healthy observers in both native profiles.
+Neither saw a call to set the User1001 session.
+Worker markers: unavailable; debug off.
+Their absence proves nothing about the save stage.
+Neither run proves the cause.
 
 The native image gets GDM from Arch through `pacman`, not this repository's
 `packaging/arch/PKGBUILD` (which builds only Tuna Desktop).
@@ -174,24 +179,27 @@ The canonical tunaOS `tunaos.toml` desktop package list requests plain
 `ghcr.io/tuna-os/marlin:gnome`; both the preview Containerfile and VM
 fixture layer run `pacman -Syu`, so a future replacement must survive the
 final package transaction rather than being silently overwritten.
-The actual [Arch GDM PKGBUILD](https://gitlab.archlinux.org/archlinux/packaging/packages/gdm/-/blob/main/PKGBUILD)
-is split `pkgbase=gdm`, `pkgname=(gdm libgdm)`, version 51.1.1 release 1.
-Its source is the upstream version tag plus the Xsession ssh-agent patch;
-`prepare()` runs `git apply -3`, then `arch-meson`/`meson compile`,
-`meson test`, and split-package installation. There is no existing
-GDM fallback-persistence patch mechanism in this native fixture.
 
-If stronger worker evidence confirms the candidate, the narrow proposal
-is an Arch source patch in that `prepare()` pipeline: in
-`gdm_session_open_session()`, for non-program sessions only, queue the
-existing `gdm_dbus_worker_call_set_session_name()` with
-`get_session_name(self)` on the same worker connection **before `Open`**
-initiates account saving. Keep the resolver untouched so explicit, saved,
-configured fallback and automatic fallback choices retain their precedence;
-do not force `tuna`, modify registration, or write AccountsService from a
-root probe. Package the GDM/libgdm pair with a distinguishable release and
-record their installed provenance before repeating both complete native
-journeys. This proposal is unbuilt, unexercised and not a qualified fix.
+The [Arch recipe at revision 36e76b2b](https://gitlab.archlinux.org/archlinux/packaging/packages/gdm/-/blob/36e76b2b4674dc196e611782c4f8f6d5e476e231/PKGBUILD)
+splits `gdm` and `libgdm` from one build.
+It uses the upstream tag and an Xsession patch.
+Its `prepare()` uses `git apply -3`.
+The build uses `arch-meson`, `meson compile` and `meson test`.
+
+[Package source PR963](https://github.com/tuna-os/tunaos-packages/pull/963)
+adds a private candidate at
+`7b52bdf34be22bc60fef62b157be64b589b13f6a`.
+It builds GDM and libgdm **51.1.1-1.1** together.
+It retains the PAM configuration, conffile declarations and split ownership.
+Both sources and patches have fixed hashes.
+`prepare()` applies the patches to the release archive.
+
+The candidate queues `gdm_dbus_worker_call_set_session_name()` before `Open`.
+It uses `get_session_name(self)` on the same worker connection.
+It does not change the resolver or program sessions.
+Explicit, saved and fallback choices keep their precedence.
+It does not force `tuna` or change registration.
+No root probe writes AccountsService state.
 
 The proposed insertion, inside the existing non-null-conversation block
 immediately before `gdm_dbus_worker_call_open()`, is:
@@ -204,10 +212,56 @@ if (!self->is_program_session)
                                                NULL, NULL);
 ```
 
-An experiment would need an explicitly reviewed, pinned Arch source rebuild
-and package installation route; no such rebuild or replacement is enabled
-by this diagnostic. A fixture-only patched daemon would not establish that
-the published Marlin/Tuna flavor contains the fix.
+The approved local factory build produced both unsigned packages.
+Meson: one pass, zero failures.
+The staged verifier installed both packages.
+It checked exact versions, owners and ELF closure.
+Both containers enforced 8 GiB memory, zero swap and CPU quota 200%.
+We removed both containers.
+
+The local archive hashes are:
+
+| Package | SHA256 |
+| --- | --- |
+| gdm 51.1.1-1.1 x86_64 | `5fa15579210678f6168ea5102b79050503b768fd93476910855281f4b3d60d92` |
+| libgdm 51.1.1-1.1 x86_64 | `ca4587fe886490c1e1925c9419bf5714fe9327cb9367685fb8d306b9a2243797` |
+
+These checks do not prove login or physical record creation.
+The C smoke used actual functions with stubs.
+It checked explicit, saved, fallback and program choices.
+It does not prove GDM, PAM, D-Bus or AccountsService runtime behavior.
+We deleted its temporary source and binary.
+
+### Private native GDM fixture
+
+The CI job builds the pinned package source once.
+It uses the existing factory build and staged verifier.
+Both native profiles use the same run's artifact.
+The artifact has package hashes and the source identity.
+Those hashes need not equal the local hashes above.
+The manifest also binds the package members to their hashes.
+
+The final `gdm51` overlay runs after every `pacman -Syu` and Orca step.
+It checks both archive hashes and package metadata.
+It installs both packages in one transaction.
+It checks their versions, owners and installed bytes.
+It checks the existing shipped-payload manifest without changes.
+No package upgrade follows.
+
+CI retains this evidence in `vm-lane-artifacts/gdm51/`.
+The final image ID and kernel provenance describe the image after the overlay.
+The fresh journey receives `TUNA_VM_GDM_NATIVE_CANDIDATE` and
+`TUNA_VM_GDM_NATIVE_SOURCE_SHA`.
+The first names the bounded manifest; the second pins the expected source.
+The journey checks the manifest and guest package identity before input.
+The existing read-only `gdm-policy` action runs once for this check.
+
+Neither the manifest nor the package versions can satisfy the physical-record guard.
+All standard/admin, first/second login, sudo, logout and reboot gates stay intact.
+At source review, both candidate journeys remain unexercised.
+No source, function or package check counts as runtime acceptance.
+The source PR stays unmerged.
+This fixture does not sign packages, publish a repository or change production pins.
 
 
 The Debian package journey must retain the original beta package's

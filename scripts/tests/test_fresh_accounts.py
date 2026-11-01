@@ -23,6 +23,30 @@ import fresh_accounts  # noqa: E402
 
 GUEST = ROOT / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
 CONF = "[daemon]\nFallbackSession=tuna\n"
+NATIVE_SOURCE = "7b52bdf34be22bc60fef62b157be64b589b13f6a"
+
+
+def candidate_manifest():
+    """Synthetic identity only: these test hashes are never CI evidence."""
+    return {
+        "schema": 1, "source_repository": "tuna-os/tunaos-packages", "source_commit": NATIVE_SOURCE,
+        "architecture": "x86_64",
+        "packages": {
+            name: {"file": f"{name}-51.1.1-1.1-x86_64.pkg.tar.zst", "version": "51.1.1-1.1", "sha256": digit * 64}
+            for name, digit in (("gdm", "a"), ("libgdm", "b"))
+        },
+        "members": {
+            path: {"package": package, "sha256": digit * 64}
+            for path, package, digit in (("/usr/bin/gdm", "gdm", "c"),
+                                         ("/usr/lib/gdm-session-worker", "gdm", "d"),
+                                         ("/usr/lib/libgdm.so.1.0.0", "libgdm", "e"))
+        },
+    }
+
+
+def candidate_policy():
+    return {"packages": {name: {"returncode": 0, "stdout": f"{name} 51.1.1-1.1\n", "truncated": False}
+                         for name in ("gdm", "libgdm")}}
 
 
 class FakeGuest:
@@ -45,9 +69,13 @@ class FakeGuest:
         self.submitted = []
         self.state_calls = []
         self.trace_actions = []
+        self.actions = []
+        self.input_calls = 0
+        self.policy_calls = []
 
     # QMP
     def keys(self, *names):
+        self.input_calls += 1
         if names == ("ret",) and len(self.typed) >= 2:
             user, password = self.typed[-2], self.typed[-1]
             if password == "tuna" and user in self.uids:
@@ -61,6 +89,7 @@ class FakeGuest:
             self.typed = []
 
     def type_text(self, text):
+        self.input_calls += 1
         self.typed.append(text)
 
     def frame(self, path):
@@ -74,6 +103,12 @@ class FakeGuest:
         pass
 
     def run(self, action, *args):
+        self.actions.append(action)
+        if action == "gdm-policy":
+            self.policy_calls.append((self.boot, self.input_calls, len(self.state_calls)))
+            if self.faults.get("policy_error"):
+                raise RuntimeError("PRIVATE-GUEST-ERROR")
+            return self.faults.get("policy", candidate_policy())
         if action in ("fresh-trace-start", "fresh-trace-stop"):
             self.trace_actions.append((action, len(self.submitted)))
             if self.faults.get("trace_error"):
@@ -119,14 +154,18 @@ class FakeGuest:
         raise ValueError(action)
 
 
-def journey(guest, gdm_trace=False):
+def journey(guest, gdm_trace=False, candidate_env=None):
     results = {}
     clock = [0.0]
 
     def sleep(seconds):
         clock[0] += seconds
 
-    with tempfile.TemporaryDirectory() as out:
+    environment = dict(os.environ)
+    for name in ("TUNA_VM_GDM_NATIVE_CANDIDATE", "TUNA_VM_GDM_NATIVE_SOURCE_SHA"):
+        environment.pop(name, None)
+    environment.update(candidate_env or {})
+    with tempfile.TemporaryDirectory() as out, mock.patch.dict(os.environ, environment, clear=True):
         run = fresh_accounts.Journey(guest, guest.connect, lambda greeter: greeter["ready"], out,
                                      lambda name, ok, detail: results.__setitem__(name, (ok, detail)),
                                      sleep=sleep, clock=lambda: clock[0], login_timeout=5, greeter_timeout=5,
@@ -337,6 +376,296 @@ class JourneyTest(unittest.TestCase):
         self.assertIn("reboot", error)
         self.assertNotIn("V-FRESH-REBOOT", results)
         self.assertTrue(receipts)
+
+
+class NativeCandidateManifestTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.path = pathlib.Path(temporary.name) / "manifest.json"
+        self.env = {"TUNA_VM_GDM_NATIVE_CANDIDATE": str(self.path),
+                    "TUNA_VM_GDM_NATIVE_SOURCE_SHA": NATIVE_SOURCE}
+        patcher = mock.patch.dict(os.environ, self.env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def load(self, value):
+        self.path.write_text(json.dumps(value))
+        return fresh_accounts.native_candidate()
+
+    def test_valid_strict_identity(self):
+        value = candidate_manifest()
+        self.assertEqual(self.load(value), value)
+
+    def test_absent_environment_is_the_unchanged_default(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(fresh_accounts.native_candidate())
+
+    def test_each_environment_value_alone_or_empty_fails(self):
+        self.path.write_text(json.dumps(candidate_manifest()))
+        for environment in (
+                {"TUNA_VM_GDM_NATIVE_CANDIDATE": str(self.path)},
+                {"TUNA_VM_GDM_NATIVE_SOURCE_SHA": NATIVE_SOURCE},
+                {"TUNA_VM_GDM_NATIVE_CANDIDATE": "", "TUNA_VM_GDM_NATIVE_SOURCE_SHA": NATIVE_SOURCE},
+                {"TUNA_VM_GDM_NATIVE_CANDIDATE": str(self.path), "TUNA_VM_GDM_NATIVE_SOURCE_SHA": ""},
+                {"TUNA_VM_GDM_NATIVE_CANDIDATE": "", "TUNA_VM_GDM_NATIVE_SOURCE_SHA": ""}):
+            with self.subTest(environment=environment), mock.patch.dict(os.environ, environment, clear=True):
+                with self.assertRaises(ValueError):
+                    fresh_accounts.native_candidate()
+
+    def test_expected_source_is_separately_pinned(self):
+        value = candidate_manifest()
+        for source in ("f" * 40, NATIVE_SOURCE.upper(), NATIVE_SOURCE[:-1], "../" + NATIVE_SOURCE):
+            with self.subTest(source=source):
+                os.environ["TUNA_VM_GDM_NATIVE_SOURCE_SHA"] = source
+                value["source_commit"] = source
+                with self.assertRaises(ValueError):
+                    self.load(value)
+
+    def test_schema_rejects_wrong_values_types_and_unsafe_paths(self):
+        cases = [
+            (("schema",), True), (("schema",), 1.0), (("schema",), "1"), (("schema",), 2),
+            (("source_repository",), "elsewhere/packages"),
+            (("source_commit",), "f" * 40), (("source_commit",), NATIVE_SOURCE.upper()),
+            (("source_commit",), None), (("architecture",), "aarch64"), (("architecture",), ["x86_64"]),
+            (("packages",), []), (("members",), None),
+            (("packages", "gdm", "version"), "51.1.1-1"),
+            (("packages", "libgdm", "version"), "51.1.1-1"),
+            (("packages", "gdm", "file"), "../gdm-51.1.1-1.1-x86_64.pkg.tar.zst"),
+            (("packages", "gdm", "file"), "/gdm-51.1.1-1.1-x86_64.pkg.tar.zst"),
+            (("packages", "libgdm", "file"), "gdm-51.1.1-1.1-x86_64.pkg.tar.zst"),
+            (("packages", "libgdm", "file"), "libgdm-51.1.1-1.1-x86_64.pkg.tar.zst/extra"),
+            (("members", "/usr/bin/gdm", "package"), "libgdm"),
+            (("members", "/usr/lib/libgdm.so.1.0.0", "package"), "gdm"),
+        ]
+        for field in (("packages", "gdm", "sha256"), ("packages", "libgdm", "sha256"),
+                      ("members", "/usr/bin/gdm", "sha256"),
+                      ("members", "/usr/lib/gdm-session-worker", "sha256"),
+                      ("members", "/usr/lib/libgdm.so.1.0.0", "sha256")):
+            cases.extend((field, invalid) for invalid in ("a" * 63, "a" * 65, "A" * 64, "z" * 64, 123, None))
+        for field, invalid in cases:
+            value = candidate_manifest()
+            parent = value
+            for key in field[:-1]:
+                parent = parent[key]
+            parent[field[-1]] = invalid
+            with self.subTest(field=field, invalid=invalid), self.assertRaises(ValueError):
+                self.load(value)
+
+    def test_every_mapping_rejects_missing_and_unknown_fields(self):
+        for field in ((), ("packages",), ("packages", "gdm"), ("packages", "libgdm"), ("members",),
+                      ("members", "/usr/bin/gdm"), ("members", "/usr/lib/gdm-session-worker"),
+                      ("members", "/usr/lib/libgdm.so.1.0.0")):
+            for change in ("missing", "unknown"):
+                value = candidate_manifest()
+                parent = value
+                for key in field:
+                    parent = parent[key]
+                if change == "missing":
+                    del parent[next(iter(parent))]
+                else:
+                    parent["unapproved"] = "PRIVATE"
+                with self.subTest(field=field, change=change), self.assertRaises(ValueError):
+                    self.load(value)
+
+    def test_member_paths_must_be_exact(self):
+        for path in ("usr/bin/gdm", "/usr/bin/../bin/gdm", "/usr/bin/gdm/extra",
+                     "/usr/bin/gdm\0", "/usr/lib/libgdm.so.1", "../../gdm"):
+            value = candidate_manifest()
+            value["members"][path] = value["members"].pop("/usr/bin/gdm")
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                self.load(value)
+
+    def test_malformed_duplicate_nonfinite_and_non_utf8_json(self):
+        encoded = json.dumps(candidate_manifest()).encode()
+        variants = [b"", b"{", b"[]", b"null", b"\xff", encoded + b" trailing",
+                    encoded.replace(b'"schema": 1', b'"schema": 1, "schema": 1'),
+                    encoded.replace(b'"version": "51.1.1-1.1"',
+                                    b'"version": "51.1.1-1.1", "version": "51.1.1-1.1"', 1),
+                    encoded.replace(b'"sha256": "' + b"c" * 64 + b'"',
+                                    b'"sha256": "' + b"c" * 64 + b'", "sha256": "' + b"c" * 64 + b'"'),
+                    encoded.replace(b'"schema": 1', b'"schema": NaN'),
+                    encoded.replace(b'"schema": 1', b'"schema": Infinity')]
+        for data in variants:
+            self.path.write_bytes(data)
+            with self.subTest(data=data[:80]), self.assertRaises(ValueError):
+                fresh_accounts.native_candidate()
+
+    def test_regular_file_size_bound_is_inclusive(self):
+        data = json.dumps(candidate_manifest()).encode()
+        self.path.write_bytes(data + b" " * (16 * 1024 - len(data)))
+        self.assertEqual(fresh_accounts.native_candidate(), candidate_manifest())
+        self.path.write_bytes(data + b" " * (16 * 1024 + 1 - len(data)))
+        with self.assertRaises(ValueError):
+            fresh_accounts.native_candidate()
+
+    def test_symlink_directory_fifo_and_missing_file_are_rejected(self):
+        target = self.path.with_name("target.json")
+        target.write_text(json.dumps(candidate_manifest()))
+        self.path.symlink_to(target)
+        with self.assertRaises(ValueError):
+            fresh_accounts.native_candidate()
+        self.path.unlink()
+        self.path.mkdir()
+        with self.assertRaises(ValueError):
+            fresh_accounts.native_candidate()
+        self.path.rmdir()
+        os.mkfifo(self.path)
+        with self.assertRaises(ValueError):
+            fresh_accounts.native_candidate()
+        self.path.unlink()
+        with self.assertRaises(OSError):
+            fresh_accounts.native_candidate()
+
+    def test_file_replacement_before_open_is_rejected(self):
+        self.path.write_text(json.dumps(candidate_manifest()))
+        original_open = os.open
+
+        def replaced(path, flags):
+            replacement = self.path.with_name("replacement.json")
+            replacement.write_text(json.dumps(candidate_manifest()))
+            replacement.replace(self.path)
+            return original_open(path, flags)
+
+        with mock.patch.object(fresh_accounts.os, "open", side_effect=replaced):
+            with self.assertRaises(ValueError):
+                fresh_accounts.native_candidate()
+
+    def test_file_change_during_read_is_rejected(self):
+        self.path.write_text(json.dumps(candidate_manifest()))
+        original_fstat = os.fstat
+        calls = []
+
+        def changed(fd):
+            calls.append(fd)
+            if len(calls) == 2:
+                self.path.write_text("{}")
+            return original_fstat(fd)
+
+        with mock.patch.object(fresh_accounts.os, "fstat", side_effect=changed):
+            with self.assertRaises(ValueError):
+                fresh_accounts.native_candidate()
+
+
+class NativeCandidateJourneyTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.path = pathlib.Path(temporary.name) / "manifest.json"
+        self.path.write_text(json.dumps(candidate_manifest()))
+        self.env = {"TUNA_VM_GDM_NATIVE_CANDIDATE": str(self.path),
+                    "TUNA_VM_GDM_NATIVE_SOURCE_SHA": NATIVE_SOURCE}
+
+    def test_success_probes_once_after_greeter_before_input_and_preserves_full_journey(self):
+        policy = candidate_policy()
+        policy.update({"templates": "PRIVATE-GUEST-PAYLOAD", "owner": "PRIVATE-GUEST-PAYLOAD"})
+        policy["packages"]["accountsservice"] = {"stdout": "PRIVATE-GUEST-PAYLOAD"}
+        guest = FakeGuest(policy=policy)
+        with mock.patch.dict(os.environ, {"PRIVATE_ENV": "PRIVATE-ENV-PAYLOAD"}):
+            passed, results, error, receipts = journey(guest, candidate_env=self.env)
+        self.assertTrue(passed, (results, error))
+        self.assertTrue(results["V-FRESH-GDM-NATIVE-CANDIDATE"][0])
+        self.assertEqual(guest.actions[:2], ["greeter", "gdm-policy"])
+        self.assertEqual(guest.policy_calls, [(1, 0, 0)])
+        self.assertEqual(guest.logins, [(1, "tunastd"), (1, "tunaadmin"), (1, "tunastd"), (1, "tunaadmin"),
+                                       (2, "tunastd"), (2, "tunaadmin")])
+        self.assertEqual(receipts[1], {"step": "preflight-gdm-native-candidate", "value": candidate_manifest()})
+        self.assertEqual(receipts[2], {"step": "preflight-gdm-native-installed",
+                                       "value": {"gdm": "51.1.1-1.1", "libgdm": "51.1.1-1.1"}})
+        rendered = json.dumps((receipts, results))
+        for private in ("PRIVATE-GUEST-PAYLOAD", "PRIVATE-ENV-PAYLOAD", str(self.path)):
+            self.assertNotIn(private, rendered)
+
+    def test_no_manifest_does_not_probe_or_add_candidate_gate_or_receipts(self):
+        guest = FakeGuest(policy_error=True)
+        passed, results, error, receipts = journey(guest)
+        self.assertTrue(passed, (results, error))
+        self.assertEqual(guest.policy_calls, [])
+        self.assertNotIn("V-FRESH-GDM-NATIVE-CANDIDATE", results)
+        self.assertFalse(any("gdm-native" in name for name in steps(receipts)))
+
+    def test_invalid_admission_stops_before_probe_and_any_input(self):
+        environments = [
+            {"TUNA_VM_GDM_NATIVE_CANDIDATE": str(self.path)},
+            {"TUNA_VM_GDM_NATIVE_SOURCE_SHA": NATIVE_SOURCE},
+            dict(self.env, TUNA_VM_GDM_NATIVE_SOURCE_SHA="f" * 40),
+        ]
+        for environment in environments:
+            guest = FakeGuest()
+            passed, results, error, _ = journey(guest, candidate_env=environment)
+            with self.subTest(environment=environment):
+                self.assertFalse(passed)
+                self.assertIsNone(error)
+                self.assertFalse(results["V-FRESH-GDM-NATIVE-CANDIDATE"][0])
+                self.assertEqual(guest.actions, ["greeter"])
+                self.assertEqual(guest.input_calls, 0)
+        self.path.write_text('{"schema":1,"schema":1}')
+        guest = FakeGuest()
+        passed, results, error, receipts = journey(guest, candidate_env=self.env)
+        self.assertFalse(passed)
+        self.assertFalse(results["V-FRESH-GDM-NATIVE-CANDIDATE"][0])
+        self.assertEqual(guest.actions, ["greeter"])
+        self.assertEqual(guest.input_calls, 0)
+        self.assertNotIn("preflight-gdm-native-candidate", steps(receipts))
+
+    def test_wrong_missing_truncated_or_failed_guest_pair_stops_before_input(self):
+        policies = [None, {}, {"packages": None}, {"packages": {}}, {"packages": []}]
+        for name in ("gdm", "libgdm"):
+            for replacement in (
+                    None, {"error": "PRIVATE-GUEST-PAYLOAD"},
+                    {"returncode": 1, "stdout": f"{name} 51.1.1-1.1\n", "truncated": False},
+                    {"returncode": False, "stdout": f"{name} 51.1.1-1.1\n", "truncated": False},
+                    {"returncode": 0, "stdout": f"{name} 51.1.1-1.1\n", "truncated": True},
+                    {"returncode": 0, "stdout": f"{name} 51.1.1-1.1\n", "truncated": 0},
+                    {"returncode": 0, "stdout": f"{name} 51.1.1-1.1\n"},
+                    {"returncode": 0, "stdout": f"{name} 51.1.1-1.1\n", "truncated": False, "error": "PRIVATE"},
+                    {"returncode": 0, "stdout": f"{name} 51.1.1-1\n", "truncated": False},
+                    {"returncode": 0, "stdout": f"{name} 51.1.1-1.1", "truncated": False},
+                    {"returncode": 0, "stdout": f"{name} 51.1.1-1.1\nextra\n", "truncated": False},
+                    {"returncode": 0, "stdout": "other 51.1.1-1.1\n", "truncated": False},
+                    {"returncode": 0, "stdout": ["51.1.1-1.1"], "truncated": False}):
+                policy = candidate_policy()
+                policy["packages"][name] = replacement
+                policies.append(policy)
+            policy = candidate_policy()
+            del policy["packages"][name]
+            policies.append(policy)
+        for policy in policies:
+            guest = FakeGuest(policy=policy)
+            passed, results, error, receipts = journey(guest, candidate_env=self.env)
+            with self.subTest(policy=policy):
+                self.assertFalse(passed)
+                self.assertIsNone(error)
+                self.assertFalse(results["V-FRESH-GDM-NATIVE-CANDIDATE"][0])
+                self.assertEqual(guest.policy_calls, [(1, 0, 0)])
+                self.assertEqual(guest.input_calls, 0)
+                self.assertEqual(guest.state_calls, [])
+                self.assertNotIn("PRIVATE", json.dumps((receipts, results)))
+
+    def test_guest_probe_exception_is_sanitized_and_not_retried(self):
+        guest = FakeGuest(policy_error=True)
+        passed, results, error, receipts = journey(guest, candidate_env=self.env)
+        self.assertFalse(passed)
+        self.assertIsNone(error)
+        self.assertFalse(results["V-FRESH-GDM-NATIVE-CANDIDATE"][0])
+        self.assertEqual(guest.policy_calls, [(1, 0, 0)])
+        self.assertEqual(guest.input_calls, 0)
+        self.assertNotIn("PRIVATE-GUEST-ERROR", json.dumps((receipts, results)))
+
+    def test_correct_pair_cannot_manufacture_physical_record_pass(self):
+        for faults in ({"no_record": True}, {"record_on_logout": True}):
+            guest = FakeGuest(**faults)
+            passed, results, error, receipts = journey(guest, candidate_env=self.env)
+            with self.subTest(faults=faults):
+                self.assertFalse(passed)
+                self.assertIsNone(error)
+                self.assertTrue(results["V-FRESH-GDM-NATIVE-CANDIDATE"][0])
+                self.assertFalse(results["V-FRESH-RECORD-CREATED-tunastd"][0])
+                self.assertNotIn("V-FRESH-REBOOT", results)
+                self.assertEqual(guest.policy_calls, [(1, 0, 0)])
+                self.assertEqual(guest.logins, [(1, "tunastd")])
+                state = receipts[steps(receipts).index("tunastd-first-state")]["value"]
+                self.assertIsNone(state["record"])
 
 
 GUEST_FUNCTIONS = {"fresh_state", "record_presence", "template_observation", "accounts_get",
@@ -550,6 +879,23 @@ class GuestStateTest(unittest.TestCase):
 
 class GdmPolicyTest(unittest.TestCase):
     """The build diagnostic reproduces tuna-gdm-default-session.sh's choice."""
+
+    def test_native_admission_reads_the_existing_policy_package_response(self):
+        def command(argv):
+            if argv[:2] == ["pacman", "-Q"]:
+                version = "51.1.1-1.1" if argv[2] in ("gdm", "libgdm") else "23.13.9-1"
+                stdout = f"{argv[2]} {version}\n".encode()
+            elif argv[-1] == "--version":
+                stdout = b"GDM 51.1.1\n"
+            else:
+                stdout = b""
+            return {"returncode": 0, "stdout": stdout.decode(), "truncated": False}, stdout
+
+        scope = guest_scope(bounded_command=command, template_observation=lambda kind: {})
+        with mock.patch.object(shutil, "which", return_value="/usr/bin/gdm"):
+            policy = scope["gdm_policy"]()
+        self.assertEqual(fresh_accounts.native_installed_pair(policy),
+                         {"gdm": "51.1.1-1.1", "libgdm": "51.1.1-1.1"})
 
     def test_version_parse_matches_the_helper(self):
         major = guest_scope()["gdm_version_major"]
