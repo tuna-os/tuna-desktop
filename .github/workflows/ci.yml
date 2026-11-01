@@ -591,7 +591,7 @@ jobs:
           tool: gtk4-layer-shell
           version: 4867d7b85cdf1e829fc1fd6f1d5f04c42cc99389
       - name: Install real colour capture consumers
-        run: sudo apt-get install -y gdb xvfb xdotool pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good python3-pil gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0
+        run: sudo apt-get install -y libegl-dev libgles-dev gdb xvfb xdotool pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good python3-pil gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0
       - run: shellcheck scripts/ci-install-vkms scripts/tuna-drm-smoke scripts/tuna-frame-pacer-build
       - run: scripts/ci-install-vkms
       # Installer/helper qualification above deliberately uses the merge ref.
@@ -603,6 +603,32 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           clean: false
       - run: scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts
+      - name: Classify independent native R8 DMA-BUF sampling
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          art=drm-smoke-artifacts
+          IFS= read -r card < "$art/color-drm-device.txt"
+          cp tests/color-dmabuf/r8-import.c "$art/r8-import.c"
+          cp LICENSE "$art/r8-import.LICENSE"
+          cc -std=c11 -Wall -Wextra -Werror -O0 -g "$art/r8-import.c" \
+            -o "$art/r8-import" $(pkg-config --cflags --libs gbm egl glesv2 libdrm)
+          {
+            git rev-parse HEAD
+            uname -a
+            cat /etc/os-release
+            cc --version
+            pkg-config --modversion gbm egl glesv2 libdrm
+            dpkg-query -W libgbm1 libegl-mesa0 libgl1-mesa-dri libgles2 linux-libc-dev
+            sha256sum "$art/r8-import.c" "$art/r8-import" "$art/r8-import.LICENSE"
+          } > "$art/r8-import-identity.txt"
+          timeout --signal=TERM --kill-after=5s 60s \
+            sudo env -u DISPLAY -u WAYLAND_DISPLAY prlimit --core=0:0 -- \
+            gdb --batch --return-child-result -ex 'set pagination off' \
+            -ex 'set print elements 16' -ex 'set print max-depth 3' \
+            -ex run -ex 'thread apply all bt full 32' -ex 'info sharedlibrary' \
+            --args "$art/r8-import" --device "$card" --dma-heap /dev/dma_heap/system \
+            > "$art/r8-import.log" 2>&1
       - name: Retain privileged colour failure artifacts as runner-owned files
         if: always()
         run: |

@@ -70,10 +70,18 @@ class Selection(unittest.TestCase):
                      "crates/compositor/examples/tuna-color-cast-client.rs",
                      "crates/compositor/tests/color_management.rs",
                      "scripts/tuna-color-capture-proof"):
-            self.assertEqual(pr(path, size=0), ["drm-smoke", "gtk-shell"], path)
+            self.assertEqual(pr(path, size=0), ["drm-smoke", "gtk-shell", "arch-package", "marlin-vm"], path)
         for path in ("scripts/tuna-color-gnome-reference-ci",
-                     "tests/color-hdr-vkms/tuna_hdr_vkms.c"):
+                     "tests/color-hdr-vkms/tuna_hdr_vkms.c",
+                     "tests/color-dmabuf/r8-import.c"):
             self.assertEqual(pr(path, size=0), ["drm-smoke"], path)
+
+    def test_native_colour_payload_always_requires_the_existing_vm_producer(self):
+        for path in ("scripts/tuna-colour-build", "scripts/lib/colour_vm.py"):
+            for run in (0, 4, 19):
+                self.assertEqual(pr(path, run=run, size=0), ["arch-package", "marlin-vm"], path)
+        self.assertEqual(pr("packaging/marlin/vm-lane/tuna-vm-colour", size=0),
+                         ["arch-package", "marlin-image", "marlin-vm"])
 
     def test_transition_policy_and_suite_always_run_journey(self):
         for path in ('scripts/lib/transition-package-policy.py',

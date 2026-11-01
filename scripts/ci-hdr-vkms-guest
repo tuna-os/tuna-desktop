@@ -303,9 +303,10 @@ def main():
                    'cp /var/lib/apt/lists/*InRelease /home/ubuntu/artifacts/apt/; '
                    'apt-get indextargets > /home/ubuntu/artifacts/apt/index-targets.txt; '
                    'sudo env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 install -y --no-install-recommends ' +
-                   ' '.join(packages) + '; test -f /lib/modules/$(uname -r)/build/Makefile; '
+                   ' '.join(packages) + '; '
                    'cd /home/ubuntu/payload; ' + args.prepare_command + '; '
-                   'python3 /home/ubuntu/hdr-source/scripts/ci-install-hdr-vkms build --build-dir /home/ubuntu/hdr-module')
+                   'python3 /home/ubuntu/hdr-source/scripts/ci-install-hdr-vkms build '
+                   '--build-dir /home/ubuntu/hdr-module --header-receipt /home/ubuntu/artifacts/kernel-headers.json')
         with (artifacts / 'guest-prepare.log').open('wb') as log:
             call([*ssh, 'bash -lc ' + shlex.quote(prepare)], stdout=log, stderr=subprocess.STDOUT, timeout=args.proof_timeout)
         positive = ('set -eu; export ARTIFACTS=/home/ubuntu/artifacts; '

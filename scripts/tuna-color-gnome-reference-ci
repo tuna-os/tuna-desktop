@@ -122,9 +122,9 @@ sha256sum --check /usr/share/colour-reference/gdm.sha256''',
  echo
 done
 ps -eo pid,ppid,uid,comm
-for name in gdm tuna-test; do
+for name in gdm gdm-greeter tuna-test; do
  uid=$(id -u "$name") || continue
- runuser -u "$name" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user show org.gnome.Shell@gdm.service org.gnome.Shell@wayland.service -p Id -p Type -p LoadState -p ActiveState -p SubState -p Result -p MainPID -p ExecMainCode -p ExecMainStatus -p FragmentPath -p DropInPaths
+ runuser -u "$name" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user show 'org.gnome.Shell@*.service' -p Id -p Type -p LoadState -p ActiveState -p SubState -p Result -p MainPID -p ExecMainCode -p ExecMainStatus -p FragmentPath -p DropInPaths
  find "/run/user/$uid" -maxdepth 1 -type s -name 'wayland-*' -printf '%f\\n'
 done
 for proc in /proc/[0-9]*; do
@@ -328,7 +328,7 @@ done
                 if line not in versions.splitlines():
                     raise RuntimeError('GNOME baseline package mismatch: ' + line)
             session_cmd = "loginctl list-sessions --no-legend | while read -r s rest; do loginctl show-session \"$s\" -p Id -p Name -p Type -p Class -p Service -p Active -p User; echo; done"
-            def session_ready(expected, mode):
+            def session_ready(expected):
                 result = ssh(session_cmd, check=False, timeout=15)
                 if result.returncode or ssh('systemctl is-active --quiet gdm.service', check=False, timeout=15).returncode:
                     return None
@@ -340,14 +340,19 @@ done
                     if not session_uid.isdigit() or session_uid == '0':
                         continue
                     name = shlex.quote(properties['Name'])
-                    unit = 'org.gnome.Shell@' + mode + '.service'
-                    state = ssh(f'runuser -u {name} -- env XDG_RUNTIME_DIR=/run/user/{session_uid} DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{session_uid}/bus systemctl --user show {unit} -p Type -p ActiveState -p SubState -p MainPID',
+                    # GNOME instances are shell modes, not display backends.
+                    # Resolve the actual notified unit for this session's user.
+                    state = ssh(f"runuser -u {name} -- env XDG_RUNTIME_DIR=/run/user/{session_uid} DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{session_uid}/bus systemctl --user show 'org.gnome.Shell@*.service' -p Id -p Type -p ActiveState -p SubState -p MainPID",
                                 check=False, timeout=15)
-                    fields = dict(line.split('=', 1) for line in state.stdout.decode().splitlines() if '=' in line)
-                    if (state.returncode == 0 and fields.get('Type') == 'notify'
-                            and fields.get('ActiveState') == 'active' and fields.get('SubState') == 'running'
-                            and fields.get('MainPID', '0').isdigit() and int(fields.get('MainPID', '0')) > 0):
-                        return block + '\n' + state.stdout.decode()
+                    if state.returncode:
+                        continue
+                    for unit_state in state.stdout.decode().split('\n\n'):
+                        fields = dict(line.split('=', 1) for line in unit_state.splitlines() if '=' in line)
+                        if (fields.get('Id', '').startswith('org.gnome.Shell@')
+                                and fields.get('Type') == 'notify'
+                                and fields.get('ActiveState') == 'active' and fields.get('SubState') == 'running'
+                                and fields.get('MainPID', '0').isdigit() and int(fields.get('MainPID', '0')) > 0):
+                            return block + '\n' + unit_state
                 return None
             # GNOME Shell 51.1, commit 33da06854e229c256afd5872fedd83c28cbfa176:
             # data/org.gnome.Shell@.service.in is Type=notify; js/ui/main.js
@@ -355,8 +360,8 @@ done
             # SSH and gdm.service alone do not wait for that user-service barrier.
             report['stage'] = 'gdm-greeter-readiness'; save()
             report['greeter'] = wait(lambda: session_ready(
-                {'Name': 'gdm', 'Type': 'wayland', 'Class': 'greeter',
-                 'Service': 'gdm-launch-environment', 'Active': 'yes'}, 'gdm'),
+                {'Type': 'wayland', 'Class': 'greeter',
+                 'Service': 'gdm-launch-environment', 'Active': 'yes'}),
                 'stock GDM Wayland greeter and notified GNOME Shell')
             report['stage'] = 'gdm-paint'; save()
             corral('key', token, 'ret')  # Emulated physical wake, not a GDM override.
@@ -367,7 +372,7 @@ done
             corral('key', token, 'ret'); time.sleep(2)
             corral('type', token, fixture_password); corral('key', token, 'ret')
             report['session'] = wait(lambda: session_ready(
-                {'Name': 'tuna-test', 'Type': 'wayland', 'Service': 'gdm-password', 'Active': 'yes'}, 'wayland'),
+                {'Name': 'tuna-test', 'Type': 'wayland', 'Service': 'gdm-password', 'Active': 'yes'}),
                 'ordinary GDM native Wayland login and notified GNOME Shell')
             save()
             # Copy only compiled caller into guest /run; no compositor/session replacement.

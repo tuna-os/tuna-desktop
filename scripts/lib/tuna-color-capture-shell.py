@@ -5,6 +5,9 @@ Uses production caller admission: this exact PID is launched with --shell-bin.
 It never acquires a portal identity or changes compositor capture policy.
 Mutter 51 meta-stream-source.c:add_format_param/update_color_state define the
 SDR BT.709/gamma-2.2 target checked at the real PipeWire appsink boundary.
+The SDR consumer requests raw BGRx without supplying colourimetry; negotiated
+producer metadata and actual pixels remain mandatory. Failed GStreamer state
+changes retain bounded bus error/debug and actual source caps before teardown.
 """
 import hashlib
 import json
@@ -87,6 +90,47 @@ def png_evidence(path, expected):
             'chromaticities_scaled': list(struct.unpack('>8I', chunks[b'cHRM']))}
 
 
+def capture_pipeline_failure(pipeline, prefix, target, node, phase):
+    # Read the real bus before NULL flushes it. Bound both the wait and the
+    # retained messages; a state-change return alone loses the plugin's cause.
+    result, current, pending = pipeline.get_state(0)
+    source = pipeline.get_by_name('producer')
+    pad = source.get_static_pad('src')
+    current_caps = pad.get_current_caps()
+    queried_caps = pad.query_caps(None)
+    evidence = {
+        'node': node, 'target': target, 'phase': phase,
+        'state_result': result.value_nick, 'current_state': current.value_nick,
+        'pending_state': pending.value_nick,
+        'source_path': source.get_property('path'),
+        'source_fd': source.get_property('fd'),
+        'source_current_caps': current_caps.to_string()[:4096] if current_caps else None,
+        'source_query_caps': queried_caps.to_string()[:4096] if queried_caps else None,
+        'messages': [],
+    }
+    bus = pipeline.get_bus()
+    kinds = Gst.MessageType.ERROR | Gst.MessageType.WARNING | Gst.MessageType.EOS
+    message = bus.timed_pop_filtered(Gst.SECOND, kinds)
+    for _ in range(8):
+        if message is None:
+            break
+        entry = {
+            'type': Gst.MessageType.get_name(message.type),
+            'source': message.src.get_path_string()[:1024] if message.src else None,
+        }
+        if message.type in (Gst.MessageType.ERROR, Gst.MessageType.WARNING):
+            error, debug = (message.parse_error() if message.type == Gst.MessageType.ERROR
+                            else message.parse_warning())
+            entry.update(domain=error.domain, code=error.code,
+                         message=error.message[:2048], debug=(debug or '')[:4096])
+        evidence['messages'].append(entry)
+        message = bus.pop_filtered(kinds)
+    if not evidence['messages']:
+        evidence['bus_diagnostic'] = 'no error, warning or EOS queued within one second'
+    publish(f'{prefix}-cast-{target}-gstreamer-error.json', evidence)
+    return RuntimeError('PipeWire capture failed: ' + json.dumps(evidence))
+
+
 def capture_stream(prefix, target, connector, window, expected, hdr=False):
     destination = 'org.gnome.Mutter.ScreenCast'
     session_interface = destination + '.Session'
@@ -136,18 +180,30 @@ def capture_stream(prefix, target, connector, window, expected, hdr=False):
             return {**evidence, 'node': node, 'expected_rgb10': expected,
                     'raw_sha256': hashlib.sha256(raw).hexdigest(),
                     'consumer_stderr': result.stderr}
-        # No videoconvert or colour filter: inspect the producer's exact
-        # negotiated BGRx samples and metadata, not a converted PNG proxy.
+        # Direct Mutter ScreenCast supplies a node on the session remote,
+        # not a portal OpenPipeWireRemote FD; pipewiresrc's default fd=-1
+        # connects to that same inherited private PipeWire session.
+        # Both bare pipewiresrc and appsink advertise ANY. PipeWire's
+        # gst_caps_to_format_all(ANY) emits no EnumFormat, so the stream
+        # gets media.class=Stream/Input/Unknown and WirePlumber's media-type
+        # check rejects the Video target. Request the actual SDR format,
+        # but never inject colourimetry or use a conversion/filter to fix it.
         pipeline = Gst.parse_launch(
-            f'pipewiresrc path={node} num-buffers=1 ! '
+            f'pipewiresrc name=producer path={node} num-buffers=1 ! '
+            'video/x-raw,format=BGRx ! '
             'appsink name=capture sync=false max-buffers=1 drop=false')
-        assert pipeline.set_state(Gst.State.PLAYING) != Gst.StateChangeReturn.FAILURE
+        deadline = time.monotonic() + 15
+        if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            raise capture_pipeline_failure(pipeline, prefix, target, node, 'set-playing')
+        result, current, _ = pipeline.get_state(
+            max(0, int((deadline - time.monotonic()) * Gst.SECOND)))
+        if result == Gst.StateChangeReturn.FAILURE or current != Gst.State.PLAYING:
+            raise capture_pipeline_failure(pipeline, prefix, target, node, 'wait-playing')
         sink = pipeline.get_by_name('capture')
-        sample = sink.emit('try-pull-sample', 15 * Gst.SECOND)
+        sample = sink.emit('try-pull-sample',
+                           max(0, int((deadline - time.monotonic()) * Gst.SECOND)))
         if sample is None:
-            message = pipeline.get_bus().pop_filtered(Gst.MessageType.ERROR)
-            raise RuntimeError('no PipeWire sample: ' + (
-                str(message.parse_error()) if message else 'timeout'))
+            raise capture_pipeline_failure(pipeline, prefix, target, node, 'pull-sample')
         caps = sample.get_caps()
         info = GstVideo.VideoInfo.new_from_caps(caps)
         assert caps.get_structure(0).get_string('format') == 'BGRx', caps.to_string()

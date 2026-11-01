@@ -18,6 +18,11 @@ Use --mode external-yuv with a real tuna-color-yuv-client and its DMA-heap/GPU
 prerequisites; repeat --client-arg=VALUE for its format/representation options.
 The raw cast buffers and negotiated caps are retained; generated cast previews
 are only viewing aids, not producer PNG metadata evidence.
+An explicit --host-wayland-socket /absolute/socket instead nests only the
+compositor into an existing actual Wayland host, preserving that host's GPU.
+It neither starts Xvfb nor uses X11 focus/pointer tools. All clients and capture
+consumers still use the newly created private compositor socket and unchanged
+pixel, geometry, authorization and negotiated-media oracles.
 
 --backend drm uses an externally owned seat and TUNA_DRM_DEVICE. --hdr also
 requires the real TUNA_HDR_PROBE endpoint helper and --hdr-consumer compiled
@@ -60,6 +65,8 @@ parser.add_argument('--hdr', action='store_true')
 parser.add_argument('--expect-unsupported-hdr', action='store_true')
 parser.add_argument('--hdr-consumer', type=Path)
 parser.add_argument('--source-receipt', type=Path)
+parser.add_argument('--host-wayland-socket', type=Path,
+                    help='explicit actual host Wayland socket for the nested compositor only; no Xvfb')
 args = parser.parse_args()
 compositor, color_client = args.compositor.resolve(), args.color_client.resolve()
 consumer = Path(__file__).resolve().parent / 'lib' / 'tuna-color-capture-shell.py'
@@ -68,6 +75,11 @@ assert not (args.hdr or args.expect_unsupported_hdr) or args.backend == 'drm', '
 assert not args.hdr or args.mode == 'all', 'HDR qualification requires highlight, SDR-white and unmanaged controls'
 hdr_consumer = args.hdr_consumer.resolve() if args.hdr_consumer else None
 assert not args.hdr or hdr_consumer is not None, '--hdr requires --hdr-consumer'
+host_socket = args.host_wayland_socket
+if host_socket is not None:
+    import stat
+    assert args.backend == 'winit' and host_socket.is_absolute(), 'absolute host socket requires winit'
+    assert stat.S_ISSOCK(host_socket.stat().st_mode), 'host endpoint is not a Wayland socket'
 binaries = [compositor, color_client]
 if hdr_consumer is not None:
     binaries.append(hdr_consumer)
@@ -134,12 +146,20 @@ report = {'scope': __doc__, 'mode': args.mode, 'backend': args.backend, 'hdr': a
                        for path in binaries},
           'scripts': {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
                       for path in (Path(__file__).resolve(), consumer)}}
+if host_socket is not None:
+    report['host_fixture'] = {
+        'kind': 'actual-host-wayland-not-Xvfb', 'socket': str(host_socket),
+        'device': host_socket.stat().st_dev, 'inode': host_socket.stat().st_ino,
+        'nested_renderer_identity': {'observed': False,
+                                     'scope': 'not inferred from the host or independent unit context'},
+        'scope': 'host compositor identity/source/package is retained by the native guest runner'}
 
 
-def spawn(command, name, **options):
+def spawn(command, name, launch_env=None, **options):
     log = (art / (name + '.log')).open('wb')
     logs.append(log)
-    process = subprocess.Popen(command, env=env, stdout=log, stderr=log,
+    process = subprocess.Popen(command, env=env if launch_env is None else launch_env,
+                               stdout=log, stderr=log,
                                start_new_session=True, **options)
     children.append(process)
     identities.append((process.pid, os.pidfd_open(process.pid)))
@@ -242,8 +262,8 @@ def start_core(label):
                  'compositor-state.json', 'stop-consumer'):
         (art / name).unlink(missing_ok=True)
     socket_name = 'tuna-color-capture'
-    # Winit must select the real Xvfb host, not our not-yet-created socket.
-    # Runtime publishes its private socket to the supervised shell afterward.
+    # The host endpoint is used ONLY by this compositor launch. Supervised
+    # consumers receive the new private socket after backend initialization.
     env.pop('WAYLAND_DISPLAY', None)
     for endpoint in (runtime / socket_name,
                      runtime / ('tuna-' + socket_name + '.control')):
@@ -252,7 +272,11 @@ def start_core(label):
                socket_name, '--shell-bin', str(consumer)]
     if args.backend == 'winit':
         command.extend(['--width', '1280', '--height', '800'])
-    core = spawn(command, 'compositor-' + label)
+    if host_socket is not None:
+        core = spawn(command, 'compositor-' + label,
+                     launch_env={**env, 'WAYLAND_DISPLAY': str(host_socket)})
+    else:
+        core = spawn(command, 'compositor-' + label)
     env['WAYLAND_DISPLAY'] = socket_name
     ready = wait(lambda: read_json(art / 'consumer-ready.json'), 'supervised capture consumer')
     consumer_descriptor = os.pidfd_open(ready['pid'])
@@ -263,7 +287,7 @@ def start_core(label):
     if args.hdr:
         assert ready['control_hello'] is not None, 'missing actual supervised control handshake'
     wait((runtime / env['WAYLAND_DISPLAY']).exists, 'native display socket')
-    if args.backend == 'winit':
+    if args.backend == 'winit' and host_socket is None:
         window = wait(lambda: run(['xdotool', 'search', '--pid', str(core.pid), '--name', 'Smithay']),
                       'nested compositor window')
         assert len(window.splitlines()) == 1, window
@@ -494,7 +518,7 @@ try:
     spawn(['pipewire'], 'pipewire')
     wait((runtime / 'pipewire-0').exists, 'private PipeWire')
     spawn(['wireplumber'], 'wireplumber')
-    if args.backend == 'winit':
+    if args.backend == 'winit' and host_socket is None:
         read_fd, write_fd = os.pipe()
         try:
             spawn(['Xvfb', '-displayfd', str(write_fd), '-screen', '0', '1280x800x24',

@@ -166,6 +166,33 @@ Native HDR separately requires a successful high-precision arithmetic probe.
 
 The native DMA-BUF diagnostic disables core files and bounds backtraces and
 printed values; raw core dumps are never qualification artifacts.
+The independent GPL-3.0-or-later driver oracle,
+[`r8-import.c`](../tests/color-dmabuf/r8-import.c), uses GBM/EGL/GLES and the
+actual Linux DMA heap without Rust, Smithay, auxiliary samplers or colour math.
+It compares ordinary uploaded RGBA and imported linear R8 pixels with one
+shader while retaining every buffer/image/texture through GPU completion.
+Its source, license, compiler/package identities and bounded GDB result accompany
+the original device receipt. A fault in the Rust control alone does not prove a
+driver cause; neither diagnostic can silently remove an existing required gate.
+
+The isolated `colour` guest route uses the shared VM producer and an opt-in
+virgl device profile, not a second producer or a normal release-admission override.
+Its fixed `init/start/state/ack/finish/cleanup/file` operations execute owned,
+finite cases; artifact export cannot select arbitrary guest paths or commands.
+The payload binds the original native Arch package to the same primary build
+environment, source, unit/example ELFs and observed final image members.
+`installed_signed_release_qualified=false` describes scope, not an admission
+shortcut. The existing all-format unit and NV12/P010 coefficient capture matrix
+remain required. Observed unit GL identity is separate from unobserved nested
+context identity; a successful probe must not invent a different process's renderer.
+
+Capture's explicit `--host-wayland-socket` selects an actual Wayland host only
+for compositor launch; proof clients still use their new private socket.
+Default Xvfb/DRM fixture behavior is unchanged. The SDR GStreamer consumer
+requests raw BGRx media, but neither injects colourimetry nor converts pixels:
+actual negotiated metadata, raw bytes and a real sample remain the oracle.
+GNOME comparison waits for the actual nonroot GDM greeter principal and loaded,
+notified Shell service, without assuming an account or service-instance name.
 
 Qualification receipts must name the emulation and exact executable/source/image
 identities. `D-COLOR-HDR`, `D-COLOR-HDR-KMS`, `D-COLOR-HDR-CAPTURE`,
@@ -177,6 +204,13 @@ framebuffer and RGB channel bits, independently of the XR30 kernel writeback
 self-test. Proof cancellation unwinds owned-process cleanup before unloading
 its endpoint. Executables staged into the pinned Noble guest are built on its
 Ubuntu 24.04 ABI baseline. Existing vkms/real-colord gamma readback remains separate.
+This ABI-compatible CI-component proof is not native Noble package or signed
+release qualification: the primary Noble Rust compiler is below the locked GTK
+MSRV, and a foreign compiler does not repair that native package prerequisite.
+Guest prerequisites use an authenticated immutable official archive snapshot.
+Kernel ABI admission compares generated `UTS_RELEASE`, packaged `kernel.release`
+and actual module vermagic with the running kernel, not the upstream Makefile's
+base version; source and native package receipts are retained on failure.
 [ADR 0008 item 5](adr/0008-v1-beta-track-and-release-scope.md) permits the v1 row
 to pass on actual named emulated-device evidence; physical HDR link quality,
 instrumented calibration accuracy and physical hotplug remain unqualified until

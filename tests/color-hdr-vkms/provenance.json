@@ -79,7 +79,7 @@
     "observed_source_identity_receipt": "image-source-receipt.json",
     "image_kernel": "6.8.0-147-generic",
     "image_kernel_package_version": "6.8.0-147.147",
-    "headers": "Exact running kernel headers, present in pinned official cloud image; verified before build. No host kernel replacement.",
+    "headers": "Exact running kernel headers, present in pinned official cloud image. Both generated UTS_RELEASE and include/config/kernel.release must equal the running kernel before external-module build; actual built module name/vermagic are checked immediately after build and again before load. No host kernel replacement or ABI override.",
     "guest_prerequisite_archive": "https://snapshot.ubuntu.com/ubuntu/20261018T000000Z/",
     "guest_prerequisite_archive_reference": "https://snapshot.ubuntu.com/",
     "guest_prerequisite_coherence": "Immutable official archive matching the authenticated image era, including Noble updates/security/backports. Noble APT normally uses By-Hash but can fall back to mutable index filenames even with force; snapshot paths remove that mirror-sync race. No acquisition retry, ignored update error, disabled signature/hash/Valid-Until check, kernel replacement, or relaxed ABI guard.",
@@ -97,7 +97,35 @@
       "failure_stage": "APT metadata acquisition; package installation and module build were not reached",
       "limit": "The log demonstrates fallback and a mutable-index coherence failure, not the reason the initial by-hash request was unavailable. Snapshot signature acceptance, complete package installation and exact kernel/header/module closure require actual guest execution; source research alone is not qualification."
     },
-    "guest_fixture_delta_receipts": "Retained guest-artifacts.tar.gz contains apt/fixture-delta.json (original/effective sources and APT config, actual kernel), apt/packages-before.tsv, guest-packages.tsv after preparation even on failure, apt/*InRelease and apt/index-targets.txt. Existing endpoint/build receipts retain actual module/source identity; source authentication is not a runtime pass.",
+    "observed_header_abi_failure": {
+      "ci_run": "41266067418",
+      "source_commit": "bdbb5d3e9d70ebd0e786ab899204aaee510bd0fc",
+      "artifact": "colour-native/hdr/guest-prepare.log",
+      "lines": "1199-1254",
+      "sequence": "Immutable signed 20261018T000000Z APT prerequisites installed successfully; the installer then rejected standalone make kernelrelease output 6.8.12 against actual running kernel 6.8.0-147-generic before module compilation.",
+      "running_kernel": "6.8.0-147-generic",
+      "rejected_standalone_make_kernelrelease": "6.8.12",
+      "retained_package_receipt": "guest-artifacts.tar.gz:artifacts/guest-packages.tsv",
+      "retained_packages": {
+        "linux-image-6.8.0-147-generic": "6.8.0-147.147",
+        "linux-headers-6.8.0-147": "6.8.0-147.147",
+        "linux-headers-6.8.0-147-generic": "6.8.0-147.147",
+        "linux-modules-extra-6.8.0-147-generic": "6.8.0-147.147"
+      },
+      "cause": "Ubuntu's packaged Makefile VERSION/PATCHLEVEL/SUBLEVEL describe upstream base 6.8.12, not Ubuntu ABI 6.8.0-147-generic. Without M=, kernelrelease calls scripts/setlocalversion and recomputes that upstream base. External-module Kbuild instead reads the packaged include/config/kernel.release, while generated UTS_RELEASE supplies module vermagic.",
+      "limit": "The failed guest retained package identities and running kernel but not generated-header contents. Matching local packaged headers were researched read-only; their contents are not represented as direct guest evidence. The earlier reported localhost preflight and this failed guest preparation were not rerun to confirm them."
+    },
+    "readonly_matching_packaged_header_evidence": {
+      "scope": "Read-only local Ubuntu 6.8.0-147.147 package/source inspection; not guest execution, compilation, load or HDR proof",
+      "headers": "/usr/src/linux-headers-6.8.0-147-generic",
+      "include/generated/utsrelease.h": "#define UTS_RELEASE \"6.8.0-147-generic\"; #define UTS_UBUNTU_RELEASE_ABI 147",
+      "include/config/kernel.release": "6.8.0-147-generic",
+      ".config": "CONFIG_VERSION_SIGNATURE=\"Ubuntu 6.8.0-147.147-generic 6.8.12\"; CONFIG_LOCALVERSION=\"\"; CONFIG_LOCALVERSION_AUTO is not set",
+      "/proc/version_signature": "Ubuntu 6.8.0-147.147-generic 6.8.12",
+      "native_source_identity": "dpkg-query: linux-headers-6.8.0-147 and linux-headers-6.8.0-147-generic are installed version 6.8.0-147.147 from source linux 6.8.0-147.147; linux-image-6.8.0-147-generic is installed version 6.8.0-147.147 from source linux-signed 6.8.0-147.147",
+      "packaged_makefile_authority": "Makefile:2-5 sets upstream 6.8.12; :365-368 reads KERNELRELEASE from include/config/kernel.release separately from KERNELVERSION; :1187-1195 recomputes release for non-external builds; :1791-1800 preserves packaged KERNELRELEASE for external modules; :2059-2060 dispatches kernelrelease to the selected computation"
+    },
+    "guest_fixture_delta_receipts": "Retained guest-artifacts.tar.gz contains apt/fixture-delta.json (original/effective sources and APT config, actual kernel), apt/packages-before.tsv, guest-packages.tsv after preparation even on failure, apt/*InRelease and apt/index-targets.txt. The installer now writes artifacts/kernel-headers.json before an ABI rejection: running/resolved header paths, bounded generated/config/Makefile identity lines and file hashes, plus native image/header package versions, source package versions and installed status. Existing endpoint/build receipts retain actual module/source identity and full built module vermagic; source authentication or header matching is not a runtime pass.",
     "acceleration": "KVM if accessible, otherwise explicitly recorded TCG; both execute actual guest kernel DRM ioctls",
     "root_assertion": "D-COLOR-HDR-KMS only after actual kernel selftest JSON/raw retention, command success, unsupported connector identity and isolated module/QEMU/disk/key cleanup; does not claim native compositor/capture qualification",
     "native_capture_assertion": "Separate payload-owned D-COLOR-HDR-CAPTURE; a default guest-command=true must not satisfy native capture qualification",
@@ -112,7 +140,7 @@
     "replug": "printf 1 > \"$TUNA_HDR_CONNECTED_CONTROL\""
   },
   "evidence_limits": [
-    "No local module compilation, module load, VM boot or graphical qualification was executed by the endpoint worker. Parent-reported compile preflight stopped before compilation because local headers report 6.8.12 while running kernel is 6.8.0-147-generic; the exact ABI guard is retained and not bypassed.",
+    "No module compilation, module load, VM boot, tests or graphical qualification was executed by this ABI-repair worker. Read-only matching local headers distinguish the Ubuntu ABI from the upstream 6.8.12 base; both generated-header and packaged kernel.release equality guards are mandatory, and built module name/vermagic must still match the running kernel. Corrected guest receipts, actual module build/load, kernel selftest and native HDR/capture remain unobserved until parent verification and CI.",
     "identity operation and property presence alone are not proof of HDR production output.",
     "selftest proves real kernel XR30 pageflip/writeback/metadata and invalid-commit rejection; native compositor FP16 render, display configuration, screencast, restart and unsupported-output journeys must run separately inside the same endpoint.",
     "snapshot reads actual active primary GEM, not composed writeback; kernel selftest separately proves the writeback path.",
