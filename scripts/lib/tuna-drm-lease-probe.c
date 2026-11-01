@@ -271,11 +271,13 @@ static int expect_request_error(uint32_t expected) {
 
 int main(int argc, char **argv) {
     const char *lease_name = NULL;
+    const char *await_name = NULL;
     bool close_fd = false, disconnect_owner = false, empty = false;
     bool duplicate = false, stale = false, expect_revoke = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--lease") == 0 && i + 1 < argc) lease_name = argv[++i];
         else if (strcmp(argv[i], "--observe") == 0 && i + 1 < argc) observe_name = argv[++i];
+        else if (strcmp(argv[i], "--await") == 0 && i + 1 < argc) await_name = argv[++i];
         else if (strcmp(argv[i], "--close-fd") == 0) close_fd = true;
         else if (strcmp(argv[i], "--disconnect") == 0) disconnect_owner = true;
         else if (strcmp(argv[i], "--duplicate") == 0) duplicate = true;
@@ -285,6 +287,16 @@ int main(int argc, char **argv) {
         else return fail("unknown option or missing connector name");
     }
     if (connect_client() != 0) return 1;
+    if (await_name) {
+        double end = now_ms() + DEADLINE_MS;
+        while ((!n_devices || !find_live(&devices[0], await_name)) && now_ms() < end)
+            if (wl_display_roundtrip(display) < 0) return fail("connector reappearance roundtrip failed");
+        if (!n_devices || !find_live(&devices[0], await_name))
+            return fail("restored connector was not offered");
+        print_devices("available");
+        wl_display_disconnect(display);
+        return 0;
+    }
     print_devices("devices");
     if (observe_name) {
         struct connector *target = n_devices ? find_live(&devices[0], observe_name) : NULL;

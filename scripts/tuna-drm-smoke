@@ -1093,6 +1093,12 @@ jq -se '[.[].event] == ["devices", "leased", "withdrawn", "unplug-revoked"]' \
 printf 'detect\n' | sudo tee "$LEASE_FORCED_STATUS" >/dev/null ||
     fail D-LEASE "could not restore owned vkms connector detection"
 LEASE_FORCED_STATUS=""
+lease_probe --await "$CONNECTOR" >"$ARTIFACTS/lease-replug.jsonl" ||
+    fail D-LEASE "actual restored vkms connector was not re-offered"
+jq -e --arg name "$CONNECTOR" '.event == "available"
+    and ([.devices[].connectors[] | select(.name == $name and .done)] | length == 1)' \
+    "$ARTIFACTS/lease-replug.jsonl" >/dev/null ||
+    fail D-LEASE "restored emulated connector identity changed"
 kill -TERM "$COMP_PID"
 wait "$COMP_PID" || true
 COMP_PID=""
