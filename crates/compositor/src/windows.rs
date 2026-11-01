@@ -487,6 +487,9 @@ pub struct WindowManager {
     super_held: bool,
     /// Key repeat as last set: rate (keys/s, 0 off) and delay (ms).
     repeat: (i32, i32),
+    /// The compositor's own key repeat, for wl_keyboard version 10.
+    key_repeat: crate::key_repeat::KeyRepeat,
+    key_repeat_epoch: u64,
     a11y_shadow: crate::a11y_shadow::Shadow,
     keymap_generation: u64,
     /// Shift held (either side) for move-window keybindings.
@@ -811,6 +814,8 @@ impl WindowManager {
             super_held: false,
             // add_keyboard below: 200 ms delay, 200 keys/s.
             repeat: (200, 200),
+            key_repeat: crate::key_repeat::KeyRepeat::new(true, 200, 1000 / 200),
+            key_repeat_epoch: 0,
             a11y_shadow: Default::default(),
             keymap_generation: 1,
             shift_held: false,
@@ -4425,6 +4430,19 @@ impl WindowManager {
         let Some(keyboard) = self.keyboard.clone() else {
             return false;
         };
+        // The compositor's repeat follows the presses reaching the seat,
+        // accelerators included, as Mutter's seat impl arms it before
+        // any consumer sees the event.
+        if pressed {
+            let repeats = key_repeats(&keyboard, state, keycode);
+            if repeats {
+                self.key_repeat_epoch = keyboard.repeat_epoch();
+            }
+            self.key_repeat
+                .press(keycode, repeats, time, std::time::Instant::now());
+        } else {
+            self.key_repeat.release(keycode);
+        }
         if pressed && keycode == ESCAPE_KEYCODE && self.cancel_strip_pointer(state) {
             keyboard.input_discard(
                 state,
@@ -4438,15 +4456,7 @@ impl WindowManager {
             });
             return true;
         }
-        let mode = if self.lock_input_active {
-            tuna_shell_control::MODE_LOCK_SCREEN
-        } else if crate::layer::exclusive_popup_keyboard_layer(state).is_some() {
-            tuna_shell_control::MODE_POPUP
-        } else if self.overview_open {
-            tuna_shell_control::MODE_OVERVIEW
-        } else {
-            tuna_shell_control::MODE_NORMAL
-        };
+        let mode = self.accelerator_mode(state);
         // A grabbed accelerator's release follows its press: swallowed.
         // The original physical key is always cleared, even after a
         // rebind or lock; modifiers are not re-resolved (they may be
@@ -4485,9 +4495,6 @@ impl WindowManager {
         // A window with approved shortcut inhibition receives the shell's
         // grabbed accelerators too. Lock input always remains compositor-owned.
         let inhibited = !self.lock_input_active && state.shortcuts_inhibited();
-        // A held grab's duplicate key-down keeps its original identity:
-        // it is consumed, activates again only without
-        // GRAB_IGNORE_AUTOREPEAT, and never creates a second release.
         let held = self
             .accel_held
             .iter()
@@ -4499,14 +4506,7 @@ impl WindowManager {
                 keycode.saturating_add(XKB_X11_OFFSET).into(),
                 KeyState::Pressed,
             );
-            if grab.0.flags & tuna_shell_control::GRAB_IGNORE_AUTOREPEAT == 0
-                && held_mode == mode
-                && !inhibited
-                && self.grab_admitted(&grab)
-            {
-                self.accel_fired
-                    .push((grab.0.accelerator.action, time, mode));
-            }
+            self.repeat_held_accelerator(state, grab, held_mode, time);
             return true;
         }
         let grabs: Vec<(tuna_shell_control::AcceleratorGrab, u64)> = if pressed && !inhibited {
@@ -4578,6 +4578,104 @@ impl WindowManager {
             self.accel_fired.push((action, time, mode));
         }
         true
+    }
+
+    /// The accelerator mode keys are matched in.
+    fn accelerator_mode(&self, state: &State) -> u32 {
+        if self.lock_input_active {
+            tuna_shell_control::MODE_LOCK_SCREEN
+        } else if crate::layer::exclusive_popup_keyboard_layer(state).is_some() {
+            tuna_shell_control::MODE_POPUP
+        } else if self.overview_open {
+            tuna_shell_control::MODE_OVERVIEW
+        } else {
+            tuna_shell_control::MODE_NORMAL
+        }
+    }
+
+    /// A held grab's repeat or duplicate key-down keeps its press's
+    /// identity, as Mutter's keybindings treat CLUTTER_EVENT_FLAG_REPEATED:
+    /// it is consumed, activates again only without
+    /// GRAB_IGNORE_AUTOREPEAT and in the press's mode, and never creates a
+    /// second release.
+    fn repeat_held_accelerator(
+        &mut self,
+        state: &State,
+        grab: (tuna_shell_control::AcceleratorGrab, u64),
+        held_mode: u32,
+        time: u32,
+    ) {
+        let mode = self.accelerator_mode(state);
+        // A window with approved shortcut inhibition receives the shell's
+        // grabbed accelerators too. Lock input always remains compositor-owned.
+        let inhibited = !self.lock_input_active && state.shortcuts_inhibited();
+        if grab.0.flags & tuna_shell_control::GRAB_IGNORE_AUTOREPEAT == 0
+            && held_mode == mode
+            && !inhibited
+            && self.grab_admitted(&grab)
+        {
+            self.accel_fired
+                .push((grab.0.accelerator.action, time, mode));
+        }
+    }
+
+    /// A physical key the compositor routes: a repeating key's press stops
+    /// the running repeat (it takes over if it reaches the seat, through
+    /// [`keyboard_key`](Self::keyboard_key)); the repeating key's release
+    /// ends it.
+    fn note_key_repeat(&mut self, state: &mut State, keycode: u32, pressed: bool) {
+        if !pressed {
+            self.key_repeat.release(keycode);
+        } else if let Some(keyboard) = self.keyboard.clone() {
+            if key_repeats(&keyboard, state, keycode) {
+                self.key_repeat.cancel();
+            }
+        }
+    }
+
+    /// When the compositor's next key repeat is due.
+    pub fn key_repeat_deadline(&self) -> Option<std::time::Instant> {
+        self.key_repeat.deadline()
+    }
+
+    /// Stop the running key repeat: a lock boundary, an idle shield or the
+    /// recovery overlay takes the keyboard.
+    pub fn cancel_key_repeat(&mut self) {
+        self.key_repeat.cancel();
+    }
+
+    /// Deliver the key repeat due at `now` (Mutter's keyboard_repeat). A
+    /// held grabbed accelerator hears it as an autorepeat; any other key's
+    /// repeat goes to the focused version 10 keyboards as
+    /// `key(state = repeated)` with a fresh serial. IM-grab keys only
+    /// repeat to the application after their original press was returned
+    /// unhandled; the grab itself never hears Repeated.
+    pub fn run_key_repeat(&mut self, state: &mut State, now: std::time::Instant, lock: bool) {
+        let Some((keycode, time)) = self.key_repeat.take_due(now) else {
+            return;
+        };
+        let Some(keyboard) = self.keyboard.clone() else {
+            return;
+        };
+        if keyboard.repeat_epoch() != self.key_repeat_epoch
+            || keyboard.current_focus().is_none_or(|focus| !focus.alive())
+        {
+            self.cancel_key_repeat();
+            return;
+        }
+        if let Some(held) = self.accel_held.iter().find(|held| held.keycode == keycode) {
+            // Consumed with its press, Escape's strip cancel included.
+            if let Some(grab) = held.grab {
+                let held_mode = held.mode;
+                self.lock_input_active = lock;
+                self.repeat_held_accelerator(state, grab, held_mode, time);
+                self.lock_input_active = false;
+            }
+            return;
+        }
+        let code = keycode.saturating_add(XKB_X11_OFFSET).into();
+        let serial = SERIAL_COUNTER.next_serial();
+        keyboard.input_repeat(state, code, serial, time);
     }
 
     /// Whether this exact grab (same flags, same admission generation)
@@ -6506,6 +6604,8 @@ impl WindowManager {
             if !*pressed {
                 self.accel_held.retain(|held| held.keycode != *keycode);
             }
+            // A consumed key's repeats are consumed too.
+            self.note_key_repeat(state, *keycode, *pressed);
             keyboard.input_discard(
                 state,
                 keycode.saturating_add(XKB_X11_OFFSET).into(),
@@ -7037,6 +7137,8 @@ impl WindowManager {
     }
 
     /// Repeat preferences can change without replacing the active keymap.
+    /// Keyboards before version 10 are told them; the compositor repeats
+    /// keys itself for version 10 keyboards, as Mutter 51 does.
     pub fn apply_keyboard_repeat(&mut self, settings: &tuna_shell_control::InputSettings) {
         let Some(keyboard) = self.keyboard.clone() else {
             return;
@@ -7046,8 +7148,14 @@ impl WindowManager {
         } else {
             0
         };
-        keyboard.change_repeat_info(rate, settings.repeat_delay_ms as i32);
-        self.repeat = (rate, settings.repeat_delay_ms as i32);
+        let delay = settings.repeat_delay_ms.min(i32::MAX as u32) as i32;
+        keyboard.change_repeat_info(rate, delay);
+        self.repeat = (rate, delay);
+        self.key_repeat.configure(
+            settings.repeat,
+            settings.repeat_delay_ms,
+            settings.repeat_interval_ms,
+        );
     }
 
     /// Lock or unlock Num Lock, telling the focused client (mutter's
@@ -7129,6 +7237,7 @@ impl WindowManager {
                 pressed,
                 time,
             } => {
+                self.note_key_repeat(state, keycode, pressed);
                 self.track_workspace_modifiers(keycode, pressed);
                 self.track_switcher_modifiers(keycode, pressed);
                 // Exclusive shell overlays own their navigation chords. Normal
@@ -8646,6 +8755,15 @@ pub(crate) fn committed_size(
             .geometry
     });
     Some(geometry.map(|g| g.size).unwrap_or(buffer))
+}
+
+/// Whether the keymap repeats the evdev `keycode`
+/// (`xkb_keymap_key_repeats`, as Mutter's seat impl asks).
+fn key_repeats(keyboard: &KeyboardHandle<State>, state: &mut State, keycode: u32) -> bool {
+    let code = keycode.saturating_add(XKB_X11_OFFSET).into();
+    keyboard.with_xkb_state(state, |context| {
+        context.xkb().lock().is_ok_and(|xkb| xkb.key_repeats(code))
+    })
 }
 
 /// The control schema's modifier bits for xkb's current modifiers.

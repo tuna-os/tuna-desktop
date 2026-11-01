@@ -20,7 +20,9 @@ pub use xkbcommon::xkb::{self, keysyms, Keycode, Keysym};
 use super::{GrabStatus, Seat, SeatHandler};
 
 #[cfg(feature = "wayland_frontend")]
-use wayland_server::{Resource, Weak};
+use wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2;
+#[cfg(feature = "wayland_frontend")]
+use wayland_server::Weak;
 #[cfg(feature = "wayland_frontend")]
 mod keymap_file;
 #[cfg(feature = "wayland_frontend")]
@@ -51,6 +53,12 @@ where
         serial: Serial,
         time: u32,
     );
+    /// The compositor repeated the held `key` (wl_keyboard version 10's
+    /// `repeated` key state). A repeat changes neither the XKB state nor
+    /// the pressed keys. The default ignores it.
+    fn repeat(&self, seat: &Seat<D>, data: &mut D, key: KeysymHandle<'_>, serial: Serial, time: u32) {
+        let _ = (seat, data, key, serial, time);
+    }
     /// Hold modifiers were changed on a keyboard from a given seat
     fn modifiers(&self, seat: &Seat<D>, data: &mut D, modifiers: ModifiersState, serial: Serial);
     /// Keyboard focus of a given seat moved from another handler to this handler
@@ -187,6 +195,11 @@ impl Xkb {
     pub fn raw_syms_for_key_in_layout(&self, keycode: Keycode, layout: Layout) -> &[Keysym] {
         self.keymap.key_get_syms_by_level(keycode, layout.0, 0)
     }
+
+    /// Whether the keymap lets `keycode` repeat (`xkb_keymap_key_repeats`).
+    pub fn key_repeats(&self, keycode: Keycode) -> bool {
+        self.keymap.key_repeats(keycode)
+    }
 }
 
 impl fmt::Debug for Xkb {
@@ -210,6 +223,8 @@ pub(crate) struct KbdInternal<D: SeatHandler> {
     pub(crate) forwarded_pressed_keys: HashSet<Keycode>,
     pub(crate) mods_state: ModifiersState,
     pending_modifiers: bool,
+    repeat_epoch: u64,
+    app_repeat_key: Option<Keycode>,
     xkb: Arc<Mutex<Xkb>>,
     pub(crate) repeat_rate: i32,
     pub(crate) repeat_delay: i32,
@@ -258,6 +273,8 @@ impl<D: SeatHandler + 'static> KbdInternal<D> {
             forwarded_pressed_keys: HashSet::new(),
             mods_state: ModifiersState::default(),
             pending_modifiers: false,
+            repeat_epoch: 0,
+            app_repeat_key: None,
             xkb: Arc::new(Mutex::new(Xkb {
                 context,
                 keymap,
@@ -271,6 +288,11 @@ impl<D: SeatHandler + 'static> KbdInternal<D> {
         })
     }
 
+    fn retire_repeat(&mut self) {
+        self.repeat_epoch = self.repeat_epoch.wrapping_add(1);
+        self.app_repeat_key = None;
+    }
+
     // returns whether the modifiers or led state has changed
     fn key_input(&mut self, keycode: Keycode, state: KeyState) -> (bool, bool) {
         // track pressed keys as xkbcommon does not seem to expose it :(
@@ -281,6 +303,9 @@ impl<D: SeatHandler + 'static> KbdInternal<D> {
             }
             KeyState::Released => {
                 self.pressed_keys.remove(&keycode);
+                if self.app_repeat_key == Some(keycode) {
+                    self.app_repeat_key = None;
+                }
                 xkb::KeyDirection::Up
             }
         };
@@ -358,6 +383,9 @@ pub(crate) struct KbdRc<D: SeatHandler> {
     pub(crate) keymap: Mutex<KeymapFile>,
     #[cfg(feature = "wayland_frontend")]
     pub(crate) known_kbds: Mutex<Vec<Weak<wayland_server::protocol::wl_keyboard::WlKeyboard>>>,
+    /// Live input-method repeat/keymap updates, independently of wl_keyboard version.
+    #[cfg(feature = "wayland_frontend")]
+    pub(crate) known_im_grab: Mutex<Option<Weak<ZwpInputMethodKeyboardGrabV2>>>,
     #[cfg(feature = "wayland_frontend")]
     pub(crate) last_enter: Mutex<Option<Serial>>,
     pub(crate) span: tracing::Span,
@@ -379,6 +407,7 @@ impl<D: SeatHandler> fmt::Debug for KbdRc<D> {
             .field("internal", &self.internal)
             .field("keymap", &self.keymap)
             .field("known_kbds", &self.known_kbds)
+            .field("known_im_grab", &self.known_im_grab)
             .field("last_enter", &self.last_enter)
             .finish()
     }
@@ -643,6 +672,22 @@ pub trait KeyboardGrab<D: SeatHandler>: Downcast {
         time: u32,
     );
 
+    /// A compositor-generated repeat of a held key
+    /// ([`KeyboardHandle::input_repeat`]). `modifiers` are only passed
+    /// when they changed since the last forwarded event; they must be sent
+    /// before the repeat. The default delivers both to the current focus.
+    fn repeat(
+        &mut self,
+        data: &mut D,
+        handle: &mut KeyboardInnerHandle<'_, D>,
+        keycode: Keycode,
+        modifiers: Option<ModifiersState>,
+        serial: Serial,
+        time: u32,
+    ) {
+        handle.repeat(data, keycode, modifiers, serial, time)
+    }
+
     /// A focus change was requested.
     fn set_focus(
         &mut self,
@@ -729,6 +774,8 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
                 #[cfg(feature = "wayland_frontend")]
                 known_kbds: Mutex::new(Vec::new()),
                 #[cfg(feature = "wayland_frontend")]
+                known_im_grab: Mutex::new(None),
+                #[cfg(feature = "wayland_frontend")]
                 last_enter: Mutex::new(None),
                 #[cfg(feature = "wayland_frontend")]
                 active_keymap: RwLock::new(active_keymap),
@@ -792,6 +839,21 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
                 );
             }
         }
+        let grab = self.arc.known_im_grab.lock().unwrap().as_ref()
+            .and_then(|grab| grab.upgrade().ok());
+        if let Some(grab) = grab {
+            if let Err(error) = keymap_file.with_fd(false, |fd, size| {
+                grab.keymap(KeymapFormat::XkbV1, fd.as_fd(), size as u32);
+            }) {
+                warn!(err = ?error, "Failed to send keymap to input method");
+            }
+            let serialized = mods.serialized;
+            grab.modifiers(
+                SERIAL_COUNTER.next_serial().into(),
+                serialized.depressed, serialized.latched, serialized.locked,
+                serialized.layout_effective,
+            );
+        }
 
         // Send updated modifiers.
         let seat = self.get_seat(data);
@@ -808,6 +870,7 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
 
     fn update_xkb_state_inner(&self, data: &mut D, keymap: xkb::Keymap, keep_locks: bool) {
         let mut internal = self.arc.internal.lock().unwrap();
+        internal.retire_repeat();
 
         let mut state = xkb::State::new(&keymap);
         for key in &internal.pressed_keys {
@@ -952,6 +1015,7 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
     /// Overwrites any current grab.
     pub fn set_grab<G: KeyboardGrab<D> + 'static>(&self, data: &mut D, grab: G, serial: Serial) {
         let mut inner = self.arc.internal.lock().unwrap();
+        inner.retire_repeat();
         if let GrabStatus::Active(_, handler) = &mut inner.grab {
             handler.unset(data);
         }
@@ -961,6 +1025,7 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
     /// Remove any current grab on this keyboard, resetting it to the default behavior
     pub fn unset_grab(&self, data: &mut D) {
         let mut inner = self.arc.internal.lock().unwrap();
+        inner.retire_repeat();
         if let GrabStatus::Active(_, handler) = &mut inner.grab {
             handler.unset(data);
         }
@@ -1108,14 +1173,6 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
         mods_changed: bool,
     ) {
         let mut guard = self.arc.internal.lock().unwrap();
-        match state {
-            KeyState::Pressed => {
-                guard.forwarded_pressed_keys.insert(keycode);
-            }
-            KeyState::Released => {
-                guard.forwarded_pressed_keys.remove(&keycode);
-            }
-        };
 
         // forward to client if no keybinding is triggered
         let seat = self.get_seat(data);
@@ -1129,6 +1186,52 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
         } else {
             trace!("No client currently focused");
         }
+    }
+
+    /// Forward an already processed physical key directly to the focus.
+    ///
+    /// Used by a trusted input method returning an unhandled original edge.
+    /// This neither mutates XKB nor temporarily removes its keyboard grab.
+    /// Only a still-held physical key can acquire compositor repeat ownership.
+    pub fn input_forward_to_focus(
+        &self,
+        data: &mut D,
+        keycode: Keycode,
+        state: KeyState,
+        serial: Serial,
+        time: u32,
+    ) {
+        let mut guard = self.arc.internal.lock().unwrap();
+        let seat = self.get_seat(data);
+        let modifiers = guard.pending_modifiers.then_some(guard.mods_state);
+        guard.pending_modifiers = false;
+        let mut handle = KeyboardInnerHandle { inner: &mut guard, seat: &seat };
+        handle.input(data, keycode, state, modifiers, serial, time);
+    }
+
+    /// Identity of the focus/keymap/grab/repeat-settings lifetime.
+    pub fn repeat_epoch(&self) -> u64 {
+        self.arc.internal.lock().unwrap().repeat_epoch
+    }
+
+    /// Deliver a compositor-generated repeat of the held `keycode`
+    /// through the current grab to the focus, as Mutter's native seat
+    /// repeats keys for wl_keyboard version 10. Neither the XKB state nor
+    /// the pressed keys change; older keyboards repeat by themselves and
+    /// receive nothing.
+    pub fn input_repeat(&self, data: &mut D, keycode: Keycode, serial: Serial, time: u32) {
+        let mut guard = self.arc.internal.lock().unwrap();
+        if guard.repeat_rate <= 0 || !guard.pressed_keys.contains(&keycode)
+            || !guard.xkb.lock().unwrap().keymap.key_repeats(keycode)
+        {
+            return;
+        }
+        let seat = self.get_seat(data);
+        let modifiers = guard.pending_modifiers.then_some(guard.mods_state);
+        guard.pending_modifiers = false;
+        guard.with_grab(data, &seat, |data, handle, grab| {
+            grab.repeat(data, handle, keycode, modifiers, serial, time);
+        });
     }
 
     /// Set the current focus of this keyboard
@@ -1229,9 +1332,16 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
     }
 
     /// Change the repeat info configured for this keyboard
+    ///
+    /// Keyboards before version 10 are told `rate` and `delay`; version 10
+    /// keyboards are told `(0, 0)`, the compositor repeating keys for them
+    /// through [`KeyboardHandle::input_repeat`].
     #[instrument(parent = &self.arc.span, skip(self))]
     pub fn change_repeat_info(&self, rate: i32, delay: i32) {
         let mut guard = self.arc.internal.lock().unwrap();
+        if guard.repeat_rate != rate || guard.repeat_delay != delay {
+            guard.retire_repeat();
+        }
         guard.repeat_delay = delay;
         guard.repeat_rate = rate;
         #[cfg(feature = "wayland_frontend")]
@@ -1239,8 +1349,14 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
             let Ok(kbd) = kbd.upgrade() else {
                 continue;
             };
-            if kbd.version() >= 4 {
-                kbd.repeat_info(rate, delay);
+            crate::wayland::seat::keyboard::send_repeat_info(&kbd, rate, delay);
+        }
+        #[cfg(feature = "wayland_frontend")]
+        {
+            let grab = self.arc.known_im_grab.lock().unwrap().as_ref()
+                .and_then(|grab| grab.upgrade().ok());
+            if let Some(grab) = grab {
+                grab.repeat_info(rate, delay);
             }
         }
     }
@@ -1297,6 +1413,37 @@ impl<D: SeatHandler> fmt::Debug for KeyboardInnerHandle<'_, D> {
     }
 }
 
+impl<D: SeatHandler> KeyboardInnerHandle<'_, D> {
+    /// Send a compositor-generated repeat to the focused keyboards, after
+    /// any changed `modifiers`.
+    pub fn repeat(
+        &mut self,
+        data: &mut D,
+        keycode: Keycode,
+        modifiers: Option<ModifiersState>,
+        serial: Serial,
+        time: u32,
+    ) {
+        if self.inner.app_repeat_key != Some(keycode) {
+            return;
+        }
+        let Some((focus, _)) = self.inner.focus.as_ref() else {
+            return;
+        };
+        if !focus.alive() {
+            return;
+        }
+        if let Some(mods) = modifiers {
+            focus.modifiers(self.seat, data, mods, serial);
+        }
+        let key = KeysymHandle {
+            xkb: &self.inner.xkb,
+            keycode,
+        };
+        focus.repeat(self.seat, data, key, serial, time);
+    }
+}
+
 impl<D: SeatHandler + 'static> KeyboardInnerHandle<'_, D> {
     /// Change the current grab on this keyboard to the provided grab
     ///
@@ -1309,6 +1456,7 @@ impl<D: SeatHandler + 'static> KeyboardInnerHandle<'_, D> {
         grab: G,
     ) {
         handler.unset(data);
+        self.inner.retire_repeat();
         self.inner.grab = GrabStatus::Active(serial, Box::new(grab));
     }
 
@@ -1324,6 +1472,7 @@ impl<D: SeatHandler + 'static> KeyboardInnerHandle<'_, D> {
         restore_focus: bool,
     ) {
         handler.unset(data);
+        self.inner.retire_repeat();
         self.inner.grab = GrabStatus::None;
         // restore the focus
         if restore_focus {
@@ -1364,6 +1513,24 @@ impl<D: SeatHandler + 'static> KeyboardInnerHandle<'_, D> {
             Some(focus) => focus,
             None => return,
         };
+        if !focus.alive() {
+            return;
+        }
+        match key_state {
+            KeyState::Pressed if self.inner.pressed_keys.contains(&keycode)
+                && self.inner.xkb.lock().unwrap().keymap.key_repeats(keycode) =>
+            {
+                self.inner.app_repeat_key = Some(keycode);
+            }
+            KeyState::Released if self.inner.app_repeat_key == Some(keycode) => {
+                self.inner.app_repeat_key = None;
+            }
+            _ => {}
+        }
+        match key_state {
+            KeyState::Pressed => { self.inner.forwarded_pressed_keys.insert(keycode); }
+            KeyState::Released => { self.inner.forwarded_pressed_keys.remove(&keycode); }
+        }
 
         // Ensure keymap is up to date.
         #[cfg(feature = "wayland_frontend")]
@@ -1413,6 +1580,9 @@ impl<D: SeatHandler + 'static> KeyboardInnerHandle<'_, D> {
         focus: Option<<D as SeatHandler>::KeyboardFocus>,
         serial: Serial,
     ) {
+        if self.inner.focus.as_ref().map(|(target, _)| target) != focus.as_ref() {
+            self.inner.retire_repeat();
+        }
         if let Some(focus) = focus {
             let old_focus = self.inner.focus.replace((focus.clone(), serial));
             match (focus, old_focus) {

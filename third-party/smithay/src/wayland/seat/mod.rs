@@ -94,6 +94,12 @@ use wayland_server::{
 
 use super::compositor::CompositorHandler;
 
+/// The wl_seat version this implementation advertises. Version 10 adds
+/// wl_keyboard's `repeated` key state: the compositor repeats keys for
+/// those keyboards ([`KeyboardHandle::input_repeat`](crate::input::keyboard::KeyboardHandle::input_repeat))
+/// and tells them `repeat_info(0, 0)`.
+pub const WL_SEAT_VERSION: u32 = 10;
+
 /// Focused objects that *might* have an underlying wl_surface.
 pub trait WaylandFocus {
     /// Returns the underlying wl_surface, if any.
@@ -173,7 +179,10 @@ impl<D: SeatHandler + 'static> SeatState<D> {
     {
         let Seat { arc } = self.new_seat(name);
 
-        let global_id = display.create_global::<D, _, _>(9, SeatGlobalData { arc: arc.clone() });
+        let global_id = display.create_global::<D, _, _>(
+            WL_SEAT_VERSION,
+            SeatGlobalData { arc: arc.clone() },
+        );
         arc.inner.lock().unwrap().global = Some(global_id);
 
         Seat { arc }
