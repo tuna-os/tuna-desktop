@@ -49,9 +49,10 @@ person to look at the frame. Record that review next to the run.
 
 ## Running it
 
-You need `corral` with its bootc plugin (`corral doctor` must pass for
-the KubeVirt context) and Playwright for Python. The script does not use
-`kubectl` or `virtctl`:
+You need a qualified `corral` release with canonical-ID wait support and its
+bootc plugin, the selected KubeVirt context, `kubectl`, and Playwright for
+Python. `kubectl` reads only projected identity metadata and performs exact
+UID-preconditioned cleanup; it does not read Secret payloads or dump configuration:
 
 ```sh
 python3 -m venv ~/.cache/tuna-journey-venv
@@ -59,15 +60,29 @@ python3 -m venv ~/.cache/tuna-journey-venv
 ~/.cache/tuna-journey-venv/bin/python -m playwright install chromium
 ~/.cache/tuna-journey-venv/bin/python scripts/tuna-corral-journey \
   --image ghcr.io/tuna-os/marlin@sha256:<index digest> \
-  --node <node> --out docs/marlin/<date>-corral-journey
+  --node karnataka --vm tuna-q-variant-<unique-run> --out docs/marlin/<date>-corral-journey
 ```
 
 Pass the image by digest; resolve the tag first with
-`skopeo inspect docker://ghcr.io/tuna-os/marlin:tuna`. VM names must
-start with `tuna-q-` (the default is `tuna-q-<date>`), so the script
-cannot name somebody else's VM. `--reuse` restarts a VM that is already
-built from the same digest. The exit status is nonzero when any step
-fails.
+`skopeo inspect docker://ghcr.io/tuna-os/marlin:tuna`. VM names must start with
+`tuna-q-variant-` (default `tuna-q-variant-YYYYMMDD`) and fit the builder-label
+length bound. An explicit node is required. The selected Corral alias and actual
+Kubernetes context are retained before create. Existing exact resources cause
+create to fail closed.
+
+After create, every VM operation uses its unmodified canonical ID from actual
+Corral inventory, with backend/context/namespace/name, node and expected VM UID
+retained in `identity.json`. The UID is rechecked at lifecycle boundaries.
+No bare-name fallback or synthesized canonical ID is used. Cleanup deletes
+only this run's proven-created resources through exact Kubernetes API paths
+with UID preconditions, never Corral's broad derived-name/label purge. Raw DELETE
+responses are projected to safe identity/status fields before retention so
+Secret payloads and last-applied annotations cannot enter receipts.
+
+Use `--reuse --keep` to inspect a VM already built from the same digest:
+adopting an identity does not authorize deletion of resources created by a
+previous run. The exit status is nonzero when any step fails; successful code
+checks or a readiness probe alone are not image qualification.
 
 For the all-variant install/GDM/session/portal/lock/unlock/logout
 subset, use `--qualification-only`; it omits the wider app/Settings/notification

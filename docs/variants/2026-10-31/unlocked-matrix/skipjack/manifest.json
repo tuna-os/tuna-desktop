@@ -1,0 +1,872 @@
+{
+  "schema": 2,
+  "started": "2026-10-31T22:48:47+00:00",
+  "runner": "scripts/tuna-corral-journey",
+  "runner_sha256": "97721d7a15781fb2f46ebd3f034715de616a9371bb1ed40f0747da628ab7c1a9",
+  "scope": "qualification-core",
+  "corral": "corral v0.7.0+36.g76b6dd5 (commit 76b6dd52d35d, built 2026-10-30T08:31:57Z, go1.27.0)",
+  "image": {
+    "ref": "ghcr.io/tuna-os/skipjack@sha256:36889e650e35893e4d3779deba2ddce7ce375f65a36271f86b77ca90d0c8e924",
+    "booted": "ghcr.io/tuna-os/skipjack@sha256:36889e650e35893e4d3779deba2ddce7ce375f65a36271f86b77ca90d0c8e924",
+    "booted_manifest_digest": "sha256:ea59d89c7621139d53a287146c1141545b969f195cad59d099c159810e47527c"
+  },
+  "vm": {
+    "name": "tuna-q-variant-skipjack-31215908",
+    "namespace": "corral-vms",
+    "backend": "kubevirt",
+    "requested": {
+      "cpu": 4,
+      "mem": "6G",
+      "disk": "40Gi",
+      "node": "karnataka"
+    },
+    "node": "karnataka",
+    "cpu": {
+      "vcpus": 4,
+      "sockets": 4,
+      "cores": 1,
+      "threads": 1,
+      "model": "host-passthrough",
+      "dedicatedCpuPlacement": false,
+      "isolateEmulatorThread": false
+    },
+    "memory": "6Gi",
+    "firmware": {
+      "type": "uefi",
+      "secureBoot": false,
+      "machine": "q35"
+    },
+    "inputs": [
+      {
+        "name": "tablet",
+        "type": "tablet",
+        "bus": "usb"
+      }
+    ],
+    "disks": [
+      {
+        "name": "rootdisk",
+        "type": "disk",
+        "bus": "virtio",
+        "source": "persistentVolumeClaim",
+        "claim": "tuna-q-variant-skipjack-31215908-bootc-disk",
+        "size": "40Gi"
+      }
+    ],
+    "tagValues": {
+      "purpose": "tuna-corral-journey"
+    },
+    "image": "ghcr.io/tuna-os/skipjack@sha256:36889e650e35893e4d3779deba2ddce7ce375f65a36271f86b77ca90d0c8e924"
+  },
+  "console": "corral console page (noVNC), Playwright Chromium, 1:1; frames are the canvas pixels",
+  "steps": [
+    {
+      "id": "greeter-user-list",
+      "title": "GDM shows the user list",
+      "started": "2026-10-31T23:00:55+00:00",
+      "checks": [
+        {
+          "name": "console size",
+          "ok": true,
+          "observed": [
+            1280,
+            800
+          ]
+        },
+        {
+          "name": "GDM greeter session on seat0",
+          "ok": true,
+          "observed": "c1"
+        },
+        {
+          "name": "no user session yet",
+          "ok": true,
+          "observed": null
+        }
+      ],
+      "result": "pass",
+      "frame": "01-greeter-user-list.png",
+      "frame_sha256": "6cf4da94393e823a3aa43efc37ae07fdd2ee2ddad60f7baec7ce23ebb56e9850",
+      "crosscheck": {
+        "identical": true,
+        "corral_png_sha256": "7848655da5a7ca5ea7b60a5a09545b0bde57ef81c364b9b9e087a089edfe1f7f"
+      },
+      "journal": [],
+      "finished": "2026-10-31T23:02:07+00:00"
+    },
+    {
+      "id": "greeter-password",
+      "title": "Select the user; GDM asks for the password",
+      "started": "2026-10-31T23:02:07+00:00",
+      "checks": [
+        {
+          "name": "password prompt requested",
+          "ok": true,
+          "observed": "Enter changed nothing; clicked the user row instead"
+        }
+      ],
+      "result": "pass",
+      "frame": "02-greeter-password.png",
+      "frame_sha256": "a6bcf446c0efb141e9ec62745bf713a1d4b60ebeedf2e212cb75538b029ff061",
+      "journal": [],
+      "finished": "2026-10-31T23:02:35+00:00"
+    },
+    {
+      "id": "session-is-tuna",
+      "title": "Password login starts Tuna Desktop (lands in the overview)",
+      "started": "2026-10-31T23:02:35+00:00",
+      "checks": [
+        {
+          "name": "logind session via gdm-password",
+          "ok": true,
+          "observed": {
+            "Service": "gdm-password",
+            "Desktop": "",
+            "Type": "wayland",
+            "Class": "user",
+            "State": "active",
+            "LockedHint": "no"
+          }
+        },
+        {
+          "name": "Tuna compositor and shell run",
+          "ok": true,
+          "observed": [
+            "tuna-compositor",
+            "tuna-ibus-bridg",
+            "tuna-shell-gtk"
+          ]
+        },
+        {
+          "name": "no gnome-shell for the user",
+          "ok": true,
+          "observed": false
+        },
+        {
+          "name": "session desktop is tuna",
+          "ok": true,
+          "observed": [
+            "XDG_CURRENT_DESKTOP=Tuna:GNOME",
+            "XDG_SESSION_DESKTOP=tuna",
+            "XDG_SESSION_TYPE=wayland"
+          ]
+        }
+      ],
+      "result": "pass",
+      "frame": "03-session-is-tuna.png",
+      "frame_sha256": "030a032a56f22dd148aa9f7eed6318fb31edd902cecd0af8c5a979412270de57",
+      "crosscheck": {
+        "identical": true,
+        "corral_png_sha256": "4bbe8246a13cf9602dfa260c19f0a215c869168ffafa230a92fc1b8dfa49ec9b"
+      },
+      "journal": [
+        "tuna-compositor: serving org.gnome.Mutter.IdleMonitor",
+        "tuna-compositor: serving org.gnome.Mutter.ServiceChannel",
+        "tuna-compositor: serving org.gnome.SettingsDaemon.Color",
+        "tuna-compositor: serving org.gnome.SessionManager (inhibitors, session activity)",
+        "tuna-compositor: session services: display environment imported (systemd=true bus=true)",
+        "tuna-compositor: session services: holding the session leader FIFO",
+        "tuna-compositor: ime: IBus bridge started",
+        "tuna-ibus-bridge: input context /org/freedesktop/IBus/InputContext_2",
+        "tuna-ibus-bridge: ready",
+        "tuna-shell-gtk: OpenGL is llvmpipe (LLVM 22.1.8, 256 bits); drawing with cairo",
+        "tuna-compositor: switcher keys: 12 chords, cycle-group Some(SwitcherKey { keysym: 65475, mods: 8, kind: CycleGroup }), cycle-windows Some(SwitcherKey { keysym: 65307, mods: 8, kind: CycleWindows })",
+        "tuna-shell-gtk: keybindings: 69 grabs, maximize on [\"<Super>Up\"]",
+        "tuna-compositor: session services: graphical target active",
+        "tuna-compositor: overview focus parked",
+        "tuna-shell-gtk: search providers: org.gnome.Settings.desktop, org.gnome.Nautilus.desktop",
+        "tuna-compositor: session services: portals refreshed",
+        "tuna-compositor: wallpaper decoded for 1280x800 in 57 ms",
+        "tuna-shell-gtk: media keys: gsd-media-keys owns the media-keys bindings",
+        "tuna-shell-gtk: keybindings: 69 grabs, maximize on [\"<Super>Up\"]",
+        "tuna-shell-gtk: IBus panel: owns org.freedesktop.IBus.Panel on the IBus bus",
+        "tuna-shell-gtk: polkit agent registered",
+        "tuna-compositor: switcher keys:",
+        "tuna-ibus-bridge: text field focused",
+        "tuna-shell-gtk: network agent registered",
+        "tuna-compositor: libinput: scroll-wheel emulation button rejected for QEMU QEMU USB Tablet: Unsupported"
+      ],
+      "finished": "2026-10-31T23:03:45+00:00"
+    },
+    {
+      "id": "portal-availability",
+      "title": "Published portal interfaces respond (not capture consent)",
+      "started": "2026-10-31T23:03:45+00:00",
+      "checks": [
+        {
+          "name": "settings portal responds",
+          "ok": true,
+          "observed": {
+            "exit": 0,
+            "stdout": "(<<uint32 0>>,)",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "screenshot portal responds",
+          "ok": true,
+          "observed": {
+            "exit": 0,
+            "stdout": "(<uint32 2>,)",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "screencast portal responds",
+          "ok": true,
+          "observed": {
+            "exit": 0,
+            "stdout": "(<uint32 7>,)",
+            "stderr": ""
+          }
+        }
+      ],
+      "result": "pass",
+      "frame": "04-portal-availability.png",
+      "frame_sha256": "cacffd80ced2254e434ff9d68dea7df0044f67260b5a7aee45503877a05a1579",
+      "journal": [],
+      "finished": "2026-10-31T23:05:00+00:00"
+    },
+    {
+      "id": "portal-screenshot",
+      "title": "Request Screenshot through the actual published frontend",
+      "started": "2026-10-31T23:05:00+00:00",
+      "checks": [
+        {
+          "name": "native requester launched",
+          "ok": true,
+          "observed": {
+            "exit": 0,
+            "pid": "5959",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "native consent and image proof exits successfully",
+          "ok": false,
+          "observed": [
+            "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"<string>\", line 68, in <module>\nRuntimeError: Screenshot grant failed: 2",
+            ""
+          ]
+        }
+      ],
+      "result": "fail",
+      "frame": "05-portal-screenshot.png",
+      "frame_sha256": "731b66f1781168ca9a0ff542694fc02f8cdcc10d02cf6ad18042b060cdcdfe94",
+      "journal": [
+        "tuna-ibus-bridge: text field left"
+      ],
+      "finished": "2026-10-31T23:07:56+00:00"
+    },
+    {
+      "id": "desktop",
+      "title": "Escape leaves the overview for the desktop",
+      "started": "2026-10-31T23:07:56+00:00",
+      "checks": [
+        {
+          "name": "overview closed",
+          "ok": true,
+          "observed": "Escape from the login overview (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "06-desktop.png",
+      "frame_sha256": "c89af11bb176e211ad3737867cb49d8e683fc37f3199b470b7b652e1c83e9f2a",
+      "journal": [
+        "tuna-compositor: overview focus restored"
+      ],
+      "finished": "2026-10-31T23:08:16+00:00"
+    },
+    {
+      "id": "portal-screencast",
+      "title": "Start frontend stream before lock (frame validated during lock)",
+      "started": "2026-10-31T23:08:22+00:00",
+      "checks": [
+        {
+          "name": "native ScreenCast requester launched",
+          "ok": true,
+          "observed": {
+            "exit": 0,
+            "pid": "6601",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "actual portal consent control activated",
+          "ok": true,
+          "observed": {
+            "method": "AT-SPI action on the visible GNOME portal consent control",
+            "helper_sha256": "1872c601c54e5167ec14a939b19205e1769c13ee152dff511bbf6c1f4e4868e3",
+            "exit": 0,
+            "stdout": "portal session before consent: {\"locked\": false}\nactual portal picker: Allow",
+            "stderr": "",
+            "accessible_tree": [
+              {
+                "role": "application",
+                "name": "xdg-desktop-portal-gtk",
+                "showing": false
+              },
+              {
+                "role": "alert",
+                "name": "Question",
+                "showing": true
+              },
+              {
+                "role": "filler",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "",
+                "showing": false
+              },
+              {
+                "role": "filler",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "filler",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "icon",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "filler",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "Allow Applications to Take Screenshots?",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "An application wants to be able to take screenshots at any time.",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "This permission can be changed at any time from the privacy settings.",
+                "showing": true
+              },
+              {
+                "role": "filler",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "filler",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "button",
+                "name": "Deny",
+                "showing": true
+              },
+              {
+                "role": "button",
+                "name": "Allow",
+                "showing": true
+              }
+            ]
+          }
+        },
+        {
+          "name": "native frame and caller isolation reached active grant",
+          "ok": false,
+          "observed": {
+            "requester_sha256": {
+              "tuna-portal-capture-client.py": "6a3e82bdbf988153feae702fb927f867ff435a56558aef392b382c5d94c15c3c",
+              "tuna-pipewire-dump.py": "a63c93d72b90be6b649909b034d3a241e79eea9daae3b1b64f9f05ba3db05b4f"
+            },
+            "frame_validated": false,
+            "session_state": [
+              {
+                "phase": "before-request",
+                "at": "2026-10-31T23:08:33+00:00",
+                "exit": 0,
+                "stdout": "(false,)",
+                "stderr": ""
+              }
+            ],
+            "frame": "portal-screencast-prompt.png",
+            "frame_sha256": "9a60183ee6d9a1311c5e75ca9d0c92de2f463d6c1ca63d64e8f94cdfcbc334d8",
+            "meaning": "console at Start; consent visibility requires visual review",
+            "input": {
+              "method": "AT-SPI action on the visible GNOME portal consent control",
+              "helper_sha256": "1872c601c54e5167ec14a939b19205e1769c13ee152dff511bbf6c1f4e4868e3",
+              "exit": 0,
+              "stdout": "portal session before consent: {\"locked\": false}\nactual portal picker: Allow",
+              "stderr": "",
+              "accessible_tree": [
+                {
+                  "role": "application",
+                  "name": "xdg-desktop-portal-gtk",
+                  "showing": false
+                },
+                {
+                  "role": "alert",
+                  "name": "Question",
+                  "showing": true
+                },
+                {
+                  "role": "filler",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "",
+                  "showing": false
+                },
+                {
+                  "role": "filler",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "filler",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "icon",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "filler",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "Allow Applications to Take Screenshots?",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "An application wants to be able to take screenshots at any time.",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "This permission can be changed at any time from the privacy settings.",
+                  "showing": true
+                },
+                {
+                  "role": "filler",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "filler",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "button",
+                  "name": "Deny",
+                  "showing": true
+                },
+                {
+                  "role": "button",
+                  "name": "Allow",
+                  "showing": true
+                }
+              ]
+            },
+            "log": [
+              "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"<frozen runpy>\", line 287, in run_path\n  File \"<frozen runpy>\", line 98, in _run_module_code\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/run/user/1000/tuna-variant-capture-123488920894554/tuna-portal-capture-client.py\", line 43, in <module>\n    code, result = request(\"Start\", \"(osa{sv})\", (session, \"\", options(\"start\")))\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/run/user/1000/tuna-variant-capture-123488920894554/tuna-portal-capture-client.py\", line 30, in request\n    if handle not in responses: raise RuntimeError(method + \" timed out\")\n                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nRuntimeError: Start timed out",
+              ""
+            ]
+          }
+        }
+      ],
+      "result": "fail",
+      "frame": "07-portal-screencast.png",
+      "frame_sha256": "6dcfb114caa76c7377e02e759d55ece5d0276528667afeed66dc4122c7ab1e40",
+      "journal": [
+        "tuna-compositor: window 1 unmapped",
+        "tuna-compositor: window 2 unmapped"
+      ],
+      "finished": "2026-10-31T23:10:12+00:00"
+    },
+    {
+      "id": "lock",
+      "title": "Super+L locks the screen",
+      "started": "2026-10-31T23:10:12+00:00",
+      "checks": [
+        {
+          "name": "ScreenSaver.GetActive is true",
+          "ok": true,
+          "observed": "(true,)"
+        },
+        {
+          "name": "logind LockedHint is yes",
+          "ok": false,
+          "observed": "no"
+        }
+      ],
+      "result": "fail",
+      "frame": "08-lock.png",
+      "frame_sha256": "794fac84ada9d93443f6fd8ceb71a7c2ef94b795cab5d78f7a2b0b2bfd75b860",
+      "crosscheck": {
+        "identical": true,
+        "corral_png_sha256": "6b4c62a6ed1ac357526742bde7e4eb84d99c712e7879f2dbec6898860340402b"
+      },
+      "journal": [
+        "tuna-compositor: cycle chord near-miss: sym=Some(65307) mods=0",
+        "tuna-compositor: display power save mode 3"
+      ],
+      "finished": "2026-10-31T23:10:48+00:00"
+    },
+    {
+      "id": "unlock-refused",
+      "title": "A wrong password is refused",
+      "started": "2026-10-31T23:10:48+00:00",
+      "checks": [
+        {
+          "name": "still locked after a wrong password",
+          "ok": true,
+          "observed": "(true,)"
+        }
+      ],
+      "result": "pass",
+      "frame": "09-unlock-refused.png",
+      "frame_sha256": "c200a4bfd841b22f88fe52b9ef62d2a6d48b22ee4746061f257c87cde08a8c8c",
+      "journal": [
+        "tuna-compositor: display power save mode 0",
+        "tuna-ibus-bridge: text field focused",
+        "tuna-ibus-bridge: text field left",
+        "tuna-ibus-bridge: text field focused"
+      ],
+      "finished": "2026-10-31T23:11:05+00:00"
+    },
+    {
+      "id": "unlock",
+      "title": "The right password unlocks",
+      "started": "2026-10-31T23:11:05+00:00",
+      "checks": [
+        {
+          "name": "ScreenSaver.GetActive is false",
+          "ok": true,
+          "observed": "(false,)"
+        }
+      ],
+      "result": "pass",
+      "frame": "10-unlock.png",
+      "frame_sha256": "3af5ad1ad8c3219b76211e153797da2308d65a3f394c3d6f7f65f0e58334881c",
+      "journal": [
+        "tuna-ibus-bridge: text field left"
+      ],
+      "finished": "2026-10-31T23:11:22+00:00"
+    },
+    {
+      "id": "power-menu",
+      "title": "Quick settings power menu",
+      "started": "2026-10-31T23:11:22+00:00",
+      "checks": [
+        {
+          "name": "power menu opened",
+          "ok": true,
+          "observed": "quick settings power button (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "11-power-menu.png",
+      "frame_sha256": "0d7533475e27eddaacf92830404b1264cf4e70630b1d9c49f6ec1630d6e6c54e",
+      "journal": [],
+      "finished": "2026-10-31T23:11:36+00:00"
+    },
+    {
+      "id": "logout-dialog",
+      "title": "Log Out asks for confirmation",
+      "started": "2026-10-31T23:11:36+00:00",
+      "checks": [
+        {
+          "name": "end-session dialog shown",
+          "ok": true,
+          "observed": "Log Out... (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "12-logout-dialog.png",
+      "frame_sha256": "520508f63e5b79a4c6d082b9ccf6adaa8d91c1890c7b4e19beeb9c58d4d86d3a",
+      "journal": [],
+      "finished": "2026-10-31T23:11:49+00:00"
+    },
+    {
+      "id": "logout",
+      "title": "Logging out returns to GDM",
+      "started": "2026-10-31T23:11:49+00:00",
+      "checks": [
+        {
+          "name": "user seat session ended",
+          "ok": true,
+          "observed": "no seat0 session for the user"
+        },
+        {
+          "name": "GDM greeter back on seat0",
+          "ok": true,
+          "observed": "c1"
+        }
+      ],
+      "result": "pass",
+      "frame": "13-logout.png",
+      "frame_sha256": "b7a4a6c48e5570754c784607e84bbef2176110cb52e0869f4f96bb7822ec37cd",
+      "journal": [
+        "tuna-compositor: shutdown after 1241 frames, 8 clients, 0 shell restarts"
+      ],
+      "finished": "2026-10-31T23:12:12+00:00"
+    }
+  ],
+  "ready": {
+    "vm": "tuna-q-variant-skipjack-31215908",
+    "ready": true,
+    "elapsed_seconds": 121.4,
+    "boot_id": "060332ca-8e23-4227-8653-9988e85f742d",
+    "conditions": [
+      {
+        "name": "running",
+        "ok": true,
+        "elapsed_seconds": 3.3,
+        "observed": "Running"
+      },
+      {
+        "name": "ssh",
+        "ok": true,
+        "elapsed_seconds": 16.8,
+        "observed": "boot 060332ca-8e23-4227-8653-9988e85f742d"
+      },
+      {
+        "name": "boot-complete",
+        "ok": true,
+        "elapsed_seconds": 120.8,
+        "observed": "running"
+      },
+      {
+        "name": "unit:gdm.service",
+        "ok": true,
+        "elapsed_seconds": 120.9,
+        "observed": "active"
+      },
+      {
+        "name": "exec:loginctl list-sessions --no-legend | awk '$6==\"greeter\" && $4==\"seat0\"' | grep -q .",
+        "ok": true,
+        "elapsed_seconds": 121.1,
+        "observed": "exit status 0"
+      },
+      {
+        "name": "paint",
+        "ok": true,
+        "elapsed_seconds": 121.4,
+        "observed": "painted 1280x800 (deviation 0.0548)"
+      }
+    ]
+  },
+  "guest": {
+    "packages": [
+      "tuna-desktop-1.0.0~beta.2-2.el10.x86_64",
+      "gdm-47.0-32.el10.x86_64",
+      "gnome-shell-49.5-18.el10.x86_64",
+      "gnome-control-center-47.7-21.el10.x86_64",
+      "nautilus-47.6-3.el10.x86_64"
+    ],
+    "tuna_payload_sha256": [
+      "bece8dd89f202d36414dd0183b350e8ce3d0fdae2326e8a52eadfab35c7a47fc  /usr/bin/tuna-session",
+      "addd99478870b9d0a73f2a4f4c79a5b71878952588a12fbb62f25a81bfd18fa6  /usr/bin/tuna-compositor",
+      "dcf1133a966ea089d3b1d727ccdf77952d146c55a22a43242a450042fb6ebd44  /usr/bin/tuna-shell-gtk",
+      "67aeabd23f9857f693e280a7010449ba41bb45f82dd897e1d5296f8b688c2640  /usr/bin/tuna-ibus-bridge"
+    ],
+    "kernel": "6.12.0-279.el10.x86_64",
+    "drm_driver": "bochs-drm",
+    "modes": [
+      "1280x800",
+      "1920x1440",
+      "2560x1080"
+    ],
+    "sessions_offered": [
+      "Name=Tuna Desktop"
+    ],
+    "gdm_custom_conf": [
+      "FallbackSession=tuna"
+    ],
+    "boot_id": "060332ca-8e23-4227-8653-9988e85f742d",
+    "account": "tuna-test:x:1000:1000::/var/home/tuna-test:/bin/bash"
+  },
+  "account": {
+    "user": "tuna-test",
+    "password": "public fixture password (packaging/marlin/vm-lane)",
+    "provisioned": "corral bootc create --user --password-stdin; image unchanged"
+  },
+  "console_endpoint": {
+    "vm": "tuna-q-variant-skipjack-31215908",
+    "namespace": "corral-vms",
+    "url": "http://127.0.0.1:42675/console/corral-vms/tuna-q-variant-skipjack-31215908",
+    "websocket": "ws://127.0.0.1:42675/api/vnc/corral-vms/tuna-q-variant-skipjack-31215908"
+  },
+  "portal_request_console": {
+    "session_state": [
+      {
+        "phase": "before-request",
+        "at": "2026-10-31T23:05:50+00:00",
+        "exit": 0,
+        "stdout": "(false,)",
+        "stderr": ""
+      },
+      {
+        "phase": "after-response",
+        "at": "2026-10-31T23:07:52+00:00",
+        "exit": 0,
+        "stdout": "(false,)",
+        "stderr": ""
+      }
+    ],
+    "frame": "portal-screenshot-prompt.png",
+    "sha256": "731b66f1781168ca9a0ff542694fc02f8cdcc10d02cf6ad18042b060cdcdfe94",
+    "meaning": "console after request; prompt visibility requires visual review",
+    "requester_exit": "1",
+    "log": [
+      "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"<string>\", line 68, in <module>\nRuntimeError: Screenshot grant failed: 2",
+      ""
+    ]
+  },
+  "portal_requester_sha256": "69de07c8d3dc1d2914fd96dfd82995dca6bdab0092001cde149982d08ba61dcb",
+  "portal_screenshot": {
+    "response": 2,
+    "results": {}
+  },
+  "portal_screencast": {
+    "requester_sha256": {
+      "tuna-portal-capture-client.py": "6a3e82bdbf988153feae702fb927f867ff435a56558aef392b382c5d94c15c3c",
+      "tuna-pipewire-dump.py": "a63c93d72b90be6b649909b034d3a241e79eea9daae3b1b64f9f05ba3db05b4f"
+    },
+    "frame_validated": false,
+    "session_state": [
+      {
+        "phase": "before-request",
+        "at": "2026-10-31T23:08:33+00:00",
+        "exit": 0,
+        "stdout": "(false,)",
+        "stderr": ""
+      }
+    ],
+    "frame": "portal-screencast-prompt.png",
+    "frame_sha256": "9a60183ee6d9a1311c5e75ca9d0c92de2f463d6c1ca63d64e8f94cdfcbc334d8",
+    "meaning": "console at Start; consent visibility requires visual review",
+    "input": {
+      "method": "AT-SPI action on the visible GNOME portal consent control",
+      "helper_sha256": "1872c601c54e5167ec14a939b19205e1769c13ee152dff511bbf6c1f4e4868e3",
+      "exit": 0,
+      "stdout": "portal session before consent: {\"locked\": false}\nactual portal picker: Allow",
+      "stderr": "",
+      "accessible_tree": [
+        {
+          "role": "application",
+          "name": "xdg-desktop-portal-gtk",
+          "showing": false
+        },
+        {
+          "role": "alert",
+          "name": "Question",
+          "showing": true
+        },
+        {
+          "role": "filler",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "",
+          "showing": false
+        },
+        {
+          "role": "filler",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "filler",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "icon",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "filler",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "Allow Applications to Take Screenshots?",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "An application wants to be able to take screenshots at any time.",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "This permission can be changed at any time from the privacy settings.",
+          "showing": true
+        },
+        {
+          "role": "filler",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "filler",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "button",
+          "name": "Deny",
+          "showing": true
+        },
+        {
+          "role": "button",
+          "name": "Allow",
+          "showing": true
+        }
+      ]
+    },
+    "log": [
+      "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"<frozen runpy>\", line 287, in run_path\n  File \"<frozen runpy>\", line 98, in _run_module_code\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/run/user/1000/tuna-variant-capture-123488920894554/tuna-portal-capture-client.py\", line 43, in <module>\n    code, result = request(\"Start\", \"(osa{sv})\", (session, \"\", options(\"start\")))\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/run/user/1000/tuna-variant-capture-123488920894554/tuna-portal-capture-client.py\", line 30, in request\n    if handle not in responses: raise RuntimeError(method + \" timed out\")\n                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nRuntimeError: Start timed out",
+      ""
+    ]
+  },
+  "cleanup": {
+    "deleted": true,
+    "result": [
+      {
+        "name": "tuna-q-variant-skipjack-31215908",
+        "deleted": true,
+        "removed": [
+          "virtualmachine.kubevirt.io/tuna-q-variant-skipjack-31215908",
+          "virtualmachineinstance.kubevirt.io/tuna-q-variant-skipjack-31215908",
+          "persistentvolumeclaim/tuna-q-variant-skipjack-31215908-bootc-disk"
+        ]
+      }
+    ],
+    "still_listed": [],
+    "failures": []
+  },
+  "finished": "2026-10-31T23:12:32+00:00"
+}

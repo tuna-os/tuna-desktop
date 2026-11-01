@@ -1,0 +1,267 @@
+{
+  "schema": 1,
+  "scope": "Dated exact-subject observations; never all-fourteen qualification. Raw failed manifests unchanged.",
+  "as_of": "2026-11-01T01:09:06.354312+00:00",
+  "counts": {
+    "failed-required": 1,
+    "owner-deferred": 1,
+    "unmeasured-required": 9,
+    "blocked-required": 3
+  },
+  "owner_deferral": "https://github.com/tuna-os/tuna-desktop/issues/577#issuecomment-6550264429",
+  "tool_prerequisite": "Canonical instance resolution and VMUID receipts in harness; independently owned CorralPR674 canonical wait fix + supported pinned tool provenance before next actual journeys.",
+  "variants": [
+    {
+      "variant": "yellowfin",
+      "required": true,
+      "qualified": false,
+      "status": "failed-required",
+      "image": "ghcr.io/tuna-os/yellowfin@sha256:64e7a29a9d832c0d021d3023ee825c07d37676d722dca59b31a2dfe492e5d0b0",
+      "manifest": "unlocked-matrix/yellowfin/manifest.json",
+      "raw_runtime": "failed",
+      "observed_gates": {
+        "install": "pass",
+        "gdm-login": "pass",
+        "session": "pass",
+        "portals": "functional-capture-and-lock-revoke-proved; visual-review-required",
+        "lock-unlock": "not-proven",
+        "visual-review": "not-run"
+      },
+      "blocker": "Actual functional Screenshot/ScreenCast and lock withdrawal in0.19s pass; explicit lock gate fails because logind LockedHint=no."
+    },
+    {
+      "variant": "albacore",
+      "required": false,
+      "qualified": false,
+      "status": "owner-deferred",
+      "image": "ghcr.io/tuna-os/albacore@sha256:b68a195dbc6e079bbab6b330086e6420d860f5364d1f2232e5f377bc6cdf2a13",
+      "manifest": "unlocked-matrix/albacore/manifest.json",
+      "raw_runtime": "failed",
+      "observed_gates": {
+        "install": "pass",
+        "gdm-login": "pass",
+        "session": "pass",
+        "portals": "functional-capture-proved; visual/lock-revoke-unproven",
+        "lock-unlock": "not-proven",
+        "visual-review": "not-run"
+      },
+      "blocker": "Owner-approved omission of albacore:tuna only while externally owned Mesa/GDM crash is repaired. Prior receipts retained; no reattempt after instruction."
+    },
+    {
+      "variant": "skipjack",
+      "required": true,
+      "qualified": false,
+      "status": "unmeasured-required",
+      "image": "ghcr.io/tuna-os/skipjack@sha256:36889e650e35893e4d3779deba2ddce7ce375f65a36271f86b77ca90d0c8e924",
+      "manifest": "unlocked-matrix/skipjack/manifest.json",
+      "raw_runtime": "failed",
+      "observed_gates": {
+        "install": "pass",
+        "gdm-login": "pass",
+        "session": "pass",
+        "portals": "availability-only",
+        "lock-unlock": "not-proven",
+        "visual-review": "not-run"
+      },
+      "blocker": "Serialized SSH bookkeeping exceeded native consent budget and ScreenCast activated stale Screenshot Allow; preserved failures require changed-source batched strict-kind orchestration, not product failure attribution."
+    },
+    {
+      "variant": "wahoo",
+      "required": true,
+      "qualified": false,
+      "status": "unmeasured-required",
+      "image": "ghcr.io/tuna-os/wahoo@sha256:865ec5320f25ae368316f07b4d3b49b5e0600308e5bc50b973ace90a5b53a46d",
+      "manifest": "unlocked-matrix/wahoo/manifest.json",
+      "raw_runtime": "failed",
+      "observed_gates": {
+        "install": "not-proven",
+        "gdm-login": "not-proven",
+        "session": "not-run",
+        "portals": "not-run",
+        "lock-unlock": "not-proven",
+        "visual-review": "not-run"
+      },
+      "blocker": "CORRAL_BUILD_FAIL provision; old harness lost full builder stderr. Earlier same-digest GDM journey exists. No unchanged retry or product pass claimed."
+    },
+    {
+      "variant": "bonito",
+      "required": true,
+      "qualified": false,
+      "status": "unmeasured-required",
+      "image": "ghcr.io/tuna-os/bonito@sha256:be9f1ab12a76482dd90f2a5d70215ad4dc1e1c3fdd6e1d13f83cfe0733d89da1",
+      "manifest": "unlocked-matrix/bonito/manifest.json",
+      "raw_runtime": "failed",
+      "observed_gates": {
+        "install": "pass",
+        "gdm-login": "not-proven",
+        "session": "not-run",
+        "portals": "not-run",
+        "lock-unlock": "not-proven",
+        "visual-review": "not-run"
+      },
+      "blocker": "Refreshed beta2-2 image installed and stockGDM painted; bare-name console resolution failed. Later Marlin/Sid diagnostics prove same harness command class ambiguous; no per-image inference of repair."
+    },
+    {
+      "variant": "hummingbird",
+      "required": true,
+      "qualified": false,
+      "status": "blocked-required",
+      "image": null,
+      "manifest": null,
+      "raw_runtime": "not-run",
+      "observed_gates": {
+        "install": "not-run",
+        "gdm-login": "not-run",
+        "session": "not-run",
+        "portals": "not-run",
+        "lock-unlock": "not-run",
+        "visual-review": "not-run"
+      },
+      "blocker": "Not admitted; imagePR3885 beta1 pin retained until signed served beta2 plus real rpm-ostree/libcanberra closure. PackagesPR959 head49bd279 green required CI but independent normal review verdict/merge outstanding."
+    },
+    {
+      "variant": "sailfin",
+      "required": true,
+      "qualified": false,
+      "status": "unmeasured-required",
+      "image": "ghcr.io/tuna-os/sailfin@sha256:cbfba99f07a74a099de7366d5de2a2552d768a677cba9000476dacf0d7486605",
+      "manifest": "unlocked-matrix/sailfin/manifest.json",
+      "raw_runtime": "failed",
+      "observed_gates": {
+        "install": "pass",
+        "gdm-login": "not-proven",
+        "session": "not-run",
+        "portals": "not-run",
+        "lock-unlock": "not-proven",
+        "visual-review": "not-run"
+      },
+      "blocker": "Image installed and stockGDM painted; bare-name console startup failed before login. Must use actual canonical inventory ID, not infer source repair qualifies the image."
+    },
+    {
+      "variant": "guppy",
+      "required": true,
+      "qualified": false,
+      "status": "blocked-required",
+      "image": null,
+      "manifest": null,
+      "raw_runtime": "not-run",
+      "observed_gates": {
+        "install": "not-run",
+        "gdm-login": "not-run",
+        "session": "not-run",
+        "portals": "not-run",
+        "lock-unlock": "not-run",
+        "visual-review": "not-run"
+      },
+      "blocker": "PR3883 Guppy build/boot gate passed on b115092; published image prohibited before desktop#577 approval by maintainer issue3202comment6547926694. No signed/candidate publication bypass."
+    },
+    {
+      "variant": "bonito-rawhide",
+      "required": true,
+      "qualified": false,
+      "status": "unmeasured-required",
+      "image": "ghcr.io/tuna-os/bonito@sha256:dd2bc06ea05ea73fc06c7f208ac3ea2c7107cc4125024362a7d4a9ddfe18c2b3",
+      "manifest": "unlocked-matrix/bonito-rawhide/manifest.json",
+      "raw_runtime": "failed",
+      "observed_gates": {
+        "install": "pass",
+        "gdm-login": "not-proven",
+        "session": "not-run",
+        "portals": "not-run",
+        "lock-unlock": "not-proven",
+        "visual-review": "not-run"
+      },
+      "blocker": "VM-name length issue fixed; image installed and stockGDM painted, but bare-name console startup failed before actual login."
+    },
+    {
+      "variant": "gurnard",
+      "required": true,
+      "qualified": false,
+      "status": "blocked-required",
+      "image": null,
+      "manifest": null,
+      "raw_runtime": "not-run",
+      "observed_gates": {
+        "install": "not-run",
+        "gdm-login": "not-run",
+        "session": "not-run",
+        "portals": "not-run",
+        "lock-unlock": "not-run",
+        "visual-review": "not-run"
+      },
+      "blocker": "Unwaived Noble-native compiler prerequisite: all-pocket/source-family primary archive audit tops at1.91.1, while locked GTK independently requires>=1.92. No native target or qualifying image. Not a release waiver."
+    },
+    {
+      "variant": "grouper",
+      "required": true,
+      "qualified": false,
+      "status": "unmeasured-required",
+      "image": "ghcr.io/tuna-os/grouper@sha256:8cebaff1fbfe7d8f5076b0d09c7988cce804bbe193b12af733180f2eee3ef6fa",
+      "manifest": "unlocked-matrix/grouper/manifest.json",
+      "raw_runtime": "failed",
+      "observed_gates": {
+        "install": "pass",
+        "gdm-login": "not-proven",
+        "session": "not-run",
+        "portals": "not-run",
+        "lock-unlock": "not-proven",
+        "visual-review": "not-run"
+      },
+      "blocker": "Image installed and stockGDM painted; bare-name console startup failed. Transient API cleanup failure stopped matrix; exact VM/VMI/PVC cleanup subsequently proved empty inventory."
+    },
+    {
+      "variant": "marlin",
+      "required": true,
+      "qualified": false,
+      "status": "unmeasured-required",
+      "image": "ghcr.io/tuna-os/marlin@sha256:5ccc023cc73296d5e4d17cfbe38526935a405abcfb0095aad43b3a28bff182e6",
+      "manifest": "batched-matrix/marlin/manifest.json",
+      "raw_runtime": "failed",
+      "observed_gates": {
+        "install": "pass",
+        "gdm-login": "not-proven",
+        "session": "not-run",
+        "portals": "not-run",
+        "lock-unlock": "not-proven",
+        "visual-review": "not-run"
+      },
+      "blocker": "Published beta2-2 installed and stockGDM painted. Full console stderr: bare instance name ambiguous; canonical inventory ID and supported scoped-wait Corral tool are required."
+    },
+    {
+      "variant": "flounder",
+      "required": true,
+      "qualified": false,
+      "status": "unmeasured-required",
+      "image": "ghcr.io/tuna-os/flounder@sha256:03a4224a791370669f5bf96228097397298fa5e39b566cd3c3d1c1fd11481e2e",
+      "manifest": "batched-matrix/flounder/manifest.json",
+      "raw_runtime": "failed",
+      "observed_gates": {
+        "install": "not-proven",
+        "gdm-login": "not-proven",
+        "session": "not-run",
+        "portals": "not-run",
+        "lock-unlock": "not-proven",
+        "visual-review": "not-run"
+      },
+      "blocker": "bootc install completed and disk/VM created; Corral info timed out120s before start/readiness. No user session or portal/lock proof."
+    },
+    {
+      "variant": "flounder-sid",
+      "required": true,
+      "qualified": false,
+      "status": "unmeasured-required",
+      "image": "ghcr.io/tuna-os/flounder@sha256:81570c4609ad406ffa4ce5ac453c64f43708e74285ffc00aba7fc4006883cbc8",
+      "manifest": "batched-matrix/flounder-sid/manifest.json",
+      "raw_runtime": "failed",
+      "observed_gates": {
+        "install": "pass",
+        "gdm-login": "not-proven",
+        "session": "not-run",
+        "portals": "not-run",
+        "lock-unlock": "not-proven",
+        "visual-review": "not-run"
+      },
+      "blocker": "Published beta1 installed and stockGDM painted. Full console stderr: bare instance name ambiguous; actual canonical inventory ID required."
+    }
+  ]
+}

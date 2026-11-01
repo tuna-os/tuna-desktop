@@ -1,0 +1,73 @@
+{
+  "schema": 2,
+  "started": "2026-11-01T00:40:49+00:00",
+  "runner": "scripts/tuna-corral-journey",
+  "runner_sha256": "1adc31768f0a9cfb8de4d68457bc5c948630e5092eed6552f7f63717d2ef4f48",
+  "scope": "qualification-core",
+  "corral": "corral v0.7.0+36.g76b6dd5 (commit 76b6dd52d35d, built 2026-10-30T08:31:57Z, go1.27.0)",
+  "image": {
+    "ref": "ghcr.io/tuna-os/flounder@sha256:03a4224a791370669f5bf96228097397298fa5e39b566cd3c3d1c1fd11481e2e"
+  },
+  "vm": {
+    "name": "tuna-q-variant-flounder-01002237",
+    "namespace": "corral-vms",
+    "backend": "kubevirt",
+    "requested": {
+      "cpu": 4,
+      "mem": "6G",
+      "disk": "40Gi",
+      "node": "karnataka"
+    }
+  },
+  "console": "corral console page (noVNC), Playwright Chromium, 1:1; frames are the canvas pixels",
+  "steps": [],
+  "provision": {
+    "argv": [
+      "corral",
+      "bootc",
+      "create",
+      "tuna-q-variant-flounder-01002237",
+      "--image",
+      "ghcr.io/tuna-os/flounder@sha256:03a4224a791370669f5bf96228097397298fa5e39b566cd3c3d1c1fd11481e2e",
+      "--cpu",
+      "4",
+      "--mem",
+      "6G",
+      "--disk",
+      "40Gi",
+      "-n",
+      "corral-vms",
+      "--user",
+      "tuna-test",
+      "--password-stdin",
+      "--tag",
+      "purpose=tuna-corral-journey",
+      "--node",
+      "karnataka"
+    ],
+    "exit": 0,
+    "stdout": "",
+    "stderr": "Building bootc disk from ghcr.io/tuna-os/flounder@sha256:03a4224a791370669f5bf96228097397298fa5e39b566cd3c3d1c1fd11481e2e\n  Disk:   pvc/tuna-q-variant-flounder-01002237-bootc-disk (40Gi, block mode)\n  Builder VM started \u2014 installing (this can take 20-40 min)...\n  Builder powered off cleanly; disk has 40960 MB of data \u2014 success.\n  Disk ready: pvc/tuna-q-variant-flounder-01002237-bootc-disk\nVM \"tuna-q-variant-flounder-01002237\" created in ns/corral-vms \u2014 start: corral start tuna-q-variant-flounder-01002237\n"
+  },
+  "error": "TimeoutExpired: Command '['corral', '--json', 'info', 'tuna-q-variant-flounder-01002237']' timed out after 120 seconds",
+  "failure_capture": {
+    "exit": 1,
+    "stderr": "virtctl vnc screenshot tuna-q-variant-flounder-01002237: exit status 1: You are using a client virtctl version that is different from the KubeVirt version running in the cluster\nClient Version: v1.8.2\nServer Version: v1.9.1\n\nCan't access VMI tuna-q-variant-flounder-01002237: an error on the server (\"virtualmachineinstance.kubevirt.io \\\"tuna-q-variant-flounder-01002237\\\" not found\") has prevented the request from succeeding (get virtualmachineinstances.kubevirt.io tuna-q-variant-flounder-01002237)\n"
+  },
+  "cleanup": {
+    "deleted": true,
+    "result": [
+      {
+        "name": "tuna-q-variant-flounder-01002237",
+        "deleted": true,
+        "removed": [
+          "virtualmachine.kubevirt.io/tuna-q-variant-flounder-01002237",
+          "persistentvolumeclaim/tuna-q-variant-flounder-01002237-bootc-disk"
+        ]
+      }
+    ],
+    "still_listed": [],
+    "failures": []
+  },
+  "finished": "2026-11-01T00:57:14+00:00"
+}

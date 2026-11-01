@@ -82,6 +82,41 @@ compiler/Cargo/standard-library closure, package build/install and immutable
 image runtime receipts are still required. No compiler from another target,
 third-party binary injection or target substitution is permitted.
 
+## Current required-cell accounting
+
+The [exact-subject ledger](variants/2026-10-31/current-accounting.json), as of
+2026-11-01 01:09 UTC, separates **0 qualified required cells**, **1 failed required
+cell**, **9 required cells with incomplete runtime measurement**, **3 blocked
+required cells**, and **1 owner-deferred/unqualified cell**. All fourteen
+identities remain present; the ledger holds every untruncated image digest and
+the corresponding raw manifest path. Source-declared unsupported is not counted
+as qualified or substituted for an unwaived prerequisite.
+
+- Corrected Yellowfin `64e7a29…`: 12 pass/1 fail; actual Screenshot and ScreenCast
+  plus lock withdrawal in 0.19 seconds pass. The remaining gate failure is
+  `LockedHint=no`. [Reviewed portal/lock frames](variants/2026-10-31/corrected-visual-review.json)
+  are additive evidence, not an all-gates pass.
+- [Frozen unlocked sequence](variants/2026-10-31/unlocked-matrix/matrix.json):
+  retains all eight attempts, including Albacore completed before its deferral.
+  It correctly stopped on unproven Grouper cleanup. [Recovery](variants/2026-10-31/unlocked-matrix-cleanup.json)
+  proves later exact Grouper VM/VMI/PVC deletion and empty owned-prefix inventory.
+- [Batched diagnostic sequence](variants/2026-10-31/batched-matrix/matrix.json):
+  Marlin `5ccc023…` and Flounder Sid `81570c…` installed and painted stock GDM,
+  but full console stderr proves bare-name instance resolution is ambiguous.
+  Flounder Trixie installed its disk/VM, then `info` timed out before readiness.
+  These are not new product portal failures or completed login journeys.
+- The next runtime prerequisite is receipt-bound canonical instance routing,
+  including actual backend/context/namespace/name and expected VM UID, plus
+  independently owned [Corral #674](https://github.com/tuna-os/corral/pull/674)
+  canonical wait support. No bare-name fallback or alias/configuration change is
+  accepted. A reviewed/merged exact-source signed normal-main CI tool may produce
+  explicitly diagnostic receipts; final qualification requires the normal signed
+  Corral release. No unreviewed PR tool or special trust waiver is used.
+- Hummingbird's independent normal provider review/publication, Guppy's explicit
+  release-approval fence, and Noble's unwaived native compiler/target prerequisite
+  remain distinct blockers. The Albacore owner exception is scoped only to that
+  single cell and does not relax any other failed or unmeasured gate.
+
 ## Published immutable subjects
 
 The complete [registry receipt](variants/2026-10-31/registry-matrix.json) records
@@ -268,9 +303,11 @@ Exact admission/publication [gate snapshot](variants/2026-10-31/admission-gates.
   native `rpm-ostree` and `libcanberra` roots. Its first native build was cancelled
   by a later external commit, so no native closure result is claimed.
 
-Focused regressions pass: 9 matrix tests, 14 unlocked-consent/ordering tests,
-8 native coordinator tests and 8 rename-scanner tests (including the actual CLI
-historical-vs-living-doc check). They are not runtime qualification.
+Focused regressions pass: 11 matrix tests, 17 unlocked-consent/ordering tests,
+8 native coordinator tests, 11 scoped identity/cleanup tests and 8 rename-scanner
+tests (including actual CLI historical-vs-living inputs). They are not runtime
+qualification; the new canonical tool consumer remains blocked on the qualified
+Corral release.
 
 ## Reusable actual-image path
 
@@ -341,8 +378,9 @@ real noVNC lock key follows the arm response immediately. The existing two-secon
 withdrawal observer remains unchanged. Full bootc provision stdout/stderr and
 console-start stderr are retained so orchestration failures are diagnosable.
 
-New matrix runs freeze the host journey, native coordinator, consent helper and
-native requester/parser sources into the output's `harness/` directory before starting any VM, recording
+New matrix runs freeze the host journey, native coordinator, shared identity
+helper, consent helper and native requester/parser sources into the output's
+`harness/` directory before starting any VM, recording
 their hashes. Subsequent worktree edits cannot mutate those long-running tests.
 Only test requester code is placed in the fixture user's runtime directory;
 the installed desktop/provider payload stays untouched.
