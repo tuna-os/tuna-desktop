@@ -24,8 +24,10 @@ arch=('x86_64')
 url='https://github.com/tuna-os/tuna-desktop'
 license=('GPL-3.0-or-later')
 depends=(
+    'colord'
     'dbus'
     'glib2'
+    'gnome-color-manager'
     'gnome-settings-daemon'
     'gnome-session'
     'gdk-pixbuf2'
