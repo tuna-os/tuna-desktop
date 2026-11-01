@@ -31,7 +31,6 @@ impl TextInput {
                 let instance_id = text_input.instance.id();
                 if instance_id.same_client_as(&surface.id()) {
                     f(&text_input.instance, surface, text_input.serial);
-                    break;
                 }
             }
         };
@@ -88,7 +87,7 @@ impl TextInputHandle {
             .iter_mut()
             .find(|instance| instance.instance == *text_input)
         {
-            instance.serial += 1
+            instance.serial = instance.serial.wrapping_add(1);
         }
     }
 
@@ -101,7 +100,14 @@ impl TextInputHandle {
     ///
     /// This doesn't send any 'enter' or 'leave' events.
     pub fn set_focus(&self, surface: Option<WlSurface>) {
-        self.inner.lock().unwrap().focus = surface;
+        let mut inner = self.inner.lock().unwrap();
+        if inner.focus != surface {
+            inner.active_text_input_id = None;
+            for instance in &mut inner.instances {
+                instance.pending_state = TextInputState::default();
+            }
+        }
+        inner.focus = surface;
     }
 
     /// Send `leave` on the text-input instance for the currently focused
@@ -110,6 +116,9 @@ impl TextInputHandle {
         let mut inner = self.inner.lock().unwrap();
         // Leaving clears the active text input.
         inner.active_text_input_id = None;
+        for instance in &mut inner.instances {
+            instance.pending_state = TextInputState::default();
+        }
         // NOTE: we implement it in a symmetrical way with `enter`.
         inner.with_focused_client_all_text_inputs(|text_input, focus, _| {
             text_input.leave(focus);
@@ -209,6 +218,16 @@ where
             data.handle.increment_serial(resource);
         }
 
+        // Version 2: the action set is checked whatever the focus and
+        // whether or not an input method runs, as Mutter's
+        // text_input_set_available_actions does.
+        if let zwp_text_input_v3::Request::SetAvailableActions { available_actions } = &request {
+            if let Err(message) = validate_available_actions(available_actions) {
+                resource.post_error(zwp_text_input_v3::Error::InvalidAction, message);
+                return;
+            }
+        }
+
         // Discard requsets without any active input method instance.
         if !data.input_method_handle.has_instance() {
             debug!("discarding text-input request without IME running");
@@ -216,7 +235,7 @@ where
         }
 
         let focus = match data.handle.focus() {
-            Some(focus) if focus.id().same_client_as(&resource.id()) => focus,
+            Some(focus) if focus.is_alive() && focus.id().same_client_as(&resource.id()) => focus,
             _ => {
                 debug!("discarding text-input request for unfocused client");
                 return;
@@ -240,7 +259,10 @@ where
 
         match request {
             zwp_text_input_v3::Request::Enable => {
-                pending_state.enable = Some(true);
+                *pending_state = TextInputState {
+                    enable: Some(true),
+                    ..TextInputState::default()
+                };
             }
             zwp_text_input_v3::Request::Disable => {
                 pending_state.enable = Some(false);
@@ -323,6 +345,13 @@ where
             zwp_text_input_v3::Request::Destroy => {
                 // Nothing to do
             }
+            // Version 2: input-method-v2 carries neither available actions
+            // nor input-panel requests, so nothing reaches the input
+            // method; the compositor reads the panel requests before
+            // dispatching here.
+            zwp_text_input_v3::Request::SetAvailableActions { .. }
+            | zwp_text_input_v3::Request::ShowInputPanel
+            | zwp_text_input_v3::Request::HideInputPanel => {}
             _ => unreachable!(),
         }
     }
@@ -332,25 +361,38 @@ where
         let deactivate_im = {
             let mut inner = data.handle.inner.lock().unwrap();
             inner.instances.retain(|inst| inst.instance.id() != destroyed_id);
-            let destroyed_focused = inner
-                .focus
-                .as_ref()
-                .map(|focus| focus.id().same_client_as(&destroyed_id))
-                .unwrap_or(true);
-
-            // Deactivate IM when we either lost focus entirely or destroyed text-input for the
-            // currently focused client.
-            destroyed_focused
-                && !inner
-                    .instances
-                    .iter()
-                    .any(|inst| inst.instance.id().same_client_as(&destroyed_id))
+            let was_active = inner.active_text_input_id.as_ref() == Some(&destroyed_id);
+            if was_active {
+                inner.active_text_input_id = None;
+            }
+            was_active
         };
 
         if deactivate_im {
             data.input_method_handle.deactivate_input_method(state);
         }
     }
+}
+
+/// Validate the native-endian uint32 action array and return its action flags.
+///
+/// Validation is independent of keyboard focus and input-method availability.
+/// Bit zero denotes submit; the protocol's `none` is never an available action.
+pub fn validate_available_actions(actions: &[u8]) -> Result<u32, String> {
+    if actions.len() % 4 != 0 {
+        return Err("Malformed action array: expected uint32 entries".into());
+    }
+    let mut seen = 0_u32;
+    for entry in actions.chunks_exact(4) {
+        let action = u32::from_ne_bytes([entry[0], entry[1], entry[2], entry[3]]);
+        match action {
+            0 => return Err("Invalid 'none' action in set".into()),
+            1 if seen != 0 => return Err("Action 1 doubly set".into()),
+            1 => seen = 1,
+            _ => return Err(format!("Unknown action {action} in set")),
+        }
+    }
+    Ok(seen)
 }
 
 #[derive(Debug)]

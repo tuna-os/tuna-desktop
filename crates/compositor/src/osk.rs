@@ -25,10 +25,26 @@ use tuna_shell_control::TextFieldFocus;
 /// mutter's `CLUTTER_INPUT_CONTENT_HINT_INHIBIT_OSK`.
 pub const HINT_INHIBIT_OSK: u32 = 0x400;
 
+/// `ZWP_TEXT_INPUT_V3_SHOW_INPUT_PANEL_SINCE_VERSION`: from this version a
+/// client asks for the input panel itself instead of re-enabling.
+const SHOW_INPUT_PANEL_SINCE: u32 = 2;
+
+/// mutter's `ClutterInputPanelState` as its text input sets it
+/// (`clutter_input_focus_set_input_panel_state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputPanel {
+    On,
+    Off,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct Pending {
     enable: Option<bool>,
     content: Option<(u32, u32)>,
+    /// `show_input_panel` (true) or `hide_input_panel` (false), the last
+    /// one before `commit` (mutter's `show_panel`).
+    panel: Option<bool>,
+    actions: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -38,6 +54,7 @@ struct Tracked {
     enabled: bool,
     /// Committed (hint, purpose).
     content: (u32, u32),
+    actions: u32,
     /// `commit` requests seen: the serial `done` must echo.
     commits: u32,
 }
@@ -47,8 +64,9 @@ struct Tracked {
 #[derive(Debug, Default)]
 pub struct TextInputs {
     tracked: Vec<Tracked>,
-    /// A focused text input was enabled again (input-panel ON).
-    show: bool,
+    /// The input-panel state the last focused commit asked for.
+    panel: Option<(ZwpTextInputV3, InputPanel)>,
+    owner: Option<ZwpTextInputV3>,
 }
 
 impl TextInputs {
@@ -69,19 +87,28 @@ impl TextInputs {
                     pending: Pending::default(),
                     enabled: false,
                     content: (0, 0),
+                    actions: 0,
                     commits: 0,
                 });
                 self.tracked.len() - 1
             }
         };
         let entry = &mut self.tracked[index];
+        // Requests queued outside this client's enter/leave interval cannot
+        // become pending state for a later focus. Serial counting is global.
+        let focused = focus.is_some_and(|surface| {
+            surface.is_alive() && surface.id().same_client_as(&resource.id())
+        });
+        if !focused && !matches!(request, zwp_text_input_v3::Request::Commit | zwp_text_input_v3::Request::Destroy) {
+            return;
+        }
         match request {
             zwp_text_input_v3::Request::Enable => {
-                // Enabling resets the field's state (the protocol's rule).
-                entry.pending = Pending {
-                    enable: Some(true),
-                    content: Some((0, 0)),
-                };
+                // Enabling resets the field's state (the protocol's
+                // rule); a panel request made before it stands, as in
+                // mutter's text_input_enable.
+                entry.pending.enable = Some(true);
+                entry.pending.content = Some((0, 0));
             }
             zwp_text_input_v3::Request::Disable => entry.pending.enable = Some(false),
             zwp_text_input_v3::Request::SetContentType { hint, purpose } => {
@@ -91,24 +118,56 @@ impl TextInputs {
                 };
                 entry.pending.content = Some((hint, u32::from(*purpose)));
             }
+            zwp_text_input_v3::Request::ShowInputPanel => entry.pending.panel = Some(true),
+            zwp_text_input_v3::Request::HideInputPanel => entry.pending.panel = Some(false),
+            zwp_text_input_v3::Request::SetAvailableActions { available_actions } => {
+                if let Ok(actions) = smithay::wayland::text_input::validate_available_actions(available_actions) {
+                    entry.pending.actions = Some(actions);
+                }
+            }
             zwp_text_input_v3::Request::Commit => {
                 entry.commits = entry.commits.wrapping_add(1);
                 let pending = std::mem::take(&mut entry.pending);
-                let focused =
-                    focus.is_some_and(|surface| surface.id().same_client_as(&resource.id()));
                 if !focused {
                     return;
                 }
+                if self.owner.as_ref().is_some_and(|owner| owner != resource) {
+                    return;
+                }
+                // mutter's text_input_commit_state.
+                let mut enable_panel_v1 = false;
                 match pending.enable {
-                    // Mutter: enabling an already focused version-1 text
-                    // input asks for the input panel (GTK re-enables on a
-                    // click into its field, `activate_osk`).
-                    Some(true) if entry.enabled => self.show = true,
-                    Some(enabled) => entry.enabled = enabled,
+                    // Enabling an already focused version-1 text input
+                    // asks for the input panel (GTK re-enables on a click
+                    // into its field, `activate_osk`); version 2 asks with
+                    // show_input_panel instead.
+                    Some(true) if entry.enabled => {
+                        enable_panel_v1 = resource.version() < SHOW_INPUT_PANEL_SINCE;
+                    }
+                    Some(enabled) => {
+                        entry.enabled = enabled;
+                        self.owner = enabled.then(|| resource.clone());
+                    }
                     None => {}
                 }
                 if let Some(content) = pending.content {
                     entry.content = content;
+                }
+                if let Some(actions) = pending.actions {
+                    entry.actions = actions;
+                }
+                // Without input-method focus the panel request is dropped.
+                if !entry.enabled {
+                    entry.actions = 0;
+                    entry.content = (0, 0);
+                    self.panel = None;
+                    return;
+                }
+                match pending.panel {
+                    Some(true) => self.panel = Some((resource.clone(), InputPanel::On)),
+                    Some(false) => self.panel = Some((resource.clone(), InputPanel::Off)),
+                    None if enable_panel_v1 => self.panel = Some((resource.clone(), InputPanel::On)),
+                    None => {}
                 }
             }
             zwp_text_input_v3::Request::Destroy => self.destroyed(resource),
@@ -119,6 +178,10 @@ impl TextInputs {
     /// A text input object went away.
     pub fn destroyed(&mut self, resource: &ZwpTextInputV3) {
         self.tracked.retain(|t| t.resource != *resource);
+        if self.owner.as_ref() == Some(resource) {
+            self.owner = None;
+            self.panel = None;
+        }
     }
 
     /// Keyboard focus moved: text inputs are disabled until their client
@@ -127,14 +190,19 @@ impl TextInputs {
         for entry in &mut self.tracked {
             entry.enabled = false;
             entry.pending = Pending::default();
+            entry.actions = 0;
+            entry.content = (0, 0);
         }
-        self.show = false;
+        self.panel = None;
+        self.owner = None;
     }
 
     fn active(&self, focus: Option<&WlSurface>) -> Option<&Tracked> {
-        let focus = focus?;
+        let focus = focus.filter(|surface| surface.is_alive())?;
         self.tracked.iter().find(|t| {
-            t.enabled && t.resource.is_alive() && focus.id().same_client_as(&t.resource.id())
+            self.owner.as_ref() == Some(&t.resource)
+                && t.enabled && t.resource.is_alive()
+                && focus.id().same_client_as(&t.resource.id())
         })
     }
 
@@ -146,9 +214,36 @@ impl TextInputs {
         })
     }
 
-    /// Take the input-panel ON request; only a focused field may make it.
+    /// Take the pending input-panel request; only a focused field may make
+    /// it.
+    pub fn take_panel(&mut self, focus: Option<&WlSurface>) -> Option<InputPanel> {
+        let (owner, panel) = self.panel.take()?;
+        self.active(focus).filter(|active| active.resource == owner).map(|_| panel)
+    }
+
+    /// Legacy shell transport carries only panel ON. Panel OFF needs the
+    /// separately negotiated typed message; it never disables the text field.
     pub fn take_show(&mut self, focus: Option<&WlSurface>) -> bool {
-        std::mem::take(&mut self.show) && self.active(focus).is_some()
+        self.take_panel(focus) == Some(InputPanel::On)
+    }
+
+    /// Committed native input-method action flags (bit zero is submit).
+    pub fn available_actions(&self, focus: Option<&WlSurface>) -> u32 {
+        self.active(focus).map_or(0, |active| active.actions)
+    }
+
+    /// Deliver an input-method action and its done boundary to the live owner.
+    /// Unsupported actions and v1 clients receive no v2 event.
+    pub fn action(&self, focus: Option<&WlSurface>, action: zwp_text_input_v3::Action) -> bool {
+        let Some(active) = self.active(focus) else { return false };
+        if active.resource.version() < 2
+            || action != zwp_text_input_v3::Action::Submit || active.actions & 1 == 0 {
+            return false;
+        }
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        active.resource.action(action, u32::from(serial));
+        active.resource.done(active.commits);
+        true
     }
 
     /// Commit `text` to the focused field (`Main.inputMethod.commit`):

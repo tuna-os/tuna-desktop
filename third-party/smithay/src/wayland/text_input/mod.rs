@@ -63,10 +63,13 @@ use crate::input::{Seat, SeatHandler};
 
 pub use text_input_handle::TextInputHandle;
 pub use text_input_handle::TextInputUserData;
+pub use text_input_handle::validate_available_actions;
 
 use super::input_method::InputMethodHandle;
 
-const MANAGER_VERSION: u32 = 1;
+/// Version 2 (Roost #364), Mutter 51's META_ZWP_TEXT_INPUT_V3_VERSION:
+/// adds set_available_actions, show_input_panel and hide_input_panel.
+const MANAGER_VERSION: u32 = 2;
 
 mod text_input_handle;
 

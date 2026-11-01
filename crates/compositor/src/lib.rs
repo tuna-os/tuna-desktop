@@ -387,6 +387,10 @@ impl BufferHandler for State {
 }
 
 impl State {
+    /// Native input-method state for the seat's currently enabled text field.
+    pub fn text_inputs(&mut self) -> &mut osk::TextInputs {
+        &mut self.protocols.text_inputs
+    }
     /// Original caller PID when a live bus- or kernel-supplied process
     /// descriptor pins it. Missing pins and exited peers yield no identity;
     /// this metadata never authorizes input, provider roles or capture.
