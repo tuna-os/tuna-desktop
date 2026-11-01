@@ -1,14 +1,10 @@
 name: Pristine Tuna firstboot diagnosis
 
-# Read-only observation of the current signed shipping platform BEFORE the
-# firstboot product fix. This is never a release/promotion or consumer gate.
+# Read-only observation of an explicitly pinned signed reference platform.
+# The before-fix UI is retained in run 41260572254. Reuse only for a genuine
+# new diagnostic input; do not replay unchanged failures on each producer PR.
+# This is never a release/promotion or consumer gate.
 on:
-  pull_request:
-    paths:
-      - .github/workflows/vm-firstboot-diagnosis.yml
-      - scripts/lib/vm_firstboot_diagnosis.py
-      - scripts/lib/vm_release_disk.go
-      - scripts/lib/vm_release.py
   workflow_dispatch:
 
 permissions:
