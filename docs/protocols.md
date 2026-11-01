@@ -118,6 +118,20 @@ ShellControl 0.47 until the ordered input/OSK cutover is integrated.
 | ext_background_effect_manager_v1 | 1 | empty capabilities until real bound-framebuffer/shader admission, then `blur`; capabilities are revoked on render failure. Double-buffered copied regions, synchronized subsurfaces, clipping/subtraction and object destruction drive the actual GLES blur. Floating-point scenes use precision-keyed FP16 intermediates without clipping extended values; admission/drawing must remain before HDR final output conversion. The actual-output consumer `scripts/tuna-background-effect-proof` is prepared but unexecuted; unsupported exit 77 is not a pass. Overview/Alt+Tab clone blur remains unqualified |
 | wp_drm_lease_device_v1 | 1 | native only, after a master-only kernel lease ioctl establishes actual support/authority. Confirmed connected non-desktop or explicitly named connectors stay off the desktop. Leases claim eligible free CRTC/primary/cursor resources, withdraw connectors and revoke before DRM master is dropped; failed kernel revocation cannot report completion or re-offer resources. Prepared D-LEASE checks real vkms lessee FD/ioctls, non-master device FD, independent-client withdrawal, empty/duplicate/stale denial, owner-loss revocation with the FD retained, and actual emulated sysfs disconnect/reappearance. These additions have not run on this integrated head. Physical headsets, monitors.xml `for-lease`, and secondary-GPU lease devices are not qualified |
 
+Toplevel-drag source reservations survive cancellation and factory/child
+destruction while the data source lives; they do not permit later clipboard
+repurposing or a second toplevel-drag association. Incompatible selection use
+reports `xdg_toplevel_drag_manager_v1.invalid_source` on the live factory.
+After that factory is destroyed it reports the core
+`wl_data_source.invalid_source` on the still-live source, rather than fabricating
+an error object for a dead factory. This preserves the source contract without
+pretending that the error placement is identical to Mutter's implementation.
+
+Foreign/stale-object and failed-destructor consumers decode the actual
+`wl_display.error` wire event and exact offending object ID. An EOF, an I/O error,
+or a missing interface lookup after proxy destruction is not substituted for
+the required event.
+
 ### xdg-activation policy
 
 A token is valid only when the client that asks for it holds keyboard

@@ -1286,6 +1286,99 @@ fn pump_to_error(
     panic!("no protocol error");
 }
 
+/// Capture the typed identity before a destructor can retire its proxy.
+fn protocol_error_target<I: wayland_client::Proxy>(object: &I) -> (u32, &'static str) {
+    (object.id().protocol_id(), I::interface().name)
+}
+
+/// Decode real wl_display.error events, retaining partial socket frames.
+/// The wire carries an object ID, not its interface; callers resolve that ID
+/// against a typed target captured before the failing request.
+fn wire_display_error(events: &[u8]) -> Option<(u32, u32, String)> {
+    let word = |offset: usize| u32::from_ne_bytes(events[offset..offset + 4].try_into().unwrap());
+    let mut offset = 0;
+    while events.len() - offset >= 8 {
+        let object = word(offset);
+        let header = word(offset + 4);
+        let length = (header >> 16) as usize;
+        assert!(length >= 8 && length % 4 == 0, "invalid Wayland frame size");
+        if length > events.len() - offset {
+            return None;
+        }
+        if object == 1 && header & 0xffff == 0 {
+            // wl_display.error(object_id, code, message): three words followed
+            // by a NUL-terminated, four-byte-padded string.
+            assert!(length >= 24, "truncated wl_display.error");
+            let object_id = word(offset + 8);
+            let code = word(offset + 12);
+            let string_len = word(offset + 16) as usize;
+            assert!(string_len > 0 && string_len <= length - 20);
+            assert_eq!(length, 20 + string_len.next_multiple_of(4));
+            let message =
+                std::ffi::CStr::from_bytes_with_nul(&events[offset + 20..offset + 20 + string_len])
+                    .expect("wl_display.error message must be NUL terminated")
+                    .to_str()
+                    .expect("wl_display.error message must be UTF-8")
+                    .to_owned();
+            return Some((object_id, code, message));
+        }
+        offset += length;
+    }
+    None
+}
+
+/// Observe errors before libwayland consumes them. Its display invalid-object
+/// errors use EINVAL, but wayland-backend only classifies EPROTO as Protocol;
+/// destroyed proxies can also lose their interface during native dispatch.
+/// Neither an I/O error nor EOF is evidence of the required protocol error.
+fn pump_to_wire_error(
+    comp: &mut TestCompositor,
+    manager: &mut WindowManager,
+    peer: &mut Peer,
+    target: (u32, &'static str),
+) -> wayland_client::backend::protocol::ProtocolError {
+    use std::io::Read;
+
+    // Reuse the canonical socket clone. No queue read/dispatch may race this
+    // observer after the malformed request or destructor has been flushed.
+    peer.queue.flush().unwrap();
+    peer.socket.set_nonblocking(true).unwrap();
+    let mut events = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    for _ in 0..ROUNDS {
+        comp.pump();
+        manager.reconcile(&mut comp.state);
+        comp.pump();
+        loop {
+            match peer.socket.read(&mut buffer) {
+                Ok(0) => panic!(
+                    "connection closed without wl_display.error ({} bytes received)",
+                    events.len()
+                ),
+                Ok(length) => {
+                    events.extend_from_slice(&buffer[..length]);
+                    if let Some((object_id, code, message)) = wire_display_error(&events) {
+                        assert_eq!(
+                            object_id, target.0,
+                            "wl_display.error must name the exact typed target {}: {}",
+                            target.1, message
+                        );
+                        return wayland_client::backend::protocol::ProtocolError {
+                            object_id,
+                            object_interface: target.1.into(),
+                            code,
+                            message,
+                        };
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("reading wl_display.error: {error}"),
+            }
+        }
+    }
+    panic!("no wl_display.error on the real client socket");
+}
+
 #[test]
 fn background_blur_regions_apply_on_commit_like_mutter() {
     let (mut comp, mut manager) = compositor();
@@ -1824,15 +1917,18 @@ fn toplevel_drag_ends_cleanly_when_its_toplevel_drag_or_source_goes() {
     );
     assert!(d.peer._conn.protocol_error().is_none());
 
-    // A second drag whose source goes away mid-drag.
+    // A second, independent drag whose source goes away mid-drag. Map
+    // its origin last so the raised replacement cannot intercept the press.
+    source.destroy();
     d.peer.client.drag.source.clear();
-    let _ = source;
-    let (x, y) = loc_of(&manager, tabs_id);
+    let (next_tabs, _next_tabs_role, next_tabs_id) =
+        shown_window(&mut comp, &mut manager, &mut d, "next tabs");
+    let (x, y) = loc_of(&manager, next_tabs_id);
     let (source, drag) = start_drag(
         &mut comp,
         &mut manager,
         &mut d,
-        &tabs,
+        &next_tabs,
         f64::from(x + 10),
         f64::from(y + 10),
     );
@@ -2153,21 +2249,13 @@ fn toplevel_drag_foreign_source_and_toplevel_ids_are_client_local() {
         }
         let mut events = Vec::new();
         wire.read_to_end(&mut events).unwrap();
-        let mut invalid_object = false;
-        let mut offset = 0;
-        while offset + 8 <= events.len() {
-            let object = u32::from_ne_bytes(events[offset..offset + 4].try_into().unwrap());
-            let header = u32::from_ne_bytes(events[offset + 4..offset + 8].try_into().unwrap());
-            let length = (header >> 16) as usize;
-            assert!(length >= 8 && offset + length <= events.len());
-            if object == 1 && header & 0xffff == 0 {
-                let code = u32::from_ne_bytes(events[offset + 12..offset + 16].try_into().unwrap());
-                invalid_object = code == 0; // wl_display.error.invalid_object
-            }
-            offset += length;
-        }
-        assert!(
-            invalid_object,
+        let (object, code, _) = wire_display_error(&events).expect("fatal invalid-object error");
+        assert_eq!(
+            (object, code),
+            (
+                1,
+                wayland_client::protocol::wl_display::Error::InvalidObject as u32
+            ),
             "a foreign object ID must disconnect only the attacker"
         );
         assert!(!comp.client_dnd_active());
@@ -2251,13 +2339,16 @@ fn toplevel_drag_destroy_before_source_end_is_ongoing_drag() {
             let drag = d.drags.get_xdg_toplevel_drag(&source, &qh, ());
             (source, drag)
         };
+        let target = protocol_error_target(&drag);
         drag.destroy();
+        let error = pump_to_wire_error(&mut comp, &mut manager, &mut d.peer, target);
         assert_eq!(
-            protocol_error(&mut comp, &mut manager, &mut d.peer),
-            Some((
-                "xdg_toplevel_drag_v1".into(),
+            (error.object_id, error.object_interface.as_str(), error.code),
+            (
+                target.0,
+                "xdg_toplevel_drag_v1",
                 xdg_toplevel_drag_v1::Error::OngoingDrag as u32
-            ))
+            )
         );
     }
 }
@@ -2330,11 +2421,16 @@ fn toplevel_drag_factory_destruction_does_not_allow_repurposing_its_source() {
     let source = d.data.create_data_source(&qh, ());
     let _drag = d.drags.get_xdg_toplevel_drag(&source, &qh, ());
     d.drags.destroy();
+    let target = protocol_error_target(&source);
     d.device.set_selection(Some(&source), 0);
-    let error = protocol_error(&mut comp, &mut manager, &mut d.peer);
+    let error = pump_to_wire_error(&mut comp, &mut manager, &mut d.peer, target);
     assert_eq!(
-        error.map(|(_, code)| code),
-        Some(xdg_toplevel_drag_manager_v1::Error::InvalidSource as u32)
+        (error.object_id, error.object_interface.as_str(), error.code),
+        (
+            target.0,
+            "wl_data_source",
+            wl_data_source::Error::InvalidSource as u32
+        )
     );
 }
 

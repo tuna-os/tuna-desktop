@@ -29,8 +29,11 @@ use smithay::{
             xdg_toplevel_drag_v1::{self, XdgToplevelDragV1},
         },
         wayland_server::{
-            backend::{protocol::ProtocolError, ClientId, GlobalId},
-            protocol::{wl_data_source::WlDataSource, wl_surface::WlSurface},
+            backend::{ClientId, GlobalId},
+            protocol::{
+                wl_data_source::{self, WlDataSource},
+                wl_surface::WlSurface,
+            },
             Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
         },
     },
@@ -57,7 +60,7 @@ pub enum DragEnd {
 struct Record {
     /// Retired after its destructor; the source reservation outlives it.
     resource: Option<XdgToplevelDragV1>,
-    manager_id: u32,
+    manager: XdgToplevelDragManagerV1,
     source: WlDataSource,
     inert: bool,
     /// Cleared when the drag ends; dead once the toplevel is destroyed.
@@ -181,21 +184,21 @@ impl ToplevelDrags {
     }
 
     /// A toplevel-drag source cannot be repurposed as a clipboard selection.
-    /// Kill via the client rather than a resource post_error: the factory may
-    /// already have been destroyed while its children remain alive.
-    pub(crate) fn selection_allowed(&self, source: &WlDataSource, dh: &DisplayHandle) -> bool {
+    /// Report the extension error on its live factory. If the factory has
+    /// gone, the source still exists and rejects its incompatible use.
+    pub(crate) fn selection_allowed(&self, source: &WlDataSource) -> bool {
         let Some(record) = self.records.iter().find(|record| &record.source == source) else {
             return true;
         };
-        if let Ok(client) = dh.get_client(source.id()) {
-            client.kill(
-                dh,
-                ProtocolError {
-                    code: xdg_toplevel_drag_manager_v1::Error::InvalidSource as u32,
-                    object_id: record.manager_id,
-                    object_interface: "xdg_toplevel_drag_manager_v1".into(),
-                    message: "toplevel drag data source cannot be used as a selection".into(),
-                },
+        if record.manager.is_alive() {
+            record.manager.post_error(
+                xdg_toplevel_drag_manager_v1::Error::InvalidSource,
+                "toplevel drag data source cannot be used as a selection",
+            );
+        } else {
+            source.post_error(
+                wl_data_source::Error::InvalidSource,
+                "toplevel drag data source cannot be used as a selection",
             );
         }
         false
@@ -271,7 +274,12 @@ impl Dispatch<XdgToplevelDragManagerV1, ()> for State {
                     |metadata| metadata.used_for_selection || metadata.drag_started,
                 )
                 .unwrap_or(true);
-                if used || drags.record_of(&data_source).is_some() {
+                if used
+                    || drags
+                        .records
+                        .iter()
+                        .any(|record| record.source == data_source)
+                {
                     manager.post_error(
                         xdg_toplevel_drag_manager_v1::Error::InvalidSource,
                         "data source is already used for selection, drag-and-drop, or toplevel drag",
@@ -280,7 +288,7 @@ impl Dispatch<XdgToplevelDragManagerV1, ()> for State {
                 }
                 drags.records.push(Record {
                     resource: Some(resource),
-                    manager_id: manager.id().protocol_id(),
+                    manager: manager.clone(),
                     source: data_source,
                     inert: false,
                     dragged: None,

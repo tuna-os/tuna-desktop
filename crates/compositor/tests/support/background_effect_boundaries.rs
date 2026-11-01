@@ -1,5 +1,7 @@
 //! Additional real socket boundaries using protocol_gaps' existing harness.
 use super::*;
+use smithay::reexports::wayland_server::{protocol::wl_region::WlRegion as ServerRegion, Resource};
+use smithay::wayland::compositor::get_region_attributes;
 use std::io::Write;
 use wayland_client::protocol::{wl_subcompositor::WlSubcompositor, wl_subsurface::WlSubsurface};
 use wayland_client::Proxy;
@@ -20,10 +22,29 @@ fn raw_region(wire: &mut UnixStream, effect: &ExtBackgroundEffectSurfaceV1, regi
     wire.write_all(&bytes).unwrap();
 }
 
+fn assert_id_absent(
+    comp: &TestCompositor,
+    client: &smithay::reexports::wayland_server::Client,
+    absent: u32,
+) {
+    comp.display
+        .handle()
+        .backend_handle()
+        .with_all_objects_for(client.id(), |object| {
+            assert_ne!(
+                object.protocol_id(),
+                absent,
+                "the rejected ID must be absent, not merely a different interface"
+            );
+        })
+        .unwrap();
+}
+
 #[test]
 fn background_effect_foreign_region_id_is_rejected_without_touching_owner() {
     let (mut comp, mut manager) = compositor();
     let mut owner = connect(&mut comp, &mut manager);
+    let (_owner_surface, _owner_top) = window(&mut owner, "foreign region owner");
     let compositor: WlCompositor = owner.bind(6);
     let owner_qh = owner.qh();
     // Make the foreign id unambiguously absent from the attacker's namespace.
@@ -33,23 +54,50 @@ fn background_effect_foreign_region_id_is_rejected_without_touching_owner() {
     let foreign = regions.last().unwrap();
     foreign.add(0, 0, 40, 40);
     pump(&mut comp, &mut manager, &mut [&mut owner]);
+    let owner_client = comp.state.toplevels()[0].wl_surface().client().unwrap();
+    let server_region: ServerRegion = owner_client
+        .object_from_protocol_id(&comp.display.handle(), foreign.id().protocol_id())
+        .unwrap();
+    let original = get_region_attributes(&server_region);
 
     let mut attacker = connect(&mut comp, &mut manager);
     let (surface, _top) = window(&mut attacker, "foreign region attacker");
     let effects: ExtBackgroundEffectManagerV1 = attacker.bind(1);
     let effect = effects.get_background_effect(&surface, &attacker.qh(), ());
     pump(&mut comp, &mut manager, &mut [&mut attacker]);
+    let attacker_client = comp.state.toplevels()[1].wl_surface().client().unwrap();
+    assert_id_absent(&comp, &attacker_client, foreign.id().protocol_id());
+    let target = protocol_error_target(&attacker._conn.display());
     raw_region(&mut attacker.socket, &effect, foreign.id().protocol_id());
-    let error = pump_to_error(&mut comp, &mut manager, &mut attacker);
+    let error = pump_to_wire_error(&mut comp, &mut manager, &mut attacker, target);
+    assert_eq!(error.object_id, target.0);
     assert_eq!(error.object_interface, "wl_display");
     assert_eq!(
         error.code,
         wayland_client::protocol::wl_display::Error::InvalidObject as u32
     );
+    assert_eq!(
+        error.message,
+        format!("Unknown id: {}.", foreign.id().protocol_id())
+    );
+    assert!(server_region.is_alive());
+    let unchanged = get_region_attributes(&server_region);
+    assert_eq!(unchanged.rects.len(), original.rects.len());
+    for ((kind, rect), (original_kind, original_rect)) in
+        unchanged.rects.iter().zip(&original.rects)
+    {
+        assert_eq!(
+            std::mem::discriminant(kind),
+            std::mem::discriminant(original_kind)
+        );
+        assert_eq!(rect, original_rect);
+    }
     // The foreign client and its region still work after the other disconnect.
     foreign.add(-10, -10, 10, 10);
     pump(&mut comp, &mut manager, &mut [&mut owner]);
     assert!(owner._conn.protocol_error().is_none());
+    assert!(get_region_attributes(&server_region).contains((-5, -5)));
+    assert!(get_region_attributes(&server_region).contains((20, 20)));
 }
 
 #[test]
@@ -63,16 +111,27 @@ fn background_effect_stale_region_id_is_rejected_at_socket_boundary() {
     let effect = effects.get_background_effect(&surface, &qh, ());
     let region = compositor.create_region(&qh, ());
     let stale = region.id().protocol_id();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let server_client = comp.state.toplevels()[0].wl_surface().client().unwrap();
+    let server_region: ServerRegion = server_client
+        .object_from_protocol_id(&comp.display.handle(), stale)
+        .unwrap();
+    assert!(server_region.is_alive());
     region.destroy();
     // Do not allocate any new object after delete_id, so this remains stale.
     pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(!server_region.is_alive());
+    assert_id_absent(&comp, &server_client, stale);
+    let target = protocol_error_target(&peer._conn.display());
     raw_region(&mut peer.socket, &effect, stale);
-    let error = pump_to_error(&mut comp, &mut manager, &mut peer);
+    let error = pump_to_wire_error(&mut comp, &mut manager, &mut peer, target);
+    assert_eq!(error.object_id, target.0);
     assert_eq!(error.object_interface, "wl_display");
     assert_eq!(
         error.code,
         wayland_client::protocol::wl_display::Error::InvalidObject as u32
     );
+    assert_eq!(error.message, format!("Unknown id: {stale}."));
 }
 
 #[test]

@@ -780,9 +780,9 @@ impl DataDeviceHandler for State {
         &mut self,
         source: Option<&smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
         _seat: &Seat<Self>,
-        dh: &DisplayHandle,
+        _dh: &DisplayHandle,
     ) -> bool {
-        source.is_none_or(|source| self.protocols.toplevel_drag.selection_allowed(source, dh))
+        source.is_none_or(|source| self.protocols.toplevel_drag.selection_allowed(source))
     }
 }
 
