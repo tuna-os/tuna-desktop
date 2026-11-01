@@ -306,8 +306,9 @@ impl LeaseDevice {
     }
 
     fn end_lease(&mut self, id: u32) {
-        self.state.revoke_lease::<State>(id);
-        self.leases.retain(|lease| lease.id() != id);
+        if self.state.revoke_lease::<State>(id) {
+            self.leases.retain(|lease| lease.id() != id);
+        }
     }
 
     /// Mutter's `find_resources_to_lease`.

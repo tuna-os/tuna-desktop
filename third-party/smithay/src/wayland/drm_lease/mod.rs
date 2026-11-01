@@ -255,31 +255,46 @@ struct DrmLeaseRef {
     connectors: HashSet<connector::Handle>,
 }
 
+fn revoke_kernel_lease(
+    drm: &DrmDeviceFd,
+    lease_id: NonZeroU32,
+    revoked: &AtomicBool,
+) -> io::Result<()> {
+    if !revoked.load(Ordering::Acquire) {
+        match drm.revoke_lease(lease_id) {
+            Ok(()) => {}
+            // The final lessee FD may already have closed.
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(error) => return Err(error),
+        }
+        revoked.store(true, Ordering::Release);
+    }
+    Ok(())
+}
+
 impl Drop for DrmLease {
     fn drop(&mut self) {
-        if let Some(obj) = &self.obj.lock().unwrap().take() {
-            obj.finished();
+        if let Err(error) = revoke_kernel_lease(&self.drm, self.lease_id, &self.revoked) {
+            tracing::error!(?error, ?self.lease_id, "Kernel lease revocation failed");
+            return;
         }
-        if !self.revoked.swap(true, Ordering::SeqCst) {
-            tracing::info!(?self.lease_id, "Revoking lease");
-            if let Err(err) = self.drm.revoke_lease(self.lease_id) {
-                tracing::warn!(?err, "Error revoking lease");
-            };
+        if let Some(obj) = self.obj.lock().unwrap().take() {
+            if obj.is_alive() {
+                obj.finished();
+            }
         }
     }
 }
 
 impl DrmLeaseRef {
-    fn force_close(&self) {
+    fn force_close(&self) -> io::Result<()> {
+        revoke_kernel_lease(&self.drm, self.lease_id, &self.revoked)?;
         if let Some(obj) = Weak::upgrade(&self.obj).and_then(|obj| obj.lock().unwrap().take()) {
-            obj.finished();
+            if obj.is_alive() {
+                obj.finished();
+            }
         }
-        if !self.revoked.swap(true, Ordering::SeqCst) {
-            tracing::info!(?self.lease_id, "Revoking lease");
-            if let Err(err) = self.drm.revoke_lease(self.lease_id) {
-                tracing::warn!(?err, "Error revoking lease");
-            };
-        }
+        Ok(())
     }
 }
 
@@ -620,21 +635,19 @@ impl DrmLeaseState {
             + Dispatch<wp_drm_lease_v1::WpDrmLeaseV1, DrmLeaseData, D>
             + 'static,
     {
-        let lease_ref = {
-            if let Some(pos) = self
-                .active_leases
-                .iter()
-                .position(|lease| lease.lease_id.get() == id)
-            {
-                let lease = self.active_leases.remove(pos);
-                self.resume_internal::<D>(Some(&lease.connectors));
-                lease
-            } else {
-                return None;
-            }
-        };
-        lease_ref.force_close();
-        Some(lease_ref)
+        let pos = self
+            .active_leases
+            .iter()
+            .position(|lease| lease.lease_id.get() == id)?;
+        // Never re-offer resources or report a completed revocation until
+        // the kernel has actually withdrawn the lessee's authority.
+        if let Err(error) = self.active_leases[pos].force_close() {
+            tracing::error!(?error, id, "Keeping resources withdrawn after failed lease revocation");
+            return None;
+        }
+        let lease = self.active_leases.remove(pos);
+        self.resume_internal::<D>(Some(&lease.connectors));
+        Some(lease)
     }
 
     /// End an active lease from the compositor's side: the client gets
