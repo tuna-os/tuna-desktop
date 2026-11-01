@@ -51,8 +51,20 @@ the GDM greeter. Every boot runs even after an earlier one fails, so one run
 reports every check. No pause substitute or fabricated greeter success is
 accepted. The current-build `marlin-vm` lanes run this same GDM login and
 logout code against the source-built image with tunaOS's tuna-flavor GDM
-configuration ([lifecycle](vm-lifecycle.md)); `--published` only lets this
-nightly qualify gaps of the released build that those lanes prove.
+configuration ([lifecycle](vm-lifecycle.md)). `--published` identifies image
+acquisition only: it does not weaken any assertion. The published disk must
+provide the actual brightness contract, GSD plugins/idle behavior, logind
+lock hint, power button, mouse delivery/hotplug, native reader keyboard,
+media-key amplification, stale-auth retirement, resume GPU uploads, reader
+reaping and product logout behavior. Missing snapshot keys or obsolete
+packages fail; another lane's current-build result cannot substitute.
+Historical upgrade behavior belongs to explicitly archived upgrade journeys,
+not current published-image qualification. There is no compatibility mode
+or separate opt-in strict flag. Existing timeouts, numeric floors and actual
+Date & Time clock-change passes remain mandatory.
+Current qualification also requires actual `tuna-*` process and serial
+identities. Retired binary/log prefixes are never rewritten into current
+Tuna evidence; archival inventory is not current feature qualification.
 
 | Area | Checks |
 |---|---|
@@ -77,6 +89,44 @@ The artifact records the digest under test, fixture image identity, shipped
 package version and hashes, harness commit, run ID, frames, tour clip,
 serial journal and redacted introspection. Passwords, process arguments
 and input key values are excluded from probe artifacts.
+
+Every VM `manifest.json` and the aggregate `repeat-manifest.json` carry these
+top-level typed fields (not caller-supplied `--meta` strings):
+
+```json
+{
+  "acquisition": "published",
+  "qualification_mode": "strict",
+  "waived_assertions": [],
+  "skipped_assertions": []
+}
+```
+
+Source-built boots use `"acquisition": "source-built"` with the same strict
+policy. `--meta` cannot overwrite policy, assertions, lane or tour fields.
+`V-STRICT-PUBLISHED` records that policy on each published boot.
+`repeat-manifest.json` retains `requested_boots`, ordered `boots` containing
+the actual manifests, `boot_results` with integer `boot` indices 1–5 and
+integer `returncode` values, and `assertion_coverage`. The repeat gate
+`V-STRICT-PUBLISHED-REPEAT` rejects any failed boot process, boot without the
+explicit policy or boot with waived/skipped assertions. Such a repeat receipt
+sets its top-level `qualification_mode` to `"unqualified"` too. Each boot
+retains the same run ID, exact harness commit, pinned image, fixture image
+identity and shipped package.
+
+`qualification.json` embeds that complete repeat receipt as `repeat` and the
+standalone final manifest as `final_boot`, which must equal `repeat.boots[-1]`.
+It carries the same top-level policy fields, but sets `qualification_mode`
+to `"unqualified"` if the five actual strict boot receipts, successful
+indexed process outcomes or final-manifest identity are absent/inconsistent.
+Assertion/check rows remain `{"pass": true|false, "detail": "..."}`. Policy
+classification does not replace feature assertions: all emitted checks,
+including both actual panel clock-change gates on the final lifecycle boot,
+must pass. The first four boots prove startup; only the fifth runs the
+tour/lifecycle. No final-only gate is claimed on an earlier boot. Old
+all-pass compatibility receipts lacking these fields are not strict evidence.
+The separate sixth soak receipt records its own actual boot policy.
+
 `qualification.json` and the job summary list every check with its result
 for that digest. A failure also writes `failure.json` with the run URL,
 digest and a bounded journal excerpt containing only lifecycle/health

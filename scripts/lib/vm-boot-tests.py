@@ -38,6 +38,99 @@ def with_owner_login_session(scope):
     return scope
 
 
+
+class StrictPublishedQualification(unittest.TestCase):
+    """Behavioral policy/receipt classification, not native guest qualification."""
+
+    def test_published_changes_acquisition_not_assertion_policy(self):
+        for published, acquisition in ((False, "source-built"), (True, "published")):
+            with self.subTest(published=published):
+                receipt = lane.qualification_receipt(published)
+                self.assertEqual(receipt, {"acquisition": acquisition,
+                                          "qualification_mode": "strict",
+                                          "waived_assertions": [], "skipped_assertions": []})
+                self.assertIs(lane.is_strict_published(receipt), published)
+
+    def test_volume_requires_packaged_owner_and_exact_gnome_ceiling(self):
+        for owner in (None, [":1.9", 7]):
+            with self.subTest(owner=owner), self.assertRaises(RuntimeError):
+                lane.amplified_ceiling({"ok": False, "owner": owner})
+        handler, ceiling = lane.amplified_ceiling(
+            {"ok": True, "owner": [":1.40", 4242]})
+        self.assertEqual(handler, "gsd-media-keys")
+        self.assertEqual(ceiling, 152.52227783203125)
+        self.assertNotEqual(ceiling, 152.52)
+
+    def receipts(self):
+        boots = [{**lane.qualification_receipt(True),
+                  "run_id": "40825026740", "harness_commit": "a" * 40,
+                  "assertions": {"V-STRICT-PUBLISHED": {"pass": True, "detail": "policy"}},
+                  "captured_utc": f"2026-10-31T00:0{index}:00Z"}
+                 for index in range(5)]
+        return {**lane.qualification_receipt(True),
+                "requested_boots": 5, "boots": boots,
+                "boot_results": [{"boot": index, "returncode": 0} for index in range(1, 6)]}
+
+    def test_repeat_requires_all_five_actual_strict_classifications(self):
+        receipt = self.receipts()
+        final = receipt["boots"][-1]
+        self.assertTrue(lane.strict_published_repeat(receipt, final))
+        for index in range(5):
+            for field, value in (("acquisition", "source-built"),
+                                 ("waived_assertions", ["V-BRIGHTNESS-CONTRACT"]),
+                                 ("skipped_assertions", ["V-LOCKED-HINT"]),
+                                 ("qualification_mode", "published-compatibility")):
+                with self.subTest(boot=index, field=field):
+                    changed = json.loads(json.dumps(receipt))
+                    changed["boots"][index][field] = value
+                    self.assertFalse(lane.strict_published_repeat(changed, final))
+        # An old all-pass receipt with no typed enforcement is never strict evidence.
+        old = self.receipts()
+        for boot in old["boots"]:
+            for field in lane.qualification_receipt(True):
+                del boot[field]
+        self.assertFalse(lane.strict_published_repeat(old, old["boots"][-1]))
+
+    def test_repeat_rejects_absent_truncated_failed_or_reindexed_receipts(self):
+        original = self.receipts()
+        for field, value in (("requested_boots", "5"), ("requested_boots", True),
+                             ("requested_boots", 4), ("boots", original["boots"][:4]),
+                             ("boot_results", []), ("qualification_mode", None)):
+            with self.subTest(field=field, value=value):
+                changed = {**original, field: value}
+                self.assertFalse(lane.strict_published_repeat(changed, original["boots"][-1]))
+        for field, value in (("boot", 0), ("boot", True), ("boot", "1"),
+                             ("returncode", False), ("returncode", 1)):
+            with self.subTest(field=field, value=value):
+                changed = self.receipts()
+                changed["boot_results"][0][field] = value
+                self.assertFalse(lane.strict_published_repeat(changed, changed["boots"][-1]))
+        self.assertFalse(lane.strict_published_repeat(None, original["boots"][-1]))
+        self.assertFalse(lane.strict_published_repeat(original, {**original["boots"][-1],
+                                                               "harness_commit": "b" * 40}))
+
+    def test_mode_rejects_missing_or_inconsistent_waiver_fields(self):
+        original = lane.qualification_receipt(True)
+        for field in original:
+            changed = dict(original)
+            del changed[field]
+            self.assertFalse(lane.is_strict_published(changed))
+        for field, value in (("acquisition", True), ("qualification_mode", "compatibility"),
+                             ("waived_assertions", False), ("skipped_assertions", None),
+                             ("waived_assertions", ["V-BRIGHTNESS-CONTRACT"])):
+            self.assertFalse(lane.is_strict_published({**original, field: value}))
+
+    def test_clock_failures_stay_failures_under_strict_policy(self):
+        mode = lane.qualification_receipt(True)
+        records = []
+        raw = {"assertions": ["G-DATETIME-CLOCK-TZ fail panel did not follow timezone",
+                              "G-DATETIME-CLOCK-SET pass actual changed clock"]}
+        with self.assertRaisesRegex(RuntimeError, "G-DATETIME-CLOCK-TZ"):
+            lane.record_datetime_gates(raw, mode["acquisition"] == "published",
+                                       lambda *row: records.append(row))
+        self.assertEqual([(gate, passed) for gate, passed, _ in records],
+                         [("G-DATETIME-CLOCK-TZ", False), ("G-DATETIME-CLOCK-SET", True)])
+
 class DatetimePublishedQualification(unittest.TestCase):
     """Behavioral lane policy tests, not native Date & Time qualification."""
 
@@ -139,8 +232,8 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
     GSD = {"ok": True, "owner": [":1.40", 4242]}
     UNOWNED = {"ok": False, "owner": None}
 
-    def run_audio(self, *, change=None, older=False, dense=False, setup_error=False,
-                  write_error=False, high=GSD_UI_MAX, media_keys=GSD, published=False):
+    def run_audio(self, *, change=None, dense=False, setup_error=False,
+                  write_error=False, high=GSD_UI_MAX, media_keys=GSD):
         tree = ast.parse(self.SOURCE.read_text())
         lifecycle = next(node for node in tree.body
                          if isinstance(node, ast.FunctionDef) and node.name == "run_lifecycle")
@@ -176,8 +269,7 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
                     reset_receipts.append(json.loads(diagnostic.read_text()) if diagnostic.exists() else None)
                     return {}
                 if action == "audio-amplification-read":
-                    percent = ((98.0, 98.0, 150.0, 98.0) if older else
-                               (100.0, 104.0, high, 100.0))[case_index]
+                    percent = (100.0, 104.0, high, 100.0)[case_index]
                     actual = value(percent, case_index in (1, 2))
                     if case_index == 3 and change:
                         actual.update(change)
@@ -189,7 +281,7 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
                         "media_keys": media_keys}
             scope = {**vars(lane), "agent": SimpleNamespace(run=run),
                      "qmp": SimpleNamespace(keys=lambda key: keys.append(key)),
-                     "evidence": directory, "older_guest": older, "published": published,
+                     "evidence": directory,
                      "record": lambda *args: records.append(args),
                      "time": SimpleNamespace(monotonic=monotonic, sleep=sleep)}
             if write_error:
@@ -246,51 +338,33 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
         self.assertEqual(result.diagnostic[2]["expected_percent"], lane.GNOME_UI_MAX_PERCENT)
         self.assertEqual(result.diagnostic[2]["key_handler"], "gsd-media-keys")
 
-    def test_ceiling_follows_the_guests_media_keys_owner(self):
-        # A published guest whose shell predates gsd-media-keys binds the
-        # volume keys natively and writes wpctl's 1.5252.
-        native = self.run_audio(high=self.NATIVE_UI_MAX, media_keys=self.UNOWNED, published=True)
-        self.assertIsNone(native.error)
-        self.assertEqual(native.diagnostic[2]["expected_percent"], lane.SHELL_NATIVE_UI_MAX_PERCENT)
-        self.assertEqual({case["key_handler"] for case in native.diagnostic}, {"shell-native"})
-        # A published guest running gsd-media-keys gets GNOME's exact ceiling.
-        self.assertIsNone(self.run_audio(media_keys=self.GSD, published=True).error)
-        truncated = self.run_audio(high=self.NATIVE_UI_MAX, media_keys=self.GSD, published=True)
+    def test_ceiling_requires_the_guests_packaged_media_keys_owner(self):
+        self.assertIsNone(self.run_audio(media_keys=self.GSD).error)
+        truncated = self.run_audio(high=self.NATIVE_UI_MAX, media_keys=self.GSD)
         self.assertIsInstance(truncated.error, RuntimeError)
-        # The native ceiling never passes for gsd's, nor gsd's for the native.
-        self.assertIsInstance(self.run_audio(media_keys=self.UNOWNED, published=True).error, RuntimeError)
-        # The current build must run the packaged gsd-media-keys, and no guest
-        # passes with an owner that is not it.
-        for media_keys, published in ((self.UNOWNED, False), ({"ok": False, "owner": [":1.9", 7]}, True),
-                                      ({"ok": False, "owner": [":1.9", 7]}, False)):
-            with self.subTest(media_keys=media_keys, published=published):
-                result = self.run_audio(high=self.NATIVE_UI_MAX, media_keys=media_keys, published=published)
+        for media_keys in (self.UNOWNED, {"ok": False, "owner": [":1.9", 7]}):
+            with self.subTest(media_keys=media_keys):
+                result = self.run_audio(high=self.NATIVE_UI_MAX, media_keys=media_keys)
                 self.assertIsInstance(result.error, RuntimeError)
                 self.assertEqual(result.records, [])
                 self.assertEqual(result.actions[-1], "audio-amplification-reset")
 
-    def test_success_preserves_legacy_receipt_actions_and_verdict(self):
-        for older in (False, True):
-            with self.subTest(older=older):
-                result = self.run_audio(older=older)
-                self.assertIsNone(result.error)
-                self.assertEqual(len(result.legacy), 4)
-                self.assertEqual([v["percent"] for v in result.legacy],
-                                 [98.0, 98.0, 150.0, 98.0] if older else [100.0, 104.0, self.GSD_UI_MAX, 100.0])
-                self.assertEqual(result.keys, [] if older else ["volumeup"] * 4)
-                self.assertEqual(result.sleeps, [] if older else [0.3] * 4)
-                self.assertEqual(result.records[0][:2], ("V-AUDIO-AMPLIFICATION", True))
-                self.assertEqual(result.actions[-1], "audio-amplification-reset")
-                self.assertEqual(len(result.actions), 9)
+    def test_success_preserves_audio_receipt_actions_and_verdict(self):
+        result = self.run_audio()
+        self.assertIsNone(result.error)
+        self.assertEqual(len(result.legacy), 4)
+        self.assertEqual([v["percent"] for v in result.legacy],
+                         [100.0, 104.0, self.GSD_UI_MAX, 100.0])
+        self.assertEqual(result.keys, ["volumeup"] * 4)
+        self.assertEqual(result.sleeps, [0.3] * 4)
+        self.assertEqual(result.records[0][:2], ("V-AUDIO-AMPLIFICATION", True))
+        self.assertEqual(result.actions[-1], "audio-amplification-reset")
+        self.assertEqual(len(result.actions), 9)
 
-    def test_precision_and_old_guest_range_stay_unchanged(self):
+    def test_exact_gnome_precision_stays_unchanged(self):
         for percent, passes in ((100.000001, True), (99.998, False), (100.0012, False)):
             with self.subTest(percent=percent):
                 result = self.run_audio(change={"percent": percent})
-                self.assertEqual(result.error is None, passes)
-        for percent, passes in ((90.0, True), (106.0, True), (106.001, False)):
-            with self.subTest(older_percent=percent):
-                result = self.run_audio(change={"percent": percent}, older=True)
                 self.assertEqual(result.error is None, passes)
 
     def test_history_cap_is_only_retention_and_keeps_last_sample(self):
@@ -1577,7 +1651,7 @@ class LifecyclePostNavigationBaseline(unittest.TestCase):
         tree = ast.parse(file.read_text())
         helpers = [next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
                    for name in ("same_apps", "same_apps_after_navigation")]
-        scope = {"guest_role": lane.guest_role}
+        scope = {}
         exec(compile(ast.Module(body=helpers, type_ignores=[]), str(file), "exec"), scope)
         return scope
 
@@ -3518,8 +3592,8 @@ class ShippedSnapshotInventory(unittest.TestCase):
         self.assertIsNone(result["state"]["pointer_position"])
         self.assertIsNone(result["state"]["native_relative_motion_count"])
 
-    def test_published_guest_with_pre_rename_binaries_still_detects_session(self):
-        # The published flavor can still ship the package from before #505.
+    def test_historical_archive_inventory_reports_actual_retired_executable(self):
+        # Inventory reports archival identities verbatim; it does not qualify them.
         uid = os.getuid()
         result = self.run_inventory(dict(self.SHIPPED_STATE), [
             ("1", "959 greeter seat0 tty1"),
@@ -3537,41 +3611,32 @@ class ShippedSnapshotInventory(unittest.TestCase):
             self.run_inventory(state, [("4", f"{uid} tuna-test - -")])
 
 
-class PreRenameGuestLog(unittest.TestCase):
+class CurrentGuestIdentity(unittest.TestCase):
     # tuna-rename: keep-begin
-    # The published flavor can still ship binaries from before #505.
-    def test_pre_rename_binary_lines_read_as_current_names(self):
-        text = lane.normalize_guest_log(
-            "session[9]: roost-compositor: drm: output Virtual-1 1280x800\n"
-            "session[9]: roost-shell-gtk: keybindings: 64 grabs\n"
-            "tuna-vm-health: roost-test ready\n")
-        self.assertRegex(text, lane.DRM_RE)
-        self.assertRegex(text, lane.SHELL_RE)
-        self.assertIn("tuna-vm-health: roost-test ready", text)
+    def test_serial_never_rewrites_retired_binary_names_into_current_evidence(self):
+        retired = ("session[9]: roost-compositor: drm: output Virtual-1 1280x800\n"
+                   "session[9]: roost-shell-gtk: keybindings: 64 grabs\n")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "serial.log"
+            path.write_text("\x1b[0m" + retired)
+            actual = lane.read_text(path)
+        self.assertEqual(actual, retired)
+        self.assertNotRegex(actual, lane.DRM_RE)
+        self.assertNotRegex(actual, lane.SHELL_RE)
 
-    def test_pre_rename_executables_compare_by_role(self):
-        self.assertEqual(lane.guest_role("roost-compositor"), "tuna-compositor")
-        self.assertEqual(lane.guest_role("tuna-shell-gtk"), "tuna-shell-gtk")
-        self.assertEqual(lane.guest_role("nautilus"), "nautilus")
+    def test_current_authentication_requires_actual_current_executable(self):
+        process = {"pid": 11, "uid": 1000, "ppid": 10, "pgrp": 11,
+                   "start_ticks": 123, "exe_device": 1, "exe_inode": 987,
+                   "executable": "tuna-compositor"}
+        self.assertEqual(lane.checked_auth_process(process, "tuna-compositor"), process)
+        for retired in ("roost-compositor", "roost-shell-gtk"):
+            with self.subTest(executable=retired), self.assertRaises(ValueError):
+                lane.checked_auth_process({**process, "executable": retired}, "tuna-compositor")
     # tuna-rename: keep-end
 
 
-class PredatingGuestQualification(unittest.TestCase):
-    # Run 37700332957: the published tuna-desktop 0.1.0-2 guest runs a healthy
-    # session whose snapshot reports every newer instrumentation key as
-    # None, and its shell moves no media-key volume. Newer-behavior gates
-    # qualify on such guests instead of failing the whole lifecycle; the
-    # current-build lane keeps proving them strictly.
-    SHIPPED_STATE = {"locked": False, "windows": [], "focused": None,
-                     "active_workspace": 0, "overview_open": False,
-                     "pointer_position": None, "native_relative_motion_count": None,
-                     "mouse_left_handed": None, "touchpad_left_handed": None,
-                     "hot_corners": None}
-    CURRENT_STATE = {"locked": False, "windows": [], "focused": None,
-                     "active_workspace": 0, "overview_open": False,
-                     "pointer_position": [0, 0], "native_relative_motion_count": 0,
-                     "mouse_left_handed": False, "touchpad_left_handed": False,
-                     "hot_corners": True}
+class MediaVolumeAndLockRecords(unittest.TestCase):
+    # Actual historical baseline-only output must fail rather than waive key behavior.
     STRICT_SERIAL = ("\n".join([
         "tuna-vm-health: audio-hda ready",
         "tuna-vm-health: volume=0.40",
@@ -3583,37 +3648,8 @@ class PredatingGuestQualification(unittest.TestCase):
     BASELINE_SERIAL = ("tuna-vm-health: audio-hda ready\n"
                        "tuna-vm-health: volume=0.40\n")
 
-    def verdict(self, text, state=None):
-        with tempfile.TemporaryDirectory() as directory:
-            lifecycle = Path(directory) / "lifecycle"
-            lifecycle.mkdir()
-            if state is not None:
-                (lifecycle / "before.json").write_text(json.dumps({"state": state}))
-            return lane.media_volume_ok(text, str(lifecycle))
-
-    def test_predating_snapshot_qualifies(self):
-        self.assertTrue(lane.predates_newer_snapshot(dict(self.SHIPPED_STATE)))
-
-    def test_current_snapshot_stays_strict(self):
-        self.assertFalse(lane.predates_newer_snapshot(dict(self.CURRENT_STATE)))
-
-    def test_partial_snapshot_stays_strict(self):
-        # Fail closed: a guest with only some newer keys still takes the
-        # strict path rather than silently qualifying.
-        state = {**self.SHIPPED_STATE, "mouse_left_handed": False}
-        self.assertFalse(lane.predates_newer_snapshot(state))
-
-    def test_sleep_auth_qualifies_on_published_guest_without_auth_owner(self):
-        state = {**self.CURRENT_STATE, "auth_owner": None}
-        self.assertTrue(lane.sleep_auth_qualifies(True, state))
-        self.assertTrue(lane.sleep_auth_qualifies(True, dict(self.SHIPPED_STATE)))
-
-    def test_sleep_auth_stays_strict_on_current_build_lane(self):
-        # marlin-vm runs the branch's own build: never qualified, even if
-        # the key were absent.
-        self.assertFalse(lane.sleep_auth_qualifies(False, dict(self.SHIPPED_STATE)))
-        owner = {"epoch": 1}
-        self.assertFalse(lane.sleep_auth_qualifies(True, {**self.CURRENT_STATE, "auth_owner": owner}))
+    def verdict(self, text):
+        return lane.media_volume_ok(text)
 
     def test_sheared_lock_result_record_reassembles(self):
         # Run 38855306157 serial: one shell eprintln! split across records.
@@ -3639,37 +3675,27 @@ class PredatingGuestQualification(unittest.TestCase):
         self.assertFalse(any("applied=false" in line for line in records))
 
     def test_media_volume_strict_sequence_passes(self):
-        ok, detail = self.verdict(self.STRICT_SERIAL, self.CURRENT_STATE)
+        ok, detail = self.verdict(self.STRICT_SERIAL)
         self.assertTrue(ok)
         self.assertNotIn("predates", detail)
 
-    def test_media_volume_qualifies_on_predating_guest(self):
-        ok, detail = self.verdict(self.BASELINE_SERIAL, self.SHIPPED_STATE)
-        self.assertTrue(ok)
-        self.assertIn("predates", detail)
-
-    def test_media_volume_stays_strict_on_current_guest(self):
-        ok, _ = self.verdict(self.BASELINE_SERIAL, self.CURRENT_STATE)
+    def test_media_volume_rejects_historical_baseline_only(self):
+        ok, detail = self.verdict(self.BASELINE_SERIAL)
         self.assertFalse(ok)
+        self.assertNotIn("predates", detail)
 
-    def test_media_volume_stays_strict_without_predation_evidence(self):
-        ok, _ = self.verdict(self.BASELINE_SERIAL, None)
-        self.assertFalse(ok)
-
-    def test_lock_chord_held_until_lock_owns_input_on_predating_guest(self):
-        # Run 37727015469: a quick Super release on the 0.1.0-2 guest is
-        # dropped before the lock surface maps, latching Super so the
-        # password never reaches PAM. Hold the chord on such guests only.
-        self.assertGreaterEqual(lane.lock_chord_hold_ms(True), 1000)
-
-    def test_lock_chord_stays_quick_on_current_guest(self):
-        # Current guests keep exercising the quick-release regression path.
-        self.assertEqual(lane.lock_chord_hold_ms(False), 80)
+    def test_media_volume_rejects_missing_or_out_of_order_key_transitions(self):
+        for text in (self.STRICT_SERIAL.replace("volume=0.46", "volume=0.40"),
+                     self.STRICT_SERIAL.replace(" [MUTED]", ""),
+                     self.STRICT_SERIAL.replace("volume=0.46", "volume=0.47"),
+                     self.BASELINE_SERIAL + self.STRICT_SERIAL):
+            with self.subTest(text=text):
+                self.assertFalse(self.verdict(text)[0])
 
     def test_media_volume_requires_hda_and_baseline(self):
-        ok, _ = self.verdict("tuna-vm-health: volume=0.40\n", self.SHIPPED_STATE)
+        ok, _ = self.verdict("tuna-vm-health: volume=0.40\n")
         self.assertFalse(ok)
-        ok, _ = self.verdict("tuna-vm-health: audio-hda ready\n", self.SHIPPED_STATE)
+        ok, _ = self.verdict("tuna-vm-health: audio-hda ready\n")
         self.assertFalse(ok)
 
 

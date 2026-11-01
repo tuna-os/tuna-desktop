@@ -142,7 +142,11 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 - <<'PY'
-          import json, os, pathlib
+          import importlib.machinery, importlib.util, json, os, pathlib
+          loader = importlib.machinery.SourceFileLoader('published_vm_lane', 'scripts/tuna-vm-lane')
+          spec = importlib.util.spec_from_loader(loader.name, loader)
+          lane = importlib.util.module_from_spec(spec)
+          loader.exec_module(lane)
           out = pathlib.Path('published-vm-artifacts')
           out.mkdir(exist_ok=True)
           digest_path = pathlib.Path('/mnt/vm/published-digest')
@@ -151,7 +155,10 @@ jobs:
           # boot's manifest carries what each check actually observed.
           checks = {}
           final = out / 'manifest.json'
-          observed = json.loads(final.read_text())['assertions'] if final.exists() else {}
+          final_boot = json.loads(final.read_text()) if final.exists() else None
+          observed = final_boot['assertions'] if final_boot else {}
+          repeat_path = out / 'repeat-manifest.json'
+          repeat = json.loads(repeat_path.read_text()) if repeat_path.exists() else None
           assertions = out / 'assertions.txt'
           if assertions.exists():
               for line in assertions.read_text().splitlines():
@@ -159,6 +166,11 @@ jobs:
                   detail = observed.get(name, {}).get('detail', '')
                   checks[name] = {'pass': verdict == 'pass',
                                   'detail': f'{detail} ({coverage})' if detail else coverage}
+          strict_repeat = lane.strict_published_repeat(repeat, final_boot)
+          checks['V-STRICT-PUBLISHED-REPEAT'] = {
+              'pass': strict_repeat,
+              'detail': 'five successful pristine boots with explicit strict published mode, no permitted waivers, and matching final boot',
+          }
           excerpt = []
           for path in out.rglob('serial.log'):
               for line in path.read_text(errors='replace').splitlines():
@@ -171,6 +183,9 @@ jobs:
           soak_dir = pathlib.Path('published-vm-soak')
           if (soak_dir / 'assertions.txt').exists():
               soak = {'artifact': f"published-marlin-tuna-soak-{os.environ['RUN_ID']}", 'checks': {}}
+              soak_manifest = soak_dir / 'manifest.json'
+              soak_boot = json.loads(soak_manifest.read_text()) if soak_manifest.exists() else {}
+              soak.update({field: soak_boot.get(field) for field in lane.qualification_receipt(True)})
               for line in (soak_dir / 'assertions.txt').read_text().splitlines():
                   name, verdict, detail = (line.split(' ', 2) + ['', ''])[:3]
                   soak['checks'][name] = {'pass': verdict == 'pass', 'detail': detail}
@@ -182,6 +197,10 @@ jobs:
               'published_image': f'ghcr.io/tuna-os/marlin@{digest}' if digest else None,
               'published_image_digest': digest,
               'checks': checks,
+              **lane.qualification_receipt(True),
+              'qualification_mode': 'strict' if strict_repeat else 'unqualified',
+              'repeat': repeat,
+              'final_boot': final_boot,
               'soak': soak,
           }
           (out / 'qualification.json').write_text(json.dumps(results, indent=2))
