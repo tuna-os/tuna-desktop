@@ -9,6 +9,14 @@ Uses a disposable overlay/cloud-init/SSH client+host keys, loopback-only fresh
 SSH port and its own QEMU process. Never uses Corral/existing VMs. KVM when
 accessible; otherwise explicitly recorded TCG (not a hardware-acceleration claim).
 
+Guest-only prerequisites use Canonical's immutable 20261018T000000Z archive
+snapshot, adjacent to the authenticated image release, not live mirror indexes.
+APT still verifies the Ubuntu archive keyring, hashes and validity timestamps.
+There are no acquisition retries or ignored update errors. The retained apt/
+receipt records the original sources/config, effective fixture sources/config,
+signed InRelease files and package identities before/after preparation. This is
+an ordinary qualification-fixture delta, not a replacement image/release claim.
+
   python3 scripts/ci-hdr-vkms-guest --work-dir /ABS/new-hdr-vm \
       --artifacts /ABS/new-hdr-evidence --payload-tar /ABS/native-payload.tar \
       --guest-command 'python3 scripts/tuna-color-capture-proof --backend drm --hdr ...'
@@ -47,6 +55,59 @@ MANIFEST = 'ubuntu-24.04-server-cloudimg-amd64.manifest'
 MANIFEST_SHA256 = '78d7da6ab1556daa6c0f685bf4e0e3da36395f170e8fad411d7ba032f14d08c2'
 FINGERPRINT = 'D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81'
 EXPECTED_KERNEL = '6.8.0-147-generic'
+APT_SNAPSHOT = '20261018T000000Z'
+APT_BASE = f'https://snapshot.ubuntu.com/ubuntu/{APT_SNAPSHOT}/'
+
+# Executed only inside the newly owned guest, before any apt operation. Keep the
+# image's original source files intact and retain their contents for comparison;
+# all guest apt callers (including --prepare-command) use one immutable archive.
+# Noble APT already enables By-Hash by default, and even "force" retains a
+# mutable-filename fallback. An immutable primary archive fixes that race too.
+# Service contract: https://snapshot.ubuntu.com/
+GUEST_APT_SETUP = r'''
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+evidence = Path('/home/ubuntu/artifacts/apt')
+evidence.mkdir()
+owner = evidence.parent.stat()
+os.chown(evidence, owner.st_uid, owner.st_gid)
+original_sources = [Path('/etc/apt/sources.list')]
+for suffix in ('*.list', '*.sources'):
+    original_sources.extend(sorted(Path('/etc/apt/sources.list.d').glob(suffix)))
+before = {str(path): path.read_text() for path in original_sources if path.is_file()}
+config_before = subprocess.check_output(['apt-config', 'dump'], text=True)
+(evidence / 'packages-before.tsv').write_bytes(subprocess.check_output(['dpkg-query', '-W']))
+source = Path('/etc/apt/tuna-hdr.sources')
+source_parts = Path('/etc/apt/tuna-hdr.sources.d')
+source_parts.mkdir()
+source.write_text(
+    'Types: deb\nURIs: ' + sys.argv[1] + '\n'
+    'Suites: noble noble-updates noble-security noble-backports\n'
+    'Components: main restricted universe multiverse\n'
+    'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n'
+)
+config = Path('/etc/apt/apt.conf.d/99tuna-hdr-fixture')
+config.write_text(
+    f'Dir::Etc::sourcelist "{source}";\n'
+    f'Dir::Etc::sourceparts "{source_parts}";\n'
+    'Acquire::Retries "0";\n'
+    'APT::Update::Error-Mode "any";\n'
+)
+(evidence / 'fixture-delta.json').write_text(json.dumps({
+    'purpose': 'Owned emulated HDR qualification guest prerequisites only',
+    'kernel': os.uname().release,
+    'original_sources': before,
+    'original_apt_config': config_before,
+    'fixture_sources': {str(source): source.read_text()},
+    'fixture_apt_config': subprocess.check_output(['apt-config', 'dump'], text=True),
+    'snapshot_url': sys.argv[1],
+    'authentication': 'Unchanged Ubuntu archive keyring, hash and validity checks',
+}, indent=2) + '\n')
+'''
 
 
 def call(args, **kwargs):
@@ -127,6 +188,7 @@ def main():
     identity = {'image_url': BASE + IMAGE, 'image_sha256': IMAGE_SHA256,
                 'image_release': '20261017', 'signing_fingerprint': FINGERPRINT,
                 'expected_kernel': EXPECTED_KERNEL, 'emulated': True,
+                'apt_snapshot': APT_SNAPSHOT, 'apt_snapshot_url': APT_BASE,
                 'native_command': args.guest_command, 'negative_command': args.negative_command,
                 'status': 'preparing'}
     try:
@@ -234,11 +296,15 @@ def main():
                     'libegl-mesa0', 'libgl1-mesa-dri', 'mesa-vulkan-drivers', 'libseat1', 'seatd',
                     'pipewire', 'pipewire-bin', 'wireplumber', 'dbus-user-session', 'python3-gi',
                     'gir1.2-glib-2.0', 'libinput10', 'libxkbcommon0', 'xwayland', 'wayland-utils']
-        prepare = ('set -eu; sudo apt-get -o DPkg::Lock::Timeout=180 update; '
+        apt_setup = 'sudo python3 -c ' + shlex.quote(GUEST_APT_SETUP) + ' ' + shlex.quote(APT_BASE)
+        prepare = ('set -eu; ' + apt_setup + '; '
+                   'trap ' + shlex.quote('dpkg-query -W > /home/ubuntu/artifacts/guest-packages.tsv') + ' EXIT; '
+                   'sudo apt-get -o DPkg::Lock::Timeout=180 update; '
+                   'cp /var/lib/apt/lists/*InRelease /home/ubuntu/artifacts/apt/; '
+                   'apt-get indextargets > /home/ubuntu/artifacts/apt/index-targets.txt; '
                    'sudo env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 install -y --no-install-recommends ' +
                    ' '.join(packages) + '; test -f /lib/modules/$(uname -r)/build/Makefile; '
                    'cd /home/ubuntu/payload; ' + args.prepare_command + '; '
-                   'dpkg-query -W > /home/ubuntu/artifacts/guest-packages.tsv; '
                    'python3 /home/ubuntu/hdr-source/scripts/ci-install-hdr-vkms build --build-dir /home/ubuntu/hdr-module')
         with (artifacts / 'guest-prepare.log').open('wb') as log:
             call([*ssh, 'bash -lc ' + shlex.quote(prepare)], stdout=log, stderr=subprocess.STDOUT, timeout=args.proof_timeout)

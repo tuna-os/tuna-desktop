@@ -7,6 +7,8 @@ PipeWire. The exact --shell-bin supervised PID is the authorized shell-role
 consumer, as in tuna-screenshot-flash-proof; no portal-name spoof or policy
 bypass. Screenshots must contain real gAMA/cHRM chunks and expected pixels.
 Casts must negotiate full-range BGRx/BT.709/gamma22 and deliver expected bytes.
+The nested compositor starts against the real Xvfb host without a Wayland
+client socket override; only its clients receive the new private socket.
 
 Prerequisites: built compositor and tuna-color-pixel-client, Xvfb, xdotool,
 dbus-daemon, pipewire, wireplumber, python3-gi, python3-pil,
@@ -239,15 +241,19 @@ def start_core(label):
     for name in ('consumer-ready.json', 'capture-request.json', 'capture-response.json',
                  'compositor-state.json', 'stop-consumer'):
         (art / name).unlink(missing_ok=True)
-    env['WAYLAND_DISPLAY'] = 'tuna-color-capture'
-    for endpoint in (runtime / env['WAYLAND_DISPLAY'],
-                     runtime / ('tuna-' + env['WAYLAND_DISPLAY'] + '.control')):
+    socket_name = 'tuna-color-capture'
+    # Winit must select the real Xvfb host, not our not-yet-created socket.
+    # Runtime publishes its private socket to the supervised shell afterward.
+    env.pop('WAYLAND_DISPLAY', None)
+    for endpoint in (runtime / socket_name,
+                     runtime / ('tuna-' + socket_name + '.control')):
         endpoint.unlink(missing_ok=True)
     command = [str(compositor), '--backend', args.backend, '--socket',
-               env['WAYLAND_DISPLAY'], '--shell-bin', str(consumer)]
+               socket_name, '--shell-bin', str(consumer)]
     if args.backend == 'winit':
         command.extend(['--width', '1280', '--height', '800'])
     core = spawn(command, 'compositor-' + label)
+    env['WAYLAND_DISPLAY'] = socket_name
     ready = wait(lambda: read_json(art / 'consumer-ready.json'), 'supervised capture consumer')
     consumer_descriptor = os.pidfd_open(ready['pid'])
     identities.append((ready['pid'], consumer_descriptor))

@@ -7,6 +7,10 @@ QEMU tool recipe, recording new binary/image identities. Optional --corral plus
 --tool-archive reuse only the independently hash-approved immutable tools.
 Never run against a shared peer's store/container/VM. Artifacts exclude keys and
 disks. No GNOME portal metadata/HDR output qualification is inferred from QMP PNGs.
+Waits for the stock GDM greeter's Wayland session and GNOME Shell's Type=notify
+readiness before a single strict paint check. A failure retains bounded guest
+service/session/DRM/renderer journals and owned QEMU logs before cleanup; it does
+not diagnose a blank frame as a timeout, qualify a renderer, or retry the frame.
 """
 import argparse
 import hashlib
@@ -50,11 +54,24 @@ def main():
     def save():
         (out / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
     save()
+    fixture_password = uuid.uuid4().hex
+    def redact(data):
+        data = data.replace(fixture_password.encode(), b'[REDACTED FIXTURE PASSWORD]')
+        return re.sub(rb'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----',
+                      b'[REDACTED PRIVATE KEY]', data, flags=re.S)
     log = (out / 'commands.log').open('wb')
-    def run(cmd, *, check=True, timeout=1800):
-        # Password/key bytes never appear in command logging.
-        r = subprocess.run([str(x) for x in cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
-        log.write(r.stdout + r.stderr); log.flush()
+    def run(cmd, *, check=True, timeout=1800, log_output=True):
+        # No argv logging: type's argv contains the fixture password. Corral's
+        # pinned type implementation prints only a character count, never text.
+        try:
+            r = subprocess.run([str(x) for x in cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            if log_output:
+                log.write(redact((error.stdout or b'') + (error.stderr or b''))); log.flush()
+            # TimeoutExpired.__str__ would expose the complete secret argv.
+            raise RuntimeError(f'{cmd[0]} timed out after {timeout}s; see commands.log') from None
+        if log_output:
+            log.write(redact(r.stdout + r.stderr)); log.flush()
         if check and r.returncode:
             raise RuntimeError(f'{cmd[0]} failed ({r.returncode}); see commands.log')
         return r
@@ -64,6 +81,79 @@ def main():
     with tempfile.TemporaryDirectory(prefix=token + '-') as tmp:
         w = Path(tmp)
         os.chmod(w, 0o700)
+        ssh = corral = None
+        def failure_evidence():
+            # Evidence is observational, never a second screenshot or a service
+            # restart. Each SSH command and each retained file has a hard bound.
+            evidence = {'stage': report.get('stage', 'fixture-preparation'), 'files': {}}
+            report['failure_evidence'] = evidence
+            limit = 128 * 1024
+            def retain(name, data, **status):
+                data = redact(data)
+                (out / name).write_bytes(data[-limit:])
+                evidence['files'][name] = {**status, 'bytes': min(len(data), limit),
+                                           'truncated': max(len(data), status.get('source_bytes', 0)) > limit}
+            vm_dir = w / 'home/.local/share/corral/vms' / token
+            for name in ('qemu.log', 'serial.log'):
+                path = vm_dir / name
+                if path.is_file():
+                    with path.open('rb') as stream:
+                        size = path.stat().st_size
+                        stream.seek(max(0, size - limit))
+                        retain('failure-' + name, stream.read(limit), source_bytes=size)
+            if corral:
+                for command in ('query-status', 'query-pci'):
+                    name = 'failure-qmp-' + command + '.txt'
+                    try:
+                        result = corral('qmp', token, command, '{}', check=False, timeout=10, log_output=False)
+                        retain(name, result.stdout + result.stderr, exit=result.returncode)
+                    except Exception as error:
+                        evidence['files'][name] = {'error': str(error)}
+            if ssh:
+                commands = {
+                    'boot-services': '''date -u --iso-8601=seconds; uname -a; cat /proc/cmdline
+systemctl get-default
+readlink -f /etc/systemd/system/default.target /etc/systemd/system/display-manager.service
+systemctl show graphical.target display-manager.service gdm.service systemd-logind.service accounts-daemon.service systemd-user-sessions.service systemd-tmpfiles-setup.service -p Id -p LoadState -p ActiveState -p SubState -p Result -p MainPID -p ExecMainCode -p ExecMainStatus -p NRestarts -p Job -p After -p Requires -p FragmentPath -p DropInPaths
+systemctl list-jobs --no-pager; systemctl --failed --no-pager
+sha256sum --check /usr/share/colour-reference/gdm.sha256''',
+                    'sessions-renderer': '''loginctl list-sessions --no-legend | while read -r s rest; do
+ loginctl show-session "$s" -p Id -p Name -p User -p Type -p Class -p Service -p Active -p State -p Seat -p VTNr -p Leader -p Scope
+ echo
+done
+ps -eo pid,ppid,uid,comm
+for name in gdm tuna-test; do
+ uid=$(id -u "$name") || continue
+ runuser -u "$name" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user show org.gnome.Shell@gdm.service org.gnome.Shell@wayland.service -p Id -p Type -p LoadState -p ActiveState -p SubState -p Result -p MainPID -p ExecMainCode -p ExecMainStatus -p FragmentPath -p DropInPaths
+ find "/run/user/$uid" -maxdepth 1 -type s -name 'wayland-*' -printf '%f\\n'
+done
+for proc in /proc/[0-9]*; do
+ [ "$(cat "$proc/comm" 2>/dev/null)" = gnome-shell ] || continue
+ echo "== $proc executable and loaded renderer libraries (not GL capability proof) =="
+ readlink "$proc/exe"
+ grep -E '/[^ ]*(dri/|lib(EGL|GL|gbm|gallium|mutter|vulkan)|swrast|llvmpipe|virgl)' "$proc/maps"
+done''',
+                    'drm': '''for node in /sys/class/drm/*; do
+ echo "== $node =="; readlink -f "$node/device/driver"
+ for value in status enabled modes device/vendor device/device; do
+  [ ! -f "$node/$value" ] || { echo "$value"; cat "$node/$value"; }
+ done
+done
+stat -c '%n mode=%a uid=%u gid=%g device=%t:%T' /dev/dri/*''',
+                    'gnome-journal': '''journalctl -b --no-pager -n 300 -o short-monotonic _SYSTEMD_UNIT=gdm.service + _COMM=gnome-shell + _COMM=gnome-session-b + _COMM=gnome-session + _SYSTEMD_USER_UNIT=org.gnome.Shell@gdm.service + _SYSTEMD_USER_UNIT=org.gnome.Shell@wayland.service + _SYSTEMD_UNIT=systemd-logind.service''',
+                    'drm-journal': '''journalctl -b -k --no-pager -n 200 -o short-monotonic --grep='(?i)(drm|virtio|gpu|framebuffer|oom|out of memory|segfault)' ''',
+                }
+                for label, command in commands.items():
+                    name = 'failure-guest-' + label + '.txt'
+                    try:
+                        # Do not request journal export, process argv/environ,
+                        # WAYLAND_DEBUG, coredumpctl, keys or any raw core.
+                        result = ssh('timeout 15s sh -c ' + shlex.quote(command),
+                                     check=False, timeout=20, log_output=False)
+                        retain(name, result.stdout + result.stderr, exit=result.returncode)
+                    except Exception as error:
+                        evidence['files'][name] = {'error': str(error)}
+            save()
         try:
             raw = run(['skopeo', 'inspect', '--raw', 'docker://' + BASE + INDEX]).stdout
             (out / 'index.json').write_bytes(raw)
@@ -112,6 +202,11 @@ def main():
             save()
             shutil.copy2(a.color_client, w / 'pixel-client'); (w / 'pixel-client').chmod(0o755)
             run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', w / 'key'])
+            password_file = w / 'fixture-password'
+            password_file.touch(mode=0o600)
+            password_file.write_text('tuna-test:' + fixture_password + '\n')
+            # Keys and build-secret bytes must not enter the build context.
+            (w / '.containerignore').write_text('*\n!Containerfile\n!packages.sh\n!fixture.tmpfiles\n')
             (w / 'home').mkdir()
             (w / 'fixture.tmpfiles').write_text('d /var/home/tuna-test 0700 tuna-test tuna-test -\nd /var/lib/AccountsService/users 0700 root root -\nf+ /var/lib/AccountsService/users/tuna-test 0600 root root - [User]\\nSystemAccount=false\\n\n')
             (w / 'packages.sh').write_text('''set -eu
@@ -125,14 +220,16 @@ pacman --config "$work/pacman.conf" -S --needed --noconfirm qemu-guest-agent ope
 ''')
             (w / 'Containerfile').write_text('''FROM ''' + BASE + INDEX + '''
 COPY packages.sh /run/packages.sh
-RUN mkdir -p /usr/share/colour-reference && pacman -Q >/usr/share/colour-reference/shipped && sha256sum /etc/gdm/custom.conf /usr/lib/systemd/system/gdm.service >/usr/share/colour-reference/gdm.sha256 && bash /run/packages.sh && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test && echo 'tuna-test:tuna' | chpasswd && systemctl enable sshd && systemctl add-wants multi-user.target qemu-guest-agent.service && sha256sum --check /usr/share/colour-reference/gdm.sha256 && pacman -Q >/usr/share/colour-reference/fixture && python3 -c 'from pathlib import Path; p=Path("/usr/share/colour-reference"); assert set((p/"shipped").read_text().splitlines()) <= set((p/"fixture").read_text().splitlines())' && rm /run/packages.sh
+RUN --mount=type=secret,id=fixture-password mkdir -p /usr/share/colour-reference && pacman -Q >/usr/share/colour-reference/shipped && sha256sum /etc/gdm/custom.conf /usr/lib/systemd/system/gdm.service >/usr/share/colour-reference/gdm.sha256 && bash /run/packages.sh && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test && chpasswd </run/secrets/fixture-password && systemctl enable sshd && systemctl add-wants multi-user.target qemu-guest-agent.service && sha256sum --check /usr/share/colour-reference/gdm.sha256 && pacman -Q >/usr/share/colour-reference/fixture && python3 -c 'from pathlib import Path; p=Path("/usr/share/colour-reference"); assert set((p/"shipped").read_text().splitlines()) <= set((p/"fixture").read_text().splitlines())' && rm /run/packages.sh
 COPY fixture.tmpfiles /usr/lib/tmpfiles.d/colour-reference.conf
 LABEL org.opencontainers.image.title="Disposable GNOME colour reference fixture, not shipping image"
 ''')
             shutil.copy2(w / 'Containerfile', out / 'Containerfile.fixture')
             shutil.copy2(w / 'packages.sh', out / 'packages.fixture.sh')
             shutil.copy2(w / 'fixture.tmpfiles', out / 'fixture.tmpfiles')
-            run(['podman', 'build', '-t', image, w])
+            # Build secrets do not invalidate cached RUN layers; a cached
+            # account password would no longer match this run's private value.
+            run(['podman', 'build', '--no-cache', '--secret', 'id=fixture-password,src=' + str(password_file), '-t', image, w])
             (out / 'fixture-image.json').write_bytes(run(['podman', 'image', 'inspect', image]).stdout)
             disk = w / 'gnome.raw'
             with disk.open('wb') as f:
@@ -188,6 +285,7 @@ done
             report['vm'] = info; save()
             port = str(info['ssh_port'])
             def ssh(command, **kw):
+                kw.setdefault('timeout', 30)
                 return tool('ssh', '-i', '/w/key', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'UserKnownHostsFile=/w/known_hosts',
                             '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', '-p', port, 'root@127.0.0.1', command, **kw)
             def wait(fn, label, seconds=180):
@@ -198,29 +296,80 @@ done
                         return result
                     time.sleep(2)
                 raise RuntimeError('timeout: ' + label)
+            def screenshot(name):
+                result = corral('screenshot', token, '--require-paint', '-o', '/w/' + name + '.png',
+                                check=False, timeout=30)
+                # Corral writes the PNG before rejecting a blank frame. Keep the
+                # actual failed frame as evidence, without retrying or relaxing it.
+                if (w / (name + '.png')).is_file():
+                    shutil.copy2(w / (name + '.png'), out / (name + '.png'))
+                if result.returncode:
+                    raise RuntimeError(name + ' strict --require-paint failed; see commands.log')
+            report['stage'] = 'guest-ssh'; save()
             wait(lambda: ssh('true', check=False).returncode == 0, 'guest SSH')
-            corral('key', token, 'ret'); time.sleep(3)
-            corral('screenshot', token, '--require-paint', '-o', '/w/gdm.png')
-            shutil.copy2(w / 'gdm.png', out / 'gdm.png')
-            # Ordinary single-user GDM chooser; these are emulated physical keys,
-            # not a PAM/session injection. Session verification below is mandatory.
-            corral('key', token, 'ret'); time.sleep(2)
-            corral('type', token, 'tuna'); corral('key', token, 'ret')
-            session_cmd = "loginctl list-sessions --no-legend | while read -r s rest; do loginctl show-session \"$s\" -p Name -p Type -p Service -p Active -p User; echo; done"
-            def session_ready():
-                text = ssh(session_cmd).stdout.decode()
-                return text if any(all(x in block.splitlines() for x in ('Name=tuna-test', 'Type=wayland', 'Service=gdm-password', 'Active=yes')) for block in text.split('\n\n')) else None
-            report['session'] = wait(session_ready, 'ordinary GDM native Wayland login')
-            identity = ssh("set -e; pacman -Q gnome-shell mutter gdm mesa linux; pacman -Qi gnome-shell mutter gdm mesa linux; pacman -Qkk gnome-shell mutter gdm mesa linux; cat /etc/pacman.conf; cat /usr/share/colour-reference/shipped; cat /usr/share/colour-reference/fixture; ps -eo pid,uid,args").stdout
-            (out / 'guest-identity.txt').write_bytes(identity)
+            # Retain package/fixture/GPU identities even if GDM never paints.
+            report['stage'] = 'guest-identity'; save()
+            identity_commands = ('pacman -Q gnome-shell mutter gdm mesa linux',
+                                 'pacman -Qi gnome-shell mutter gdm mesa linux',
+                                 'pacman -Qkk gnome-shell mutter gdm mesa linux',
+                                 'cat /etc/pacman.conf', 'cat /usr/share/colour-reference/shipped',
+                                 'cat /usr/share/colour-reference/fixture', 'ps -eo pid,ppid,uid,comm')
+            identity = ssh('status=0; ' + '; '.join(command + ' || status=1' for command in identity_commands)
+                           + '; exit "$status"', check=False)
+            (out / 'guest-identity.txt').write_bytes(redact(identity.stdout + identity.stderr))
             gpu = ssh('''for d in /sys/bus/pci/devices/*; do if [ "$(cat "$d/vendor")" = 0x1af4 ] && [ "$(cat "$d/device")" = 0x1050 ]; then echo "$d"; cat "$d/vendor" "$d/device"; readlink "$d/driver"; fi; done; uname -a''').stdout.decode()
             (out / 'guest-gpu.txt').write_text(gpu)
+            if identity.returncode:
+                raise RuntimeError('guest package identity check failed; see guest-identity.txt')
             if '0x1050' not in gpu:
                 raise RuntimeError('expected native virtio GPU 1050 missing')
             versions = ssh('pacman -Q gnome-shell mutter gdm mesa linux').stdout.decode()
             for line in ('gnome-shell 1:51.1-1', 'mutter 51.1-1', 'gdm 51.1.1-1', 'mesa 1:26.2.6-1', 'linux 7.2.11.arch1-1'):
                 if line not in versions.splitlines():
                     raise RuntimeError('GNOME baseline package mismatch: ' + line)
+            session_cmd = "loginctl list-sessions --no-legend | while read -r s rest; do loginctl show-session \"$s\" -p Id -p Name -p Type -p Class -p Service -p Active -p User; echo; done"
+            def session_ready(expected, mode):
+                result = ssh(session_cmd, check=False, timeout=15)
+                if result.returncode or ssh('systemctl is-active --quiet gdm.service', check=False, timeout=15).returncode:
+                    return None
+                for block in result.stdout.decode().split('\n\n'):
+                    properties = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
+                    if not all(properties.get(key) == value for key, value in expected.items()):
+                        continue
+                    session_uid = properties.get('User', '')
+                    if not session_uid.isdigit() or session_uid == '0':
+                        continue
+                    name = shlex.quote(properties['Name'])
+                    unit = 'org.gnome.Shell@' + mode + '.service'
+                    state = ssh(f'runuser -u {name} -- env XDG_RUNTIME_DIR=/run/user/{session_uid} DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{session_uid}/bus systemctl --user show {unit} -p Type -p ActiveState -p SubState -p MainPID',
+                                check=False, timeout=15)
+                    fields = dict(line.split('=', 1) for line in state.stdout.decode().splitlines() if '=' in line)
+                    if (state.returncode == 0 and fields.get('Type') == 'notify'
+                            and fields.get('ActiveState') == 'active' and fields.get('SubState') == 'running'
+                            and fields.get('MainPID', '0').isdigit() and int(fields.get('MainPID', '0')) > 0):
+                        return block + '\n' + state.stdout.decode()
+                return None
+            # GNOME Shell 51.1, commit 33da06854e229c256afd5872fedd83c28cbfa176:
+            # data/org.gnome.Shell@.service.in is Type=notify; js/ui/main.js
+            # _initializeUI() emits util_sd_notify() after UI initialization.
+            # SSH and gdm.service alone do not wait for that user-service barrier.
+            report['stage'] = 'gdm-greeter-readiness'; save()
+            report['greeter'] = wait(lambda: session_ready(
+                {'Name': 'gdm', 'Type': 'wayland', 'Class': 'greeter',
+                 'Service': 'gdm-launch-environment', 'Active': 'yes'}, 'gdm'),
+                'stock GDM Wayland greeter and notified GNOME Shell')
+            report['stage'] = 'gdm-paint'; save()
+            corral('key', token, 'ret')  # Emulated physical wake, not a GDM override.
+            screenshot('gdm')
+            # Ordinary single-user GDM chooser; these are emulated physical keys,
+            # not a PAM/session injection. Session verification below is mandatory.
+            report['stage'] = 'gdm-password-login'; save()
+            corral('key', token, 'ret'); time.sleep(2)
+            corral('type', token, fixture_password); corral('key', token, 'ret')
+            report['session'] = wait(lambda: session_ready(
+                {'Name': 'tuna-test', 'Type': 'wayland', 'Service': 'gdm-password', 'Active': 'yes'}, 'wayland'),
+                'ordinary GDM native Wayland login and notified GNOME Shell')
+            save()
             # Copy only compiled caller into guest /run; no compositor/session replacement.
             tool('scp', '-i', '/w/key', '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=/w/known_hosts', '-P', port,
                  '/w/pixel-client', 'root@127.0.0.1:/run/colour-pixel-client')
@@ -232,6 +381,7 @@ done
                 raise RuntimeError('ambiguous graphical Wayland socket')
             from PIL import Image
             for mode, flag in (('sdr', '--sdr'), ('unmanaged', '--unmanaged'), ('pq', '')):
+                report['stage'] = mode + '-presentation'; save()
                 ssh(f'runuser -u tuna-test -- env XDG_RUNTIME_DIR=/run/user/{uid} DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus WAYLAND_DISPLAY={shlex.quote(display[0])} /run/colour-pixel-client {flag} >/run/colour-{mode}.log 2>&1 & echo $! >/run/colour-client.pid')
                 try:
                     def ready():
@@ -254,8 +404,8 @@ done
                         ],
                     }))
                     time.sleep(.2)
-                    corral('screenshot', token, '--require-paint', '-o', '/w/' + mode + '.png')
-                    shutil.copy2(w / (mode + '.png'), out / (mode + '.png'))
+                    report['stage'] = mode + '-paint'; save()
+                    screenshot(mode)
                     im = Image.open(out / (mode + '.png')).convert('RGB')
                     cx, cy = im.width // 2, im.height // 2
                     pixels = [im.getpixel((cx + x, cy + y)) for x in range(-4, 5) for y in range(-4, 5)]
@@ -276,7 +426,12 @@ done
             report['hdr_output'] = 'not qualified: virtual SDR framebuffer route; PQ input conversion is not HDR output support'
             save()
         except BaseException as e:
-            report['error'] = str(e); save()
+            report['error'] = redact(str(e).encode()).decode(errors='replace'); save()
+            try:
+                failure_evidence()
+            except Exception as error:
+                report['failure_evidence_error'] = redact(str(error).encode()).decode(errors='replace')
+                save()
             raise
         finally:
             # Never globally prune or remove immutable/shared tool/base image tags.
