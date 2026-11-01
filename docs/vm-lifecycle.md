@@ -71,6 +71,16 @@ one existing login deadline. There is one credential pair per login, no
 fixed-sleep increase and no retry. This fixes wrong-phase input; the old
 receipts alone do not identify which input was lost during startup.
 
+The first native observer run found 1267 distinct GNOME greeter actors,
+exceeding the unchanged 512-node observation budget when hidden actors were
+enumerated. This was not a cycle (maximum depth 15, no duplicate objects).
+The actual focused username entry had all required flags, and every
+non-root ancestor was SHOWING/VISIBLE. Pruning non-SHOWING branches visits
+131 nodes instead, including hidden branch roots, without changing the
+node/depth/time limits. The application metadata root is exempt from this
+prune because it is not a visible component. This follows the existing
+shell-focus observer's SHOWING traversal rule.
+
 
 | Gate | Actual operation and evidence |
 | --- | --- |

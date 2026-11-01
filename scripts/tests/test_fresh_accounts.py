@@ -4,10 +4,12 @@ import ast
 import json
 import os
 import pathlib
+import runpy
 import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts/lib"))
@@ -278,6 +280,72 @@ class JourneyTest(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn("reboot", error)
         self.assertNotIn("V-FRESH-REBOOT", results)
+
+
+class NativePromptTreeTest(unittest.TestCase):
+    """Exercise the actual guest traversal, not a copied/extracted source body."""
+
+    @classmethod
+    def setUpClass(cls):
+        with mock.patch("pwd.getpwnam", return_value=SimpleNamespace(pw_uid=1001)):
+            cls.probe = staticmethod(runpy.run_path(str(GUEST))["greeter_prompt_entries"])
+        cls.api = SimpleNamespace(
+            Role=SimpleNamespace(TEXT=61, ENTRY=79, PASSWORD_TEXT=40),
+            StateType=SimpleNamespace(**{name: name for name in
+                ("FOCUSED", "SHOWING", "VISIBLE", "EDITABLE", "SENSITIVE", "ENABLED")}))
+        cls.ready = {"FOCUSED", "SHOWING", "VISIBLE", "EDITABLE", "SENSITIVE", "ENABLED"}
+
+    class Node:
+        def __init__(self, role=39, flags=(), children=(), hidden=False):
+            self.role, self.flags, self.children = role, set(flags), list(children)
+            self.hidden = hidden
+
+        def clear_cache(self):
+            pass
+
+        def get_state_set(self):
+            return SimpleNamespace(contains=self.flags.__contains__)
+
+        def get_role(self):
+            return self.role
+
+        def get_child_count(self):
+            if self.hidden:
+                raise AssertionError("hidden actor subtree must not be enumerated")
+            return len(self.children)
+
+        def get_child_at_index(self, index):
+            return self.children[index]
+
+    def observe(self, root):
+        return self.probe(root, self.api, lambda method, *args: method(*args))
+
+    def test_hidden_actor_population_does_not_exhaust_prompt_budget(self):
+        # Native GNOME: 1267 unique actors, but only 131 visited with SHOWING
+        # pruning. Application metadata itself lacks SHOWING and VISIBLE.
+        prompt = self.Node(role=61, flags=self.ready)
+        for _ in range(10):
+            prompt = self.Node(flags={"SHOWING", "VISIBLE"}, children=[prompt])
+        hidden = self.Node(children=[self.Node() for _ in range(1200)], hidden=True)
+        root = self.Node(role=75, children=[prompt, hidden])
+        self.assertEqual(self.observe(root), ["username"])
+
+    def test_actual_password_role_is_distinct(self):
+        root = self.Node(role=75, children=[self.Node(role=40, flags=self.ready)])
+        self.assertEqual(self.observe(root), ["password"])
+
+    def test_hidden_or_insensitive_entry_never_becomes_ready(self):
+        for missing in ("SHOWING", "VISIBLE", "EDITABLE", "FOCUSED", "SENSITIVE", "ENABLED"):
+            with self.subTest(missing=missing):
+                root = self.Node(role=75, children=[
+                    self.Node(role=40, flags=self.ready - {missing}, hidden=missing == "SHOWING")])
+                self.assertEqual(self.observe(root), [])
+
+    def test_showing_scene_retains_original_node_bound(self):
+        root = self.Node(role=75, children=[
+            self.Node(flags={"SHOWING"}, children=[self.Node(flags={"SHOWING"}) for _ in range(511)])])
+        with self.assertRaisesRegex(RuntimeError, "tree exceeds bound"):
+            self.observe(root)
 
 
 class GuestStateTest(unittest.TestCase):

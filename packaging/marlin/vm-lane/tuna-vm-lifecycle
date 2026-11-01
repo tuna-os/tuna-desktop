@@ -2179,6 +2179,36 @@ def fresh_logout(name):
     return {"user": name, "terminated": ended}
 
 
+def greeter_prompt_entries(app, Atspi, query):
+    """Inspect only the showing greeter scene, not its hidden actor trees."""
+    pending, visited, entries = [(app, 0)], 0, []
+    while pending:
+        node, depth = pending.pop()
+        visited += 1
+        if visited > 512 or depth > 32:
+            raise RuntimeError("greeter accessibility tree exceeds bound")
+        query(node.clear_cache)
+        states = query(node.get_state_set)
+        # The application is metadata, not a showing component. All other
+        # nodes must belong to the showing scene: AT-SPI SHOWING includes
+        # ancestor visibility, so a hidden branch cannot contain the prompt.
+        if depth and not states.contains(Atspi.StateType.SHOWING):
+            continue
+        role = query(node.get_role)
+        if (role in (Atspi.Role.TEXT, Atspi.Role.ENTRY, Atspi.Role.PASSWORD_TEXT)
+                and all(states.contains(flag) for flag in
+                        (Atspi.StateType.FOCUSED, Atspi.StateType.SHOWING,
+                         Atspi.StateType.VISIBLE, Atspi.StateType.EDITABLE,
+                         Atspi.StateType.SENSITIVE, Atspi.StateType.ENABLED))):
+            entries.append("password" if role == Atspi.Role.PASSWORD_TEXT else "username")
+        count = query(node.get_child_count)
+        if not 0 <= count <= 512:
+            raise RuntimeError("greeter accessibility children exceed bound")
+        pending.extend((child, depth + 1) for index in range(count)
+                       if (child := query(node.get_child_at_index, index)) is not None)
+    return entries
+
+
 def greeter_prompt_user(pid, ticks):
     """Read only role/state from the original greeter's focused entry.
 
@@ -2228,26 +2258,7 @@ def greeter_prompt_user(pid, ticks):
                 for method in ("GetConnectionUnixProcessID", "GetConnectionUnixUser")]
     if credentials() != [pid, uid]:
         raise RuntimeError("greeter accessibility bus credentials disagree")
-    pending, visited, entries = [(app, 0)], 0, []
-    while pending:
-        node, depth = pending.pop()
-        visited += 1
-        if visited > 512 or depth > 32:
-            raise RuntimeError("greeter accessibility tree exceeds bound")
-        query(node.clear_cache)
-        states = query(node.get_state_set)
-        role = query(node.get_role)
-        if (role in (Atspi.Role.TEXT, Atspi.Role.ENTRY, Atspi.Role.PASSWORD_TEXT)
-                and all(states.contains(flag) for flag in
-                        (Atspi.StateType.FOCUSED, Atspi.StateType.SHOWING,
-                         Atspi.StateType.VISIBLE, Atspi.StateType.EDITABLE,
-                         Atspi.StateType.SENSITIVE, Atspi.StateType.ENABLED))):
-            entries.append("password" if role == Atspi.Role.PASSWORD_TEXT else "username")
-        count = query(node.get_child_count)
-        if not 0 <= count <= 512:
-            raise RuntimeError("greeter accessibility children exceed bound")
-        pending.extend((child, depth + 1) for index in range(count)
-                       if (child := query(node.get_child_at_index, index)) is not None)
+    entries = greeter_prompt_entries(app, Atspi, query)
     if credentials() != [pid, uid] or principal() != expected:
         raise RuntimeError("original greeter changed during prompt observation")
     return {"pid": pid, "uid": uid, "start_ticks": ticks, "atspi_owner": owner,
