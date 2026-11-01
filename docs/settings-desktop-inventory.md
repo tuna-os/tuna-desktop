@@ -184,7 +184,7 @@ Stale rows corrected in this review (they were `Ignored` while main consumed the
 
 | Key | Status | Reason | Owner |
 |---|---|---|---|
-| automatic-timezone | Honored (gsd-datetime, unqualified) | gnome-settings-daemon 51's datetime plugin, started by the Tuna session (V-GSD-PLUGINS), applies it through Geoclue and timedated; the time zone change itself is unproven | implemented — gsd 51 `plugins/datetime/gsd-datetime-manager.c:31`; proof:V-GSD-PLUGINS [GNOME Settings: system] |
+| automatic-timezone | Honored (gsd-datetime, unqualified) | gnome-settings-daemon 51's datetime plugin, started by the Tuna session (V-GSD-PLUGINS), applies it through GeoClue, real reverse geocoding and timedated; the standalone official-static-source observer checks actual daemon caller, zone/localtime, master/auto-off controls and owner-bound panel clock but awaits current-build service/UI qualification (`docs/datetime-proof.md`) | implemented — gsd 51 `plugins/datetime/gsd-datetime-manager.c:31`; proof:V-GSD-PLUGINS [GNOME Settings: system] |
 ## org.gnome.desktop.default-applications.office.calendar
 
 | Key | Status | Reason | Owner |
