@@ -173,7 +173,13 @@ jobs:
         env:
           PLATFORM: ${{ matrix.platform }}
         run: |
-          "$RUNNER_TEMP/vm-browser/bin/python" scripts/lib/try_tuna_desktop.py qualify --artifact-dir "$RUNNER_TEMP/vm-release" --evidence-dir "$RUNNER_TEMP/vm-native/$PLATFORM" --platform "$PLATFORM"
+          if [ "$RUNNER_OS" = Linux ]; then
+            # Exercise the real terminal-backed sudo path. The runner's policy
+            # stays unchanged; this is not proof of passworded host auth.
+            script --quiet --return --command 'exec "$RUNNER_TEMP/vm-browser/bin/python" scripts/lib/try_tuna_desktop.py qualify --artifact-dir "$RUNNER_TEMP/vm-release" --evidence-dir "$RUNNER_TEMP/vm-native/$PLATFORM" --platform "$PLATFORM"' /dev/null
+          else
+            "$RUNNER_TEMP/vm-browser/bin/python" scripts/lib/try_tuna_desktop.py qualify --artifact-dir "$RUNNER_TEMP/vm-release" --evidence-dir "$RUNNER_TEMP/vm-native/$PLATFORM" --platform "$PLATFORM"
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
