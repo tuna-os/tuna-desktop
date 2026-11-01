@@ -804,29 +804,19 @@ class OrcaStagedDiagnostic(unittest.TestCase):
         # Fault-injected transport only; no claim of genuine AT-SPI execution.
 
     def test_helper_error_serialization_never_emits_exception_details(self):
-        from contextlib import redirect_stdout
+        import sys
         helper = PublicOrcaNavigation().focus_module()
-        tree = ast.parse(Path(helper.__file__).read_text())
-        main = next(n for n in tree.body if isinstance(n, ast.If) and "__name__" in ast.unparse(n.test))
-        observed = []
-        def failed(*args):
-            observed.append(args)
-            raise TypeError("private query and field value")
-        scope = {"__name__": "__main__", "json": json, "sys": SimpleNamespace(argv=["helper", "1083", "1187", "tuna-shell-gtk", "wayland-0"]),
-                 "observe": failed, "FOCUS_OPERATION": "atspi-owner", "FOCUS_OPERATIONS": helper.FOCUS_OPERATIONS}
-        stream = io.StringIO()
-        with redirect_stdout(stream), self.assertRaises(SystemExit) as exited:
-            exec(compile(ast.Module(body=[main], type_ignores=[]), helper.__file__, "exec"), scope)
-        self.assertEqual(exited.exception.code, 1)
-        self.assertEqual(len(observed), 1)
-        self.assertEqual(json.loads(stream.getvalue()), {"focus_error_type": "TypeError", "focus_operation": "atspi-owner"})
-        self.assertNotIn("private", stream.getvalue())
-        # Every marker is a literal phase, never a queried name, argument or path.
-        markers = [n.value.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
-                   and any(isinstance(t, ast.Name) and t.id == "FOCUS_OPERATION" for t in n.targets)
-                   and isinstance(n.value, ast.Constant)]
-        self.assertTrue(markers)
-        self.assertTrue(set(markers) <= helper.FOCUS_OPERATIONS)
+        private = "private-query-and-field-value"
+        for arguments in ([private, "1187", "tuna-shell-gtk", "wayland-0"],
+                          ["1083", "1187", "tuna-shell-gtk", "wayland-0", private]):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([sys.executable, helper.__file__, *arguments],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(json.loads(result.stdout), {
+                    "focus_error_type": "ValueError", "focus_operation": "arguments"})
+                self.assertNotIn(private, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "")
 
     def test_speech_failure_schema_accepts_observation_stage(self):
         scope = self.agent_scope("speech_failure_diagnostic")
@@ -3849,37 +3839,72 @@ class FixtureLoginSession(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in (Path(__file__).resolve().parents[2]
                                                  / "packaging/marlin/vm-lane/tunaos").iterdir()), sorted(steps))
 
-    def test_tunaos_steps_give_the_preview_image_the_published_login_path(self):
+    def test_tunaos_steps_use_installed_gdm_for_global_template_policy(self):
         source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tunaos"
-        with tempfile.TemporaryDirectory() as root:
-            root = Path(root)
-            (root / "etc/gdm").mkdir(parents=True)
-            (root / "etc/gdm/custom.conf").write_text("[daemon]\nDefaultSession=gnome.desktop\n")
-            (root / "usr/share/accountsservice/user-templates").mkdir(parents=True)
-            (root / "usr/share/accountsservice/user-templates/standard").write_text("[User]\nSession=gnome\n")
-            sessions = root / "usr/share/wayland-sessions"
-            sessions.mkdir(parents=True)
-            (sessions / "tuna.desktop").write_text("[Desktop Entry]\nName=Tuna Desktop\nExec=tuna-session\n")
-            (sessions / "gnome.desktop").write_text("[Desktop Entry]\nName=GNOME\nExec=gnome-session\n")
-            environment = {**os.environ, "TUNAOS_GDM_DEFAULT_ROOT": str(root),
-                           "TUNAOS_GDM_SESSIONS_ROOT": str(root)}
-            for step in ("tuna-gdm-default-session.sh", "tuna-hide-other-sessions.sh"):
-                subprocess.run(["bash", str(source / step)], env=environment, check=True,
-                               capture_output=True, timeout=10)
-            scope = lifecycle_scope(*GdmSessionList.NAMES, "gdm_daemon_key", "gdm_fallback_session",
-                                    "GDM_LAUNCH_DIRS")
-            which = lambda program: program if program in ("tuna-session", "gnome-session") else None
-            offered = scope["gdm_sessions"](tuple(str(root) + d for d in scope["GDM_SESSION_DIRS"]), which=which)
-            fallback = scope["gdm_fallback_session"](root / "etc/gdm/custom.conf",
-                                                     tuple(str(root) + d for d in scope["GDM_LAUNCH_DIRS"]),
-                                                     which=which)
-            self.assertTrue(lane.greeter_list_ok({"sessions": offered})[0], offered)
-            self.assertTrue(lane.fallback_session_ok({"fallback_session": fallback})[0], fallback)
-            self.assertIn("NoDisplay=true", (sessions / "gnome.desktop").read_text())
-            self.assertNotIn("NoDisplay", (sessions / "tuna.desktop").read_text())
-            self.assertIn("Session=tuna", (root / "etc/accountsservice/user-templates/standard").read_text())
-            self.assertNotIn("DefaultSession", (root / "etc/gdm/custom.conf").read_text())
-        # Configuration-file policy only, not a booted GDM.
+        cases = (
+            ("usr/sbin/gdm", "GDM 48.0", True, "tuna"),
+            ("usr/bin/gdm", "GDM 50.0", True, "tuna"),
+            ("usr/bin/gdm", "GDM 51.1.1", True, ""),
+            ("usr/sbin/gdm3", "gdm3 51.1.1", True, ""),
+            ("usr/bin/gdm3", "GDM 51.1.1", True, ""),
+            ("usr/bin/gdm", "GDM 51.1.1", False, "tuna"),
+            ("usr/bin/gdm", "GDM unknown", True, "tuna"),
+            (None, None, False, "tuna"),
+        )
+        for binary_name, version, fallback_capability, expected_session in cases:
+            with self.subTest(binary=binary_name, version=version, capability=fallback_capability), \
+                    tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                if binary_name:
+                    binary = root / binary_name
+                    binary.parent.mkdir(parents=True)
+                    # An external installed-binary fixture, not a caller-supplied
+                    # version override: the real vendored helper runs --version
+                    # and checks the compiled daemon/FallbackSession key.
+                    capability = "# daemon/FallbackSession\n" if fallback_capability else ""
+                    binary.write_text("#!/bin/sh\n" + capability
+                                      + f'[ "$#" -eq 1 ] && [ "$1" = --version ] || exit 1\n'
+                                      + f"printf '%s\\n' {shlex.quote(version)}\n")
+                    binary.chmod(0o755)
+                (root / "etc/gdm").mkdir(parents=True)
+                (root / "etc/gdm/custom.conf").write_text("[daemon]\nDefaultSession=gnome.desktop\n")
+                templates = root / "usr/share/accountsservice/user-templates"
+                templates.mkdir(parents=True)
+                for account_type in ("standard", "administrator"):
+                    (templates / account_type).write_text(
+                        "[User]\nLanguage=en_US.UTF-8\nSession=gnome\n\n[Extension]\nSession=keep\n")
+                records = root / "var/lib/AccountsService/users"
+                records.mkdir(parents=True)
+                saved = b"[User]\nSession=gnome\nLanguage=fr_FR.UTF-8\n"
+                (records / "existing").write_bytes(saved)
+                sessions = root / "usr/share/wayland-sessions"
+                sessions.mkdir(parents=True)
+                (sessions / "tuna.desktop").write_text("[Desktop Entry]\nName=Tuna Desktop\nExec=tuna-session\n")
+                (sessions / "gnome.desktop").write_text("[Desktop Entry]\nName=GNOME\nExec=gnome-session\n")
+                environment = {**os.environ, "TUNAOS_GDM_DEFAULT_ROOT": str(root),
+                               "TUNAOS_GDM_SESSIONS_ROOT": str(root)}
+                for step in ("tuna-gdm-default-session.sh", "tuna-hide-other-sessions.sh"):
+                    subprocess.run(["bash", str(source / step)], env=environment, check=True,
+                                   capture_output=True, timeout=10)
+                scope = lifecycle_scope(*GdmSessionList.NAMES, "gdm_daemon_key", "gdm_fallback_session",
+                                        "GDM_LAUNCH_DIRS")
+                which = lambda program: program if program in ("tuna-session", "gnome-session") else None
+                offered = scope["gdm_sessions"](tuple(str(root) + d for d in scope["GDM_SESSION_DIRS"]), which=which)
+                fallback = scope["gdm_fallback_session"](root / "etc/gdm/custom.conf",
+                                                         tuple(str(root) + d for d in scope["GDM_LAUNCH_DIRS"]),
+                                                         which=which)
+                self.assertTrue(lane.greeter_list_ok({"sessions": offered})[0], offered)
+                self.assertTrue(lane.fallback_session_ok({"fallback_session": fallback})[0], fallback)
+                self.assertIn("NoDisplay=true", (sessions / "gnome.desktop").read_text())
+                self.assertNotIn("NoDisplay", (sessions / "tuna.desktop").read_text())
+                for account_type in ("standard", "administrator"):
+                    self.assertEqual((root / "etc/accountsservice/user-templates" / account_type).read_text(),
+                                     "[User]\nLanguage=en_US.UTF-8\n"
+                                     f"Session={expected_session}\n\n[Extension]\nSession=keep\n")
+                self.assertEqual({path.name: path.read_bytes() for path in records.iterdir()}, {"existing": saved})
+                self.assertNotIn("DefaultSession", (root / "etc/gdm/custom.conf").read_text())
+        # Real helper execution and configuration-file policy only, not a
+        # booted GDM/AccountsService persistence proof.
 
     def test_orca_secret_generator_serves_only_the_fixture_user_once_per_login(self):
         source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-orca-token"

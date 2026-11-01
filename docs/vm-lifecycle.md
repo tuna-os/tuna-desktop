@@ -5,9 +5,9 @@ preview image built from source, then a CI-only fixture layer
 (`packaging/marlin/vm-lane/Containerfile`). The layer gives the image the
 published `marlin:tuna` login path: stock GDM with tunaOS's tuna-flavor GDM
 steps (`tunaos.toml` `[desktops.tuna]` `after_install`: greeter theme
-overlay, `FallbackSession=tuna` with `Session=tuna` account templates, every
-other session hidden), vendored byte-for-byte in
-`packaging/marlin/vm-lane/tunaos/` from tunaOS 193cc0ef, on the package's
+overlay, `FallbackSession=tuna` with version-appropriate global account
+templates, every other session hidden), vendored byte-for-byte in
+`packaging/marlin/vm-lane/tunaos/` from tunaOS d98ed1e09b61635a2a9b115ce559944e42f97d74, on the package's
 own `Tuna Desktop` session entry. The fixture account has no saved session.
 No autologin or initial session exists: the lane drives GDM's user list and
 types the fixture password exactly as the published-flavor nightly does
@@ -29,7 +29,16 @@ is a separate boot of the same disk (QEMU `-snapshot`) that passes the
 `tuna-vm-fresh-accounts.service` run `useradd -m` before GDM starts, as an
 installer would: `tunastd` (standard), `tunaadmin` (`wheel`), and the
 control `tunaseeded`, whose record is pre-seeded. `tunastd` and `tunaadmin`
-get no AccountsService record, no Session preselection and no autologin.
+get no per-user AccountsService record, no per-user Session preselection
+and no autologin. This is distinct from the global AccountsService
+templates: on an installed GDM 51+ with `FallbackSession` support, their
+`[User]` group explicitly sets `Session=`. GDM can launch the configured
+`tuna` fallback without propagating that name to the worker's persistent
+settings; empty templates alone have not qualified record creation.
+Older GDM retains global `Session=tuna`: it can prefer launchable GNOME
+even when that session has `NoDisplay=true`. An absent or unparseable GDM
+version must not opt into the empty-template policy. Neither policy edits
+existing per-user records or replaces a valid saved session choice.
 
 | Gate | Actual operation and evidence |
 | --- | --- |
@@ -39,11 +48,502 @@ get no AccountsService record, no Session preselection and no autologin.
 | V-FRESH-RECORD-CREATED-<user> | After the first login AccountsService wrote the record; any saved `Session` is `tuna` |
 | V-FRESH-SUDO-<user> | `sudo -S -k true` as the account with its password: admin succeeds, standard is refused by sudo policy |
 | V-FRESH-LOGOUT-<user>-<round> | logind ends the session and the greeter is ready again |
-| V-FRESH-REBOOT / V-FRESH-RECORD-KEPT-<user> | In-guest reboot (new `boot_id`), records survive, then both accounts log in again |
+| V-FRESH-REBOOT / V-FRESH-RECORD-KEPT-<user> | Observe a different `boot_id` and ready greeter, then physical records for both accounts; both must log in and log out again |
+
+The controller reads a nonempty old boot ID through the read-only `greeter`
+action, then calls `GuestAgent.request_reboot()` once.
+It sends QGA [`guest-shutdown` with `mode=reboot`](https://www.qemu.org/docs/master/interop/qemu-ga-ref.html#command-QGA-qapi-schema.guest-shutdown).
+QGA returns no response on success and does not guarantee shutdown.
+The method retires its transport after it tries to send; send errors propagate.
+A return is not an acknowledgement or proof of reboot.
+
+The controller reconnects at once, with no extra sleep.
+It retains the 180-second limit for a new boot and ready greeter.
+A boot ID that did not change cannot pass, nor can a greeter that is not ready.
+Physical record retention and both post-reboot logins and logouts remain mandatory.
+The 60-second login limit, two authentication tries and 90-second trace stay unchanged.
+
+Run 41215443626 failed both native VM jobs with the AccountsService record
+still missing after a real record-free `tunastd` manual GDM login on
+GDM 51.1.1-1 / AccountsService 26.27.3-1. First login, standard-user sudo
+denial and logout passed; admin, second-login and reboot coverage aborted.
+The inherited global `Session=tuna` suggested a same-value setter might
+explain the missing write. Run 41237623922 disproved that as the remaining
+cause: even empty effective settings left the record absent. An empty
+global template is not itself proof that persistence is fixed: only the
+unchanged native gates above can qualify the fix. No setup script may
+create the fresh accounts' records or invoke a cache operation to do so.
 
 Receipts are in `fresh-accounts-receipts.json`; frames per attempt and
-session. Only Arch/GDM 51 is covered here; pre-51 GDM is not exercised by
-this lane.
+session. Both native VM jobs must complete the standard and administrator
+first login, real record creation, sudo policy, logout, manual second
+login, reboot, record retention and post-reboot login gates. Only Arch/GDM
+51 is covered by this native lane; helper-execution tests also cover
+legacy GDM template policy, but do not constitute a pre-51 native proof.
+
+Run 41226473836 (desktop c3713c34) left the record absent after a real
+orca51 `tunastd` first login, and the helper's chosen policy unobserved.
+Two read-only diagnostics now record what happened; neither is a gate.
+The image build prints `tuna-vm-lifecycle gdm-policy`: the `gdm` the helper
+resolves and its realpath, bounded `--version` output/status and parse, the
+`daemon/FallbackSession` literal-probe status, the derived `empty`/`legacy`
+policy, `pacman -Q gdm libgdm accountsservice` and the binary's owner.
+Each `fresh-state` receipt adds an `accounts` block, collected in order:
+physical record presence, the global `standard`/`administrator` templates
+(candidate presence in `/run`, `/etc`, `/usr/local/share`, `/usr/share`
+precedence, the winner, and every `[User]` `Session`, `SessionType`,
+`XSession` and `SystemAccount` occurrence: `[]` is missing, `[""]` empty),
+`Properties.Get` without D-Bus activation of exactly `Session`,
+`SessionType`, `Saved` and `LocalAccount` on
+`/org/freedesktop/Accounts/User<uid>`, then record presence again.
+An unexported object, absent bus or wrong type is an explicit error
+(remote D-Bus error name or exception type only), never an empty Session or
+false `Saved`. Collection points: preflight, first session, after each
+first-round logout (before a missing-record abort), after reboot, and once
+when a login fails. Nothing calls `FindUserByName`, `CacheUser` or a
+setter, retries, or dumps other template keys, error messages or stderr.
+A record seen only after logout, `Saved=true` or an effective
+`Session=tuna` never substitutes for `V-FRESH-RECORD-CREATED-<user>` at
+the first session.
+
+### Observed GDM 51 persistence failure and bounded trace
+
+Run [41237623922](https://github.com/tuna-os/tuna-desktop/actions/runs/41237623922),
+head `f7208bba`, failed `V-FRESH-RECORD-CREATED-tunastd` in **both**
+native profiles. The receipts show UID 1001, a real `gdm-password` VT 2
+Wayland login running `tuna-compositor` and `tuna-shell-gtk`, successful
+standard-user sudo denial and logout, but no physical record during the
+session or after logout. The winning `/etc/accountsservice/user-templates/`
+standard and administrator templates each contain `Session=`; effective
+`Session` and `SessionType` are empty, `Saved=false`, `LocalAccount=true`.
+Packages are `gdm 51.1.1-1` and `accountsservice 26.27.3-1`. Administrator,
+second-login and reboot acceptance remains unexercised, not passed.
+The retained logs of jobs 124646121324 and 124646121372 contain none of the
+four allowlisted worker markers below and no session-setter call headers.
+This is an evidence gap, **not proof that saving was skipped**.
+
+For review before the next native campaign, add just `--fresh-gdm-trace`
+to its existing `scripts/tuna-vm-lane --fresh-accounts ...` command.
+The opt-in helper `tuna-vm-gdm-trace` runs only around the first ordinary
+`tunastd` login attempt, stops before any existing selection retry, and is
+stopped in `finally` on login/input/guest-agent failure. The observer has
+an independent 90-second lifetime, a 1 MiB header-input bound and 128-event
+bound; these add no login timeout, wait, retry, session or acceptance gate.
+Transient-service startup allows at most two seconds for observer readiness.
+Existing-marker queries additionally stop at 64 KiB or three seconds.
+The trace receipts are `tunastd-first-trace-{start,stop}` in the existing
+`fresh-accounts-receipts.json`; collection failure is explicit and non-gating.
+
+Privacy contract:
+
+- `dbus-monitor --system --profile`, **not** normal monitor/binary mode,
+  prints tab-separated message headers and no argument or error bodies.
+  Match rules select only `SetSession`, `SetSessionType`, `SetXSession`
+  calls on `/org/freedesktop/Accounts/User1001`. Return/error headers have
+  no path, so the observer consumes their metadata and retains only replies
+  correlated by call sender/serial and reply destination/reply-serial.
+  Unrelated headers are discarded in memory; no raw bus log is written.
+- Existing `gdm-password` worker journal entries are reduced to four fixed
+  labels: saving account details for `tunastd`, session name set to `tuna`,
+  save failed, and `SESSION_OPENED`. PID, time, method and reply metadata
+  are sufficient; usernames other than the fixture, journal text, setter
+  argument values, error names/bodies, PAM conversations and environment
+  values are not exported by this observer.
+- **Never enable GDM debug or send SIGUSR1.** The audited upstream
+  [worker source](https://github.com/GNOME/gdm/blob/51.1.1/daemon/gdm-session-worker.c#L757)
+  logs complete PAM query payloads at line 757, selected choice responses
+  at line 576 and PAM environment entries at line 1537. Filtering this
+  observer's output cannot make a broader journal/serial export safe.
+  Missing pre-existing markers are reported as
+  `unavailable-or-debug-disabled`; no conclusion about the save stage
+  follows from their absence.
+- No probe invokes `FindUserByName`, `CacheUser` or an AccountsService
+  setter, writes a per-user cache record, changes GDM configuration, or
+  offers a fake second desktop session.
+
+A matching setter error header proves an error reply, not its cause.
+A successful reply without a record points at persistence, not at missing
+session propagation. No setter observed with unavailable worker markers
+remains incomplete evidence. The physical-record gate is unchanged.
+
+### Root-fix candidate and actual Arch package boundary
+
+The upstream [GDM 51.1.1 normal-session open path](https://github.com/GNOME/gdm/blob/51.1.1/daemon/gdm-session.c#L2982)
+sends display mode and `XDG_SESSION_TYPE`, then `Open`; it does not send
+`SetSessionName`. Explicit selection does send
+`SetSessionName(get_session_name(self))`. With one offered Tuna session,
+[GNOME Shell 51.0 hides the session menu](https://github.com/GNOME/gnome-shell/blob/51.0/js/gdm/loginDialog.js#L543).
+The [settings save routine](https://github.com/GNOME/gdm/blob/51.1.1/daemon/gdm-session-settings.c#L369)
+can succeed with null session/type/language and, for a local account,
+without a setter or `CacheUser`. Registration is not this save trigger.
+**Inference:** fallback selection may never reach the worker's settings.
+
+Run [41245509890](https://github.com/tuna-os/tuna-desktop/actions/runs/41245509890)
+had healthy observers in both native profiles.
+Neither saw a call to set the User1001 session.
+Worker markers: unavailable; debug off.
+Their absence proves nothing about the save stage.
+Neither run proves the cause.
+
+The native image gets GDM from Arch through `pacman`, not this repository's
+`packaging/arch/PKGBUILD` (which builds only Tuna Desktop).
+The canonical tunaOS `tunaos.toml` desktop package list requests plain
+`gdm`, without a Tuna GDM version/patch override. This lane starts from
+`ghcr.io/tuna-os/marlin:gnome`; both the preview Containerfile and VM
+fixture layer run `pacman -Syu`, so a future replacement must survive the
+final package transaction rather than being silently overwritten.
+
+The [Arch recipe at revision 36e76b2b](https://gitlab.archlinux.org/archlinux/packaging/packages/gdm/-/blob/36e76b2b4674dc196e611782c4f8f6d5e476e231/PKGBUILD)
+splits `gdm` and `libgdm` from one build.
+It uses the upstream tag and an Xsession patch.
+Its `prepare()` uses `git apply -3`.
+The build uses `arch-meson`, `meson compile` and `meson test`.
+
+[Package source PR963](https://github.com/tuna-os/tunaos-packages/pull/963)
+adds a private candidate at
+`7b52bdf34be22bc60fef62b157be64b589b13f6a`.
+It builds GDM and libgdm **51.1.1-1.1** together.
+It retains the PAM configuration, conffile declarations and split ownership.
+Both sources and patches have fixed hashes.
+`prepare()` applies the patches to the release archive.
+
+The candidate queues `gdm_dbus_worker_call_set_session_name()` before `Open`.
+It uses `get_session_name(self)` on the same worker connection.
+It does not change the resolver or program sessions.
+Explicit, saved and fallback choices keep their precedence.
+It does not force `tuna` or change registration.
+No root probe writes AccountsService state.
+
+The proposed insertion, inside the existing non-null-conversation block
+immediately before `gdm_dbus_worker_call_open()`, is:
+
+```c
+if (!self->is_program_session)
+        gdm_dbus_worker_call_set_session_name (conversation->worker_proxy,
+                                               get_session_name (self),
+                                               conversation->worker_cancellable,
+                                               NULL, NULL);
+```
+
+The approved local factory build produced both unsigned packages.
+Meson: one pass, zero failures.
+The staged verifier installed both packages.
+It checked exact versions, owners and ELF closure.
+Both containers enforced 8 GiB memory, zero swap and CPU quota 200%.
+We removed both containers.
+
+The local archive hashes are:
+
+| Package | SHA256 |
+| --- | --- |
+| gdm 51.1.1-1.1 x86_64 | `5fa15579210678f6168ea5102b79050503b768fd93476910855281f4b3d60d92` |
+| libgdm 51.1.1-1.1 x86_64 | `ca4587fe886490c1e1925c9419bf5714fe9327cb9367685fb8d306b9a2243797` |
+
+These checks do not prove login or physical record creation.
+The C smoke used actual functions with stubs.
+It checked explicit, saved, fallback and program choices.
+It does not prove GDM, PAM, D-Bus or AccountsService runtime behavior.
+We deleted its temporary source and binary.
+
+### Private native GDM fixture
+
+The CI job builds the pinned package source once.
+It uses the existing factory build and staged verifier.
+Both native profiles use the same run's artifact.
+The artifact has package hashes and the source identity.
+Those hashes need not equal the local hashes above.
+The manifest also binds the package members to their hashes.
+
+The final `gdm51` overlay runs after every `pacman -Syu` and Orca step.
+It checks both archive hashes and package metadata.
+It installs both packages in one transaction.
+It checks their versions, owners and installed bytes.
+It checks the existing shipped-payload manifest without changes.
+No package upgrade follows.
+
+CI retains this evidence in `vm-lane-artifacts/gdm51/`.
+The final image ID and kernel provenance describe the image after the overlay.
+The fresh journey receives `TUNA_VM_GDM_NATIVE_CANDIDATE` and
+`TUNA_VM_GDM_NATIVE_SOURCE_SHA`.
+The first names the bounded manifest; the second pins the expected source.
+The journey checks the manifest and guest package identity before input.
+The existing read-only `gdm-policy` action runs once for this check.
+
+Neither the manifest nor the package versions can satisfy the physical-record guard.
+All standard/admin, first/second login, sudo, logout and reboot gates stay intact.
+Candidate admission alone does not exercise either native journey.
+No source, function or package check counts as runtime acceptance.
+The source PR stays unmerged.
+This fixture does not sign packages, publish a repository or change production pins.
+
+### Actual candidate campaign 41255271531
+
+[Run 41255271531](https://github.com/tuna-os/tuna-desktop/actions/runs/41255271531)
+ran for desktop PR head `31bf6bb30ee9949918b161a3a6035e906c2efb79`.
+CI uses a merge checkout, not the PR head directly.
+It built package source `7b52bdf34be22bc60fef62b157be64b589b13f6a` once.
+The factory build and staged verifier passed.
+Both containers reported 8 GiB memory, zero swap and CPU quota 200%.
+Cleanup completed.
+
+These are the CI hashes of the package archives, not the local hashes above:
+
+| Package | SHA256 |
+| --- | --- |
+| gdm 51.1.1-1.1 x86_64 | `8c67e6be0e707f157cd901d319dd2af522f9666c352af42958d4a8bbaca62f66` |
+| libgdm 51.1.1-1.1 x86_64 | `a559fae8e6d3166294c6d11ff76b39258ed0ca2c5e62f4e9ccdd5bc5d24f9af4` |
+
+Both profiles installed that exact pair after all upgrades.
+Their metadata, owners and installed bytes matched its manifest.
+Both checks left the shipped-payload manifest unchanged.
+Both profiles passed the ordinary hardware-session lane.
+
+| Profile | Final immutable image |
+| --- | --- |
+| distribution | `sha256:92de3d18015d68e81e4fc769154ac5f130bfa719f3ed70043a0fb8ca6cd90491` |
+| upstream Orca 51 | `sha256:6a00f62d298ad8e3f79f5b9bfde0247f65976cc474a8d0c931f60c8f2a6ec3f4` |
+
+Both profiles began with no physical record for UID1001.
+Both passed its first real `gdm-password` login.
+Both saw a physical record with `Session=tuna` during that session.
+That record also survived logout.
+The Orca profile passed the same first-record guard for UID1002.
+These results cover those logins, not the complete journey.
+
+The Orca observer saw a `SetSession` call and its successful reply.
+It retained only headers.
+The distribution trace covered its first try.
+Its standard login succeeded on the second try, after the trace stopped.
+Missing headers do not prove a missing setter.
+Worker markers: unavailable; debug off.
+
+Sudo refused the standard user in both profiles.
+The admin did not log in on the distribution profile after two tries.
+The admin login and record checks passed on the Orca profile.
+Sudo refused that wheel administrator by policy, with exit status 1.
+The evidence does not establish the inherited contents of sudoers.
+Second-login and reboot acceptance did not run.
+
+Both fresh journeys remain **failed**, not qualified.
+Neither the persistence evidence nor the package provenance satisfies the missing gates.
+No production publication, image pin or merge follows from this run.
+
+### Actual candidate campaign 41262331704
+
+[Run 41262331704](https://github.com/tuna-os/tuna-desktop/actions/runs/41262331704)
+ran for PR #985 head `598ca553abc24f4b10bb335d22f99a5ff4e17a81`.
+CI used merge commit `a3d6334efd4176ff7082a6b4d1ddc5d9ad1fe1d3`,
+with parents `eed9aa95658f5d75496954b10142d50c807ee88f` and
+`598ca553abc24f4b10bb335d22f99a5ff4e17a81`.
+Package source stayed at `7b52bdf34be22bc60fef62b157be64b589b13f6a`.
+The archives in CI had the same hashes as those in the previous run:
+
+| Package | SHA256 |
+| --- | --- |
+| gdm 51.1.1-1.1 x86_64 | `8c67e6be0e707f157cd901d319dd2af522f9666c352af42958d4a8bbaca62f66` |
+| libgdm 51.1.1-1.1 x86_64 | `a559fae8e6d3166294c6d11ff76b39258ed0ca2c5e62f4e9ccdd5bc5d24f9af4` |
+
+For both profiles, real first logins passed for the standard user and administrator.
+Physical records held `Session=tuna`; read-only observations reported `Saved=true`.
+Both records survived the first logout.
+Standard sudo denial, administrator authorization, both manual second logins
+and all pre-reboot logouts passed.
+
+Then the host reported literal `timed out` before `V-FRESH-REBOOT`.
+No actual new boot ID, post-boot retention or post-reboot login/logout received credit.
+Both fresh journeys failed.
+
+The old CLI used `systemctl reboot --no-block` before it wrote JSON.
+Its host still awaited the child exit and output through the agent being torn down.
+That sequence can cause a teardown/reply race; the run does not identify the
+exact timed-out I/O or prove that the guest changed boots.
+The QGA request removes only that dependency; all gates stay intact.
+
+The receipt for each profile contains nine cases for the strip.
+Both reported `TimeoutError` and `cleanup_confirmed=true`.
+This failure of a strip deadline is independent of policy binding.
+This run is not a PASS for the full suite.
+This run does not qualify reboot.
+No production publication, image pin or merge follows from it.
+
+### Actual candidate campaign 41267289849
+
+[Run 41267289849](https://github.com/tuna-os/tuna-desktop/actions/runs/41267289849)
+used PR #985 head `c8554f32c87630ffc68afefcd0bb17e2d5f21ec3`.
+CI used merge commit `b50a3148e90e3d362bed2beb327b287ac281888a`.
+Its parents are `017a7c6af924894f0ccd74f4d2bba46b3ac765f4`
+and that PR head.
+Package source stayed at `7b52bdf34be22bc60fef62b157be64b589b13f6a`.
+The new factory build measured the same three archive hashes as the previous CI run.
+
+Both native profiles passed all 24 unchanged gates for fresh accounts.
+Each profile has six login/logout cycles for UID 1001 and UID 1002.
+All sessions used `gdm-password`, Wayland VT2 and Tuna Desktop.
+During first login, the physical records existed before the read-only property queries.
+They had `Session=tuna`.
+
+Sudo refused the standard user and authorized the administrator.
+Each account passed its manual second login.
+
+The reboot proof includes actual distinct boot IDs and a ready GDM greeter:
+
+| Profile | Before the request | After reboot |
+| --- | --- | --- |
+| Distribution | `2eacd615-fc63-4dda-a7ab-09fbe78b83c0` | `c7dafa91-fbde-451f-9a76-de691354a5b2` |
+| Orca | `df390a84-f4e9-4bde-b0f1-9a7c59c5e0b2` | `565b11aa-2ded-452e-8f37-a546bb4f7da6` |
+
+Before the postboot login cycle, both accounts had physical records with `Session=tuna`.
+Both postboot login and logout cycles then passed.
+Each trace has a `SetSession` call for `User1001` and a return with the same serial.
+There is no message body.
+Worker markers remain unavailable; no debug toggle occurred.
+Their absence gives no negative evidence.
+
+The final images, after all upgrades and the verified pair installation, were:
+
+| Profile | Immutable image ID |
+| --- | --- |
+| Distribution | `sha256:226fd57b804f944c9f7d80dbb3e4756c7a679e166739517407ce1c6f58d13968` |
+| Orca | `sha256:503888154f04fd42a03ded3b1f85c6e2a056f5e5d8c971f12c0d0a1d24c39512` |
+
+The package artifact is `13067948020`.
+The distribution and Orca artifacts are `13068871310` and `13069002236`.
+Public hashes from the initial guest boot matched the final overlay's payload seal.
+The probe did not read those policy files again after the fresh journey's reboot.
+
+This qualifies the native fresh-account behavior, not the full CI run or production.
+Both ordinary strip journeys still failed at `10-column-height` for `beta`.
+Their diagnostics show 21 tries and last reason `fixture-color-mismatch`.
+The local deadline of 10 seconds expired, with more than 81 seconds left on the total deadline.
+Cleanup passed.
+
+No timeout, pixel, identity or acceptance guard changed.
+PR #985 remains blocked by the required strip gate; there is no merge or publication.
+
+### Bounded strip capture failure metadata
+
+Run 41262331704 placed the strip failure inside the capture for case 10.
+That run did not establish whether the local or total deadline caused the failure.
+The new diagnostic does not change either deadline or qualify a failed capture.
+
+A failed capture adds one `capture_failure` object to the existing receipt.
+It contains the source-owned case `label` and `role`, plus the `attempts` count.
+Its fixed fields are:
+
+- `capture_begin_monotonic_ns` and `failure_monotonic_ns`;
+- `local_deadline_monotonic_ns`, `capture_deadline_monotonic_ns`
+  and `total_deadline_monotonic_ns`;
+- `stage`: `png-acquire`, `ppm-acquire`, `ppm-pixels`, `png-pixels`,
+  `retry-refresh` or `post-frame-read`;
+- `last_not_ready_reason`: `fixture-body-not-visible`,
+  `fixture-color-mismatch`, `other-not-ready` or null;
+- `ppm_rgb_verified` and `png_rgb_verified`: separate booleans for the latest try.
+  Null means that the capture did not reach the color check.
+
+The object contains no frames, inventory, exception text or bus payload.
+The capture re-raises its original exception; cleanup stays unchanged.
+The local 10-second and total 120-second limits stay unchanged.
+Both pixel checks and the identity check after the frame remain mandatory.
+
+The existing code does not guard the final write of `receipt.json`.
+An `OSError` from that write can mask an earlier failure.
+This diagnostic does not change that existing limit.
+
+### Normal notification preparation for strip proof
+
+The public frames show a notification over Beta.
+It covered two of the 25 color points in both PNG and PPM.
+The fix uses normal keyboard input, not a change to the pixel tolerance.
+
+Strip preparation uses `Super+N`, observes key release, then uses `Tab`
+and observes release again.
+Before `Return`, a second observation must find one `Notifications` Close control.
+That control must belong to the original shell process and its AT-SPI bus.
+It must report `FOCUSED`.
+A layer namespace alone is not proof of that owner.
+
+After the normal Close action, the banner must be absent and all keys released.
+Original windows, focus, workspace and session mode must remain unchanged.
+Both PNG and PPM still need all original 25 color checks.
+No pointer coordinates or empirical offsets select the control.
+There is no DND change, backend notification clear or authentication-dialog action.
+
+The controller refuses preparation for held buttons, gestures, authentication UI or unknown or ambiguous overlays.
+All key commands share the unchanged 10-second capture and 120-second total deadlines.
+
+#### Actual nested UI proof
+
+A private smoke of the nested UI used the exact package from run 41267289849,
+artifact `tuna-arch` / `13067334148`.
+Its package hash and both executable hashes match the receipts from both native profiles.
+The original checks of 25 color points failed for each format with a test banner of `critical` urgency.
+The normal focused Close action removed it.
+The first post-close PNG and PPM pair passed the original checks.
+Window geometry, focus and mode stayed unchanged; post-frame identity and cleanup passed.
+
+The smoke used separate actual PNG and PPM acquisitions through private Xvfb/scrot.
+It did not use native QMP acquisition or exercise an installed VM.
+There was no native compilation.
+Both required locks, the 40-GiB floor and the 8-GiB/no-swap/200-percent caps applied.
+Its HOME/XDG directories were fresh.
+
+Focused checks passed: 57 acceptance/stationary tests and 20 existing navigation tests.
+The keyboard path has approval from two independent reviews.
+Receipt: `985-c855-public-notification-close/receipt.json` in the retained finish evidence.
+
+The keyboard path still needs qualification in CI with the actual installed image.
+The completed fresh-account proof above does not qualify that separate path.
+
+### Private image and input corrections
+
+The old controller used one or two forward Tabs.
+[Each user has a focusable button](https://github.com/GNOME/gnome-shell/blob/51.0/js/gdm/loginDialog.js#L67-L137).
+Hover can also move focus.
+The number of Tabs depends on the list and current focus.
+The retained run does not reveal where the UI had focus.
+
+The corrected input parks the pointer outside the list.
+Both Escapes share the original two-second budget.
+Five Up presses reach the first item without vertical wrap.
+Two backward Tabs then reach `Not listed?` through the bottom accessibility button.
+The fixture has at most four human accounts and those two buttons.
+The old per-Tab sleeps are gone.
+
+[GNOME's focus handler](https://github.com/GNOME/gnome-shell/blob/51.0/src/st/st-focus-manager.c#L102-L140)
+lets backward Tabs wrap, but not Up by default.
+The controller still allows at most two login tries.
+Its 60-second login deadline and 90-second trace bound stay unchanged.
+Real UI qualification still needs the complete native journeys.
+
+The [pinned installer](https://github.com/tuna-os/bootc-installer/blob/9f582fe0ecc19561be1115dfef64a59e91ea5072/bootc_installer/defaults/user.py#L16-L17)
+gives administrators the wheel group.
+Its [user setup](https://github.com/tuna-os/fisherman/blob/d349c31e47b1c05ef82d67811d5f4f9e77a62e2a/internal/post/user.go)
+does not grant sudo authorization.
+The result shows a gap in authorization for the administrator.
+It does not establish the inherited sudoers bytes.
+
+The shared image uses `tuna-vm-admin-policy` for its global wheel role.
+Its rule is `%wheel ALL=(ALL:ALL) PASSWD: ALL`.
+It names no test account or probe command.
+The installed file has owner `0:0` and mode `0440`.
+The account helper and sudo probe remain unchanged.
+Standard accounts outside wheel must still fail by policy.
+
+An explicit include precedes inherited rules.
+The `.conf` suffix prevents a second include through `@includedir`.
+This order keeps exceptions for specific commands, such as bootc upgrade.
+The image uses real `visudo` to check syntax and effective inclusion.
+
+The `cvtsudoers` tree proves the role is first and unique.
+It rejects alternate or indirect duplicate includes.
+Setup keeps one explicit include.
+Tests parse the actual role with sudo's tools, without PAM or privileges.
+
+The image appends hashes for the policy and root sudoers file.
+It does not regenerate the existing GDM payload entries.
+Later Orca and GDM layers must preserve that complete receipt.
+These source and parser checks do not qualify the runtime gates.
+
 
 The Debian package journey must retain the original beta package's
 `share/pam.d/tuna-lock` conffile bytes, including its comment. Run
@@ -239,9 +739,12 @@ changing HOME alone does not isolate that route. The proof now exports
 private state/cache roots explicitly. It does not touch the real user
 paths or bypass the migration guard.
 
-The local full speech proof is blocked by host Orca 46.1, which does not
-satisfy the required KeyboardMonitor contract. A new Ubuntu 26.04 run with
-distribution Orca 50.3 must establish all speech gates against the native
-package correction. The original failed run's eight passing gates do not
-establish a nine-gate pass for this change, and a GTK auth-prompt regression
-does not qualify end-to-end Orca speech.
+The first local attempt used host Orca 46.1, which could not satisfy the
+KeyboardMonitor contract. A later isolated Ubuntu 26.04 run with native
+Orca `50.3-0ubuntu0.1+tuna1` passed all 11 speech assertions in 141 seconds.
+It typed nine characters, observed nine spoken bullets without plaintext,
+unlocked through PAM, and confirmed that the toggle stopped Orca.
+[The retained report](https://github.com/tuna-os/tuna-desktop/pull/931#issuecomment-6545553530)
+records source `69e9a04fd20aa2bc38427c79aec043cb3174da3b` and the actual
+package and binary identities. This proves the nested speech path, not
+the separate GDM fresh-account journey or ISO installation.

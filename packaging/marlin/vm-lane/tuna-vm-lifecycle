@@ -12,7 +12,9 @@ import sys
 import time
 import hashlib
 import hashlib
+import re
 import shlex
+import shutil
 import time
 import uuid
 import base64
@@ -1904,6 +1906,46 @@ def strip_stop_identity(original, uid, deadline):
         os.close(fd)
 
 
+def strip_notification_ui(summary, owner, *, observe_control=False):
+    """Fixed public layer roles and a read-only original-shell Close control."""
+    layers = summary.get("layers")
+    if type(layers) is not list or len(layers) > 32:
+        raise RuntimeError("bounded actual strip layer observation missing")
+    public = []
+    for layer in layers:
+        rect = layer.get("rect")
+        if (type(rect) is not list or len(rect) != 4
+                or any(type(value) is not int or abs(value) > 16384 for value in rect)
+                or min(rect[2:]) <= 0):
+            raise RuntimeError("invalid actual strip layer geometry")
+        namespace = layer.get("namespace")
+        public.append({"namespace": namespace if namespace in {"tuna-panel", "tuna-shell-banners"} else "other",
+                       "rect": rect})
+    result = {"layers": public, "control": None}
+    if not observe_control:
+        return result
+    if (summary["locked"] or summary["overview_open"]
+            or any(layer["namespace"] == "other" for layer in public)
+            or sum(layer["namespace"] == "tuna-shell-banners" for layer in public) != 1):
+        raise RuntimeError("notification Close requires one unambiguous unlocked banner")
+    shell = owner["core"]["tuna-shell-gtk"]
+    observer = pathlib.Path("/usr/libexec/tuna-vm-shell-focus")
+    observer_sha = strip_sha(observer)
+    raw = call(str(observer), str(shell["pid"]), str(shell["start_ticks"]), "tuna-shell-gtk",
+               f"tuna-nested-{owner['core']['tuna-compositor']['pid']}", "notification-banner", user=True)
+    if len(raw.encode()) > 8192:
+        raise RuntimeError("notification control observation exceeds byte bound")
+    control = json.loads(raw)
+    if (control.get("observer_sha256") != observer_sha or strip_sha(observer) != observer_sha
+            or strip_core(inventory()) != owner["core"]):
+        raise RuntimeError("original notification observer/shell identity changed")
+    after = strip_json(STATE, OWNER.pw_uid)
+    if after["locked"] or after["overview_open"] or strip_notification_ui(after, owner)["layers"] != public:
+        raise RuntimeError("notification layers changed during control observation")
+    result["control"] = control
+    return result
+
+
 def strip_client(action, nonce):
     nonce = strip_nonce(nonce)
     receipt_path = pathlib.Path(RUNTIME, f"tuna-vm-strip-{nonce}.json")
@@ -1962,7 +2004,7 @@ def strip_client(action, nonce):
             raise RuntimeError("unknown fixture launch prevents confirmed cleanup")
         return {"nonce": nonce, "boot_id": owner["boot_id"], "owned_processes": records,
                 "cleanup_confirmed": True, "descendant_group_retirement_qualified": False}
-    if action != "state" or owner.get("launch_state") != "known":
+    if action not in ("state", "notification-control") or owner.get("launch_state") != "known":
         raise RuntimeError("strip fixture ownership not admitted")
     fixture = strip_json(receipt_path, OWNER.pw_uid)
     if strip_validate_client(fixture, nonce, owner["launcher"], mode) != owner["client"]:
@@ -1977,6 +2019,7 @@ def strip_client(action, nonce):
     # Native window->PID kernel credentials are not in the current summary.
     # Nonce app IDs/new-map sets are checked by the host; never fabricate that join.
     return {"owner": owner, "fixture": fixture, "inventory": current,
+            "notification_ui": strip_notification_ui(summary, owner, observe_control=action == "notification-control"),
             "native_window_kernel_pid_join_qualified": False}
 
 
@@ -2106,27 +2149,170 @@ def soak_read(name, offset):
 FRESH_USERS = ("tunastd", "tunaadmin", "tunaseeded")
 ACCOUNTS_RECORD_DIR = pathlib.Path("/var/lib/AccountsService/users")
 GDM_CUSTOM_CONF = pathlib.Path("/etc/gdm/custom.conf")
+# Read-only diagnostics of the GDM 51 template policy (tunaOS#4092). They
+# never gate: the physical record above stays the only persistence proof.
+# Global templates in the canonical check's precedence; only these [User]
+# keys leave the guest (never Icon or other template content).
+ACCOUNTS_TEMPLATE_DIRS = ("/run", "/etc", "/usr/local/share", "/usr/share")
+ACCOUNTS_TEMPLATE_KINDS = ("standard", "administrator")
+ACCOUNTS_TEMPLATE_KEYS = ("Session", "SessionType", "XSession", "SystemAccount")
+ACCOUNTS_TEMPLATE_BOUND = 16384
+# Read-only org.freedesktop.Accounts.User properties (accountsservice
+# 26.27.3 data/org.freedesktop.Accounts.User.xml) and their D-Bus types.
+ACCOUNTS_PROPERTIES = {"Session": "s", "SessionType": "s", "Saved": "b", "LocalAccount": "b"}
+ACCOUNTS_TIMEOUT_MS = 3000
+GDM_POLICY_PACKAGES = ("gdm", "libgdm", "accountsservice")
+DIAGNOSTIC_OUTPUT_BOUND = 256
+# tuna-gdm-default-session.sh's bash ERE; [[:space:]] is the C locale's set.
+GDM_VERSION = re.compile(r"[Gg][Dd][Mm]3?[ \t\n\v\f\r]+([0-9]+)\.[0-9]+([.-][0-9A-Za-z.-]+)?[ \t\n\v\f\r]*")
 FRESH_DESKTOP = ("tuna-session", COMPOSITOR_COMM, SHELL_GTK[:15], "gnome-shell", "gnome-session-b",
                  "gnome-session-s")
 
 
+def record_presence(path):
+    """Presence of the fixed physical record path, without reading it."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return {"present": False}
+    except OSError as error:
+        return {"error": type(error).__name__}
+    return {"present": True, "regular": stat.S_ISREG(info.st_mode)}
+
+
+def template_observation(kind):
+    """The global `kind` template: each candidate's presence, the winning
+    path and every occurrence of the allowlisted [User] keys in file order,
+    parsed as the helper's awk does ([] = missing, [""] = explicit empty)."""
+    candidates = [pathlib.Path(directory, "accountsservice/user-templates", kind)
+                  for directory in ACCOUNTS_TEMPLATE_DIRS]
+    present = [path.is_file() for path in candidates]
+    result = {"candidates": [{"path": str(path), "present": flag} for path, flag in zip(candidates, present)],
+              "winner": None}
+    if True not in present:
+        return result
+    winner = candidates[present.index(True)]
+    result["winner"] = str(winner)
+    try:
+        with winner.open("rb") as stream:
+            data = stream.read(ACCOUNTS_TEMPLATE_BOUND + 1)
+    except OSError as error:
+        result["error"] = type(error).__name__
+        return result
+    keys = {key: [] for key in ACCOUNTS_TEMPLATE_KEYS}
+    groups, in_user = 0, False
+    for line in data[:ACCOUNTS_TEMPLATE_BOUND].decode(errors="replace").split("\n"):
+        if line.startswith("["):
+            in_user = line == "[User]"
+            groups += in_user
+        elif in_user and "=" in line:
+            key, value = line.split("=", 1)
+            if key in keys:
+                keys[key].append(value)
+    result |= {"truncated": len(data) > ACCOUNTS_TEMPLATE_BOUND, "user_groups": groups, "keys": keys}
+    return result
+
+
+def accounts_get(bus, path, name):
+    """One Properties.Get without D-Bus activation: {"value": v}, or
+    {"error": id} with the remote D-Bus error name, never its message."""
+    from gi.repository import Gio, GLib
+    try:
+        reply = bus.call_sync("org.freedesktop.Accounts", path, "org.freedesktop.DBus.Properties", "Get",
+                              GLib.Variant("(ss)", ("org.freedesktop.Accounts.User", name)),
+                              GLib.VariantType("(v)"), Gio.DBusCallFlags.NO_AUTO_START,
+                              ACCOUNTS_TIMEOUT_MS, None)
+        value = reply.get_child_value(0).get_variant()
+        signature = value.get_type_string()
+        if signature != ACCOUNTS_PROPERTIES[name]:
+            return {"error": "unexpected-type", "type": signature[:16]}
+        return {"value": value.unpack()}
+    except GLib.Error as error:
+        return {"error": (Gio.DBusError.get_remote_error(error) or f"{error.domain}:{error.code}")[:128]}
+    except Exception as error:
+        return {"error": type(error).__name__}
+
+
+def accounts_properties(uid):
+    """Effective AccountsService state of /org/freedesktop/Accounts/User<uid>:
+    exactly the fixed read-only properties, each a value or an explicit error."""
+    path = f"/org/freedesktop/Accounts/User{uid}"
+    try:
+        from gi.repository import Gio
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    except Exception as error:
+        return {"object": path, "properties": {name: {"error": f"bus:{type(error).__name__}"}
+                                               for name in ACCOUNTS_PROPERTIES}}
+    return {"object": path, "properties": {name: accounts_get(bus, path, name) for name in ACCOUNTS_PROPERTIES}}
+
+
+def bounded_command(argv, timeout=10):
+    """(record, stdout): exit status and bounded stdout; stderr is discarded."""
+    try:
+        run = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"error": type(error).__name__}, b""
+    return ({"returncode": run.returncode,
+             "stdout": run.stdout[:DIAGNOSTIC_OUTPUT_BOUND].decode(errors="replace"),
+             "truncated": len(run.stdout) > DIAGNOSTIC_OUTPUT_BOUND}, run.stdout)
+
+
+def gdm_version_major(stdout, returncode):
+    """The helper's parse: bash $(...) drops NULs and trailing newlines, and
+    a failed --version reads as empty."""
+    text = stdout.replace(b"\0", b"").rstrip(b"\n").decode(errors="surrogateescape") if returncode == 0 else ""
+    match = GDM_VERSION.fullmatch(text)
+    return int(match.group(1)) if match else None
+
+
+def gdm_policy(search_path=None):
+    """What tuna-gdm-default-session.sh selects on this root: the binary it
+    resolves, its bounded --version result and parse, the exact literal
+    probe, the derived template policy, package provenance and templates."""
+    binary = shutil.which("gdm", path=search_path) or shutil.which("gdm3", path=search_path)
+    result = {"binary": binary, "realpath": os.path.realpath(binary) if binary else None}
+    if binary is None:
+        version, stdout, probe = {"error": "no-binary"}, b"", {"error": "no-binary"}
+    else:
+        version, stdout = bounded_command([binary, "--version"])
+        probe = bounded_command(["grep", "-aFq", "daemon/FallbackSession", binary])[0]
+    major = gdm_version_major(stdout, version.get("returncode"))
+    result |= {"version": version, "version_major": major, "fallback_literal": probe,
+               "policy": "empty" if major is not None and major >= 51 and probe.get("returncode") == 0
+               else "legacy",
+               "packages": {name: bounded_command(["pacman", "-Q", name])[0] for name in GDM_POLICY_PACKAGES},
+               "owner": (bounded_command(["pacman", "-Qo", result["realpath"]])[0] if binary
+                         else {"error": "no-binary"}),
+               "templates": {kind: template_observation(kind) for kind in ACCOUNTS_TEMPLATE_KINDS}}
+    return result
+
+
 def fresh_state(name):
     """Identity, groups and AccountsService record of a fixture account; the
-    record text is the public cache file (no secrets live there)."""
+    record text is the public cache file (no secrets live there). The
+    diagnostic "accounts" block reads record presence, global templates,
+    the effective properties, then record presence again, in that order."""
     try:
         entry = pwd.getpwnam(name)
     except KeyError:
         return {"user": name, "exists": False}
     record = ACCOUNTS_RECORD_DIR / name
+    before = record_presence(record)
     try:
         text = record.read_text(errors="replace")[:4096]
     except FileNotFoundError:
         text = None
+    templates = {kind: template_observation(kind) for kind in ACCOUNTS_TEMPLATE_KINDS}
+    effective = accounts_properties(entry.pw_uid)
+    after = record_presence(record)
     return {"user": name, "exists": True, "uid": entry.pw_uid,
             "groups": call("id", "-nG", name).split(),
             "home": entry.pw_dir, "home_exists": os.path.isdir(entry.pw_dir),
             "record": text,
-            "custom_conf": GDM_CUSTOM_CONF.read_text(errors="replace")[:8192]}
+            "custom_conf": GDM_CUSTOM_CONF.read_text(errors="replace")[:8192],
+            "accounts": {"record_path": str(record), "record_before": before, "templates": templates,
+                         "effective": effective, "record_after": after}}
 
 
 def fresh_session(name):
@@ -2207,7 +2393,7 @@ def main():
         if len(sys.argv) != 4:
             raise ValueError("soak-read takes a file name and offset")
         result = soak_read(sys.argv[2], int(sys.argv[3]))
-    elif action in ("strip-start", "strip-edge-start", "strip-state", "strip-stop"):
+    elif action in ("strip-start", "strip-edge-start", "strip-state", "strip-notification-control", "strip-stop"):
         if len(sys.argv) != 3:
             raise ValueError("strip action requires exactly one nonce")
         try:
@@ -2829,16 +3015,22 @@ print(json.dumps(result))
                    "fallback_session": gdm_fallback_session(),
                    "greeter_pids": greeter_pids,
                    "greeter_uids": [pathlib.Path(f"/proc/{pid}").stat().st_uid for pid in greeter_pids]}
+    elif action == "gdm-policy":
+        # Build-time GDM template policy diagnostic (Containerfile); read-only.
+        if len(sys.argv) != 2:
+            raise ValueError("gdm-policy takes no arguments")
+        result = gdm_policy()
+    elif action in ("fresh-trace-start", "fresh-trace-stop"):
+        if len(sys.argv) != 2:
+            raise ValueError("fresh trace takes no arguments")
+        result = json.loads(call(sys.executable, "/usr/libexec/tuna-vm-gdm-trace",
+                                 action.removeprefix("fresh-trace-")))
     elif action in FRESH_ACTIONS:
         # tunaOS#4092: record-free accounts made by tuna-vm-fresh-accounts.
         # Only the fixed public fixture names are accepted.
         if len(sys.argv) != 3 or sys.argv[2] not in FRESH_USERS:
             raise ValueError("fresh-account action takes one fixture account name")
         result = FRESH_ACTIONS[action](sys.argv[2])
-    elif action == "reboot":
-        boot_id = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-        call("systemctl", "reboot", "--no-block")
-        result = {"requested": "reboot", "boot_id": boot_id}
     elif action == "payload":
         payload = pathlib.Path("/usr/share/tuna-vm/shipped-payload.sha256")
         call("sha256sum", "--check", str(payload))

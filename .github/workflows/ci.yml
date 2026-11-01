@@ -1276,6 +1276,226 @@ jobs:
           podman push "$img:latest"
           podman push "$img:${{ github.sha }}"
 
+  gdm51-native-package:
+    # Private fixture only: one exact-source native build shared by both VM profiles.
+    needs: [select-lanes]
+    if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: tuna-os/tunaos-packages
+          ref: 7b52bdf34be22bc60fef62b157be64b589b13f6a
+          persist-credentials: false
+          path: package-source
+      - name: Free preinstalled runner tool space for the native factory
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift
+          df -h /
+      - name: Install native factory host tools
+        run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends python3-yaml zstd libarchive-tools
+      - name: Build once and stage-verify with the existing pinned package factory
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import tempfile
+          import urllib.request
+          import yaml
+
+          def collect_candidate(artifacts, output, sha):
+              """Retain the actual native outputs and derive the strict runtime manifest."""
+              if sha != '7b52bdf34be22bc60fef62b157be64b589b13f6a':
+                  raise RuntimeError('candidate collection requires the approved source commit')
+              packages = output / 'packages'
+              packages.mkdir()
+              manifest = {'schema': 1, 'source_repository': 'tuna-os/tunaos-packages',
+                          'source_commit': sha, 'architecture': 'x86_64', 'packages': {}, 'members': {}}
+              expected_members = {'/usr/bin/gdm': 'gdm', '/usr/lib/gdm-session-worker': 'gdm',
+                                  '/usr/lib/libgdm.so.1.0.0': 'libgdm'}
+              archive_hashes = {}
+              for archive in sorted(artifacts.glob('*.pkg.tar.zst')):
+                  allowed = {f'{name}-51.1.1-1.1-x86_64.pkg.tar.zst': name
+                             for name in ('gdm', 'libgdm', 'gdm-debug')}
+                  if archive.is_symlink() or not archive.is_file() or archive.name not in allowed:
+                      raise RuntimeError('unexpected native package output')
+                  shutil.copyfile(archive, packages / archive.name)
+                  with archive.open('rb') as stream:
+                      archive_hashes[archive.name] = hashlib.file_digest(stream, 'sha256').hexdigest()
+                  for member in ('.BUILDINFO', '.PKGINFO'):
+                      payload = subprocess.check_output(['bsdtar', '-xOf', str(archive), member], timeout=60)
+                      if member == '.PKGINFO':
+                          fields = {}
+                          for line in payload.decode().splitlines():
+                              if ' = ' in line:
+                                  key, value = line.split(' = ', 1)
+                                  fields.setdefault(key, []).append(value)
+                          for key, value in (('pkgname', allowed[archive.name]),
+                                             ('pkgver', '51.1.1-1.1'), ('arch', 'x86_64')):
+                              if fields.get(key) != [value]:
+                                  raise RuntimeError('native package metadata mismatch')
+                      (output / (archive.name + member)).write_bytes(payload)
+              for name in ('gdm', 'libgdm'):
+                  filename = f'{name}-51.1.1-1.1-x86_64.pkg.tar.zst'
+                  manifest['packages'][name] = {'file': filename, 'version': '51.1.1-1.1',
+                                                'sha256': archive_hashes[filename]}
+              for member, name in expected_members.items():
+                  archive = packages / manifest['packages'][name]['file']
+                  payload = subprocess.check_output(
+                      ['bsdtar', '-xOf', str(archive), member.lstrip('/')], timeout=60)
+                  manifest['members'][member] = {'package': name,
+                                                'sha256': hashlib.sha256(payload).hexdigest()}
+              (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+              return manifest, archive_hashes
+
+          source = Path('package-source').resolve()
+          output = Path('gdm51-artifacts').resolve()
+          output.mkdir()
+          work = Path(tempfile.mkdtemp(prefix='gdm51-', dir=os.environ['RUNNER_TEMP']))
+          for directory in ('bin', 'home/.cache/tideforge/sources', 'home/.config', 'tmp', 'cell'):
+              (work / directory).mkdir(parents=True, exist_ok=True)
+          sha = '7b52bdf34be22bc60fef62b157be64b589b13f6a'
+          image = 'docker.io/library/archlinux@sha256:2fd1ae548076c67bcd41098ddd44e799058010e8d55f085d453dbb890e706860'
+          docker = shutil.which('docker')
+          if docker is None or os.uname().machine != 'x86_64':
+              raise RuntimeError('native x86_64 Docker runner required')
+          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=source, text=True).strip()
+          if head != sha:
+              raise RuntimeError('package-source checkout differs from approved commit')
+          factory = yaml.safe_load((source / 'manifests/package-factory.yaml').read_text())
+          recipe = yaml.safe_load((source / 'packages/gdm/package.yaml').read_text())
+          if factory['targets']['arch']['probe_images']['x86_64'] != image:
+              raise RuntimeError('factory pinned Arch image changed')
+          if recipe.get('architectures') != {'arch': ['x86_64']}:
+              raise RuntimeError('GDM native architecture admission changed')
+          container = f'tuna-gdm51-{os.environ["GITHUB_RUN_ID"]}-{os.environ["GITHUB_RUN_ATTEMPT"]}'
+          env = {
+              'PATH': f'{work}/bin:/usr/local/bin:/usr/bin:/bin', 'HOME': str(work / 'home'),
+              'XDG_CONFIG_HOME': str(work / 'home/.config'), 'XDG_CACHE_HOME': str(work / 'home/.cache'),
+              'TMPDIR': str(work / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1',
+              'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'TZ': 'UTC',
+              'CELL_ID': 'tideforge-gdm-arch-x86_64', 'ENGINE': 'tideforge',
+              'PACKAGE': 'gdm', 'TARGET': 'arch', 'FORMAT': 'pkg.tar.zst', 'ARCHITECTURE': 'x86_64',
+              'RECIPE': 'packages/gdm/package.yaml', 'IMAGE': image, 'OUT_DIR': str(work / 'cell'),
+              'SOURCE_DATE_EPOCH': subprocess.check_output(
+                  ['git', 'show', '-s', '--format=%ct', 'HEAD'], cwd=source, text=True).strip(),
+              'GDM_BUILD_CONTAINER': container, 'GDM_BUILD_IMAGE': image, 'GDM_REAL_DOCKER': docker,
+              'GDM_BUILD_CPUS': ','.join(str(cpu) for cpu in sorted(os.sched_getaffinity(0))[:2]),
+          }
+          # Only these checksum-locked exact URLs seed a new, isolated CAS.
+          # Cache hits avoid the factory's optional ORAS push path entirely.
+          expected_sources = [
+              ('https://download.gnome.org/sources/gdm/51/gdm-51.1.1.tar.xz',
+               '390ae9e7540f71db28a3dc64319a8f687f4d88bd4d5f1ff816b7a9f2249ab4aa'),
+              ('https://gitlab.archlinux.org/archlinux/packaging/packages/gdm/-/raw/36e76b2b4674dc196e611782c4f8f6d5e476e231/0001-Xsession-Don-t-start-ssh-agent-by-default.patch',
+               '39a7e1189d423dd428ace9baac77ba0442c6706a861d3c3db9eb3a6643e223f8'),
+          ]
+          sources = [recipe['source'], *recipe.get('sources', [])]
+          if [(item['url'], item['sha256']) for item in sources] != expected_sources:
+              raise RuntimeError('reviewed checksum-locked source closure changed')
+          source_receipts = []
+          for item in sources:
+              with urllib.request.urlopen(item['url'], timeout=60) as response:
+                  payload = response.read(2 * 1024**2 + 1)
+              actual = hashlib.sha256(payload).hexdigest()
+              if len(payload) > 2 * 1024**2 or actual != item['sha256']:
+                  raise RuntimeError('source download exceeds bound or differs from recipe checksum')
+              (work / 'home/.cache/tideforge/sources' / actual).write_bytes(payload)
+              source_receipts.append({'url': item['url'], 'sha256': actual, 'bytes': len(payload)})
+          launcher = r'''#!/usr/bin/python3
+          import os
+          import sys
+          args = sys.argv[1:]
+          if not args or args.pop(0) != 'run':
+              raise SystemExit('only the factory Docker run operation is admitted')
+          image = os.environ['GDM_BUILD_IMAGE']
+          if args.count(image) != 1:
+              raise SystemExit('expected exactly the reviewed immutable Arch image')
+          index = args.index(image)
+          guard = r"""set -euo pipefail
+          read -r memory < /sys/fs/cgroup/memory.max
+          read -r swap < /sys/fs/cgroup/memory.swap.max
+          read -r quota period < /sys/fs/cgroup/cpu.max
+          [[ "$memory" != max && "$memory" -le 8589934592 && "$swap" == 0 ]]
+          [[ "$quota" != max && "$quota" -le $((2 * period)) ]]
+          printf 'GDM_CGROUP={"memory_max":"%s","swap_max":"%s","cpu_quota":"%s","cpu_period":"%s"}\n' "$memory" "$swap" "$quota" "$period"
+          exec "$@"
+          """
+          actual = [os.environ['GDM_REAL_DOCKER'], 'run',
+                    '--name', os.environ['GDM_BUILD_CONTAINER'], '--memory=8g', '--memory-swap=8g',
+                    '--cpus=2', '--cpuset-cpus=' + os.environ['GDM_BUILD_CPUS'], '--pull=never',
+                    '--env', 'MAKEFLAGS=-j2', *args[:index+1],
+                    'bash', '-ec', guard, 'gdm-resource-guard', *args[index+1:]]
+          os.execve(actual[0], actual, os.environ)
+          '''
+          (work / 'bin/docker').write_text(launcher)
+          (work / 'bin/docker').chmod(0o755)
+          tracked = subprocess.check_output(
+              ['git', 'ls-files', '-z', 'packages/gdm', 'scripts', 'manifests/package-factory.yaml'],
+              cwd=source).decode().split('\0')
+          source_hashes = {name: hashlib.sha256((source / name).read_bytes()).hexdigest()
+                           for name in tracked if name}
+          shutil.copytree(source / 'packages/gdm', output / 'source/gdm',
+                          ignore=shutil.ignore_patterns('__pycache__'))
+          receipt = {'source_repository': 'tuna-os/tunaos-packages', 'source_commit': head,
+                     'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+                     'pinned_image': image, 'source_inputs': source_receipts, 'source_files': source_hashes,
+                     'memory_bytes': 8589934592, 'swap_bytes': 0, 'cpu_quota_percent': 200,
+                     'publication': False, 'steps': [], 'cgroups': []}
+          try:
+              steps = [
+                  ('pull-immutable-native-image', [docker, 'pull', '--platform', 'linux/amd64', image]),
+                  ('actual-native-factory-build', ['bash', 'scripts/run-package-factory-cell.sh']),
+                  ('actual-staged-package-verification', ['bash', 'scripts/verify-package-factory-cell.sh']),
+              ]
+              for label, command in steps:
+                  if shutil.disk_usage(work).free < 40 * 1024**3:
+                      raise RuntimeError('native package factory requires 40 GiB free')
+                  log_path = output / (label + '.log')
+                  with log_path.open('wb') as log:
+                      result = subprocess.run(['timeout', '--kill-after=10s', '1500s', *command],
+                                              cwd=source, env=env, stdout=log,
+                                              stderr=subprocess.STDOUT, timeout=1520)
+                  receipt['steps'].append({'name': label, 'returncode': result.returncode})
+                  for line in log_path.read_text(errors='replace').splitlines():
+                      if line.startswith('GDM_CGROUP='):
+                          print(line, flush=True)
+                          receipt['cgroups'].append({'step': label, **json.loads(line.split('=', 1)[1])})
+                  if result.returncode:
+                      raise RuntimeError(f'{label} failed; see retained same-run log')
+              if len(receipt['cgroups']) != 2:
+                  raise RuntimeError('both actual factory containers must report resource evidence')
+              shutil.copyfile(work / 'cell/package-info.txt', output / 'package-info.txt')
+              manifest, archive_hashes = collect_candidate(work / 'cell/artifacts', output, sha)
+              receipt['package_sha256'] = archive_hashes
+              receipt['optional_debug'] = {
+                  'present': 'gdm-debug-51.1.1-1.1-x86_64.pkg.tar.zst' in archive_hashes,
+                  'absence_is_persistence_proof': False,
+              }
+          finally:
+              cleanup = subprocess.run([docker, 'rm', '--force', container], env=env,
+                                       capture_output=True, text=True, timeout=15)
+              receipt['cleanup'] = ('complete' if cleanup.returncode == 0
+                                    or 'no such container' in cleanup.stderr.lower() else 'failed')
+              (output / 'build-provenance.json').write_text(json.dumps(receipt, indent=2) + '\n')
+              if receipt['cleanup'] != 'complete':
+                  raise RuntimeError('native factory container cleanup failed')
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: gdm51-native-package
+          path: gdm51-artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
   marlin-vm:
     # Real-VM lane (#68): install the Marlin Tuna Desktop image (plus the CI-only
     # layer in packaging/marlin/vm-lane: tunaOS's tuna-flavor GDM login path,
@@ -1290,7 +1510,7 @@ jobs:
       matrix:
         orca: [distribution, upstream51]
     runs-on: ubuntu-26.04
-    needs: [select-lanes, arch-package]
+    needs: [select-lanes, arch-package, gdm51-native-package]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm')
     timeout-minutes: 60
     steps:
@@ -1301,6 +1521,10 @@ jobs:
         with:
           name: tuna-arch
           path: arch-artifacts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: gdm51-native-package
+          path: gdm51-artifacts
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -1332,6 +1556,25 @@ jobs:
             sudo podman rm "$probe_container"
             sudo chown -R "$(id -u):$(id -g)" orca51-package-provenance
           fi
+          # Final overlay is deliberately after BOTH branches and every Syu.
+          # FROM receives an immutable prior image ID, never a mutable tag.
+          mkdir -p vm-lane-artifacts/gdm51
+          cp gdm51-artifacts/manifest.json gdm51-artifacts/build-provenance.json vm-lane-artifacts/gdm51/
+          prior_image=$(sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}')
+          scripts/tuna-vm-strip-image --canonical-image-id "$prior_image" > vm-lane-artifacts/gdm51/prior-image-id
+          sudo podman build --pull=never -f packaging/marlin/vm-lane/gdm51/Containerfile \
+            --build-arg "BASE_IMAGE=$(cat vm-lane-artifacts/gdm51/prior-image-id)" \
+            --build-arg GDM_SOURCE_SHA=7b52bdf34be22bc60fef62b157be64b589b13f6a \
+            -t localhost/marlin-tuna-vm:ci .
+          final_image=$(sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}')
+          sudo podman image inspect "$final_image" > vm-lane-artifacts/gdm51/final-image-inspect.json
+          scripts/tuna-vm-strip-image --canonical-image-id "$final_image" > vm-lane-artifacts/gdm51/final-image-id
+          provenance_container=$(sudo podman create "$final_image" /usr/bin/true)
+          trap 'sudo podman rm -f "$provenance_container" >/dev/null 2>&1 || true' EXIT
+          sudo podman cp "$provenance_container:/usr/share/tuna-vm-gdm51/." vm-lane-artifacts/gdm51/
+          sudo podman rm "$provenance_container"
+          trap - EXIT
+          sudo chown -R "$(id -u):$(id -g)" vm-lane-artifacts/gdm51
           sudo podman image inspect ghcr.io/tuna-os/marlin:gnome --format '{{.Digest}}' | tee /mnt/vm/base-digest
           sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}' > /mnt/vm/image-id-observed
           scripts/tuna-vm-strip-image --canonical-image-id "$(cat /mnt/vm/image-id-observed)" | tee /mnt/vm/image-id
@@ -1397,9 +1640,12 @@ jobs:
       # session-less tuna-test case above; -snapshot leaves the disk pristine.
       - name: Fresh-account GDM journey (record-free standard and admin)
         if: ${{ !cancelled() }}
+        env:
+          TUNA_VM_GDM_NATIVE_CANDIDATE: vm-lane-artifacts/gdm51/manifest.json
+          TUNA_VM_GDM_NATIVE_SOURCE_SHA: 7b52bdf34be22bc60fef62b157be64b589b13f6a
         run: >-
           test -f /mnt/vm/disk.raw &&
-          scripts/tuna-vm-lane --fresh-accounts --disk /mnt/vm/disk.raw --out vm-lane-artifacts/fresh-accounts
+          scripts/tuna-vm-lane --fresh-accounts --fresh-gdm-trace --disk /mnt/vm/disk.raw --out vm-lane-artifacts/fresh-accounts
           --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
           --meta "commit=${{ github.sha }}"
@@ -1521,7 +1767,7 @@ jobs:
     # One stable status for the run: lanes the selection skipped report
     # skipped, any failed or cancelled job fails the gate.
     if: always()
-    needs: [select-lanes, check, fprint-phase-proof, journey, app-content, scroll-proof, drm-smoke, grid-cancel-comparison, gtk-shell, orca-speech, portal-security, remote-security, niri-parity, arch-package, marlin-image, marlin-vm, parity-ledger, docs-shots]
+    needs: [select-lanes, check, fprint-phase-proof, journey, app-content, scroll-proof, drm-smoke, grid-cancel-comparison, gtk-shell, orca-speech, portal-security, remote-security, niri-parity, arch-package, marlin-image, gdm51-native-package, marlin-vm, parity-ledger, docs-shots]
     runs-on: *runner-24
     steps:
       - env:
