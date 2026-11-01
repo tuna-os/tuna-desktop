@@ -1131,6 +1131,39 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
         }
     }
 
+    /// Forward an already-intercepted key directly to the focused client,
+    /// preserving the installed keyboard grab and its ownership.
+    ///
+    /// Callers must first establish that the current grab is their input
+    /// method filter. Compositor-owned grabs must use `input_forward` instead.
+    pub fn input_forward_to_focus(
+        &self,
+        data: &mut D,
+        keycode: Keycode,
+        state: KeyState,
+        serial: Serial,
+        time: u32,
+        mods_changed: bool,
+    ) {
+        let mut guard = self.arc.internal.lock().unwrap();
+        match state {
+            KeyState::Pressed => {
+                guard.forwarded_pressed_keys.insert(keycode);
+            }
+            KeyState::Released => {
+                guard.forwarded_pressed_keys.remove(&keycode);
+            }
+        }
+        let seat = self.get_seat(data);
+        let modifiers = (mods_changed || guard.pending_modifiers).then_some(guard.mods_state);
+        guard.pending_modifiers = false;
+        KeyboardInnerHandle {
+            inner: &mut guard,
+            seat: &seat,
+        }
+        .input(data, keycode, state, modifiers, serial, time);
+    }
+
     /// Set the current focus of this keyboard
     ///
     /// If the new focus is different from the previous one, any previous focus
