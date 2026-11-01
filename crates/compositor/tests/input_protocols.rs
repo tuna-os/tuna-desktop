@@ -1937,6 +1937,36 @@ fn authorized_virtual_keyboard_returns_keys_without_retiring_the_input_method_gr
         "settings cannot rearm a retired IM grab"
     );
     assert_eq!(owner.client.ime_repeat_events.last(), Some(&(0, 0)));
+    let grab_events = owner.client.ime_grab_events;
+    let denied_grab = im.grab_keyboard(&owner.queue.handle(), ());
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert!(
+        keyboard.has_grab(serial),
+        "a late standard GetGrab must not replace the compositor grab"
+    );
+    assert_eq!(unsets.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        owner.client.ime_grab_events, grab_events,
+        "denied GetGrab must initialize an inert child without metadata"
+    );
+    denied_grab.release();
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert!(
+        keyboard.has_grab(serial),
+        "releasing a denied child must not unset the compositor grab"
+    );
+    manager.keyboard_key(&mut comp.state, 50, true, 7);
+    manager.keyboard_key(&mut comp.state, 50, false, 8);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert_eq!(
+        keys.load(Ordering::SeqCst),
+        4,
+        "compositor grab continues consuming physical keys after denial"
+    );
+    im.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert!(keyboard.has_grab(serial));
+    assert_eq!(unsets.load(Ordering::SeqCst), 0);
     assert!(owner._conn.backend().last_error().is_none());
     assert!(app._conn.backend().last_error().is_none());
 }
