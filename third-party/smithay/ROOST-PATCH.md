@@ -195,20 +195,6 @@ drm-smoke's D-LEASE leases the vkms connector through it with a real
 client. The isolated diff is retained in DRM-LEASE-PATCH.diff; the pinned
 version stays 0.7.0.
 
-Issue #364 advertises wl_seat 10. Version 10 keyboards receive
-`repeat_info(0, 0)` and compositor-generated `key(state = repeated)`;
-older resources retain client-side repeat. Repeats do not update XKB
-or the held-key set. Focus/keymap/grab/settings changes retire the hold.
-Input-method grabs retain press/release semantics and live configured
-repeat_info/keymap updates from b52fcaec. The bridge alone offers IBus
-repeats, without virtual-keyboard forwarding on decline. The compositor
-repeats to the app only after an original physically-held press was
-explicitly returned to it, never when IBus consumed the original.
-`input_forward_to_focus` preserves the persistent IM grab while admitting
-that original edge. Real-client coverage lives in
-crates/compositor/tests/key_repeat.rs; examples/seat-repeat-client.rs is
-the reusable negotiated-version/text-input consumer for native proofs.
-
 Issues #364 and #588 additionally change
 src/wayland/selection/data_device/mod.rs and dnd_grab.rs for
 xdg_toplevel_drag_v1, which Roost implements outside Smithay

@@ -36,7 +36,6 @@ pub struct InputMethodKeyboardGrab {
     pub(crate) inner: Arc<Mutex<InputMethodKeyboard>>,
 }
 
-
 impl<D> KeyboardGrab<D> for InputMethodKeyboardGrab
 where
     D: SeatHandler + 'static,
@@ -67,30 +66,6 @@ where
                     )
                 }
             });
-    }
-
-    /// IM-grab wire has only press/release. The bridge owns IBus repeats
-    /// from repeat_info; only an original key explicitly returned to the
-    /// application acquires compositor repeat ownership.
-    fn repeat(
-        &mut self,
-        data: &mut D,
-        handle: &mut KeyboardInnerHandle<'_, D>,
-        keycode: Keycode,
-        modifiers: Option<ModifiersState>,
-        serial: Serial,
-        time: u32,
-    ) {
-        if let Some(serialized) = modifiers.map(|mods| mods.serialized) {
-            let inner = self.inner.lock().unwrap();
-            if let Some(keyboard) = inner.grab.as_ref() {
-                inner.text_input_handle.active_text_input_serial_or_default(serial.0, |serial| {
-                    keyboard.modifiers(serial, serialized.depressed, serialized.latched,
-                        serialized.locked, serialized.layout_effective);
-                });
-            }
-        }
-        handle.repeat(data, keycode, modifiers, serial, time);
     }
 
     fn set_focus(
@@ -131,17 +106,10 @@ impl<D: SeatHandler + 'static> Dispatch<ZwpInputMethodKeyboardGrabV2, InputMetho
     fn destroyed(
         state: &mut D,
         _client: ClientId,
-        object: &ZwpInputMethodKeyboardGrabV2,
+        _object: &ZwpInputMethodKeyboardGrabV2,
         data: &InputMethodKeyboardUserData<D>,
     ) {
-        let mut inner = data.handle.inner.lock().unwrap();
-        // A released older resource must not retire a replacement grab.
-        if inner.grab.as_ref() != Some(object) {
-            return;
-        }
-        inner.grab = None;
-        drop(inner);
-        *data.keyboard_handle.arc.known_im_grab.lock().unwrap() = None;
+        data.handle.inner.lock().unwrap().grab = None;
         data.keyboard_handle.unset_grab(state);
     }
 
