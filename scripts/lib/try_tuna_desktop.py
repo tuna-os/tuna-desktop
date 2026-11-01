@@ -338,7 +338,7 @@ def package_transaction(command):
 def ensure_dependencies(verifier):
     """Use native package trust for QEMU and the declared amd64 UEFI firmware."""
     needed = [tool for tool in ("qemu-img", "qemu-system-x86_64") if not shutil.which(tool)]
-    if shutil.which("brew"):
+    if platform.system() == "Darwin" and shutil.which("brew"):
         if needed or not package_present(["brew", "list", "--versions", "qemu"]):
             package_transaction(["brew", "install", "qemu"])
     elif platform.system() == "Linux":
