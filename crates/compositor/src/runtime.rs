@@ -5112,14 +5112,11 @@ impl Runtime {
         // Send what this tick queued for the shell now, not at the next
         // wake, which may be far off (#503).
         self.control.flush(self.manager.model());
-        #[cfg(feature = "drm")]
-        if matches!(self.backend, Backend::Drm(_)) {
-            // Rendering queues callbacks only for a submitted scanout. Send
-            // those events now so a redraw need not wait for the next tick.
-            self.display
-                .flush_clients()
-                .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-        }
+        // Every backend queues render-produced callbacks. Send them before
+        // sleeping, without requiring another client request or render wake.
+        self.display
+            .flush_clients()
+            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         Ok(!self.exit)
     }
 

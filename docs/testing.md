@@ -196,6 +196,11 @@ Clippy runs with `-D warnings`, so any warning fails CI.
 (`hundred_fault_runs_keep_apps_alive_and_resync` in
 `crates/compositor/tests/recovery.rs`) and needs no display or GPU.
 
+After rendering, every backend flushes queued Wayland events before sleeping.
+A frame callback must not wait for an unrelated client request or another loop
+wake to reach its client. This delivery flush does not schedule another render;
+actual presentation and animation cadence still require graphical proof.
+
 The real Wayland-wire pointer tests in `crates/compositor/tests/move_resize.rs`
 cover a window mapping beneath a stationary pointer (#425). The scene repick
 must send `wl_pointer.enter` before any press, the first click must arrive
