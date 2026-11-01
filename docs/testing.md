@@ -330,6 +330,88 @@ or a still-missing module fails setup, and package installation errors are
 fatal. Module loading and the real vkms device and presentation assertions
 remain mandatory in the smoke test.
 
+## GNOME Core applications: installed-image evidence
+
+`tuna-app-content` qualifies nested Chromium content, not the 28 Core
+applications in [#397](https://github.com/tuna-os/tuna-desktop/issues/397).
+The [2026-11-01 native Corral receipt](https://github.com/tuna-os/tuna-desktop/issues/397#issuecomment-6551467493)
+records real installed-app operations on the owned `karnataka` KVM VM
+`tuna-q-coreapps-native`. **No whole-app row is qualified by that partial run.**
+Untested applications are not reported broken.
+
+The published base was
+`marlin@sha256:5ccc023cc73296d5e4d17cfbe38526935a405abcfb0095aad43b3a28bff182e6`,
+with the original `tuna-desktop 1.0.0beta.2-2` package/source
+`1e6ce28f4d5dfd7918ac7340bd93454a9fcc211c`. The explicit, local-only
+app-installation fixture has image digest
+`sha256:2a10d804cba17cc8fd7ef6a2bff7360adfc0f5821285632c1601e104fbf1ccfe`.
+It installs normal Arch packages against the image's own sync databases,
+preserves every originally shipped package/version and Tuna/GDM payload
+hash, and does not add these applications to the shipping image.
+
+All entries below are **native Arch packages**, identified by their actual
+installed desktop-entry IDs. No Flatpak application installation is claimed.
+The operation column is deliberately narrower than whole-app acceptance:
+
+| Core application / application ID | Installed package and version | Actual bounded operation receipt |
+|---|---|---|
+| Audio Player — `org.gnome.Decibels` | `decibels 49.6.1-1` | Not exercised |
+| Calculator — `org.gnome.Calculator` | `gnome-calculator 51.1-1` | Keyboard arithmetic, focused result and actual clipboard; different-result control |
+| Calendar — `org.gnome.Calendar` | `gnome-calendar 51.0-1` | Real Cancel/Save; exact event UID, summary and dates in local EDS data |
+| Camera — `org.gnome.Snapshot` | `snapshot 51.0-1` | Real camera-portal denial and denied consumer state; capture not exercised |
+| Characters — `org.gnome.Characters` | `gnome-characters 51.0-1` | Not exercised |
+| Clocks — `org.gnome.clocks` | `gnome-clocks 51.0-2` | Not exercised |
+| Connections — `org.gnome.Connections` | `gnome-connections 51.0-1` | Not exercised; no remote-endpoint claim |
+| Console — `org.gnome.Console` | `gnome-console 51.0-1` | Real shell pipeline/file bytes and inter-app clipboard paste |
+| Contacts — `org.gnome.Contacts` | `gnome-contacts 51.0-1` | Actual local-book setup, Cancel/Add/Edit/Done; genuine EDS vCard payload |
+| Disk Usage Analyzer — `org.gnome.baobab` | `baobab 50.0-1` | Not exercised |
+| Disks — `org.gnome.DiskUtility` | `gnome-disk-utility 46.1-3` | Not exercised; disposable virtual disk is a fixture, not an operation pass |
+| Document Scanner — `org.gnome.SimpleScan` | `simple-scan 50.0-1` | Not exercised; no scanner hardware claim |
+| Document Viewer — `org.gnome.Papers` | `papers 51.1-1` | Actual PDF rendering, zoom and focused text selection/copy |
+| Files — `org.gnome.Nautilus` | `nautilus 51.1-1` | Create/copy/rename/move/Trash/Undo with actual bytes, Trash origin and unchanged control |
+| Fonts — `org.gnome.font-viewer` | `gnome-font-viewer 50.0-1` | Real external-font preview/install; installed bytes and changed fontconfig match |
+| Help — `org.gnome.Yelp` | `yelp 49.2-1` | Not exercised; real `gnome-user-docs 51.0-1` content installed |
+| Image Viewer — `org.gnome.Loupe` | `loupe 51.1-1` | Known image rendered; actual file-reference clipboard MIME/path observed |
+| Logs — `org.gnome.Logs` | `gnome-logs 50.0-1` | Not exercised |
+| Maps — `org.gnome.Maps` | `gnome-maps 51.2-1` | Not exercised; no Geoclue/location-service claim |
+| Music — `org.gnome.Music` | `gnome-music 1:50.0-1` | Not exercised |
+| Settings — `org.gnome.Settings` | `gnome-control-center 51.1-1` | Desktop launch/search only; no changed-control acceptance |
+| Software — `org.gnome.Software` | `gnome-software 51.1-1` | Actual Flathub catalog and denied/cancelled system install; positive transaction not exercised |
+| System Monitor — `org.gnome.SystemMonitor` | `gnome-system-monitor 51.1-1` | Not exercised |
+| Text Editor — `org.gnome.TextEditor` | `gnome-text-editor 51.0-1` | Real picker cancel/grant, content edit, clipboard paste and Save As byte roundtrip |
+| Tour — `org.gnome.Tour` | `gnome-tour 50.0-1` | Not exercised |
+| Video Player — `org.gnome.Showtime` | `showtime 50.0-1` | Not exercised |
+| Weather — `org.gnome.Weather` | `gnome-weather 50.0-1` | Not exercised; no weather-service claim |
+| Web — `org.gnome.Epiphany` | `epiphany 51.2-1` | Not exercised |
+
+The retained local archive is
+`/home/ubuntu/dev/tuna-coreapps-397-20261101-partial.tar.gz`, SHA256
+`3fdb26509936ebcd6cf91318aedcc150fb3d906ea5dffa76e4d1268620f89283`.
+It includes numbered command/exit/output receipts, full-resolution frames,
+the native inventory, actual payload controls and the original fixture-build
+log. The issue comment gives exact package/archive/ELF/disk identities and
+receipt numbers. This is private Corral evidence, not a trusted CI artifact
+or final shipped-image certification.
+
+Failed observations remain failures: an invalid QMP display-console selector
+crashed the owned emulator; initially coalesced pointer motion/press was not
+a reliable click; a requested image-clipboard MIME was not offered; and PDF
+copy before focusing the document retained the previous clipboard. Corrected
+input and actual consumer data distinguish those fixture/interaction outcomes
+from application defects. No Contacts defect was inferred after correctly
+positioned input selected its real address book. A normal user font install
+resolved missing CJK glyph coverage without changing the default image.
+
+Remaining #397 acceptance includes the unexercised principal operations,
+per-app linguistic IME, applicable handlers/portal grants, scaling, settings
+persistence, service-owner/negative/restart controls, complete lock/restart
+recovery, and a rerun against the qualified final package/image. Camera and
+scanner physical behavior remains separate from explicitly named emulation.
+The run stopped when `karnataka` SSH/SFTP/legacy-SCP transport became
+unreachable; final beta3 qualification inputs had not been supplied.
+No timeout, lock policy, host capacity setting or qualification floor was
+relaxed.
+
 ## Marlin VM lane
 
 The `marlin-vm` job (#68) boots the real TunaOS Marlin image with Tuna Desktop
