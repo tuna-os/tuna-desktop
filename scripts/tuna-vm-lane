@@ -3765,6 +3765,8 @@ def repeat_boots(args):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--profile", choices=("lifecycle",), default="lifecycle",
+                    help="ordinary native Tuna lifecycle profile")
     ap.add_argument("--disk", required=True)
     ap.add_argument("--out", default="vm-lane-artifacts")
     ap.add_argument("--timeout", type=int, default=900)
