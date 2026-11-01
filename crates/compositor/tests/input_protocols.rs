@@ -2,6 +2,7 @@
 //! locked pointer stays put while relative motion flows, and GNOME's
 //! three-finger swipes classify as the shell's.
 
+use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 
 use smithay::utils::{Logical, Point};
@@ -11,7 +12,7 @@ use tuna_compositor::TestCompositor;
 use wayland_client::{
     protocol::{
         wl_compositor::WlCompositor,
-        wl_keyboard::WlKeyboard,
+        wl_keyboard::{self, WlKeyboard},
         wl_pointer::{self, WlPointer},
         wl_region::WlRegion,
         wl_registry::{self, WlRegistry},
@@ -46,6 +47,10 @@ use wayland_protocols_misc::zwp_input_method_v2::client::{
     zwp_input_method_v2::{self, ZwpInputMethodV2},
     zwp_input_popup_surface_v2::{self, ZwpInputPopupSurfaceV2},
 };
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
+    zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+    zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+};
 
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1},
@@ -62,6 +67,10 @@ struct Client {
     text_input_manager: Option<ZwpTextInputManagerV3>,
     input_method_manager: Option<ZwpInputMethodManagerV2>,
     input_method_name: Option<u32>,
+    vk_manager: Option<ZwpVirtualKeyboardManagerV1>,
+    vk_manager_name: Option<u32>,
+    vk: Option<ZwpVirtualKeyboardV1>,
+    keyboard_keys: Vec<(u32, wl_keyboard::KeyState)>,
     relative_manager: Option<ZwpRelativePointerManagerV1>,
     constraints: Option<ZwpPointerConstraintsV1>,
     pointer: Option<WlPointer>,
@@ -77,6 +86,7 @@ struct Client {
     text_enters: usize,
     ime_grab_events: usize,
     ime_keys: usize,
+    ime_repeat_events: Vec<(i32, i32)>,
     ime_popup_events: usize,
     /// Relative motion received (dx, dy).
     relative: Vec<(f64, f64)>,
@@ -116,6 +126,10 @@ impl Dispatch<WlRegistry, ()> for Client {
                     state.input_method_name = Some(name);
                     state.input_method_manager = Some(registry.bind(name, 1, qh, ()))
                 }
+                "zwp_virtual_keyboard_manager_v1" => {
+                    state.vk_manager_name = Some(name);
+                    state.vk_manager = Some(registry.bind(name, 1, qh, ()))
+                }
                 "zwp_relative_pointer_manager_v1" => {
                     state.relative_manager = Some(registry.bind(name, 1, qh, ()))
                 }
@@ -124,6 +138,26 @@ impl Dispatch<WlRegistry, ()> for Client {
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+impl Dispatch<WlKeyboard, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_keyboard::Event::Key {
+            key,
+            state: wayland_client::WEnum::Value(key_state),
+            ..
+        } = event
+        {
+            state.keyboard_keys.push((key, key_state));
         }
     }
 }
@@ -268,8 +302,17 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for Client {
         _: &QueueHandle<Self>,
     ) {
         state.ime_grab_events += 1;
-        if matches!(event, zwp_input_method_keyboard_grab_v2::Event::Key { .. }) {
-            state.ime_keys += 1;
+        match event {
+            zwp_input_method_keyboard_grab_v2::Event::Key { .. } => state.ime_keys += 1,
+            zwp_input_method_keyboard_grab_v2::Event::RepeatInfo { rate, delay } => {
+                state.ime_repeat_events.push((rate, delay));
+            }
+            zwp_input_method_keyboard_grab_v2::Event::Keymap { fd, size, format } => {
+                if let (Some(vk), wayland_client::WEnum::Value(format)) = (&state.vk, format) {
+                    vk.keymap(format as u32, fd.as_fd(), size);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -318,10 +361,11 @@ impl Dispatch<ZwpRelativePointerV1, ()> for Client {
 
 wayland_client::delegate_noop!(Client: ignore WlCompositor);
 wayland_client::delegate_noop!(Client: ignore WlSurface);
-wayland_client::delegate_noop!(Client: ignore WlKeyboard);
 wayland_client::delegate_noop!(Client: ignore XdgToplevel);
 wayland_client::delegate_noop!(Client: ignore ZwpTextInputManagerV3);
 wayland_client::delegate_noop!(Client: ignore ZwpInputMethodManagerV2);
+wayland_client::delegate_noop!(Client: ignore ZwpVirtualKeyboardManagerV1);
+wayland_client::delegate_noop!(Client: ignore ZwpVirtualKeyboardV1);
 wayland_client::delegate_noop!(Client: ignore ZwpRelativePointerManagerV1);
 wayland_client::delegate_noop!(Client: ignore ZwpPointerConstraintsV1);
 wayland_client::delegate_noop!(Client: ignore WlRegion);
@@ -1342,13 +1386,15 @@ fn inert_input_method_new_ids_have_no_role_events_or_grab_side_effects() {
 }
 
 #[test]
-fn ordinary_and_spoofed_clients_cannot_discover_or_force_bind_an_input_method() {
-    for spoof_identity in [false, true] {
+fn ordinary_and_spoofed_clients_cannot_discover_or_force_bind_privileged_input_managers() {
+    for (spoof_identity, force_vk) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut comp = TestCompositor::new();
         let mut manager = comp.window_manager();
         let mut app = connect(&mut comp);
         pump(&mut comp, &mut manager, &mut [&mut app]);
         assert!(app.client.input_method_manager.is_none());
+        assert!(app.client.vk_manager.is_none());
+        assert!(app.client.vk_manager_name.is_none());
         assert!(
             app.client.input_method_name.is_none(),
             "hidden before any bridge claims the seat"
@@ -1380,11 +1426,35 @@ fn ordinary_and_spoofed_clients_cannot_discover_or_force_bind_an_input_method() 
         // Only the server-owned private connection is authorized.
         let mut bridge = connect_ime_bridge(&mut comp);
         pump(&mut comp, &mut manager, &mut [&mut app, &mut bridge]);
-        let name = bridge
-            .client
-            .input_method_name
-            .expect("authorized bridge sees the manager");
-        let _forced: ZwpInputMethodManagerV2 = app.registry.bind(name, 1, &app.queue.handle(), ());
+        let (_forced_im, _forced_vk) = if force_vk {
+            let name = bridge
+                .client
+                .vk_manager_name
+                .expect("authorized bridge sees VK manager");
+            (
+                None,
+                Some(app.registry.bind::<ZwpVirtualKeyboardManagerV1, _, _>(
+                    name,
+                    1,
+                    &app.queue.handle(),
+                    (),
+                )),
+            )
+        } else {
+            let name = bridge
+                .client
+                .input_method_name
+                .expect("authorized bridge sees IM manager");
+            (
+                Some(app.registry.bind::<ZwpInputMethodManagerV2, _, _>(
+                    name,
+                    1,
+                    &app.queue.handle(),
+                    (),
+                )),
+                None,
+            )
+        };
         let mut denied = false;
         for _ in 0..ROUNDS {
             let _ = app.queue.flush();
@@ -1439,6 +1509,7 @@ fn a_copied_helper_on_a_public_connection_cannot_claim_input_method_authority() 
             client.input_method_manager.is_none(),
             "copy sees no privileged global"
         );
+        assert!(client.vk_manager.is_none());
         let name = name.to_str().unwrap().parse::<u32>().unwrap();
         let _forced: ZwpInputMethodManagerV2 = registry.bind(name, 1, &queue.handle(), ());
         assert!(
@@ -1728,4 +1799,144 @@ fn input_method_parent_destroy_retires_live_grab_and_popup_before_replacement() 
 #[test]
 fn input_method_parent_destroy_preserves_a_compositor_replacement_grab() {
     parent_destroy_journey(true);
+}
+
+#[test]
+fn authorized_virtual_keyboard_returns_keys_without_retiring_the_input_method_grab() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let mut comp = TestCompositor::new();
+    comp.state.set_output_size(1280, 800);
+    let mut manager = comp.window_manager();
+    let mut owner = connect_ime_bridge(&mut comp);
+    let mut app = connect(&mut comp);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert!(app.client.vk_manager.is_none());
+    let im = owner
+        .client
+        .input_method_manager
+        .as_ref()
+        .unwrap()
+        .get_input_method(
+            owner.client.seat.as_ref().unwrap(),
+            &owner.queue.handle(),
+            (),
+        );
+    let _text = app
+        .client
+        .text_input_manager
+        .as_ref()
+        .unwrap()
+        .get_text_input(app.client.seat.as_ref().unwrap(), &app.queue.handle(), ());
+    let _surface = window(&mut app);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    let vk = owner
+        .client
+        .vk_manager
+        .as_ref()
+        .unwrap()
+        .create_virtual_keyboard(
+            owner.client.seat.as_ref().unwrap(),
+            &owner.queue.handle(),
+            (),
+        );
+    owner.client.vk = Some(vk.clone());
+    let _grab = im.grab_keyboard(&owner.queue.handle(), ());
+    // The real IM keymap FD is forwarded into this VK by the client event
+    // handler, exactly as the supervised bridge initializes returned keys.
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    let keyboard = comp.test_seat().get_keyboard().unwrap();
+    let grab_serial = keyboard.with_grab(|serial, _| serial).unwrap();
+    let repeat_events = owner.client.ime_repeat_events.len();
+    let live_repeat = *owner
+        .client
+        .ime_repeat_events
+        .last()
+        .expect("real live IM repeat info");
+    assert!(live_repeat.0 > 0 && live_repeat.1 >= 0);
+    let mut physical_events = 0;
+    for (key, pressed, time) in [(30, true, 1), (30, false, 2), (48, true, 3), (48, false, 4)] {
+        manager.keyboard_key(&mut comp.state, key, pressed, time);
+        pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+        physical_events += 1;
+        assert_eq!(
+            owner.client.ime_keys, physical_events,
+            "continued physical input still reaches the live IM grab"
+        );
+        vk.key(time, key, u32::from(pressed));
+        pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+        assert_eq!(
+            owner.client.ime_keys, physical_events,
+            "returned key must not loop back into the IM"
+        );
+        assert!(
+            keyboard.has_grab(grab_serial),
+            "returning one key must not retire or replace the IM grab"
+        );
+    }
+    assert_eq!(
+        app.client.keyboard_keys,
+        [
+            (30, wl_keyboard::KeyState::Pressed),
+            (30, wl_keyboard::KeyState::Released),
+            (48, wl_keyboard::KeyState::Pressed),
+            (48, wl_keyboard::KeyState::Released),
+        ]
+    );
+    im.commit_string("still active after returned keys".into());
+    im.commit(owner.client.ime_done);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert_eq!(app.client.committed, ["still active after returned keys"]);
+    assert_eq!(
+        owner.client.ime_repeat_events.len(),
+        repeat_events,
+        "returned keys must not pause or rearm the IM repeat clock"
+    );
+    assert_eq!(owner.client.ime_repeat_events.last(), Some(&live_repeat));
+    let keys = Arc::new(AtomicUsize::new(0));
+    let unsets = Arc::new(AtomicUsize::new(0));
+    let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+    keyboard.set_grab(
+        &mut comp.state,
+        CompositorKeyboardGrab {
+            start: smithay::input::keyboard::GrabStartData { focus: None },
+            keys: keys.clone(),
+            unsets: unsets.clone(),
+        },
+        serial,
+    );
+    vk.key(5, 46, 1);
+    vk.key(6, 46, 0);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert_eq!(
+        keys.load(Ordering::SeqCst),
+        2,
+        "returned keys must honor a non-IM compositor grab"
+    );
+    assert_eq!(unsets.load(Ordering::SeqCst), 0);
+    assert!(keyboard.has_grab(serial));
+    assert_eq!(owner.client.ime_keys, physical_events);
+    assert_eq!(
+        app.client.keyboard_keys.len(),
+        4,
+        "the bridge cannot bypass a compositor grab"
+    );
+    assert_eq!(
+        owner.client.ime_repeat_events.last(),
+        Some(&(0, 0)),
+        "permanent grab replacement pauses the retired IM repeat owner"
+    );
+    let retired_repeat_events = owner.client.ime_repeat_events.len();
+    keyboard.change_repeat_info(37, 420);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert_eq!(
+        owner.client.ime_repeat_events.len(),
+        retired_repeat_events,
+        "settings cannot rearm a retired IM grab"
+    );
+    assert_eq!(owner.client.ime_repeat_events.last(), Some(&(0, 0)));
+    assert!(owner._conn.backend().last_error().is_none());
+    assert!(app._conn.backend().last_error().is_none());
 }

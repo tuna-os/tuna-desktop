@@ -84,9 +84,14 @@ where
     }
 
     fn unset(&mut self, _data: &mut D) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.grab = None;
-        inner.serial = None;
+        let retiring = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.serial = None;
+            inner.grab.take()
+        };
+        if let Some(retiring) = retiring {
+            retiring.repeat_info(0, 0);
+        }
     }
 }
 
