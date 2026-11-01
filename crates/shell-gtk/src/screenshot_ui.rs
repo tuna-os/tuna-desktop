@@ -437,6 +437,12 @@ impl ScreenshotUi {
                 match key {
                     gdk::Key::Escape => ui.close(),
                     gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::space => ui.capture(),
+                    // screenshot.js binds Ctrl+C to `activate` as well.
+                    gdk::Key::c | gdk::Key::C
+                        if modifiers.contains(gdk::ModifierType::CONTROL_MASK) =>
+                    {
+                        ui.capture()
+                    }
                     gdk::Key::s | gdk::Key::S => ui.set_mode(Mode::Selection),
                     gdk::Key::c | gdk::Key::C => ui.set_mode(Mode::Screen),
                     gdk::Key::w | gdk::Key::W => {

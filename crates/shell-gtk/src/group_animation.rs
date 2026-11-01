@@ -56,9 +56,25 @@ impl Group {
         } else {
             self.height.get()
         };
+        // Keyboard focus inside the state being replaced moves into the
+        // new one, so Enter (expand) and Escape (collapse) never strand it.
+        let focus = self
+            .widget
+            .root()
+            .and_then(|root| root.focus())
+            .filter(|focus| focus.is_ancestor(&self.stack));
         self.stack
             .set_visible_child_name(if open { "expanded" } else { "collapsed" });
         let child = self.stack.visible_child().expect("group has both states");
+        if focus.is_some() {
+            // The collapsed group is itself the focus stop (its top card's
+            // Close sits inside it); the expanded one passes focus inward.
+            if child.is_focusable() {
+                child.grab_focus();
+            } else {
+                child.child_focus(gtk::DirectionType::TabForward);
+            }
+        }
         let (_, natural, _, _) =
             child.measure(gtk::Orientation::Vertical, self.widget.width().max(1));
         let to = f64::from(natural);
