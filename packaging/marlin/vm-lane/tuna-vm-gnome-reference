@@ -1,0 +1,1025 @@
+#!/usr/bin/python3
+"""Fixed CI reference fixture; public read-only accessibility, never input injection.
+
+All times are guest CLOCK_MONOTONIC unless explicitly labeled otherwise.  The
+root controller owns private receipts; a finite unprivileged child reads the
+already-existing user and accessibility buses.  No Tuna state files are read.
+"""
+import base64
+import gzip
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import pwd
+import re
+import select
+import shlex
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+ROOT = Path('/run/tuna-vm-gnome-reference')
+FILES = ('claim.json', 'prepare.json', 'snapshot.json', 'stop.json', 'failure.json')
+APPS = ('/usr/bin/nautilus', '/usr/bin/gnome-control-center')
+BINDINGS = ('switch-applications', 'switch-applications-backward', 'switch-windows',
+            'switch-windows-backward', 'switch-group', 'switch-group-backward')
+MAX_BYTES = 16 * 1024 * 1024
+UID = 1000
+CLOCK = 'guest CLOCK_MONOTONIC'
+
+
+class Deadline:
+    def __init__(self, seconds):
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or not 0 < seconds <= 25:
+            raise ValueError('budget_s must be finite, positive and <=25')
+        self.end = time.monotonic() + seconds
+
+    def remaining(self):
+        left = self.end - time.monotonic()
+        if left <= 0:
+            raise TimeoutError('guest operation absolute monotonic deadline expired')
+        return left
+
+
+class FixtureNotReady(RuntimeError):
+    """Actual startup window inventory is incomplete, never native admission."""
+
+
+def payload(operation, value):
+    if operation not in ('admit', 'prepare', 'observe', 'file', 'stop') or not isinstance(value, dict):
+        raise ValueError('fixed operation and JSON object required')
+    allowed = {'budget_s', 'nonce', 'name'} if operation == 'file' else {'profile', 'budget_s'}
+    if operation in ('prepare', 'observe', 'stop'):
+        allowed.add('nonce')
+    if set(value) - allowed:
+        raise ValueError('unexpected operation arguments')
+    if operation != 'file' and value.get('profile') not in ('gnome', 'tuna'):
+        raise ValueError('profile must be gnome or tuna')
+    if operation != 'admit' and (not isinstance(value.get('nonce'), str) or not re.fullmatch('[0-9a-f]{32}', value['nonce'])):
+        raise ValueError('fresh lowercase 32hex nonce required')
+    if operation == 'file' and value.get('name') not in FILES:
+        raise ValueError('receipt name is not allowlisted')
+    return Deadline(value.get('budget_s', 20))
+
+
+def run(argv, deadline):
+    result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, timeout=deadline.remaining(),
+                            env={'PATH': '/usr/bin', 'LANG': 'C.UTF-8'}, check=False)
+    if result.returncode:
+        raise RuntimeError(f'fixed command {argv[0]} failed ({result.returncode}): ' + result.stderr.decode(errors='replace')[:1500])
+    if len(result.stdout) > MAX_BYTES:
+        raise RuntimeError('fixed command output exceeds byte bound')
+    return result.stdout.decode()
+
+
+def proc_identity(pid, uid=None):
+    pid = int(pid)
+    if pid <= 1:
+        raise RuntimeError('invalid principal PID')
+    directory = Path('/proc') / str(pid)
+    before = (directory / 'stat').read_text().rsplit(')', 1)[1].split()
+    owner = directory.stat().st_uid
+    if uid is not None and owner != uid:
+        raise RuntimeError('foreign process UID')
+    if before[0] == 'Z':
+        raise ProcessLookupError('principal is a zombie')
+    exe = os.readlink(directory / 'exe')
+    if not exe.startswith('/') or exe.endswith(' (deleted)'):
+        raise RuntimeError('deleted or nonabsolute executable')
+    inode = (directory / 'exe').stat()
+    data = (directory / 'exe').read_bytes()
+    disk = Path(exe).stat()
+    after = (directory / 'stat').read_text().rsplit(')', 1)[1].split()
+    if before[19] != after[19] or directory.stat().st_uid != owner or (inode.st_dev, inode.st_ino) != (disk.st_dev, disk.st_ino):
+        raise RuntimeError('process identity changed during observation')
+    return {'pid': pid, 'uid': owner, 'start_ticks': int(before[19]), 'exe': exe,
+            'exe_sha256': hashlib.sha256(data).hexdigest(),
+            'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+            'start_clock_domain': 'Linux /proc starttime ticks since boot',
+            'clock_ticks_per_second': os.sysconf('SC_CLK_TCK')}
+
+
+def same_process(expected, actual):
+    keys = ('pid', 'uid', 'start_ticks', 'exe', 'exe_sha256', 'boot_id')
+    if any(expected.get(key) != actual.get(key) for key in keys):
+        raise RuntimeError('principal identity changed; refusing ownership claim')
+
+
+def local_package_database(deadline, cache):
+    if '_package_database' not in cache:
+        value = run(['/usr/bin/pacman-conf', 'DBPath'], deadline).strip()
+        if not value or len(value.splitlines()) != 1 or '\x00' in value or not Path(value).is_absolute():
+            raise RuntimeError('installed pacman DBPath is missing or malformed')
+        local = (Path(value) / 'local').resolve(strict=True)
+        if not local.is_dir():
+            raise RuntimeError('installed pacman local database is not a directory')
+        cache['_package_database'] = local
+    return cache['_package_database']
+
+
+def packaged(identity, deadline, cache):
+    path = identity['exe']
+    if path not in cache:
+        name = run(['/usr/bin/pacman', '-Qoq', path], deadline).strip()
+        if not re.fullmatch('[a-zA-Z0-9@_.+-]+', name):
+            raise RuntimeError('ambiguous package owner')
+        parts = run(['/usr/bin/pacman', '-Q', name], deadline).split()
+        if len(parts) != 2 or parts[0] != name:
+            raise RuntimeError('missing installed package identity')
+        version = parts[1]
+        manifest = local_package_database(deadline, cache) / f'{name}-{version}' / 'mtree'
+        wanted = './' + path.lstrip('/')
+        digest = None
+        with gzip.open(manifest, 'rt') as stream:
+            for line in stream:
+                fields = shlex.split(line)
+                if fields and fields[0] == wanted:
+                    digest = next((f.split('=', 1)[1] for f in fields[1:] if f.startswith('sha256digest=')), None)
+                    break
+        if not digest or not re.fullmatch('[0-9a-f]{64}', digest):
+            raise RuntimeError('packaged ELF has no original SHA256 manifest evidence')
+        cache[path] = {'name': name, 'version': version, 'manifest_sha256': digest,
+                       'manifest_path': str(manifest)}
+    package = cache[path]
+    if identity['exe_sha256'] != package['manifest_sha256']:
+        raise RuntimeError('executable differs from original installed package manifest')
+    return dict(identity, package=package)
+
+
+def properties(text):
+    return dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
+
+
+def sessions(deadline):
+    rows = run(['/usr/bin/loginctl', 'list-sessions', '--no-legend', '--no-pager'], deadline)
+    result = []
+    for line in rows.splitlines():
+        sid = line.split()[0]
+        if not re.fullmatch('[A-Za-z0-9_-]+', sid):
+            raise RuntimeError('malformed actual logind session ID')
+        keys = 'Id,User,Name,Type,Class,Active,Remote,Seat,VTNr,Service,Leader,State,Desktop,Scope'
+        result.append(properties(run(['/usr/bin/loginctl', 'show-session', sid, '--no-pager', '--property=' + keys], deadline)))
+    return result
+
+
+def process_candidates(paths, uid, deadline):
+    result = []
+    for directory in Path('/proc').iterdir():
+        deadline.remaining()
+        if not directory.name.isdigit():
+            continue
+        try:
+            if directory.stat().st_uid == uid and os.readlink(directory / 'exe') in paths:
+                result.append(proc_identity(int(directory.name), uid))
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # A process exited while enumerating; never claim it as live.
+    return result
+
+
+def session_environment(identity, logind, deadline):
+    same_process(identity, proc_identity(identity['pid'], UID))
+    raw = (Path('/proc') / str(identity['pid']) / 'environ').read_bytes()
+    values = dict(item.split(b'=', 1) for item in raw.split(b'\0') if b'=' in item)
+    if b'XDG_SESSION_ID' in values and values[b'XDG_SESSION_ID'].decode() != logind['Id']:
+        raise RuntimeError('native principal belongs to a different logind session')
+    if b'WAYLAND_DEBUG' in values:
+        raise RuntimeError('native principal has a debug override')
+    owner = pwd.getpwnam('tuna-test')
+    if owner.pw_uid != UID:
+        raise RuntimeError('tuna-test is not UID1000')
+    runtime = Path('/run/user/1000')
+    private_directory(runtime, UID)
+    base = {'PATH': '/usr/bin', 'LANG': 'C.UTF-8', 'HOME': owner.pw_dir,
+            'USER': owner.pw_name, 'LOGNAME': owner.pw_name,
+            'XDG_RUNTIME_DIR': str(runtime),
+            'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/run/user/1000/bus'}
+    check_socket_peer(str(runtime / 'bus'), UID, deadline)
+    # GNOME Shell creates WAYLAND_DISPLAY after exec; /proc/environ is not an
+    # authority for its later mutation. Read the existing user manager export.
+    exported = subprocess.run(['/usr/bin/systemctl', '--user', 'show-environment'],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=base, user=UID, group=owner.pw_gid, extra_groups=[],
+        timeout=deadline.remaining(), check=True)
+    actual = properties(exported.stdout.decode())
+    if actual.get('XDG_SESSION_TYPE') != 'wayland' or 'WAYLAND_DEBUG' in actual:
+        raise RuntimeError('existing user manager has no native Wayland environment')
+    if actual.get('XDG_SESSION_ID', logind['Id']) != logind['Id']:
+        raise RuntimeError('user manager exports a different session')
+    display = actual.get('WAYLAND_DISPLAY', '')
+    if not re.fullmatch('wayland-[A-Za-z0-9_-]+', display):
+        raise RuntimeError('actual native Wayland socket name unavailable')
+    peer = check_socket_peer(str(runtime / display), UID, deadline)
+    same_process(identity, peer)
+    return dict(base, XDG_SESSION_ID=logind['Id'], XDG_SESSION_TYPE='wayland',
+                WAYLAND_DISPLAY=display)
+
+
+def package_list(data):
+    result = {}
+    for line in data.decode().splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not re.fullmatch('[A-Za-z0-9@_.+-]+', fields[0]) or fields[0] in result:
+            raise RuntimeError('malformed or duplicate package receipt entry')
+        result[fields[0]] = fields[1]
+    if not result:
+        raise RuntimeError('empty package receipt')
+    return result
+
+
+def hash_manifest(data):
+    entries = {}
+    for line in data.decode().splitlines():
+        match = re.fullmatch(r'([0-9a-f]{64}) [ *](/[^\n]+)', line)
+        if not match or '/..' in match[2] or '\x00' in match[2]:
+            raise RuntimeError('malformed original payload SHA256 entry')
+        digest, path = match.groups()
+        if path in entries and entries[path] != digest:
+            raise RuntimeError('contradictory original payload SHA256 entries')
+        entries[path] = digest
+    if not entries:
+        raise RuntimeError('empty original payload SHA256 receipt')
+    return entries
+
+
+def payload_receipt(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or info.st_size > MAX_BYTES:
+            raise RuntimeError('unsafe root-owned image payload receipt')
+        data = os.read(fd, MAX_BYTES + 1)
+        if len(data) != info.st_size:
+            raise RuntimeError('image payload receipt changed during read')
+        return data
+    finally:
+        os.close(fd)
+
+
+def payload_integrity(deadline):
+    directory = Path('/usr/share/tuna-vm')
+    evidence = {'ready': False}
+    for key, name in (('stock', 'stock-payload.sha256'), ('current_tuna', 'current-payload.sha256')):
+        path = directory / name
+        data = payload_receipt(path)
+        entries = hash_manifest(data)
+        required = ('/usr/bin/gdm', '/usr/bin/gnome-shell', *APPS) if key == 'stock' else ('/usr/bin/tuna-compositor', '/usr/bin/tuna-shell-gtk')
+        if not set(required) <= entries.keys():
+            raise RuntimeError('image payload receipt omits required original native principals')
+        if key == 'current_tuna' and len(entries) != 6:
+            raise RuntimeError('current source payload receipt is not the six installed original Tuna ELFs')
+        run(['/usr/bin/sha256sum', '--check', '--strict', '--quiet', str(path)], deadline)
+        evidence[key] = {'receipt_path': str(path), 'receipt_sha256': hashlib.sha256(data).hexdigest(),
+                         'checked_files': len(entries)}
+    for key, name in (('reference_packages', 'reference-packages.txt'), ('fixture_packages', 'fixture-packages.txt'), ('current_package', 'current-package.txt')):
+        path = directory / name
+        data = payload_receipt(path)
+        evidence[key] = {'receipt_path': str(path), 'receipt_sha256': hashlib.sha256(data).hexdigest(),
+                         'packages': package_list(data)}
+    original = evidence['reference_packages']['packages']
+    fixture = evidence['fixture_packages']['packages']
+    if any(fixture.get(name) != version for name, version in original.items()):
+        raise RuntimeError('paired fixture changed an original installed package version')
+    current = evidence['current_package']['packages']
+    if set(current) != {'tuna-desktop'} or fixture.get('tuna-desktop') != current['tuna-desktop']:
+        raise RuntimeError('actual current-source Tuna package receipt missing or inconsistent')
+    if package_list(run(['/usr/bin/pacman', '-Q'], deadline).encode()) != fixture:
+        raise RuntimeError('actual installed packages differ from recorded paired fixture')
+    if Path('/etc/systemd/system/display-manager.service').resolve() != Path('/usr/lib/systemd/system/gdm.service'):
+        raise RuntimeError('actual display-manager is not stock GDM unit')
+    evidence['ready'] = True
+    return evidence
+
+
+def pci_identity(device):
+    for parent in (device, *device.parents):
+        subsystem = parent / 'subsystem'
+        if subsystem.exists() and subsystem.resolve().name == 'pci':
+            vendor = (parent / 'vendor').read_text().strip()
+            product = (parent / 'device').read_text().strip()
+            if not re.fullmatch('0x[0-9a-fA-F]{4}', vendor) or not re.fullmatch('0x[0-9a-fA-F]{4}', product):
+                raise RuntimeError('actual PCI vendor/device identity malformed')
+            return {'address': parent.name, 'sysfs': str(parent), 'vendor': vendor,
+                    'device': product, 'driver': (parent / 'driver').resolve(strict=True).name}
+    raise RuntimeError('actual native DRM node has no PCI ancestor')
+
+
+def native_gpu(compositor, deadline):
+    same_process(compositor, proc_identity(compositor['pid'], UID))
+    devices = []
+    for entry in (Path('/proc') / str(compositor['pid']) / 'fd').iterdir():
+        deadline.remaining()
+        try:
+            target = os.readlink(entry)
+        except FileNotFoundError:
+            continue
+        if not re.fullmatch('/dev/dri/(?:card[0-9]+|renderD[0-9]+)', target):
+            continue
+        actual = entry.stat()
+        node = Path(target).stat()
+        if not stat.S_ISCHR(actual.st_mode) or actual.st_rdev != node.st_rdev or (actual.st_dev, actual.st_ino) != (node.st_dev, node.st_ino):
+            raise RuntimeError('DRM fd is not the actual original device character node')
+        major, minor = os.major(actual.st_rdev), os.minor(actual.st_rdev)
+        device = (Path('/sys/dev/char') / f'{major}:{minor}' / 'device').resolve(strict=True)
+        connectors = []
+        if Path(target).name.startswith('card'):
+            for connector in sorted(Path('/sys/class/drm').glob(Path(target).name + '-*')):
+                connectors.append({'name': connector.name,
+                    'status': (connector / 'status').read_text().strip(),
+                    'enabled': (connector / 'enabled').read_text().strip(),
+                    'modes': (connector / 'modes').read_text().splitlines()})
+        devices.append({'fd': int(entry.name), 'path': target, 'major': major, 'minor': minor,
+            'sysfs_device': str(device), 'driver': (device / 'driver').resolve(strict=True).name,
+            'pci': pci_identity(device), 'connectors': connectors})
+    if not any(Path(d['path']).name.startswith('card') and any(c['status'] == 'connected' and c['enabled'] == 'enabled' and c['modes'] for c in d['connectors']) for d in devices):
+        raise RuntimeError('original compositor lacks actual native DRM card fd with connected enabled output')
+    same_process(compositor, proc_identity(compositor['pid'], UID))
+    return {'ready': True, 'compositor': compositor, 'drm_fds': devices}
+
+
+def admission(profile, deadline, cache):
+    missing = []
+    gdm = {'ready': False, 'available': False, 'service': {}, 'process': None, 'greeters': []}
+    session = {'ready': False, 'started': False, 'logind': None, 'active_vt': None,
+               'compositor': None, 'shell': None}
+    environment = None
+    actual = sessions(deadline)
+    candidates = [s for s in actual if s.get('User') == str(UID) and s.get('Name') == 'tuna-test' and s.get('Class') == 'user' and s.get('Service') == 'gdm-password']
+    session['started'] = bool(candidates)
+    integrity = {'ready': False}
+    try:
+        integrity = payload_integrity(deadline)
+    except (OSError, ValueError, RuntimeError) as error:
+        missing.append('payload_integrity: ' + str(error))
+    try:
+        service = properties(run(['/usr/bin/systemctl', 'show', 'gdm.service', '--property=MainPID,ActiveState,SubState,FragmentPath'], deadline))
+        gdm['service'] = service
+        if service.get('ActiveState') != 'active' or service.get('SubState') != 'running':
+            raise RuntimeError('stock GDM service is not running')
+        principal = packaged(proc_identity(int(service['MainPID']), 0), deadline, cache)
+        if principal['exe'] != '/usr/bin/gdm' or principal['package']['name'] != 'gdm' or not version_51_1(principal['package']['version']):
+            raise RuntimeError('original stock GDM51.1 principal absent')
+        gdm['process'] = principal
+        for greeter in actual:
+            if greeter.get('Class') != 'greeter':
+                continue
+            uid = int(greeter['User'])
+            if uid == 0 or greeter.get('Type') != 'wayland' or greeter.get('Remote') != 'no' or greeter.get('Service') != 'gdm-launch-environment':
+                raise RuntimeError('foreign/non-native GDM greeter session')
+            shells = process_candidates(('/usr/bin/gnome-shell',), uid, deadline)
+            if len(shells) != 1:
+                raise RuntimeError('original GDM greeter shell is not unique')
+            shell = packaged(shells[0], deadline, cache)
+            if shell['package']['name'] != 'gnome-shell' or not version_51_1(shell['package']['version']):
+                raise RuntimeError('stock GNOME51.1 greeter principal absent')
+            gdm['greeters'].append({'logind': greeter, 'shell': shell})
+        if not candidates:
+            active_vt = Path('/sys/class/tty/tty0/active').read_text().strip()
+            active = [g for g in gdm['greeters'] if g['logind'].get('Active') == 'yes'
+                      and g['logind'].get('State') == 'active'
+                      and g['logind'].get('Seat') == 'seat0'
+                      and g['logind'].get('VTNr') not in (None, '0')
+                      and active_vt == 'tty' + g['logind']['VTNr']]
+            if len(active) != 1:
+                raise RuntimeError('no unique actual active-VT stock GDM greeter')
+        gdm['ready'] = True
+    except (OSError, ValueError, RuntimeError, KeyError) as error:
+        missing.append('gdm: ' + str(error))
+    try:
+        if len(candidates) != 1:
+            raise RuntimeError('expected one actual tuna-test GDM user session')
+        current = candidates[0]
+        session['logind'] = current
+        vt = Path('/sys/class/tty/tty0/active').read_text().strip()
+        session['active_vt'] = vt
+        required = {'Type': 'wayland', 'Active': 'yes', 'Remote': 'no', 'Seat': 'seat0', 'State': 'active'}
+        if any(current.get(k) != v for k, v in required.items()) or current.get('VTNr') in (None, '0') or vt != 'tty' + current['VTNr']:
+            raise RuntimeError('session is not active local native Wayland on physical active VT')
+        paths = ('/usr/bin/gnome-shell',) if profile == 'gnome' else ('/usr/bin/tuna-compositor', '/usr/bin/tuna-shell-gtk')
+        forbidden = ('/usr/bin/tuna-compositor', '/usr/bin/tuna-shell-gtk') if profile == 'gnome' else ('/usr/bin/gnome-shell',)
+        if process_candidates(forbidden, UID, deadline):
+            raise RuntimeError('opposite-profile UID1000 native compositor/shell is live')
+        principals = process_candidates(paths, UID, deadline)
+        by_path = {path: [p for p in principals if p['exe'] == path] for path in paths}
+        if any(len(items) != 1 for items in by_path.values()):
+            raise RuntimeError('original native compositor/shell not unique')
+        compositor = packaged(by_path[paths[0]][0], deadline, cache)
+        shell = packaged(by_path[paths[-1]][0], deadline, cache)
+        if profile == 'gnome':
+            if shell['package']['name'] != 'gnome-shell' or not version_51_1(shell['package']['version']):
+                raise RuntimeError('actual original GNOME Shell package is not 51.1')
+            session['gnome_shell_version'] = shell['package']['version']
+        elif any(p['package']['name'] != 'tuna-desktop' for p in (compositor, shell)):
+            raise RuntimeError('current original Tuna package principals absent')
+        environment = session_environment(compositor, current, deadline)
+        user_bus = packaged(check_socket_peer('/run/user/1000/bus', UID, deadline), deadline, cache)
+        if user_bus['package']['name'] not in ('dbus', 'dbus-broker', 'systemd'):
+            raise RuntimeError('existing user bus server is not an original packaged bus principal')
+        session['user_bus'] = {'address': 'unix:path=/run/user/1000/bus',
+                               'peer': user_bus, 'identity_source': 'kernel SO_PEERCRED'}
+        if shell['pid'] != compositor['pid']:
+            raw = (Path('/proc') / str(shell['pid']) / 'environ').read_bytes()
+            shell_env = dict(item.split(b'=', 1) for item in raw.split(b'\0') if b'=' in item)
+            if shell_env.get(b'XDG_SESSION_ID', b'').decode() != current['Id'] or b'WAYLAND_DEBUG' in shell_env:
+                raise RuntimeError('original Tuna Shell has no matching actual logind session environment')
+        session['native_gpu'] = native_gpu(compositor, deadline)
+        session['wayland_socket'] = {'path': '/run/user/1000/' + environment['WAYLAND_DISPLAY'],
+                                     'peer': compositor, 'identity_source': 'kernel SO_PEERCRED'}
+        session.update(compositor=compositor, shell=shell, ready=True)
+    except (OSError, ValueError, RuntimeError, KeyError, subprocess.CalledProcessError) as error:
+        missing.append('session: ' + str(error))
+    gdm['available'] = gdm['ready']
+    gdm['ready'] = gdm['available'] and integrity['ready'] and not session['started']
+    return {'schema': 1, 'profile': profile, 'gdm': gdm, 'session': session,
+            'payload_integrity': integrity,
+            'ready': gdm['available'] and session['ready'] and integrity['ready'], 'missing': missing}, environment
+
+
+def version_51_1(version):
+    return bool(re.fullmatch(r'51\.1(?:[-+.]\S+)?', version.split(':')[-1]))
+
+
+def private_directory(path, uid, create=False):
+    if create:
+        path.mkdir(mode=0o700)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o700:
+        raise RuntimeError('unsafe or foreign private metadata directory')
+    return {'path': str(path), 'device': info.st_dev, 'inode': info.st_ino, 'uid': info.st_uid, 'mode': stat.S_IMODE(info.st_mode)}
+
+
+def read_bytes(path, uid=0):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > MAX_BYTES:
+            raise RuntimeError('unsafe receipt owner/mode/type/size')
+        data = os.read(fd, MAX_BYTES + 1)
+        if len(data) > MAX_BYTES or len(data) != info.st_size or os.fstat(fd).st_mtime_ns != info.st_mtime_ns:
+            raise RuntimeError('receipt changed or exceeds byte bound')
+        return data
+    finally:
+        os.close(fd)
+
+
+def save(directory, name, value):
+    if name not in FILES:
+        raise ValueError('receipt name not allowlisted')
+    data = json.dumps(value, sort_keys=True).encode()
+    if len(data) > MAX_BYTES:
+        raise RuntimeError('receipt exceeds byte bound')
+    temporary = directory / (name + '.new')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, directory / name)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def retained_files(directory, pending=()):
+    return [name for name in FILES if name in pending or (directory / name).exists()]
+
+
+def retrieve_file(directory, name):
+    if name not in FILES:
+        raise ValueError('receipt name is not allowlisted')
+    data = read_bytes(directory / name)
+    return {'name': name, 'base64': base64.b64encode(data).decode(),
+            'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
+
+
+def validate_claim(claim, args):
+    if not isinstance(claim, dict) or claim.get('nonce') != args['nonce'] or claim.get('schema') != 1 or claim.get('profile') not in ('gnome', 'tuna'):
+        raise RuntimeError('foreign or malformed claim')
+    if 'profile' in args and claim['profile'] != args['profile']:
+        raise RuntimeError('claim belongs to different profile')
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    if claim.get('boot_id') != boot:
+        raise RuntimeError('stale boot claim')
+    fixture = claim.get('fixture')
+    if not isinstance(fixture, dict) or not {'directories', 'directory_identities', 'processes'} <= fixture.keys():
+        raise RuntimeError('missing owned fixture metadata')
+    base = Path('/run/user/1000') / ('tuna-vm-gnome-reference-' + args['nonce'])
+    paths = [str(base), str(base / 'first'), str(base / 'second')]
+    if fixture['directories'] not in ([], paths[1:]):
+        raise RuntimeError('foreign fixture directory paths')
+    records = fixture['directory_identities']
+    if not isinstance(records, list) or len(records) > 3:
+        raise RuntimeError('malformed directory ownership records')
+    for index, record in enumerate(records):
+        if not isinstance(record, dict) or record.get('path') != paths[index] or record.get('uid') != UID or record.get('mode') != 0o700 or any(type(record.get(key)) is not int or record[key] < 0 for key in ('inode', 'device')):
+            raise RuntimeError('foreign or malformed directory ownership record')
+    principals = fixture['processes']
+    launchers = fixture.get('launchers', [])
+    if not isinstance(principals, list) or len(principals) > 2 or not isinstance(launchers, list) or len(launchers) > 1:
+        raise RuntimeError('malformed fixture process ownership records')
+    seen = set()
+    for principal in principals + launchers:
+        if not isinstance(principal, dict) or principal.get('uid') != UID or principal.get('exe') not in APPS or principal.get('boot_id') != boot or type(principal.get('pid')) is not int or principal['pid'] <= 1 or type(principal.get('start_ticks')) is not int or principal['start_ticks'] <= 0 or not isinstance(principal.get('exe_sha256'), str) or not re.fullmatch('[0-9a-f]{64}', principal['exe_sha256']):
+            raise RuntimeError('foreign or malformed process ownership record')
+        generation = (principal['pid'], principal['start_ticks'])
+        if generation in seen:
+            raise RuntimeError('duplicate process ownership record')
+        seen.add(generation)
+    return claim
+
+
+def load_claim(directory, args):
+    private_directory(ROOT, 0)
+    private_directory(directory, 0)
+    claim = json.loads(read_bytes(directory / 'claim.json'))
+    return validate_claim(claim, args)
+
+
+def check_socket_peer(path, uid, deadline):
+    info = Path(path).lstat()
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != uid:
+        raise RuntimeError('bus socket has foreign owner or type')
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+        stream.settimeout(min(1, deadline.remaining()))
+        stream.connect(path)
+        pid, peer_uid, _ = struct.unpack('3i', stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+    if peer_uid != uid:
+        raise RuntimeError('bus server peer has foreign UID')
+    return proc_identity(pid, uid)
+
+
+def read_gio_settings(Gio):
+    """Only get_value: no preferences, bindings or accessibility flags written."""
+    schemas = Gio.SettingsSchemaSource.get_default()
+
+    def values(schema_name, keys):
+        definition = schemas.lookup(schema_name, True) if schemas else None
+        if definition is None or any(not definition.has_key(key) for key in keys):
+            raise RuntimeError('required actual Gio settings schema/key missing: ' + schema_name)
+        setting = Gio.Settings.new_full(definition, None, None)
+        return {key: setting.get_value(key).unpack() for key in keys}
+
+    return {
+        'bindings': values('org.gnome.desktop.wm.keybindings', BINDINGS),
+        'app_switcher': values('org.gnome.shell.app-switcher', ('current-workspace-only',)),
+        'window_switcher': values('org.gnome.shell.window-switcher', ('current-workspace-only',)),
+        'interface': values('org.gnome.desktop.interface', ('text-scaling-factor', 'scaling-factor', 'gtk-theme', 'icon-theme', 'cursor-theme', 'cursor-size', 'color-scheme', 'font-name', 'document-font-name', 'monospace-font-name', 'enable-animations')),
+        'input_sources': values('org.gnome.desktop.input-sources', ('sources', 'current', 'mru-sources', 'xkb-options')),
+    }
+
+
+def session_observe(args, deadline):
+    """Read Gio and AT-SPI only, as the existing session owner (no autolaunch)."""
+    if os.geteuid() != UID:
+        raise RuntimeError('public observation requires actual UID1000')
+    import gi
+    gi.require_version('Gio', '2.0')
+    from gi.repository import Gio, GLib
+
+    def variant(signature, values):
+        return GLib.Variant(signature, values)
+
+    def connect(address):
+        # Addresses come only from fixed existing user bus or public a11y Bus.
+        match = re.fullmatch(r'unix:path=([^,;]+)(?:,guid=[0-9a-f]+)?', address)
+        if not match or not match[1].startswith('/run/user/1000/'):
+            raise RuntimeError('public bus address is not the existing owned runtime socket')
+        peer = check_socket_peer(match[1], UID, deadline)
+        connection = Gio.DBusConnection.new_for_address_sync(address,
+            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+        return connection, peer
+
+    def call(connection, bus, path, interface, method, parameters=None):
+        millis = max(1, min(2000, int(deadline.remaining() * 1000)))
+        return connection.call_sync(bus, path, interface, method, parameters, None,
+            Gio.DBusCallFlags.NO_AUTO_START, millis, None).unpack()
+
+    def owner(connection, bus):
+        unique = call(connection, 'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'GetNameOwner', variant('(s)', (bus,)))[0]
+        pid = call(connection, 'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'GetConnectionUnixProcessID', variant('(s)', (unique,)))[0]
+        uid = call(connection, 'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'GetConnectionUnixUser', variant('(s)', (unique,)))[0]
+        if uid != UID:
+            raise RuntimeError('AT-SPI/public session peer is not actual UID1000')
+        return unique, proc_identity(pid, UID)
+
+    session_bus, session_peer = connect('unix:path=/run/user/1000/bus')
+    a11y_owner, a11y_launcher = owner(session_bus, 'org.a11y.Bus')
+    address = call(session_bus, a11y_owner, '/org/a11y/bus', 'org.a11y.Bus', 'GetAddress')[0]
+    bus, bus_peer = connect(address)
+    registry_name, registry = owner(bus, 'org.a11y.atspi.Registry')
+    peers = {p['pid']: p for p in (session_peer, a11y_launcher, bus_peer, registry)}
+    current_settings = read_gio_settings(Gio)
+    display_name, display_owner = owner(session_bus, 'org.gnome.Mutter.DisplayConfig')
+    same_process(args['compositor'], display_owner)
+    state = call(session_bus, display_name, '/org/gnome/Mutter/DisplayConfig', 'org.gnome.Mutter.DisplayConfig', 'GetCurrentState')
+    current_settings['display_config'] = dict(zip(('serial', 'monitors', 'logical_monitors', 'properties'), state))
+
+    def unvariant(value):
+        if isinstance(value, GLib.Variant):
+            return unvariant(value.unpack())
+        if isinstance(value, dict):
+            return {key: unvariant(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [unvariant(item) for item in value]
+        return value
+
+    owners = {}
+    visited = set()
+    count = 0
+
+    def tree(bus_name, path, depth=0):
+        nonlocal count
+        deadline.remaining()
+        if depth > 64 or count >= 6000:
+            raise RuntimeError('public AT-SPI tree exceeded finite observation bound')
+        if bus_name not in owners:
+            unique, principal = owner(bus, bus_name)
+            owners[bus_name] = (unique, principal)
+            peers[principal['pid']] = principal
+        unique, principal = owners[bus_name]
+        key = (unique, path)
+        if key in visited:
+            raise RuntimeError('cyclic/duplicate public AT-SPI tree')
+        visited.add(key)
+        count += 1
+        props = call(bus, unique, path, 'org.freedesktop.DBus.Properties', 'GetAll', variant('(s)', ('org.a11y.atspi.Accessible',)))[0]
+        role = call(bus, unique, path, 'org.a11y.atspi.Accessible', 'GetRoleName')[0]
+        words = call(bus, unique, path, 'org.a11y.atspi.Accessible', 'GetState')[0]
+        states = [index * 32 + bit for index, word in enumerate(words) for bit in range(32) if word & (1 << bit)]
+        children = call(bus, unique, path, 'org.a11y.atspi.Accessible', 'GetChildren')[0]
+        name = unvariant(props.get('Name'))
+        if not isinstance(name, str) or not isinstance(role, str):
+            raise RuntimeError('malformed actual AT-SPI properties')
+        node = {'atspi': {'bus_name': unique, 'path': path, 'id_domain': 'AT-SPI'},
+                'name': name, 'role_name': role, 'states': states, 'process': principal,
+                'children': []}
+        # Full original Shell tree; other apps need only their real top-level
+        # windows, not thousands of irrelevant document widget objects.
+        if principal['exe'] in ('/usr/bin/gnome-shell', '/usr/bin/tuna-shell-gtk') or role not in ('frame', 'window', 'dialog'):
+            for child_bus, child_path in children:
+                if child_path != '/org/a11y/atspi/null':
+                    node['children'].append(tree(child_bus or unique, child_path, depth + 1))
+        return node
+
+    roots = call(bus, registry_name, '/org/a11y/atspi/accessible/root', 'org.a11y.atspi.Accessible', 'GetChildren')[0]
+    trees = [tree(name, path) for name, path in roots]
+    for bus_name, (_, principal) in owners.items():
+        _, current = owner(bus, bus_name)
+        same_process(principal, current)
+    return unvariant({'settings': current_settings,
+        'atspi': {'address': address, 'registry': registry, 'peers': list(peers.values()),
+                  'session_bus_peer': session_peer, 'bus_peer': bus_peer, 'launcher': a11y_launcher},
+        'trees': trees, 'observed_monotonic_ns': time.monotonic_ns(), 'clock_domain': CLOCK})
+
+
+def flatten(nodes):
+    for node in nodes:
+        yield node
+        yield from flatten(node['children'])
+
+
+def window_context(trees, fixture, shell):
+    windows = []
+    shell_trees = [node for node in trees if node['process']['pid'] == shell['pid']]
+    if len(shell_trees) != 1:
+        raise RuntimeError('original Shell public AT-SPI application tree unavailable or ambiguous')
+    same_process(shell, shell_trees[0]['process'])
+    principals = {p['pid']: p for p in fixture['processes']}
+    for node in flatten(trees):
+        principal = node['process']
+        if node['role_name'] not in ('frame', 'window', 'dialog') or 25 not in node['states'] or 30 not in node['states']:
+            continue
+        if principal['exe'] not in APPS:
+            # Shell panels/overlays are not application windows.
+            if principal['pid'] != shell['pid']:
+                raise RuntimeError('uncertain extra visible application window: ' + node['name'])
+            continue
+        if principal['pid'] not in principals:
+            raise RuntimeError('visible fixture application belongs to unowned process')
+        same_process(principals[principal['pid']], principal)
+        record = {key: node[key] for key in ('atspi', 'name', 'role_name', 'states', 'process')}
+        record['process'] = principals[principal['pid']]
+        if principal['exe'] == APPS[1]:
+            if 'network' not in node['name'].casefold():
+                raise FixtureNotReady('Settings window does not actually expose Network panel identity')
+            record['role'] = 'settings'
+        else:
+            matches = [i for i, path in enumerate(fixture['directories']) if Path(path).name in node['name']]
+            if len(matches) != 1:
+                raise FixtureNotReady('Nautilus window does not expose unique owned directory title')
+            record['role'] = ('files-first', 'files-second')[matches[0]]
+        windows.append(record)
+    if len(windows) < 3:
+        raise FixtureNotReady('actual fixture window inventory is incomplete: ' + repr([w['role'] for w in windows]))
+    if sorted(w['role'] for w in windows) != ['files-first', 'files-second', 'settings']:
+        raise RuntimeError('actual showing inventory is not exactly two owned Files plus one Network Settings')
+    ids = [(w['atspi']['bus_name'], w['atspi']['path']) for w in windows]
+    if len(set(ids)) != 3:
+        raise RuntimeError('fixture windows do not have distinct actual AT-SPI identities')
+    active = [w for w in windows if 1 in w['states']]
+    if not active:
+        raise FixtureNotReady('actual active application window is not yet exposed')
+    if len(active) != 1:
+        raise RuntimeError('actual active application window is unavailable or ambiguous')
+    shell_nodes = [n for n in flatten(shell_trees) if n['process']['pid'] == shell['pid']]
+    leaf = lambda n: {k: n[k] for k in ('atspi', 'name', 'role_name', 'states', 'process')}
+    selection = {'shell_process': shell, 'objects': shell_trees,
+                 'selected': [leaf(n) for n in shell_nodes if 23 in n['states']],
+                 'focused': [leaf(n) for n in shell_nodes if 12 in n['states']],
+                 'active_windows': active}
+    return windows, selection
+
+
+def public_observation(environment, admitted, deadline):
+    worker_args = {'compositor': admitted['session']['compositor']}
+    owner = pwd.getpwnam('tuna-test')
+    command = ['/usr/bin/python3', str(Path(__file__).resolve()), '_observe']
+    worker = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=environment, user=UID, group=owner.pw_gid, extra_groups=[], start_new_session=True)
+    try:
+        remaining = deadline.remaining()
+        raw, errors = worker.communicate(json.dumps(dict(worker_args, budget_s=min(25, remaining))).encode(),
+                                         timeout=max(0.001, remaining - 0.1))
+    except BaseException:
+        worker.kill()
+        worker.communicate(timeout=0.1)
+        raise
+    if worker.returncode:
+        raise RuntimeError('finite UID1000 public observation failed: ' + errors.decode(errors='replace')[:3000])
+    if len(raw) > MAX_BYTES:
+        raise RuntimeError('public observation exceeded byte bound')
+    return json.loads(raw)
+
+
+def snapshot(args, claim, admitted, environment, deadline, cache):
+    if not admitted['ready']:
+        raise RuntimeError('actual native admission failed: ' + '; '.join(admitted['missing']))
+    original_admission = claim['admission']
+    for key in ('compositor', 'shell'):
+        same_process(original_admission['session'][key], admitted['session'][key])
+    same_process(original_admission['gdm']['process'], admitted['gdm']['process'])
+    if original_admission['session']['logind']['Id'] != admitted['session']['logind']['Id'] or original_admission['session']['active_vt'] != admitted['session']['active_vt']:
+        raise RuntimeError('original native fixture session or active VT changed')
+    for principal in claim['fixture']['processes']:
+        same_process(principal, proc_identity(principal['pid'], UID))
+    observation = public_observation(environment, admitted, deadline)
+    if observation['settings'] != claim['settings']:
+        raise RuntimeError('actual original settings/bindings/display configuration changed')
+    for principal in claim['fixture']['processes']:
+        expected_package = 'nautilus' if principal['exe'] == APPS[0] else 'gnome-control-center'
+        if principal['package']['name'] != expected_package:
+            raise RuntimeError('fixture is not the original named application package')
+    registry = packaged(observation['atspi']['registry'], deadline, cache)
+    if registry['package']['name'] != 'at-spi2-core':
+        raise RuntimeError('public AT-SPI registry is not original at-spi2-core')
+    observation['atspi']['registry'] = registry
+    observation['atspi']['peers'] = [packaged(p, deadline, cache) for p in observation['atspi']['peers']]
+    for node in flatten(observation['trees']):
+        node['process'] = packaged(node['process'], deadline, cache)
+    windows, selection = window_context(observation.pop('trees'), claim['fixture'], admitted['session']['shell'])
+    return dict(observation, schema=1, profile=args['profile'], nonce=args['nonce'], ready=True,
+                admission=admitted, fixture=claim['fixture'], windows=windows, selection=selection,
+                missing=[], files=retained_files(ROOT / args['nonce'], ('snapshot.json',)))
+
+
+def retire(principal, deadline):
+    deadline.remaining()
+    pid = principal['pid']
+    fd = None
+    try:
+        if hasattr(os, 'pidfd_open'):
+            fd = os.pidfd_open(pid)
+        poll = select.poll()
+        if fd is not None:
+            poll.register(fd, select.POLLIN)
+        try:
+            actual = proc_identity(pid, principal['uid'])
+        except (FileNotFoundError, ProcessLookupError):
+            if fd is not None:
+                if not poll.poll(int(deadline.remaining() * 1000)):
+                    raise RuntimeError('principal /proc vanished but pidfd retirement unconfirmed')
+            elif Path('/proc', str(pid)).exists():
+                raise RuntimeError('principal retirement cannot be confirmed without pidfd')
+            return {'original': principal, 'retired': True, 'method': 'already-exited'}
+        same_process(principal, actual)
+        if fd is not None:
+            signal.pidfd_send_signal(fd, signal.SIGTERM)
+            # The pidfd was opened before identity validation, closing PID reuse.
+            if not poll.poll(int(min(2, deadline.remaining()) * 1000)):
+                same_process(principal, proc_identity(pid, principal['uid']))
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+                if not poll.poll(int(deadline.remaining() * 1000)):
+                    raise TimeoutError('owned process retirement unconfirmed')
+            return {'original': principal, 'retired': True, 'method': 'pidfd'}
+        # Without pidfds, refuse to signal: checking /proc cannot close PID reuse.
+        raise RuntimeError('safe owned process retirement requires kernel pidfd support')
+    except ProcessLookupError:
+        return {'original': principal, 'retired': True, 'method': 'already-exited'}
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def remove_directory(record):
+    path = Path(record['path'])
+    actual = private_directory(path, record['uid'])
+    if actual != record:
+        raise RuntimeError('fixture directory identity changed; refusing deletion')
+    # Never recursively delete: application-created/user data is not ours.
+    path.rmdir()
+    return {'original': record, 'removed': True}
+
+
+def cleanup(args, claim, directory, deadline):
+    receipt = {'schema': 1, 'profile': args['profile'], 'nonce': args['nonce'],
+               'ready': False, 'cleaned': False, 'processes': [], 'directories': [], 'errors': [],
+               'files': retained_files(directory, ('stop.json',))}
+    owned = claim['fixture']['processes'] + claim['fixture'].get('launchers', [])
+    for principal in reversed(owned):
+        try:
+            receipt['processes'].append(retire(principal, deadline))
+        except (OSError, RuntimeError, TimeoutError) as error:
+            receipt['errors'].append(str(error))
+    if not receipt['errors']:
+        for item in reversed(claim['fixture']['directory_identities']):
+            try:
+                deadline.remaining()
+                receipt['directories'].append(remove_directory(item))
+            except (OSError, RuntimeError) as error:
+                receipt['errors'].append(str(error))
+    receipt['ready'] = receipt['cleaned'] = not receipt['errors']
+    save(directory, 'stop.json', receipt)
+    return receipt
+
+
+def prepare(args, directory, deadline, cache):
+    admitted, environment = admission(args['profile'], deadline, cache)
+    if not admitted['ready']:
+        raise RuntimeError('cannot prepare unadmitted native session: ' + '; '.join(admitted['missing']))
+    if process_candidates(APPS, UID, deadline):
+        raise RuntimeError('preexisting Files/Settings process refused; no unrelated process will be killed')
+    # Also inspect public inventory before launching, not just Linux process names.
+    before = public_observation(environment, admitted, deadline)
+    shell_roots = [node for node in before['trees'] if node['process']['pid'] == admitted['session']['shell']['pid']]
+    if len(shell_roots) != 1:
+        raise RuntimeError('original Shell public accessibility tree unavailable before fixture creation')
+    same_process(admitted['session']['shell'], shell_roots[0]['process'])
+    for node in flatten(before['trees']):
+        if node['process']['exe'] in APPS:
+            raise RuntimeError('preexisting relevant public application refused')
+        if node['process']['pid'] != admitted['session']['shell']['pid'] and node['role_name'] in ('frame', 'window', 'dialog') and 25 in node['states'] and 30 in node['states']:
+            raise RuntimeError('preexisting unrelated visible application window refused')
+    base = Path('/run/user/1000') / ('tuna-vm-gnome-reference-' + args['nonce'])
+    claim = load_claim(directory, args)
+    fixture = claim['fixture']
+    fixture['directories'] = [str(base / 'first'), str(base / 'second')]
+    fixture['launchers'] = []
+    claim['admission'] = admitted
+    claim['settings'] = before['settings']
+    save(directory, 'claim.json', claim)
+    # Claim is saved before any fixture effect. Persist every new owned object.
+    for path in (base, base / 'first', base / 'second'):
+        path.mkdir(mode=0o700)
+        os.chown(path, UID, pwd.getpwnam('tuna-test').pw_gid)
+        fixture['directory_identities'].append(private_directory(path, UID))
+        save(directory, 'claim.json', claim)
+    owner = pwd.getpwnam('tuna-test')
+    environment = dict(environment, GDK_BACKEND='wayland')
+    children = []
+    for argv in ([APPS[0], '--new-window', fixture['directories'][0]],
+                 [APPS[0], '--new-window', fixture['directories'][1]],
+                 [APPS[1], 'network']):
+        deadline.remaining()
+        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, env=environment, user=UID,
+                                 group=owner.pw_gid, extra_groups=[], start_new_session=True)
+        children.append(child)
+        secondary = argv == [APPS[0], '--new-window', fixture['directories'][1]]
+        try:
+            identity = proc_identity(child.pid, UID)
+            if identity['exe'] != argv[0]:
+                raise RuntimeError('fixture launcher did not enter original application ELF')
+            bucket = fixture['launchers'] if secondary else fixture['processes']
+            bucket.append(identity)
+            save(directory, 'claim.json', claim)
+            bucket[-1] = packaged(identity, deadline, cache)
+            save(directory, 'claim.json', claim)
+        except (FileNotFoundError, ProcessLookupError):
+            if not secondary or child.wait(timeout=deadline.remaining()) != 0:
+                raise RuntimeError('original fixture application died before identity capture')
+        if secondary:
+            if child.wait(timeout=deadline.remaining()) != 0:
+                raise RuntimeError('second Nautilus invocation failed to forward its window')
+        # First Nautilus must own its GApplication name before second launch.
+        if argv[0] == APPS[0] and len(children) == 1:
+            while True:
+                obs = public_observation(environment, admitted, deadline)
+                matching = [n for n in flatten(obs['trees']) if n['process']['pid'] == child.pid and n['role_name'] in ('frame', 'window') and 25 in n['states']]
+                if matching:
+                    break
+                time.sleep(min(0.1, deadline.remaining()))
+    # Existing app process descendants must be the recorded original principals;
+    # no process discovered by a name-only scan gains cleanup ownership.
+    while True:
+        try:
+            result = snapshot(args, claim, admitted, environment, deadline, cache)
+            if result['selection']['active_windows'][0]['role'] != 'settings':
+                raise FixtureNotReady('original Settings Network window is not actually active')
+            break
+        except FixtureNotReady as error:
+            for child in children:
+                status = child.poll()
+                if status not in (None, 0):
+                    raise RuntimeError('fixture launcher failed: ' + str(status)) from error
+            save(directory, 'failure.json', {'schema': 1, 'ready': False,
+                'operation': 'prepare', 'nonce': args['nonce'], 'profile': args['profile'],
+                'error': str(error), 'observed_monotonic_ns': time.monotonic_ns(), 'clock_domain': CLOCK})
+            if deadline.end - time.monotonic() < 0.2:
+                raise RuntimeError('actual fixture observation never became ready: ' + str(error)) from error
+            time.sleep(min(0.1, deadline.remaining()))
+    (directory / 'failure.json').unlink(missing_ok=True)
+    result['files'] = retained_files(directory, ('snapshot.json',))
+    save(directory, 'snapshot.json', result)
+    response = {'schema': 1, 'nonce': args['nonce'], 'profile': args['profile'], 'ready': True,
+                'admission': admitted, 'processes': fixture['processes'], 'fixture': fixture,
+                'snapshot': result, 'files': retained_files(directory, ('prepare.json',))}
+    save(directory, 'prepare.json', response)
+    return response
+
+
+def main():
+    if len(sys.argv) == 2 and sys.argv[1] == '_observe':
+        value = json.loads(sys.stdin.buffer.read(65537))
+        if set(value) != {'compositor', 'budget_s'}:
+            raise ValueError('fixed observation arguments required')
+        result = session_observe(value, Deadline(value['budget_s']))
+        print(json.dumps(result))
+        return
+    if os.geteuid() != 0 or len(sys.argv) != 3:
+        raise RuntimeError('fixed root transport requires OP JSON')
+    args = {}
+    operation = sys.argv[1] if len(sys.argv) > 1 else ''
+    directory = None
+    owned_directory = False
+    try:
+        args = json.loads(sys.argv[2])
+        deadline = payload(operation, args)
+        cache = {}
+        if operation == 'admit':
+            result, _ = admission(args['profile'], deadline, cache)
+        else:
+            directory = ROOT / args['nonce']
+            if operation == 'prepare':
+                try:
+                    ROOT.mkdir(mode=0o700)
+                except FileExistsError:
+                    pass
+                private_directory(ROOT, 0)
+                private_directory(directory, 0, create=True)  # Atomic exclusive nonce claim.
+                owned_directory = True
+                save(directory, 'claim.json', {
+                    'schema': 1, 'nonce': args['nonce'], 'profile': args['profile'],
+                    'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                    'created_monotonic_ns': time.monotonic_ns(), 'clock_domain': CLOCK,
+                    'fixture': {'directories': [], 'directory_identities': [], 'processes': []}})
+                result = prepare(args, directory, deadline, cache)
+            else:
+                claim = load_claim(directory, args)
+                owned_directory = True
+                if operation == 'file':
+                    result = retrieve_file(directory, args['name'])
+                elif operation == 'stop':
+                    result = cleanup(args, claim, directory, deadline)
+                else:
+                    admitted, environment = admission(args['profile'], deadline, cache)
+                    result = snapshot(args, claim, admitted, environment, deadline, cache)
+                    save(directory, 'snapshot.json', result)
+        deadline.remaining()
+        print(json.dumps(result))
+        if not result.get('ready', True) and operation != 'admit':
+            raise SystemExit(1)
+    except Exception as error:
+        safe_args = args if isinstance(args, dict) else {}
+        result = {'schema': 1, 'ready': False, 'operation': operation, 'profile': safe_args.get('profile'),
+                  'nonce': safe_args.get('nonce'), 'error': type(error).__name__ + ': ' + str(error),
+                  'observed_monotonic_ns': time.monotonic_ns(), 'clock_domain': CLOCK}
+        if owned_directory and directory is not None:
+            try:
+                private_directory(directory, 0)
+                save(directory, 'failure.json', result)
+                result['files'] = retained_files(directory)
+            except (OSError, RuntimeError) as saving:
+                result['retention_error'] = str(saving)
+        print(json.dumps(result))
+        raise SystemExit(1)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,538 @@
+"""Controlled JSON/files/QMP unit tests. NONE is real GNOME/native runtime proof."""
+import base64
+import copy
+import io
+import json
+from pathlib import Path
+import struct
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+import zlib
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
+import vm_gnome_reference as proof
+
+
+def process(name, pid, profile='gnome', uid=1000):
+    package = 'tuna-desktop' if name.startswith('tuna-') else name
+    if name in ('at-spi2-registryd', 'at-spi-bus-launcher'):
+        package = 'at-spi2-core'
+    return {'pid': pid, 'start_ticks': pid * 10, 'uid': uid, 'exe': '/usr/bin/' + name,
+            'exe_sha256': proof.digest(name.encode()), 'boot_id': 'controlled-boot-' + profile,
+            'start_clock_domain': 'Linux /proc starttime ticks since boot', 'clock_ticks_per_second': 100,
+            'package': {'name': package, 'version': '51.1-1'}}
+
+
+def payload_integrity():
+    evidence = {'ready': True}
+    for key, name, count in (('stock', 'stock-payload.sha256', 4), ('current_tuna', 'current-payload.sha256', 6)):
+        evidence[key] = {'receipt_path': '/usr/share/tuna-vm/' + name,
+                         'receipt_sha256': proof.digest(name.encode()), 'checked_files': count}
+    original = {n: '51.1-1' for n in ('gdm', 'gnome-shell', 'nautilus', 'gnome-control-center')}
+    fixture = {**original, 'tuna-desktop': '51.1-1'}
+    for key, name, packages in (('reference_packages', 'reference-packages.txt', original),
+                                ('fixture_packages', 'fixture-packages.txt', fixture),
+                                ('current_package', 'current-package.txt', {'tuna-desktop': '51.1-1'})):
+        evidence[key] = {'receipt_path': '/usr/share/tuna-vm/' + name,
+                         'receipt_sha256': proof.digest(name.encode()), 'packages': packages}
+    return evidence
+
+
+def admission(profile):
+    compositor = process('gnome-shell' if profile == 'gnome' else 'tuna-compositor', 200, profile)
+    shell = compositor if profile == 'gnome' else process('tuna-shell-gtk', 201, profile)
+    gdm = process('gdm', 100, profile, 0)
+    return {'schema': 1, 'profile': profile, 'ready': True, 'missing': [],
+            'payload_integrity': payload_integrity(),
+            'gdm': {'ready': False, 'available': True, 'service': {'ActiveState': 'active', 'SubState': 'running', 'MainPID': '100'},
+                    'process': gdm, 'greeters': []},
+            'session': {'ready': True, 'started': True, 'active_vt': 'tty2', 'compositor': compositor, 'shell': shell,
+                        'user_bus': {'address': 'unix:path=/run/user/1000/bus', 'peer': process('dbus-broker', 251, profile),
+                                     'identity_source': 'kernel SO_PEERCRED'},
+                        'wayland_socket': {'path': '/run/user/1000/wayland-0', 'peer': compositor,
+                                           'identity_source': 'kernel SO_PEERCRED'},
+                        'native_gpu': {'ready': True, 'compositor': compositor, 'drm_fds': [
+                            {'fd': 7, 'path': '/dev/dri/card0', 'major': 226, 'minor': 0,
+                             'sysfs_device': '/sys/devices/pci0000:00/0000:01:00.0/virtio0', 'driver': 'virtio_gpu',
+                             'pci': {'address': '0000:01:00.0', 'sysfs': '/sys/devices/pci0000:00/0000:01:00.0',
+                                     'vendor': '0x1af4', 'device': '0x1050', 'driver': 'virtio-pci'},
+                             'connectors': [{'name': 'card0-Virtual-1', 'status': 'connected',
+                                             'enabled': 'enabled', 'modes': ['1280x800']}]}]},
+                        'logind': {'User': '1000', 'Name': 'tuna-test', 'Class': 'user', 'Service': 'gdm-password',
+                                   'Type': 'wayland', 'Active': 'yes', 'Remote': 'no', 'Seat': 'seat0',
+                                   'State': 'active', 'VTNr': '2'}}}
+
+
+def node(owner, suffix, name, role='frame', states=None):
+    return {'atspi': {'bus_name': ':1.' + str(owner['pid']), 'path': '/org/a11y/' + suffix, 'id_domain': 'AT-SPI'},
+            'name': name, 'role_name': role, 'states': states if states is not None else [25, 30], 'process': owner}
+
+
+def snapshot(profile='gnome', nonce='a' * 32, *, active='settings', held=False, stamp=1, expanded=False, window_mode=False):
+    admitted = admission(profile)
+    nautilus, settings = process('nautilus', 300, profile), process('gnome-control-center', 301, profile)
+    shell = admitted['session']['shell']
+    user_bus, a11y_bus, launcher = admitted['session']['user_bus']['peer'], process('dbus-broker', 252, profile), process('at-spi-bus-launcher', 253, profile)
+    raw_peer = lambda p: {k: v for k, v in p.items() if k != 'package'}
+    windows = []
+    for role, name, owner in [('files-first', 'first', nautilus), ('files-second', 'second', nautilus),
+                              ('settings', 'Network', settings)]:
+        window = node(owner, role, name)
+        window['role'] = role
+        if role == active:
+            window['states'].append(1)
+        windows.append(window)
+    base = '/run/user/1000/controlled-' + nonce
+    directories = [{'path': path, 'device': 1, 'inode': index + 1000, 'uid': 1000, 'mode': 0o700}
+                   for index, path in enumerate((base, base + '/first', base + '/second'))]
+    suffix = 'window-selection' if window_mode else 'selection'
+    selected = node(shell, suffix, 'second' if window_mode else 'Files', 'push button', [23, 12, 25, 30] if held else [])
+    tree = copy.deepcopy(selected)
+    tree['children'] = [node(shell, suffix + '-other', 'Network' if window_mode else 'Settings', 'push button')] if held else []
+    if expanded and held:
+        tree['states'] = [25, 30]
+        selected = node(shell, 'first-thumbnail', 'first', 'push button', [23, 12, 25, 30])
+        tree['children'].extend([copy.deepcopy(selected), node(shell, 'second-thumbnail', 'second', 'push button')])
+    return {'schema': 1, 'profile': profile, 'nonce': nonce, 'ready': True, 'missing': [],
+            'observed_monotonic_ns': stamp, 'clock_domain': 'guest CLOCK_MONOTONIC', 'admission': admitted,
+            'settings': {'bindings': {action: ['<Alt>Tab' if action == 'switch-applications' else '<Alt>F6']
+                                      for action in proof.ACTIONS},
+                         'app_switcher': {'current-workspace-only': False},
+                         'window_switcher': {'current-workspace-only': False},
+                         'interface': {'scaling-factor': 1, 'text-scaling-factor': 1.0, 'gtk-theme': 'Adwaita',
+                                       'icon-theme': 'Adwaita', 'cursor-theme': 'Adwaita', 'cursor-size': 24,
+                                       'color-scheme': 'default', 'font-name': 'Sans 11', 'document-font-name': 'Sans 11',
+                                       'monospace-font-name': 'Monospace 11', 'enable-animations': True},
+                         'input_sources': {'sources': [['xkb', 'us']], 'current': 0,
+                                           'mru-sources': [['xkb', 'us']], 'xkb-options': []},
+                         'display_config': {'serial': 1,
+                             'monitors': [[['Virtual-1', 'controlled-vendor', 'controlled-model', 'controlled-serial'],
+                                           [['1280x800', 1280, 800, 60.0, 1.0, [1.0], {'is-current': True}]], {}]],
+                             'logical_monitors': [[0, 0, 1.0, 0, True,
+                                                   [['Virtual-1', 'controlled-vendor', 'controlled-model', 'controlled-serial']], {}]],
+                             'properties': {}}},
+            'atspi': {'address': 'unix:controlled-unit-test', 'registry': process('at-spi2-registryd', 250, profile),
+                      'peers': [nautilus, settings, shell, user_bus, a11y_bus, launcher],
+                      'session_bus_peer': raw_peer(user_bus), 'bus_peer': raw_peer(a11y_bus), 'launcher': raw_peer(launcher)},
+            'windows': windows,
+            'selection': {'shell_process': shell, 'objects': [tree], 'selected': [selected] if held else [],
+                          'focused': [selected] if held else [],
+                          'active_windows': [w for w in windows if w['role'] == active]},
+            'fixture': {'directories': [d['path'] for d in directories[1:]], 'directory_identities': directories,
+                        'processes': [nautilus, settings], 'launchers': [process('nautilus', 302, profile)]},
+            'files': ['claim.json', 'prepare.json', 'snapshot.json']}
+
+
+def png(seed=0, width=1280, height=800):
+    def chunk(kind, payload):
+        return struct.pack('>I', len(payload)) + kind + payload + struct.pack('>I', zlib.crc32(kind + payload) & 0xffffffff)
+    rows = (b'\0' + bytes([seed % 255, 40, 60]) * width) * height
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
+            + chunk(b'IDAT', zlib.compress(rows)) + chunk(b'IEND', b''))
+
+
+class Clock:
+    def __init__(self):
+        self.now = 1_000_000_000
+
+    def ns(self):
+        self.now += 1_000_000
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += int(seconds * 1e9)
+
+
+class ControlledGuest:
+    """A stateful deterministic transport harness, not a native evidence producer."""
+    def __init__(self, profile='gnome', failure=None):
+        self.profile, self.failure = profile, failure
+        self.nonce, self.files, self.calls, self.keys = None, {}, [], set()
+        self.active, self.action, self.stamp = 'settings', 0, 0
+        self.frame_count, self.stopped, self.capture_changed = 0, False, False
+        self.stop_value = None
+        self.expanded = False
+
+    def store(self, name, value):
+        self.files[name] = json.dumps(value, sort_keys=True).encode()
+
+    def observe(self):
+        self.stamp += 1
+        value = snapshot(self.profile, self.nonce, active=self.active, held='alt' in self.keys, stamp=self.stamp,
+                         expanded=self.expanded and self.action == 1, window_mode=self.action >= 2)
+        if self.failure == 'scale':
+            value['settings']['interface']['text-scaling-factor'] = 1.25
+        elif self.failure == 'app-package':
+            for window in value['windows']:
+                if window['role'].startswith('files-'):
+                    window['process']['package']['version'] = '51.1-controlled-different'
+            value['fixture']['processes'][0]['package']['version'] = '51.1-controlled-different'
+        if self.capture_changed:
+            value['selection']['objects'][0]['name'] = 'changed across capture'
+        self.store('snapshot.json', value)
+        return value
+
+    def run(self, route, op, payload, *, timeout):
+        if route != 'gnome-reference' or timeout > 30:
+            raise AssertionError('unbounded/nonfixed guest route')
+        args = json.loads(payload)
+        if args['budget_s'] > 25:
+            raise AssertionError('unbounded guest request')
+        if op == 'file':
+            if set(args) != {'nonce', 'name', 'budget_s'}:
+                raise AssertionError('file operation accepts no profile or arbitrary fields')
+        elif args.get('profile') != self.profile:
+            raise AssertionError('foreign guest request')
+        self.calls.append(op)
+        if op == 'admit':
+            return admission(self.profile)
+        if op == 'prepare':
+            self.nonce = args['nonce']
+            value = self.observe()
+            self.store('claim.json', {'schema': 1, 'profile': self.profile, 'nonce': self.nonce,
+                                      'fixture': value['fixture'], 'admission': value['admission']})
+            prepared = {'schema': 1, 'profile': self.profile, 'nonce': self.nonce, 'ready': True,
+                        'admission': value['admission'], 'processes': value['fixture']['processes'],
+                        'fixture': value['fixture'], 'snapshot': value, 'files': list(self.files)}
+            self.store('prepare.json', prepared)
+            return prepared
+        if op == 'observe':
+            return self.observe()
+        if op == 'stop':
+            self.stopped = True
+            fixture = json.loads(self.files['claim.json'])['fixture']
+            value = {'schema': 1, 'profile': self.profile, 'nonce': self.nonce, 'ready': True,
+                     'cleaned': True, 'errors': [],
+                     'processes': [{'original': p, 'retired': True, 'method': 'pidfd'}
+                                   for p in fixture['processes'] + fixture['launchers']],
+                     'directories': [{'original': d, 'removed': True} for d in fixture['directory_identities']]}
+            if self.failure == 'cleanup':
+                value.update(ready=False, cleaned=False, errors=['controlled pidfd failure'])
+            self.stop_value = value
+            self.store('stop.json', value)
+            return value
+        if op == 'file':
+            data = self.files[args['name']]
+            if self.failure == 'raw-snapshot' and args['name'] == 'snapshot.json':
+                value = json.loads(data)
+                value['nonce'] = 'b' * 32
+                data = json.dumps(value).encode()
+            return {'name': args['name'], 'base64': base64.b64encode(data).decode(),
+                    'sha256': proof.digest(data), 'size': len(data)}
+        raise AssertionError('unknown operation')
+
+    def cmd(self, command, **arguments):
+        if command == 'query-kvm':
+            return {'enabled': self.failure != 'kvm', 'present': True}
+        if command == 'query-pci':
+            return [{'bus': 1, 'devices': [{'bus': 1, 'slot': 0, 'function': 0,
+                     'id': {'vendor': 0x1af4, 'device': 0x1050}, 'class_info': {'class': 0x0300},
+                     'qdev_id': 'controlled-native-vga'}]}]
+        if command != 'input-send-event':
+            raise AssertionError('not physical input')
+        for event in arguments['events']:
+            if event['type'] != 'key':
+                continue
+            key, down = event['data']['key']['data'], event['data']['down']
+            if down:
+                self.keys.add(key)
+                if key in ('tab', 'f6'):
+                    self.action += 1
+                if key == 'down':
+                    self.expanded = True
+                if self.failure == 'keydown' and key == 'tab':
+                    raise OSError('controlled lost acknowledgement after physical key-down')
+            else:
+                self.keys.remove(key)
+                if key == 'alt':
+                    self.active = 'files-first' if self.action == 1 else 'files-second'
+
+    def frame(self, path):
+        self.frame_count += 1
+        if self.failure == 'frame' and self.frame_count == 2:
+            raise OSError('controlled framebuffer error')
+        Path(path).write_bytes(png(self.frame_count + (20 if self.profile == 'tuna' else 0)))
+        if self.failure == 'unstable' and self.frame_count == 2:
+            self.capture_changed = True
+
+
+def provenance(profile):
+    return {'base_image': proof.BASE_REPOSITORY + '@' + proof.PINNED_PLATFORM,
+            'test_image_id': 'sha256:' + ('2' if profile == 'gnome' else '3') * 64,
+            'commit': '4' * 40}
+
+
+class NativeSwitcherReferenceTests(unittest.TestCase):
+    def setUp(self):
+        # The controlled index digest is explicitly patched; these bytes are
+        # not the published index, cosign verification, or native runtime proof.
+        self.index_bytes = json.dumps({'schemaVersion': 2, 'manifests': [
+            {'digest': proof.PINNED_PLATFORM, 'platform': {'os': 'linux', 'architecture': 'amd64'}}]}).encode()
+        self.cosign = [{'critical': {'image': {'docker-manifest-digest': proof.PINNED_PLATFORM},
+                                     'identity': {'docker-reference': proof.BASE_REPOSITORY},
+                                     'type': 'cosign container image signature'},
+                        'optional': {'Subject': proof.CERTIFICATE_SUBJECT, 'Issuer': proof.CERTIFICATE_ISSUER}}]
+        patched = patch.object(proof, 'PINNED_INDEX', 'sha256:' + proof.digest(self.index_bytes))
+        patched.start()
+        self.addCleanup(patched.stop)
+
+    def base_evidence(self, root):
+        directory = Path(root) / 'controlled-base-input'
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / 'index.json').write_bytes(self.index_bytes)
+        (directory / 'platform-cosign.json').write_bytes(json.dumps(self.cosign).encode())
+        return directory
+
+    def collect(self, root, profile='gnome', failure=None):
+        guest, clock, records = ControlledGuest(profile, failure), Clock(), []
+        base = self.base_evidence(root)
+        with patch.object(proof.time, 'monotonic_ns', clock.ns), patch.object(proof.time, 'sleep', clock.sleep):
+            result = proof.run(guest, guest, root, lambda *r: records.append(r),
+                               profile=profile, provenance=provenance(profile), base_evidence_dir=base)
+        return result, guest, records
+
+    def pair(self, root):
+        for profile in ('gnome', 'tuna'):
+            self.collect(root / profile, profile)
+        return root / 'gnome/member.json', root / 'tuna/member.json'
+
+    def test_controlled_collection_brackets_real_retained_png_bytes_and_input_bounds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt, guest, records = self.collect(root)
+            self.assertTrue(receipt['ready'])
+            self.assertEqual([p['phase'] for p in receipt['phases']], list(proof.PHASES))
+            self.assertEqual(guest.keys, set())
+            self.assertTrue(guest.stopped)
+            self.assertEqual(records[0][:2], ('P-WM01-CONTEXT', True))
+            self.assertEqual(receipt['provenance'], provenance('gnome'))
+            self.assertEqual(proof.validate_member(root / 'member.json', 'gnome'), receipt)
+            for phase in receipt['phases']:
+                self.assertEqual(proof.digest((root / phase['path']).read_bytes()), phase['sha256'])
+                self.assertLess(phase['before']['observed_monotonic_ns'], phase['after']['observed_monotonic_ns'])
+                self.assertEqual(phase['clock_domain'], 'host CLOCK_MONOTONIC')
+                if phase['held_keys']:
+                    self.assertGreaterEqual(phase['capture_begin_ns'] - phase['hold_anchor_ns'], 500_000_000)
+            self.assertNotIn('failure.json', receipt['guest_files'])
+
+    def test_frame_and_changed_selection_failures_release_keys_and_preserve_strict_cleanup(self):
+        for failure in ('frame', 'unstable', 'keydown'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                guest, clock, records = ControlledGuest(failure=failure), Clock(), []
+                base = self.base_evidence(directory)
+                with patch.object(proof.time, 'monotonic_ns', clock.ns), patch.object(proof.time, 'sleep', clock.sleep):
+                    with self.assertRaises((OSError, ValueError)):
+                        proof.run(guest, guest, directory, lambda *r: records.append(r),
+                                  profile='gnome', provenance=provenance('gnome'), base_evidence_dir=base)
+                self.assertTrue(guest.stopped)
+                self.assertEqual(guest.keys, set())
+                receipt = json.loads((Path(directory) / 'member.json').read_bytes())
+                self.assertFalse(receipt['ready'])
+                self.assertEqual(receipt['cleanup'], guest.stop_value)
+                self.assertTrue((Path(directory) / 'guest/stop.json').is_file())
+                self.assertFalse(records[-1][1])
+
+    def test_cleanup_only_failure_is_not_ready_and_retains_exact_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, 'cleanup/retention'):
+                self.collect(Path(directory), failure='cleanup')
+            receipt = json.loads((Path(directory) / 'member.json').read_bytes())
+            raw = json.loads((Path(directory) / 'guest/stop.json').read_bytes())
+            self.assertEqual(receipt['cleanup'], raw)
+            self.assertEqual(raw['errors'], ['controlled pidfd failure'])
+            self.assertFalse(receipt['ready'])
+
+    def test_missing_or_forged_accessibility_identity_and_provenance_are_rejected(self):
+        for mutate in (
+            lambda s: s['windows'].pop(),
+            lambda s: s['windows'][0]['process'].update(exe='/usr/bin/fake-nautilus'),
+            lambda s: s['windows'][0]['atspi'].update(id_domain='WM'),
+            lambda s: s['selection']['selected'][0]['atspi'].update(path='/not/in/actual/tree'),
+            lambda s: s['selection']['selected'][0].update(process=s['windows'][0]['process']),
+            lambda s: s['admission']['session']['logind'].update(Service='autologin'),
+            lambda s: s['settings'].pop('display_config'),
+            lambda s: s['windows'][0]['states'].remove(25),
+        ):
+            value = snapshot(held=True)
+            mutate(value)
+            with self.assertRaises((ValueError, KeyError)):
+                proof.validate_snapshot(value, 'gnome', 'a' * 32)
+
+    def test_original_shell_selected_object_remains_distinct_from_real_gtk_windows(self):
+        value = snapshot(held=True)
+        proof.validate_snapshot(value, 'gnome', 'a' * 32)
+        selected = proof.atspi_id(value['selection']['selected'][0])
+        self.assertNotIn(selected, [proof.atspi_id(w) for w in value['windows']])
+        value['selection']['active_windows'] = value['selection']['selected']
+        with self.assertRaises(ValueError):
+            proof.validate_snapshot(value, 'gnome', 'a' * 32)
+
+    def test_configured_bindings_are_read_not_rewritten_and_unsupported_action_fails(self):
+        settings = snapshot()['settings']
+        original = copy.deepcopy(settings)
+        self.assertEqual(proof.choose_binding(settings, 'switch-applications')['key'], 'tab')
+        self.assertEqual(settings, original)
+        settings['bindings']['switch-applications'] = ['<Hyper>Tab']
+        with self.assertRaisesRegex(ValueError, 'configured'):
+            proof.choose_binding(settings, 'switch-applications')
+
+    def test_png_crc_truncation_dimensions_and_hash_are_validated(self):
+        data = png()
+        self.assertEqual(proof.png_info(data)['width'], 1280)
+        for bad in (data[:-1], data[:45] + bytes([data[45] ^ 1]) + data[46:], b'not a screenshot'):
+            with self.assertRaises(ValueError):
+                proof.png_info(bad)
+        with self.assertRaisesRegex(ValueError, '1280x800'):
+            proof.png_info(png(width=1279))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'capture.png').write_bytes(data)
+            with self.assertRaisesRegex(ValueError, 'hash/size'):
+                proof.retained_file(root, {'path': 'capture.png', 'sha256': '0' * 64, 'size': len(data)})
+            with self.assertRaisesRegex(ValueError, 'escapes'):
+                proof.retained_file(root, {'path': '../capture.png'})
+
+    def test_pair_is_only_context_ready_never_visual_or_v1_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            left, right = self.pair(root)
+            value = proof.compare(left, right, root / 'pair')
+            self.assertTrue(value['ready'], value)
+            self.assertFalse(value['p_wm01_complete'])
+            self.assertEqual(value['visual_verdict'], 'not-classified')
+            self.assertNotIn('visual_match', value)
+
+    def test_pair_rejects_retained_capture_corruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            left, right = self.pair(root)
+            (root / 'gnome/applications-held.png').write_bytes(png(99))
+            result = proof.compare(left, right, root / 'pair')
+            self.assertFalse(result['ready'])
+            self.assertIn('hash/size', result['error']['message'])
+
+    def test_member_rejects_timing_replay_held_sets_missing_phases_and_cleanup_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original, _, _ = self.collect(root)
+            mutations = (
+                lambda r: r['phases'][1].update(hold_anchor_ns=r['phases'][1]['capture_begin_ns'] - 499_999_999),
+                lambda r: r['phases'][1]['after'].update(observed_monotonic_ns=r['phases'][1]['before']['observed_monotonic_ns']),
+                lambda r: r['phases'][1].update(held_keys=['meta_l']),
+                lambda r: r['phases'].pop(),
+                lambda r: r['cleanup']['processes'][0]['original'].update(start_ticks=999999),
+                lambda r: r['cleanup']['directories'][0].update(removed=False),
+                lambda r: r['commands'][1].update(held_before=['alt']),
+            )
+            for mutate in mutations:
+                changed = copy.deepcopy(original)
+                mutate(changed)
+                proof.save_json(root / 'member.json', changed)
+                with self.assertRaises((ValueError, KeyError)):
+                    proof.validate_member(root / 'member.json', 'gnome')
+
+    def test_pair_rejects_actual_scale_and_original_package_context_differences(self):
+        for difference in ('scale', 'app-package'):
+            with self.subTest(difference=difference), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.collect(root / 'gnome', 'gnome')
+                self.collect(root / 'tuna', 'tuna', failure=difference)
+                result = proof.compare(root / 'gnome/member.json', root / 'tuna/member.json', root / 'pair')
+                self.assertFalse(result['ready'])
+                self.assertIn('differ' if difference == 'scale' else 'mismatch', result['error']['message'])
+
+    def test_base_index_bytes_membership_and_exact_cosign_claims_are_required(self):
+        proof.validate_base_bytes(self.index_bytes, json.dumps(self.cosign).encode())
+        with self.assertRaisesRegex(ValueError, 'index29097'):
+            proof.validate_base_bytes(self.index_bytes + b' ', json.dumps(self.cosign).encode())
+        for field in ('Subject', 'Issuer'):
+            bad = copy.deepcopy(self.cosign)
+            bad[0]['optional'][field] = 'untrusted-controlled-value'
+            with self.assertRaisesRegex(ValueError, 'subject/issuer'):
+                proof.validate_base_bytes(self.index_bytes, json.dumps(bad).encode())
+        bad = copy.deepcopy(self.cosign)
+        bad[0]['critical']['image']['docker-manifest-digest'] = 'sha256:' + '6' * 64
+        with self.assertRaisesRegex(ValueError, 'actual platform'):
+            proof.validate_base_bytes(self.index_bytes, json.dumps(bad).encode())
+        wrong = json.dumps({'schemaVersion': 2, 'manifests': [
+            {'digest': proof.PINNED_PLATFORM, 'platform': {'os': 'linux', 'architecture': 'arm64'}}]}).encode()
+        with patch.object(proof, 'PINNED_INDEX', 'sha256:' + proof.digest(wrong)):
+            with self.assertRaisesRegex(ValueError, 'linux/amd64'):
+                proof.validate_base_bytes(wrong, json.dumps(self.cosign).encode())
+
+    def test_snapshot_version_and_unknown_profile_do_not_fall_back_to_tuna(self):
+        value = snapshot()
+        value['admission']['session']['compositor']['package']['version'] = '51.0-1'
+        with self.assertRaisesRegex(ValueError, 'GNOME 51.1'):
+            proof.validate_snapshot(value, 'gnome', 'a' * 32)
+        with self.assertRaises(ValueError):
+            proof.session_status(ControlledGuest(), profile='fallback')
+
+    def test_compare_cli_reads_retained_members_and_returns_context_exit_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            left, right = self.pair(root)
+            with patch('sys.stdout', new_callable=io.StringIO) as stdout:
+                result = proof.main(['compare', '--gnome', str(left), '--tuna', str(right), '--out', str(root / 'pair')])
+            self.assertEqual(result, 0)
+            self.assertTrue(json.loads(stdout.getvalue())['ready'])
+            with patch('sys.stdout', new_callable=io.StringIO):
+                result = proof.main(['compare', '--gnome', str(right), '--tuna', str(left), '--out', str(root / 'wrong')])
+            self.assertEqual(result, 1)
+
+    def test_missing_actual_metadata_fails_before_any_guest_effect_without_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, guest = Path(directory), ControlledGuest()
+            base = self.base_evidence(root)
+            actual = provenance('gnome')
+            actual.pop('commit')
+            with self.assertRaisesRegex(ValueError, 'source/test-image'):
+                proof.run(guest, guest, root, lambda *r: None, profile='gnome',
+                          provenance=actual, base_evidence_dir=base)
+            self.assertEqual(guest.calls, [])
+            receipt = json.loads((root / 'member.json').read_bytes())
+            self.assertFalse(receipt['ready'])
+            self.assertEqual(receipt['provenance'], actual)
+
+    def test_actual_drm_payload_and_wayland_peer_observations_are_mandatory(self):
+        for mutate in (
+            lambda a: a['payload_integrity']['stock'].update(checked_files=0),
+            lambda a: a['payload_integrity']['current_tuna'].update(checked_files=7),
+            lambda a: a['session']['native_gpu']['drm_fds'][0]['pci'].update(device='0x1111'),
+            lambda a: a['session']['native_gpu']['drm_fds'][0]['connectors'][0].update(enabled='disabled'),
+            lambda a: a['session']['wayland_socket'].update(peer=process('gnome-shell', 999)),
+            lambda a: a['payload_integrity']['fixture_packages']['packages'].update(gdm='51.0-1'),
+        ):
+            value = admission('gnome')
+            mutate(value)
+            with self.assertRaises(ValueError):
+                proof.validate_admission(value, 'gnome')
+
+    def test_disabled_kvm_fails_on_actual_query_before_any_guest_effect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, guest = Path(directory), ControlledGuest(failure='kvm')
+            with self.assertRaisesRegex(ValueError, 'enabled KVM'):
+                proof.run(guest, guest, root, lambda *r: None, profile='gnome',
+                          provenance=provenance('gnome'), base_evidence_dir=self.base_evidence(root))
+            self.assertEqual(guest.calls, [])
+            receipt = json.loads((root / 'member.json').read_bytes())
+            self.assertFalse(receipt['native_topology']['query-kvm']['result']['enabled'])
+            self.assertFalse(receipt['ready'])
+
+    def test_valid_hashed_but_foreign_raw_snapshot_cannot_qualify_member(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(ValueError, 'cleanup/retention'):
+                self.collect(root, failure='raw-snapshot')
+            receipt = json.loads((root / 'member.json').read_bytes())
+            self.assertTrue(receipt['cleanup']['cleaned'])
+            self.assertFalse(receipt['ready'])
+            self.assertEqual(receipt['cleanup_errors'][-1]['stage'], 'retained-receipt-validation')
+            self.assertEqual(json.loads((root / 'guest/snapshot.json').read_bytes())['nonce'], 'b' * 32)
+
+
+if __name__ == '__main__':
+    unittest.main()
