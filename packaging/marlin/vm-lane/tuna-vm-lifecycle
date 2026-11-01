@@ -2990,10 +2990,6 @@ print(json.dumps(result))
         if len(sys.argv) != 3 or sys.argv[2] not in FRESH_USERS:
             raise ValueError("fresh-account action takes one fixture account name")
         result = FRESH_ACTIONS[action](sys.argv[2])
-    elif action == "reboot":
-        boot_id = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-        call("systemctl", "reboot", "--no-block")
-        result = {"requested": "reboot", "boot_id": boot_id}
     elif action == "payload":
         payload = pathlib.Path("/usr/share/tuna-vm/shipped-payload.sha256")
         call("sha256sum", "--check", str(payload))

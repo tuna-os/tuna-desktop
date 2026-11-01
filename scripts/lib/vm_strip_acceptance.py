@@ -511,56 +511,91 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         ppm = destination / (label + '.ppm')
         if png.exists() or ppm.exists():
             raise RuntimeError('refuse reused framebuffer capture path')
-        capture_deadline = min(deadline, time.monotonic() + 10.0)
+        capture_begin = time.monotonic()
+        local_deadline = capture_begin + 10.0
+        capture_deadline = min(deadline, local_deadline)
         capture_transport = QmpDeadline(qmp, capture_deadline)
+        # One fixed-size public failure receipt, not frames, inventory, or
+        # exception text. Pixel results describe only the latest attempt;
+        # None means that format's check was not reached.
+        diagnostic = {
+            'label': label, 'role': role, 'attempts': 0,
+            'capture_begin_monotonic_ns': time.monotonic_ns(),
+            'local_deadline_monotonic_ns': int(local_deadline * 1_000_000_000),
+            'capture_deadline_monotonic_ns': int(capture_deadline * 1_000_000_000),
+            'total_deadline_monotonic_ns': int(deadline * 1_000_000_000),
+            'stage': 'png-acquire', 'last_not_ready_reason': None,
+            'ppm_rgb_verified': None, 'png_rgb_verified': None,
+        }
         attempts = 0
         last_error = None
-        while time.monotonic() < capture_deadline:
-            attempts += 1
-            capture_transport.command('screendump', filename=str(png), format='png')
-            capture_transport.command('screendump', filename=str(ppm), format='ppm')
-            actual_image = read_ppm(str(ppm))
-            if actual_image[:2] != (1280, 800):
-                raise RuntimeError('actual framebuffer dimensions differ from admitted viewport')
-            try:
-                colored_frame(actual_image, found[role]['rect'], COLORS[role])
-                # QMP PNG and PPM are separate acquisitions. Validate both actual
-                # images; an earlier unvalidated PNG is not a qualified walkthrough.
-                from PIL import Image
-                with Image.open(png) as frame:
-                    if frame.format != 'PNG' or frame.size != (1280, 800):
-                        raise RuntimeError('actual PNG framebuffer format/dimensions differ')
-                    png_image = frame.convert('RGB')
-                    colored_frame((png_image.width, png_image.height, png_image.tobytes()),
-                                  found[role]['rect'], COLORS[role])
-                if time.monotonic() >= capture_deadline:
-                    raise TimeoutError('installed framebuffer capture exceeded deadline')
-                break
-            except NotReady as error:
-                last_error = error
-                if attempts == 1:
-                    png.replace(destination / (label + '-not-ready.png'))
-                    ppm.replace(destination / (label + '-not-ready.ppm'))
-                remaining = capture_deadline - time.monotonic()
-                if remaining <= 0:
-                    raise
-                time.sleep(min(0.25, remaining))
-                refreshed = read(capture_deadline)
-                if windows(refreshed, original, edge=edge) != found:
-                    raise RuntimeError('actual window geometry changed while awaiting framebuffer')
-                sample = refreshed
-                if attempts > 1:
-                    png.unlink(missing_ok=True)
-                    ppm.unlink(missing_ok=True)
-        else:
-            if last_error is not None:
-                raise last_error
-            raise TimeoutError('installed framebuffer capture exceeded deadline')
-        after = read(capture_deadline)
-        if time.monotonic() >= capture_deadline:
-            raise TimeoutError('installed framebuffer validation exceeded capture deadline')
-        if windows(after, original, edge=edge) != found:
-            raise RuntimeError('actual window geometry changed across framebuffer acquisition')
+        try:
+            while time.monotonic() < capture_deadline:
+                attempts += 1
+                diagnostic.update(attempts=attempts, stage='png-acquire',
+                                  ppm_rgb_verified=None, png_rgb_verified=None)
+                capture_transport.command('screendump', filename=str(png), format='png')
+                diagnostic['stage'] = 'ppm-acquire'
+                capture_transport.command('screendump', filename=str(ppm), format='ppm')
+                diagnostic['stage'] = 'ppm-pixels'
+                actual_image = read_ppm(str(ppm))
+                if actual_image[:2] != (1280, 800):
+                    raise RuntimeError('actual framebuffer dimensions differ from admitted viewport')
+                try:
+                    diagnostic['ppm_rgb_verified'] = False
+                    colored_frame(actual_image, found[role]['rect'], COLORS[role])
+                    diagnostic['ppm_rgb_verified'] = True
+                    # QMP PNG and PPM are separate acquisitions. Validate both actual
+                    # images; an earlier unvalidated PNG is not a qualified walkthrough.
+                    diagnostic['stage'] = 'png-pixels'
+                    from PIL import Image
+                    with Image.open(png) as frame:
+                        if frame.format != 'PNG' or frame.size != (1280, 800):
+                            raise RuntimeError('actual PNG framebuffer format/dimensions differ')
+                        png_image = frame.convert('RGB')
+                        diagnostic['png_rgb_verified'] = False
+                        colored_frame((png_image.width, png_image.height, png_image.tobytes()),
+                                      found[role]['rect'], COLORS[role])
+                        diagnostic['png_rgb_verified'] = True
+                    if time.monotonic() >= capture_deadline:
+                        raise TimeoutError('installed framebuffer capture exceeded deadline')
+                    break
+                except NotReady as error:
+                    last_error = error
+                    # Only source-owned fixed reasons can enter the public receipt.
+                    diagnostic['last_not_ready_reason'] = {
+                        'fixture body not visibly large enough to prove pixels': 'fixture-body-not-visible',
+                        'actual framebuffer differs from owned fixture color': 'fixture-color-mismatch',
+                    }.get(str(error), 'other-not-ready')
+                    if attempts == 1:
+                        png.replace(destination / (label + '-not-ready.png'))
+                        ppm.replace(destination / (label + '-not-ready.ppm'))
+                    remaining = capture_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    diagnostic['stage'] = 'retry-refresh'
+                    time.sleep(min(0.25, remaining))
+                    refreshed = read(capture_deadline)
+                    if windows(refreshed, original, edge=edge) != found:
+                        raise RuntimeError('actual window geometry changed while awaiting framebuffer')
+                    sample = refreshed
+                    if attempts > 1:
+                        png.unlink(missing_ok=True)
+                        ppm.unlink(missing_ok=True)
+            else:
+                if last_error is not None:
+                    raise last_error
+                raise TimeoutError('installed framebuffer capture exceeded deadline')
+            diagnostic['stage'] = 'post-frame-read'
+            after = read(capture_deadline)
+            if time.monotonic() >= capture_deadline:
+                raise TimeoutError('installed framebuffer validation exceeded capture deadline')
+            if windows(after, original, edge=edge) != found:
+                raise RuntimeError('actual window geometry changed across framebuffer acquisition')
+        except BaseException:
+            diagnostic['failure_monotonic_ns'] = time.monotonic_ns()
+            receipt['capture_failure'] = diagnostic
+            raise
         entry = {'label': label, 'sample': sample, 'after': after,
                  'png_sha256': hashlib.sha256(png.read_bytes()).hexdigest(),
                  'ppm_sha256': hashlib.sha256(ppm.read_bytes()).hexdigest(),

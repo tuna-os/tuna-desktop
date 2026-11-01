@@ -233,8 +233,10 @@ def sudo_ok(result, admin):
 class Journey:
     """Drive the journey through QMP keys and the guest agent.
 
-    connect() returns a fresh guest agent (with run(action, *args) and
-    close()); greeter_ready(greeter) is the lane's greeter predicate.
+    connect() returns a fresh guest agent with run(action, *args),
+    request_reboot() and close(). request_reboot() transmits without an
+    acknowledgement and retires its transport; only a new boot ID with a
+    ready greeter proves reboot. greeter_ready(greeter) is the lane's predicate.
     """
 
     def __init__(self, qmp, connect, greeter_ready, out, record, sleep=time.sleep,
@@ -286,7 +288,7 @@ class Journey:
             try:
                 greeter = self._run("greeter")
                 if self.greeter_ready(greeter) and (not_boot is None
-                                                    or greeter.get("boot_id") not in (None, not_boot)):
+                                                    or greeter.get("boot_id") not in (None, "", not_boot)):
                     self._receipt(f"{step}-greeter", greeter)
                     return greeter
             except (OSError, RuntimeError, ValueError):
@@ -439,10 +441,11 @@ class Journey:
             return False
         if not (self._cycle("first") and self._cycle("second")):
             return False
-        before = self._run("reboot")["boot_id"]
-        self.agent.close()
-        self.agent = None
-        self.sleep(10)
+        before = self._run("greeter").get("boot_id")
+        if not isinstance(before, str) or not before.strip():
+            raise RuntimeError("reboot: missing pre-reboot boot ID")
+        self.agent.request_reboot()
+        self.agent = None  # A transmitted request retires this transport.
         greeter = self._greeter("reboot", not_boot=before)
         self.record("V-FRESH-REBOOT", True, f"guest rebooted: boot {before} -> {greeter['boot_id']}")
         states = {user: self._run("fresh-state", user) for user in JOURNEY_USERS}

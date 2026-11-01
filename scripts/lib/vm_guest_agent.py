@@ -348,6 +348,24 @@ class GuestAgent:
             raise RuntimeError(f"guest-agent command {name} rejected")
         return result["return"]
 
+    def request_reboot(self, *, timeout=5):
+        """Transmit one QGA reboot request and retire this transport.
+
+        guest-shutdown has no success reply. Returning None means only that
+        the request was transmitted, not acknowledged or that a reboot occurred;
+        the caller must independently observe a new boot and readiness.
+        """
+        if getattr(self, "poisoned", False):
+            raise RuntimeError("guest-agent transport poisoned")
+        if (getattr(self, "guest_exec_state", "none") != "none"
+                or getattr(self, "pending_guest_pid", None) is not None):
+            raise RuntimeError("previous guest-exec retirement unconfirmed")
+        deadline = time.monotonic() + timeout
+        try:
+            self._send(b'{"execute": "guest-shutdown", "arguments": {"mode": "reboot"}}\n', deadline)
+        finally:
+            self._poison()
+
     def run(self, action, *arguments, timeout=30):
         deadline = time.monotonic() + timeout
         if getattr(self, "guest_exec_state", "none") != "none":

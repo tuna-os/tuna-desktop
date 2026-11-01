@@ -48,7 +48,20 @@ existing per-user records or replaces a valid saved session choice.
 | V-FRESH-RECORD-CREATED-<user> | After the first login AccountsService wrote the record; any saved `Session` is `tuna` |
 | V-FRESH-SUDO-<user> | `sudo -S -k true` as the account with its password: admin succeeds, standard is refused by sudo policy |
 | V-FRESH-LOGOUT-<user>-<round> | logind ends the session and the greeter is ready again |
-| V-FRESH-REBOOT / V-FRESH-RECORD-KEPT-<user> | In-guest reboot (new `boot_id`), records survive, then both accounts log in again |
+| V-FRESH-REBOOT / V-FRESH-RECORD-KEPT-<user> | Observe a different `boot_id` and ready greeter, then physical records for both accounts; both must log in and log out again |
+
+The controller reads a nonempty old boot ID through the read-only `greeter`
+action, then calls `GuestAgent.request_reboot()` once.
+It sends QGA [`guest-shutdown` with `mode=reboot`](https://www.qemu.org/docs/master/interop/qemu-ga-ref.html#command-QGA-qapi-schema.guest-shutdown).
+QGA returns no response on success and does not guarantee shutdown.
+The method retires its transport after it tries to send; send errors propagate.
+A return is not an acknowledgement or proof of reboot.
+
+The controller reconnects at once, with no extra sleep.
+It retains the 180-second limit for a new boot and ready greeter.
+A boot ID that did not change cannot pass, nor can a greeter that is not ready.
+Physical record retention and both post-reboot logins and logouts remain mandatory.
+The 60-second login limit, two authentication tries and 90-second trace stay unchanged.
 
 Run 41215443626 failed both native VM jobs with the AccountsService record
 still missing after a real record-free `tunastd` manual GDM login on
@@ -258,7 +271,7 @@ The existing read-only `gdm-policy` action runs once for this check.
 
 Neither the manifest nor the package versions can satisfy the physical-record guard.
 All standard/admin, first/second login, sudo, logout and reboot gates stay intact.
-At source review, both candidate journeys remain unexercised.
+Candidate admission alone does not exercise either native journey.
 No source, function or package check counts as runtime acceptance.
 The source PR stays unmerged.
 This fixture does not sign packages, publish a repository or change production pins.
@@ -266,7 +279,8 @@ This fixture does not sign packages, publish a repository or change production p
 ### Actual candidate campaign 41255271531
 
 [Run 41255271531](https://github.com/tuna-os/tuna-desktop/actions/runs/41255271531)
-used desktop source `31bf6bb30ee9949918b161a3a6035e906c2efb79`.
+ran for desktop PR head `31bf6bb30ee9949918b161a3a6035e906c2efb79`.
+CI uses a merge checkout, not the PR head directly.
 It built package source `7b52bdf34be22bc60fef62b157be64b589b13f6a` once.
 The factory build and staged verifier passed.
 Both containers reported 8 GiB memory, zero swap and CPU quota 200%.
@@ -313,6 +327,73 @@ Second-login and reboot acceptance did not run.
 Both fresh journeys remain **failed**, not qualified.
 Neither the persistence evidence nor the package provenance satisfies the missing gates.
 No production publication, image pin or merge follows from this run.
+
+### Actual candidate campaign 41262331704
+
+[Run 41262331704](https://github.com/tuna-os/tuna-desktop/actions/runs/41262331704)
+ran for PR #985 head `598ca553abc24f4b10bb335d22f99a5ff4e17a81`.
+CI used merge commit `a3d6334efd4176ff7082a6b4d1ddc5d9ad1fe1d3`,
+with parents `eed9aa95658f5d75496954b10142d50c807ee88f` and
+`598ca553abc24f4b10bb335d22f99a5ff4e17a81`.
+Package source stayed at `7b52bdf34be22bc60fef62b157be64b589b13f6a`.
+The archives in CI had the same hashes as those in the previous run:
+
+| Package | SHA256 |
+| --- | --- |
+| gdm 51.1.1-1.1 x86_64 | `8c67e6be0e707f157cd901d319dd2af522f9666c352af42958d4a8bbaca62f66` |
+| libgdm 51.1.1-1.1 x86_64 | `a559fae8e6d3166294c6d11ff76b39258ed0ca2c5e62f4e9ccdd5bc5d24f9af4` |
+
+For both profiles, real first logins passed for the standard user and administrator.
+Physical records held `Session=tuna`; read-only observations reported `Saved=true`.
+Both records survived the first logout.
+Standard sudo denial, administrator authorization, both manual second logins
+and all pre-reboot logouts passed.
+
+Then the host reported literal `timed out` before `V-FRESH-REBOOT`.
+No actual new boot ID, post-boot retention or post-reboot login/logout received credit.
+Both fresh journeys failed.
+
+The old CLI used `systemctl reboot --no-block` before it wrote JSON.
+Its host still awaited the child exit and output through the agent being torn down.
+That sequence can cause a teardown/reply race; the run does not identify the
+exact timed-out I/O or prove that the guest changed boots.
+The QGA request removes only that dependency; all gates stay intact.
+
+The receipt for each profile contains nine cases for the strip.
+Both reported `TimeoutError` and `cleanup_confirmed=true`.
+This failure of a strip deadline is independent of policy binding.
+This run is not a PASS for the full suite.
+This run does not qualify reboot.
+No production publication, image pin or merge follows from it.
+
+### Bounded strip capture failure metadata
+
+The retained metadata places the strip failure inside the capture for case 10.
+It does not establish whether the local or total deadline caused the failure.
+The new diagnostic does not change either deadline or qualify a failed capture.
+
+A failed capture adds one `capture_failure` object to the existing receipt.
+It contains the source-owned case `label` and `role`, plus the `attempts` count.
+Its fixed fields are:
+
+- `capture_begin_monotonic_ns` and `failure_monotonic_ns`;
+- `local_deadline_monotonic_ns`, `capture_deadline_monotonic_ns`
+  and `total_deadline_monotonic_ns`;
+- `stage`: `png-acquire`, `ppm-acquire`, `ppm-pixels`, `png-pixels`,
+  `retry-refresh` or `post-frame-read`;
+- `last_not_ready_reason`: `fixture-body-not-visible`,
+  `fixture-color-mismatch`, `other-not-ready` or null;
+- `ppm_rgb_verified` and `png_rgb_verified`: separate booleans for the latest try.
+  Null means that the capture did not reach the color check.
+
+The object contains no frames, inventory, exception text or bus payload.
+The capture re-raises its original exception; cleanup stays unchanged.
+The local 10-second and total 120-second limits stay unchanged.
+Both pixel checks and the identity check after the frame remain mandatory.
+
+The existing code does not guard the final write of `receipt.json`.
+An `OSError` from that write can mask an earlier failure.
+This diagnostic does not change that existing limit.
 
 ### Private image and input corrections
 

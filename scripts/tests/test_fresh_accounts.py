@@ -74,6 +74,10 @@ class FakeGuest:
         self.state_calls = []
         self.trace_actions = []
         self.actions = []
+        self.transport_events = []
+        self.connections = []
+        self.reboot_requests = 0
+        self.reboot_pending = False
         self.input_calls = 0
         self.policy_calls = []
         self.key_calls = []
@@ -173,10 +177,48 @@ class FakeGuest:
 
     # guest agent
     def connect(self):
-        return self
+        if self.reboot_pending and not self.faults.get("no_actual_boot"):
+            self.reboot_pending = False
+            self.boot += 1
+            self.logged_in = self.logged_out = None
+            for user in self.faults.get("missing_retained_record", ()):
+                self.records.pop(user, None)
+            self.records.update(self.faults.get("retained_records", {}))
+            self._show_list()
+        number = len(self.connections) + 1
+        retired = False
+        self.transport_events.append(("connect", number))
 
-    def close(self):
-        pass
+        def run(action, *args):
+            if retired:
+                raise RuntimeError("retired guest agent")
+            self.transport_events.append(("run", number, action))
+            return self.run(action, *args)
+
+        def close():
+            nonlocal retired
+            if not retired:
+                retired = True
+                self.transport_events.append(("close", number))
+
+        def request_reboot():
+            if retired:
+                raise RuntimeError("retired guest agent")
+            self.transport_events.append(("request_reboot", number))
+            try:
+                return self.request_reboot()
+            finally:
+                close()
+
+        agent = SimpleNamespace(run=run, request_reboot=request_reboot, close=close)
+        self.connections.append(agent)
+        return agent
+
+    def request_reboot(self):
+        self.reboot_requests += 1
+        if self.faults.get("reboot_send_error"):
+            raise RuntimeError("reboot send failed")
+        self.reboot_pending = True
 
     def run(self, action, *args):
         self.actions.append(action)
@@ -193,7 +235,16 @@ class FakeGuest:
             return {"ready": True} if action.endswith("start") else {"profile": "headers-only", "events": []}
         if action == "greeter":
             boot = self.boot if not self.faults.get("stale_boot") else 1
-            return {"ready": self.logged_in is None, "boot_id": f"boot-{boot}"}
+            ready = self.logged_in is None and not (self.boot > 1 and self.faults.get("unready_greeter"))
+            result = {"ready": ready, "boot_id": f"boot-{boot}"}
+            if len(self.logins) == 4 and not self.reboot_requests:
+                if self.faults.get("missing_old_boot_id"):
+                    result.pop("boot_id")
+                elif "old_boot_id" in self.faults:
+                    result["boot_id"] = self.faults["old_boot_id"]
+            if self.boot > 1 and "new_boot_id" in self.faults:
+                result["boot_id"] = self.faults["new_boot_id"]
+            return result
         if action == "fresh-state":
             user = args[0]
             self.state_calls.append(user)
@@ -225,12 +276,6 @@ class FakeGuest:
                 self.logged_in, self.logged_out = None, args[0]
                 self._show_list()
             return {"user": args[0]}
-        if action == "reboot":
-            before = f"boot-{self.boot}"
-            self.boot += 1
-            self.logged_in = self.logged_out = None
-            self._show_list()
-            return {"boot_id": before}
         raise ValueError(action)
 
 
@@ -395,11 +440,11 @@ class JourneyTest(unittest.TestCase):
         guest = FakeGuest()
         passed, results, error, _ = journey(guest)
         self.assertTrue(passed, (results, error))
-        self.assertEqual(guest.sleeps, [1, 1, 2, 2] * 4 + [10] + [1, 1, 2, 2] * 2)
+        self.assertEqual(guest.sleeps, [1, 1, 2, 2] * 6)
         self.assertEqual(guest.key_calls.count(("up",)), 30)
         self.assertEqual(guest.key_calls.count(("shift", "tab")), 12)
         self.assertNotIn(("tab",), guest.key_calls)
-        self.assertAlmostEqual(guest.elapsed, 67.6)
+        self.assertAlmostEqual(guest.elapsed, 57.6)
 
     def test_rejected_login_keeps_two_sixty_second_attempts_and_ninety_second_trace(self):
         guest = FakeGuest(reject_login=True)
@@ -429,8 +474,19 @@ class JourneyTest(unittest.TestCase):
                                         (2, "tunastd"), (2, "tunaadmin")])
         for name in ("V-FRESH-RECORD-FREE-tunastd", "V-FRESH-RECORD-FREE-tunaadmin", "V-FRESH-CONTROL",
                      "V-FRESH-RECORD-CREATED-tunastd", "V-FRESH-SUDO-tunaadmin", "V-FRESH-SUDO-tunastd",
-                     "V-FRESH-REBOOT", "V-FRESH-RECORD-KEPT-tunaadmin", "V-FRESH-LOGOUT-tunaadmin-reboot"):
+                     "V-FRESH-REBOOT"):
             self.assertIn(name, results)
+        retained = next(receipt["value"] for receipt in receipts if receipt["step"] == "reboot-state")
+        for user in fresh_accounts.JOURNEY_USERS:
+            self.assertEqual(fresh_accounts.parse_record(retained[user]["record"])["Session"], "tuna")
+            self.assertIn(f"V-FRESH-RECORD-KEPT-{user}", results)
+            for round_name in ("first", "second", "reboot"):
+                self.assertIn(f"V-FRESH-LOGIN-{user}-{round_name}", results)
+                self.assertIn(f"V-FRESH-LOGOUT-{user}-{round_name}", results)
+        self.assertEqual(guest.reboot_requests, 1)
+        self.assertEqual(len(guest.connections), 2)
+        self.assertNotIn("reboot", guest.actions)
+        self.assertNotIn(10, guest.sleeps)
 
     def test_first_round_records_state_after_each_logout(self):
         _, _, _, receipts = journey(FakeGuest())
@@ -588,6 +644,109 @@ class JourneyTest(unittest.TestCase):
         self.assertIn("reboot", error)
         self.assertNotIn("V-FRESH-REBOOT", results)
         self.assertTrue(receipts)
+
+    def test_old_boot_read_precedes_one_request_and_new_connection(self):
+        guest = FakeGuest()
+        passed, results, error, _ = journey(guest)
+        self.assertTrue(passed, (results, error))
+        events = guest.transport_events
+        request = events.index(("request_reboot", 1))
+        self.assertEqual(events[request - 1:request + 4],
+                         [("run", 1, "greeter"), ("request_reboot", 1), ("close", 1),
+                          ("connect", 2), ("run", 2, "greeter")])
+        self.assertEqual(guest.reboot_requests, 1)
+        self.assertNotIn(("run", 1, "reboot"), events)
+        self.assertNotIn(10, guest.sleeps)
+
+    def test_transmission_without_a_new_boot_has_no_reboot_credit(self):
+        guest = FakeGuest(no_actual_boot=True)
+        passed, results, error, receipts = journey(guest)
+        self.assertFalse(passed)
+        self.assertIn("reboot: GDM greeter did not become ready", error)
+        self.assertEqual(guest.reboot_requests, 1)
+        self.assertEqual(guest.boot, 1)
+        self.assertEqual(len(guest.connections), 2)
+        self.assertEqual(len(guest.logins), 4)
+        self.assertNotIn("V-FRESH-REBOOT", results)
+        self.assertNotIn("reboot-state", steps(receipts))
+        self.assertFalse(any("RECORD-KEPT" in name or name.endswith("-reboot") for name in results))
+
+    def test_new_boot_without_ready_greeter_has_no_reboot_credit(self):
+        guest = FakeGuest(unready_greeter=True)
+        passed, results, error, receipts = journey(guest)
+        self.assertFalse(passed)
+        self.assertIn("reboot: GDM greeter did not become ready", error)
+        self.assertEqual(guest.reboot_requests, 1)
+        self.assertEqual(guest.boot, 2)
+        self.assertEqual(len(guest.logins), 4)
+        self.assertNotIn("V-FRESH-REBOOT", results)
+        self.assertNotIn("reboot-state", steps(receipts))
+
+    def test_reboot_send_error_propagates_without_observation_or_credit(self):
+        guest = FakeGuest(reboot_send_error=True)
+        passed, results, error, receipts = journey(guest)
+        self.assertFalse(passed)
+        self.assertEqual(error, "reboot send failed")
+        self.assertEqual(guest.reboot_requests, 1)
+        self.assertEqual(len(guest.connections), 1)
+        self.assertEqual(guest.transport_events[-2:], [("request_reboot", 1), ("close", 1)])
+        self.assertEqual(len(guest.logins), 4)
+        self.assertNotIn("V-FRESH-REBOOT", results)
+        self.assertNotIn("reboot-greeter", steps(receipts))
+        self.assertNotIn("reboot-state", steps(receipts))
+
+    def test_missing_or_empty_old_boot_id_refuses_request(self):
+        for faults in ({"missing_old_boot_id": True}, {"old_boot_id": None},
+                       {"old_boot_id": ""}, {"old_boot_id": "   "}):
+            with self.subTest(faults=faults):
+                guest = FakeGuest(**faults)
+                passed, results, error, _ = journey(guest)
+                self.assertFalse(passed)
+                self.assertEqual(error, "reboot: missing pre-reboot boot ID")
+                self.assertEqual(guest.reboot_requests, 0)
+                self.assertEqual(len(guest.connections), 1)
+                self.assertEqual(len(guest.logins), 4)
+                self.assertNotIn("V-FRESH-REBOOT", results)
+
+    def test_missing_or_empty_new_boot_id_is_not_reboot_proof(self):
+        for boot_id in (None, ""):
+            with self.subTest(boot_id=boot_id):
+                guest = FakeGuest(new_boot_id=boot_id)
+                passed, results, error, receipts = journey(guest)
+                self.assertFalse(passed)
+                self.assertIn("reboot: GDM greeter did not become ready", error)
+                self.assertEqual(guest.boot, 2)
+                self.assertEqual(len(guest.logins), 4)
+                self.assertNotIn("V-FRESH-REBOOT", results)
+                self.assertNotIn("reboot-state", steps(receipts))
+
+    def test_each_missing_retained_record_blocks_both_postboot_logins(self):
+        for user in fresh_accounts.JOURNEY_USERS:
+            with self.subTest(user=user):
+                guest = FakeGuest(missing_retained_record=(user,))
+                passed, results, error, receipts = journey(guest)
+                self.assertFalse(passed)
+                self.assertIsNone(error)
+                self.assertTrue(results["V-FRESH-REBOOT"][0])
+                self.assertFailed(results, f"V-FRESH-RECORD-KEPT-{user}")
+                self.assertEqual(len(guest.logins), 4)
+                retained = next(receipt["value"] for receipt in receipts if receipt["step"] == "reboot-state")
+                self.assertIsNone(retained[user]["record"])
+                self.assertNotIn("V-FRESH-LOGIN-tunastd-reboot", results)
+                self.assertNotIn("V-FRESH-LOGIN-tunaadmin-reboot", results)
+
+    def test_wrong_retained_session_blocks_both_postboot_logins(self):
+        for user in fresh_accounts.JOURNEY_USERS:
+            with self.subTest(user=user):
+                guest = FakeGuest(retained_records={user: "[User]\nSession=gnome\n"})
+                passed, results, error, _ = journey(guest)
+                self.assertFalse(passed)
+                self.assertIsNone(error)
+                self.assertTrue(results["V-FRESH-REBOOT"][0])
+                self.assertFailed(results, f"V-FRESH-RECORD-KEPT-{user}")
+                self.assertEqual(len(guest.logins), 4)
+                self.assertNotIn("V-FRESH-LOGIN-tunastd-reboot", results)
+                self.assertNotIn("V-FRESH-LOGIN-tunaadmin-reboot", results)
 
 
 class NativeCandidateManifestTest(unittest.TestCase):

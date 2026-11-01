@@ -466,6 +466,216 @@ class EndpointEvidence(unittest.TestCase):
         self.assertFalse(evidence['qualified'])
 
 
+class CaptureFailureEvidence(unittest.TestCase):
+    """Synthetic capture failures exercise the real receipt and cleanup path."""
+
+    def run_failure(self, *, start=0.0, acquire_error=None, mismatch=None,
+                    post_error=None, late_post=False, late_pixels=False,
+                    unknown_reason=False, retry_once=False, cleanup_confirmed=True):
+        from unittest.mock import patch
+        from PIL import Image
+        value = sample()
+        value['inventory']['state']['session_mode'] = 'gnome'
+        for window in value['inventory']['state']['windows']:
+            window['workspace'] = 0
+        root = Path(proof.__file__).resolve().parents[2]
+        members = {
+            '/usr/libexec/' + name: hashlib.sha256(
+                (root / 'packaging/marlin/vm-lane' / name).read_bytes()).hexdigest()
+            for name in ('tuna-vm-input', 'tuna-vm-lifecycle')}
+        for name, identity in value['owner']['core'].items():
+            identity['exe_sha256'] = members['/usr/bin/' + name] = 'e' * 64
+        image = {'schema': 1, 'commit': 'a' * 40, 'image_id': 'sha256:' + 'b' * 64,
+                 'base_image': 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'c' * 64,
+                 'package_sha256': 'd' * 64, 'member_sha256': members}
+        clock = [0.0]
+        calls, acquisitions, deadlines = [], [], []
+        primary = RuntimeError('private raw exception body must not be retained')
+        color = proof.COLORS['alpha']
+        good = (1280, 800, bytes(color) * 1280 * 800)
+        wrong = (1280, 800, bytes((0, 0, 0)) * 1280 * 800)
+
+        class Agent:
+            poisoned = False
+
+            def run(self, action, *args, timeout):
+                calls.append((action, timeout))
+                if action == 'strip-start':
+                    return {'owner': value['owner']}
+                if action == 'strip-stop':
+                    return {'cleanup_confirmed': cleanup_confirmed}
+                if action == 'strip-state':
+                    if post_error == 'transport' and (not retry_once or reads[0] > 1):
+                        raise primary
+                    after = copy.deepcopy(value)
+                    if post_error == 'identity':
+                        after['fixture']['identity']['start_ticks'] += 1
+                    if post_error == 'geometry':
+                        after['inventory']['state']['windows'][0]['rect'][0] += 1
+                    if late_post:
+                        clock[0] = start + 10
+                    return after
+                raise AssertionError(action)
+
+        class Transport:
+            def __init__(self, _qmp, deadline):
+                deadlines.append(deadline)
+
+            def command(self, command, **kwargs):
+                if command != 'screendump':
+                    return None
+                fmt = kwargs['format']
+                acquisitions.append(fmt)
+                if acquire_error == fmt:
+                    raise primary
+                path = Path(kwargs['filename'])
+                if fmt == 'png':
+                    Image.new('RGB', (1280, 800),
+                              (0, 0, 0) if mismatch == 'png' else color).save(path)
+                else:
+                    path.write_bytes(b'synthetic PPM acquisition')
+
+        def ready(*_args, **_kwargs):
+            clock[0] = start
+            return value, [value] * 3
+
+        def sleep(duration):
+            self.assertLessEqual(duration, .25)
+            # Let the existing retry sleep reach the actual effective deadline.
+            clock[0] = min(120.0, start + 10.0)
+
+        def pixels(*args):
+            if unknown_reason:
+                raise proof.NotReady('private readiness body ' + 'x' * 10000)
+            if late_pixels:
+                clock[0] = start + 10
+            return proof_colored_frame(*args)
+
+        proof_colored_frame = proof.colored_frame
+        reads = [0]
+
+        def read_ppm(_path):
+            reads[0] += 1
+            return wrong if mismatch == 'ppm' and (not retry_once or reads[0] == 1) else good
+
+        def retry_sleep(duration):
+            if retry_once and reads[0] == 1:
+                clock[0] += duration
+            else:
+                sleep(duration)
+
+        records = []
+        with tempfile.TemporaryDirectory() as scratch, \
+                patch.object(proof, 'QmpDeadline', Transport), \
+                patch.object(proof, 'await_endpoint', side_effect=ready), \
+                patch.object(proof.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(proof.time, 'monotonic_ns', side_effect=lambda: int(clock[0] * 1e9)), \
+                patch.object(proof.time, 'sleep', side_effect=retry_sleep), \
+                patch.object(proof, 'colored_frame', side_effect=pixels):
+            def reconnect():
+                self.fail('healthy primary stream must perform cleanup')
+            with self.assertRaises(BaseException) as caught:
+                proof.prove_installed_strip(
+                    object(), Agent(), reconnect, scratch, image, read_ppm,
+                    lambda *entry: records.append(entry))
+            receipt = json.loads((Path(scratch) / 'strip-acceptance/receipt.json').read_text())
+        self.assertFalse(receipt['completed'])
+        self.assertEqual(receipt['cases'], [])
+        self.assertEqual(receipt['cleanup_confirmed'], cleanup_confirmed)
+        self.assertEqual(calls[-1], ('strip-stop', 10))
+        self.assertFalse(records[-1][1])
+        self.assertEqual(deadlines, [120.0, min(120.0, start + 10.0)])
+        diagnostic = receipt['capture_failure']
+        self.assertEqual(set(diagnostic), {
+            'label', 'role', 'attempts', 'capture_begin_monotonic_ns',
+            'failure_monotonic_ns', 'local_deadline_monotonic_ns',
+            'capture_deadline_monotonic_ns', 'total_deadline_monotonic_ns',
+            'stage', 'last_not_ready_reason', 'ppm_rgb_verified', 'png_rgb_verified'})
+        self.assertEqual((diagnostic['label'], diagnostic['role']), ('01-floating', 'alpha'))
+        self.assertEqual(diagnostic['capture_begin_monotonic_ns'], int(start * 1e9))
+        self.assertEqual(diagnostic['local_deadline_monotonic_ns'], int((start + 10) * 1e9))
+        self.assertEqual(diagnostic['capture_deadline_monotonic_ns'], int(min(120, start + 10) * 1e9))
+        self.assertEqual(diagnostic['total_deadline_monotonic_ns'], 120_000_000_000)
+        self.assertLess(len(json.dumps(diagnostic).encode()), 1024)
+        self.assertNotIn('private', json.dumps(receipt))
+        return diagnostic, caught.exception, primary, acquisitions, calls
+
+    def test_local_and_global_deadlines_are_distinguishable_after_pixel_mismatch(self):
+        for start, failure_ns in ((0, 10_000_000_000), (112, 120_000_000_000)):
+            with self.subTest(start=start):
+                diagnostic, error, _, acquisitions, calls = self.run_failure(start=start, mismatch='ppm')
+                self.assertIsInstance(error, TimeoutError)
+                self.assertEqual(str(error), 'installed sample absolute deadline')
+                self.assertEqual(diagnostic['failure_monotonic_ns'], failure_ns)
+                self.assertEqual(diagnostic['stage'], 'retry-refresh')
+                self.assertEqual(diagnostic['last_not_ready_reason'], 'fixture-color-mismatch')
+                self.assertIs(diagnostic['ppm_rgb_verified'], False)
+                self.assertIsNone(diagnostic['png_rgb_verified'])
+                self.assertEqual(diagnostic['attempts'], 1)
+                self.assertEqual(acquisitions, ['png', 'ppm'])
+                self.assertNotIn('strip-state', [action for action, _ in calls])
+
+    def test_png_mismatch_is_distinct_from_valid_ppm(self):
+        diagnostic, error, _, _, _ = self.run_failure(mismatch='png')
+        self.assertIsInstance(error, TimeoutError)
+        self.assertIs(diagnostic['ppm_rgb_verified'], True)
+        self.assertIs(diagnostic['png_rgb_verified'], False)
+        self.assertEqual(diagnostic['last_not_ready_reason'], 'fixture-color-mismatch')
+
+    def test_each_acquisition_failure_preserves_primary_and_cleanup(self):
+        for fmt in ('png', 'ppm'):
+            with self.subTest(format=fmt):
+                diagnostic, error, primary, acquisitions, _ = self.run_failure(acquire_error=fmt)
+                self.assertIs(error, primary)
+                self.assertEqual(diagnostic['stage'], fmt + '-acquire')
+                self.assertEqual(diagnostic['attempts'], 1)
+                self.assertEqual(acquisitions, ['png'] if fmt == 'png' else ['png', 'ppm'])
+                self.assertIsNone(diagnostic['last_not_ready_reason'])
+                self.assertIsNone(diagnostic['ppm_rgb_verified'])
+                self.assertIsNone(diagnostic['png_rgb_verified'])
+
+    def test_post_frame_identity_geometry_and_transport_failure_remain_terminal(self):
+        for failure in ('identity', 'geometry', 'transport'):
+            with self.subTest(failure=failure):
+                diagnostic, error, primary, _, calls = self.run_failure(post_error=failure)
+                self.assertIsInstance(error, RuntimeError)
+                if failure == 'transport':
+                    self.assertIs(error, primary)
+                self.assertEqual(diagnostic['stage'], 'post-frame-read')
+                self.assertIs(diagnostic['ppm_rgb_verified'], True)
+                self.assertIs(diagnostic['png_rgb_verified'], True)
+                self.assertEqual([action for action, _ in calls], ['strip-start', 'strip-state', 'strip-stop'])
+
+    def test_valid_pixels_cannot_bypass_local_deadline_or_late_post_read(self):
+        for late_post in (False, True):
+            with self.subTest(late_post=late_post):
+                diagnostic, error, _, _, _ = self.run_failure(
+                    late_post=late_post, late_pixels=not late_post)
+                self.assertIsInstance(error, TimeoutError)
+                self.assertEqual(diagnostic['stage'], 'post-frame-read' if late_post else 'png-pixels')
+                self.assertEqual(diagnostic['failure_monotonic_ns'], 10_000_000_000)
+                self.assertIs(diagnostic['ppm_rgb_verified'], True)
+                self.assertIs(diagnostic['png_rgb_verified'], True)
+
+    def test_retry_attempt_count_and_last_fixed_reason_survive_later_failure(self):
+        diagnostic, error, primary, acquisitions, _ = self.run_failure(
+            mismatch='ppm', retry_once=True, post_error='transport')
+        self.assertIs(error, primary)
+        self.assertEqual(diagnostic['attempts'], 2)
+        self.assertEqual(diagnostic['stage'], 'post-frame-read')
+        self.assertEqual(diagnostic['last_not_ready_reason'], 'fixture-color-mismatch')
+        self.assertIs(diagnostic['ppm_rgb_verified'], True)
+        self.assertIs(diagnostic['png_rgb_verified'], True)
+        self.assertEqual(acquisitions, ['png', 'ppm', 'png', 'ppm'])
+
+    def test_unknown_readiness_text_is_fixed_and_cleanup_failure_does_not_replace_primary(self):
+        diagnostic, error, _, _, _ = self.run_failure(unknown_reason=True)
+        self.assertIsInstance(error, TimeoutError)
+        self.assertEqual(diagnostic['last_not_ready_reason'], 'other-not-ready')
+        _, error, primary, _, _ = self.run_failure(acquire_error='png', cleanup_confirmed=False)
+        self.assertIs(error, primary)
+
+
 class TransportAndCleanup(unittest.TestCase):
     def test_actual_qmp_event_and_partial_line_dribble_are_absolutely_bounded(self):
         loader = importlib.machinery.SourceFileLoader('installed_test_baseline',
