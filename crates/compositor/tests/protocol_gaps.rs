@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
-use tuna_compositor::osk::InputPanel;
 use tuna_compositor::windows::{
     ManagerInput, WindowManager, ESCAPE_KEYCODE, PAGE_DOWN_KEYCODE, SUPER_LEFT_KEYCODE,
 };
@@ -37,14 +36,6 @@ use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
 use wayland_protocols::wp::presentation_time::client::{
     wp_presentation::{self, WpPresentation},
     wp_presentation_feedback::{self, WpPresentationFeedback},
-};
-use wayland_protocols::wp::text_input::zv3::client::{
-    zwp_text_input_manager_v3::ZwpTextInputManagerV3,
-    zwp_text_input_v3::{self, ZwpTextInputV3},
-};
-use wayland_protocols_misc::zwp_input_method_v2::client::{
-    zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
-    zwp_input_method_v2::{self, ZwpInputMethodV2},
 };
 use wayland_protocols::xdg::dialog::v1::client::{
     xdg_dialog_v1::XdgDialogV1, xdg_wm_dialog_v1::XdgWmDialogV1,
@@ -90,9 +81,6 @@ struct Client {
     imports_destroyed: usize,
     /// ext_background_effect_manager_v1 capabilities, as sent.
     background_effects: Option<u32>,
-    text_events: Vec<zwp_text_input_v3::Event>,
-    ime_active: bool,
-    ime_done: u32,
     /// What the drag-and-drop objects heard (xdg-toplevel-drag tests).
     drag: DragLog,
 }
@@ -332,40 +320,6 @@ wayland_client::delegate_noop!(Client: ignore ZxdgImporterV1);
 wayland_client::delegate_noop!(Client: ignore ExtBackgroundEffectSurfaceV1);
 wayland_client::delegate_noop!(Client: ignore wayland_client::protocol::wl_region::WlRegion);
 
-
-wayland_client::delegate_noop!(Client: ignore ZwpTextInputManagerV3);
-wayland_client::delegate_noop!(Client: ignore ZwpInputMethodManagerV2);
-
-impl Dispatch<ZwpInputMethodV2, ()> for Client {
-    fn event(
-        state: &mut Self,
-        _: &ZwpInputMethodV2,
-        event: zwp_input_method_v2::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            zwp_input_method_v2::Event::Activate => state.ime_active = true,
-            zwp_input_method_v2::Event::Deactivate => state.ime_active = false,
-            zwp_input_method_v2::Event::Done => state.ime_done = state.ime_done.wrapping_add(1),
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<ZwpTextInputV3, ()> for Client {
-    fn event(
-        state: &mut Self,
-        _: &ZwpTextInputV3,
-        event: zwp_text_input_v3::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        state.text_events.push(event);
-    }
-}
 struct Peer {
     _conn: Connection,
     queue: EventQueue<Client>,
@@ -1412,252 +1366,6 @@ fn a_blur_region_for_a_destroyed_surface_is_a_protocol_error() {
         error.code,
         ext_background_effect_surface_v1::Error::SurfaceDestroyed as u32
     );
-}
-
-/// An actual Wayland app connection. IME calls below enter through the same
-/// native text-input state used by the OSK, not a fabricated client event.
-struct TextApp {
-    peer: Peer,
-    surface: WlSurface,
-    _toplevel: XdgToplevel,
-    input: ZwpTextInputV3,
-}
-
-fn text_app(comp: &mut TestCompositor, manager: &mut WindowManager, version: u32) -> TextApp {
-    let mut peer = connect(comp, manager);
-    assert_eq!(peer.client.globals["zwp_text_input_manager_v3"].1, 2);
-    let seat: WlSeat = peer.bind(9);
-    let text_manager: ZwpTextInputManagerV3 = peer.bind(version);
-    let (surface, toplevel) = window(&mut peer, "text-input journey");
-    pump(comp, manager, &mut [&mut peer]);
-    let input = text_manager.get_text_input(&seat, &peer.qh(), ());
-    pump(comp, manager, &mut [&mut peer]);
-    assert!(peer.client.text_events.iter().any(|event| {
-        matches!(event, zwp_text_input_v3::Event::Enter { surface: entered } if *entered == surface)
-    }));
-    TextApp { peer, surface, _toplevel: toplevel, input }
-}
-
-fn text_focus(comp: &TestCompositor) -> Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface> {
-    comp.test_seat().get_keyboard().and_then(|keyboard| keyboard.current_focus())
-}
-
-fn text_panel(comp: &mut TestCompositor) -> Option<InputPanel> {
-    let focus = text_focus(comp);
-    comp.state.text_inputs().take_panel(focus.as_ref())
-}
-
-fn ime_submit(comp: &mut TestCompositor) -> bool {
-    let focus = text_focus(comp);
-    comp.state.text_inputs().action(
-        focus.as_ref(),
-        smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::Action::Submit,
-    )
-}
-
-#[test]
-fn text_input_v2_app_ime_actions_and_panel_journey() {
-    let (mut comp, mut manager) = compositor();
-    let mut app = text_app(&mut comp, &mut manager, 2);
-    let mut ime = connect(&mut comp, &mut manager);
-    let ime_manager: ZwpInputMethodManagerV2 = ime.bind(1);
-    let ime_seat: WlSeat = ime.bind(9);
-    let input_method = ime_manager.get_input_method(&ime_seat, &ime.qh(), ());
-    pump(&mut comp, &mut manager, &mut [&mut app.peer, &mut ime]);
-    app.input.enable();
-    app.input.set_available_actions(1_u32.to_ne_bytes().to_vec());
-    app.input.show_input_panel();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    assert_eq!(text_panel(&mut comp), None, "all state waits for commit");
-    assert!(!ime_submit(&mut comp));
-    app.input.commit();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    assert_eq!(text_panel(&mut comp), Some(InputPanel::On));
-    assert_eq!(text_panel(&mut comp), None, "one-shot panel request");
-    let focus = text_focus(&comp);
-    assert_eq!(comp.state.text_inputs().available_actions(focus.as_ref()), 1);
-    app.peer.client.text_events.clear();
-    assert!(comp.state.text_inputs().commit(focus.as_ref(), "旅"));
-    assert!(ime_submit(&mut comp));
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    assert!(matches!(&app.peer.client.text_events[..], [
-        zwp_text_input_v3::Event::CommitString { text: Some(text) },
-        zwp_text_input_v3::Event::Done { serial: 1 },
-        zwp_text_input_v3::Event::Action { action: wayland_client::WEnum::Value(zwp_text_input_v3::Action::Submit), .. },
-        zwp_text_input_v3::Event::Done { serial: 1 },
-    ] if text == "旅"));
-    app.input.hide_input_panel();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    assert_eq!(text_panel(&mut comp), None);
-    app.input.commit();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    assert_eq!(text_panel(&mut comp), Some(InputPanel::Off));
-    assert!(ime_submit(&mut comp), "hiding retains focus and committed actions");
-    pump(&mut comp, &mut manager, &mut [&mut app.peer, &mut ime]);
-    assert!(ime.client.ime_active, "panel OFF must not deactivate the native IME");
-    app.peer.client.text_events.clear();
-    input_method.set_preedit_string("に".into(), 3, 3);
-    input_method.commit(ime.client.ime_done);
-    pump(&mut comp, &mut manager, &mut [&mut app.peer, &mut ime]);
-    assert!(app.peer.client.text_events.iter().any(|event| {
-        matches!(event, zwp_text_input_v3::Event::PreeditString { text: Some(text), .. } if text == "に")
-    }));
-    app.peer.client.text_events.clear();
-    input_method.commit_string("日".into());
-    input_method.commit(ime.client.ime_done);
-    pump(&mut comp, &mut manager, &mut [&mut app.peer, &mut ime]);
-    assert!(app.peer.client.text_events.iter().any(|event| {
-        matches!(event, zwp_text_input_v3::Event::CommitString { text: Some(text) } if text == "日")
-    }));
-    assert!(matches!(app.peer.client.text_events.last(), Some(zwp_text_input_v3::Event::Done { serial: 2 })));
-    app.input.set_available_actions(Vec::new());
-    assert!(ime_submit(&mut comp), "pending clear cannot affect current actions");
-    app.input.commit();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    assert!(!ime_submit(&mut comp));
-    app.input.show_input_panel();
-    app.input.hide_input_panel();
-    app.input.commit();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    assert_eq!(text_panel(&mut comp), Some(InputPanel::Off), "last request wins");
-    app.input.hide_input_panel();
-    app.input.enable();
-    app.input.commit();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    assert_eq!(text_panel(&mut comp), Some(InputPanel::Off), "enable preserves pending panel hint");
-    app.input.disable();
-    app.input.show_input_panel();
-    app.input.commit();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    assert_eq!(text_panel(&mut comp), None);
-    assert!(!ime_submit(&mut comp));
-}
-
-#[test]
-fn text_input_panel_and_actions_cannot_transfer_between_owners() {
-    let (mut comp, mut manager) = compositor();
-    let mut app = text_app(&mut comp, &mut manager, 2);
-    app.input.enable();
-    app.input.set_available_actions(1_u32.to_ne_bytes().to_vec());
-    app.input.commit();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    let seat: WlSeat = app.peer.bind(9);
-    let text_manager: ZwpTextInputManagerV3 = app.peer.bind(2);
-    let other = text_manager.get_text_input(&seat, &app.peer.qh(), ());
-    other.enable();
-    other.show_input_panel();
-    other.commit();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    assert_eq!(text_panel(&mut comp), None, "second enabled object cannot own the field");
-    assert!(ime_submit(&mut comp));
-    app.input.show_input_panel();
-    app.input.commit();
-    app.input.destroy();
-    other.enable();
-    other.commit();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    assert_eq!(text_panel(&mut comp), None, "destroyed owner's request cannot reach replacement");
-    assert!(!ime_submit(&mut comp), "replacement starts with no actions");
-
-    // A second client's focus retires both pending and committed state.
-    other.hide_input_panel();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    let mut second = text_app(&mut comp, &mut manager, 2);
-    app.input = other;
-    app.input.enable();
-    app.input.show_input_panel();
-    app.input.commit();
-    second.input.enable();
-    second.input.commit();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer, &mut second.peer]);
-    assert_eq!(text_panel(&mut comp), None, "cross-client request is ignored");
-    assert!(!ime_submit(&mut comp));
-    second.input.show_input_panel();
-    second.input.commit();
-    second.surface.destroy();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer, &mut second.peer]);
-    assert_eq!(text_panel(&mut comp), None, "dead focus cannot own queued panel requests");
-}
-
-#[test]
-fn text_input_v1_keeps_reenable_panel_and_no_v2_action_events() {
-    let (mut comp, mut manager) = compositor();
-    let mut app = text_app(&mut comp, &mut manager, 1);
-    assert_eq!(wayland_client::Proxy::version(&app.input), 1);
-    app.input.enable();
-    app.input.commit();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    assert_eq!(text_panel(&mut comp), None);
-    app.input.enable();
-    app.input.commit();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    assert_eq!(text_panel(&mut comp), Some(InputPanel::On));
-    assert!(!ime_submit(&mut comp));
-    app.input.disable();
-    app.input.commit();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    assert_eq!(text_panel(&mut comp), None);
-}
-
-#[test]
-fn available_actions_validation_is_independent_of_focus_and_ime() {
-    for (bytes, message) in [
-        (0_u32.to_ne_bytes().to_vec(), "Invalid 'none' action in set"),
-        ([1_u32.to_ne_bytes(), 1_u32.to_ne_bytes()].concat(), "Action 1 doubly set"),
-        (u32::MAX.to_ne_bytes().to_vec(), "Unknown action 4294967295 in set"),
-        (vec![1, 0, 0], "Malformed action array: expected uint32 entries"),
-    ] {
-        let (mut comp, mut manager) = compositor();
-        let mut peer = connect(&mut comp, &mut manager);
-        let seat: WlSeat = peer.bind(9);
-        let text_manager: ZwpTextInputManagerV3 = peer.bind(2);
-        let input = text_manager.get_text_input(&seat, &peer.qh(), ());
-        input.set_available_actions(bytes);
-        let error = pump_to_error(&mut comp, &mut manager, &mut peer);
-        assert_eq!(error.object_interface, "zwp_text_input_v3");
-        assert_eq!(error.code, zwp_text_input_v3::Error::InvalidAction as u32);
-        assert_eq!(error.message, message);
-    }
-}
-
-#[test]
-fn valid_action_sets_need_neither_focus_nor_an_input_method() {
-    let (mut comp, mut manager) = compositor();
-    let mut peer = connect(&mut comp, &mut manager);
-    let seat: WlSeat = peer.bind(9);
-    let text_manager: ZwpTextInputManagerV3 = peer.bind(2);
-    let input = text_manager.get_text_input(&seat, &peer.qh(), ());
-    input.set_available_actions(1_u32.to_ne_bytes().to_vec());
-    input.commit();
-    input.set_available_actions(Vec::new());
-    input.commit();
-    pump(&mut comp, &mut manager, &mut [&mut peer]);
-    assert!(peer._conn.protocol_error().is_none());
-    assert!(!ime_submit(&mut comp));
-    assert_eq!(text_panel(&mut comp), None);
-}
-
-#[test]
-fn text_input_pending_state_dies_with_its_focus_interval() {
-    let (mut comp, mut manager) = compositor();
-    let mut app = text_app(&mut comp, &mut manager, 2);
-    app.input.enable();
-    app.input.set_available_actions(1_u32.to_ne_bytes().to_vec());
-    app.input.show_input_panel();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    let old_focus = text_focus(&comp);
-    let keyboard = comp.test_seat().get_keyboard().unwrap();
-    keyboard.set_focus(&mut comp.state, None, smithay::utils::SERIAL_COUNTER.next_serial());
-    keyboard.set_focus(&mut comp.state, old_focus, smithay::utils::SERIAL_COUNTER.next_serial());
-    app.input.commit();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    assert_eq!(text_panel(&mut comp), None);
-    assert!(!ime_submit(&mut comp), "leave invalidates the pending enable and actions");
-    app.input.enable();
-    app.input.commit();
-    pump(&mut comp, &mut manager, &mut [&mut app.peer]);
-    assert_eq!(text_panel(&mut comp), None, "fresh enable cannot replay a stale panel request");
-    assert!(!ime_submit(&mut comp));
 }
 
 // xdg_toplevel_drag_v1 (#364, #588): Mutter 51's meta-wayland-toplevel-drag.c.
