@@ -6,6 +6,7 @@ import io
 from pathlib import Path
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -92,6 +93,60 @@ class HandoffTests(unittest.TestCase):
             name = "corral-" + platform
             url = "https://github.com/tuna-os/corral/releases/download/v2.0.0/" + name
             self.value["corral"]["assets"][platform] = {"name": name, "url": url, "sha256": "a" * 64, "bundleUrl": url + ".sigstore.json"}
+
+    def test_admit_cli_requires_explicit_read_token_before_any_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = root / "tools"
+            tools.mkdir()
+            marker = root / "child-started"
+            boundary = tools / "boundary"
+            # A real OS process boundary, not a producer/API mock. A valid
+            # credential control must reach it, but never actual network.
+            boundary.write_text('#!/bin/sh\n: > "$VM_TEST_CHILD_MARKER"\nexit 97\n')
+            boundary.chmod(0o700)
+            for name in ("gh", "curl", "cosign", "skopeo", "sudo", "gpg", "zstd"):
+                (tools / name).symlink_to(boundary)
+            config = root / "gh-config"
+            config.mkdir()
+            persisted = "test-persisted-credential-must-not-be-used"
+            (config / "hosts.yml").write_text("github.com:\n    oauth_token: " + persisted + "\n")
+            handoff = root / "handoff.json"
+            handoff.write_bytes(producer.canonical(self.value))
+            env = {
+                "PATH": str(tools), "HOME": str(root), "GH_CONFIG_DIR": str(config),
+                "VM_TEST_CHILD_MARKER": str(marker),
+                "GITHUB_REPOSITORY": producer.DESKTOP, "GITHUB_REF": "refs/heads/main",
+                "GITHUB_WORKFLOW_REF": producer.DESKTOP + "/.github/workflows/vm-release.yml@refs/heads/main",
+                "GH_TOKEN": "test-gh-fallback-must-not-be-used",
+                "GITHUB_TOKEN": "test-job-fallback-must-not-be-used",
+            }
+            command = [sys.executable, str(Path(producer.__file__).resolve()), "admit",
+                       "--handoff", str(handoff), "--output", str(root / "output")]
+            expected = ("vm-release: rejected: configure secrets.VM_RELEASE_READ_TOKEN: "
+                        "admission requires a read-only cross-repository GitHub credential\n")
+            for token in (None, "", " \t\n"):
+                child_env = dict(env)
+                if token is not None:
+                    child_env["VM_RELEASE_READ_TOKEN"] = token
+                with self.subTest(token=token):
+                    result = subprocess.run(command, env=child_env, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(result.stderr, expected)
+                    self.assertFalse(marker.exists(), "admission started a tool before requiring its credential")
+                    self.assertFalse((root / "output").exists())
+                    for credential in (persisted, env["GH_TOKEN"], env["GITHUB_TOKEN"]):
+                        self.assertNotIn(credential, result.stdout + result.stderr)
+            # Prove the executable boundary is live through the actual CLI.
+            # Its nonzero exit prevents these synthetic inputs qualifying.
+            env["VM_RELEASE_READ_TOKEN"] = "test-explicit-read-credential"
+            result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(marker.is_file())
+            self.assertFalse((root / "output" / "admitted.json").exists())
+            for credential in (persisted, env["GH_TOKEN"], env["GITHUB_TOKEN"], env["VM_RELEASE_READ_TOKEN"]):
+                self.assertNotIn(credential, result.stdout + result.stderr)
 
     def test_exact_parser_shape_admitted(self):
         self.assertEqual(set(self.value["corral"]["assets"]), {

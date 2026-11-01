@@ -67,6 +67,40 @@ release identities. Its presence does **not** mean a launcher VM release has run
 or passed. Keep the shipped launcher unchanged until the resulting signed bytes
 have actually passed all native gates.
 
+Before dispatch, a maintainer must externally configure the Actions secret
+`VM_RELEASE_READ_TOKEN`, available to `tuna-os/tuna-desktop`, with a scoped
+read-only GitHub credential. The repository's automatic `github.token` cannot
+download Actions artifacts owned by the package and image repositories.
+Admission's actual GitHub API targets and minimum repository permissions are:
+
+| Repository | Required read access | Admission use |
+| --- | --- | --- |
+| `tuna-os/tuna-desktop` | Actions, Contents, Metadata | CI/review/installed-control/image-qualification runs, jobs and artifact ZIPs; review source, release and tag |
+| `tuna-os/tunaos-packages` | Actions, Contents, Metadata | Factory run/jobs/artifact ZIP; exact recipe and production public key |
+| `tuna-os/tunaOS` | Actions, Metadata | Image build run/jobs and amd64 digest artifact ZIP |
+| `tuna-os/corral` | Contents, Metadata | Published release, assets and exact tag/source resolution |
+
+For a single fine-grained credential, select these four repositories and grant
+only **Actions: read**, **Contents: read**, and **Metadata: read**. No write,
+publication, signing, administration or secret-management permission is needed.
+Credential provisioning is an external maintainer prerequisite, not something
+the producer creates, copies from local `gh` authentication, or bypasses.
+Until it is configured, actual `admit` fails with
+`configure secrets.VM_RELEASE_READ_TOKEN: admission requires a read-only cross-repository GitHub credential`
+before reading the handoff or starting any API/network child process.
+
+Only the actual admission step receives `secrets.VM_RELEASE_READ_TOKEN`, as the
+explicit `VM_RELEASE_READ_TOKEN` environment input. Admission requires a nonempty,
+non-whitespace value and maps it to `GH_TOKEN` in that process only, removing
+`GITHUB_TOKEN`; there is no repository-token or persisted-`gh` fallback. It does
+not persist the credential or pass it to the subsequent disk-build step,
+signing, native qualification or publication jobs. Those stages keep their
+existing credentials and permissions. This read credential authorizes transport
+only: fixed GPG/Sigstore identities, exact source/artifact checks, and all real
+qualification fences remain unchanged. The workflow selects no job environment
+and calls no reusable workflow, so no environment-scoped or reusable inherited
+secret supplies this prerequisite implicitly.
+
 Dispatch only from `main`, after the owning package/image qualification completes:
 
 ```sh
@@ -219,11 +253,13 @@ Do not send a schema/example document as a handoff. Required identities are:
    evidence archive, signature bundle and **last** the exact qualified manifest.
    It never rewrites signed manifest bytes or clobbers existing release assets.
    Only this job has release-write permission; only signing has OIDC permission.
-   The workflow has no inherited permissions: only admission/build has
-   `actions: read` for actual run/job/artifact APIs; signing/native jobs use
-   `contents: read`; publication uses `contents: write` for release/tag reads
-   and asset uploads, not speculative Actions API access. Signing and publication
-   install QEMU inspection tools before consumer admission. Build installs
+   The workflow has no inherited permissions: only the admission/build job has
+   `actions: read`; its repository job token does not authorize cross-repository
+   artifacts. The separate read credential above is available only to admission.
+   Signing/native jobs use `contents: read`; publication uses `contents: write`
+   for release/tag reads and asset uploads, not speculative Actions API access.
+   Signing and publication install QEMU inspection tools before consumer
+   admission. Build installs
    `skopeo`, `qemu-img`, GPG, YAML and Pillow; native jobs install x86 QEMU/UEFI,
    tesseract and an isolated Python environment with Requests, Pillow,
    Playwright and its real Chromium dependencies.

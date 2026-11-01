@@ -318,6 +318,13 @@ def verify_blob(path, identity, commit=None):
 
 
 def admit(args):
+    # This credential is transport only, never a trust assertion. Require it
+    # before reading the handoff or invoking any API/tool; gh must not fall
+    # back to the repository job token or persisted local authentication.
+    token = os.environ.pop("VM_RELEASE_READ_TOKEN", "")
+    need(token.strip(), "configure secrets.VM_RELEASE_READ_TOKEN: admission requires a read-only cross-repository GitHub credential")
+    os.environ["GH_TOKEN"] = token
+    os.environ.pop("GITHUB_TOKEN", None)
     value = validate_handoff(parse(regular(args.handoff).read_bytes()))
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)

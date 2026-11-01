@@ -67,7 +67,7 @@ jobs:
           sudo chmod a+rw /dev/kvm
       - name: Admit real source, package, image, receipts and signed Corral assets
         env:
-          GH_TOKEN: ${{ github.token }}
+          VM_RELEASE_READ_TOKEN: ${{ secrets.VM_RELEASE_READ_TOKEN }}
           HANDOFF: ${{ inputs.handoff }}
         run: |
           python3 -c 'import os,pathlib; pathlib.Path(os.environ["RUNNER_TEMP"],"vm-handoff.json").write_text(os.environ["HANDOFF"])'
