@@ -25,7 +25,7 @@ INDEX = "sha256:5ccc023cc73296d5e4d17cfbe38526935a405abcfb0095aad43b3a28bff182e6
 PLATFORM = "sha256:8c7a952fd654c45a021bfb9318ce4027d7bb4b734a1a4f63fb1a5a294e4096f3"
 IMAGE = "ghcr.io/tuna-os/marlin"
 IMAGE_IDENTITY = "https://github.com/tuna-os/tunaOS/.github/workflows/reusable-build-image.yml@refs/heads/main"
-CORRAL_SOURCE = "76b6dd52d35deab2b105038b2673f010d5b95191"
+CORRAL_SOURCE = "667edf09b70eb88b2a6398ae834d4c841c13f629"
 CORRAL_SHA256 = "67673b95bee120b1305be7bb4d0f06f368fb934958fffb37353fdf86320b0e6d"
 CORRAL_IDENTITY = "https://github.com/tuna-os/corral/.github/workflows/ci.yml@refs/heads/main"
 

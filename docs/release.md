@@ -181,6 +181,13 @@ Do not send a schema/example document as a handoff. Required identities are:
    diagnosis on Ubuntu 26.04 stopped at its explicit unsupported-host dependency
    check (run `41254044292`); no browser/platform override or guest proof was
    substituted.
+   The next diagnosis (`41254733163`) verified the exact image platform but
+   correctly refused the Corral bundle: the pinned binary's actual signed
+   source was `667edf09b70eb88b2a6398ae834d4c841c13f629`, not the stale
+   `76b6dd52...` checkout. The diagnosis pins both checkout and certificate to
+   that independently confirmed normal-main descendant; its binary checksum,
+   signer, issuer and transparency requirements are unchanged. Neither failed
+   run reached guest boot or constitutes pristine firstboot qualification.
 6. `finalize --output DIR --evidence-dir ROOT` admits the same signed bytes
    through the consumer's `inspect` command and requires each platform's
    `qualification.json`: exact manifest/disk/host-Corral/producer hashes and run,
