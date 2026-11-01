@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "scope": "Human-style direct frame review is additive; raw machine manifests are preserved. Reviewed portal/lock frames do not establish all daily-driver or all-variant acceptance.",
+  "variants": {
+    "yellowfin": {
+      "image": "ghcr.io/tuna-os/yellowfin@sha256:64e7a29a9d832c0d021d3023ee825c07d37676d722dca59b31a2dfe492e5d0b0",
+      "receipt": "/tmp/tuna-variant-unlocked-20261031/yellowfin/manifest.json",
+      "reviewed": ["portal-screenshot-prompt.png", "portal-captured.png", "portal-screencast-prompt.png", "portal-screencast-frame.png", "08-lock.png"],
+      "observations": [
+        "Screenshot prompt visibly offers Deny and Allow over the unlocked Tuna overview.",
+        "Returned Screenshot is a varied 1280x800 Tuna overview showing the Yellowfin wallpaper; no lock curtain or black frame.",
+        "ScreenCast prompt visibly offers Share and selected Virtual-1.",
+        "Decoded ScreenCast frame shows the unlocked Tuna desktop/Yellowfin wallpaper without the consent dialog.",
+        "Explicit lock frame shows blurred wallpaper, time/date and Click or press a key curtain; no desktop content is visibly exposed beyond blur."
+      ],
+      "machine_result": "12 pass, 1 fail; lock failure is LockedHint=no. Actual lock-triggered stream withdrawal 0.19 seconds under unchanged 2-second bound.",
+      "qualification": "not-qualified; recorded lock-hint failure remains"
+    }
+  }
+}

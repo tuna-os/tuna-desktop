@@ -68,10 +68,19 @@ Existing admission branches were repaired rather than creating competing PRs:
 Both branches retain their manual workflow-path merge fence and promotion hold.
 Neither was merged or bypassed. Noble's missing target is tracked in
 [packages #834](https://github.com/tuna-os/tunaos-packages/issues/834).
-The current public [Noble-updates package search](https://packages.ubuntu.com/search?keywords=rustc-1.9&searchon=names&suite=noble-updates&section=all)
-returns `rustc-1.91` version `1.91.1+dfsg~24.04-0ubuntu0.24.04.3`;
-[the Noble rustc-1.92 search](https://packages.ubuntu.com/search?keywords=rustc-1.92&searchon=names&suite=noble&section=all)
-returns no results. These observations do not claim an exhaustive archive audit.
+The 2026-10-31 primary-archive audit covers all Noble pockets and compiler
+names, not merely the exact `rustc-1.92` name:
+[published rustc sources](https://api.launchpad.net/1.0/ubuntu/+archive/primary?ws.op=getPublishedSources&distro_series=https%3A%2F%2Fapi.launchpad.net%2F1.0%2Fubuntu%2Fnoble&source_name=rustc&exact_match=false&status=Published&ws.size=300)
+and [published Cargo sources](https://api.launchpad.net/1.0/ubuntu/+archive/primary?ws.op=getPublishedSources&distro_series=https%3A%2F%2Fapi.launchpad.net%2F1.0%2Fubuntu%2Fnoble&source_name=cargo&exact_match=false&status=Published&ws.size=300)
+still top out at native `1.91.1`; `rustc-web` and `cargo-web` are not Noble
+escape hatches. The selected locked [gtk4 0.11.5 metadata](https://crates.io/api/v1/crates/gtk4/0.11.5)
+independently requires Rust **at least 1.92**. This is a confirmed lower bound,
+not an assertion about the whole lockfile's exact maximum MSRV.
+**Gurnard remains a blocker for the full fourteen-variant goal**, not a waiver
+or qualified variant. An actual native Noble factory target, compatible
+compiler/Cargo/standard-library closure, package build/install and immutable
+image runtime receipts are still required. No compiler from another target,
+third-party binary injection or target substitution is permitted.
 
 ## Published immutable subjects
 
@@ -179,13 +188,24 @@ Neither `punjab` nor the independent soak VM was touched.
 | yellowfin old `355f66…` (beta1) | pass in both retained runs | availability only; expanded run Screenshot Response 2 and ScreenCast Start timeout because generic Enter did not activate the visible Allow/Share controls | `LockedHint=no` fails; refusal/unlock pass | fail |
 | yellowfin refreshed `64e7a29…` | trusted refresh run [41221855489](https://github.com/tuna-os/tunaOS/actions/runs/41221855489) succeeded; guest reports beta2-2.el10; retained core run 10 pass/3 fail | earlier capture failures were locked-session denials; later untouched-image unlocked Screenshot/ScreenCast deliver real frames, with lock withdrawal observed in 0.147 seconds | `LockedHint=no`; refusal/unlock/logout pass | not qualified; full corrected core matrix receipt and visual review remain separate |
 | marlin | existing exact beta2-2 journey passes these gates | not qualified by that daily-driver receipt | lock hint fails; refused password/unlock pass | fail, not a v1 pass |
-| albacore `b68a195…` | pass; actual beta1; subsequent retained core run 12 pass/1 fail | real Screenshot PNG and ScreenCast frame/caller isolation pass | `LockedHint=no`; withdrawal unproven because requester expired before host armed the unchanged 30-second handshake | not qualified; capture failures from the earlier Enter run are superseded, not product defects |
+| albacore `b68a195…` | historical receipts retain actual beta1/GDM/session results | historical capture observations retained, not current admission | lock failures remain recorded | **owner-deferred/unqualified**: omit only `albacore:tuna` from active qualification/publication until the externally owned [Mesa crash #3969](https://github.com/tuna-os/tunaOS/issues/3969) is repaired |
 | skipjack, wahoo, bonito, sailfin | expanded run: install/GDM/session pass | earlier receipts lack unlocked/timely-consent preconditions; not functional qualification | `LockedHint=no` | fail on retained receipts; corrected preconditions pending |
 | bonito-rawhide | builder Secret label exceeded Kubernetes' 63-byte limit before the VM existed | unproven | unproven | harness failure fixed by VM-name bound; rerun pending |
 | grouper | expanded run interrupted during build; orphan builder VM/Secret/PVC deleted, inventory empty | unproven | unproven | not qualified |
 | flounder, flounder-sid | publication resolved; not yet run | unproven | unproven | not qualified |
 | hummingbird, guppy | admission branches remain open; no admitted immutable-image runtime proof | unproven | unproven | not qualified; stale package-unavailable reasons rejected |
 | gurnard | no native Tuna target | unproven | unproven | source-backed unsupported prerequisite, not a runtime pass |
+
+**[Owner scope override](https://github.com/tuna-os/tuna-desktop/issues/577#issuecomment-6550264429):** Tuna on Albacore may be skipped temporarily while
+its Mesa/GDM crash is fixed elsewhere. This is an explicit deferred/unqualified
+row, not a pass or accepted fourteen-variant release. The current sequential run
+had already finished its Albacore attempt before that instruction arrived; its
+receipt stays unchanged, and no further Albacore attempt or publication is made.
+No other failed variant or gate is omitted by this decision.
+The [machine-readable owner deferral](variants/2026-10-31/owner-deferred.json)
+keeps `qualified:false` distinct from required qualified, required failed and
+required unmeasured cells. Noble's native-compiler prerequisite is separate and
+has no owner exception.
 
 The expanded-run receipts are not retroactively converted into failures of
 the published desktop. The visible GNOME dialogs prove the harness pressed
@@ -248,9 +268,9 @@ Exact admission/publication [gate snapshot](variants/2026-10-31/admission-gates.
   native `rpm-ostree` and `libcanberra` roots. Its first native build was cancelled
   by a later external commit, so no native closure result is claimed.
 
-Focused regressions pass: 9 matrix tests, 9 unlocked-consent/ordering tests, and
-8 rename-scanner tests, including the actual CLI historical-vs-living-doc check.
-They are not runtime qualification.
+Focused regressions pass: 9 matrix tests, 14 unlocked-consent/ordering tests,
+8 native coordinator tests and 8 rename-scanner tests (including the actual CLI
+historical-vs-living-doc check). They are not runtime qualification.
 
 ## Reusable actual-image path
 
@@ -261,6 +281,10 @@ through `tuna-corral-journey`; `--variant NAME` limits runtime work, never hides
 other inventory rows. The only node accepted by this lane is `karnataka`.
 Only newly owned `tuna-q-variant-*` VMs/disks are created/deleted. Existing
 `punjab` and the independent soak VM are never named.
+During the Albacore deferral, use explicit repeated `--variant` selections for
+the other ten published variants; registry discovery still retains all fourteen
+source rows. Do not start another unfiltered `--run` until the owner lifts that
+single-cell deferral.
 
 The default runtime scope is the required real-GDM/session/portal/
 lock/unlock/logout core, using the journey's explicit `--qualification-only`
@@ -309,9 +333,16 @@ GNOME Allow/Share control; Corral retains the console frame externally instead
 of using X11-only `scrot`. A grant test requires an unlocked session at request,
 consent and response; locked-session denial is a separate negative result, never
 a capture-product failure. Console frames still require visual review.
+The coordinator batches launch/readiness, then actual consent/unlocked/active/
+arm bookkeeping beside the unchanged native requester; serialized SSH file reads
+must not consume the native 60-second consent or 30-second active-grant budget.
+ScreenCast may activate only Share, never a stale Screenshot Allow dialog. Its
+real noVNC lock key follows the arm response immediately. The existing two-second
+withdrawal observer remains unchanged. Full bootc provision stdout/stderr and
+console-start stderr are retained so orchestration failures are diagnosable.
 
-New matrix runs freeze the host journey, consent helper and native requester/parser
-sources into the output's `harness/` directory before starting any VM, recording
+New matrix runs freeze the host journey, native coordinator, consent helper and
+native requester/parser sources into the output's `harness/` directory before starting any VM, recording
 their hashes. Subsequent worktree edits cannot mutate those long-running tests.
 Only test requester code is placed in the fixture user's runtime directory;
 the installed desktop/provider payload stays untouched.
