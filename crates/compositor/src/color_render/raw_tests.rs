@@ -3,7 +3,7 @@
 use super::tests::{draw_raw, headless_renderer, reference, SIDE};
 use super::*;
 use crate::color_state::{ColorState, Colorspace, Decode, Encode, Params, TransferFunction};
-use smithay::backend::renderer::ImportMem;
+use smithay::backend::renderer::{Bind, ExportMem, Frame, ImportMem, Offscreen, Renderer, Texture};
 
 fn assert_pixels(
     got: &[[u8; 4]],
@@ -21,6 +21,139 @@ fn assert_pixels(
             );
         }
     }
+}
+
+/// Diagnostic control: draw through Smithay's ordinary texture path unless a
+/// minimal auxiliary-sampler program is explicitly supplied. The framebuffer
+/// and readback are real GLES resources, not a CPU emulation of sampling.
+fn sample_control(
+    renderer: &mut GlesRenderer,
+    texture: &GlesTexture,
+    program: Option<&GlesTexProgram>,
+    uniforms: &[Uniform<'_>],
+    raw: Option<&RawPlanes>,
+) -> Vec<[u8; 4]> {
+    let size = (SIDE, SIDE).into();
+    let mut target: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, size).unwrap();
+    let mut bound = renderer.bind(&mut target).unwrap();
+    let out = Rectangle::<i32, Physical>::from_size((SIDE, SIDE).into());
+    {
+        let mut frame = renderer
+            .render(&mut bound, out.size, smithay::utils::Transform::Normal)
+            .unwrap();
+        frame.clear(Color32F::TRANSPARENT, &[out]).unwrap();
+        let source = texture.size();
+        let source = Rectangle::<f64, smithay::utils::Buffer>::from_size(
+            (f64::from(source.w), f64::from(source.h)).into(),
+        );
+        let draw = |frame: &mut GlesFrame<'_, '_>| {
+            frame.render_texture_from_to(
+                texture,
+                source,
+                out,
+                &[out],
+                &[],
+                smithay::utils::Transform::Normal,
+                1.0,
+                program,
+                uniforms,
+            )
+        };
+        if let Some(raw) = raw {
+            raw.with_bindings(&mut frame, draw).unwrap();
+        } else {
+            draw(&mut frame).unwrap();
+        }
+        frame.finish().unwrap().wait().unwrap();
+    }
+    let mapping = renderer
+        .copy_framebuffer(&bound, Rectangle::from_size(size), Fourcc::Abgr8888)
+        .unwrap();
+    renderer
+        .map_texture(&mapping)
+        .unwrap()
+        .as_chunks::<4>()
+        .0
+        .to_vec()
+}
+
+fn nv12_sampling_controls(renderer: &mut GlesRenderer, raw: &RawPlanes, input: [u8; 4]) {
+    let size = (SIDE, SIDE).into();
+    let rgba = [37, 89, 163, 255];
+    let memory = rgba.repeat((SIDE * SIDE) as usize);
+    let texture = renderer
+        .import_memory(&memory, Fourcc::Abgr8888, size, false)
+        .unwrap();
+    eprintln!("YUV-QUAL control=import-memory-default begin");
+    let got = sample_control(renderer, &texture, None, &[], None);
+    assert_pixels(&got, rgba, None, false, false);
+    eprintln!("YUV-QUAL control=import-memory-default end");
+    for (index, expected) in [
+        (0, [input[0], 0, 0, 255]),
+        (1, [input[1], input[2], 0, 255]),
+    ] {
+        eprintln!("YUV-QUAL control=real-plane-default begin plane={index}");
+        let got = sample_control(renderer, &raw.textures[index], None, &[], None);
+        assert_pixels(&got, expected, None, false, false);
+        eprintln!("YUV-QUAL control=real-plane-default end plane={index}");
+    }
+    // No ICC/LUT, coefficient branches or colour transforms: this isolates
+    // the auxiliary binding API from the full production colour program.
+    let minimal = r#"#version 100
+//_DEFINES_
+precision mediump float;
+varying vec2 v_coords;
+uniform sampler2D component0;
+uniform sampler2D component1;
+uniform float alpha;
+void main() {
+    gl_FragColor = vec4(texture2D(component0, v_coords).r,
+                        texture2D(component1, v_coords).rg, 1.0) * alpha;
+}
+"#;
+    let program = renderer
+        .compile_custom_texture_shader(
+            minimal,
+            &[
+                UniformName::new("component0", UniformType::_1i),
+                UniformName::new("component1", UniformType::_1i),
+            ],
+        )
+        .unwrap();
+    eprintln!("YUV-QUAL control=real-nv12-minimal-auxiliary begin");
+    let got = sample_control(
+        renderer,
+        &texture,
+        Some(&program),
+        &[
+            Uniform::new("component0", 2i32),
+            Uniform::new("component1", 3i32),
+        ],
+        Some(raw),
+    );
+    assert_pixels(&got, input, None, false, false);
+    eprintln!("YUV-QUAL control=real-nv12-minimal-auxiliary end");
+
+    let textures = [[input[0], 0, 0, 255], [input[1], input[2], 0, 255]].map(|pixel| {
+        renderer
+            .import_memory(
+                &pixel.repeat((SIDE * SIDE) as usize),
+                Fourcc::Abgr8888,
+                size,
+                false,
+            )
+            .unwrap()
+    });
+    let memory_raw = RawPlanes {
+        _views: Vec::new(),
+        textures: Vec::from(textures),
+        layout: raw.layout,
+    };
+    let dummy = vec![rgba; (SIDE * SIDE) as usize];
+    eprintln!("YUV-QUAL control=import-memory-full-colour-program begin");
+    let got = draw_raw(renderer, &dummy, None, true, false, Some(&memory_raw));
+    assert_pixels(&got, input, None, true, false);
+    eprintln!("YUV-QUAL control=import-memory-full-colour-program end");
 }
 
 #[test]
@@ -337,6 +470,9 @@ fn real_dmabuf_identity_component_import_qualification() {
                 panic!("{format:?}: raw component import unavailable: {error}")
             });
             eprintln!("YUV-QUAL stage=raw-import end format={format:?}");
+            if format == Fourcc::Nv12 {
+                nv12_sampling_controls(&mut renderer, &raw, input);
+            }
             let expected = [
                 input[0],
                 input[1],
