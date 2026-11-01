@@ -125,6 +125,14 @@ pub struct Notification {
     pub expanded: bool,
     /// Action keys already invoked (replay guard).
     consumed: HashSet<String>,
+    /// The sound its banner plays (`sound-name`, `sound-file`). Not
+    /// kept across restarts: GNOME's notifications do not outlive the
+    /// shell, so a restored banner comes back silent.
+    sound: Sound,
+    /// Sent with `x-gnome-privacy-scope` `system` (GNOME's
+    /// `PrivacyScope.SYSTEM`): a source of only these shows its details
+    /// on the lock screen.
+    system_scope: bool,
 }
 
 impl Notification {
@@ -191,6 +199,16 @@ impl Notification {
             .filter(|id| !self.consumed.contains(*id))
             .collect()
     }
+
+    /// The sound its banner plays (empty for none).
+    pub fn sound(&self) -> &Sound {
+        &self.sound
+    }
+
+    /// Whether it is system-scoped (`x-gnome-privacy-scope` `system`).
+    pub fn system_scope(&self) -> bool {
+        self.system_scope
+    }
 }
 
 impl std::fmt::Debug for Notification {
@@ -232,6 +250,13 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default()
+}
+
+/// Put `entry` among `store`'s in id order, which is arrival order (an
+/// update keeps its id and its place).
+fn insert_by_id(store: &mut VecDeque<Notification>, entry: Notification) {
+    let at = store.partition_point(|n| n.id < entry.id);
+    store.insert(at, entry);
 }
 
 /// Decode one queue-file notification; `None` skips a malformed
@@ -302,6 +327,11 @@ fn decode_notification(item: &serde_json::Value) -> Option<Notification> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
         consumed,
+        sound: Sound::default(),
+        system_scope: item
+            .get("privacy_scope")
+            .and_then(serde_json::Value::as_str)
+            == Some("system"),
     })
 }
 
@@ -341,6 +371,8 @@ pub struct Incoming {
     /// The `desktop-entry` hint.
     pub desktop_entry: String,
     pub sound: Sound,
+    /// `x-gnome-privacy-scope` is `system`.
+    pub system_scope: bool,
 }
 
 /// The policy store behind a center (none: everything generic with the
@@ -366,6 +398,11 @@ pub struct NotificationCenter {
     banners: VecDeque<u64>,
     /// Full history, oldest first (bounded).
     history: VecDeque<Notification>,
+    /// Disabled apps' notifications, oldest first (bounded like
+    /// history): kept out of every view, and back in history when the
+    /// app is enabled again. GNOME's tray drops a disabled source but
+    /// the source keeps its notifications (`_onSourceEnableChanged`).
+    hidden: VecDeque<Notification>,
     /// Do Not Disturb: normal/low notifications skip the banners.
     dnd: bool,
     /// Queue file behind this center; `None` keeps it memory-only.
@@ -374,8 +411,6 @@ pub struct NotificationCenter {
     queue_path: Option<PathBuf>,
     /// GNOME Settings' notification policy.
     policy: PolicySlot,
-    /// Sounds due to play, oldest first (the shell drains them).
-    sounds: Vec<Sound>,
     /// In-place replacements so far: a view that keys its drawn list on
     /// ids redraws when this moves.
     replacements: u64,
@@ -431,23 +466,35 @@ impl NotificationCenter {
             .get("next_id")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        let mut history = VecDeque::new();
+        let (mut history, mut hidden) = (VecDeque::new(), VecDeque::new());
         if let Some(items) = doc.get("notifications").and_then(|v| v.as_array()) {
             for item in items {
                 let Some(entry) = decode_notification(item) else {
                     continue;
                 };
-                history.push_back(entry);
+                if item.get("hidden").and_then(serde_json::Value::as_bool) == Some(true) {
+                    hidden.push_back(entry);
+                } else {
+                    history.push_back(entry);
+                }
             }
         }
-        while history.len() > MAX_HISTORY {
-            history.pop_front();
+        for store in [&mut history, &mut hidden] {
+            while store.len() > MAX_HISTORY {
+                store.pop_front();
+            }
         }
         // Ids must keep moving forward even when the file was edited
         // by hand: never reuse an id a live entry still carries.
-        let high = history.iter().map(|n| n.id).max().unwrap_or(0);
+        let high = history
+            .iter()
+            .chain(&hidden)
+            .map(|n| n.id)
+            .max()
+            .unwrap_or(0);
         center.next_id = center.next_id.max(high);
         center.history = history;
+        center.hidden = hidden;
         let live: HashSet<u64> = center.history.iter().map(|n| n.id).collect();
         let mut banners = VecDeque::new();
         if let Some(ids) = doc.get("banners").and_then(|v| v.as_array()) {
@@ -472,29 +519,33 @@ impl NotificationCenter {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let item = |n: &Notification, hidden: bool| {
+            serde_json::json!({
+                "id": n.id,
+                "app": n.app,
+                "icon": n.icon,
+                "desktop_entry": n.desktop_entry,
+                "app_id": n.app_id,
+                "acknowledged": n.acknowledged,
+                "received": n.received,
+                "title": n.title,
+                "body": n.body,
+                "actions": n.actions.iter().map(|a| serde_json::json!({
+                    "id": a.id,
+                    "label": a.label,
+                })).collect::<Vec<_>>(),
+                "urgency": n.urgency.as_str(),
+                "expanded": n.expanded,
+                "consumed": n.consumed.iter().collect::<Vec<_>>(),
+                "privacy_scope": if n.system_scope { "system" } else { "user" },
+                "hidden": hidden,
+            })
+        };
         let items: Vec<serde_json::Value> = self
             .history
             .iter()
-            .map(|n| {
-                serde_json::json!({
-                    "id": n.id,
-                    "app": n.app,
-                    "icon": n.icon,
-                    "desktop_entry": n.desktop_entry,
-                    "app_id": n.app_id,
-                    "acknowledged": n.acknowledged,
-                    "received": n.received,
-                    "title": n.title,
-                    "body": n.body,
-                    "actions": n.actions.iter().map(|a| serde_json::json!({
-                        "id": a.id,
-                        "label": a.label,
-                    })).collect::<Vec<_>>(),
-                    "urgency": n.urgency.as_str(),
-                    "expanded": n.expanded,
-                    "consumed": n.consumed.iter().collect::<Vec<_>>(),
-                })
-            })
+            .map(|n| item(n, false))
+            .chain(self.hidden.iter().map(|n| item(n, true)))
             .collect();
         let doc = serde_json::json!({
             "version": QUEUE_VERSION,
@@ -596,16 +647,19 @@ impl NotificationCenter {
         urgency: Urgency,
         replaces_id: Option<u64>,
     ) -> u64 {
-        let id = self.file(app, title, body, actions, urgency, replaces_id);
+        let id = self.file(false, app, title, body, actions, urgency, replaces_id);
         self.queue_banner(id, urgency);
         self.persist();
         id
     }
 
-    /// Store a notification, replacing `replaces_id` in place when it
-    /// names a live entry; banners are left to the caller.
+    /// Store a notification in history, or with `hidden` among the
+    /// disabled apps' ones, replacing `replaces_id` in place when it names
+    /// an entry there; banners are left to the caller.
+    #[allow(clippy::too_many_arguments)]
     fn file(
         &mut self,
+        hidden: bool,
         app: &str,
         title: &str,
         body: &str,
@@ -613,8 +667,13 @@ impl NotificationCenter {
         urgency: Urgency,
         replaces_id: Option<u64>,
     ) -> u64 {
+        let store = if hidden {
+            &mut self.hidden
+        } else {
+            &mut self.history
+        };
         if let Some(replaces) = replaces_id {
-            if let Some(entry) = self.history.iter_mut().find(|n| n.id == replaces) {
+            if let Some(entry) = store.iter_mut().find(|n| n.id == replaces) {
                 entry.app = app.to_owned();
                 entry.title = title.to_owned();
                 entry.body = body.to_owned();
@@ -624,16 +683,20 @@ impl NotificationCenter {
                 entry.expanded = false;
                 entry.acknowledged = false;
                 entry.consumed.clear();
+                entry.sound = Sound::default();
+                entry.system_scope = false;
                 self.replacements += 1;
                 return replaces;
             }
         }
-        self.alloc_fresh(app, title, body, actions, urgency)
+        self.alloc_fresh(hidden, app, title, body, actions, urgency)
     }
 
-    /// Append a fresh entry, pruning history.
+    /// Append a fresh entry to history (or, with `hidden`, to the
+    /// disabled apps' store), pruning it.
     fn alloc_fresh(
         &mut self,
+        hidden: bool,
         app: &str,
         title: &str,
         body: &str,
@@ -642,7 +705,7 @@ impl NotificationCenter {
     ) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
-        self.history.push_back(Notification {
+        let entry = Notification {
             id,
             icon: String::new(),
             desktop_entry: String::new(),
@@ -656,14 +719,30 @@ impl NotificationCenter {
             urgency,
             expanded: false,
             consumed: HashSet::new(),
-        });
+            sound: Sound::default(),
+            system_scope: false,
+        };
+        if hidden {
+            self.hidden.push_back(entry);
+        } else {
+            self.history.push_back(entry);
+        }
+        self.prune();
+        id
+    }
+
+    /// Hold history and the hidden store to [`MAX_HISTORY`] each, oldest
+    /// dropping first, with no banner left for a dropped one.
+    fn prune(&mut self) {
         while self.history.len() > MAX_HISTORY {
             let dropped = self.history.pop_front().map(|n| n.id);
             if let Some(dropped) = dropped {
                 self.banners.retain(|b| *b != dropped);
             }
         }
-        id
+        while self.hidden.len() > MAX_HISTORY {
+            self.hidden.pop_front();
+        }
     }
 
     /// Queue a banner unless the DND gate holds (critical always
@@ -703,39 +782,44 @@ impl NotificationCenter {
         }
     }
 
-    /// File a `Notify` call under its source's policy. A disabled app's
-    /// notification is dropped (never stored, critical or not), but the
-    /// sender still gets a fresh id, as from GNOME. Otherwise the app is
-    /// registered with GNOME Settings, and the policy decides the
-    /// banner, its sound and whether it opens expanded.
+    /// File a `Notify` call under its source's policy. The app is
+    /// registered with GNOME Settings (messageTray.js `add` stores every
+    /// source's policy). A disabled app's notification, critical or not,
+    /// is kept hidden: in no view, with no banner, until the app is
+    /// enabled again (see [`apply_policy`](Self::apply_policy)). Otherwise
+    /// the policy decides the banner, its sound and whether it opens
+    /// expanded.
     pub fn deliver(&mut self, n: Incoming) -> u64 {
         let app_id = self
             .policy
             .0
             .as_ref()
             .and_then(|store| store.app_for(&n.desktop_entry, &n.app));
-        let policy = self.policy_for(app_id.as_deref());
-        let Some(delivery) = notification_policy::deliver(&policy, n.urgency, self.dnd) else {
-            return match n
-                .replaces_id
-                .filter(|id| self.history.iter().any(|e| e.id == *id))
-            {
-                // Replacing a filed one from a since-disabled app: it goes.
-                Some(id) => {
-                    self.remove(id);
-                    id
-                }
-                None => {
-                    self.next_id += 1;
-                    self.persist();
-                    self.next_id
-                }
-            };
-        };
         if let (Some(store), Some(app)) = (self.policy.0.as_ref(), app_id.as_deref()) {
             store.register(app);
         }
+        let policy = self.policy_for(app_id.as_deref());
+        let delivery = notification_policy::deliver(&policy, n.urgency, self.dnd);
+        let hidden = delivery.is_none();
+        // The entry an update replaces goes where the update is filed:
+        // hidden for a disabled app, back in history for an enabled one.
+        if let Some(replaces) = n.replaces_id {
+            let (from, to) = if hidden {
+                (&mut self.history, &mut self.hidden)
+            } else {
+                (&mut self.hidden, &mut self.history)
+            };
+            if let Some(entry) = from
+                .iter()
+                .position(|e| e.id == replaces)
+                .and_then(|at| from.remove(at))
+            {
+                insert_by_id(to, entry);
+                self.banners.retain(|b| *b != replaces);
+            }
+        }
         let id = self.file(
+            hidden,
             &n.app,
             &n.title,
             &n.body,
@@ -743,46 +827,87 @@ impl NotificationCenter {
             n.urgency,
             n.replaces_id,
         );
-        if let Some(entry) = self.history.iter_mut().find(|e| e.id == id) {
+        let store = if hidden {
+            &mut self.hidden
+        } else {
+            &mut self.history
+        };
+        if let Some(entry) = store.iter_mut().find(|e| e.id == id) {
             entry.icon = n.icon;
             entry.desktop_entry = n.desktop_entry.trim_end_matches(".desktop").to_owned();
             entry.app_id = app_id.unwrap_or_default();
-            entry.expanded = delivery.expanded;
+            entry.expanded = delivery.is_some_and(|d| d.expanded);
+            entry.sound = n.sound;
+            entry.system_scope = n.system_scope;
         }
-        if delivery.banner {
+        if delivery.is_some_and(|d| d.banner) {
             self.push_banner(id, n.urgency);
         } else {
             self.banners.retain(|b| *b != id);
-        }
-        if delivery.sound && !n.sound.is_empty() {
-            self.sounds.push(n.sound);
         }
         self.persist();
         id
     }
 
-    /// Re-apply the policy to what is already filed: an app disabled
-    /// since its notifications arrived loses them. Returns the dropped
-    /// ids.
-    pub fn enforce_policy(&mut self) -> Vec<u64> {
-        let disabled: Vec<u64> = self
-            .history
-            .iter()
-            .filter(|n| !n.app_id.is_empty())
-            .filter(|n| !self.policy_for(Some(&n.app_id)).enable)
-            .map(|n| n.id)
-            .collect();
-        if !disabled.is_empty() {
-            self.history.retain(|n| !disabled.contains(&n.id));
-            self.banners.retain(|b| !disabled.contains(b));
-            self.persist();
+    /// Re-apply the policy to what is filed, as messageTray.js
+    /// `_onSourceEnableChanged` takes a source out of the tray and puts
+    /// it back: an app disabled since its notifications arrived loses
+    /// them from every view, and an app enabled again gets them all back
+    /// in history, seen or unseen as they were, with no banner. Nothing
+    /// is closed either way.
+    pub fn apply_policy(&mut self) {
+        let mut enabled: std::collections::HashMap<&str, bool> = Default::default();
+        for n in self.history.iter().chain(&self.hidden) {
+            if !n.app_id.is_empty() && !enabled.contains_key(n.app_id.as_str()) {
+                enabled.insert(&n.app_id, self.policy_for(Some(&n.app_id)).enable);
+            }
         }
-        disabled
+        let on = |n: &Notification| enabled.get(n.app_id.as_str()).copied().unwrap_or(true);
+        let (hide, restore): (Vec<u64>, Vec<u64>) = (
+            self.history
+                .iter()
+                .filter(|n| !on(n))
+                .map(|n| n.id)
+                .collect(),
+            self.hidden.iter().filter(|n| on(n)).map(|n| n.id).collect(),
+        );
+        if hide.is_empty() && restore.is_empty() {
+            return;
+        }
+        for (ids, from_history) in [(hide, true), (restore, false)] {
+            for id in ids {
+                let (from, to) = if from_history {
+                    (&mut self.history, &mut self.hidden)
+                } else {
+                    (&mut self.hidden, &mut self.history)
+                };
+                if let Some(entry) = from
+                    .iter()
+                    .position(|n| n.id == id)
+                    .and_then(|at| from.remove(at))
+                {
+                    insert_by_id(to, entry);
+                }
+                self.banners.retain(|b| *b != id);
+            }
+        }
+        self.prune();
+        self.persist();
     }
 
-    /// Sounds due to play since the last call.
-    pub fn take_sounds(&mut self) -> Vec<Sound> {
-        std::mem::take(&mut self.sounds)
+    /// The disabled apps' notifications, oldest first: in no view until
+    /// [`apply_policy`](Self::apply_policy) finds their app enabled.
+    pub fn hidden(&self) -> &VecDeque<Notification> {
+        &self.hidden
+    }
+
+    /// The sound to play as `id`'s banner comes on screen, by the
+    /// source's policy at that moment (see
+    /// [`notification_policy::plays_sound`]); `None` for silence.
+    pub fn banner_sound(&self, id: u64) -> Option<Sound> {
+        let n = self.history.iter().find(|n| n.id == id)?;
+        let policy = self.policy_for((!n.app_id.is_empty()).then_some(n.app_id.as_str()));
+        notification_policy::plays_sound(&policy, &n.sound).then(|| n.sound.clone())
     }
 
     /// Mark notifications seen (a banner shown, the list opened).
@@ -800,7 +925,7 @@ impl NotificationCenter {
     /// source with unseen notifications that may show while locked
     /// (see [`notification_policy::lock_screen`]).
     pub fn lock_screen(&self) -> Vec<LockSource> {
-        notification_policy::lock_screen(self.history.iter().rev(), |n| {
+        notification_policy::lock_screen(self.history.iter(), |n| {
             self.policy_for((!n.app_id.is_empty()).then_some(n.app_id.as_str()))
         })
     }
@@ -939,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_apps_are_dropped_and_others_register() {
+    fn disabled_apps_are_hidden_and_every_app_registers() {
         let (mut c, store) = policed();
         store.set("org.example.Chat", |a| a.enable = false);
         let mail = c.deliver(incoming(
@@ -948,18 +1073,26 @@ mod tests {
             Urgency::Normal,
         ));
         let chat = c.deliver(incoming("org.example.Chat", "Chat", Urgency::Critical));
-        // The sender still gets an id, but nothing is filed or shown.
+        // The sender gets an id; the notification is kept, but nothing
+        // shows it: no history, no banner, no lock screen.
         assert_ne!(chat, 0);
         assert_ne!(chat, mail);
         assert_eq!(c.history().iter().map(|n| n.id).collect::<Vec<_>>(), [mail]);
         assert_eq!(c.banners().iter().map(|n| n.id).collect::<Vec<_>>(), [mail]);
         assert_eq!(c.history()[0].app_id(), "org.example.Mail");
-        // Only the app that notified registers with GNOME Settings.
-        assert_eq!(*store.registered.lock().unwrap(), ["org.example.Mail"]);
+        assert_eq!(c.hidden().iter().map(|n| n.id).collect::<Vec<_>>(), [chat]);
+        assert_eq!(c.hidden()[0].app_id(), "org.example.Chat");
+        assert!(c.lock_screen().iter().all(|s| s.key != "org.example.Chat"));
+        // Every app that notified registers with GNOME Settings, as
+        // messageTray.js stores each source's policy.
+        assert_eq!(
+            *store.registered.lock().unwrap(),
+            ["org.example.Mail", "org.example.Chat"]
+        );
         // A generic sender registers nothing and follows the defaults.
         c.deliver(incoming("", "Generic", Urgency::Normal));
         assert_eq!(c.history().len(), 2);
-        assert_eq!(store.registered.lock().unwrap().len(), 1);
+        assert_eq!(store.registered.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -976,23 +1109,38 @@ mod tests {
             c.banners().iter().map(|n| n.id).collect::<Vec<_>>(),
             [mail, generic]
         );
-        // Mail is muted, chat had no banner: only the generic one sounds.
-        assert_eq!(c.take_sounds().len(), 1);
-        assert!(c.take_sounds().is_empty());
+        // Sounds play as banners show: chat has none to show, mail is
+        // muted, the generic one sounds.
+        let named = Some(Sound {
+            name: "message-new-instant".to_owned(),
+            file: String::new(),
+        });
+        assert_eq!(c.banner_sound(mail), None);
+        assert_eq!(c.banner_sound(generic), named);
         let _ = chat;
-        // Do Not Disturb holds every banner and sound but critical ones,
-        // which also break through the per-app banner switch.
+        // enable-sound-alerts is read when the banner shows, so turning
+        // it back on reaches a banner still waiting in the queue.
+        store.set("org.example.Mail", |a| a.enable_sound = true);
+        assert_eq!(c.banner_sound(mail), named);
+        // Do Not Disturb holds every banner but critical ones, which
+        // also break through the per-app banner switch, and sound.
         c.set_dnd(true);
         c.deliver(incoming("org.example.Mail", "Quiet", Urgency::Normal));
         let crit = c.deliver(incoming("org.example.Chat", "Alarm", Urgency::Critical));
         assert_eq!(c.banners().last().map(|n| n.id), Some(crit));
         assert!(c.banners().last().unwrap().expanded);
-        assert_eq!(c.take_sounds().len(), 1);
-        // suppress-sound (an empty Sound) plays nothing.
+        assert_eq!(c.banner_sound(crit), named);
+        // No sound hint: nothing to play.
         let mut quiet = incoming("org.example.Chat", "Alarm 2", Urgency::Critical);
         quiet.sound = Sound::default();
-        c.deliver(quiet);
-        assert!(c.take_sounds().is_empty());
+        let quiet = c.deliver(quiet);
+        assert_eq!(c.banner_sound(quiet), None);
+        // A replacement carries its own sound (notification.set()).
+        let mut update = incoming("org.example.Chat", "Alarm 3", Urgency::Critical);
+        update.replaces_id = Some(quiet);
+        assert_eq!(c.deliver(update), quiet);
+        assert_eq!(c.banner_sound(quiet), named);
+        assert_eq!(c.banner_sound(9999), None);
     }
 
     #[test]
@@ -1007,21 +1155,88 @@ mod tests {
     }
 
     #[test]
-    fn disabling_an_app_later_drops_what_it_filed() {
+    fn disabling_an_app_hides_what_it_filed_and_enabling_restores_it() {
         let (mut c, store) = policed();
         let mail = c.deliver(incoming("org.example.Mail", "Mail", Urgency::Normal));
         let chat = c.deliver(incoming("org.example.Chat", "Chat", Urgency::Normal));
-        assert!(c.enforce_policy().is_empty());
+        let late = c.deliver(incoming("org.example.Mail", "Late", Urgency::Normal));
+        c.acknowledge(&[chat]);
+        c.apply_policy();
+        assert!(c.hidden().is_empty());
+        let ids = |q: &VecDeque<Notification>| q.iter().map(|n| n.id).collect::<Vec<_>>();
         store.set("org.example.Chat", |a| a.enable = false);
-        assert_eq!(c.enforce_policy(), [chat]);
-        assert_eq!(c.history().iter().map(|n| n.id).collect::<Vec<_>>(), [mail]);
-        assert!(c.banners().iter().all(|n| n.id == mail));
-        // An update sent by a disabled app takes the notification it
-        // replaces away and files nothing.
-        let mut again = incoming("org.example.Chat", "Chat 2", Urgency::Normal);
-        again.replaces_id = Some(mail);
-        c.deliver(again);
-        assert!(c.history().is_empty());
+        c.apply_policy();
+        assert_eq!(ids(c.history()), [mail, late]);
+        assert_eq!(ids(c.hidden()), [chat]);
+        assert!(c.banners().iter().all(|n| n.id != chat));
+        // While disabled, what it sends is kept hidden too, and an update
+        // to a shown notification takes that one into hiding.
+        let quiet = c.deliver(incoming("org.example.Chat", "Quiet", Urgency::Critical));
+        let mut update = incoming("org.example.Chat", "Chat 2", Urgency::Normal);
+        update.replaces_id = Some(mail);
+        assert_eq!(c.deliver(update), mail);
+        assert_eq!(ids(c.history()), [late]);
+        assert_eq!(ids(c.hidden()), [mail, chat, quiet]);
+        assert!(c.banners().iter().all(|n| n.id == late));
+        // Enabled again: everything comes back in arrival order, seen
+        // as it was, and no banner goes up for any of it.
+        store.set("org.example.Chat", |a| a.enable = true);
+        let banner_ids =
+            |c: &NotificationCenter| c.banners().iter().map(|n| n.id).collect::<Vec<_>>();
+        let banners = banner_ids(&c);
+        c.apply_policy();
+        assert!(c.hidden().is_empty());
+        assert_eq!(ids(c.history()), [mail, chat, late, quiet]);
+        let by = |id| c.history().iter().find(|n| n.id == id).unwrap();
+        assert!(by(chat).acknowledged() && !by(quiet).acknowledged());
+        assert_eq!(by(mail).summary(), "Chat 2");
+        assert_eq!(banner_ids(&c), banners);
+        // Unseen and allowed there, they are back on the lock screen.
+        let view = c.lock_screen();
+        let chat_source = view.iter().find(|s| s.key == "org.example.Chat").unwrap();
+        assert_eq!(chat_source.count, 2);
+    }
+
+    #[test]
+    fn an_update_from_an_enabled_app_brings_its_hidden_notification_back() {
+        let (mut c, store) = policed();
+        store.set("org.example.Chat", |a| a.enable = false);
+        let chat = c.deliver(incoming("org.example.Chat", "Chat", Urgency::Normal));
+        // Enabled, and the update lands before the policy is re-applied.
+        store.set("org.example.Chat", |a| a.enable = true);
+        let mut update = incoming("org.example.Chat", "Chat 2", Urgency::Normal);
+        update.replaces_id = Some(chat);
+        assert_eq!(c.deliver(update), chat);
+        assert!(c.hidden().is_empty());
+        assert_eq!(c.banners().iter().map(|n| n.id).collect::<Vec<_>>(), [chat]);
+        assert_eq!(c.history()[0].summary(), "Chat 2");
+    }
+
+    #[test]
+    fn hidden_notifications_survive_a_restart_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(QUEUE_FILE);
+        let (mut c, store) = policed();
+        c.set_queue_path(path.clone());
+        let mail = c.deliver(incoming("org.example.Mail", "Mail", Urgency::Normal));
+        store.set("org.example.Chat", |a| a.enable = false);
+        let chat = c.deliver(incoming("org.example.Chat", "Chat", Urgency::Normal));
+        let mut back = NotificationCenter::load(&path);
+        assert_eq!(
+            back.history().iter().map(|n| n.id).collect::<Vec<_>>(),
+            [mail]
+        );
+        assert_eq!(
+            back.hidden().iter().map(|n| n.id).collect::<Vec<_>>(),
+            [chat]
+        );
+        // Ids keep moving past the hidden one.
+        assert!(back.notify("x", "t", "b", vec![], Urgency::Normal, None) > chat);
+        // Enabled while the shell was down: the next policy pass restores.
+        store.set("org.example.Chat", |a| a.enable = true);
+        back.set_policy(store);
+        back.apply_policy();
+        assert!(back.history().iter().any(|n| n.id == chat));
     }
 
     #[test]
@@ -1051,12 +1266,18 @@ mod tests {
         let (mut c, _store) = policed();
         c.set_queue_path(path.clone());
         let a = c.deliver(incoming("org.example.Mail", "A", Urgency::Normal));
-        let b = c.deliver(incoming("org.example.Mail", "B", Urgency::Normal));
+        let mut system = incoming("org.example.Mail", "B", Urgency::Normal);
+        system.system_scope = true;
+        let b = c.deliver(system);
         c.acknowledge(&[a]);
         let back = NotificationCenter::load(&path);
         let by = |id| back.history().iter().find(|n| n.id == id).unwrap();
         assert_eq!(by(b).app_id(), "org.example.Mail");
         assert!(by(a).acknowledged() && !by(b).acknowledged());
+        // The privacy scope survives; the sound does not (a restored
+        // banner comes back silent).
+        assert!(by(b).system_scope() && !by(a).system_scope());
+        assert!(by(b).sound().is_empty());
     }
 
     #[test]

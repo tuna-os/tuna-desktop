@@ -27,10 +27,15 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tuna_shell_host::intake::NotificationBus;
-use tuna_shell_host::notification_policy::GioPolicyStore;
+use tuna_shell_host::notification_policy::{GioPolicyStore, LockSource};
 use tuna_shell_host::notifications::{
     Notification, NotificationAction, NotificationCenter, Urgency,
 };
+
+use crate::lock_notifications::LockEntry;
+
+/// Told when what the lock screen shows may have changed.
+type LockListener = Box<dyn Fn()>;
 
 /// How long a normal or low banner stays up (GNOME: about 4 s).
 pub const BANNER_TIMEOUT: Duration = Duration::from_secs(4);
@@ -336,9 +341,15 @@ impl ActionDispatch {
     }
 
     /// Release callbacks whose center entries were removed or history-pruned.
-    /// Banner absence is not removal: dismissed history still belongs to the center.
+    /// Banner absence is not removal: dismissed history still belongs to the
+    /// center, and so does a disabled app's hidden notification.
     fn retain_history(&mut self, center: &NotificationCenter) {
-        let present: HashSet<u64> = center.history().iter().map(|n| n.id).collect();
+        let present: HashSet<u64> = center
+            .history()
+            .iter()
+            .chain(center.hidden())
+            .map(|n| n.id)
+            .collect();
         self.handlers.retain(|(id, _), _| present.contains(id));
         self.live.retain(|id| present.contains(id));
     }
@@ -411,6 +422,20 @@ pub struct NotifyUi {
     dnd_changed: RefCell<Vec<DndListener>>,
     /// The date menu is open: banners hide (`MessageTray.bannerBlocked`).
     banner_blocked: Cell<bool>,
+    /// The session is locked: GNOME's lock screen session mode has no
+    /// notifications (`sessionMode.hasNotifications`), so no banner
+    /// shows and arrivals wait unseen for the lock screen's list.
+    locked: Cell<bool>,
+    /// Told when what the lock screen shows may have changed.
+    lock_changed: RefCell<Option<LockListener>>,
+    /// The lock screen's sources at the last look, and their entries.
+    lock_cache: RefCell<(Vec<LockSource>, Vec<LockEntry>)>,
+    /// GNOME Settings' notification keys, global (under "") and per app,
+    /// watched so a change applies at once, as messageTray.js's policies
+    /// re-read their keys on `changed`. `None` (tests) watches nothing.
+    policy_watch: RefCell<Option<HashMap<String, gio::Settings>>>,
+    /// A policy change is waiting for its idle.
+    policy_idle: Cell<bool>,
 }
 
 /// Told when Do Not Disturb turns on or off.
@@ -464,12 +489,15 @@ fn card(n: &Notification) -> (gtk::Box, gtk::Button) {
     summary.add_css_class("message-title");
     summary.set_xalign(0.0);
     summary.set_wrap(true);
+    summary.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    summary.set_max_width_chars(48);
     content.append(&summary);
     if !n.body().is_empty() {
         let body = gtk::Label::new(Some(n.body()));
         body.add_css_class("message-body");
         body.set_xalign(0.0);
         body.set_wrap(true);
+        body.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         body.set_max_width_chars(48);
         content.append(&body);
     }
@@ -536,13 +564,16 @@ impl NotifyUi {
     pub fn new(app: &gtk::Application) -> Rc<Self> {
         let center = Arc::new(Mutex::new(NotificationCenter::load_system()));
         // GNOME Settings' notification policy, read live on every
-        // arrival (#348); a restart drops whatever an app disabled
-        // since it was filed.
+        // arrival and banner (#348); a restart hides whatever an app
+        // disabled since it was filed, and restores what it enabled.
         if let Ok(mut filed) = center.lock() {
             filed.set_policy(Arc::new(GioPolicyStore::new()));
-            filed.enforce_policy();
+            filed.apply_policy();
         }
-        Self::build(app, center, true)
+        let ui = Self::build(app, center, true);
+        *ui.policy_watch.borrow_mut() = Some(HashMap::new());
+        ui.watch_policy();
+        ui
     }
 
     // Tests use an in-memory center and ordinary GTK window. Production
@@ -661,6 +692,11 @@ impl NotifyUi {
             user_watch_signal: RefCell::new(None),
             dnd_changed: RefCell::new(Vec::new()),
             banner_blocked: Cell::new(false),
+            locked: Cell::new(false),
+            lock_changed: RefCell::new(None),
+            lock_cache: RefCell::default(),
+            policy_watch: RefCell::new(None),
+            policy_idle: Cell::new(false),
         });
         {
             let weak = Rc::downgrade(&ui);
@@ -854,6 +890,129 @@ impl NotifyUi {
         self.banner_window.set_focus_visible(false);
     }
 
+    /// Follow the session lock: while locked no banner shows (GNOME's
+    /// lock screen session mode), and on unlock the queue resumes.
+    pub fn set_locked(self: &Rc<Self>, locked: bool) {
+        if self.locked.replace(locked) != locked {
+            self.update();
+        }
+    }
+
+    /// Call `f` whenever what the lock screen shows may have changed: an
+    /// arrival, a removal, a banner seen, or a policy key.
+    pub fn connect_lock_changed(&self, f: impl Fn() + 'static) {
+        *self.lock_changed.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// What the lock screen shows now (unlockDialog.js
+    /// `NotificationsBox`), by the live policy: per source its name,
+    /// icon, unseen count and, only where details are allowed, titles
+    /// and bodies.
+    pub fn lock_entries(&self) -> Vec<LockEntry> {
+        let Ok(center) = self.center.lock() else {
+            return Vec::new();
+        };
+        let sources = center.lock_screen();
+        let mut cache = self.lock_cache.borrow_mut();
+        if cache.0 != sources {
+            let entries = sources
+                .iter()
+                .filter_map(|s| {
+                    let newest = center.history().iter().find(|n| n.id == s.newest)?;
+                    let (title, icon) = source_of(newest);
+                    Some(LockEntry {
+                        title,
+                        icon: icon
+                            .and_then(|i| gio::prelude::IconExt::to_string(&i).map(Into::into)),
+                        count: s.count,
+                        critical: s.critical,
+                        details: s.details.clone(),
+                    })
+                })
+                .collect();
+            *cache = (sources, entries);
+        }
+        cache.1.clone()
+    }
+
+    /// Watch GNOME Settings' global notification keys and those of every
+    /// app with a notification filed, so a change applies at once.
+    fn watch_policy(self: &Rc<Self>) {
+        let apps: Vec<String> = {
+            let watched = self.policy_watch.borrow();
+            let Some(watched) = watched.as_ref() else {
+                return;
+            };
+            let Ok(center) = self.center.lock() else {
+                return;
+            };
+            let mut apps: Vec<String> = center
+                .history()
+                .iter()
+                .chain(center.hidden())
+                .map(|n| n.app_id())
+                .filter(|id| !id.is_empty() && !watched.contains_key(*id))
+                .map(str::to_owned)
+                .collect();
+            if !watched.contains_key("") {
+                apps.push(String::new());
+            }
+            apps.sort();
+            apps.dedup();
+            apps
+        };
+        for app in apps {
+            let settings = if app.is_empty() {
+                GioPolicyStore::global_settings()
+            } else {
+                GioPolicyStore::app_settings(&app)
+            };
+            let Some(settings) = settings else {
+                continue;
+            };
+            let weak = Rc::downgrade(self);
+            settings.connect_changed(None, move |_, _| {
+                // A write by this shell (registering an app while it files
+                // a notification, with the store held) signals at once on
+                // the main context: apply the change from an idle, once.
+                if let Some(me) = weak.upgrade() {
+                    if !me.policy_idle.replace(true) {
+                        let weak = Rc::downgrade(&me);
+                        glib::idle_add_local_once(move || {
+                            if let Some(me) = weak.upgrade() {
+                                me.policy_idle.set(false);
+                                me.policy_changed();
+                            }
+                        });
+                    }
+                }
+            });
+            // GSettings only signals keys read since a handler connected.
+            if let Some(schema) = settings.settings_schema() {
+                for key in schema.list_keys() {
+                    let _ = settings.value(&key);
+                }
+            }
+            if let Some(watched) = self.policy_watch.borrow_mut().as_mut() {
+                watched.insert(app, settings);
+            }
+        }
+    }
+
+    /// A notification key changed. GNOME's policies notify at once: an app
+    /// switched off leaves the tray, its notifications kept, and comes back
+    /// with them when switched on (`_onSourceEnableChanged`), and the lock
+    /// screen re-reads `show-in-lock-screen` and `details-in-lock-screen`
+    /// (`_visibleChanged`, `_detailedChanged`). Banner, sound and
+    /// expansion keys are read as each banner is asked for or shows.
+    fn policy_changed(self: &Rc<Self>) {
+        match self.center.lock() {
+            Ok(mut center) => center.apply_policy(),
+            Err(_) => return,
+        }
+        self.update();
+    }
+
     /// Claim the bus (retrying every [`BUS_RETRY`] while it is not
     /// ours), expire the banner on screen, redraw on change, and arm the
     /// next wake: its deadline, or an away user's return. Runs on every
@@ -1025,6 +1184,10 @@ impl NotifyUi {
     fn refresh(self: &Rc<Self>) {
         self.refresh_list();
         self.sync_banner();
+        self.watch_policy();
+        if let Some(changed) = self.lock_changed.borrow().as_ref() {
+            changed();
+        }
     }
 
     /// Redraw the calendar's list and its placeholder on change.
@@ -1085,13 +1248,29 @@ impl NotifyUi {
     /// dropping in once the last has gone, the one on screen showing
     /// again when it was updated.
     fn sync_banner(self: &Rc<Self>) {
+        if self.locked.get() {
+            // The lock screen's session mode has no notifications
+            // (`hasNotifications` false in `_updateState`): the banner on
+            // screen closes at once, unanimated, and no other shows; the
+            // queue waits, unseen, for the lock screen and the unlock.
+            if matches!(self.tray.get(), TrayState::Showing | TrayState::Shown) {
+                if let Some(id) = self.showing.get() {
+                    if let Ok(mut center) = self.center.lock() {
+                        let _ = center.dismiss(id);
+                    }
+                    self.retire_local_actions(id);
+                }
+                self.leave_banner(false);
+            }
+            return;
+        }
         if self.banner_blocked.get() {
             // `bannerBlocked`: the open date menu hides the tray at once;
             // the banner keeps its place until the menu closes.
             self.banner_window.set_visible(false);
             return;
         }
-        let (step, card) = {
+        let (step, card, sound) = {
             let Ok(mut center) = self.center.lock() else {
                 return;
             };
@@ -1108,11 +1287,16 @@ impl NotifyUi {
                 }),
                 _ => None,
             };
-            if let TrayStep::Show(id) = step {
-                // `_updateShowingNotification`: what shows is seen.
-                center.acknowledge(&[id]);
-            }
-            (step, card)
+            let sound = match step {
+                TrayStep::Show(id) => {
+                    // `_updateShowingNotification`: what shows is seen,
+                    // and plays its sound (`playSound`).
+                    center.acknowledge(&[id]);
+                    center.banner_sound(id)
+                }
+                _ => None,
+            };
+            (step, card, sound)
         };
         match (step, card) {
             (TrayStep::Show(id), Some((card, spoken))) => {
@@ -1128,6 +1312,9 @@ impl NotifyUi {
                 self.enter_banner(again);
                 if !again {
                     crate::accessibility::announce(&self.banner_window, &spoken);
+                }
+                if let Some(sound) = sound {
+                    crate::sound_feedback::notification(&sound);
                 }
             }
             (TrayStep::Hide, _) => {
