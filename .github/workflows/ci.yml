@@ -611,7 +611,9 @@ jobs:
   colour-native:
     # P-DS-03: actual emulated HDR KMS and independently signed native
     # Marlin GNOME comparison. No physical HDR claim or host-kernel changes.
-    runs-on: ubuntu-latest
+    # Executables also run inside the pinned Noble guest: build against its
+    # glibc/system-library baseline, not a migrating newer ubuntu-latest ABI.
+    runs-on: ubuntu-24.04
     needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'drm-smoke')
     timeout-minutes: 90
@@ -631,7 +633,7 @@ jobs:
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: colour-native-ubuntu
+          key: colour-native-ubuntu24
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
       - name: Install native colour proof prerequisites
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils ovmf gnupg podman skopeo python3-pil libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libpipewire-0.3-dev libclang-dev pkg-config libegl1 libgl1-mesa-dri libfontconfig1-dev librsvg2-common

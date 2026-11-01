@@ -204,14 +204,15 @@ def request_capture(payload, seconds=100):
 
 def native_snapshot(mode, expected):
     metadata_path = art / (mode + '-native-scanout.json')
-    raw_path = art / (mode + '-native-scanout.xr30')
+    raw_path = art / (mode + '-native-scanout.rgb10')
 
     def presented():
         subprocess.run([env['TUNA_HDR_PROBE'], 'snapshot', env['TUNA_DRM_DEVICE'],
                         str(metadata_path), str(raw_path)], env=env,
                        capture_output=True, text=True, timeout=5, check=True)
         value = read_json(metadata_path)
-        assert value['format'] == 'XR30' and value['fourcc'] == 0x30335258, value
+        assert (value['format'], value['fourcc']) in {
+            ('XR30', 0x30335258), ('AR30', 0x30335241)}, value
         assert value['colorspace'] == 'BT2020_RGB' and value['max_bpc'] >= 10, value
         assert value['pixels'] == 'active-primary-GEM-not-writeback', value
         metadata = bytes.fromhex(value['active_hdr_metadata_hex'])
@@ -469,7 +470,15 @@ def live_hotplug(connector):
             control.write_text('1\n')
 
 
+def interrupted(signum, _frame):
+    # Unwind through the owned-process cleanup instead of abandoning detached
+    # children that keep the emulated DRM endpoint busy during cancellation.
+    signal.signal(signum, signal.SIG_IGN)
+    raise InterruptedError('colour proof interrupted by signal ' + str(signum))
+
+
 try:
+    signal.signal(signal.SIGTERM, interrupted)
     bus_path = runtime / 'bus'
     spawn(['dbus-daemon', '--session', '--nofork', '--address=unix:path=' + str(bus_path)], 'dbus')
     wait(bus_path.exists, 'private D-Bus')

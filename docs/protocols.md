@@ -154,9 +154,15 @@ distinct channels, range boundaries and alpha rather than matching that syntax
 error or special-casing neutral fixtures.
 
 Qualification receipts must name the emulation and exact executable/source/image
-identities. `D-COLOR-HDR`, `D-COLOR-YUV`, `D-COLOR-YUV-CAPTURE` and
-`D-COLOR-CAPTURE` are executable pixel/consumer gates, not passes merely because
-the scripts exist. Existing vkms/real-colord gamma readback remains separate.
+identities. `D-COLOR-HDR`, `D-COLOR-HDR-KMS`, `D-COLOR-HDR-CAPTURE`,
+`D-COLOR-HDR-RESTART`, `D-COLOR-HDR-HOTPLUG`, `D-COLOR-HDR-REJECT`,
+`D-COLOR-YUV`, `D-COLOR-YUV-CAPTURE`, `D-COLOR-CAPTURE` and
+`D-COLOR-GNOME` are executable pixel/consumer gates, not passes merely because
+the scripts exist. The active-primary snapshot reports the actual XR30 or AR30
+framebuffer and RGB channel bits, independently of the XR30 kernel writeback
+self-test. Proof cancellation unwinds owned-process cleanup before unloading
+its endpoint. Executables staged into the pinned Noble guest are built on its
+Ubuntu 24.04 ABI baseline. Existing vkms/real-colord gamma readback remains separate.
 [ADR 0008 item 5](adr/0008-v1-beta-track-and-release-scope.md) permits the v1 row
 to pass on actual named emulated-device evidence; physical HDR link quality,
 instrumented calibration accuracy and physical hotplug remain unqualified until

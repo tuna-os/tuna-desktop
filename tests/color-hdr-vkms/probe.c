@@ -207,7 +207,7 @@ static void raw_write(const char *path, const uint8_t *data, uint32_t pitch)
 	require(fclose(file) == 0, "close raw evidence");
 }
 
-static void report(const char *path, bool active, const char *pixels, const char *kind)
+static void report(const char *path, bool active, const char *pixels, const char *kind, uint32_t format)
 {
 	uint64_t edid_id = value(connector, DRM_MODE_OBJECT_CONNECTOR, "EDID");
 	drmModePropertyBlobRes *edid = drmModeGetPropertyBlob(fd, edid_id);
@@ -236,7 +236,12 @@ static void report(const char *path, bool active, const char *pixels, const char
 		fprintf(file, ",\n  \"active_hdr_metadata_hex\": \"");
 		for (unsigned i = 0; i < blob->length; i++)
 			fprintf(file, "%02x", ((uint8_t *)blob->data)[i]);
-		fprintf(file, "\", \"colorspace\": \"BT2020_RGB\", \"max_bpc\": 10,\n  \"width\": %u, \"height\": %u, \"stride\": %u, \"fourcc\": %u, \"format\": \"XR30\", \"raw_layout\": \"little-endian-u32-B10-G10-R10-X2-tight-rows\", \"pixels\": \"%s\"", mode.hdisplay, mode.vdisplay, mode.hdisplay * 4u, DRM_FORMAT_XRGB2101010, pixels);
+		fprintf(file, "\", \"colorspace\": \"BT2020_RGB\", \"max_bpc\": 10,\n"
+			"  \"width\": %u, \"height\": %u, \"stride\": %u, \"fourcc\": %u, \"format\": \"%s\", "
+			"\"raw_layout\": \"little-endian-u32-B10-G10-R10-%s2-tight-rows\", \"pixels\": \"%s\"",
+			mode.hdisplay, mode.vdisplay, mode.hdisplay * 4u, format,
+			format == DRM_FORMAT_ARGB2101010 ? "AR30" : "XR30",
+			format == DRM_FORMAT_ARGB2101010 ? "A" : "X", pixels);
 		drmModeFreePropertyBlob(blob);
 	}
 	if (!strcmp(kind, "selftest"))
@@ -325,7 +330,7 @@ static void selftest(const char *json, const char *raw)
 	add(req, connector, DRM_MODE_OBJECT_CONNECTOR, "HDR_OUTPUT_METADATA", bad_blob);
 	rejected(req, "non-PQ HDR metadata was not rejected by kernel");
 	raw_write(raw, wb.data, wb.pitch);
-	report(json, true, "kernel-composed-writeback", "selftest");
+	report(json, true, "kernel-composed-writeback", "selftest", DRM_FORMAT_XRGB2101010);
 	/* File close releases all GEM handles and blob references. The isolated
 	 * run wrapper then shuts down and unloads precisely this device.
 	 */
@@ -335,7 +340,10 @@ static void snapshot(const char *json, const char *raw)
 {
 	uint32_t id = value(plane, DRM_MODE_OBJECT_PLANE, "FB_ID");
 	drmModeFB2 *fb = drmModeGetFB2(fd, id);
-	require(fb && fb->handles[0] && fb->pixel_format == DRM_FORMAT_XRGB2101010, "actual root-readable active XR30 framebuffer");
+	require(fb && fb->handles[0] &&
+		(fb->pixel_format == DRM_FORMAT_XRGB2101010 ||
+		 fb->pixel_format == DRM_FORMAT_ARGB2101010),
+		"actual root-readable active RGB10 framebuffer");
 	require(fb->modifier == DRM_FORMAT_MOD_LINEAR || fb->modifier == DRM_FORMAT_MOD_INVALID, "linear framebuffer");
 	drmModeCrtc *active = drmModeGetCrtc(fd, crtc);
 	require(active && active->mode_valid, "actual active CRTC mode");
@@ -348,7 +356,7 @@ static void snapshot(const char *json, const char *raw)
 	uint8_t *pixels = mmap(NULL, length, PROT_READ, MAP_SHARED, fd, map.offset);
 	require(pixels != MAP_FAILED, "active framebuffer mmap");
 	raw_write(raw, pixels + fb->offsets[0], fb->pitches[0]);
-	report(json, true, "active-primary-GEM-not-writeback", "snapshot");
+	report(json, true, "active-primary-GEM-not-writeback", "snapshot", fb->pixel_format);
 	munmap(pixels, length);
 	drmModeFreeFB2(fb);
 }
@@ -388,7 +396,7 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[1], "connection") && argc == 4)
 		connection_report(argv[3]);
 	else if (!strcmp(argv[1], "identity") && argc == 4)
-		report(argv[3], false, NULL, "identity");
+		report(argv[3], false, NULL, "identity", 0);
 	else if (!strcmp(argv[1], "selftest") && argc == 5)
 		selftest(argv[3], argv[4]);
 	else if (!strcmp(argv[1], "snapshot") && argc == 5)
