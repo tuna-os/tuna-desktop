@@ -21,6 +21,9 @@ with patch.dict(sys.modules, {'PIL': SimpleNamespace(Image=Mock(), ImageChops=Mo
     journey = importlib.util.module_from_spec(spec)
     loader.exec_module(journey)
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_corral_identity import FakeCorral
+
 
 class PortalSessionTests(unittest.TestCase):
     def test_records_unlocked_state_at_each_boundary_without_more_ssh(self):
@@ -136,23 +139,128 @@ class FailureReceiptTests(unittest.TestCase):
             return SimpleNamespace(stdout=io.StringIO(''), returncode=1, wait=lambda **kw: 1)
         with patch.object(journey.subprocess, 'Popen', side_effect=spawn):
             with self.assertRaises(RuntimeError) as caught:
-                journey.start_console('tuna-q-owned')
+                journey.start_console(SimpleNamespace(target='actual-opaque-inventory-id'))
         self.assertIn(detail, str(caught.exception))
 
     def test_build_failure_retains_stdout_stderr_and_password_stays_stdin(self):
-        args = SimpleNamespace(reuse=False, vm='tuna-q-owned', image='immutable', cpu=4,
-                               mem='6G', disk='40Gi', namespace='corral-vms', node='karnataka')
-        receipt = {}
+        fake = FakeCorral()
+        identity = fake.prepare()
+        args = SimpleNamespace(reuse=False, vm=fake.name, image=fake.image, cpu=4,
+                               mem='6G', disk='40Gi', namespace=fake.namespace, node=fake.node)
+        receipt = {'vm': {}, 'image': {}}
         detail = 'CORRAL_BUILD_FAIL ' + 'serial detail ' * 1000
         with patch.object(journey, 'run', return_value=SimpleNamespace(
                 returncode=1, stdout=detail, stderr='complete stderr')) as command:
             with self.assertRaisesRegex(RuntimeError, 'complete output retained'):
-                journey.provision(args, Mock(), receipt)
+                journey.provision(args, Mock(), receipt, identity)
         self.assertEqual(receipt['provision']['stdout'], detail)
         self.assertEqual(receipt['provision']['stderr'], 'complete stderr')
         self.assertFalse(command.call_args.kwargs['check'])
         self.assertEqual(command.call_args.kwargs['input'], journey.PASSWORD + '\n')
         self.assertNotIn(journey.PASSWORD, receipt['provision']['argv'])
+        self.assertIn('--context', receipt['provision']['argv'])
+        self.assertEqual(receipt['provision']['argv'][receipt['provision']['argv'].index('--context') + 1],
+                         'fixture-alias')
+        self.assertEqual(identity.state['identities'], {})
+
+
+class CanonicalCallerTests(unittest.TestCase):
+    def test_start_restart_wait_info_ssh_console_and_crosscheck_use_exact_id(self):
+        for status, lifecycle in (('Stopped', 'start'), ('Running', 'restart')):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                fake = FakeCorral()
+                identity = fake.prepare()
+                fake.add_vm()['status'] = status
+                args = SimpleNamespace(reuse=True, vm=fake.name, image=fake.image, node=fake.node)
+                receipt = {'vm': {}, 'image': {}}
+                calls = []
+                def command(argv, **kwargs):
+                    calls.append(argv)
+                    if argv[:3] == ['corral', '--json', 'wait']:
+                        stdout = json.dumps({'ready': True})
+                    elif argv[:3] == ['corral', '--json', 'info']:
+                        stdout = fake.command(argv)['stdout']
+                    elif argv[:2] == ['corral', 'ssh']:
+                        script = argv[-1]
+                        stdout = (json.dumps({'status': {'booted': {'image': {
+                            'image': {'image': fake.image}, 'imageDigest': 'digest'}}}})
+                            if script == 'bootc status --format json' else 'fixture-output')
+                    else:
+                        stdout = ''
+                    return SimpleNamespace(returncode=0, stdout=stdout, stderr='')
+                guest = journey.Guest(identity)
+                with patch.object(journey, 'run', side_effect=command):
+                    journey.provision(args, guest, receipt, identity)
+                    before = len(fake.calls)
+                    guest.sh('ordinary exchange')
+                    guest.sh('another ordinary exchange')
+                    self.assertEqual(len(fake.calls), before, 'SSH must not add UID roundtrips')
+                    # A screenshot failure avoids image codec use but exercises routing.
+                    with patch.object(journey, 'run', return_value=SimpleNamespace(
+                            returncode=1, stdout='', stderr='capture failed')) as screenshot:
+                        tour = journey.Journey(args, guest, Mock(), {}, Path(tmp))
+                        tour.crosscheck(Path(tmp) / 'frame.png')
+                        self.assertEqual(screenshot.call_args.args[0][2], fake.target)
+                self.assertIn(['corral', lifecycle, fake.target], calls)
+                for argv in calls:
+                    if argv[:2] == ['corral', 'ssh']:
+                        self.assertEqual(argv[2], fake.target)
+                    if argv[:3] in (['corral', '--json', 'wait'], ['corral', '--json', 'info']):
+                        self.assertEqual(argv[3], fake.target)
+                identity.acquire(boundary='before-console-journey')
+                endpoint = {'vm': fake.name, 'namespace': fake.namespace, 'context': '', 'url': 'http://console/'}
+                proc = Mock(stdout=io.StringIO(json.dumps(endpoint) + '\n'))
+                with patch.object(journey.subprocess, 'Popen', return_value=proc) as spawn:
+                    self.assertEqual(journey.start_console(identity), (proc, endpoint))
+                    self.assertEqual(spawn.call_args.args[0], ['corral', '--json', 'console', fake.target])
+
+    def test_main_failure_capture_and_cleanup_never_fall_back_to_names(self):
+        fake = FakeCorral()
+        identity = fake.prepare()
+        fake.add_vm()
+        captures = []
+        def command(argv, **kwargs):
+            if argv[:2] == ['corral', 'screenshot']:
+                captures.append(argv)
+                Path(argv[-1]).write_bytes(b'failure-console')
+            return SimpleNamespace(returncode=0, stdout='fixture-version', stderr='')
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'evidence'
+            with patch.dict(sys.modules, {'playwright.sync_api': SimpleNamespace(sync_playwright=Mock())}), \
+                    patch.object(journey.Identity, 'prepare', return_value=identity), \
+                    patch.object(journey, 'provision', side_effect=RuntimeError('readiness failed')), \
+                    patch.object(journey, 'run', side_effect=command), \
+                    patch('sys.argv', ['journey', '--vm', fake.name, '--image', fake.image,
+                                       '--node', fake.node, '--out', str(out)]):
+                with self.assertRaisesRegex(RuntimeError, 'readiness failed'):
+                    journey.main()
+            receipt = json.loads((out / 'manifest.json').read_text())
+        self.assertEqual(captures[0][2], fake.target)
+        self.assertEqual(receipt['failure_capture']['argv'], captures[0])
+        self.assertTrue(receipt['cleanup']['deleted'])
+        self.assertEqual([operation['canonical_identity']['id'] for operation in receipt['cleanup']['result']],
+                         [fake.target])
+
+    def test_resolution_failure_skips_failure_screenshot_and_refuses_cleanup(self):
+        fake = FakeCorral()
+        identity = fake.prepare()
+        fake.add_vm()
+        fake.info_changes = {'node': 'foreign-node'}
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'evidence'
+            with patch.dict(sys.modules, {'playwright.sync_api': SimpleNamespace(sync_playwright=Mock())}), \
+                    patch.object(journey.Identity, 'prepare', return_value=identity), \
+                    patch.object(journey, 'provision', side_effect=RuntimeError('resolution failed')), \
+                    patch.object(journey, 'run', return_value=SimpleNamespace(
+                        returncode=0, stdout='fixture-version', stderr='')) as command, \
+                    patch('sys.argv', ['journey', '--vm', fake.name, '--image', fake.image,
+                                       '--node', fake.node, '--out', str(out)]):
+                with self.assertRaisesRegex(RuntimeError, 'resolution failed'):
+                    journey.main()
+            receipt = json.loads((out / 'manifest.json').read_text())
+        self.assertFalse(any(call.args[0][:2] == ['corral', 'screenshot'] for call in command.call_args_list))
+        self.assertFalse(receipt['cleanup']['deleted'])
+        self.assertIn('node mismatch', receipt['failure_capture']['error'])
 
 
 class ConsentVisibilityTests(unittest.TestCase):

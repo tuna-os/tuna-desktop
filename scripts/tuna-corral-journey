@@ -32,6 +32,9 @@ import time
 
 from PIL import Image, ImageChops
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
+from corral_identity import Identity, save_identity
+
 USER, PASSWORD = 'tuna-test', 'tuna'  # public fixture account, as in packaging/marlin/vm-lane
 WIDTH, HEIGHT = 1280, 800
 # Pointer targets on the 1280x800 profile, in guest pixels.
@@ -67,7 +70,8 @@ def now():
 def run(cmd, timeout=120, check=True, input=None):
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input)
     if check and r.returncode:
-        raise RuntimeError(f'{shlex.join(cmd)} exited {r.returncode}: {r.stderr.strip()[-800:]}')
+        raise RuntimeError(json.dumps({'argv': cmd, 'exit': r.returncode,
+                                       'stdout': r.stdout, 'stderr': r.stderr}))
     return r
 
 
@@ -80,8 +84,12 @@ def corral_json(argv, timeout=120, check=True, input=None):
 class Guest:
     """Root shell in the VM over `corral ssh` (virtctl ssh on KubeVirt)."""
 
-    def __init__(self, vm):
-        self.vm = vm
+    def __init__(self, identity):
+        self.identity = identity
+
+    @property
+    def vm(self):
+        return self.identity.target
 
     def sh(self, script, user=False, timeout=120):
         if user:
@@ -92,9 +100,7 @@ class Guest:
             r = run(['corral', 'ssh', self.vm, '-u', 'root', '-c', script], timeout=timeout, check=False)
         except subprocess.TimeoutExpired:
             return 124, '', f'corral ssh timed out after {timeout}s'
-        err = '\n'.join(line for line in r.stderr.splitlines()
-                        if not re.search(r'virtctl version|Client Version|Server Version|^exit status', line))
-        return r.returncode, r.stdout.strip(), err.strip()
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
 
     def out(self, script, user=False):
         code, out, err = self.sh(script, user)
@@ -187,22 +193,30 @@ class Console:
         self.browser.close()
 
 
-def start_console(vm):
+def start_console(identity):
     """`corral console` serves the VM's console page on a port the OS picks.
 
     Its first stdout line is JSON that names the page's URL."""
     # A file retains complete startup diagnostics without a PIPE filling while
     # the long-lived console runs. The child keeps its inherited descriptor.
     with tempfile.TemporaryFile(mode='w+t') as errors:
-        proc = subprocess.Popen(['corral', '--json', 'console', vm], stdout=subprocess.PIPE,
+        argv = ['corral', '--json', 'console', identity.target]
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
                                 stderr=errors, text=True)
         line = proc.stdout.readline()
         if not line:
             proc.wait(timeout=30)
             errors.seek(0)
-            raise RuntimeError(f'corral console exited {proc.returncode} before it printed a URL; '
+            raise RuntimeError(f'{shlex.join(argv)} exited {proc.returncode} before it printed a URL; '
                                f'stderr: {errors.read()}')
-    return proc, json.loads(line)
+    endpoint = json.loads(line)
+    try:
+        identity.validate_endpoint(endpoint)
+    except Exception:
+        proc.terminate()
+        proc.wait(timeout=30)
+        raise
+    return proc, endpoint
 
 
 def require_report_unlocked(record, phase):
@@ -248,12 +262,13 @@ def wait_for(predicate, timeout, what, interval=5):
     raise RuntimeError(f'timed out waiting for {what}')
 
 
-def provision(args, guest, receipt):
+def provision(args, guest, receipt, identity):
     if not args.reuse:
         # The account is created in the installed system at build time; the
         # password goes in on stdin, never in argv.
         argv = ['corral', 'bootc', 'create', args.vm, '--image', args.image, '--cpu', str(args.cpu),
-                '--mem', args.mem, '--disk', args.disk, '-n', args.namespace,
+                '--mem', args.mem, '--disk', args.disk, '-n', identity.scope['namespace'],
+                '--context', identity.scope['corral_context_alias'],
                 '--user', USER, '--password-stdin', '--tag', 'purpose=tuna-corral-journey']
         argv += ['--node', args.node] if args.node else []
         try:
@@ -265,24 +280,38 @@ def provision(args, guest, receipt):
             raise
         receipt['provision'] = {'argv': argv, 'exit': result.returncode,
                                 'stdout': result.stdout, 'stderr': result.stderr}
+        # Resolve immediately after create, including failures which left a VM.
+        # Never replace failed resolution with a bare-name selector.
+        try:
+            identity.acquire(required=result.returncode == 0, boundary='after-create')
+        except Exception as error:
+            receipt['identity_resolution_error'] = f'{type(error).__name__}: {error}'
+            raise
         if result.returncode:
             raise RuntimeError(f'corral bootc create exited {result.returncode}; '
                                'complete output retained in provision receipt')
-    info = corral_json(['info', args.vm])
-    wait = ['wait', args.vm, '--boot-complete', '--unit', 'gdm.service', '--exec', GREETER, '--paint',
+    info = identity.acquire(boundary='before-start')
+    receipt['vm'].update(identity.state['identities'][args.vm])
+    wait = ['wait', identity.target, '--boot-complete', '--unit', 'gdm.service', '--exec', GREETER, '--paint',
             '--timeout', '15m']
     if info.get('status') == 'Running':
         # `corral restart` returns before the guest reboots; wait for a boot
         # other than this one.
         wait += ['--boot-id', guest.out('cat /proc/sys/kernel/random/boot_id')]
-        run(['corral', 'restart', args.vm], timeout=300)
+        run(['corral', 'restart', identity.target], timeout=300)
     else:
-        run(['corral', 'start', args.vm], timeout=300)
-    ready = corral_json(wait, timeout=1000, check=False)
+        run(['corral', 'start', identity.target], timeout=300)
+    argv = ['corral', '--json', *wait]
+    result = run(argv, timeout=1000, check=False)
+    receipt['ready_command'] = {'argv': argv, 'exit': result.returncode,
+                                 'stdout': result.stdout, 'stderr': result.stderr}
+    ready = json.loads(result.stdout) if result.stdout.strip() else None
     receipt['ready'] = ready
     if not (ready or {}).get('ready'):
         raise RuntimeError(f'corral wait: VM not ready: {json.dumps(ready)[-800:]}')
-    info = corral_json(['info', args.vm])
+    info = corral_json(['info', identity.target])
+    if not identity.matches(info, args.vm) or (args.node and info.get('node') != args.node):
+        raise RuntimeError(f'post-wait VM identity/placement mismatch: {json.dumps(info)}')
     receipt['vm'].update({k: info.get(k) for k in ('node', 'cpu', 'memory', 'firmware', 'inputs', 'disks',
                                                    'tagValues', 'image')})
     if not any(i.get('type') == 'tablet' for i in info.get('inputs') or []):
@@ -361,12 +390,14 @@ class Journey:
         The capture is kept only when its pixels differ from the frame."""
         other = self.out / 'crosscheck' / f'{frame.stem}-corral.png'
         other.parent.mkdir(exist_ok=True)
-        r = run(['corral', 'screenshot', self.args.vm, '-o', str(other)], check=False)
+        argv = ['corral', 'screenshot', self.guest.vm, '-o', str(other)]
+        r = run(argv, check=False)
         # KubeVirt keeps one VNC session; the screenshot's session ends the
         # page's, and the page reconnects by itself.
         self.console.connected()
         if r.returncode:
-            return {'identical': False, 'observed': r.stderr.strip()[-300:]}
+            return {'identical': False, 'argv': argv, 'exit': r.returncode,
+                    'stdout': r.stdout, 'stderr': r.stderr, 'observed': r.stderr.strip()}
         digest = hashlib.sha256(other.read_bytes()).hexdigest()
         box = ImageChops.difference(Image.open(frame).convert('RGB'), Image.open(other).convert('RGB')).getbbox()
         if box is None:
@@ -734,10 +765,10 @@ class Journey:
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--image', required=True, help='bootc image pinned by digest: REPO@sha256:...')
-    p.add_argument('--vm', default='tuna-q-' + datetime.date.today().strftime('%Y%m%d'))
+    p.add_argument('--vm', default='tuna-q-variant-' + datetime.date.today().strftime('%Y%m%d'))
     p.add_argument('--out', required=True, help='new evidence directory')
     p.add_argument('--namespace', default='corral-vms')
-    p.add_argument('--node', help='KubeVirt node to schedule on')
+    p.add_argument('--node', required=True, help='KubeVirt node to schedule on and retain in the identity receipt')
     p.add_argument('--cpu', type=int, default=4)
     p.add_argument('--mem', default='6G')
     p.add_argument('--disk', default='40Gi')
@@ -748,8 +779,8 @@ def main():
     args = p.parse_args()
     if not re.fullmatch(r'[^@\s]+@sha256:[0-9a-f]{64}', args.image):
         p.error('--image must be pinned by digest (REPO@sha256:...)')
-    if not args.vm.startswith('tuna-q-'):
-        p.error('--vm must start with tuna-q- so it never names somebody else\'s VM')
+    if not args.vm.startswith('tuna-q-variant-'):
+        p.error('--vm must start with tuna-q-variant- so it never names somebody else\'s VM')
     # Corral labels its builder Secret `<vm>-bootc-builder-cloudinit`; Kubernetes
     # rejects label values above 63 bytes after the disk PVC already exists.
     if len(args.vm + '-bootc-builder-cloudinit') > 63:
@@ -767,10 +798,22 @@ def main():
                       'requested': {'cpu': args.cpu, 'mem': args.mem, 'disk': args.disk, 'node': args.node}},
                'console': 'corral console page (noVNC), Playwright Chromium, 1:1; frames are the canvas pixels',
                'steps': []}
-    guest, console_proc = Guest(args.vm), None
+    identity, console_proc = None, None
+    identity_path = out / 'identity.json'
+    # Both the normal runner and an interrupted-run driver use this same receipt.
+    # The first scoped metadata snapshot is durable before bootc create starts.
+    def command(argv, timeout=120, input=None):
+        result = run(argv, timeout=timeout, input=input, check=False)
+        return {'argv': argv, 'exit': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}
+
     try:
-        provision(args, guest, receipt)
-        console_proc, endpoint = start_console(args.vm)
+        identity = Identity.prepare(command, args.vm, args.namespace, args.node, args.image,
+                                    lambda state: save_identity(identity_path, state), reuse=args.reuse)
+        receipt['identity'] = identity.state
+        guest = Guest(identity)
+        provision(args, guest, receipt, identity)
+        identity.acquire(boundary='before-console-journey')
+        console_proc, endpoint = start_console(identity)
         receipt['console_endpoint'] = endpoint
         with sync_playwright() as pw:
             console = Console(pw, endpoint['url'])
@@ -782,9 +825,14 @@ def main():
         # A failed install/readiness gate must retain its console evidence too.
         # Do not turn inability to obtain a frame into a passing readiness gate.
         try:
+            if identity is None:
+                raise RuntimeError('no scoped identity receipt; failure screenshot refused')
+            identity.acquire(boundary='before-failure-capture')
             frame = out / 'failure-console.png'
-            capture = run(['corral', 'screenshot', args.vm, '-o', str(frame)], timeout=90, check=False)
-            receipt['failure_capture'] = {'exit': capture.returncode, 'stderr': capture.stderr}
+            argv = ['corral', 'screenshot', identity.target, '-o', str(frame)]
+            capture = run(argv, timeout=90, check=False)
+            receipt['failure_capture'] = {'argv': argv, 'exit': capture.returncode,
+                                          'stdout': capture.stdout, 'stderr': capture.stderr}
             if capture.returncode == 0:
                 receipt['failure_capture'].update(
                     frame=frame.name, sha256=hashlib.sha256(frame.read_bytes()).hexdigest())
@@ -796,30 +844,15 @@ def main():
             console_proc.terminate()
             console_proc.wait(timeout=30)
         if not args.keep:
-            try:
-                # Only the requested VM and its exact Corral builder are owned.
-                # A prefix collision must never authorize deleting another run.
-                names = [args.vm] + [v['name'] for v in corral_json(['list', '--prefix', args.vm]) or []
-                                     if v['name'] == args.vm + '-bootc-builder']
-                result, failures = [], []
-                for name in names:
-                    r = run(['corral', '--json', 'delete', name, '-f', '--wait', '--timeout', '10m'],
-                            timeout=900, check=False)
-                    result += json.loads(r.stdout) if r.stdout.strip() else []
-                    if r.returncode:
-                        failures.append({'name': name, 'stderr': r.stderr.strip()[-400:]})
-                left = [v['name'] for v in corral_json(['list', '--prefix', args.vm]) or []]
-                receipt['cleanup'] = {'deleted': not failures and not left, 'result': result,
-                                      'still_listed': left, 'failures': failures}
-            except (subprocess.TimeoutExpired, RuntimeError, ValueError) as e:
-                receipt['cleanup'] = {'deleted': False, 'output': f'{type(e).__name__}: {e}'}
+            receipt['cleanup'] = (identity.cleanup() if identity is not None else
+                                  {'deleted': False, 'output': 'no prepared scoped identity; cleanup refused'})
         receipt['finished'] = now()
         (out / 'manifest.json').write_text(json.dumps(receipt, indent=2) + '\n')
     failed = [s['id'] for s in receipt['steps'] if s['result'] == 'fail']
     counts = {r: sum(s['result'] == r for s in receipt['steps']) for r in ('pass', 'fail', 'not-exercised')}
     print(f"{counts['pass']} passed, {counts['fail']} failed, {counts['not-exercised']} not exercised"
           + (f"; failed: {', '.join(failed)}" if failed else ''))
-    return 1 if failed else 0
+    return 1 if failed or (not args.keep and not receipt.get('cleanup', {}).get('deleted')) else 0
 
 
 if __name__ == '__main__':

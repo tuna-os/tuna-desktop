@@ -9,17 +9,33 @@ import argparse
 import base64
 import datetime
 import hashlib
+import importlib.util
 import json
+import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tomllib
 
 
-def command(argv, timeout=120):
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-    return {'argv': argv, 'exit': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}
+def command(argv, timeout=120, input=None):
+    process = subprocess.Popen(argv, stdin=subprocess.PIPE if input is not None else None,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                               start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(input=input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # An interrupted journey must not leave a bootc child creating a final
+        # VM after emergency cleanup has proved absence.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(argv, timeout, output=stdout, stderr=stderr)
+    return {'argv': argv, 'exit': process.returncode, 'stdout': stdout, 'stderr': stderr}
 
 
 def github(path):
@@ -43,6 +59,22 @@ def github(path):
 
 def save(path, report):
     path.write_text(json.dumps(report, indent=2) + '\n')
+
+
+def emergency_cleanup(directory, harness, vm, node):
+    receipt = directory / 'identity.json'
+    if not receipt.exists():
+        return {'deleted': False, 'failures': ['no retained identity receipt; refusing guessed cleanup']}
+    state = json.loads(receipt.read_text())
+    scope = state.get('scope', {})
+    if scope.get('name') != vm or scope.get('node') != node or scope.get('backend') != 'kubevirt':
+        return {'deleted': False, 'failures': ['retained cleanup scope does not match this driver run']}
+    # Use the same frozen identity implementation as the interrupted journey.
+    helper = harness / 'lib/corral_identity.py'
+    spec = importlib.util.spec_from_file_location('qualification_frozen_identity', helper)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.Identity(command, state, lambda value: module.save_identity(receipt, value)).cleanup()
 
 
 def main():
@@ -70,7 +102,7 @@ def main():
         report['harness_sha256'] = {}
         for name in ('tuna-corral-journey', 'lib/tuna-portal-screenshot-client.py', 'lib/tuna-portal-consent.py',
                      'lib/tuna-portal-capture-client.py', 'lib/tuna-pipewire-dump.py',
-                     'lib/tuna-portal-journey-client.py'):
+                     'lib/tuna-portal-journey-client.py', 'lib/corral_identity.py'):
             data = (source_root / name).read_bytes()
             target = harness / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -180,19 +212,8 @@ def main():
             except (subprocess.TimeoutExpired, OSError, ValueError, KeyError) as error:
                 row['runtime'] = 'failed'
                 row['error'] = f'{type(error).__name__}: {error}'
-                cleanup, deleted = [], []
-                listed = command(['corral', '--json', 'list', '--prefix', vm], timeout=120)
-                names = [vm] + ([v['name'] for v in json.loads(listed['stdout'])
-                                if v['name'] == vm + '-bootc-builder'] if listed['exit'] == 0 else [])
-                for owned in names:
-                    result = command(['corral', '--json', 'delete', owned, '-f', '--wait', '--timeout', '10m'], timeout=900)
-                    cleanup.append(result)
-                    deleted += json.loads(result['stdout']) if result['exit'] == 0 else [{'name': owned, 'deleted': False}]
-                row['emergency_cleanup'] = cleanup
-                inventory = command(['corral', '--json', 'list', '--prefix', vm], timeout=120)
-                row['emergency_cleanup_inventory'] = inventory
-                absent = json.loads(inventory['stdout']) == [] if inventory['exit'] == 0 else False
-                if listed['exit'] or not deleted or not all(item.get('deleted') for item in deleted) or not absent:
+                row['emergency_cleanup'] = emergency_cleanup(directory, harness, vm, args.node)
+                if not row['emergency_cleanup'].get('deleted'):
                     raise RuntimeError('owned VM/disk cleanup unproven; refusing to create another VM')
             finally:
                 save(receipt, report)

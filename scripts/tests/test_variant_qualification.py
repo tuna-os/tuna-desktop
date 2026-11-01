@@ -8,14 +8,33 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'tuna-variant-qualification'
 loader = importlib.machinery.SourceFileLoader('variant_qualification', str(SCRIPT))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 module = importlib.util.module_from_spec(spec)
 loader.exec_module(module)
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_corral_identity import FakeCorral
+
+
+class CommandCancellationTests(unittest.TestCase):
+    def test_timeout_retires_entire_journey_group_before_cleanup_can_run(self):
+        process = Mock(pid=123)
+        process.communicate.side_effect = [
+            module.subprocess.TimeoutExpired(['journey'], 5), ('full stdout', 'full stderr')]
+        with patch.object(module.subprocess, 'Popen', return_value=process) as spawn, \
+                patch.object(module.os, 'killpg') as kill:
+            with self.assertRaises(module.subprocess.TimeoutExpired) as caught:
+                module.command(['journey'], timeout=5)
+        self.assertTrue(spawn.call_args.kwargs['start_new_session'])
+        kill.assert_called_once_with(123, module.signal.SIGKILL)
+        self.assertEqual(caught.exception.stdout, 'full stdout')
+        self.assertEqual(caught.exception.stderr, 'full stderr')
 
 
 class MatrixTests(unittest.TestCase):
@@ -53,6 +72,7 @@ package_target = "debian"
         self.assertEqual(row['qualification'], 'not-qualified')
         self.assertEqual(row['runtime'], 'not-run')
         self.assertIn('--no-tags', calls[0].args[0])
+        self.assertIn('lib/corral_identity.py', report['harness_sha256'])
 
     def test_registry_failure_is_not_an_unsupported_waiver(self):
         code, report, _ = self.inventory('''
@@ -136,32 +156,35 @@ status = "admitted"
 package_target = "el10"
 '''
         source = {'content': base64.b64encode(config.encode()).decode()}
-        calls, listings = [], []
+        calls = []
+        fake = FakeCorral()
+        fake.node = 'karnataka'
         def github(path):
             return {'sha': 'a' * 40} if path.endswith('commits/main') else source
-        def command(argv, timeout=120):
+        def command(argv, timeout=120, input=None):
             calls.append(argv)
             if argv[0] == 'skopeo':
                 return {'exit': 0, 'stdout': json.dumps({'Digest': 'sha256:' + 'b' * 64}), 'stderr': ''}
-            if argv[:3] == ['corral', '--json', 'list']:
-                # The first listing sees the interrupted builder; the final one proves absence.
-                listed = [{'name': argv[-1] + '-bootc-builder'}] if builder and not listings else []
-                if unrelated:
-                    listed.append({'name': argv[-1] + '-another-run'})
-                listings.append(listed)
-                return {'exit': 0, 'stdout': json.dumps(listed), 'stderr': ''}
-            if argv[:3] == ['corral', '--json', 'delete']:
-                return {'exit': 0, 'stdout': json.dumps([{'name': argv[3], 'deleted': True}]), 'stderr': ''}
+            if argv[0] in ('corral', 'kubectl'):
+                return fake.command(argv, timeout=timeout, input=input)
+            fake.name = argv[argv.index('--vm') + 1]
+            identity = fake.prepare()
+            fake.add_vm(alternatives=unrelated)
+            if builder:
+                fake.add_vm(builder=True, alternatives=unrelated)
+            directory = Path(argv[argv.index('--out') + 1])
+            directory.mkdir()
+            # This is the early durable receipt, not a completed manifest.
+            (directory / 'identity.json').write_text(json.dumps(identity.state))
             raise module.subprocess.TimeoutExpired(argv, timeout)
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / 'evidence'
             with patch.object(module, 'github', side_effect=github), patch.object(module, 'command', side_effect=command), patch('sys.argv', [str(SCRIPT), '--out', str(out), '--run']):
-                if unrelated:
-                    with self.assertRaisesRegex(RuntimeError, 'cleanup unproven'):
-                        module.main()
-                else:
-                    module.main()
+                module.main()
             report = json.loads((out / 'matrix.json').read_text())
+            frozen = out / 'harness/lib/corral_identity.py'
+            self.assertEqual(frozen.read_bytes(), (SCRIPT.parent / 'lib/corral_identity.py').read_bytes())
+            self.assertTrue((out / name / 'identity.json').exists())
         return calls, report
 
     def test_longest_variant_vm_fits_corral_builder_label(self):
@@ -174,17 +197,28 @@ package_target = "el10"
         calls, report = self.interrupted_journey('grouper', builder=True)
         journey = next(argv for argv in calls if argv[0] != 'skopeo' and argv[0] != 'corral')
         vm = journey[journey.index('--vm') + 1]
-        deleted = [argv[3] for argv in calls if argv[:3] == ['corral', '--json', 'delete']]
-        self.assertEqual(deleted, [vm, vm + '-bootc-builder'])
+        deleted = [operation['canonical_identity']['id']
+                   for operation in report['variants'][0]['emergency_cleanup']['result']]
+        self.assertEqual(deleted, [FakeCorral.builder_target, FakeCorral.target])
         self.assertEqual(report['variants'][0]['runtime'], 'failed')
 
     def test_cleanup_does_not_delete_prefix_collision(self):
         calls, report = self.interrupted_journey('grouper', builder=True, unrelated=True)
         journey = next(argv for argv in calls if argv[0] != 'skopeo' and argv[0] != 'corral')
         vm = journey[journey.index('--vm') + 1]
-        deleted = [argv[3] for argv in calls if argv[:3] == ['corral', '--json', 'delete']]
-        self.assertEqual(deleted, [vm, vm + '-bootc-builder'])
+        deleted = [operation['canonical_identity']['id']
+                   for operation in report['variants'][0]['emergency_cleanup']['result']]
+        self.assertEqual(deleted, [FakeCorral.builder_target, FakeCorral.target])
         self.assertEqual(report['variants'][0]['runtime'], 'failed')
+        self.assertTrue(report['variants'][0]['emergency_cleanup']['deleted'])
+
+    def test_emergency_cleanup_without_early_identity_never_guesses_a_vm_id(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(module, 'command') as command:
+            result = module.emergency_cleanup(Path(tmp), Path(tmp) / 'harness',
+                                              FakeCorral.name, 'karnataka')
+        self.assertFalse(result['deleted'])
+        self.assertIn('no retained identity', result['failures'][0])
+        command.assert_not_called()
 
     def test_deferred_frame_validation_is_required_for_functional_capture(self):
         config = '''
