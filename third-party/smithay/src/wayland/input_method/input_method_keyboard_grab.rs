@@ -27,6 +27,7 @@ use super::InputMethodManagerState;
 #[derive(Default, Debug)]
 pub(crate) struct InputMethodKeyboard {
     pub grab: Option<ZwpInputMethodKeyboardGrabV2>,
+    pub serial: Option<Serial>,
     pub text_input_handle: TextInputHandle,
 }
 
@@ -82,7 +83,11 @@ where
         &KeyboardGrabStartData { focus: None }
     }
 
-    fn unset(&mut self, _data: &mut D) {}
+    fn unset(&mut self, _data: &mut D) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.grab = None;
+        inner.serial = None;
+    }
 }
 
 /// User data of ZwpInputKeyboardGrabV2 object
@@ -106,11 +111,18 @@ impl<D: SeatHandler + 'static> Dispatch<ZwpInputMethodKeyboardGrabV2, InputMetho
     fn destroyed(
         state: &mut D,
         _client: ClientId,
-        _object: &ZwpInputMethodKeyboardGrabV2,
+        object: &ZwpInputMethodKeyboardGrabV2,
         data: &InputMethodKeyboardUserData<D>,
     ) {
-        data.handle.inner.lock().unwrap().grab = None;
-        data.keyboard_handle.unset_grab(state);
+        let mut inner = data.handle.inner.lock().unwrap();
+        if inner.grab.as_ref() == Some(object) {
+            inner.grab = None;
+            let serial = inner.serial.take();
+            drop(inner);
+            if serial.is_some_and(|serial| data.keyboard_handle.has_grab(serial)) {
+                data.keyboard_handle.unset_grab(state);
+            }
+        }
     }
 
     fn request(
