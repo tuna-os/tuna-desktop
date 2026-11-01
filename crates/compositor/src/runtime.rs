@@ -5582,6 +5582,17 @@ impl Runtime {
     /// show — no windows, no layer-shell chrome (panel, notifications),
     /// no wallpaper — over a dark lock background.
     fn render(&mut self) -> Result<(), RuntimeError> {
+        let result = self.render_frame();
+        if result.is_err() {
+            // A failed render cannot keep promising a working effect. In
+            // particular shader/FBO/copy failures are never a silent no-op.
+            self.state.protocols.background_effects.set_blur_supported(false);
+            let _ = self.display.flush_clients();
+        }
+        result
+    }
+
+    fn render_frame(&mut self) -> Result<(), RuntimeError> {
         let locked = self.is_locked();
         #[cfg(feature = "drm")]
         if locked {
@@ -6031,6 +6042,13 @@ impl Runtime {
                         let mut frame = renderer
                             .render(&mut framebuffer, size, Transform::Flipped180)
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        if !admit_background_blur(
+                            &mut frame,
+                            &mut self.state.protocols.background_effects,
+                            &self.wake,
+                        ) {
+                            elements.blur.clear();
+                        }
                         let drew = match (zoom_plan.as_ref(), zoomed) {
                             (Some(plan), Some((scene, zoom, drew))) => {
                                 crate::magnifier::present(
@@ -6406,6 +6424,13 @@ impl Runtime {
                                 crate::orientation::render_transform(out.transform),
                             )
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        if !admit_background_blur(
+                            &mut frame,
+                            &mut self.state.protocols.background_effects,
+                            &self.wake,
+                        ) {
+                            elements.blur.clear();
+                        }
                         let drew = match (zoom_plan.as_ref(), zoomed) {
                             (Some(plan), Some((scene, zoom, drew))) => {
                                 crate::magnifier::present(
@@ -6762,6 +6787,26 @@ fn switcher_preview(
 }
 
 use crate::wellbeing_effects::FrameColor;
+
+/// This is deliberately after acquiring/binding the existing frame, never
+/// before the unchanged-scene early return. The probe caches its verdict by
+/// context and actual framebuffer component type, without resizing on hits.
+fn admit_background_blur(
+    frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+    effects: &mut crate::background_effect::BackgroundEffects,
+    wake: &crate::wake::Wake,
+) -> bool {
+    let supported = crate::background_blur::supported(frame).unwrap_or_else(|error| {
+        eprintln!("tuna-compositor: background blur admission failed: {error}");
+        false
+    });
+    if effects.set_blur_supported(supported) {
+        // Scene collection preceded this first real framebuffer. Revisit it
+        // even if a client committed a region before capability admission.
+        wake.signal();
+    }
+    supported
+}
 
 /// One output's surfaces, front to back, with GNOME's tile preview
 /// slotted in: `elements[..above]` draw over the preview (the dragged

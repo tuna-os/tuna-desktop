@@ -129,6 +129,8 @@ struct Cache {
     programs: Option<Option<Programs>>,
     /// Full-size copy, then the two downscaled passes.
     targets: [Target; 3],
+    support: Option<GlSupport>,
+    admitted: Option<(TargetFormat, bool)>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -136,7 +138,96 @@ struct Target {
     texture: ffi::types::GLuint,
     framebuffer: ffi::types::GLuint,
     size: (i32, i32),
-    rgb: bool,
+    format: TargetFormat,
+}
+
+/// Include precision in the cache key: an SDR target must never be reused
+/// after the renderer switches to the FP16 scene before its final HDR pass.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum TargetFormat {
+    Rgb8,
+    #[default]
+    Rgba8,
+    Rgba16F,
+    Rgba16FOes,
+}
+
+impl TargetFormat {
+    fn floating(self) -> bool {
+        matches!(self, Self::Rgba16F | Self::Rgba16FOes)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GlSupport {
+    es3: bool,
+    component_query: bool,
+    half_float_linear: bool,
+}
+
+impl GlSupport {
+    unsafe fn read(gl: &ffi::Gles2) -> Result<Self, GlesError> {
+        let version = gl.GetString(ffi::VERSION);
+        if version.is_null() {
+            return Err(GlesError::GLFunctionLoaderError);
+        }
+        let version = std::ffi::CStr::from_ptr(version.cast()).to_bytes();
+        let es3 = version.starts_with(b"OpenGL ES 3.");
+        // ES3 guarantees both the query and half-float linear sampling.
+        // GetString(EXTENSIONS) is deliberately not used on ES3.
+        if es3 {
+            return Ok(Self { es3, component_query: true, half_float_linear: true });
+        }
+        let extensions = gl.GetString(ffi::EXTENSIONS);
+        if extensions.is_null() {
+            return Err(GlesError::GLFunctionLoaderError);
+        }
+        let extensions = std::ffi::CStr::from_ptr(extensions.cast()).to_bytes();
+        let has = |name: &[u8]| extensions.split(|c| *c == b' ').any(|ext| ext == name);
+        Ok(Self {
+            es3,
+            component_query: has(b"GL_EXT_color_buffer_half_float")
+                || has(b"GL_EXT_color_buffer_float"),
+            half_float_linear: has(b"GL_OES_texture_half_float")
+                && has(b"GL_OES_texture_half_float_linear"),
+        })
+    }
+
+    unsafe fn target_format(
+        self,
+        gl: &ffi::Gles2,
+        framebuffer: i32,
+        rgb: bool,
+    ) -> Result<TargetFormat, GlesError> {
+        if gl.GetError() != ffi::NO_ERROR {
+            return Err(GlesError::FramebufferBindingError);
+        }
+        let mut component = 0;
+        if self.component_query {
+            gl.GetFramebufferAttachmentParameteriv(
+                ffi::FRAMEBUFFER,
+                if framebuffer == 0 { ffi::BACK } else { ffi::COLOR_ATTACHMENT0 },
+                ffi::FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE,
+                &mut component,
+            );
+            // A failed query is unknown, not evidence of an 8-bit target.
+            if gl.GetError() != ffi::NO_ERROR {
+                return Err(GlesError::FramebufferBindingError);
+            }
+        }
+        if component == ffi::FLOAT as i32 {
+            if !self.half_float_linear {
+                return Err(GlesError::GLExtensionNotSupported(&[
+                    "GL_OES_texture_half_float_linear",
+                ]));
+            }
+            Ok(if self.es3 { TargetFormat::Rgba16F } else { TargetFormat::Rgba16FOes })
+        } else {
+            // Without either ES3 or a color-buffer-float extension, an
+            // FP16 renderable attachment cannot exist in this context.
+            Ok(if rgb { TargetFormat::Rgb8 } else { TargetFormat::Rgba8 })
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -158,6 +249,7 @@ struct Programs {
     saturation: ffi::types::GLint,
     noise: ffi::types::GLint,
     noise_size: ffi::types::GLint,
+    extended_range: ffi::types::GLint,
 }
 
 struct CacheData(Arc<Mutex<Cache>>);
@@ -229,6 +321,7 @@ uniform float alpha;
 uniform float saturation;
 uniform float noise;
 uniform vec2 noise_size;
+uniform bool extended_range;
 varying vec2 v_uv;
 float random_noise(vec2 position) {
     return fract(52.9829189 * fract(dot(position, vec2(0.06711056, 0.00583715))));
@@ -245,7 +338,11 @@ void main() {
             float grain = 0.5 * sign(uniform_noise) * (1.0 - sqrt(1.0 - abs(uniform_noise)));
             color += vec3(grain * noise);
         }
-        color = clamp(color, vec3(0.0), vec3(1.0));
+        // SDR retains Mutter's clamp. The FP16 scene carries extended
+        // sRGB (including negative channels) until the final HDR pass.
+        if (!extended_range) {
+            color = clamp(color, vec3(0.0), vec3(1.0));
+        }
         color_out.rgb = color * color_out.a;
     }
     gl_FragColor = color_out;
@@ -326,32 +423,43 @@ unsafe fn programs(gl: &ffi::Gles2) -> Option<Programs> {
         saturation: uniform(&composite, c"saturation"),
         noise: uniform(&composite, c"noise"),
         noise_size: uniform(&composite, c"noise_size"),
+        extended_range: uniform(&composite, c"extended_range"),
         blur,
         composite,
     })
 }
 
-/// (Re)allocate `target` at `size`; RGB when it receives a
-/// `glCopyTexSubImage2D` from a framebuffer that may lack alpha.
-unsafe fn ensure(gl: &ffi::Gles2, target: &mut Target, size: (i32, i32), rgb: bool) -> bool {
-    if target.texture != 0 && target.size == size && target.rgb == rgb {
+/// (Re)allocate an intermediate without reducing the scene's precision.
+unsafe fn ensure(
+    gl: &ffi::Gles2,
+    target: &mut Target,
+    size: (i32, i32),
+    format: TargetFormat,
+) -> bool {
+    if target.texture != 0 && target.size == size && target.format == format {
         return true;
     }
     if target.texture == 0 {
         gl.GenTextures(1, &mut target.texture);
         gl.GenFramebuffers(1, &mut target.framebuffer);
     }
-    let format = if rgb { ffi::RGB } else { ffi::RGBA };
+    let (internal, external, component) = match format {
+        TargetFormat::Rgb8 => (ffi::RGB, ffi::RGB, ffi::UNSIGNED_BYTE),
+        TargetFormat::Rgba8 => (ffi::RGBA, ffi::RGBA, ffi::UNSIGNED_BYTE),
+        TargetFormat::Rgba16F => (ffi::RGBA16F, ffi::RGBA, ffi::HALF_FLOAT),
+        // OES_texture_half_float uses an unsized format and its own token.
+        TargetFormat::Rgba16FOes => (ffi::RGBA, ffi::RGBA, 0x8D61),
+    };
     gl.BindTexture(ffi::TEXTURE_2D, target.texture);
     gl.TexImage2D(
         ffi::TEXTURE_2D,
         0,
-        format as i32,
+        internal as i32,
         size.0,
         size.1,
         0,
-        format,
-        ffi::UNSIGNED_BYTE,
+        external,
+        component,
         std::ptr::null(),
     );
     gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
@@ -374,9 +482,11 @@ unsafe fn ensure(gl: &ffi::Gles2, target: &mut Target, size: (i32, i32), rgb: bo
         target.texture,
         0,
     );
-    let complete = gl.CheckFramebufferStatus(ffi::FRAMEBUFFER) == ffi::FRAMEBUFFER_COMPLETE;
+    let status = gl.CheckFramebufferStatus(ffi::FRAMEBUFFER);
+    let error = gl.GetError();
+    let complete = status == ffi::FRAMEBUFFER_COMPLETE && error == ffi::NO_ERROR;
     target.size = size;
-    target.rgb = rgb;
+    target.format = format;
     if !complete {
         gl.DeleteFramebuffers(1, &target.framebuffer);
         gl.DeleteTextures(1, &target.texture);
@@ -425,6 +535,50 @@ unsafe fn quad(
     gl.DrawArrays(ffi::TRIANGLE_STRIP, 0, 4);
 }
 
+/// Admit the capability only against a real, bound scene framebuffer.
+/// Call after binding the SDR/FP16 scene, not before HDR target creation.
+/// A false result is unsupported hardware; an error leaves precision unknown.
+pub(crate) fn supported(frame: &mut GlesFrame<'_, '_>) -> Result<bool, GlesError> {
+    let user_data = frame.egl_context().user_data();
+    user_data.insert_if_missing_threadsafe(|| CacheData(Arc::new(Mutex::new(Cache::default()))));
+    let cache = user_data.get::<CacheData>().ok_or(GlesError::FramebufferBindingError)?.0.clone();
+    let blit = frame.capabilities().contains(&Capability::Blit);
+    frame.with_context(|gl| unsafe {
+        let mut cache = cache.lock().unwrap();
+        let mut framebuffer = 0;
+        gl.GetIntegerv(ffi::FRAMEBUFFER_BINDING, &mut framebuffer);
+        let support = match cache.support {
+            Some(support) => support,
+            None => {
+                let support = GlSupport::read(gl)?;
+                cache.support = Some(support);
+                support
+            }
+        };
+        let format = support.target_format(gl, framebuffer, !blit)?;
+        if let Some((previous, supported)) = cache.admitted {
+            if previous == format {
+                return Ok(supported);
+            }
+        }
+        let mut texture = 0;
+        gl.GetIntegerv(ffi::TEXTURE_BINDING_2D, &mut texture);
+        if cache.programs.is_none() {
+            cache.programs = Some(programs(gl));
+        }
+        let pass_format = if format.floating() { format } else { TargetFormat::Rgba8 };
+        let [copy, vertical, horizontal] = &mut cache.targets;
+        let targets = ensure(gl, copy, (4, 4), format)
+            && ensure(gl, vertical, (4, 4), pass_format)
+            && ensure(gl, horizontal, (4, 4), pass_format);
+        gl.BindFramebuffer(ffi::FRAMEBUFFER, framebuffer as u32);
+        gl.BindTexture(ffi::TEXTURE_2D, texture as u32);
+        let supported = targets && matches!(cache.programs, Some(Some(_)));
+        cache.admitted = Some((format, supported));
+        Ok(supported)
+    })?
+}
+
 const UNIT_QUAD: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
 
 /// Paint, under the surface about to be drawn, what the frame holds so
@@ -447,7 +601,7 @@ pub(crate) fn draw_behind(
     let user_data = frame.egl_context().user_data();
     user_data.insert_if_missing_threadsafe(|| CacheData(Arc::new(Mutex::new(Cache::default()))));
     let Some(cache) = user_data.get::<CacheData>().map(|data| data.0.clone()) else {
-        return Ok(());
+        return Err(GlesError::FramebufferBindingError);
     };
     let blit = frame.capabilities().contains(&Capability::Blit);
     let instancing = frame.capabilities().contains(&Capability::Instancing);
@@ -458,10 +612,19 @@ pub(crate) fn draw_behind(
             cache.programs = Some(programs(gl));
         }
         let Some(Some(programs)) = cache.programs else {
-            return;
+            return Err(GlesError::ShaderCompileError);
         };
         let mut framebuffer = 0;
         gl.GetIntegerv(ffi::FRAMEBUFFER_BINDING, &mut framebuffer);
+        let support = match cache.support {
+            Some(support) => support,
+            None => {
+                let support = GlSupport::read(gl)?;
+                cache.support = Some(support);
+                support
+            }
+        };
+        let format = support.target_format(gl, framebuffer, !blit)?;
         let mut viewport = [0i32; 4];
         gl.GetIntegerv(ffi::VIEWPORT, viewport.as_mut_ptr());
         let mut scissor = [0i32; 4];
@@ -471,7 +634,7 @@ pub(crate) fn draw_behind(
 
         let source = to_window(&projection, viewport, sample);
         if source.size.w <= 0 || source.size.h <= 0 {
-            return;
+            return Ok(());
         }
         let factor = downscale_factor(source.size.w as f32, source.size.h as f32, radius);
         let scaled = (
@@ -479,13 +642,14 @@ pub(crate) fn draw_behind(
             ((source.size.h as f32 / factor).floor() as i32).max(1),
         );
         let [copy, vertical, horizontal] = &mut cache.targets;
-        if !ensure(gl, copy, (source.size.w, source.size.h), !blit)
-            || !ensure(gl, vertical, scaled, false)
-            || !ensure(gl, horizontal, scaled, false)
+        let pass_format = if format.floating() { format } else { TargetFormat::Rgba8 };
+        if !ensure(gl, copy, (source.size.w, source.size.h), format)
+            || !ensure(gl, vertical, scaled, pass_format)
+            || !ensure(gl, horizontal, scaled, pass_format)
         {
             gl.BindFramebuffer(ffi::FRAMEBUFFER, framebuffer as u32);
             gl.BindTexture(ffi::TEXTURE_2D, 0);
-            return;
+            return Err(GlesError::FramebufferBindingError);
         }
         let (copy, vertical, horizontal) = (*copy, *vertical, *horizontal);
 
@@ -572,6 +736,7 @@ pub(crate) fn draw_behind(
         gl.Uniform1f(programs.alpha, alpha.min(1.0));
         gl.Uniform1f(programs.saturation, BLUR_SATURATION);
         gl.Uniform1f(programs.noise, BLUR_NOISE);
+        gl.Uniform1i(programs.extended_range, i32::from(format.floating()));
         gl.Uniform2f(
             programs.noise_size,
             source.size.w as f32,
@@ -610,7 +775,11 @@ pub(crate) fn draw_behind(
         if !blend {
             gl.Disable(ffi::BLEND);
         }
-    })
+        if gl.GetError() != ffi::NO_ERROR {
+            return Err(GlesError::BlitError);
+        }
+        Ok(())
+    })?
 }
 
 #[cfg(test)]
@@ -818,5 +987,49 @@ mod tests {
         }
         // Release the GL context before the surfaceless display drops.
         drop(renderer);
+    }
+
+    #[cfg(feature = "drm")]
+    #[test]
+    fn fp16_blur_preserves_negative_and_above_one_channels_after_sdr_cache_use() {
+        use smithay::backend::allocator::Fourcc;
+        use smithay::backend::renderer::{Bind, Color32F, Frame, Offscreen, Renderer};
+        use smithay::utils::Transform;
+        let Some(mut renderer) = headless_renderer() else {
+            eprintln!("UNSUPPORTED: FP16 blur test requires surfaceless EGL");
+            return;
+        };
+        // Populate all three intermediates as 8-bit first. Their precision
+        // must be replaced, even if the HDR sample has exactly the same size.
+        let _ = draw(&mut renderer, (64, 64), Transform::Normal, &[rect(0, 0, 64, 64)], 8.0, 1.0, None);
+        let target: Result<smithay::backend::renderer::gles::GlesTexture, _> =
+            renderer.create_buffer(Fourcc::Abgr16161616f, (64, 64).into());
+        let Ok(mut target) = target else {
+            eprintln!("UNSUPPORTED: device cannot allocate an FP16 scene framebuffer");
+            return;
+        };
+        let mut bound = renderer.bind(&mut target).unwrap();
+        let mut frame = renderer.render(&mut bound, (64, 64).into(), Transform::Normal).unwrap();
+        assert!(supported(&mut frame).unwrap(), "FP16 scene exists but blur is unsupported");
+        let full = rect(0, 0, 64, 64);
+        let source = [-0.25f32, 1.5, 2.0];
+        frame.clear(Color32F::BLACK, &[full]).unwrap();
+        frame.draw_solid(full, &[full], Color32F::new(source[0], source[1], source[2], 1.0)).unwrap();
+        draw_behind(&mut frame, &[full], 8.0, 1.0, full).unwrap();
+        let mut pixel = [0.0f32; 4];
+        frame.with_context(|gl| unsafe {
+            gl.ReadPixels(32, 32, 1, 1, ffi::RGBA, ffi::FLOAT, pixel.as_mut_ptr().cast());
+            assert_eq!(gl.GetError(), ffi::NO_ERROR, "FP16 readback failed");
+        }).unwrap();
+        let luma = source[0] * 0.299 + source[1] * 0.587 + source[2] * 0.114;
+        for channel in 0..3 {
+            let expected = luma + (source[channel] - luma) * BLUR_SATURATION;
+            assert!((pixel[channel] - expected).abs() < 0.03, "HDR channel clipped/quantized: {pixel:?}, expected {expected}");
+        }
+        assert!(pixel[0] < 0.0 && pixel[1] > 1.0 && pixel[2] > 1.0, "{pixel:?}");
+        let _ = frame.finish().unwrap();
+        drop(bound);
+        // And restore the original SDR path and clamp after the FP16 frame.
+        let _ = draw(&mut renderer, (64, 64), Transform::Normal, &[full], 8.0, 1.0, None);
     }
 }

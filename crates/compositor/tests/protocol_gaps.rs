@@ -60,6 +60,9 @@ use wayland_protocols::xdg::shell::client::{
 use wayland_protocols::xdg::system_bell::v1::client::xdg_system_bell_v1::XdgSystemBellV1;
 use wayland_protocols::xdg::toplevel_tag::v1::client::xdg_toplevel_tag_manager_v1::XdgToplevelTagManagerV1;
 
+#[path = "support/background_effect_boundaries.rs"]
+mod background_effect_boundaries;
+
 const ROUNDS: usize = 10;
 
 /// What a feedback object (by its tag) was told.
@@ -1279,10 +1282,10 @@ fn background_blur_regions_apply_on_commit_like_mutter() {
     let compositor: WlCompositor = peer.bind(6);
     let (surface, _toplevel) = window(&mut peer, "terminal");
     pump(&mut comp, &mut manager, &mut [&mut peer]);
-    // Told at bind: blur is supported.
+    // A headless protocol fixture has no admitted scene framebuffer.
     assert_eq!(
         peer.client.background_effects,
-        Some(ext_background_effect_manager_v1::Capability::Blur.bits())
+        Some(0)
     );
     let server = comp.state.toplevels()[0].wl_surface().clone();
     assert_eq!(blur_area(&server), None, "no effect until asked");
