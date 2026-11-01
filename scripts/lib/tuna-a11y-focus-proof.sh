@@ -17,7 +17,8 @@ a11y_focus_rect() {
         | select(. != null) | map(tostring) | join(",")' "$1"
 }
 
-# One real key, then the panel's focus indicator timeline for $2 seconds.
+# One real key command, then bounded captures for $2 seconds from its return.
+# Capture bounds are observations, not delivery/draw/presentation timestamps.
 # $1 label, $3 key, then NAME=RECT pairs.
 a11y_focus_timeline() {
     _label="$1" _seconds="$2" _key="$3"
@@ -27,7 +28,9 @@ a11y_focus_timeline() {
         fail G-FOCUS-RING "frame sampler failed for $_label"
 }
 
-# jq over a timeline's per-control summary.
+# jq over capture-bound summaries. Onset uses first-lit capture END; expiry
+# must lie wholly between last-lit capture BEGIN and first-unlit capture END,
+# inside the original policy interval (never shifted by observed onset).
 a11y_focus_check() {
     if jq -e --arg c "$2" ".controls[\$c] | $3" "$ARTIFACTS/focus-ring-$1.json" >/dev/null; then
         return 0
@@ -62,12 +65,12 @@ a11y_focus_ring_proof() {
     a11y_focus_dump default
     focused "$ARTIFACTS/a11y-focus-default.json" Activities ||
         fail G-FOCUS-RING "Ctrl+Alt+Tab did not focus Activities"
-    a11y_focus_check default act '(.lit_before | not) and .lit_from != null and .lit_from <= 0.8' ||
-        fail G-FOCUS-RING "Activities showed no focus fill after Ctrl+Alt+Tab"
-    a11y_focus_check default clock '.lit_from == null' ||
+    a11y_focus_check default act '(.lit_before | not) and .first_lit != null and .first_lit.capture_end_s <= 0.8' ||
+        fail G-FOCUS-RING "could not bound Activities focus onset within 0.8 s"
+    a11y_focus_check default clock '.first_lit == null' ||
         fail G-FOCUS-RING "the unfocused clock was lit"
-    a11y_focus_check default act '.lit_until != null and .lit_until >= 2.8 and .lit_until <= 3.9' ||
-        fail G-FOCUS-RING-TIMEOUT "the default focus indication did not clear after about 3 s"
+    a11y_focus_check default act '.last_lit != null and .first_unlit != null and .last_lit.capture_begin_s >= 2.8 and .first_unlit.capture_end_s <= 3.9' ||
+        fail G-FOCUS-RING-TIMEOUT "could not bound default focus expiry within 2.8-3.9 s"
 
     # Two seconds: shorter than the toolkit timer, on the next control.
     gsettings set "$A11Y_INTERFACE" "$A11Y_FOCUS_KEY" 2
@@ -78,12 +81,12 @@ a11y_focus_ring_proof() {
         fail G-FOCUS-RING "Tab did not move focus to the clock"
     focused "$ARTIFACTS/a11y-focus-two.json" Activities &&
         fail G-FOCUS-RING "Activities kept focus after Tab"
-    a11y_focus_check two clock '(.lit_before | not) and .lit_from != null and .lit_from <= 0.8' ||
-        fail G-FOCUS-RING "Tab did not light the clock"
-    a11y_focus_check two act '.lit_from == null' ||
+    a11y_focus_check two clock '(.lit_before | not) and .first_lit != null and .first_lit.capture_end_s <= 0.8' ||
+        fail G-FOCUS-RING "could not bound clock focus onset within 0.8 s"
+    a11y_focus_check two act '.first_lit == null' ||
         fail G-FOCUS-RING "Activities stayed lit after focus left it"
-    a11y_focus_check two clock '.lit_until != null and .lit_until >= 1.8 and .lit_until <= 2.9' ||
-        fail G-FOCUS-RING-TIMEOUT "a 2 s timeout did not clear the indication after 2 s"
+    a11y_focus_check two clock '.last_lit != null and .first_unlit != null and .last_lit.capture_begin_s >= 1.8 and .first_unlit.capture_end_s <= 2.9' ||
+        fail G-FOCUS-RING-TIMEOUT "could not bound 2 s focus expiry within 1.8-2.9 s"
     pass G-FOCUS-RING "real Ctrl+Alt+Tab and Tab light GNOME's 17% focus fill on exactly the focused panel control"
 
     # Five seconds: outlives the toolkit's own three-second timer.
@@ -93,18 +96,18 @@ a11y_focus_ring_proof() {
     a11y_focus_dump five
     focused "$ARTIFACTS/a11y-focus-five.json" Activities ||
         fail G-FOCUS-RING "Shift+Tab did not return focus to Activities"
-    a11y_focus_check five act '.lit_from != null and .lit_from <= 0.8' ||
-        fail G-FOCUS-RING "Shift+Tab did not light Activities within 0.8 s (5 s setting)"
-    a11y_focus_check five act '.lit_until != null and .lit_until >= 4.8 and .lit_until <= 5.9' ||
-        fail G-FOCUS-RING-TIMEOUT "a 5 s timeout did not keep the indication past the toolkit's 3 s"
+    a11y_focus_check five act '.first_lit != null and .first_lit.capture_end_s <= 0.8' ||
+        fail G-FOCUS-RING "could not bound Activities focus onset within 0.8 s (5 s setting)"
+    a11y_focus_check five act '.last_lit != null and .first_unlit != null and .last_lit.capture_begin_s >= 4.8 and .first_unlit.capture_end_s <= 5.9' ||
+        fail G-FOCUS-RING-TIMEOUT "could not bound 5 s focus expiry within 4.8-5.9 s"
 
     # Zero: forever.
     gsettings set "$A11Y_INTERFACE" "$A11Y_FOCUS_KEY" 0
     sleep 0.5
     a11y_focus_timeline forever 8 Tab "act=$act" "clock=$clock"
-    a11y_focus_check forever clock '.lit_from != null and .lit_from <= 0.8' ||
-        fail G-FOCUS-RING "Tab did not light the clock within 0.8 s (zero timeout)"
-    a11y_focus_check forever clock '.lit_until == null' ||
+    a11y_focus_check forever clock '.first_lit != null and .first_lit.capture_end_s <= 0.8' ||
+        fail G-FOCUS-RING "could not bound clock focus onset within 0.8 s (zero timeout)"
+    a11y_focus_check forever clock '.first_unlit == null' ||
         fail G-FOCUS-RING-TIMEOUT "a zero timeout let the indication clear within 8 s"
     a11y_focus_dump forever
     focused "$ARTIFACTS/a11y-focus-forever.json" "Date and Time" ||

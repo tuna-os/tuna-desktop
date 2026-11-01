@@ -160,16 +160,25 @@ capture() {
         fail "$2" "screenshot overlay did not close after $label"
 }
 # Wait until the session snapshot carries the expected JSON predicate.
+# An optional second predicate also waits for the compositor's state,
+# within the same 20-second deadline. Shell publication alone does not
+# mean the first color-effect shader has compiled and its frame submitted.
 snapshot() {
     end=$(($(date +%s) + 20))
     while [ "$(date +%s)" -le "$end" ]; do
         if [ -s "$RUN_PRIV/tuna-magnifier.json" ] &&
             jq -e "$1" "$RUN_PRIV/tuna-magnifier.json" >/dev/null 2>&1; then
-            return 0
+            if [ $# -eq 1 ]; then
+                return 0
+            fi
+            if [ -s "$CSTATE" ] && jq -e "$2" "$CSTATE" >/dev/null 2>&1; then
+                return 0
+            fi
         fi
         sleep 0.3
     done
     cat "$RUN_PRIV/tuna-magnifier.json" >&2 2>/dev/null || true
+    if [ $# -gt 1 ]; then cat "$CSTATE" >&2 2>/dev/null || true; fi
     return 1
 }
 
@@ -584,12 +593,19 @@ pass M-KEYS "Super+Alt+8 toggles off and on; Super+Alt+= / - step 2 -> 3 -> 2 wi
 
 # M-INVERT: Shell.InvertLightnessEffect, every channel + (1 - 2L).
 gsettings set org.gnome.desktop.a11y.magnifier invert-lightness true
-snapshot '.invert_lightness == true' || fail M-INVERT "invert-lightness never reached the snapshot"
+snapshot '.invert_lightness == true' '.magnifier | .regions["tuna-0"].submitted.generation == .generation and .regions["tuna-0"].submitted.invert_lightness == true' ||
+    fail M-INVERT "invert-lightness never reached the snapshot and compositor"
+# Only successful output submission acknowledges an effect generation;
+# loading settings or planning an offscreen capture cannot satisfy it.
+# Preserve both sides of that handoff beside the single observed image.
+cp "$RUN_PRIV/tuna-magnifier.json" "$ARTIFACTS/16-invert-settings.json"
+cp "$CSTATE" "$ARTIFACTS/16-invert-state.json"
 grab 16-invert M-INVERT
 expect M-INVERT 16-invert 440 520 "93 217 160" 14 "inverted green"
 expect M-INVERT 16-invert 840 520 "255 122 25" 14 "inverted orange"
 gsettings set org.gnome.desktop.a11y.magnifier invert-lightness false
-snapshot '.invert_lightness == false' || fail M-INVERT "invert-lightness never reset"
+snapshot '.invert_lightness == false' '.magnifier | .regions["tuna-0"].submitted.generation == .generation and .regions["tuna-0"].submitted.invert_lightness == false' ||
+    fail M-INVERT "invert-lightness never reset in the snapshot and compositor"
 pass M-INVERT "invert lightness turns green into 93 217 160 and orange into 255 122 25"
 
 # M-CROSSHAIRS: opaque red hairs through the magnified pointer.

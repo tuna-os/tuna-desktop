@@ -1082,5 +1082,159 @@ class SkipUndisturbed(unittest.TestCase):
                     ('skip-undisturbed', 1000.0, 1002.0, 30), **owned)
 
 
+class SkipScheduleEvidence(unittest.TestCase):
+    """Synthetic source observations; never claimed as live CI evidence."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / 'nested.log'
+        self.pid, self.start = owner_identity()
+
+    def skip(self, *, now=911, before=1000, after=1000, pid=None, idle=0):
+        return (f'tuna-shell-gtk: wellbeing: skip schedule pid={self.pid if pid is None else pid} '
+                f'now={now} idle={idle} before={before} after={after}\n')
+
+    def due(self, *, now=1001, due=1000, pid=None, idle=0):
+        return (f'tuna-shell-gtk: wellbeing: due schedule pid={self.pid if pid is None else pid} '
+                f'now={now} idle={idle} due={due}\n')
+
+    def check(self, text=None, *, offset=0, orig=1000, arrival=1003, gate=900):
+        if text is not None:
+            self.path.write_text(text)
+        return mod.check_skip_schedule(
+            self.path, offset, orig, arrival, gate,
+            expected_pid=self.pid, expected_start_ticks=self.start)
+
+    def test_deadline_and_within_budget_presentation_are_recorded_separately(self):
+        receipt = self.check(self.skip() + self.due())
+        self.assertEqual(receipt['scheduled_due'], 1000)
+        self.assertEqual(receipt['schedule_drift_secs'], 0)
+        self.assertEqual(receipt['arrival_lag_secs'], 3)
+        self.assertEqual(receipt['skip']['before'], receipt['skip']['after'])
+        self.assertEqual(receipt['skip']['after'], receipt['due_notice']['due'])
+
+    def test_eleven_second_arrival_still_fails_with_unchanged_actual_deadline(self):
+        with self.assertRaisesRegex(AssertionError, 'got 11.0s'):
+            self.check(self.skip() + self.due(), arrival=1011)
+
+    def test_eleven_second_actual_schedule_drift_still_fails(self):
+        with self.assertRaisesRegex(AssertionError, 'got 11.0s'):
+            self.check(self.skip(before=1011, after=1011)
+                       + self.due(now=1011, due=1011), arrival=1011)
+
+    def test_even_one_second_consumer_or_later_deadline_change_fails(self):
+        for text in (self.skip(after=1001) + self.due(due=1001),
+                     self.skip() + self.due(due=1001)):
+            with self.subTest(text=text):
+                with self.assertRaisesRegex(AssertionError, 'deadline'):
+                    self.check(text)
+
+    def test_arrival_without_actual_source_evidence_never_qualifies(self):
+        for text in ('', self.skip(), self.due()):
+            with self.subTest(text=text):
+                with self.assertRaisesRegex(mod.HarnessError, 'exactly one'):
+                    self.check(text)
+
+    def test_duplicate_actions_including_stale_invocations_fail(self):
+        with self.assertRaisesRegex(mod.HarnessError, 'exactly one'):
+            self.check(self.skip() + self.skip(now=912) + self.due())
+
+    def test_ambiguous_due_notices_fail(self):
+        with self.assertRaisesRegex(mod.HarnessError, 'exactly one'):
+            self.check(self.skip() + self.due() + self.due(now=1002))
+
+    def test_zero_missing_nonfinite_and_malformed_deadlines_fail_closed(self):
+        for value in (0, None, 'NaN', 'inf', -1):
+            for text in (self.skip(before=value, after=value) + self.due(),
+                         self.skip() + self.due(due=value)):
+                with self.subTest(value=value, text=text):
+                    with self.assertRaises(mod.HarnessError):
+                        self.check(text)
+        with self.assertRaises(mod.HarnessError):
+            self.check(self.skip().replace(' after=1000', '') + self.due())
+
+    def test_invalid_source_clock_or_idle_fails_closed(self):
+        for text in (self.skip(now='NaN') + self.due(),
+                     self.skip(idle=-1) + self.due(),
+                     self.skip() + self.due(now=0)):
+            with self.subTest(text=text):
+                with self.assertRaises(mod.HarnessError):
+                    self.check(text)
+
+    def test_skip_must_act_on_an_actual_future_deadline(self):
+        with self.assertRaisesRegex(AssertionError, 'upcoming'):
+            self.check(self.skip(now=1000) + self.due())
+
+    def test_records_must_follow_action_gate_and_due_time(self):
+        for text in (self.due() + self.skip(),
+                     self.skip(now=899) + self.due(),
+                     self.skip() + self.due(now=999),
+                     self.skip() + self.due(now=1012)):
+            with self.subTest(text=text):
+                with self.assertRaises(AssertionError):
+                    self.check(text)
+
+    def test_foreign_or_replaced_shell_cannot_supply_deadlines(self):
+        for text in (self.skip(pid=self.pid + 1) + self.due(),
+                     self.skip() + self.due(pid=self.pid + 1)):
+            with self.subTest(text=text):
+                with self.assertRaisesRegex(mod.HarnessError, 'owner'):
+                    self.check(text)
+        for starts in ([self.start + 1], [self.start, self.start + 1]):
+            self.path.write_text(self.skip() + self.due())
+            with mock.patch.object(mod, 'proc_start_ticks', side_effect=starts):
+                with self.assertRaisesRegex(mod.HarnessError, 'replaced'):
+                    self.check()
+
+    def test_fresh_log_offset_excludes_old_actions(self):
+        old = self.skip(now=811, before=850, after=850) + self.due(now=851, due=850)
+        receipt = self.check(old + self.skip() + self.due(),
+                             offset=len(old.encode()))
+        self.assertEqual(receipt['scheduled_due'], 1000)
+        with self.assertRaisesRegex(mod.HarnessError, 'exactly one'):
+            self.check(old, offset=len(old.encode()))
+
+    def test_truncated_or_mid_line_log_mark_fails_closed(self):
+        text = self.skip() + self.due()
+        for offset in (-1, True, 1, len(text.encode()) + 1):
+            with self.subTest(offset=offset):
+                with self.assertRaises(mod.HarnessError):
+                    self.check(text, offset=offset)
+
+    def test_missing_log_and_untyped_epochs_are_harness_errors(self):
+        with self.assertRaises(mod.HarnessError):
+            self.check()
+        for value in (None, True, float('nan'), float('inf'), 0, -1):
+            for key in ('orig', 'arrival', 'gate'):
+                with self.subTest(key=key, value=value):
+                    with self.assertRaises(mod.HarnessError):
+                        self.check(self.skip() + self.due(), **{key: value})
+
+    def test_cli_emits_actual_schedule_receipt(self):
+        self.path.write_text(self.skip() + self.due())
+        with mock.patch('builtins.print') as printed:
+            self.assertEqual(mod.main([
+                'skip-schedule', '--log', str(self.path), '--log-offset', '0',
+                '--orig-due', '1000', '--due-arrival', '1003', '--gate-start', '900',
+                '--expect-pid', str(self.pid), '--expect-start', str(self.start),
+            ]), 0)
+        self.assertEqual(json.loads(printed.call_args.args[0])['scheduled_due'], 1000)
+
+    def test_shell_uses_authoritative_due_and_keeps_existing_wait_budget(self):
+        proof = (HERE.parent / 'tuna-gtk-shell-proof').read_text()
+        gate = proof.split('wb_gate_begin G-WELLBEING-ACTION-SKIP\n', 1)[1]
+        gate = gate.split('\nwb_break_cleanup', 1)[0]
+        self.assertLess(gate.index('skip_schedule_log_offset='),
+                        gate.index('gsettings set org.gnome.desktop.break-reminders selected-breaks'))
+        self.assertIn('skip-schedule \\\n', gate)
+        self.assertIn('--expect-pid "$WB_SHELL_PID" --expect-start "$WB_SHELL_START"', gate)
+        self.assertIn('--due-arrival "$skip_due_epoch"', gate)
+        self.assertIn('--due-new "$skip_due_epoch"', gate)
+        self.assertIn('--log "$LOG" --log-offset "$skip_schedule_log_offset"', gate)
+        self.assertIn('>"$ARTIFACTS/wb-skip-schedule.json"', gate)
+        self.assertIn('end=$(($(date +%s) + 150))', gate)
+
+
 if __name__ == '__main__':
     unittest.main()

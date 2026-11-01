@@ -20,13 +20,14 @@ with at least six fill columns (its padding), so antialiased label
 edges on the black bar never count. A control is lit when a lit pill
 covers its centre.
 
-Frames are sampled every ~40 ms for SECONDS after the key. The JSON
-records the lit pills per frame and, per control, `lit_before` (the
-frame before the key), `lit_from` (first lit frame, seconds after the
-key) and `lit_until` (first unlit frame after that, or null if it stayed
-lit). The panel strip before the key, half a second after it, at the
-first lit frame and at the first expired frame are saved next to
-OUT.json as PNG evidence.
+Frames are sampled with a 10 ms pause, only within SECONDS of `xdotool key`
+returning. Monotonic command begin/end bound the command, not input delivery,
+drawing or presentation. Every capture records begin/end relative to command
+return, without rounding. A first-lit capture's END bounds onset above; the
+last-lit capture's BEGIN and first-unlit capture's END conservatively bracket
+expiry. Neither capture endpoint is a presentation timestamp. The panel strip
+before the key, half a second after it, at the first lit frame and at the first
+expired frame are saved next to OUT.json as PNG evidence.
 """
 import json
 import pathlib
@@ -34,9 +35,9 @@ import subprocess
 import sys
 import time
 
-from PIL import ImageGrab
 
 PANEL_HEIGHT = 32
+SAMPLE_PAUSE_S = 0.01
 
 
 def fill(pixel):
@@ -62,7 +63,24 @@ def lit_pills(frame, band):
     return pills
 
 
+def summarize_control(frames, name, rect, lit_before):
+    first_lit = last_lit = first_unlit = None
+    for frame in frames:
+        bounds = {field: frame[field] for field in ("capture_begin_s", "capture_end_s")}
+        if frame["lit"][name]:
+            if first_lit is None:
+                first_lit = bounds
+            last_lit = bounds
+        elif first_lit is not None:
+            first_unlit = bounds
+            break
+    return {"rect": rect, "lit_before": lit_before, "first_lit": first_lit,
+            "last_lit": last_lit, "first_unlit": first_unlit}
+
+
 def main():
+    from PIL import ImageGrab
+
     display, out, seconds, key = sys.argv[1], pathlib.Path(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
     rects = {}
     for arg in sys.argv[5:]:
@@ -74,40 +92,54 @@ def main():
     centres = {name: x + w // 2 for name, (x, _, w, _) in rects.items()}
 
     def grab():
-        return ImageGrab.grab(bbox=(0, 0, width, PANEL_HEIGHT), xdisplay=display).convert("RGB")
+        begin = time.monotonic()
+        frame = ImageGrab.grab(bbox=(0, 0, width, PANEL_HEIGHT), xdisplay=display)
+        end = time.monotonic()
+        return frame.convert("RGB"), begin, end
 
     def lit(pills):
         return {name: any(a <= c <= b for a, b in pills) for name, c in centres.items()}
 
-    before = grab()
+    before, before_begin, before_end = grab()
     saved = {"before": before}
+    command_begin = time.monotonic()
     subprocess.run(["xdotool", "key", key], check=True, timeout=5)
-    start = time.monotonic()
+    command_end = time.monotonic()
+    origin = command_end
+    deadline = origin + seconds
     frames = []
-    while (now := time.monotonic() - start) < seconds:
-        frame = grab()
+    while time.monotonic() < deadline:
+        frame, capture_begin, capture_end = grab()
+        # A capture that finishes outside the original window cannot qualify.
+        if capture_end > deadline:
+            break
         pills = lit_pills(frame, band)
-        frames.append({"t": round(now, 3), "pills": pills, "lit": lit(pills)})
+        frames.append({"capture_begin_s": capture_begin - origin,
+                       "capture_end_s": capture_end - origin,
+                       "pills": pills, "lit": lit(pills)})
         if pills and "lit" not in saved:
             saved["lit"] = frame
-        if now >= 0.5 and "early" not in saved:
+        if capture_end - origin >= 0.5 and "early" not in saved:
             saved["early"] = frame
         if not pills and "lit" in saved and "expired" not in saved:
             saved["expired"] = frame
-        time.sleep(0.04)
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(SAMPLE_PAUSE_S, remaining))
     lit_before = lit(lit_pills(before, band))
-    summary = {}
-    for name in rects:
-        lit_from = next((f["t"] for f in frames if f["lit"][name]), None)
-        lit_until = None
-        if lit_from is not None:
-            lit_until = next((f["t"] for f in frames if f["t"] > lit_from and not f["lit"][name]), None)
-        summary[name] = {"rect": rects[name], "lit_before": lit_before[name],
-                         "lit_from": lit_from, "lit_until": lit_until}
+    summary = {name: summarize_control(frames, name, rect, lit_before[name])
+               for name, rect in rects.items()}
     for label, frame in saved.items():
         frame.save(out.with_name(f"{out.stem}-{label}.png"))
-    out.write_text(json.dumps({"key": key, "seconds": seconds, "controls": summary,
-                               "frames": frames}, indent=1) + "\n")
+    out.write_text(json.dumps({"key": key, "seconds": seconds, "clock": "monotonic",
+                               "origin": "xdotool-command-return",
+                               "origin_monotonic_s": origin,
+                               "command": {"begin_monotonic_s": command_begin,
+                                           "end_monotonic_s": command_end},
+                               "before_capture": {"capture_begin_s": before_begin - origin,
+                                                  "capture_end_s": before_end - origin},
+                               "sample_pause_s": SAMPLE_PAUSE_S,
+                               "controls": summary, "frames": frames}, indent=1) + "\n")
     print(json.dumps({"key": key, "controls": summary}))
     return 0
 

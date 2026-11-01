@@ -1,0 +1,1353 @@
+﻿2026-10-31T18:48:41.9499055Z Current runner version: '2.338.2'
+2026-10-31T18:48:41.9521261Z ##[group]Runner Image Provisioner
+2026-10-31T18:48:41.9522014Z Hosted Compute Agent
+2026-10-31T18:48:41.9522498Z Version: 20261021.618
+2026-10-31T18:48:41.9523224Z Commit: 21505ad2541d5be6135ed84fc33697146cf75b8e
+2026-10-31T18:48:41.9523874Z Build Date: 2026-10-21T00:45:21Z
+2026-10-31T18:48:41.9524486Z Worker ID: {ad8a8bfb-3347-4291-85d0-86a57e565c93}
+2026-10-31T18:48:41.9525152Z Region: centralus
+2026-10-31T18:48:41.9525610Z Cloud: Azure
+2026-10-31T18:48:41.9526129Z ##[endgroup]
+2026-10-31T18:48:41.9527327Z ##[group]Operating System
+2026-10-31T18:48:41.9527897Z Ubuntu
+2026-10-31T18:48:41.9528362Z 24.04.5
+2026-10-31T18:48:41.9528801Z LTS
+2026-10-31T18:48:41.9529278Z ##[endgroup]
+2026-10-31T18:48:41.9529780Z ##[group]Runner Image
+2026-10-31T18:48:41.9530284Z Image: ubuntu-24.04
+2026-10-31T18:48:41.9530873Z Version: 20261025.353.1
+2026-10-31T18:48:41.9531903Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20261025.353/images/ubuntu/Ubuntu2404-Readme.md
+2026-10-31T18:48:41.9533437Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20261025.353
+2026-10-31T18:48:41.9534276Z ##[endgroup]
+2026-10-31T18:48:41.9535270Z ##[group]GITHUB_TOKEN Permissions
+2026-10-31T18:48:41.9536984Z Contents: read
+2026-10-31T18:48:41.9537543Z Metadata: read
+2026-10-31T18:48:41.9538027Z Packages: write
+2026-10-31T18:48:41.9538546Z ##[endgroup]
+2026-10-31T18:48:41.9540312Z Secret source: Actions
+2026-10-31T18:48:41.9541210Z Cache mode: write
+2026-10-31T18:48:41.9541794Z Prepare workflow directory
+2026-10-31T18:48:42.0070473Z Prepare all required actions
+2026-10-31T18:48:42.0129205Z Getting action download info
+2026-10-31T18:48:42.2554409Z Download action repository 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' (SHA:3d3c42e5aac5ba805825da76410c181273ba90b1)
+2026-10-31T18:48:42.4265673Z Download action repository 'docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302' (SHA:dc802804100637a589fabce1cb79ff13a1411302)
+2026-10-31T18:48:42.9065024Z Download action repository 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333' (SHA:9000827ccba6bdab643e8b6fd33ac0654aef8333)
+2026-10-31T18:48:43.3580368Z Uses: tuna-os/tunaOS/.github/workflows/reusable-build-image.yml@refs/heads/main (f5b93442b3b8f504c6cdc63ed7cb774f957f707e)
+2026-10-31T18:48:43.3585410Z ##[group] Inputs
+2026-10-31T18:48:43.3586189Z   image-name: marlin
+2026-10-31T18:48:43.3586962Z   image-aliases: arch,archlinux
+2026-10-31T18:48:43.3587848Z   image-desc: Based on Arch Linux (rolling)
+2026-10-31T18:48:43.3588772Z   flavor: gnome
+2026-10-31T18:48:43.3589499Z   platforms: linux/amd64,linux/arm64
+2026-10-31T18:48:43.3591257Z   platforms-json: [{"platform":"linux/amd64","safeplatform":"linux-amd64"},{"platform":"linux/arm64","safeplatform":"linux-arm64"}]
+2026-10-31T18:48:43.3593174Z   major-version: 10
+2026-10-31T18:48:43.3593895Z   default-tag: gnome
+2026-10-31T18:48:43.3594611Z   image-variant: marlin
+2026-10-31T18:48:43.3595682Z   sbom: true
+2026-10-31T18:48:43.3596380Z   cleanup_runner: true
+2026-10-31T18:48:43.3597108Z   publish: true
+2026-10-31T18:48:43.3597843Z   remove-unwanted-software: false
+2026-10-31T18:48:43.3598733Z   pr-desktop-contract: false
+2026-10-31T18:48:43.3599614Z   chain-base-image: 
+2026-10-31T18:48:43.3600338Z   image-registry: 
+2026-10-31T18:48:43.3601031Z ##[endgroup]
+2026-10-31T18:48:43.3601837Z Complete job name: 🚀-marlin / gnome / Manifest
+2026-10-31T18:48:43.4192667Z ##[group]Checking docker version
+2026-10-31T18:48:43.4203995Z ##[command]/usr/bin/docker version --format '{{.Server.APIVersion}}'
+2026-10-31T18:48:43.4942082Z '1.48'
+2026-10-31T18:48:43.4957430Z Docker daemon API version: '1.48'
+2026-10-31T18:48:43.4958762Z ##[command]/usr/bin/docker version --format '{{.Client.APIVersion}}'
+2026-10-31T18:48:43.5202294Z '1.48'
+2026-10-31T18:48:43.5218414Z Docker client API version: '1.48'
+2026-10-31T18:48:43.5224307Z ##[endgroup]
+2026-10-31T18:48:43.5226933Z ##[group]Clean up resources from previous jobs
+2026-10-31T18:48:43.5233375Z ##[command]/usr/bin/docker ps --all --quiet --no-trunc --filter "label=715217"
+2026-10-31T18:48:43.5383432Z ##[command]/usr/bin/docker network prune --force --filter "label=715217"
+2026-10-31T18:48:43.5522362Z ##[endgroup]
+2026-10-31T18:48:43.5523919Z ##[group]Create local container network
+2026-10-31T18:48:43.5534381Z ##[command]/usr/bin/docker network create --label 715217 github_network_fd6f06bf3f6e47e1815d49474933d016
+2026-10-31T18:48:43.6550882Z d54664e13a380643548a32b28fb11171a85e2795622a7c61dd86833b4518556c
+2026-10-31T18:48:43.6589475Z ##[endgroup]
+2026-10-31T18:48:43.6636949Z ##[group]Starting job container
+2026-10-31T18:48:43.6669035Z ##[command]/usr/bin/docker pull cgr.dev/chainguard/wolfi-base@sha256:73f2cab0f11208427595d4bdd784046bc4116ef7cc52f0c1b48b6b7f820288d5
+2026-10-31T18:48:44.1141942Z cgr.dev/chainguard/wolfi-base@sha256:73f2cab0f11208427595d4bdd784046bc4116ef7cc52f0c1b48b6b7f820288d5: Pulling from chainguard/wolfi-base
+2026-10-31T18:48:44.1145066Z 413b1e3d2c47: Pulling fs layer
+2026-10-31T18:48:44.1146500Z 7a4877cecca8: Pulling fs layer
+2026-10-31T18:48:44.1147825Z 8693a2d13661: Pulling fs layer
+2026-10-31T18:48:44.1148944Z 82087d46dc9d: Pulling fs layer
+2026-10-31T18:48:44.1150136Z f53829540a90: Pulling fs layer
+2026-10-31T18:48:44.1151213Z 324761fa1ddb: Pulling fs layer
+2026-10-31T18:48:44.1152269Z 7e77629aa519: Pulling fs layer
+2026-10-31T18:48:44.1153632Z 81aee3040b67: Pulling fs layer
+2026-10-31T18:48:44.1154762Z 53abc9c20665: Pulling fs layer
+2026-10-31T18:48:44.1155913Z 4c6b4e14ddc2: Pulling fs layer
+2026-10-31T18:48:44.1157004Z 450153d232c9: Pulling fs layer
+2026-10-31T18:48:44.1158112Z 7e77629aa519: Waiting
+2026-10-31T18:48:44.1159171Z 81aee3040b67: Waiting
+2026-10-31T18:48:44.1160158Z 53abc9c20665: Waiting
+2026-10-31T18:48:44.1161199Z 4c6b4e14ddc2: Waiting
+2026-10-31T18:48:44.1162208Z 450153d232c9: Waiting
+2026-10-31T18:48:44.1163379Z 82087d46dc9d: Waiting
+2026-10-31T18:48:44.1164430Z 324761fa1ddb: Waiting
+2026-10-31T18:48:44.1165532Z f53829540a90: Waiting
+2026-10-31T18:48:44.4183092Z 7a4877cecca8: Verifying Checksum
+2026-10-31T18:48:44.4184556Z 7a4877cecca8: Download complete
+2026-10-31T18:48:44.4867223Z 8693a2d13661: Verifying Checksum
+2026-10-31T18:48:44.4868510Z 8693a2d13661: Download complete
+2026-10-31T18:48:44.7057468Z 82087d46dc9d: Verifying Checksum
+2026-10-31T18:48:44.7058355Z 82087d46dc9d: Download complete
+2026-10-31T18:48:44.7887528Z f53829540a90: Verifying Checksum
+2026-10-31T18:48:44.7888431Z f53829540a90: Download complete
+2026-10-31T18:48:44.8058853Z 413b1e3d2c47: Verifying Checksum
+2026-10-31T18:48:44.8060415Z 413b1e3d2c47: Download complete
+2026-10-31T18:48:44.8523348Z 413b1e3d2c47: Pull complete
+2026-10-31T18:48:45.0381428Z 7e77629aa519: Verifying Checksum
+2026-10-31T18:48:45.0382130Z 7e77629aa519: Download complete
+2026-10-31T18:48:45.0829621Z 81aee3040b67: Verifying Checksum
+2026-10-31T18:48:45.0830491Z 81aee3040b67: Download complete
+2026-10-31T18:48:45.3752593Z 53abc9c20665: Verifying Checksum
+2026-10-31T18:48:45.3753319Z 53abc9c20665: Download complete
+2026-10-31T18:48:45.4988448Z 324761fa1ddb: Verifying Checksum
+2026-10-31T18:48:45.4989031Z 324761fa1ddb: Download complete
+2026-10-31T18:48:45.5089629Z 4c6b4e14ddc2: Download complete
+2026-10-31T18:48:45.6207753Z 450153d232c9: Verifying Checksum
+2026-10-31T18:48:45.6208288Z 450153d232c9: Download complete
+2026-10-31T18:48:46.1161533Z 7a4877cecca8: Pull complete
+2026-10-31T18:48:46.1446001Z 8693a2d13661: Pull complete
+2026-10-31T18:48:46.1659216Z 82087d46dc9d: Pull complete
+2026-10-31T18:48:46.1821806Z f53829540a90: Pull complete
+2026-10-31T18:48:46.1957834Z 324761fa1ddb: Pull complete
+2026-10-31T18:48:46.2049287Z 7e77629aa519: Pull complete
+2026-10-31T18:48:46.2145070Z 81aee3040b67: Pull complete
+2026-10-31T18:48:46.2244006Z 53abc9c20665: Pull complete
+2026-10-31T18:48:46.2429958Z 4c6b4e14ddc2: Pull complete
+2026-10-31T18:48:46.2836729Z 450153d232c9: Pull complete
+2026-10-31T18:48:46.2866802Z Digest: sha256:73f2cab0f11208427595d4bdd784046bc4116ef7cc52f0c1b48b6b7f820288d5
+2026-10-31T18:48:46.2874501Z Status: Downloaded newer image for cgr.dev/chainguard/wolfi-base@sha256:73f2cab0f11208427595d4bdd784046bc4116ef7cc52f0c1b48b6b7f820288d5
+2026-10-31T18:48:46.2880767Z cgr.dev/chainguard/wolfi-base@sha256:73f2cab0f11208427595d4bdd784046bc4116ef7cc52f0c1b48b6b7f820288d5
+2026-10-31T18:48:46.3009948Z ##[command]/usr/bin/docker create --name 5a33719571d94496aad8dd3209817452_cgrdevchainguardwolfibasesha25673f2cab0f11208427595d4bdd784046bc4116ef7cc52f0c1b48b6b7f820288d5_44b0ea --label 715217 --workdir /__w/tunaOS/tunaOS --network github_network_fd6f06bf3f6e47e1815d49474933d016 --privileged -e "HOME=/github/home" -e GITHUB_ACTIONS=true -e CI=true -v "/var/run/docker.sock":"/var/run/docker.sock" -v "/home/runner/work":"/__w" -v "/home/runner/actions-runner/cached/2.338.2/externals":"/__e":ro -v "/home/runner/work/_temp":"/__w/_temp" -v "/home/runner/work/_actions":"/__w/_actions" -v "/opt/hostedtoolcache":"/__t" -v "/home/runner/work/_temp/_github_home":"/github/home" -v "/home/runner/work/_temp/_github_workflow":"/github/workflow" --entrypoint "tail" cgr.dev/chainguard/wolfi-base@sha256:73f2cab0f11208427595d4bdd784046bc4116ef7cc52f0c1b48b6b7f820288d5 "-f" "/dev/null"
+2026-10-31T18:48:46.3439788Z c186ac469c5a194930897620b809ba631cdfc7224d9701d10543bc411218afca
+2026-10-31T18:48:46.3463436Z ##[command]/usr/bin/docker start c186ac469c5a194930897620b809ba631cdfc7224d9701d10543bc411218afca
+2026-10-31T18:48:46.5215530Z c186ac469c5a194930897620b809ba631cdfc7224d9701d10543bc411218afca
+2026-10-31T18:48:46.5248722Z ##[command]/usr/bin/docker ps --all --filter id=c186ac469c5a194930897620b809ba631cdfc7224d9701d10543bc411218afca --filter status=running --no-trunc --format "{{.ID}} {{.Status}}"
+2026-10-31T18:48:46.5367397Z c186ac469c5a194930897620b809ba631cdfc7224d9701d10543bc411218afca Up Less than a second
+2026-10-31T18:48:46.5388294Z ##[command]/usr/bin/docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" c186ac469c5a194930897620b809ba631cdfc7224d9701d10543bc411218afca
+2026-10-31T18:48:46.5508923Z GITHUB_ACTIONS=true
+2026-10-31T18:48:46.5509270Z CI=true
+2026-10-31T18:48:46.5509501Z HOME=/github/home
+2026-10-31T18:48:46.5509921Z PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin
+2026-10-31T18:48:46.5510390Z SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+2026-10-31T18:48:46.5530223Z ##[endgroup]
+2026-10-31T18:48:46.5538201Z ##[group]Waiting for all services to be ready
+2026-10-31T18:48:46.5539609Z ##[endgroup]
+2026-10-31T18:48:46.5700963Z ##[group]Run # Retry the install, because apk.cgr.dev sometimes refuses a single
+2026-10-31T18:48:46.5701545Z [36;1m# Retry the install, because apk.cgr.dev sometimes refuses a single[0m
+2026-10-31T18:48:46.5701961Z [36;1m# package download. apk-tools 2.14 reports an HTTP 401/403 as[0m
+2026-10-31T18:48:46.5702325Z [36;1m# EACCES, so the log says "Permission denied", but no file[0m
+2026-10-31T18:48:46.5702615Z [36;1m# permission is involved:[0m
+2026-10-31T18:48:46.5702967Z [36;1m#[0m
+2026-10-31T18:48:46.5703166Z [36;1m#   (56/69) Installing libgpg-error (1.61-r3)[0m
+2026-10-31T18:48:46.5703481Z [36;1m#   ERROR: libgpg-error-1.61-r3: Permission denied[0m
+2026-10-31T18:48:46.5703779Z [36;1m#   2 errors; 257 MiB in 88 packages     (exit 2)[0m
+2026-10-31T18:48:46.5704034Z [36;1m#[0m
+2026-10-31T18:48:46.5704285Z [36;1m# Each refused package fails 50-90 ms after its "Installing" line,[0m
+2026-10-31T18:48:46.5704748Z [36;1m# before any download. The packages differ on every run: bonito-rawhide[0m
+2026-10-31T18:48:46.5705152Z [36;1m# base 36046888245 (linux-pam, libgpg-error), flounder-sid kde[0m
+2026-10-31T18:48:46.5705517Z [36;1m# 36083457907 (5 packages), yellowfin gnome-hwe 35957716969. When[0m
+2026-10-31T18:48:46.5705881Z [36;1m# this hits `base`, the whole variant is lost. A second `apk add`[0m
+2026-10-31T18:48:46.5706234Z [36;1m# fetches only the packages that the first one did not install[0m
+2026-10-31T18:48:46.5706530Z [36;1m# (tuna-os/tunaOS#2693).[0m
+2026-10-31T18:48:46.5706887Z [36;1m# tests/regressions/test_issue_2693_manifest_apk_install_retries_a_refused_download.py[0m
+2026-10-31T18:48:46.5707472Z [36;1m# runs this function against a stub apk.[0m
+2026-10-31T18:48:46.5707724Z [36;1mapk_install() {[0m
+2026-10-31T18:48:46.5707918Z [36;1m  attempt=1[0m
+2026-10-31T18:48:46.5708216Z [36;1m  until apk update && apk add "$@"; do[0m
+2026-10-31T18:48:46.5708493Z [36;1m    if [ "$attempt" -ge 4 ]; then[0m
+2026-10-31T18:48:46.5708793Z [36;1m      echo "::error::apk add failed $attempt times; giving up."[0m
+2026-10-31T18:48:46.5709086Z [36;1m      return 1[0m
+2026-10-31T18:48:46.5709273Z [36;1m    fi[0m
+2026-10-31T18:48:46.5709587Z [36;1m    echo "::warning::apk add failed (attempt $attempt of 4); retrying in $((attempt * 5))s."[0m
+2026-10-31T18:48:46.5709958Z [36;1m    sleep $((attempt * 5))[0m
+2026-10-31T18:48:46.5710181Z [36;1m    attempt=$((attempt + 1))[0m
+2026-10-31T18:48:46.5710386Z [36;1m  done[0m
+2026-10-31T18:48:46.5710541Z [36;1m}[0m
+2026-10-31T18:48:46.5710782Z [36;1m# Install necessary packages for building and pushing the image[0m
+2026-10-31T18:48:46.5711252Z [36;1mapk_install jq git podman uutils bash conmon crun netavark fuse-overlayfs libstdc++ yq python3[0m
+2026-10-31T18:48:46.5711677Z [36;1m# Point /bin/sh at bash WITHOUT `ln -sf`.[0m
+2026-10-31T18:48:46.5711918Z [36;1m#[0m
+2026-10-31T18:48:46.5712170Z [36;1m# This step installs uutils, which replaces coreutils in PATH, so the[0m
+2026-10-31T18:48:46.5712586Z [36;1m# very next command runs uutils' ln. uutils 0.12.0-r0 rewrote the -f[0m
+2026-10-31T18:48:46.5713133Z [36;1m# path to "replace links atomically instead of unlinking first"[0m
+2026-10-31T18:48:46.5713512Z [36;1m# (uutils/coreutils#14623, released in 0.12.0), and `ln -sf` then[0m
+2026-10-31T18:48:46.5713826Z [36;1m# started failing here with[0m
+2026-10-31T18:48:46.5714039Z [36;1m#[0m
+2026-10-31T18:48:46.5714269Z [36;1m#   ln: failed to create symbolic link '/bin/sh': Not a directory[0m
+2026-10-31T18:48:46.5714549Z [36;1m#[0m
+2026-10-31T18:48:46.5714772Z [36;1m# The image is pinned by digest but `apk add` is not, so the bump[0m
+2026-10-31T18:48:46.5715160Z [36;1m# landed mid-run and split one run cleanly by clock: in Build Bonito[0m
+2026-10-31T18:48:46.5715557Z [36;1m# 35202293222 every Manifest job started up to 09:54 passed and every[0m
+2026-10-31T18:48:46.5715938Z [36;1m# one from 09:58 failed, and Build Gurnard 35205505527 hit the same[0m
+2026-10-31T18:48:46.5716437Z [36;1m# error at 10:11. Nothing in this repository changed.[0m
+2026-10-31T18:48:46.5716710Z [36;1m#[0m
+2026-10-31T18:48:46.5716948Z [36;1m# `rm` then a plain `ln -s` never enters the rewritten -f path, and[0m
+2026-10-31T18:48:46.5717311Z [36;1m# behaves the same under GNU, busybox and uutils. Deliberately not[0m
+2026-10-31T18:48:46.5717693Z [36;1m# pinned to uutils 0.11.0-r1: a pin here would need someone to notice[0m
+2026-10-31T18:48:46.5718029Z [36;1m# and lift it once upstream fixes the regression.[0m
+2026-10-31T18:48:46.5718294Z [36;1mrm -f /bin/sh[0m
+2026-10-31T18:48:46.5718488Z [36;1mln -s /bin/bash /bin/sh[0m
+2026-10-31T18:48:46.5718712Z [36;1mmkdir -p /etc/containers[0m
+2026-10-31T18:48:46.5719073Z [36;1mecho '{"default":[{"type":"insecureAcceptAnything"}]}' | jq . > /etc/containers/policy.json[0m
+2026-10-31T18:48:46.5722091Z shell: sh -e {0}
+2026-10-31T18:48:46.5722438Z env:
+2026-10-31T18:48:46.5722617Z   IMAGE_NAME: marlin
+2026-10-31T18:48:46.5723009Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:48:46.5723255Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:48:46.5723471Z   DEFAULT_TAG: gnome
+2026-10-31T18:48:46.5723650Z   MAJOR_VERSION: 10
+2026-10-31T18:48:46.5723837Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:48:46.5724066Z ##[endgroup]
+2026-10-31T18:48:46.6148436Z fetch https://apk.cgr.dev/chainguard/x86_64/APKINDEX.tar.gz
+2026-10-31T18:48:47.5577947Z  [https://apk.cgr.dev/chainguard]
+2026-10-31T18:48:47.5578445Z OK: 106380 distinct packages available
+2026-10-31T18:48:48.0987420Z (1/84) Installing ncurses-terminfo-base (6.6.20261024-r0)
+2026-10-31T18:48:48.5530452Z (2/84) Installing ncurses (6.6.20261024-r0)
+2026-10-31T18:48:48.9358168Z (3/84) Installing bash (5.3-r14)
+2026-10-31T18:48:49.6002674Z (4/84) Installing libffi (3.8.0-r2)
+2026-10-31T18:48:49.9986181Z (5/84) Installing libblkid (2.42.4-r2)
+2026-10-31T18:48:50.3572218Z (6/84) Installing libpcre2-8-0 (10.49-r1)
+2026-10-31T18:48:50.6974567Z (7/84) Installing libsepol (3.11-r3)
+2026-10-31T18:48:51.2723852Z (8/84) Installing libselinux (3.11-r2)
+2026-10-31T18:48:51.8485106Z (9/84) Installing libmount (2.42.4-r2)
+2026-10-31T18:48:52.1572220Z (10/84) Installing glib (2.90.1-r1)
+2026-10-31T18:48:52.9136672Z (11/84) Installing lz4 (1.10.0-r11)
+2026-10-31T18:48:53.1664183Z (12/84) Installing xz (5.8.4-r0)
+2026-10-31T18:48:53.5085557Z (13/84) Installing zstd (1.5.7-r12)
+2026-10-31T18:48:53.8267628Z (14/84) Installing libsystemd-compression-libs (262.1-r4)
+2026-10-31T18:48:54.1661421Z (15/84) Installing libsystemd (262.1-r4)
+2026-10-31T18:48:54.4667641Z (16/84) Installing conmon (2.2.1-r3)
+2026-10-31T18:48:54.7763409Z (17/84) Installing libkrunfw (5.6.2-r1)
+2026-10-31T18:48:56.4079315Z (18/84) Installing libkrun (1.19.7-r0)
+2026-10-31T18:48:56.7675970Z (19/84) Installing linux-pam (1.7.3-r3)
+2026-10-31T18:48:57.1991150Z (20/84) Installing libcap (2.78-r4)
+2026-10-31T18:48:57.5214722Z (21/84) Installing json-c (0.19-r2)
+2026-10-31T18:48:57.8510936Z (22/84) Installing libseccomp (2.6.1-r4)
+2026-10-31T18:48:58.2161669Z (23/84) Installing crun (1.30.1-r0)
+2026-10-31T18:48:58.5390865Z (24/84) Installing fuse3-libs (3.18.3-r2)
+2026-10-31T18:48:58.8680870Z (25/84) Installing fuse3 (3.18.3-r2)
+2026-10-31T18:48:59.1864267Z (26/84) Installing fuse-overlayfs (1.18-r1)
+2026-10-31T18:48:59.5763087Z (27/84) Installing krb5-conf (1.0-r10)
+2026-10-31T18:48:59.9255953Z (28/84) Installing libcom_err (1.47.4-r5)
+2026-10-31T18:49:00.3276217Z (29/84) Installing keyutils-libs (1.6.3-r41)
+2026-10-31T18:49:00.6623894Z (30/84) Installing libverto (0.3.2-r11)
+2026-10-31T18:49:01.0298100Z (31/84) Installing krb5-libs (1.22.2-r5)
+2026-10-31T18:49:01.4021803Z (32/84) Installing libunistring (1.5-r0)
+2026-10-31T18:49:02.0826154Z (33/84) Installing libidn2 (2.3.8-r12)
+2026-10-31T18:49:02.3866620Z (34/84) Installing openssl-3.6-libcrypto (3.6.5-r6)
+2026-10-31T18:49:02.9964468Z (35/84) Installing gdbm (1.26-r9)
+2026-10-31T18:49:03.3607557Z (36/84) Installing lmdb (0.9.35-r3)
+2026-10-31T18:49:04.0087331Z (37/84) Installing readline (8.3-r3)
+2026-10-31T18:49:05.0010493Z (38/84) Installing sqlite-libs (3.54.1-r0)
+2026-10-31T18:49:05.4176747Z (39/84) Installing heimdal-libs (7.8.0-r55)
+2026-10-31T18:49:05.7399182Z (40/84) Installing cyrus-sasl-heimdal-libs (2.1.28-r58)
+2026-10-31T18:49:06.1468894Z (41/84) Installing openssl-3.6-libssl (3.6.5-r6)
+2026-10-31T18:49:06.5077674Z (42/84) Installing libldap-2.6 (2.6.14-r0)
+2026-10-31T18:49:06.8091471Z (43/84) Installing libnghttp2-14 (1.70.0-r7)
+2026-10-31T18:49:07.1770865Z (44/84) Installing nghttp3 (1.18.0-r3)
+2026-10-31T18:49:07.5963781Z (45/84) Installing ngtcp2 (1.25.0-r7)
+2026-10-31T18:49:08.0830334Z (46/84) Installing libpsl (0.23.3-r4)
+2026-10-31T18:49:08.4713701Z (47/84) Installing libcurl-openssl4 (8.23.0-r2)
+2026-10-31T18:49:08.7977634Z (48/84) Installing libexpat1 (2.9.0-r0)
+2026-10-31T18:49:09.1704463Z (49/84) Installing git (2.56.0-r3)
+2026-10-31T18:49:10.7280505Z (50/84) Installing oniguruma (6.9.10-r7)
+2026-10-31T18:49:11.1020836Z (51/84) Installing jq (1.8.2-r3)
+2026-10-31T18:49:11.4026763Z (52/84) Installing libstdc++ (16.2.0-r2)
+2026-10-31T18:49:11.8444829Z (53/84) Installing aardvark-dns (2.1.0-r3)
+2026-10-31T18:49:12.3351379Z (54/84) Installing libedit (3.1-r20)
+2026-10-31T18:49:12.6196144Z (55/84) Installing gmp (6.3.0-r12)
+2026-10-31T18:49:12.9506975Z (56/84) Installing jansson (2.15.1-r4)
+2026-10-31T18:49:13.2704689Z (57/84) Installing libmnl (1.0.5-r10)
+2026-10-31T18:49:13.5511183Z (58/84) Installing libnftnl (1.3.2-r3)
+2026-10-31T18:49:13.9200815Z (59/84) Installing nftables (1.1.7-r0)
+2026-10-31T18:49:14.3454865Z (60/84) Installing netavark (2.1.0-r5)
+2026-10-31T18:49:15.3185997Z (61/84) Installing containers-image (5.41.2-r0)
+2026-10-31T18:49:15.6034913Z (62/84) Installing containers-shortnames (0_git20260415-r0)
+2026-10-31T18:49:15.8870965Z (63/84) Installing containers-skopeo-config (1.24.1-r0)
+2026-10-31T18:49:16.1700955Z (64/84) Installing containers-storage (1.64.1-r0)
+2026-10-31T18:49:16.6278946Z (65/84) Installing containers-common (0.69.2-r0)
+2026-10-31T18:49:17.0424181Z (66/84) Installing libgpg-error (1.61-r6)
+2026-10-31T18:49:17.4001200Z (67/84) Installing libassuan (3.0.2-r12)
+2026-10-31T18:49:17.7275586Z (68/84) Installing libgcrypt (1.12.4-r2)
+2026-10-31T18:49:18.1291616Z (69/84) Installing gnupg-gpgconf (2.4.9-r12)
+2026-10-31T18:49:18.4155514Z (70/84) Installing libbz2-1 (1.0.8-r28)
+2026-10-31T18:49:18.8064218Z (71/84) Installing libksba (1.8.1-r4)
+2026-10-31T18:49:19.1414958Z (72/84) Installing npth (1.8-r11)
+2026-10-31T18:49:19.4327881Z (73/84) Installing gpg (2.4.9-r12)
+2026-10-31T18:49:19.7373564Z (74/84) Installing gpg-agent (2.4.9-r12)
+2026-10-31T18:49:20.0830403Z (75/84) Installing gpgsm (2.4.9-r12)
+2026-10-31T18:49:20.3919643Z (76/84) Installing gpgme (2.2.0-r3)
+2026-10-31T18:49:20.7940135Z (77/84) Installing podman-6.0 (6.0.2-r2)
+2026-10-31T18:49:22.2263962Z (78/84) Installing py3-pip-wheel (26.2.2-r2)
+2026-10-31T18:49:22.6698541Z (79/84) Installing mpdecimal (4.0.1-r6)
+2026-10-31T18:49:22.9523621Z (80/84) Installing libuuid (2.42.4-r2)
+2026-10-31T18:49:23.3172046Z (81/84) Installing python-3.13-base (3.13.18_git20261030-r0)
+2026-10-31T18:49:23.8605751Z (82/84) Installing python-3.13 (3.13.18_git20261030-r0)
+2026-10-31T18:49:24.2238050Z (83/84) Installing uutils (0.12.0-r5)
+2026-10-31T18:49:25.0905333Z (84/84) Installing yq (4.54.1-r5)
+2026-10-31T18:49:25.9740040Z Executing busybox-1.38.0-r3.trigger
+2026-10-31T18:49:25.9979083Z OK: 341 MiB in 103 packages
+2026-10-31T18:49:26.1151756Z ##[group]Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+2026-10-31T18:49:26.1152076Z with:
+2026-10-31T18:49:26.1152257Z   persist-credentials: false
+2026-10-31T18:49:26.1152474Z   repository: tuna-os/tunaOS
+2026-10-31T18:49:26.1154577Z   token: ***
+2026-10-31T18:49:26.1154755Z   ssh-strict: true
+2026-10-31T18:49:26.1154929Z   ssh-user: git
+2026-10-31T18:49:26.1155094Z   clean: true
+2026-10-31T18:49:26.1155389Z   sparse-checkout-cone-mode: true
+2026-10-31T18:49:26.1155601Z   fetch-depth: 1
+2026-10-31T18:49:26.1155775Z   fetch-tags: false
+2026-10-31T18:49:26.1155947Z   show-progress: true
+2026-10-31T18:49:26.1156120Z   lfs: false
+2026-10-31T18:49:26.1156282Z   submodules: false
+2026-10-31T18:49:26.1156471Z   set-safe-directory: true
+2026-10-31T18:49:26.1156672Z   allow-unsafe-pr-checkout: false
+2026-10-31T18:49:26.1156910Z env:
+2026-10-31T18:49:26.1157062Z   IMAGE_NAME: marlin
+2026-10-31T18:49:26.1157249Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:26.1157518Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:26.1157714Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:26.1157882Z   MAJOR_VERSION: 10
+2026-10-31T18:49:26.1158054Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:26.1158263Z ##[endgroup]
+2026-10-31T18:49:26.1198760Z ##[command]/usr/bin/docker exec  c186ac469c5a194930897620b809ba631cdfc7224d9701d10543bc411218afca sh -c "cat /etc/*release | grep ^ID"
+2026-10-31T18:49:26.3853191Z Syncing repository: tuna-os/tunaOS
+2026-10-31T18:49:26.3854575Z ##[group]Getting Git version info
+2026-10-31T18:49:26.3854840Z Working directory is '/__w/tunaOS/tunaOS'
+2026-10-31T18:49:26.3855391Z [command]/usr/bin/git version
+2026-10-31T18:49:26.3859416Z git version 2.56.0.1.g02cd7dbd28
+2026-10-31T18:49:26.3884571Z ##[endgroup]
+2026-10-31T18:49:26.3892414Z Temporarily overriding HOME='/__w/_temp/b625f8e1-3283-4252-acdf-0de137588fbe' before making global git config changes
+2026-10-31T18:49:26.3893531Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-31T18:49:26.3894213Z [command]/usr/bin/git config --global --add safe.directory /__w/tunaOS/tunaOS
+2026-10-31T18:49:26.3924452Z Deleting the contents of '/__w/tunaOS/tunaOS'
+2026-10-31T18:49:26.3930570Z ##[group]Determining repository object format
+2026-10-31T18:49:26.3931590Z ##[endgroup]
+2026-10-31T18:49:26.3932385Z ##[group]Initializing the repository
+2026-10-31T18:49:26.3932871Z [command]/usr/bin/git init /__w/tunaOS/tunaOS
+2026-10-31T18:49:26.3976429Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-10-31T18:49:26.3976967Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-10-31T18:49:26.3977542Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-10-31T18:49:26.3978001Z hint: call:
+2026-10-31T18:49:26.3978227Z hint:
+2026-10-31T18:49:26.3978550Z hint: 	git config --global init.defaultBranch <name>
+2026-10-31T18:49:26.3978911Z hint:
+2026-10-31T18:49:26.3979274Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-10-31T18:49:26.3979884Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-10-31T18:49:26.3980327Z hint:
+2026-10-31T18:49:26.3980558Z hint: 	git branch -m <name>
+2026-10-31T18:49:26.3984803Z hint:
+2026-10-31T18:49:26.3985372Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-10-31T18:49:26.3986246Z Initialized empty Git repository in /__w/tunaOS/tunaOS/.git/
+2026-10-31T18:49:26.3991904Z [command]/usr/bin/git remote add origin https://github.com/tuna-os/tunaOS
+2026-10-31T18:49:26.4038383Z ##[endgroup]
+2026-10-31T18:49:26.4039171Z ##[group]Disabling automatic garbage collection
+2026-10-31T18:49:26.4039840Z [command]/usr/bin/git config --local gc.auto 0
+2026-10-31T18:49:26.4099964Z ##[endgroup]
+2026-10-31T18:49:26.4100517Z ##[group]Setting up auth
+2026-10-31T18:49:26.4101127Z Removing SSH command configuration
+2026-10-31T18:49:26.4102162Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-31T18:49:26.4113359Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-31T18:49:26.4453399Z Removing HTTP extra header
+2026-10-31T18:49:26.4454058Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-31T18:49:26.4493990Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-31T18:49:26.4781934Z Removing includeIf entries pointing to credentials config files
+2026-10-31T18:49:26.4786504Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-31T18:49:26.4813981Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-31T18:49:26.5104935Z [command]/usr/bin/git config --file /__w/_temp/git-credentials-e43423f5-3387-4c37-b4de-64cd2cd364ac.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-10-31T18:49:26.5137089Z [command]/usr/bin/git config --local includeIf.gitdir:/__w/tunaOS/tunaOS/.git.path /__w/_temp/git-credentials-e43423f5-3387-4c37-b4de-64cd2cd364ac.config
+2026-10-31T18:49:26.5164419Z [command]/usr/bin/git config --local includeIf.gitdir:/__w/tunaOS/tunaOS/.git/worktrees/*.path /__w/_temp/git-credentials-e43423f5-3387-4c37-b4de-64cd2cd364ac.config
+2026-10-31T18:49:26.5189879Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-e43423f5-3387-4c37-b4de-64cd2cd364ac.config
+2026-10-31T18:49:26.5216321Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-e43423f5-3387-4c37-b4de-64cd2cd364ac.config
+2026-10-31T18:49:26.5240655Z ##[endgroup]
+2026-10-31T18:49:26.5241095Z ##[group]Fetching the repository
+2026-10-31T18:49:26.5246359Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +f5b93442b3b8f504c6cdc63ed7cb774f957f707e:refs/remotes/origin/main
+2026-10-31T18:49:28.0479029Z From https://github.com/tuna-os/tunaOS
+2026-10-31T18:49:28.0479781Z  * [new ref]         f5b93442b3b8f504c6cdc63ed7cb774f957f707e -> origin/main
+2026-10-31T18:49:28.0487839Z [command]/usr/bin/git branch --list --remote origin/main
+2026-10-31T18:49:28.0511912Z   origin/main
+2026-10-31T18:49:28.0518086Z [command]/usr/bin/git rev-parse refs/remotes/origin/main
+2026-10-31T18:49:28.0538015Z f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+2026-10-31T18:49:28.0541075Z ##[endgroup]
+2026-10-31T18:49:28.0541541Z ##[group]Determining the checkout info
+2026-10-31T18:49:28.0542088Z ##[endgroup]
+2026-10-31T18:49:28.0544966Z [command]/usr/bin/git sparse-checkout disable
+2026-10-31T18:49:28.3639692Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-10-31T18:49:28.3670036Z ##[group]Checking out the ref
+2026-10-31T18:49:28.3672308Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
+2026-10-31T18:49:28.5642388Z Switched to a new branch 'main'
+2026-10-31T18:49:28.5642964Z branch 'main' set up to track 'origin/main'.
+2026-10-31T18:49:28.5654241Z ##[endgroup]
+2026-10-31T18:49:28.5689700Z [command]/usr/bin/git log -1 --format=%H
+2026-10-31T18:49:28.5711585Z f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+2026-10-31T18:49:28.5718977Z ##[group]Removing auth
+2026-10-31T18:49:28.5719329Z Removing SSH command configuration
+2026-10-31T18:49:28.5722374Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-31T18:49:28.5748825Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-31T18:49:28.6037358Z Removing HTTP extra header
+2026-10-31T18:49:28.6039841Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-31T18:49:28.6066258Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-31T18:49:28.6350862Z Removing includeIf entries pointing to credentials config files
+2026-10-31T18:49:28.6354252Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-31T18:49:28.6377740Z includeif.gitdir:/__w/tunaOS/tunaOS/.git.path
+2026-10-31T18:49:28.6378228Z includeif.gitdir:/__w/tunaOS/tunaOS/.git/worktrees/*.path
+2026-10-31T18:49:28.6378681Z includeif.gitdir:/github/workspace/.git.path
+2026-10-31T18:49:28.6379100Z includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-10-31T18:49:28.6385887Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/__w/tunaOS/tunaOS/.git.path
+2026-10-31T18:49:28.6406638Z /__w/_temp/git-credentials-e43423f5-3387-4c37-b4de-64cd2cd364ac.config
+2026-10-31T18:49:28.6419506Z [command]/usr/bin/git config --local --unset includeif.gitdir:/__w/tunaOS/tunaOS/.git.path \/__w\/_temp\/git\-credentials\-e43423f5\-3387\-4c37\-b4de\-64cd2cd364ac\.config
+2026-10-31T18:49:28.6443495Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/__w/tunaOS/tunaOS/.git/worktrees/*.path
+2026-10-31T18:49:28.6463472Z /__w/_temp/git-credentials-e43423f5-3387-4c37-b4de-64cd2cd364ac.config
+2026-10-31T18:49:28.6471328Z [command]/usr/bin/git config --local --unset includeif.gitdir:/__w/tunaOS/tunaOS/.git/worktrees/*.path \/__w\/_temp\/git\-credentials\-e43423f5\-3387\-4c37\-b4de\-64cd2cd364ac\.config
+2026-10-31T18:49:28.6498853Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+2026-10-31T18:49:28.6518226Z /github/runner_temp/git-credentials-e43423f5-3387-4c37-b4de-64cd2cd364ac.config
+2026-10-31T18:49:28.6524528Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-e43423f5\-3387\-4c37\-b4de\-64cd2cd364ac\.config
+2026-10-31T18:49:28.6551607Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-10-31T18:49:28.6571604Z /github/runner_temp/git-credentials-e43423f5-3387-4c37-b4de-64cd2cd364ac.config
+2026-10-31T18:49:28.6577100Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-e43423f5\-3387\-4c37\-b4de\-64cd2cd364ac\.config
+2026-10-31T18:49:28.6604009Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-31T18:49:28.6884770Z Removing credentials config '/__w/_temp/git-credentials-e43423f5-3387-4c37-b4de-64cd2cd364ac.config'
+2026-10-31T18:49:28.6893246Z ##[endgroup]
+2026-10-31T18:49:28.7064623Z ##[group]Run python3 scripts/publish-credential.py >> "$GITHUB_OUTPUT"
+2026-10-31T18:49:28.7065039Z [36;1mpython3 scripts/publish-credential.py >> "$GITHUB_OUTPUT"[0m
+2026-10-31T18:49:28.7065402Z shell: sh -e {0}
+2026-10-31T18:49:28.7065577Z env:
+2026-10-31T18:49:28.7065760Z   IMAGE_NAME: marlin
+2026-10-31T18:49:28.7065957Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:28.7066195Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:28.7066402Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:28.7066578Z   MAJOR_VERSION: 10
+2026-10-31T18:49:28.7066759Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:28.7066991Z   TUNAOS_PUBLISH_DESTINATION: ghcr.io/tuna-os
+2026-10-31T18:49:28.7067218Z   TUNAOS_PUBLISH: true
+2026-10-31T18:49:28.7067402Z   TUNAOS_PUBLISH_EVENT: schedule
+2026-10-31T18:49:28.7067598Z   TUNAOS_PUBLISH_SCOPE: 
+2026-10-31T18:49:28.7067797Z   TUNAOS_HAS_PUBLISH_USERNAME: false
+2026-10-31T18:49:28.7068001Z   TUNAOS_HAS_PUBLISH_PASSWORD: false
+2026-10-31T18:49:28.7068225Z ##[endgroup]
+2026-10-31T18:49:28.8127665Z Prepare all required actions
+2026-10-31T18:49:28.8153994Z ##[group]Run ./.github/actions/prepare-config
+2026-10-31T18:49:28.8154233Z env:
+2026-10-31T18:49:28.8154393Z   IMAGE_NAME: marlin
+2026-10-31T18:49:28.8154587Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:28.8154839Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:28.8155040Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:28.8155206Z   MAJOR_VERSION: 10
+2026-10-31T18:49:28.8155387Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:28.8155592Z ##[endgroup]
+2026-10-31T18:49:28.8198270Z ##[start-action display=Generate build configuration;id=__self.__run]
+2026-10-31T18:49:28.8316505Z ##[group]Run python3 scripts/config.py generate
+2026-10-31T18:49:28.8316792Z [36;1mpython3 scripts/config.py generate[0m
+2026-10-31T18:49:28.8318247Z shell: bash --noprofile --norc -e -o pipefail {0}
+2026-10-31T18:49:28.8318507Z env:
+2026-10-31T18:49:28.8318667Z   IMAGE_NAME: marlin
+2026-10-31T18:49:28.8318914Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:28.8319151Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:28.8319359Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:28.8319525Z   MAJOR_VERSION: 10
+2026-10-31T18:49:28.8319713Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:28.8319935Z ##[endgroup]
+2026-10-31T18:49:29.0883912Z /__w/tunaOS/tunaOS/.github/build-config.yml
+2026-10-31T18:49:29.1005601Z ##[end-action id=__self.__run;outcome=success;conclusion=success;duration_ms=280]
+2026-10-31T18:49:29.1055117Z ##[group]Run echo "Job status:"
+2026-10-31T18:49:29.1055387Z [36;1mecho "Job status:"[0m
+2026-10-31T18:49:29.1055669Z [36;1mecho "$JOBS" | jq -r 'to_entries[] | " - \(.key): \(.value.result)"'[0m
+2026-10-31T18:49:29.1055957Z [36;1m[0m
+2026-10-31T18:49:29.1056199Z [36;1m# This step used to `exit 1` the moment any build_push leg was not[0m
+2026-10-31T18:49:29.1056576Z [36;1m# success/skipped. `needs.build_push.result` is the aggregate of the[0m
+2026-10-31T18:49:29.1056973Z [36;1m# whole platform matrix, so one arch failing aborted the manifest —[0m
+2026-10-31T18:49:29.1057340Z [36;1m# and with it every stage that depends on this flavor, including[0m
+2026-10-31T18:49:29.1057697Z [36;1m# flavors that declare only the arch that DID build. On 2026-08-14[0m
+2026-10-31T18:49:29.1058249Z [36;1m# that turned three `sudo podman login` faults on arm64 runners into[0m
+2026-10-31T18:49:29.1058613Z [36;1m# 16 red cells across sailfin/marlin/flounder/gurnard, 14 of which[0m
+2026-10-31T18:49:29.1058985Z [36;1m# never produced a job at all (tuna-os/tunaOS#1729).[0m
+2026-10-31T18:49:29.1059236Z [36;1m#[0m
+2026-10-31T18:49:29.1059474Z [36;1m# The real precondition for building a manifest is "at least one[0m
+2026-10-31T18:49:29.1059823Z [36;1m# platform produced a digest", which is asserted from the digest[0m
+2026-10-31T18:49:29.1060184Z [36;1m# artifacts in `Require at least one platform` below — evidence of[0m
+2026-10-31T18:49:29.1060572Z [36;1m# what was actually pushed, not an aggregate job result. Completeness[0m
+2026-10-31T18:49:29.1060950Z [36;1m# is still enforced, just later and where it belongs: `Check Platform[0m
+2026-10-31T18:49:29.1061316Z [36;1m# Completeness` sets all_platforms_built=false and the promote job[0m
+2026-10-31T18:49:29.1061674Z [36;1m# leaves the bare :<flavor> tag at its last good version. A partial[0m
+2026-10-31T18:49:29.1062049Z [36;1m# build can therefore reach :<flavor>-candidate, and can never reach[0m
+2026-10-31T18:49:29.1062339Z [36;1m# :<flavor>.[0m
+2026-10-31T18:49:29.1062859Z [36;1mif echo "$JOBS" | jq -e 'to_entries[] | select(.value.result != "success" and .value.result != "skipped")' >/dev/null; then[0m
+2026-10-31T18:49:29.1063664Z [36;1m  echo "::warning::Not every upstream job succeeded; continuing with whatever platforms published. The bare tag will not be promoted unless all declared platforms are present."[0m
+2026-10-31T18:49:29.1064221Z [36;1mfi[0m
+2026-10-31T18:49:29.1064468Z shell: sh -e {0}
+2026-10-31T18:49:29.1064635Z env:
+2026-10-31T18:49:29.1064800Z   IMAGE_NAME: marlin
+2026-10-31T18:49:29.1064992Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:29.1065226Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:29.1065436Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:29.1065601Z   MAJOR_VERSION: 10
+2026-10-31T18:49:29.1065820Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:29.1066108Z   JOBS: {
+  "build_push": {
+    "result": "success",
+    "outputs": {}
+  }
+}
+2026-10-31T18:49:29.1066394Z ##[endgroup]
+2026-10-31T18:49:29.1374054Z Job status:
+2026-10-31T18:49:29.1397221Z  - build_push: success
+2026-10-31T18:49:29.1476051Z ##[group]Run # Should generate a timestamp like what is defined on the ArtifactHub documentation
+2026-10-31T18:49:29.1476580Z [36;1m# Should generate a timestamp like what is defined on the ArtifactHub documentation[0m
+2026-10-31T18:49:29.1476918Z [36;1m# E.G: 2022-02-08T15:38:15Z'[0m
+2026-10-31T18:49:29.1477235Z [36;1m# https://artifacthub.io/docs/topics/repositories/container-images/[0m
+2026-10-31T18:49:29.1477564Z [36;1m# https://linux.die.net/man/1/date[0m
+2026-10-31T18:49:29.1477853Z [36;1mecho "date=$(date -u +%Y\-%m\-%d\T%H\:%M\:%S\Z)" >> $GITHUB_OUTPUT[0m
+2026-10-31T18:49:29.1478210Z shell: sh -e {0}
+2026-10-31T18:49:29.1478376Z env:
+2026-10-31T18:49:29.1478530Z   IMAGE_NAME: marlin
+2026-10-31T18:49:29.1478733Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:29.1478964Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:29.1479168Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:29.1479335Z   MAJOR_VERSION: 10
+2026-10-31T18:49:29.1479551Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:29.1479761Z ##[endgroup]
+2026-10-31T18:49:29.1879338Z ##[group]Run numbers_only=$(echo "${MAJOR_VERSION}" | tr -cd '0-9')
+2026-10-31T18:49:29.1879712Z [36;1mnumbers_only=$(echo "${MAJOR_VERSION}" | tr -cd '0-9')[0m
+2026-10-31T18:49:29.1880044Z [36;1mecho "MAJOR_VERSION_NUMBER=${numbers_only}" >> "${GITHUB_ENV}"[0m
+2026-10-31T18:49:29.1880394Z shell: sh -e {0}
+2026-10-31T18:49:29.1880557Z env:
+2026-10-31T18:49:29.1880721Z   IMAGE_NAME: marlin
+2026-10-31T18:49:29.1880912Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:29.1881141Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:29.1881348Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:29.1881515Z   MAJOR_VERSION: 10
+2026-10-31T18:49:29.1881901Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:29.1882131Z ##[endgroup]
+2026-10-31T18:49:29.2300436Z ##[group]Run set -euo pipefail
+2026-10-31T18:49:29.2300701Z [36;1mset -euo pipefail[0m
+2026-10-31T18:49:29.2300931Z [36;1msource build_scripts/lib/identity.env[0m
+2026-10-31T18:49:29.2301165Z [36;1m{[0m
+2026-10-31T18:49:29.2301338Z [36;1m  echo "website=${TUNAOS_WEBSITE}"[0m
+2026-10-31T18:49:29.2301598Z [36;1m  echo "documentation=${TUNAOS_DOCS_URL}/intro"[0m
+2026-10-31T18:49:29.2301872Z [36;1m  echo "keyword=${TUNAOS_PROJECT_ID}"[0m
+2026-10-31T18:49:29.2302119Z [36;1m} >> "${GITHUB_OUTPUT}"[0m
+2026-10-31T18:49:29.2302473Z shell: bash --noprofile --norc -e -o pipefail {0}
+2026-10-31T18:49:29.2302913Z env:
+2026-10-31T18:49:29.2303139Z   IMAGE_NAME: marlin
+2026-10-31T18:49:29.2303382Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:29.2303619Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:29.2303830Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:29.2304015Z   MAJOR_VERSION: 10
+2026-10-31T18:49:29.2304195Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:29.2304447Z   MAJOR_VERSION_NUMBER: 10
+2026-10-31T18:49:29.2304632Z ##[endgroup]
+2026-10-31T18:49:29.2690977Z ##[group]Run docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302
+2026-10-31T18:49:29.2691308Z with:
+2026-10-31T18:49:29.2691482Z   tags: type=raw,value=gnome
+
+2026-10-31T18:49:29.2694535Z   labels: io.artifacthub.package.readme-url=https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md
+org.opencontainers.image.created=2026-10-31T18:49:29Z
+org.opencontainers.image.description=Based on Arch Linux (rolling)
+org.opencontainers.image.documentation=https://tunaos.org/docs/intro
+org.opencontainers.image.source=https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10
+org.opencontainers.image.title=marlin
+org.opencontainers.image.url=https://tunaos.org
+org.opencontainers.image.vendor=tuna-os
+org.opencontainers.image.version=10
+io.artifacthub.package.deprecated=false
+io.artifacthub.package.keywords=bootc,tunaos
+io.artifacthub.package.license=Apache-2.0
+io.artifacthub.package.logo-url=https://avatars.githubusercontent.com/u/223733964?s=200&v=4
+io.artifacthub.package.maintainers=[{\"name\":\"tuna-os\",\"email\":\"\"}]
+io.artifacthub.package.prerelease=true
+containers.bootc=1
+
+2026-10-31T18:49:29.2697282Z   context: workflow
+2026-10-31T18:49:29.2699080Z   github-token: ***
+2026-10-31T18:49:29.2699258Z env:
+2026-10-31T18:49:29.2699417Z   IMAGE_NAME: marlin
+2026-10-31T18:49:29.2699615Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:29.2699859Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:29.2700063Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:29.2700234Z   MAJOR_VERSION: 10
+2026-10-31T18:49:29.2700414Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:29.2700629Z   MAJOR_VERSION_NUMBER: 10
+2026-10-31T18:49:29.2701016Z   README_URL: https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md
+2026-10-31T18:49:29.2701596Z   SOURCE_URL: https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10
+2026-10-31T18:49:29.2701977Z ##[endgroup]
+2026-10-31T18:49:29.2709863Z ##[command]/usr/bin/docker exec  c186ac469c5a194930897620b809ba631cdfc7224d9701d10543bc411218afca sh -c "cat /etc/*release | grep ^ID"
+2026-10-31T18:49:30.1013120Z ##[group]Context info
+2026-10-31T18:49:30.1013348Z eventName: schedule
+2026-10-31T18:49:30.1013552Z sha: f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+2026-10-31T18:49:30.1013789Z ref: refs/heads/main
+2026-10-31T18:49:30.1013968Z workflow: Build Marlin
+2026-10-31T18:49:30.1014142Z action: metadata
+2026-10-31T18:49:30.1014326Z actor: github-merge-queue
+2026-10-31T18:49:30.1014509Z runNumber: 172
+2026-10-31T18:49:30.1014674Z runId: 41226288216
+2026-10-31T18:49:30.1051360Z commitDate: Sat Oct 31 2026 17:21:42 GMT+0000 (Coordinated Universal Time)
+2026-10-31T18:49:30.1052161Z ##[endgroup]
+2026-10-31T18:49:30.1054428Z ##[group]Processing images input
+2026-10-31T18:49:30.1055913Z ##[endgroup]
+2026-10-31T18:49:30.1063543Z ##[group]Processing tags input
+2026-10-31T18:49:30.1064888Z type=raw,value=gnome,enable=true,priority=200
+2026-10-31T18:49:30.1065911Z ##[endgroup]
+2026-10-31T18:49:30.1066661Z ##[group]Processing flavor input
+2026-10-31T18:49:30.1067375Z latest=auto
+2026-10-31T18:49:30.1067630Z prefix=
+2026-10-31T18:49:30.1067866Z prefixLatest=false
+2026-10-31T18:49:30.1068125Z suffix=
+2026-10-31T18:49:30.1068364Z suffixLatest=false
+2026-10-31T18:49:30.1068825Z ##[endgroup]
+2026-10-31T18:49:30.1095191Z ##[group]Docker image version
+2026-10-31T18:49:30.1095480Z gnome
+2026-10-31T18:49:30.1095881Z ##[endgroup]
+2026-10-31T18:49:30.1099540Z ##[group]Docker tags
+2026-10-31T18:49:30.1100151Z gnome
+2026-10-31T18:49:30.1100896Z ##[endgroup]
+2026-10-31T18:49:30.1237179Z ##[group]Docker labels
+2026-10-31T18:49:30.1237438Z containers.bootc=1
+2026-10-31T18:49:30.1237653Z io.artifacthub.package.deprecated=false
+2026-10-31T18:49:30.1237959Z io.artifacthub.package.keywords=bootc,tunaos
+2026-10-31T18:49:30.1238221Z io.artifacthub.package.license=Apache-2.0
+2026-10-31T18:49:30.1239398Z io.artifacthub.package.logo-url=https://avatars.githubusercontent.com/u/223733964?s=200&v=4
+2026-10-31T18:49:30.1240119Z io.artifacthub.package.maintainers=[{\"name\":\"tuna-os\",\"email\":\"\"}]
+2026-10-31T18:49:30.1240604Z io.artifacthub.package.prerelease=true
+2026-10-31T18:49:30.1241338Z io.artifacthub.package.readme-url=https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md
+2026-10-31T18:49:30.1241836Z org.opencontainers.image.created=2026-10-31T18:49:29Z
+2026-10-31T18:49:30.1242164Z org.opencontainers.image.description=Based on Arch Linux (rolling)
+2026-10-31T18:49:30.1242539Z org.opencontainers.image.documentation=https://tunaos.org/docs/intro
+2026-10-31T18:49:30.1243497Z org.opencontainers.image.licenses=Apache-2.0
+2026-10-31T18:49:30.1244096Z org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+2026-10-31T18:49:30.1244894Z org.opencontainers.image.source=https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10
+2026-10-31T18:49:30.1245372Z org.opencontainers.image.title=marlin
+2026-10-31T18:49:30.1245632Z org.opencontainers.image.url=https://tunaos.org
+2026-10-31T18:49:30.1245898Z org.opencontainers.image.vendor=tuna-os
+2026-10-31T18:49:30.1246131Z org.opencontainers.image.version=10
+2026-10-31T18:49:30.1246511Z ##[endgroup]
+2026-10-31T18:49:30.1246796Z ##[group]Annotations
+2026-10-31T18:49:30.1247048Z manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z
+2026-10-31T18:49:30.1247545Z manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop
+2026-10-31T18:49:30.1247999Z manifest:org.opencontainers.image.licenses=Apache-2.0
+2026-10-31T18:49:30.1248364Z manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+2026-10-31T18:49:30.1248788Z manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS
+2026-10-31T18:49:30.1249137Z manifest:org.opencontainers.image.title=tunaOS
+2026-10-31T18:49:30.1249466Z manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS
+2026-10-31T18:49:30.1249791Z manifest:org.opencontainers.image.version=gnome
+2026-10-31T18:49:30.1250151Z ##[endgroup]
+2026-10-31T18:49:30.1256463Z ##[group]JSON output
+2026-10-31T18:49:30.1257021Z {
+2026-10-31T18:49:30.1257378Z   "tags": [
+2026-10-31T18:49:30.1257717Z     "gnome"
+2026-10-31T18:49:30.1257937Z   ],
+2026-10-31T18:49:30.1258216Z   "tag-names": [
+2026-10-31T18:49:30.1258453Z     "gnome"
+2026-10-31T18:49:30.1258663Z   ],
+2026-10-31T18:49:30.1258870Z   "labels": {
+2026-10-31T18:49:30.1259123Z     "containers.bootc": "1",
+2026-10-31T18:49:30.1259465Z     "io.artifacthub.package.deprecated": "false",
+2026-10-31T18:49:30.1259892Z     "io.artifacthub.package.keywords": "bootc,tunaos",
+2026-10-31T18:49:30.1260315Z     "io.artifacthub.package.license": "Apache-2.0",
+2026-10-31T18:49:30.1261335Z     "io.artifacthub.package.logo-url": "https://avatars.githubusercontent.com/u/223733964?s=200&v=4",
+2026-10-31T18:49:30.1262093Z     "io.artifacthub.package.maintainers": "[{\\\"name\\\":\\\"tuna-os\\\",\\\"email\\\":\\\"\\\"}]",
+2026-10-31T18:49:30.1262648Z     "io.artifacthub.package.prerelease": "true",
+2026-10-31T18:49:30.1263549Z     "io.artifacthub.package.readme-url": "https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md",
+2026-10-31T18:49:30.1264362Z     "org.opencontainers.image.created": "2026-10-31T18:49:29Z",
+2026-10-31T18:49:30.1264870Z     "org.opencontainers.image.description": "Based on Arch Linux (rolling)",
+2026-10-31T18:49:30.1265503Z     "org.opencontainers.image.documentation": "https://tunaos.org/docs/intro",
+2026-10-31T18:49:30.1266044Z     "org.opencontainers.image.licenses": "Apache-2.0",
+2026-10-31T18:49:30.1266578Z     "org.opencontainers.image.revision": "f5b93442b3b8f504c6cdc63ed7cb774f957f707e",
+2026-10-31T18:49:30.1267485Z     "org.opencontainers.image.source": "https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10",
+2026-10-31T18:49:30.1268477Z     "org.opencontainers.image.title": "marlin",
+2026-10-31T18:49:30.1268964Z     "org.opencontainers.image.url": "https://tunaos.org",
+2026-10-31T18:49:30.1269373Z     "org.opencontainers.image.vendor": "tuna-os",
+2026-10-31T18:49:30.1269774Z     "org.opencontainers.image.version": "10"
+2026-10-31T18:49:30.1270081Z   },
+2026-10-31T18:49:30.1270304Z   "annotations": [
+2026-10-31T18:49:30.1270675Z     "manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z",
+2026-10-31T18:49:30.1271220Z     "manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop",
+2026-10-31T18:49:30.1271780Z     "manifest:org.opencontainers.image.licenses=Apache-2.0",
+2026-10-31T18:49:30.1272217Z     "manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e",
+2026-10-31T18:49:30.1272876Z     "manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS",
+2026-10-31T18:49:30.1273358Z     "manifest:org.opencontainers.image.title=tunaOS",
+2026-10-31T18:49:30.1273894Z     "manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS",
+2026-10-31T18:49:30.1274257Z     "manifest:org.opencontainers.image.version=gnome"
+2026-10-31T18:49:30.1274496Z   ]
+2026-10-31T18:49:30.1274640Z }
+2026-10-31T18:49:30.1274945Z ##[endgroup]
+2026-10-31T18:49:30.1275235Z ##[group]Bake file definition (tags)
+2026-10-31T18:49:30.1275433Z {
+2026-10-31T18:49:30.1275581Z   "target": {
+2026-10-31T18:49:30.1275844Z     "docker-metadata-action": {
+2026-10-31T18:49:30.1276182Z       "tags": [
+2026-10-31T18:49:30.1276407Z         "gnome"
+2026-10-31T18:49:30.1276636Z       ],
+2026-10-31T18:49:30.1276869Z       "args": {
+2026-10-31T18:49:30.1277124Z         "DOCKER_META_IMAGES": "",
+2026-10-31T18:49:30.1277467Z         "DOCKER_META_VERSION": "gnome"
+2026-10-31T18:49:30.1277778Z       }
+2026-10-31T18:49:30.1278008Z     }
+2026-10-31T18:49:30.1278226Z   }
+2026-10-31T18:49:30.1278425Z }
+2026-10-31T18:49:30.1278808Z ##[endgroup]
+2026-10-31T18:49:30.1279290Z ##[group]Bake file definition (labels)
+2026-10-31T18:49:30.1279607Z {
+2026-10-31T18:49:30.1279815Z   "target": {
+2026-10-31T18:49:30.1280067Z     "docker-metadata-action": {
+2026-10-31T18:49:30.1280375Z       "labels": {
+2026-10-31T18:49:30.1280629Z         "containers.bootc": "1",
+2026-10-31T18:49:30.1280975Z         "io.artifacthub.package.deprecated": "false",
+2026-10-31T18:49:30.1281407Z         "io.artifacthub.package.keywords": "bootc,tunaos",
+2026-10-31T18:49:30.1281886Z         "io.artifacthub.package.license": "Apache-2.0",
+2026-10-31T18:49:30.1282573Z         "io.artifacthub.package.logo-url": "https://avatars.githubusercontent.com/u/223733964?s=200&v=4",
+2026-10-31T18:49:30.1283752Z         "io.artifacthub.package.maintainers": "[{\\\"name\\\":\\\"tuna-os\\\",\\\"email\\\":\\\"\\\"}]",
+2026-10-31T18:49:30.1284387Z         "io.artifacthub.package.prerelease": "true",
+2026-10-31T18:49:30.1285568Z         "io.artifacthub.package.readme-url": "https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md",
+2026-10-31T18:49:30.1286547Z         "org.opencontainers.image.created": "2026-10-31T18:49:29Z",
+2026-10-31T18:49:30.1287173Z         "org.opencontainers.image.description": "Based on Arch Linux (rolling)",
+2026-10-31T18:49:30.1287988Z         "org.opencontainers.image.documentation": "https://tunaos.org/docs/intro",
+2026-10-31T18:49:30.1288682Z         "org.opencontainers.image.licenses": "Apache-2.0",
+2026-10-31T18:49:30.1289102Z         "org.opencontainers.image.revision": "f5b93442b3b8f504c6cdc63ed7cb774f957f707e",
+2026-10-31T18:49:30.1289772Z         "org.opencontainers.image.source": "https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10",
+2026-10-31T18:49:30.1290339Z         "org.opencontainers.image.title": "marlin",
+2026-10-31T18:49:30.1290684Z         "org.opencontainers.image.url": "https://tunaos.org",
+2026-10-31T18:49:30.1291014Z         "org.opencontainers.image.vendor": "tuna-os",
+2026-10-31T18:49:30.1291501Z         "org.opencontainers.image.version": "10"
+2026-10-31T18:49:30.1291763Z       }
+2026-10-31T18:49:30.1291940Z     }
+2026-10-31T18:49:30.1292098Z   }
+2026-10-31T18:49:30.1292264Z }
+2026-10-31T18:49:30.1292600Z ##[endgroup]
+2026-10-31T18:49:30.1293235Z ##[group]Bake file definition (annotations)
+2026-10-31T18:49:30.1293494Z {
+2026-10-31T18:49:30.1293741Z   "target": {
+2026-10-31T18:49:30.1294007Z     "docker-metadata-action": {
+2026-10-31T18:49:30.1294359Z       "annotations": [
+2026-10-31T18:49:30.1294822Z         "manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z",
+2026-10-31T18:49:30.1295762Z         "manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop",
+2026-10-31T18:49:30.1296526Z         "manifest:org.opencontainers.image.licenses=Apache-2.0",
+2026-10-31T18:49:30.1297006Z         "manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e",
+2026-10-31T18:49:30.1297457Z         "manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS",
+2026-10-31T18:49:30.1297926Z         "manifest:org.opencontainers.image.title=tunaOS",
+2026-10-31T18:49:30.1298497Z         "manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS",
+2026-10-31T18:49:30.1298908Z         "manifest:org.opencontainers.image.version=gnome"
+2026-10-31T18:49:30.1299142Z       ]
+2026-10-31T18:49:30.1299283Z     }
+2026-10-31T18:49:30.1299421Z   }
+2026-10-31T18:49:30.1299560Z }
+2026-10-31T18:49:30.1299840Z ##[endgroup]
+2026-10-31T18:49:30.1490722Z ##[group]Run actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+2026-10-31T18:49:30.1491058Z with:
+2026-10-31T18:49:30.1491234Z   pattern: marlin-gnome-*
+2026-10-31T18:49:30.1491425Z   merge-multiple: true
+2026-10-31T18:49:30.1491603Z   path: /tmp/artifacts
+2026-10-31T18:49:30.1491804Z   repository: tuna-os/tunaOS
+2026-10-31T18:49:30.1491993Z   run-id: 41226288216
+2026-10-31T18:49:30.1492166Z   skip-decompress: false
+2026-10-31T18:49:30.1492351Z   digest-mismatch: error
+2026-10-31T18:49:30.1492520Z env:
+2026-10-31T18:49:30.1492665Z   IMAGE_NAME: marlin
+2026-10-31T18:49:30.1493081Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:30.1493330Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:30.1493530Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:30.1493696Z   MAJOR_VERSION: 10
+2026-10-31T18:49:30.1493873Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:30.1494084Z   MAJOR_VERSION_NUMBER: 10
+2026-10-31T18:49:30.1494316Z   DOCKER_METADATA_OUTPUT_VERSION: gnome
+2026-10-31T18:49:30.1494539Z   DOCKER_METADATA_OUTPUT_TAGS: gnome
+2026-10-31T18:49:30.1494756Z   DOCKER_METADATA_OUTPUT_TAG_NAMES: gnome
+2026-10-31T18:49:30.1497839Z   DOCKER_METADATA_OUTPUT_LABELS: containers.bootc=1
+io.artifacthub.package.deprecated=false
+io.artifacthub.package.keywords=bootc,tunaos
+io.artifacthub.package.license=Apache-2.0
+io.artifacthub.package.logo-url=https://avatars.githubusercontent.com/u/223733964?s=200&v=4
+io.artifacthub.package.maintainers=[{\"name\":\"tuna-os\",\"email\":\"\"}]
+io.artifacthub.package.prerelease=true
+io.artifacthub.package.readme-url=https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md
+org.opencontainers.image.created=2026-10-31T18:49:29Z
+org.opencontainers.image.description=Based on Arch Linux (rolling)
+org.opencontainers.image.documentation=https://tunaos.org/docs/intro
+org.opencontainers.image.licenses=Apache-2.0
+org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+org.opencontainers.image.source=https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10
+org.opencontainers.image.title=marlin
+org.opencontainers.image.url=https://tunaos.org
+org.opencontainers.image.vendor=tuna-os
+org.opencontainers.image.version=10
+2026-10-31T18:49:30.1502644Z   DOCKER_METADATA_OUTPUT_ANNOTATIONS: manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z
+manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop
+manifest:org.opencontainers.image.licenses=Apache-2.0
+manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS
+manifest:org.opencontainers.image.title=tunaOS
+manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS
+manifest:org.opencontainers.image.version=gnome
+2026-10-31T18:49:30.1509183Z   DOCKER_METADATA_OUTPUT_JSON: {"tags":["gnome"],"tag-names":["gnome"],"labels":{"containers.bootc":"1","io.artifacthub.package.deprecated":"false","io.artifacthub.package.keywords":"bootc,tunaos","io.artifacthub.package.license":"Apache-2.0","io.artifacthub.package.logo-url":"https://avatars.githubusercontent.com/u/223733964?s=200&v=4","io.artifacthub.package.maintainers":"[{\\\"name\\\":\\\"tuna-os\\\",\\\"email\\\":\\\"\\\"}]","io.artifacthub.package.prerelease":"true","io.artifacthub.package.readme-url":"https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md","org.opencontainers.image.created":"2026-10-31T18:49:29Z","org.opencontainers.image.description":"Based on Arch Linux (rolling)","org.opencontainers.image.documentation":"https://tunaos.org/docs/intro","org.opencontainers.image.licenses":"Apache-2.0","org.opencontainers.image.revision":"f5b93442b3b8f504c6cdc63ed7cb774f957f707e","org.opencontainers.image.source":"https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10","org.opencontainers.image.title":"marlin","org.opencontainers.image.url":"https://tunaos.org","org.opencontainers.image.vendor":"tuna-os","org.opencontainers.image.version":"10"},"annotations":["manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z","manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop","manifest:org.opencontainers.image.licenses=Apache-2.0","manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e","manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS","manifest:org.opencontainers.image.title=tunaOS","manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS","manifest:org.opencontainers.image.version=gnome"]}
+2026-10-31T18:49:30.1514521Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_TAGS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-tags.json
+2026-10-31T18:49:30.1515146Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_LABELS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-labels.json
+2026-10-31T18:49:30.1515806Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_ANNOTATIONS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-annotations.json
+2026-10-31T18:49:30.1516413Z   DOCKER_METADATA_OUTPUT_BAKE_FILE: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake.json
+2026-10-31T18:49:30.1516903Z ##[endgroup]
+2026-10-31T18:49:30.1520192Z ##[command]/usr/bin/docker exec  c186ac469c5a194930897620b809ba631cdfc7224d9701d10543bc411218afca sh -c "cat /etc/*release | grep ^ID"
+2026-10-31T18:49:30.4956367Z Found 27 artifact(s)
+2026-10-31T18:49:30.4957519Z Filtering artifacts by pattern 'marlin-gnome-*'
+2026-10-31T18:49:30.4974334Z Preparing to download the following artifacts:
+2026-10-31T18:49:30.4980181Z - marlin-gnome-linux-amd64-41226288216 (ID: 13053831963, Size: 465, Expected Digest: sha256:41fc47a5a0683dc7d84830715997c1b70ed39bfbec6a4eb74381e39798f1930d)
+2026-10-31T18:49:30.4981517Z - marlin-gnome-linux-arm64-41226288216 (ID: 13053453114, Size: 462, Expected Digest: sha256:b3a66592161ec54e2ef573d174c5622352446134ccfec1b8654789827a69e9ea)
+2026-10-31T18:49:30.7628916Z Redirecting to blob download url: https://productionresultssa13.blob.core.windows.net/actions-results/5344d6e2-b932-8c7e-86f7-97d3358588cb/workflow-job-run-d0596733-1bc1-5461-8ac7-b01919eaf1ea/artifacts/a99f4e73d269cac6e85056ce342b73bf9918535e56298c148534b5219136e28f.zip
+2026-10-31T18:49:30.7630319Z Starting download of artifact to: /tmp/artifacts
+2026-10-31T18:49:30.7917119Z Redirecting to blob download url: https://productionresultssa13.blob.core.windows.net/actions-results/5344d6e2-b932-8c7e-86f7-97d3358588cb/workflow-job-run-bb1e6765-7ccb-53c8-aa1b-8409f0f90b16/artifacts/3680e1aee828585c2e072ead368de13c328819feb1645a4d9844183a61b4d84f.zip
+2026-10-31T18:49:30.7918896Z Starting download of artifact to: /tmp/artifacts
+2026-10-31T18:49:30.9071189Z (node:333) [DEP0005] DeprecationWarning: Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.
+2026-10-31T18:49:30.9072087Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-10-31T18:49:30.9122298Z SHA256 digest of downloaded artifact is b3a66592161ec54e2ef573d174c5622352446134ccfec1b8654789827a69e9ea
+2026-10-31T18:49:30.9123153Z Artifact download completed successfully.
+2026-10-31T18:49:30.9476508Z SHA256 digest of downloaded artifact is 41fc47a5a0683dc7d84830715997c1b70ed39bfbec6a4eb74381e39798f1930d
+2026-10-31T18:49:30.9477161Z Artifact download completed successfully.
+2026-10-31T18:49:30.9477412Z Total of 2 artifact(s) downloaded
+2026-10-31T18:49:30.9481402Z Download artifact has finished successfully
+2026-10-31T18:49:30.9621348Z ##[group]Run set -e
+2026-10-31T18:49:30.9621598Z [36;1mset -e[0m
+2026-10-31T18:49:30.9621789Z [36;1mDIGESTS_JSON="$(jq -n '{}')"[0m
+2026-10-31T18:49:30.9622056Z [36;1mfor digest_file in /tmp/artifacts/*.txt; do[0m
+2026-10-31T18:49:30.9622352Z [36;1m  FILENAME_ONLY="$(basename "${digest_file}")"[0m
+2026-10-31T18:49:30.9622997Z [36;1m  # Extract the safeplatform key from the filename (e.g., "bonito-base-linux-amd64-v2.txt" -> "linux-amd64-v2")[0m
+2026-10-31T18:49:30.9623469Z [36;1m  # Remove prefix "${IMAGE_NAME}-${DEFAULT_TAG}-"[0m
+2026-10-31T18:49:30.9623796Z [36;1m  KEY_PART="${FILENAME_ONLY#${IMAGE_NAME}-${DEFAULT_TAG}-}"[0m
+2026-10-31T18:49:30.9624108Z [36;1m  # Remove suffix ".txt"[0m
+2026-10-31T18:49:30.9624345Z [36;1m  PLATFORM_KEY="${KEY_PART%.txt}"[0m
+2026-10-31T18:49:30.9624590Z [36;1m  DIGEST="$(cat "${digest_file}")"[0m
+2026-10-31T18:49:30.9625035Z [36;1m  DIGESTS_JSON="$(echo "${DIGESTS_JSON}" | jq --arg key "${PLATFORM_KEY}" --arg value "${DIGEST}" '. + {($key): $value}')"[0m
+2026-10-31T18:49:30.9625427Z [36;1mdone[0m
+2026-10-31T18:49:30.9625710Z [36;1mecho "DIGESTS_JSON=$(echo "$DIGESTS_JSON" | jq -c '.')" >> "${GITHUB_OUTPUT}"[0m
+2026-10-31T18:49:30.9626302Z shell: sh -e {0}
+2026-10-31T18:49:30.9626480Z env:
+2026-10-31T18:49:30.9626653Z   IMAGE_NAME: marlin
+2026-10-31T18:49:30.9626860Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:30.9627112Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:30.9627325Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:30.9627507Z   MAJOR_VERSION: 10
+2026-10-31T18:49:30.9627710Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:30.9627932Z   MAJOR_VERSION_NUMBER: 10
+2026-10-31T18:49:30.9628318Z   DOCKER_METADATA_OUTPUT_VERSION: gnome
+2026-10-31T18:49:30.9628555Z   DOCKER_METADATA_OUTPUT_TAGS: gnome
+2026-10-31T18:49:30.9628777Z   DOCKER_METADATA_OUTPUT_TAG_NAMES: gnome
+2026-10-31T18:49:30.9631885Z   DOCKER_METADATA_OUTPUT_LABELS: containers.bootc=1
+io.artifacthub.package.deprecated=false
+io.artifacthub.package.keywords=bootc,tunaos
+io.artifacthub.package.license=Apache-2.0
+io.artifacthub.package.logo-url=https://avatars.githubusercontent.com/u/223733964?s=200&v=4
+io.artifacthub.package.maintainers=[{\"name\":\"tuna-os\",\"email\":\"\"}]
+io.artifacthub.package.prerelease=true
+io.artifacthub.package.readme-url=https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md
+org.opencontainers.image.created=2026-10-31T18:49:29Z
+org.opencontainers.image.description=Based on Arch Linux (rolling)
+org.opencontainers.image.documentation=https://tunaos.org/docs/intro
+org.opencontainers.image.licenses=Apache-2.0
+org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+org.opencontainers.image.source=https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10
+org.opencontainers.image.title=marlin
+org.opencontainers.image.url=https://tunaos.org
+org.opencontainers.image.vendor=tuna-os
+org.opencontainers.image.version=10
+2026-10-31T18:49:30.9636765Z   DOCKER_METADATA_OUTPUT_ANNOTATIONS: manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z
+manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop
+manifest:org.opencontainers.image.licenses=Apache-2.0
+manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS
+manifest:org.opencontainers.image.title=tunaOS
+manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS
+manifest:org.opencontainers.image.version=gnome
+2026-10-31T18:49:30.9643418Z   DOCKER_METADATA_OUTPUT_JSON: {"tags":["gnome"],"tag-names":["gnome"],"labels":{"containers.bootc":"1","io.artifacthub.package.deprecated":"false","io.artifacthub.package.keywords":"bootc,tunaos","io.artifacthub.package.license":"Apache-2.0","io.artifacthub.package.logo-url":"https://avatars.githubusercontent.com/u/223733964?s=200&v=4","io.artifacthub.package.maintainers":"[{\\\"name\\\":\\\"tuna-os\\\",\\\"email\\\":\\\"\\\"}]","io.artifacthub.package.prerelease":"true","io.artifacthub.package.readme-url":"https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md","org.opencontainers.image.created":"2026-10-31T18:49:29Z","org.opencontainers.image.description":"Based on Arch Linux (rolling)","org.opencontainers.image.documentation":"https://tunaos.org/docs/intro","org.opencontainers.image.licenses":"Apache-2.0","org.opencontainers.image.revision":"f5b93442b3b8f504c6cdc63ed7cb774f957f707e","org.opencontainers.image.source":"https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10","org.opencontainers.image.title":"marlin","org.opencontainers.image.url":"https://tunaos.org","org.opencontainers.image.vendor":"tuna-os","org.opencontainers.image.version":"10"},"annotations":["manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z","manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop","manifest:org.opencontainers.image.licenses=Apache-2.0","manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e","manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS","manifest:org.opencontainers.image.title=tunaOS","manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS","manifest:org.opencontainers.image.version=gnome"]}
+2026-10-31T18:49:30.9648653Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_TAGS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-tags.json
+2026-10-31T18:49:30.9649382Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_LABELS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-labels.json
+2026-10-31T18:49:30.9650181Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_ANNOTATIONS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-annotations.json
+2026-10-31T18:49:30.9650826Z   DOCKER_METADATA_OUTPUT_BAKE_FILE: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake.json
+2026-10-31T18:49:30.9651222Z ##[endgroup]
+2026-10-31T18:49:31.0235901Z ##[group]Run set -euo pipefail
+2026-10-31T18:49:31.0236159Z [36;1mset -euo pipefail[0m
+2026-10-31T18:49:31.0236410Z [36;1mcount="$(echo "${DIGESTS_JSON}" | jq 'length')"[0m
+2026-10-31T18:49:31.0236675Z [36;1mif [ "${count}" -eq 0 ]; then[0m
+2026-10-31T18:49:31.0237064Z [36;1m  echo "::error::No platform produced a digest — every build leg failed, nothing to publish."[0m
+2026-10-31T18:49:31.0237436Z [36;1m  exit 1[0m
+2026-10-31T18:49:31.0237605Z [36;1mfi[0m
+2026-10-31T18:49:31.0237851Z [36;1mecho "${count} platform digest(s) available for the manifest."[0m
+2026-10-31T18:49:31.0238219Z shell: sh -e {0}
+2026-10-31T18:49:31.0238398Z env:
+2026-10-31T18:49:31.0238561Z   IMAGE_NAME: marlin
+2026-10-31T18:49:31.0238766Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:31.0239056Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:31.0239270Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:31.0239485Z   MAJOR_VERSION: 10
+2026-10-31T18:49:31.0240028Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:31.0240354Z   MAJOR_VERSION_NUMBER: 10
+2026-10-31T18:49:31.0240571Z   DOCKER_METADATA_OUTPUT_VERSION: gnome
+2026-10-31T18:49:31.0241315Z   DOCKER_METADATA_OUTPUT_TAGS: gnome
+2026-10-31T18:49:31.0241658Z   DOCKER_METADATA_OUTPUT_TAG_NAMES: gnome
+2026-10-31T18:49:31.0245048Z   DOCKER_METADATA_OUTPUT_LABELS: containers.bootc=1
+io.artifacthub.package.deprecated=false
+io.artifacthub.package.keywords=bootc,tunaos
+io.artifacthub.package.license=Apache-2.0
+io.artifacthub.package.logo-url=https://avatars.githubusercontent.com/u/223733964?s=200&v=4
+io.artifacthub.package.maintainers=[{\"name\":\"tuna-os\",\"email\":\"\"}]
+io.artifacthub.package.prerelease=true
+io.artifacthub.package.readme-url=https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md
+org.opencontainers.image.created=2026-10-31T18:49:29Z
+org.opencontainers.image.description=Based on Arch Linux (rolling)
+org.opencontainers.image.documentation=https://tunaos.org/docs/intro
+org.opencontainers.image.licenses=Apache-2.0
+org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+org.opencontainers.image.source=https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10
+org.opencontainers.image.title=marlin
+org.opencontainers.image.url=https://tunaos.org
+org.opencontainers.image.vendor=tuna-os
+org.opencontainers.image.version=10
+2026-10-31T18:49:31.0249839Z   DOCKER_METADATA_OUTPUT_ANNOTATIONS: manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z
+manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop
+manifest:org.opencontainers.image.licenses=Apache-2.0
+manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS
+manifest:org.opencontainers.image.title=tunaOS
+manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS
+manifest:org.opencontainers.image.version=gnome
+2026-10-31T18:49:31.0256708Z   DOCKER_METADATA_OUTPUT_JSON: {"tags":["gnome"],"tag-names":["gnome"],"labels":{"containers.bootc":"1","io.artifacthub.package.deprecated":"false","io.artifacthub.package.keywords":"bootc,tunaos","io.artifacthub.package.license":"Apache-2.0","io.artifacthub.package.logo-url":"https://avatars.githubusercontent.com/u/223733964?s=200&v=4","io.artifacthub.package.maintainers":"[{\\\"name\\\":\\\"tuna-os\\\",\\\"email\\\":\\\"\\\"}]","io.artifacthub.package.prerelease":"true","io.artifacthub.package.readme-url":"https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md","org.opencontainers.image.created":"2026-10-31T18:49:29Z","org.opencontainers.image.description":"Based on Arch Linux (rolling)","org.opencontainers.image.documentation":"https://tunaos.org/docs/intro","org.opencontainers.image.licenses":"Apache-2.0","org.opencontainers.image.revision":"f5b93442b3b8f504c6cdc63ed7cb774f957f707e","org.opencontainers.image.source":"https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10","org.opencontainers.image.title":"marlin","org.opencontainers.image.url":"https://tunaos.org","org.opencontainers.image.vendor":"tuna-os","org.opencontainers.image.version":"10"},"annotations":["manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z","manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop","manifest:org.opencontainers.image.licenses=Apache-2.0","manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e","manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS","manifest:org.opencontainers.image.title=tunaOS","manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS","manifest:org.opencontainers.image.version=gnome"]}
+2026-10-31T18:49:31.0262061Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_TAGS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-tags.json
+2026-10-31T18:49:31.0262820Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_LABELS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-labels.json
+2026-10-31T18:49:31.0263531Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_ANNOTATIONS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-annotations.json
+2026-10-31T18:49:31.0264156Z   DOCKER_METADATA_OUTPUT_BAKE_FILE: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake.json
+2026-10-31T18:49:31.0264949Z   DIGESTS_JSON: {"linux-amd64":"sha256:6c1e25b1fa9ddc07d7e71f767456839676333d3ebdc332b642a467f56c8ff71b","linux-arm64":"sha256:c99cedc0fcfedfcc5a08d132b8b062bfa8b2548db246d10382dc04fbdff2a446"}
+2026-10-31T18:49:31.0265562Z ##[endgroup]
+2026-10-31T18:49:31.0610868Z 2 platform digest(s) available for the manifest.
+2026-10-31T18:49:31.0663819Z ##[group]Run set -e
+2026-10-31T18:49:31.0664082Z [36;1mset -e[0m
+2026-10-31T18:49:31.0664258Z [36;1m[0m
+2026-10-31T18:49:31.0664516Z [36;1m# Expected platforms = what this flavor actually declares. The[0m
+2026-10-31T18:49:31.0664886Z [36;1m# build matrix resolves per-flavor platform overrides into[0m
+2026-10-31T18:49:31.0665256Z [36;1m# inputs.platforms (gnome-asahi is arm64-only; judging it against[0m
+2026-10-31T18:49:31.0665626Z [36;1m# the variant's amd64+arm64 list made Promote silently skip[0m
+2026-10-31T18:49:31.0665983Z [36;1m# forever). Fall back to the variant list only if the input is[0m
+2026-10-31T18:49:31.0666348Z [36;1m# somehow empty. PR builds force amd64 here but never promote.[0m
+2026-10-31T18:49:31.0666651Z [36;1mDEFAULT_PLATFORMS="${PLATFORMS}"[0m
+2026-10-31T18:49:31.0666928Z [36;1mif [ -z "$DEFAULT_PLATFORMS" ]; then[0m
+2026-10-31T18:49:31.0667226Z [36;1m  # Use strenv() for robust environment variable access in yq[0m
+2026-10-31T18:49:31.0667784Z [36;1m  DEFAULT_PLATFORMS=$(yq -r '.variants[] | select(.id == strenv(IMAGE_VARIANT)) | .platforms | join(",")' .github/build-config.yml)[0m
+2026-10-31T18:49:31.0668228Z [36;1mfi[0m
+2026-10-31T18:49:31.0668426Z [36;1mif [ -z "$DEFAULT_PLATFORMS" ]; then[0m
+2026-10-31T18:49:31.0668692Z [36;1m  echo "Unknown variant: ${IMAGE_VARIANT}"[0m
+2026-10-31T18:49:31.0668975Z [36;1m  DEFAULT_PLATFORMS="linux/arm64,linux/amd64"[0m
+2026-10-31T18:49:31.0669232Z [36;1mfi[0m
+2026-10-31T18:49:31.0669404Z [36;1m[0m
+2026-10-31T18:49:31.0669577Z [36;1mecho "Variant: ${IMAGE_VARIANT}"[0m
+2026-10-31T18:49:31.0669885Z [36;1mecho "Default platforms for this variant: ${DEFAULT_PLATFORMS}"[0m
+2026-10-31T18:49:31.0670171Z [36;1m[0m
+2026-10-31T18:49:31.0670435Z [36;1m# Parse expected platforms (use default platforms, not input platforms)[0m
+2026-10-31T18:49:31.0670973Z [36;1mexpected_platforms=()[0m
+2026-10-31T18:49:31.0671267Z [36;1mIFS=',' read -r -a expected_platforms <<< "${DEFAULT_PLATFORMS}"[0m
+2026-10-31T18:49:31.0671583Z [36;1m[0m
+2026-10-31T18:49:31.0671785Z [36;1m# Check if all expected platforms have digests[0m
+2026-10-31T18:49:31.0672052Z [36;1mall_platforms_built="true"[0m
+2026-10-31T18:49:31.0672369Z [36;1mfor platform_original in "${expected_platforms[@]}"; do[0m
+2026-10-31T18:49:31.0672677Z [36;1m  platform_key="${platform_original//\//-}"[0m
+2026-10-31T18:49:31.0673608Z [36;1m  digest="$(echo "${DIGESTS_JSON}" | jq -r --arg key "${platform_key}" '.[$key]')"[0m
+2026-10-31T18:49:31.0673965Z [36;1m[0m
+2026-10-31T18:49:31.0674226Z [36;1m  if [ "$digest" == "null" ] || [ -z "$digest" ]; then[0m
+2026-10-31T18:49:31.0674570Z [36;1m    echo "Missing platform: ${platform_original} (key: ${platform_key})"[0m
+2026-10-31T18:49:31.0674901Z [36;1m    all_platforms_built="false"[0m
+2026-10-31T18:49:31.0675149Z [36;1m  else[0m
+2026-10-31T18:49:31.0675403Z [36;1m    echo "Found platform: ${platform_original} (key: ${platform_key})"[0m
+2026-10-31T18:49:31.0675700Z [36;1m  fi[0m
+2026-10-31T18:49:31.0675872Z [36;1mdone[0m
+2026-10-31T18:49:31.0676032Z [36;1m[0m
+2026-10-31T18:49:31.0676285Z [36;1mecho "All default platforms built: ${all_platforms_built}"[0m
+2026-10-31T18:49:31.0676656Z [36;1mecho "all_platforms_built=${all_platforms_built}" >> "${GITHUB_OUTPUT}"[0m
+2026-10-31T18:49:31.0677044Z shell: sh -e {0}
+2026-10-31T18:49:31.0677221Z env:
+2026-10-31T18:49:31.0677388Z   IMAGE_NAME: marlin
+2026-10-31T18:49:31.0677591Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:31.0677830Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:31.0678035Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:31.0678215Z   MAJOR_VERSION: 10
+2026-10-31T18:49:31.0678397Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:31.0678627Z   MAJOR_VERSION_NUMBER: 10
+2026-10-31T18:49:31.0678840Z   DOCKER_METADATA_OUTPUT_VERSION: gnome
+2026-10-31T18:49:31.0679096Z   DOCKER_METADATA_OUTPUT_TAGS: gnome
+2026-10-31T18:49:31.0679324Z   DOCKER_METADATA_OUTPUT_TAG_NAMES: gnome
+2026-10-31T18:49:31.0682643Z   DOCKER_METADATA_OUTPUT_LABELS: containers.bootc=1
+io.artifacthub.package.deprecated=false
+io.artifacthub.package.keywords=bootc,tunaos
+io.artifacthub.package.license=Apache-2.0
+io.artifacthub.package.logo-url=https://avatars.githubusercontent.com/u/223733964?s=200&v=4
+io.artifacthub.package.maintainers=[{\"name\":\"tuna-os\",\"email\":\"\"}]
+io.artifacthub.package.prerelease=true
+io.artifacthub.package.readme-url=https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md
+org.opencontainers.image.created=2026-10-31T18:49:29Z
+org.opencontainers.image.description=Based on Arch Linux (rolling)
+org.opencontainers.image.documentation=https://tunaos.org/docs/intro
+org.opencontainers.image.licenses=Apache-2.0
+org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+org.opencontainers.image.source=https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10
+org.opencontainers.image.title=marlin
+org.opencontainers.image.url=https://tunaos.org
+org.opencontainers.image.vendor=tuna-os
+org.opencontainers.image.version=10
+2026-10-31T18:49:31.0687601Z   DOCKER_METADATA_OUTPUT_ANNOTATIONS: manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z
+manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop
+manifest:org.opencontainers.image.licenses=Apache-2.0
+manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS
+manifest:org.opencontainers.image.title=tunaOS
+manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS
+manifest:org.opencontainers.image.version=gnome
+2026-10-31T18:49:31.0694016Z   DOCKER_METADATA_OUTPUT_JSON: {"tags":["gnome"],"tag-names":["gnome"],"labels":{"containers.bootc":"1","io.artifacthub.package.deprecated":"false","io.artifacthub.package.keywords":"bootc,tunaos","io.artifacthub.package.license":"Apache-2.0","io.artifacthub.package.logo-url":"https://avatars.githubusercontent.com/u/223733964?s=200&v=4","io.artifacthub.package.maintainers":"[{\\\"name\\\":\\\"tuna-os\\\",\\\"email\\\":\\\"\\\"}]","io.artifacthub.package.prerelease":"true","io.artifacthub.package.readme-url":"https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md","org.opencontainers.image.created":"2026-10-31T18:49:29Z","org.opencontainers.image.description":"Based on Arch Linux (rolling)","org.opencontainers.image.documentation":"https://tunaos.org/docs/intro","org.opencontainers.image.licenses":"Apache-2.0","org.opencontainers.image.revision":"f5b93442b3b8f504c6cdc63ed7cb774f957f707e","org.opencontainers.image.source":"https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10","org.opencontainers.image.title":"marlin","org.opencontainers.image.url":"https://tunaos.org","org.opencontainers.image.vendor":"tuna-os","org.opencontainers.image.version":"10"},"annotations":["manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z","manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop","manifest:org.opencontainers.image.licenses=Apache-2.0","manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e","manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS","manifest:org.opencontainers.image.title=tunaOS","manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS","manifest:org.opencontainers.image.version=gnome"]}
+2026-10-31T18:49:31.0699300Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_TAGS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-tags.json
+2026-10-31T18:49:31.0699928Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_LABELS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-labels.json
+2026-10-31T18:49:31.0700733Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_ANNOTATIONS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-annotations.json
+2026-10-31T18:49:31.0701390Z   DOCKER_METADATA_OUTPUT_BAKE_FILE: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake.json
+2026-10-31T18:49:31.0702174Z   DIGESTS_JSON: {"linux-amd64":"sha256:6c1e25b1fa9ddc07d7e71f767456839676333d3ebdc332b642a467f56c8ff71b","linux-arm64":"sha256:c99cedc0fcfedfcc5a08d132b8b062bfa8b2548db246d10382dc04fbdff2a446"}
+2026-10-31T18:49:31.0702938Z   IMAGE_VARIANT: marlin
+2026-10-31T18:49:31.0703125Z ##[endgroup]
+2026-10-31T18:49:31.1041426Z Variant: marlin
+2026-10-31T18:49:31.1042288Z Default platforms for this variant: linux/amd64,linux/arm64
+2026-10-31T18:49:31.1088370Z Found platform: linux/amd64 (key: linux-amd64)
+2026-10-31T18:49:31.1114728Z Found platform: linux/arm64 (key: linux-arm64)
+2026-10-31T18:49:31.1115032Z All default platforms built: true
+2026-10-31T18:49:31.1171535Z ##[group]Run podman manifest create ${IMAGE_REGISTRY}/${IMAGE_NAME}:${DEFAULT_TAG}
+2026-10-31T18:49:31.1171983Z [36;1mpodman manifest create ${IMAGE_REGISTRY}/${IMAGE_NAME}:${DEFAULT_TAG}[0m
+2026-10-31T18:49:31.1172406Z [36;1mecho "MANIFEST=${IMAGE_REGISTRY}/${IMAGE_NAME}:${DEFAULT_TAG}" >> $GITHUB_OUTPUT[0m
+2026-10-31T18:49:31.1173035Z shell: sh -e {0}
+2026-10-31T18:49:31.1173249Z env:
+2026-10-31T18:49:31.1173412Z   IMAGE_NAME: marlin
+2026-10-31T18:49:31.1173612Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:31.1173869Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:31.1174082Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:31.1174259Z   MAJOR_VERSION: 10
+2026-10-31T18:49:31.1174455Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:31.1174684Z   MAJOR_VERSION_NUMBER: 10
+2026-10-31T18:49:31.1174903Z   DOCKER_METADATA_OUTPUT_VERSION: gnome
+2026-10-31T18:49:31.1175133Z   DOCKER_METADATA_OUTPUT_TAGS: gnome
+2026-10-31T18:49:31.1175429Z   DOCKER_METADATA_OUTPUT_TAG_NAMES: gnome
+2026-10-31T18:49:31.1178830Z   DOCKER_METADATA_OUTPUT_LABELS: containers.bootc=1
+io.artifacthub.package.deprecated=false
+io.artifacthub.package.keywords=bootc,tunaos
+io.artifacthub.package.license=Apache-2.0
+io.artifacthub.package.logo-url=https://avatars.githubusercontent.com/u/223733964?s=200&v=4
+io.artifacthub.package.maintainers=[{\"name\":\"tuna-os\",\"email\":\"\"}]
+io.artifacthub.package.prerelease=true
+io.artifacthub.package.readme-url=https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md
+org.opencontainers.image.created=2026-10-31T18:49:29Z
+org.opencontainers.image.description=Based on Arch Linux (rolling)
+org.opencontainers.image.documentation=https://tunaos.org/docs/intro
+org.opencontainers.image.licenses=Apache-2.0
+org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+org.opencontainers.image.source=https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10
+org.opencontainers.image.title=marlin
+org.opencontainers.image.url=https://tunaos.org
+org.opencontainers.image.vendor=tuna-os
+org.opencontainers.image.version=10
+2026-10-31T18:49:31.1183662Z   DOCKER_METADATA_OUTPUT_ANNOTATIONS: manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z
+manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop
+manifest:org.opencontainers.image.licenses=Apache-2.0
+manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS
+manifest:org.opencontainers.image.title=tunaOS
+manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS
+manifest:org.opencontainers.image.version=gnome
+2026-10-31T18:49:31.1190044Z   DOCKER_METADATA_OUTPUT_JSON: {"tags":["gnome"],"tag-names":["gnome"],"labels":{"containers.bootc":"1","io.artifacthub.package.deprecated":"false","io.artifacthub.package.keywords":"bootc,tunaos","io.artifacthub.package.license":"Apache-2.0","io.artifacthub.package.logo-url":"https://avatars.githubusercontent.com/u/223733964?s=200&v=4","io.artifacthub.package.maintainers":"[{\\\"name\\\":\\\"tuna-os\\\",\\\"email\\\":\\\"\\\"}]","io.artifacthub.package.prerelease":"true","io.artifacthub.package.readme-url":"https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md","org.opencontainers.image.created":"2026-10-31T18:49:29Z","org.opencontainers.image.description":"Based on Arch Linux (rolling)","org.opencontainers.image.documentation":"https://tunaos.org/docs/intro","org.opencontainers.image.licenses":"Apache-2.0","org.opencontainers.image.revision":"f5b93442b3b8f504c6cdc63ed7cb774f957f707e","org.opencontainers.image.source":"https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10","org.opencontainers.image.title":"marlin","org.opencontainers.image.url":"https://tunaos.org","org.opencontainers.image.vendor":"tuna-os","org.opencontainers.image.version":"10"},"annotations":["manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z","manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop","manifest:org.opencontainers.image.licenses=Apache-2.0","manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e","manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS","manifest:org.opencontainers.image.title=tunaOS","manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS","manifest:org.opencontainers.image.version=gnome"]}
+2026-10-31T18:49:31.1195348Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_TAGS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-tags.json
+2026-10-31T18:49:31.1195983Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_LABELS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-labels.json
+2026-10-31T18:49:31.1196678Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_ANNOTATIONS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-annotations.json
+2026-10-31T18:49:31.1197419Z   DOCKER_METADATA_OUTPUT_BAKE_FILE: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake.json
+2026-10-31T18:49:31.1197806Z ##[endgroup]
+2026-10-31T18:49:31.2511019Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:31.2592386Z ##[group]Run set -e # Ensure script exits on error
+2026-10-31T18:49:31.2593202Z [36;1mset -e # Ensure script exits on error[0m
+2026-10-31T18:49:31.2593586Z [36;1m[0m
+2026-10-31T18:49:31.2593965Z [36;1m# Turn the comma separated inputs.platforms string into a list[0m
+2026-10-31T18:49:31.2594439Z [36;1mplatforms=()[0m
+2026-10-31T18:49:31.2594821Z [36;1mIFS=',' read -r -a platforms <<< "${PLATFORMS}"[0m
+2026-10-31T18:49:31.2595222Z [36;1m[0m
+2026-10-31T18:49:31.2595547Z [36;1mfor platform_original in "${platforms[@]}"; do[0m
+2026-10-31T18:49:31.2596047Z [36;1m  platform_key_for_lookup="${platform_original//\//-}"[0m
+2026-10-31T18:49:31.2596484Z [36;1m[0m
+2026-10-31T18:49:31.2596947Z [36;1m  digest="$(echo "${DIGESTS_JSON}" | jq -r --arg key "${platform_key_for_lookup}" '.[$key]')"[0m
+2026-10-31T18:49:31.2597455Z [36;1m[0m
+2026-10-31T18:49:31.2597842Z [36;1m  # A platform with no digest means that leg failed. Skip it rather[0m
+2026-10-31T18:49:31.2598522Z [36;1m  # than aborting: the manifest is still useful to every stage that[0m
+2026-10-31T18:49:31.2599115Z [36;1m  # builds on the platforms that DID publish, and the bare tag is[0m
+2026-10-31T18:49:31.2599720Z [36;1m  # withheld anyway because `Check Platform Completeness` has already[0m
+2026-10-31T18:49:31.2600284Z [36;1m  # set all_platforms_built=false (tuna-os/tunaOS#1729).[0m
+2026-10-31T18:49:31.2600765Z [36;1m  if [ "$digest" == "null" ] || [ -z "$digest" ]; then[0m
+2026-10-31T18:49:31.2601601Z [36;1m    echo "::warning::No digest for platform ${platform_original} (key: ${platform_key_for_lookup}); omitting it from the manifest. The bare tag will not be promoted."[0m
+2026-10-31T18:49:31.2602449Z [36;1m    continue[0m
+2026-10-31T18:49:31.2602888Z [36;1m  fi[0m
+2026-10-31T18:49:31.2603138Z [36;1m[0m
+2026-10-31T18:49:31.2603478Z [36;1m  # os/arch[/variant] -> OCI platform fields, parsed as[0m
+2026-10-31T18:49:31.2604053Z [36;1m  # scripts/lib/platform-digest.sh does. linux/amd64/v2 must land as[0m
+2026-10-31T18:49:31.2604654Z [36;1m  # architecture amd64 + variant v2: passing "amd64/v2" as --arch[0m
+2026-10-31T18:49:31.2605200Z [36;1m  # published an architecture no spec-following client can match,[0m
+2026-10-31T18:49:31.2605763Z [36;1m  # and the v2 image config carries no variant for podman to copy.[0m
+2026-10-31T18:49:31.2606406Z [36;1m  IFS=/ read -r platform_os platform_arch platform_variant <<<"${platform_original}"[0m
+2026-10-31T18:49:31.2607072Z [36;1m  platform_flags=(--os "${platform_os}" --arch "${platform_arch}")[0m
+2026-10-31T18:49:31.2607724Z [36;1m  [[ -z "${platform_variant}" ]] || platform_flags+=(--variant "${platform_variant}")[0m
+2026-10-31T18:49:31.2608593Z [36;1m  podman manifest add "${MANIFEST}" "docker://${IMAGE_REGISTRY}/${IMAGE_NAME}@${digest}" "${platform_flags[@]}"[0m
+2026-10-31T18:49:31.2609229Z [36;1mdone[0m
+2026-10-31T18:49:31.2609500Z [36;1m[0m
+2026-10-31T18:49:31.2609847Z [36;1m# Apply the labels to the manifest (separated by newlines)[0m
+2026-10-31T18:49:31.2610302Z [36;1mwhile IFS= read -r label; do[0m
+2026-10-31T18:49:31.2610678Z [36;1m  echo "Applying label ${label} to manifest"[0m
+2026-10-31T18:49:31.2611226Z [36;1m  podman manifest annotate --index --annotation "$label" "${MANIFEST}"[0m
+2026-10-31T18:49:31.2611718Z [36;1mdone <<< "${LABELS}"[0m
+2026-10-31T18:49:31.2612591Z shell: sh -e {0}
+2026-10-31T18:49:31.2613016Z env:
+2026-10-31T18:49:31.2613267Z   IMAGE_NAME: marlin
+2026-10-31T18:49:31.2613560Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:31.2613938Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:31.2614271Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:31.2614544Z   MAJOR_VERSION: 10
+2026-10-31T18:49:31.2615100Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:31.2615447Z   MAJOR_VERSION_NUMBER: 10
+2026-10-31T18:49:31.2615780Z   DOCKER_METADATA_OUTPUT_VERSION: gnome
+2026-10-31T18:49:31.2616161Z   DOCKER_METADATA_OUTPUT_TAGS: gnome
+2026-10-31T18:49:31.2616525Z   DOCKER_METADATA_OUTPUT_TAG_NAMES: gnome
+2026-10-31T18:49:31.2621964Z   DOCKER_METADATA_OUTPUT_LABELS: containers.bootc=1
+io.artifacthub.package.deprecated=false
+io.artifacthub.package.keywords=bootc,tunaos
+io.artifacthub.package.license=Apache-2.0
+io.artifacthub.package.logo-url=https://avatars.githubusercontent.com/u/223733964?s=200&v=4
+io.artifacthub.package.maintainers=[{\"name\":\"tuna-os\",\"email\":\"\"}]
+io.artifacthub.package.prerelease=true
+io.artifacthub.package.readme-url=https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md
+org.opencontainers.image.created=2026-10-31T18:49:29Z
+org.opencontainers.image.description=Based on Arch Linux (rolling)
+org.opencontainers.image.documentation=https://tunaos.org/docs/intro
+org.opencontainers.image.licenses=Apache-2.0
+org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+org.opencontainers.image.source=https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10
+org.opencontainers.image.title=marlin
+org.opencontainers.image.url=https://tunaos.org
+org.opencontainers.image.vendor=tuna-os
+org.opencontainers.image.version=10
+2026-10-31T18:49:31.2630387Z   DOCKER_METADATA_OUTPUT_ANNOTATIONS: manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z
+manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop
+manifest:org.opencontainers.image.licenses=Apache-2.0
+manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS
+manifest:org.opencontainers.image.title=tunaOS
+manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS
+manifest:org.opencontainers.image.version=gnome
+2026-10-31T18:49:31.2640873Z   DOCKER_METADATA_OUTPUT_JSON: {"tags":["gnome"],"tag-names":["gnome"],"labels":{"containers.bootc":"1","io.artifacthub.package.deprecated":"false","io.artifacthub.package.keywords":"bootc,tunaos","io.artifacthub.package.license":"Apache-2.0","io.artifacthub.package.logo-url":"https://avatars.githubusercontent.com/u/223733964?s=200&v=4","io.artifacthub.package.maintainers":"[{\\\"name\\\":\\\"tuna-os\\\",\\\"email\\\":\\\"\\\"}]","io.artifacthub.package.prerelease":"true","io.artifacthub.package.readme-url":"https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md","org.opencontainers.image.created":"2026-10-31T18:49:29Z","org.opencontainers.image.description":"Based on Arch Linux (rolling)","org.opencontainers.image.documentation":"https://tunaos.org/docs/intro","org.opencontainers.image.licenses":"Apache-2.0","org.opencontainers.image.revision":"f5b93442b3b8f504c6cdc63ed7cb774f957f707e","org.opencontainers.image.source":"https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10","org.opencontainers.image.title":"marlin","org.opencontainers.image.url":"https://tunaos.org","org.opencontainers.image.vendor":"tuna-os","org.opencontainers.image.version":"10"},"annotations":["manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z","manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop","manifest:org.opencontainers.image.licenses=Apache-2.0","manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e","manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS","manifest:org.opencontainers.image.title=tunaOS","manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS","manifest:org.opencontainers.image.version=gnome"]}
+2026-10-31T18:49:31.2650025Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_TAGS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-tags.json
+2026-10-31T18:49:31.2651325Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_LABELS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-labels.json
+2026-10-31T18:49:31.2652640Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_ANNOTATIONS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-annotations.json
+2026-10-31T18:49:31.2653979Z   DOCKER_METADATA_OUTPUT_BAKE_FILE: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake.json
+2026-10-31T18:49:31.2654612Z   MANIFEST: ghcr.io/tuna-os/marlin:gnome
+2026-10-31T18:49:31.2655633Z   DIGESTS_JSON: {"linux-amd64":"sha256:6c1e25b1fa9ddc07d7e71f767456839676333d3ebdc332b642a467f56c8ff71b","linux-arm64":"sha256:c99cedc0fcfedfcc5a08d132b8b062bfa8b2548db246d10382dc04fbdff2a446"}
+2026-10-31T18:49:31.2661312Z   LABELS: containers.bootc=1
+io.artifacthub.package.deprecated=false
+io.artifacthub.package.keywords=bootc,tunaos
+io.artifacthub.package.license=Apache-2.0
+io.artifacthub.package.logo-url=https://avatars.githubusercontent.com/u/223733964?s=200&v=4
+io.artifacthub.package.maintainers=[{\"name\":\"tuna-os\",\"email\":\"\"}]
+io.artifacthub.package.prerelease=true
+io.artifacthub.package.readme-url=https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md
+org.opencontainers.image.created=2026-10-31T18:49:29Z
+org.opencontainers.image.description=Based on Arch Linux (rolling)
+org.opencontainers.image.documentation=https://tunaos.org/docs/intro
+org.opencontainers.image.licenses=Apache-2.0
+org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+org.opencontainers.image.source=https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10
+org.opencontainers.image.title=marlin
+org.opencontainers.image.url=https://tunaos.org
+org.opencontainers.image.vendor=tuna-os
+org.opencontainers.image.version=10
+2026-10-31T18:49:31.2666819Z ##[endgroup]
+2026-10-31T18:49:31.6916876Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.1088977Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.1107031Z Applying label containers.bootc=1 to manifest
+2026-10-31T18:49:32.1669249Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.1687099Z Applying label io.artifacthub.package.deprecated=false to manifest
+2026-10-31T18:49:32.1867952Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.1881607Z Applying label io.artifacthub.package.keywords=bootc,tunaos to manifest
+2026-10-31T18:49:32.2273848Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.2289247Z Applying label io.artifacthub.package.license=Apache-2.0 to manifest
+2026-10-31T18:49:32.2476212Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.2497376Z Applying label io.artifacthub.package.logo-url=https://avatars.githubusercontent.com/u/223733964?s=200&v=4 to manifest
+2026-10-31T18:49:32.2869713Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.2887529Z Applying label io.artifacthub.package.maintainers=[{\"name\":\"tuna-os\",\"email\":\"\"}] to manifest
+2026-10-31T18:49:32.3485498Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.3500416Z Applying label io.artifacthub.package.prerelease=true to manifest
+2026-10-31T18:49:32.3682170Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.3695264Z Applying label io.artifacthub.package.readme-url=https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md to manifest
+2026-10-31T18:49:32.3880206Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.3894143Z Applying label org.opencontainers.image.created=2026-10-31T18:49:29Z to manifest
+2026-10-31T18:49:32.4079855Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.4093062Z Applying label org.opencontainers.image.description=Based on Arch Linux (rolling) to manifest
+2026-10-31T18:49:32.4278500Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.4292655Z Applying label org.opencontainers.image.documentation=https://tunaos.org/docs/intro to manifest
+2026-10-31T18:49:32.4476759Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.4498974Z Applying label org.opencontainers.image.licenses=Apache-2.0 to manifest
+2026-10-31T18:49:32.4685055Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.4698369Z Applying label org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e to manifest
+2026-10-31T18:49:32.4985451Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.5001645Z Applying label org.opencontainers.image.source=https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10 to manifest
+2026-10-31T18:49:32.5185261Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.5198536Z Applying label org.opencontainers.image.title=marlin to manifest
+2026-10-31T18:49:32.5608911Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.5628133Z Applying label org.opencontainers.image.url=https://tunaos.org to manifest
+2026-10-31T18:49:32.5900983Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.5914573Z Applying label org.opencontainers.image.vendor=tuna-os to manifest
+2026-10-31T18:49:32.6392953Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.6406320Z Applying label org.opencontainers.image.version=10 to manifest
+2026-10-31T18:49:32.6988776Z 8c4639d251e462732e6aa193a2fa3532997155d323dc70f40183fc5d450af4f5
+2026-10-31T18:49:32.7061549Z ##[group]Run echo "***" | podman login -u "${GITHUB_ACTOR}" --password-stdin "${REGISTRY}"
+2026-10-31T18:49:32.7064128Z [36;1mecho "***" | podman login -u "${GITHUB_ACTOR}" --password-stdin "${REGISTRY}"[0m
+2026-10-31T18:49:32.7066240Z [36;1mecho "***" | podman login -u "${GITHUB_ACTOR}" --password-stdin "${REGISTRY}"[0m
+2026-10-31T18:49:32.7066633Z shell: sh -e {0}
+2026-10-31T18:49:32.7066806Z env:
+2026-10-31T18:49:32.7066977Z   IMAGE_NAME: marlin
+2026-10-31T18:49:32.7067249Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:32.7067605Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:32.7068095Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:32.7068432Z   MAJOR_VERSION: 10
+2026-10-31T18:49:32.7068775Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:32.7069156Z   MAJOR_VERSION_NUMBER: 10
+2026-10-31T18:49:32.7069549Z   DOCKER_METADATA_OUTPUT_VERSION: gnome
+2026-10-31T18:49:32.7069922Z   DOCKER_METADATA_OUTPUT_TAGS: gnome
+2026-10-31T18:49:32.7070404Z   DOCKER_METADATA_OUTPUT_TAG_NAMES: gnome
+2026-10-31T18:49:32.7073912Z   DOCKER_METADATA_OUTPUT_LABELS: containers.bootc=1
+io.artifacthub.package.deprecated=false
+io.artifacthub.package.keywords=bootc,tunaos
+io.artifacthub.package.license=Apache-2.0
+io.artifacthub.package.logo-url=https://avatars.githubusercontent.com/u/223733964?s=200&v=4
+io.artifacthub.package.maintainers=[{\"name\":\"tuna-os\",\"email\":\"\"}]
+io.artifacthub.package.prerelease=true
+io.artifacthub.package.readme-url=https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md
+org.opencontainers.image.created=2026-10-31T18:49:29Z
+org.opencontainers.image.description=Based on Arch Linux (rolling)
+org.opencontainers.image.documentation=https://tunaos.org/docs/intro
+org.opencontainers.image.licenses=Apache-2.0
+org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+org.opencontainers.image.source=https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10
+org.opencontainers.image.title=marlin
+org.opencontainers.image.url=https://tunaos.org
+org.opencontainers.image.vendor=tuna-os
+org.opencontainers.image.version=10
+2026-10-31T18:49:32.7079004Z   DOCKER_METADATA_OUTPUT_ANNOTATIONS: manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z
+manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop
+manifest:org.opencontainers.image.licenses=Apache-2.0
+manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS
+manifest:org.opencontainers.image.title=tunaOS
+manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS
+manifest:org.opencontainers.image.version=gnome
+2026-10-31T18:49:32.7086073Z   DOCKER_METADATA_OUTPUT_JSON: {"tags":["gnome"],"tag-names":["gnome"],"labels":{"containers.bootc":"1","io.artifacthub.package.deprecated":"false","io.artifacthub.package.keywords":"bootc,tunaos","io.artifacthub.package.license":"Apache-2.0","io.artifacthub.package.logo-url":"https://avatars.githubusercontent.com/u/223733964?s=200&v=4","io.artifacthub.package.maintainers":"[{\\\"name\\\":\\\"tuna-os\\\",\\\"email\\\":\\\"\\\"}]","io.artifacthub.package.prerelease":"true","io.artifacthub.package.readme-url":"https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md","org.opencontainers.image.created":"2026-10-31T18:49:29Z","org.opencontainers.image.description":"Based on Arch Linux (rolling)","org.opencontainers.image.documentation":"https://tunaos.org/docs/intro","org.opencontainers.image.licenses":"Apache-2.0","org.opencontainers.image.revision":"f5b93442b3b8f504c6cdc63ed7cb774f957f707e","org.opencontainers.image.source":"https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10","org.opencontainers.image.title":"marlin","org.opencontainers.image.url":"https://tunaos.org","org.opencontainers.image.vendor":"tuna-os","org.opencontainers.image.version":"10"},"annotations":["manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z","manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop","manifest:org.opencontainers.image.licenses=Apache-2.0","manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e","manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS","manifest:org.opencontainers.image.title=tunaOS","manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS","manifest:org.opencontainers.image.version=gnome"]}
+2026-10-31T18:49:32.7091622Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_TAGS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-tags.json
+2026-10-31T18:49:32.7092410Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_LABELS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-labels.json
+2026-10-31T18:49:32.7093422Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_ANNOTATIONS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-annotations.json
+2026-10-31T18:49:32.7094223Z   DOCKER_METADATA_OUTPUT_BAKE_FILE: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake.json
+2026-10-31T18:49:32.7094783Z   REGISTRY: ghcr.io
+2026-10-31T18:49:32.7096662Z   GITHUB_TOKEN: ***
+2026-10-31T18:49:32.7097049Z ##[endgroup]
+2026-10-31T18:49:33.0610110Z Login Succeeded!
+2026-10-31T18:49:33.3531704Z Login Succeeded!
+2026-10-31T18:49:33.3623398Z ##[group]Run # Push every tag under a -candidate suffix (RFC 018). The testing ring
+2026-10-31T18:49:33.3624183Z [36;1m# Push every tag under a -candidate suffix (RFC 018). The testing ring[0m
+2026-10-31T18:49:33.3624711Z [36;1m# (:<flavor>-testing) and the bare tags users pull are only written[0m
+2026-10-31T18:49:33.3625124Z [36;1m# by the promote job after the gates pass — a broken image can land[0m
+2026-10-31T18:49:33.3625502Z [36;1m# in GHCR as :<flavor>-candidate but never as :<flavor>-testing or[0m
+2026-10-31T18:49:33.3625793Z [36;1m# :<flavor>.[0m
+2026-10-31T18:49:33.3625999Z [36;1mwhile IFS= read -r tag; do[0m
+2026-10-31T18:49:33.3626307Z [36;1m  # GHCR does not support multi-range blob requests (returns 501),[0m
+2026-10-31T18:49:33.3626860Z [36;1m  # which makes zstd:chunked pulls hard-fail on podman versions[0m
+2026-10-31T18:49:33.3627216Z [36;1m  # that lack a fallback path (tuna-os/tunaos#579).[0m
+2026-10-31T18:49:33.3627599Z [36;1m  podman manifest push --all=false --digestfile=/tmp/digestfile \[0m
+2026-10-31T18:49:33.3627924Z [36;1m    --compression-format=zstd \[0m
+2026-10-31T18:49:33.3628173Z [36;1m    --compression-level=3 \[0m
+2026-10-31T18:49:33.3628406Z [36;1m    --force-compression \[0m
+2026-10-31T18:49:33.3628688Z [36;1m    "$MANIFEST" "$IMAGE_REGISTRY/$IMAGE_NAME:${tag}-candidate"[0m
+2026-10-31T18:49:33.3628977Z [36;1mdone <<< "$TAGS"[0m
+2026-10-31T18:49:33.3629173Z [36;1m[0m
+2026-10-31T18:49:33.3629354Z [36;1mDIGEST=$(cat /tmp/digestfile)[0m
+2026-10-31T18:49:33.3629610Z [36;1mecho "DIGEST=$DIGEST" >> $GITHUB_OUTPUT[0m
+2026-10-31T18:49:33.3629915Z [36;1mecho "IMAGE=$IMAGE_REGISTRY/$IMAGE_NAME" >> $GITHUB_OUTPUT[0m
+2026-10-31T18:49:33.3630271Z shell: sh -e {0}
+2026-10-31T18:49:33.3630455Z env:
+2026-10-31T18:49:33.3630618Z   IMAGE_NAME: marlin
+2026-10-31T18:49:33.3630826Z   IMAGE_DESC: Based on Arch Linux (rolling)
+2026-10-31T18:49:33.3631068Z   IMAGE_REGISTRY: ghcr.io/tuna-os
+2026-10-31T18:49:33.3631295Z   DEFAULT_TAG: gnome
+2026-10-31T18:49:33.3631483Z   MAJOR_VERSION: 10
+2026-10-31T18:49:33.3631676Z   PLATFORMS: linux/amd64,linux/arm64
+2026-10-31T18:49:33.3631909Z   MAJOR_VERSION_NUMBER: 10
+2026-10-31T18:49:33.3632128Z   DOCKER_METADATA_OUTPUT_VERSION: gnome
+2026-10-31T18:49:33.3632363Z   DOCKER_METADATA_OUTPUT_TAGS: gnome
+2026-10-31T18:49:33.3632600Z   DOCKER_METADATA_OUTPUT_TAG_NAMES: gnome
+2026-10-31T18:49:33.3636024Z   DOCKER_METADATA_OUTPUT_LABELS: containers.bootc=1
+io.artifacthub.package.deprecated=false
+io.artifacthub.package.keywords=bootc,tunaos
+io.artifacthub.package.license=Apache-2.0
+io.artifacthub.package.logo-url=https://avatars.githubusercontent.com/u/223733964?s=200&v=4
+io.artifacthub.package.maintainers=[{\"name\":\"tuna-os\",\"email\":\"\"}]
+io.artifacthub.package.prerelease=true
+io.artifacthub.package.readme-url=https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md
+org.opencontainers.image.created=2026-10-31T18:49:29Z
+org.opencontainers.image.description=Based on Arch Linux (rolling)
+org.opencontainers.image.documentation=https://tunaos.org/docs/intro
+org.opencontainers.image.licenses=Apache-2.0
+org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+org.opencontainers.image.source=https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10
+org.opencontainers.image.title=marlin
+org.opencontainers.image.url=https://tunaos.org
+org.opencontainers.image.vendor=tuna-os
+org.opencontainers.image.version=10
+2026-10-31T18:49:33.3640933Z   DOCKER_METADATA_OUTPUT_ANNOTATIONS: manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z
+manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop
+manifest:org.opencontainers.image.licenses=Apache-2.0
+manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e
+manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS
+manifest:org.opencontainers.image.title=tunaOS
+manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS
+manifest:org.opencontainers.image.version=gnome
+2026-10-31T18:49:33.3647564Z   DOCKER_METADATA_OUTPUT_JSON: {"tags":["gnome"],"tag-names":["gnome"],"labels":{"containers.bootc":"1","io.artifacthub.package.deprecated":"false","io.artifacthub.package.keywords":"bootc,tunaos","io.artifacthub.package.license":"Apache-2.0","io.artifacthub.package.logo-url":"https://avatars.githubusercontent.com/u/223733964?s=200&v=4","io.artifacthub.package.maintainers":"[{\\\"name\\\":\\\"tuna-os\\\",\\\"email\\\":\\\"\\\"}]","io.artifacthub.package.prerelease":"true","io.artifacthub.package.readme-url":"https://raw.githubusercontent.com/tuna-os/marlin/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/README.md","org.opencontainers.image.created":"2026-10-31T18:49:29Z","org.opencontainers.image.description":"Based on Arch Linux (rolling)","org.opencontainers.image.documentation":"https://tunaos.org/docs/intro","org.opencontainers.image.licenses":"Apache-2.0","org.opencontainers.image.revision":"f5b93442b3b8f504c6cdc63ed7cb774f957f707e","org.opencontainers.image.source":"https://github.com/tuna-os/marlin/blob/f5b93442b3b8f504c6cdc63ed7cb774f957f707e/Containerfile.el10","org.opencontainers.image.title":"marlin","org.opencontainers.image.url":"https://tunaos.org","org.opencontainers.image.vendor":"tuna-os","org.opencontainers.image.version":"10"},"annotations":["manifest:org.opencontainers.image.created=2026-10-31T18:49:30.106Z","manifest:org.opencontainers.image.description=Bringing a modern cloud-native experience to the Enterprise Linux Desktop","manifest:org.opencontainers.image.licenses=Apache-2.0","manifest:org.opencontainers.image.revision=f5b93442b3b8f504c6cdc63ed7cb774f957f707e","manifest:org.opencontainers.image.source=https://github.com/tuna-os/tunaOS","manifest:org.opencontainers.image.title=tunaOS","manifest:org.opencontainers.image.url=https://github.com/tuna-os/tunaOS","manifest:org.opencontainers.image.version=gnome"]}
+2026-10-31T18:49:33.3653130Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_TAGS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-tags.json
+2026-10-31T18:49:33.3653776Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_LABELS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-labels.json
+2026-10-31T18:49:33.3654484Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_ANNOTATIONS: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake-annotations.json
+2026-10-31T18:49:33.3655140Z   DOCKER_METADATA_OUTPUT_BAKE_FILE: /__w/_temp/docker-actions-toolkit-oPAwVe/docker-metadata-action-bake.json
+2026-10-31T18:49:33.3655557Z   MANIFEST: ghcr.io/tuna-os/marlin:gnome
+2026-10-31T18:49:33.3655787Z   TAGS: gnome
+2026-10-31T18:49:33.3655960Z ##[endgroup]
+2026-10-31T18:49:33.4762095Z Getting image list signatures
+2026-10-31T18:49:33.4762592Z Copying 0 images generated from 2 images in list
+2026-10-31T18:49:33.4763193Z Writing manifest list to image destination
+2026-10-31T18:49:34.0237462Z Storing list signatures
+2026-10-31T18:49:34.0398289Z Post job cleanup.
+2026-10-31T18:49:34.0404633Z ##[command]/usr/bin/docker exec  c186ac469c5a194930897620b809ba631cdfc7224d9701d10543bc411218afca sh -c "cat /etc/*release | grep ^ID"
+2026-10-31T18:49:34.1749489Z [command]/usr/bin/git version
+2026-10-31T18:49:34.1800443Z git version 2.56.0.1.g02cd7dbd28
+2026-10-31T18:49:34.1833844Z Temporarily overriding HOME='/__w/_temp/e544e6b7-a306-4d91-90d8-3fe822f3fd2b' before making global git config changes
+2026-10-31T18:49:34.1834778Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-31T18:49:34.1838418Z [command]/usr/bin/git config --global --add safe.directory /__w/tunaOS/tunaOS
+2026-10-31T18:49:34.1876349Z Removing SSH command configuration
+2026-10-31T18:49:34.1880952Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-31T18:49:34.1916986Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-31T18:49:34.2310071Z Removing HTTP extra header
+2026-10-31T18:49:34.2314192Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-31T18:49:34.2349188Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-31T18:49:34.2680446Z Removing includeIf entries pointing to credentials config files
+2026-10-31T18:49:34.2684876Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-31T18:49:34.2712607Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-31T18:49:34.3149338Z Stop and remove container: 5a33719571d94496aad8dd3209817452_cgrdevchainguardwolfibasesha25673f2cab0f11208427595d4bdd784046bc4116ef7cc52f0c1b48b6b7f820288d5_44b0ea
+2026-10-31T18:49:34.3153304Z ##[command]/usr/bin/docker rm --force c186ac469c5a194930897620b809ba631cdfc7224d9701d10543bc411218afca
+2026-10-31T18:49:36.5734301Z c186ac469c5a194930897620b809ba631cdfc7224d9701d10543bc411218afca
+2026-10-31T18:49:36.5763689Z Remove container network: github_network_fd6f06bf3f6e47e1815d49474933d016
+2026-10-31T18:49:36.5767363Z ##[command]/usr/bin/docker network rm github_network_fd6f06bf3f6e47e1815d49474933d016
+2026-10-31T18:49:36.6686778Z github_network_fd6f06bf3f6e47e1815d49474933d016
+2026-10-31T18:49:36.6752598Z Evaluate and set job outputs
+2026-10-31T18:49:36.6757248Z Set output 'image'
+2026-10-31T18:49:36.6758789Z Set output 'digest'
+2026-10-31T18:49:36.6759481Z Set output 'all_platforms_built'
+2026-10-31T18:49:36.6760044Z Cleaning up orphan processes

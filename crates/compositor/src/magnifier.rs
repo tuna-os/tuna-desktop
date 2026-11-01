@@ -576,6 +576,8 @@ pub struct Region {
     offset: (i32, i32),
     scale: f64,
     shown: Option<ZoomView>,
+    /// Last successfully submitted output frame, never an offscreen capture.
+    submitted: Option<(u64, bool)>,
 }
 
 /// One frame's tracking points for one output, in its local physical
@@ -610,6 +612,7 @@ impl Region {
             offset: (0, 0),
             scale: 1.0,
             shown: None,
+            submitted: None,
         }
     }
 
@@ -910,6 +913,14 @@ impl MagnifierState {
         self.generation
     }
 
+    /// Acknowledge only after the backend successfully submits this output's
+    /// frame. Planning (including screenshots/casts) must never call this.
+    pub fn mark_submitted(&mut self, output: &str, generation: u64, invert_lightness: bool) {
+        if let Some(region) = self.regions.get_mut(output) {
+            region.submitted = Some((generation, invert_lightness));
+        }
+    }
+
     /// Whether AT-SPI focus and caret events are wanted (GNOME
     /// registers its listeners only while active with the mode on).
     pub fn wants_focus_events(&self) -> bool {
@@ -1047,6 +1058,12 @@ impl MagnifierState {
                         "roi": [roi.0, roi.1, roi.2, roi.3],
                         "following": r.following_until.is_some(),
                         "delayed": r.delayed.is_some(),
+                        "submitted": r.submitted.map(|(generation, invert_lightness)| {
+                            serde_json::json!({
+                                "generation": generation,
+                                "invert_lightness": invert_lightness,
+                            })
+                        }),
                     }),
                 ))
             })
@@ -1872,6 +1889,81 @@ mod tests {
         assert_eq!(out[0], 1.0);
         assert!((out[1] - 0.5).abs() < 1e-6);
         assert!((out[2] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn inversion_acknowledgement_requires_submission_of_the_changed_effect() {
+        let mut state = MagnifierState::new();
+        let mut config = enabled();
+        state.set_config(config.clone());
+        let before = state
+            .plan_for(output("tuna-0", 800, 600), at(400.0, 300.0, 0), [0.0; 3])
+            .unwrap();
+        assert!(state.diagnostics()["regions"]["tuna-0"]["submitted"].is_null());
+        state.mark_submitted("tuna-0", before.generation, before.effects.invert);
+        assert_eq!(
+            state.diagnostics()["regions"]["tuna-0"]["submitted"]["invert_lightness"],
+            false
+        );
+        assert!(before.effects.identity);
+
+        config.invert_lightness = true;
+        state.set_config(config.clone());
+        let inverted = state
+            .plan_for(output("tuna-0", 800, 600), at(400.0, 300.0, 1), [0.0; 3])
+            .unwrap();
+        // Offscreen planning/loading settings does not acknowledge an output
+        // submission, even though the requested generation already changed.
+        assert_eq!(
+            state.diagnostics()["regions"]["tuna-0"]["submitted"]["generation"],
+            before.generation
+        );
+        assert_eq!(
+            state.diagnostics()["regions"]["tuna-0"]["submitted"]["invert_lightness"],
+            false
+        );
+        state.mark_submitted("tuna-0", inverted.generation, inverted.effects.invert);
+        assert_eq!(
+            state.diagnostics()["regions"]["tuna-0"]["submitted"]["generation"],
+            inverted.generation
+        );
+        assert_eq!(
+            state.diagnostics()["regions"]["tuna-0"]["submitted"]["invert_lightness"],
+            true
+        );
+        assert!(inverted.effects.invert);
+        assert!(!inverted.effects.identity);
+        assert_ne!(before.signature_bits(), inverted.signature_bits());
+        for (rgb, expected) in [
+            ([38, 162, 105], [93, 217, 160]),
+            ([230, 97, 0], [255, 122, 25]),
+        ] {
+            let actual = inverted.effects.apply(rgb.map(|v| v as f32 / 255.0));
+            for (actual, expected) in actual.into_iter().zip(expected) {
+                assert!((actual * 255.0 - expected as f32).abs() < 0.001);
+            }
+        }
+
+        config.invert_lightness = false;
+        state.set_config(config);
+        let restored = state
+            .plan_for(output("tuna-0", 800, 600), at(400.0, 300.0, 2), [0.0; 3])
+            .unwrap();
+        assert_eq!(
+            state.diagnostics()["regions"]["tuna-0"]["submitted"]["invert_lightness"],
+            true
+        );
+        state.mark_submitted("tuna-0", restored.generation, restored.effects.invert);
+        assert_eq!(
+            state.diagnostics()["regions"]["tuna-0"]["submitted"]["generation"],
+            restored.generation
+        );
+        assert_eq!(
+            state.diagnostics()["regions"]["tuna-0"]["submitted"]["invert_lightness"],
+            false
+        );
+        assert!(restored.effects.identity);
+        assert_ne!(inverted.signature_bits(), restored.signature_bits());
     }
 
     #[test]

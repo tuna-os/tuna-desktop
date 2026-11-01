@@ -1,0 +1,21 @@
+{
+  "subject": "ghcr.io/tuna-os/marlin@sha256:6c1e25b1fa9ddc07d7e71f767456839676333d3ebdc332b642a467f56c8ff71b",
+  "identity": "https://github.com/tuna-os/tunaOS/.github/workflows/reusable-build-image.yml@refs/heads/main",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "exit_code": 0,
+  "verification_stderr": "\nVerification for ghcr.io/tuna-os/marlin@sha256:6c1e25b1fa9ddc07d7e71f767456839676333d3ebdc332b642a467f56c8ff71b --\nThe following checks were performed on each of these signatures:\n  - The cosign claims were validated\n  - Existence of the claims in the transparency log was verified offline\n  - The code-signing certificate was verified using trusted certificate authority certificates\n",
+  "verified": [
+    {
+      "critical": {
+        "identity": {
+          "docker-reference": "ghcr.io/tuna-os/marlin@sha256:6c1e25b1fa9ddc07d7e71f767456839676333d3ebdc332b642a467f56c8ff71b"
+        },
+        "image": {
+          "docker-manifest-digest": "sha256:6c1e25b1fa9ddc07d7e71f767456839676333d3ebdc332b642a467f56c8ff71b"
+        },
+        "type": "https://sigstore.dev/cosign/sign/v1"
+      },
+      "optional": {}
+    }
+  ]
+}

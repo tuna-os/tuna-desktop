@@ -5668,6 +5668,7 @@ impl Runtime {
                 let size = backend.window_size();
                 let age = backend.buffer_age().unwrap_or(0);
                 let mut presented: PresentedFrame = None;
+                let mut zoom_submission = None;
                 {
                     let (renderer, mut framebuffer) = backend
                         .bind()
@@ -5948,6 +5949,12 @@ impl Runtime {
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                         let cost = FrameCost::new(&drew, &elements.owners, &damage, size);
                         presented = Some((damage, cost, presented_cursor));
+                        if self.state_path.is_some() {
+                            zoom_submission = zoom_plan
+                                .as_ref()
+                                .filter(|plan| plan.effects.identity || zoom_program.is_some())
+                                .map(|plan| (plan.generation, plan.effects.invert));
+                        }
                     }
                 }
                 if let Some((damage, drawn, presented_cursor)) = presented {
@@ -5956,6 +5963,12 @@ impl Runtime {
                     backend
                         .submit(Some(&damage))
                         .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                    if self.state_path.is_some() {
+                        if let Some((generation, invert_lightness)) = zoom_submission {
+                            self.magnifier
+                                .mark_submitted("tuna-0", generation, invert_lightness);
+                        }
+                    }
                     if let Some(surface) = &presented_cursor {
                         crate::cursor::Cursor::frame_done(
                             &crate::cursor::Pointer::Surface(surface.clone()),
@@ -6335,6 +6348,18 @@ impl Runtime {
                         // commit: back to the previous one (#340).
                         out.revert_failed_mode();
                         continue;
+                    }
+                    if self.state_path.is_some() {
+                        if let Some(plan) = zoom_plan
+                            .as_ref()
+                            .filter(|plan| plan.effects.identity || zoom_program.is_some())
+                        {
+                            self.magnifier.mark_submitted(
+                                &out.name,
+                                plan.generation,
+                                plan.effects.invert,
+                            );
+                        }
                     }
                     out.mode_committed();
                     out.trace_wake_submission();

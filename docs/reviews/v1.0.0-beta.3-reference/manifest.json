@@ -4,7 +4,30 @@
   "public_base": {
     "image": "ghcr.io/tuna-os/marlin@sha256:4aac01014ecb392b05cc80beeefd58512379319314f23acfdf5d601c13dfa8c6",
     "created": "2026-10-31T18:46:51.960277785Z",
-    "image_version_label": "f5b9344"
+    "image_version_label": "f5b9344",
+    "source_build": {
+      "repository": "https://github.com/tuna-os/tunaOS",
+      "revision": "f5b93442b3b8f504c6cdc63ed7cb774f957f707e",
+      "run_id": 41226288216,
+      "manifest_job_id": 124693889731,
+      "amd64_build_job_id": 124693889610,
+      "manifest_log": "build-gnome-manifest.log",
+      "manifest_log_sha256": "c991ff7663835f077beb1f4046fc31237328e852a26e1b7b9a4b6a28edb1722f",
+      "scope": "Completed GNOME amd64 and manifest jobs; log records the exact source checkout and contained platform digests. Does not assert success of the whole multi-flavor workflow."
+    },
+    "index_receipt": "base-index.json",
+    "index_receipt_sha256": "4aac01014ecb392b05cc80beeefd58512379319314f23acfdf5d601c13dfa8c6",
+    "index_revision_annotation": "f5b93442b3b8f504c6cdc63ed7cb774f957f707e",
+    "selected_platform": {
+      "os": "linux",
+      "architecture": "amd64",
+      "digest": "sha256:6c1e25b1fa9ddc07d7e71f767456839676333d3ebdc332b642a467f56c8ff71b"
+    },
+    "platform_signature_verification": {
+      "receipt": "base-platform-cosign.json",
+      "sha256": "8e8ec108c4b55848eab117a6837f23f84474d0072b05890d0c497e925e2fb1a0",
+      "scope": "Actual successful cosign verification of this contained amd64 platform with the main reusable-build-image workflow identity and GitHub Actions issuer; not an index signature or another flavor's signature"
+    }
   },
   "local_reference_fixture": {
     "image_id": "sha256:4f08645db7984d2ec0199ebdf477a115396da3f3e7c028ac1dced8948e67790f",

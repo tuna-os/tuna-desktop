@@ -2174,6 +2174,9 @@ struct Runtime {
     actions: Rc<RefCell<Vec<BreakActionKind>>>,
     sent_effect: Option<EffectState>,
     screen_timer: Option<glib::SourceId>,
+    // The existing proof clock opts into deadline-only diagnostics. These
+    // contain no account/history/window data and never change the scheduler.
+    proof_diagnostics: bool,
     stopped: bool,
 }
 
@@ -2255,6 +2258,22 @@ fn break_tick(rt: &Rc<RefCell<Runtime>>) {
         let mut r = rt.borrow_mut();
         let idle_secs = idle_time().map(|d| d.as_secs() as i64).unwrap_or(0);
         let mut events = r.breaks.poll(now, idle_secs);
+        // Record the logical deadline when the model emits a due/overdue
+        // notice, before queued actions can alter it. Banner presentation and
+        // an AT-SPI walk happen later and are not scheduling timestamps.
+        if r.proof_diagnostics
+            && events
+                .iter()
+                .any(|event| matches!(event, BreakUiEvent::Notify(notice) if notice.allow_take))
+        {
+            eprintln!(
+                "tuna-shell-gtk: wellbeing: due schedule pid={} now={} idle={} due={}",
+                std::process::id(),
+                now,
+                idle_secs,
+                r.breaks.manager.next_break_due_time(now)
+            );
+        }
         // Queued notice actions apply here, on the tick — never inside a
         // hook — so the model mutates under exactly one borrow and a
         // banner press lands within one 2 s tick. Drained into a local
@@ -2265,7 +2284,25 @@ fn break_tick(rt: &Rc<RefCell<Runtime>>) {
             events.extend(match kind {
                 BreakActionKind::Take => r.breaks.take_break(),
                 BreakActionKind::Delay => r.breaks.delay_break(now),
-                BreakActionKind::Skip => r.breaks.skip_break(now),
+                BreakActionKind::Skip => {
+                    let before = r
+                        .proof_diagnostics
+                        .then(|| r.breaks.manager.next_break_due_time(now));
+                    let events = r.breaks.skip_break(now);
+                    if let Some(before) = before {
+                        // Both deadlines come from the same manager borrow
+                        // and wall-time sample around the actual consumer.
+                        eprintln!(
+                            "tuna-shell-gtk: wellbeing: skip schedule pid={} now={} idle={} before={} after={}",
+                            std::process::id(),
+                            now,
+                            idle_secs,
+                            before,
+                            r.breaks.manager.next_break_due_time(now)
+                        );
+                    }
+                    events
+                }
             });
         }
         (r.hooks.clone(), r.effect, r.countdown, r.resident, events)
@@ -2319,6 +2356,7 @@ pub fn start(
         actions,
         sent_effect: None,
         screen_timer: None,
+        proof_diagnostics: std::env::var_os("TUNA_ANIMATION_CLOCK").is_some(),
         stopped: false,
     }));
     // Baseline first: the compositor starts from neutral even if a limit
@@ -2894,6 +2932,31 @@ mod tests {
         service.skip_break(T0 + 1380);
         assert_eq!(service.manager.state(), BreakState::Active);
         assert_eq!(service.manager.next_break_due_time(T0 + 1380), T0 + 2580);
+    }
+
+    #[test]
+    fn skip_upcoming_preserves_the_actual_deadline_through_due() {
+        let (t, mut cfg) = eyesight();
+        cfg.interval_secs = 130;
+        cfg.notify_upcoming = true;
+        let mut service = BreakService::new();
+        service.manager.set_selected(&[(t, cfg)], T0);
+        assert!(has_title(&service.poll(T0 + 10, 0), "Eyesight Break Soon"));
+        let due = service.manager.next_break_due_time(T0 + 11);
+        assert_eq!(due, T0 + 130);
+        // GNOME's skipBreak only restarts already-due breaks. An actual
+        // upcoming Skip is a timer no-op, not a restart at the press.
+        service.skip_break(T0 + 11);
+        assert_eq!(service.manager.next_break_due_time(T0 + 11), due);
+        assert!(!has_title(
+            &service.poll(due - 1, 0),
+            "Time for an Eyesight Break"
+        ));
+        assert!(has_title(
+            &service.poll(due, 0),
+            "Time for an Eyesight Break"
+        ));
+        assert_eq!(service.manager.next_break_due_time(due), due);
     }
 
     #[test]

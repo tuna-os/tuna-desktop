@@ -6,8 +6,10 @@ Take-with-lock observes the session lock; Take-with-fade observes a
 faded frame; Delay observes a live due moved by delay-seconds; Skip
 observes the upcoming warning retired with the due schedule left
 undisturbed (GNOME 51 offers Skip only on the upcoming notice, where
-the press is a timer no-op, so the due banner must still arrive on
-the original schedule).
+the press is a timer no-op). Source-owned deadlines before/after the
+actual consumer and at the due notice must agree exactly. Both the
+actual deadline and the observed banner arrival must independently
+retain the original enable-derived schedule's fixed tolerance.
 
 Stale-press is NARROWED (w3-354pixel-proof4f decision, do not expand):
 a stale press of a retired resident must FAIL (nothing to press, no
@@ -45,6 +47,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -52,11 +55,10 @@ sys.dont_write_bytecode = True
 
 TICK_TOLERANCE_SECS = 5.0
 PRESS_SETTLE_SECS = 1.5
-# Skip-on-upcoming anchors the original due at enable time (no live due is
-# observable before the press), so this bound covers the one-sided
-# enable->shell lag (settings propagation + the 2s break poll) plus the ~2s
-# arrival-detection cadence and 1s clock truncations. Fixed here, exactly
-# like TICK_TOLERANCE_SECS; missing epochs fail closed at the call sites.
+# Both the actual deadline and banner arrival retain the original fixed
+# enable-derived bound. Actual manager deadlines around Skip and at the due
+# notice must also agree EXACTLY. A late AT-SPI observation still fails the
+# original arrival gate, even when source evidence proves no schedule move.
 SKIP_SCHEDULE_TOLERANCE_SECS = 8.0
 
 
@@ -357,13 +359,91 @@ def check_skip(press_epoch, new_due_epoch, interval_secs,
     return delta
 
 
-def check_skip_undisturbed(orig_due_epoch, due_arrival_epoch,
+def check_skip_undisturbed(orig_due_epoch, scheduled_due_epoch,
                            tolerance=SKIP_SCHEDULE_TOLERANCE_SECS):
-    delta = due_arrival_epoch - orig_due_epoch
+    delta = scheduled_due_epoch - orig_due_epoch
     assert abs(delta) <= tolerance, \
         (f'Skip on the upcoming notice must leave the due schedule '
          f'undisturbed (drift 0s): got {delta:.1f}s')
     return delta
+
+
+def check_skip_schedule(log_path, log_offset, orig_due_epoch, due_arrival_epoch,
+                        gate_start_epoch, *, expected_pid, expected_start_ticks):
+    """Bind the actual Skip and due-notice deadlines to this owned log slice.
+
+    The proof-clock-only source diagnostics read the manager, not rendered
+    labels. No schedule can be inferred from a missing record or a presentation
+    timestamp. Exactly one action also makes an accidental stale invocation fail.
+    """
+    for label, value in (('original due', orig_due_epoch),
+                         ('due arrival', due_arrival_epoch),
+                         ('gate start', gate_start_epoch)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not math.isfinite(value) or value <= 0:
+            raise HarnessError(f'{label} must be a finite positive epoch')
+    if type(log_offset) is not int or log_offset < 0:
+        raise HarnessError('schedule log offset must be a non-negative int')
+    if proc_start_ticks(expected_pid, str(log_path)) != expected_start_ticks:
+        raise HarnessError('schedule log owner was replaced before validation')
+    try:
+        with Path(log_path).open('rb') as stream:
+            size = stream.seek(0, 2)
+            if log_offset > size:
+                raise HarnessError('schedule log was truncated after the gate mark')
+            if log_offset:
+                stream.seek(log_offset - 1)
+                if stream.read(1) != b'\n':
+                    raise HarnessError('schedule log mark is not a line boundary')
+            stream.seek(log_offset)
+            lines = stream.read().decode('utf-8').splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise HarnessError(f'schedule log unreadable {log_path}: {exc}')
+    patterns = {
+        'skip': r'pid=(\d+) now=(\d+) idle=(\d+) before=(\d+) after=(\d+)',
+        'due': r'pid=(\d+) now=(\d+) idle=(\d+) due=(\d+)',
+    }
+    fields = {
+        'skip': ('pid', 'now', 'idle', 'before', 'after'),
+        'due': ('pid', 'now', 'idle', 'due'),
+    }
+    records = {'skip': [], 'due': []}
+    for index, line in enumerate(lines):
+        for kind, pattern in patterns.items():
+            prefix = f'tuna-shell-gtk: wellbeing: {kind} schedule '
+            if not line.startswith(prefix):
+                continue
+            match = re.fullmatch(pattern, line[len(prefix):])
+            if match is None:
+                raise HarnessError(f'malformed {kind} schedule record: {line}')
+            record = dict(zip(fields[kind], map(int, match.groups())))
+            if record['pid'] != expected_pid:
+                raise HarnessError(f'{kind} schedule record has the wrong owner')
+            if any(value <= 0 for key, value in record.items() if key != 'idle'):
+                raise HarnessError(f'{kind} schedule needs actual positive deadlines')
+            records[kind].append((index, record))
+    if len(records['skip']) != 1 or len(records['due']) != 1:
+        raise HarnessError('schedule proof needs exactly one Skip and one due notice')
+    skip_index, skip = records['skip'][0]
+    due_index, due = records['due'][0]
+    assert gate_start_epoch < orig_due_epoch, 'original due predates the gate'
+    assert skip_index < due_index, 'due notice predates the actual Skip'
+    assert gate_start_epoch <= skip['now'] <= due['now'] <= due_arrival_epoch, \
+        'schedule records are outside this gate/arrival'
+    assert skip['now'] < skip['before'], 'Skip did not act on an upcoming break'
+    assert skip['before'] == skip['after'], 'Skip changed the actual deadline'
+    assert skip['after'] == due['due'], 'deadline changed before the due notice'
+    assert due['now'] >= due['due'], 'due notice was emitted before its deadline'
+    delta = check_skip_undisturbed(orig_due_epoch, due['due'])
+    # Keep the original presentation assertion as well as the authoritative
+    # deadline checks above: new introspection must not make an old failure pass.
+    check_skip_undisturbed(orig_due_epoch, due_arrival_epoch)
+    if proc_start_ticks(expected_pid, str(log_path)) != expected_start_ticks:
+        raise HarnessError('schedule log owner was replaced during validation')
+    return {'scheduled_due': due['due'], 'schedule_drift_secs': delta,
+            'arrival_epoch': due_arrival_epoch,
+            'arrival_lag_secs': due_arrival_epoch - due['due'],
+            'log_offset': log_offset, 'skip': skip, 'due_notice': due}
 
 
 def pressable(nodes, label):
@@ -497,6 +577,15 @@ def main(argv=None):
     p.add_argument('--orig-due', type=float, required=True)
     p.add_argument('--due-arrival', type=float, required=True)
 
+    p = sub.add_parser('skip-schedule')
+    p.add_argument('--log', type=Path, required=True)
+    p.add_argument('--log-offset', type=int, required=True)
+    p.add_argument('--orig-due', type=float, required=True)
+    p.add_argument('--due-arrival', type=float, required=True)
+    p.add_argument('--gate-start', type=float, required=True)
+    p.add_argument('--expect-pid', type=int, required=True)
+    p.add_argument('--expect-start', type=int, required=True)
+
     p = sub.add_parser('notice-buttons')
     p.add_argument('a11y', type=Path)
     p.add_argument('--title', required=True)
@@ -548,6 +637,11 @@ def main(argv=None):
         elif args.command == 'skip-undisturbed':
             delta = check_skip_undisturbed(args.orig_due, args.due_arrival)
             print(f'skip drift {delta:.1f}s against the original due')
+        elif args.command == 'skip-schedule':
+            print(json.dumps(check_skip_schedule(
+                args.log, args.log_offset, args.orig_due, args.due_arrival,
+                args.gate_start, expected_pid=args.expect_pid,
+                expected_start_ticks=args.expect_start)))
         elif args.command == 'notice-buttons':
             expect = [v for v in
                       (s.strip() for s in args.expect.split(','))

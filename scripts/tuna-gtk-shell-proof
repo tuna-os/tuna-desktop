@@ -7326,6 +7326,10 @@ gsettings set org.gnome.desktop.break-reminders.eyesight fade-screen false ||
     fail G-WELLBEING-ACTION-SKIP "could not clear fade-screen"
 gsettings set org.gnome.desktop.break-reminders.eyesight lock-screen false ||
     fail G-WELLBEING-ACTION-SKIP "could not clear lock-screen"
+# Bind source-owned deadline observations to this selection and live shell.
+# AT-SPI arrival time includes presentation/traversal latency, not just scheduling.
+# Keep the original arrival bound too; diagnostics do not relax that gate.
+skip_schedule_log_offset="$(wc -c <"$LOG")"
 gsettings set org.gnome.desktop.break-reminders selected-breaks "['eyesight']" ||
     fail G-WELLBEING-ACTION-SKIP "could not select the eyesight break"
 skip_enable_epoch="$(date +%s)"
@@ -7388,9 +7392,17 @@ done
     fail G-WELLBEING-ACTION-SKIP "the due banner does not offer Take+Delay without Skip"
 # Capture label stays skip-redue: pinned by test_wb_shell_contract.py.
 wb_capture_after_live_action skip-redue
+"$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" skip-schedule \
+    --log "$LOG" --log-offset "$skip_schedule_log_offset" \
+    --orig-due "$skip_orig_due_epoch" --due-arrival "$skip_due_epoch" \
+    --gate-start "$WB_START" --expect-pid "$WB_SHELL_PID" --expect-start "$WB_SHELL_START" \
+    >"$ARTIFACTS/wb-skip-schedule.json" ||
+    fail G-WELLBEING-ACTION-SKIP "the actual Skip/due deadlines or original arrival bound failed"
+jq -c '{scheduled_due, schedule_drift_secs, arrival_epoch, arrival_lag_secs}' \
+    "$ARTIFACTS/wb-skip-schedule.json"
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" skip-undisturbed \
     --orig-due "$skip_orig_due_epoch" --due-arrival "$skip_due_epoch" ||
-    fail G-WELLBEING-ACTION-SKIP "the Skip press disturbed the due schedule"
+    fail G-WELLBEING-ACTION-SKIP "the due banner missed the original schedule"
 "$PY" "$ROOT/scripts/lib/tuna-wellbeing-action-proof.py" stale-press \
     --exit-code "$stale_code" \
     --before "$ARTIFACTS/wb-skip-stale-before.json" \
