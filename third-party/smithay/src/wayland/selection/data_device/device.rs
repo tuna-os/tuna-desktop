@@ -68,8 +68,25 @@ where
                 serial,
             } => {
                 let serial = Serial::from(serial);
+                // An existing DND grab is not an implicit press grab, even if
+                // it still carries the press serial that started it.
+                if super::client_dnd_active(&seat) {
+                    return;
+                }
+                // A serial alone is not authority: a different client can
+                // guess it. The origin must own the actual implicit grab.
+                if !resource.id().same_client_as(&origin.id()) {
+                    return;
+                }
                 if let Some(pointer) = seat.get_pointer() {
                     if pointer.has_grab(serial) {
+                        let start_data = pointer.grab_start_data().unwrap();
+                        let owns_origin = start_data.focus.as_ref()
+                            .and_then(|(focus, _)| focus.wl_surface())
+                            .is_some_and(|surface| surface.as_ref() == &origin);
+                        if !owns_origin {
+                            return;
+                        }
                         if let Some(ref icon) = icon {
                             if compositor::give_role(icon, DND_ICON_ROLE).is_err() {
                                 resource.post_error(
@@ -79,9 +96,12 @@ where
                                 return;
                             }
                         }
-                        // The StartDrag is in response to a pointer implicit grab, all is good
+                        // The origin owns this implicit pointer grab.
+                        if let Some(source) = &source {
+                            source.data::<super::DataSourceUserData>().unwrap()
+                                .inner.lock().unwrap().drag_started = true;
+                        }
                         handler.started(source.clone(), icon.clone(), seat.clone());
-                        let start_data = pointer.grab_start_data().unwrap();
                         pointer.set_grab(
                             handler,
                             dnd_grab::DnDGrab::new_pointer(dh, start_data, source, origin, seat, icon),
@@ -93,6 +113,13 @@ where
                 }
                 if let Some(touch) = seat.get_touch() {
                     if touch.has_grab(serial) {
+                        let start_data = touch.grab_start_data().unwrap();
+                        let owns_origin = start_data.focus.as_ref()
+                            .and_then(|(focus, _)| focus.wl_surface())
+                            .is_some_and(|surface| surface.as_ref() == &origin);
+                        if !owns_origin {
+                            return;
+                        }
                         if let Some(ref icon) = icon {
                             if compositor::give_role(icon, DND_ICON_ROLE).is_err() {
                                 resource.post_error(
@@ -102,9 +129,12 @@ where
                                 return;
                             }
                         }
-                        // The StartDrag is in response to a touch implicit grab, all is good
+                        // The origin owns this implicit touch grab.
+                        if let Some(source) = &source {
+                            source.data::<super::DataSourceUserData>().unwrap()
+                                .inner.lock().unwrap().drag_started = true;
+                        }
                         handler.started(source.clone(), icon.clone(), seat.clone());
-                        let start_data = touch.grab_start_data().unwrap();
                         touch.set_grab(
                             handler,
                             dnd_grab::DnDGrab::new_touch(dh, start_data, source, origin, seat, icon),
@@ -116,6 +146,9 @@ where
                 debug!(serial = ?serial, client = ?client, "denying drag from client without implicit grab");
             }
             wl_data_device::Request::SetSelection { source, .. } => {
+                if !handler.allow_selection(source.as_ref(), &seat, dh) {
+                    return;
+                }
                 let seat_data = match seat.get_keyboard() {
                     Some(keyboard) if keyboard.client_of_object_has_focus(&resource.id()) => seat
                         .user_data()
@@ -129,6 +162,10 @@ where
                         return;
                     }
                 };
+                if let Some(source) = &source {
+                    source.data::<super::DataSourceUserData>().unwrap()
+                        .inner.lock().unwrap().used_for_selection = true;
+                }
                 let source = source.map(SelectionSourceProvider::DataDevice);
 
                 handler.new_selection(

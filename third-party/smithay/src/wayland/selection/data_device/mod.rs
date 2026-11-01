@@ -173,6 +173,20 @@ pub trait DataDeviceHandler: Sized + SelectionHandler + ClientDndGrabHandler + S
     /// [DataDeviceState] getter
     fn data_device_state(&self) -> &DataDeviceState;
 
+    /// Validate a clipboard source before changing selection state.
+    ///
+    /// Extensions may reserve a source for drag-and-drop and post their
+    /// specified protocol error here. Returning false leaves the selection
+    /// untouched. The default preserves ordinary clipboard behavior.
+    fn allow_selection(
+        &mut self,
+        source: Option<&WlDataSource>,
+        seat: &Seat<Self>,
+        dh: &DisplayHandle,
+    ) -> bool {
+        true
+    }
+
     /// Action chooser for DnD negociation
     fn action_choice(&mut self, available: DndAction, preferred: DndAction) -> DndAction {
         default_action_chooser(available, preferred)

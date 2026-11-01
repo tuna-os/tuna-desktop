@@ -30,6 +30,7 @@ pub(super) struct ToplevelWindowDrag {
     pub(super) id: u64,
     /// Pointer hotspot relative to the window geometry.
     offset: Point<i32, Logical>,
+    attachment: u64,
     /// Where the window was when the drag began.
     start: Point<i32, Logical>,
     /// The layout the drag took the window out of.
@@ -46,22 +47,28 @@ impl WindowManager {
         self.toplevel_drag.is_some_and(|drag| drag.id == id)
     }
 
-    /// Start moving toplevels attached since the last tick, if shown.
+    /// Start moving the active drag's attached toplevel, if shown.
     /// Runs after new toplevels are mapped, before they are placed.
     pub(super) fn reconcile_toplevel_drag(&mut self, state: &mut State) {
+        if state.protocols.toplevel_drag.retire_dead_source() {
+            state.cancel_client_dnd(
+                (crate::state::system_millis() & u64::from(u32::MAX)) as u32,
+            );
+        }
         self.end_finished_toplevel_drag(state);
-        let attached = state.protocols.toplevel_drag.take_attached();
-        let Some((surface, offset)) = state.protocols.toplevel_drag.target() else {
+        let Some((surface, offset, attachment)) = state.protocols.toplevel_drag.target() else {
             return;
         };
-        if self.toplevel_drag.is_some() || !attached.contains(&surface) {
+        if self.toplevel_drag.is_some() {
             return;
         }
         let Some(id) = self.surface_index.get(&surface).copied() else {
             return;
         };
-        if self.windows.get(&id).is_some_and(|w| !w.unplaced) {
-            self.start_toplevel_drag(state, id, offset);
+        if super::committed_size(&surface).is_some()
+            && self.windows.get(&id).is_some_and(|w| !w.unplaced)
+        {
+            self.start_toplevel_drag(state, id, offset, attachment);
         }
     }
 
@@ -72,7 +79,7 @@ impl WindowManager {
         state: &State,
         id: u64,
     ) -> Option<Point<i32, Logical>> {
-        let (surface, offset) = state.protocols.toplevel_drag.target()?;
+        let (surface, offset, _) = state.protocols.toplevel_drag.target()?;
         if self.toplevel_drag.is_some() || self.surface_of(id).as_ref() != Some(&surface) {
             return None;
         }
@@ -81,9 +88,9 @@ impl WindowManager {
 
     /// Begin the window drag of `id` once it is placed.
     pub(super) fn start_placed_toplevel_drag(&mut self, state: &mut State, id: u64) {
-        if let Some((surface, offset)) = state.protocols.toplevel_drag.target() {
+        if let Some((surface, offset, attachment)) = state.protocols.toplevel_drag.target() {
             if self.toplevel_drag.is_none() && self.surface_of(id).as_ref() == Some(&surface) {
-                self.start_toplevel_drag(state, id, offset);
+                self.start_toplevel_drag(state, id, offset, attachment);
             }
         }
     }
@@ -114,7 +121,11 @@ impl WindowManager {
         };
         let surface = self.surface_of(drag.id);
         let target = state.protocols.toplevel_drag.target();
-        if surface.is_some() && target.map(|(s, _)| s) == surface {
+        if surface.is_some()
+            && target.is_some_and(|(s, _, attachment)| {
+                Some(s) == surface && attachment == drag.attachment
+            })
+        {
             return;
         }
         self.toplevel_drag = None;
@@ -128,6 +139,9 @@ impl WindowManager {
                 }
                 if drag.layout != WindowLayout::Floating {
                     self.apply_layout(state, drag.id, drag.layout);
+                    if drag.layout == WindowLayout::Strip {
+                        self.relayout_strip(state);
+                    }
                 }
             }
             Some(DragEnd::Dropped) if self.workspace_policy.edge_tiling => {
@@ -150,11 +164,13 @@ impl WindowManager {
         }
     }
 
-    fn start_toplevel_drag(&mut self, state: &mut State, id: u64, offset: Point<i32, Logical>) {
-        // Scroll-mode columns have no Mutter counterpart: they stay put.
-        if self.mode == super::SessionMode::Scroll {
-            return;
-        }
+    fn start_toplevel_drag(
+        &mut self,
+        state: &mut State,
+        id: u64,
+        offset: Point<i32, Logical>,
+        attachment: u64,
+    ) {
         let Some(layout) = self.windows.get(&id).map(|w| w.layout) else {
             return;
         };
@@ -165,9 +181,17 @@ impl WindowManager {
         let Some(start) = self.windows.get(&id).map(|w| w.geometry.loc) else {
             return;
         };
+        if layout == WindowLayout::Strip {
+            self.relayout_strip(state);
+            let loc = self.pointer_hotspot(offset);
+            if let Some(window) = self.windows.get_mut(&id) {
+                window.geometry.loc = loc;
+            }
+        }
         self.toplevel_drag = Some(ToplevelWindowDrag {
             id,
             offset,
+            attachment,
             start,
             layout,
             pointer_start: self.pointer_pos,

@@ -695,6 +695,7 @@ impl CompositorHandler for State {
                 self, surface,
             );
         }
+        self.protocols.toplevel_drag.surface_committed(surface);
         self.window_icons.commit(surface);
         self.popups.commit(surface);
         if let Some(smithay::desktop::PopupKind::Xdg(popup)) = self.popups.find_popup(surface) {
@@ -769,6 +770,15 @@ impl ServerDndGrabHandler for State {}
 impl DataDeviceHandler for State {
     fn data_device_state(&self) -> &DataDeviceState {
         &self.data_device_state
+    }
+
+    fn allow_selection(
+        &mut self,
+        source: Option<&smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
+        _seat: &Seat<Self>,
+        dh: &DisplayHandle,
+    ) -> bool {
+        source.is_none_or(|source| self.protocols.toplevel_drag.selection_allowed(source, dh))
     }
 }
 

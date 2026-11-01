@@ -1995,10 +1995,10 @@ impl WindowManager {
                 }
                 let focused = self.model.focused() == Some(id);
                 self.configure(id, focused);
-                self.start_placed_toplevel_drag(state, id);
             } else if let Some(window) = self.windows.get_mut(&id) {
                 window.unplaced = false;
             }
+            self.start_placed_toplevel_drag(state, id);
         }
     }
 
