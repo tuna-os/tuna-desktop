@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Build the real DRM/GBM/EGL/Wayland consumer without building the desktop.
+set -euo pipefail
+if [[ $# != 1 ]]; then
+    echo 'usage: tuna-explicit-sync-build OUTPUT_DIRECTORY' >&2
+    exit 2
+fi
+script_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+protocol_root=$(pkg-config --variable=pkgdatadir wayland-protocols)
+mkdir -p -- "$1"
+output_root=$(cd -- "$1" && pwd)
+protocols=(
+    'xdg-shell:stable/xdg-shell/xdg-shell.xml'
+    'presentation-time:stable/presentation-time/presentation-time.xml'
+    'linux-dmabuf:unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml'
+    'linux-drm-syncobj:staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml'
+)
+sources=()
+for protocol in "${protocols[@]}"; do
+    name=${protocol%%:*}
+    xml=$protocol_root/${protocol#*:}
+    wayland-scanner client-header "$xml" "$output_root/$name-client-protocol.h"
+    wayland-scanner private-code "$xml" "$output_root/$name-protocol.c"
+    sources+=("$output_root/$name-protocol.c")
+done
+read -r -a compile_flags <<< "$(pkg-config --cflags wayland-client libdrm gbm egl glesv2)"
+read -r -a link_flags <<< "$(pkg-config --libs wayland-client libdrm gbm egl glesv2)"
+cc -std=c11 -O2 -Wall -Wextra -Werror "${compile_flags[@]}" -I "$output_root" \
+    "$script_root/lib/tuna-explicit-sync-client.c" "${sources[@]}" \
+    "${link_flags[@]}" -o "$output_root/tuna-explicit-sync-client"

@@ -10,8 +10,9 @@
 //! `true`. Or it won't be possible to create the blocker. This is similar to other
 //! implementations.
 //!
-//! The release fence is signalled when all references to a
-//! [`Buffer`][crate::backend::renderer::utils::Buffer] are dropped.
+//! GPU renderers must retain each accessed [`Buffer`][crate::backend::renderer::utils::Buffer]
+//! until they attach the frame's completion fence. Buffer release transfers that
+//! fence into the release timeline; dropping a CPU reference is not GPU completion.
 //!
 //! ```no_run
 //! # use smithay::delegate_drm_syncobj;
@@ -94,6 +95,7 @@ pub struct DrmSyncobjCachedState {
     pub acquire_point: Option<DrmSyncPoint>,
     /// Timeline point to be signaled when server is done with buffer
     pub release_point: Option<DrmSyncPoint>,
+    buffer_removed: bool,
 }
 
 impl Cacheable for DrmSyncobjCachedState {
@@ -101,20 +103,39 @@ impl Cacheable for DrmSyncobjCachedState {
         Self {
             acquire_point: self.acquire_point.take(),
             release_point: self.release_point.take(),
+            buffer_removed: std::mem::take(&mut self.buffer_removed),
         }
     }
 
-    fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
-        if self.acquire_point.is_some() && self.release_point.is_some() {
+    fn merge_into(mut self, into: &mut Self, _dh: &DisplayHandle) {
+        if self.buffer_removed || (self.acquire_point.is_some() && self.release_point.is_some()) {
             if let Some(release_point) = &into.release_point {
                 if let Err(err) = release_point.signal() {
                     tracing::error!("Failed to signal syncobj release point: {}", err);
                 }
             }
-            into.acquire_point = self.acquire_point;
-            into.release_point = self.release_point;
+            into.acquire_point = self.acquire_point.take();
+            into.release_point = self.release_point.take();
         }
     }
+}
+
+impl Drop for DrmSyncobjCachedState {
+    fn drop(&mut self) {
+        // These points have never been handed to the renderer. This includes
+        // cached synchronized subsurfaces destroyed before their parent commits.
+        if let Some(release) = self.release_point.take() {
+            if let Err(err) = release.signal() {
+                tracing::error!("Failed to release unused syncobj buffer: {}", err);
+            }
+        }
+    }
+}
+
+/// Permanently reject the pending transaction after a fatal validation or
+/// acquire-watch failure, rather than applying it after posting an error.
+pub fn reject_pending_commit(surface: &WlSurface) {
+    compositor::abort_pending_commit(surface);
 }
 
 /// Delegate type for a `wp_linux_drm_syncobj_manager_v1` global
@@ -283,32 +304,42 @@ pub fn pending_commit_error(
 }
 
 fn commit_hook<D: DrmSyncobjHandler>(_data: &mut D, _dh: &DisplayHandle, surface: &WlSurface) {
-    compositor::with_states(surface, |states| {
+    let invalid = compositor::with_states(surface, |states| {
         let Some(data) = states
             .data_map
             .get::<RefCell<Option<WpLinuxDrmSyncobjSurfaceV1>>>()
         else {
-            return;
+            return false;
         };
         let data = data.borrow();
         let Some(syncobj_surface) = data.as_ref() else {
-            return;
+            return false;
         };
         if let Some((error, message)) = pending_commit_error(states) {
             syncobj_surface.post_error(error as u32, message);
+            return true;
         }
+        let removed = matches!(
+            states.cached_state.get::<SurfaceAttributes>().pending().buffer,
+            Some(BufferAssignment::Removed)
+        );
+        states.cached_state.get::<DrmSyncobjCachedState>().pending().buffer_removed = removed;
+        false
     });
+    if invalid {
+        reject_pending_commit(surface);
+    }
 }
 
 fn destruction_hook<D: DrmSyncobjHandler>(_data: &mut D, surface: &WlSurface) {
     compositor::with_states(surface, |states| {
         let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
-        if let Some(release_point) = &cached.pending().release_point {
+        if let Some(release_point) = cached.pending().release_point.take() {
             if let Err(err) = release_point.signal() {
                 tracing::error!("Failed to signal syncobj release point: {}", err);
             }
         }
-        if let Some(release_point) = &cached.current().release_point {
+        if let Some(release_point) = cached.current().release_point.take() {
             if let Err(err) = release_point.signal() {
                 tracing::error!("Failed to signal syncobj release point: {}", err);
             }
@@ -359,9 +390,9 @@ where
                     },
                 );
                 with_states(&surface, |states| {
-                    states
-                        .data_map
-                        .insert_if_missing(|| RefCell::new(Some(syncobj_surface)))
+                    states.data_map.insert_if_missing(|| RefCell::new(None::<WpLinuxDrmSyncobjSurfaceV1>));
+                    *states.data_map.get::<RefCell<Option<WpLinuxDrmSyncobjSurfaceV1>>>()
+                        .unwrap().borrow_mut() = Some(syncobj_surface);
                 });
             }
             wp_linux_drm_syncobj_manager_v1::Request::ImportTimeline { id, fd } => {
@@ -522,12 +553,12 @@ impl<D: DrmSyncobjHandler> Dispatch<WpLinuxDrmSyncobjTimelineV1, DrmSyncobjTimel
         state: &mut D,
         _client: wayland_server::backend::ClientId,
         _resource: &WpLinuxDrmSyncobjTimelineV1,
-        data: &DrmSyncobjTimelineData,
+        _data: &DrmSyncobjTimelineData,
     ) {
         if let Some(state) = state.drm_syncobj_state() {
             state
                 .known_timelines
-                .retain(|t| t.upgrade().is_some_and(|t| !Arc::ptr_eq(&t, &data.timeline.0)))
+                .retain(|timeline| timeline.upgrade().is_some())
         }
     }
 }

@@ -1,0 +1,179 @@
+#!/usr/bin/python3
+"""Real native explicit-sync/dmabuf feedback proof; never starts or mutates a VM/device.
+
+Requires an already-running owned --backend drm compositor, an actual timeline-
+capable DRM render node, and an independent display-capture command. The capture
+argv is a JSON array; a fresh destination PNG path is appended to each invocation
+(e.g. an owner-provided QMP screendump-to-PNG command). It must capture the actual
+native output, not this client's producer readback or compositor introspection.
+No unsupported-device skip is a pass. Image/package identities remain caller-
+supplied provenance, distinct from the pinned running compositor executable.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import select
+import signal
+import subprocess
+import time
+
+from PIL import Image
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--client', type=Path, required=True)
+parser.add_argument('--device', type=Path, required=True)
+parser.add_argument('--artifacts', type=Path, required=True)
+parser.add_argument('--compositor-pid', type=int, required=True)
+parser.add_argument('--compositor-sha256', required=True)
+parser.add_argument('--source-revision', required=True)
+parser.add_argument('--image-digest', required=True)
+parser.add_argument('--package-digest', required=True)
+parser.add_argument('--capture-argv', required=True)
+args = parser.parse_args()
+capture_argv = json.loads(args.capture_argv)
+if (not isinstance(capture_argv, list) or not capture_argv or
+        any(not isinstance(value, str) or not value for value in capture_argv)):
+    parser.error('--capture-argv must be a nonempty JSON string array')
+for name, value, size in (('source revision', args.source_revision, 40),
+                          ('compositor SHA256', args.compositor_sha256, 64)):
+    if len(value) != size or any(c not in '0123456789abcdef' for c in value):
+        parser.error('invalid ' + name)
+for name, value in (('image', args.image_digest), ('package', args.package_digest)):
+    digest = value.removeprefix('sha256:')
+    if len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+        parser.error(name + ' digest must be an actual SHA256')
+artifacts = args.artifacts.resolve()
+artifacts.mkdir(mode=0o700, parents=True, exist_ok=False)
+client = args.client.resolve(strict=True)
+pidfd = os.pidfd_open(args.compositor_pid)
+receipt = {
+    'scope': 'native DRM ioctl timelines + offered dmabuf + GBM/EGL GPU producer + independent output capture',
+    'source_revision': args.source_revision,
+    'image_digest_supplied': args.image_digest,
+    'package_digest_supplied': args.package_digest,
+    'client_sha256': hashlib.sha256(client.read_bytes()).hexdigest(),
+    'proof_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    'device': str(args.device), 'compositor_pid': args.compositor_pid,
+    'compositor_sha256': args.compositor_sha256,
+    'cases': {}, 'captures': {}, 'complete': False,
+    'qualification_limits': [
+        'A supplied package/image digest is provenance, not independent installation verification.',
+        'A successful emulated-device run does not qualify physical GPU drivers.',
+        'Producer readback is not compositor output; only the independent captures qualify visible pixels.',
+        'The proof checks safe release ordering/reuse; no claim that every release fence was observed while unsignalled.',
+    ],
+}
+child = None
+
+def assert_original_native():
+    if select.select([pidfd], [], [], 0)[0]:
+        raise AssertionError('original native compositor exited')
+    proc = Path('/proc', str(args.compositor_pid))
+    command = (proc / 'cmdline').read_bytes().split(b'\0')
+    if not (any(command[i:i + 2] == [b'--backend', b'drm'] for i in range(len(command) - 1))
+            or b'--backend=drm' in command):
+        raise AssertionError('running compositor is not explicitly --backend drm')
+    if hashlib.sha256((proc / 'exe').read_bytes()).hexdigest() != args.compositor_sha256:
+        raise AssertionError('running native compositor bytes changed')
+    return os.readlink(proc / 'exe')
+
+
+def count_rgb(image, rgb):
+    return sum(1 for pixel in image.getdata()
+               if all(abs(actual - expected) <= 8 for actual, expected in zip(pixel, rgb)))
+
+
+def capture(checkpoint):
+    assert_original_native()
+    name = checkpoint['name']
+    path = artifacts / (name + '.png')
+    if path.exists():
+        raise AssertionError('capture destination already exists')
+    result = subprocess.run(capture_argv + [str(path)], capture_output=True, timeout=4, check=False)
+    (artifacts / (name + '-capture.log')).write_bytes(result.stdout + result.stderr)
+    if result.returncode != 0:
+        raise AssertionError('independent native capture failed: ' + name)
+    image = Image.open(path).convert('RGB')
+    count = count_rgb(image, checkpoint['rgb'])
+    if count < 512:
+        raise AssertionError('native output does not contain the actual dmabuf color: ' + name)
+    blocked_green = count_rgb(image, [16, 240, 16]) if name == 'green-blocked' else None
+    if blocked_green is not None and blocked_green >= 512:
+        raise AssertionError('unacquired green dmabuf became visible')
+    receipt['captures'][name] = {
+        'sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'rgb': checkpoint['rgb'],
+        'matching_pixels': count, 'green_matching_pixels': blocked_green,
+        'size': list(image.size), 'independent_capture_argv': capture_argv,
+    }
+
+
+def run_case(case):
+    global child
+    directory = artifacts / case
+    directory.mkdir(mode=0o700)
+    command = [str(client), '--device', str(args.device), '--artifacts', str(directory), '--case', case]
+    if case == 'ordering':
+        command.append('--checkpoints')
+    rows = []
+    with (directory / 'stderr.log').open('wb') as error, (directory / 'events.jsonl').open('wb') as log:
+        child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=error, start_new_session=True, bufsize=0)
+        remaining = b''
+        deadline = time.monotonic() + 45
+        while True:
+            assert_original_native()
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([child.stdout], [], [], left)[0]:
+                raise AssertionError('real native client deadline: ' + case)
+            chunk = os.read(child.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            log.write(chunk)
+            remaining += chunk
+            while b'\n' in remaining:
+                line, remaining = remaining.split(b'\n', 1)
+                row = json.loads(line)
+                rows.append(row)
+                if row.get('event') == 'checkpoint':
+                    capture(row)
+                    child.stdin.write(b'continue\n')
+                    child.stdin.flush()
+        if remaining:
+            raise AssertionError('truncated real-client JSON output')
+        code = child.wait(timeout=5)
+        child = None
+    if code != 0 or not any(row == {'event': 'case-pass', 'case': case} for row in rows):
+        raise AssertionError('real native case failed: ' + case)
+    receipt['cases'][case] = {'exit_code': code, 'events': rows}
+
+
+try:
+    receipt['running_executable'] = assert_original_native()
+    run_case('ordering')
+    for case in ('destroy', 'unmap', 'disconnect', 'surface-exists', 'invalid-timeline',
+                 'no-surface', 'unsupported-buffer', 'no-buffer', 'no-acquire',
+                 'no-release', 'conflicting-points'):
+        run_case(case)
+    if set(receipt['captures']) != {'red-presented', 'green-blocked', 'green-presented', 'blue-presented'}:
+        raise AssertionError('missing independent native pixel checkpoints')
+    assert_original_native()
+    receipt['complete'] = True
+except BaseException as error:
+    receipt['failure'] = type(error).__name__ + ': ' + str(error)
+    raise
+finally:
+    if child is not None:
+        if child.poll() is None:
+            os.killpg(child.pid, signal.SIGTERM)
+            try:
+                child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait(timeout=3)
+        receipt['owned_client_cleanup'] = {'pid': child.pid, 'exit_code': child.returncode}
+    else:
+        receipt['owned_client_cleanup'] = 'all owned clients exited and were reaped'
+    os.close(pidfd)
+    (artifacts / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')

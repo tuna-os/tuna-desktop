@@ -1284,7 +1284,7 @@ impl Runtime {
             #[cfg(feature = "drm")]
             state.enable_explicit_sync(match &mut backend {
                 Backend::Winit(winit) => crate::explicit_sync::probe(winit.renderer()),
-                Backend::Drm(drm) => crate::explicit_sync::probe(&drm.renderer),
+                Backend::Drm(drm) => crate::explicit_sync::probe(&mut drm.renderer),
             });
         }
 
@@ -4735,7 +4735,7 @@ impl Runtime {
         #[cfg(feature = "drm")]
         {
             let queued = self.state.take_acquire_waits();
-            self.acquire_waits.watch(
+            let failed = self.acquire_waits.watch(
                 &self.loop_handle,
                 queued,
                 |runtime: &mut Runtime, id, surface| {
@@ -4743,6 +4743,9 @@ impl Runtime {
                     crate::explicit_sync::acquired(&mut runtime.state, surface);
                 },
             );
+            for surface in failed {
+                crate::explicit_sync::acquire_watch_failed(&mut self.state, &surface);
+            }
         }
         self.manager.reconcile(&mut self.state);
         self.state.window_sessions_mut().save_if_due(Instant::now());

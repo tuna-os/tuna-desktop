@@ -388,14 +388,16 @@ fn explicit_sync_is_advertised_only_with_timeline_syncobj() {
         device: Some(stand_in_drm_device()),
         timeline: true,
         eventfd: true,
+        gpu_release_fence: true,
     };
     type Without = fn(&mut SyncobjSupport);
-    let lacking: [(&str, Without); 5] = [
+    let lacking: [(&str, Without); 6] = [
         ("native fence sync", |s| s.native_fence_sync = false),
         ("EGL device node", |s| s.device_path = None),
         ("opened device", |s| s.device = None),
         ("timeline syncobj", |s| s.timeline = false),
         ("syncobj eventfd", |s| s.eventfd = false),
+        ("GPU release fence", |s| s.gpu_release_fence = false),
     ];
     for (missing, without) in lacking {
         let mut comp = TestCompositor::new();

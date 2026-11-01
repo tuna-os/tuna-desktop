@@ -336,6 +336,8 @@ pub struct GlesFrame<'frame, 'buffer> {
     size: Size<i32, Physical>,
     tex_program_override: Option<(GlesTexProgram, Vec<Uniform<'static>>)>,
     finished: AtomicBool,
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    accessed_buffers: Vec<super::utils::Buffer>,
 
     span: EnteredSpan,
 }
@@ -2127,6 +2129,8 @@ impl Renderer for GlesRenderer {
             size: output_size,
             tex_program_override: None,
             finished: AtomicBool::new(false),
+            #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+            accessed_buffers: Vec::new(),
 
             span,
         })
@@ -2326,6 +2330,18 @@ impl Frame for GlesFrame<'_, '_> {
         self.renderer.wait(sync)
     }
 
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    fn note_buffer_access(&mut self, buffer: &super::utils::Buffer) -> Result<(), Self::Error> {
+        let Some(acquire) = buffer.acquire_point() else {
+            return Ok(());
+        };
+        if !self.accessed_buffers.iter().any(|held| held.same_commit(buffer)) {
+            self.renderer.wait(&SyncPoint::from(acquire.clone()))?;
+            self.accessed_buffers.push(buffer.clone());
+        }
+        Ok(())
+    }
+
     #[profiling::function]
     fn finish(mut self) -> Result<SyncPoint, Self::Error> {
         self.finish_internal()
@@ -2361,7 +2377,12 @@ impl GlesFrame<'_, '_> {
                 unsafe {
                     self.renderer.gl.Flush();
                 }
-                return Ok(SyncPoint::from(fence));
+                let sync = SyncPoint::from(fence);
+                #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+                for buffer in self.accessed_buffers.drain(..) {
+                    buffer.set_release_fence(sync.clone());
+                }
+                return Ok(sync);
             }
         }
 
@@ -2369,6 +2390,8 @@ impl GlesFrame<'_, '_> {
         unsafe {
             self.renderer.gl.Finish();
         }
+        #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+        self.accessed_buffers.clear();
         Ok(SyncPoint::signaled())
     }
 

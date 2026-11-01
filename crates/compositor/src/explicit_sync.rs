@@ -19,24 +19,30 @@
 //!   signals: a Smithay blocker released by the point's eventfd, as
 //!   Mutter's transaction waits on `meta_wayland_drm_syncobj_create_source`.
 //!   A point already signalled applies at once, as there.
-//! - The release point is signalled when the compositor drops the buffer
-//!   (Smithay's renderer `Buffer`, after the next buffer replaced it and
-//!   the frames that sampled it are done).
+//! - Rendered buffers retain the real completion fences of every GLES frame
+//!   that sampled them. On final release those GPU fences are merged and
+//!   transferred into the client's timeline, never CPU-signalled on reference
+//!   drop before GPU completion.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Mutex};
 
 use smithay::backend::drm::DrmDeviceFd;
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::gles::{Capability, GlesRenderer};
 use smithay::backend::renderer::sync::Fence;
+use smithay::backend::renderer::ImportDma as _;
 use smithay::delegate_drm_syncobj;
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
 use smithay::reexports::drm::{Device as _, DriverCapability};
+use smithay::reexports::drm::control::Device as _;
 use smithay::reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource, Weak};
 use smithay::utils::DeviceFd;
-use smithay::wayland::compositor::{add_blocker, with_states, CompositorHandler};
+use smithay::wayland::compositor::{
+    add_blocker, with_states, Blocker, BlockerState, BufferAssignment, CompositorHandler,
+    SurfaceAttributes,
+};
 use smithay::wayland::drm_syncobj::{
-    pending_commit_error, supports_syncobj_eventfd, DrmSyncPointSource, DrmSyncobjCachedState,
-    DrmSyncobjHandler, DrmSyncobjState,
+    pending_commit_error, reject_pending_commit, supports_syncobj_eventfd, DrmSyncPointBlocker,
+    DrmSyncPointSource, DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState, DrmTimeline,
 };
 
 use crate::State;
@@ -57,6 +63,8 @@ pub struct SyncobjSupport {
     pub timeline: bool,
     /// `drmSyncobjEventfd` exists: a probe on handle 0 fails with ENOENT.
     pub eventfd: bool,
+    /// A real renderer GPU fence successfully transfers into a DRM timeline.
+    pub gpu_release_fence: bool,
 }
 
 impl SyncobjSupport {
@@ -80,12 +88,15 @@ impl SyncobjSupport {
                 "drmSyncobjEventfd failed: linux-drm-syncobj requires eventfd support".into(),
             );
         }
+        if !self.gpu_release_fence {
+            return Err("Renderer cannot export and transfer GPU release fences".into());
+        }
         Ok(())
     }
 }
 
 /// Ask `renderer` what Mutter asks Cogl and the kernel.
-pub fn probe(renderer: &GlesRenderer) -> SyncobjSupport {
+pub fn probe(renderer: &mut GlesRenderer) -> SyncobjSupport {
     let display = renderer.egl_context().display();
     let mut support = SyncobjSupport {
         native_fence_sync: display
@@ -121,6 +132,26 @@ pub fn probe(renderer: &GlesRenderer) -> SyncobjSupport {
         .get_driver_capability(DriverCapability::TimelineSyncObj)
         .is_ok_and(|cap| cap != 0);
     support.eventfd = support.timeline && supports_syncobj_eventfd(&device);
+    if support.eventfd
+        && renderer.capabilities().contains(&Capability::ExportFence)
+        && renderer.dmabuf_formats().iter().next().is_some()
+    {
+        let display = renderer.egl_context().display().clone();
+        support.gpu_release_fence = renderer.with_context(|gl| {
+            let Ok(fence) = smithay::backend::egl::fence::EGLFence::create(&display) else {
+                return false;
+            };
+            unsafe { gl.Flush() };
+            let Some(fd) = Fence::export(&fence) else { return false };
+            let Ok(handle) = device.create_syncobj(false) else { return false };
+            let exported = device.syncobj_to_fd(handle, false);
+            let _ = device.destroy_syncobj(handle);
+            exported
+                .and_then(|fd| DrmTimeline::new(&device, fd))
+                .and_then(|timeline| timeline.point(1).import_sync_file(std::os::fd::AsFd::as_fd(&fd)))
+                .is_ok()
+        }).unwrap_or(false);
+    }
     support.device = Some(device);
     support
 }
@@ -161,6 +192,21 @@ impl DrmSyncobjHandler for State {
 }
 delegate_drm_syncobj!(State);
 
+#[derive(Default)]
+struct PendingAcquires(Mutex<Vec<DrmSyncPointBlocker>>);
+
+fn acquire_failure(state: &State, surface: &WlSurface, message: String) {
+    reject_pending_commit(surface);
+    if let Some(client) = surface.client() {
+        client.kill(&state.dh, smithay::reexports::wayland_server::backend::ProtocolError {
+            code: smithay::reexports::wayland_server::protocol::wl_display::Error::Implementation as u32,
+            object_id: 1,
+            object_interface: "wl_display".into(),
+            message,
+        });
+    }
+}
+
 /// Pre-commit: hold a valid commit whose acquire point has not signalled
 /// until it does. Invalid commits are left to Smithay's check, which
 /// disconnects the client.
@@ -169,6 +215,17 @@ pub(crate) fn hold_until_acquired(state: &mut State, surface: &WlSurface) {
         return;
     }
     let acquire = with_states(surface, |states| {
+        states.data_map.insert_if_missing_threadsafe(PendingAcquires::default);
+        let mut waits = states.data_map.get::<PendingAcquires>().unwrap().0.lock().unwrap();
+        waits.retain(|wait| wait.state() == BlockerState::Pending);
+        if matches!(
+            states.cached_state.get::<SurfaceAttributes>().pending().buffer,
+            Some(BufferAssignment::Removed)
+        ) {
+            for wait in waits.drain(..) {
+                wait.cancel();
+            }
+        }
         let acquire = states
             .cached_state
             .get::<DrmSyncobjCachedState>()
@@ -185,14 +242,16 @@ pub(crate) fn hold_until_acquired(state: &mut State, surface: &WlSurface) {
     }
     match acquire.generate_blocker() {
         Ok((blocker, source)) => {
+            with_states(surface, |states| {
+                states.data_map.get::<PendingAcquires>().unwrap().0.lock().unwrap().push(blocker.clone());
+            });
             add_blocker(surface, blocker);
             state
                 .protocols
                 .acquire_waits
                 .push((source, surface.downgrade()));
         }
-        // Mutter applies the commit at once when it cannot get the eventfd.
-        Err(err) => eprintln!("tuna-compositor: explicit sync: acquire point eventfd: {err}"),
+        Err(err) => acquire_failure(state, surface, format!("Cannot wait for explicit-sync acquire: {err}")),
     }
 }
 
@@ -201,7 +260,7 @@ pub(crate) fn hold_until_acquired(state: &mut State, surface: &WlSurface) {
 #[derive(Debug, Default)]
 pub(crate) struct AcquireWaits {
     next: u64,
-    watching: Vec<(u64, RegistrationToken, Weak<WlSurface>)>,
+    watching: Vec<(u64, RegistrationToken, Weak<WlSurface>, DrmSyncPointBlocker)>,
 }
 
 impl AcquireWaits {
@@ -214,39 +273,62 @@ impl AcquireWaits {
         handle: &LoopHandle<'static, L>,
         queued: Vec<(DrmSyncPointSource, Weak<WlSurface>)>,
         signalled: fn(&mut L, u64, &Weak<WlSurface>),
-    ) {
+    ) -> Vec<Weak<WlSurface>> {
+        let mut failed = Vec::new();
         for (source, surface) in queued {
             let id = self.next;
             self.next += 1;
             let watched = surface.clone();
+            let blocker = source.blocker();
             match handle.insert_source(source, move |(), _, data: &mut L| {
                 signalled(data, id, &surface);
                 Ok(())
             }) {
-                Ok(token) => self.watching.push((id, token, watched)),
-                Err(err) => eprintln!(
-                    "tuna-compositor: explicit sync: watch acquire point: {}",
-                    err.error
-                ),
+                Ok(token) => self.watching.push((id, token, watched, blocker)),
+                Err(err) => {
+                    eprintln!("tuna-compositor: explicit sync: watch acquire point: {}", err.error);
+                    drop(err);
+                    failed.push(watched);
+                }
             }
         }
-        self.watching.retain(|(_, token, surface)| {
-            let alive = surface.upgrade().is_ok();
-            if !alive {
+        self.watching.retain(|(_, token, surface, blocker)| {
+            let keep = surface.upgrade().is_ok() && blocker.state() == BlockerState::Pending;
+            if !keep {
                 handle.remove(*token);
             }
-            alive
+            keep
         });
+        failed
     }
 
     /// Point `id` signalled; its source has removed itself.
     pub(crate) fn signalled(&mut self, id: u64) {
-        self.watching.retain(|(watched, _, _)| *watched != id);
+        self.watching.retain(|(watched, _, _, _)| *watched != id);
     }
+}
+
+/// A calloop registration failure must cancel/disconnect, not authorize an
+/// unacquired transaction or leave it waiting without an event source.
+pub(crate) fn acquire_watch_failed(state: &mut State, surface: &Weak<WlSurface>) {
+    if let Ok(surface) = surface.upgrade() {
+        acquire_failure(state, &surface, "Cannot register explicit-sync acquire wait".into());
+    }
+    acquired(state, surface);
 }
 
 /// An acquire point on `surface` signalled: apply the commits it held.
 pub(crate) fn acquired(state: &mut State, surface: &Weak<WlSurface>) {
+    if let Ok(surface) = surface.upgrade() {
+        let cancelled = with_states(&surface, |states| {
+            states.data_map.get::<PendingAcquires>().is_some_and(|waits| {
+                waits.0.lock().unwrap().iter().any(|wait| wait.state() == BlockerState::Cancelled)
+            })
+        });
+        if cancelled {
+            acquire_failure(state, &surface, "Explicit-sync acquire device was invalidated".into());
+        }
+    }
     if let Some(client) = surface.upgrade().ok().and_then(|s| s.client()) {
         let dh = state.dh.clone();
         state
@@ -271,6 +353,7 @@ mod tests {
             )),
             timeline: true,
             eventfd: true,
+            gpu_release_fence: true,
         }
     }
 
@@ -280,7 +363,7 @@ mod tests {
     fn explicit_sync_needs_every_capability_mutter_checks() {
         assert_eq!(capable().verdict(), Ok(()));
         type Without = fn(&mut SyncobjSupport);
-        let cases: [(Without, &str); 5] = [
+        let cases: [(Without, &str); 6] = [
             (
                 |s| s.native_fence_sync = false,
                 "Missing 'EGL_ANDROID_native_fence_sync'",
@@ -300,6 +383,10 @@ mod tests {
             (
                 |s| s.eventfd = false,
                 "drmSyncobjEventfd failed: linux-drm-syncobj requires eventfd support",
+            ),
+            (
+                |s| s.gpu_release_fence = false,
+                "Renderer cannot export and transfer GPU release fences",
             ),
         ];
         for (without, reason) in cases {

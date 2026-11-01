@@ -2305,6 +2305,7 @@ mod explicit_sync {
                 device: Some(device),
                 timeline: true,
                 eventfd: true,
+                gpu_release_fence: true,
             }));
         (comp, manager)
     }
