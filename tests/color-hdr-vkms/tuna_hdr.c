@@ -7,6 +7,7 @@
 #include <linux/module.h>
 #include <linux/kstrtox.h>
 #include <linux/mutex.h>
+#include <linux/string.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_atomic_helper.h>
@@ -75,14 +76,17 @@ enum drm_connector_status tuna_hdr_detect(struct drm_connector *connector,
 
 int tuna_hdr_get_modes(struct drm_connector *connector)
 {
-	const struct edid *edid = (const struct edid *)(hdr_sink ?
-					 tuna_edid_hdr : tuna_edid_sdr);
+	struct edid edid[2];
 	int ret;
+	_Static_assert(sizeof(edid) == sizeof(tuna_edid_hdr), "HDR EDID size");
+	_Static_assert(sizeof(edid) == sizeof(tuna_edid_sdr), "SDR EDID size");
 	if (!READ_ONCE(connected)) {
 		drm_connector_update_edid_property(connector, NULL);
 		return 0;
 	}
 
+	/* The legacy mode parser requires writable EDID storage. */
+	memcpy(edid, hdr_sink ? tuna_edid_hdr : tuna_edid_sdr, sizeof(edid));
 	ret = drm_connector_update_edid_property(connector, edid);
 	if (ret)
 		return ret;
