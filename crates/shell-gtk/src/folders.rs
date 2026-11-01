@@ -1398,6 +1398,7 @@ mod tests {
             argv: Vec::new(),
             icon: None,
             categories: categories.iter().map(|c| (*c).to_owned()).collect(),
+            new_window: Default::default(),
         }
     }
 
