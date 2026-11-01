@@ -122,9 +122,9 @@ class Console:
     The page shows only the VM's noVNC canvas at 1:1, so page pixels map onto
     guest pixels, and it reconnects by itself after the VNC session drops."""
 
-    def __init__(self, playwright, url):
-        self.browser = playwright.chromium.launch()
-        self.page = self.browser.new_page(viewport={'width': WIDTH + 40, 'height': HEIGHT + 40})
+    def __init__(self, playwright, url, *, browser=None, page=None):
+        self.browser = browser if browser is not None else playwright.chromium.launch()
+        self.page = page if page is not None else self.browser.new_page(viewport={'width': WIDTH + 40, 'height': HEIGHT + 40})
         self.url = url
 
     def open(self):

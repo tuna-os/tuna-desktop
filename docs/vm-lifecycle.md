@@ -28,6 +28,49 @@ and `skipped_assertions: []`; the nightly/repeat receipts preserve and
 classify every actual boot ([receipt contract](marlin-tuna-nightly.md)).
 
 
+## Pristine release-disk qualification is separate
+
+The signed release-disk consumer and its native observer live in
+`scripts/lib/try_tuna_desktop.py` and `scripts/lib/try_tuna_qualification.py`.
+They do not turn the fixture journeys above into pristine firstboot proof.
+The observer requires the normal-release signed manifest and its exact
+declared bytes, with the observer checkout matching the signed producer
+source. It boots a writable copy while retaining the shipping disk's hash;
+there are no injected accounts, passwords, SSH keys or fixture services in
+that shipping disk.
+
+Each native Linux/macOS amd64/arm64 host must execute its matching signed
+Corral binary, real local QEMU, browser and noVNC transport. Executable
+headers reject foreign host binaries even where Rosetta/binfmt could run
+them. The guest remains the declared qualified amd64/UEFI disk; ARM hosts
+explicitly use TCG. Receipts retain actual QEMU target/accelerator, firmware
+and binary hashes rather than claiming native guest acceleration.
+
+Actual GNOME Initial Setup creates a passworded operator account in the
+copy. Normal GDM must then enter Tuna, including visible application search,
+with wheel membership and password-required sudo; logout/login and reboot
+must preserve that account and user data. RFB connection alone means
+browser/transport readiness, never successful guest boot or Tuna login.
+Terminal cancellation, stop, failed browser launch and failed acquisition
+must retire owned processes/listeners/locks without touching an unrelated
+VM. Normal launch preserves writable user data; qualification explicitly
+deletes only its own disposable copies after retirement.
+
+The consumer requires Python 3 and the native package manager (on macOS,
+Homebrew and its normal command-line-tool prerequisites). It obtains the
+checksum-pinned Sigstore verifier itself and acquires QEMU plus amd64 UEFI
+through native package trust, including when QEMU exists but firmware is
+missing. Linux without caller access to `/dev/kvm` explicitly uses TCG.
+Cancellation waits for an already-started native package transaction to
+finish safely; it does not start a VM afterward. No Podman or guest disk
+build belongs in this consumer. An artifact directory changes only where
+the same signed bytes are read; it does not replace identities, trust roots
+or descriptors, and is not a promise of network-free dependency bootstrap.
+
+The existing public wrapper is not cut over until a real signed disk and
+manifest pass all four native firstboot/browser/lifecycle qualifications.
+Private helper code or fixture receipts alone do not establish that result.
+
 ## Record-free fresh accounts (tunaOS#4092)
 
 `tuna-test` above has a session-less AccountsService record, so it proves
