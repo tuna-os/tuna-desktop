@@ -1,0 +1,31 @@
+[15:53:29:630] [30:0000001e] [WARN][com.freerdp.client.common.cmdline] - [warn_credential_args]: Using /p is insecure
+[15:53:29:630] [30:0000001e] [WARN][com.freerdp.client.common.cmdline] - [warn_credential_args]: Passing credentials or secrets via command line might expose these in the process list
+[15:53:29:630] [30:0000001e] [WARN][com.freerdp.client.common.cmdline] - [warn_credential_args]: Consider using one of the following (more secure) alternatives:
+[15:53:29:630] [30:0000001e] [WARN][com.freerdp.client.common.cmdline] - [warn_credential_args]:   - /args-from: pipe in arguments from stdin, file, file descriptor or environment variable
+[15:53:29:630] [30:0000001e] [WARN][com.freerdp.client.common.cmdline] - [warn_credential_args]:   - /from-stdin pass the credential via stdin
+[15:53:29:630] [30:0000001e] [WARN][com.freerdp.client.common.cmdline] - [warn_credential_args]:   - set environment variable FREERDP_ASKPASS to have a gui tool query for credentials
+[15:53:29:632] [30:00000020] [WARN][com.freerdp.client.x11] - [load_map_from_xkbfile]:     : keycode: 0x08 -> no RDP scancode found
+[15:53:29:632] [30:00000020] [WARN][com.freerdp.client.x11] - [load_map_from_xkbfile]:     : keycode: 0x5d -> no RDP scancode found
+[15:53:29:660] [30:00000020] [WARN][com.freerdp.crypto] - [tls_verify_certificate]: [DANGER] Certificate not checked, /cert:ignore in use.
+[15:53:29:660] [30:00000020] [WARN][com.freerdp.crypto] - [tls_verify_certificate]: [DANGER] This prevents MITM attacks from being detected!
+[15:53:29:660] [30:00000020] [WARN][com.freerdp.crypto] - [tls_verify_certificate]: [DANGER] Avoid using this unless in a secure LAN (=no internet) environment
+[15:53:29:848] [30:00000020] [ERROR][com.winpr.sspi.Kerberos] - [krb_log_context_encryption]: fn (Client not found in Kerberos database [-1765328378])
+[15:53:29:939] [30:00000020] [ERROR][com.winpr.sspi.Kerberos] - [krb5glue_get_init_creds]: krb5_init_creds_get (Client 'tuna-test@ATHENA.MIT.EDU' not found in Kerberos database [-1765328378])
+[15:53:29:942] [30:00000020] [ERROR][com.winpr.sspi.Kerberos] - [kerberos_AcquireCredentialsHandleA]: krb5glue_get_init_creds (Client 'tuna-test@ATHENA.MIT.EDU' not found in Kerberos database [-1765328378])
+[15:53:30:078] [30:00000020] [ERROR][com.winpr.sspi.Kerberos] - [krb_log_context_encryption]: fn (Client not found in Kerberos database [-1765328378])
+[15:53:30:181] [30:00000020] [ERROR][com.winpr.sspi.Kerberos] - [krb5glue_get_init_creds]: krb5_init_creds_get (Client 'tuna-test@ATHENA.MIT.EDU' not found in Kerberos database [-1765328378])
+[15:53:30:181] [30:00000020] [ERROR][com.winpr.sspi.Kerberos] - [kerberos_AcquireCredentialsHandleA]: krb5glue_get_init_creds (Client 'tuna-test@ATHENA.MIT.EDU' not found in Kerberos database [-1765328378])
+fuse: device /dev/fuse not found. Kernel module not loaded?
+[15:53:30:288] [30:00000020] [ERROR][com.freerdp.core] - [rdp_set_error_info]: ERRINFO_LOGOFF_BY_USER [0x0001000C]
+[15:53:30:288] [30:00000020] [ERROR][com.freerdp.core.rdp] - [rdp_recv_callback_int][0x583270f75190]: CONNECTION_STATE_CAPABILITIES_EXCHANGE_DEMAND_ACTIVE status STATE_RUN_QUIT_SESSION [-2]
+[15:53:30:288] [30:00000020] [ERROR][com.freerdp.core.transport] - [transport_check_fds]: transport_check_fds: transport->ReceiveCallback() - STATE_RUN_QUIT_SESSION [-2]
+[15:53:30:293] [30:00000020] [WARN][com.freerdp.client.common.cliprdr.file] - [cliprdr_file_session_terminate]: winpr_PathFileExists(/tmp/com.freerdp.client.cliprdr.30) failed
+[15:53:30:293] [30:00000020] [WARN][com.freerdp.client.x11] - [xf_Pointer_get_window]: xf_Pointer: Invalid window
+[15:53:30:278] [30:00000020] [INFO][com.freerdp.gdi] - [gdi_init_ex]: Local framebuffer format  PIXEL_FORMAT_BGRX32
+[15:53:30:278] [30:00000020] [INFO][com.freerdp.gdi] - [gdi_init_ex]: Remote framebuffer format PIXEL_FORMAT_BGRA32
+[15:53:30:280] [30:00000020] [INFO][com.freerdp.channels.rdpsnd.client] - [rdpsnd_load_device_plugin]: [static] Loaded fake backend for rdpsnd
+[15:53:30:281] [30:00000020] [INFO][com.freerdp.channels.drdynvc.client] - [dvcman_load_addin]: Loading Dynamic Virtual Channel ainput
+[15:53:30:281] [30:00000020] [INFO][com.freerdp.channels.drdynvc.client] - [dvcman_load_addin]: Loading Dynamic Virtual Channel rdpgfx
+[15:53:30:281] [30:00000020] [INFO][com.freerdp.channels.drdynvc.client] - [dvcman_load_addin]: Loading Dynamic Virtual Channel disp
+[15:53:30:281] [30:00000020] [INFO][com.freerdp.channels.drdynvc.client] - [dvcman_load_addin]: Loading Dynamic Virtual Channel rdpsnd
+[15:53:30:288] [30:00000020] [INFO][com.freerdp.core] - [rdp_print_errinfo]: ERRINFO_LOGOFF_BY_USER (0x0000000C):The disconnection was initiated by the user logging off their session on the server.
