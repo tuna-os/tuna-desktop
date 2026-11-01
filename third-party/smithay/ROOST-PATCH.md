@@ -161,3 +161,14 @@ those still require the installed native OSK/IBus producer and exact binary
 and image identities. A rejection can be reported by libwayland as a fatal
 I/O error for `wl_display.invalid_object` (code zero), so the negative
 consumers assert terminal connection failure, not only `ProtocolError`.
+
+Destroying any input-method parent also destroys its associated popup/grab
+resources, including inert child IDs. Active-owner retirement detaches its
+popup and grab before any callback, without holding IM or grab locks across
+callouts. Keyboard-grab `unset` clears its recorded ownership, and teardown
+checks the installed grab's serial before releasing it: a compositor-owned
+replacement or a new input method must not be canceled by old child cleanup.
+The native consumers retain child proxies across parent destruction, check
+the actual server objects are gone, and exercise both parent-first and
+child-first destruction, continued compositor-grab key delivery and a fresh
+input method's typing/grab after retirement.

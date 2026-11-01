@@ -220,6 +220,7 @@ where
                     input_method,
                     InputMethodUserData {
                         handle: handle.clone(),
+                        children: Default::default(),
                         text_input_handle: text_input_handle.clone(),
                         keyboard_handle,
                         popup_geometry_callback: D::parent_geometry,

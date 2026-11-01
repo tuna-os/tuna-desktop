@@ -376,6 +376,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for Client {
 
 struct Peer {
     _conn: Connection,
+    server: wayland_server::Client,
     registry: WlRegistry,
     queue: EventQueue<Client>,
     client: Client,
@@ -391,16 +392,17 @@ fn connect_ime_bridge(comp: &mut TestCompositor) -> Peer {
 
 fn connect_with_admission(comp: &mut TestCompositor, ime_bridge: bool) -> Peer {
     let (server, stream) = UnixStream::pair().unwrap();
-    if ime_bridge {
-        comp.add_ime_bridge_client(server);
+    let server = if ime_bridge {
+        comp.add_ime_bridge_client(server)
     } else {
-        comp.add_client(server);
-    }
+        comp.add_client(server)
+    };
     let conn = Connection::from_socket(stream).unwrap();
     let queue = conn.new_event_queue();
     let registry = conn.display().get_registry(&queue.handle(), ());
     Peer {
         _conn: conn,
+        server,
         registry,
         queue,
         client: Client::default(),
@@ -1171,7 +1173,8 @@ fn unavailable_input_methods_cannot_inject_or_retire_the_live_resource() {
 
 #[test]
 fn inert_input_method_new_ids_have_no_role_events_or_grab_side_effects() {
-    for same_client in [false, true] {
+    for (same_client, parent_first) in [(false, false), (false, true), (true, false), (true, true)]
+    {
         let mut comp = TestCompositor::new();
         comp.state.set_output_size(1280, 800);
         let mut manager = comp.window_manager();
@@ -1254,13 +1257,45 @@ fn inert_input_method_new_ids_have_no_role_events_or_grab_side_effects() {
             0
         );
         assert_eq!(app.client.text_leaves, leaves);
-        inert_grab.release();
-        popup.destroy();
+        let backend = wayland_server::Resource::handle(&comp.state.first_toplevel_surface())
+            .upgrade()
+            .unwrap();
+        let client = if same_client {
+            owner.server.id()
+        } else {
+            foreign.server.id()
+        };
+        let popup_id = backend
+            .object_for_protocol_id(
+                client.clone(),
+                <ZwpInputPopupSurfaceV2 as wayland_client::Proxy>::interface(),
+                wayland_client::Proxy::id(&popup).protocol_id(),
+            )
+            .unwrap();
+        let grab_id = backend
+            .object_for_protocol_id(
+                client,
+                <ZwpInputMethodKeyboardGrabV2 as wayland_client::Proxy>::interface(),
+                wayland_client::Proxy::id(&inert_grab).protocol_id(),
+            )
+            .unwrap();
+        if !parent_first {
+            inert_grab.release();
+            popup.destroy();
+        }
         rejected.destroy();
         pump(
             &mut comp,
             &mut manager,
             &mut [&mut app, &mut owner, &mut foreign],
+        );
+        assert!(
+            backend.object_info(popup_id).is_err(),
+            "inert popup must retire in either destructor order"
+        );
+        assert!(
+            backend.object_info(grab_id).is_err(),
+            "inert grab must retire in either destructor order"
         );
         let keys = owner.client.ime_keys;
         manager.keyboard_key(&mut comp.state, 30, true, 1);
@@ -1475,4 +1510,222 @@ fn a_copied_helper_on_a_public_connection_cannot_claim_input_method_authority() 
         );
     pump(&mut comp, &mut manager, &mut [&mut bridge]);
     assert!(!bridge.client.ime_unavailable);
+}
+
+struct CompositorKeyboardGrab {
+    start: smithay::input::keyboard::GrabStartData<tuna_compositor::State>,
+    keys: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    unsets: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl smithay::input::keyboard::KeyboardGrab<tuna_compositor::State> for CompositorKeyboardGrab {
+    fn input(
+        &mut self,
+        _: &mut tuna_compositor::State,
+        _: &mut smithay::input::keyboard::KeyboardInnerHandle<'_, tuna_compositor::State>,
+        _: smithay::input::keyboard::Keycode,
+        _: smithay::backend::input::KeyState,
+        _: Option<smithay::input::keyboard::ModifiersState>,
+        _: smithay::utils::Serial,
+        _: u32,
+    ) {
+        self.keys.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn set_focus(
+        &mut self,
+        state: &mut tuna_compositor::State,
+        handle: &mut smithay::input::keyboard::KeyboardInnerHandle<'_, tuna_compositor::State>,
+        focus: Option<wayland_server::protocol::wl_surface::WlSurface>,
+        serial: smithay::utils::Serial,
+    ) {
+        handle.set_focus(state, focus, serial);
+    }
+
+    fn start_data(&self) -> &smithay::input::keyboard::GrabStartData<tuna_compositor::State> {
+        &self.start
+    }
+
+    fn unset(&mut self, _: &mut tuna_compositor::State) {
+        self.unsets
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn parent_destroy_journey(compositor_replaces_grab: bool) {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let mut comp = TestCompositor::new();
+    comp.state.set_output_size(1280, 800);
+    let mut manager = comp.window_manager();
+    let mut owner = connect_ime_bridge(&mut comp);
+    let mut app = connect(&mut comp);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    let im = owner
+        .client
+        .input_method_manager
+        .as_ref()
+        .unwrap()
+        .get_input_method(
+            owner.client.seat.as_ref().unwrap(),
+            &owner.queue.handle(),
+            (),
+        );
+    let text = app
+        .client
+        .text_input_manager
+        .as_ref()
+        .unwrap()
+        .get_text_input(app.client.seat.as_ref().unwrap(), &app.queue.handle(), ());
+    let _surface = window(&mut app);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    let popup_surface = owner
+        .client
+        .compositor
+        .as_ref()
+        .unwrap()
+        .create_surface(&owner.queue.handle(), ());
+    let _popup = im.get_input_popup_surface(&popup_surface, &owner.queue.handle(), ());
+    let _grab = im.grab_keyboard(&owner.queue.handle(), ());
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    text.set_cursor_rectangle(10, 20, 2, 15);
+    text.commit();
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert!(
+        owner.client.ime_popup_events > 0,
+        "live popup must receive the real cursor rectangle"
+    );
+    manager.keyboard_key(&mut comp.state, 30, true, 1);
+    manager.keyboard_key(&mut comp.state, 30, false, 2);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert_eq!(
+        owner.client.ime_keys, 2,
+        "live grab must receive real keys before retirement"
+    );
+    let keys = Arc::new(AtomicUsize::new(0));
+    let unsets = Arc::new(AtomicUsize::new(0));
+    let keyboard = comp.test_seat().get_keyboard().unwrap();
+    let compositor_serial = smithay::utils::SERIAL_COUNTER.next_serial();
+    if compositor_replaces_grab {
+        keyboard.set_grab(
+            &mut comp.state,
+            CompositorKeyboardGrab {
+                start: smithay::input::keyboard::GrabStartData { focus: None },
+                keys: keys.clone(),
+                unsets: unsets.clone(),
+            },
+            compositor_serial,
+        );
+        manager.keyboard_key(&mut comp.state, 48, true, 3);
+        manager.keyboard_key(&mut comp.state, 48, false, 4);
+        pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+        assert_eq!(keys.load(Ordering::SeqCst), 2);
+        assert_eq!(owner.client.ime_keys, 2);
+    }
+    let popup_events = owner.client.ime_popup_events;
+    let backend = wayland_server::Resource::handle(&comp.state.first_toplevel_surface())
+        .upgrade()
+        .unwrap();
+    let popup_id = backend
+        .object_for_protocol_id(
+            owner.server.id(),
+            <ZwpInputPopupSurfaceV2 as wayland_client::Proxy>::interface(),
+            wayland_client::Proxy::id(&_popup).protocol_id(),
+        )
+        .expect("live popup is a real server resource");
+    let grab_id = backend
+        .object_for_protocol_id(
+            owner.server.id(),
+            <ZwpInputMethodKeyboardGrabV2 as wayland_client::Proxy>::interface(),
+            wayland_client::Proxy::id(&_grab).protocol_id(),
+        )
+        .expect("live keyboard grab is a real server resource");
+    // Deliberately keep both child proxies: the parent's destructor must
+    // retire its children without relying on explicit child releases.
+    im.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    if compositor_replaces_grab {
+        assert!(
+            keyboard.has_grab(compositor_serial),
+            "old IM cannot cancel the compositor's replacement grab"
+        );
+        assert_eq!(unsets.load(Ordering::SeqCst), 0);
+    } else {
+        assert!(
+            !keyboard.is_grabbed(),
+            "destroying the owning IM must release its live keyboard grab"
+        );
+    }
+    assert!(
+        backend.object_info(popup_id).is_err(),
+        "parent destruction must destroy the real popup resource"
+    );
+    assert!(
+        backend.object_info(grab_id).is_err(),
+        "parent destruction must destroy the real grab resource"
+    );
+    manager.keyboard_key(&mut comp.state, 46, true, 5);
+    manager.keyboard_key(&mut comp.state, 46, false, 6);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert_eq!(
+        owner.client.ime_keys, 2,
+        "retired child must receive no more keys"
+    );
+    if compositor_replaces_grab {
+        assert_eq!(
+            keys.load(Ordering::SeqCst),
+            4,
+            "compositor replacement still consumes real keys"
+        );
+    }
+    let replacement = owner
+        .client
+        .input_method_manager
+        .as_ref()
+        .unwrap()
+        .get_input_method(
+            owner.client.seat.as_ref().unwrap(),
+            &owner.queue.handle(),
+            (),
+        );
+    text.enable();
+    text.set_cursor_rectangle(70, 80, 3, 16);
+    text.commit();
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert_eq!(
+        owner.client.ime_popup_events, popup_events,
+        "new IM must not reactivate its predecessor's popup"
+    );
+    replacement.commit_string("replacement after child retirement".into());
+    replacement.commit(owner.client.ime_done);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+    assert_eq!(app.client.committed, ["replacement after child retirement"]);
+    if compositor_replaces_grab {
+        assert!(keyboard.has_grab(compositor_serial));
+        assert_eq!(unsets.load(Ordering::SeqCst), 0);
+    } else {
+        let _replacement_grab = replacement.grab_keyboard(&owner.queue.handle(), ());
+        pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+        manager.keyboard_key(&mut comp.state, 32, true, 7);
+        manager.keyboard_key(&mut comp.state, 32, false, 8);
+        pump(&mut comp, &mut manager, &mut [&mut app, &mut owner]);
+        assert_eq!(
+            owner.client.ime_keys, 4,
+            "new owner can install and consume its own grab"
+        );
+    }
+    assert!(owner._conn.backend().last_error().is_none());
+    assert!(app._conn.backend().last_error().is_none());
+}
+
+#[test]
+fn input_method_parent_destroy_retires_live_grab_and_popup_before_replacement() {
+    parent_destroy_journey(false);
+}
+
+#[test]
+fn input_method_parent_destroy_preserves_a_compositor_replacement_grab() {
+    parent_destroy_journey(true);
 }
