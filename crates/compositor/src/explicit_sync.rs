@@ -32,8 +32,8 @@ use smithay::backend::renderer::sync::Fence;
 use smithay::backend::renderer::ImportDma as _;
 use smithay::delegate_drm_syncobj;
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
-use smithay::reexports::drm::{Device as _, DriverCapability};
 use smithay::reexports::drm::control::Device as _;
+use smithay::reexports::drm::{Device as _, DriverCapability};
 use smithay::reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource, Weak};
 use smithay::utils::DeviceFd;
 use smithay::wayland::compositor::{
@@ -137,33 +137,50 @@ pub fn probe(renderer: &mut GlesRenderer) -> SyncobjSupport {
         && renderer.dmabuf_formats().iter().next().is_some()
     {
         let display = renderer.egl_context().display().clone();
-        support.gpu_release_fence = renderer.with_context(|gl| {
-            let Ok(fence) = smithay::backend::egl::fence::EGLFence::create(&display) else {
-                return false;
-            };
-            unsafe { gl.Flush() };
-            let Some(fd) = Fence::export(&fence) else { return false };
-            let Ok(handle) = device.create_syncobj(false) else { return false };
-            let exported = device.syncobj_to_fd(handle, false);
-            let _ = device.destroy_syncobj(handle);
-            exported
-                .and_then(|fd| DrmTimeline::new(&device, fd))
-                .and_then(|timeline| timeline.point(1).import_sync_file(std::os::fd::AsFd::as_fd(&fd)))
-                .is_ok()
-        }).unwrap_or(false);
+        support.gpu_release_fence = renderer
+            .with_context(|gl| {
+                let Ok(fence) = smithay::backend::egl::fence::EGLFence::create(&display) else {
+                    return false;
+                };
+                unsafe { gl.Flush() };
+                let Some(fd) = Fence::export(&fence) else {
+                    return false;
+                };
+                let Ok(handle) = device.create_syncobj(false) else {
+                    return false;
+                };
+                let exported = device.syncobj_to_fd(handle, false);
+                let _ = device.destroy_syncobj(handle);
+                exported
+                    .and_then(|fd| DrmTimeline::new(&device, fd))
+                    .and_then(|timeline| {
+                        timeline
+                            .point(1)
+                            .import_sync_file(std::os::fd::AsFd::as_fd(&fd))
+                    })
+                    .is_ok()
+            })
+            .unwrap_or(false);
     }
     support.device = Some(device);
     support
 }
 
 impl State {
-    /// Advertise `wp_linux_drm_syncobj_manager_v1` (version 1, as Mutter)
-    /// when `support` passes Mutter's checks; timelines import on its
-    /// device. Returns whether the global exists. Once only.
-    pub fn enable_explicit_sync(&mut self, support: SyncobjSupport) -> bool {
+    /// Advertise `wp_linux_drm_syncobj_manager_v1` only after probing the
+    /// actual DMA-BUF backend renderer and its native device, as Mutter.
+    pub(crate) fn enable_explicit_sync(&mut self) -> bool {
         if self.protocols.syncobj.is_some() {
             return true;
         }
+        let Some(backend) = self.protocols.dmabuf_backend.as_ref() else {
+            eprintln!("tuna-compositor: explicit sync disabled: no DMA-BUF renderer");
+            return false;
+        };
+        let support = {
+            let mut renderer = backend.renderer();
+            probe(&mut renderer)
+        };
         if let Err(reason) = support.verdict() {
             eprintln!("tuna-compositor: explicit sync disabled: {reason}");
             return false;
@@ -198,12 +215,17 @@ struct PendingAcquires(Mutex<Vec<DrmSyncPointBlocker>>);
 fn acquire_failure(state: &State, surface: &WlSurface, message: String) {
     reject_pending_commit(surface);
     if let Some(client) = surface.client() {
-        client.kill(&state.dh, smithay::reexports::wayland_server::backend::protocol::ProtocolError {
-            code: smithay::reexports::wayland_server::protocol::wl_display::Error::Implementation as u32,
-            object_id: 1,
-            object_interface: "wl_display".into(),
-            message,
-        });
+        client.kill(
+            &state.dh,
+            smithay::reexports::wayland_server::backend::protocol::ProtocolError {
+                code:
+                    smithay::reexports::wayland_server::protocol::wl_display::Error::Implementation
+                        as u32,
+                object_id: 1,
+                object_interface: "wl_display".into(),
+                message,
+            },
+        );
     }
 }
 
@@ -215,11 +237,23 @@ pub(crate) fn hold_until_acquired(state: &mut State, surface: &WlSurface) {
         return;
     }
     let acquire = with_states(surface, |states| {
-        states.data_map.insert_if_missing_threadsafe(PendingAcquires::default);
-        let mut waits = states.data_map.get::<PendingAcquires>().unwrap().0.lock().unwrap();
+        states
+            .data_map
+            .insert_if_missing_threadsafe(PendingAcquires::default);
+        let mut waits = states
+            .data_map
+            .get::<PendingAcquires>()
+            .unwrap()
+            .0
+            .lock()
+            .unwrap();
         waits.retain(|wait| wait.state() == BlockerState::Pending);
         if matches!(
-            states.cached_state.get::<SurfaceAttributes>().pending().buffer,
+            states
+                .cached_state
+                .get::<SurfaceAttributes>()
+                .pending()
+                .buffer,
             Some(BufferAssignment::Removed)
         ) {
             for wait in waits.drain(..) {
@@ -243,7 +277,14 @@ pub(crate) fn hold_until_acquired(state: &mut State, surface: &WlSurface) {
     match acquire.generate_blocker() {
         Ok((blocker, source)) => {
             with_states(surface, |states| {
-                states.data_map.get::<PendingAcquires>().unwrap().0.lock().unwrap().push(blocker.clone());
+                states
+                    .data_map
+                    .get::<PendingAcquires>()
+                    .unwrap()
+                    .0
+                    .lock()
+                    .unwrap()
+                    .push(blocker.clone());
             });
             add_blocker(surface, blocker);
             state
@@ -251,7 +292,11 @@ pub(crate) fn hold_until_acquired(state: &mut State, surface: &WlSurface) {
                 .acquire_waits
                 .push((source, surface.downgrade()));
         }
-        Err(err) => acquire_failure(state, surface, format!("Cannot wait for explicit-sync acquire: {err}")),
+        Err(err) => acquire_failure(
+            state,
+            surface,
+            format!("Cannot wait for explicit-sync acquire: {err}"),
+        ),
     }
 }
 
@@ -286,7 +331,10 @@ impl AcquireWaits {
             }) {
                 Ok(token) => self.watching.push((id, token, watched, blocker)),
                 Err(err) => {
-                    eprintln!("tuna-compositor: explicit sync: watch acquire point: {}", err.error);
+                    eprintln!(
+                        "tuna-compositor: explicit sync: watch acquire point: {}",
+                        err.error
+                    );
                     drop(err);
                     failed.push(watched);
                 }
@@ -312,7 +360,11 @@ impl AcquireWaits {
 /// unacquired transaction or leave it waiting without an event source.
 pub(crate) fn acquire_watch_failed(state: &mut State, surface: &Weak<WlSurface>) {
     if let Ok(surface) = surface.upgrade() {
-        acquire_failure(state, &surface, "Cannot register explicit-sync acquire wait".into());
+        acquire_failure(
+            state,
+            &surface,
+            "Cannot register explicit-sync acquire wait".into(),
+        );
     }
     acquired(state, surface);
 }
@@ -321,12 +373,24 @@ pub(crate) fn acquire_watch_failed(state: &mut State, surface: &Weak<WlSurface>)
 pub(crate) fn acquired(state: &mut State, surface: &Weak<WlSurface>) {
     if let Ok(surface) = surface.upgrade() {
         let cancelled = with_states(&surface, |states| {
-            states.data_map.get::<PendingAcquires>().is_some_and(|waits| {
-                waits.0.lock().unwrap().iter().any(|wait| wait.state() == BlockerState::Cancelled)
-            })
+            states
+                .data_map
+                .get::<PendingAcquires>()
+                .is_some_and(|waits| {
+                    waits
+                        .0
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|wait| wait.state() == BlockerState::Cancelled)
+                })
         });
         if cancelled {
-            acquire_failure(state, &surface, "Explicit-sync acquire device was invalidated".into());
+            acquire_failure(
+                state,
+                &surface,
+                "Explicit-sync acquire device was invalidated".into(),
+            );
         }
     }
     if let Some(client) = surface.upgrade().ok().and_then(|s| s.client()) {

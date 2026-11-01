@@ -1,5 +1,6 @@
-/* Native linux-drm-syncobj + dmabuf-feedback consumer. No fabricated DRM fd,
- * CPU-only buffer, software stand-in, capability override or retry path.
+/* Native linux-drm-syncobj + dmabuf-feedback consumer. Every successful DMA-BUF
+ * uses real DRM/GBM; a regular memfd is only an explicitly rejected negative.
+ * No software stand-in, capability override or retry path.
  * Build with scripts/tuna-explicit-sync-build. Run the proof driver against an
  * already-running owned native compositor and a timeline-capable render node.
  * --checkpoints pauses at JSON checkpoints for independent display capture. */
@@ -63,6 +64,9 @@ static struct wl_shm *shm;
 static struct xdg_wm_base *wm;
 static struct wp_presentation *presentation;
 static struct zwp_linux_dmabuf_v1 *dmabuf;
+static struct zwp_linux_dmabuf_v1 *legacy_dmabuf;
+static struct format legacy_formats[MAX_FORMATS];
+static size_t legacy_count;
 static struct wp_linux_drm_syncobj_manager_v1 *sync_manager;
 static struct wl_surface *surface;
 static struct wp_linux_drm_syncobj_surface_v1 *sync_surface;
@@ -194,6 +198,19 @@ static void clock_id(void *data, struct wp_presentation *proxy, uint32_t id) {
 static const struct wp_presentation_listener clock_listener = { .clock_id = clock_id };
 static void buffer_release(void *data, struct wl_buffer *proxy) { (void)data; (void)proxy; }
 static const struct wl_buffer_listener buffer_listener = { .release = buffer_release };
+static void legacy_format(void *data, struct zwp_linux_dmabuf_v1 *proxy, uint32_t format) {
+    (void)data; (void)format;
+    REQUIRE(wl_proxy_get_version((struct wl_proxy *)proxy) == 3, "v5 sent a deprecated format event");
+}
+static void legacy_modifier(void *data, struct zwp_linux_dmabuf_v1 *proxy, uint32_t format, uint32_t hi, uint32_t lo) {
+    (void)data;
+    REQUIRE(wl_proxy_get_version((struct wl_proxy *)proxy) == 3, "v5 sent a deprecated modifier event");
+    REQUIRE(legacy_count < MAX_FORMATS, "legacy modifier offer overflow");
+    legacy_formats[legacy_count++] = (struct format){ .fourcc = format, .modifier = ((uint64_t)hi << 32) | lo };
+}
+static const struct zwp_linux_dmabuf_v1_listener dmabuf_listener = {
+    .format = legacy_format, .modifier = legacy_modifier,
+};
 static void global(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
     (void)data;
     if (!strcmp(interface, "wl_compositor")) compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 4);
@@ -207,9 +224,12 @@ static void global(void *data, struct wl_registry *registry, uint32_t name, cons
         presentation = wl_registry_bind(registry, name, &wp_presentation_interface, 1);
         wp_presentation_add_listener(presentation, &clock_listener, NULL);
     }
-    else if (!strcmp(interface, "zwp_linux_dmabuf_v1") && version >= 4)
-        dmabuf = wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface, 4);
-    else if (!strcmp(interface, "wp_linux_drm_syncobj_manager_v1")) {
+    else if (!strcmp(interface, "zwp_linux_dmabuf_v1") && version >= 5) {
+        dmabuf = wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface, 5);
+        legacy_dmabuf = wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface, 3);
+        zwp_linux_dmabuf_v1_add_listener(dmabuf, &dmabuf_listener, NULL);
+        zwp_linux_dmabuf_v1_add_listener(legacy_dmabuf, &dmabuf_listener, NULL);
+    } else if (!strcmp(interface, "wp_linux_drm_syncobj_manager_v1")) {
         REQUIRE(version == 1, "unexpected syncobj global version");
         sync_manager = wl_registry_bind(registry, name, &wp_linux_drm_syncobj_manager_v1_interface, 1);
     }
@@ -252,11 +272,16 @@ static bool default_offers(struct format format) {
             defaults.offers[i].format.modifier == format.modifier) return true;
     return false;
 }
+static bool legacy_offers(struct format format) {
+    for (size_t i = 0; i < legacy_count; ++i)
+        if (legacy_formats[i].fourcc == format.fourcc && legacy_formats[i].modifier == format.modifier) return true;
+    return false;
+}
 static struct format choose_format(struct buffer *buffer) {
     REQUIRE(same_device(defaults.main) && same_device(local.main), "feedback main device differs from named render node");
     for (size_t i = 0; i < local.count; ++i) {
         struct format f = local.offers[i].format;
-        if (!same_device(local.offers[i].target) || !default_offers(f) ||
+        if (!same_device(local.offers[i].target) || !default_offers(f) || !legacy_offers(f) ||
             (f.fourcc != DRM_FORMAT_ARGB8888 && f.fourcc != DRM_FORMAT_XRGB8888)) continue;
         struct gbm_bo *bo = f.modifier == DRM_FORMAT_MOD_INVALID
             ? gbm_bo_create(gbm, SIDE, SIDE, f.fourcc, GBM_BO_USE_RENDERING)
@@ -267,7 +292,7 @@ static struct format choose_format(struct buffer *buffer) {
     }
     fail("no allocatable common advertised surface/default ARGB/XRGB modifier"); return (struct format){0};
 }
-static void buffer_new(struct buffer *b, struct format format) {
+static void buffer_new(struct buffer *b, struct format format, struct zwp_linux_dmabuf_v1 *manager) {
     if (!b->bo) b->bo = format.modifier == DRM_FORMAT_MOD_INVALID
         ? gbm_bo_create(gbm, SIDE, SIDE, format.fourcc, GBM_BO_USE_RENDERING)
         : gbm_bo_create_with_modifiers2(gbm, SIDE, SIDE, format.fourcc, &format.modifier, 1, GBM_BO_USE_RENDERING);
@@ -275,7 +300,7 @@ static void buffer_new(struct buffer *b, struct format format) {
     printf("{\"event\":\"allocated-dmabuf\",\"fourcc\":%u,\"offered_modifier\":%" PRIu64 ",\"allocated_modifier\":%" PRIu64 "}\n",
            format.fourcc, format.modifier, gbm_bo_get_modifier(b->bo));
     unsigned count = gbm_bo_get_plane_count(b->bo); REQUIRE(count > 0 && count <= 4, "dmabuf plane count");
-    struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(dmabuf);
+    struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(manager);
     const EGLint plane_fd[4] = { EGL_DMA_BUF_PLANE0_FD_EXT, EGL_DMA_BUF_PLANE1_FD_EXT, EGL_DMA_BUF_PLANE2_FD_EXT, EGL_DMA_BUF_PLANE3_FD_EXT };
     const EGLint plane_offset[4] = { EGL_DMA_BUF_PLANE0_OFFSET_EXT, EGL_DMA_BUF_PLANE1_OFFSET_EXT, EGL_DMA_BUF_PLANE2_OFFSET_EXT, EGL_DMA_BUF_PLANE3_OFFSET_EXT };
     const EGLint plane_pitch[4] = { EGL_DMA_BUF_PLANE0_PITCH_EXT, EGL_DMA_BUF_PLANE1_PITCH_EXT, EGL_DMA_BUF_PLANE2_PITCH_EXT, EGL_DMA_BUF_PLANE3_PITCH_EXT };
@@ -306,6 +331,46 @@ static void buffer_new(struct buffer *b, struct format format) {
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, b->rb);
     REQUIRE(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE, "dmabuf render target");
     timeline_new(&b->acquire, &b->acquire_wl); timeline_new(&b->release, &b->release_wl);
+}
+
+struct rejected_import { bool done, failed, created; };
+static void rejected_created(void *data, struct zwp_linux_buffer_params_v1 *params, struct wl_buffer *buffer) {
+    (void)params;
+    struct rejected_import *result = data;
+    result->created = true; result->done = true;
+    wl_buffer_destroy(buffer);
+}
+static void rejected_failed(void *data, struct zwp_linux_buffer_params_v1 *params) {
+    (void)params;
+    struct rejected_import *result = data;
+    result->failed = true; result->done = true;
+}
+static const struct zwp_linux_buffer_params_v1_listener rejected_listener = {
+    .created = rejected_created, .failed = rejected_failed,
+};
+
+/* Match an actual accepted allocation's plane metadata, changing only its
+ * backing FD to a regular file. Basic bounds checks must not masquerade as
+ * proof that this FD can be imported by the compositor's renderer. */
+static struct zwp_linux_buffer_params_v1 *regular_fd_params(struct buffer *accepted, struct format format) {
+    unsigned count = gbm_bo_get_plane_count(accepted->bo);
+    REQUIRE(count > 0 && count <= 4, "actual allocation plane metadata");
+    uint64_t bytes = 0;
+    for (unsigned p = 0; p < count; ++p) {
+        uint64_t end = gbm_bo_get_offset(accepted->bo, p) +
+            (uint64_t)gbm_bo_get_stride_for_plane(accepted->bo, p) * SIDE;
+        if (end > bytes) bytes = end;
+    }
+    int fd = memfd_create("not-a-dmabuf-negative-control", MFD_CLOEXEC);
+    REQUIRE(fd >= 0 && bytes > 0 && bytes <= INT64_MAX && ftruncate(fd, (off_t)bytes) == 0,
+            "regular FD with otherwise-valid plane bounds");
+    struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(dmabuf);
+    for (unsigned p = 0; p < count; ++p) {
+        zwp_linux_buffer_params_v1_add(params, fd, p, gbm_bo_get_offset(accepted->bo, p),
+            gbm_bo_get_stride_for_plane(accepted->bo, p), format.modifier >> 32, format.modifier);
+    }
+    close(fd);
+    return params;
 }
 static int paint(struct buffer *b, unsigned r, unsigned g, unsigned blue, const char *name) {
     glBindFramebuffer(GL_FRAMEBUFFER, b->fb); glViewport(0, 0, SIDE, SIDE);
@@ -409,6 +474,8 @@ static void initialize(const char *device_path) {
     zwp_linux_dmabuf_feedback_v1_add_listener(df, &feedback_listener, &defaults);
     zwp_linux_dmabuf_feedback_v1_add_listener(sf, &feedback_listener, &local);
     REQUIRE(dispatch_for(DEADLINE_MS, &defaults.done) && dispatch_for(DEADLINE_MS, &local.done), "default/surface feedback did not complete");
+    REQUIRE(wl_display_roundtrip(display) >= 0 && legacy_count > 0, "v3 legacy modifier announcements absent");
+    printf("{\"event\":\"dmabuf-negotiation\",\"feedback_version\":5,\"legacy_version\":3,\"legacy_modifiers\":%zu,\"v5_deprecated_events\":0}\n", legacy_count);
     printf("{\"event\":\"feedback\",\"default_main_device\":%ju,\"surface_main_device\":%ju,\"default_formats\":%zu,\"surface_formats\":%zu}\n", (uintmax_t)defaults.main, (uintmax_t)local.main, defaults.count, local.count);
     for (size_t i = 0; i < local.count; ++i) printf("{\"event\":\"surface-tranche-format\",\"target_device\":%ju,\"flags\":%u,\"fourcc\":%u,\"modifier\":%" PRIu64 "}\n", (uintmax_t)local.offers[i].target, local.offers[i].flags, local.offers[i].format.fourcc, local.offers[i].format.modifier);
     zwp_linux_dmabuf_feedback_v1_destroy(df); zwp_linux_dmabuf_feedback_v1_destroy(sf); wl_registry_destroy(registry);
@@ -425,9 +492,70 @@ int main(int argc, char **argv) {
     REQUIRE(device && artifacts, "device and artifacts are required"); setvbuf(stdout, NULL, _IOLBF, 0);
     initialize(device); struct buffer a = {0}, b = {0}; struct format format = choose_format(&a);
     printf("{\"event\":\"selected-format\",\"fourcc\":%u,\"modifier\":%" PRIu64 "}\n", format.fourcc, format.modifier);
-    buffer_new(&a, format);
+    buffer_new(&a, format, !strcmp(scenario, "legacy-v3") ? legacy_dmabuf : dmabuf);
     if (strcmp(scenario, "ordering")) {
         const char *interface = "wp_linux_drm_syncobj_surface_v1"; uint32_t error = 0;
+        if (!strcmp(scenario, "mixed-modifiers-v5") || !strcmp(scenario, "mixed-modifiers-v3")) {
+            REQUIRE(wl_display_roundtrip(display) >= 0, "actual offered DMA-BUF import prerequisite");
+            bool modern = !strcmp(scenario, "mixed-modifiers-v5");
+            struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(modern ? dmabuf : legacy_dmabuf);
+            int fd = gbm_bo_get_fd_for_plane(a.bo, 0); REQUIRE(fd >= 0, "actual DMA-BUF modifier boundary FD");
+            uint64_t different = format.modifier ^ UINT64_C(1);
+            uint32_t stride = gbm_bo_get_stride_for_plane(a.bo, 0);
+            zwp_linux_buffer_params_v1_add(params, fd, 0, 0, stride, format.modifier >> 32, format.modifier);
+            zwp_linux_buffer_params_v1_add(params, fd, 1, 0, stride, different >> 32, different); close(fd);
+            if (modern) expect_error("zwp_linux_buffer_params_v1", ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_FORMAT);
+            else {
+                REQUIRE(wl_display_roundtrip(display) >= 0, "v3 must not impose the v5 add-time modifier equality rule");
+                zwp_linux_buffer_params_v1_destroy(params);
+                REQUIRE(wl_display_roundtrip(display) >= 0, "cancelled v3 params leave the connection usable");
+            }
+            printf("{\"event\":\"case-pass\",\"case\":\"%s\"}\n", scenario); return 0;
+        }
+        if (!strcmp(scenario, "legacy-v3")) {
+            xdg = xdg_wm_base_get_xdg_surface(wm, surface);
+            xdg_surface_add_listener(xdg, &xdg_listener, NULL); toplevel = xdg_surface_get_toplevel(xdg);
+            xdg_toplevel_add_listener(toplevel, &top_listener, NULL);
+            xdg_toplevel_set_app_id(toplevel, "org.tuna.LegacyDmabufProof");
+            xdg_toplevel_set_title(toplevel, "Actual negotiated v3 DMA-BUF");
+            xdg_toplevel_set_min_size(toplevel, SIDE, SIDE); xdg_toplevel_set_max_size(toplevel, SIDE, SIDE);
+            wl_surface_commit(surface); REQUIRE(dispatch_for(DEADLINE_MS, &configured), "v3 initial xdg configure");
+            acquire_from_gpu(&a, 1, paint(&a, 240, 16, 16, "legacy-v3-red"));
+            struct presented presented_v3 = {0}; commit_buffer(&a, 1, 2, &presented_v3);
+            await_presented(&presented_v3, "legacy-v3");
+            wl_surface_attach(surface, NULL, 0, 0); wl_surface_commit(surface);
+            REQUIRE(wl_display_roundtrip(display) >= 0, "unmap negotiated v3 DMA-BUF");
+            wait_release(&a, 2);
+            printf("{\"event\":\"case-pass\",\"case\":\"%s\"}\n", scenario); return 0;
+        }
+        if (!strcmp(scenario, "failed-dmabuf")) {
+            REQUIRE(wl_display_roundtrip(display) >= 0, "actual offered DMA-BUF import prerequisite");
+            struct rejected_import result = {0};
+            struct zwp_linux_buffer_params_v1 *params = regular_fd_params(&a, format);
+            zwp_linux_buffer_params_v1_add_listener(params, &rejected_listener, &result);
+            zwp_linux_buffer_params_v1_create(params, SIDE, SIDE, format.fourcc, 0);
+            REQUIRE(dispatch_for(DEADLINE_MS, &result.done) && result.failed && !result.created,
+                    "fallible regular-FD import must fail without creating a wl_buffer");
+            zwp_linux_buffer_params_v1_destroy(params);
+            REQUIRE(wl_display_roundtrip(display) >= 0, "failed import must leave the real connection usable");
+            printf("{\"event\":\"case-pass\",\"case\":\"%s\"}\n", scenario); return 0;
+        }
+        if (!strcmp(scenario, "destroy-sync-shm")) {
+            wl_surface_commit(surface);
+            REQUIRE(wl_display_roundtrip(display) >= 0, "bufferless explicit-sync commit");
+            wp_linux_drm_syncobj_surface_v1_destroy(sync_surface); sync_surface = NULL;
+            int fd = memfd_create("actual-shm-after-sync-destroy", MFD_CLOEXEC);
+            REQUIRE(fd >= 0 && ftruncate(fd, SIDE * SIDE * 4) == 0, "actual SHM allocation after sync teardown");
+            struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, SIDE * SIDE * 4); close(fd);
+            struct wl_buffer *ordinary = wl_shm_pool_create_buffer(pool, 0, SIDE, SIDE, SIDE * 4, WL_SHM_FORMAT_ARGB8888);
+            wl_buffer_add_listener(ordinary, &buffer_listener, NULL);
+            wl_shm_pool_destroy(pool);
+            wl_surface_attach(surface, ordinary, 0, 0); wl_surface_commit(surface);
+            REQUIRE(wl_display_roundtrip(display) >= 0, "SHM is legal after explicit-sync surface destruction");
+            sync_surface = wp_linux_drm_syncobj_manager_v1_get_surface(sync_manager, surface);
+            REQUIRE(wl_display_roundtrip(display) >= 0, "new explicit-sync object is legal after prior destruction");
+            printf("{\"event\":\"case-pass\",\"case\":\"%s\"}\n", scenario); return 0;
+        }
         if (!strcmp(scenario, "destroy") || !strcmp(scenario, "unmap") || !strcmp(scenario, "disconnect")) {
             commit_buffer(&a, 1, 2, NULL); REQUIRE(wl_display_roundtrip(display) >= 0 && !released(&a, 2), "unsignalled buffer was released before discard");
             if (!strcmp(scenario, "destroy")) { wl_surface_destroy(surface); surface = NULL; }
@@ -436,6 +564,14 @@ int main(int argc, char **argv) {
             if (display) REQUIRE(wl_display_roundtrip(display) >= 0, "discard request dispatch");
             wait_release(&a, 2);
             printf("{\"event\":\"case-pass\",\"case\":\"%s\"}\n", scenario); return 0;
+        } else if (!strcmp(scenario, "invalid-dmabuf") || !strcmp(scenario, "invalid-dmabuf-destroy-params")) {
+            REQUIRE(wl_display_roundtrip(display) >= 0, "actual offered DMA-BUF import prerequisite");
+            struct zwp_linux_buffer_params_v1 *params = regular_fd_params(&a, format);
+            struct wl_buffer *invalid = zwp_linux_buffer_params_v1_create_immed(params, SIDE, SIDE, format.fourcc, 0);
+            wl_buffer_add_listener(invalid, &buffer_listener, NULL);
+            if (!strcmp(scenario, "invalid-dmabuf-destroy-params")) zwp_linux_buffer_params_v1_destroy(params);
+            interface = "zwp_linux_buffer_params_v1";
+            error = ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_WL_BUFFER;
         } else if (!strcmp(scenario, "surface-exists")) {
             wp_linux_drm_syncobj_manager_v1_get_surface(sync_manager, surface); interface = "wp_linux_drm_syncobj_manager_v1"; error = 0;
         } else if (!strcmp(scenario, "invalid-timeline")) {
@@ -462,7 +598,7 @@ int main(int argc, char **argv) {
         REQUIRE(wl_display_flush(display) >= 0, "flush invalid request"); expect_error(interface, error);
         printf("{\"event\":\"case-pass\",\"case\":\"%s\"}\n", scenario); return 0;
     }
-    buffer_new(&b, format); xdg = xdg_wm_base_get_xdg_surface(wm, surface);
+    buffer_new(&b, format, dmabuf); xdg = xdg_wm_base_get_xdg_surface(wm, surface);
     xdg_surface_add_listener(xdg, &xdg_listener, NULL); toplevel = xdg_surface_get_toplevel(xdg);
     xdg_toplevel_add_listener(toplevel, &top_listener, NULL);
     xdg_toplevel_set_title(toplevel, "Tuna actual explicit-sync dmabuf proof");

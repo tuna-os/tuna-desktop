@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 use std::os::unix::net::UnixStream;
 
-use smithay::backend::allocator::{Fourcc, Modifier};
 use tuna_compositor::windows::WindowManager;
 use tuna_compositor::TestCompositor;
 use wayland_client::{
@@ -32,10 +31,6 @@ use wayland_protocols::xdg::{
     },
 };
 
-use wayland_protocols::wp::linux_dmabuf::zv1::client::{
-    zwp_linux_dmabuf_feedback_v1::{self, ZwpLinuxDmabufFeedbackV1},
-    zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
-};
 use wayland_protocols::xdg::toplevel_icon::v1::client::{
     xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1, xdg_toplevel_icon_v1::XdgToplevelIconV1,
 };
@@ -339,246 +334,16 @@ fn advertised_globals_match_the_golden_list() {
 }
 
 #[test]
-fn dmabuf_is_advertised_only_with_renderer_formats() {
+fn native_buffer_protocols_are_absent_without_a_renderer() {
     let mut comp = TestCompositor::new();
     let mut manager = comp.window_manager();
-    comp.state.enable_dmabuf(Vec::new(), Some(RENDER_NODE));
     let mut peer = connect(&mut comp);
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert!(!peer.client.globals.contains_key("zwp_linux_dmabuf_v1"));
-
-    // No renderer device: version 3, as Mutter without
-    // EGL_EXT_device_drm(_render_node).
-    comp.state.enable_dmabuf(
-        vec![smithay::backend::allocator::Format {
-            code: Fourcc::Argb8888,
-            modifier: Modifier::Linear,
-        }],
-        None,
-    );
-    let mut late = connect(&mut comp);
-    pump(&mut comp, &mut manager, &mut [&mut late]);
-    assert_eq!(
-        late.client.globals.get("zwp_linux_dmabuf_v1").map(|g| g.1),
-        Some(3)
-    );
-}
-
-/// A stand-in import device: the gate only needs one to exist (timeline
-/// imports on it fail).
-#[cfg(feature = "drm")]
-fn stand_in_drm_device() -> smithay::backend::drm::DrmDeviceFd {
-    let file = std::fs::File::open("/dev/null").unwrap();
-    smithay::backend::drm::DrmDeviceFd::new(smithay::utils::DeviceFd::from(
-        std::os::fd::OwnedFd::from(file),
-    ))
-}
-
-/// Mutter creates wp_linux_drm_syncobj_manager_v1 only when every check of
-/// `meta_wayland_drm_syncobj_manager_new` passes; one missing capability
-/// keeps it away, all of them give version 1.
-#[cfg(feature = "drm")]
-#[test]
-fn explicit_sync_is_advertised_only_with_timeline_syncobj() {
-    use tuna_compositor::explicit_sync::SyncobjSupport;
-    let capable = || SyncobjSupport {
-        native_fence_sync: true,
-        device_path: Some("/dev/dri/renderD128".into()),
-        device: Some(stand_in_drm_device()),
-        timeline: true,
-        eventfd: true,
-        gpu_release_fence: true,
-    };
-    type Without = fn(&mut SyncobjSupport);
-    let lacking: [(&str, Without); 6] = [
-        ("native fence sync", |s| s.native_fence_sync = false),
-        ("EGL device node", |s| s.device_path = None),
-        ("opened device", |s| s.device = None),
-        ("timeline syncobj", |s| s.timeline = false),
-        ("syncobj eventfd", |s| s.eventfd = false),
-        ("GPU release fence", |s| s.gpu_release_fence = false),
-    ];
-    for (missing, without) in lacking {
-        let mut comp = TestCompositor::new();
-        let mut manager = comp.window_manager();
-        let mut support = capable();
-        without(&mut support);
-        assert!(!comp.state.enable_explicit_sync(support), "{missing}");
-        let mut peer = connect(&mut comp);
-        pump(&mut comp, &mut manager, &mut [&mut peer]);
-        assert!(
-            !peer
-                .client
-                .globals
-                .contains_key("wp_linux_drm_syncobj_manager_v1"),
-            "advertised without {missing}"
-        );
-    }
-
-    let mut comp = TestCompositor::new();
-    let mut manager = comp.window_manager();
-    assert!(comp.state.enable_explicit_sync(capable()));
-    let mut peer = connect(&mut comp);
-    pump(&mut comp, &mut manager, &mut [&mut peer]);
-    assert_eq!(
-        peer.client
-            .globals
-            .get("wp_linux_drm_syncobj_manager_v1")
-            .map(|g| g.1),
-        Some(1)
-    );
-}
-
-/// renderD128's device number (major 226, minor 128).
-const RENDER_NODE: u64 = (226 << 8) | 128;
-
-#[derive(Default)]
-struct Feedback {
-    main_device: Option<Vec<u8>>,
-    table: Option<(std::os::fd::OwnedFd, u32)>,
-    target_device: Option<Vec<u8>>,
-    indices: Vec<u16>,
-    tranche_flags: Option<u32>,
-    tranches: usize,
-    done: bool,
-}
-
-#[derive(Default)]
-struct DmabufClient {
-    globals: BTreeMap<String, (u32, u32)>,
-    feedback: Feedback,
-}
-
-impl Dispatch<WlRegistry, ()> for DmabufClient {
-    fn event(
-        state: &mut Self,
-        _: &WlRegistry,
-        event: wl_registry::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        {
-            state.globals.insert(interface, (name, version));
-        }
-    }
-}
-
-impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for DmabufClient {
-    fn event(
-        state: &mut Self,
-        _: &ZwpLinuxDmabufFeedbackV1,
-        event: zwp_linux_dmabuf_feedback_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        use zwp_linux_dmabuf_feedback_v1::Event;
-        let feedback = &mut state.feedback;
-        match event {
-            Event::MainDevice { device } => feedback.main_device = Some(device),
-            Event::FormatTable { fd, size } => feedback.table = Some((fd, size)),
-            Event::TrancheTargetDevice { device } => feedback.target_device = Some(device),
-            Event::TrancheFormats { indices } => feedback.indices.extend(
-                indices
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|i| u16::from_ne_bytes(*i)),
-            ),
-            Event::TrancheFlags { flags } => {
-                feedback.tranche_flags = Some(match flags {
-                    wayland_client::WEnum::Value(flags) => flags.bits(),
-                    wayland_client::WEnum::Unknown(bits) => bits,
-                })
-            }
-            Event::TrancheDone => feedback.tranches += 1,
-            Event::Done => feedback.done = true,
-            _ => {}
-        }
-    }
-}
-
-wayland_client::delegate_noop!(DmabufClient: ignore ZwpLinuxDmabufV1);
-
-#[test]
-fn dmabuf_feedback_names_the_renderer_device_like_mutter() {
-    // Mutter 51 (meta-wayland-dma-buf.c): with the EGL device's node the
-    // global is version 5 and the default feedback names that device
-    // with one tranche of the renderer's formats.
-    let mut comp = TestCompositor::new();
-    let formats = [
-        (Fourcc::Argb8888, Modifier::Linear),
-        (Fourcc::Xrgb8888, Modifier::Invalid),
-    ];
-    comp.state.enable_dmabuf(
-        formats
-            .iter()
-            .map(|&(code, modifier)| smithay::backend::allocator::Format { code, modifier })
-            .collect(),
-        Some(RENDER_NODE),
-    );
-    let (server, stream) = UnixStream::pair().unwrap();
-    comp.add_client(server);
-    let conn = Connection::from_socket(stream).unwrap();
-    let mut queue = conn.new_event_queue();
-    let qh = queue.handle();
-    let registry = conn.display().get_registry(&qh, ());
-    let mut client = DmabufClient::default();
-    let mut pump = |client: &mut DmabufClient, comp: &mut TestCompositor| {
-        for _ in 0..10 {
-            queue.flush().unwrap();
-            comp.pump();
-            if let Some(guard) = queue.prepare_read() {
-                let _ = guard.read();
-            }
-            queue.dispatch_pending(client).unwrap();
-        }
-    };
-    pump(&mut client, &mut comp);
-    let (name, version) = client.globals["zwp_linux_dmabuf_v1"];
-    assert_eq!(version, 5);
-    let dmabuf: ZwpLinuxDmabufV1 = registry.bind(name, 5, &qh, ());
-    let _feedback = dmabuf.get_default_feedback(&qh, ());
-    pump(&mut client, &mut comp);
-
-    let feedback = &client.feedback;
-    assert!(feedback.done);
-    let device = RENDER_NODE.to_ne_bytes().to_vec();
-    assert_eq!(feedback.main_device.as_ref(), Some(&device));
-    assert_eq!(feedback.target_device.as_ref(), Some(&device));
-    assert_eq!(feedback.tranches, 1);
-    assert_eq!(feedback.tranche_flags, Some(0), "no scanout tranche");
-
-    // The format table: 16-byte (format, padding, modifier) entries the
-    // tranche indexes.
-    let (fd, size) = feedback.table.as_ref().expect("format table");
-    let mut table = vec![0u8; *size as usize];
-    let mut file = std::fs::File::from(fd.try_clone().unwrap());
-    std::io::Read::read_exact(&mut file, &mut table).unwrap();
-    let mut offered: Vec<(u32, u64)> = feedback
-        .indices
-        .iter()
-        .map(|&i| {
-            let entry = &table[usize::from(i) * 16..usize::from(i) * 16 + 16];
-            (
-                u32::from_ne_bytes(entry[0..4].try_into().unwrap()),
-                u64::from_ne_bytes(entry[8..16].try_into().unwrap()),
-            )
-        })
-        .collect();
-    offered.sort();
-    let mut expected: Vec<(u32, u64)> = formats
-        .iter()
-        .map(|&(code, modifier)| (code as u32, u64::from(modifier)))
-        .collect();
-    expected.sort();
-    assert_eq!(offered, expected);
+    assert!(!peer
+        .client
+        .globals
+        .contains_key("wp_linux_drm_syncobj_manager_v1"));
 }
 
 #[test]
@@ -601,23 +366,28 @@ fn wl_fixes_destroys_a_registry_and_its_announcements_stop() {
     fixes.destroy_registry(&dropped);
     pump(&mut comp, &mut manager, &mut [&mut peer]);
 
-    // A new global: the renderer reports dmabuf formats.
-    let dmabuf = "zwp_linux_dmabuf_v1";
-    assert!(!peer.client.tagged[&1].iter().any(|i| i == dmabuf));
-    comp.state.enable_dmabuf(
-        vec![smithay::backend::allocator::Format {
-            code: Fourcc::Argb8888,
-            modifier: Modifier::Linear,
-        }],
-        None,
+    // A new real Wayland global, independent of any renderer capability.
+    let interface = "wl_output";
+    assert!(!peer.client.tagged[&1].iter().any(|i| i == interface));
+    let output = smithay::output::Output::new(
+        "registry-lifecycle-output".into(),
+        smithay::output::PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: smithay::output::Subpixel::Unknown,
+            make: "Tuna".into(),
+            model: "Registry lifecycle".into(),
+        },
     );
+    let _global = output.create_global::<tuna_compositor::State>(&comp.display.handle());
+    comp.state
+        .add_output("registry-lifecycle-output", Some(output), 1280, 800);
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert!(
-        peer.client.tagged[&1].iter().any(|i| i == dmabuf),
+        peer.client.tagged[&1].iter().any(|i| i == interface),
         "a live registry hears the new global"
     );
     assert!(
-        !peer.client.tagged[&2].iter().any(|i| i == dmabuf),
+        !peer.client.tagged[&2].iter().any(|i| i == interface),
         "a destroyed registry hears nothing more"
     );
     fixes.destroy();

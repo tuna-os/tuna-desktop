@@ -22,7 +22,9 @@ import time
 ROOT = Path('/run/tuna-explicit-sync-proof')
 CLIENT = Path('/usr/libexec/tuna-explicit-sync-client')
 CASES = ('ordering', 'destroy', 'unmap', 'disconnect', 'surface-exists', 'invalid-timeline',
-         'no-surface', 'unsupported-buffer', 'no-buffer', 'no-acquire', 'no-release', 'conflicting-points')
+         'no-surface', 'unsupported-buffer', 'no-buffer', 'no-acquire', 'no-release', 'conflicting-points',
+         'failed-dmabuf', 'invalid-dmabuf', 'invalid-dmabuf-destroy-params', 'destroy-sync-shm',
+         'legacy-v3', 'mixed-modifiers-v3', 'mixed-modifiers-v5')
 CHECKPOINTS = {'red-presented', 'green-blocked', 'green-presented', 'blue-presented'}
 
 
@@ -73,7 +75,7 @@ def run(nonce, compositor_pid, start_ticks, uid, expected_hash):
         raise RuntimeError('one actual session Wayland socket and DRM render node required')
     account = pwd.getpwuid(uid)
     env = {name: value for name, value in os.environ.items()
-           if name not in {'WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'DISPLAY', 'LIBGL_ALWAYS_SOFTWARE',
+           if name not in {'WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'WAYLAND_DEBUG', 'DISPLAY', 'LIBGL_ALWAYS_SOFTWARE',
                            'GALLIUM_DRIVER', 'LD_PRELOAD', 'LD_LIBRARY_PATH'}}
     env.update(XDG_RUNTIME_DIR=str(runtime), WAYLAND_DISPLAY=sockets[0].name,
                HOME=account.pw_dir, USER=account.pw_name, LOGNAME=account.pw_name)

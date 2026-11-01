@@ -339,7 +339,9 @@ impl LeaseDevice {
                     &self.debug_names,
                 )
             {
-                return Err(format!("connector {handle:?} is no longer eligible for lease"));
+                return Err(format!(
+                    "connector {handle:?} is no longer eligible for lease"
+                ));
             }
             let possible: Vec<crtc::Handle> = info
                 .encoders()

@@ -951,7 +951,10 @@ fn foreign_rejects_non_toplevel_exports_and_children() {
             let error = pump_to_error(&mut comp, &mut manager, &mut portal);
             assert_eq!(error.object_interface, interface);
             assert_eq!(error.code, 0);
-            assert!(app._conn.protocol_error().is_none(), "other clients stay live");
+            assert!(
+                app._conn.protocol_error().is_none(),
+                "other clients stay live"
+            );
         }
     }
 }
@@ -1300,10 +1303,7 @@ fn background_blur_regions_apply_on_commit_like_mutter() {
     let (surface, _toplevel) = window(&mut peer, "terminal");
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     // A headless protocol fixture has no admitted scene framebuffer.
-    assert_eq!(
-        peer.client.background_effects,
-        Some(0)
-    );
+    assert_eq!(peer.client.background_effects, Some(0));
     let server = comp.state.toplevels()[0].wl_surface().clone();
     assert_eq!(blur_area(&server), None, "no effect until asked");
 
@@ -1818,7 +1818,10 @@ fn toplevel_drag_ends_cleanly_when_its_toplevel_drag_or_source_goes() {
     assert_eq!(loc_of(&manager, second_id), (550, 340), "stops where it is");
     button(&mut manager, &mut comp, false);
     pump(&mut comp, &mut manager, &mut [&mut d.peer]);
-    assert_eq!(d.peer.client.drag.source, ["dnd_drop_performed", "cancelled"]);
+    assert_eq!(
+        d.peer.client.drag.source,
+        ["dnd_drop_performed", "cancelled"]
+    );
     assert!(d.peer._conn.protocol_error().is_none());
 
     // A second drag whose source goes away mid-drag.
@@ -1909,7 +1912,12 @@ fn toplevel_drag_attached_before_start_survives_idle_reconciliation() {
     pump(&mut comp, &mut manager, &mut [&mut d.peer]);
     motion(&mut manager, &mut comp, 900.0, 500.0);
     assert_eq!(loc_of(&manager, id), start, "attach alone must not move");
-    motion(&mut manager, &mut comp, f64::from(start.0 + 20), f64::from(start.1 + 30));
+    motion(
+        &mut manager,
+        &mut comp,
+        f64::from(start.0 + 20),
+        f64::from(start.1 + 30),
+    );
     button(&mut manager, &mut comp, true);
     pump(&mut comp, &mut manager, &mut [&mut d.peer]);
     let serial = *d.peer.client.drag.presses.last().unwrap();
@@ -1934,8 +1942,12 @@ fn toplevel_drag_unmap_detaches_live_role_and_reattach_uses_new_offset() {
     let (tabs, role, id) = shown_window(&mut comp, &mut manager, &mut d, "tabs");
     let start = loc_of(&manager, id);
     let (_source, drag) = start_drag(
-        &mut comp, &mut manager, &mut d, &tabs,
-        f64::from(start.0 + 20), f64::from(start.1 + 30),
+        &mut comp,
+        &mut manager,
+        &mut d,
+        &tabs,
+        f64::from(start.0 + 20),
+        f64::from(start.1 + 30),
     );
     drag.attach(&role, 20, 30);
     pump(&mut comp, &mut manager, &mut [&mut d.peer]);
@@ -1945,7 +1957,11 @@ fn toplevel_drag_unmap_detaches_live_role_and_reattach_uses_new_offset() {
     tabs.commit();
     pump(&mut comp, &mut manager, &mut [&mut d.peer]);
     motion(&mut manager, &mut comp, 800.0, 450.0);
-    assert_eq!(loc_of(&manager, id), (680, 370), "unmap detaches a live role");
+    assert_eq!(
+        loc_of(&manager, id),
+        (680, 370),
+        "unmap detaches a live role"
+    );
     // A different live role may be attached without destroying the old role.
     let (detached, detached_role) = window(&mut d.peer, "detached");
     pump(&mut comp, &mut manager, &mut [&mut d.peer]);
@@ -1967,24 +1983,39 @@ fn toplevel_drag_owner_exit_releases_grab_without_stealing_next_clients_drag() {
     let (tabs, role, id) = shown_window(&mut comp, &mut manager, &mut owner, "owner");
     let start = loc_of(&manager, id);
     let (_source, drag) = start_drag(
-        &mut comp, &mut manager, &mut owner, &tabs,
-        f64::from(start.0 + 20), f64::from(start.1 + 30),
+        &mut comp,
+        &mut manager,
+        &mut owner,
+        &tabs,
+        f64::from(start.0 + 20),
+        f64::from(start.1 + 30),
     );
     drag.attach(&role, 20, 30);
     pump(&mut comp, &mut manager, &mut [&mut owner.peer]);
-    owner.peer.socket.shutdown(std::net::Shutdown::Both).unwrap();
+    owner
+        .peer
+        .socket
+        .shutdown(std::net::Shutdown::Both)
+        .unwrap();
     for _ in 0..ROUNDS {
         comp.pump();
         manager.reconcile(&mut comp.state);
     }
-    assert!(!comp.client_dnd_active(), "owner exit must retire the native grab without input");
+    assert!(
+        !comp.client_dnd_active(),
+        "owner exit must retire the native grab without input"
+    );
     button(&mut manager, &mut comp, false);
     let mut next = dragger(&mut comp, &mut manager);
     let (tabs, role, id) = shown_window(&mut comp, &mut manager, &mut next, "next");
     let start = loc_of(&manager, id);
     let (_source, drag) = start_drag(
-        &mut comp, &mut manager, &mut next, &tabs,
-        f64::from(start.0 + 20), f64::from(start.1 + 30),
+        &mut comp,
+        &mut manager,
+        &mut next,
+        &tabs,
+        f64::from(start.0 + 20),
+        f64::from(start.1 + 30),
     );
     drag.attach(&role, 20, 30);
     pump(&mut comp, &mut manager, &mut [&mut next.peer]);
@@ -2001,7 +2032,12 @@ fn toplevel_drag_rejects_stale_and_other_clients_press_serials() {
         let mut owner = dragger(&mut comp, &mut manager);
         let (tabs, owner_role, id) = shown_window(&mut comp, &mut manager, &mut owner, "owner");
         let start = loc_of(&manager, id);
-        motion(&mut manager, &mut comp, f64::from(start.0 + 20), f64::from(start.1 + 30));
+        motion(
+            &mut manager,
+            &mut comp,
+            f64::from(start.0 + 20),
+            f64::from(start.1 + 30),
+        );
         button(&mut manager, &mut comp, true);
         pump(&mut comp, &mut manager, &mut [&mut owner.peer]);
         let serial = *owner.peer.client.drag.presses.last().unwrap();
@@ -2023,7 +2059,9 @@ fn toplevel_drag_rejects_stale_and_other_clients_press_serials() {
         source.set_actions(DndAction::Move);
         let drag = requester.drags.get_xdg_toplevel_drag(&source, &qh, ());
         drag.attach(&role, 20, 30);
-        requester.device.start_drag(Some(&source), &origin, None, serial);
+        requester
+            .device
+            .start_drag(Some(&source), &origin, None, serial);
         pump(&mut comp, &mut manager, &mut [&mut requester.peer]);
         assert!(!comp.client_dnd_active());
         motion(&mut manager, &mut comp, 700.0, 400.0);
@@ -2053,7 +2091,11 @@ fn toplevel_drag_foreign_source_and_toplevel_ids_are_client_local() {
         let len = bytes.len() as u32;
         bytes.resize(bytes.len().next_multiple_of(4), 0);
         let mut body = vec![global, len];
-        body.extend(bytes.chunks_exact(4).map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap())));
+        body.extend(
+            bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap())),
+        );
         body.extend([version, id]);
         request(stream, 2, 0, &body);
     }
@@ -2070,15 +2112,38 @@ fn toplevel_drag_foreign_source_and_toplevel_ids_are_client_local() {
         let (_, role, id) = shown_window(&mut comp, &mut manager, &mut victim, "victim");
         let start = loc_of(&manager, id);
         let (server, mut wire) = UnixStream::pair().unwrap();
-        wire.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        wire.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
         comp.add_client(server);
         request(&mut wire, 1, 1, &[2]); // wl_display.get_registry
-        bind(&mut wire, victim.peer.client.globals["xdg_toplevel_drag_manager_v1"].0,
-             "xdg_toplevel_drag_manager_v1", 1, 3);
-        bind(&mut wire, victim.peer.client.globals["wl_data_device_manager"].0,
-             "wl_data_device_manager", 3, 4);
+        bind(
+            &mut wire,
+            victim.peer.client.globals["xdg_toplevel_drag_manager_v1"].0,
+            "xdg_toplevel_drag_manager_v1",
+            1,
+            3,
+        );
+        bind(
+            &mut wire,
+            victim.peer.client.globals["wl_data_device_manager"].0,
+            "wl_data_device_manager",
+            3,
+            4,
+        );
         request(&mut wire, 4, 0, &[5]); // create_data_source
-        request(&mut wire, 3, 1, &[6, if foreign_source { source.id().protocol_id() } else { 5 }]);
+        request(
+            &mut wire,
+            3,
+            1,
+            &[
+                6,
+                if foreign_source {
+                    source.id().protocol_id()
+                } else {
+                    5
+                },
+            ],
+        );
         if !foreign_source {
             request(&mut wire, 6, 1, &[role.id().protocol_id(), 0, 0]);
         }
@@ -2101,7 +2166,10 @@ fn toplevel_drag_foreign_source_and_toplevel_ids_are_client_local() {
             }
             offset += length;
         }
-        assert!(invalid_object, "a foreign object ID must disconnect only the attacker");
+        assert!(
+            invalid_object,
+            "a foreign object ID must disconnect only the attacker"
+        );
         assert!(!comp.client_dnd_active());
         motion(&mut manager, &mut comp, 700.0, 400.0);
         assert_eq!(loc_of(&manager, id), start);
@@ -2117,7 +2185,12 @@ fn toplevel_drag_manager_destroy_preserves_children_and_native_dnd_remains_indep
         let mut d = dragger(&mut comp, &mut manager);
         let (tabs, role, id) = shown_window(&mut comp, &mut manager, &mut d, "tabs");
         let start = loc_of(&manager, id);
-        motion(&mut manager, &mut comp, f64::from(start.0 + 20), f64::from(start.1 + 30));
+        motion(
+            &mut manager,
+            &mut comp,
+            f64::from(start.0 + 20),
+            f64::from(start.1 + 30),
+        );
         button(&mut manager, &mut comp, true);
         pump(&mut comp, &mut manager, &mut [&mut d.peer]);
         let serial = *d.peer.client.drag.presses.last().unwrap();
@@ -2134,14 +2207,23 @@ fn toplevel_drag_manager_destroy_preserves_children_and_native_dnd_remains_indep
         pump(&mut comp, &mut manager, &mut [&mut d.peer]);
         assert!(comp.client_dnd_active());
         motion(&mut manager, &mut comp, 700.0, 400.0);
-        assert_eq!(loc_of(&manager, id), if toplevel_drag { (680, 370) } else { start });
+        assert_eq!(
+            loc_of(&manager, id),
+            if toplevel_drag { (680, 370) } else { start }
+        );
         // Empty desktop: plain DND must not inherit the extension's
         // unconditional dnd_drop_performed behavior.
         motion(&mut manager, &mut comp, 1200.0, 700.0);
         button(&mut manager, &mut comp, false);
         pump(&mut comp, &mut manager, &mut [&mut d.peer]);
-        assert_eq!(d.peer.client.drag.source,
-                   if toplevel_drag { vec!["dnd_drop_performed", "cancelled"] } else { vec!["cancelled"] });
+        assert_eq!(
+            d.peer.client.drag.source,
+            if toplevel_drag {
+                vec!["dnd_drop_performed", "cancelled"]
+            } else {
+                vec!["cancelled"]
+            }
+        );
         assert!(!comp.client_dnd_active());
         assert!(d.peer._conn.protocol_error().is_none());
     }
@@ -2155,8 +2237,14 @@ fn toplevel_drag_destroy_before_source_end_is_ongoing_drag() {
         let (tabs, _, id) = shown_window(&mut comp, &mut manager, &mut d, "tabs");
         let start = loc_of(&manager, id);
         let (_source, drag) = if started {
-            start_drag(&mut comp, &mut manager, &mut d, &tabs,
-                       f64::from(start.0 + 20), f64::from(start.1 + 30))
+            start_drag(
+                &mut comp,
+                &mut manager,
+                &mut d,
+                &tabs,
+                f64::from(start.0 + 20),
+                f64::from(start.1 + 30),
+            )
         } else {
             let qh = d.peer.qh();
             let source = d.data.create_data_source(&qh, ());
@@ -2164,8 +2252,13 @@ fn toplevel_drag_destroy_before_source_end_is_ongoing_drag() {
             (source, drag)
         };
         drag.destroy();
-        assert_eq!(protocol_error(&mut comp, &mut manager, &mut d.peer),
-                   Some(("xdg_toplevel_drag_v1".into(), xdg_toplevel_drag_v1::Error::OngoingDrag as u32)));
+        assert_eq!(
+            protocol_error(&mut comp, &mut manager, &mut d.peer),
+            Some((
+                "xdg_toplevel_drag_v1".into(),
+                xdg_toplevel_drag_v1::Error::OngoingDrag as u32
+            ))
+        );
     }
 }
 
@@ -2186,8 +2279,13 @@ fn toplevel_drag_selection_sources_are_rejected_in_both_request_orders() {
             let _drag = d.drags.get_xdg_toplevel_drag(&source, &qh, ());
             d.device.set_selection(Some(&source), 0);
         }
-        assert_eq!(protocol_error(&mut comp, &mut manager, &mut d.peer),
-                   Some(("xdg_toplevel_drag_manager_v1".into(), xdg_toplevel_drag_manager_v1::Error::InvalidSource as u32)));
+        assert_eq!(
+            protocol_error(&mut comp, &mut manager, &mut d.peer),
+            Some((
+                "xdg_toplevel_drag_manager_v1".into(),
+                xdg_toplevel_drag_manager_v1::Error::InvalidSource as u32
+            ))
+        );
     }
 }
 
@@ -2197,7 +2295,12 @@ fn toplevel_drag_must_be_created_before_native_drag_starts() {
     let mut d = dragger(&mut comp, &mut manager);
     let (tabs, _, id) = shown_window(&mut comp, &mut manager, &mut d, "tabs");
     let start = loc_of(&manager, id);
-    motion(&mut manager, &mut comp, f64::from(start.0 + 20), f64::from(start.1 + 30));
+    motion(
+        &mut manager,
+        &mut comp,
+        f64::from(start.0 + 20),
+        f64::from(start.1 + 30),
+    );
     button(&mut manager, &mut comp, true);
     pump(&mut comp, &mut manager, &mut [&mut d.peer]);
     let serial = *d.peer.client.drag.presses.last().unwrap();
@@ -2209,8 +2312,13 @@ fn toplevel_drag_must_be_created_before_native_drag_starts() {
     pump(&mut comp, &mut manager, &mut [&mut d.peer]);
     assert!(comp.client_dnd_active());
     let _drag = d.drags.get_xdg_toplevel_drag(&source, &qh, ());
-    assert_eq!(protocol_error(&mut comp, &mut manager, &mut d.peer),
-               Some(("xdg_toplevel_drag_manager_v1".into(), xdg_toplevel_drag_manager_v1::Error::InvalidSource as u32)));
+    assert_eq!(
+        protocol_error(&mut comp, &mut manager, &mut d.peer),
+        Some((
+            "xdg_toplevel_drag_manager_v1".into(),
+            xdg_toplevel_drag_manager_v1::Error::InvalidSource as u32
+        ))
+    );
 }
 
 #[test]
@@ -2224,8 +2332,10 @@ fn toplevel_drag_factory_destruction_does_not_allow_repurposing_its_source() {
     d.drags.destroy();
     d.device.set_selection(Some(&source), 0);
     let error = protocol_error(&mut comp, &mut manager, &mut d.peer);
-    assert_eq!(error.map(|(_, code)| code),
-               Some(xdg_toplevel_drag_manager_v1::Error::InvalidSource as u32));
+    assert_eq!(
+        error.map(|(_, code)| code),
+        Some(xdg_toplevel_drag_manager_v1::Error::InvalidSource as u32)
+    );
 }
 
 #[test]
@@ -2234,16 +2344,30 @@ fn toplevel_drag_source_stays_dnd_only_after_cancel_and_child_destruction() {
     let mut d = dragger(&mut comp, &mut manager);
     let (tabs, _, id) = shown_window(&mut comp, &mut manager, &mut d, "tabs");
     let start = loc_of(&manager, id);
-    let (source, drag) = start_drag(&mut comp, &mut manager, &mut d, &tabs,
-                                  f64::from(start.0 + 20), f64::from(start.1 + 30));
+    let (source, drag) = start_drag(
+        &mut comp,
+        &mut manager,
+        &mut d,
+        &tabs,
+        f64::from(start.0 + 20),
+        f64::from(start.1 + 30),
+    );
     assert!(comp.cancel_client_dnd(50));
     pump(&mut comp, &mut manager, &mut [&mut d.peer]);
     drag.destroy();
     pump(&mut comp, &mut manager, &mut [&mut d.peer]);
-    assert!(d.peer._conn.protocol_error().is_none(), "destroy after cancellation is allowed");
+    assert!(
+        d.peer._conn.protocol_error().is_none(),
+        "destroy after cancellation is allowed"
+    );
     d.device.set_selection(Some(&source), 0);
-    assert_eq!(protocol_error(&mut comp, &mut manager, &mut d.peer),
-               Some(("xdg_toplevel_drag_manager_v1".into(), xdg_toplevel_drag_manager_v1::Error::InvalidSource as u32)));
+    assert_eq!(
+        protocol_error(&mut comp, &mut manager, &mut d.peer),
+        Some((
+            "xdg_toplevel_drag_manager_v1".into(),
+            xdg_toplevel_drag_manager_v1::Error::InvalidSource as u32
+        ))
+    );
 }
 
 #[test]
@@ -2255,8 +2379,14 @@ fn toplevel_drag_scroll_windows_follow_dnd_and_escape_restores_column_membership
     let (tabs, role, id) = shown_window(&mut comp, &mut manager, &mut d, "tabs");
     assert_eq!(manager.window_layout(id), Some(WindowLayout::Strip));
     let start = loc_of(&manager, id);
-    let (_source, drag) = start_drag(&mut comp, &mut manager, &mut d, &tabs,
-                                   f64::from(start.0 + 20), f64::from(start.1 + 30));
+    let (_source, drag) = start_drag(
+        &mut comp,
+        &mut manager,
+        &mut d,
+        &tabs,
+        f64::from(start.0 + 20),
+        f64::from(start.1 + 30),
+    );
     drag.attach(&role, 20, 30);
     pump(&mut comp, &mut manager, &mut [&mut d.peer]);
     assert_eq!(manager.window_layout(id), Some(WindowLayout::Floating));
@@ -2269,224 +2399,4 @@ fn toplevel_drag_scroll_windows_follow_dnd_and_escape_restores_column_membership
     button(&mut manager, &mut comp, false);
     pump(&mut comp, &mut manager, &mut [&mut d.peer]);
     assert!(d.peer._conn.protocol_error().is_none());
-}
-
-/// linux-drm-syncobj v1 (explicit sync) against a stand-in import device:
-/// the errors Mutter's `meta-wayland-linux-drm-syncobj.c` raises that need
-/// no timeline syncobj. The checks that do (acquire and release points on
-/// a dmabuf, `no_buffer`, `conflicting_points`) are unit tests of the same
-/// check in `explicit_sync.rs`; a timeline-capable GPU runs them for real.
-#[cfg(feature = "drm")]
-mod explicit_sync {
-    use super::*;
-    use std::os::fd::AsFd;
-    use wayland_client::protocol::{wl_buffer::WlBuffer, wl_shm::WlShm, wl_shm_pool::WlShmPool};
-    use wayland_protocols::wp::linux_dmabuf::zv1::client::{
-        zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
-        zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
-    };
-    use wayland_protocols::wp::linux_drm_syncobj::v1::client::{
-        wp_linux_drm_syncobj_manager_v1::{self, WpLinuxDrmSyncobjManagerV1},
-        wp_linux_drm_syncobj_surface_v1::{self, WpLinuxDrmSyncobjSurfaceV1},
-        wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1,
-    };
-
-    wayland_client::delegate_noop!(Client: ignore WpLinuxDrmSyncobjManagerV1);
-    wayland_client::delegate_noop!(Client: ignore WpLinuxDrmSyncobjSurfaceV1);
-    wayland_client::delegate_noop!(Client: ignore WpLinuxDrmSyncobjTimelineV1);
-    wayland_client::delegate_noop!(Client: ignore ZwpLinuxDmabufV1);
-    wayland_client::delegate_noop!(Client: ignore ZwpLinuxBufferParamsV1);
-    wayland_client::delegate_noop!(Client: ignore WlShm);
-    wayland_client::delegate_noop!(Client: ignore WlShmPool);
-    wayland_client::delegate_noop!(Client: ignore WlBuffer);
-
-    const SIZE: i32 = 4;
-
-    /// A compositor offering linux-dmabuf and explicit sync, timelines
-    /// importing on /dev/null (so every import fails).
-    fn compositor() -> (TestCompositor, WindowManager) {
-        let (mut comp, manager) = super::compositor();
-        comp.state.enable_dmabuf(
-            vec![smithay::backend::allocator::Format {
-                code: smithay::backend::allocator::Fourcc::Argb8888,
-                modifier: smithay::backend::allocator::Modifier::Linear,
-            }],
-            None,
-        );
-        let null = std::fs::File::open("/dev/null").unwrap();
-        let device = smithay::backend::drm::DrmDeviceFd::new(smithay::utils::DeviceFd::from(
-            std::os::fd::OwnedFd::from(null),
-        ));
-        assert!(comp
-            .state
-            .enable_explicit_sync(tuna_compositor::explicit_sync::SyncobjSupport {
-                native_fence_sync: true,
-                device_path: Some("/dev/null".into()),
-                device: Some(device),
-                timeline: true,
-                eventfd: true,
-                gpu_release_fence: true,
-            }));
-        (comp, manager)
-    }
-
-    /// Like [`super::pump`], but a client may be disconnected on the way.
-    fn pump(comp: &mut TestCompositor, manager: &mut WindowManager, peer: &mut Peer) {
-        for _ in 0..ROUNDS {
-            let _ = peer.queue.flush();
-            comp.pump();
-            manager.reconcile(&mut comp.state);
-            comp.pump();
-            if let Some(guard) = peer.queue.prepare_read() {
-                let _ = guard.read();
-            }
-            let _ = peer.queue.dispatch_pending(&mut peer.client);
-        }
-    }
-
-    /// The protocol error the compositor posted, as `(interface, code)`.
-    fn error(peer: &Peer) -> Option<(String, u32)> {
-        peer._conn
-            .protocol_error()
-            .map(|e| (e.object_interface, e.code))
-    }
-
-    /// A fresh client's surface and the syncobj manager.
-    fn syncobj_client(
-        comp: &mut TestCompositor,
-        manager: &mut WindowManager,
-    ) -> (Peer, WpLinuxDrmSyncobjManagerV1, WlSurface) {
-        let peer = connect(comp, manager);
-        let compositor: WlCompositor = peer.bind(6);
-        let surface = compositor.create_surface(&peer.qh(), ());
-        let syncobj: WpLinuxDrmSyncobjManagerV1 = peer.bind(1);
-        (peer, syncobj, surface)
-    }
-
-    fn shm_buffer(peer: &Peer) -> WlBuffer {
-        let file = tempfile::tempfile().unwrap();
-        file.set_len((SIZE * SIZE * 4) as u64).unwrap();
-        let shm: WlShm = peer.bind(1);
-        let pool = shm.create_pool(file.as_fd(), SIZE * SIZE * 4, &peer.qh(), ());
-        pool.create_buffer(
-            0,
-            SIZE,
-            SIZE,
-            SIZE * 4,
-            wayland_client::protocol::wl_shm::Format::Argb8888,
-            &peer.qh(),
-            (),
-        )
-    }
-
-    /// A linux-dmabuf buffer (linear ARGB8888; a memfd stands in for the
-    /// dmabuf, which only drawing would notice).
-    fn dmabuf_buffer(peer: &Peer) -> WlBuffer {
-        let file = tempfile::tempfile().unwrap();
-        file.set_len((SIZE * SIZE * 4) as u64).unwrap();
-        let dmabuf: ZwpLinuxDmabufV1 = peer.bind(3);
-        let params = dmabuf.create_params(&peer.qh(), ());
-        params.add(file.as_fd(), 0, 0, (SIZE * 4) as u32, 0, 0);
-        params.create_immed(
-            SIZE,
-            SIZE,
-            smithay::backend::allocator::Fourcc::Argb8888 as u32,
-            zwp_linux_buffer_params_v1::Flags::empty(),
-            &peer.qh(),
-            (),
-        )
-    }
-
-    #[test]
-    fn a_second_syncobj_surface_is_surface_exists() {
-        let (mut comp, mut manager) = compositor();
-        let (mut peer, syncobj, surface) = syncobj_client(&mut comp, &mut manager);
-        syncobj.get_surface(&surface, &peer.qh(), ());
-        pump(&mut comp, &mut manager, &mut peer);
-        assert_eq!(error(&peer), None);
-        syncobj.get_surface(&surface, &peer.qh(), ());
-        pump(&mut comp, &mut manager, &mut peer);
-        assert_eq!(
-            error(&peer),
-            Some((
-                "wp_linux_drm_syncobj_manager_v1".into(),
-                wp_linux_drm_syncobj_manager_v1::Error::SurfaceExists as u32
-            ))
-        );
-    }
-
-    #[test]
-    fn a_timeline_that_does_not_import_is_invalid_timeline() {
-        let (mut comp, mut manager) = compositor();
-        let (mut peer, syncobj, _surface) = syncobj_client(&mut comp, &mut manager);
-        let not_a_syncobj = tempfile::tempfile().unwrap();
-        syncobj.import_timeline(not_a_syncobj.as_fd(), &peer.qh(), ());
-        pump(&mut comp, &mut manager, &mut peer);
-        assert_eq!(
-            error(&peer),
-            Some((
-                "wp_linux_drm_syncobj_manager_v1".into(),
-                wp_linux_drm_syncobj_manager_v1::Error::InvalidTimeline as u32
-            ))
-        );
-    }
-
-    /// Mutter checks the buffer type before the points: shm under explicit
-    /// sync is `unsupported_buffer` even with no points set.
-    #[test]
-    fn an_shm_buffer_under_explicit_sync_is_unsupported_buffer() {
-        let (mut comp, mut manager) = compositor();
-        let (mut peer, syncobj, surface) = syncobj_client(&mut comp, &mut manager);
-        let _sync = syncobj.get_surface(&surface, &peer.qh(), ());
-        surface.attach(Some(&shm_buffer(&peer)), 0, 0);
-        surface.commit();
-        pump(&mut comp, &mut manager, &mut peer);
-        assert_eq!(
-            error(&peer),
-            Some((
-                "wp_linux_drm_syncobj_surface_v1".into(),
-                wp_linux_drm_syncobj_surface_v1::Error::UnsupportedBuffer as u32
-            ))
-        );
-    }
-
-    /// A dmabuf attached without an acquire point is `no_acquire_point`
-    /// (the spec's "if and only if"; upstream Smithay let it through).
-    #[test]
-    fn a_dmabuf_without_points_is_no_acquire_point() {
-        let (mut comp, mut manager) = compositor();
-        let (mut peer, syncobj, surface) = syncobj_client(&mut comp, &mut manager);
-        let _sync = syncobj.get_surface(&surface, &peer.qh(), ());
-        surface.attach(Some(&dmabuf_buffer(&peer)), 0, 0);
-        surface.commit();
-        pump(&mut comp, &mut manager, &mut peer);
-        assert_eq!(
-            error(&peer),
-            Some((
-                "wp_linux_drm_syncobj_surface_v1".into(),
-                wp_linux_drm_syncobj_surface_v1::Error::NoAcquirePoint as u32
-            ))
-        );
-    }
-
-    /// Commits without a buffer or points are fine, and so is shm once the
-    /// syncobj surface is gone (Mutter forgets it with the object).
-    #[test]
-    fn bufferless_commits_and_shm_after_destroy_are_accepted() {
-        let (mut comp, mut manager) = compositor();
-        let (mut peer, syncobj, surface) = syncobj_client(&mut comp, &mut manager);
-        let sync = syncobj.get_surface(&surface, &peer.qh(), ());
-        surface.commit();
-        pump(&mut comp, &mut manager, &mut peer);
-        assert_eq!(error(&peer), None);
-        sync.destroy();
-        surface.attach(Some(&shm_buffer(&peer)), 0, 0);
-        surface.commit();
-        pump(&mut comp, &mut manager, &mut peer);
-        assert_eq!(error(&peer), None);
-        // A second syncobj surface is allowed once the first is destroyed.
-        let _again = syncobj.get_surface(&surface, &peer.qh(), ());
-        pump(&mut comp, &mut manager, &mut peer);
-        assert_eq!(error(&peer), None);
-    }
 }

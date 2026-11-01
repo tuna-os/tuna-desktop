@@ -29,7 +29,7 @@ impl Runtime {
                 let properties = output.physical_properties();
                 let (size, refresh) = match output.current_mode() {
                     Some(mode) => (mode.size, mode.refresh),
-                    None => (backend.window_size(), 60_000),
+                    None => (backend.borrow().window_size(), 60_000),
                 };
                 DisplayState {
                     serial: 0,
@@ -65,7 +65,7 @@ impl Runtime {
                 }
             }
             #[cfg(feature = "drm")]
-            Backend::Drm(drm) => drm.display_state(),
+            Backend::Drm(drm) => drm.borrow().display_state(),
         }
     }
 
@@ -80,15 +80,19 @@ impl Runtime {
                     .primary_output()
                     .and_then(|o| o.current_mode())
                     .map(|m| m.size)
-                    .unwrap_or_else(|| backend.window_size());
+                    .unwrap_or_else(|| backend.borrow().window_size());
                 (size.w, size.h, self.scale.to_bits())
             }
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => {
-                if drm.take_mode_reverted() {
+                let (reverted, generation) = {
+                    let mut drm = drm.borrow_mut();
+                    (drm.take_mode_reverted(), drm.layout_generation())
+                };
+                if reverted {
                     self.display_published = None;
                 }
-                (0, 0, drm.layout_generation())
+                (0, 0, generation)
             }
         };
         #[cfg(feature = "drm")]
@@ -115,10 +119,15 @@ impl Runtime {
         else {
             return;
         };
-        if let Some(value) = settings.poll() {
-            drm.privacy_setting_read(value);
-        }
-        if let Some(value) = drm.take_privacy_setting_write() {
+        let setting = settings.poll();
+        let write = {
+            let mut drm = drm.borrow_mut();
+            if let Some(value) = setting {
+                drm.privacy_setting_read(value);
+            }
+            drm.take_privacy_setting_write()
+        };
+        if let Some(value) = write {
             settings.write(value);
         }
     }
@@ -256,7 +265,7 @@ impl Runtime {
                         primary.transform
                     );
                 }
-                let size = backend.window_size();
+                let size = backend.borrow().window_size();
                 let (lw, lh) = logical_size(size.w, size.h, self.scale);
                 self.state.set_output_size(lw, lh);
                 // Anchored layer surfaces (the panel) follow the new
@@ -275,7 +284,7 @@ impl Runtime {
                             .effective(&layout.connector, enabled.transform);
                     }
                 }
-                drm.apply_layout(&layouts)?;
+                drm.borrow_mut().apply_layout(&layouts)?;
             }
         }
         for logical in &config.logical {
@@ -304,6 +313,7 @@ impl Runtime {
         // (connector, output, layout position, logical size)
         type Leader = (String, smithay::output::Output, (i32, i32), (i32, i32));
         let leaders: Vec<Leader> = drm
+            .borrow()
             .outputs
             .iter()
             .filter(|o| o.is_leader())
@@ -359,7 +369,7 @@ impl Runtime {
         let state = self.display_share.snapshot();
         #[cfg(feature = "drm")]
         let crtc_modes = match &self.backend {
-            Backend::Drm(drm) => drm.crtc_modes(),
+            Backend::Drm(drm) => drm.borrow().crtc_modes(),
             Backend::Winit(_) => Vec::new(),
         };
         #[cfg(not(feature = "drm"))]

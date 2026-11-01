@@ -51,9 +51,7 @@ impl WindowManager {
     /// Runs after new toplevels are mapped, before they are placed.
     pub(super) fn reconcile_toplevel_drag(&mut self, state: &mut State) {
         if state.protocols.toplevel_drag.retire_dead_source() {
-            state.cancel_client_dnd(
-                (crate::state::system_millis() & u64::from(u32::MAX)) as u32,
-            );
+            state.cancel_client_dnd((crate::state::system_millis() & u64::from(u32::MAX)) as u32);
         }
         self.end_finished_toplevel_drag(state);
         let Some((surface, offset, attachment)) = state.protocols.toplevel_drag.target() else {

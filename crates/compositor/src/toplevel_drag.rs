@@ -107,7 +107,9 @@ impl ToplevelDrags {
     }
 
     fn record_index(&self, resource: &XdgToplevelDragV1) -> Option<usize> {
-        self.records.iter().position(|r| r.resource.as_ref() == Some(resource))
+        self.records
+            .iter()
+            .position(|r| r.resource.as_ref() == Some(resource))
     }
 
     /// The toplevel drag of `source`, if it still has one.
@@ -124,7 +126,11 @@ impl ToplevelDrags {
         let source = self.dnd_source.as_ref().filter(|s| s.is_alive())?;
         let record = self.record_of(source)?;
         let dragged = record.live_dragged()?;
-        Some((dragged.wl_surface().clone(), record.offset, record.attachment))
+        Some((
+            dragged.wl_surface().clone(),
+            record.offset,
+            record.attachment,
+        ))
     }
 
     /// Called after Smithay applies each surface commit, not once per tick:
@@ -147,8 +153,13 @@ impl ToplevelDrags {
     pub(crate) fn retire_dead_source(&mut self) -> bool {
         // A destroyed drag still reserves its original live source for DND.
         // Once both resources are gone there is no association left to keep.
-        self.records.retain(|record| record.resource.is_some() || record.source.is_alive());
-        if !self.dnd_source.as_ref().is_some_and(|source| !source.is_alive()) {
+        self.records
+            .retain(|record| record.resource.is_some() || record.source.is_alive());
+        if !self
+            .dnd_source
+            .as_ref()
+            .is_some_and(|source| !source.is_alive())
+        {
             return false;
         }
         let source = self.dnd_source.take();
@@ -177,12 +188,15 @@ impl ToplevelDrags {
             return true;
         };
         if let Ok(client) = dh.get_client(source.id()) {
-            client.kill(dh, ProtocolError {
-                code: xdg_toplevel_drag_manager_v1::Error::InvalidSource as u32,
-                object_id: record.manager_id,
-                object_interface: "xdg_toplevel_drag_manager_v1".into(),
-                message: "toplevel drag data source cannot be used as a selection".into(),
-            });
+            client.kill(
+                dh,
+                ProtocolError {
+                    code: xdg_toplevel_drag_manager_v1::Error::InvalidSource as u32,
+                    object_id: record.manager_id,
+                    object_interface: "xdg_toplevel_drag_manager_v1".into(),
+                    message: "toplevel drag data source cannot be used as a selection".into(),
+                },
+            );
         }
         false
     }
@@ -204,11 +218,7 @@ impl ToplevelDrags {
         let Some(source) = self.dnd_source.take() else {
             return;
         };
-        let Some(record) = self
-            .records
-            .iter_mut()
-            .find(|r| r.source == source)
-        else {
+        let Some(record) = self.records.iter_mut().find(|r| r.source == source) else {
             return;
         };
         if let Some(dragged) = record.dragged.take().filter(|t| t.alive()) {
@@ -257,8 +267,10 @@ impl Dispatch<XdgToplevelDragManagerV1, ()> for State {
                 let drags = &mut state.protocols.toplevel_drag;
                 let resource = data_init.init(id, ());
                 let used = smithay::wayland::selection::data_device::with_source_metadata(
-                    &data_source, |metadata| metadata.used_for_selection || metadata.drag_started,
-                ).unwrap_or(true);
+                    &data_source,
+                    |metadata| metadata.used_for_selection || metadata.drag_started,
+                )
+                .unwrap_or(true);
                 if used || drags.record_of(&data_source).is_some() {
                     manager.post_error(
                         xdg_toplevel_drag_manager_v1::Error::InvalidSource,
@@ -328,7 +340,11 @@ impl Dispatch<XdgToplevelDragV1, ()> for State {
                 record.dragged = Some(surface);
             }
             xdg_toplevel_drag_v1::Request::Destroy => {
-                if state.protocols.toplevel_drag.records.iter()
+                if state
+                    .protocols
+                    .toplevel_drag
+                    .records
+                    .iter()
                     .find(|record| record.resource.as_ref() == Some(resource))
                     .is_some_and(|record| record.live_source().is_some())
                 {
@@ -344,7 +360,11 @@ impl Dispatch<XdgToplevelDragV1, ()> for State {
 
     fn destroyed(state: &mut Self, _client: ClientId, resource: &XdgToplevelDragV1, _data: &()) {
         // Keep the source's DND-only reservation until the source dies.
-        if let Some(record) = state.protocols.toplevel_drag.records.iter_mut()
+        if let Some(record) = state
+            .protocols
+            .toplevel_drag
+            .records
+            .iter_mut()
             .find(|record| record.resource.as_ref() == Some(resource))
         {
             record.resource = None;

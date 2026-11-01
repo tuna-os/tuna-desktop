@@ -13,7 +13,9 @@
 //! Layer-shell is served from [`State`](crate::State) (see [`crate::layer`])
 //! so the supervised panel attaches over this same display.
 
+use std::cell::{RefCell, RefMut};
 use std::ffi::OsString;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -262,11 +264,26 @@ pub fn has_host_display() -> bool {
         .any(|key| std::env::var_os(key).is_some_and(|v| !v.is_empty()))
 }
 
-/// The live display backend.
-enum Backend {
-    Winit(Box<winit::WinitGraphicsBackend<GlesRenderer>>),
+/// The live backend shared with synchronous protocol import callbacks.
+/// Rc replaces the old Box allocation; it does not add a second renderer,
+/// context or import cache. Guards never cross Wayland dispatch.
+#[derive(Clone)]
+pub(crate) enum Backend {
+    Winit(Rc<RefCell<winit::WinitGraphicsBackend<GlesRenderer>>>),
     #[cfg(feature = "drm")]
-    Drm(Box<crate::drm::DrmBackend>),
+    Drm(Rc<RefCell<crate::drm::DrmBackend>>),
+}
+
+impl Backend {
+    pub(crate) fn renderer(&self) -> RefMut<'_, GlesRenderer> {
+        match self {
+            Self::Winit(backend) => RefMut::map(backend.borrow_mut(), |backend| backend.renderer()),
+            #[cfg(feature = "drm")]
+            Self::Drm(backend) => {
+                RefMut::map(backend.borrow_mut(), |backend| &mut backend.renderer)
+            }
+        }
+    }
 }
 
 impl NestedSession {
@@ -988,6 +1005,7 @@ impl Runtime {
                             }
                         }
                         if let Backend::Drm(drm) = &mut rt.backend {
+                            let mut drm = drm.borrow_mut();
                             drm.on_session_event(event);
                         }
                         if active {
@@ -1023,7 +1041,7 @@ impl Runtime {
                 handle
                     .insert_source(sources.drm, |event, metadata, rt: &mut Runtime| {
                         let flip = match &mut rt.backend {
-                            Backend::Drm(drm) => drm.on_drm_event(event, metadata),
+                            Backend::Drm(drm) => drm.borrow_mut().on_drm_event(event, metadata),
                             Backend::Winit(_) => None,
                         };
                         if let Some(flip) = flip {
@@ -1062,6 +1080,7 @@ impl Runtime {
                         );
                         let inputs = match &mut rt.backend {
                             Backend::Drm(drm) => {
+                                let mut drm = drm.borrow_mut();
                                 drm.set_hot_corner_active(corners_active);
                                 drm.translate(event, &corner_layout)
                             }
@@ -1094,6 +1113,7 @@ impl Runtime {
                         // hotplug and tool changes.
                         let tablet_events = match &mut rt.backend {
                             Backend::Drm(drm) => {
+                                let mut drm = drm.borrow_mut();
                                 rt.tablet_settings
                                     .want(drm.tablet_settings_wanted(), Instant::now());
                                 drm.take_tablet_events()
@@ -1108,6 +1128,7 @@ impl Runtime {
                         // pointer stays put): the drawn cursor follows it.
                         let pos = rt.manager.pointer_pos();
                         if let Backend::Drm(drm) = &mut rt.backend {
+                            let mut drm = drm.borrow_mut();
                             drm.set_pointer(pos);
                         }
                     })
@@ -1120,13 +1141,14 @@ impl Runtime {
                             if let smithay::backend::udev::UdevEvent::Changed { device_id } = event
                             {
                                 if let Backend::Drm(drm) = &mut rt.backend {
+                                    let mut drm = drm.borrow_mut();
                                     drm.on_device_changed(device_id);
                                 }
                             }
                         })
                         .map_err(|e| RuntimeError::Loop(e.to_string()))?;
                 }
-                Some(Backend::Drm(Box::new(drm)))
+                Some(Backend::Drm(Rc::new(RefCell::new(drm))))
             }
             _ => None,
         };
@@ -1160,8 +1182,9 @@ impl Runtime {
         // scale from monitors.xml (#59).
         #[cfg(feature = "drm")]
         if let Some(Backend::Drm(drm)) = &backend {
-            if let Some(first) = drm.outputs.first() {
-                state.set_preferred_scale(first.scale);
+            let scale = drm.borrow().outputs.first().map(|output| output.scale);
+            if let Some(scale) = scale {
+                state.set_preferred_scale(scale);
             }
         }
         if backend.is_none() {
@@ -1211,7 +1234,7 @@ impl Runtime {
                         runtime.on_winit_event(event);
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
-                Backend::Winit(Box::new(backend))
+                Backend::Winit(Rc::new(RefCell::new(backend)))
             }
         };
         {
@@ -1262,30 +1285,11 @@ impl Runtime {
         // with feedback naming the renderer's device as Mutter's does.
         // Explicit sync follows when that renderer's device has timeline
         // syncobjs, on whichever backend, as Mutter decides it (#364).
-        let mut backend = backend;
         let mut state = state;
         {
-            use smithay::backend::renderer::ImportDma;
-            let (formats, main_device): (Vec<_>, _) = match &mut backend {
-                Backend::Winit(winit) => {
-                    let renderer = winit.renderer();
-                    (
-                        renderer.dmabuf_formats().into_iter().collect(),
-                        crate::protocols::renderer_main_device(renderer),
-                    )
-                }
-                #[cfg(feature = "drm")]
-                Backend::Drm(drm) => (
-                    drm.renderer.dmabuf_formats().into_iter().collect(),
-                    crate::protocols::renderer_main_device(&drm.renderer),
-                ),
-            };
-            state.enable_dmabuf(formats, main_device);
+            state.enable_dmabuf(backend.clone());
             #[cfg(feature = "drm")]
-            state.enable_explicit_sync(match &mut backend {
-                Backend::Winit(winit) => crate::explicit_sync::probe(winit.renderer()),
-                Backend::Drm(drm) => crate::explicit_sync::probe(&mut drm.renderer),
-            });
+            state.enable_explicit_sync();
         }
 
         // org.gnome.Mutter.ScreenCast and DisplayConfig (#61): screen
@@ -1305,10 +1309,14 @@ impl Runtime {
             Backend::Winit(_) => None,
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => {
-                color_share.set_gamma_sizes(drm.gamma_sizes());
+                let (gamma_sizes, monitors) = {
+                    let drm = drm.borrow();
+                    (drm.gamma_sizes(), drm.colord_monitors())
+                };
+                color_share.set_gamma_sizes(gamma_sizes);
                 Some(crate::color_manager::ColordClient::start(
                     color_share.clone(),
-                    drm.colord_monitors(),
+                    monitors,
                     crate::color_manager::Bus::System,
                     crate::color_manager::icc_directory(),
                 ))
@@ -1679,7 +1687,7 @@ impl Runtime {
                 // Pointer positions land in logical pixels.
                 let area = match &self.backend {
                     Backend::Winit(backend) => {
-                        let size = backend.window_size();
+                        let size = backend.borrow().window_size();
                         logical_size(size.w, size.h, self.scale).into()
                     }
                     #[cfg(feature = "drm")]
@@ -2513,7 +2521,7 @@ impl Runtime {
     fn input_device_states(&self) -> Vec<serde_json::Value> {
         #[cfg(feature = "drm")]
         if let Backend::Drm(drm) = &self.backend {
-            return drm.input_device_states();
+            return drm.borrow().input_device_states();
         }
         Vec::new()
     }
@@ -2823,7 +2831,7 @@ impl Runtime {
         doc["native_relative_motion_count"] = serde_json::json!((!self.is_locked())
             .then_some(match &self.backend {
                 #[cfg(feature = "drm")]
-                Backend::Drm(drm) => Some(drm.relative_motion_events()),
+                Backend::Drm(drm) => Some(drm.borrow().relative_motion_events()),
                 Backend::Winit(_) => None::<u64>,
             })
             .flatten());
@@ -2878,7 +2886,7 @@ impl Runtime {
         doc["input_devices"] = serde_json::Value::Array(self.input_device_states());
         #[cfg(feature = "drm")]
         if let Backend::Drm(drm) = &self.backend {
-            doc["tablets"] = drm.tablets_introspect();
+            doc["tablets"] = drm.borrow().tablets_introspect();
         }
         let doc = doc.to_string();
         if doc == self.state_last {
@@ -3019,14 +3027,10 @@ impl Runtime {
         let policy = crate::size_change::Policy::from_motion(self.input_settings.motion);
         let allowed = !self.control.overview_open() && self.shell_swipe.is_none();
         let now = self.animation_clock.now();
-        let renderer = match &mut self.backend {
-            Backend::Winit(backend) => backend.renderer(),
-            #[cfg(feature = "drm")]
-            Backend::Drm(drm) => &mut drm.renderer,
-        };
+        let mut renderer = self.backend.renderer();
         crate::size_change::step_frame(
             &mut self.manager,
-            renderer,
+            &mut *renderer,
             &self.state,
             now,
             policy,
@@ -3467,12 +3471,9 @@ impl Runtime {
             scale,
         };
         let wellbeing = self.wellbeing_effects.sample(self.animation_clock.now());
-        let renderer = match &mut self.backend {
-            Backend::Winit(backend) => backend.renderer(),
-            #[cfg(feature = "drm")]
-            Backend::Drm(drm) => &mut drm.renderer,
-        };
-        let color_effect = crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, None);
+        let mut renderer = self.backend.renderer();
+        let color_effect =
+            crate::wellbeing_effects::FrameColor::new(&mut renderer, wellbeing, None);
         // Surface-local origin such that the window geometry (inside any
         // client-side shadow) starts at the buffer's corner.
         let geo = crate::popup::window_geometry_loc(&surface);
@@ -3491,9 +3492,9 @@ impl Runtime {
                     Kind::Unspecified,
                 ));
             };
-        tree(renderer, &surface, origin);
+        tree(&mut renderer, &surface, origin);
         for popup in crate::popup::placed_popups(&surface, origin, true) {
-            tree(renderer, &popup.surface, popup.origin);
+            tree(&mut renderer, &popup.surface, popup.origin);
         }
         let elements = Scene::flat(crate::layer::front_to_back(elements));
         let buffer_size = (w, h).into();
@@ -3533,7 +3534,7 @@ impl Runtime {
     fn background_desktop(&self) -> [i32; 4] {
         match &self.backend {
             Backend::Winit(backend) => {
-                let size = backend.window_size();
+                let size = backend.borrow().window_size();
                 [
                     0,
                     0,
@@ -3543,6 +3544,7 @@ impl Runtime {
             }
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => {
+                let drm = drm.borrow();
                 let mut left = i32::MAX;
                 let mut top = i32::MAX;
                 let mut right = i32::MIN;
@@ -3639,37 +3641,44 @@ impl Runtime {
         let wellbeing = self.wellbeing_effects.sample(self.animation_clock.now());
         let zoom_inputs = self.magnifier_inputs();
         let zoom_now = self.animation_clock.now();
-        let (renderer, size, view, output_name) = match &mut self.backend {
+        let (mut renderer, size, view, output_name) = match &self.backend {
             Backend::Winit(backend) => {
+                let backend = backend.borrow_mut();
                 let size = backend.window_size();
                 let view = View {
                     offset: (0, 0),
                     scale: self.scale,
                 };
-                (backend.renderer(), size, view, "tuna-0".to_owned())
+                (
+                    RefMut::map(backend, |backend| backend.renderer()),
+                    size,
+                    view,
+                    "tuna-0".to_owned(),
+                )
             }
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => {
-                let crate::drm::DrmBackend {
-                    renderer, outputs, ..
-                } = &mut **drm;
+                let drm = drm.borrow_mut();
                 let out = match connector {
-                    Some(name) => outputs.iter().find(|o| o.name == name)?,
-                    None => outputs.first()?,
+                    Some(name) => drm.outputs.iter().find(|o| o.name == name)?,
+                    None => drm.outputs.first()?,
                 };
                 let view = View {
                     offset: out.loc,
                     scale: out.scale,
                 };
-                (renderer, out.size, view, out.name.clone())
+                let size = out.size;
+                let name = out.name.clone();
+                (RefMut::map(drm, |drm| &mut drm.renderer), size, view, name)
             }
         };
-        let color_effect = crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, None);
+        let color_effect =
+            crate::wellbeing_effects::FrameColor::new(&mut renderer, wellbeing, None);
         let buffer_size = (size.w, size.h).into();
         let mut texture: smithay::backend::renderer::gles::GlesTexture =
             renderer.create_buffer(fourcc, buffer_size).ok()?;
         let mut elements = scene_elements(
-            renderer,
+            &mut *renderer,
             &self.manager,
             &self.menu_close,
             &self.state,
@@ -3690,23 +3699,23 @@ impl Runtime {
                 .extend(focus_ring_elements(&self.manager, view, None));
         }
         elements.top = previews_to_elements(
-            renderer,
+            &mut *renderer,
             &self.manager,
             view,
             &switcher_previews(&self.manager, &self.switcher_thumbnails),
         );
         elements.top.extend(dnd_icon_elements(
-            renderer,
+            &mut *renderer,
             &self.state,
             view,
             self.manager.pointer_pos(),
         ));
         install_bell(&mut elements, view, bell, desktop);
         let decor = decor_for_output(&decor_global, view);
-        let previews = preview_elements(renderer, &self.manager, view, cards);
+        let previews = preview_elements(&mut renderer, &self.manager, view, cards);
         let paper = backdrop(
             &mut self.wallpaper,
-            renderer,
+            &mut *renderer,
             background_geometry(size, view, desktop),
             view,
             overview.is_none(),
@@ -3727,13 +3736,13 @@ impl Runtime {
         let zoom_program = zoom_plan
             .as_ref()
             .filter(|plan| !plan.effects.identity)
-            .and_then(|_| crate::magnifier::effects_program(renderer));
+            .and_then(|_| crate::magnifier::effects_program(&mut renderer));
         // The magnifier's passes (#349): captures and casts carry the
         // zoom region as shown, without the pointer sprite.
         let zoomed = match zoom_plan.as_ref() {
             Some(plan) => {
                 let (scene, zoom, _) = zoom_passes(
-                    renderer,
+                    &mut *renderer,
                     &mut self.zoom_targets,
                     &mut self.cursor,
                     &output_name,
@@ -4241,6 +4250,7 @@ impl Runtime {
                 self.power_save_beat = None;
                 #[cfg(feature = "drm")]
                 if let Backend::Drm(drm) = &mut self.backend {
+                    let mut drm = drm.borrow_mut();
                     drm.power_off(disable_outputs);
                 }
                 #[cfg(not(feature = "drm"))]
@@ -4250,6 +4260,7 @@ impl Runtime {
                 eprintln!("tuna-compositor: display power save mode {mode}");
                 #[cfg(feature = "drm")]
                 if let Backend::Drm(drm) = &mut self.backend {
+                    let mut drm = drm.borrow_mut();
                     drm.power_on();
                 }
                 self.winit_tracker = None;
@@ -4304,6 +4315,7 @@ impl Runtime {
         // Winit displays the host cursor; seat state alone leaves it behind.
         match &self.backend {
             Backend::Winit(backend) => {
+                let backend = backend.borrow();
                 let size = backend.window_size();
                 let logical = self.state.desktop_size();
                 let physical = smithay::reexports::winit::dpi::PhysicalPosition::new(
@@ -4357,6 +4369,7 @@ impl Runtime {
         }
         #[cfg(feature = "drm")]
         if let Backend::Drm(drm) = &mut self.backend {
+            let mut drm = drm.borrow_mut();
             drm.apply_input_settings(&settings);
         }
         // Orientation lock (#345): stop sensor rotation live (and tell
@@ -4392,6 +4405,7 @@ impl Runtime {
                 })
                 .collect();
             if let Backend::Drm(drm) = &mut self.backend {
+                let mut drm = drm.borrow_mut();
                 for (name, want) in wants {
                     let Some(out) = drm.outputs.iter_mut().find(|o| o.name == name) else {
                         continue;
@@ -4423,6 +4437,7 @@ impl Runtime {
             Backend::Winit(_) => vec![None],
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => drm
+                .borrow()
                 .outputs
                 .iter()
                 .filter(|o| o.enabled)
@@ -4745,6 +4760,7 @@ impl Runtime {
         // is ahead of the manager's until the frame delivers it.
         #[cfg(feature = "drm")]
         if let Backend::Drm(drm) = &mut self.backend {
+            let mut drm = drm.borrow_mut();
             if !self.motion_queue.pending() {
                 drm.set_pointer(self.manager.pointer_pos());
             }
@@ -4758,7 +4774,7 @@ impl Runtime {
         let mut native_outputs = Vec::new();
         #[cfg(feature = "drm")]
         if let Backend::Drm(drm) = &self.backend {
-            native_outputs = drm.native_outputs();
+            native_outputs = drm.borrow().native_outputs();
         }
         self.control.set_native_outputs(native_outputs);
         let pointer = self.manager.pointer_pos();
@@ -4786,7 +4802,7 @@ impl Runtime {
         #[cfg(feature = "drm")]
         if let Backend::Drm(drm) = &self.backend {
             self.control
-                .set_seat_touch_mode(drm.touch_mode().touch_mode());
+                .set_seat_touch_mode(drm.borrow().touch_mode().touch_mode());
         }
         let outcome = self.control.poll(self.manager.model_mut());
         for workspace in outcome.departed_workspaces.iter().copied() {
@@ -5263,7 +5279,7 @@ impl Runtime {
         }
         #[cfg(feature = "drm")]
         if let (Some(snapshot), Backend::Drm(drm)) = (snapshot, &mut self.backend) {
-            drm.set_tablet_settings(snapshot);
+            drm.borrow_mut().set_tablet_settings(snapshot);
             self.pad_osd_tick();
         }
     }
@@ -5414,10 +5430,12 @@ impl Runtime {
             let Backend::Drm(drm) = &mut self.backend else {
                 return;
             };
+            let mut drm = drm.borrow_mut();
             let Some((desc, mut osd)) = drm.tablets().pad_osd(pad, edition_mode) else {
                 return;
             };
             drm.tablets().set_pad_osd_shown(Some(pad));
+            drop(drm);
             self.fill_pad_feedback(&desc, &mut osd.labels);
             self.pad_osd_labels_sent = Some(osd.labels.clone());
             eprintln!(
@@ -5435,6 +5453,7 @@ impl Runtime {
     fn pad_osd_closed(&mut self, pad: u32) {
         #[cfg(feature = "drm")]
         if let Backend::Drm(drm) = &mut self.backend {
+            let mut drm = drm.borrow_mut();
             if drm.tablets().pad_osd_shown() == Some(pad) {
                 drm.tablets().set_pad_osd_shown(None);
                 self.pad_osd_labels_sent = None;
@@ -5482,6 +5501,7 @@ impl Runtime {
             let Backend::Drm(drm) = &mut self.backend else {
                 return;
             };
+            let mut drm = drm.borrow_mut();
             self.control.set_pad_targets(drm.tablets().pad_targets());
             let Some(pad) = drm.tablets().pad_osd_shown() else {
                 return;
@@ -5494,6 +5514,7 @@ impl Runtime {
             let Some((desc, mut labels)) = drm.tablets().pad_osd_labels(pad) else {
                 return;
             };
+            drop(drm);
             self.fill_pad_feedback(&desc, &mut labels);
             if self.pad_osd_labels_sent.as_ref() != Some(&labels) {
                 self.pad_osd_labels_sent = Some(labels.clone());
@@ -5567,7 +5588,10 @@ impl Runtime {
         if result.is_err() {
             // A failed render cannot keep promising a working effect. In
             // particular shader/FBO/copy failures are never a silent no-op.
-            self.state.protocols.background_effects.set_blur_supported(false);
+            self.state
+                .protocols
+                .background_effects
+                .set_blur_supported(false);
             let _ = self.display.flush_clients();
         }
         result
@@ -5634,11 +5658,7 @@ impl Runtime {
         // calibration as the CRTC white point (P-DS-03); the renderer
         // tints only outputs without one.
         let tint_needed = self.update_white_points(self.night_light.applied_kelvin());
-        let renderer = match &mut self.backend {
-            Backend::Winit(backend) => backend.renderer(),
-            #[cfg(feature = "drm")]
-            Backend::Drm(drm) => &mut drm.renderer,
-        };
+        let mut renderer = self.backend.renderer();
         self.manager.step_modal_dim(
             now,
             self.input_settings.motion,
@@ -5647,7 +5667,7 @@ impl Runtime {
         );
         crate::window_lifecycle::step_frame(
             &mut self.manager,
-            renderer,
+            &mut *renderer,
             &self.state,
             now,
             self.input_settings.motion,
@@ -5655,7 +5675,7 @@ impl Runtime {
             self.input_settings.right_to_left,
         );
         self.menu_close.step(
-            renderer,
+            &mut *renderer,
             &self.state,
             now,
             self.input_settings.motion,
@@ -5664,16 +5684,17 @@ impl Runtime {
         // The tint program is compiled once per renderer and cached;
         // a compile failure draws this frame untinted.
         let night_tint = crate::wellbeing_effects::FrameColor::new(
-            renderer,
+            &mut *renderer,
             wellbeing,
             night_gains.filter(|_| tint_needed),
         );
         // Outputs whose CRTC carries the white point draw untinted.
         #[cfg(feature = "drm")]
         let plain_tint = match night_gains {
-            Some(_) => crate::wellbeing_effects::FrameColor::new(renderer, wellbeing, None),
+            Some(_) => crate::wellbeing_effects::FrameColor::new(&mut renderer, wellbeing, None),
             None => night_tint.clone(),
         };
+        drop(renderer);
         let overview = (show_content && !overlay_visible && drawn).then(|| self.overview_layout());
         // While search shows results, the workspace view steps aside.
         let cards = overview
@@ -5770,6 +5791,7 @@ impl Runtime {
         }
         let queued = match &mut self.backend {
             Backend::Winit(backend) => {
+                let mut backend = backend.borrow_mut();
                 backend.window().set_cursor_visible(false);
                 let size = backend.window_size();
                 let age = backend.buffer_age().unwrap_or(0);
@@ -6100,6 +6122,7 @@ impl Runtime {
             }
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => {
+                let mut drm = drm.borrow_mut();
                 if !drm.scanout_ready() {
                     self.performance_trace.cancel();
                     return Ok(());
@@ -6107,7 +6130,7 @@ impl Runtime {
                 let pointer = drm.pointer();
                 let crate::drm::DrmBackend {
                     renderer, outputs, ..
-                } = &mut **drm;
+                } = &mut *drm;
                 // What each output's frame draws, for presentation
                 // feedback at its page flip (#89): a surface belongs to
                 // the output under its center, else the primary.
@@ -8234,6 +8257,7 @@ fn run_loop(
                 // Lock is compositor-owned even if the supervised shell died.
                 runtime.engage_lock();
                 if let Backend::Drm(drm) = &mut runtime.backend {
+                    let mut drm = drm.borrow_mut();
                     drm.resume_from_sleep();
                 }
             }

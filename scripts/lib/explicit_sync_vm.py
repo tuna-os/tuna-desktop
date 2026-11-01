@@ -17,7 +17,9 @@ from PIL import Image
 from vm_guest_agent import GuestAgent
 
 CASES = ('ordering', 'destroy', 'unmap', 'disconnect', 'surface-exists', 'invalid-timeline',
-         'no-surface', 'unsupported-buffer', 'no-buffer', 'no-acquire', 'no-release', 'conflicting-points')
+         'no-surface', 'unsupported-buffer', 'no-buffer', 'no-acquire', 'no-release', 'conflicting-points',
+         'failed-dmabuf', 'invalid-dmabuf', 'invalid-dmabuf-destroy-params', 'destroy-sync-shm',
+         'legacy-v3', 'mixed-modifiers-v3', 'mixed-modifiers-v5')
 
 def gpu_devices(width, height):
     return ['-device', 'pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1',

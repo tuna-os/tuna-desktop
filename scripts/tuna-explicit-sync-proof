@@ -156,7 +156,9 @@ try:
     run_case('ordering')
     for case in ('destroy', 'unmap', 'disconnect', 'surface-exists', 'invalid-timeline',
                  'no-surface', 'unsupported-buffer', 'no-buffer', 'no-acquire',
-                 'no-release', 'conflicting-points'):
+                 'no-release', 'conflicting-points', 'failed-dmabuf', 'invalid-dmabuf',
+                 'invalid-dmabuf-destroy-params', 'destroy-sync-shm', 'legacy-v3',
+                 'mixed-modifiers-v3', 'mixed-modifiers-v5'):
         run_case(case)
     if set(receipt['captures']) != {'red-presented', 'green-blocked', 'green-presented', 'blue-presented'}:
         raise AssertionError('missing independent native pixel checkpoints')

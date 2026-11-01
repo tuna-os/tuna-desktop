@@ -54,10 +54,10 @@ Xwayland-only global is not in that list; its own tests assert that
 ordinary clients never see it.
 
 **Qualification boundary for #364.** This branch contains new implementation
-and consumer source, not a completed qualification receipt. No builds, tests,
-graphical journeys, installed native-package proof or exact-head CI were run
-for this integrated stack. The retained captures above describe their recorded
-older revisions only. P-SY-09 remains partial.
+and consumer source, not a completed qualification receipt. Graphical journeys,
+installed native-package proof and exact-head CI are still required for this
+integrated stack. Focused source/socket checks do not replace them. The retained
+captures above describe their recorded older revisions only. P-SY-09 remains partial.
 
 The comparison source is [Mutter 51.0](https://github.com/GNOME/mutter/tree/138a14fbeef09d49ebf5be8a0cb83b042dd5c841).
 Actual locked generator inputs are `wayland-server 0.31.14` (core XML maxima:
@@ -123,6 +123,32 @@ A valid request focuses the window and raises it unless
 these as `META_CLIENT_TYPE_APPLICATION`). This is Mutter's
 focus-stealing prevention in its simplest form: a background app cannot
 mint its way to the front.
+
+### DMA-BUF import and feedback
+
+Admission uses the actual backend renderer and its formats/device, not a supplied
+capability manifest. A compositor without a backend advertises neither DMA-BUF
+nor explicit sync. The runtime and protocol handler share the same backend and
+GLES texture cache; backend borrows end before Wayland dispatch and before import
+completion emits events or protocol errors.
+
+Each imported buffer is synchronously imported into that renderer while its
+`zwp_linux_buffer_params_v1` resource is alive. Failed fallible creation sends
+`failed`; failed immediate creation posts `invalid_wl_buffer`, including when
+the client queues `params.destroy` immediately after creation. Successful import
+retains the actual renderer's cached texture, rather than validating with a
+second context and importing again. Import is not sampling: acquire-fence waits
+and committed YUV/colour conversion still govern later rendering.
+
+The native consumer source binds v5 and v3 separately: only v3 receives legacy
+modifier events. It checks v5's add-time equal-modifier rule and v3's older
+cancel-before-create behavior, presents a real v3 GBM buffer, and compares v5
+default/surface feedback with real device identity and allocatable buffers.
+Regular memfds with the accepted allocation's advertised format/modifier and
+plane geometry are explicit failed-import controls, never successful DMA-BUF
+fixtures. Successful advertised-device, import, rendering and fencing proof is
+still required under the named native emulation; compiling this consumer is
+not qualification.
 
 ### Explicit sync
 

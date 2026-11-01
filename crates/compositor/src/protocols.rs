@@ -127,6 +127,9 @@ pub(crate) struct Protocols {
     pub(crate) xwayland_grabs: crate::xwayland_grab::XwaylandGrabs,
     pub(crate) dmabuf_state: DmabufState,
     pub(crate) dmabuf_global: Option<DmabufGlobal>,
+    /// The actual backend is retained for synchronous EGL validation while
+    /// the client's params resource is still alive.
+    pub(crate) dmabuf_backend: Option<crate::runtime::Backend>,
     /// wp_linux_drm_syncobj_manager_v1, once the renderer passes Mutter's
     /// checks ([`crate::explicit_sync`]).
     #[cfg(feature = "drm")]
@@ -192,6 +195,7 @@ impl Protocols {
         Self {
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
+            dmabuf_backend: None,
             #[cfg(feature = "drm")]
             syncobj: None,
             #[cfg(feature = "drm")]
@@ -328,13 +332,23 @@ impl State {
     /// of the same formats, and surface feedback is the default (Tuna
     /// Desktop composites every surface, so it offers no scanout
     /// tranche). Without one it stays version 3, as Mutter does.
-    pub fn enable_dmabuf(&mut self, formats: Vec<Format>, main_device: Option<libc::dev_t>) {
-        if formats.is_empty() || self.protocols.dmabuf_global.is_some() {
-            if formats.is_empty() {
-                eprintln!("tuna-compositor: no dmabuf formats, linux-dmabuf not advertised");
-            }
+    pub(crate) fn enable_dmabuf(&mut self, backend: crate::runtime::Backend) {
+        use smithay::backend::renderer::ImportDma;
+        if self.protocols.dmabuf_global.is_some() {
             return;
         }
+        let (formats, main_device): (Vec<Format>, _) = {
+            let renderer = backend.renderer();
+            (
+                renderer.dmabuf_formats().into_iter().collect(),
+                renderer_main_device(&renderer),
+            )
+        };
+        if formats.is_empty() {
+            eprintln!("tuna-compositor: no dmabuf formats, linux-dmabuf not advertised");
+            return;
+        }
+        self.protocols.dmabuf_backend = Some(backend);
         let feedback = main_device.and_then(|device| {
             smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(device, formats.iter().copied())
                 .build()
@@ -587,13 +601,27 @@ impl DmabufHandler for State {
     fn dmabuf_imported(
         &mut self,
         _global: &DmabufGlobal,
-        _dmabuf: Dmabuf,
+        dmabuf: Dmabuf,
         notifier: ImportNotifier,
     ) {
-        // The renderer lives with the backend: buffers import when a
-        // frame first draws them, and a failed import only skips that
-        // surface. The global only lists formats the renderer imports.
-        let _ = notifier.successful::<State>();
+        use smithay::backend::renderer::ImportDma;
+        let imported = self
+            .protocols
+            .dmabuf_backend
+            .as_ref()
+            .is_some_and(|backend| {
+                // Import/cache on the real renderer before a following
+                // params.destroy can retire the error-reporting resource.
+                // Committed surface YUV conversion still owns its later
+                // cache invalidation/reimport, not this pre-commit check.
+                backend.renderer().import_dmabuf(&dmabuf, None).is_ok()
+            });
+        // The backend guard is dropped before either protocol completion.
+        if imported {
+            let _ = notifier.successful::<State>();
+        } else {
+            notifier.failed();
+        }
     }
 }
 delegate_dmabuf!(State);
