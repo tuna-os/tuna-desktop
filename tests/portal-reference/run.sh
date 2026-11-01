@@ -37,7 +37,7 @@ wireplumber >/out/wireplumber.log 2>&1 & pids="$pids $!"
 export WAYLAND_DISPLAY=portal-proof GDK_BACKEND=wayland
 dbus-update-activation-environment DISPLAY WAYLAND_DISPLAY GDK_BACKEND GTK_A11Y XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME
 export TUNA_COMPOSITOR_STATE=/out/compositor-state.json
-env -u WAYLAND_DISPLAY /candidate/usr/bin/tuna-compositor --backend winit --socket portal-proof --width 1280 --height 800 --shell-bin /candidate/usr/bin/tuna-shell-gtk >/out/compositor.log 2>&1 & pids="$pids $!"
+env -u WAYLAND_DISPLAY /candidate/usr/bin/tuna-compositor --backend winit --socket portal-proof --width 1280 --height 800 --shell-bin /candidate/usr/bin/tuna-shell-gtk >/out/compositor.log 2>&1 & compositor_pid=$!; pids="$pids $compositor_pid"
 end=$((SECONDS + 30))
 until [ -S "$XDG_RUNTIME_DIR/portal-proof" ] && [ -s "$TUNA_COMPOSITOR_STATE" ]; do [ "$SECONDS" -lt "$end" ] || exit 1; sleep .1; done
 export WAYLAND_DISPLAY=portal-proof GDK_BACKEND=wayland
@@ -72,6 +72,13 @@ done
 # GTK3 uses its installed public GDK exporter against the same real provider,
 # with live-parent input controls and an actually revoked handle negative.
 python3 /repo/scripts/lib/tuna-gtk3-portal-proof.py /out
+browser="$(command -v chromium-browser || command -v chromium)"
+python3 /repo/scripts/tuna-toplevel-drag-proof --browser "$browser" \
+    --compositor-pid "$compositor_pid" --state "$TUNA_COMPOSITOR_STATE" \
+    --artifacts /out/toplevel-drag-browser --input-display "$DISPLAY" \
+    --wayland-display "$WAYLAND_DISPLAY" \
+    --source-revision "$(cat /out/observer-source-revision.txt)" \
+    --source-status /out/observer-source-status.txt
 python3 /repo/scripts/lib/tuna-nautilus-file-operations.py > /out/nautilus-operations.log 2>&1
 if grep -qE 'Failed to open service channel Wayland connection|Compositor service channel missing' /out/nautilus.log; then
     cat /out/nautilus.log

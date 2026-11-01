@@ -117,33 +117,35 @@ fn in_patterns(patterns: &[String], class: &str, instance: &str) -> bool {
 /// characters (none included), `?` exactly one character, everything
 /// else itself; there is no escape.
 pub fn pattern_matches(pattern: &str, string: &str) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let string: Vec<char> = string.chars().collect();
     let (mut p, mut s) = (0, 0);
-    // The latest `*` and the string position it currently covers up to.
+    // Byte offsets always remain on UTF-8 character boundaries. Keep only
+    // the latest star's backtracking position, without copying either input.
     let mut star: Option<(usize, usize)> = None;
-    while s < string.len() {
-        match pattern.get(p) {
+    while let Some(actual) = string[s..].chars().next() {
+        match pattern[p..].chars().next() {
             Some('*') => {
                 star = Some((p, s));
                 p += 1;
             }
-            Some(&c) if c == '?' || c == string[s] => {
-                p += 1;
-                s += 1;
+            Some(expected) if expected == '?' || expected == actual => {
+                p += expected.len_utf8();
+                s += actual.len_utf8();
             }
             _ => match star {
-                // Let the last `*` take one more character and retry.
                 Some((star_p, star_s)) => {
-                    star = Some((star_p, star_s + 1));
+                    let Some(skipped) = string[star_s..].chars().next() else {
+                        return false;
+                    };
+                    let next = star_s + skipped.len_utf8();
+                    star = Some((star_p, next));
                     p = star_p + 1;
-                    s = star_s + 1;
+                    s = next;
                 }
                 None => return false,
             },
         }
     }
-    pattern[p..].iter().all(|&c| c == '*')
+    pattern[p..].chars().all(|c| c == '*')
 }
 
 /// One `zwp_xwayland_keyboard_grab_v1`.

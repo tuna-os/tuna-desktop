@@ -50,9 +50,14 @@ def main():
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--input-display", required=True, help="private Xvfb display hosting winit")
     parser.add_argument("--wayland-display", required=True)
+    parser.add_argument("--source-revision", required=True, help="actual observer checkout revision")
+    parser.add_argument("--source-status", type=Path, required=True, help="retained observer git status")
     parser.add_argument("--tab-x", type=int, default=110, help="first tab hotspot relative to window")
     parser.add_argument("--tab-y", type=int, default=18)
     args = parser.parse_args()
+    if len(args.source_revision) != 40 or any(c not in "0123456789abcdef" for c in args.source_revision):
+        parser.error("--source-revision must identify the actual 40-hex checkout")
+    source_status = args.source_status.read_text()
     art = args.artifacts.resolve()
     art.mkdir(parents=True, exist_ok=False)
     profile = art / "profile"
@@ -65,10 +70,9 @@ def main():
     environment = dict(os.environ, DISPLAY=args.input_display, WAYLAND_DISPLAY=args.wayland_display,
                        WAYLAND_DEBUG="client", NO_AT_BRIDGE="1", ACCESSIBILITY_ENABLED="0")
     manifest = {
-        "source_revision": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent.parent, text=True).strip(),
-        "source_dirty": bool(subprocess.check_output(
-            ["git", "status", "--porcelain"], cwd=Path(__file__).resolve().parent.parent, text=True).strip()),
+        "source_revision": args.source_revision,
+        "source_dirty": bool(source_status.strip()),
+        "source_status_sha256": digest(args.source_status),
         "scope": "nested real Chromium, winit/Xvfb input and rendered pixels; not native GPU proof",
         "browser": {"path": str(browser), "sha256": digest(browser),
                     "version": subprocess.check_output([str(browser), "--version"], text=True).strip()},
@@ -80,6 +84,20 @@ def main():
         "gnome_source": "https://gitlab.gnome.org/GNOME/mutter/-/blob/138a14fbeef09d49ebf5be8a0cb83b042dd5c841/src/wayland/meta-wayland-toplevel-drag.c",
         "assertions": [],
     }
+    hosts = subprocess.check_output(
+        ["xdotool", "search", "--onlyvisible", "--pid", str(args.compositor_pid), "--name", "^Smithay"],
+        env=environment, text=True, timeout=5).split()
+    if len(hosts) != 1:
+        raise AssertionError("expected exactly one visible host owned by the original compositor")
+    host = hosts[0]
+    geometry = dict(line.split("=", 1) for line in subprocess.check_output(
+        ["xdotool", "getwindowgeometry", "--shell", host], env=environment, text=True, timeout=5).splitlines())
+    subprocess.run(["xdotool", "windowfocus", "--sync", host], env=environment, check=True, timeout=5)
+    actual_focus = subprocess.check_output(
+        ["xdotool", "getwindowfocus"], env=environment, text=True, timeout=5).strip()
+    if actual_focus != host:
+        raise AssertionError("the original compositor host did not receive real keyboard focus")
+    manifest["input_host"] = {"window": int(host), "geometry": geometry, "actual_focus": int(actual_focus)}
     fixtures = []
     for name, color in (("A", "#17365d"), ("B", "#8a211c")):
         fixture = art / f"tab-{name}.html"
@@ -117,7 +135,7 @@ def main():
         subprocess.run(["xdotool", *map(str, command)], env=environment, check=True)
 
     def move(x, y):
-        input_("mousemove", "--sync", x, y)
+        input_("mousemove", "--sync", "--window", host, x, y)
         time.sleep(.15)
 
     def capture(label):
