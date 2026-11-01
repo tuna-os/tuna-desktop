@@ -177,6 +177,10 @@ Do not send a schema/example document as a handoff. Required identities are:
    jobs deliberately use native `qemu-system-x86_64` with amd64 UEFI and explicit
    TCG, never native ARM guests, KVM or HVF. Host architecture does not select an
    alternate disk.
+   These jobs install only browser observation tooling. The actual consumer
+   acquires/checks its pinned verifier and native QEMU/UEFI packages through the
+   host's normal package manager, and records the emulator and firmware identity.
+   It chooses available acceleration without a device-permission override.
    These are supported Playwright 1.58 host images. The initial pristine
    diagnosis on Ubuntu 26.04 stopped at its explicit unsupported-host dependency
    check (run `41254044292`); no browser/platform override or guest proof was

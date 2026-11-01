@@ -153,25 +153,22 @@ jobs:
         with:
           name: vm-signed-candidate
           path: ${{ runner.temp }}/vm-release
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          cosign-release: v3.1.4
-      - name: Install Linux native QEMU and browser dependencies
+      - name: Install Linux browser observation dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf python3-venv tesseract-ocr
-      - name: Enable native Linux amd64 KVM
-        if: matrix.platform == 'linux-amd64'
-        run: sudo chmod a+rw /dev/kvm
-      - name: Install macOS native QEMU
+          sudo apt-get install -y --no-install-recommends python3-venv tesseract-ocr
+      - name: Install macOS browser observation dependencies
         if: runner.os == 'macOS'
-        run: brew install qemu tesseract
+        run: brew install tesseract
       - name: Install isolated real browser driver
         run: |
           python3 -m venv "$RUNNER_TEMP/vm-browser"
           "$RUNNER_TEMP/vm-browser/bin/pip" install playwright==1.58.0 requests==2.32.5 Pillow==12.1.0
           "$RUNNER_TEMP/vm-browser/bin/python" -m playwright install --with-deps chromium
+      # The real consumer, not this job's setup, must acquire/check its pinned
+      # verifier and native QEMU/UEFI dependencies through the normal host tools.
+      # It selects available acceleration itself; do not chmod host KVM devices.
       - name: Qualify signed bytes, pristine firstboot UI, browser, guest arch and cleanup
         env:
           PLATFORM: ${{ matrix.platform }}
