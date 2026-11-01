@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Real nested Runtime/ControlClient state propagation on simulated sleep
+# and seat notifications. Not a physical VT, libseat fd or S3/KMS proof.
+# Run through `just proof session-sync-proof`; $1 is the artifact directory.
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+art=${1:?artifact directory required}
+mkdir -p "$art"
+art=$(realpath "$art")
+target=${CARGO_TARGET_DIR:-$root/target}
+cargo build --locked --manifest-path "$root/Cargo.toml" -p tuna-shell-host --example session-sync-proof
+cargo build --locked --manifest-path "$root/Cargo.toml" -p tuna-compositor --example tuna-modal-dim-client
+export TUNA_SESSION_SYNC_ROOT="$art"
+export TUNA_SESSION_SYNC_WINDOW="$target/debug/examples/tuna-modal-dim-client"
+# A private bus and software EGL display; all session processes inherit
+# the just proof marker and are reaped by the recipe's EXIT trap.
+timeout 120 env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u TUNA_CONTROL_SOCKET -u TUNA_SESSION_SYNC_CHILD \
+    dbus-run-session -- xvfb-run -a env GDK_BACKEND=x11 WINIT_UNIX_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 \
+    "$target/debug/examples/session-sync-proof" > "$art/runtime.log" 2>&1
+cat "$art/result.json"
