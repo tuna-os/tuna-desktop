@@ -127,8 +127,9 @@ pub fn leasable_connectors(
         .iter()
         .filter_map(|&handle| {
             let info = dev.get_connector(handle, false).ok()?;
-            // Mutter keeps no connector state for a disconnected one.
-            if info.state() == connector::State::Disconnected {
+            // Only a confirmed connected connector has current resources
+            // that can be handed to a lessee.
+            if info.state() != connector::State::Connected {
                 return None;
             }
             let name = connector_name(&info);
@@ -180,6 +181,12 @@ impl LeaseDevice {
         desktop_planes: Vec<plane::Handle>,
         debug_names: Vec<String>,
     ) -> Result<Self, String> {
+        // This master-only lease ioctl establishes both kernel leasing
+        // support and authority on the actual session FD before any global
+        // or eligible connector is advertised.
+        drm.device_fd()
+            .list_lessees()
+            .map_err(|error| format!("DRM leasing unavailable on the session master: {error}"))?;
         let node = DrmNode::from_dev_id(drm.device_id()).map_err(|e| e.to_string())?;
         let state = DrmLeaseState::new::<State>(dh, &node).map_err(|e| e.to_string())?;
         let mut device = Self {
@@ -286,6 +293,11 @@ impl LeaseDevice {
 
     /// Session active again: offer the connectors for lease again.
     pub fn resume(&mut self) {
+        if let Err(error) = self.fd.list_lessees() {
+            eprintln!("tuna-compositor: drm-lease: session has no lease authority: {error}");
+            self.paused = true;
+            return;
+        }
         self.paused = false;
         self.update_connectors();
         // Bindings that could not open the card get their DRM fd now
@@ -319,6 +331,15 @@ impl LeaseDevice {
                 .fd
                 .get_connector(handle, false)
                 .map_err(|e| e.to_string())?;
+            if info.state() != connector::State::Connected
+                || !is_for_lease(
+                    &connector_name(&info),
+                    non_desktop(&self.fd, handle),
+                    &self.debug_names,
+                )
+            {
+                return Err(format!("connector {handle:?} is no longer eligible for lease"));
+            }
             let possible: Vec<crtc::Handle> = info
                 .encoders()
                 .iter()

@@ -977,14 +977,19 @@ impl Runtime {
                         }
                         let active =
                             matches!(event, smithay::backend::session::Event::ActivateSession);
+                        // Revoke while the session FD still owns DRM master.
+                        // Dropping master first can make REVOKE_LEASE fail.
+                        if !active {
+                            if let Some(lease) = rt.state.protocols.drm_lease.as_mut() {
+                                lease.pause();
+                            }
+                        }
                         if let Backend::Drm(drm) = &mut rt.backend {
                             drm.on_session_event(event);
                         }
-                        if let Some(lease) = rt.state.protocols.drm_lease.as_mut() {
-                            if active {
+                        if active {
+                            if let Some(lease) = rt.state.protocols.drm_lease.as_mut() {
                                 lease.resume();
-                            } else {
-                                lease.pause();
                             }
                         }
                     })

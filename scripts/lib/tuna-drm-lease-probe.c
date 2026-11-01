@@ -9,6 +9,18 @@
  *   ... --lease NAME --close-fd           end it by closing the lease fd
  *                                         instead (the compositor must send
  *                                         finished)
+ *   ... --lease NAME --disconnect         disconnect the owning Wayland
+ *                                         client while retaining its lease FD;
+ *                                         a new client must see the connector
+ *                                         and the old FD must be revoked
+ *   ... --lease NAME --stale              submit a request made before
+ *                                         withdrawal; it must receive finished
+ *   ... --lease NAME --duplicate          require duplicate_connector error
+ *   tuna-drm-lease-probe --empty          require empty_lease error
+ *   ... --lease NAME --expect-revoke     wait for actual connector unplug,
+ *                                         requiring finished and revoked FD
+ *   ... --observe NAME                   independently observe withdrawal and
+ *                                         re-offering while another client leases
  * Either way the connector must be offered again. Exits nonzero on any
  * protocol step that does not happen within its deadline. */
 #define _POSIX_C_SOURCE 200809L
@@ -23,8 +35,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
-#include <drm/drm.h>
-#include <drm/drm_mode.h>
+#include <xf86drm.h>
+#include <drm_mode.h>
 #include <wayland-client.h>
 #include "drm-lease-v1-client-protocol.h"
 
@@ -53,6 +65,11 @@ static struct device devices[MAX_DEVICES];
 static unsigned n_devices;
 static int lease_fd = -1;
 static bool lease_finished;
+static const char *observe_name;
+static bool observed_withdrawn;
+static bool observed_reoffered;
+static bool stale_finished;
+static bool stale_fd;
 
 static double now_ms(void) {
     struct timespec ts;
@@ -88,10 +105,25 @@ static void connector_id(void *data, struct wp_drm_lease_connector_v1 *c, uint32
     (void)c; ((struct connector *)data)->id = id;
 }
 static void connector_done(void *data, struct wp_drm_lease_connector_v1 *c) {
-    (void)c; ((struct connector *)data)->done = true;
+    (void)c;
+    struct connector *conn = data;
+    conn->done = true;
+    if (observe_name && observed_withdrawn && !conn->withdrawn &&
+        strcmp(conn->name, observe_name) == 0) {
+        observed_reoffered = true;
+        printf("{\"event\":\"observer-reoffered\",\"id\":%u}\n", conn->id);
+        fflush(stdout);
+    }
 }
 static void connector_withdrawn(void *data, struct wp_drm_lease_connector_v1 *c) {
-    (void)c; ((struct connector *)data)->withdrawn = true;
+    (void)c;
+    struct connector *conn = data;
+    conn->withdrawn = true;
+    if (observe_name && strcmp(conn->name, observe_name) == 0) {
+        observed_withdrawn = true;
+        printf("{\"event\":\"observer-withdrawn\",\"id\":%u}\n", conn->id);
+        fflush(stdout);
+    }
 }
 static const struct wp_drm_lease_connector_v1_listener connector_listener = {
     .name = connector_name, .description = connector_description,
@@ -142,6 +174,18 @@ static void lease_finished_event(void *data, struct wp_drm_lease_v1 *l) {
 }
 static const struct wp_drm_lease_v1_listener lease_listener = { .lease_fd = lease_fd_event, .finished = lease_finished_event };
 
+static void stale_fd_event(void *data, struct wp_drm_lease_v1 *l, int32_t fd) {
+    (void)data; (void)l;
+    stale_fd = true;
+    close(fd);
+}
+static void stale_finished_event(void *data, struct wp_drm_lease_v1 *l) {
+    (void)data; (void)l; stale_finished = true;
+}
+static const struct wp_drm_lease_v1_listener stale_listener = {
+    .lease_fd = stale_fd_event, .finished = stale_finished_event,
+};
+
 static void json_string(const char *s) {
     putchar('"');
     for (; *s; s++) {
@@ -191,28 +235,74 @@ static int fail(const char *what) {
     return 1;
 }
 
-int main(int argc, char **argv) {
-    const char *lease_name = NULL;
-    bool close_fd = false;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--lease") == 0 && i + 1 < argc) lease_name = argv[++i];
-        else if (strcmp(argv[i], "--close-fd") == 0) close_fd = true;
-        else return fail("usage: tuna-drm-lease-probe [--lease NAME [--close-fd]]");
-    }
+static int connect_client(void) {
     display = wl_display_connect(NULL);
     if (!display) return fail("cannot connect to the Wayland display");
     struct wl_registry *registry = wl_display_get_registry(display);
     wl_registry_add_listener(registry, &registry_listener, NULL);
     if (wl_display_roundtrip(display) < 0) return fail("registry roundtrip failed");
-    /* Every bound device sends drm_fd, its connectors, then done. */
     for (unsigned i = 0; i < n_devices; i++) {
         bool done = false;
         double end = now_ms() + DEADLINE_MS;
         while (!(done = devices[i].dones > 0 || devices[i].released) && now_ms() < end)
             if (wl_display_roundtrip(display) < 0) return fail("device roundtrip failed");
         if (!done) return fail("a lease device never sent done");
+        if (devices[i].drm_fd >= 0 && drmIsMaster(devices[i].drm_fd) != 0)
+            return fail("lease device leaked a DRM master FD");
     }
+    return 0;
+}
+
+static int expect_request_error(uint32_t expected) {
+    double end = now_ms() + DEADLINE_MS;
+    while (now_ms() < end) {
+        if (wl_display_roundtrip(display) < 0) {
+            const struct wl_interface *interface = NULL;
+            uint32_t code = wl_display_get_protocol_error(display, &interface, NULL);
+            if (!interface || strcmp(interface->name, "wp_drm_lease_request_v1") != 0 || code != expected)
+                return fail("wrong lease request protocol error");
+            printf("{\"event\":\"request-error\",\"code\":%u}\n", code);
+            wl_display_disconnect(display);
+            return 0;
+        }
+    }
+    return fail("invalid lease request did not produce a protocol error");
+}
+
+int main(int argc, char **argv) {
+    const char *lease_name = NULL;
+    bool close_fd = false, disconnect_owner = false, empty = false;
+    bool duplicate = false, stale = false, expect_revoke = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--lease") == 0 && i + 1 < argc) lease_name = argv[++i];
+        else if (strcmp(argv[i], "--observe") == 0 && i + 1 < argc) observe_name = argv[++i];
+        else if (strcmp(argv[i], "--close-fd") == 0) close_fd = true;
+        else if (strcmp(argv[i], "--disconnect") == 0) disconnect_owner = true;
+        else if (strcmp(argv[i], "--duplicate") == 0) duplicate = true;
+        else if (strcmp(argv[i], "--stale") == 0) stale = true;
+        else if (strcmp(argv[i], "--expect-revoke") == 0) expect_revoke = true;
+        else if (strcmp(argv[i], "--empty") == 0) empty = true;
+        else return fail("unknown option or missing connector name");
+    }
+    if (connect_client() != 0) return 1;
     print_devices("devices");
+    if (observe_name) {
+        struct connector *target = n_devices ? find_live(&devices[0], observe_name) : NULL;
+        if (!target) return fail("observer target was not offered");
+        if (!dispatch_until(&observed_withdrawn) || !dispatch_until(&observed_reoffered))
+            return fail("independent client did not observe withdrawal and re-offering");
+        if (!find_live(&devices[0], observe_name))
+            return fail("independent client has no re-offered connector");
+        print_devices("observer-complete");
+        wl_display_disconnect(display);
+        return 0;
+    }
+    if (empty) {
+        if (!n_devices) return fail("no lease device for empty request");
+        struct wp_drm_lease_request_v1 *request = wp_drm_lease_device_v1_create_lease_request(devices[0].proxy);
+        wp_drm_lease_request_v1_submit(request);
+        return expect_request_error(WP_DRM_LEASE_REQUEST_V1_ERROR_EMPTY_LEASE);
+    }
     if (!lease_name) return 0;
 
     if (n_devices == 0) return fail("no lease device");
@@ -221,8 +311,17 @@ int main(int argc, char **argv) {
     if (!target) return fail("the connector to lease is not offered");
     uint32_t target_id = target->id;
     unsigned dones = dev->dones;
+    struct wp_drm_lease_request_v1 *stale_request = NULL;
+    if (stale) {
+        stale_request = wp_drm_lease_device_v1_create_lease_request(dev->proxy);
+        wp_drm_lease_request_v1_request_connector(stale_request, target->proxy);
+    }
     struct wp_drm_lease_request_v1 *request = wp_drm_lease_device_v1_create_lease_request(dev->proxy);
     wp_drm_lease_request_v1_request_connector(request, target->proxy);
+    if (duplicate) {
+        wp_drm_lease_request_v1_request_connector(request, target->proxy);
+        return expect_request_error(WP_DRM_LEASE_REQUEST_V1_ERROR_DUPLICATE_CONNECTOR);
+    }
     struct wp_drm_lease_v1 *lease = wp_drm_lease_request_v1_submit(request);
     wp_drm_lease_v1_add_listener(lease, &lease_listener, NULL);
     bool leased = false;
@@ -230,6 +329,7 @@ int main(int argc, char **argv) {
     while (!(leased = lease_fd >= 0) && !lease_finished && now_ms() < end)
         if (wl_display_roundtrip(display) < 0) return fail("lease roundtrip failed");
     if (!leased) return fail(lease_finished ? "the lease was refused (finished)" : "no lease_fd");
+    if (drmIsMaster(lease_fd) != 1) return fail("the lease FD is not a DRM lessee master");
 
     /* The lessee's fd shows exactly the leased connector and one CRTC. */
     struct drm_mode_card_res res = { 0 };
@@ -256,6 +356,52 @@ int main(int argc, char **argv) {
         if (wl_display_roundtrip(display) < 0) return fail("withdraw roundtrip failed");
     if (!target->withdrawn) return fail("the leased connector was not withdrawn");
     print_devices("withdrawn");
+    if (expect_revoke) {
+        if (!dispatch_until(&lease_finished))
+            return fail("connector unplug did not finish its active lease");
+        struct drm_mode_card_res revoked = { 0 };
+        if (ioctl(lease_fd, DRM_IOCTL_MODE_GETRESOURCES, &revoked) != 0 ||
+            revoked.count_connectors || revoked.count_crtcs || revoked.count_encoders)
+            return fail("connector unplug did not revoke the native lease FD");
+        /* Drain the withdrawal batch before inspecting available objects. */
+        if (wl_display_roundtrip(display) < 0) return fail("unplug roundtrip failed");
+        if (find_live(dev, lease_name)) return fail("unplugged connector is still offered");
+        printf("{\"event\":\"unplug-revoked\"}\n");
+        fflush(stdout);
+        close(lease_fd);
+        wp_drm_lease_v1_destroy(lease);
+        wl_display_disconnect(display);
+        return 0;
+    }
+    if (stale) {
+        struct wp_drm_lease_v1 *refused = wp_drm_lease_request_v1_submit(stale_request);
+        wp_drm_lease_v1_add_listener(refused, &stale_listener, NULL);
+        if (!dispatch_until(&stale_finished) || stale_fd)
+            return fail("a stale connector request was not refused with finished");
+        printf("{\"event\":\"stale-finished\"}\n");
+        wp_drm_lease_v1_destroy(refused);
+    }
+    if (disconnect_owner) {
+        /* Keep the native FD open: revocation must follow Wayland owner loss,
+         * not merely the kernel noticing that the final FD was closed. */
+        wl_display_disconnect(display);
+        for (unsigned i = 0; i < n_devices; i++)
+            if (devices[i].drm_fd >= 0) close(devices[i].drm_fd);
+        memset(devices, 0, sizeof devices);
+        n_devices = 0;
+        if (connect_client() != 0) return 1;
+        if (!n_devices || !find_live(&devices[0], lease_name))
+            return fail("owner exit did not re-offer its connector to a new client");
+        struct drm_mode_card_res revoked = { 0 };
+        if (ioctl(lease_fd, DRM_IOCTL_MODE_GETRESOURCES, &revoked) != 0 ||
+            revoked.count_connectors || revoked.count_crtcs || revoked.count_encoders)
+            return fail("Wayland owner exit did not revoke the still-open lease FD");
+        printf("{\"event\":\"owner-revoked\"}\n");
+        print_devices("reoffered");
+        close(lease_fd);
+        wl_display_disconnect(display);
+        return 0;
+    }
 
     dones = dev->dones;
     if (close_fd) {

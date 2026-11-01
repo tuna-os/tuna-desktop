@@ -77,9 +77,18 @@ EMU_PID=""
 CLIENT_PID=""
 CARD_ACL=""
 CARD_RULE=""
+LEASE_OBSERVER_PID=""
+LEASE_FORCED_STATUS=""
 
 cleanup() {
     if [ -n "$CLIENT_PID" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
+    if [ -n "$LEASE_OBSERVER_PID" ]; then
+        kill "$LEASE_OBSERVER_PID" 2>/dev/null || true
+        wait "$LEASE_OBSERVER_PID" 2>/dev/null || true
+    fi
+    if [ -n "$LEASE_FORCED_STATUS" ]; then
+        printf 'detect\n' | sudo tee "$LEASE_FORCED_STATUS" >/dev/null || true
+    fi
     # The emulator (root) exits when its command pipe closes.
     exec 8>&- 2>/dev/null || true
     if [ -n "$EMU_PID" ]; then wait "$EMU_PID" 2>/dev/null || true; fi
@@ -194,9 +203,9 @@ wayland-scanner client-header "$lease_xml" "$ARTIFACTS/lease-probe/drm-lease-v1-
 wayland-scanner private-code "$lease_xml" "$ARTIFACTS/lease-probe/drm-lease-v1-protocol.c"
 # pkg-config emits compiler and linker arguments, split on purpose.
 # shellcheck disable=SC2046
-cc -std=c11 -O2 -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I "$ARTIFACTS/lease-probe" \
+cc -std=c11 -O2 -Wall -Wextra -Werror $(pkg-config --cflags wayland-client libdrm) -I "$ARTIFACTS/lease-probe" \
     "$ROOT/scripts/lib/tuna-drm-lease-probe.c" "$ARTIFACTS/lease-probe/drm-lease-v1-protocol.c" \
-    $(pkg-config --libs wayland-client) -o "$LEASE_PROBE"
+    $(pkg-config --libs wayland-client libdrm) -o "$LEASE_PROBE"
 
 # seatd always serves /run/seatd.sock (and removes a leftover one), so a
 # running system seatd is stopped for the test and restarted on exit.
@@ -1023,12 +1032,39 @@ jq -e --arg name "$CONNECTOR" '.devices | length == 1 and .[0].drm_fd
         and ([.[0].connectors[] | select(.name == $name and .id > 0 and .done)] | length == 1)' \
     "$ARTIFACTS/lease-offered.json" >/dev/null ||
     fail D-LEASE "$CONNECTOR not offered: $(cat "$ARTIFACTS/lease-offered.json")"
+lease_probe --empty >"$ARTIFACTS/lease-empty.jsonl" ||
+    fail D-LEASE "empty lease request did not produce empty_lease"
+lease_probe --lease "$CONNECTOR" --duplicate >"$ARTIFACTS/lease-duplicate.jsonl" ||
+    fail D-LEASE "duplicate connector request did not produce duplicate_connector"
+lease_probe --observe "$CONNECTOR" >"$ARTIFACTS/lease-observer.jsonl" &
+LEASE_OBSERVER_PID=$!
+end=$(($(date +%s) + 5))
+while ! jq -se 'any(.[]; .event == "devices")' "$ARTIFACTS/lease-observer.jsonl" >/dev/null 2>&1; do
+    kill -0 "$LEASE_OBSERVER_PID" 2>/dev/null || fail D-LEASE "independent lease observer exited before admission"
+    [ "$(date +%s)" -le "$end" ] || fail D-LEASE "independent lease observer never received its initial devices"
+    sleep 0.05
+done
 lease_probe --lease "$CONNECTOR" >"$ARTIFACTS/lease-destroy.jsonl" ||
     fail D-LEASE "lease, withdraw and re-offer by destroy failed: $(tail -1 "$ARTIFACTS/lease-probe.stderr")"
 jq -se '[.[].event] == ["devices", "leased", "withdrawn", "reoffered"]
         and (.[2].devices[0].connectors | length == 0) and (.[3].devices[0].connectors | length == 1)' \
     "$ARTIFACTS/lease-destroy.jsonl" >/dev/null ||
     fail D-LEASE "unexpected lease sequence: $(cat "$ARTIFACTS/lease-destroy.jsonl")"
+wait "$LEASE_OBSERVER_PID" || fail D-LEASE "independent client missed withdrawal or re-offering"
+LEASE_OBSERVER_PID=""
+jq -se '[.[].event] == ["devices", "observer-withdrawn", "observer-reoffered", "observer-complete"]' \
+    "$ARTIFACTS/lease-observer.jsonl" >/dev/null ||
+    fail D-LEASE "independent lease observer got an unexpected lifecycle"
+lease_probe --lease "$CONNECTOR" --stale >"$ARTIFACTS/lease-stale.jsonl" ||
+    fail D-LEASE "stale pre-withdrawal connector request was not refused"
+jq -se '[.[].event] == ["devices", "leased", "withdrawn", "stale-finished", "reoffered"]' \
+    "$ARTIFACTS/lease-stale.jsonl" >/dev/null ||
+    fail D-LEASE "unexpected stale lease request lifecycle"
+lease_probe --lease "$CONNECTOR" --disconnect >"$ARTIFACTS/lease-owner-exit.jsonl" ||
+    fail D-LEASE "Wayland owner loss did not revoke the still-open native lease FD"
+jq -se '[.[].event] == ["devices", "leased", "withdrawn", "owner-revoked", "reoffered"]' \
+    "$ARTIFACTS/lease-owner-exit.jsonl" >/dev/null ||
+    fail D-LEASE "unexpected owner-exit lease lifecycle"
 lease_probe --lease "$CONNECTOR" --close-fd >"$ARTIFACTS/lease-close.jsonl" ||
     fail D-LEASE "closing the lease fd did not end the lease: $(tail -1 "$ARTIFACTS/lease-probe.stderr")"
 jq -se '[.[].event] == ["devices", "leased", "withdrawn", "finished", "reoffered"]' \
@@ -1036,10 +1072,31 @@ jq -se '[.[].event] == ["devices", "leased", "withdrawn", "finished", "reoffered
     fail D-LEASE "unexpected lease sequence: $(cat "$ARTIFACTS/lease-close.jsonl")"
 grep -q "drm-lease: lessee .* disappeared" "$LEASE_LOG" ||
     fail D-LEASE "the compositor did not notice the lessee go"
+# An actual vkms connector state transition, not a synthetic compositor event.
+# Keep the leased native FD open while forcing the owned emulated connector off.
+lease_probe --lease "$CONNECTOR" --expect-revoke >"$ARTIFACTS/lease-unplug.jsonl" &
+CLIENT_PID=$!
+end=$(($(date +%s) + 5))
+while ! jq -se 'any(.[]; .event == "withdrawn")' "$ARTIFACTS/lease-unplug.jsonl" >/dev/null 2>&1; do
+    kill -0 "$CLIENT_PID" 2>/dev/null || fail D-LEASE "unplug client exited before receiving its lease"
+    [ "$(date +%s)" -le "$end" ] || fail D-LEASE "unplug client never received its lease and withdrawal"
+    sleep 0.05
+done
+LEASE_FORCED_STATUS="/sys/class/drm/$(basename "$CARD")-$CONNECTOR/status"
+printf 'off\n' | sudo tee "$LEASE_FORCED_STATUS" >/dev/null ||
+    fail D-LEASE "could not unplug the owned vkms connector"
+wait "$CLIENT_PID" || fail D-LEASE "actual emulated connector unplug did not revoke its lease FD"
+CLIENT_PID=""
+jq -se '[.[].event] == ["devices", "leased", "withdrawn", "unplug-revoked"]' \
+    "$ARTIFACTS/lease-unplug.jsonl" >/dev/null ||
+    fail D-LEASE "unexpected actual connector unplug lifecycle"
+printf 'detect\n' | sudo tee "$LEASE_FORCED_STATUS" >/dev/null ||
+    fail D-LEASE "could not restore owned vkms connector detection"
+LEASE_FORCED_STATUS=""
 kill -TERM "$COMP_PID"
 wait "$COMP_PID" || true
 COMP_PID=""
 if grep -q panicked "$LEASE_LOG"; then fail D-NOPANIC "panic in the lease session"; fi
-pass D-LEASE "TUNA_DEBUG_LEASE_CONNECTORS=$CONNECTOR: off the desktop, offered, leased (lessee fd holds it and a CRTC), withdrawn, re-offered after destroy and after the lease fd closed"
+pass D-LEASE "vkms named emulation: eligible connector kept off desktop; non-master device FD, real lessee master FD/ioctl, cross-client withdrawal/re-offer, empty/duplicate/stale denial, destroy/FD-close/Wayland-owner-loss revocation"
 
 echo "tuna-drm-smoke: OK, artifacts in $ARTIFACTS"
