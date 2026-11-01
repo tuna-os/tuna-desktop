@@ -38,6 +38,374 @@ def with_owner_login_session(scope):
     return scope
 
 
+class NativeImeQualification(unittest.TestCase):
+    """Controlled contract/schema regressions, never installed native evidence."""
+
+    ROOT = Path(__file__).resolve().parents[2]
+    GUEST = ROOT / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+
+    def receipts(self):
+        digest = "a" * 64
+        admitted = {"package": "controlled-package", "payload_sha256":
+                    [digest + "  /usr/bin/tuna-ibus-bridge"]}
+        directory = "/run/user/1000/tuna-vm-ime"
+        copied = directory + "/ime-admission/bridge/tuna-ibus-bridge"
+        context = "/org/freedesktop/IBus/InputContext_7"
+        denial = "tuna-ibus-bridge: the compositor offers no seat or input-method-v2"
+        receipt = {"verified": True, "scope": "public-input-method-denial-only",
+            "uid": 1000, "wayland_display": "tuna-nested-91",
+            "admitted_bridge_sha256": digest,
+            "source": {"path": "/usr/bin/tuna-ibus-bridge", "sha256": digest},
+            "copy": {"path": copied, "sha256": digest},
+            "registry": {"command": ["/usr/bin/wayland-info"], "exit_status": 0,
+                         "wl_seat": True, "zwp_input_method_manager_v2": False,
+                         "stdout": "interface: 'wl_seat', version: 9, name: 2\n", "stderr": ""},
+            "copied_helper": {"command": [copied], "exit_status": 1, "stdout": "",
+                              "stderr": f"tuna-ibus-bridge: input context {context}\n{denial}\n",
+                              "input_context": context, "denial": denial},
+            "observation_budget_seconds": 15, "elapsed_seconds": 0.25}
+        started = {"admission": admitted, "bridge_sha256": digest, "evidence_dir": directory,
+                   "original": {"uid": 1000, "engine": "controlled-original", "daemon_pid": 20,
+                                "settings": {"controlled-schema": {"controlled-key": "'original'"}}},
+                   "native": {"wayland_display": "tuna-nested-91"},
+                   "bridge": {"exe_sha256": digest}, "processes": {"engine": {"identity": {"pid": 17}}}}
+        return {"verified": True, "exit_status": 0, "receipt": receipt}, started, admitted
+
+    def test_receipt_binds_actual_producer_hash_display_registry_and_exact_denial(self):
+        result, started, admitted = self.receipts()
+        self.assertIs(lane.require_ime_admission(result, started, admitted), result["receipt"])
+        mutations = [
+            (("verified",), False), (("exit_status",), False),
+            (("receipt", "uid"), 0), (("receipt", "wayland_display"), "wrong-display"),
+            (("receipt", "scope"), "composition"),
+            (("receipt", "source", "path"), "/tmp/test-bridge"),
+            (("receipt", "source", "sha256"), "b" * 64),
+            (("receipt", "copy", "sha256"), "b" * 64),
+            (("receipt", "registry", "wl_seat"), False),
+            (("receipt", "registry", "exit_status"), False),
+            (("receipt", "registry", "zwp_input_method_manager_v2"), True),
+            (("receipt", "copied_helper", "exit_status"), True),
+            (("receipt", "copied_helper", "exit_status"), 2),
+            (("receipt", "copied_helper", "command"), ["/tmp/test-bridge", "--version"]),
+            (("receipt", "copied_helper", "stderr"), "IBus bus failure\n"),
+            (("receipt", "elapsed_seconds"), float("nan")),
+            (("receipt", "elapsed_seconds"), 15.001),
+            (("receipt", "observation_budget_seconds"), 30),
+        ]
+        for keys, value in mutations:
+            changed = json.loads(json.dumps(result))
+            target = changed
+            for key in keys[:-1]:
+                target = target[key]
+            target[keys[-1]] = value
+            with self.subTest(keys=keys), self.assertRaises(RuntimeError):
+                lane.require_ime_admission(changed, started, admitted)
+        different = {**admitted, "package": "different-controlled-package"}
+        with self.assertRaises(RuntimeError):
+            lane.require_ime_admission(result, started, different)
+        changed = json.loads(json.dumps(result))
+        helper = changed["receipt"]["copied_helper"]
+        helper["stderr"] = "\n".join(reversed(helper["stderr"].splitlines())) + "\n"
+        with self.assertRaises(RuntimeError):
+            lane.require_ime_admission(changed, started, admitted)
+
+    def test_readiness_accounts_for_action_time_without_extending_guest_deadline(self):
+        now, calls = [0.0], []
+        def run(action, timeout):
+            calls.append((action, timeout))
+            now[0] += 21
+            return {"ready": True}
+        with patch.object(lane.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(lane.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "budget expired"):
+                lane.native_ime_wait(SimpleNamespace(run=run), "ime-ready",
+                                     lambda value: value["ready"], 40, 0.5)
+        self.assertEqual(calls, [("ime-ready", 20.0)])
+        sleep.assert_not_called()
+
+    def guest_function(self, name, scope):
+        node = next(n for n in ast.parse(self.GUEST.read_text()).body
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(self.GUEST), "exec"), scope)
+        return scope[name]
+
+    def setup_readiness(self, failure=None):
+        """Controlled process/IBus observations, no installed qualification."""
+        compositor = {"executable": "tuna-compositor", "pid": 91, "start_ticks": 5}
+        owner_uid, observations = 1000, []
+        class ProcPath:
+            def __init__(self, value):
+                self.value = str(value)
+                self.name = self.value.rsplit("/", 1)[-1]
+            def __str__(self): return self.value
+            def __truediv__(self, child): return ProcPath(self.value + "/" + child)
+            def iterdir(self):
+                return [] if failure == "missing-bridge" else [ProcPath("/proc/19")]
+            def stat(self): return SimpleNamespace(st_uid=owner_uid)
+            def read_text(self): return "19 (tuna-ibus-bridge) S 91\n"
+        def identity(pid, uid):
+            self.assertEqual(uid, owner_uid)
+            if pid == 20 and failure in ("missing-daemon", "wrong-daemon-owner"):
+                raise ProcessLookupError("controlled missing/wrong-owner daemon")
+            return {"pid": pid, "uid": uid, "start_ticks": 9, "exe_sha256": "a" * 64}
+        def executable(path):
+            if str(path) == "/proc/19/exe": return "/usr/bin/tuna-ibus-bridge"
+            self.assertEqual(str(path), "/proc/20/exe")
+            return "/usr/bin/not-ibus" if failure == "wrong-daemon-executable" else "/usr/bin/ibus-daemon"
+        def observe(*args, **kwargs):
+            observations.append((args, kwargs))
+            if failure == "disconnected":
+                raise subprocess.CalledProcessError(1, args)
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(args, 1)
+            return SimpleNamespace(stdout=json.dumps({"uid": owner_uid, "daemon_pid": 20,
+                "engine": None if failure == "no-global-engine" else "controlled-original",
+                "settings": {}}))
+        def no_journal(*args, **kwargs):
+            raise AssertionError("an inherited journal stream has no child-PID marker")
+        scope = {"inventory": lambda: {"state": {"locked": False}, "processes": [compositor]},
+                 "COMPOSITOR": "tuna-compositor", "pathlib": SimpleNamespace(Path=ProcPath),
+                 "OWNER": SimpleNamespace(pw_uid=owner_uid), "os": SimpleNamespace(readlink=executable),
+                 "strip_identity": identity, "ime_user_run": observe, "call": no_journal,
+                 "IME_FIXTURES": Path("/fixture"), "json": json, "subprocess": subprocess,
+                 "strip_core": lambda _: "controlled-core", "actual_session_display": lambda _: "tuna-nested-91"}
+        return self.guest_function("ime_ready", scope)(), observations
+
+    def test_inherited_stream_needs_no_child_journal_pid_for_actual_ibus_setup(self):
+        setup, observations = self.setup_readiness()
+        self.assertTrue(setup["ready"])
+        self.assertEqual(setup["ready_scope"], "supervised-process-and-connected-ibus-setup-only")
+        self.assertEqual(setup["ibus_setup"]["daemon"]["pid"], 20)
+        self.assertEqual(observations, [(({"executable": "tuna-compositor", "pid": 91, "start_ticks": 5},
+            Path("/fixture/tuna-vm-ime-session"), "observe"), {"timeout": 1})])
+
+    def test_missing_disconnected_or_wrong_daemon_never_qualifies_setup(self):
+        for failure in ("missing-bridge", "missing-daemon", "wrong-daemon-owner",
+                        "wrong-daemon-executable", "disconnected", "timeout", "no-global-engine"):
+            with self.subTest(failure=failure):
+                setup, _ = self.setup_readiness(failure)
+                self.assertFalse(setup["ready"])
+                self.assertIsNone(setup["ibus_setup"])
+
+    def test_actual_user_environment_sanitizes_debug_and_forces_wayland_gtk_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "environ").write_bytes(b"XDG_RUNTIME_DIR=/run/user/1000\0"
+                b"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\0"
+                b"WAYLAND_SOCKET=9\0DISPLAY=:1\0IBUS_ADDRESS=private\0WAYLAND_DEBUG=1\0"
+                b"GDK_BACKEND=x11\0GTK_IM_MODULE=ibus\0")
+            (root / "bus").touch()
+            scope = {"pathlib": SimpleNamespace(Path=lambda *parts: root /
+                     ("environ" if str(parts[0]).startswith("/proc/") else "bus")),
+                     "OWNER": SimpleNamespace(pw_uid=os.getuid(), pw_name="fixture", pw_dir="/home/fixture"),
+                     "RUNTIME": "/run/user/1000", "actual_session_display": lambda _: "tuna-nested-91"}
+            environment = self.guest_function("ime_environment", scope)({"pid": 91})
+        for key in ("WAYLAND_SOCKET", "DISPLAY", "IBUS_ADDRESS", "WAYLAND_DEBUG"):
+            self.assertNotIn(key, environment)
+        self.assertEqual(environment["WAYLAND_DISPLAY"], "tuna-nested-91")
+        self.assertEqual(environment["GTK_IM_MODULE"], "wayland")
+        self.assertEqual(environment["GDK_BACKEND"], "wayland")
+        self.assertEqual(environment["DBUS_SESSION_BUS_ADDRESS"], "unix:path=/run/user/1000/bus")
+
+    def test_restore_failure_still_retires_only_both_recorded_fixture_principals(self):
+        original = {"native": {"compositor": {"pid": 91}}, "original": {"engine": "original"},
+                    "processes": {"window": {"identity": {"pid": 17}},
+                                  "engine": {"identity": {"pid": 18}}}}
+        retired, unlinked = [], []
+        def restore(*args):
+            raise RuntimeError("controlled settings restore failure")
+        scope = {"IME_OWNER": SimpleNamespace(exists=lambda: True, unlink=lambda: unlinked.append(True)),
+                 "strip_json": lambda *args: original, "json": json,
+                 "ime_user_run": restore, "IME_FIXTURES": Path("/fixture"),
+                 "time": SimpleNamespace(monotonic=lambda: 0),
+                 "OWNER": SimpleNamespace(pw_uid=1000),
+                 "strip_stop_identity": lambda identity, uid, deadline:
+                     retired.append((identity["pid"], uid, deadline)) or {"retired": True}}
+        result = self.guest_function("ime_stop", scope)()
+        self.assertEqual(retired, [(17, 1000, 6), (18, 1000, 6)])
+        self.assertFalse(result["cleanup_confirmed"])
+        self.assertEqual(result["errors"], [{"stage": "restore", "exception_type": "RuntimeError"}])
+        self.assertFalse(unlinked)
+
+    def test_installed_helper_observation_uses_fixed_path_admitted_hash_and_one_attempt(self):
+        result, started, _ = self.receipts()
+        owner = {**started, "native": {**started["native"], "compositor": {"pid": 91}}}
+        for status in (0, 2):
+            calls = []
+            def execute(*args, **kwargs):
+                calls.append((args, kwargs))
+                if status:
+                    raise subprocess.CalledProcessError(status, args)
+                return SimpleNamespace(stdout=json.dumps(result["receipt"]), returncode=0)
+            scope = {"ime_load": lambda: owner, "ime_observe": lambda **kwargs: {"engine_ready": True},
+                     "ime_user_run": execute, "IME_FIXTURES": Path("/fixture"),
+                     "IME_DIR": Path("/owned"), "json": json, "subprocess": subprocess}
+            actual = self.guest_function("ime_admission", scope)()
+            self.assertEqual(len(calls), 1)
+            args, kwargs = calls[0]
+            self.assertEqual(args, ({"pid": 91}, Path("/fixture/tuna-ime-admission-proof.py"),
+                "--out-dir", Path("/owned/ime-admission"), "--wayland-display", "tuna-nested-91",
+                "--bridge-sha256", "a" * 64))
+            self.assertEqual(kwargs, {"timeout": 17})
+            self.assertEqual(actual["verified"], status == 0)
+            self.assertEqual(actual["exit_status"], status)
+
+    def test_existing_owner_refusal_does_not_retire_an_earlier_fixture_run(self):
+        _, started, admitted = self.receipts()
+        stop = unittest.mock.Mock()
+        def reserve(*args, **kwargs):
+            self.assertEqual(kwargs, {"exclusive": True})
+            raise FileExistsError("controlled prior owner")
+        scope = {"shipped_payload": lambda: admitted,
+                 "ime_ready": lambda: {"ready": True, "compositor": {"pid": 91},
+                                      "bridge": started["bridge"]},
+                 "ime_user_run": lambda *args: SimpleNamespace(
+                     stdout='{"uid":1000,"daemon_pid":20,"engine":"original"}'),
+                 "strip_identity": lambda *args: {"pid": 20},
+                 "OWNER": SimpleNamespace(pw_uid=1000), "json": json,
+                 "os": SimpleNamespace(readlink=lambda _: "/usr/bin/ibus-daemon"),
+                 "IME_FIXTURES": Path("/fixture"), "IME_DIR": Path("/owned"),
+                 "ime_write_owner": reserve, "ime_stop": stop}
+        with self.assertRaises(FileExistsError):
+            self.guest_function("ime_start", scope)()
+        stop.assert_not_called()
+
+    def run_driver(self, precommitted=False, denied=False, cleanup_failure=False, lost_owner=False):
+        result, started, admitted = self.receipts()
+        events, records, typed, space = [], [], [], [False]
+        principal = {"processes": {"engine": {"identity": {"pid": 17}},
+                                  "window": {"identity": {"pid": 18}}},
+                     "bridge": {"pid": 19}, "daemon": {"pid": 20}, "engine_ready": True}
+        def text():
+            return "你好" if space[0] else ("nihao" if precommitted and len(typed) == 5 else None)
+        def run(action, *args, **kwargs):
+            events.append(action)
+            if action == "ime-ready": return {"ready": True}
+            if action == "ime-start": return started
+            if action == "ime-observe": return {**principal, "text": text()}
+            if action == "ime-admission": return {"verified": False, "exit_status": 1} if denied else result
+            if action == "ime-window-start": return principal["processes"]["window"]
+            if action == "inventory":
+                return {"state": {"focused": 7, "windows": [
+                    {"id": 7, "app_id": "tuna-ime", "rect": [10, 10, 480, 160]}]}}
+            if action == "ime-stop":
+                if lost_owner: return {"started": False, "cleanup_confirmed": True}
+                roles = ("engine", "window") if "ime-window-start" in events else ("engine",)
+                return {"started": True, "cleanup_confirmed": not cleanup_failure, "errors": [],
+                        "restored": {**started["original"], "restored": True},
+                        "retired": {role: {"original": principal["processes"][role]["identity"],
+                                          "retired": True, "proc_absent": True} for role in roles}}
+            if action == "ime-file":
+                files = {"ime-admission/receipt.json": json.dumps(result["receipt"]).encode(),
+                         "engine.log": b"tuna-ibus-test-engine: ready\n", "window.log": b""}
+                for prefix, observer in (("wayland-info", result["receipt"]["registry"]),
+                                         ("copied-helper", result["receipt"]["copied_helper"])):
+                    for channel in ("stdout", "stderr"):
+                        name = "wayland-info.txt" if prefix == "wayland-info" and channel == "stdout" \
+                            else prefix + "." + channel
+                        files["ime-admission/" + name] = observer[channel].encode()
+                if text() is not None:
+                    files["ime.txt"] = text().encode()
+                name = args[0]
+                if name not in files: return {"name": name, "exists": False}
+                data = files[name]
+                return {"name": name, "exists": True, "size": len(data),
+                        "sha256": lane.hashlib.sha256(data).hexdigest(),
+                        "data": base64.b64encode(data).decode()}
+            raise AssertionError(action)
+        def command(name, **kwargs):
+            self.assertEqual(name, "send-key")
+            self.assertEqual(kwargs["hold-time"], 50)
+            key = kwargs["keys"][0]["data"]
+            typed.append(key)
+            events.append("key:" + key)
+        def keys(key):
+            self.assertEqual(key, "spc")
+            space[0] = True
+            events.append("key:spc")
+        error = None
+        with tempfile.TemporaryDirectory() as temporary, patch.object(lane.time, "sleep"):
+            root = Path(temporary)
+            evidence = root / "lifecycle"
+            evidence.mkdir()
+            (root / "shipped-payload.json").write_text(json.dumps(admitted))
+            try:
+                lane.run_native_ime_proof(SimpleNamespace(cmd=command, keys=keys,
+                    click=lambda *args: None, frame=lambda *args: None),
+                    SimpleNamespace(run=run), str(root), str(evidence), lambda *args: records.append(args))
+            except RuntimeError as caught:
+                error = caught
+            diagnostic = json.loads((evidence / "ime-composition.json").read_text())
+        return SimpleNamespace(error=error, events=events, records=records, typed=typed, diagnostic=diagnostic)
+
+    def test_native_driver_keeps_denial_then_real_physical_composition_then_cleanup(self):
+        result = self.run_driver()
+        self.assertIsNone(result.error)
+        self.assertEqual(result.typed, list("nihao"))
+        self.assertLess(result.events.index("ime-admission"), result.events.index("ime-window-start"))
+        self.assertLess(result.events.index("ime-window-start"), result.events.index("key:n"))
+        self.assertLess(result.events.index("key:spc"), result.events.index("ime-stop"))
+        self.assertEqual([(name, passed) for name, passed, _ in result.records],
+                         [("V-IME-ADMISSION", True), ("V-IME-COMPOSITION", True)])
+
+    def test_denial_and_preedit_failures_never_pass_composition_or_skip_cleanup(self):
+        denied = self.run_driver(denied=True)
+        self.assertIsNotNone(denied.error)
+        self.assertEqual(denied.typed, [])
+        self.assertIn("ime-stop", denied.events)
+        self.assertTrue(all(not passed for _, passed, _ in denied.records))
+        preedit = self.run_driver(precommitted=True, cleanup_failure=True)
+        self.assertIn("pinyin reached", str(preedit.error))
+        self.assertNotIn("key:spc", preedit.events)
+        self.assertIn("ime-stop", preedit.events)
+        self.assertTrue(preedit.diagnostic["cleanup_errors"])
+        cleanup = self.run_driver(cleanup_failure=True)
+        self.assertIn("cleanup/evidence", str(cleanup.error))
+
+    def test_lost_owner_after_composition_cannot_pass_cleanup(self):
+        result = self.run_driver(lost_owner=True)
+        self.assertIn("cleanup/evidence", str(result.error))
+        self.assertEqual(result.diagnostic["observations"]["committed"]["text"], "你好")
+        self.assertEqual(result.diagnostic["observations"]["cleanup"],
+                         {"started": False, "cleanup_confirmed": True})
+        self.assertEqual(result.diagnostic["cleanup_errors"],
+                         [{"stage": "restore-retire", "exception_type": "RuntimeError"}])
+
+    def test_cleanup_requires_exact_original_settings_and_each_captured_principal(self):
+        _, started, _ = self.receipts()
+        processes = {**started["processes"], "window": {"identity": {"pid": 18}}}
+        cleanup = {"started": True, "cleanup_confirmed": True, "errors": [],
+                   "restored": {**started["original"], "restored": True},
+                   "retired": {role: {"original": process["identity"], "retired": True,
+                                     "proc_absent": True} for role, process in processes.items()}}
+        lane.require_ime_cleanup(cleanup, started["original"], processes)
+        mutations = [(("started",), False), (("restored", "restored"), False),
+                     (("restored", "engine"), "replacement"),
+                     (("restored", "daemon_pid"), 21), (("restored", "settings"), {}),
+                     (("retired", "window", "original"), {"pid": 19}),
+                     (("retired", "engine", "retired"), False),
+                     (("retired", "window", "proc_absent"), False), (("retired",), {})]
+        for keys, value in mutations:
+            changed = json.loads(json.dumps(cleanup))
+            target = changed
+            for key in keys[:-1]:
+                target = target[key]
+            target[keys[-1]] = value
+            with self.subTest(keys=keys), self.assertRaises(RuntimeError):
+                lane.require_ime_cleanup(changed, started["original"], processes)
+
+    def test_both_images_copy_unchanged_shared_fixtures_only_into_qualification_layer(self):
+        sources = "scripts/lib/tuna-ibus-test-engine.py scripts/lib/tuna-ime-window.py " \
+                  "scripts/lib/tuna-ime-admission-proof.py /usr/local/lib/tuna-vm-fixtures/"
+        for name in ("Containerfile", "Containerfile.published"):
+            source = (self.ROOT / "packaging/marlin/vm-lane" / name).read_text()
+            self.assertIn("COPY " + sources, source)
+            self.assertIn("COPY packaging/marlin/vm-lane/tuna-vm-ime-session "
+                          "/usr/local/lib/tuna-vm-fixtures/tuna-vm-ime-session", source)
+            self.assertIn("/usr/bin/tuna-ibus-bridge", source)
+            self.assertIn("wayland-utils", source)
+
+
 class DatetimePublishedQualification(unittest.TestCase):
     """Behavioral lane policy tests, not native Date & Time qualification."""
 
@@ -2419,7 +2787,8 @@ class InputProbePlacement(unittest.TestCase):
             raise FrameReached()
 
         qmp = SimpleNamespace(click=lambda x, y: clicks.append((x, y)), frame=frame)
-        with tempfile.TemporaryDirectory() as out:
+        # This placement-only unit test does not qualify IBus composition.
+        with tempfile.TemporaryDirectory() as out, patch.object(lane, "run_native_ime_proof"):
             with self.assertRaises(FrameReached):
                 lane.run_lifecycle(qmp, SimpleNamespace(run=run), out, "/unused", lambda *_: None)
             self.assertEqual(clicks, [(600, 350)])

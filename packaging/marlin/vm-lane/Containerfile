@@ -46,6 +46,8 @@ COPY packaging/marlin/vm-lane/tuna-vm-lifecycle /usr/libexec/tuna-vm-lifecycle
 COPY scripts/lib/gnome-brightness-proof.py /usr/libexec/tuna-brightness-proof
 COPY scripts/lib/tuna-datetime-proof.py /usr/libexec/tuna-datetime-proof
 COPY packaging/marlin/vm-lane/tuna-vm-input /usr/libexec/tuna-vm-input
+COPY scripts/lib/tuna-ibus-test-engine.py scripts/lib/tuna-ime-window.py scripts/lib/tuna-ime-admission-proof.py /usr/local/lib/tuna-vm-fixtures/
+COPY packaging/marlin/vm-lane/tuna-vm-ime-session /usr/local/lib/tuna-vm-fixtures/tuna-vm-ime-session
 COPY packaging/marlin/vm-lane/tuna-vm-shell-focus /usr/libexec/tuna-vm-shell-focus
 COPY packaging/marlin/vm-lane/tuna-vm-orca-token /usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token
 COPY packaging/marlin/vm-lane/tuna-vm-gdm.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf

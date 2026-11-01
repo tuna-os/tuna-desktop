@@ -2100,6 +2100,264 @@ def soak_read(name, offset):
     return {"name": name, "offset": offset, "size": size, "data": base64.b64encode(data).decode()}
 
 
+IME_FIXTURES = pathlib.Path("/usr/local/lib/tuna-vm-fixtures")
+IME_OWNER = pathlib.Path("/run/tuna-vm-ime-owner.json")
+IME_DIR = pathlib.Path(RUNTIME, "tuna-vm-ime")
+IME_FILES = ("ime-admission/receipt.json", "ime-admission/wayland-info.txt",
+             "ime-admission/wayland-info.stderr", "ime-admission/copied-helper.stdout",
+             "ime-admission/copied-helper.stderr", "engine.log", "window.log", "ime.txt")
+
+
+def shipped_payload():
+    payload = pathlib.Path("/usr/share/tuna-vm/shipped-payload.sha256")
+    call("sha256sum", "--check", str(payload))
+    package = pathlib.Path("/usr/share/tuna-vm/shipped-package.txt").read_text().strip()
+    if call("pacman", "-Q", PACKAGE) != package:
+        raise RuntimeError("shipped Tuna Desktop package changed")
+    return {"probe_uid": os.geteuid(), "package": package,
+            "payload_sha256": payload.read_text().splitlines(),
+            "shipped_packages": pathlib.Path("/usr/share/tuna-vm/shipped-packages.txt").read_text().splitlines(),
+            "fixture_packages": pathlib.Path("/usr/share/tuna-vm/fixture-packages.txt").read_text().splitlines()}
+
+
+def actual_session_display(compositor):
+    # runtime::default_for_pid uses this public socket on DRM too. The
+    # historical "nested" spelling does not imply a nested backend.
+    if strip_identity(compositor["pid"], OWNER.pw_uid)["start_ticks"] != compositor["start_ticks"]:
+        raise RuntimeError("original compositor PID changed before display derivation")
+    return f"{NESTED}{compositor['pid']}"
+
+
+def ime_environment(compositor):
+    with pathlib.Path(f"/proc/{compositor['pid']}/environ").open("rb") as stream:
+        raw = stream.read(131073)
+    if len(raw) > 131072:
+        raise RuntimeError("actual session environment exceeds bound")
+    environment = dict(item.decode().split("=", 1) for item in raw.split(b"\0") if b"=" in item)
+    for key in ("WAYLAND_SOCKET", "DISPLAY", "IBUS_ADDRESS", "WAYLAND_DEBUG"):
+        environment.pop(key, None)
+    if (environment.get("XDG_RUNTIME_DIR") != RUNTIME
+            or not environment.get("DBUS_SESSION_BUS_ADDRESS")
+            or pathlib.Path(RUNTIME, "bus").stat().st_uid != OWNER.pw_uid):
+        raise RuntimeError("actual ordinary user's runtime/session bus is absent")
+    environment.update(WAYLAND_DISPLAY=actual_session_display(compositor),
+                       GDK_BACKEND="wayland", GTK_IM_MODULE="wayland",
+                       HOME=OWNER.pw_dir, USER=OWNER.pw_name, LOGNAME=OWNER.pw_name)
+    return environment
+
+
+def ime_user_run(compositor, *arguments, timeout=10):
+    return subprocess.run(["/usr/bin/python3", *map(str, arguments)],
+                          env=ime_environment(compositor), user=OWNER.pw_uid,
+                          group=OWNER.pw_gid, extra_groups=os.getgrouplist(OWNER.pw_name, OWNER.pw_gid),
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          timeout=timeout, check=True)
+
+
+def ime_write_owner(owner, exclusive=False):
+    fd = os.open(IME_OWNER, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW |
+                 (os.O_EXCL if exclusive else os.O_TRUNC), 0o600)
+    with os.fdopen(fd, "w") as stream:
+        if os.fstat(stream.fileno()).st_uid != 0:
+            raise RuntimeError("IME owner record is not root-owned")
+        json.dump(owner, stream)
+
+
+def ime_ready():
+    current = inventory()
+    if current["state"]["locked"]:
+        raise RuntimeError("native IME proof requires the unlocked original session")
+    compositors = [p for p in current["processes"] if p["executable"] == COMPOSITOR]
+    if len(compositors) != 1:
+        raise RuntimeError("one owned actual compositor is required")
+    compositor = compositors[0]
+    bridges = []
+    for path in pathlib.Path("/proc").iterdir():
+        if not path.name.isdigit():
+            continue
+        try:
+            if (path.stat().st_uid == OWNER.pw_uid
+                    and os.readlink(path / "exe") == "/usr/bin/tuna-ibus-bridge"):
+                metadata = (path / "stat").read_text().rsplit(")", 1)[1].split()
+                if int(metadata[1]) == compositor["pid"]:
+                    bridges.append(strip_identity(int(path.name), OWNER.pw_uid))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    if len(bridges) > 1:
+        raise RuntimeError("ambiguous compositor-supervised native IBus bridge")
+    bridge = bridges[0] if bridges else None
+    setup = None
+    if bridge:
+        try:
+            actual = json.loads(ime_user_run(
+                compositor, IME_FIXTURES / "tuna-vm-ime-session", "observe", timeout=1).stdout)
+            daemon = strip_identity(actual["daemon_pid"], OWNER.pw_uid)
+            if (actual["uid"] == OWNER.pw_uid and isinstance(actual["engine"], str)
+                    and actual["engine"]
+                    and os.readlink(f"/proc/{daemon['pid']}/exe") == "/usr/bin/ibus-daemon"):
+                bridge_path = pathlib.Path(f"/proc/{bridge['pid']}")
+                parent = int((bridge_path / "stat").read_text().rsplit(")", 1)[1].split()[1])
+                if (parent == compositor["pid"]
+                        and strip_identity(bridge["pid"], OWNER.pw_uid) == bridge):
+                    setup = {"ibus": actual, "daemon": daemon}
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError,
+                subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            # Setup can be unavailable while the real session starts. Never
+            # substitute a daemon/default engine or claim process liveness
+            # proves the private protocol: actual composition below must pass.
+            setup = None
+    # Inherited stderr streams carry the original stream peer's journal PID,
+    # not necessarily this child bridge's PID. No journal-PID readiness claim.
+    return {"ready": setup is not None,
+            "ready_scope": "supervised-process-and-connected-ibus-setup-only",
+            "ibus_setup": setup, "compositor": compositor, "bridge": bridge,
+            "core": strip_core(current), "wayland_display": actual_session_display(compositor)}
+
+
+def ime_load():
+    owner = strip_json(IME_OWNER, 0)
+    current = inventory()
+    if current["state"]["locked"] or strip_core(current) != owner["native"]["core"]:
+        raise RuntimeError("original unlocked native compositor/shell changed during IME proof")
+    for role in ("bridge", "daemon"):
+        if strip_identity(owner[role]["pid"], OWNER.pw_uid) != owner[role]:
+            raise RuntimeError("original supervised bridge/IBus daemon changed")
+    for process in owner["processes"].values():
+        if strip_identity(process["identity"]["pid"], OWNER.pw_uid) != process["identity"]:
+            raise RuntimeError("owned original IME fixture exited or changed")
+        if strip_sha(IME_FIXTURES / process["script"]) != process["script_sha256"]:
+            raise RuntimeError("installed original IME fixture script changed")
+    return owner
+
+
+def ime_launch(owner, role, script, *arguments):
+    with (IME_DIR / f"{role}.log").open("xb") as log:
+        os.chmod(log.name, 0o600)
+        process = subprocess.Popen(
+            ["/usr/bin/python3", "-u", str(IME_FIXTURES / script), *map(str, arguments)],
+            env=ime_environment(owner["native"]["compositor"]), user=OWNER.pw_uid,
+            group=OWNER.pw_gid, extra_groups=os.getgrouplist(OWNER.pw_name, OWNER.pw_gid),
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    try:
+        identity = strip_identity(process.pid, OWNER.pw_uid)
+        owner["processes"][role] = {"identity": identity, "script": script,
+                                    "script_sha256": strip_sha(IME_FIXTURES / script)}
+        ime_write_owner(owner)
+    except BaseException:
+        # Still our unreaped direct child: never discover or signal by name.
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+        raise
+
+
+def ime_start():
+    admission = shipped_payload()
+    hashes = [line.split()[0] for line in admission["payload_sha256"]
+              if line.split()[1:] == ["/usr/bin/tuna-ibus-bridge"]]
+    if len(hashes) != 1:
+        raise RuntimeError("installed production bridge absent from admitted shipped payload")
+    native = ime_ready()
+    if not native["ready"] or native["bridge"]["exe_sha256"] != hashes[0]:
+        raise RuntimeError("actual installed admitted supervised bridge is not ready")
+    original = json.loads(ime_user_run(native["compositor"], IME_FIXTURES / "tuna-vm-ime-session",
+                                       "observe").stdout)
+    daemon = strip_identity(original["daemon_pid"], OWNER.pw_uid)
+    if os.readlink(f"/proc/{daemon['pid']}/exe") != "/usr/bin/ibus-daemon":
+        raise RuntimeError("actual connected IBus peer is not the installed daemon")
+    owner = {"native": native, "bridge": native["bridge"], "daemon": daemon,
+             "original": original, "admission": admission, "bridge_sha256": hashes[0],
+             "evidence_dir": str(IME_DIR), "processes": {}}
+    ime_write_owner(owner, exclusive=True)
+    try:
+        IME_DIR.mkdir(mode=0o700)
+        os.chown(IME_DIR, OWNER.pw_uid, OWNER.pw_gid)
+        ime_launch(owner, "engine", "tuna-ibus-test-engine.py")
+    except BaseException:
+        # Only our newly reserved owner record may be cleaned on failed
+        # startup. An O_EXCL refusal above must never retire an earlier run.
+        ime_stop()
+        raise
+    return owner
+
+
+def ime_observe(timeout=10):
+    owner = ime_load()
+    actual = json.loads(ime_user_run(owner["native"]["compositor"], IME_FIXTURES / "tuna-vm-ime-session",
+                                     "observe", timeout=timeout).stdout)
+    engine_log = read_evidence(IME_DIR / "engine.log",
+                               file_identity((IME_DIR / "engine.log").lstat()), 65536).decode()
+    text_path = IME_DIR / "ime.txt"
+    text = (read_evidence(text_path, file_identity(text_path.lstat()), 4096).decode()
+            if text_path.exists() else None)
+    return {"engine_ready": "tuna-ibus-test-engine: ready" in engine_log.splitlines()
+                            and actual["engine"] == "tuna-test",
+            "ibus": actual, "text": text, "processes": owner["processes"],
+            "bridge": owner["bridge"], "daemon": owner["daemon"],
+            "wayland_display": owner["native"]["wayland_display"]}
+
+
+def ime_admission():
+    owner = ime_load()
+    if not ime_observe(timeout=3)["engine_ready"]:
+        raise RuntimeError("actual owned IBus test engine is not active for denial observation")
+    try:
+        completed = ime_user_run(owner["native"]["compositor"],
+                                 IME_FIXTURES / "tuna-ime-admission-proof.py",
+                                 "--out-dir", IME_DIR / "ime-admission",
+                                 "--wayland-display", owner["native"]["wayland_display"],
+                                 "--bridge-sha256", owner["bridge_sha256"], timeout=17)
+    except subprocess.CalledProcessError as error:
+        return {"verified": False, "exit_status": error.returncode}
+    receipt = json.loads(completed.stdout)
+    if not ime_observe(timeout=3)["engine_ready"]:
+        raise RuntimeError("original active legitimate engine changed during denial observation")
+    return {"verified": receipt.get("verified") is True, "exit_status": completed.returncode,
+            "receipt": receipt}
+
+
+def ime_stop():
+    # Cleanup deliberately does not require liveness: restore and retire every
+    # recorded owned process even if a preceding observation failed.
+    if not IME_OWNER.exists():
+        return {"started": False, "cleanup_confirmed": True}
+    owner = strip_json(IME_OWNER, 0)
+    result = {"started": True, "restored": None, "retired": {}, "errors": []}
+    try:
+        result["restored"] = json.loads(ime_user_run(
+            owner["native"]["compositor"], IME_FIXTURES / "tuna-vm-ime-session",
+            "restore", json.dumps(owner["original"])).stdout)
+    except Exception as error:
+        result["errors"].append({"stage": "restore", "exception_type": type(error).__name__})
+    deadline = time.monotonic() + 6
+    for role in ("window", "engine"):
+        if role not in owner["processes"]:
+            continue
+        try:
+            result["retired"][role] = strip_stop_identity(
+                owner["processes"][role]["identity"], OWNER.pw_uid, deadline)
+        except Exception as error:
+            result["errors"].append({"stage": role, "exception_type": type(error).__name__})
+    result["cleanup_confirmed"] = not result["errors"]
+    if result["cleanup_confirmed"]:
+        IME_OWNER.unlink()
+    return result
+
+
+def ime_file(name):
+    if name not in IME_FILES:
+        raise ValueError("unknown fixed IME evidence file")
+    path = IME_DIR / name
+    if not path.exists():
+        return {"name": name, "exists": False}
+    data = read_evidence(path, file_identity(path.lstat()), 262144)
+    return {"name": name, "exists": True, "sha256": hashlib.sha256(data).hexdigest(),
+            "data": base64.b64encode(data).decode(), "size": len(data)}
+
+
 def main():
     if sys.argv[1] == "background-user-diagnostics":
         print(json.dumps(background_user_diagnostics()))
@@ -2534,10 +2792,28 @@ print(json.dumps(result))
         call("systemctl", "--user", "stop", "xdg-desktop-portal.service",
              "xdg-desktop-portal-gnome.service", user=True)
         result = {"stopped": "portal"}
+    elif action == "ime-ready":
+        result = ime_ready()
+    elif action == "ime-start":
+        result = ime_start()
+    elif action == "ime-observe":
+        result = ime_observe()
+    elif action == "ime-admission":
+        result = ime_admission()
+    elif action == "ime-window-start":
+        owner = ime_load()
+        if not ime_observe()["engine_ready"] or "window" in owner["processes"]:
+            raise RuntimeError("original active engine and no previous window required")
+        ime_launch(owner, "window", "tuna-ime-window.py", IME_DIR / "ime.txt")
+        result = owner["processes"]["window"]
+    elif action == "ime-stop":
+        result = ime_stop()
+    elif action == "ime-file":
+        result = ime_file(sys.argv[2])
     elif action == "capture-input":
         compositor = next(p for p in inventory()["processes"] if p["executable"] == COMPOSITOR)
         # The actual DRM session uses this socket, as runtime::default_for_pid does.
-        display = f"WAYLAND_DISPLAY={NESTED}{compositor['pid']}"
+        display = f"WAYLAND_DISPLAY={actual_session_display(compositor)}"
         def attempt(*args):
             try:
                 result = subprocess.run(["runuser", "-u", OWNER.pw_name, "--", "env",
@@ -2754,15 +3030,7 @@ print(json.dumps(result))
                    "greeter_pids": greeter_pids,
                    "greeter_uids": [pathlib.Path(f"/proc/{pid}").stat().st_uid for pid in greeter_pids]}
     elif action == "payload":
-        payload = pathlib.Path("/usr/share/tuna-vm/shipped-payload.sha256")
-        call("sha256sum", "--check", str(payload))
-        package = pathlib.Path("/usr/share/tuna-vm/shipped-package.txt").read_text().strip()
-        if call("pacman", "-Q", PACKAGE) != package:
-            raise RuntimeError("shipped Tuna Desktop package changed")
-        result = {"probe_uid": os.geteuid(), "package": package,
-                  "payload_sha256": payload.read_text().splitlines(),
-                  "shipped_packages": pathlib.Path("/usr/share/tuna-vm/shipped-packages.txt").read_text().splitlines(),
-                  "fixture_packages": pathlib.Path("/usr/share/tuna-vm/fixture-packages.txt").read_text().splitlines()}
+        result = shipped_payload()
     else:
         raise ValueError("unknown lifecycle action")
     print(json.dumps(result))

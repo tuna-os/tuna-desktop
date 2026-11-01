@@ -8494,15 +8494,27 @@ if command -v ibus-daemon >/dev/null 2>&1 &&
     grep -q "tuna-ibus-bridge: ready" "$LOG" || fail G-IME "the IBus bridge never came up"
     # The engine belongs to the same private bus as the native bridge,
     # rather than the outer display used to drive this nested proof.
-    env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET WAYLAND_DISPLAY="$SOCKET_NAME" \
+    env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET -u WAYLAND_DEBUG WAYLAND_DISPLAY="$SOCKET_NAME" \
         "$PY" -u "$ROOT/scripts/lib/tuna-ibus-test-engine.py" >"$ARTIFACTS/ibus-engine.log" 2>&1 &
     IME_PIDS="$!"
     for _ in $(seq 1 30); do grep -q ready "$ARTIFACTS/ibus-engine.log" && break; sleep 0.5; done
     grep -q ready "$ARTIFACTS/ibus-engine.log" || fail G-IME "the test engine did not register with IBus"
+    if [ "$INSTALLED_PACKAGE" = 1 ]; then
+        # Reuse package preflight admission, never admit a debug/source bridge here.
+        ime_bridge_sha256="$(jq -er '.files["tuna-ibus-bridge"].sha256' "$ARTIFACTS/installed-package.json")" ||
+            fail G-IME-ADMISSION "installed preflight has no admitted bridge SHA256"
+        "$PY" "$ROOT/scripts/lib/tuna-ime-admission-proof.py" \
+            --out-dir "$ARTIFACTS/ime-admission" --wayland-display "$SOCKET_NAME" \
+            --bridge-sha256 "$ime_bridge_sha256" >"$ARTIFACTS/ime-admission.json" ||
+            fail G-IME-ADMISSION "copied installed bridge public-socket denial was not proved"
+        pass G-IME-ADMISSION "admitted installed bridge copy sees the public seat but no input-method-v2 and exits 1 with the exact denial; actual typing follows"
+    fi
     IME_OUT="$ARTIFACTS/ime.txt"
     rm -f "$IME_OUT"
     focused_before="$(grep -c 'tuna-ibus-bridge: text field focused' "$LOG")"
-    WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-ime-window.py" "$IME_OUT" \
+    env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET -u WAYLAND_DEBUG \
+        WAYLAND_DISPLAY="$SOCKET_NAME" GDK_BACKEND=wayland GTK_IM_MODULE=wayland \
+        "$PY" "$ROOT/scripts/lib/tuna-ime-window.py" "$IME_OUT" \
         >"$ARTIFACTS/ime-window.log" 2>&1 &
     IME_WINDOW="$!"
     IME_PIDS="$IME_PIDS $IME_WINDOW"
@@ -8511,6 +8523,8 @@ if command -v ibus-daemon >/dev/null 2>&1 &&
         [ "$(grep -c 'tuna-ibus-bridge: text field focused' "$LOG")" -gt "$focused_before" ] && break
         sleep 0.3
     done
+    [ "$(grep -c 'tuna-ibus-bridge: text field focused' "$LOG")" -gt "$focused_before" ] ||
+        fail G-IME "the production bridge did not observe the GTK text field focus"
     sleep 0.5
     xdotool type --delay 100 nihao
     sleep 0.8

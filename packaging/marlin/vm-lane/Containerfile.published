@@ -27,6 +27,8 @@ COPY scripts/lib/endurance_presentation.py /usr/libexec/tuna-soak/lib/endurance_
 COPY packaging/marlin/vm-lane/tuna-vm-lifecycle /usr/libexec/tuna-vm-lifecycle
 COPY scripts/lib/tuna-datetime-proof.py /usr/libexec/tuna-datetime-proof
 COPY packaging/marlin/vm-lane/tuna-vm-input /usr/libexec/tuna-vm-input
+COPY scripts/lib/tuna-ibus-test-engine.py scripts/lib/tuna-ime-window.py scripts/lib/tuna-ime-admission-proof.py /usr/local/lib/tuna-vm-fixtures/
+COPY packaging/marlin/vm-lane/tuna-vm-ime-session /usr/local/lib/tuna-vm-fixtures/tuna-vm-ime-session
 COPY packaging/marlin/vm-lane/tuna-vm-gdm.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
 COPY packaging/marlin/vm-lane/journald.conf /usr/lib/systemd/journald.conf.d/90-tuna-vm-lane.conf
 COPY packaging/marlin/vm-lane/kargs.toml /usr/lib/bootc/kargs.d/90-tuna-vm-lane.toml

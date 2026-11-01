@@ -1,0 +1,77 @@
+#!/usr/bin/python3
+"""CI-only IBus/settings observation and restoration; never an input injector."""
+import json
+import os
+import sys
+
+import gi
+
+gi.require_version("IBus", "1.0")
+from gi.repository import Gio, GLib, IBus
+
+
+SETTINGS = {
+    "org.gnome.desktop.input-sources": ("sources", "current", "mru-sources"),
+    "org.freedesktop.ibus.general": ("preload-engines", "engines-order", "use-global-engine"),
+}
+
+
+def observe(bus):
+    engine = bus.get_global_engine()
+    if engine is None:
+        raise RuntimeError("the actual IBus daemon has no global engine")
+    connection = bus.get_connection()
+    daemon_pid = connection.call_sync(
+        "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+        "GetConnectionUnixProcessID", GLib.Variant("(s)", ("org.freedesktop.IBus",)),
+        GLib.VariantType.new("(u)"), Gio.DBusCallFlags.NONE, 3000, None).unpack()[0]
+    values = {}
+    source = Gio.SettingsSchemaSource.get_default()
+    for schema, keys in SETTINGS.items():
+        definition = source.lookup(schema, True)
+        if definition is None:
+            raise RuntimeError("required installed input settings schema is absent")
+        settings = Gio.Settings.new_full(definition, None, None)
+        values[schema] = {key: settings.get_value(key).print_(True)
+                          for key in keys if definition.has_key(key)}
+    return {"uid": os.geteuid(), "engine": engine.get_name(), "daemon_pid": daemon_pid,
+            "settings": values}
+
+
+def main():
+    if os.geteuid() == 0 or len(sys.argv) not in (2, 3):
+        raise RuntimeError("ordinary session owner and fixed operation required")
+    if any(key in os.environ for key in ("WAYLAND_SOCKET", "DISPLAY", "IBUS_ADDRESS", "WAYLAND_DEBUG")):
+        raise RuntimeError("inherited display, address or debug override refused")
+    IBus.init()
+    bus = IBus.Bus()
+    if not bus.is_connected():
+        raise RuntimeError("the actual session IBus daemon is not connected")
+    if sys.argv[1] == "observe" and len(sys.argv) == 2:
+        result = observe(bus)
+    elif sys.argv[1] == "restore" and len(sys.argv) == 3:
+        original = json.loads(sys.argv[2])
+        if original["uid"] != os.geteuid():
+            raise RuntimeError("original IBus settings belong to another user")
+        if not bus.set_global_engine(original["engine"]):
+            raise RuntimeError("original IBus engine restoration was refused")
+        for schema, keys in original["settings"].items():
+            if schema not in SETTINGS or not set(keys) <= set(SETTINGS[schema]):
+                raise RuntimeError("unexpected input settings restoration")
+            settings = Gio.Settings.new(schema)
+            for key, value in keys.items():
+                variant = GLib.Variant.parse(settings.get_value(key).get_type(), value, None, None)
+                if not settings.set_value(key, variant):
+                    raise RuntimeError("original input settings restoration was refused")
+        Gio.Settings.sync()
+        result = observe(bus)
+        if any(result[key] != original[key] for key in ("uid", "engine", "daemon_pid", "settings")):
+            raise RuntimeError("original engine/settings restoration did not read back exactly")
+        result["restored"] = True
+    else:
+        raise ValueError("unknown fixed IBus operation")
+    print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    main()

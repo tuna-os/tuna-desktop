@@ -758,6 +758,227 @@ def retain_amplification_sample(case, actual, checks):
     case["passed"] = all(checks.values())
 
 
+def native_ime_wait(agent, action, predicate, attempts, interval):
+    deadline = time.monotonic() + attempts * interval
+    for _ in range(attempts):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        value = agent.run(action, timeout=min(30, remaining))
+        if time.monotonic() >= deadline:
+            break
+        if predicate(value):
+            return value
+        time.sleep(min(interval, max(0, deadline - time.monotonic())))
+    raise RuntimeError(f"native IME {action} readiness budget expired")
+
+
+def require_ime_admission(result, started, admitted):
+    """Bind the denial-only observer to the producer's installed payload admission."""
+    if started["admission"] != admitted:
+        raise RuntimeError("native IME producer admission differs from the pre-login receipt")
+    hashes = [line.split()[0] for line in admitted["payload_sha256"]
+              if line.split()[1:] == ["/usr/bin/tuna-ibus-bridge"]]
+    if len(hashes) != 1 or started["bridge_sha256"] != hashes[0]:
+        raise RuntimeError("native IME lacks one actually admitted installed bridge hash")
+    receipt = result.get("receipt", {})
+    copied = os.path.join(started["evidence_dir"], "ime-admission", "bridge", "tuna-ibus-bridge")
+    registry = receipt.get("registry", {})
+    helper = receipt.get("copied_helper", {})
+    elapsed = receipt.get("elapsed_seconds")
+    denial = "tuna-ibus-bridge: the compositor offers no seat or input-method-v2"
+    lines = helper.get("stderr", "").splitlines()
+    context = "tuna-ibus-bridge: input context " + helper.get("input_context", "")
+    if (result.get("verified") is not True or type(result.get("exit_status")) is not int
+            or result["exit_status"] != 0 or receipt.get("verified") is not True
+            or receipt.get("scope") != "public-input-method-denial-only"
+            or type(receipt.get("uid")) is not int
+            or receipt["uid"] != started["original"]["uid"] or receipt["uid"] == 0
+            or receipt.get("wayland_display") != started["native"]["wayland_display"]
+            or receipt.get("admitted_bridge_sha256") != hashes[0]
+            or receipt.get("source") != {"path": "/usr/bin/tuna-ibus-bridge", "sha256": hashes[0]}
+            or receipt.get("copy") != {"path": copied, "sha256": hashes[0]}
+            or started["bridge"]["exe_sha256"] != hashes[0]
+            or registry.get("command") != ["/usr/bin/wayland-info"]
+            or type(registry.get("exit_status")) is not int
+            or registry["exit_status"] != 0 or registry.get("wl_seat") is not True
+            or registry.get("zwp_input_method_manager_v2") is not False
+            or helper.get("command") != [copied] or type(helper.get("exit_status")) is not int
+            or helper["exit_status"] != 1
+            or helper.get("denial") != denial or not helper.get("input_context", "").startswith("/")
+            or lines.count(context) != 1 or lines.count(denial) != 1
+            or not lines or lines[-1] != denial or lines.index(context) >= lines.index(denial)
+            or type(receipt.get("observation_budget_seconds")) is not int
+            or receipt["observation_budget_seconds"] != 15
+            or type(elapsed) not in (int, float) or not math.isfinite(elapsed) or not 0 <= elapsed <= 15):
+        raise RuntimeError("actual installed native helper denial receipt did not qualify")
+    return receipt
+
+
+def collect_ime_files(agent, evidence):
+    """Transfer only fixed actual fixture outputs, each digest/size checked."""
+    names = ("ime-admission/receipt.json", "ime-admission/wayland-info.txt",
+             "ime-admission/wayland-info.stderr", "ime-admission/copied-helper.stdout",
+             "ime-admission/copied-helper.stderr", "engine.log", "window.log", "ime.txt")
+    collected, errors = {}, []
+    for name in names:
+        try:
+            receipt = agent.run("ime-file", name)
+            if receipt["name"] != name:
+                raise RuntimeError("IME evidence file name mismatch")
+            if not receipt["exists"]:
+                continue
+            data = base64.b64decode(receipt["data"], validate=True)
+            if (type(receipt["size"]) is not int or not 0 <= receipt["size"] <= 262144
+                    or len(data) != receipt["size"] or hashlib.sha256(data).hexdigest() != receipt["sha256"]):
+                raise RuntimeError("IME actual evidence size/digest mismatch")
+            destination = os.path.join(evidence, name if name.startswith("ime-admission/")
+                                       else os.path.join("ime-composition", name))
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            with open(destination, "wb") as stream:
+                stream.write(data)
+            collected[name] = data
+        except Exception as error:
+            errors.append({"file": name, "exception_type": type(error).__name__})
+    return collected, errors
+
+
+def require_ime_cleanup(cleanup, original, processes):
+    """No missing-owner/no-op response can stand in for owned restoration."""
+    restored = cleanup.get("restored", {})
+    retired = cleanup.get("retired", {})
+    if (cleanup.get("started") is not True or cleanup.get("cleanup_confirmed") is not True
+            or cleanup.get("errors") != [] or not isinstance(restored, dict)
+            or not isinstance(retired, dict) or restored.get("restored") is not True
+            or any(restored.get(key) != original[key] for key in ("uid", "engine", "daemon_pid", "settings"))
+            or "engine" not in processes or not set(processes) <= {"engine", "window"}
+            or set(retired) != set(processes)):
+        raise RuntimeError("native IME original settings/owned retirement receipt did not qualify")
+    for role, process in processes.items():
+        receipt = retired[role]
+        if (not isinstance(receipt, dict) or receipt.get("original") != process["identity"]
+                or receipt.get("retired") is not True
+                or receipt.get("proc_absent") is not True):
+            raise RuntimeError("native IME exact owned process retirement is unconfirmed")
+
+
+def run_native_ime_proof(qmp, agent, out, evidence, record):
+    """Installed supervised native IBus composition, independent of key counts."""
+    observations, primary = {}, None
+    attempted = False
+    owned_processes = {}
+    admission_passed = composition_passed = False
+    try:
+        with open(os.path.join(out, "shipped-payload.json")) as stream:
+            admitted = json.load(stream)
+        # The original nested proof's readiness budgets, split into short QGA
+        # actions; never enlarge GuestAgent's per-action absolute deadline.
+        native_ime_wait(agent, "ime-ready", lambda value: value["ready"], 40, 0.5)
+        started = agent.run("ime-start")
+        attempted = True
+        observations["start"] = started
+        owned_processes.update(started["processes"])
+        if started["admission"] != admitted:
+            raise RuntimeError("installed payload/package admission changed before native input")
+        active = native_ime_wait(agent, "ime-observe", lambda value: value["engine_ready"], 30, 0.5)
+        observations["engine_active"] = active
+        denial = agent.run("ime-admission")
+        observations["admission"] = denial
+        receipt = require_ime_admission(denial, started, admitted)
+        collected, errors = collect_ime_files(agent, evidence)
+        if errors or json.loads(collected.get("ime-admission/receipt.json", b"null")) != receipt:
+            raise RuntimeError("actual native denial artifacts were not retained exactly")
+        for name, value in (("wayland-info.txt", receipt["registry"]["stdout"]),
+                            ("wayland-info.stderr", receipt["registry"]["stderr"]),
+                            ("copied-helper.stdout", receipt["copied_helper"]["stdout"]),
+                            ("copied-helper.stderr", receipt["copied_helper"]["stderr"])):
+            if collected.get("ime-admission/" + name) != value.encode():
+                raise RuntimeError("actual native denial output differs from its receipt")
+        record("V-IME-ADMISSION", True,
+               "actual admitted installed bridge ELF copy, ordinary session public registry: seat present, "
+               "input-method-v2 absent; IBus input context then exact denial/exit 1; denial only")
+        admission_passed = True
+        observations["window"] = agent.run("ime-window-start")
+        owned_processes["window"] = observations["window"]
+        focus_deadline = time.monotonic() + 20 * 0.3
+        for _ in range(20):
+            remaining = focus_deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("real native Gtk.Entry focus budget expired")
+            current = agent.run("inventory", timeout=min(30, remaining))
+            windows = [w for w in current["state"]["windows"] if w["app_id"] == "tuna-ime"]
+            if len(windows) == 1:
+                window = windows[0]
+                x, y, width, height = window["rect"]
+                click_x, click_y = x + min(100, width // 2), y + min(20, height // 2)
+                if not (0 <= click_x < WIDTH and 0 <= click_y < HEIGHT):
+                    raise RuntimeError("actual native IME entry lies outside the output")
+                qmp.click(click_x, click_y)
+                remaining = focus_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("real native Gtk.Entry focus budget expired")
+                focused = agent.run("inventory", timeout=min(30, remaining))
+                if focused["state"]["focused"] == window["id"]:
+                    if time.monotonic() >= focus_deadline:
+                        raise RuntimeError("real native Gtk.Entry focus budget expired")
+                    break
+            time.sleep(min(0.3, max(0, focus_deadline - time.monotonic())))
+        else:
+            raise RuntimeError("real native Gtk.Entry window never mapped/focused")
+        time.sleep(0.5)
+        if agent.run("ime-observe")["text"] not in (None, ""):
+            raise RuntimeError("real native Gtk.Entry was not initially empty")
+        for key in "nihao":
+            # The existing physical QMP send-key route, at nested's 100 ms
+            # inter-key timing (QMP.keys normally adds its own 150 ms sleep).
+            qmp.cmd("send-key", keys=[{"type": "qcode", "data": key}], **{"hold-time": 50})
+            time.sleep(0.1)
+        time.sleep(0.8)
+        preedit = agent.run("ime-observe")
+        observations["preedit"] = preedit
+        qmp.frame(os.path.join(evidence, "ime-preedit.png"))
+        if not preedit["engine_ready"] or preedit["text"] not in (None, ""):
+            raise RuntimeError("pinyin reached actual native Gtk.Entry before Space commit")
+        qmp.keys("spc")
+        committed = native_ime_wait(agent, "ime-observe", lambda value: value["text"] == "你好", 20, 0.3)
+        observations["committed"] = committed
+        if (not committed["engine_ready"] or committed["processes"] != preedit["processes"]
+                or committed["bridge"] != preedit["bridge"] or committed["daemon"] != preedit["daemon"]):
+            raise RuntimeError("original supervised native IME principals changed during physical composition")
+        qmp.frame(os.path.join(evidence, "ime-committed.png"))
+        record("V-IME-COMPOSITION", True,
+               "unchanged engine/window fixtures; GTK Wayland text-input path through installed supervised "
+               "IBus bridge: physical nihao stays uncommitted, Space commits actual Gtk.Entry text 你好")
+        composition_passed = True
+    except BaseException as error:
+        primary = error
+        if not admission_passed:
+            record("V-IME-ADMISSION", False, f"actual native denial did not qualify ({type(error).__name__})")
+        if not composition_passed:
+            record("V-IME-COMPOSITION", False, f"actual native composition did not qualify ({type(error).__name__})")
+        raise
+    finally:
+        cleanup_errors = []
+        if attempted:
+            try:
+                cleanup = agent.run("ime-stop")
+                observations["cleanup"] = cleanup
+                require_ime_cleanup(cleanup, started["original"], owned_processes)
+            except Exception as error:
+                cleanup_errors.append({"stage": "restore-retire", "exception_type": type(error).__name__})
+            _, errors = collect_ime_files(agent, evidence)
+            cleanup_errors.extend(errors)
+        try:
+            with open(os.path.join(evidence, "ime-composition.json"), "w") as stream:
+                json.dump({"observations": observations,
+                           "primary_error_type": type(primary).__name__ if primary else None,
+                           "cleanup_errors": cleanup_errors}, stream, indent=2)
+        except Exception as error:
+            cleanup_errors.append({"stage": "evidence-retention", "exception_type": type(error).__name__})
+        if primary is None and cleanup_errors:
+            raise RuntimeError("native IME cleanup/evidence retention failed")
+
+
 def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconnect=None, strip_edge=False,
                   published=False, orca_contract="distribution"):
     """Actual DRM/logind lifecycle on the final boot, with unchanged app identities."""
@@ -842,6 +1063,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                                                           right[2][offset:offset+3])) > 24
         return changed
 
+    run_native_ime_proof(qmp, agent, out, evidence, record)
     agent.run("start-input-probe")
     probe = await_state(lambda state: any(w["app_id"] == "org.tuna.VmInput" for w in state["state"]["windows"]), label="input-created")
     probe_window = next(w for w in probe["state"]["windows"] if w["app_id"] == "org.tuna.VmInput")
