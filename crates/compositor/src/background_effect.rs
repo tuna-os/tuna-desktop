@@ -3,9 +3,10 @@
 //! content behind part of its surface to be blurred.
 //!
 //! As in Mutter the global is created unconditionally
-//! (`meta_wayland_init_background_effect`) and every bind is told the
-//! `blur` capability straight away. One `ext_background_effect_surface_v1`
-//! per surface (`background_effect_exists` on the manager otherwise);
+//! (`meta_wayland_init_background_effect`). The blur capability is sent
+//! only after the real scene framebuffer passes renderer admission.
+//! One `ext_background_effect_surface_v1` per surface (`background_effect_exists`
+//! on the manager otherwise);
 //! `set_blur_region` copies the region into the surface's pending state,
 //! applied on the next `wl_surface.commit` (synchronised subsurfaces
 //! included), a NULL region removing the effect. On a destroyed surface it
@@ -42,6 +43,8 @@ pub const VERSION: u32 = 1;
 pub(crate) struct BackgroundEffects {
     _global: GlobalId,
     surfaces: Vec<Weak<WlSurface>>,
+    managers: Vec<Weak<ExtBackgroundEffectManagerV1>>,
+    blur_supported: bool,
 }
 
 /// A committed blur region, as the renderer reads it.
@@ -64,12 +67,44 @@ impl BackgroundEffects {
         Self {
             _global: dh.create_global::<State, ExtBackgroundEffectManagerV1, ()>(VERSION, ()),
             surfaces: Vec::new(),
+            managers: Vec::new(),
+            blur_supported: false,
+        }
+    }
+
+    /// Re-admit after a scene format/context change; revoke on draw failure.
+    /// The global remains available even when the device cannot render blur.
+    pub(crate) fn set_blur_supported(&mut self, supported: bool) -> bool {
+        if self.blur_supported == supported {
+            return false;
+        }
+        self.blur_supported = supported;
+        let capabilities = self.capabilities();
+        self.managers.retain(|weak| {
+            if let Ok(manager) = weak.upgrade() {
+                manager.capabilities(capabilities);
+                true
+            } else {
+                false
+            }
+        });
+        true
+    }
+
+    fn capabilities(&self) -> ext_background_effect_manager_v1::Capability {
+        if self.blur_supported {
+            ext_background_effect_manager_v1::Capability::Blur
+        } else {
+            ext_background_effect_manager_v1::Capability::empty()
         }
     }
 
     /// Live surfaces with a non-empty committed blur region; nothing to
     /// look at (and no work for the renderer) when no client asked.
     pub(crate) fn blurred(&self) -> Vec<Blurred> {
+        if !self.blur_supported {
+            return Vec::new();
+        }
         self.surfaces
             .iter()
             .filter_map(|weak| weak.upgrade().ok())
@@ -215,7 +250,7 @@ fn clip(
 
 impl GlobalDispatch<ExtBackgroundEffectManagerV1, ()> for State {
     fn bind(
-        _state: &mut Self,
+        state: &mut Self,
         _dh: &DisplayHandle,
         _client: &Client,
         resource: New<ExtBackgroundEffectManagerV1>,
@@ -223,8 +258,10 @@ impl GlobalDispatch<ExtBackgroundEffectManagerV1, ()> for State {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let manager = data_init.init(resource, ());
-        // background_effect_manager_bind: the capabilities, at once.
-        manager.capabilities(ext_background_effect_manager_v1::Capability::Blur);
+        let effects = &mut state.protocols.background_effects;
+        manager.capabilities(effects.capabilities());
+        effects.managers.retain(|weak| weak.upgrade().is_ok());
+        effects.managers.push(manager.downgrade());
     }
 }
 
