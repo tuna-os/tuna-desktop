@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -589,10 +590,34 @@ class ProcessAndConsoleTests(unittest.TestCase):
                           {"event": "listening", "vm": "owned", "namespace": "local"}):
                 instance.console = self.child("import time; print(" + repr(json.dumps(event)) + ", flush=True); time.sleep(60)")
                 with self.subTest(event=event), self.assertRaisesRegex(ValueError, "handshake identity"):
-                    instance.browser_ready()
+                    instance.browser_ready(None)
                 self.assertFalse(instance.receipt["browserRfbConnected"])
                 self.assertFalse((instance.state / "receipt.json").exists())
                 launcher.terminate_child(instance.console, group=True, timeout=1)
+
+    def test_actual_browser_wait_accepts_owned_stop_without_receipting_rfb_success(self):
+        with tempfile.TemporaryDirectory(prefix="tuna-stop-readiness-", dir="/tmp") as temporary:
+            state = Path(temporary).resolve()
+            instance = object.__new__(launcher.Launch)
+            instance.state = state
+            instance.record = {"name": "owned"}
+            instance.receipt = {"browserRfbConnected": False}
+            instance.console = self.child("import time; time.sleep(2)")
+            with socket.socket(socket.AF_UNIX) as listener, socket.socket(socket.AF_UNIX) as caller:
+                listener.bind(str(state / "control.sock"))
+                listener.listen(1)
+                caller.settimeout(5)
+                caller.connect(str(state / "control.sock"))
+                caller.sendall(b"stop\n")
+                with self.assertRaises(launcher._StopRequested) as stopped:
+                    instance.browser_ready(listener)
+                # The production browser waiter transfers this exact live OS
+                # connection to launch's cleanup owner; it must not ack cleanup.
+                with stopped.exception.client as accepted:
+                    accepted.sendall(b"accepted\n")
+                    self.assertEqual(caller.recv(16), b"accepted\n")
+                self.assertFalse(instance.receipt["browserRfbConnected"])
+                self.assertFalse((state / "receipt.json").exists())
 
     def test_console_endpoint_requires_owned_loopback_and_readiness_nonce(self):
         name = "try-tuna-" + "a" * 20

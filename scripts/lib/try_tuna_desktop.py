@@ -490,15 +490,38 @@ def admit(manifest_path, bundle_path, state, artifact_dir=None, expected=None):
     return manifest, hashlib.sha256(payload).hexdigest(), binary, pristine, tools
 
 
-def read_event(process, timeout):
+class _StopRequested(Exception):
+    """Transfer an accepted control connection to the launch cleanup owner."""
+    def __init__(self, client):
+        super().__init__("launcher stop requested")
+        self.client = client
+
+
+def _accept_stop(listener):
+    client, _ = listener.accept()
+    try:
+        client.settimeout(2)
+        require(client.recv(16) == b"stop\n", "unknown launcher control request")
+        return client
+    except BaseException:
+        client.close()
+        raise
+
+
+def read_event(process, timeout, *, control=None):
     selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
     data = bytearray()
     try:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        if control is not None:
+            selector.register(control, selectors.EVENT_READ)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             require(not CANCELLED, "console handoff cancelled")
-            if selector.select(.1):
+            events = selector.select(.1)
+            if control is not None and any(key.fileobj is control for key, _ in events):
+                raise _StopRequested(_accept_stop(control))
+            for key, _ in events:
                 char = os.read(process.stdout.fileno(), 1)
                 require(char, "console exited before its readiness event")
                 if char == b"\n":
@@ -641,8 +664,8 @@ class Launch:
         atomic_json(self.state / "receipt.json", self.receipt)
         return endpoint["url"]
 
-    def browser_ready(self):
-        event = read_event(self.console, 180)
+    def browser_ready(self, listener):
+        event = read_event(self.console, 180, control=listener)
         require(event.get("event") == "rfb-connected" and event.get("vm") == self.record["name"]
                 and event.get("namespace") == "local", "browser handshake identity differs")
         self.receipt["browserRfbConnected"] = True
@@ -732,18 +755,20 @@ def launch(options):
         else:
             require(shutil.which("xdg-open"), "xdg-open is required to open your browser")
             run(["xdg-open", url], timeout=30)
-        instance.browser_ready()
-        print("Browser connected to the VM console. The guest may still be booting or need first setup.\n"
-              "Close the browser to disconnect only; Ctrl-C or `stop` stops the VM and retains your guest data.", flush=True)
-        while not CANCELLED:
-            require(instance.console.poll() is None, "owned console process exited")
-            try:
-                client, _ = listener.accept()
-                client.settimeout(2)
-                require(client.recv(16) == b"stop\n", "unknown launcher control request")
-                break
-            except socket.timeout:
-                pass
+        try:
+            instance.browser_ready(listener)
+        except _StopRequested as request:
+            client = request.client
+        else:
+            print("Browser connected to the VM console. The guest may still be booting or need first setup.\n"
+                  "Close the browser to disconnect only; Ctrl-C or `stop` stops the VM and retains your guest data.", flush=True)
+            while not CANCELLED:
+                require(instance.console.poll() is None, "owned console process exited")
+                try:
+                    client = _accept_stop(listener)
+                    break
+                except socket.timeout:
+                    pass
     finally:
         try:
             if instance is not None:

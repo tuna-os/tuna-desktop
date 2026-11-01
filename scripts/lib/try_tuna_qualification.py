@@ -10,6 +10,7 @@ import re
 import runpy
 import secrets
 import shlex
+import select
 import shutil
 import signal
 import subprocess
@@ -53,7 +54,8 @@ def browser_process(url):
             process.send_signal(requested_stop)
         launcher.atomic_json(profile.parent / (profile.name + "-identity.json"),
                              {"executable": executable, "sha256": launcher.sha256(executable), "pid": process.pid,
-                              "system": platform.system(), "machine": platform.machine()})
+                              "system": platform.system(), "machine": platform.machine(),
+                              "profile": str(profile), "url": url})
         returncode = process.wait()
     finally:
         if process.poll() is None:
@@ -62,6 +64,18 @@ def browser_process(url):
     launcher.atomic_json(profile.parent / (profile.name + "-exit.json"),
                          {"pid": process.pid, "returncode": returncode, "ownedChildWaited": True})
     raise SystemExit(returncode if returncode >= 0 else 128 - returncode)
+
+
+def no_rfb_opener(url):
+    """Observe an actual successful OS opener without connecting any browser."""
+    profile = launcher.private_directory(os.environ["TUNA_VM_BROWSER_PROFILE"])
+    executable = "/usr/bin/true"
+    process = subprocess.Popen([executable, url], stdin=subprocess.DEVNULL, env=launcher.trusted_environment())
+    returncode = process.wait()
+    launcher.atomic_json(profile.parent / (profile.name + "-opener-exit.json"),
+                         {"executable": executable, "sha256": launcher.sha256(executable), "pid": process.pid,
+                          "profile": str(profile), "url": url, "returncode": returncode, "ownedChildWaited": True})
+    raise SystemExit(returncode)
 
 
 class Screen:
@@ -310,33 +324,133 @@ def qualify(options):
     consumer_log = (output / "launcher.log").open("ab")
     def command(*args):
         return launcher.run([corral, "--backend", "qemu", *args], cancellable=False)
-    def start(browser=True):
-        nonlocal child
+    console_urls = set()
+    readiness_deadline = None
+    def start(browser=True, opener=None):
+        nonlocal child, readiness_deadline
         profile = launcher.private_directory(work / ("browser-" + secrets.token_hex(8)))
         env = dict(launcher.trusted_environment(), TUNA_VM_BROWSER_PROFILE=str(profile))
         args = [sys.executable, str(CONSUMER), "launch", "--manifest", str(options.artifact_dir / "manifest.json"),
                 "--bundle", str(options.artifact_dir / "manifest.json.sigstore.json"),
                 "--manifest-sha256", receipt["manifestSha256"], "--artifact-dir", str(options.artifact_dir),
                 "--state-dir", str(state), "--browser"]
-        args += [sys.executable, str(Path(__file__).resolve())] if browser else [shutil.which("false")]
+        args += opener if opener is not None else ([sys.executable, str(Path(__file__).resolve())] if browser else [shutil.which("false")])
         child = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=consumer_log, start_new_session=True)
         endpoint = launcher.read_event(child, 900)
+        readiness_deadline = time.monotonic() + 180
         launcher.require(endpoint.get("event") == "console-listening", "native CLI did not hand off its actual console")
+        launcher.require(endpoint["url"] not in console_urls, "native CLI reused a previous console URL")
+        console_urls.add(endpoint["url"])
+        current_runtime(endpoint)
         return endpoint, profile
-    def finish(expected=0, cancel_signal=None):
+    def current_runtime(endpoint):
+        value = json.loads((state / "receipt.json").read_text())
+        launcher.require(value.get("console", {}).get("url") == endpoint["url"]
+                         and value.get("manifestSha256") == receipt["manifestSha256"]
+                         and value.get("cleanupComplete") is False,
+                         "native readiness receipt does not belong to the current signed launch")
+        return value
+    def observe_until(predicate, deadline, message):
+        # Consume only the existing human CLI output while observing owned
+        # helper files/receipts; no synthetic readiness event or fixed sleep.
+        while time.monotonic() < deadline:
+            launcher.require(child.poll() is None, "native CLI exited while observing " + message)
+            if predicate():
+                return
+            if select.select([child.stdout], [], [], min(.1, max(0, deadline - time.monotonic())))[0]:
+                data = os.read(child.stdout.fileno(), 65536)
+                launcher.require(data, "native CLI closed its output while observing " + message)
+                consumer_log.write(data)
+        raise TimeoutError(message)
+    def browser_identity(profile, endpoint):
+        identity = json.loads((profile.parent / (profile.name + "-identity.json")).read_text())
+        launcher.require(identity.get("profile") == str(profile) and identity.get("url") == endpoint["url"]
+                         and identity.get("system") == platform.system() and identity.get("machine") == platform.machine()
+                         and type(identity.get("pid")) is int and identity["pid"] > 0,
+                         "native Chromium identity is not from this profile/host/console")
+        launcher.verify_host_binary(identity["executable"], options.platform)
+        launcher.require(identity["sha256"] == launcher.sha256(identity["executable"]),
+                         "native Chromium executable changed")
+        return identity
+    def active_browser(browser, console, profile, endpoint, identity):
+        launcher.require(browser_identity(profile, endpoint) == identity, "current native Chromium identity changed")
+        processes = browser.new_browser_cdp_session()
+        try:
+            actual = processes.send("SystemInfo.getProcessInfo")["processInfo"]
+        finally:
+            processes.detach()
+        launcher.require([entry["id"] for entry in actual if entry["type"] == "browser"] == [identity["pid"]],
+                         "CDP is not attached to the actual owned native Chromium process")
+        launcher.require(console.page.url == endpoint["url"]
+                         and console.page.evaluate('document.body.dataset.connected === "true" && !!document.querySelector("#vnc-canvas")'),
+                         "actual current Chromium page has no RFB connection")
+        value = current_runtime(endpoint)
+        launcher.require(value.get("browserRfbConnected") is True, "current consumer receipt has no RFB connection")
+        return value
+    def connect_browser(driver, endpoint, profile, label):
+        port_file = profile / "DevToolsActivePort"
+        identity_file = profile.parent / (profile.name + "-identity.json")
+        observe_until(lambda: port_file.is_file() and identity_file.is_file(),
+                      min(readiness_deadline, time.monotonic() + 120), "actual native browser debugging endpoint absent")
+        identity = browser_identity(profile, endpoint)
+        launcher.require(Path(identity["executable"]).resolve() == Path(driver.chromium.executable_path).resolve(),
+                         "owned native Chromium differs from the actual installed browser")
+        port = int(port_file.read_text().splitlines()[0])
+        browser = driver.chromium.connect_over_cdp(f"http://127.0.0.1:{port}",
+                                                  timeout=max(1, int((readiness_deadline - time.monotonic()) * 1000)))
+        pages = browser.contexts[0].pages
+        launcher.require(len(pages) == 1 and pages[0].url == endpoint["url"], "browser did not open the owned noVNC URL")
+        pages[0].set_viewport_size({"width": 1400, "height": 1000})
+        Console = runpy.run_path(str(ROOT / "scripts/tuna-corral-journey"))["Console"]
+        console = Console(driver, endpoint["url"], browser=browser, page=pages[0])
+        console.connected(timeout=max(1, min(60000, int((readiness_deadline - time.monotonic()) * 1000))))
+        observe_until(lambda: current_runtime(endpoint).get("browserRfbConnected") is True,
+                      readiness_deadline, "current native RFB readiness receipt absent")
+        value = active_browser(browser, console, profile, endpoint, identity)
+        launcher.atomic_json(output / (label + "-identity.json"), identity)
+        launcher.atomic_json(output / (label + "-connected.json"),
+                             {"console": value["console"], "browserRfbConnected": True, "browserPid": identity["pid"],
+                              "profile": str(profile), "nativeHeaderVerified": True, "version": browser.version})
+        return browser, console, identity
+    def browser_retired(profile, identity, label):
+        exit_file = profile.parent / (profile.name + "-exit.json")
+        launcher.require(exit_file.is_file(), "owned native Chromium helper did not report actual child retirement")
+        value = json.loads(exit_file.read_text())
+        launcher.require(value.get("pid") == identity["pid"] and value.get("ownedChildWaited") is True
+                         and type(value.get("returncode")) is int,
+                         "native Chromium retirement does not match its owned current process")
+        launcher.atomic_json(output / (label + "-exit.json"), value)
+        return value
+    def finish(expected=0, cancel_signal=None, connected=None, early_opener=None):
         if cancel_signal is not None:
+            launcher.require(connected is not None, "cancellation requires an actual connected native Chromium")
+            browser, console, profile, endpoint, identity, label = connected
+            active_browser(browser, console, profile, endpoint, identity)
             launcher.require(child.poll() is None, "native CLI exited before the cancellation signal")
             child.send_signal(cancel_signal)
         else:
+            stop_started = time.monotonic()
             launcher.run([sys.executable, CONSUMER, "stop", "--state-dir", state], timeout=180)
+            launcher.require(time.monotonic() - stop_started < 150, "actual stop did not acknowledge within its existing deadline")
         child.wait(timeout=180)
         launcher.require(child.returncode == expected if cancel_signal is None else child.returncode in (0, 1, 128 + cancel_signal), "native CLI returned unexpected lifecycle status")
         value = json.loads((state / "receipt.json").read_text())
         launcher.require(value["cleanupComplete"] is True and value["diskLockReleased"] is True
                          and value["userDataRetained"] is True and Path(value["userDataPath"]).is_file(), "actual lifecycle cleanup/data retention failed")
         if cancel_signal is not None:
+            launcher.require(value.get("console", {}).get("url") == endpoint["url"] and value.get("browserRfbConnected") is True,
+                             "cancellation cleanup receipt is not the connected current launch")
+            browser_retired(profile, identity, label)
             value["qualificationCancellationSignal"] = signal.Signals(cancel_signal).name
             value["qualificationCliReturncode"] = child.returncode
+        else:
+            value["qualificationStopAcknowledged"] = True
+        if early_opener is not None:
+            launcher.require(value.get("console", {}).get("url") == early_opener["url"]
+                             and value.get("browserRfbConnected") is False,
+                             "early stop claimed RFB readiness or returned a stale cleanup receipt")
+            value["qualificationEarlyStop"] = True
+            value["qualificationOpener"] = early_opener
         known_records.append(value["vm"])
         launcher.atomic_json(output / ("lifecycle-" + str(len(known_records)) + ".json"), value)
         if guard:
@@ -374,24 +488,11 @@ def qualify(options):
         checks["nativeExecution"] = True
         # Attach to the actual Chromium process opened by the real CLI, not a
         # second simulated browser. Reuse the existing journey console driver.
-        deadline = time.monotonic() + 120
-        port_file = profile / "DevToolsActivePort"
-        while not port_file.exists() and time.monotonic() < deadline:
-            launcher.require(child.poll() is None, "browser/CLI failed before real connection")
-            time.sleep(.1)
-        launcher.require(port_file.is_file(), "actual native browser debugging endpoint absent")
-        port = int(port_file.read_text().splitlines()[0])
         nonce = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ") for _ in range(12))
         user, password, full_name = "tuna" + secrets.token_hex(4), secrets.token_urlsafe(24), "Tuna Launcher " + nonce
         with sync_playwright() as driver:
-            browser = driver.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            browser, console, identity = connect_browser(driver, endpoint, profile, "browser-first")
             launcher.atomic_json(output / "browser-runtime.json", {"version": browser.version, "nativePlatform": options.platform})
-            pages = browser.contexts[0].pages
-            launcher.require(len(pages) == 1 and pages[0].url == endpoint["url"], "browser did not open the owned noVNC URL")
-            pages[0].set_viewport_size({"width": 1400, "height": 1000})
-            Console = runpy.run_path(str(ROOT / "scripts/tuna-corral-journey"))["Console"]
-            console = Console(driver, endpoint["url"], browser=browser, page=pages[0])
-            console.connected()
             checks["browserRfbConnected"] = True
             screen = Screen(console, output)
             setup_account(screen, user, password, full_name)
@@ -425,12 +526,10 @@ def qualify(options):
             session = browser.new_browser_cdp_session()
             session.send("Browser.close")
             exit_file = profile.parent / (profile.name + "-exit.json")
-            deadline = time.monotonic() + 60
-            while not exit_file.exists() and time.monotonic() < deadline:
-                time.sleep(.1)
-            launcher.require(exit_file.is_file(), "actual Chromium process did not retire after browser close")
-            browser_exit = json.loads(exit_file.read_text())
-            launcher.require(browser_exit.get("ownedChildWaited") is True and browser_exit.get("returncode") == 0,
+            observe_until(exit_file.is_file, time.monotonic() + 60,
+                          "actual Chromium process did not retire after browser close")
+            browser_exit = browser_retired(profile, identity, "browser-first")
+            launcher.require(browser_exit.get("returncode") == 0,
                              "actual native browser did not close successfully")
             launcher.atomic_json(output / "browser-close.json", browser_exit)
         # Closing a browser disconnects only; the VM/data must remain alive.
@@ -447,11 +546,35 @@ def qualify(options):
         command("create", guard_name, "--loopback", "--arch", "amd64", "--disk", "64M", "--mem", "128M", "--cpu", "1")
         command("start", guard)
         finish()
+        # A successful OS opener is not browser/RFB readiness. Stop must remain
+        # serviceable while the real signed VM/console await a connection.
+        endpoint, profile = start(opener=[sys.executable, str(Path(__file__).resolve()), "no-rfb-opener"])
+        opener_exit = profile.parent / (profile.name + "-opener-exit.json")
+        observe_until(opener_exit.is_file, readiness_deadline, "actual no-RFB OS opener did not exit")
+        opener = json.loads(opener_exit.read_text())
+        launcher.require(opener.get("executable") == "/usr/bin/true"
+                         and opener.get("sha256") == launcher.sha256("/usr/bin/true")
+                         and opener.get("profile") == str(profile) and opener.get("url") == endpoint["url"]
+                         and type(opener.get("pid")) is int and opener["pid"] > 0
+                         and opener.get("returncode") == 0 and opener.get("ownedChildWaited") is True,
+                         "early stop did not observe its actual successful OS opener")
+        early_runtime = current_runtime(endpoint)
+        launcher.require(early_runtime.get("browserRfbConnected") is False,
+                         "no-RFB OS opener unexpectedly established readiness")
+        launcher.require(json.loads(command("qmp", "qemu//local/" + early_runtime["vm"]["name"], "query-status"))["running"] is True,
+                         "early-stop negative did not run the actual VM")
+        launcher.atomic_json(output / "early-stop-opener-exit.json", opener)
+        launcher.atomic_json(output / "early-stop-awaiting-readiness.json", early_runtime)
+        early_cleanup = finish(early_opener=opener)
+        launcher.atomic_json(output / "early-stop-cleanup.json", early_cleanup)
         checks["stopCleanup"] = True
         checks["diskLockReleased"] = True
         for cancel_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            start()
-            finish(cancel_signal=cancel_signal)
+            endpoint, profile = start()
+            label = "browser-cancel-" + signal.Signals(cancel_signal).name.lower()
+            with sync_playwright() as driver:
+                browser, console, identity = connect_browser(driver, endpoint, profile, label)
+                finish(cancel_signal=cancel_signal, connected=(browser, console, profile, endpoint, identity, label))
         checks["cancellationCleanup"] = True
         start(browser=False)
         child.wait(timeout=180)
@@ -537,5 +660,10 @@ def qualify(options):
 
 
 if __name__ == "__main__":
-    launcher.require(len(sys.argv) == 2 and sys.argv[1].startswith("http://127.0.0.1:"), "qualification browser requires the actual loopback console URL")
-    browser_process(sys.argv[1])
+    no_rfb = len(sys.argv) == 3 and sys.argv[1] == "no-rfb-opener"
+    launcher.require((len(sys.argv) == 2 or no_rfb) and sys.argv[-1].startswith("http://127.0.0.1:"),
+                     "qualification browser requires the actual loopback console URL")
+    if no_rfb:
+        no_rfb_opener(sys.argv[-1])
+    else:
+        browser_process(sys.argv[-1])

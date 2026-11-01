@@ -55,6 +55,12 @@ Terminal cancellation (SIGINT, SIGTERM or SIGHUP), stop, failed browser launch a
 must retire owned processes/listeners/locks without touching an unrelated
 VM. Normal launch preserves writable user data; qualification explicitly
 deletes only its own disposable copies after retirement.
+The owned stop socket remains serviceable while browser readiness is pending;
+an opener returning zero is not a connection. Native qualification must prove
+early stop after that real no-RFB opener, and each cancellation signal must
+follow an actual current RFB connection in native Chromium. Its retained
+executable/profile identity and actual owned-child wait/exit receipt must agree;
+a pre-browser cancellation or a stale readiness receipt cannot pass.
 
 The consumer requires Python 3 and the native package manager (on macOS,
 Homebrew and its normal command-line-tool prerequisites). It obtains the
