@@ -421,6 +421,150 @@ def retain_endpoint_evidence(path, diagnostic, primary=None):
     return None
 
 
+def notification_layers(sample):
+    """Only the actual panel and notification role; unknown overlays fail closed."""
+    ui = sample.get('notification_ui')
+    layers = ui.get('layers') if type(ui) is dict else None
+    if type(layers) is not list or len(layers) > 32:
+        raise RuntimeError('actual bounded notification layer observation missing')
+    for layer in layers:
+        if type(layer) is not dict or layer.get('namespace') not in ('tuna-panel', 'tuna-shell-banners'):
+            raise RuntimeError('refuse notification input across an unknown overlay')
+        rect = layer.get('rect')
+        if (type(rect) is not list or len(rect) != 4 or any(type(value) is not int for value in rect)
+                or min(rect[:2]) < 0 or min(rect[2:]) <= 0
+                or rect[0] + rect[2] > 1280 or rect[1] + rect[3] > 800):
+            raise RuntimeError('notification layer outside actual viewport')
+    banners = [layer for layer in layers if layer['namespace'] == 'tuna-shell-banners']
+    if len(banners) > 1 or sum(layer['namespace'] == 'tuna-panel' for layer in layers) > 1:
+        raise RuntimeError('ambiguous actual notification layers')
+    return layers, banners
+
+
+def notification_close_control(sample, original, observer_sha256, *, require_focused=False, edge=False):
+    """Join a concrete Close control to the original shell, not a namespace alone."""
+    import re
+    windows(sample, original, edge=edge)
+    state = sample['inventory']['state']
+    if (state.get('tile_preview') is not None or type(state.get('seat_pressed_key_count')) is not int
+            or state['seat_pressed_key_count'] != 0):
+        raise RuntimeError('refuse notification input during an owned gesture/key hold')
+    layers, banners = notification_layers(sample)
+    if len(banners) != 1:
+        raise RuntimeError('one concrete notification banner is required')
+    control = sample['notification_ui'].get('control')
+    if type(control) is not dict or control.get('observer_sha256') != observer_sha256:
+        raise RuntimeError('notification observer differs from exact executing source')
+    shell = original['core']['tuna-shell-gtk']
+    principal = {key: shell[key] for key in ('pid', 'uid', 'start_ticks')}
+    principal['executable'] = 'tuna-shell-gtk'
+    owner = control.get('atspi_owner')
+    expected = {'GetNameOwner': owner, 'GetConnectionUnixProcessID': shell['pid'],
+                'GetConnectionUnixUser': shell['uid']}
+    if (control.get('principal') != principal or type(owner) is not str
+            or re.fullmatch(r':\d+\.\d+', owner) is None or len(owner) > 64
+            or control.get('credentials_before') != expected or control.get('credentials_after') != expected
+            or control.get('observation_only') is not True):
+        raise RuntimeError('notification control lacks original shell bus/process ownership')
+    banner = control.get('notification_banner')
+    x, y, width, height = banners[0]['rect']
+    if (type(banner) is not dict or banner.get('frames') != [[0, 0, width, height]]
+            or type(banner.get('close_controls')) is not list or len(banner['close_controls']) != 1):
+        raise RuntimeError('one actual owned Notifications frame and Close control required')
+    close = banner['close_controls'][0]
+    if type(close) is not dict or type(close.get('focused')) is not bool:
+        raise RuntimeError('actual notification Close focus observation missing')
+    if require_focused and close['focused'] is not True:
+        raise RuntimeError('normal notification activation requires original Close focused')
+    rect = close.get('rect')
+    if (type(rect) is not list or len(rect) != 4 or any(type(value) is not int for value in rect)
+            or min(rect[:2]) < 0 or min(rect[2:]) <= 0
+            or rect[0] + rect[2] > width or rect[1] + rect[3] > height):
+        raise RuntimeError('notification Close control lies outside its actual banner')
+    # WINDOW extents establish membership/size, not Wayland screen coordinates:
+    # GTK CSS/surface offsets need not appear in AT-SPI extents. Never infer a
+    # pointer target from them. Only normal keys reaching this focused Close
+    # may activate it.
+    for layer in layers:
+        if layer is banners[0]:
+            continue
+        left, top, w, h = layer['rect']
+        if left < x + width and x < left + w and top < y + height and y < top + h:
+            raise RuntimeError('another actual layer overlaps the notification banner')
+    return control
+
+
+def dismiss_notification_banner(read, observe, send_key, sample, original, observer_sha256, *,
+                                deadline, input_idle, evidence, edge=False):
+    """Normal keyboard Close, only after original focused-control observation."""
+    layers, banners = notification_layers(sample)
+    if not banners:
+        return sample
+    found = windows(sample, original, edge=edge)
+    baseline = {key: sample['inventory']['state'][key]
+                for key in ('session_mode', 'focused', 'active_workspace')}
+    if not input_idle:
+        raise RuntimeError('refuse notification input while a fixture button is held')
+
+    def checked(actual, expected_layers=None):
+        if time.monotonic() >= deadline:
+            raise TimeoutError('notification observation exceeded capture deadline')
+        if (windows(actual, original, edge=edge) != found
+                or any(actual['inventory']['state'][key] != value for key, value in baseline.items())):
+            raise RuntimeError('actual fixture geometry/focus/mode changed across notification input')
+        count = actual['inventory']['state'].get('seat_pressed_key_count')
+        if type(count) is not int or count < 0:
+            raise RuntimeError('actual notification key-release observation missing')
+        actual_layers, actual_banners = notification_layers(actual)
+        if expected_layers is not None and actual_layers != expected_layers:
+            raise RuntimeError('actual notification layers changed before focused activation')
+        return actual_layers, actual_banners
+
+    def release_observed():
+        while time.monotonic() < deadline:
+            actual = read(deadline)
+            checked(actual, layers)
+            count = actual['inventory']['state'].get('seat_pressed_key_count')
+            if count == 0:
+                return
+            time.sleep(min(.05, max(0, deadline - time.monotonic())))
+        raise TimeoutError('notification key release exceeded capture deadline')
+
+    if time.monotonic() >= deadline:
+        raise TimeoutError('notification preparation exceeded capture deadline')
+    actual = observe(deadline)
+    checked(actual, layers)
+    notification_close_control(actual, original, observer_sha256, edge=edge)
+    evidence.update(activation='normal-keyboard-focused-Close', focus_input_sent=False,
+                    activated=False, confirmed_absent=False)
+    send_key('meta_l', 'n')
+    evidence['focus_input_sent'] = True
+    release_observed()
+    send_key('tab')
+    release_observed()
+    focused = observe(deadline)
+    checked(focused, layers)
+    evidence['control'] = notification_close_control(
+        focused, original, observer_sha256, require_focused=True, edge=edge)
+    if time.monotonic() >= deadline:
+        raise TimeoutError('notification focus validation exceeded capture deadline')
+    send_key('ret')
+    evidence['activated'] = True
+    while time.monotonic() < deadline:
+        after = read(deadline)
+        after_layers, remaining = checked(after)
+        if not remaining:
+            if after_layers != [layer for layer in layers if layer not in banners]:
+                raise RuntimeError('unexpected layer change across notification input')
+            if after['inventory']['state'].get('seat_pressed_key_count') == 0:
+                evidence.update(confirmed_absent=True, confirmed_absent_monotonic_ns=time.monotonic_ns())
+                return after
+        elif after_layers != layers:
+            raise RuntimeError('notification layer changed ambiguously after input')
+        time.sleep(min(.05, max(0, deadline - time.monotonic())))
+    raise TimeoutError('normal notification Close did not remove actual banner')
+
+
 def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *, edge=False):
     """Run actual installed input. CI image admission is separate from signed release admission."""
     import hashlib
@@ -441,6 +585,8 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         local = root / 'packaging/marlin/vm-lane' / name
         if image['member_sha256'].get('/usr/libexec/' + name) != hashlib.sha256(local.read_bytes()).hexdigest():
             raise RuntimeError('installed fixture/observer differs from exact executing source')
+    notification_observer_sha256 = hashlib.sha256(
+        (root / 'packaging/marlin/vm-lane/tuna-vm-shell-focus').read_bytes()).hexdigest()
     destination = Path(out) / 'strip-acceptance'
     destination.mkdir(mode=0o700, exist_ok=False)
     nonce = uuid.uuid4().hex
@@ -453,6 +599,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
     started = False
     primary = None
     endpoint_sequence = 0
+    button_down = False
 
     def guest(action, *args, budget=12):
         remaining = min(budget, deadline - time.monotonic())
@@ -500,10 +647,12 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
             {'type': 'abs', 'data': {'axis': 'y', 'value': int(y * 32767 / 800)}}])
 
     def button(down, name='left'):
+        nonlocal button_down
+        button_down = down
         transport.command('input-send-event', events=[{'type': 'btn', 'data': {'button': name, 'down': down}}])
 
-    def chord(*keys):
-        transport.command('send-key', keys=[{'type': 'qcode', 'data': key} for key in keys], **{'hold-time': 80})
+    def chord(*keys, input_transport=transport):
+        input_transport.command('send-key', keys=[{'type': 'qcode', 'data': key} for key in keys], **{'hold-time': 80})
 
     def capture(label, sample, role='alpha'):
         found = windows(sample, original, edge=edge)
@@ -528,8 +677,20 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
             'ppm_rgb_verified': None, 'png_rgb_verified': None,
         }
         attempts = 0
+        dismissal = {}
         last_error = None
         try:
+            diagnostic['stage'] = 'post-frame-read'
+            def observe_notification(sample_deadline):
+                remaining = min(12, sample_deadline - time.monotonic(), deadline - time.monotonic())
+                if remaining <= 0:
+                    raise TimeoutError('installed notification observation absolute deadline')
+                return agent.run('strip-notification-control', nonce, timeout=remaining)
+            def notification_key(*keys):
+                chord(*keys, input_transport=capture_transport)
+            sample = dismiss_notification_banner(
+                read, observe_notification, notification_key, sample, original, notification_observer_sha256,
+                deadline=capture_deadline, input_idle=not button_down, evidence=dismissal, edge=edge)
             while time.monotonic() < capture_deadline:
                 attempts += 1
                 diagnostic.update(attempts=attempts, stage='png-acquire',
@@ -596,6 +757,9 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
             diagnostic['failure_monotonic_ns'] = time.monotonic_ns()
             receipt['capture_failure'] = diagnostic
             raise
+        finally:
+            if dismissal:
+                receipt.setdefault('notification_dismissals', []).append({'label': label, **dismissal})
         entry = {'label': label, 'sample': sample, 'after': after,
                  'png_sha256': hashlib.sha256(png.read_bytes()).hexdigest(),
                  'ppm_sha256': hashlib.sha256(ppm.read_bytes()).hexdigest(),

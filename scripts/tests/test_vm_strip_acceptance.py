@@ -33,8 +33,10 @@ def sample():
         windows.append({'id': index + 1, 'app_id': app, 'rect': [16 + index * 256, 48, 240, 160]})
     return {'owner': owner, 'fixture': {'nonce': nonce, 'identity': copy.deepcopy(identity), 'backend': 'wayland',
                                       'schema': 1, 'fixture_mode': 'baseline', 'windows': roles, 'sequence': 5},
+            'notification_ui': {'layers': [{'namespace': 'tuna-panel', 'rect': [0, 0, 1280, 32]}], 'control': None},
             'inventory': {'processes': [{'executable': name, **value} for name, value in core.items()],
                           'state': {'locked': False, 'overview_open': False, 'session_mode': 'scroll',
+                                    'focused': 1, 'active_workspace': 0, 'seat_pressed_key_count': 0,
                                     'rendered_frames': 20, 'strip_animating': False, 'windows': windows}}}
 
 
@@ -466,12 +468,254 @@ class EndpointEvidence(unittest.TestCase):
         self.assertFalse(evidence['qualified'])
 
 
+class NotificationPreparation(unittest.TestCase):
+    def setUp(self):
+        self.value = sample()
+        self.original = copy.deepcopy(self.value['owner'])
+        self.sha = 'd' * 64
+        shell = self.original['core']['tuna-shell-gtk']
+        credentials = {'GetNameOwner': ':1.42', 'GetConnectionUnixProcessID': shell['pid'],
+                       'GetConnectionUnixUser': shell['uid']}
+        self.value['notification_ui']['layers'].append(
+            {'namespace': 'tuna-shell-banners', 'rect': [384, 32, 512, 108]})
+        self.value['notification_ui']['control'] = {
+            'principal': {**shell, 'executable': 'tuna-shell-gtk'}, 'atspi_owner': ':1.42',
+            'credentials_before': credentials, 'credentials_after': copy.deepcopy(credentials),
+            'observation_only': True, 'observer_sha256': self.sha,
+            'notification_banner': {'frames': [[0, 0, 512, 108]],
+                                    'close_controls': [{'rect': [472, 12, 32, 32], 'focused': False}]}}
+        self.focused = copy.deepcopy(self.value)
+        self.focused['notification_ui']['control']['notification_banner']['close_controls'][0]['focused'] = True
+        self.after = copy.deepcopy(self.value)
+        self.after['notification_ui']['layers'].pop()
+        self.after['notification_ui']['control'] = None
+
+    def dismiss(self, *, before=None, observed=None, after=None, idle=True, clock=None, late_absence=False):
+        from unittest.mock import patch
+        self.keys, self.evidence = [], {}
+        clock = clock or [0.0]
+        observations = [0]
+        def read(deadline):
+            self.assertEqual(deadline, 1)
+            if not self.keys or self.keys[-1] != ('ret',):
+                return self.value
+            if late_absence:
+                clock[0] = 2
+            return after if after is not None else self.after
+        def observe(_deadline):
+            observations[0] += 1
+            return observed if observed is not None else self.value if observations[0] == 1 else self.focused
+        with patch.object(proof.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(proof.time, 'sleep', side_effect=lambda duration: clock.__setitem__(0, clock[0] + duration)):
+            return proof.dismiss_notification_banner(
+                read, observe, lambda *keys: self.keys.append(keys), before if before is not None else self.value,
+                self.original, self.sha, deadline=1, input_idle=idle, evidence=self.evidence)
+
+    def test_owned_close_requires_actual_focused_control_before_return_and_real_absence(self):
+        self.assertIs(self.dismiss(), self.after)
+        self.assertEqual(self.keys, [('meta_l', 'n'), ('tab',), ('ret',)])
+        self.assertTrue(self.evidence['activated'])
+        self.assertTrue(self.evidence['confirmed_absent'])
+        self.assertLess(len(json.dumps(self.evidence)), 2048)
+
+    def test_no_banner_means_no_extra_observer_read_or_input(self):
+        self.assertIs(self.dismiss(before=self.after), self.after)
+        self.assertEqual(self.keys, [])
+        self.assertEqual(self.evidence, {})
+
+    def test_namespace_never_substitutes_for_original_process_bus_or_source(self):
+        for mutation in ('principal', 'owner', 'before', 'after', 'source', 'observation'):
+            value = copy.deepcopy(self.value)
+            control = value['notification_ui']['control']
+            if mutation == 'principal':
+                control['principal']['pid'] += 1
+            elif mutation == 'owner':
+                control['atspi_owner'] = 'org.private.untrusted'
+            elif mutation in ('before', 'after'):
+                control['credentials_' + mutation]['GetConnectionUnixProcessID'] += 1
+            elif mutation == 'source':
+                control['observer_sha256'] = 'f' * 64
+            else:
+                control['observation_only'] = False
+            with self.subTest(mutation=mutation), self.assertRaises(RuntimeError):
+                self.dismiss(observed=value)
+            self.assertEqual(self.keys, [])
+
+    def test_authentication_unknown_overlay_and_ambiguous_controls_never_receive_input(self):
+        for mutation in ('lock', 'overview', 'polkit', 'other', 'duplicate-layer', 'duplicate-frame',
+                         'duplicate-close', 'close-outside', 'frame-size', 'panel-overlap', 'keys', 'gesture'):
+            value = copy.deepcopy(self.value)
+            ui, state = value['notification_ui'], value['inventory']['state']
+            if mutation == 'lock':
+                state['locked'] = True
+            elif mutation == 'overview':
+                state['overview_open'] = True
+            elif mutation in ('polkit', 'other'):
+                ui['layers'].append({'namespace': 'tuna-polkit' if mutation == 'polkit' else 'other',
+                                     'rect': [900, 400, 100, 100]})
+            elif mutation == 'duplicate-layer':
+                ui['layers'].append(copy.deepcopy(ui['layers'][-1]))
+            elif mutation == 'duplicate-frame':
+                ui['control']['notification_banner']['frames'] *= 2
+            elif mutation == 'duplicate-close':
+                ui['control']['notification_banner']['close_controls'] *= 2
+            elif mutation == 'close-outside':
+                ui['control']['notification_banner']['close_controls'][0]['rect'][0] = 510
+            elif mutation == 'frame-size':
+                ui['control']['notification_banner']['frames'][0][2] = 511
+            elif mutation == 'panel-overlap':
+                ui['layers'][0]['rect'] = [0, 0, 1280, 100]
+            elif mutation == 'keys':
+                state['seat_pressed_key_count'] = 1
+            else:
+                state['tile_preview'] = {'window': 1}
+            with self.subTest(mutation=mutation), self.assertRaises(RuntimeError):
+                self.dismiss(before=value, observed=value)
+            self.assertEqual(self.keys, [])
+        with self.assertRaises(RuntimeError):
+            self.dismiss(idle=False)
+        self.assertEqual(self.keys, [])
+
+    def test_stale_control_and_identity_geometry_mode_or_focus_changes_fail_closed(self):
+        for mutation in ('identity', 'geometry', 'mode', 'focus', 'new-overlay'):
+            value = copy.deepcopy(self.after)
+            if mutation == 'identity':
+                value['fixture']['identity']['start_ticks'] += 1
+            elif mutation == 'geometry':
+                value['inventory']['state']['windows'][0]['rect'][0] += 1
+            elif mutation == 'mode':
+                value['inventory']['state']['session_mode'] = 'gnome'
+            elif mutation == 'focus':
+                value['inventory']['state']['focused'] = 2
+            else:
+                value['notification_ui']['layers'].append({'namespace': 'other', 'rect': [0, 0, 40, 40]})
+            with self.subTest(mutation=mutation), self.assertRaises(RuntimeError):
+                self.dismiss(after=value)
+            self.assertEqual(self.keys, [('meta_l', 'n'), ('tab',), ('ret',)])
+            self.assertFalse(self.evidence['confirmed_absent'])
+        value = copy.deepcopy(self.value)
+        value['notification_ui']['layers'][-1]['rect'][0] += 1
+        with self.assertRaises(RuntimeError):
+            self.dismiss(observed=value)
+        self.assertEqual(self.keys, [])
+
+    def test_persistent_banner_cannot_be_claimed_dismissed_or_repeatedly_activated(self):
+        with self.assertRaises(TimeoutError):
+            self.dismiss(after=self.value)
+        self.assertEqual(self.keys, [('meta_l', 'n'), ('tab',), ('ret',)])
+        self.assertFalse(self.evidence['confirmed_absent'])
+
+    def test_wrong_button_or_unfocused_close_never_receives_return(self):
+        with self.assertRaisesRegex(RuntimeError, 'Close focused'):
+            self.dismiss(observed=self.value)
+        self.assertEqual(self.keys, [('meta_l', 'n'), ('tab',)])
+        self.assertFalse(self.evidence['activated'])
+
+    def test_late_observation_or_absence_does_not_extend_existing_deadline(self):
+        from unittest.mock import patch
+        clock, keys = [0.0], []
+        def late(_):
+            clock[0] = 2
+            return self.value
+        with patch.object(proof.time, 'monotonic', side_effect=lambda: clock[0]):
+            with self.assertRaises(TimeoutError):
+                proof.dismiss_notification_banner(lambda _: self.after, late, lambda *k: keys.append(k),
+                    self.value, self.original, self.sha, deadline=1, input_idle=True, evidence={})
+        self.assertEqual(keys, [])
+        with self.assertRaises(TimeoutError):
+            self.dismiss(late_absence=True)
+        self.assertEqual(self.keys, [('meta_l', 'n'), ('tab',), ('ret',)])
+
+    def test_focus_chord_release_must_be_observed_before_tab(self):
+        from unittest.mock import patch
+        clock, keys = [0.0], []
+        held = copy.deepcopy(self.value)
+        held['inventory']['state']['seat_pressed_key_count'] = 1
+        with patch.object(proof.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(proof.time, 'sleep', side_effect=lambda duration: clock.__setitem__(0, clock[0] + duration)):
+            with self.assertRaises(TimeoutError):
+                proof.dismiss_notification_banner(lambda _: held, lambda _: self.value, lambda *k: keys.append(k),
+                    self.value, self.original, self.sha, deadline=1, input_idle=True, evidence={})
+        self.assertEqual(keys, [('meta_l', 'n')])
+
+    def test_real_checker_still_refuses_occluded_or_wrong_body_pixels(self):
+        color = proof.COLORS['beta']
+        pixels = bytearray(bytes(color) * 1280 * 800)
+        for y in range(36, 140):
+            for x in range(384, 896):
+                offset = (y * 1280 + x) * 3
+                pixels[offset:offset + 3] = bytes((84, 84, 90))
+        rect = [16, 48, 616, 300]
+        with self.assertRaises(proof.NotReady):
+            proof.colored_frame((1280, 800, pixels), rect, color)
+        self.assertTrue(proof.colored_frame((1280, 800, bytes(color) * 1280 * 800), rect, color))
+        with self.assertRaises(proof.NotReady):
+            proof.colored_frame((1280, 800, bytes(proof.COLORS['alpha']) * 1280 * 800), rect, color)
+
+    def test_lifecycle_projection_sanitizes_unknown_namespace_and_never_clears_backend(self):
+        import ast
+        root = Path(proof.__file__).resolve().parents[2]
+        path = root / 'packaging/marlin/vm-lane/tuna-vm-lifecycle'
+        tree = ast.parse(path.read_text())
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == 'strip_notification_ui')
+        scope = {}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), 'exec'), scope)
+        summary = {'layers': [{'namespace': 'private namespace', 'rect': [0, 0, 100, 100]}]}
+        self.assertEqual(scope['strip_notification_ui'](summary, self.original),
+                         {'layers': [{'namespace': 'other', 'rect': [0, 0, 100, 100]}], 'control': None})
+        with self.assertRaises(RuntimeError):
+            scope['strip_notification_ui']({'layers': []} | {'locked': True}, self.original, observe_control=True)
+        source = ast.get_source_segment(path.read_text(), function)
+        self.assertNotIn('CloseNotification', source)
+        self.assertNotIn('show-banners', source)
+
+    def test_notification_observer_never_reads_body_text_and_retains_owned_bounds_only(self):
+        import ast
+        root = Path(proof.__file__).resolve().parents[2]
+        path = root / 'packaging/marlin/vm-lane/tuna-vm-shell-focus'
+        loader = importlib.machinery.SourceFileLoader('strip_notification_focus', str(path))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        tree = ast.parse(path.read_text())
+        observer = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'observe')
+        branch = next(node for node in ast.walk(observer) if isinstance(node, ast.If)
+                      and isinstance(node.test, ast.Name) and node.test.id == 'notification'
+                      and any(isinstance(child, ast.If) for child in node.body))
+        loop = ast.For(target=ast.Name(id='_', ctx=ast.Store()), iter=ast.Tuple(elts=[ast.Constant(0)], ctx=ast.Load()),
+                       body=[branch], orelse=[])
+        compiled = compile(ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[])), str(path), 'exec')
+        class Node:
+            def get_name(self):
+                if role not in ('frame', 'push button'):
+                    raise AssertionError('private notification text must not be queried')
+                return name
+            def get_component_iface(self):
+                return self
+        component = SimpleNamespace(get_extents=lambda _node, coordinates: SimpleNamespace(x=0, y=0, width=512, height=108))
+        for role, name, inside in [('label', 'private body', True), ('text', 'private body', True),
+                                   ('frame', 'Notifications', False), ('frame', 'Private dialog', False),
+                                   ('push button', 'Close', True), ('push button', 'Other action', True)]:
+            scope = {'notification': True, 'role': role, 'in_notification': inside, 'node': Node(),
+                     'accessibility_query': lambda method, *args: method(*args),
+                     'Atspi': SimpleNamespace(Component=component, CoordType=SimpleNamespace(WINDOW='window'),
+                                              StateType=SimpleNamespace(SENSITIVE='sensitive', FOCUSED='focused')),
+                     'states': SimpleNamespace(contains=lambda _: True),
+                     'notification_frames': [], 'notification_closes': []}
+            exec(compiled, scope)
+            self.assertEqual(len(scope['notification_frames']), int(role == 'frame' and name == 'Notifications'))
+            self.assertEqual(len(scope['notification_closes']), int(role == 'push button' and name == 'Close' and inside))
+        self.assertEqual(module.canonical_role('button'), 'push button')
+
+
 class CaptureFailureEvidence(unittest.TestCase):
     """Synthetic capture failures exercise the real receipt and cleanup path."""
 
     def run_failure(self, *, start=0.0, acquire_error=None, mismatch=None,
                     post_error=None, late_post=False, late_pixels=False,
-                    unknown_reason=False, retry_once=False, cleanup_confirmed=True):
+                    unknown_reason=False, retry_once=False, cleanup_confirmed=True,
+                    banner=False, notification_key_expiry=False):
         from unittest.mock import patch
         from PIL import Image
         value = sample()
@@ -488,8 +732,16 @@ class CaptureFailureEvidence(unittest.TestCase):
         image = {'schema': 1, 'commit': 'a' * 40, 'image_id': 'sha256:' + 'b' * 64,
                  'base_image': 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'c' * 64,
                  'package_sha256': 'd' * 64, 'member_sha256': members}
+        if banner:
+            notification = NotificationPreparation()
+            notification.setUp()
+            value['notification_ui'] = copy.deepcopy(notification.value['notification_ui'])
+            value['notification_ui']['control']['observer_sha256'] = hashlib.sha256(
+                (root / 'packaging/marlin/vm-lane/tuna-vm-shell-focus').read_bytes()).hexdigest()
         clock = [0.0]
         calls, acquisitions, deadlines = [], [], []
+        inputs = []
+        notification_keys = []
         primary = RuntimeError('private raw exception body must not be retained')
         color = proof.COLORS['alpha']
         good = (1280, 800, bytes(color) * 1280 * 800)
@@ -504,10 +756,17 @@ class CaptureFailureEvidence(unittest.TestCase):
                     return {'owner': value['owner']}
                 if action == 'strip-stop':
                     return {'cleanup_confirmed': cleanup_confirmed}
+                if action == 'strip-notification-control':
+                    observed = copy.deepcopy(value)
+                    observed['notification_ui']['control']['notification_banner']['close_controls'][0]['focused'] = ['tab'] in notification_keys
+                    return observed
                 if action == 'strip-state':
                     if post_error == 'transport' and (not retry_once or reads[0] > 1):
                         raise primary
                     after = copy.deepcopy(value)
+                    if banner and ['ret'] in notification_keys:
+                        after['notification_ui']['layers'].pop()
+                        after['notification_ui']['control'] = None
                     if post_error == 'identity':
                         after['fixture']['identity']['start_ticks'] += 1
                     if post_error == 'geometry':
@@ -520,8 +779,16 @@ class CaptureFailureEvidence(unittest.TestCase):
         class Transport:
             def __init__(self, _qmp, deadline):
                 deadlines.append(deadline)
+                self.deadline = deadline
 
             def command(self, command, **kwargs):
+                if command in ('input-send-event', 'send-key'):
+                    inputs.append((self.deadline, kwargs.get('events', kwargs.get('keys'))))
+                    if command == 'send-key' and self.deadline != 120:
+                        notification_keys.append([key['data'] for key in kwargs['keys']])
+                    if notification_key_expiry and self.deadline != 120:
+                        clock[0] = min(120, start + 10)
+                        raise primary
                 if command != 'screendump':
                     return None
                 fmt = kwargs['format']
@@ -579,6 +846,7 @@ class CaptureFailureEvidence(unittest.TestCase):
                     object(), Agent(), reconnect, scratch, image, read_ppm,
                     lambda *entry: records.append(entry))
             receipt = json.loads((Path(scratch) / 'strip-acceptance/receipt.json').read_text())
+        self.last_receipt, self.last_inputs = receipt, inputs
         self.assertFalse(receipt['completed'])
         self.assertEqual(receipt['cases'], [])
         self.assertEqual(receipt['cleanup_confirmed'], cleanup_confirmed)
@@ -599,6 +867,27 @@ class CaptureFailureEvidence(unittest.TestCase):
         self.assertLess(len(json.dumps(diagnostic).encode()), 1024)
         self.assertNotIn('private', json.dumps(receipt))
         return diagnostic, caught.exception, primary, acquisitions, calls
+
+    def test_notification_keys_join_all_commands_to_existing_capture_deadline(self):
+        diagnostic, error, primary, _, calls = self.run_failure(banner=True, acquire_error='png')
+        self.assertIs(error, primary)
+        self.assertEqual(diagnostic['stage'], 'png-acquire')
+        self.assertEqual([deadline for deadline, _ in self.last_inputs], [120, 120, 120, 10, 10, 10])
+        self.assertEqual([action for action, _ in calls],
+                         ['strip-start', 'strip-notification-control', 'strip-state', 'strip-state',
+                          'strip-notification-control', 'strip-state', 'strip-stop'])
+        self.assertTrue(self.last_receipt['notification_dismissals'][0]['confirmed_absent'])
+
+    def test_expired_notification_focus_chord_never_sends_tab_or_return(self):
+        diagnostic, error, primary, acquisitions, _ = self.run_failure(
+            banner=True, notification_key_expiry=True)
+        self.assertIs(error, primary)
+        self.assertEqual(diagnostic['stage'], 'post-frame-read')
+        self.assertEqual(diagnostic['attempts'], 0)
+        self.assertEqual(acquisitions, [])
+        self.assertEqual([deadline for deadline, _ in self.last_inputs], [120, 120, 120, 10])
+        self.assertFalse(self.last_receipt['notification_dismissals'][0]['activated'])
+        self.assertFalse(self.last_receipt['notification_dismissals'][0]['confirmed_absent'])
 
     def test_local_and_global_deadlines_are_distinguishable_after_pixel_mismatch(self):
         for start, failure_ns in ((0, 10_000_000_000), (112, 120_000_000_000)):

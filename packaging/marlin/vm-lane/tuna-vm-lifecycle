@@ -1906,6 +1906,46 @@ def strip_stop_identity(original, uid, deadline):
         os.close(fd)
 
 
+def strip_notification_ui(summary, owner, *, observe_control=False):
+    """Fixed public layer roles and a read-only original-shell Close control."""
+    layers = summary.get("layers")
+    if type(layers) is not list or len(layers) > 32:
+        raise RuntimeError("bounded actual strip layer observation missing")
+    public = []
+    for layer in layers:
+        rect = layer.get("rect")
+        if (type(rect) is not list or len(rect) != 4
+                or any(type(value) is not int or abs(value) > 16384 for value in rect)
+                or min(rect[2:]) <= 0):
+            raise RuntimeError("invalid actual strip layer geometry")
+        namespace = layer.get("namespace")
+        public.append({"namespace": namespace if namespace in {"tuna-panel", "tuna-shell-banners"} else "other",
+                       "rect": rect})
+    result = {"layers": public, "control": None}
+    if not observe_control:
+        return result
+    if (summary["locked"] or summary["overview_open"]
+            or any(layer["namespace"] == "other" for layer in public)
+            or sum(layer["namespace"] == "tuna-shell-banners" for layer in public) != 1):
+        raise RuntimeError("notification Close requires one unambiguous unlocked banner")
+    shell = owner["core"]["tuna-shell-gtk"]
+    observer = pathlib.Path("/usr/libexec/tuna-vm-shell-focus")
+    observer_sha = strip_sha(observer)
+    raw = call(str(observer), str(shell["pid"]), str(shell["start_ticks"]), "tuna-shell-gtk",
+               f"tuna-nested-{owner['core']['tuna-compositor']['pid']}", "notification-banner", user=True)
+    if len(raw.encode()) > 8192:
+        raise RuntimeError("notification control observation exceeds byte bound")
+    control = json.loads(raw)
+    if (control.get("observer_sha256") != observer_sha or strip_sha(observer) != observer_sha
+            or strip_core(inventory()) != owner["core"]):
+        raise RuntimeError("original notification observer/shell identity changed")
+    after = strip_json(STATE, OWNER.pw_uid)
+    if after["locked"] or after["overview_open"] or strip_notification_ui(after, owner)["layers"] != public:
+        raise RuntimeError("notification layers changed during control observation")
+    result["control"] = control
+    return result
+
+
 def strip_client(action, nonce):
     nonce = strip_nonce(nonce)
     receipt_path = pathlib.Path(RUNTIME, f"tuna-vm-strip-{nonce}.json")
@@ -1964,7 +2004,7 @@ def strip_client(action, nonce):
             raise RuntimeError("unknown fixture launch prevents confirmed cleanup")
         return {"nonce": nonce, "boot_id": owner["boot_id"], "owned_processes": records,
                 "cleanup_confirmed": True, "descendant_group_retirement_qualified": False}
-    if action != "state" or owner.get("launch_state") != "known":
+    if action not in ("state", "notification-control") or owner.get("launch_state") != "known":
         raise RuntimeError("strip fixture ownership not admitted")
     fixture = strip_json(receipt_path, OWNER.pw_uid)
     if strip_validate_client(fixture, nonce, owner["launcher"], mode) != owner["client"]:
@@ -1979,6 +2019,7 @@ def strip_client(action, nonce):
     # Native window->PID kernel credentials are not in the current summary.
     # Nonce app IDs/new-map sets are checked by the host; never fabricate that join.
     return {"owner": owner, "fixture": fixture, "inventory": current,
+            "notification_ui": strip_notification_ui(summary, owner, observe_control=action == "notification-control"),
             "native_window_kernel_pid_join_qualified": False}
 
 
@@ -2352,7 +2393,7 @@ def main():
         if len(sys.argv) != 4:
             raise ValueError("soak-read takes a file name and offset")
         result = soak_read(sys.argv[2], int(sys.argv[3]))
-    elif action in ("strip-start", "strip-edge-start", "strip-state", "strip-stop"):
+    elif action in ("strip-start", "strip-edge-start", "strip-state", "strip-notification-control", "strip-stop"):
         if len(sys.argv) != 3:
             raise ValueError("strip action requires exactly one nonce")
         try:

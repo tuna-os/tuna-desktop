@@ -1406,8 +1406,17 @@ class GdmHeaderTraceTest(unittest.TestCase):
         self.assertFalse(result["debug_enabled_by_probe"])
 
     def test_journal_output_is_bounded_before_parsing(self):
-        status, output = TRACE.bounded_journal([sys.executable, "-c", "print('PRIVATE' * 20000)"])
+        # Exercise the byte limit independently of host process scheduling.
+        with mock.patch.dict(TRACE.bounded_journal.__globals__,
+                             {"time": SimpleNamespace(monotonic=lambda: 0.0)}):
+            status, output = TRACE.bounded_journal([sys.executable, "-c", "print('PRIVATE' * 20000)"])
         self.assertEqual((status, output), ("journal-output-bound", b""))
+
+    def test_journal_deadline_discards_output_and_terminates_child(self):
+        with mock.patch.dict(TRACE.bounded_journal.__globals__,
+                             {"time": SimpleNamespace(monotonic=mock.Mock(side_effect=[0.0, 4.0]))}):
+            status, output = TRACE.bounded_journal([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.assertEqual((status, output), ("journal-time-bound", b""))
 
     @unittest.skipUnless(all(shutil.which(name) for name in ("dbus-daemon", "dbus-monitor", "dbus-send")),
                          "private D-Bus test needs dbus tools")

@@ -366,10 +366,64 @@ This run is not a PASS for the full suite.
 This run does not qualify reboot.
 No production publication, image pin or merge follows from it.
 
+### Actual candidate campaign 41267289849
+
+[Run 41267289849](https://github.com/tuna-os/tuna-desktop/actions/runs/41267289849)
+used PR #985 head `c8554f32c87630ffc68afefcd0bb17e2d5f21ec3`.
+CI used merge commit `b50a3148e90e3d362bed2beb327b287ac281888a`.
+Its parents are `017a7c6af924894f0ccd74f4d2bba46b3ac765f4`
+and that PR head.
+Package source stayed at `7b52bdf34be22bc60fef62b157be64b589b13f6a`.
+The new factory build measured the same three archive hashes as the previous CI run.
+
+Both native profiles passed all 24 unchanged gates for fresh accounts.
+Each profile has six login/logout cycles for UID 1001 and UID 1002.
+All sessions used `gdm-password`, Wayland VT2 and Tuna Desktop.
+During first login, the physical records existed before the read-only property queries.
+They had `Session=tuna`.
+
+Sudo refused the standard user and authorized the administrator.
+Each account passed its manual second login.
+
+The reboot proof includes actual distinct boot IDs and a ready GDM greeter:
+
+| Profile | Before the request | After reboot |
+| --- | --- | --- |
+| Distribution | `2eacd615-fc63-4dda-a7ab-09fbe78b83c0` | `c7dafa91-fbde-451f-9a76-de691354a5b2` |
+| Orca | `df390a84-f4e9-4bde-b0f1-9a7c59c5e0b2` | `565b11aa-2ded-452e-8f37-a546bb4f7da6` |
+
+Before the postboot login cycle, both accounts had physical records with `Session=tuna`.
+Both postboot login and logout cycles then passed.
+Each trace has a `SetSession` call for `User1001` and a return with the same serial.
+There is no message body.
+Worker markers remain unavailable; no debug toggle occurred.
+Their absence gives no negative evidence.
+
+The final images, after all upgrades and the verified pair installation, were:
+
+| Profile | Immutable image ID |
+| --- | --- |
+| Distribution | `sha256:226fd57b804f944c9f7d80dbb3e4756c7a679e166739517407ce1c6f58d13968` |
+| Orca | `sha256:503888154f04fd42a03ded3b1f85c6e2a056f5e5d8c971f12c0d0a1d24c39512` |
+
+The package artifact is `13067948020`.
+The distribution and Orca artifacts are `13068871310` and `13069002236`.
+Public hashes from the initial guest boot matched the final overlay's payload seal.
+The probe did not read those policy files again after the fresh journey's reboot.
+
+This qualifies the native fresh-account behavior, not the full CI run or production.
+Both ordinary strip journeys still failed at `10-column-height` for `beta`.
+Their diagnostics show 21 tries and last reason `fixture-color-mismatch`.
+The local deadline of 10 seconds expired, with more than 81 seconds left on the total deadline.
+Cleanup passed.
+
+No timeout, pixel, identity or acceptance guard changed.
+PR #985 remains blocked by the required strip gate; there is no merge or publication.
+
 ### Bounded strip capture failure metadata
 
-The retained metadata places the strip failure inside the capture for case 10.
-It does not establish whether the local or total deadline caused the failure.
+Run 41262331704 placed the strip failure inside the capture for case 10.
+That run did not establish whether the local or total deadline caused the failure.
 The new diagnostic does not change either deadline or qualify a failed capture.
 
 A failed capture adds one `capture_failure` object to the existing receipt.
@@ -394,6 +448,51 @@ Both pixel checks and the identity check after the frame remain mandatory.
 The existing code does not guard the final write of `receipt.json`.
 An `OSError` from that write can mask an earlier failure.
 This diagnostic does not change that existing limit.
+
+### Normal notification preparation for strip proof
+
+The public frames show a notification over Beta.
+It covered two of the 25 color points in both PNG and PPM.
+The fix uses normal keyboard input, not a change to the pixel tolerance.
+
+Strip preparation uses `Super+N`, observes key release, then uses `Tab`
+and observes release again.
+Before `Return`, a second observation must find one `Notifications` Close control.
+That control must belong to the original shell process and its AT-SPI bus.
+It must report `FOCUSED`.
+A layer namespace alone is not proof of that owner.
+
+After the normal Close action, the banner must be absent and all keys released.
+Original windows, focus, workspace and session mode must remain unchanged.
+Both PNG and PPM still need all original 25 color checks.
+No pointer coordinates or empirical offsets select the control.
+There is no DND change, backend notification clear or authentication-dialog action.
+
+The controller refuses preparation for held buttons, gestures, authentication UI or unknown or ambiguous overlays.
+All key commands share the unchanged 10-second capture and 120-second total deadlines.
+
+#### Actual nested UI proof
+
+A private smoke of the nested UI used the exact package from run 41267289849,
+artifact `tuna-arch` / `13067334148`.
+Its package hash and both executable hashes match the receipts from both native profiles.
+The original checks of 25 color points failed for each format with a test banner of `critical` urgency.
+The normal focused Close action removed it.
+The first post-close PNG and PPM pair passed the original checks.
+Window geometry, focus and mode stayed unchanged; post-frame identity and cleanup passed.
+
+The smoke used separate actual PNG and PPM acquisitions through private Xvfb/scrot.
+It did not use native QMP acquisition or exercise an installed VM.
+There was no native compilation.
+Both required locks, the 40-GiB floor and the 8-GiB/no-swap/200-percent caps applied.
+Its HOME/XDG directories were fresh.
+
+Focused checks passed: 57 acceptance/stationary tests and 20 existing navigation tests.
+The keyboard path has approval from two independent reviews.
+Receipt: `985-c855-public-notification-close/receipt.json` in the retained finish evidence.
+
+The keyboard path still needs qualification in CI with the actual installed image.
+The completed fresh-account proof above does not qualify that separate path.
 
 ### Private image and input corrections
 
