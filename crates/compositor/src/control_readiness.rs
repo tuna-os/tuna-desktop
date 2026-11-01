@@ -107,11 +107,11 @@ mod tests {
             .unwrap();
         assert_eq!(count, 2);
         drop(receiver);
+        test_peer::wait_for_peer_close(&mut sender, Duration::from_secs(1))
+            .expect("watch must not hold the peer alive");
         event_loop
             .dispatch(Some(Duration::ZERO), &mut count)
             .unwrap();
         assert_eq!(count, 2, "closed original fd must remove interest");
-        test_peer::wait_for_peer_close(&mut sender, Duration::from_secs(1))
-            .expect("watch must not hold the peer alive");
     }
 }
