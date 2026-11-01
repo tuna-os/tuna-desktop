@@ -6,9 +6,43 @@ import subprocess
 from pathlib import Path
 import time
 import pyatspi
-from gi.repository import GLib
+from gi.repository import Gio, GLib
 out, decision = sys.argv[1:3]
 remote = len(sys.argv) > 3 and sys.argv[3] == "remote"
+external_capture = "--external-capture" in sys.argv[3:]
+kind = sys.argv[sys.argv.index("--kind") + 1] if "--kind" in sys.argv else None
+request_exit = Path(sys.argv[sys.argv.index("--request-exit") + 1]) if "--request-exit" in sys.argv else None
+
+def require_pending_request():
+    if request_exit is not None and request_exit.exists():
+        raise RuntimeError("native requester exited; refusing a stale portal picker")
+
+def button_names():
+    if kind == "screenshot":
+        return ("Deny",) if decision == "cancel" else ("Allow",)
+    if kind == "screencast":
+        return ("Cancel",) if decision == "cancel" else ("Share",)
+    if kind is not None:
+        raise RuntimeError("unknown portal consent kind: " + kind)
+    return ("Cancel", "Deny") if decision == "cancel" else ("Share", "Allow")
+
+
+def require_visible_session():
+    # AT-SPI's STATE_SHOWING describes the dialog's own widget tree, not
+    # whether the compositor's lock curtain covers it. In a real installed
+    # session, never activate a consent control hidden behind that curtain.
+    if not external_capture:
+        return
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    active = bus.call_sync(
+        "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver",
+        "org.gnome.ScreenSaver", "GetActive", None, None,
+        Gio.DBusCallFlags.NONE, 5000, None).unpack()
+    print("portal session before consent: " + json.dumps({"locked": active != (False,)}),
+          flush=True)
+    if active != (False,):
+        raise RuntimeError("portal consent is hidden by a locked session")
+
 def walk(acc, nodes, controls):
     try:
         showing = acc.getState().contains(pyatspi.STATE_SHOWING)
@@ -19,6 +53,7 @@ def walk(acc, nodes, controls):
         pass
 deadline = time.monotonic() + 30
 while time.monotonic() < deadline:
+    require_pending_request()
     desktop = pyatspi.Registry.getDesktop(0)
     for i in range(desktop.childCount):
         app = desktop.getChildAtIndex(i)
@@ -29,10 +64,12 @@ while time.monotonic() < deadline:
         if "portal" not in (app.name or "").lower(): continue
         nodes, controls = [], []
         walk(app, nodes, controls)
-        buttons = [a for a in controls if a.getRoleName() in ("push button", "button") and a.name in (("Cancel", "Deny") if decision == "cancel" else ("Share", "Allow"))]
+        buttons = [a for a in controls if a.getRoleName() in ("push button", "button")
+                   and a.name in button_names()]
         if not buttons: continue
         with open(out, "w") as f: json.dump(nodes, f, indent=2)
-        subprocess.run(["scrot", str(Path(out).with_suffix(".png"))], check=True)
+        if not external_capture:
+            subprocess.run(["scrot", str(Path(out).with_suffix(".png"))], check=True)
         button = buttons[0]
         if remote and decision != "cancel":
             interaction = [control for control in controls
@@ -73,6 +110,8 @@ while time.monotonic() < deadline:
                     except Exception: pass
         if button.getState().contains(pyatspi.STATE_SENSITIVE):
             button_name = button.name
+            require_visible_session()
+            require_pending_request()
             button.queryAction().doAction(0)
             print("actual portal picker: " + button_name)
             sys.exit(0)
@@ -80,5 +119,6 @@ while time.monotonic() < deadline:
 nodes, controls = [], []
 walk(pyatspi.Registry.getDesktop(0), nodes, controls)
 Path(out).write_text(json.dumps(nodes, indent=2))
-subprocess.run(["scrot", str(Path(out).with_suffix(".png"))], check=True)
+if not external_capture:
+    subprocess.run(["scrot", str(Path(out).with_suffix(".png"))], check=True)
 raise RuntimeError("actual GNOME portal consent picker did not become actionable")

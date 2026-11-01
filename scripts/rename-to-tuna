@@ -68,9 +68,9 @@ KEEP_PREFIXES = (
     "scripts/rename-to-tuna",
     "scripts/lib/rename-to-tuna-tests.py",
 )
-# Dated evidence under docs/perf (directories and reports); the living
-# docs beside them (README, how-tos) are renamed.
-KEEP_PATTERN = re.compile(r"docs/perf/20[0-9]{2}-")
+# Dated performance and immutable-image receipts (including foreign source
+# snapshots) retain the observed bytes/hashes; living docs still receive checks.
+KEEP_PATTERN = re.compile(r"docs/(?:perf|variants)/20[0-9]{2}-")
 KEEP_FILES = {
     # Recorded capture: tests/protocols/marlin-gnome51-source.json holds
     # its sha256, and both describe one historical run.
@@ -91,7 +91,7 @@ PROTECTED = re.compile(
             # Historical CI runs (html and API links, any owner).
             r"https?://[^\s\"'<>()\[\]]*/actions/runs/[^\s\"'<>()\[\]]*",
             # Paths into kept trees and files.
-            r"(?:docs/(?:perf/20[0-9]{2}-|niri-parity/|marlin/)|third-party/)[^\s\"'`<>()\[\],;]*",
+            r"(?:docs/(?:(?:perf|variants)/20[0-9]{2}-|niri-parity/|marlin/)|third-party/)[^\s\"'`<>()\[\],;]*",
             r"marlin-roost-wayland-info\.txt",
             # Identifiers defined in third-party code.
             r"roost_transport_bounds",

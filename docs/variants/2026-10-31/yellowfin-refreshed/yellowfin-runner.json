@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "/home/ubuntu/.cache/tuna-journey-venv/bin/python",
+    "/tmp/tuna-variant-recover-yellowfin-20261031/harness/tuna-corral-journey",
+    "--image",
+    "ghcr.io/tuna-os/yellowfin@sha256:64e7a29a9d832c0d021d3023ee825c07d37676d722dca59b31a2dfe492e5d0b0",
+    "--vm",
+    "tuna-q-variant-yellowfin-31191923",
+    "--node",
+    "karnataka",
+    "--out",
+    "/tmp/tuna-variant-recover-yellowfin-20261031/yellowfin",
+    "--qualification-only"
+  ],
+  "exit": 1,
+  "stdout": "pass  greeter-user-list: GDM shows the user list\npass  greeter-password: Select the user; GDM asks for the password\npass  session-is-tuna: Password login starts Tuna Desktop (lands in the overview)\npass  portal-availability: Published portal interfaces respond (not capture consent)\nfail  portal-screenshot: Request Screenshot through the actual published frontend\npass  desktop: Escape leaves the overview for the desktop\nfail  portal-screencast: Consume a real frontend stream before locking\nfail  lock: Super+L locks the screen\npass  unlock-refused: A wrong password is refused\npass  unlock: The right password unlocks\npass  power-menu: Quick settings power menu\npass  logout-dialog: Log Out asks for confirmation\npass  logout: Logging out returns to GDM\n10 passed, 3 failed, 0 not exercised; failed: portal-screenshot, portal-screencast, lock\n",
+  "stderr": ""
+}

@@ -1,0 +1,2871 @@
+signal time=1793479026.222467 sender=org.freedesktop.DBus -> destination=:1.76 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.76"
+signal time=1793479026.222571 sender=org.freedesktop.DBus -> destination=:1.76 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.76"
+method call time=1793479026.311210 sender=:1.77 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479026.311230 sender=org.freedesktop.DBus -> destination=:1.77 serial=4294967295 reply_serial=1
+   string ":1.77"
+signal time=1793479026.311234 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.77"
+   string ""
+   string ":1.77"
+signal time=1793479026.311238 sender=org.freedesktop.DBus -> destination=:1.77 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.77"
+method call time=1793479026.311817 sender=:1.77 -> destination=org.freedesktop.DBus serial=2 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',interface='org.freedesktop.portal.Request',member='Response'"
+method return time=1793479026.311828 sender=org.freedesktop.DBus -> destination=:1.77 serial=4294967295 reply_serial=2
+method call time=1793479026.312299 sender=:1.77 -> destination=org.freedesktop.portal.Desktop serial=3 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.portal.Screenshot; member=Screenshot
+   string ""
+   array [
+      dict entry(
+         string "handle_token"
+         variant             string "shotproof"
+      )
+      dict entry(
+         string "interactive"
+         variant             boolean false
+      )
+   ]
+method call time=1793479026.312896 sender=:1.56 -> destination=org.freedesktop.DBus serial=143 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionCredentials
+   string ":1.77"
+method return time=1793479026.312903 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=143
+   array [
+      dict entry(
+         string "UnixUserID"
+         variant             uint32 1000
+      )
+      dict entry(
+         string "ProcessID"
+         variant             uint32 4358
+      )
+      dict entry(
+         string "UnixGroupIDs"
+         variant             array [
+               uint32 1000
+               uint32 1000
+            ]
+      )
+      dict entry(
+         string "LinuxSecurityLabel"
+         variant             array of bytes "unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023" + \0
+      )
+      dict entry(
+         string "ProcessFD"
+         variant             file descriptor
+                  inode: 4359
+                  type:       )
+   ]
+method return time=1793479026.315474 sender=:1.56 -> destination=:1.77 serial=144 reply_serial=3
+   object path "/org/freedesktop/portal/desktop/request/1_77/shotproof"
+method call time=1793479026.315483 sender=:1.56 -> destination=:1.58 serial=145 path=/org/freedesktop/impl/portal/PermissionStore; interface=org.freedesktop.impl.portal.PermissionStore; member=Lookup
+   string "screenshot"
+   string "screenshot"
+error time=1793479026.316249 sender=:1.58 -> destination=:1.56 error_name=org.freedesktop.portal.Error.NotFound reply_serial=145
+   string "No entry for screenshot"
+method call time=1793479026.316452 sender=:1.56 -> destination=:1.66 serial=146 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.impl.portal.Access; member=AccessDialog
+   object path "/org/freedesktop/portal/desktop/request/1_77/shotproof"
+   string ""
+   string ""
+   string "Allow Applications to Take Screenshots?"
+   string "An application wants to be able to take screenshots at any time."
+   string "This permission can be changed at any time from the privacy settings."
+   array [
+      dict entry(
+         string "deny_label"
+         variant             string "Deny"
+      )
+      dict entry(
+         string "grant_label"
+         variant             string "Allow"
+      )
+      dict entry(
+         string "icon"
+         variant             string "applets-screenshooter-symbolic"
+      )
+      dict entry(
+         string "modal"
+         variant             boolean true
+      )
+   ]
+signal time=1793479026.347551 sender=:1.3 -> destination=(null destination) serial=293 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=WindowsChanged
+signal time=1793479026.347569 sender=:1.3 -> destination=(null destination) serial=294 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=RunningApplicationsChanged
+signal time=1793479026.368223 sender=:1.3 -> destination=(null destination) serial=295 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=WindowsChanged
+method call time=1793479028.087967 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=187 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479028.088307 sender=:1.7 -> destination=:1.24 serial=303 reply_serial=187
+   uint64 21994
+method call time=1793479030.088867 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=188 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479030.089137 sender=:1.7 -> destination=:1.24 serial=304 reply_serial=188
+   uint64 23994
+method call time=1793479032.090283 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=189 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479032.090528 sender=:1.7 -> destination=:1.24 serial=312 reply_serial=189
+   uint64 25996
+method call time=1793479034.091592 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=190 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479034.091818 sender=:1.7 -> destination=:1.24 serial=313 reply_serial=190
+   uint64 27997
+method call time=1793479036.092269 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=191 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479036.092526 sender=:1.7 -> destination=:1.24 serial=314 reply_serial=191
+   uint64 29998
+method call time=1793479038.093037 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=192 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479038.093399 sender=:1.7 -> destination=:1.24 serial=322 reply_serial=192
+   uint64 31999
+method call time=1793479040.093761 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=193 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479040.093993 sender=:1.7 -> destination=:1.24 serial=323 reply_serial=193
+   uint64 33999
+method call time=1793479042.094497 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=194 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479042.094733 sender=:1.7 -> destination=:1.24 serial=331 reply_serial=194
+   uint64 36000
+method call time=1793479042.205030 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=195 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479042.205213 sender=:1.7 -> destination=:1.24 serial=332 reply_serial=195
+   uint64 36110
+method call time=1793479044.094927 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=196 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479044.095198 sender=:1.7 -> destination=:1.24 serial=333 reply_serial=196
+   uint64 38000
+method call time=1793479046.096047 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=197 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479046.096289 sender=:1.7 -> destination=:1.24 serial=334 reply_serial=197
+   uint64 40002
+method call time=1793479048.096946 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=198 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479048.097064 sender=:1.7 -> destination=:1.24 serial=342 reply_serial=198
+   uint64 42002
+method call time=1793479050.097384 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=199 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479050.097619 sender=:1.7 -> destination=:1.24 serial=343 reply_serial=199
+   uint64 44003
+signal time=1793479051.324742 sender=:1.56 -> destination=:1.77 serial=147 path=/org/freedesktop/portal/desktop/request/1_77/shotproof; interface=org.freedesktop.portal.Request; member=Response
+   uint32 2
+   array [
+   ]
+signal time=1793479051.354827 sender=org.freedesktop.DBus -> destination=:1.77 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.77"
+signal time=1793479051.354844 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.77"
+   string ":1.77"
+   string ""
+method call time=1793479052.098705 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=200 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479052.099106 sender=:1.7 -> destination=:1.24 serial=351 reply_serial=200
+   uint64 46004
+method call time=1793479054.099317 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=201 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479054.099548 sender=:1.7 -> destination=:1.24 serial=352 reply_serial=201
+   uint64 48005
+method call time=1793479056.100729 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=202 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479056.100916 sender=:1.7 -> destination=:1.24 serial=353 reply_serial=202
+   uint64 50006
+method call time=1793479058.101571 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=203 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479058.101793 sender=:1.7 -> destination=:1.24 serial=361 reply_serial=203
+   uint64 52007
+method call time=1793479060.102405 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=204 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479060.102661 sender=:1.7 -> destination=:1.24 serial=362 reply_serial=204
+   uint64 54008
+method call time=1793479062.103199 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=205 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479062.103641 sender=:1.7 -> destination=:1.24 serial=370 reply_serial=205
+   uint64 56009
+method call time=1793479064.103933 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=206 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479064.104164 sender=:1.7 -> destination=:1.24 serial=371 reply_serial=206
+   uint64 58009
+method call time=1793479066.104469 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=207 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479066.104692 sender=:1.7 -> destination=:1.24 serial=372 reply_serial=207
+   uint64 60010
+method call time=1793479068.104984 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=208 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479068.105124 sender=:1.7 -> destination=:1.24 serial=380 reply_serial=208
+   uint64 62010
+method call time=1793479070.106319 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=209 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479070.106597 sender=:1.7 -> destination=:1.24 serial=381 reply_serial=209
+   uint64 64012
+method call time=1793479072.107215 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=210 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479072.107478 sender=:1.7 -> destination=:1.24 serial=389 reply_serial=210
+   uint64 66013
+method call time=1793479072.206658 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=211 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479072.206883 sender=:1.7 -> destination=:1.24 serial=390 reply_serial=211
+   uint64 66112
+method call time=1793479074.108048 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=212 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479074.108291 sender=:1.7 -> destination=:1.24 serial=391 reply_serial=212
+   uint64 68014
+method call time=1793479076.108613 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=213 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479076.108817 sender=:1.7 -> destination=:1.24 serial=392 reply_serial=213
+   uint64 70014
+method call time=1793479078.109603 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=214 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479078.109811 sender=:1.7 -> destination=:1.24 serial=400 reply_serial=214
+   uint64 72015
+method call time=1793479080.110525 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=215 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479080.110702 sender=:1.7 -> destination=:1.24 serial=401 reply_serial=215
+   uint64 74016
+method call time=1793479082.111847 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=216 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479082.112062 sender=:1.7 -> destination=:1.24 serial=409 reply_serial=216
+   uint64 76017
+method call time=1793479083.224824 sender=:1.78 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479083.224842 sender=org.freedesktop.DBus -> destination=:1.78 serial=4294967295 reply_serial=1
+   string ":1.78"
+signal time=1793479083.224845 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.78"
+   string ""
+   string ":1.78"
+signal time=1793479083.224847 sender=org.freedesktop.DBus -> destination=:1.78 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.78"
+method call time=1793479083.225304 sender=:1.78 -> destination=org.gnome.ScreenSaver serial=2 path=/org/gnome/ScreenSaver; interface=org.freedesktop.DBus.Introspectable; member=Introspect
+method return time=1793479083.225663 sender=:1.24 -> destination=:1.78 serial=217 reply_serial=2
+   string "<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+                      "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- GDBus 2.80.4 -->
+<node>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <method name="GetAll">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="a{sv}" name="properties" direction="out"/>
+    </method>
+    <method name="Set">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="in"/>
+    </method>
+    <signal name="PropertiesChanged">
+      <arg type="s" name="interface_name"/>
+      <arg type="a{sv}" name="changed_properties"/>
+      <arg type="as" name="invalidated_properties"/>
+    </signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect">
+      <arg type="s" name="xml_data" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Peer">
+    <method name="Ping"/>
+    <method name="GetMachineId">
+      <arg type="s" name="machine_uuid" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.gnome.ScreenSaver">
+    <method name="Lock">
+    </method>
+    <method name="GetActive">
+      <arg type="b" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <method name="SetActive">
+      <arg type="b" name="arg_0" direction="in">
+      </arg>
+    </method>
+    <method name="GetActiveTime">
+      <arg type="u" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <signal name="ActiveChanged">
+      <arg type="b" name="arg_0">
+      </arg>
+    </signal>
+  </interface>
+</node>
+"
+method call time=1793479083.225919 sender=:1.78 -> destination=org.gnome.ScreenSaver serial=3 path=/org/gnome/ScreenSaver; interface=org.gnome.ScreenSaver; member=GetActive
+method return time=1793479083.226074 sender=:1.24 -> destination=:1.78 serial=218 reply_serial=3
+   boolean false
+signal time=1793479083.226251 sender=org.freedesktop.DBus -> destination=:1.78 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.78"
+signal time=1793479083.226257 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.78"
+   string ":1.78"
+   string ""
+method call time=1793479083.506152 sender=:1.79 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479083.506169 sender=org.freedesktop.DBus -> destination=:1.79 serial=4294967295 reply_serial=1
+   string ":1.79"
+signal time=1793479083.506173 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.79"
+   string ""
+   string ":1.79"
+signal time=1793479083.506175 sender=org.freedesktop.DBus -> destination=:1.79 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.79"
+method call time=1793479083.506382 sender=:1.79 -> destination=org.a11y.Bus serial=2 path=/org/a11y/bus; interface=org.a11y.Bus; member=GetAddress
+method return time=1793479083.506825 sender=:1.39 -> destination=:1.79 serial=17 reply_serial=2
+   string "unix:path=/run/user/1000/at-spi/bus"
+method return time=1793479083.522263 sender=:1.66 -> destination=:1.56 serial=47 reply_serial=146
+   uint32 0
+   array [
+   ]
+signal time=1793479083.524272 sender=:1.3 -> destination=(null destination) serial=410 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=WindowsChanged
+signal time=1793479083.524279 sender=:1.3 -> destination=(null destination) serial=411 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=RunningApplicationsChanged
+signal time=1793479083.531842 sender=org.freedesktop.DBus -> destination=:1.79 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.79"
+signal time=1793479083.531863 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.79"
+   string ":1.79"
+   string ""
+method call time=1793479084.113181 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=219 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479084.113484 sender=:1.7 -> destination=:1.24 serial=412 reply_serial=219
+   uint64 78019
+method call time=1793479085.537039 sender=:1.80 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479085.537054 sender=org.freedesktop.DBus -> destination=:1.80 serial=4294967295 reply_serial=1
+   string ":1.80"
+signal time=1793479085.537057 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.80"
+   string ""
+   string ":1.80"
+signal time=1793479085.537060 sender=org.freedesktop.DBus -> destination=:1.80 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.80"
+method call time=1793479085.537626 sender=:1.80 -> destination=org.gnome.ScreenSaver serial=2 path=/org/gnome/ScreenSaver; interface=org.freedesktop.DBus.Introspectable; member=Introspect
+method return time=1793479085.537814 sender=:1.24 -> destination=:1.80 serial=220 reply_serial=2
+   string "<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+                      "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- GDBus 2.80.4 -->
+<node>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <method name="GetAll">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="a{sv}" name="properties" direction="out"/>
+    </method>
+    <method name="Set">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="in"/>
+    </method>
+    <signal name="PropertiesChanged">
+      <arg type="s" name="interface_name"/>
+      <arg type="a{sv}" name="changed_properties"/>
+      <arg type="as" name="invalidated_properties"/>
+    </signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect">
+      <arg type="s" name="xml_data" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Peer">
+    <method name="Ping"/>
+    <method name="GetMachineId">
+      <arg type="s" name="machine_uuid" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.gnome.ScreenSaver">
+    <method name="Lock">
+    </method>
+    <method name="GetActive">
+      <arg type="b" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <method name="SetActive">
+      <arg type="b" name="arg_0" direction="in">
+      </arg>
+    </method>
+    <method name="GetActiveTime">
+      <arg type="u" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <signal name="ActiveChanged">
+      <arg type="b" name="arg_0">
+      </arg>
+    </signal>
+  </interface>
+</node>
+"
+method call time=1793479085.538034 sender=:1.80 -> destination=org.gnome.ScreenSaver serial=3 path=/org/gnome/ScreenSaver; interface=org.gnome.ScreenSaver; member=GetActive
+method return time=1793479085.538206 sender=:1.24 -> destination=:1.80 serial=221 reply_serial=3
+   boolean false
+signal time=1793479085.538704 sender=org.freedesktop.DBus -> destination=:1.80 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.80"
+signal time=1793479085.538715 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.80"
+   string ":1.80"
+   string ""
+method call time=1793479086.114236 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=222 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479086.114460 sender=:1.7 -> destination=:1.24 serial=413 reply_serial=222
+   uint64 80020
+method call time=1793479088.115091 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=223 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479088.115340 sender=:1.7 -> destination=:1.24 serial=421 reply_serial=223
+   uint64 82021
+method call time=1793479090.115416 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=224 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479090.115656 sender=:1.7 -> destination=:1.24 serial=422 reply_serial=224
+   uint64 84021
+method call time=1793479092.116751 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=225 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479092.116973 sender=:1.7 -> destination=:1.24 serial=430 reply_serial=225
+   uint64 86022
+method call time=1793479094.117374 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=226 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479094.117641 sender=:1.7 -> destination=:1.24 serial=431 reply_serial=226
+   uint64 88023
+method call time=1793479096.118253 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=227 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479096.118491 sender=:1.7 -> destination=:1.24 serial=432 reply_serial=227
+   uint64 90024
+method call time=1793479098.119538 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=228 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479098.119770 sender=:1.7 -> destination=:1.24 serial=440 reply_serial=228
+   uint64 92025
+method call time=1793479100.119906 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=229 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479100.120097 sender=:1.7 -> destination=:1.24 serial=441 reply_serial=229
+   uint64 94025
+method call time=1793479102.120622 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=230 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479102.120837 sender=:1.7 -> destination=:1.24 serial=449 reply_serial=230
+   uint64 96026
+method call time=1793479102.207938 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=231 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479102.208209 sender=:1.7 -> destination=:1.24 serial=450 reply_serial=231
+   uint64 96113
+method call time=1793479104.121946 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=232 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479104.122231 sender=:1.7 -> destination=:1.24 serial=451 reply_serial=232
+   uint64 98027
+method call time=1793479106.122650 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=233 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479106.122861 sender=:1.7 -> destination=:1.24 serial=452 reply_serial=233
+   uint64 100028
+method call time=1793479108.123353 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=234 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479108.123617 sender=:1.7 -> destination=:1.24 serial=460 reply_serial=234
+   uint64 102029
+method call time=1793479110.123776 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=235 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479110.123970 sender=:1.7 -> destination=:1.24 serial=461 reply_serial=235
+   uint64 104029
+method call time=1793479112.124410 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=236 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479112.124801 sender=:1.7 -> destination=:1.24 serial=469 reply_serial=236
+   uint64 106030
+method call time=1793479114.124824 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=237 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479114.125039 sender=:1.7 -> destination=:1.24 serial=470 reply_serial=237
+   uint64 108030
+method call time=1793479116.125896 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=238 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479116.126115 sender=:1.7 -> destination=:1.24 serial=471 reply_serial=238
+   uint64 110031
+method call time=1793479118.126400 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=239 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479118.126662 sender=:1.7 -> destination=:1.24 serial=479 reply_serial=239
+   uint64 112032
+method call time=1793479120.127497 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=240 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479120.127746 sender=:1.7 -> destination=:1.24 serial=480 reply_serial=240
+   uint64 114033
+method call time=1793479122.127820 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=241 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479122.128026 sender=:1.7 -> destination=:1.24 serial=488 reply_serial=241
+   uint64 116033
+method call time=1793479124.128617 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=242 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479124.128851 sender=:1.7 -> destination=:1.24 serial=489 reply_serial=242
+   uint64 118034
+method call time=1793479126.129393 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=243 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479126.129681 sender=:1.7 -> destination=:1.24 serial=490 reply_serial=243
+   uint64 120035
+method call time=1793479128.130015 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=244 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479128.130337 sender=:1.7 -> destination=:1.24 serial=498 reply_serial=244
+   uint64 122036
+method call time=1793479130.130731 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=245 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479130.130923 sender=:1.7 -> destination=:1.24 serial=499 reply_serial=245
+   uint64 444
+method call time=1793479132.132104 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=246 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479132.132391 sender=:1.7 -> destination=:1.24 serial=507 reply_serial=246
+   uint64 2446
+method call time=1793479132.209116 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=247 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479132.209516 sender=:1.7 -> destination=:1.24 serial=508 reply_serial=247
+   uint64 2523
+method call time=1793479134.132714 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=248 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479134.132942 sender=:1.7 -> destination=:1.24 serial=509 reply_serial=248
+   uint64 4446
+method call time=1793479136.133297 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=249 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479136.133519 sender=:1.7 -> destination=:1.24 serial=510 reply_serial=249
+   uint64 6447
+method call time=1793479138.133965 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=250 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479138.134193 sender=:1.7 -> destination=:1.24 serial=518 reply_serial=250
+   uint64 8447
+method call time=1793479140.134817 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=251 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479140.135037 sender=:1.7 -> destination=:1.24 serial=519 reply_serial=251
+   uint64 10448
+method call time=1793479142.135404 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=252 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479142.135635 sender=:1.7 -> destination=:1.24 serial=527 reply_serial=252
+   uint64 12449
+method call time=1793479144.136660 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=253 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479144.136964 sender=:1.7 -> destination=:1.24 serial=528 reply_serial=253
+   uint64 14450
+method call time=1793479145.411466 sender=:1.81 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479145.411485 sender=org.freedesktop.DBus -> destination=:1.81 serial=4294967295 reply_serial=1
+   string ":1.81"
+signal time=1793479145.411490 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.81"
+   string ""
+   string ":1.81"
+signal time=1793479145.411493 sender=org.freedesktop.DBus -> destination=:1.81 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.81"
+method call time=1793479145.411495 sender=:1.81 -> destination=org.gnome.ScreenSaver serial=2 path=/org/gnome/ScreenSaver; interface=org.freedesktop.DBus.Introspectable; member=Introspect
+method return time=1793479145.411497 sender=:1.24 -> destination=:1.81 serial=254 reply_serial=2
+   string "<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+                      "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- GDBus 2.80.4 -->
+<node>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <method name="GetAll">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="a{sv}" name="properties" direction="out"/>
+    </method>
+    <method name="Set">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="in"/>
+    </method>
+    <signal name="PropertiesChanged">
+      <arg type="s" name="interface_name"/>
+      <arg type="a{sv}" name="changed_properties"/>
+      <arg type="as" name="invalidated_properties"/>
+    </signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect">
+      <arg type="s" name="xml_data" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Peer">
+    <method name="Ping"/>
+    <method name="GetMachineId">
+      <arg type="s" name="machine_uuid" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.gnome.ScreenSaver">
+    <method name="Lock">
+    </method>
+    <method name="GetActive">
+      <arg type="b" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <method name="SetActive">
+      <arg type="b" name="arg_0" direction="in">
+      </arg>
+    </method>
+    <method name="GetActiveTime">
+      <arg type="u" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <signal name="ActiveChanged">
+      <arg type="b" name="arg_0">
+      </arg>
+    </signal>
+  </interface>
+</node>
+"
+method call time=1793479145.411620 sender=:1.81 -> destination=org.gnome.ScreenSaver serial=3 path=/org/gnome/ScreenSaver; interface=org.gnome.ScreenSaver; member=GetActive
+method return time=1793479145.411633 sender=:1.24 -> destination=:1.81 serial=255 reply_serial=3
+   boolean false
+signal time=1793479145.412447 sender=org.freedesktop.DBus -> destination=:1.81 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.81"
+signal time=1793479145.412455 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.81"
+   string ":1.81"
+   string ""
+method call time=1793479145.481099 sender=:1.82 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479145.481118 sender=org.freedesktop.DBus -> destination=:1.82 serial=4294967295 reply_serial=1
+   string ":1.82"
+signal time=1793479145.481122 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.82"
+   string ""
+   string ":1.82"
+signal time=1793479145.481130 sender=org.freedesktop.DBus -> destination=:1.82 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.82"
+method call time=1793479145.481744 sender=:1.82 -> destination=org.freedesktop.DBus serial=2 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',interface='org.freedesktop.portal.Request',member='Response'"
+method return time=1793479145.481760 sender=org.freedesktop.DBus -> destination=:1.82 serial=4294967295 reply_serial=2
+method call time=1793479145.482126 sender=:1.82 -> destination=org.freedesktop.portal.Desktop serial=3 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.portal.Screenshot; member=Screenshot
+   string ""
+   array [
+      dict entry(
+         string "handle_token"
+         variant             string "shotproof"
+      )
+      dict entry(
+         string "interactive"
+         variant             boolean false
+      )
+   ]
+method call time=1793479145.482816 sender=:1.56 -> destination=org.freedesktop.DBus serial=148 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionCredentials
+   string ":1.82"
+method return time=1793479145.482825 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=148
+   array [
+      dict entry(
+         string "UnixUserID"
+         variant             uint32 1000
+      )
+      dict entry(
+         string "ProcessID"
+         variant             uint32 4898
+      )
+      dict entry(
+         string "UnixGroupIDs"
+         variant             array [
+               uint32 1000
+               uint32 1000
+            ]
+      )
+      dict entry(
+         string "LinuxSecurityLabel"
+         variant             array of bytes "unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023" + \0
+      )
+      dict entry(
+         string "ProcessFD"
+         variant             file descriptor
+                  inode: 4899
+                  type:       )
+   ]
+method return time=1793479145.484765 sender=:1.56 -> destination=:1.82 serial=149 reply_serial=3
+   object path "/org/freedesktop/portal/desktop/request/1_82/shotproof"
+method call time=1793479145.484775 sender=:1.56 -> destination=:1.58 serial=150 path=/org/freedesktop/impl/portal/PermissionStore; interface=org.freedesktop.impl.portal.PermissionStore; member=Lookup
+   string "screenshot"
+   string "screenshot"
+error time=1793479145.485085 sender=:1.58 -> destination=:1.56 error_name=org.freedesktop.portal.Error.NotFound reply_serial=150
+   string "No entry for screenshot"
+method call time=1793479145.485326 sender=:1.56 -> destination=:1.66 serial=151 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.impl.portal.Access; member=AccessDialog
+   object path "/org/freedesktop/portal/desktop/request/1_82/shotproof"
+   string ""
+   string ""
+   string "Allow Applications to Take Screenshots?"
+   string "An application wants to be able to take screenshots at any time."
+   string "This permission can be changed at any time from the privacy settings."
+   array [
+      dict entry(
+         string "deny_label"
+         variant             string "Deny"
+      )
+      dict entry(
+         string "grant_label"
+         variant             string "Allow"
+      )
+      dict entry(
+         string "icon"
+         variant             string "applets-screenshooter-symbolic"
+      )
+      dict entry(
+         string "modal"
+         variant             boolean true
+      )
+   ]
+signal time=1793479145.490035 sender=:1.3 -> destination=(null destination) serial=529 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=WindowsChanged
+signal time=1793479145.490060 sender=:1.3 -> destination=(null destination) serial=530 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=RunningApplicationsChanged
+signal time=1793479145.508924 sender=:1.3 -> destination=(null destination) serial=531 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=WindowsChanged
+method call time=1793479146.137635 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=256 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479146.137845 sender=:1.7 -> destination=:1.24 serial=532 reply_serial=256
+   uint64 16451
+method call time=1793479148.138235 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=257 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479148.138556 sender=:1.7 -> destination=:1.24 serial=540 reply_serial=257
+   uint64 18452
+method call time=1793479150.138886 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=258 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479150.139200 sender=:1.7 -> destination=:1.24 serial=541 reply_serial=258
+   uint64 20452
+method call time=1793479151.511231 sender=:1.83 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479151.511253 sender=org.freedesktop.DBus -> destination=:1.83 serial=4294967295 reply_serial=1
+   string ":1.83"
+signal time=1793479151.511257 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.83"
+   string ""
+   string ":1.83"
+signal time=1793479151.511261 sender=org.freedesktop.DBus -> destination=:1.83 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.83"
+method call time=1793479151.511921 sender=:1.83 -> destination=org.a11y.Bus serial=2 path=/org/a11y/bus; interface=org.a11y.Bus; member=GetAddress
+method return time=1793479151.512608 sender=:1.39 -> destination=:1.83 serial=18 reply_serial=2
+   string "unix:path=/run/user/1000/at-spi/bus"
+method return time=1793479151.521874 sender=:1.66 -> destination=:1.56 serial=48 reply_serial=151
+   uint32 0
+   array [
+   ]
+method call time=1793479151.522270 sender=:1.56 -> destination=:1.58 serial=152 path=/org/freedesktop/impl/portal/PermissionStore; interface=org.freedesktop.impl.portal.PermissionStore; member=SetPermission
+   string "screenshot"
+   boolean true
+   string "screenshot"
+   string ""
+   array [
+      string "yes"
+   ]
+signal time=1793479151.522836 sender=:1.58 -> destination=(null destination) serial=7 path=/org/freedesktop/impl/portal/PermissionStore; interface=org.freedesktop.impl.portal.PermissionStore; member=Changed
+   string "screenshot"
+   string "screenshot"
+   boolean false
+   variant       byte 0
+   array [
+      dict entry(
+         string ""
+         array [
+            string "yes"
+         ]
+      )
+   ]
+method return time=1793479151.525617 sender=:1.58 -> destination=:1.56 serial=8 reply_serial=152
+signal time=1793479151.526292 sender=:1.3 -> destination=(null destination) serial=542 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=WindowsChanged
+signal time=1793479151.526301 sender=:1.3 -> destination=(null destination) serial=543 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=RunningApplicationsChanged
+method call time=1793479151.526926 sender=:1.56 -> destination=org.freedesktop.DBus serial=153 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',sender='org.freedesktop.impl.portal.desktop.gnome',interface='org.freedesktop.impl.portal.Request',path='/org/freedesktop/portal/desktop/request/1_82/shotproof'"
+method return time=1793479151.526936 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=153
+method call time=1793479151.527010 sender=:1.56 -> destination=org.freedesktop.DBus serial=154 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=StartServiceByName
+   string "org.freedesktop.impl.portal.desktop.gnome"
+   uint32 0
+method return time=1793479151.527042 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=154
+   uint32 2
+method call time=1793479151.527282 sender=:1.56 -> destination=org.freedesktop.DBus serial=155 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479151.527290 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=155
+   string ":1.61"
+method call time=1793479151.527401 sender=:1.56 -> destination=:1.61 serial=156 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.impl.portal.Screenshot; member=Screenshot
+   object path "/org/freedesktop/portal/desktop/request/1_82/shotproof"
+   string ""
+   string ""
+   array [
+      dict entry(
+         string "interactive"
+         variant             boolean false
+      )
+      dict entry(
+         string "permission_store_checked"
+         variant             boolean true
+      )
+   ]
+method call time=1793479151.528568 sender=:1.61 -> destination=org.a11y.Bus serial=99 path=/org/a11y/bus; interface=org.a11y.Bus; member=GetAddress
+method return time=1793479151.528913 sender=:1.39 -> destination=:1.61 serial=19 reply_serial=99
+   string "unix:path=/run/user/1000/at-spi/bus"
+method call time=1793479151.535128 sender=:1.61 -> destination=:1.4 serial=100 path=/org/gnome/Shell/Screenshot; interface=org.gnome.Shell.Screenshot; member=Screenshot
+   boolean false
+   boolean true
+   string "Screenshot"
+method call time=1793479151.535544 sender=:1.4 -> destination=org.freedesktop.DBus serial=544 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479151.535566 sender=org.freedesktop.DBus -> destination=:1.4 serial=4294967295 reply_serial=544
+   uint32 3830
+method call time=1793479151.537797 sender=:1.4 -> destination=org.freedesktop.DBus serial=545 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479151.537818 sender=org.freedesktop.DBus -> destination=:1.4 serial=4294967295 reply_serial=545
+   string ":1.61"
+signal time=1793479151.542033 sender=org.freedesktop.DBus -> destination=:1.83 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.83"
+signal time=1793479151.542060 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.83"
+   string ":1.83"
+   string ""
+method call time=1793479152.142183 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=259 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479152.147630 sender=:1.7 -> destination=:1.24 serial=553 reply_serial=259
+   uint64 22461
+method return time=1793479152.230948 sender=:1.4 -> destination=:1.61 serial=554 reply_serial=100
+   boolean true
+   string "/var/home/tuna-test/Pictures/Screenshots/Screenshot From 2026-10-31 20-39-11.png"
+method return time=1793479152.271532 sender=:1.61 -> destination=:1.56 serial=101 reply_serial=156
+   uint32 0
+   array [
+      dict entry(
+         string "uri"
+         variant             string "file:///var/home/tuna-test/Pictures/Screenshots/Screenshot%20From%202026-10-31%2020-39-11.png"
+      )
+   ]
+signal time=1793479152.272237 sender=:1.56 -> destination=:1.82 serial=157 path=/org/freedesktop/portal/desktop/request/1_82/shotproof; interface=org.freedesktop.portal.Request; member=Response
+   uint32 0
+   array [
+      dict entry(
+         string "uri"
+         variant             string "file:///var/home/tuna-test/Pictures/Screenshots/Screenshot%20From%202026-10-31%2020-39-11.png"
+      )
+   ]
+method call time=1793479152.272569 sender=:1.56 -> destination=org.freedesktop.DBus serial=158 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=RemoveMatch
+   string "type='signal',sender='org.freedesktop.impl.portal.desktop.gnome',interface='org.freedesktop.impl.portal.Request',path='/org/freedesktop/portal/desktop/request/1_82/shotproof'"
+method return time=1793479152.272603 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=158
+signal time=1793479152.336857 sender=org.freedesktop.DBus -> destination=:1.82 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.82"
+signal time=1793479152.337029 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.82"
+   string ":1.82"
+   string ""
+method call time=1793479152.342042 sender=:1.84 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479152.342061 sender=org.freedesktop.DBus -> destination=:1.84 serial=4294967295 reply_serial=1
+   string ":1.84"
+signal time=1793479152.342065 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.84"
+   string ""
+   string ":1.84"
+signal time=1793479152.342069 sender=org.freedesktop.DBus -> destination=:1.84 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.84"
+method call time=1793479152.342894 sender=:1.84 -> destination=org.gnome.ScreenSaver serial=2 path=/org/gnome/ScreenSaver; interface=org.freedesktop.DBus.Introspectable; member=Introspect
+method return time=1793479152.343114 sender=:1.24 -> destination=:1.84 serial=260 reply_serial=2
+   string "<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+                      "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- GDBus 2.80.4 -->
+<node>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <method name="GetAll">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="a{sv}" name="properties" direction="out"/>
+    </method>
+    <method name="Set">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="in"/>
+    </method>
+    <signal name="PropertiesChanged">
+      <arg type="s" name="interface_name"/>
+      <arg type="a{sv}" name="changed_properties"/>
+      <arg type="as" name="invalidated_properties"/>
+    </signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect">
+      <arg type="s" name="xml_data" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Peer">
+    <method name="Ping"/>
+    <method name="GetMachineId">
+      <arg type="s" name="machine_uuid" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.gnome.ScreenSaver">
+    <method name="Lock">
+    </method>
+    <method name="GetActive">
+      <arg type="b" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <method name="SetActive">
+      <arg type="b" name="arg_0" direction="in">
+      </arg>
+    </method>
+    <method name="GetActiveTime">
+      <arg type="u" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <signal name="ActiveChanged">
+      <arg type="b" name="arg_0">
+      </arg>
+    </signal>
+  </interface>
+</node>
+"
+method call time=1793479152.343460 sender=:1.84 -> destination=org.gnome.ScreenSaver serial=3 path=/org/gnome/ScreenSaver; interface=org.gnome.ScreenSaver; member=GetActive
+method return time=1793479152.343755 sender=:1.24 -> destination=:1.84 serial=261 reply_serial=3
+   boolean false
+signal time=1793479152.344558 sender=org.freedesktop.DBus -> destination=:1.84 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.84"
+signal time=1793479152.344583 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.84"
+   string ":1.84"
+   string ""
+method call time=1793479154.143087 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=262 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479154.143317 sender=:1.7 -> destination=:1.24 serial=555 reply_serial=262
+   uint64 24457
+method call time=1793479156.144145 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=263 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479156.144383 sender=:1.7 -> destination=:1.24 serial=556 reply_serial=263
+   uint64 26458
+method call time=1793479158.145360 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=264 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479158.145981 sender=:1.7 -> destination=:1.24 serial=564 reply_serial=264
+   uint64 28459
+method call time=1793479160.146234 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=265 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479160.146596 sender=:1.7 -> destination=:1.24 serial=565 reply_serial=265
+   uint64 30460
+method call time=1793479162.146635 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=266 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479162.146900 sender=:1.7 -> destination=:1.24 serial=573 reply_serial=266
+   uint64 32460
+method call time=1793479162.210634 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=267 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479162.210818 sender=:1.7 -> destination=:1.24 serial=574 reply_serial=267
+   uint64 32524
+method call time=1793479164.147698 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=268 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479164.147922 sender=:1.7 -> destination=:1.24 serial=575 reply_serial=268
+   uint64 34461
+method call time=1793479166.148102 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=269 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479166.148378 sender=:1.7 -> destination=:1.24 serial=576 reply_serial=269
+   uint64 36462
+method call time=1793479168.149291 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=270 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479168.149571 sender=:1.7 -> destination=:1.24 serial=584 reply_serial=270
+   uint64 38463
+method call time=1793479170.150157 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=271 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479170.150463 sender=:1.7 -> destination=:1.24 serial=585 reply_serial=271
+   uint64 40464
+method call time=1793479172.151138 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=272 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479172.151373 sender=:1.7 -> destination=:1.24 serial=593 reply_serial=272
+   uint64 42465
+method call time=1793479174.152063 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=273 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479174.152440 sender=:1.7 -> destination=:1.24 serial=594 reply_serial=273
+   uint64 979
+method call time=1793479176.153164 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=274 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479176.153764 sender=:1.7 -> destination=:1.24 serial=595 reply_serial=274
+   uint64 2981
+method call time=1793479178.154269 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=275 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479178.154815 sender=:1.7 -> destination=:1.24 serial=603 reply_serial=275
+   uint64 4982
+method call time=1793479180.155182 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=276 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479180.155573 sender=:1.7 -> destination=:1.24 serial=604 reply_serial=276
+   uint64 6983
+method call time=1793479182.155500 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=277 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479182.155967 sender=:1.7 -> destination=:1.24 serial=612 reply_serial=277
+   uint64 8983
+method call time=1793479184.156201 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=278 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479184.156668 sender=:1.7 -> destination=:1.24 serial=613 reply_serial=278
+   uint64 10984
+method call time=1793479185.052696 sender=:1.85 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479185.052714 sender=org.freedesktop.DBus -> destination=:1.85 serial=4294967295 reply_serial=1
+   string ":1.85"
+signal time=1793479185.052723 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.85"
+   string ""
+   string ":1.85"
+signal time=1793479185.052726 sender=org.freedesktop.DBus -> destination=:1.85 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.85"
+method call time=1793479185.053338 sender=:1.85 -> destination=org.gnome.ScreenSaver serial=2 path=/org/gnome/ScreenSaver; interface=org.freedesktop.DBus.Introspectable; member=Introspect
+method return time=1793479185.053345 sender=:1.24 -> destination=:1.85 serial=279 reply_serial=2
+   string "<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+                      "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- GDBus 2.80.4 -->
+<node>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <method name="GetAll">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="a{sv}" name="properties" direction="out"/>
+    </method>
+    <method name="Set">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="in"/>
+    </method>
+    <signal name="PropertiesChanged">
+      <arg type="s" name="interface_name"/>
+      <arg type="a{sv}" name="changed_properties"/>
+      <arg type="as" name="invalidated_properties"/>
+    </signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect">
+      <arg type="s" name="xml_data" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Peer">
+    <method name="Ping"/>
+    <method name="GetMachineId">
+      <arg type="s" name="machine_uuid" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.gnome.ScreenSaver">
+    <method name="Lock">
+    </method>
+    <method name="GetActive">
+      <arg type="b" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <method name="SetActive">
+      <arg type="b" name="arg_0" direction="in">
+      </arg>
+    </method>
+    <method name="GetActiveTime">
+      <arg type="u" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <signal name="ActiveChanged">
+      <arg type="b" name="arg_0">
+      </arg>
+    </signal>
+  </interface>
+</node>
+"
+method call time=1793479185.053706 sender=:1.85 -> destination=org.gnome.ScreenSaver serial=3 path=/org/gnome/ScreenSaver; interface=org.gnome.ScreenSaver; member=GetActive
+method return time=1793479185.053785 sender=:1.24 -> destination=:1.85 serial=280 reply_serial=3
+   boolean false
+signal time=1793479185.054224 sender=org.freedesktop.DBus -> destination=:1.85 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.85"
+signal time=1793479185.054232 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.85"
+   string ":1.85"
+   string ""
+method call time=1793479185.057276 sender=:1.86 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479185.057284 sender=org.freedesktop.DBus -> destination=:1.86 serial=4294967295 reply_serial=1
+   string ":1.86"
+signal time=1793479185.057287 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.86"
+   string ""
+   string ":1.86"
+signal time=1793479185.057290 sender=org.freedesktop.DBus -> destination=:1.86 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.86"
+method call time=1793479185.057773 sender=:1.86 -> destination=org.freedesktop.DBus serial=2 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus.Monitoring; member=BecomeMonitor
+   array [
+   ]
+   uint32 0
+method return time=1793479185.057812 sender=org.freedesktop.DBus -> destination=:1.86 serial=4294967295 reply_serial=2
+signal time=1793479185.057846 sender=org.freedesktop.DBus -> destination=:1.86 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.86"
+signal time=1793479185.057892 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.86"
+   string ":1.86"
+   string ""
+method call time=1793479185.147501 sender=:1.87 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479185.147516 sender=org.freedesktop.DBus -> destination=:1.87 serial=4294967295 reply_serial=1
+   string ":1.87"
+signal time=1793479185.147520 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.87"
+   string ""
+   string ":1.87"
+signal time=1793479185.147524 sender=org.freedesktop.DBus -> destination=:1.87 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.87"
+method call time=1793479185.147745 sender=:1.87 -> destination=org.freedesktop.DBus serial=2 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',interface='org.freedesktop.portal.Request',member='Response'"
+method return time=1793479185.147752 sender=org.freedesktop.DBus -> destination=:1.87 serial=4294967295 reply_serial=2
+method call time=1793479185.147968 sender=:1.87 -> destination=org.freedesktop.portal.Desktop serial=3 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.portal.ScreenCast; member=CreateSession
+   array [
+      dict entry(
+         string "handle_token"
+         variant             string "create"
+      )
+      dict entry(
+         string "session_handle_token"
+         variant             string "tunaproof5111"
+      )
+   ]
+method call time=1793479185.148276 sender=:1.56 -> destination=org.freedesktop.DBus serial=159 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionCredentials
+   string ":1.87"
+method return time=1793479185.148284 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=159
+   array [
+      dict entry(
+         string "UnixUserID"
+         variant             uint32 1000
+      )
+      dict entry(
+         string "ProcessID"
+         variant             uint32 5111
+      )
+      dict entry(
+         string "UnixGroupIDs"
+         variant             array [
+               uint32 1000
+               uint32 1000
+            ]
+      )
+      dict entry(
+         string "LinuxSecurityLabel"
+         variant             array of bytes "unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023" + \0
+      )
+      dict entry(
+         string "ProcessFD"
+         variant             file descriptor
+                  inode: 5112
+                  type:       )
+   ]
+method call time=1793479185.148760 sender=:1.56 -> destination=org.freedesktop.DBus serial=160 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',sender='org.freedesktop.impl.portal.desktop.gnome',interface='org.freedesktop.impl.portal.Request',path='/org/freedesktop/portal/desktop/request/1_87/create'"
+method return time=1793479185.148948 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=160
+method call time=1793479185.149022 sender=:1.56 -> destination=org.freedesktop.DBus serial=161 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=StartServiceByName
+   string "org.freedesktop.impl.portal.desktop.gnome"
+   uint32 0
+method return time=1793479185.149037 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=161
+   uint32 2
+method call time=1793479185.149125 sender=:1.56 -> destination=org.freedesktop.DBus serial=162 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479185.149446 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=162
+   string ":1.61"
+method call time=1793479185.149504 sender=:1.56 -> destination=org.freedesktop.DBus serial=163 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',sender='org.freedesktop.impl.portal.desktop.gnome',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='/org/freedesktop/portal/desktop/session/1_87/tunaproof5111',arg0='org.freedesktop.impl.portal.Session'"
+method return time=1793479185.149521 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=163
+method call time=1793479185.149668 sender=:1.56 -> destination=org.freedesktop.DBus serial=164 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',sender='org.freedesktop.impl.portal.desktop.gnome',interface='org.freedesktop.impl.portal.Session',path='/org/freedesktop/portal/desktop/session/1_87/tunaproof5111'"
+method return time=1793479185.149737 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=164
+method call time=1793479185.149741 sender=:1.56 -> destination=org.freedesktop.DBus serial=165 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=StartServiceByName
+   string "org.freedesktop.impl.portal.desktop.gnome"
+   uint32 0
+method return time=1793479185.149744 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=165
+   uint32 2
+method call time=1793479185.149926 sender=:1.56 -> destination=org.freedesktop.DBus serial=166 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479185.150009 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=166
+   string ":1.61"
+method call time=1793479185.150225 sender=:1.56 -> destination=:1.61 serial=167 path=/org/freedesktop/portal/desktop/session/1_87/tunaproof5111; interface=org.freedesktop.DBus.Properties; member=GetAll
+   string "org.freedesktop.impl.portal.Session"
+error time=1793479185.150256 sender=:1.61 -> destination=:1.56 error_name=org.freedesktop.DBus.Error.UnknownMethod reply_serial=167
+   string "Object does not exist at path “/org/freedesktop/portal/desktop/session/1_87/tunaproof5111”"
+method call time=1793479185.150585 sender=:1.56 -> destination=:1.61 serial=168 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.impl.portal.ScreenCast; member=CreateSession
+   object path "/org/freedesktop/portal/desktop/request/1_87/create"
+   object path "/org/freedesktop/portal/desktop/session/1_87/tunaproof5111"
+   string ""
+   array [
+   ]
+method return time=1793479185.150611 sender=:1.56 -> destination=:1.87 serial=169 reply_serial=3
+   object path "/org/freedesktop/portal/desktop/request/1_87/create"
+method return time=1793479185.151095 sender=:1.61 -> destination=:1.56 serial=103 reply_serial=168
+   uint32 0
+   array [
+   ]
+signal time=1793479185.151354 sender=:1.56 -> destination=:1.87 serial=170 path=/org/freedesktop/portal/desktop/request/1_87/create; interface=org.freedesktop.portal.Request; member=Response
+   uint32 0
+   array [
+      dict entry(
+         string "session_handle"
+         variant             string "/org/freedesktop/portal/desktop/session/1_87/tunaproof5111"
+      )
+   ]
+method call time=1793479185.151367 sender=:1.56 -> destination=org.freedesktop.DBus serial=171 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=RemoveMatch
+   string "type='signal',sender='org.freedesktop.impl.portal.desktop.gnome',interface='org.freedesktop.impl.portal.Request',path='/org/freedesktop/portal/desktop/request/1_87/create'"
+method return time=1793479185.151374 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=171
+method call time=1793479185.172396 sender=:1.87 -> destination=org.freedesktop.portal.Desktop serial=4 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.portal.ScreenCast; member=SelectSources
+   object path "/org/freedesktop/portal/desktop/session/1_87/tunaproof5111"
+   array [
+      dict entry(
+         string "handle_token"
+         variant             string "select"
+      )
+      dict entry(
+         string "types"
+         variant             uint32 1
+      )
+      dict entry(
+         string "multiple"
+         variant             boolean false
+      )
+      dict entry(
+         string "cursor_mode"
+         variant             uint32 1
+      )
+   ]
+method call time=1793479185.172954 sender=:1.56 -> destination=org.freedesktop.DBus serial=172 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',sender='org.freedesktop.impl.portal.desktop.gnome',interface='org.freedesktop.impl.portal.Request',path='/org/freedesktop/portal/desktop/request/1_87/select'"
+method return time=1793479185.172972 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=172
+method call time=1793479185.172974 sender=:1.56 -> destination=org.freedesktop.DBus serial=173 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=StartServiceByName
+   string "org.freedesktop.impl.portal.desktop.gnome"
+   uint32 0
+method return time=1793479185.172984 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=173
+   uint32 2
+method call time=1793479185.173131 sender=:1.56 -> destination=org.freedesktop.DBus serial=174 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479185.173141 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=174
+   string ":1.61"
+method call time=1793479185.173466 sender=:1.56 -> destination=:1.61 serial=175 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.impl.portal.ScreenCast; member=SelectSources
+   object path "/org/freedesktop/portal/desktop/request/1_87/select"
+   object path "/org/freedesktop/portal/desktop/session/1_87/tunaproof5111"
+   string ""
+   array [
+      dict entry(
+         string "types"
+         variant             uint32 1
+      )
+      dict entry(
+         string "multiple"
+         variant             boolean false
+      )
+      dict entry(
+         string "cursor_mode"
+         variant             uint32 1
+      )
+   ]
+method return time=1793479185.173484 sender=:1.56 -> destination=:1.87 serial=176 reply_serial=4
+   object path "/org/freedesktop/portal/desktop/request/1_87/select"
+method return time=1793479185.173893 sender=:1.61 -> destination=:1.56 serial=104 reply_serial=175
+   uint32 0
+   array [
+   ]
+signal time=1793479185.174166 sender=:1.56 -> destination=:1.87 serial=177 path=/org/freedesktop/portal/desktop/request/1_87/select; interface=org.freedesktop.portal.Request; member=Response
+   uint32 0
+   array [
+   ]
+method call time=1793479185.174174 sender=:1.56 -> destination=org.freedesktop.DBus serial=178 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=RemoveMatch
+   string "type='signal',sender='org.freedesktop.impl.portal.desktop.gnome',interface='org.freedesktop.impl.portal.Request',path='/org/freedesktop/portal/desktop/request/1_87/select'"
+method return time=1793479185.174176 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=178
+method call time=1793479185.195273 sender=:1.87 -> destination=org.freedesktop.portal.Desktop serial=5 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.portal.ScreenCast; member=Start
+   object path "/org/freedesktop/portal/desktop/session/1_87/tunaproof5111"
+   string ""
+   array [
+      dict entry(
+         string "handle_token"
+         variant             string "start"
+      )
+   ]
+method call time=1793479185.196027 sender=:1.56 -> destination=org.freedesktop.DBus serial=179 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',sender='org.freedesktop.impl.portal.desktop.gnome',interface='org.freedesktop.impl.portal.Request',path='/org/freedesktop/portal/desktop/request/1_87/start'"
+method return time=1793479185.196039 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=179
+method call time=1793479185.196183 sender=:1.56 -> destination=org.freedesktop.DBus serial=180 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=StartServiceByName
+   string "org.freedesktop.impl.portal.desktop.gnome"
+   uint32 0
+method return time=1793479185.196267 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=180
+   uint32 2
+method call time=1793479185.196342 sender=:1.56 -> destination=org.freedesktop.DBus serial=181 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479185.196439 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=181
+   string ":1.61"
+method call time=1793479185.196659 sender=:1.56 -> destination=:1.61 serial=182 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.impl.portal.ScreenCast; member=Start
+   object path "/org/freedesktop/portal/desktop/request/1_87/start"
+   object path "/org/freedesktop/portal/desktop/session/1_87/tunaproof5111"
+   string ""
+   string ""
+   array [
+   ]
+method return time=1793479185.196670 sender=:1.56 -> destination=:1.87 serial=183 reply_serial=5
+   object path "/org/freedesktop/portal/desktop/request/1_87/start"
+method call time=1793479185.199979 sender=:1.61 -> destination=:1.3 serial=105 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=GetWindows
+method call time=1793479185.200469 sender=:1.3 -> destination=org.freedesktop.DBus serial=614 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479185.200550 sender=org.freedesktop.DBus -> destination=:1.3 serial=4294967295 reply_serial=614
+   uint32 3830
+method call time=1793479185.200574 sender=:1.3 -> destination=org.freedesktop.DBus serial=615 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479185.200577 sender=org.freedesktop.DBus -> destination=:1.3 serial=4294967295 reply_serial=615
+   string ":1.61"
+method return time=1793479185.200734 sender=:1.3 -> destination=:1.61 serial=616 reply_serial=105
+   array [
+   ]
+signal time=1793479185.226406 sender=:1.3 -> destination=(null destination) serial=617 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=WindowsChanged
+signal time=1793479185.226439 sender=:1.3 -> destination=(null destination) serial=618 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=RunningApplicationsChanged
+method call time=1793479185.226871 sender=:1.61 -> destination=:1.3 serial=106 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=GetWindows
+method call time=1793479185.227244 sender=:1.3 -> destination=org.freedesktop.DBus serial=619 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479185.227254 sender=org.freedesktop.DBus -> destination=:1.3 serial=4294967295 reply_serial=619
+   uint32 3830
+method call time=1793479185.227380 sender=:1.3 -> destination=org.freedesktop.DBus serial=620 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479185.227388 sender=org.freedesktop.DBus -> destination=:1.3 serial=4294967295 reply_serial=620
+   string ":1.61"
+method return time=1793479185.227536 sender=:1.3 -> destination=:1.61 serial=621 reply_serial=106
+   array [
+      dict entry(
+         uint64 3
+         array [
+            dict entry(
+               string "height"
+               variant                   uint32 600
+            )
+            dict entry(
+               string "title"
+               variant                   string "Share Screen"
+            )
+            dict entry(
+               string "has-focus"
+               variant                   boolean true
+            )
+            dict entry(
+               string "app-id"
+               variant                   string "xdg-desktop-portal-gnome.desktop"
+            )
+            dict entry(
+               string "width"
+               variant                   uint32 800
+            )
+            dict entry(
+               string "is-hidden"
+               variant                   boolean false
+            )
+            dict entry(
+               string "client-type"
+               variant                   uint32 0
+            )
+         ]
+      )
+   ]
+method call time=1793479185.228553 sender=:1.61 -> destination=org.freedesktop.DBus serial=107 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',path='/org/freedesktop/DBus',arg0='org.freedesktop.portal.Documents'"
+method return time=1793479185.228563 sender=org.freedesktop.DBus -> destination=:1.61 serial=4294967295 reply_serial=107
+method call time=1793479185.228705 sender=:1.61 -> destination=org.freedesktop.DBus serial=108 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.portal.Documents"
+method return time=1793479185.228714 sender=org.freedesktop.DBus -> destination=:1.61 serial=4294967295 reply_serial=108
+   string ":1.59"
+signal time=1793479185.694475 sender=:1.3 -> destination=(null destination) serial=622 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=WindowsChanged
+method call time=1793479185.694894 sender=:1.61 -> destination=:1.3 serial=109 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=GetWindows
+method call time=1793479185.695575 sender=:1.3 -> destination=org.freedesktop.DBus serial=623 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479185.695643 sender=org.freedesktop.DBus -> destination=:1.3 serial=4294967295 reply_serial=623
+   uint32 3830
+method call time=1793479185.700945 sender=:1.3 -> destination=org.freedesktop.DBus serial=624 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479185.700967 sender=org.freedesktop.DBus -> destination=:1.3 serial=4294967295 reply_serial=624
+   string ":1.61"
+method return time=1793479185.701167 sender=:1.3 -> destination=:1.61 serial=625 reply_serial=109
+   array [
+      dict entry(
+         uint64 3
+         array [
+            dict entry(
+               string "client-type"
+               variant                   uint32 0
+            )
+            dict entry(
+               string "title"
+               variant                   string "Share Screen"
+            )
+            dict entry(
+               string "has-focus"
+               variant                   boolean true
+            )
+            dict entry(
+               string "width"
+               variant                   uint32 660
+            )
+            dict entry(
+               string "height"
+               variant                   uint32 500
+            )
+            dict entry(
+               string "is-hidden"
+               variant                   boolean false
+            )
+            dict entry(
+               string "app-id"
+               variant                   string "xdg-desktop-portal-gnome.desktop"
+            )
+         ]
+      )
+   ]
+method call time=1793479186.156717 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=281 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479186.157113 sender=:1.7 -> destination=:1.24 serial=626 reply_serial=281
+   uint64 12984
+method call time=1793479188.157252 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=282 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479188.157700 sender=:1.7 -> destination=:1.24 serial=634 reply_serial=282
+   uint64 14984
+method call time=1793479190.158489 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=283 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479190.158978 sender=:1.7 -> destination=:1.24 serial=635 reply_serial=283
+   uint64 16986
+method call time=1793479191.174660 sender=:1.88 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479191.174773 sender=org.freedesktop.DBus -> destination=:1.88 serial=4294967295 reply_serial=1
+   string ":1.88"
+signal time=1793479191.174780 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.88"
+   string ""
+   string ":1.88"
+signal time=1793479191.174784 sender=org.freedesktop.DBus -> destination=:1.88 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.88"
+method call time=1793479191.174785 sender=:1.88 -> destination=org.a11y.Bus serial=2 path=/org/a11y/bus; interface=org.a11y.Bus; member=GetAddress
+method return time=1793479191.175786 sender=:1.39 -> destination=:1.88 serial=20 reply_serial=2
+   string "unix:path=/run/user/1000/at-spi/bus"
+signal time=1793479191.256175 sender=org.freedesktop.DBus -> destination=:1.88 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.88"
+signal time=1793479191.256190 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.88"
+   string ":1.88"
+   string ""
+method call time=1793479191.494801 sender=:1.61 -> destination=:1.5 serial=110 path=/org/gnome/Mutter/ScreenCast; interface=org.gnome.Mutter.ScreenCast; member=CreateSession
+   array [
+   ]
+method call time=1793479191.495243 sender=:1.5 -> destination=org.freedesktop.DBus serial=636 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479191.495252 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=636
+   uint32 3830
+method call time=1793479191.495337 sender=:1.5 -> destination=org.freedesktop.DBus serial=637 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479191.495343 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=637
+   string ":1.61"
+method return time=1793479191.495677 sender=:1.5 -> destination=:1.61 serial=638 reply_serial=110
+   object path "/org/gnome/Mutter/ScreenCast/Session/u1"
+method call time=1793479191.496597 sender=:1.61 -> destination=org.freedesktop.DBus serial=111 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',sender='org.gnome.Mutter.ScreenCast',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='/org/gnome/Mutter/ScreenCast/Session/u1',arg0='org.gnome.Mutter.ScreenCast.Session'"
+method return time=1793479191.496605 sender=org.freedesktop.DBus -> destination=:1.61 serial=4294967295 reply_serial=111
+method call time=1793479191.496607 sender=:1.61 -> destination=org.freedesktop.DBus serial=112 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',sender='org.gnome.Mutter.ScreenCast',interface='org.gnome.Mutter.ScreenCast.Session',path='/org/gnome/Mutter/ScreenCast/Session/u1'"
+method return time=1793479191.496614 sender=org.freedesktop.DBus -> destination=:1.61 serial=4294967295 reply_serial=112
+method call time=1793479191.496615 sender=:1.61 -> destination=org.freedesktop.DBus serial=113 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.gnome.Mutter.ScreenCast"
+method return time=1793479191.496616 sender=org.freedesktop.DBus -> destination=:1.61 serial=4294967295 reply_serial=113
+   string ":1.5"
+method call time=1793479191.497538 sender=:1.61 -> destination=:1.5 serial=114 path=/org/gnome/Mutter/ScreenCast/Session/u1; interface=org.freedesktop.DBus.Properties; member=GetAll
+   string "org.gnome.Mutter.ScreenCast.Session"
+method return time=1793479191.498685 sender=:1.5 -> destination=:1.61 serial=639 reply_serial=114
+   array [
+   ]
+method call time=1793479191.499015 sender=:1.61 -> destination=:1.5 serial=115 path=/org/gnome/Mutter/ScreenCast/Session/u1; interface=org.gnome.Mutter.ScreenCast.Session; member=RecordMonitor
+   string "Virtual-1"
+   array [
+      dict entry(
+         string "cursor-mode"
+         variant             uint32 0
+      )
+   ]
+method return time=1793479191.499370 sender=:1.5 -> destination=:1.61 serial=640 reply_serial=115
+   object path "/org/gnome/Mutter/ScreenCast/Stream/u2"
+method call time=1793479191.499845 sender=:1.61 -> destination=org.freedesktop.DBus serial=116 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',sender='org.gnome.Mutter.ScreenCast',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='/org/gnome/Mutter/ScreenCast/Stream/u2',arg0='org.gnome.Mutter.ScreenCast.Stream'"
+method return time=1793479191.499856 sender=org.freedesktop.DBus -> destination=:1.61 serial=4294967295 reply_serial=116
+method call time=1793479191.499860 sender=:1.61 -> destination=org.freedesktop.DBus serial=117 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',sender='org.gnome.Mutter.ScreenCast',interface='org.gnome.Mutter.ScreenCast.Stream',path='/org/gnome/Mutter/ScreenCast/Stream/u2'"
+method return time=1793479191.499863 sender=org.freedesktop.DBus -> destination=:1.61 serial=4294967295 reply_serial=117
+method call time=1793479191.499864 sender=:1.61 -> destination=org.freedesktop.DBus serial=118 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.gnome.Mutter.ScreenCast"
+method return time=1793479191.499866 sender=org.freedesktop.DBus -> destination=:1.61 serial=4294967295 reply_serial=118
+   string ":1.5"
+method call time=1793479191.499965 sender=:1.61 -> destination=:1.5 serial=119 path=/org/gnome/Mutter/ScreenCast/Stream/u2; interface=org.freedesktop.DBus.Properties; member=GetAll
+   string "org.gnome.Mutter.ScreenCast.Stream"
+method return time=1793479191.500207 sender=:1.5 -> destination=:1.61 serial=641 reply_serial=119
+   array [
+      dict entry(
+         string "Parameters"
+         variant             array [
+               dict entry(
+                  string "position"
+                  variant                      struct {
+                        int32 0
+                        int32 0
+                     }
+               )
+               dict entry(
+                  string "size"
+                  variant                      struct {
+                        int32 1280
+                        int32 800
+                     }
+               )
+            ]
+      )
+   ]
+method call time=1793479191.500576 sender=:1.61 -> destination=:1.5 serial=120 path=/org/gnome/Mutter/ScreenCast/Session/u1; interface=org.gnome.Mutter.ScreenCast.Session; member=Start
+method return time=1793479191.501102 sender=:1.5 -> destination=:1.61 serial=642 reply_serial=120
+method call time=1793479191.501822 sender=:1.5 -> destination=org.freedesktop.DBus serial=643 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479191.501836 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=643
+   uint32 3830
+method call time=1793479191.502465 sender=:1.5 -> destination=org.freedesktop.DBus serial=644 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479191.502473 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=644
+   string ":1.61"
+method call time=1793479191.503981 sender=:1.89 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479191.504003 sender=org.freedesktop.DBus -> destination=:1.89 serial=4294967295 reply_serial=1
+   string ":1.89"
+signal time=1793479191.504015 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.89"
+   string ""
+   string ":1.89"
+signal time=1793479191.504027 sender=org.freedesktop.DBus -> destination=:1.89 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.89"
+method call time=1793479191.504637 sender=:1.89 -> destination=org.freedesktop.DBus serial=2 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameHasOwner
+   string "org.freedesktop.portal.Desktop"
+method return time=1793479191.504656 sender=org.freedesktop.DBus -> destination=:1.89 serial=4294967295 reply_serial=2
+   boolean true
+method call time=1793479191.505004 sender=:1.89 -> destination=org.freedesktop.portal.Desktop serial=3 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.DBus.Properties; member=Get
+   string "org.freedesktop.portal.Realtime"
+   string "MaxRealtimePriority"
+method return time=1793479191.505304 sender=:1.56 -> destination=:1.89 serial=184 reply_serial=3
+   variant       int32 20
+method call time=1793479191.505513 sender=:1.89 -> destination=org.freedesktop.portal.Desktop serial=4 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.DBus.Properties; member=Get
+   string "org.freedesktop.portal.Realtime"
+   string "MinNiceLevel"
+method return time=1793479191.505718 sender=:1.56 -> destination=:1.89 serial=185 reply_serial=4
+   variant       int32 -15
+method call time=1793479191.505837 sender=:1.89 -> destination=org.freedesktop.portal.Desktop serial=5 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.DBus.Properties; member=Get
+   string "org.freedesktop.portal.Realtime"
+   string "RTTimeUSecMax"
+method return time=1793479191.506003 sender=:1.56 -> destination=:1.89 serial=186 reply_serial=5
+   variant       int64 200000
+signal time=1793479191.513876 sender=:1.3 -> destination=(null destination) serial=645 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=WindowsChanged
+signal time=1793479191.514088 sender=:1.3 -> destination=(null destination) serial=646 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=RunningApplicationsChanged
+method call time=1793479191.514214 sender=:1.61 -> destination=:1.3 serial=121 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=GetWindows
+method call time=1793479191.514449 sender=:1.3 -> destination=org.freedesktop.DBus serial=647 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479191.514500 sender=org.freedesktop.DBus -> destination=:1.3 serial=4294967295 reply_serial=647
+   uint32 3830
+method call time=1793479191.514634 sender=:1.3 -> destination=org.freedesktop.DBus serial=648 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479191.514641 sender=org.freedesktop.DBus -> destination=:1.3 serial=4294967295 reply_serial=648
+   string ":1.61"
+method return time=1793479191.515040 sender=:1.3 -> destination=:1.61 serial=649 reply_serial=121
+   array [
+   ]
+signal time=1793479191.539311 sender=:1.5 -> destination=(null destination) serial=650 path=/org/gnome/Mutter/ScreenCast/Stream/u2; interface=org.gnome.Mutter.ScreenCast.Stream; member=PipeWireStreamAdded
+   uint32 58
+method return time=1793479191.540029 sender=:1.61 -> destination=:1.56 serial=122 reply_serial=182
+   uint32 0
+   array [
+      dict entry(
+         string "streams"
+         variant             array [
+               struct {
+                  uint32 58
+                  array [
+                     dict entry(
+                        string "id"
+                        variant                            string "0"
+                     )
+                     dict entry(
+                        string "source_type"
+                        variant                            uint32 1
+                     )
+                     dict entry(
+                        string "position"
+                        variant                            struct {
+                              int32 0
+                              int32 0
+                           }
+                     )
+                     dict entry(
+                        string "size"
+                        variant                            struct {
+                              int32 1280
+                              int32 800
+                           }
+                     )
+                  ]
+               }
+            ]
+      )
+   ]
+signal time=1793479191.540368 sender=:1.56 -> destination=:1.87 serial=187 path=/org/freedesktop/portal/desktop/request/1_87/start; interface=org.freedesktop.portal.Request; member=Response
+   uint32 0
+   array [
+      dict entry(
+         string "streams"
+         variant             array [
+               struct {
+                  uint32 58
+                  array [
+                     dict entry(
+                        string "id"
+                        variant                            string "0"
+                     )
+                     dict entry(
+                        string "source_type"
+                        variant                            uint32 1
+                     )
+                     dict entry(
+                        string "position"
+                        variant                            struct {
+                              int32 0
+                              int32 0
+                           }
+                     )
+                     dict entry(
+                        string "size"
+                        variant                            struct {
+                              int32 1280
+                              int32 800
+                           }
+                     )
+                  ]
+               }
+            ]
+      )
+   ]
+method call time=1793479191.540570 sender=:1.56 -> destination=org.freedesktop.DBus serial=188 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=RemoveMatch
+   string "type='signal',sender='org.freedesktop.impl.portal.desktop.gnome',interface='org.freedesktop.impl.portal.Request',path='/org/freedesktop/portal/desktop/request/1_87/start'"
+method return time=1793479191.540577 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=188
+method call time=1793479191.561935 sender=:1.87 -> destination=org.freedesktop.portal.Desktop serial=6 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.portal.ScreenCast; member=OpenPipeWireRemote
+   object path "/org/freedesktop/portal/desktop/session/1_87/tunaproof5111"
+   array [
+   ]
+method call time=1793479191.563230 sender=:1.90 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479191.563238 sender=org.freedesktop.DBus -> destination=:1.90 serial=4294967295 reply_serial=1
+   string ":1.90"
+signal time=1793479191.563241 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.90"
+   string ""
+   string ":1.90"
+signal time=1793479191.563248 sender=org.freedesktop.DBus -> destination=:1.90 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.90"
+method call time=1793479191.563249 sender=:1.90 -> destination=org.freedesktop.DBus serial=2 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameHasOwner
+   string "org.freedesktop.portal.Desktop"
+method return time=1793479191.563250 sender=org.freedesktop.DBus -> destination=:1.90 serial=4294967295 reply_serial=2
+   boolean true
+method call time=1793479191.563835 sender=:1.90 -> destination=org.freedesktop.portal.Desktop serial=3 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.DBus.Properties; member=Get
+   string "org.freedesktop.portal.Realtime"
+   string "MaxRealtimePriority"
+method return time=1793479191.564583 sender=:1.56 -> destination=:1.90 serial=189 reply_serial=3
+   variant       int32 20
+method call time=1793479191.564858 sender=:1.90 -> destination=org.freedesktop.portal.Desktop serial=4 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.DBus.Properties; member=Get
+   string "org.freedesktop.portal.Realtime"
+   string "MinNiceLevel"
+method return time=1793479191.565138 sender=:1.56 -> destination=:1.90 serial=190 reply_serial=4
+   variant       int32 -15
+method call time=1793479191.565505 sender=:1.90 -> destination=org.freedesktop.portal.Desktop serial=5 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.DBus.Properties; member=Get
+   string "org.freedesktop.portal.Realtime"
+   string "RTTimeUSecMax"
+method call time=1793479191.565578 sender=:1.46 -> destination=org.freedesktop.impl.portal.PermissionStore serial=5 path=/org/freedesktop/impl/portal/PermissionStore; interface=org.freedesktop.impl.portal.PermissionStore; member=Lookup
+   string "devices"
+   string "camera"
+method return time=1793479191.565825 sender=:1.56 -> destination=:1.90 serial=191 reply_serial=5
+   variant       int64 200000
+error time=1793479191.565924 sender=:1.58 -> destination=:1.46 error_name=org.freedesktop.portal.Error.NotFound reply_serial=5
+   string "No entry for camera"
+signal time=1793479191.566655 sender=org.freedesktop.DBus -> destination=:1.90 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.90"
+signal time=1793479191.566689 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.90"
+   string ":1.90"
+   string ""
+method return time=1793479191.567417 sender=:1.56 -> destination=:1.87 serial=192 reply_serial=6
+   file descriptor
+         inode: 26740
+         type: socket
+         address family: unix
+         name @
+         peer @
+method call time=1793479191.602480 sender=:1.5 -> destination=org.freedesktop.DBus serial=651 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479191.602525 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=651
+   uint32 3830
+method call time=1793479191.602624 sender=:1.5 -> destination=org.freedesktop.DBus serial=652 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479191.602639 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=652
+   string ":1.61"
+method call time=1793479191.703166 sender=:1.5 -> destination=org.freedesktop.DBus serial=653 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479191.703191 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=653
+   uint32 3830
+method call time=1793479191.703313 sender=:1.5 -> destination=org.freedesktop.DBus serial=654 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479191.703331 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=654
+   string ":1.61"
+method call time=1793479191.804760 sender=:1.5 -> destination=org.freedesktop.DBus serial=662 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479191.804774 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=662
+   uint32 3830
+method call time=1793479191.804908 sender=:1.5 -> destination=org.freedesktop.DBus serial=663 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479191.804914 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=663
+   string ":1.61"
+method call time=1793479191.905311 sender=:1.5 -> destination=org.freedesktop.DBus serial=664 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479191.905335 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=664
+   uint32 3830
+method call time=1793479191.905598 sender=:1.5 -> destination=org.freedesktop.DBus serial=665 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479191.905604 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=665
+   string ":1.61"
+method call time=1793479192.006106 sender=:1.5 -> destination=org.freedesktop.DBus serial=666 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479192.006118 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=666
+   uint32 3830
+method call time=1793479192.006173 sender=:1.5 -> destination=org.freedesktop.DBus serial=667 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479192.006193 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=667
+   string ":1.61"
+method call time=1793479192.106719 sender=:1.5 -> destination=org.freedesktop.DBus serial=668 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479192.106733 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=668
+   uint32 3830
+method call time=1793479192.106785 sender=:1.5 -> destination=org.freedesktop.DBus serial=669 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479192.106805 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=669
+   string ":1.61"
+method call time=1793479192.159489 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=284 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479192.159796 sender=:1.7 -> destination=:1.24 serial=670 reply_serial=284
+   uint64 18987
+method call time=1793479192.207276 sender=:1.5 -> destination=org.freedesktop.DBus serial=671 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479192.207298 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=671
+   uint32 3830
+method call time=1793479192.207437 sender=:1.5 -> destination=org.freedesktop.DBus serial=672 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479192.207448 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=672
+   string ":1.61"
+method call time=1793479192.212397 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=285 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479192.212606 sender=:1.7 -> destination=:1.24 serial=673 reply_serial=285
+   uint64 19040
+method call time=1793479192.307950 sender=:1.5 -> destination=org.freedesktop.DBus serial=674 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479192.307967 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=674
+   uint32 3830
+method call time=1793479192.308094 sender=:1.5 -> destination=org.freedesktop.DBus serial=675 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479192.308100 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=675
+   string ":1.61"
+method call time=1793479192.408716 sender=:1.5 -> destination=org.freedesktop.DBus serial=676 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479192.408731 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=676
+   uint32 3830
+method call time=1793479192.408867 sender=:1.5 -> destination=org.freedesktop.DBus serial=677 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479192.408874 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=677
+   string ":1.61"
+method call time=1793479192.509757 sender=:1.5 -> destination=org.freedesktop.DBus serial=678 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479192.509785 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=678
+   uint32 3830
+method call time=1793479192.509894 sender=:1.5 -> destination=org.freedesktop.DBus serial=679 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479192.509920 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=679
+   string ":1.61"
+method call time=1793479192.610414 sender=:1.5 -> destination=org.freedesktop.DBus serial=680 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479192.610455 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=680
+   uint32 3830
+method call time=1793479192.610630 sender=:1.5 -> destination=org.freedesktop.DBus serial=681 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479192.610640 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=681
+   string ":1.61"
+method call time=1793479192.711116 sender=:1.5 -> destination=org.freedesktop.DBus serial=682 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479192.711129 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=682
+   uint32 3830
+method call time=1793479192.711256 sender=:1.5 -> destination=org.freedesktop.DBus serial=683 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479192.711262 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=683
+   string ":1.61"
+method call time=1793479192.811739 sender=:1.5 -> destination=org.freedesktop.DBus serial=684 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479192.811756 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=684
+   uint32 3830
+method call time=1793479192.811876 sender=:1.5 -> destination=org.freedesktop.DBus serial=685 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479192.811927 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=685
+   string ":1.61"
+method call time=1793479192.842593 sender=:1.91 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479192.842609 sender=org.freedesktop.DBus -> destination=:1.91 serial=4294967295 reply_serial=1
+   string ":1.91"
+signal time=1793479192.842613 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.91"
+   string ""
+   string ":1.91"
+signal time=1793479192.842615 sender=org.freedesktop.DBus -> destination=:1.91 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.91"
+method call time=1793479192.843211 sender=:1.91 -> destination=org.freedesktop.DBus serial=2 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',path='/org/freedesktop/DBus',arg0='org.gtk.vfs.Daemon'"
+method return time=1793479192.843219 sender=org.freedesktop.DBus -> destination=:1.91 serial=4294967295 reply_serial=2
+method call time=1793479192.843220 sender=:1.91 -> destination=org.freedesktop.DBus serial=3 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=StartServiceByName
+   string "org.gtk.vfs.Daemon"
+   uint32 0
+method return time=1793479192.843239 sender=org.freedesktop.DBus -> destination=:1.91 serial=4294967295 reply_serial=3
+   uint32 2
+method call time=1793479192.843406 sender=:1.91 -> destination=org.freedesktop.DBus serial=4 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.gtk.vfs.Daemon"
+method return time=1793479192.843412 sender=org.freedesktop.DBus -> destination=:1.91 serial=4294967295 reply_serial=4
+   string ":1.27"
+method call time=1793479192.843615 sender=:1.91 -> destination=:1.27 serial=5 path=/org/gtk/vfs/mounttracker; interface=org.gtk.vfs.MountTracker; member=ListMountableInfo
+method return time=1793479192.844371 sender=:1.27 -> destination=:1.91 serial=22 reply_serial=5
+   array [
+      struct {
+         string "wsdd"
+         string "wsdd"
+         array [
+         ]
+         int32 0
+         boolean false
+      }
+      struct {
+         string "trash"
+         string "trash"
+         array [
+         ]
+         int32 0
+         boolean false
+      }
+      struct {
+         string "sftp"
+         string "sftp"
+         array [
+            string "ssh"
+         ]
+         int32 22
+         boolean true
+      }
+      struct {
+         string "recent"
+         string "recent"
+         array [
+         ]
+         int32 0
+         boolean false
+      }
+      struct {
+         string "network"
+         string "network"
+         array [
+         ]
+         int32 0
+         boolean false
+      }
+      struct {
+         string "localtest"
+         string "localtest"
+         array [
+         ]
+         int32 0
+         boolean false
+      }
+      struct {
+         string "http"
+         string "http"
+         array [
+         ]
+         int32 0
+         boolean false
+      }
+      struct {
+         string "ftps"
+         string "ftps"
+         array [
+         ]
+         int32 21
+         boolean true
+      }
+      struct {
+         string "ftpis"
+         string "ftpis"
+         array [
+         ]
+         int32 990
+         boolean true
+      }
+      struct {
+         string "ftp"
+         string "ftp"
+         array [
+         ]
+         int32 21
+         boolean true
+      }
+      struct {
+         string "dns-sd"
+         string "dns-sd"
+         array [
+         ]
+         int32 0
+         boolean false
+      }
+      struct {
+         string "davs"
+         string "davs"
+         array [
+         ]
+         int32 0
+         boolean false
+      }
+      struct {
+         string "dav"
+         string "dav"
+         array [
+         ]
+         int32 0
+         boolean false
+      }
+      struct {
+         string "davs+sd"
+         string "davs+sd"
+         array [
+         ]
+         int32 0
+         boolean false
+      }
+      struct {
+         string "dav+sd"
+         string "dav+sd"
+         array [
+         ]
+         int32 0
+         boolean false
+      }
+      struct {
+         string "computer"
+         string "computer"
+         array [
+         ]
+         int32 0
+         boolean false
+      }
+      struct {
+         string "admin"
+         string "admin"
+         array [
+         ]
+         int32 0
+         boolean false
+      }
+   ]
+method call time=1793479192.844726 sender=:1.91 -> destination=org.freedesktop.DBus serial=6 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=RemoveMatch
+   string "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',path='/org/freedesktop/DBus',arg0='org.gtk.vfs.Daemon'"
+method return time=1793479192.844734 sender=org.freedesktop.DBus -> destination=:1.91 serial=4294967295 reply_serial=6
+method call time=1793479192.912345 sender=:1.5 -> destination=org.freedesktop.DBus serial=686 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479192.912361 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=686
+   uint32 3830
+method call time=1793479192.912537 sender=:1.5 -> destination=org.freedesktop.DBus serial=687 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479192.912548 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=687
+   string ":1.61"
+method call time=1793479193.013343 sender=:1.5 -> destination=org.freedesktop.DBus serial=688 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479193.013359 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=688
+   uint32 3830
+method call time=1793479193.013556 sender=:1.5 -> destination=org.freedesktop.DBus serial=689 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479193.013619 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=689
+   string ":1.61"
+method call time=1793479193.115216 sender=:1.5 -> destination=org.freedesktop.DBus serial=690 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479193.115247 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=690
+   uint32 3830
+method call time=1793479193.115383 sender=:1.5 -> destination=org.freedesktop.DBus serial=691 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479193.115393 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=691
+   string ":1.61"
+method call time=1793479193.216033 sender=:1.5 -> destination=org.freedesktop.DBus serial=692 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479193.216065 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=692
+   uint32 3830
+method call time=1793479193.216149 sender=:1.5 -> destination=org.freedesktop.DBus serial=693 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479193.216156 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=693
+   string ":1.61"
+method call time=1793479193.316789 sender=:1.5 -> destination=org.freedesktop.DBus serial=694 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479193.316804 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=694
+   uint32 3830
+method call time=1793479193.316939 sender=:1.5 -> destination=org.freedesktop.DBus serial=695 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479193.316947 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=695
+   string ":1.61"
+method call time=1793479193.417468 sender=:1.5 -> destination=org.freedesktop.DBus serial=696 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479193.417487 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=696
+   uint32 3830
+method call time=1793479193.417644 sender=:1.5 -> destination=org.freedesktop.DBus serial=697 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479193.417653 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=697
+   string ":1.61"
+method call time=1793479193.518265 sender=:1.5 -> destination=org.freedesktop.DBus serial=698 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479193.518281 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=698
+   uint32 3830
+method call time=1793479193.518418 sender=:1.5 -> destination=org.freedesktop.DBus serial=699 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479193.518515 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=699
+   string ":1.61"
+method call time=1793479193.619095 sender=:1.5 -> destination=org.freedesktop.DBus serial=700 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479193.619121 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=700
+   uint32 3830
+method call time=1793479193.619297 sender=:1.5 -> destination=org.freedesktop.DBus serial=701 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479193.619304 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=701
+   string ":1.61"
+method call time=1793479193.719775 sender=:1.5 -> destination=org.freedesktop.DBus serial=702 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479193.719795 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=702
+   uint32 3830
+method call time=1793479193.720782 sender=:1.5 -> destination=org.freedesktop.DBus serial=703 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479193.720878 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=703
+   string ":1.61"
+method call time=1793479193.821343 sender=:1.5 -> destination=org.freedesktop.DBus serial=704 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479193.821358 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=704
+   uint32 3830
+method call time=1793479193.821959 sender=:1.5 -> destination=org.freedesktop.DBus serial=705 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479193.822012 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=705
+   string ":1.61"
+method call time=1793479193.922389 sender=:1.5 -> destination=org.freedesktop.DBus serial=706 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479193.922403 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=706
+   uint32 3830
+method call time=1793479193.922542 sender=:1.5 -> destination=org.freedesktop.DBus serial=707 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479193.922550 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=707
+   string ":1.61"
+method call time=1793479194.023869 sender=:1.5 -> destination=org.freedesktop.DBus serial=708 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479194.024030 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=708
+   uint32 3830
+method call time=1793479194.024034 sender=:1.5 -> destination=org.freedesktop.DBus serial=709 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479194.024038 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=709
+   string ":1.61"
+method call time=1793479194.124300 sender=:1.5 -> destination=org.freedesktop.DBus serial=710 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479194.124322 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=710
+   uint32 3830
+method call time=1793479194.124414 sender=:1.5 -> destination=org.freedesktop.DBus serial=711 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479194.124534 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=711
+   string ":1.61"
+method call time=1793479194.160066 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=286 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479194.160422 sender=:1.7 -> destination=:1.24 serial=712 reply_serial=286
+   uint64 20987
+method call time=1793479194.224922 sender=:1.5 -> destination=org.freedesktop.DBus serial=713 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479194.224946 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=713
+   uint32 3830
+method call time=1793479194.225187 sender=:1.5 -> destination=org.freedesktop.DBus serial=714 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479194.225195 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=714
+   string ":1.61"
+method call time=1793479194.325853 sender=:1.5 -> destination=org.freedesktop.DBus serial=715 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479194.325881 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=715
+   uint32 3830
+method call time=1793479194.326161 sender=:1.5 -> destination=org.freedesktop.DBus serial=716 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479194.326170 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=716
+   string ":1.61"
+method call time=1793479194.426764 sender=:1.5 -> destination=org.freedesktop.DBus serial=717 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479194.426793 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=717
+   uint32 3830
+method call time=1793479194.426933 sender=:1.5 -> destination=org.freedesktop.DBus serial=718 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479194.426939 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=718
+   string ":1.61"
+method call time=1793479194.527382 sender=:1.5 -> destination=org.freedesktop.DBus serial=719 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479194.527404 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=719
+   uint32 3830
+method call time=1793479194.527523 sender=:1.5 -> destination=org.freedesktop.DBus serial=720 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479194.527556 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=720
+   string ":1.61"
+method call time=1793479194.627936 sender=:1.5 -> destination=org.freedesktop.DBus serial=721 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479194.627958 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=721
+   uint32 3830
+method call time=1793479194.628084 sender=:1.5 -> destination=org.freedesktop.DBus serial=722 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479194.628089 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=722
+   string ":1.61"
+method call time=1793479194.728525 sender=:1.5 -> destination=org.freedesktop.DBus serial=723 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479194.728550 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=723
+   uint32 3830
+method call time=1793479194.728638 sender=:1.5 -> destination=org.freedesktop.DBus serial=724 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479194.728644 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=724
+   string ":1.61"
+method call time=1793479194.829110 sender=:1.5 -> destination=org.freedesktop.DBus serial=725 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479194.829133 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=725
+   uint32 3830
+method call time=1793479194.829289 sender=:1.5 -> destination=org.freedesktop.DBus serial=726 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479194.829297 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=726
+   string ":1.61"
+method call time=1793479194.932166 sender=:1.5 -> destination=org.freedesktop.DBus serial=727 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479194.932193 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=727
+   uint32 3830
+method call time=1793479194.933395 sender=:1.5 -> destination=org.freedesktop.DBus serial=728 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479194.933405 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=728
+   string ":1.61"
+method call time=1793479195.034061 sender=:1.5 -> destination=org.freedesktop.DBus serial=729 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479195.034089 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=729
+   uint32 3830
+method call time=1793479195.034303 sender=:1.5 -> destination=org.freedesktop.DBus serial=730 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479195.034506 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=730
+   string ":1.61"
+method call time=1793479195.134888 sender=:1.5 -> destination=org.freedesktop.DBus serial=731 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479195.134916 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=731
+   uint32 3830
+method call time=1793479195.135902 sender=:1.5 -> destination=org.freedesktop.DBus serial=732 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479195.135914 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=732
+   string ":1.61"
+method call time=1793479195.236755 sender=:1.5 -> destination=org.freedesktop.DBus serial=733 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479195.236795 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=733
+   uint32 3830
+method call time=1793479195.238101 sender=:1.5 -> destination=org.freedesktop.DBus serial=734 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479195.238117 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=734
+   string ":1.61"
+method call time=1793479195.338711 sender=:1.5 -> destination=org.freedesktop.DBus serial=735 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479195.338745 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=735
+   uint32 3830
+method call time=1793479195.338977 sender=:1.5 -> destination=org.freedesktop.DBus serial=736 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479195.338988 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=736
+   string ":1.61"
+method call time=1793479195.439966 sender=:1.5 -> destination=org.freedesktop.DBus serial=737 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479195.440005 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=737
+   uint32 3830
+method call time=1793479195.440008 sender=:1.5 -> destination=org.freedesktop.DBus serial=738 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479195.440010 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=738
+   string ":1.61"
+method call time=1793479195.540557 sender=:1.5 -> destination=org.freedesktop.DBus serial=739 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479195.540582 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=739
+   uint32 3830
+method call time=1793479195.540679 sender=:1.5 -> destination=org.freedesktop.DBus serial=740 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479195.540705 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=740
+   string ":1.61"
+method call time=1793479195.641460 sender=:1.5 -> destination=org.freedesktop.DBus serial=741 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479195.641493 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=741
+   uint32 3830
+method call time=1793479195.641496 sender=:1.5 -> destination=org.freedesktop.DBus serial=742 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479195.641499 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=742
+   string ":1.61"
+method call time=1793479195.741998 sender=:1.5 -> destination=org.freedesktop.DBus serial=743 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479195.742016 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=743
+   uint32 3830
+method call time=1793479195.742126 sender=:1.5 -> destination=org.freedesktop.DBus serial=744 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479195.742135 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=744
+   string ":1.61"
+method call time=1793479195.842649 sender=:1.5 -> destination=org.freedesktop.DBus serial=745 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479195.842667 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=745
+   uint32 3830
+method call time=1793479195.842756 sender=:1.5 -> destination=org.freedesktop.DBus serial=746 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479195.842763 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=746
+   string ":1.61"
+method call time=1793479195.943671 sender=:1.5 -> destination=org.freedesktop.DBus serial=747 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479195.943699 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=747
+   uint32 3830
+method call time=1793479195.943702 sender=:1.5 -> destination=org.freedesktop.DBus serial=748 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479195.943704 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=748
+   string ":1.61"
+method call time=1793479196.045625 sender=:1.5 -> destination=org.freedesktop.DBus serial=749 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479196.045660 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=749
+   uint32 3830
+method call time=1793479196.045692 sender=:1.5 -> destination=org.freedesktop.DBus serial=750 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479196.045698 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=750
+   string ":1.61"
+method call time=1793479196.146279 sender=:1.5 -> destination=org.freedesktop.DBus serial=751 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479196.146308 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=751
+   uint32 3830
+method call time=1793479196.146529 sender=:1.5 -> destination=org.freedesktop.DBus serial=752 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479196.146539 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=752
+   string ":1.61"
+method call time=1793479196.161023 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=287 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479196.161656 sender=:1.7 -> destination=:1.24 serial=753 reply_serial=287
+   uint64 22988
+method call time=1793479196.247513 sender=:1.5 -> destination=org.freedesktop.DBus serial=754 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479196.247586 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=754
+   uint32 3830
+method call time=1793479196.247800 sender=:1.5 -> destination=org.freedesktop.DBus serial=755 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479196.247809 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=755
+   string ":1.61"
+method call time=1793479196.348748 sender=:1.5 -> destination=org.freedesktop.DBus serial=756 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479196.348770 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=756
+   uint32 3830
+method call time=1793479196.348923 sender=:1.5 -> destination=org.freedesktop.DBus serial=757 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479196.348932 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=757
+   string ":1.61"
+method call time=1793479196.449440 sender=:1.5 -> destination=org.freedesktop.DBus serial=758 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479196.449477 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=758
+   uint32 3830
+method call time=1793479196.450121 sender=:1.5 -> destination=org.freedesktop.DBus serial=759 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479196.450133 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=759
+   string ":1.61"
+method call time=1793479196.552635 sender=:1.5 -> destination=org.freedesktop.DBus serial=760 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479196.552656 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=760
+   uint32 3830
+method call time=1793479196.552794 sender=:1.5 -> destination=org.freedesktop.DBus serial=761 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479196.552802 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=761
+   string ":1.61"
+signal time=1793479196.593648 sender=org.freedesktop.DBus -> destination=:1.91 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.91"
+signal time=1793479196.593674 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.91"
+   string ":1.91"
+   string ""
+method call time=1793479196.653237 sender=:1.5 -> destination=org.freedesktop.DBus serial=762 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479196.653270 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=762
+   uint32 3830
+method call time=1793479196.653394 sender=:1.5 -> destination=org.freedesktop.DBus serial=763 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479196.653399 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=763
+   string ":1.61"
+method call time=1793479196.694629 sender=:1.92 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479196.694645 sender=org.freedesktop.DBus -> destination=:1.92 serial=4294967295 reply_serial=1
+   string ":1.92"
+signal time=1793479196.694649 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.92"
+   string ""
+   string ":1.92"
+signal time=1793479196.694652 sender=org.freedesktop.DBus -> destination=:1.92 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.92"
+method call time=1793479196.695035 sender=:1.92 -> destination=org.freedesktop.DBus serial=2 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameHasOwner
+   string "org.freedesktop.portal.Desktop"
+method return time=1793479196.695052 sender=org.freedesktop.DBus -> destination=:1.92 serial=4294967295 reply_serial=2
+   boolean true
+method call time=1793479196.695193 sender=:1.92 -> destination=org.freedesktop.portal.Desktop serial=3 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.DBus.Properties; member=Get
+   string "org.freedesktop.portal.Realtime"
+   string "MaxRealtimePriority"
+method return time=1793479196.695828 sender=:1.56 -> destination=:1.92 serial=193 reply_serial=3
+   variant       int32 20
+method call time=1793479196.695929 sender=:1.92 -> destination=org.freedesktop.portal.Desktop serial=4 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.DBus.Properties; member=Get
+   string "org.freedesktop.portal.Realtime"
+   string "MinNiceLevel"
+method return time=1793479196.696266 sender=:1.56 -> destination=:1.92 serial=194 reply_serial=4
+   variant       int32 -15
+method call time=1793479196.696418 sender=:1.92 -> destination=org.freedesktop.portal.Desktop serial=5 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.DBus.Properties; member=Get
+   string "org.freedesktop.portal.Realtime"
+   string "RTTimeUSecMax"
+method return time=1793479196.696874 sender=:1.56 -> destination=:1.92 serial=195 reply_serial=5
+   variant       int64 200000
+method call time=1793479196.754308 sender=:1.5 -> destination=org.freedesktop.DBus serial=764 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479196.754329 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=764
+   uint32 3830
+method call time=1793479196.755166 sender=:1.5 -> destination=org.freedesktop.DBus serial=765 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479196.755176 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=765
+   string ":1.61"
+signal time=1793479196.782679 sender=org.freedesktop.DBus -> destination=:1.92 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.92"
+signal time=1793479196.782693 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.92"
+   string ":1.92"
+   string ""
+method call time=1793479196.805967 sender=:1.93 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479196.805993 sender=org.freedesktop.DBus -> destination=:1.93 serial=4294967295 reply_serial=1
+   string ":1.93"
+signal time=1793479196.805999 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.93"
+   string ""
+   string ":1.93"
+signal time=1793479196.806001 sender=org.freedesktop.DBus -> destination=:1.93 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.93"
+method call time=1793479196.806290 sender=:1.93 -> destination=org.freedesktop.portal.Desktop serial=2 path=/org/freedesktop/portal/desktop/session/1_87/tunaproof5111; interface=org.freedesktop.portal.Session; member=Close
+error time=1793479196.806795 sender=:1.56 -> destination=:1.93 error_name=org.freedesktop.DBus.Error.AccessDenied reply_serial=2
+   string "Portal operation not allowed, Unmatched caller"
+method call time=1793479196.807013 sender=:1.87 -> destination=org.freedesktop.portal.Desktop serial=7 path=/org/freedesktop/portal/desktop/session/1_87/tunaproof5111; interface=org.freedesktop.portal.Session; member=Close
+method call time=1793479196.807240 sender=:1.56 -> destination=:1.61 serial=197 path=/org/freedesktop/portal/desktop/session/1_87/tunaproof5111; interface=org.freedesktop.impl.portal.Session; member=Close
+method call time=1793479196.807559 sender=:1.61 -> destination=:1.5 serial=123 path=/org/gnome/Mutter/ScreenCast/Session/u1; interface=org.gnome.Mutter.ScreenCast.Session; member=Stop
+signal time=1793479196.807824 sender=:1.5 -> destination=(null destination) serial=773 path=/org/gnome/Mutter/ScreenCast/Session/u1; interface=org.gnome.Mutter.ScreenCast.Session; member=Closed
+method return time=1793479196.808128 sender=:1.5 -> destination=:1.61 serial=774 reply_serial=123
+method call time=1793479196.808872 sender=:1.61 -> destination=org.freedesktop.DBus serial=124 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=RemoveMatch
+   string "type='signal',sender='org.gnome.Mutter.ScreenCast',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='/org/gnome/Mutter/ScreenCast/Stream/u2',arg0='org.gnome.Mutter.ScreenCast.Stream'"
+method return time=1793479196.808878 sender=org.freedesktop.DBus -> destination=:1.61 serial=4294967295 reply_serial=124
+method call time=1793479196.808880 sender=:1.61 -> destination=org.freedesktop.DBus serial=125 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=RemoveMatch
+   string "type='signal',sender='org.gnome.Mutter.ScreenCast',interface='org.gnome.Mutter.ScreenCast.Stream',path='/org/gnome/Mutter/ScreenCast/Stream/u2'"
+method return time=1793479196.808881 sender=org.freedesktop.DBus -> destination=:1.61 serial=4294967295 reply_serial=125
+method call time=1793479196.808882 sender=:1.61 -> destination=org.freedesktop.DBus serial=126 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=RemoveMatch
+   string "type='signal',sender='org.gnome.Mutter.ScreenCast',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='/org/gnome/Mutter/ScreenCast/Session/u1',arg0='org.gnome.Mutter.ScreenCast.Session'"
+method return time=1793479196.808883 sender=org.freedesktop.DBus -> destination=:1.61 serial=4294967295 reply_serial=126
+method call time=1793479196.808884 sender=:1.61 -> destination=org.freedesktop.DBus serial=127 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=RemoveMatch
+   string "type='signal',sender='org.gnome.Mutter.ScreenCast',interface='org.gnome.Mutter.ScreenCast.Session',path='/org/gnome/Mutter/ScreenCast/Session/u1'"
+method return time=1793479196.808886 sender=org.freedesktop.DBus -> destination=:1.61 serial=4294967295 reply_serial=127
+method return time=1793479196.813058 sender=:1.61 -> destination=:1.56 serial=128 reply_serial=197
+method call time=1793479196.813536 sender=:1.56 -> destination=org.freedesktop.DBus serial=198 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=RemoveMatch
+   string "type='signal',sender='org.freedesktop.impl.portal.desktop.gnome',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='/org/freedesktop/portal/desktop/session/1_87/tunaproof5111',arg0='org.freedesktop.impl.portal.Session'"
+method return time=1793479196.813694 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=198
+method call time=1793479196.813698 sender=:1.56 -> destination=org.freedesktop.DBus serial=199 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=RemoveMatch
+   string "type='signal',sender='org.freedesktop.impl.portal.desktop.gnome',interface='org.freedesktop.impl.portal.Session',path='/org/freedesktop/portal/desktop/session/1_87/tunaproof5111'"
+method return time=1793479196.813701 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=199
+method return time=1793479196.813702 sender=:1.56 -> destination=:1.87 serial=200 reply_serial=7
+method call time=1793479196.818123 sender=:1.94 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479196.818133 sender=org.freedesktop.DBus -> destination=:1.94 serial=4294967295 reply_serial=1
+   string ":1.94"
+signal time=1793479196.818136 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.94"
+   string ""
+   string ":1.94"
+signal time=1793479196.818139 sender=org.freedesktop.DBus -> destination=:1.94 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.94"
+method call time=1793479196.818658 sender=:1.94 -> destination=org.freedesktop.DBus serial=2 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameHasOwner
+   string "org.freedesktop.portal.Desktop"
+method return time=1793479196.818964 sender=org.freedesktop.DBus -> destination=:1.94 serial=4294967295 reply_serial=2
+   boolean true
+method call time=1793479196.818970 sender=:1.94 -> destination=org.freedesktop.portal.Desktop serial=3 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.DBus.Properties; member=Get
+   string "org.freedesktop.portal.Realtime"
+   string "MaxRealtimePriority"
+method return time=1793479196.819190 sender=:1.56 -> destination=:1.94 serial=201 reply_serial=3
+   variant       int32 20
+method call time=1793479196.819351 sender=:1.94 -> destination=org.freedesktop.portal.Desktop serial=4 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.DBus.Properties; member=Get
+   string "org.freedesktop.portal.Realtime"
+   string "MinNiceLevel"
+method return time=1793479196.819629 sender=:1.56 -> destination=:1.94 serial=202 reply_serial=4
+   variant       int32 -15
+method call time=1793479196.819726 sender=:1.94 -> destination=org.freedesktop.portal.Desktop serial=5 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.DBus.Properties; member=Get
+   string "org.freedesktop.portal.Realtime"
+   string "RTTimeUSecMax"
+method return time=1793479196.819898 sender=:1.56 -> destination=:1.94 serial=203 reply_serial=5
+   variant       int64 200000
+signal time=1793479196.824774 sender=org.freedesktop.DBus -> destination=:1.94 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.94"
+signal time=1793479196.824785 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.94"
+   string ":1.94"
+   string ""
+signal time=1793479196.838326 sender=org.freedesktop.DBus -> destination=:1.87 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.87"
+signal time=1793479196.838403 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.87"
+   string ":1.87"
+   string ""
+signal time=1793479196.838409 sender=org.freedesktop.DBus -> destination=:1.93 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.93"
+signal time=1793479196.838411 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.93"
+   string ":1.93"
+   string ""
+method call time=1793479196.841072 sender=:1.95 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479196.841084 sender=org.freedesktop.DBus -> destination=:1.95 serial=4294967295 reply_serial=1
+   string ":1.95"
+signal time=1793479196.841089 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.95"
+   string ""
+   string ":1.95"
+signal time=1793479196.841092 sender=org.freedesktop.DBus -> destination=:1.95 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.95"
+method call time=1793479196.841565 sender=:1.95 -> destination=org.gnome.ScreenSaver serial=2 path=/org/gnome/ScreenSaver; interface=org.freedesktop.DBus.Introspectable; member=Introspect
+method return time=1793479196.841695 sender=:1.24 -> destination=:1.95 serial=288 reply_serial=2
+   string "<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+                      "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- GDBus 2.80.4 -->
+<node>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <method name="GetAll">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="a{sv}" name="properties" direction="out"/>
+    </method>
+    <method name="Set">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="in"/>
+    </method>
+    <signal name="PropertiesChanged">
+      <arg type="s" name="interface_name"/>
+      <arg type="a{sv}" name="changed_properties"/>
+      <arg type="as" name="invalidated_properties"/>
+    </signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect">
+      <arg type="s" name="xml_data" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Peer">
+    <method name="Ping"/>
+    <method name="GetMachineId">
+      <arg type="s" name="machine_uuid" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.gnome.ScreenSaver">
+    <method name="Lock">
+    </method>
+    <method name="GetActive">
+      <arg type="b" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <method name="SetActive">
+      <arg type="b" name="arg_0" direction="in">
+      </arg>
+    </method>
+    <method name="GetActiveTime">
+      <arg type="u" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <signal name="ActiveChanged">
+      <arg type="b" name="arg_0">
+      </arg>
+    </signal>
+  </interface>
+</node>
+"
+method call time=1793479196.841870 sender=:1.95 -> destination=org.gnome.ScreenSaver serial=3 path=/org/gnome/ScreenSaver; interface=org.gnome.ScreenSaver; member=GetActive
+method return time=1793479196.842069 sender=:1.24 -> destination=:1.95 serial=289 reply_serial=3
+   boolean false
+signal time=1793479196.842308 sender=org.freedesktop.DBus -> destination=:1.95 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.95"
+signal time=1793479196.842548 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.95"
+   string ":1.95"
+   string ""
+method call time=1793479196.856743 sender=:1.5 -> destination=org.freedesktop.DBus serial=775 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479196.856766 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=775
+   uint32 3830
+method call time=1793479196.856923 sender=:1.5 -> destination=org.freedesktop.DBus serial=776 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479196.856928 sender=org.freedesktop.DBus -> destination=:1.5 serial=4294967295 reply_serial=776
+   string ":1.61"
+signal time=1793479196.857032 sender=:1.5 -> destination=(null destination) serial=777 path=/org/gnome/Mutter/ScreenCast/Session/u1; interface=org.gnome.Mutter.ScreenCast.Session; member=Closed
+method call time=1793479198.161512 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=290 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479198.161833 sender=:1.7 -> destination=:1.24 serial=778 reply_serial=290
+   uint64 24989
+method call time=1793479200.162787 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=291 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479200.163331 sender=:1.7 -> destination=:1.24 serial=779 reply_serial=291
+   uint64 26990
+method call time=1793479202.163901 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=292 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479202.164190 sender=:1.7 -> destination=:1.24 serial=787 reply_serial=292
+   uint64 28991
+method call time=1793479204.165329 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=293 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479204.165839 sender=:1.7 -> destination=:1.24 serial=788 reply_serial=293
+   uint64 30993
+method call time=1793479206.165931 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=294 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479206.166184 sender=:1.7 -> destination=:1.24 serial=789 reply_serial=294
+   uint64 32993
+method call time=1793479208.166710 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=295 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479208.166947 sender=:1.7 -> destination=:1.24 serial=797 reply_serial=295
+   uint64 34994
+method call time=1793479210.167620 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=296 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479210.167896 sender=:1.7 -> destination=:1.24 serial=798 reply_serial=296
+   uint64 36995
+method call time=1793479212.169016 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=297 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479212.169320 sender=:1.7 -> destination=:1.24 serial=806 reply_serial=297
+   uint64 38996
+method call time=1793479214.169728 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=298 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479214.170088 sender=:1.7 -> destination=:1.24 serial=807 reply_serial=298
+   uint64 40997
+method call time=1793479216.170648 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=299 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479216.170937 sender=:1.7 -> destination=:1.24 serial=808 reply_serial=299
+   uint64 42998
+method call time=1793479218.171872 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=300 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479218.172135 sender=:1.7 -> destination=:1.24 serial=816 reply_serial=300
+   uint64 44999
+method call time=1793479220.172176 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=301 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479220.172404 sender=:1.7 -> destination=:1.24 serial=817 reply_serial=301
+   uint64 46999
+method call time=1793479222.172943 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=302 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479222.173298 sender=:1.7 -> destination=:1.24 serial=825 reply_serial=302
+   uint64 49000
+method call time=1793479222.214020 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=303 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479222.214256 sender=:1.7 -> destination=:1.24 serial=826 reply_serial=303
+   uint64 49041
+method call time=1793479224.173368 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=304 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479224.173770 sender=:1.7 -> destination=:1.24 serial=827 reply_serial=304
+   uint64 51001
+method call time=1793479226.174233 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=305 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479226.174720 sender=:1.7 -> destination=:1.24 serial=828 reply_serial=305
+   uint64 53002
+method call time=1793479228.175133 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=306 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479228.175526 sender=:1.7 -> destination=:1.24 serial=836 reply_serial=306
+   uint64 55002
+method call time=1793479230.175706 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=307 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479230.175999 sender=:1.7 -> destination=:1.24 serial=837 reply_serial=307
+   uint64 57003
+method call time=1793479232.176702 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=308 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479232.177070 sender=:1.7 -> destination=:1.24 serial=845 reply_serial=308
+   uint64 59004
+method call time=1793479234.177777 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=309 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479234.178155 sender=:1.7 -> destination=:1.24 serial=846 reply_serial=309
+   uint64 61005
+method call time=1793479236.178164 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=310 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479236.178482 sender=:1.7 -> destination=:1.24 serial=847 reply_serial=310
+   uint64 63005
+method call time=1793479238.179099 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=311 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479238.179394 sender=:1.7 -> destination=:1.24 serial=855 reply_serial=311
+   uint64 65006
+method call time=1793479240.179923 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=312 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479240.180508 sender=:1.7 -> destination=:1.24 serial=856 reply_serial=312
+   uint64 67007
+method call time=1793479242.180264 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=313 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479242.180568 sender=:1.7 -> destination=:1.24 serial=864 reply_serial=313
+   uint64 69008
+method call time=1793479244.180602 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=314 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479244.180856 sender=:1.7 -> destination=:1.24 serial=865 reply_serial=314
+   uint64 71008
+method call time=1793479246.181287 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=315 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479246.181597 sender=:1.7 -> destination=:1.24 serial=866 reply_serial=315
+   uint64 73009
+method call time=1793479248.181956 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=316 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479248.182254 sender=:1.7 -> destination=:1.24 serial=874 reply_serial=316
+   uint64 75009
+signal time=1793479249.811563 sender=:1.24 -> destination=:1.25 serial=317 path=/org/gnome/Shell; interface=org.gnome.Shell; member=AcceleratorActivated
+   uint32 16
+   array [
+      dict entry(
+         string "device-node"
+         variant             string ""
+      )
+      dict entry(
+         string "action-mode"
+         variant             uint32 1
+      )
+      dict entry(
+         string "device-id"
+         variant             uint32 0
+      )
+      dict entry(
+         string "timestamp"
+         variant             uint32 392344
+      )
+   ]
+method call time=1793479249.812383 sender=:1.25 -> destination=org.freedesktop.DBus serial=69 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',path='/org/freedesktop/DBus',arg0='org.gnome.ScreenSaver'"
+method return time=1793479249.812393 sender=org.freedesktop.DBus -> destination=:1.25 serial=4294967295 reply_serial=69
+method call time=1793479249.812399 sender=:1.25 -> destination=org.freedesktop.DBus serial=70 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.gnome.ScreenSaver"
+method return time=1793479249.812402 sender=org.freedesktop.DBus -> destination=:1.25 serial=4294967295 reply_serial=70
+   string ":1.24"
+method call time=1793479249.812404 sender=:1.25 -> destination=org.freedesktop.DBus serial=71 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',sender='org.gnome.ScreenSaver',interface='org.gnome.ScreenSaver',path='/org/gnome/ScreenSaver'"
+method return time=1793479249.812412 sender=org.freedesktop.DBus -> destination=:1.25 serial=4294967295 reply_serial=71
+method call time=1793479249.812415 sender=:1.25 -> destination=org.freedesktop.DBus serial=72 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=StartServiceByName
+   string "org.gnome.ScreenSaver"
+   uint32 0
+method return time=1793479249.812417 sender=org.freedesktop.DBus -> destination=:1.25 serial=4294967295 reply_serial=72
+   uint32 2
+method call time=1793479249.812577 sender=:1.25 -> destination=org.freedesktop.DBus serial=73 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.gnome.ScreenSaver"
+method return time=1793479249.812583 sender=org.freedesktop.DBus -> destination=:1.25 serial=4294967295 reply_serial=73
+   string ":1.24"
+method call time=1793479249.812826 sender=:1.25 -> destination=:1.24 serial=74 path=/org/gnome/ScreenSaver; interface=org.gnome.ScreenSaver; member=Lock
+signal time=1793479249.819567 sender=:1.24 -> destination=(null destination) serial=318 path=/org/gnome/ScreenSaver; interface=org.gnome.ScreenSaver; member=ActiveChanged
+   boolean true
+method call time=1793479249.821211 sender=:1.23 -> destination=:1.7 serial=61 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=AddIdleWatch
+   uint64 30000
+method call time=1793479249.821270 sender=:1.23 -> destination=:1.7 serial=62 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=RemoveWatch
+   uint32 1
+method call time=1793479249.821271 sender=:1.23 -> destination=:1.7 serial=63 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=AddUserActiveWatch
+method call time=1793479249.821273 sender=:1.23 -> destination=:1.5 serial=64 path=/org/gnome/Mutter/DisplayConfig; interface=org.freedesktop.DBus.Properties; member=Set
+   string "org.gnome.Mutter.DisplayConfig"
+   string "PowerSaveMode"
+   variant       int32 3
+method return time=1793479249.822143 sender=:1.7 -> destination=:1.23 serial=875 reply_serial=61
+   uint32 2
+method return time=1793479249.822161 sender=:1.7 -> destination=:1.23 serial=876 reply_serial=63
+   uint32 3
+signal time=1793479249.830120 sender=:1.5 -> destination=(null destination) serial=877 path=/org/gnome/Mutter/DisplayConfig; interface=org.freedesktop.DBus.Properties; member=PropertiesChanged
+   string "org.gnome.Mutter.DisplayConfig"
+   array [
+      dict entry(
+         string "PowerSaveMode"
+         variant             int32 3
+      )
+   ]
+   array [
+   ]
+method return time=1793479249.830543 sender=:1.5 -> destination=:1.23 serial=878 reply_serial=64
+signal time=1793479249.837151 sender=:1.7 -> destination=(null destination) serial=879 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=WatchFired
+   uint32 3
+method call time=1793479249.837699 sender=:1.23 -> destination=:1.5 serial=65 path=/org/gnome/Mutter/DisplayConfig; interface=org.freedesktop.DBus.Properties; member=Set
+   string "org.gnome.Mutter.DisplayConfig"
+   string "PowerSaveMode"
+   variant       int32 0
+method call time=1793479249.837718 sender=:1.23 -> destination=:1.24 serial=66 path=/org/gnome/Shell/Brightness; interface=org.gnome.Shell.Brightness; member=SetDimming
+   boolean false
+signal time=1793479249.838220 sender=:1.5 -> destination=(null destination) serial=880 path=/org/gnome/Mutter/DisplayConfig; interface=org.freedesktop.DBus.Properties; member=PropertiesChanged
+   string "org.gnome.Mutter.DisplayConfig"
+   array [
+      dict entry(
+         string "PowerSaveMode"
+         variant             int32 0
+      )
+   ]
+   array [
+   ]
+method return time=1793479249.838238 sender=:1.5 -> destination=:1.23 serial=881 reply_serial=65
+method return time=1793479249.838576 sender=:1.24 -> destination=:1.23 serial=319 reply_serial=66
+method return time=1793479249.864345 sender=:1.24 -> destination=:1.25 serial=320 reply_serial=74
+method call time=1793479250.184150 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=321 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479250.184470 sender=:1.7 -> destination=:1.24 serial=882 reply_serial=321
+   uint64 325
+method call time=1793479252.182855 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=322 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479252.184679 sender=:1.7 -> destination=:1.24 serial=890 reply_serial=322
+   uint64 2325
+method call time=1793479252.215039 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=323 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479252.215360 sender=:1.7 -> destination=:1.24 serial=891 reply_serial=323
+   uint64 2356
+method call time=1793479254.183525 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=324 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479254.183992 sender=:1.7 -> destination=:1.24 serial=892 reply_serial=324
+   uint64 4324
+method call time=1793479256.187080 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=325 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479256.187385 sender=:1.7 -> destination=:1.24 serial=893 reply_serial=325
+   uint64 6328
+method call time=1793479258.184484 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=326 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479258.184684 sender=:1.7 -> destination=:1.24 serial=901 reply_serial=326
+   uint64 8325
+method call time=1793479260.185062 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=327 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479260.185301 sender=:1.7 -> destination=:1.24 serial=902 reply_serial=327
+   uint64 10326
+method call time=1793479262.186611 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=328 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479262.187216 sender=:1.7 -> destination=:1.24 serial=910 reply_serial=328
+   uint64 12328
+method call time=1793479262.583543 sender=:1.96 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479262.583562 sender=org.freedesktop.DBus -> destination=:1.96 serial=4294967295 reply_serial=1
+   string ":1.96"
+signal time=1793479262.583566 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.96"
+   string ""
+   string ":1.96"
+signal time=1793479262.583570 sender=org.freedesktop.DBus -> destination=:1.96 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.96"
+method call time=1793479262.584357 sender=:1.96 -> destination=org.gnome.ScreenSaver serial=2 path=/org/gnome/ScreenSaver; interface=org.freedesktop.DBus.Introspectable; member=Introspect
+method return time=1793479262.584673 sender=:1.24 -> destination=:1.96 serial=329 reply_serial=2
+   string "<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+                      "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- GDBus 2.80.4 -->
+<node>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <method name="GetAll">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="a{sv}" name="properties" direction="out"/>
+    </method>
+    <method name="Set">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="in"/>
+    </method>
+    <signal name="PropertiesChanged">
+      <arg type="s" name="interface_name"/>
+      <arg type="a{sv}" name="changed_properties"/>
+      <arg type="as" name="invalidated_properties"/>
+    </signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect">
+      <arg type="s" name="xml_data" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Peer">
+    <method name="Ping"/>
+    <method name="GetMachineId">
+      <arg type="s" name="machine_uuid" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.gnome.ScreenSaver">
+    <method name="Lock">
+    </method>
+    <method name="GetActive">
+      <arg type="b" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <method name="SetActive">
+      <arg type="b" name="arg_0" direction="in">
+      </arg>
+    </method>
+    <method name="GetActiveTime">
+      <arg type="u" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <signal name="ActiveChanged">
+      <arg type="b" name="arg_0">
+      </arg>
+    </signal>
+  </interface>
+</node>
+"
+method call time=1793479262.584926 sender=:1.96 -> destination=org.gnome.ScreenSaver serial=3 path=/org/gnome/ScreenSaver; interface=org.gnome.ScreenSaver; member=GetActive
+method return time=1793479262.585143 sender=:1.24 -> destination=:1.96 serial=330 reply_serial=3
+   boolean true
+signal time=1793479262.585418 sender=org.freedesktop.DBus -> destination=:1.96 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.96"
+signal time=1793479262.585449 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.96"
+   string ":1.96"
+   string ""
+method call time=1793479262.690607 sender=:1.97 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479262.690625 sender=org.freedesktop.DBus -> destination=:1.97 serial=4294967295 reply_serial=1
+   string ":1.97"
+signal time=1793479262.690628 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.97"
+   string ""
+   string ":1.97"
+signal time=1793479262.690631 sender=org.freedesktop.DBus -> destination=:1.97 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.97"
+method call time=1793479262.692341 sender=:1.97 -> destination=org.freedesktop.DBus serial=2 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',interface='org.freedesktop.portal.Request',member='Response'"
+method return time=1793479262.692348 sender=org.freedesktop.DBus -> destination=:1.97 serial=4294967295 reply_serial=2
+method call time=1793479262.692349 sender=:1.97 -> destination=org.freedesktop.portal.Desktop serial=3 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.portal.Screenshot; member=Screenshot
+   string ""
+   array [
+      dict entry(
+         string "handle_token"
+         variant             string "shotproof"
+      )
+      dict entry(
+         string "interactive"
+         variant             boolean false
+      )
+   ]
+method call time=1793479262.692679 sender=:1.56 -> destination=org.freedesktop.DBus serial=204 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionCredentials
+   string ":1.97"
+method return time=1793479262.692684 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=204
+   array [
+      dict entry(
+         string "UnixUserID"
+         variant             uint32 1000
+      )
+      dict entry(
+         string "ProcessID"
+         variant             uint32 5480
+      )
+      dict entry(
+         string "UnixGroupIDs"
+         variant             array [
+               uint32 1000
+               uint32 1000
+            ]
+      )
+      dict entry(
+         string "LinuxSecurityLabel"
+         variant             array of bytes "unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023" + \0
+      )
+      dict entry(
+         string "ProcessFD"
+         variant             file descriptor
+                  inode: 5481
+                  type:       )
+   ]
+method return time=1793479262.693097 sender=:1.56 -> destination=:1.97 serial=205 reply_serial=3
+   object path "/org/freedesktop/portal/desktop/request/1_97/shotproof"
+method call time=1793479262.693104 sender=:1.56 -> destination=:1.58 serial=206 path=/org/freedesktop/impl/portal/PermissionStore; interface=org.freedesktop.impl.portal.PermissionStore; member=Lookup
+   string "screenshot"
+   string "screenshot"
+method return time=1793479262.693353 sender=:1.58 -> destination=:1.56 serial=10 reply_serial=206
+   array [
+      dict entry(
+         string ""
+         array [
+            string "yes"
+         ]
+      )
+   ]
+   variant       byte 0
+method call time=1793479262.693793 sender=:1.56 -> destination=org.freedesktop.DBus serial=207 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',sender='org.freedesktop.impl.portal.desktop.gnome',interface='org.freedesktop.impl.portal.Request',path='/org/freedesktop/portal/desktop/request/1_97/shotproof'"
+method return time=1793479262.693800 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=207
+method call time=1793479262.693801 sender=:1.56 -> destination=org.freedesktop.DBus serial=208 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=StartServiceByName
+   string "org.freedesktop.impl.portal.desktop.gnome"
+   uint32 0
+method return time=1793479262.693803 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=208
+   uint32 2
+method call time=1793479262.695008 sender=:1.56 -> destination=org.freedesktop.DBus serial=209 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479262.695015 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=209
+   string ":1.61"
+method call time=1793479262.695443 sender=:1.56 -> destination=:1.61 serial=210 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.impl.portal.Screenshot; member=Screenshot
+   object path "/org/freedesktop/portal/desktop/request/1_97/shotproof"
+   string ""
+   string ""
+   array [
+      dict entry(
+         string "interactive"
+         variant             boolean false
+      )
+      dict entry(
+         string "permission_store_checked"
+         variant             boolean true
+      )
+   ]
+method call time=1793479262.701530 sender=:1.61 -> destination=:1.4 serial=129 path=/org/gnome/Shell/Screenshot; interface=org.gnome.Shell.Screenshot; member=Screenshot
+   boolean false
+   boolean true
+   string "Screenshot"
+method call time=1793479262.702258 sender=:1.4 -> destination=org.freedesktop.DBus serial=911 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionUnixProcessID
+   string ":1.61"
+method return time=1793479262.702265 sender=org.freedesktop.DBus -> destination=:1.4 serial=4294967295 reply_serial=911
+   uint32 3830
+method call time=1793479262.702564 sender=:1.4 -> destination=org.freedesktop.DBus serial=912 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetNameOwner
+   string "org.freedesktop.impl.portal.desktop.gnome"
+method return time=1793479262.702571 sender=org.freedesktop.DBus -> destination=:1.4 serial=4294967295 reply_serial=912
+   string ":1.61"
+method return time=1793479262.708901 sender=:1.4 -> destination=:1.61 serial=913 reply_serial=129
+   boolean false
+   string ""
+method return time=1793479262.718880 sender=:1.61 -> destination=:1.56 serial=130 reply_serial=210
+   uint32 0
+   array [
+      dict entry(
+         string "uri"
+         variant             string ""
+      )
+   ]
+signal time=1793479262.719472 sender=:1.56 -> destination=:1.97 serial=211 path=/org/freedesktop/portal/desktop/request/1_97/shotproof; interface=org.freedesktop.portal.Request; member=Response
+   uint32 0
+   array [
+      dict entry(
+         string "uri"
+         variant             string ""
+      )
+   ]
+method call time=1793479262.719657 sender=:1.56 -> destination=org.freedesktop.DBus serial=212 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=RemoveMatch
+   string "type='signal',sender='org.freedesktop.impl.portal.desktop.gnome',interface='org.freedesktop.impl.portal.Request',path='/org/freedesktop/portal/desktop/request/1_97/shotproof'"
+method return time=1793479262.719664 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=212
+signal time=1793479262.752399 sender=org.freedesktop.DBus -> destination=:1.97 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.97"
+signal time=1793479262.752445 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.97"
+   string ":1.97"
+   string ""
+method call time=1793479262.757040 sender=:1.98 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479262.757052 sender=org.freedesktop.DBus -> destination=:1.98 serial=4294967295 reply_serial=1
+   string ":1.98"
+signal time=1793479262.757055 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.98"
+   string ""
+   string ":1.98"
+signal time=1793479262.757058 sender=org.freedesktop.DBus -> destination=:1.98 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.98"
+method call time=1793479262.757543 sender=:1.98 -> destination=org.gnome.ScreenSaver serial=2 path=/org/gnome/ScreenSaver; interface=org.freedesktop.DBus.Introspectable; member=Introspect
+method return time=1793479262.757794 sender=:1.24 -> destination=:1.98 serial=331 reply_serial=2
+   string "<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+                      "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- GDBus 2.80.4 -->
+<node>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <method name="GetAll">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="a{sv}" name="properties" direction="out"/>
+    </method>
+    <method name="Set">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="in"/>
+    </method>
+    <signal name="PropertiesChanged">
+      <arg type="s" name="interface_name"/>
+      <arg type="a{sv}" name="changed_properties"/>
+      <arg type="as" name="invalidated_properties"/>
+    </signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect">
+      <arg type="s" name="xml_data" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Peer">
+    <method name="Ping"/>
+    <method name="GetMachineId">
+      <arg type="s" name="machine_uuid" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.gnome.ScreenSaver">
+    <method name="Lock">
+    </method>
+    <method name="GetActive">
+      <arg type="b" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <method name="SetActive">
+      <arg type="b" name="arg_0" direction="in">
+      </arg>
+    </method>
+    <method name="GetActiveTime">
+      <arg type="u" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <signal name="ActiveChanged">
+      <arg type="b" name="arg_0">
+      </arg>
+    </signal>
+  </interface>
+</node>
+"
+method call time=1793479262.758065 sender=:1.98 -> destination=org.gnome.ScreenSaver serial=3 path=/org/gnome/ScreenSaver; interface=org.gnome.ScreenSaver; member=GetActive
+method return time=1793479262.758277 sender=:1.24 -> destination=:1.98 serial=332 reply_serial=3
+   boolean true
+signal time=1793479262.758672 sender=org.freedesktop.DBus -> destination=:1.98 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.98"
+signal time=1793479262.758722 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.98"
+   string ":1.98"
+   string ""
+method call time=1793479264.187055 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=333 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479264.187471 sender=:1.7 -> destination=:1.24 serial=914 reply_serial=333
+   uint64 14328
+method call time=1793479266.187551 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=334 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479266.187843 sender=:1.7 -> destination=:1.24 serial=915 reply_serial=334
+   uint64 16328

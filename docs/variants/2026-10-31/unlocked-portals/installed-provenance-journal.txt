@@ -1,0 +1,282 @@
+tuna-desktop-1.0.0~beta.2-2.el10.x86_64
+xdg-desktop-portal-1.20.0-2.el10.x86_64
+xdg-desktop-portal-gnome-47.3-1.el10.x86_64
+xdg-desktop-portal-gtk-1.15.3-1.el10.x86_64
+pipewire-1.6.9-1.el10.x86_64
+addd99478870b9d0a73f2a4f4c79a5b71878952588a12fbb62f25a81bfd18fa6  /usr/bin/tuna-compositor
+dcf1133a966ea089d3b1d727ccdf77952d146c55a22a43242a450042fb6ebd44  /usr/bin/tuna-shell-gtk
+bece8dd89f202d36414dd0183b350e8ce3d0fdae2326e8a52eadfab35c7a47fc  /usr/bin/tuna-session
+974cb72e0268351fba0ae457f1dcb708a6b0edd37070911eeeca4accc2610385  /usr/libexec/xdg-desktop-portal-gnome
+Id=4
+User=1000
+Name=tuna-test
+Timestamp=Sat 2026-10-31 20:35:50 UTC
+TimestampMonotonic=93091188
+VTNr=2
+Seat=seat0
+TTY=tty2
+Remote=no
+Service=gdm-password
+Scope=session-4.scope
+Leader=3233
+Audit=4
+Type=wayland
+Class=user
+Active=yes
+State=active
+IdleHint=no
+IdleSinceHint=0
+IdleSinceHintMonotonic=0
+CanIdle=yes
+CanLock=yes
+LockedHint=no
+tuna-test tuna-test 700 /var/home/tuna-test
+tuna-test tuna-test 755 /var/home/tuna-test/Pictures
+tuna-test tuna-test 755 /var/home/tuna-test/Pictures/Screenshots
+f9dc77c6f9d3bf1a243d1c02f04321567afac0f84daf5fc85f2e30ecdc36cebe  /var/home/tuna-test/Pictures/Screenshots/Screenshot From 2026-10-31 20-39-11.png
+[preferred]
+default=gnome;gtk;
+org.freedesktop.impl.portal.ScreenCast=gnome;
+org.freedesktop.impl.portal.Screenshot=gnome;
+org.freedesktop.impl.portal.Access=gtk;
+Oct 31 20:35:50.733038 tuna-q-isg-yf1 systemd[3293]: Queued start job for default target default.target.
+Oct 31 20:35:50.741842 tuna-q-isg-yf1 systemd[3293]: Created slice app.slice - User Application Slice.
+Oct 31 20:35:50.742256 tuna-q-isg-yf1 systemd[3293]: Started podman-auto-update.timer - Podman auto-update timer.
+Oct 31 20:35:50.742275 tuna-q-isg-yf1 systemd[3293]: Started systemd-tmpfiles-clean.timer - Daily Cleanup of User's Temporary Directories.
+Oct 31 20:35:50.742284 tuna-q-isg-yf1 systemd[3293]: Reached target paths.target - Paths.
+Oct 31 20:35:50.742330 tuna-q-isg-yf1 systemd[3293]: Reached target timers.target - Timers.
+Oct 31 20:35:50.744039 tuna-q-isg-yf1 systemd[3293]: Starting dbus.socket - D-Bus User Message Bus Socket...
+Oct 31 20:35:50.744200 tuna-q-isg-yf1 systemd[3293]: Listening on pipewire-pulse.socket - PipeWire PulseAudio.
+Oct 31 20:35:50.744282 tuna-q-isg-yf1 systemd[3293]: Listening on pipewire.socket - PipeWire Multimedia System Sockets.
+Oct 31 20:35:50.744832 tuna-q-isg-yf1 systemd[3293]: Starting systemd-tmpfiles-setup.service - Create User Files and Directories...
+Oct 31 20:35:50.754535 tuna-q-isg-yf1 systemd[3293]: Finished systemd-tmpfiles-setup.service - Create User Files and Directories.
+Oct 31 20:35:50.754968 tuna-q-isg-yf1 systemd[3293]: Listening on dbus.socket - D-Bus User Message Bus Socket.
+Oct 31 20:35:50.755060 tuna-q-isg-yf1 systemd[3293]: Reached target sockets.target - Sockets.
+Oct 31 20:35:50.755136 tuna-q-isg-yf1 systemd[3293]: Reached target basic.target - Basic System.
+Oct 31 20:35:50.755209 tuna-q-isg-yf1 systemd[3293]: Reached target default.target - Main User Target.
+Oct 31 20:35:50.755259 tuna-q-isg-yf1 systemd[3293]: Startup finished in 127ms.
+Oct 31 20:35:50.830216 tuna-q-isg-yf1 systemd[3293]: Created slice session.slice - User Core Session Slice.
+Oct 31 20:35:50.831750 tuna-q-isg-yf1 systemd[3293]: Starting dbus-broker.service - D-Bus User Message Bus...
+Oct 31 20:35:50.847112 tuna-q-isg-yf1 dbus-broker-launch[3335]: Policy to allow eavesdropping in /usr/share/dbus-1/session.conf +31: Eavesdropping is deprecated and ignored
+Oct 31 20:35:50.847112 tuna-q-isg-yf1 dbus-broker-launch[3335]: Policy to allow eavesdropping in /usr/share/dbus-1/session.conf +33: Eavesdropping is deprecated and ignored
+Oct 31 20:35:50.848287 tuna-q-isg-yf1 systemd[3293]: Started dbus-broker.service - D-Bus User Message Bus.
+Oct 31 20:35:50.852236 tuna-q-isg-yf1 dbus-broker-launch[3335]: Ready
+Oct 31 20:35:50.865950 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: nested session on tuna-nested-3341 (1280x800)
+Oct 31 20:35:50.896409 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: pci id for fd 11: 1234:1111, driver (null)
+Oct 31 20:35:50.896964 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: pci id for fd 10: 1234:1111, driver (null)
+Oct 31 20:35:50.897491 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: pci id for fd 12: 1234:1111, driver (null)
+Oct 31 20:35:50.898289 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: pci id for fd 10: 1234:1111, driver (null)
+Oct 31 20:35:50.898767 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: pci id for fd 12: 1234:1111, driver (null)
+Oct 31 20:35:51.141723 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: drm: output Virtual-1 1280x800 at 0,0 scale 1 transform 0
+Oct 31 20:35:51.156466 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: linux-dmabuf v3 with 106 formats
+Oct 31 20:35:51.159462 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: serving org.gnome.Mutter.DisplayConfig
+Oct 31 20:35:51.159462 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: screenshot service on org.gnome.Shell.Screenshot
+Oct 31 20:35:51.159462 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: serving org.gnome.Shell.Introspect
+Oct 31 20:35:51.160285 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: serving org.gnome.Mutter.ScreenCast
+Oct 31 20:35:51.160667 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: serving org.gnome.Mutter.RemoteDesktop
+Oct 31 20:35:51.160977 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: serving org.gnome.Mutter.ServiceChannel
+Oct 31 20:35:51.161346 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: serving org.gnome.SettingsDaemon.Color
+Oct 31 20:35:51.165890 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: cursor theme "Adwaita" size 24 (themes ["Adwaita", "hicolor", "default"])
+Oct 31 20:35:51.168449 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: serving org.gnome.Mutter.IdleMonitor
+Oct 31 20:35:51.173730 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: serving org.gnome.SessionManager (inhibitors, session activity)
+Oct 31 20:35:51.219739 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: session services: display environment imported (systemd=true bus=true)
+Oct 31 20:35:51.367185 tuna-q-isg-yf1 systemd[3293]: Starting gnome-session-monitor.service - Monitor Session leader for GNOME Session...
+Oct 31 20:35:51.367902 tuna-q-isg-yf1 systemd[3293]: Starting tunaos-dms-wallpaper.service - Set the variant wallpaper in DankMaterialShell on first login (no-op without dms)...
+Oct 31 20:35:51.368846 tuna-q-isg-yf1 systemd[3293]: Started ublue-user-setup.service - Configure system for current user.
+Oct 31 20:35:51.369458 tuna-q-isg-yf1 systemd[3293]: Starting xdg-user-dirs.service - User folders update...
+Oct 31 20:35:51.378269 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: ime: IBus bridge started
+Oct 31 20:35:51.382307 tuna-q-isg-yf1 systemd[3293]: Finished xdg-user-dirs.service - User folders update.
+Oct 31 20:35:51.382884 tuna-q-isg-yf1 systemd[3293]: Finished tunaos-dms-wallpaper.service - Set the variant wallpaper in DankMaterialShell on first login (no-op without dms).
+Oct 31 20:35:51.383228 tuna-q-isg-yf1 systemd[3293]: Reached target graphical-session-pre.target - Session services which should run early before the graphical session is brought up.
+Oct 31 20:35:51.386214 tuna-q-isg-yf1 systemd[3293]: Started gnome-session-monitor.service - Monitor Session leader for GNOME Session.
+Oct 31 20:35:51.386354 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: session services: holding the session leader FIFO
+Oct 31 20:35:51.386887 tuna-q-isg-yf1 systemd[3293]: Reached target gnome-session-pre.target - Tasks to be run before GNOME Session starts.
+Oct 31 20:35:51.387062 tuna-q-isg-yf1 systemd[3293]: Reached target gnome-session-initialized.target - GNOME Session is initialized.
+Oct 31 20:35:51.387966 tuna-q-isg-yf1 systemd[3293]: Starting gnome-session-signal-init.service - Signal initialization done to GNOME Session Manager...
+Oct 31 20:35:51.388820 tuna-q-isg-yf1 systemd[3293]: Starting org.freedesktop.IBus.session.GNOME.service - IBus Daemon for GNOME...
+Oct 31 20:35:51.390700 tuna-q-isg-yf1 systemd[3293]: Starting org.gnome.SettingsDaemon.Datetime.service - GNOME date & time service...
+Oct 31 20:35:51.392249 tuna-q-isg-yf1 ublue-user-setup[3427]: /usr/lib/ublue/setup-services/libsetup.sh: line 55: /var/home/tuna-test/.local/share/ublue/setup_versioning.json.lock: No such file or directory
+Oct 31 20:35:51.396783 tuna-q-isg-yf1 systemd[3293]: Starting org.gnome.SettingsDaemon.Housekeeping.service - GNOME maintenance of expirable data service...
+Oct 31 20:35:51.399007 tuna-q-isg-yf1 systemd[3293]: Starting org.gnome.SettingsDaemon.Keyboard.service - GNOME keyboard configuration service...
+Oct 31 20:35:51.403700 tuna-q-isg-yf1 systemd[3293]: Starting org.gnome.SettingsDaemon.MediaKeys.service - GNOME keyboard shortcuts service...
+Oct 31 20:35:51.404734 tuna-q-isg-yf1 systemd[3293]: Starting org.gnome.SettingsDaemon.Power.service - GNOME power management service...
+Oct 31 20:35:51.408831 tuna-q-isg-yf1 systemd[3293]: Starting org.gnome.SettingsDaemon.PrintNotifications.service - GNOME printer notifications service...
+Oct 31 20:35:51.410142 tuna-q-isg-yf1 gnome-session-c[3424]: Failed to call signal initialization: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'Initialized'
+Oct 31 20:35:51.411039 tuna-q-isg-yf1 systemd[3293]: Starting org.gnome.SettingsDaemon.Rfkill.service - GNOME RFKill support service...
+Oct 31 20:35:51.412707 tuna-q-isg-yf1 systemd[3293]: Starting org.gnome.SettingsDaemon.ScreensaverProxy.service - GNOME FreeDesktop screensaver service...
+Oct 31 20:35:51.416021 tuna-q-isg-yf1 systemd[3293]: Starting org.gnome.SettingsDaemon.Sharing.service - GNOME file sharing service...
+Oct 31 20:35:51.417925 tuna-q-isg-yf1 systemd[3293]: Starting org.gnome.SettingsDaemon.Smartcard.service - GNOME smartcard service...
+Oct 31 20:35:51.420641 tuna-q-isg-yf1 systemd[3293]: Starting org.gnome.SettingsDaemon.Sound.service - GNOME sound sample caching service...
+Oct 31 20:35:51.422865 tuna-q-isg-yf1 systemd[3293]: Starting org.gnome.SettingsDaemon.UsbProtection.service - GNOME USB protection service...
+Oct 31 20:35:51.424084 tuna-q-isg-yf1 systemd[3293]: Starting org.gnome.SettingsDaemon.Wwan.service - GNOME WWan support service...
+Oct 31 20:35:51.428134 tuna-q-isg-yf1 systemd[3293]: Finished gnome-session-signal-init.service - Signal initialization done to GNOME Session Manager.
+Oct 31 20:35:51.438045 tuna-q-isg-yf1 gsd-datetime[3426]: Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Oct 31 20:35:51.439072 tuna-q-isg-yf1 systemd[3293]: Started org.gnome.SettingsDaemon.Datetime.service - GNOME date & time service.
+Oct 31 20:35:51.439358 tuna-q-isg-yf1 systemd[3293]: Reached target org.gnome.SettingsDaemon.Datetime.target - GNOME date & time target.
+Oct 31 20:35:51.441317 tuna-q-isg-yf1 ublue-user-setup[3450]: Running all privileged units
+Oct 31 20:35:51.460723 tuna-q-isg-yf1 systemd[3293]: Starting gvfs-daemon.service - Virtual filesystem service...
+Oct 31 20:35:51.507875 tuna-q-isg-yf1 systemd[3293]: Started org.gnome.SettingsDaemon.ScreensaverProxy.service - GNOME FreeDesktop screensaver service.
+Oct 31 20:35:51.508370 tuna-q-isg-yf1 systemd[3293]: Reached target org.gnome.SettingsDaemon.ScreensaverProxy.target - GNOME FreeDesktop screensaver target.
+Oct 31 20:35:51.508713 tuna-q-isg-yf1 gsd-smartcard[3451]: Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Oct 31 20:35:51.509568 tuna-q-isg-yf1 systemd[3293]: Started org.gnome.SettingsDaemon.Smartcard.service - GNOME smartcard service.
+Oct 31 20:35:51.509857 tuna-q-isg-yf1 systemd[3293]: Reached target org.gnome.SettingsDaemon.Smartcard.target - GNOME smartcard target.
+Oct 31 20:35:51.510325 tuna-q-isg-yf1 gsd-screensaver[3448]: Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Oct 31 20:35:51.519648 tuna-q-isg-yf1 ublue-user-setup[3475]: Error accessing /usr/libexec/ublue-privileged-setup: No such file or directory
+Oct 31 20:35:51.526103 tuna-q-isg-yf1 gsd-sharing[3449]: Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Oct 31 20:35:51.526104 tuna-q-isg-yf1 systemd[3293]: ublue-user-setup.service: Main process exited, code=exited, status=127/n/a
+Oct 31 20:35:51.526214 tuna-q-isg-yf1 systemd[3293]: ublue-user-setup.service: Failed with result 'exit-code'.
+Oct 31 20:35:51.526442 tuna-q-isg-yf1 gsd-usb-protect[3460]: Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Oct 31 20:35:51.527714 tuna-q-isg-yf1 gsd-wwan[3461]: Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Oct 31 20:35:51.534718 tuna-q-isg-yf1 systemd[3293]: Started org.gnome.SettingsDaemon.Sharing.service - GNOME file sharing service.
+Oct 31 20:35:51.534898 tuna-q-isg-yf1 systemd[3293]: Started org.gnome.SettingsDaemon.Wwan.service - GNOME WWan support service.
+Oct 31 20:35:51.535010 tuna-q-isg-yf1 systemd[3293]: Started org.gnome.SettingsDaemon.UsbProtection.service - GNOME USB protection service.
+Oct 31 20:35:51.535194 tuna-q-isg-yf1 systemd[3293]: Reached target org.gnome.SettingsDaemon.Sharing.target - GNOME file sharing target.
+Oct 31 20:35:51.543682 tuna-q-isg-yf1 systemd[3293]: Reached target org.gnome.SettingsDaemon.UsbProtection.target - GNOME USB protection target.
+Oct 31 20:35:51.544150 tuna-q-isg-yf1 systemd[3293]: Reached target org.gnome.SettingsDaemon.Wwan.target - GNOME WWan support target.
+Oct 31 20:35:51.550624 tuna-q-isg-yf1 systemd[3293]: Created slice app-dbus\x2d:1.2\x2dorg.gnome.ScreenSaver.slice - Slice /app/dbus-:1.2-org.gnome.ScreenSaver.
+Oct 31 20:35:51.555544 tuna-q-isg-yf1 systemd[3293]: Started dbus-:1.2-org.gnome.ScreenSaver@0.service.
+Oct 31 20:35:51.562598 tuna-q-isg-yf1 systemd[3293]: Started gvfs-daemon.service - Virtual filesystem service.
+Oct 31 20:35:51.567890 tuna-q-isg-yf1 gsd-print-notif[3440]: Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Oct 31 20:35:51.569637 tuna-q-isg-yf1 gsd-housekeepin[3431]: Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Oct 31 20:35:51.570130 tuna-q-isg-yf1 systemd[3293]: Started org.gnome.SettingsDaemon.PrintNotifications.service - GNOME printer notifications service.
+Oct 31 20:35:51.570362 tuna-q-isg-yf1 systemd[3293]: Started org.gnome.SettingsDaemon.Housekeeping.service - GNOME maintenance of expirable data service.
+Oct 31 20:35:51.570682 tuna-q-isg-yf1 systemd[3293]: Reached target org.gnome.SettingsDaemon.Housekeeping.target - GNOME maintenance of expirable data target.
+Oct 31 20:35:51.570826 tuna-q-isg-yf1 systemd[3293]: Reached target org.gnome.SettingsDaemon.PrintNotifications.target - GNOME printer notifications target.
+Oct 31 20:35:51.575126 tuna-q-isg-yf1 gsd-sound[3456]: Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Oct 31 20:35:51.599333 tuna-q-isg-yf1 systemd[3293]: Started org.freedesktop.IBus.session.GNOME.service - IBus Daemon for GNOME.
+Oct 31 20:35:51.600752 tuna-q-isg-yf1 systemd[3293]: Started org.gnome.SettingsDaemon.Sound.service - GNOME sound sample caching service.
+Oct 31 20:35:51.604067 tuna-q-isg-yf1 gsd-rfkill[3444]: Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Oct 31 20:35:51.609610 tuna-q-isg-yf1 systemd[3293]: Started org.gnome.SettingsDaemon.Rfkill.service - GNOME RFKill support service.
+Oct 31 20:35:51.610989 tuna-q-isg-yf1 systemd[3293]: Created slice app-dbus\x2d:1.2\x2dorg.freedesktop.portal.IBus.slice - Slice /app/dbus-:1.2-org.freedesktop.portal.IBus.
+Oct 31 20:35:51.611201 tuna-q-isg-yf1 systemd[3293]: Reached target org.gnome.SettingsDaemon.Rfkill.target - GNOME RFKill support target.
+Oct 31 20:35:51.611640 tuna-q-isg-yf1 systemd[3293]: Reached target org.gnome.SettingsDaemon.Sound.target - GNOME sound sample caching target.
+Oct 31 20:35:51.613702 tuna-q-isg-yf1 systemd[3293]: Started dbus-:1.2-org.freedesktop.portal.IBus@0.service.
+Oct 31 20:35:51.634709 tuna-q-isg-yf1 gsd-printer[3544]: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Oct 31 20:35:51.644793 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3413]: tuna-ibus-bridge: input context /org/freedesktop/IBus/InputContext_2
+Oct 31 20:35:51.698532 tuna-q-isg-yf1 gsd-usb-protect[3460]: Failed to get screen saver status: GDBus.Error:org.freedesktop.DBus.Error.NoReply: Remote peer disconnected
+Oct 31 20:35:51.700630 tuna-q-isg-yf1 gsd-usb-protect[3460]: Failed to fetch USBGuard parameters: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The name is not activatable
+Oct 31 20:35:51.723444 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3413]: tuna-ibus-bridge: ready
+Oct 31 20:35:51.730800 tuna-q-isg-yf1 systemd[3293]: Starting at-spi-dbus-bus.service - Accessibility services bus...
+Oct 31 20:35:51.745113 tuna-q-isg-yf1 systemd[3293]: Started at-spi-dbus-bus.service - Accessibility services bus.
+Oct 31 20:35:51.749941 tuna-q-isg-yf1 at-spi-bus-laun[3659]: Failed to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Oct 31 20:35:51.753891 tuna-q-isg-yf1 dbus-broker-launch[3668]: Ready
+Oct 31 20:35:51.763930 tuna-q-isg-yf1 systemd[3293]: Started org.gnome.SettingsDaemon.Keyboard.service - GNOME keyboard configuration service.
+Oct 31 20:35:51.764529 tuna-q-isg-yf1 systemd[3293]: Reached target org.gnome.SettingsDaemon.Keyboard.target - GNOME keyboard configuration target.
+Oct 31 20:35:51.770626 tuna-q-isg-yf1 systemd[3293]: Created slice app-dbus\x2d:1.40\x2dorg.a11y.atspi.Registry.slice - Slice /app/dbus-:1.40-org.a11y.atspi.Registry.
+Oct 31 20:35:51.772026 tuna-q-isg-yf1 systemd[3293]: Started dbus-:1.40-org.a11y.atspi.Registry@0.service.
+Oct 31 20:35:51.774165 tuna-q-isg-yf1 gsd-keyboard[3432]: Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Oct 31 20:35:51.796628 tuna-q-isg-yf1 at-spi2-registryd[3679]: SpiRegistry daemon is running with well-known name - org.a11y.atspi.Registry
+Oct 31 20:35:51.802158 tuna-q-isg-yf1 gsd-media-keys[3435]: Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Oct 31 20:35:51.802377 tuna-q-isg-yf1 systemd[3293]: Started org.gnome.SettingsDaemon.MediaKeys.service - GNOME keyboard shortcuts service.
+Oct 31 20:35:51.802941 tuna-q-isg-yf1 systemd[3293]: Reached target org.gnome.SettingsDaemon.MediaKeys.target - GNOME keyboard shortcuts target.
+Oct 31 20:35:51.807724 tuna-q-isg-yf1 systemd[3293]: Started pipewire.service - PipeWire Multimedia Service.
+Oct 31 20:35:51.809302 tuna-q-isg-yf1 systemd[3293]: Started wireplumber.service - Multimedia Service Session Manager.
+Oct 31 20:35:51.810533 tuna-q-isg-yf1 systemd[3293]: Started pipewire-pulse.service - PipeWire PulseAudio.
+Oct 31 20:35:51.848526 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3410]: tuna-shell-gtk: OpenGL is llvmpipe (LLVM 22.1.8, 256 bits); drawing with cairo
+Oct 31 20:35:51.880518 tuna-q-isg-yf1 systemd[3293]: Started dbus-:1.2-org.gnome.ScreenSaver@1.service.
+Oct 31 20:35:52.009899 tuna-q-isg-yf1 wireplumber[3688]: spa.bluez5: BlueZ system service is not available
+Oct 31 20:35:52.017860 tuna-q-isg-yf1 wireplumber[3688]: wp-device: SPA handle 'api.libcamera.enum.manager' could not be loaded; is it installed?
+Oct 31 20:35:52.017880 tuna-q-isg-yf1 wireplumber[3688]: s-monitors-libcamera: PipeWire's libcamera SPA plugin is missing or broken. Some camera types may not be supported.
+Oct 31 20:35:52.020685 tuna-q-isg-yf1 systemd[3293]: Starting dconf.service - User preferences database...
+Oct 31 20:35:52.069294 tuna-q-isg-yf1 systemd[3293]: Started dconf.service - User preferences database.
+Oct 31 20:35:52.098356 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: switcher keys: 12 chords, cycle-group Some(SwitcherKey { keysym: 65475, mods: 8, kind: CycleGroup }), cycle-windows Some(SwitcherKey { keysym: 65307, mods: 8, kind: CycleWindows })
+Oct 31 20:35:52.098829 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3410]: tuna-shell-gtk: keybindings: 69 grabs, maximize on ["<Super>Up"]
+Oct 31 20:35:52.109553 tuna-q-isg-yf1 gsd-power[3438]: Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Oct 31 20:35:52.110332 tuna-q-isg-yf1 systemd[3293]: Started org.gnome.SettingsDaemon.Power.service - GNOME power management service.
+Oct 31 20:35:52.110702 tuna-q-isg-yf1 systemd[3293]: Reached target org.gnome.SettingsDaemon.Power.target - GNOME power management target.
+Oct 31 20:35:52.111315 tuna-q-isg-yf1 systemd[3293]: Reached target gnome-session.target - GNOME Session.
+Oct 31 20:35:52.111723 tuna-q-isg-yf1 systemd[3293]: Reached target graphical-session.target - Current graphical user session.
+Oct 31 20:35:52.111936 tuna-q-isg-yf1 systemd[3293]: Reached target tuna-session.target - Tuna Desktop graphical user session.
+Oct 31 20:35:52.126050 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: session services: graphical target active
+Oct 31 20:35:52.166720 tuna-q-isg-yf1 systemd[3293]: Starting xdg-desktop-portal.service - Portal service...
+Oct 31 20:35:52.170360 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: overview focus parked
+Oct 31 20:35:52.181615 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: session services: portals refreshed
+Oct 31 20:35:52.187594 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3410]: tuna-shell-gtk: search providers: org.gnome.Settings.desktop, org.gnome.Nautilus.desktop
+Oct 31 20:35:52.191784 tuna-q-isg-yf1 systemd[3293]: Created slice app-dbus\x2d:1.2\x2dorg.gnome.Shell.CalendarServer.slice - Slice /app/dbus-:1.2-org.gnome.Shell.CalendarServer.
+Oct 31 20:35:52.194053 tuna-q-isg-yf1 systemd[3293]: Started dbus-:1.2-org.gnome.Shell.CalendarServer@0.service.
+Oct 31 20:35:52.195450 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: wallpaper decoded for 1280x800 in 93 ms
+Oct 31 20:35:52.207408 tuna-q-isg-yf1 systemd[3293]: Starting xdg-permission-store.service - sandboxed app permission store...
+Oct 31 20:35:52.248242 tuna-q-isg-yf1 systemd[3293]: Starting evolution-source-registry.service - Evolution source registry...
+Oct 31 20:35:52.256300 tuna-q-isg-yf1 systemd[3293]: Started xdg-permission-store.service - sandboxed app permission store.
+Oct 31 20:35:52.263951 tuna-q-isg-yf1 systemd[3293]: Starting xdg-document-portal.service - flatpak document portal service...
+Oct 31 20:35:52.269507 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3410]: tuna-shell-gtk: media keys: gsd-media-keys owns the media-keys bindings
+Oct 31 20:35:52.271118 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3410]: tuna-shell-gtk: keybindings: 69 grabs, maximize on ["<Super>Up"]
+Oct 31 20:35:52.272355 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3410]: tuna-shell-gtk: IBus panel: owns org.freedesktop.IBus.Panel on the IBus bus
+Oct 31 20:35:52.275841 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3410]: tuna-shell-gtk: polkit agent registered
+Oct 31 20:35:52.279647 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: switcher keys: 12 chords, cycle-group Some(SwitcherKey { keysym: 65475, mods: 8, kind: CycleGroup }), cycle-windows Some(SwitcherKey { keysym: 65307, mods: 8, kind: CycleWindows })
+Oct 31 20:35:52.286974 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3413]: tuna-ibus-bridge: text field focused
+Oct 31 20:35:52.294664 tuna-q-isg-yf1 systemd[3293]: Started xdg-document-portal.service - flatpak document portal service.
+Oct 31 20:35:52.311866 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3410]: tuna-shell-gtk: network agent registered
+Oct 31 20:35:52.323316 tuna-q-isg-yf1 systemd[3293]: Starting xdg-desktop-portal-gnome.service - Portal service (GNOME implementation)...
+Oct 31 20:35:52.406398 tuna-q-isg-yf1 systemd[3293]: Created slice app-dbus\x2d:1.2\x2dorg.gnome.OnlineAccounts.slice - Slice /app/dbus-:1.2-org.gnome.OnlineAccounts.
+Oct 31 20:35:52.408738 tuna-q-isg-yf1 systemd[3293]: Started dbus-:1.2-org.gnome.OnlineAccounts@0.service.
+Oct 31 20:35:52.485737 tuna-q-isg-yf1 goa-daemon[3836]: goa-daemon version 3.52.8 starting
+Oct 31 20:35:52.497803 tuna-q-isg-yf1 systemd[3293]: Started evolution-source-registry.service - Evolution source registry.
+Oct 31 20:35:52.515648 tuna-q-isg-yf1 systemd[3293]: Created slice app-dbus\x2d:1.2\x2dorg.gnome.Identity.slice - Slice /app/dbus-:1.2-org.gnome.Identity.
+Oct 31 20:35:52.519191 tuna-q-isg-yf1 systemd[3293]: Started dbus-:1.2-org.gnome.Identity@0.service.
+Oct 31 20:35:52.535607 tuna-q-isg-yf1 systemd[3293]: Starting evolution-calendar-factory.service - Evolution calendar service...
+Oct 31 20:35:52.587124 tuna-q-isg-yf1 systemd[3293]: Started xdg-desktop-portal-gnome.service - Portal service (GNOME implementation).
+Oct 31 20:35:52.610813 tuna-q-isg-yf1 systemd[3293]: Starting xdg-desktop-portal-gtk.service - Portal service (GTK/GNOME implementation)...
+Oct 31 20:35:52.728692 tuna-q-isg-yf1 systemd[3293]: Started evolution-calendar-factory.service - Evolution calendar service.
+Oct 31 20:35:52.733644 tuna-q-isg-yf1 systemd[3293]: Started xdg-desktop-portal-gtk.service - Portal service (GTK/GNOME implementation).
+Oct 31 20:35:52.758450 tuna-q-isg-yf1 systemd[3293]: Starting evolution-addressbook-factory.service - Evolution address book service...
+Oct 31 20:35:52.760754 tuna-q-isg-yf1 gnome-shell-cal[3784]: e_cal_client_set_default_timezone: assertion 'zone != NULL' failed
+Oct 31 20:35:52.781389 tuna-q-isg-yf1 systemd[3293]: Starting gvfs-metadata.service - Virtual filesystem metadata service...
+Oct 31 20:35:52.814859 tuna-q-isg-yf1 systemd[3293]: Started gvfs-metadata.service - Virtual filesystem metadata service.
+Oct 31 20:35:52.820533 tuna-q-isg-yf1 xdg-desktop-por[3778]: Choosing gnome-keyring.portal for org.freedesktop.impl.portal.Secret via the deprecated UseIn key
+Oct 31 20:35:52.820545 tuna-q-isg-yf1 xdg-desktop-por[3778]: The preferred method to match portal implementations to desktop environments is to use the portals.conf(5) configuration file
+Oct 31 20:35:52.824052 tuna-q-isg-yf1 gnome-shell-cal[3784]: e_cal_client_set_default_timezone: assertion 'zone != NULL' failed
+Oct 31 20:35:52.826747 tuna-q-isg-yf1 systemd[3293]: Created slice app-dbus\x2d:1.2\x2dorg.freedesktop.secrets.slice - Slice /app/dbus-:1.2-org.freedesktop.secrets.
+Oct 31 20:35:52.851353 tuna-q-isg-yf1 systemd[3293]: Started dbus-:1.2-org.freedesktop.secrets@0.service.
+Oct 31 20:35:52.885803 tuna-q-isg-yf1 systemd[3293]: Started evolution-addressbook-factory.service - Evolution address book service.
+Oct 31 20:35:52.898786 tuna-q-isg-yf1 gnome-keyring-daemon[3898]: discover_other_daemon: 1
+Oct 31 20:35:52.907461 tuna-q-isg-yf1 systemd[3293]: Started xdg-desktop-portal.service - Portal service.
+Oct 31 20:36:46.094034 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: libinput: scroll-wheel emulation button rejected for QEMU QEMU USB Tablet: Unsupported
+Oct 31 20:37:06.317038 tuna-q-isg-yf1 xdg-desktop-por[3871]: Unhandled parent window type 
+Oct 31 20:37:06.317049 tuna-q-isg-yf1 xdg-desktop-por[3871]: Failed to associate portal window with parent window 
+Oct 31 20:37:06.347500 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3413]: tuna-ibus-bridge: text field left
+Oct 31 20:37:31.324367 tuna-q-isg-yf1 xdg-desktop-por[3778]: Failed to show access dialog: Timeout was reached
+Oct 31 20:38:03.524006 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: window 1 unmapped
+Oct 31 20:39:05.485611 tuna-q-isg-yf1 xdg-desktop-por[3871]: Unhandled parent window type 
+Oct 31 20:39:05.485620 tuna-q-isg-yf1 xdg-desktop-por[3871]: Failed to associate portal window with parent window 
+Oct 31 20:39:11.526001 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: window 2 unmapped
+Oct 31 20:39:11.527792 tuna-q-isg-yf1 xdg-desktop-por[3830]: Failed to associate portal window with parent window ''
+Oct 31 20:39:11.729461 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: screenshot saved to /var/home/tuna-test/Pictures/Screenshots/Screenshot From 2026-10-31 20-39-11.png
+Oct 31 20:39:33.154447 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: overview focus restored
+Oct 31 20:39:45.196951 tuna-q-isg-yf1 xdg-desktop-por[3830]: Failed to associate portal window with parent window 
+Oct 31 20:39:51.506910 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: screen cast 1: Unconnected -> Connecting
+Oct 31 20:39:51.513570 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: window 3 unmapped
+Oct 31 20:39:51.539232 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: screen cast 1: Connecting -> Paused
+Oct 31 20:39:56.709573 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: screen cast 1: Paused -> Streaming
+Oct 31 20:39:56.716807 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: screen cast 1: Streaming -> Paused
+Oct 31 20:39:56.716807 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: screen cast 1: Paused -> Streaming
+Oct 31 20:39:56.779778 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: screen cast 1: Streaming -> Paused
+Oct 31 20:39:56.807922 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: screen cast 1: Paused -> Unconnected
+Oct 31 20:40:49.793608 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: modifier super keycode=125 pressed=true
+Oct 31 20:40:49.794579 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: modifier super keycode=125 pressed=true
+Oct 31 20:40:49.821973 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: display power save mode 3
+Oct 31 20:40:49.838001 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: display power save mode 0
+Oct 31 20:40:49.858919 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: modifier super keycode=125 pressed=false
+Oct 31 20:40:49.858919 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: modifier super keycode=125 pressed=false
+Oct 31 20:40:49.874503 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3413]: tuna-ibus-bridge: text field focused
+Oct 31 20:40:49.919579 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: wallpaper decoded for 1280x800 in 106 ms
+Oct 31 20:41:02.697361 tuna-q-isg-yf1 xdg-desktop-por[3830]: Failed to associate portal window with parent window ''
+Oct 31 20:41:06.480904 tuna-q-isg-yf1 systemd[3293]: Created slice background.slice - User Background Tasks Slice.
+Oct 31 20:41:06.481992 tuna-q-isg-yf1 systemd[3293]: Starting systemd-tmpfiles-clean.service - Cleanup of User's Temporary Files and Directories...
+Oct 31 20:41:06.498574 tuna-q-isg-yf1 systemd[3293]: Finished systemd-tmpfiles-clean.service - Cleanup of User's Temporary Files and Directories.
+Oct 31 20:41:19.869268 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: display power save mode 3
+Oct 31 20:41:58.532343 tuna-q-isg-yf1 xdg-desktop-por[3830]: Failed to associate portal window with parent window 
+Oct 31 20:41:58.534387 tuna-q-isg-yf1 xdg-desktop-por[3830]: Failed to get window list: GDBus.Error:org.freedesktop.DBus.Error.AccessDenied: session locked
+Oct 31 20:41:58.542477 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3413]: tuna-ibus-bridge: text field left
+Oct 31 20:41:58.543523 tuna-q-isg-yf1 xdg-desktop-por[3830]: Failed to get window list: GDBus.Error:org.freedesktop.DBus.Error.AccessDenied: session locked
+Oct 31 20:41:58.623448 tuna-q-isg-yf1 xdg-desktop-por[3830]: Failed to get window list: GDBus.Error:org.freedesktop.DBus.Error.AccessDenied: session locked
+Oct 31 20:42:02.811593 tuna-q-isg-yf1 xdg-desktop-por[3830]: Failed to start session: GDBus.Error:org.freedesktop.DBus.Error.AccessDenied: session locked
+Oct 31 20:42:02.812040 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: window 4 unmapped
+Oct 31 20:42:02.812542 tuna-q-isg-yf1 xdg-desktop-por[3830]: Failed to get window list: GDBus.Error:org.freedesktop.DBus.Error.AccessDenied: session locked
+Oct 31 20:42:11.248522 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3341]: tuna-compositor: display power save mode 0
+Oct 31 20:42:11.276336 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3413]: tuna-ibus-bridge: text field focused
+Oct 31 20:42:11.494558 tuna-q-isg-yf1 /usr/libexec/gdm-wayland-session[3413]: tuna-ibus-bridge: text field left
+Oct 31 20:42:11.533115 tuna-q-isg-yf1 113[5755]: PAM unable to dlopen(/usr/lib64/security/pam_fprintd.so): /usr/lib64/security/pam_fprintd.so: cannot open shared object file: No such file or directory
+Oct 31 20:42:11.533124 tuna-q-isg-yf1 113[5755]: PAM adding faulty module: /usr/lib64/security/pam_fprintd.so
+Oct 31 20:42:11.554795 tuna-q-isg-yf1 113[5760]: pam_unix(tuna-lock:account): setuid failed: Operation not permitted
+STDERR

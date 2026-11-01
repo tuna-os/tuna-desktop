@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "/home/ubuntu/.cache/tuna-journey-venv/bin/python",
+    "/tmp/tuna-variant-corrected-20261031/harness/tuna-corral-journey",
+    "--image",
+    "ghcr.io/tuna-os/skipjack@sha256:36889e650e35893e4d3779deba2ddce7ce375f65a36271f86b77ca90d0c8e924",
+    "--vm",
+    "tuna-q-variant-skipjack-31195144",
+    "--node",
+    "karnataka",
+    "--out",
+    "/tmp/tuna-variant-corrected-20261031/skipjack",
+    "--qualification-only"
+  ],
+  "exit": 1,
+  "stdout": "pass  greeter-user-list: GDM shows the user list\npass  greeter-password: Select the user; GDM asks for the password\npass  session-is-tuna: Password login starts Tuna Desktop (lands in the overview)\npass  portal-availability: Published portal interfaces respond (not capture consent)\nfail  portal-screenshot: Request Screenshot through the actual published frontend\npass  desktop: Escape leaves the overview for the desktop\nfail  portal-screencast: Consume a real frontend stream before locking\nfail  lock: Super+L locks the screen\npass  unlock-refused: A wrong password is refused\npass  unlock: The right password unlocks\npass  power-menu: Quick settings power menu\npass  logout-dialog: Log Out asks for confirmation\npass  logout: Logging out returns to GDM\n10 passed, 3 failed, 0 not exercised; failed: portal-screenshot, portal-screencast, lock\n",
+  "stderr": ""
+}

@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "qualification": "not complete; no all-variant v1 pass",
+  "resumed_attempt": {
+    "receipt": "resumed-interrupted-matrix.json",
+    "vm": "tuna-q-variant-albacore-1031155931",
+    "result": "interrupted before a runtime manifest/readiness verdict; no successful installation/GDM/session/portal/lock gate inferred",
+    "remaining_variants": "registry inventory resolved; no later variant VM created by the resumed sequence"
+  },
+  "final_owned_cleanup": {
+    "command": "env CORRAL_KUBECTL_TIMEOUT=30s corral --json --backend kubevirt delete tuna-q-variant-albacore-1031155931 -f --wait --timeout 10m",
+    "deleted": true,
+    "removed": [
+      "virtualmachine.kubevirt.io/tuna-q-variant-albacore-1031155931",
+      "persistentvolumeclaim/tuna-q-variant-albacore-1031155931-bootc-disk"
+    ],
+    "post_delete_command": "env CORRAL_KUBECTL_TIMEOUT=30s corral --json list --prefix tuna-q-variant-",
+    "post_delete_inventory": []
+  },
+  "remote_pipelines": {
+    "snapshot": "admission-gates.json",
+    "hummingbird_packages_41213268502": "native build succeeded; publication still in progress at snapshot; served publication/verification not claimed",
+    "guppy_image_41219478905": "Guppy matrix selection succeeded and actual Guppy image job in progress; Albacore sibling image job failed",
+    "cancelled": false
+  },
+  "local_watchers": "stopped without cancelling remote workflows",
+  "new_harness_verification": "Final frozen-harness/native Screenshot/ScreenCast-lock-revocation integration not exercised by the retained completed Yellowfin run. Main agent must verify it; no passing runtime claim from code alone.",
+  "untouched": ["punjab", "tuna-q-soak-20261031-r2"]
+}
