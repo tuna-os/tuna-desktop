@@ -94,6 +94,10 @@ for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus
 done
 install -d "$STAGE/usr/share/tuna-desktop/icons"
 cp -a share/tuna-desktop/icons/. "$STAGE/usr/share/tuna-desktop/icons/"
+# Git checkouts may be group-writable under umask 002; package data must not
+# inherit that builder policy. Preserve bytes and symlinks, normalize staged modes.
+find "$STAGE/usr/share/tuna-desktop" -type d -exec chmod 0755 {} +
+find "$STAGE/usr/share/tuna-desktop" -type f -exec chmod 0644 {} +
 python3 scripts/tuna-cursor-assets-check "$STAGE/usr/share/tuna-desktop/icons/Adwaita"
 install -m0644 share/wayland-sessions/tuna.desktop \
     "$STAGE/usr/share/wayland-sessions/tuna.desktop"

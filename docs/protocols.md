@@ -114,6 +114,12 @@ Cargo.lock and licensed BSD-3-Clause OR Apache-2.0.
 
 ### Colour output and capture contract
 
+Native ICC assignment and calibration require colord's daemon and
+`org.freedesktop.ColorHelper`/`colord-session` activation; the compositor's
+Mutter-compatible calibration API is not an obsolete `gcm-calibrate` launcher.
+GNOME Settings' profile-view action separately requires `gcm-viewer`, supplied
+by `gnome-color-manager`. Native package dependencies declare both consumers.
+
 The native output path retains colord profile assignment, generated EDID/sRGB
 device profiles, imported ICC profiles and calibration sessions. Assigned VCGT
 curves reach the actual CRTC gamma ramp, separately from the output colour mode,
