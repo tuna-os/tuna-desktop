@@ -62,6 +62,8 @@ mod bell;
 pub mod capture_security;
 pub mod color_management;
 pub mod color_manager;
+#[cfg(feature = "drm")]
+pub(crate) mod color_output;
 pub(crate) mod color_render;
 pub mod color_state;
 mod constraint_motion;
@@ -654,6 +656,7 @@ impl CompositorHandler for State {
     /// role is gone it marks the meaningless pending state as anchored on
     /// every edge, which the validator accepts.
     fn new_surface(&mut self, surface: &wl_surface::WlSurface) {
+        self.protocols.color.track(surface);
         smithay::wayland::compositor::add_pre_commit_hook::<State, _>(
             surface,
             |state, _dh, surface| {
@@ -673,7 +676,7 @@ impl CompositorHandler for State {
         self.pointer_scene_dirty = true;
         on_commit_buffer_handler::<State>(surface);
         crate::color_management::damage_changed(surface);
-        self.check_color_representation(surface);
+        self.check_color_representation_tree(surface);
         self.window_icons.commit(surface);
         self.popups.commit(surface);
         if let Some(smithay::desktop::PopupKind::Xdg(popup)) = self.popups.find_popup(surface) {

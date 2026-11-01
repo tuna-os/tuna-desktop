@@ -41,6 +41,7 @@ impl MonitorSpec {
 pub struct MonitorConfig {
     pub spec: MonitorSpec,
     pub mode: Option<ModeSpec>,
+    pub color_mode: crate::display_config::ColorMode,
 }
 
 /// One logical monitor; several monitors mirror it.
@@ -185,7 +186,19 @@ pub fn parse(xml: &str) -> Vec<MonitorsConfig> {
     doc.root_element()
         .children()
         .filter(|n| n.has_tag_name("configuration"))
-        .map(|configuration| {
+        .filter_map(|configuration| {
+            // Mutter rejects an unknown colormode, rather than silently
+            // dropping that monitor and applying the rest of the layout.
+            if configuration
+                .descendants()
+                .filter(|node| node.has_tag_name("colormode"))
+                .any(|node| {
+                    crate::display_config::ColorMode::from_xml(node.text().unwrap_or("").trim())
+                        .is_none()
+                })
+            {
+                return None;
+            }
             let logical = configuration
                 .children()
                 .filter(|n| n.has_tag_name("logicalmonitor"))
@@ -206,7 +219,15 @@ pub fn parse(xml: &str) -> Vec<MonitorsConfig> {
                                 .children()
                                 .find(|c| c.has_tag_name("mode"))
                                 .and_then(parse_mode);
-                            Some(MonitorConfig { spec, mode })
+                            let color_mode = match child_text(monitor, "colormode") {
+                                None => crate::display_config::ColorMode::Default,
+                                Some(value) => crate::display_config::ColorMode::from_xml(&value)?,
+                            };
+                            Some(MonitorConfig {
+                                spec,
+                                mode,
+                                color_mode,
+                            })
                         })
                         .collect();
                     (!monitors.is_empty()).then(|| LogicalMonitorConfig {
@@ -229,7 +250,7 @@ pub fn parse(xml: &str) -> Vec<MonitorsConfig> {
                 .flat_map(|d| d.children().filter(|c| c.has_tag_name("monitorspec")))
                 .filter_map(parse_spec)
                 .collect();
-            MonitorsConfig { logical, disabled }
+            Some(MonitorsConfig { logical, disabled })
         })
         .filter(|c| !c.logical.is_empty())
         .collect()
@@ -330,6 +351,12 @@ pub fn to_xml(configs: &[MonitorsConfig]) -> String {
                         },
                     ));
                 }
+                if monitor.color_mode != crate::display_config::ColorMode::Default {
+                    out.push_str(&format!(
+                        "        <colormode>{}</colormode>\n",
+                        monitor.color_mode.xml(),
+                    ));
+                }
                 out.push_str("      </monitor>\n");
             }
             out.push_str("    </logicalmonitor>\n");
@@ -427,6 +454,7 @@ mod tests {
             monitors: vec![MonitorConfig {
                 spec: spec(connector),
                 mode: mode(1920, 1080, 60.0),
+                color_mode: crate::display_config::ColorMode::Default,
             }],
         }
     }
@@ -473,6 +501,7 @@ mod tests {
                 refresh: 59.94,
                 interlaced: true,
             }),
+            color_mode: crate::display_config::ColorMode::Default,
         });
         let config = MonitorsConfig {
             logical: vec![mirrored],
@@ -587,5 +616,28 @@ mod tests {
             choose(&configs, &["eDP-1".to_owned(), "HDMI-A-1".to_owned()]),
             Some(lid_closed)
         );
+    }
+    #[test]
+    fn color_modes_round_trip_without_enabling_unspecified_hdr() {
+        use crate::display_config::ColorMode;
+        let mut hdr = MonitorsConfig {
+            logical: vec![logical("DP-1", 0, 1.0, true)],
+            disabled: vec![],
+        };
+        hdr.logical[0].monitors[0].color_mode = ColorMode::Bt2100;
+        let xml = to_xml(std::slice::from_ref(&hdr));
+        assert!(xml.contains("<colormode>bt2100</colormode>"));
+        assert_eq!(parse(&xml), [hdr.clone()]);
+        let merged = merge(XML, &hdr);
+        let selected = choose(&parse(&merged), &["DP-1".to_owned()]).unwrap();
+        assert_eq!(selected, hdr);
+        assert_eq!(
+            parse(XML)[0].logical[0].monitors[0].color_mode,
+            ColorMode::Default
+        );
+        let invalid = xml.replace("bt2100", "unsupported-hdr");
+        assert!(parse(&invalid).is_empty());
+        hdr.logical[0].monitors[0].color_mode = ColorMode::Default;
+        assert!(!to_xml(&[hdr]).contains("colormode"));
     }
 }

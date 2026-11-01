@@ -1,3 +1,14 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Rust adaptations of Mutter 51.0's Clutter colour implementation:
+// Copyright (C) 2022 Intel Corporation
+// Copyright (C) 2023-2026 Red Hat
+// Copyright (C) 2024 SUSE Software Solutions Germany GmbH
+// Authors include Naveen Kumar, Jonas Ådahl and Joan Torres.
+// Clutter originals are LGPL-2.0-or-later; these adaptations select the
+// GNU GPL under LGPL v2 section 3 and are distributed as GPL-3.0-or-later.
+// Distributed WITHOUT ANY WARRANTY; see the GNU GPL in the root LICENSE.
+//
 //! Colour states and the transforms between them (P-DS-03, #341), as
 //! Clutter's colour pipeline in Mutter 51 builds them.
 //!
@@ -15,11 +26,10 @@
 //! the source EOTF (or the ICC TRCs / 3D LUT) to linear BT.2020 D65 via
 //! XYZ and Bradford adaptation, the luminance mapping
 //! `(dst.ref / src.ref) * (src.max / dst.max)`, the target's inverse
-//! EOTF, premultiply. Outputs are always parametric (Mutter's
-//! `META_COLOR_MODE_DEFAULT`: sRGB primaries, gamma 2.2, the SDR
-//! luminances), so after Clutter's combine pass every transform here
-//! is one decode stage, one 3x3 matrix and one encode stage: the shape
-//! [`Transform`] holds and the renderer's shader runs.
+//! EOTF, premultiply. Output states are parametric, as Mutter's
+//! `MetaColorDevice` states are, so after Clutter's combine pass each
+//! transform is one decode stage, one 3x3 matrix and one encode stage:
+//! the shape [`Transform`] holds and the renderer's shader runs.
 //!
 //! The arithmetic mirrors Mutter's: single-precision ops with the same
 //! constants (Clutter's D65 and D50 white points, the Bradford matrix,
@@ -621,9 +631,23 @@ pub fn transform(source: &ColorState, target: &ColorState) -> Option<Transform> 
         return None;
     }
     let Kind::Params(dst) = target.kind() else {
-        // Outputs are parametric (`META_COLOR_MODE_DEFAULT`).
+        // Output encodings are parametric (`MetaColorDevice`).
         return None;
     };
+    if let Kind::Params(src) = source.kind() {
+        let (source_luminance, target_luminance) = (src.luminance(), dst.luminance());
+        if src.colorimetry == dst.colorimetry
+            && src.eotf == dst.eotf
+            && source_luminance.min == target_luminance.min
+            && source_luminance.max == target_luminance.max
+            && source_luminance.reference == target_luminance.reference
+        {
+            // An extended mastering range changes required storage, not
+            // the pixel encoding. Default SDR content is already in the
+            // HDR scene's gamma-2.2 blending space.
+            return None;
+        }
+    }
     let (decode, to_bt2020) = match source.kind() {
         Kind::Params(src) => (decode_of(src.eotf), params_to_bt2020(src)),
         Kind::Icc(icc) => match &icc.model {
@@ -814,6 +838,31 @@ pub fn output_params() -> Params {
         Colorimetry::Colorspace(Colorspace::Srgb),
         Eotf::Named(TransferFunction::Gamma22),
         Some(Luminance::SDR),
+    )
+}
+
+/// `META_COLOR_MODE_BT2100`: BT.2020 primaries, PQ and its default
+/// luminance. Advertising this state requires a qualified native HDR
+/// pipeline; accepting PQ client content alone is not HDR output support.
+pub fn hdr_output_params() -> Params {
+    Params::named(Colorspace::Bt2020, TransferFunction::Pq)
+}
+
+/// `clutter_color_state_params_get_blending` without force-linear.
+/// PQ outputs blend in extended-range sRGB/gamma 2.2, then encode the
+/// completed scene to PQ. The mastering range requires an FP16 target;
+/// it must not be clipped into an 8-bit intermediate.
+pub fn blending_params(output: &Params) -> Params {
+    if output.eotf != Eotf::Named(TransferFunction::Pq) {
+        return *output;
+    }
+    let luminance = output.luminance();
+    let mut blending = Luminance::SDR;
+    blending.mastering_max = blending.reference * luminance.mastering_max / luminance.reference;
+    Params::new(
+        Colorimetry::Colorspace(Colorspace::Srgb),
+        Eotf::Named(TransferFunction::Gamma22),
+        Some(blending),
     )
 }
 
@@ -1012,5 +1061,51 @@ mod tests {
                 assert!(near(out[k], c[k], 1e-5), "{c:?} → {out:?}");
             }
         }
+    }
+
+    #[test]
+    fn hdr_blending_preserves_highlights_and_round_trips_to_pq() {
+        let params = hdr_output_params();
+        let hdr = ColorState::params(params);
+        let blend_params = blending_params(&params);
+        assert_eq!(
+            blend_params.colorimetry(),
+            Colorimetry::Colorspace(Colorspace::Srgb)
+        );
+        assert_eq!(blend_params.eotf(), Eotf::Named(TransferFunction::Gamma22));
+        let luminance = blend_params.luminance();
+        assert!(near(luminance.mastering_max, 80.0 * 10000.0 / 203.0, 0.01));
+        let blending = ColorState::params(blend_params);
+        let to_blending = transform(&hdr, &blending).unwrap();
+        let to_output = transform(&blending, &hdr).unwrap();
+        for source in [
+            [0.25, 0.5, 0.75, 1.0],
+            [0.75, 0.75, 0.75, 1.0],
+            [0.125, 0.25, 0.375, 0.5],
+            [0.0, 0.0, 0.0, 0.0],
+        ] {
+            let encoded = to_output.apply(to_blending.apply(source));
+            for channel in 0..4 {
+                assert!(
+                    near(encoded[channel], source[channel], 2e-4),
+                    "{source:?} → {encoded:?}"
+                );
+            }
+        }
+        let highlight = to_blending.apply([0.75, 0.75, 0.75, 1.0]);
+        assert!(
+            highlight[..3].iter().all(|channel| *channel > 1.0),
+            "{highlight:?}"
+        );
+        assert_eq!(blending_params(&output_params()), output_params());
+        let default = ColorState::params(default_params());
+        assert!(
+            !default.equals(&blending),
+            "mastering range still identifies the state"
+        );
+        assert!(
+            transform(&default, &blending).is_none(),
+            "storage range is not a pixel conversion"
+        );
     }
 }

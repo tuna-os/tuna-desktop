@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""Owned native GNOME51.1 framebuffer colour comparison on a fresh privileged CI host.
+
+Requires root, KVM, rootful podman, skopeo, cosign, ssh-keygen and Pillow.
+Defaults to public source bootstrap of exact Corral revision and a source-derived
+QEMU tool recipe, recording new binary/image identities. Optional --corral plus
+--tool-archive reuse only the independently hash-approved immutable tools.
+Never run against a shared peer's store/container/VM. Artifacts exclude keys and
+disks. No GNOME portal metadata/HDR output qualification is inferred from QMP PNGs.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import tempfile
+import time
+import uuid
+
+INDEX = 'sha256:4aac01014ecb392b05cc80beeefd58512379319314f23acfdf5d601c13dfa8c6'
+PLATFORM = 'sha256:6c1e25b1fa9ddc07d7e71f767456839676333d3ebdc332b642a467f56c8ff71b'
+TOOL = 'sha256:715b5bd18b2f0cbe75784932e7cf7aa84c72ab272d974c6cb7594348da860179'
+CORRAL = '14c6f45eb2345784dffa01d766770ecf260bc42dafb41ccb0f31090b4ad5ec3a'
+BASE = 'ghcr.io/tuna-os/marlin@'
+CORRAL_SOURCE = '76b6dd52d35deab2b105038b2673f010d5b95191'
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--corral', type=Path)
+    p.add_argument('--tool-archive', type=Path)
+    p.add_argument('--color-client', type=Path, required=True)
+    p.add_argument('--artifacts', type=Path, required=True)
+    a = p.parse_args()
+    if os.geteuid() != 0:
+        p.error('rootful native CI host required')
+    if bool(a.corral) != bool(a.tool_archive):
+        p.error('--corral and --tool-archive must be supplied together')
+    if a.corral and hashlib.sha256(a.corral.read_bytes()).hexdigest() != CORRAL:
+        p.error('Corral immutable binary hash mismatch')
+    out = a.artifacts.resolve()
+    out.mkdir(parents=True, exist_ok=False, mode=0o700)
+    report = {'passed': False, 'scope': 'GNOME native QMP framebuffer comparison; not portal metadata or HDR output qualification',
+              'index': INDEX, 'platform': PLATFORM,
+              'client_sha256': hashlib.sha256(a.color_client.read_bytes()).hexdigest(), 'cases': {}}
+    def save():
+        (out / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
+    save()
+    log = (out / 'commands.log').open('wb')
+    def run(cmd, *, check=True, timeout=1800):
+        # Password/key bytes never appear in command logging.
+        r = subprocess.run([str(x) for x in cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        log.write(r.stdout + r.stderr); log.flush()
+        if check and r.returncode:
+            raise RuntimeError(f'{cmd[0]} failed ({r.returncode}); see commands.log')
+        return r
+    token = 'tuna-q-colour-' + uuid.uuid4().hex[:12]
+    container, image = token + '-tools', 'localhost/' + token + ':fixture'
+    own_tool = 'localhost/' + token + ':tools'
+    with tempfile.TemporaryDirectory(prefix=token + '-') as tmp:
+        w = Path(tmp)
+        os.chmod(w, 0o700)
+        try:
+            raw = run(['skopeo', 'inspect', '--raw', 'docker://' + BASE + INDEX]).stdout
+            (out / 'index.json').write_bytes(raw)
+            if 'sha256:' + hashlib.sha256(raw).hexdigest() != INDEX:
+                raise RuntimeError('raw index digest mismatch')
+            manifests = json.loads(raw)['manifests']
+            selected = [m['digest'] for m in manifests if m.get('platform') == {'architecture': 'amd64', 'os': 'linux'}]
+            if selected != [PLATFORM]:
+                raise RuntimeError('index AMD64 binding changed')
+            signature = run(['cosign', 'verify', '--certificate-identity',
+                             'https://github.com/tuna-os/tunaOS/.github/workflows/reusable-build-image.yml@refs/heads/main',
+                             '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com', BASE + PLATFORM])
+            (out / 'platform-cosign.json').write_bytes(signature.stdout)
+            (out / 'platform-cosign.stderr').write_bytes(signature.stderr)
+            if a.tool_archive:
+                run(['podman', 'load', '-i', a.tool_archive.resolve()])
+                tool_image = TOOL
+                shutil.copy2(a.corral, w / 'corral')
+                report['tool_origin'] = 'approved immutable tools'
+            else:
+                base = json.loads(run(['skopeo', 'inspect', 'docker://registry.fedoraproject.org/fedora:43']).stdout)
+                pinned_base = 'registry.fedoraproject.org/fedora@' + base['Digest']
+                tools = w / 'tools'
+                tools.mkdir()
+                recipe = ('FROM ' + pinned_base + '\n'
+                          'RUN dnf -y install qemu-kvm qemu-img edk2-ovmf podman jq openssh-clients ffmpeg-free skopeo procps-ng util-linux xorriso git findutils which golang && dnf clean all\n'
+                          'ENV GOTOOLCHAIN=go1.27.0 CGO_ENABLED=0\n'
+                          'RUN git init /src && cd /src && git remote add origin https://github.com/tuna-os/corral.git && '
+                          'git fetch --depth=1 origin ' + CORRAL_SOURCE + ' && git checkout --detach FETCH_HEAD && '
+                          'test \"$(git rev-parse HEAD)\" = ' + CORRAL_SOURCE + ' && '
+                          'go build -mod=readonly -trimpath -o /usr/local/bin/corral .\n')
+                (tools / 'Containerfile').write_text(recipe)
+                (out / 'Containerfile.tools').write_text(recipe)
+                run(['podman', 'build', '-t', own_tool, tools])
+                tool_image = run(['podman', 'image', 'inspect', own_tool, '--format', '{{.Id}}']).stdout.decode().strip()
+                run(['podman', 'run', '--rm', '-v', str(w) + ':/w', tool_image,
+                     'cp', '/usr/local/bin/corral', '/w/corral'])
+                report['tool_origin'] = {'corral_source': CORRAL_SOURCE, 'repository': 'https://github.com/tuna-os/corral.git',
+                                         'base_image': pinned_base, 'go_toolchain': 'go1.27.0'}
+            actual = run(['podman', 'image', 'inspect', tool_image, '--format', '{{.Id}}']).stdout.decode().strip()
+            if a.tool_archive and actual.removeprefix('sha256:') != TOOL.removeprefix('sha256:'):
+                raise RuntimeError('tool image ID mismatch')
+            report['tool_image_id'] = actual
+            report['corral_sha256'] = hashlib.sha256((w / 'corral').read_bytes()).hexdigest()
+            (w / 'corral').chmod(0o755)
+            save()
+            shutil.copy2(a.color_client, w / 'pixel-client'); (w / 'pixel-client').chmod(0o755)
+            run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', w / 'key'])
+            (w / 'home').mkdir()
+            (w / 'fixture.tmpfiles').write_text('d /var/home/tuna-test 0700 tuna-test tuna-test -\nd /var/lib/AccountsService/users 0700 root root -\nf+ /var/lib/AccountsService/users/tuna-test 0600 root root - [User]\\nSystemAccount=false\\n\n')
+            (w / 'packages.sh').write_text('''set -eu
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+grep -qx 'Include = /etc/pacman.d/mirrorlist' /etc/pacman.conf
+sed "s|^Include = /etc/pacman.d/mirrorlist$|Include = $work/mirrorlist|" /etc/pacman.conf >"$work/pacman.conf"
+cat /etc/pacman.d/mirrorlist >"$work/mirrorlist"
+echo 'Server = https://archive.archlinux.org/packages/.all' >>"$work/mirrorlist"
+pacman --config "$work/pacman.conf" -S --needed --noconfirm qemu-guest-agent openssh python
+''')
+            (w / 'Containerfile').write_text('''FROM ''' + BASE + INDEX + '''
+COPY packages.sh /run/packages.sh
+RUN mkdir -p /usr/share/colour-reference && pacman -Q >/usr/share/colour-reference/shipped && sha256sum /etc/gdm/custom.conf /usr/lib/systemd/system/gdm.service >/usr/share/colour-reference/gdm.sha256 && bash /run/packages.sh && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test && echo 'tuna-test:tuna' | chpasswd && systemctl enable sshd && systemctl add-wants multi-user.target qemu-guest-agent.service && sha256sum --check /usr/share/colour-reference/gdm.sha256 && pacman -Q >/usr/share/colour-reference/fixture && python3 -c 'from pathlib import Path; p=Path("/usr/share/colour-reference"); assert set((p/"shipped").read_text().splitlines()) <= set((p/"fixture").read_text().splitlines())' && rm /run/packages.sh
+COPY fixture.tmpfiles /usr/lib/tmpfiles.d/colour-reference.conf
+LABEL org.opencontainers.image.title="Disposable GNOME colour reference fixture, not shipping image"
+''')
+            shutil.copy2(w / 'Containerfile', out / 'Containerfile.fixture')
+            shutil.copy2(w / 'packages.sh', out / 'packages.fixture.sh')
+            shutil.copy2(w / 'fixture.tmpfiles', out / 'fixture.tmpfiles')
+            run(['podman', 'build', '-t', image, w])
+            (out / 'fixture-image.json').write_bytes(run(['podman', 'image', 'inspect', image]).stdout)
+            disk = w / 'gnome.raw'
+            with disk.open('wb') as f:
+                f.truncate(20 * 1024**3)
+            probe = '''if ls /usr/lib/bootupd/updates/EFI/*/grub*.efi >/dev/null 2>&1; then :; elif grep -A8 '^\\[composefs\\]' /usr/lib/ostree/prepare-root.conf 2>/dev/null | grep -qiE 'enabled[[:space:]]*=[[:space:]]*(yes|true|1|signed)' || find /usr/lib/systemd/boot/efi -name 'systemd-boot*.efi' | grep -q .; then echo --composefs-backend; fi; grep -A8 '^\\[composefs\\]' /usr/lib/ostree/prepare-root.conf 2>/dev/null | grep -qiE 'enabled[[:space:]]*=[[:space:]]*(yes|true|1|signed)' && echo '--filesystem ext4' || true'''
+            flags = shlex.split(run(['podman', 'run', '--rm', '--entrypoint', '', image, 'sh', '-c', probe]).stdout.decode())
+            if any(x not in ('--composefs-backend', '--filesystem', 'ext4') for x in flags):
+                raise RuntimeError('unexpected bootc probe flags')
+            report['install_flags'] = flags; save()
+            run(['podman', 'run', '--rm', '--privileged', '--pid=host', '--security-opt', 'label=type:unconfined_t',
+                 '-v', '/dev:/dev', '-v', '/var/lib/containers:/var/lib/containers', '-v', str(w) + ':/output',
+                 '-v', str(w / 'key.pub') + ':/buildkey.pub:ro', image, 'bootc', 'install', 'to-disk', '--via-loopback',
+                 '--generic-image', '--wipe', *flags, '--root-ssh-authorized-keys', '/buildkey.pub', '/output/gnome.raw'])
+            if '--composefs-backend' in flags:
+                fixup = '''set -eu
+KDIR=
+for d in /usr/lib/modules/*/; do if [ -f "${d}vmlinuz" ] && [ -f "${d}initramfs.img" ]; then KDIR=$d; break; fi; done
+[ -n "$KDIR" ]
+LOOP=$(losetup --find --show --partscan /target.img)
+MNT=$(mktemp -d)
+trap 'umount "$MNT" 2>/dev/null || true; losetup -d "$LOOP"' EXIT
+for i in 1 2 3 4 5 6 7 8 9 10; do ls "${LOOP}"p* >/dev/null 2>&1 && break; sleep 1; done
+ESP=0; ROOT=0
+for part in "${LOOP}"p*; do
+ mount "$part" "$MNT" 2>/dev/null || continue
+ for entry in "$MNT"/EFI/Linux/bootc_composefs-*; do
+  [ -d "$entry" ] || continue
+  cp "${KDIR}vmlinuz" "$entry/vmlinuz"; cp "${KDIR}initramfs.img" "$entry/initrd"; ESP=1
+ done
+ if [ -d "$MNT/state/os/default" ]; then
+  ROOT=1; SSHDIR="$MNT/state/os/default/var/roothome/.ssh"; mkdir -p "$SSHDIR"; chmod 700 "$SSHDIR"; cp /buildkey.pub "$SSHDIR/authorized_keys"; chmod 600 "$SSHDIR/authorized_keys"; chown -R 0:0 "$SSHDIR"
+ fi
+ sync; umount "$MNT"
+done
+[ "$ESP" = 1 ] && [ "$ROOT" = 1 ]
+'''
+                (w / 'fixup.sh').write_text(fixup)
+                (out / 'composefs-fixup.sh').write_text(fixup)
+                run(['podman', 'run', '--rm', '--privileged', '-v', '/dev:/dev', '-v', str(disk) + ':/target.img',
+                     '-v', str(w / 'key.pub') + ':/buildkey.pub:ro', '-v', str(w / 'fixup.sh') + ':/fixup.sh:ro',
+                     '--entrypoint', '/bin/sh', image, '/fixup.sh'])
+            with disk.open('rb') as f:
+                report['raw_sha256'] = hashlib.file_digest(f, 'sha256').hexdigest()
+            run(['podman', 'run', '-d', '--name', container, '--privileged', '--device', '/dev/kvm', '--network', 'host',
+                 '--security-opt', 'label=disable', '-v', str(w) + ':/w', '-e', 'HOME=/w/home', '-w', '/w', tool_image, 'sleep', 'infinity'])
+            def tool(*cmd, **kw):
+                return run(['podman', 'exec', container, *cmd], **kw)
+            def corral(*cmd, **kw):
+                return tool('/w/corral', *cmd, **kw)
+            tool('qemu-img', 'create', '-f', 'qcow2', '-F', 'raw', '-b', '/w/gnome.raw', '/w/template.qcow2')
+            corral('create', token, '--qcow', '/w/template.qcow2', '--firmware', 'uefi', '--cpu', '4', '--mem', '6G', '--start')
+            info = json.loads(corral('info', token).stdout)
+            report['vm'] = info; save()
+            port = str(info['ssh_port'])
+            def ssh(command, **kw):
+                return tool('ssh', '-i', '/w/key', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'UserKnownHostsFile=/w/known_hosts',
+                            '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', '-p', port, 'root@127.0.0.1', command, **kw)
+            def wait(fn, label, seconds=180):
+                deadline = time.monotonic() + seconds
+                while time.monotonic() < deadline:
+                    result = fn()
+                    if result:
+                        return result
+                    time.sleep(2)
+                raise RuntimeError('timeout: ' + label)
+            wait(lambda: ssh('true', check=False).returncode == 0, 'guest SSH')
+            corral('key', token, 'ret'); time.sleep(3)
+            corral('screenshot', token, '--require-paint', '-o', '/w/gdm.png')
+            shutil.copy2(w / 'gdm.png', out / 'gdm.png')
+            # Ordinary single-user GDM chooser; these are emulated physical keys,
+            # not a PAM/session injection. Session verification below is mandatory.
+            corral('key', token, 'ret'); time.sleep(2)
+            corral('type', token, 'tuna'); corral('key', token, 'ret')
+            session_cmd = "loginctl list-sessions --no-legend | while read -r s rest; do loginctl show-session \"$s\" -p Name -p Type -p Service -p Active -p User; echo; done"
+            def session_ready():
+                text = ssh(session_cmd).stdout.decode()
+                return text if any(all(x in block.splitlines() for x in ('Name=tuna-test', 'Type=wayland', 'Service=gdm-password', 'Active=yes')) for block in text.split('\n\n')) else None
+            report['session'] = wait(session_ready, 'ordinary GDM native Wayland login')
+            identity = ssh("set -e; pacman -Q gnome-shell mutter gdm mesa linux; pacman -Qi gnome-shell mutter gdm mesa linux; pacman -Qkk gnome-shell mutter gdm mesa linux; cat /etc/pacman.conf; cat /usr/share/colour-reference/shipped; cat /usr/share/colour-reference/fixture; ps -eo pid,uid,args").stdout
+            (out / 'guest-identity.txt').write_bytes(identity)
+            gpu = ssh('''for d in /sys/bus/pci/devices/*; do if [ "$(cat "$d/vendor")" = 0x1af4 ] && [ "$(cat "$d/device")" = 0x1050 ]; then echo "$d"; cat "$d/vendor" "$d/device"; readlink "$d/driver"; fi; done; uname -a''').stdout.decode()
+            (out / 'guest-gpu.txt').write_text(gpu)
+            if '0x1050' not in gpu:
+                raise RuntimeError('expected native virtio GPU 1050 missing')
+            versions = ssh('pacman -Q gnome-shell mutter gdm mesa linux').stdout.decode()
+            for line in ('gnome-shell 1:51.1-1', 'mutter 51.1-1', 'gdm 51.1.1-1', 'mesa 1:26.2.6-1', 'linux 7.2.11.arch1-1'):
+                if line not in versions.splitlines():
+                    raise RuntimeError('GNOME baseline package mismatch: ' + line)
+            # Copy only compiled caller into guest /run; no compositor/session replacement.
+            tool('scp', '-i', '/w/key', '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=/w/known_hosts', '-P', port,
+                 '/w/pixel-client', 'root@127.0.0.1:/run/colour-pixel-client')
+            uid = ssh('id -u tuna-test').stdout.decode().strip()
+            if not uid.isdigit() or uid == '0':
+                raise RuntimeError('nonroot graphical account missing')
+            display = ssh(f'find /run/user/{uid} -maxdepth 1 -type s -name "wayland-*" -printf "%f\\n"').stdout.decode().splitlines()
+            if len(display) != 1:
+                raise RuntimeError('ambiguous graphical Wayland socket')
+            from PIL import Image
+            for mode, flag in (('sdr', '--sdr'), ('unmanaged', '--unmanaged'), ('pq', '')):
+                ssh(f'runuser -u tuna-test -- env XDG_RUNTIME_DIR=/run/user/{uid} DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus WAYLAND_DISPLAY={shlex.quote(display[0])} /run/colour-pixel-client {flag} >/run/colour-{mode}.log 2>&1 & echo $! >/run/colour-client.pid')
+                try:
+                    def ready():
+                        text = ssh(f'cat /run/colour-{mode}.log').stdout.decode()
+                        found = re.search(r'^READY ((?:\d+ ){5}\d+)$', text, re.M)
+                        if found:
+                            return [int(v) for v in found[1].split()]
+                        alive = ssh('kill -0 $(cat /run/colour-client.pid)', check=False)
+                        if alive.returncode:
+                            (out / (mode + '-client.log')).write_text(text)
+                            raise RuntimeError(mode + ' client exited before presentation; not an unsupported-HDR pass')
+                        return None
+                    values = wait(ready, mode + ' frame presentation', 30)
+                    # Move the emulated physical mouse away from the
+                    # colour patch; do not hide/crop a cursor over it.
+                    corral('qmp', token, 'input-send-event', json.dumps({
+                        'events': [
+                            {'type': 'rel', 'data': {'axis': 'x', 'value': -10000}},
+                            {'type': 'rel', 'data': {'axis': 'y', 'value': -10000}},
+                        ],
+                    }))
+                    time.sleep(.2)
+                    corral('screenshot', token, '--require-paint', '-o', '/w/' + mode + '.png')
+                    shutil.copy2(w / (mode + '.png'), out / (mode + '.png'))
+                    im = Image.open(out / (mode + '.png')).convert('RGB')
+                    cx, cy = im.width // 2, im.height // 2
+                    pixels = [im.getpixel((cx + x, cy + y)) for x in range(-4, 5) for y in range(-4, 5)]
+                    expected = values[3:]
+                    if mode == 'pq' and values[:3] == expected:
+                        raise RuntimeError('PQ client reference transform is indistinguishable from control')
+                    if mode != 'pq' and values[:3] != expected:
+                        raise RuntimeError('control reference differs from source code')
+                    if any(abs(pixel[c] - expected[c]) > 2 for pixel in pixels for c in range(3)):
+                        raise RuntimeError(mode + ' actual framebuffer differs from expected SDR transform')
+                    report['cases'][mode] = {'code': values[:3], 'expected': expected, 'centre': list(pixels[40]),
+                                              'frame_sha256': hashlib.sha256((out / (mode + '.png')).read_bytes()).hexdigest()}
+                    (out / (mode + '-client.log')).write_bytes(ssh(f'cat /run/colour-{mode}.log').stdout)
+                    save()
+                finally:
+                    ssh('kill $(cat /run/colour-client.pid)', check=False)
+            report['comparison_complete'] = True
+            report['hdr_output'] = 'not qualified: virtual SDR framebuffer route; PQ input conversion is not HDR output support'
+            save()
+        except BaseException as e:
+            report['error'] = str(e); save()
+            raise
+        finally:
+            # Never globally prune or remove immutable/shared tool/base image tags.
+            cleanup_errors = []
+            def cleanup(command):
+                try:
+                    result = run(command, check=False)
+                    if result.returncode:
+                        cleanup_errors.append({'command': command, 'exit': result.returncode})
+                except Exception as error:
+                    cleanup_errors.append({'command': command, 'error': str(error)})
+            try:
+                exists = run(['podman', 'container', 'exists', container], check=False)
+                if exists.returncode == 0:
+                    cleanup(['podman', 'exec', container, '/w/corral', 'stop', token])
+                    cleanup(['podman', 'exec', container, '/w/corral', 'delete', token, '-f'])
+                    cleanup(['podman', 'rm', '-f', container])
+                elif exists.returncode != 1:
+                    cleanup_errors.append({'container_existence_exit': exists.returncode})
+                for tag in (image, *(() if a.tool_archive else (own_tool,))):
+                    exists = run(['podman', 'image', 'exists', tag], check=False)
+                    if exists.returncode == 0:
+                        cleanup(['podman', 'untag', tag])
+                    elif exists.returncode != 1:
+                        cleanup_errors.append({'image': tag, 'existence_exit': exists.returncode})
+                # Remove disposable private key, disks and isolated store before pass.
+                shutil.rmtree(w)
+            except Exception as error:
+                cleanup_errors.append({'error': str(error)})
+            report['cleanup'] = {'passed': not cleanup_errors, 'errors': cleanup_errors}
+            report['passed'] = bool(report.get('comparison_complete') and not report.get('error') and not cleanup_errors)
+            save()
+            (out / 'assertions.txt').write_text(
+                'D-COLOR-GNOME ' + ('pass' if report['passed'] else 'fail') +
+                ' native ordinary GDM Wayland login; trusted platform/source and exact package versions; '
+                'real SDR/unmanaged/PQ framebuffer pixels; owned cleanup; no HDR output qualification\n')
+            log.close()
+            if cleanup_errors and not report.get('error'):
+                raise RuntimeError('owned GNOME fixture cleanup failed; see receipt.json')
+
+
+if __name__ == '__main__':
+    main()

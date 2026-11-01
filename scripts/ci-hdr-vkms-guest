@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""Run real EMULATED HDR KMS proofs in a fresh, owned Ubuntu 24.04 Linux 6.8 VM.
+
+No host kernel/module/package/service changes. Requires existing qemu-system-x86_64,
+qemu-img, cloud-localds, ssh/scp/ssh-keygen, gpg, tar and Python3. Downloads the
+fixed official 20261017 Noble image, authenticates Canonical's signed checksums
+against its documented full signing fingerprint, and checks a committed SHA256.
+Uses a disposable overlay/cloud-init/SSH client+host keys, loopback-only fresh
+SSH port and its own QEMU process. Never uses Corral/existing VMs. KVM when
+accessible; otherwise explicitly recorded TCG (not a hardware-acceleration claim).
+
+  python3 scripts/ci-hdr-vkms-guest --work-dir /ABS/new-hdr-vm \
+      --artifacts /ABS/new-hdr-evidence --payload-tar /ABS/native-payload.tar \
+      --guest-command 'python3 scripts/tuna-color-capture-proof --backend drm --hdr ...'
+
+Payload tar is extracted into /home/ubuntu/payload. Prepare binaries/assets there
+before calling; no repository/managed-store traversal is performed by this tool.
+The native command runs in that directory, under owned seatd-launch, inside the
+HDR module endpoint, with CARD/TUNA_HDR_* and ARTIFACTS=/home/ubuntu/artifacts.
+The helper always performs the real kernel XR30 flip/writeback/negative-atomic
+selftest first. Optional --negative-command runs in a fresh unsupported SDR
+endpoint (default is identity only). A default identity is not a compositor or
+capture qualification pass. Artifact logs/JSON/raw writeback pixels are retained
+on failure; QEMU and ephemeral private keys/overlay are removed in all cases.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.request
+import uuid
+
+ROOT = Path(__file__).resolve().parent.parent
+BASE = 'https://cloud-images.ubuntu.com/releases/noble/release-20261017/'
+IMAGE = 'ubuntu-24.04-server-cloudimg-amd64.img'
+IMAGE_SHA256 = '04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94'
+MANIFEST = 'ubuntu-24.04-server-cloudimg-amd64.manifest'
+MANIFEST_SHA256 = '78d7da6ab1556daa6c0f685bf4e0e3da36395f170e8fad411d7ba032f14d08c2'
+FINGERPRINT = 'D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81'
+EXPECTED_KERNEL = '6.8.0-147-generic'
+
+
+def call(args, **kwargs):
+    return subprocess.run([str(a) for a in args], check=True, **kwargs)
+
+
+def digest(path):
+    result = hashlib.sha256()
+    with path.open('rb') as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+            result.update(chunk)
+    return result.hexdigest()
+
+
+def fetch(url, path):
+    with urllib.request.urlopen(url, timeout=90) as response, path.open('xb') as output:
+        shutil.copyfileobj(response, output)
+
+
+def retained_kernel_proof(archive_path):
+    # Read only named regular JSON/raw members; never extract guest paths.
+    with tarfile.open(archive_path, 'r:gz') as archive:
+        def receipt(name):
+            member = archive.getmember('artifacts/' + name)
+            if not member.isfile() or member.size > 65536:
+                raise RuntimeError(f'invalid retained proof member {name}')
+            with archive.extractfile(member) as source:
+                return json.load(source)
+        proof = receipt('kernel-selftest.json')
+        for key in ('emulated', 'writeback_fence_signaled', 'all_composed_pixels_match',
+                    'eight_bit_hdr_rejected', 'non_pq_metadata_rejected'):
+            if proof.get(key) is not True:
+                raise RuntimeError(f'missing actual kernel selftest evidence: {key}')
+        if proof.get('driver') != 'tuna_hdr_vkms' or proof.get('operation') != 'selftest' or proof.get('page_flip_events') != 1:
+            raise RuntimeError('invalid real kernel page-flip receipt')
+        raw = archive.getmember('artifacts/kernel-writeback.xr30')
+        if not raw.isfile() or raw.size != proof['width'] * proof['height'] * 4:
+            raise RuntimeError('actual composed writeback bytes were not retained')
+        for endpoint_name in ('kernel-endpoint', 'hdr-endpoint', 'unsupported-endpoint'):
+            endpoint_receipt = receipt(endpoint_name + '/endpoint.json')
+            if endpoint_receipt.get('status') != 'unloaded' or endpoint_receipt.get('command_exit') != 0:
+                raise RuntimeError(f'owned endpoint cleanup/command failed: {endpoint_name}')
+            if endpoint_receipt.get('kernel') != EXPECTED_KERNEL:
+                raise RuntimeError('retained endpoint kernel differs from authenticated image')
+        unsupported = receipt('unsupported-endpoint/identity.json')
+        if unsupported.get('hdr_property_present') is not False:
+            raise RuntimeError('unsupported control was not a real SDR connector')
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--work-dir', required=True)
+    parser.add_argument('--artifacts', required=True)
+    parser.add_argument('--payload-tar')
+    parser.add_argument('--guest-command', default='true', help='native proof command; default runs kernel selftest only')
+    parser.add_argument('--negative-command', default='"$TUNA_HDR_PROBE" identity "$CARD" "$ARTIFACTS/unsupported-identity.json"')
+    parser.add_argument('--prepare-command', default='true', help='additional guest-only runtime dependency preparation')
+    parser.add_argument('--accel', choices=('auto', 'kvm', 'tcg'), default='auto')
+    parser.add_argument('--memory-mib', type=int, default=8192)
+    parser.add_argument('--cpus', type=int, default=4)
+    parser.add_argument('--boot-timeout', type=int, default=600)
+    parser.add_argument('--proof-timeout', type=int, default=1200)
+    args = parser.parse_args()
+    work = Path(args.work_dir).absolute()
+    artifacts = Path(args.artifacts).absolute()
+    if work == artifacts or work in artifacts.parents or artifacts in work.parents:
+        raise RuntimeError('work and retained artifacts must be separate, non-nested new directories')
+    for binary in ('qemu-system-x86_64', 'qemu-img', 'cloud-localds', 'ssh', 'scp', 'ssh-keygen', 'gpg', 'tar'):
+        if not shutil.which(binary):
+            raise RuntimeError(f'missing host prerequisite {binary}; no packages are installed on host')
+    work.mkdir(mode=0o700, parents=False, exist_ok=False)
+    artifacts.mkdir(mode=0o700, parents=False, exist_ok=False)
+    qemu = None
+    ssh = None
+    ssh_ready = False
+    success = False
+    identity = {'image_url': BASE + IMAGE, 'image_sha256': IMAGE_SHA256,
+                'image_release': '20261017', 'signing_fingerprint': FINGERPRINT,
+                'expected_kernel': EXPECTED_KERNEL, 'emulated': True,
+                'native_command': args.guest_command, 'negative_command': args.negative_command,
+                'status': 'preparing'}
+    try:
+        # All credentials, disk writes and GPG state belong to this new directory.
+        gpg_home = work / 'gnupg'
+        gpg_home.mkdir(mode=0o700)
+        for name in ('SHA256SUMS', 'SHA256SUMS.gpg'):
+            fetch(BASE + name, work / name)
+        fetch('https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x' + FINGERPRINT, work / 'ubuntu-cloud-signing.asc')
+        gpg = ['gpg', '--batch', '--homedir', str(gpg_home)]
+        call([*gpg, '--import', work / 'ubuntu-cloud-signing.asc'], stdout=subprocess.DEVNULL)
+        verified = subprocess.check_output([*gpg, '--status-fd', '1', '--verify', str(work / 'SHA256SUMS.gpg'), str(work / 'SHA256SUMS')], text=True)
+        valid = [line.split()[2] for line in verified.splitlines() if line.startswith('[GNUPG:] VALIDSIG ')]
+        if valid != [FINGERPRINT]:
+            raise RuntimeError(f'unexpected checksum signing fingerprint(s): {valid}')
+        checksums = dict((line.split()[1].lstrip('*'), line.split()[0]) for line in (work / 'SHA256SUMS').read_text().splitlines() if line.strip())
+        if checksums.get(IMAGE) != IMAGE_SHA256:
+            raise RuntimeError('signed image checksum no longer matches committed fixed identity')
+        if checksums.get(MANIFEST) != MANIFEST_SHA256:
+            raise RuntimeError('signed package manifest checksum differs from fixed identity')
+        fetch(BASE + MANIFEST, work / MANIFEST)
+        if digest(work / MANIFEST) != MANIFEST_SHA256:
+            raise RuntimeError('downloaded signed package manifest SHA256 mismatch')
+        packages_in_image = dict(line.split('\t', 1) for line in (work / MANIFEST).read_text().splitlines())
+        for package in ('linux-image-' + EXPECTED_KERNEL, 'linux-headers-' + EXPECTED_KERNEL):
+            if packages_in_image.get(package) != '6.8.0-147.147':
+                raise RuntimeError(f'authenticated official image manifest lacks exact {package}')
+        shutil.copyfile(work / MANIFEST, artifacts / MANIFEST)
+        identity['authenticated_manifest_sha256'] = MANIFEST_SHA256
+        for name in ('SHA256SUMS', 'SHA256SUMS.gpg', 'ubuntu-cloud-signing.asc'):
+            shutil.copyfile(work / name, artifacts / name)
+        (artifacts / 'signature-status.txt').write_text(verified)
+        fetch(BASE + IMAGE, work / IMAGE)
+        if digest(work / IMAGE) != IMAGE_SHA256:
+            raise RuntimeError('downloaded cloud image SHA256 mismatch')
+        call(['qemu-img', 'create', '-f', 'qcow2', '-F', 'qcow2', '-b', work / IMAGE, work / 'guest.qcow2'])
+        call(['qemu-img', 'resize', work / 'guest.qcow2', '32G'])
+        for name in ('client-key', 'guest-host-key'):
+            call(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', work / name])
+        config = {
+            'users': [{'name': 'ubuntu', 'sudo': 'ALL=(ALL) NOPASSWD:ALL', 'groups': ['video', 'render'],
+                       'shell': '/bin/bash', 'lock_passwd': True,
+                       'ssh_authorized_keys': [(work / 'client-key.pub').read_text().strip()]}],
+            'ssh_pwauth': False, 'disable_root': True, 'package_update': False, 'package_upgrade': False,
+            'ssh_keys': {'ed25519_private': (work / 'guest-host-key').read_text(),
+                         'ed25519_public': (work / 'guest-host-key.pub').read_text().strip()},
+        }
+        (work / 'user-data').write_text('#cloud-config\n' + json.dumps(config, indent=2) + '\n')
+        (work / 'meta-data').write_text(json.dumps({'instance-id': 'tuna-hdr-' + uuid.uuid4().hex, 'local-hostname': 'tuna-hdr-owned'}))
+        call(['cloud-localds', work / 'seed.img', work / 'user-data', work / 'meta-data'])
+        with socket.socket() as reservation:
+            reservation.bind(('127.0.0.1', 0))
+            port = reservation.getsockname()[1]
+        host_key = (work / 'guest-host-key.pub').read_text().strip()
+        (work / 'known_hosts').write_text(f'[127.0.0.1]:{port} {host_key}\n')
+        accel = args.accel
+        if accel == 'auto':
+            accel = 'kvm' if os.access('/dev/kvm', os.R_OK | os.W_OK) else 'tcg'
+        if accel == 'kvm' and not os.access('/dev/kvm', os.R_OK | os.W_OK):
+            raise RuntimeError('requested KVM is unavailable; no permissions/devices changed')
+        identity.update(acceleration=accel, ssh_bind=f'127.0.0.1:{port}')
+        options = ['-i', str(work / 'client-key'), '-p', str(port), '-o', 'BatchMode=yes',
+                   '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
+                   '-o', f'UserKnownHostsFile={work / "known_hosts"}', '-o', 'ConnectTimeout=5',
+                   '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=3']
+        ssh = ['ssh', *options, 'ubuntu@127.0.0.1']
+        qemu_args = ['qemu-system-x86_64', '-name', 'tuna-hdr-owned', '-machine', f'q35,accel={accel}',
+                     '-cpu', 'host' if accel == 'kvm' else 'max', '-smp', str(args.cpus), '-m', str(args.memory_mib),
+                     '-display', 'none', '-vga', 'none', '-monitor', 'none', '-serial', f'file:{artifacts / "serial.log"}',
+                     '-no-reboot', '-drive', f'file={work / "guest.qcow2"},if=virtio,format=qcow2',
+                     '-drive', f'file={work / "seed.img"},if=virtio,format=raw,readonly=on',
+                     '-netdev', f'user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:22', '-device', 'virtio-net-pci,netdev=net0']
+        with (artifacts / 'qemu.log').open('wb') as qemu_log:
+            qemu = subprocess.Popen(qemu_args, stdout=qemu_log, stderr=subprocess.STDOUT)
+        deadline = time.monotonic() + args.boot_timeout
+        while time.monotonic() < deadline:
+            if qemu.poll() is not None:
+                raise RuntimeError(f'owned QEMU exited {qemu.returncode}; see qemu.log/serial.log')
+            result = subprocess.run([*ssh, 'true'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if result.returncode == 0:
+                ssh_ready = True
+                break
+            time.sleep(2)
+        if not ssh_ready:
+            raise RuntimeError('owned guest did not reach authenticated SSH before boot timeout')
+        call([*ssh, 'sudo cloud-init status --wait'], timeout=args.boot_timeout)
+        actual_kernel = subprocess.check_output([*ssh, 'uname -r'], text=True).strip()
+        identity['actual_kernel'] = actual_kernel
+        if actual_kernel != EXPECTED_KERNEL:
+            raise RuntimeError(f'fixed cloud image kernel mismatch: {actual_kernel}')
+        # No host filesystem is shared with guest; send only explicitly listed
+        # endpoint sources and the caller's already-staged payload archive.
+        source_tar = work / 'hdr-source.tar'
+        with tarfile.open(source_tar, 'w') as archive:
+            archive.add(ROOT / 'scripts/ci-install-hdr-vkms', arcname='scripts/ci-install-hdr-vkms')
+            archive.add(ROOT / 'tests/color-hdr-vkms', arcname='tests/color-hdr-vkms')
+        call([*ssh, 'mkdir -p /home/ubuntu/hdr-source /home/ubuntu/payload /home/ubuntu/artifacts'])
+        with source_tar.open('rb') as source:
+            call([*ssh, 'tar -xf - -C /home/ubuntu/hdr-source'], stdin=source)
+        if args.payload_tar:
+            with Path(args.payload_tar).open('rb') as payload:
+                call([*ssh, 'tar -xf - -C /home/ubuntu/payload'], stdin=payload)
+        packages = ['build-essential', 'pkg-config', 'libdrm-dev', 'kmod', 'libgbm1', 'libegl1', 'libgles2',
+                    'linux-modules-extra-' + EXPECTED_KERNEL,
+                    'libegl-mesa0', 'libgl1-mesa-dri', 'mesa-vulkan-drivers', 'libseat1', 'seatd',
+                    'pipewire', 'pipewire-bin', 'wireplumber', 'dbus-user-session', 'python3-gi',
+                    'gir1.2-glib-2.0', 'libinput10', 'libxkbcommon0', 'xwayland', 'wayland-utils']
+        prepare = ('set -eu; sudo apt-get -o DPkg::Lock::Timeout=180 update; '
+                   'sudo env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 install -y --no-install-recommends ' +
+                   ' '.join(packages) + '; test -f /lib/modules/$(uname -r)/build/Makefile; '
+                   'cd /home/ubuntu/payload; ' + args.prepare_command + '; '
+                   'dpkg-query -W > /home/ubuntu/artifacts/guest-packages.tsv; '
+                   'python3 /home/ubuntu/hdr-source/scripts/ci-install-hdr-vkms build --build-dir /home/ubuntu/hdr-module')
+        with (artifacts / 'guest-prepare.log').open('wb') as log:
+            call([*ssh, 'bash -lc ' + shlex.quote(prepare)], stdout=log, stderr=subprocess.STDOUT, timeout=args.proof_timeout)
+        positive = ('set -eu; export ARTIFACTS=/home/ubuntu/artifacts; '
+                    'cd /home/ubuntu/payload; export LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD"; '
+                    'exec seatd-launch -- bash -lc ' + shlex.quote(args.guest_command))
+        endpoint = 'sudo python3 /home/ubuntu/hdr-source/scripts/ci-install-hdr-vkms run --build-dir /home/ubuntu/hdr-module'
+        kernel_proof = ('export ARTIFACTS=/home/ubuntu/artifacts; '
+                        'exec "$TUNA_HDR_PROBE" selftest "$CARD" "$ARTIFACTS/kernel-selftest.json" "$ARTIFACTS/kernel-writeback.xr30"')
+        # Reload between driver selftest and compositor: no stale HDR property
+        # blob/framebuffer from the selftest may satisfy a production assertion.
+        proof = endpoint + ' --state-dir /home/ubuntu/artifacts/kernel-endpoint -- bash -lc ' + shlex.quote(kernel_proof) + '; '
+        proof += endpoint + ' --state-dir /home/ubuntu/artifacts/hdr-endpoint -- bash -lc ' + shlex.quote(positive) + '; '
+        # set -e prevents negative identity from masking a positive failure.
+        negative = ('export ARTIFACTS=/home/ubuntu/artifacts; cd /home/ubuntu/payload; '
+                    'export LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD"; '
+                    'exec seatd-launch -- bash -lc ' + shlex.quote(args.negative_command))
+        proof += endpoint + ' --state-dir /home/ubuntu/artifacts/unsupported-endpoint --unsupported -- bash -lc ' + shlex.quote(negative)
+        identity['status'] = 'running-proofs'
+        (artifacts / 'guest-identity.json').write_text(json.dumps(identity, indent=2) + '\n')
+        with (artifacts / 'guest-proof.log').open('wb') as log:
+            call([*ssh, 'bash -ec ' + shlex.quote(proof)], stdout=log, stderr=subprocess.STDOUT, timeout=args.proof_timeout)
+        success = True
+    finally:
+        try:
+            if ssh_ready and ssh and qemu is not None and qemu.poll() is None:
+                # Retain, but never extract, this guest-produced archive on host.
+                archive_path = artifacts / 'guest-artifacts.tar.gz'
+                try:
+                    with archive_path.open('wb') as output:
+                        result = subprocess.run([*ssh, 'sudo tar -czf - -C /home/ubuntu artifacts'], stdout=output, stderr=subprocess.DEVNULL, timeout=60)
+                    identity['artifact_copy_exit'] = result.returncode
+                    if result.returncode:
+                        success = False
+                    else:
+                        retained_kernel_proof(archive_path)
+                        identity['retained_kernel_proof_valid'] = True
+                except (OSError, RuntimeError, KeyError, ValueError, tarfile.TarError, subprocess.TimeoutExpired) as error:
+                    identity['artifact_copy_or_proof_error'] = str(error)
+                    success = False
+        finally:
+            if qemu is not None and qemu.poll() is None:
+                qemu.terminate()
+                try:
+                    qemu.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    qemu.kill()
+                    qemu.wait()
+            # Removing this private directory removes all ephemeral SSH keys,
+            # cloud-init secrets and writable guest disks. No pass until done.
+            shutil.rmtree(work)
+            identity['owned_qemu_stopped'] = qemu is None or qemu.poll() is not None
+            identity['owned_ephemeral_files_removed'] = True
+            success = success and identity.get('retained_kernel_proof_valid') is True and identity['owned_qemu_stopped']
+            identity['status'] = 'completed' if success else 'failed'
+            (artifacts / 'guest-identity.json').write_text(json.dumps(identity, indent=2) + '\n')
+            if success:
+                (artifacts / 'assertions.txt').write_text(
+                    'D-COLOR-HDR-KMS pass EMULATED tuna_hdr_vkms actual XR30 frameflip event, '
+                    'composed ten-bit writeback/fence/all pixels, PQ metadata readback, '
+                    '8bit/nonPQ negative atomic controls; command_exit=0; '
+                    f'image=noble-release-20261017 sha256={IMAGE_SHA256} kernel={EXPECTED_KERNEL}; '
+                    'retained raw/JSON artifacts; isolated modules unloaded; owned guest/disk/key cleanup; '
+                    'not a native compositor/capture or physical panel qualification claim\n')
+    return 0 if success else 1
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    try:
+        sys.exit(main())
+    except (OSError, RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+        print(f'ci-hdr-vkms-guest: {error}', file=sys.stderr)
+        sys.exit(1)

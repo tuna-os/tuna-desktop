@@ -251,6 +251,44 @@ pub fn calculate_scale(mode: &ModeSpec, width_mm: i32, height_mm: i32) -> f32 {
     best
 }
 
+/// Mutter's public monitor colour-mode values and monitors.xml names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ColorMode {
+    #[default]
+    Default = 0,
+    Bt2100 = 1,
+    SdrNative = 2,
+}
+
+impl ColorMode {
+    pub fn from_raw(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Default),
+            1 => Some(Self::Bt2100),
+            2 => Some(Self::SdrNative),
+            _ => None,
+        }
+    }
+
+    pub fn from_xml(value: &str) -> Option<Self> {
+        match value {
+            "default" => Some(Self::Default),
+            "bt2100" => Some(Self::Bt2100),
+            "sdr-native" => Some(Self::SdrNative),
+            _ => None,
+        }
+    }
+
+    pub fn xml(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Bt2100 => "bt2100",
+            Self::SdrNative => "sdr-native",
+        }
+    }
+}
+
 /// One connected monitor as GetCurrentState lists it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MonitorState {
@@ -265,6 +303,9 @@ pub struct MonitorState {
     pub preferred: usize,
     /// The mode it shows; `None` while it is off.
     pub current: Option<usize>,
+    pub color_mode: ColorMode,
+    /// Modes the complete connector, scanout and renderer pipeline supports.
+    pub supported_color_modes: Vec<ColorMode>,
     /// Its privacy screen (#356); `None` without one, and then
     /// GetCurrentState omits `privacy-screen-state`.
     pub privacy_screen: Option<crate::privacy_screen::ScreenState>,
@@ -342,6 +383,7 @@ impl DisplayState {
                         .map(|c| MonitorConfig {
                             spec: spec_of(c),
                             mode: mode_of(c),
+                            color_mode: self.monitor(c).map(|m| m.color_mode).unwrap_or_default(),
                         })
                         .collect(),
                 })
@@ -548,11 +590,10 @@ pub fn verify(
             if monitor.underscanning == Some(true) {
                 return Err(invalid("Underscanning requested but unsupported"));
             }
-            // GNOME Settings always sends `color-mode`; only the
-            // default (SDR) mode is supported (HDR is P-DS-03).
-            if let Some(color_mode) = monitor.color_mode.filter(|c| *c != 0) {
-                return Err(invalid(format!("Color mode {color_mode} not supported")));
-            }
+            let raw_color_mode = monitor.color_mode.unwrap_or(0);
+            let color_mode = ColorMode::from_raw(raw_color_mode)
+                .filter(|mode| state_monitor.supported_color_modes.contains(mode))
+                .ok_or_else(|| invalid(format!("Color mode {raw_color_mode} not supported")))?;
             if seen.contains(&monitor.connector.as_str()) {
                 return Err(invalid(format!(
                     "connector '{}' configured more than once",
@@ -563,6 +604,7 @@ pub fn verify(
             monitors.push(MonitorConfig {
                 spec: state_monitor.spec.clone(),
                 mode: Some(mode),
+                color_mode,
             });
         }
         let Some(first) = monitors.first() else {
@@ -692,6 +734,7 @@ pub struct OutputLayout {
 pub struct EnabledLayout {
     /// `None` keeps the current mode (an arrangement without modes).
     pub mode: Option<ModeSpec>,
+    pub color_mode: ColorMode,
     pub loc: (i32, i32),
     pub scale: f64,
     pub transform: u32,
@@ -713,6 +756,7 @@ pub fn output_layouts(config: &MonitorsConfig) -> Vec<OutputLayout> {
                 connector: monitor.spec.connector.clone(),
                 enabled: Some(EnabledLayout {
                     mode: monitor.mode,
+                    color_mode: monitor.color_mode,
                     loc: (logical.x, logical.y),
                     scale: logical.scale,
                     transform: logical.transform,
@@ -739,6 +783,7 @@ pub struct StartupConnector {
     pub name: String,
     pub modes: Vec<ModeSpec>,
     pub preferred: usize,
+    pub supported_color_modes: Vec<ColorMode>,
 }
 
 /// The layout a hardware session starts with (#59, #340): the stored
@@ -771,6 +816,9 @@ pub fn startup_layouts(
                 .mode
                 .filter(|m| c.modes.iter().any(|x| x.equals(m)))
                 .or(Some(c.modes[c.preferred]));
+            if !c.supported_color_modes.contains(&enabled.color_mode) {
+                enabled.color_mode = ColorMode::Default;
+            }
         }
     }
     if !layouts.iter().any(|l| l.enabled.is_some()) {
@@ -829,6 +877,7 @@ pub fn startup_layouts(
         }
         let enabled = EnabledLayout {
             mode: Some(c.modes[c.preferred]),
+            color_mode: ColorMode::Default,
             loc: (next_x, 0),
             scale: fallback_scale,
             transform: 0,
@@ -864,6 +913,7 @@ pub struct ConfigManager {
     history: VecDeque<MonitorsConfig>,
     pending: Option<u64>,
     generation: u64,
+    deferred_keep: bool,
 }
 
 /// What GNOME Shell's answer to the confirmation dialog does.
@@ -898,6 +948,18 @@ impl ConfigManager {
     /// pending confirmation timeout first.
     pub fn cancel_confirmation(&mut self) {
         self.pending = None;
+        self.deferred_keep = false;
+    }
+
+    /// A tested configuration failed its real hardware commit. It cannot
+    /// subsequently be confirmed or saved; retain the restored live state.
+    pub fn hardware_reverted(&mut self, live: MonitorsConfig) {
+        self.pending = None;
+        self.deferred_keep = false;
+        if self.history.front() == Some(&live) {
+            self.history.pop_front();
+        }
+        self.current = Some(live);
     }
 
     /// `meta_monitor_config_manager_set_current`: the previous
@@ -928,8 +990,23 @@ impl ConfigManager {
         }
     }
 
+    /// Keep Changes may arrive before the first real KMS commit. Record the
+    /// answer, but do not write monitors.xml until the whole layout commits.
+    pub fn defer_keep_until_commit(&mut self) {
+        self.deferred_keep = self.pending.is_some();
+    }
+
+    pub fn hardware_committed(&mut self) -> Confirmation {
+        if self.deferred_keep {
+            self.confirm(true)
+        } else {
+            Confirmation::Ignored
+        }
+    }
+
     /// `meta_monitor_manager_confirm_configuration`.
     pub fn confirm(&mut self, keep: bool) -> Confirmation {
+        self.deferred_keep = false;
         if self.pending.take().is_none() {
             return Confirmation::Ignored;
         }
@@ -943,7 +1020,7 @@ impl ConfigManager {
     /// The confirmation timeout fired (`save_config_timeout`); true
     /// when it still counts and the previous configuration returns.
     pub fn timed_out(&mut self, generation: u64) -> bool {
-        if self.pending == Some(generation) {
+        if self.pending == Some(generation) && !self.deferred_keep {
             self.pending = None;
             true
         } else {
@@ -985,6 +1062,8 @@ mod tests {
             modes,
             preferred: 0,
             current,
+            color_mode: ColorMode::Default,
+            supported_color_modes: vec![ColorMode::Default],
             privacy_screen: None,
         }
     }
@@ -1571,6 +1650,7 @@ mod tests {
             name: name.into(),
             modes,
             preferred: 0,
+            supported_color_modes: vec![ColorMode::Default],
         };
         vec![
             connector("eDP-1", vec![mode(1920, 1080, 60.0), mode(1280, 720, 60.0)]),
@@ -1622,6 +1702,7 @@ mod tests {
                 .map(|(c, m)| MonitorConfig {
                     spec: MonitorSpec::connector(c),
                     mode: *m,
+                    color_mode: crate::display_config::ColorMode::Default,
                 })
                 .collect(),
         }
@@ -1728,5 +1809,92 @@ mod tests {
                 ),
             ]
         );
+    }
+    #[test]
+    fn color_modes_survive_verification_live_state_and_hotplug_requalification() {
+        let mut state = two_monitors();
+        state.monitors[0]
+            .supported_color_modes
+            .push(ColorMode::Bt2100);
+        state.monitors[0].color_mode = ColorMode::Bt2100;
+        let mut request = request(0, 0, 1.0, true, &[("eDP-1", "1920x1080@60.000")]);
+        request.monitors[0].color_mode = Some(ColorMode::Bt2100 as u32);
+        let config = verify(&state, 7, None, &[request.clone()]).unwrap();
+        assert_eq!(config.logical[0].monitors[0].color_mode, ColorMode::Bt2100);
+        assert_eq!(
+            state.live_config().logical[0].monitors[0].color_mode,
+            ColorMode::Bt2100
+        );
+        assert_eq!(
+            output_layouts(&config)[0]
+                .enabled
+                .as_ref()
+                .unwrap()
+                .color_mode,
+            ColorMode::Bt2100
+        );
+        let mut connectors = startup_connectors();
+        connectors[0].supported_color_modes.push(ColorMode::Bt2100);
+        assert_eq!(
+            startup_layouts(Some(&config), &connectors, 1.0)[0]
+                .enabled
+                .as_ref()
+                .unwrap()
+                .color_mode,
+            ColorMode::Bt2100
+        );
+        connectors[0].supported_color_modes = vec![ColorMode::Default];
+        assert_eq!(
+            startup_layouts(Some(&config), &connectors, 1.0)[0]
+                .enabled
+                .as_ref()
+                .unwrap()
+                .color_mode,
+            ColorMode::Default
+        );
+        state.monitors[0].supported_color_modes = vec![ColorMode::Default];
+        assert!(verify(&state, 7, None, &[request.clone()]).is_err());
+        request.monitors[0].color_mode = Some(u32::MAX);
+        assert!(verify(&state, 7, None, &[request]).is_err());
+    }
+
+    #[test]
+    fn failed_hardware_commit_cannot_be_confirmed_or_persisted() {
+        let before = config(1.0);
+        let mut hdr = before.clone();
+        hdr.logical[0].monitors[0].color_mode = ColorMode::Bt2100;
+        let mut manager = ConfigManager::default();
+        manager.ensure_current(before.clone());
+        let generation = manager.applied(hdr, Method::Persistent).unwrap();
+        manager.hardware_reverted(before.clone());
+        assert_eq!(manager.current(), Some(&before));
+        assert!(!manager.awaiting_confirmation());
+        assert_eq!(manager.confirm(true), Confirmation::Ignored);
+        assert!(!manager.timed_out(generation));
+        // Reapplying and confirming SDR persists the working encoding only.
+        manager.applied(before.clone(), Method::Persistent);
+        assert_eq!(manager.confirm(true), Confirmation::Save(before));
+    }
+
+    #[test]
+    fn keep_before_commit_defers_persistence_and_failure_cancels_it() {
+        let before = config(1.0);
+        let mut hdr = before.clone();
+        hdr.logical[0].monitors[0].color_mode = ColorMode::Bt2100;
+        let mut manager = ConfigManager::default();
+        manager.ensure_current(before.clone());
+        let generation = manager.applied(hdr.clone(), Method::Persistent).unwrap();
+        manager.defer_keep_until_commit();
+        assert!(
+            !manager.timed_out(generation),
+            "the user already answered Keep"
+        );
+        manager.hardware_reverted(before.clone());
+        assert_eq!(manager.hardware_committed(), Confirmation::Ignored);
+        assert_eq!(manager.current(), Some(&before));
+        manager.applied(hdr.clone(), Method::Persistent);
+        manager.defer_keep_until_commit();
+        assert_eq!(manager.hardware_committed(), Confirmation::Save(hdr));
+        assert_eq!(manager.hardware_committed(), Confirmation::Ignored);
     }
 }

@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Rust protocol implementation following Mutter 51.0:
+// Copyright (C) 2024 SUSE Software Solutions Germany GmbH
+// Copyright (C) 2024 Red Hat
+// Copyright (C) 2025 Red Hat Inc.
+// Original Wayland colour sources are GPL-2.0-or-later; this adaptation
+// selects GPL-3.0-or-later. Distributed WITHOUT ANY WARRANTY; see LICENSE.
+//
 //! `wp_color_manager_v1` (version 2) and `wp_color_representation_manager_v1`
 //! (version 1), as Mutter 51 serves them (P-DS-03, #341).
 //!
@@ -7,14 +16,12 @@
 //!   features; gamma 2.2, gamma 2.8, PQ, BT.1886 and linear transfer
 //!   functions plus compound power 2.4 (sRGB on version 1); and the
 //!   sRGB, BT.2020, NTSC, PAL and Display P3 primaries.
-//! - Each output's image description is its colour state
-//!   ([`crate::color_state::output_params`]: Mutter's default colour
-//!   mode is the only one Tuna Desktop offers, see `display_config`),
-//!   with information. A removed output's object fails with `no_output`.
+//! - Each output's image description is its actual parametric output
+//!   encoding, with information. A removed output's object fails with
+//!   `no_output`, even if a new output reuses the connector's name.
 //! - Surface feedback reports the colour state of the surface's main
 //!   output (the primary output when it is on none), with information.
-//!   Every output has the same parameters, so `preferred_changed` never
-//!   fires, exactly as Mutter compares states before sending it.
+//!   Output encoding and placement changes update subscribed clients.
 //! - Parametric and ICC creators build image descriptions without
 //!   information, with Mutter's validation and errors (mastering
 //!   primaries and luminances are unsupported, max-CLL/FALL ignored,
@@ -252,7 +259,9 @@ pub(crate) fn damage_changed(surface: &WlSurface) {
 
 /// The EGL import conversion for a surface's YCbCr buffers. Unset
 /// coefficients are BT.709 limited, Mutter's default. Identity has no
-/// EGL hint, so it falls back to the driver default (a divergence).
+/// EGL hint: the colour renderer samples raw component views instead,
+/// refusing layouts/modifiers it cannot preserve rather than guessing
+/// the driver's conversion or inverting a potentially clipped sample.
 fn yuv_conversion(coefficients: Coefficients) -> Option<smithay::backend::egl::YuvConversion> {
     use smithay::backend::egl::{YuvColorSpace as S, YuvConversion, YuvRange as R};
     let (color_space, range) = match coefficients {
@@ -311,8 +320,10 @@ pub(crate) struct ColorManagement {
     default: Arc<ColorState>,
     /// Each output's colour state, by output name.
     outputs: Vec<(String, Arc<ColorState>)>,
-    /// Surfaces that ever had a colour object: what the renderer looks
-    /// at each frame.
+    /// Live output protocol objects, for `image_description_changed`.
+    output_objects: Vec<WpColorManagementOutputV1>,
+    /// All live surfaces, including clients without colour objects:
+    /// unmanaged content still needs a transform on a non-default output.
     surfaces: Vec<Weak<WlSurface>>,
     /// Version 1 `ready`/`preferred_changed` identities
     /// (`get_image_description_id`): per state, freed ids reused lowest
@@ -334,6 +345,7 @@ impl ColorManagement {
             ),
             default: ColorState::params(color_state::default_params()),
             outputs: Vec::new(),
+            output_objects: Vec::new(),
             surfaces: Vec::new(),
             v1_ids: Vec::new(),
             v1_free: BTreeSet::new(),
@@ -362,7 +374,7 @@ impl ColorManagement {
         self.outputs.retain(|(n, _)| n != name);
     }
 
-    fn track(&mut self, surface: &WlSurface) {
+    pub(crate) fn track(&mut self, surface: &WlSurface) {
         self.surfaces.retain(|weak| weak.upgrade().is_ok());
         if !self
             .surfaces
@@ -379,7 +391,7 @@ impl ColorManagement {
             .retain(|weak| weak.upgrade().is_ok_and(|s| s != *surface));
     }
 
-    /// Live surfaces that ever had a colour object.
+    /// Live surfaces, including surfaces without an explicit image description.
     pub(crate) fn tracked_surfaces(&self) -> impl Iterator<Item = WlSurface> + '_ {
         self.surfaces.iter().filter_map(|weak| weak.upgrade().ok())
     }
@@ -611,6 +623,58 @@ fn send_supported(resource: &WpColorManagerV1) {
 }
 
 impl State {
+    /// Publish an output encoding only after the native backend has
+    /// admitted its actual render/scanout path. Existing descriptions
+    /// remain immutable; subscribers request a new one after the event.
+    pub fn set_output_color_state(&mut self, name: &str, params: Params) -> bool {
+        let color = ColorState::params(params);
+        let old = self.protocols.color.output_state(name);
+        if old.equals(&color) {
+            return false;
+        }
+        if let Some((_, state)) = self
+            .protocols
+            .color
+            .outputs
+            .iter_mut()
+            .find(|(n, _)| n == name)
+        {
+            *state = color;
+        }
+        self.protocols
+            .color
+            .output_objects
+            .retain(Resource::is_alive);
+        let output = self
+            .outputs
+            .iter()
+            .find(|entry| entry.name == name)
+            .and_then(|entry| entry.output.as_ref());
+        for object in &self.protocols.color.output_objects {
+            if object.data::<OutputData>().and_then(|data| data.0.as_ref()) == output
+                && output.is_some()
+            {
+                object.image_description_changed();
+            }
+        }
+        self.refresh_color_preferences();
+        true
+    }
+
+    /// Re-evaluate feedback after window movement, output layout changes
+    /// or a colour-mode transition, not just at object creation.
+    pub(crate) fn refresh_color_preferences(&mut self) {
+        let surfaces: Vec<_> = self
+            .protocols
+            .color
+            .tracked_surfaces()
+            .filter(has_feedback)
+            .collect();
+        for surface in surfaces {
+            self.update_preferred(&surface);
+        }
+    }
+
     /// Answer the `get_information` requests of the last dispatch; call
     /// after `Display::dispatch_clients`, before flushing.
     pub fn send_color_information(&mut self) {
@@ -639,11 +703,20 @@ impl State {
                     .or_else(|| self.primary_output_name());
             }
             if let Some(loc) = self.window_origins.get(&surface) {
-                let rect = smithay::utils::Rectangle::new(*loc, (1, 1).into());
+                let size = smithay::backend::renderer::utils::with_renderer_surface_state(
+                    &surface,
+                    |state| state.surface_size(),
+                )
+                .flatten()
+                .unwrap_or_else(|| (1, 1).into());
+                let rect = smithay::utils::Rectangle::new(*loc, size);
+                let monitor = self.monitor_geometry(rect);
                 return self
                     .outputs
                     .iter()
-                    .find(|e| smithay::utils::Rectangle::new(e.loc.into(), e.size).overlaps(rect))
+                    .find(|entry| {
+                        smithay::utils::Rectangle::new(entry.loc.into(), entry.size) == monitor
+                    })
                     .map(|e| e.name.clone())
                     .or_else(|| self.primary_output_name());
             }
@@ -700,6 +773,34 @@ impl State {
     /// `meta_wayland_color_representation_commit_check`, after the
     /// commit applied: YCbCr coefficients need a YCbCr buffer, a chroma
     /// location a 4:2:0 one.
+    pub(crate) fn check_color_representation_tree(&mut self, surface: &WlSurface) {
+        if compositor::is_sync_subsurface(surface) {
+            return;
+        }
+        let mut represented = Vec::new();
+        compositor::with_surface_tree_upward(
+            surface,
+            (),
+            |_, _, _| compositor::TraversalAction::DoChildren(()),
+            |surface, states, _| {
+                if states
+                    .data_map
+                    .get::<SurfaceObjectsData>()
+                    .is_some_and(|objects| objects.lock().unwrap().representation.is_some())
+                {
+                    represented.push(surface.clone());
+                }
+            },
+            |_, _, _| true,
+        );
+        // Tree callbacks hold Smithay's surface mutex. Validation reads
+        // renderer/cached state through with_states, so it must run only
+        // after the traversal releases those locks.
+        for surface in represented {
+            self.check_color_representation(&surface);
+        }
+    }
+
     pub(crate) fn check_color_representation(&mut self, surface: &WlSurface) {
         let Some(resource) = with_objects(surface, |o| o.representation.clone()) else {
             return;
@@ -727,6 +828,51 @@ impl State {
                  YCbCr pixel format and a buffer with an RGB pixel format",
             );
         }
+        if is_ycbcr(format)
+            && matches!(
+                committed.coefficients,
+                Coefficients::IdentityFull | Coefficients::IdentityLimited
+            )
+        {
+            use smithay::backend::renderer::utils::with_renderer_surface_state;
+            let supported = with_renderer_surface_state(surface, |state| {
+                state.buffer().is_none_or(|buffer| {
+                    smithay::wayland::dmabuf::get_dmabuf(buffer)
+                        .is_ok_and(crate::color_render::identity_ycbcr_supported)
+                })
+            })
+            .unwrap_or(false);
+            if !supported {
+                reject_identity_ycbcr(
+                    surface,
+                    "The identity coefficient layout or modifier cannot be sampled as raw channels",
+                );
+            }
+        }
+    }
+}
+
+fn has_feedback(surface: &WlSurface) -> bool {
+    with_states(surface, |states| {
+        states
+            .data_map
+            .get::<SurfaceObjectsData>()
+            .is_some_and(|objects| {
+                objects
+                    .lock()
+                    .unwrap()
+                    .feedback
+                    .iter()
+                    .any(Resource::is_alive)
+            })
+    })
+}
+
+/// Refuse an identity YCbCr import which cannot preserve raw channel
+/// values. Guessing an EGL conversion would change the client's content.
+pub(crate) fn reject_identity_ycbcr(surface: &WlSurface, message: &str) {
+    if let Some(resource) = with_objects(surface, |objects| objects.representation.clone()) {
+        resource.post_error(repr::Error::PixelFormat, message);
     }
 }
 
@@ -861,7 +1007,13 @@ impl Dispatch<WpColorManagerV1, ()> for State {
     ) {
         match request {
             manager::Request::GetOutput { id, output } => {
-                init.init(id, OutputData(Output::from_resource(&output)));
+                let object = init.init(id, OutputData(Output::from_resource(&output)));
+                state
+                    .protocols
+                    .color
+                    .output_objects
+                    .retain(Resource::is_alive);
+                state.protocols.color.output_objects.push(object);
             }
             manager::Request::GetSurface { id, surface } => {
                 let object = init.init(id, SurfaceData(surface.downgrade()));
@@ -934,11 +1086,13 @@ impl Dispatch<WpColorManagementOutputV1, OutputData> for State {
     ) {
         if let cm_output::Request::GetImageDescription { image_description } = request {
             let resource = init.init(image_description, ImageDescription::default());
-            let name = data
-                .0
-                .as_ref()
-                .map(Output::name)
-                .filter(|name| state.outputs.iter().any(|e| &e.name == name));
+            let name = data.0.as_ref().and_then(|output| {
+                state
+                    .outputs
+                    .iter()
+                    .find(|entry| entry.output.as_ref() == Some(output))
+                    .map(|entry| entry.name.clone())
+            });
             match name {
                 Some(name) => {
                     let color = state.protocols.color.output_state(&name);

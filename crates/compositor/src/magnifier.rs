@@ -1064,24 +1064,34 @@ impl MagnifierState {
 /// kept across frames and recreated on a size change.
 #[derive(Default)]
 pub struct ZoomTargets {
-    outputs: HashMap<String, [Option<GlesTexture>; 2]>,
+    outputs: HashMap<String, (bool, [Option<GlesTexture>; 2])>,
 }
 
 fn sized(
     slot: &mut Option<GlesTexture>,
     renderer: &mut GlesRenderer,
     size: (i32, i32),
+    format: Fourcc,
 ) -> Result<GlesTexture, GlesError> {
     let want: Size<i32, BufferCoords> = (size.0.max(1), size.1.max(1)).into();
     if let Some(texture) = slot.as_ref().filter(|t| t.size() == want) {
         return Ok(texture.clone());
     }
-    let texture: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, want)?;
+    let texture: GlesTexture = renderer.create_buffer(format, want)?;
     *slot = Some(texture.clone());
     Ok(texture)
 }
 
 impl ZoomTargets {
+    /// Native HDR must not clip extended blending values in the magnifier's
+    /// intermediate textures before the final output encoding pass.
+    pub(crate) fn set_hdr(&mut self, output: &str, hdr: bool) {
+        let entry = self.outputs.entry(output.to_owned()).or_default();
+        if entry.0 != hdr {
+            *entry = (hdr, [None, None]);
+        }
+    }
+
     /// The scene (output-sized) and zoom (content-sized) textures.
     pub fn textures(
         &mut self,
@@ -1089,9 +1099,14 @@ impl ZoomTargets {
         output: &str,
         plan: &ZoomPlan,
     ) -> Result<(GlesTexture, GlesTexture), GlesError> {
-        let [scene, zoom] = self.outputs.entry(output.to_owned()).or_default();
-        let scene = sized(scene, renderer, plan.output)?;
-        let zoom = sized(zoom, renderer, (plan.content.2, plan.content.3))?;
+        let (hdr, [scene, zoom]) = self.outputs.entry(output.to_owned()).or_default();
+        let format = if *hdr {
+            Fourcc::Abgr16161616f
+        } else {
+            Fourcc::Abgr8888
+        };
+        let scene = sized(scene, renderer, plan.output, format)?;
+        let zoom = sized(zoom, renderer, (plan.content.2, plan.content.3), format)?;
         Ok((scene, zoom))
     }
 
@@ -1253,9 +1268,9 @@ const SHADER: &str = r#"#version 100
 #endif
 precision mediump float;
 #if defined(EXTERNAL)
-uniform samplerExternalOES tex;
+uniform highp samplerExternalOES tex;
 #else
-uniform sampler2D tex;
+uniform highp sampler2D tex;
 #endif
 uniform float alpha;
 uniform float desaturation;

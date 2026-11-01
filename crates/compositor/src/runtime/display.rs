@@ -52,6 +52,8 @@ impl Runtime {
                         }],
                         preferred: 0,
                         current: Some(0),
+                        color_mode: display_config::ColorMode::Default,
+                        supported_color_modes: vec![display_config::ColorMode::Default],
                         privacy_screen: None,
                     }],
                     logical: vec![LogicalState {
@@ -73,6 +75,10 @@ impl Runtime {
     /// (cheap otherwise); a new state bumps the serial and announces
     /// MonitorsChanged.
     pub(super) fn publish_display_state(&mut self) {
+        #[cfg(feature = "drm")]
+        let mut hardware_reverted = false;
+        #[cfg(feature = "drm")]
+        let mut hardware_committed = false;
         let key = match &mut self.backend {
             Backend::Winit(backend) => {
                 let size = self
@@ -87,17 +93,36 @@ impl Runtime {
             Backend::Drm(drm) => {
                 if drm.take_mode_reverted() {
                     self.display_published = None;
+                    hardware_reverted = true;
                 }
+                // Hotplug invalidates pending confirmations too: never save
+                // a pre-hotplug HDR request after a sink was replaced.
+                hardware_reverted |= drm.take_connectors_changed();
+                hardware_committed = !drm.configuration_pending();
                 (0, 0, drm.layout_generation())
             }
         };
         #[cfg(feature = "drm")]
-        if self.display_published.is_none() {
-            // A refused commit changed an output's size.
-            self.sync_drm_outputs();
+        if hardware_reverted {
+            self.display_configs
+                .hardware_reverted(self.display_state().live_config());
+        }
+        #[cfg(feature = "drm")]
+        if hardware_committed {
+            let confirmation = self.display_configs.hardware_committed();
+            self.handle_display_confirmation(confirmation);
         }
         if self.display_published == Some(key) {
             return;
+        }
+        #[cfg(feature = "drm")]
+        {
+            self.sync_drm_outputs();
+            if let Backend::Drm(drm) = &self.backend {
+                for (name, params) in drm.output_colour_states() {
+                    self.state.set_output_color_state(&name, params);
+                }
+            }
         }
         self.display_published = Some(key);
         self.display_share.publish(self.display_state());
@@ -178,7 +203,20 @@ impl Runtime {
     /// "Keep Changes" saves the configuration, "Revert Settings"
     /// restores the previous one.
     pub(super) fn complete_display_change(&mut self, keep: bool) {
-        match self.display_configs.confirm(keep) {
+        // Consume failed native commits before a fast confirmation can save
+        // a configuration that the kernel never displayed.
+        self.publish_display_state();
+        #[cfg(feature = "drm")]
+        if keep && matches!(&self.backend, Backend::Drm(drm) if drm.configuration_pending()) {
+            self.display_configs.defer_keep_until_commit();
+            return;
+        }
+        let confirmation = self.display_configs.confirm(keep);
+        self.handle_display_confirmation(confirmation);
+    }
+
+    fn handle_display_confirmation(&mut self, confirmation: Confirmation) {
+        match confirmation {
             Confirmation::Ignored => {}
             Confirmation::Save(config) => match crate::monitors::save(&config) {
                 Ok(path) => eprintln!(
@@ -350,6 +388,7 @@ impl Runtime {
         // Anchored layer surfaces (the panel) follow a new mode now,
         // not on their next commit.
         crate::layer::arrange_after_commit(&self.state);
+        self.refresh_colord_monitors();
     }
 
     /// The display configuration for the proof state file: the serial,

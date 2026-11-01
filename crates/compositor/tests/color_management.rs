@@ -20,13 +20,17 @@ use wayland_client::{
         wl_registry::{self, WlRegistry},
         wl_shm::{self, WlShm},
         wl_shm_pool::WlShmPool,
+        wl_subcompositor::WlSubcompositor,
+        wl_subsurface::WlSubsurface,
         wl_surface::WlSurface,
     },
     Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
 };
 use wayland_protocols::wp::color_management::v1::client::{
-    wp_color_management_output_v1::WpColorManagementOutputV1,
-    wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1,
+    wp_color_management_output_v1::{self as cm_output, WpColorManagementOutputV1},
+    wp_color_management_surface_feedback_v1::{
+        self as cm_feedback, WpColorManagementSurfaceFeedbackV1,
+    },
     wp_color_management_surface_v1::{self as cm_surface, WpColorManagementSurfaceV1},
     wp_color_manager_v1::{self as manager, WpColorManagerV1},
     wp_image_description_creator_icc_v1::{self as creator_icc, WpImageDescriptionCreatorIccV1},
@@ -76,6 +80,8 @@ struct Client {
     repr_done: bool,
     fates: HashMap<u32, Fate>,
     infos: HashMap<u32, Vec<Info>>,
+    output_changes: usize,
+    preferred_changes: Vec<u64>,
 }
 
 impl Dispatch<WlRegistry, ()> for Client {
@@ -219,15 +225,51 @@ impl Dispatch<WpImageDescriptionInfoV1, u32> for Client {
     }
 }
 
+impl Dispatch<WpColorManagementOutputV1, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &WpColorManagementOutputV1,
+        event: cm_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let cm_output::Event::ImageDescriptionChanged = event {
+            state.output_changes += 1;
+        }
+    }
+}
+
+impl Dispatch<WpColorManagementSurfaceFeedbackV1, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &WpColorManagementSurfaceFeedbackV1,
+        event: cm_feedback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let identity = match event {
+            cm_feedback::Event::PreferredChanged { identity } => u64::from(identity),
+            cm_feedback::Event::PreferredChanged2 {
+                identity_hi,
+                identity_lo,
+            } => (u64::from(identity_hi) << 32) | u64::from(identity_lo),
+            _ => return,
+        };
+        state.preferred_changes.push(identity);
+    }
+}
+
 wayland_client::delegate_noop!(Client: ignore WlCompositor);
 wayland_client::delegate_noop!(Client: ignore WlSurface);
+wayland_client::delegate_noop!(Client: ignore WlSubcompositor);
+wayland_client::delegate_noop!(Client: ignore WlSubsurface);
 wayland_client::delegate_noop!(Client: ignore WlOutput);
 wayland_client::delegate_noop!(Client: ignore WlShm);
 wayland_client::delegate_noop!(Client: ignore WlShmPool);
 wayland_client::delegate_noop!(Client: ignore WlBuffer);
-wayland_client::delegate_noop!(Client: ignore WpColorManagementOutputV1);
 wayland_client::delegate_noop!(Client: ignore WpColorManagementSurfaceV1);
-wayland_client::delegate_noop!(Client: ignore WpColorManagementSurfaceFeedbackV1);
 wayland_client::delegate_noop!(Client: ignore WpImageDescriptionCreatorIccV1);
 wayland_client::delegate_noop!(Client: ignore WpImageDescriptionCreatorParamsV1);
 wayland_client::delegate_noop!(Client: ignore WpColorRepresentationSurfaceV1);
@@ -378,6 +420,102 @@ fn assert_srgb_gamma22_sdr(events: &[Info]) {
         assert!((got - want).abs() <= 1, "{primaries:?}");
     }
     assert!(events.contains(&Info::TargetPrimaries(primaries)));
+}
+
+#[test]
+fn output_encoding_changes_notify_clients_and_preserve_old_descriptions() {
+    use tuna_compositor::color_state;
+    for version in [1, 2] {
+        let (mut comp, mut manager, mut peer) = peer();
+        let cm: WpColorManagerV1 = peer.bind(version);
+        let compositor: WlCompositor = peer.bind(6);
+        let output: WlOutput = peer.bind(4);
+        let surface = compositor.create_surface(&peer.qh(), ());
+        let feedback = cm.get_surface_feedback(&surface, &peer.qh(), ());
+        let color_output = cm.get_output(&output, &peer.qh(), ());
+        let old = color_output.get_image_description(&peer.qh(), 11);
+        pump(&mut comp, &mut manager, &mut peer);
+        old.get_information(&peer.qh(), 11);
+        pump(&mut comp, &mut manager, &mut peer);
+        let old_identity = peer.client.fates[&11].clone();
+        assert_srgb_gamma22_sdr(&peer.client.infos[&11]);
+        assert!(peer.client.preferred_changes.is_empty());
+
+        assert!(comp
+            .state
+            .set_output_color_state("tuna-0", color_state::hdr_output_params()));
+        pump(&mut comp, &mut manager, &mut peer);
+        assert_eq!(peer.client.output_changes, 1);
+        assert_eq!(peer.client.preferred_changes.len(), 1);
+        let new = color_output.get_image_description(&peer.qh(), 12);
+        let preferred = feedback.get_preferred(&peer.qh(), 13);
+        pump(&mut comp, &mut manager, &mut peer);
+        new.get_information(&peer.qh(), 12);
+        preferred.get_information(&peer.qh(), 13);
+        pump(&mut comp, &mut manager, &mut peer);
+        assert_eq!(peer.client.fates[&12], peer.client.fates[&13]);
+        assert_ne!(peer.client.fates[&12], old_identity);
+        assert_eq!(peer.client.fates[&11], old_identity);
+        for tag in [12, 13] {
+            assert!(
+                peer.client.infos[&tag].contains(&Info::PrimariesNamed(WEnum::Value(
+                    manager::Primaries::Bt2020
+                ),))
+            );
+            assert!(
+                peer.client.infos[&tag].contains(&Info::TfNamed(WEnum::Value(
+                    manager::TransferFunction::St2084Pq
+                ),))
+            );
+        }
+        assert!(!comp
+            .state
+            .set_output_color_state("tuna-0", color_state::hdr_output_params()));
+        pump(&mut comp, &mut manager, &mut peer);
+        assert_eq!(peer.client.output_changes, 1);
+        assert_eq!(peer.client.preferred_changes.len(), 1);
+
+        assert!(comp
+            .state
+            .set_output_color_state("tuna-0", color_state::output_params()));
+        pump(&mut comp, &mut manager, &mut peer);
+        assert_eq!(peer.client.output_changes, 2);
+        assert_eq!(peer.client.preferred_changes.len(), 2);
+        let restored = color_output.get_image_description(&peer.qh(), 14);
+        pump(&mut comp, &mut manager, &mut peer);
+        restored.get_information(&peer.qh(), 14);
+        pump(&mut comp, &mut manager, &mut peer);
+        assert_srgb_gamma22_sdr(&peer.client.infos[&14]);
+        assert_eq!(peer.error(), None);
+    }
+}
+
+#[test]
+fn removed_output_description_stays_inert_when_connector_name_is_reused() {
+    let (mut comp, mut manager, mut peer) = peer();
+    let cm: WpColorManagerV1 = peer.bind(2);
+    let output: WlOutput = peer.bind(4);
+    let old = cm.get_output(&output, &peer.qh(), ());
+    pump(&mut comp, &mut manager, &mut peer);
+    assert!(comp.state.remove_output("tuna-0"));
+    let replacement = Output::new(
+        "tuna-0".to_owned(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Tuna Desktop".to_owned(),
+            model: "Replacement".to_owned(),
+        },
+    );
+    comp.state
+        .add_output("tuna-0", Some(replacement), 1280, 800);
+    old.get_image_description(&peer.qh(), 15);
+    pump(&mut comp, &mut manager, &mut peer);
+    assert!(matches!(
+        peer.client.fates.get(&15),
+        Some(Fate::Failed(WEnum::Value(image_desc::Cause::NoOutput), _))
+    ));
+    assert_eq!(peer.error(), None);
 }
 
 #[test]
@@ -842,4 +980,40 @@ fn color_representation_follows_mutter() {
         }),
         expect(SURFACE, repr::Error::Inert as u32)
     );
+}
+
+#[test]
+fn synchronized_children_validate_representation_when_parent_applies_the_buffer() {
+    for chroma in [false, true] {
+        let (mut comp, mut manager, mut peer) = peer();
+        let compositor: WlCompositor = peer.bind(6);
+        let subcompositor: WlSubcompositor = peer.bind(1);
+        let representation: WpColorRepresentationManagerV1 = peer.bind(1);
+        let parent = compositor.create_surface(&peer.qh(), ());
+        let child = compositor.create_surface(&peer.qh(), ());
+        let _role = subcompositor.get_subsurface(&child, &parent, &peer.qh(), ());
+        let color = representation.get_surface(&child, &peer.qh(), ());
+        if chroma {
+            color.set_chroma_location(repr::ChromaLocation::Type0);
+        } else {
+            color.set_coefficients_and_range(repr::Coefficients::Bt709, repr::Range::Limited);
+        }
+        attach_rgb(&peer, &child);
+        child.commit();
+        pump(&mut comp, &mut manager, &mut peer);
+        assert_eq!(
+            peer.error(),
+            None,
+            "synchronized state has not taken effect"
+        );
+        parent.commit();
+        pump(&mut comp, &mut manager, &mut peer);
+        assert_eq!(
+            peer.error(),
+            expect(
+                "wp_color_representation_surface_v1",
+                repr::Error::PixelFormat as u32
+            )
+        );
+    }
 }

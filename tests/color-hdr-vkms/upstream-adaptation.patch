@@ -1,0 +1,219 @@
+--- a/drivers/gpu/drm/vkms/Makefile
++++ b/drivers/gpu/drm/vkms/Makefile
+@@ -1,11 +1,12 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-vkms-y := \
++tuna_hdr_vkms-y := \
+ 	vkms_drv.o \
+ 	vkms_plane.o \
+ 	vkms_output.o \
+ 	vkms_formats.o \
+ 	vkms_crtc.o \
+ 	vkms_composer.o \
+-	vkms_writeback.o
++	vkms_writeback.o \
++	tuna_hdr.o
+ 
+-obj-$(CONFIG_DRM_VKMS) += vkms.o
++obj-m += tuna_hdr_vkms.o
+--- a/drivers/gpu/drm/vkms/vkms_drv.c
++++ b/drivers/gpu/drm/vkms/vkms_drv.c
+@@ -17,7 +17,6 @@
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_drv.h>
+-#include <drm/drm_fbdev_generic.h>
+ #include <drm/drm_file.h>
+ #include <drm/drm_gem_framebuffer_helper.h>
+ #include <drm/drm_ioctl.h>
+@@ -27,12 +26,13 @@
+ #include <drm/drm_vblank.h>
+ 
+ #include "vkms_drv.h"
++#include "tuna_hdr.h"
+ 
+ #include <drm/drm_print.h>
+ #include <drm/drm_debugfs.h>
+ 
+-#define DRIVER_NAME	"vkms"
+-#define DRIVER_DESC	"Virtual Kernel Mode Setting"
++#define DRIVER_NAME	"tuna_hdr_vkms"
++#define DRIVER_DESC	"Tuna EMULATED HDR10 sink (qualification only)"
+ #define DRIVER_DATE	"20180514"
+ #define DRIVER_MAJOR	1
+ #define DRIVER_MINOR	0
+@@ -124,7 +124,11 @@
+ {
+ 	struct drm_crtc *crtc;
+ 	struct drm_crtc_state *new_crtc_state;
+-	int i;
++	int i, ret;
++
++	ret = tuna_hdr_atomic_check(dev, state);
++	if (ret)
++		return ret;
+ 
+ 	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
+ 		if (!new_crtc_state->gamma_lut || !new_crtc_state->color_mgmt_changed)
+@@ -222,8 +226,8 @@
+ 	ret = drm_dev_register(&vkms_device->drm, 0);
+ 	if (ret)
+ 		goto out_devres;
+-
+-	drm_fbdev_generic_setup(&vkms_device->drm, 0);
++	tuna_hdr_set_registered_device(&vkms_device->drm);
++
+ 
+ 	return 0;
+ 
+@@ -267,6 +271,7 @@
+ 
+ 	pdev = config->dev->platform;
+ 
++	tuna_hdr_set_registered_device(NULL);
+ 	drm_dev_unregister(&config->dev->drm);
+ 	drm_atomic_helper_shutdown(&config->dev->drm);
+ 	devres_release_group(&pdev->dev, NULL);
+--- a/drivers/gpu/drm/vkms/vkms_plane.c
++++ b/drivers/gpu/drm/vkms/vkms_plane.c
+@@ -15,6 +15,8 @@
+ static const u32 vkms_formats[] = {
+ 	DRM_FORMAT_ARGB8888,
+ 	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_XRGB2101010,
++	DRM_FORMAT_ARGB2101010,
+ 	DRM_FORMAT_XRGB16161616,
+ 	DRM_FORMAT_ARGB16161616,
+ 	DRM_FORMAT_RGB565
+--- a/drivers/gpu/drm/vkms/vkms_output.c
++++ b/drivers/gpu/drm/vkms/vkms_output.c
+@@ -1,14 +1,16 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ 
+ #include "vkms_drv.h"
++#include "tuna_hdr.h"
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_edid.h>
+ #include <drm/drm_probe_helper.h>
+ 
+ static const struct drm_connector_funcs vkms_connector_funcs = {
+ 	.fill_modes = drm_helper_probe_single_connector_modes,
++	.detect = tuna_hdr_detect,
+ 	.destroy = drm_connector_cleanup,
+-	.reset = drm_atomic_helper_connector_reset,
++	.reset = tuna_hdr_connector_reset,
+ 	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
+ 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
+ };
+@@ -17,14 +19,10 @@
+ 	.destroy = drm_encoder_cleanup,
+ };
+ 
++
+ static int vkms_conn_get_modes(struct drm_connector *connector)
+ {
+-	int count;
+-
+-	count = drm_add_modes_noedid(connector, XRES_MAX, YRES_MAX);
+-	drm_set_preferred_mode(connector, XRES_DEF, YRES_DEF);
+-
+-	return count;
++	return tuna_hdr_get_modes(connector);
+ }
+ 
+ static const struct drm_connector_helper_funcs vkms_conn_helper_funcs = {
+@@ -88,6 +86,11 @@
+ 	}
+ 
+ 	drm_connector_helper_add(connector, &vkms_conn_helper_funcs);
++	connector->polled = DRM_CONNECTOR_POLL_HPD;
++
++	ret = tuna_hdr_connector_init(connector);
++	if (ret)
++		goto err_encoder;
+ 
+ 	ret = drm_encoder_init(dev, encoder, &vkms_encoder_funcs,
+ 			       DRM_MODE_ENCODER_VIRTUAL, NULL);
+--- a/drivers/gpu/drm/vkms/vkms_formats.c
++++ b/drivers/gpu/drm/vkms/vkms_formats.c
+@@ -2,6 +2,7 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/minmax.h>
++#include <asm/unaligned.h>
+ 
+ #include <drm/drm_blend.h>
+ #include <drm/drm_rect.h>
+@@ -51,6 +52,39 @@
+ 	return x;
+ }
+ 
++/* Preserve all ten bits through VKMS's u16 composer and writeback. */
++static void ARGB2101010_to_argb_u16(u8 *src, struct pixel_argb_u16 *out)
++{
++	u32 pixel = get_unaligned_le32(src);
++
++	out->a = (pixel >> 30) * 21845;
++	out->r = DIV_ROUND_CLOSEST(((pixel >> 20) & 1023) * 65535, 1023);
++	out->g = DIV_ROUND_CLOSEST(((pixel >> 10) & 1023) * 65535, 1023);
++	out->b = DIV_ROUND_CLOSEST((pixel & 1023) * 65535, 1023);
++}
++
++static void XRGB2101010_to_argb_u16(u8 *src, struct pixel_argb_u16 *out)
++{
++	ARGB2101010_to_argb_u16(src, out);
++	out->a = 65535;
++}
++
++static void argb_u16_to_ARGB2101010(u8 *dst, struct pixel_argb_u16 *in)
++{
++	u32 a = DIV_ROUND_CLOSEST(in->a, 21845);
++	u32 r = DIV_ROUND_CLOSEST(in->r * 1023, 65535);
++	u32 g = DIV_ROUND_CLOSEST(in->g * 1023, 65535);
++	u32 b = DIV_ROUND_CLOSEST(in->b * 1023, 65535);
++
++	put_unaligned_le32((a << 30) | (r << 20) | (g << 10) | b, dst);
++}
++
++static void argb_u16_to_XRGB2101010(u8 *dst, struct pixel_argb_u16 *in)
++{
++	argb_u16_to_ARGB2101010(dst, in);
++	put_unaligned_le32(get_unaligned_le32(dst) | 0xc0000000, dst);
++}
++
+ static void ARGB8888_to_argb_u16(u8 *src_pixels, struct pixel_argb_u16 *out_pixel)
+ {
+ 	/*
+@@ -230,6 +264,10 @@
+ void *get_pixel_conversion_function(u32 format)
+ {
+ 	switch (format) {
++	case DRM_FORMAT_ARGB2101010:
++		return &ARGB2101010_to_argb_u16;
++	case DRM_FORMAT_XRGB2101010:
++		return &XRGB2101010_to_argb_u16;
+ 	case DRM_FORMAT_ARGB8888:
+ 		return &ARGB8888_to_argb_u16;
+ 	case DRM_FORMAT_XRGB8888:
+@@ -248,6 +286,10 @@
+ void *get_pixel_write_function(u32 format)
+ {
+ 	switch (format) {
++	case DRM_FORMAT_ARGB2101010:
++		return &argb_u16_to_ARGB2101010;
++	case DRM_FORMAT_XRGB2101010:
++		return &argb_u16_to_XRGB2101010;
+ 	case DRM_FORMAT_ARGB8888:
+ 		return &argb_u16_to_ARGB8888;
+ 	case DRM_FORMAT_XRGB8888:
+--- a/drivers/gpu/drm/vkms/vkms_writeback.c
++++ b/drivers/gpu/drm/vkms/vkms_writeback.c
+@@ -17,6 +17,8 @@
+ static const u32 vkms_wb_formats[] = {
+ 	DRM_FORMAT_ARGB8888,
+ 	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_XRGB2101010,
++	DRM_FORMAT_ARGB2101010,
+ 	DRM_FORMAT_XRGB16161616,
+ 	DRM_FORMAT_ARGB16161616,
+ 	DRM_FORMAT_RGB565

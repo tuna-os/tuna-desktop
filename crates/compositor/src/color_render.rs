@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Colour pipeline adapted from Mutter/Clutter:
+// Copyright (C) 2022 Intel Corporation
+// Copyright (C) 2023-2026 Red Hat Inc.
+// Copyright (C) 2024 SUSE SOFTWARE SOLUTIONS GERMANY GMBH
+// Representation reference: Copyright (C) 2018 Barco NV,
+// authored by Niels De Graef; GPL-2.0-or-later, selecting GPL-3.0-or-later.
+// Clutter LGPL-2.0-or-later portions are used under GPL-3.0-or-later
+// pursuant to LGPL v2 section 3. See the repository LICENSE and protocol docs.
 //! Surfaces drawn through their colour transform (P-DS-03, #341).
 //!
 //! Mutter attaches each surface's colour pipeline to its texture's Cogl
@@ -27,11 +36,15 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
+use smithay::backend::allocator::{
+    dmabuf::{Dmabuf, DmabufFlags, WeakDmabuf},
+    Buffer as AllocatorBuffer, Fourcc, Modifier,
+};
 use smithay::backend::renderer::{
     element::{Id, RenderElement},
     gles::{
-        ffi, GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform, UniformName, UniformType,
-        UniformValue,
+        ffi, GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform, UniformName,
+        UniformType, UniformValue,
     },
     utils::with_renderer_surface_state,
     Color32F,
@@ -44,6 +57,13 @@ use crate::color_state::{self, Decode, Encode, Transform, LUT_3D_SIZE, TRC_SAMPL
 use crate::wellbeing_effects::FrameColor;
 use crate::State;
 
+mod raw;
+pub(crate) use raw::identity_ycbcr_supported;
+use raw::{raw_planes, RawPlanes};
+
+#[cfg(all(test, feature = "drm"))]
+mod raw_tests;
+
 /// How one surface is drawn.
 #[derive(Debug, Clone)]
 enum Entry {
@@ -52,9 +72,13 @@ enum Entry {
     Texture {
         uniforms: Vec<Uniform<'static>>,
         lut: Option<u32>,
+        raw: Option<Rc<RawPlanes>>,
     },
     /// A single-pixel buffer, colour already transformed.
     Solid(Color32F),
+    /// A representation that cannot be sampled exactly must never use
+    /// the ordinary driver's guessed YUV conversion.
+    Refused,
 }
 
 /// What the surfaces of one frame need beyond the default texture
@@ -86,10 +110,6 @@ impl ColorFrame {
         state: &mut State,
         output: Option<&str>,
     ) -> Self {
-        let surfaces: Vec<WlSurface> = state.protocols.color.tracked_surfaces().collect();
-        if surfaces.is_empty() {
-            return Self::default();
-        }
         let output = output
             .map(str::to_owned)
             .or_else(|| state.primary_output_name());
@@ -97,32 +117,76 @@ impl ColorFrame {
             Some(name) => state.protocols.color.output_state(&name),
             None => state.protocols.color.default_state().clone(),
         };
+        Self::for_target(renderer, state, target)
+    }
+
+    /// Capture uses its own negotiated SDR BT.709/gamma-2.2 target, not
+    /// the monitor's ICC profile or HDR scanout state.
+    pub(crate) fn for_capture(renderer: &mut GlesRenderer, state: &mut State) -> Self {
+        Self::for_target(renderer, state, capture_target())
+    }
+
+    pub(crate) fn for_target(
+        renderer: &mut GlesRenderer,
+        state: &mut State,
+        target: Arc<color_state::ColorState>,
+    ) -> Self {
+        raw::prune(renderer);
+        let source_default = state.protocols.color.default_state().clone();
         let mut wanted = Vec::new();
-        for surface in surfaces {
+        for surface in state.protocols.color.tracked_surfaces() {
             let color = color_management::current(&surface);
-            let transform = color
-                .image
-                .as_ref()
-                .and_then(|image| color_state::transform(image, &target));
+            let transform = source_transform(color.image.as_ref(), &source_default, &target);
             let straight = color.alpha_mode == AlphaMode::Straight;
-            let limited =
-                color.coefficients == Coefficients::IdentityLimited && !surface_is_ycbcr(&surface);
-            if transform.is_none() && !straight && !limited {
+            let limited = color.coefficients == Coefficients::IdentityLimited;
+            let raw = matches!(
+                color.coefficients,
+                Coefficients::IdentityFull | Coefficients::IdentityLimited
+            )
+            .then(|| surface_ycbcr(&surface))
+            .flatten();
+            if transform.is_none() && !straight && !limited && raw.is_none() {
                 continue;
             }
-            wanted.push((surface, transform, straight, limited));
+            wanted.push((surface, transform, straight, limited, raw));
         }
         if wanted.is_empty() {
             return Self::default();
         }
-        let Some(program) = program(renderer) else {
-            return Self::default();
-        };
+        let program = program(renderer);
         let cache = LutCache::of(renderer);
         let mut luts = cache.borrow_mut();
         let mut entries = HashMap::new();
-        for (surface, transform, straight, limited) in wanted {
+        for (surface, transform, straight, limited, dmabuf) in wanted {
             let id = Id::from_wayland_resource(&surface);
+            if program.is_none() {
+                if dmabuf.is_some() {
+                    color_management::reject_identity_ycbcr(
+                        &surface,
+                        "Raw YCbCr shader unavailable",
+                    );
+                } else {
+                    eprintln!(
+                        "tuna-compositor: refusing colour-managed surface: shader unavailable"
+                    );
+                }
+                entries.insert(id, Entry::Refused);
+                continue;
+            }
+            let raw = match dmabuf.as_ref() {
+                Some(dmabuf) => match raw_planes(renderer, dmabuf) {
+                    Ok(raw) => Some(raw),
+                    Err(error) => {
+                        color_management::reject_identity_ycbcr(
+                            &surface,
+                            &format!("Cannot sample identity YCbCr planes: {error}"),
+                        );
+                        entries.insert(id, Entry::Refused);
+                        continue;
+                    }
+                },
+                None => None,
+            };
             if let Some(color) = single_pixel(&surface) {
                 let mut c = color;
                 if limited {
@@ -149,22 +213,26 @@ impl ColorFrame {
                 Some(Decode::Curve(_) | Decode::Lut3d(_))
             ) && lut.is_none()
             {
-                // No float textures on this GL: drawn untransformed.
+                eprintln!("tuna-compositor: refusing colour-managed surface: ICC LUT unavailable");
+                entries.insert(id, Entry::Refused);
                 continue;
             }
             entries.insert(
                 id,
                 Entry::Texture {
-                    uniforms: uniforms(transform.as_ref(), straight, limited),
+                    uniforms: uniforms(
+                        transform.as_ref(),
+                        straight,
+                        limited,
+                        raw.as_ref().map_or(0.0, |r| r.layout),
+                    ),
                     lut,
+                    raw,
                 },
             );
         }
         luts.prune(renderer);
-        Self {
-            entries,
-            program: Some(program),
-        }
+        Self { entries, program }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -172,18 +240,37 @@ impl ColorFrame {
     }
 }
 
-/// Whether a surface's current buffer is a YCbCr dmabuf.
-fn surface_is_ycbcr(surface: &WlSurface) -> bool {
+fn capture_target() -> Arc<color_state::ColorState> {
+    color_state::ColorState::params(color_state::output_params())
+}
+
+fn source_transform(
+    image: Option<&Arc<color_state::ColorState>>,
+    default: &Arc<color_state::ColorState>,
+    target: &Arc<color_state::ColorState>,
+) -> Option<Transform> {
+    color_state::transform(image.unwrap_or(default), target)
+}
+
+/// Reuse the surface pipeline for the final full-scene output transform.
+pub(crate) fn final_output_program(renderer: &mut GlesRenderer) -> Option<GlesTexProgram> {
+    program(renderer)
+}
+
+pub(crate) fn final_output_uniforms(transform: &Transform) -> Vec<Uniform<'static>> {
+    let mut values = uniforms(Some(transform), false, false, 0.0);
+    values.extend(effect_uniforms(None, 1.0));
+    values
+}
+
+/// The original dmabuf, never a driver-converted RGB texture.
+fn surface_ycbcr(surface: &WlSurface) -> Option<Dmabuf> {
     with_renderer_surface_state(surface, |s| {
-        s.buffer().and_then(|b| {
-            use smithay::backend::allocator::Buffer;
-            smithay::wayland::dmabuf::get_dmabuf(b)
-                .ok()
-                .map(|d| d.format().code)
-        })
+        let buffer = s.buffer()?;
+        let dmabuf = smithay::wayland::dmabuf::get_dmabuf(buffer).ok()?;
+        color_management::is_ycbcr(dmabuf.format().code).then(|| dmabuf.clone())
     })
     .flatten()
-    .is_some_and(color_management::is_ycbcr)
 }
 
 /// A surface's single-pixel buffer colour, premultiplied.
@@ -198,7 +285,12 @@ fn single_pixel(surface: &WlSurface) -> Option<[f32; 4]> {
     .flatten()
 }
 
-fn uniforms(transform: Option<&Transform>, straight: bool, limited: bool) -> Vec<Uniform<'static>> {
+fn uniforms(
+    transform: Option<&Transform>,
+    straight: bool,
+    limited: bool,
+    raw_layout: f32,
+) -> Vec<Uniform<'static>> {
     let flag = |b: bool| if b { 1.0f32 } else { 0.0 };
     let (decode, decode_power) = match transform.map(|t| &t.decode) {
         None | Some(Decode::None) => (0.0, 1.0),
@@ -227,6 +319,10 @@ fn uniforms(transform: Option<&Transform>, straight: bool, limited: bool) -> Vec
         m[0][0], m[1][0], m[2][0], m[0][1], m[1][1], m[2][1], m[0][2], m[1][2], m[2][2],
     ];
     vec![
+        Uniform::new("raw_layout", raw_layout),
+        Uniform::new("plane0", 2i32),
+        Uniform::new("plane1", 3i32),
+        Uniform::new("plane2", 4i32),
         Uniform::new("straight", flag(straight)),
         Uniform::new("limited", flag(limited)),
         Uniform::new("transformed", flag(transform.is_some())),
@@ -254,6 +350,10 @@ fn program(renderer: &mut GlesRenderer) -> Option<GlesTexProgram> {
         return cached.0.clone();
     }
     let names = [
+        ("raw_layout", UniformType::_1f),
+        ("plane0", UniformType::_1i),
+        ("plane1", UniformType::_1i),
+        ("plane2", UniformType::_1i),
         ("straight", UniformType::_1f),
         ("limited", UniformType::_1f),
         ("transformed", UniformType::_1f),
@@ -492,7 +592,8 @@ where
             (Some(Entry::Solid(color)), _) => {
                 frame.draw_solid(geometry, &damage, *color * element.alpha())
             }
-            (Some(Entry::Texture { uniforms, lut }), Some(program)) => {
+            (Some(Entry::Refused), _) => Ok(()),
+            (Some(Entry::Texture { uniforms, lut, raw }), Some(program)) => {
                 let mut all = uniforms.clone();
                 all.extend(effect_uniforms(tint, brightness));
                 frame.override_default_tex_program(program.clone(), all);
@@ -504,7 +605,13 @@ where
                         gl.ActiveTexture(ffi::TEXTURE0);
                     })?;
                 }
-                let drawn = element.draw(frame, element.src(), geometry, &damage, &[]);
+                let drawn = if let Some(raw) = raw {
+                    raw.with_bindings(frame, |frame| {
+                        element.draw(frame, element.src(), geometry, &damage, &[])
+                    })
+                } else {
+                    element.draw(frame, element.src(), geometry, &damage, &[])
+                };
                 if lut.is_some() {
                     frame.with_context(|gl| unsafe {
                         gl.ActiveTexture(ffi::TEXTURE1);
@@ -550,9 +657,9 @@ precision highp float;
 precision mediump float;
 #endif
 #if defined(EXTERNAL)
-uniform samplerExternalOES tex;
+uniform highp samplerExternalOES tex;
 #else
-uniform sampler2D tex;
+uniform highp sampler2D tex;
 #endif
 uniform float alpha;
 varying vec2 v_coords;
@@ -567,12 +674,16 @@ uniform float decode_power;
 uniform mat3 color_matrix;
 uniform float encode;
 uniform float encode_power;
-uniform sampler2D lut;
+uniform highp sampler2D lut;
 uniform float lut_size;
 uniform float brightness;
 uniform vec3 nl_gains;
 uniform float desaturation;
 uniform float wellbeing_brightness;
+uniform float raw_layout;
+uniform highp sampler2D plane0;
+uniform highp sampler2D plane1;
+uniform highp sampler2D plane2;
 
 vec3 gamma_power(vec3 color, float power) {
     vec3 is_negative = vec3(lessThan(color, vec3(0.0)));
@@ -690,6 +801,29 @@ void main() {
 #if defined(NO_ALPHA)
     color = vec4(color.rgb, 1.0);
 #endif
+    // Raw component views bypass all EGL YUV conversion and clamping.
+    // Layout numbers are shared with raw_layout() below.
+    if (raw_layout == 1.0 || raw_layout == 2.0) {
+        vec2 uv = texture2D(plane1, v_coords).rg;
+        color = vec4(texture2D(plane0, v_coords).r,
+                     raw_layout == 1.0 ? uv : uv.yx, 1.0);
+    } else if (raw_layout == 3.0 || raw_layout == 4.0) {
+        float u = texture2D(plane1, v_coords).r;
+        float v = texture2D(plane2, v_coords).r;
+        color = vec4(texture2D(plane0, v_coords).r,
+                     raw_layout == 3.0 ? vec2(u, v) : vec2(v, u), 1.0);
+    } else if (raw_layout == 5.0 || raw_layout == 6.0) {
+        color = texture2D(plane0, v_coords);
+        if (raw_layout == 6.0) color.a = 1.0;
+    } else if (raw_layout == 7.0 || raw_layout == 8.0) {
+        vec2 uv = texture2D(plane1, v_coords).ga;
+        color = vec4(texture2D(plane0, v_coords).r,
+                     raw_layout == 7.0 ? uv : uv.yx, 1.0);
+    } else if (raw_layout == 9.0 || raw_layout == 10.0) {
+        vec2 uv = texture2D(plane0, v_coords).br;
+        color = vec4(texture2D(plane1, v_coords).g,
+                     raw_layout == 9.0 ? uv : uv.yx, 1.0);
+    }
     if (limited > 0.5)
         color.rgb = 255.0 / 219.0 * (color.rgb - 16.0 / 255.0);
     if (straight > 0.5)
@@ -737,11 +871,11 @@ mod tests {
     use smithay::backend::renderer::{Bind, ExportMem, Frame, ImportMem, Offscreen, Renderer};
     use smithay::utils::{Buffer, Size};
 
-    const SIDE: i32 = 8;
+    pub(super) const SIDE: i32 = 8;
 
     /// Surfaceless EGL, or `None` on a machine without EGL (the test
     /// skips, as the night-light GL test does).
-    fn headless_renderer() -> Option<GlesRenderer> {
+    pub(super) fn headless_renderer() -> Option<GlesRenderer> {
         use smithay::backend::egl::native::EGLSurfacelessDisplay;
         use smithay::backend::egl::{EGLContext, EGLDisplay};
         let display = unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }.ok()?;
@@ -768,6 +902,17 @@ mod tests {
         transform: Option<&Transform>,
         straight: bool,
         limited: bool,
+    ) -> Vec<[u8; 4]> {
+        draw_raw(renderer, texels, transform, straight, limited, None)
+    }
+
+    pub(super) fn draw_raw(
+        renderer: &mut GlesRenderer,
+        texels: &[[u8; 4]],
+        transform: Option<&Transform>,
+        straight: bool,
+        limited: bool,
+        raw: Option<&RawPlanes>,
     ) -> Vec<[u8; 4]> {
         let program = program(renderer).expect("colour shader compiles");
         let lut = {
@@ -797,7 +942,7 @@ mod tests {
                 .render(&mut bound, out.size, smithay::utils::Transform::Normal)
                 .unwrap();
             frame.clear(Color32F::TRANSPARENT, &[out]).unwrap();
-            let mut all = uniforms(transform, straight, limited);
+            let mut all = uniforms(transform, straight, limited, raw.map_or(0.0, |r| r.layout));
             all.extend(effect_uniforms(None, 1.0));
             frame.override_default_tex_program(program, all);
             if let Some(lut) = lut {
@@ -809,8 +954,8 @@ mod tests {
                     })
                     .unwrap();
             }
-            frame
-                .render_texture_from_to(
+            let draw = |frame: &mut GlesFrame<'_, '_>| {
+                frame.render_texture_from_to(
                     &texture,
                     Rectangle::<f64, Buffer>::from_size((f64::from(SIDE), f64::from(SIDE)).into()),
                     out,
@@ -821,7 +966,12 @@ mod tests {
                     None,
                     &[],
                 )
-                .unwrap();
+            };
+            if let Some(raw) = raw {
+                raw.with_bindings(&mut frame, draw).unwrap();
+            } else {
+                draw(&mut frame).unwrap();
+            }
             frame.clear_tex_program_override();
             let _ = frame.finish().unwrap();
         }
@@ -833,7 +983,7 @@ mod tests {
     }
 
     /// The CPU reference: the same steps on each texel, in f32.
-    fn reference(
+    pub(super) fn reference(
         texel: [u8; 4],
         transform: Option<&Transform>,
         straight: bool,
