@@ -289,8 +289,14 @@ Provides: roost
     def test_native_colour_consumers_are_required_in_real_package_metadata(self):
         control = next(body for item, body in self.control
                        if item.name.removeprefix('./') == 'control')
+        # makepkg checks runtime dependencies before compiling the real package.
+        bootstrap = next(line.split() for line in
+                         (ROOT / '.github/workflows/ci.yml').read_text().splitlines()
+                         if line.strip().startswith(
+                             '- run: pacman -Syu --noconfirm --needed base-devel '))
         for dependency in ('colord', 'gnome-color-manager'):
             with self.subTest(dependency=dependency):
+                self.assertIn(dependency, bootstrap)
                 without_dependency = control.replace((', ' + dependency).encode(), b'')
                 changed = replace(self.control, 'control', member('control', without_dependency))
                 self.reject(control=changed, reason='missing runtime floor ' + dependency)

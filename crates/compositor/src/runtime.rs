@@ -5943,7 +5943,7 @@ impl Runtime {
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                         let cost = FrameCost::new(&drew, &elements.owners, &damage, size);
                         presented = Some((damage, cost, presented_cursor));
-                        if self.state_path.is_some() {
+                        if self.state_publisher.is_some() {
                             zoom_submission = zoom_plan
                                 .as_ref()
                                 .filter(|plan| plan.effects.identity || zoom_program.is_some())
@@ -5957,7 +5957,7 @@ impl Runtime {
                     backend
                         .submit(Some(&damage))
                         .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-                    if self.state_path.is_some() {
+                    if self.state_publisher.is_some() {
                         if let Some((generation, invert_lightness)) = zoom_submission {
                             self.magnifier
                                 .mark_submitted("tuna-0", generation, invert_lightness);
@@ -6343,7 +6343,7 @@ impl Runtime {
                         out.revert_failed_mode();
                         continue;
                     }
-                    if self.state_path.is_some() {
+                    if self.state_publisher.is_some() {
                         if let Some(plan) = zoom_plan
                             .as_ref()
                             .filter(|plan| plan.effects.identity || zoom_program.is_some())

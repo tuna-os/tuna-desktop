@@ -117,7 +117,7 @@ class InversionObservation(unittest.TestCase):
         drawing = runtime.split("let queued = match &mut self.backend {", 1)[1]
         drawing = drawing.split("let hidden = hidden_surfaces", 1)[0]
         nested, native = drawing.split("Backend::Drm(drm) => {", 1)
-        receipt_start = nested.rindex("if self.state_path.is_some() {")
+        receipt_start = nested.rindex("if self.state_publisher.is_some() {")
         nested_before, nested_after = nested[:receipt_start], nested[receipt_start:]
         # The real error-propagating submit must precede acknowledgement:
         # a failed submission exits, rather than recording the planned effect.
@@ -133,15 +133,15 @@ class InversionObservation(unittest.TestCase):
         shader_guard = re.escape(
             ".filter(|plan| plan.effects.identity || zoom_program.is_some())")
         self.assertRegex(nested_before, re.compile(
-            r"if self\.state_path\.is_some\(\) {\s*zoom_submission = zoom_plan\s*"
+            r"if self\.state_publisher\.is_some\(\) {\s*zoom_submission = zoom_plan\s*"
             r"\.as_ref\(\)\s*" + shader_guard + r"\s*"
             + re.escape(".map(|plan| (plan.generation, plan.effects.invert))")))
         self.assertRegex(nested_after, re.compile(
-            r"if self\.state_path\.is_some\(\) {\s*"
+            r"if self\.state_publisher\.is_some\(\) {\s*"
             r"if let Some\(\(generation, invert_lightness\)\) = zoom_submission {"))
 
         failed_queue = native.split("if let Err(e) = out.surface.queue_buffer(", 1)[1]
-        failed_queue, native_receipt = failed_queue.split("if self.state_path.is_some() {", 1)
+        failed_queue, native_receipt = failed_queue.split("if self.state_publisher.is_some() {", 1)
         self.assertRegex(failed_queue, re.compile(
             r"out\.revert_failed_mode\(\);\s*continue;\s*}\s*$"))
         self.assertNotIn("mark_submitted", failed_queue)
