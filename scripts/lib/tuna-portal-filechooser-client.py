@@ -15,6 +15,14 @@ import gi
 
 out, method, decision = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 parent_mode = sys.argv[4] if len(sys.argv) > 4 else "none"
+toolkit = sys.argv[5] if len(sys.argv) > 5 else "gtk4"
+if toolkit not in ("gtk3", "gtk4") or (toolkit == "gtk3" and parent_mode != "wayland"):
+    raise RuntimeError("GTK3 parenting requires the ordinary Wayland parent path")
+gtk3 = toolkit == "gtk3"
+export_lifetime = sys.argv[6] if len(sys.argv) > 6 else "live"
+if export_lifetime not in ("live", "revoked") or (export_lifetime == "revoked"
+        and (not gtk3 or method != "OpenFile" or decision != "cancel")):
+    raise RuntimeError("Revoked-export negative requires GTK3 OpenFile cancel")
 if method not in ("OpenFile", "SaveFile") or decision not in ("cancel", "grant", "close"):
     raise RuntimeError("Unknown file-picker operation or decision")
 if parent_mode not in ("none", "x11", "wayland"):
@@ -35,6 +43,14 @@ original_pointer_host = None
 state_path = Path(os.environ.get("TUNA_COMPOSITOR_STATE", "/out/compositor-state.json"))
 def scene():
     return json.loads(state_path.read_text())
+def widget_size(widget):
+    if gtk3:
+        return [widget.get_allocated_width(), widget.get_allocated_height()]
+    return [widget.get_width(), widget.get_height()]
+
+def parent_native():
+    return parent_window.get_window() if gtk3 else parent_window.get_surface()
+
 def pump_parent_until(predicate, message, timeout=5):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -46,8 +62,8 @@ def pump_parent_until(predicate, message, timeout=5):
     if parent_window is not None:
         out.with_suffix(".parent-failure.json").write_text(json.dumps({
             "failure": message, "parent": parent_identity, "scene": scene(),
-            "window_size": [parent_window.get_width(), parent_window.get_height()],
-            "button_size": [parent_button.get_width(), parent_button.get_height()],
+            "window_size": widget_size(parent_window),
+            "button_size": widget_size(parent_button),
             "button_mapped": parent_button.get_mapped(),
             "client_after_paint_count": parent_paints,
             "client_last_painted_size": parent_painted_size,
@@ -55,6 +71,9 @@ def pump_parent_until(predicate, message, timeout=5):
         }, indent=2))
     raise RuntimeError(message)
 def measured_parent_target():
+    if gtk3:
+        from tuna_picker_gtk3 import measured_target
+        return measured_target(parent_window, parent_button, parent_paints, parent_painted_size)
     valid, bounds = parent_button.compute_bounds(parent_window)
     if not valid or not parent_button.get_mapped() or not parent_button.is_sensitive():
         raise RuntimeError("Original parent button has no mapped sensitive bounds")
@@ -165,34 +184,50 @@ if parent_mode != "none":
     os.environ["GDK_BACKEND"] = parent_mode
     os.environ.setdefault("GSK_RENDERER", "cairo")
     GLib.set_prgname("tuna-" + parent_mode + "-picker-parent")
-    gi.require_version("Gtk", "4.0")
+    gtk_version = "3.0" if gtk3 else "4.0"
+    gi.require_version("Gtk", gtk_version)
     from gi.repository import Gtk, Gdk
     if parent_mode == "x11":
-        gi.require_version("GdkX11", "4.0")
+        gi.require_version("GdkX11", gtk_version)
         from gi.repository import GdkX11
+    elif gtk3:
+        # GTK3 builds a Gdk GIR but no GdkWayland GIR. Call its public native
+        # export API, rather than substituting a protocol client/fake handle.
+        from tuna_picker_gtk3 import WaylandWindow
     else:
-        gi.require_version("GdkWayland", "4.0")
+        gi.require_version("GdkWayland", gtk_version)
         from gi.repository import GdkWayland
-    Gtk.init()
+    Gtk.init([]) if gtk3 else Gtk.init()
     parent_title = "Tuna Desktop " + parent_mode + " picker parent"
     parent_window = Gtk.Window(title=parent_title)
     parent_window.set_default_size(1100, 700)
+    if gtk3:
+        # No CSD shadows/insets: GTK3's native buffer and compositor window
+        # geometry then share an origin. This remains an ordinary xdg toplevel,
+        # not a popup, layer shell or custom surface.
+        parent_window.set_decorated(False)
     parent_button = Gtk.Button(label="Actual GTK " + parent_mode + " parent input control")
     def clicked(_button):
         global parent_clicks
         parent_clicks += 1
     parent_button.connect("clicked", clicked)
-    parent_window.set_child(parent_button)
-    key_controller = Gtk.EventControllerKey()
-    key_controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-    def parent_key_pressed(_controller, keyval, _keycode, _state):
+    if gtk3:
+        parent_window.add(parent_button)
+    else:
+        parent_window.set_child(parent_button)
+    def parent_key_pressed(_controller, keyval, _keycode=None, _state=None):
         global parent_keys
-        if keyval == Gdk.KEY_F8:
+        if (keyval.keyval if gtk3 else keyval) == Gdk.KEY_F8:
             parent_keys += 1
             return True
         return False
-    key_controller.connect("key-pressed", parent_key_pressed)
-    parent_window.add_controller(key_controller)
+    if gtk3:
+        parent_window.connect("key-press-event", parent_key_pressed)
+    else:
+        key_controller = Gtk.EventControllerKey()
+        key_controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        key_controller.connect("key-pressed", parent_key_pressed)
+        parent_window.add_controller(key_controller)
     input_path = out.with_suffix(".parent-input.json")
     def record_parent_input():
         global parent_sequence
@@ -202,11 +237,13 @@ if parent_mode != "none":
         temporary.replace(input_path)
         return True
     GLib.timeout_add(50, record_parent_input)
+    if gtk3:
+        parent_window.show_all()
     parent_window.present()
     def painted(_clock):
         global parent_paints, parent_painted_size
         parent_paints += 1
-        parent_painted_size = [parent_window.get_width(), parent_window.get_height()]
+        parent_painted_size = widget_size(parent_window)
     parent_window.get_frame_clock().connect("after-paint", painted)
     parent_app_id = "org.example.TunaWaylandPickerParent"
     parent_app_id_set = False
@@ -214,27 +251,36 @@ if parent_mode != "none":
     while time.monotonic() < end:
         while GLib.MainContext.default().pending():
             GLib.MainContext.default().iteration(False)
-        native = parent_window.get_surface()
+        native = parent_native()
         if native is not None:
             if parent_mode == "wayland" and not parent_app_id_set:
-                GdkWayland.WaylandToplevel.set_application_id(native, parent_app_id)
+                wayland_type = WaylandWindow if gtk3 else GdkWayland.WaylandToplevel
+                wayland_type.set_application_id(native, parent_app_id)
                 parent_app_id_set = True
             xid = GdkX11.X11Surface.get_xid(native) if parent_mode == "x11" else None
             candidate = new_parent_window(scene(), previous_parent_ids,
                                           mode=parent_mode, xid=xid, app_id=parent_app_id)
             if candidate is not None:
-                parent_identity = {"mode": parent_mode, "xid": xid, "id": candidate["id"], "app_id": candidate["app_id"], "pid": os.getpid(), "uid": os.getuid(), "start_ticks": Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19], "display": display, "input_path": str(input_path)}
+                parent_identity = {"mode": parent_mode, "toolkit": toolkit, "xid": xid, "id": candidate["id"], "app_id": candidate["app_id"], "pid": os.getpid(), "uid": os.getuid(), "start_ticks": Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19], "display": display, "input_path": str(input_path)}
                 if parent_mode == "x11":
                     parent_handle = "x11:" + format(xid, "x")
                 break
         time.sleep(.05)
     else:
         raise RuntimeError("Actual GTK parent did not map on Tuna Desktop's requested display")
+    if gtk3:
+        # Export an already painted, committed ordinary GTK3 window, not an
+        # unbuffered surface admitted on its initial configure.
+        pump_parent_until(lambda: parent_paints > 0 and parent_painted_size == widget_size(parent_window)
+                          and parent_button.get_mapped() and widget_size(parent_button)[0] >= 1000
+                          and any(w["id"] == parent_identity["id"] and w["rect"][2:] == widget_size(parent_window)
+                                  for w in scene()["windows"]),
+                          "GTK3 parent did not commit its current painted buffer before export")
     if parent_mode == "wayland":
         exported_handles = []
         def exported(_surface, handle, _data):
             exported_handles.append(handle)
-        if not GdkWayland.WaylandToplevel.export_handle(native, exported, None):
+        if not wayland_type.export_handle(native, exported, None):
             raise RuntimeError("GTK refused to export the actual Wayland parent surface")
         pump_parent_until(lambda: bool(exported_handles), "Actual Wayland parent handle was not exported")
         if len(exported_handles) != 1 or not exported_handles[0]:
@@ -244,9 +290,13 @@ if parent_mode != "none":
             "parent": parent_identity, "handle": parent_handle, "pid": os.getpid(),
         }, indent=2))
     pump_parent_until(lambda: scene()["focused"] == parent_identity["id"], "Actual caller did not receive initial focus")
-    pump_parent_until(lambda: parent_paints > 0 and parent_painted_size == [parent_window.get_width(), parent_window.get_height()] and parent_button.get_mapped() and parent_button.get_width() >= 1000
-                      and any(w["id"] == parent_identity["id"] and w["rect"][2] >= 1000 for w in scene()["windows"]),
+    pump_parent_until(lambda: parent_paints > 0 and parent_painted_size == widget_size(parent_window) and parent_button.get_mapped() and widget_size(parent_button)[0] >= 1000
+                      and any(w["id"] == parent_identity["id"] and w["rect"][2] >= 1000
+                              and (not gtk3 or w["rect"][2:] == widget_size(parent_window)) for w in scene()["windows"]),
                       "Actual original client did not map, allocate and complete its initial paint")
+    if gtk3:
+        from tuna_picker_gtk3 import installed_toolkit
+        out.with_suffix(".toolkit.json").write_text(json.dumps(installed_toolkit(Gtk), indent=2))
     # Real host pointer input must reach the GTK button before requesting a dialog.
     click_parent_content()
     pump_parent_until(lambda: parent_clicks == 1, "Initial real pointer click did not reach the parent button")
@@ -348,15 +398,27 @@ if parent_mode != "none":
     out.with_suffix(".multiple-apps-before.json").write_text(json.dumps({
         "parent": parent_identity, "unrelated": unrelated_before,
         "unrelated_window_id": unrelated_window["id"], "scene": scene()}, indent=2))
+    if export_lifetime == "revoked":
+        # Reuse only the handle GDK actually exported, after GDK actually
+        # destroys it. A roundtrip orders revocation before the portal import.
+        wayland_type.unexport_handle(native)
+        Gdk.Display.get_default().sync()
+        parent_identity["export_revoked"] = True
+        parent_identity["unrelated_window_id"] = unrelated_window["id"]
+        out.with_suffix(".revoked-export.json").write_text(json.dumps({
+            "parent": parent_identity, "handle": parent_handle, "scene": scene(),
+        }, indent=2))
 fixture = out.parent / "filechooser-fixtures"
 fixture.mkdir(exist_ok=True)
 payload = b"Tuna Desktop genuine GNOME FileChooser application data\n"
 source = fixture / "open-proof.txt"
 source.write_bytes(payload)
-expected = source if method == "OpenFile" else fixture / (("saved-proof" if decision == "grant" else decision + "-save-proof") + ("-" + parent_mode if parent_mode != "none" else "") + ".txt")
+expected = source if method == "OpenFile" else fixture / (("saved-proof" if decision == "grant" else decision + "-save-proof") + ("-" + parent_mode if parent_mode != "none" else "") + ("-gtk3" if gtk3 else "") + ".txt")
 if method == "SaveFile" and expected.exists():
     raise RuntimeError("Save fixture must start without a destination")
 title = "Tuna Desktop " + method + " " + decision + " proof"
+if gtk3:
+    title += " gtk3 " + export_lifetime
 bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
 def call(dest, path, iface, name, args):
     return bus.call_sync(dest, path, iface, name, args, None, Gio.DBusCallFlags.NONE, 10000, None).unpack()
@@ -454,7 +516,26 @@ else:
     if nautilus_identity() != identity:
         raise RuntimeError("Nautilus provider owner or executable changed during request")
     out.with_suffix(".response.json").write_text(json.dumps({"response": code, "results": results, "provider": identity}, indent=2))
-if parent_identity is not None:
+if export_lifetime == "revoked":
+    negative = json.loads(out.with_suffix(".revoked-parent.json").read_text())
+    dialog_id = negative["observations"][-1]["dialog_id"]
+    pump_parent_until(lambda: not any(w["id"] == dialog_id for w in scene()["windows"]),
+                      "Actual revoked-handle chooser did not disappear after cancellation")
+    unrelated_sequence = unrelated_state()["sequence"]
+    pump_parent_until(lambda: unrelated_state()["sequence"] >= unrelated_sequence + 10,
+                      "Independent application stopped processing the revoked-handle journey")
+    unrelated_after = unrelated_state()
+    current = scene()
+    if (parent_clicks != 1 or parent_keys != 1 or unrelated_after["clicks"] != 1
+            or unrelated_after["keys"] != 1 or not any(
+                w["id"] == parent_identity["id"] and w["app_id"] == parent_identity["app_id"]
+                for w in current["windows"])):
+        raise RuntimeError("Revoked-handle negative lost its actual A/B input controls")
+    out.with_suffix(".revoked-after.json").write_text(json.dumps({
+        "parent": parent_identity, "parent_clicks": parent_clicks, "parent_keys": parent_keys,
+        "unrelated": unrelated_after, "dialog_id": dialog_id, "scene": current,
+    }, indent=2))
+if parent_identity is not None and export_lifetime == "live":
     end = time.monotonic() + 5
     while time.monotonic() < end:
         GLib.MainContext.default().iteration(False)
@@ -486,7 +567,11 @@ if parent_identity is not None:
     out.with_suffix(".parent-after.json").write_text(input_path.read_text())
     print("G-FILECHOOSER-MULTIPLE-APPS: original caller pointer/keyboard restored; independent client unchanged")
     if parent_mode == "wayland":
-        GdkWayland.WaylandToplevel.drop_exported_handle(native, exported_handles[0])
+        if gtk3:
+            wayland_type.unexport_handle(native)
+            Gdk.Display.get_default().flush()
+        else:
+            wayland_type.drop_exported_handle(native, exported_handles[0])
 if decision == "close":
     while GLib.MainContext.default().pending():
         GLib.MainContext.default().iteration(False)

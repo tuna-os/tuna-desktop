@@ -48,6 +48,40 @@ parent_checked = request.get("parent") is None
 while time.monotonic() < end:
     nodes, controls = dialog()
     if controls:
+        if not parent_checked and request["parent"].get("export_revoked"):
+            # A real GTK3 export was destroyed and roundtripped before this
+            # request reused that exact handle. The genuine chooser may open,
+            # but must not acquire A or focused-independent B as its parent.
+            parent = request["parent"]
+            input_path = Path(parent["input_path"])
+            before = json.loads(input_path.read_text())
+            observations = []
+            negative_end = min(end, time.monotonic() + 5)
+            while time.monotonic() < negative_end:
+                current = json.loads(Path("/out/compositor-state.json").read_text())
+                after = json.loads(input_path.read_text())
+                candidates = [w for w in current["windows"] if w.get("app_id") == "org.gnome.Nautilus"]
+                originals = [w for w in current["windows"] if w["id"] == parent["id"]
+                             and w.get("app_id") == parent["app_id"] and w.get("x11_window_id") is None]
+                if len(candidates) == len(originals) == 1:
+                    child = candidates[0]
+                    denied_ids = (parent["id"], parent["unrelated_window_id"])
+                    if child.get("parent_window_id") in denied_ids or child.get("application_window_id") in denied_ids:
+                        raise RuntimeError("Revoked actual GTK3 handle parented the real Nautilus chooser")
+                    if current["focused"] != child["id"] or min(child["rect"][2:]) <= 0:
+                        raise RuntimeError("Revoked-handle negative lacks the actual focused mapped chooser")
+                    if after["pid"] != parent["pid"] or after["clicks"] != 1 or after["keys"] != 1:
+                        raise RuntimeError("Revoked-handle journey lost original GTK3 caller/input identity")
+                    observations.append({"input": after, "scene": current, "dialog_id": child["id"]})
+                    if after["sequence"] >= before["sequence"] + 10:
+                        out.with_suffix(".revoked-parent.json").write_text(json.dumps({
+                            "parent": parent, "before": before, "observations": observations,
+                        }, indent=2))
+                        parent_checked = True
+                        break
+                time.sleep(.05)
+            else:
+                raise RuntimeError("Revoked-handle negative lacked fresh unparented actual chooser observations")
         if not parent_checked:
             relationship_end = min(end, time.monotonic() + 5)
             while time.monotonic() < relationship_end:
