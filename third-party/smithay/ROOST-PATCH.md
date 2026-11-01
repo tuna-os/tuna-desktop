@@ -190,3 +190,10 @@ the actual pause event and that a later keyboard repeat-settings change
 does not rearm the retired grab. This baseline has no IM weak repeat
 registration; integrations which add one must clear only the retiring
 resource's registration, never a replacement's.
+
+A standard `grab_keyboard` request from the admitted current IM also
+rechecks actual seat ownership: it cannot replace a non-IM compositor grab.
+Such a late request receives a tracked inert child without metadata; its
+release and parent teardown cannot unset the compositor owner. The returned-
+key consumer exercises this race with actual standard requests and verifies
+continued physical-key delivery to the compositor grab.

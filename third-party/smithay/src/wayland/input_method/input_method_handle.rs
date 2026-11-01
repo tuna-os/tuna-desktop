@@ -230,9 +230,16 @@ where
             .instance
             .as_ref()
             .is_some_and(|instance| instance.object == *seat);
-        if !owns_instance {
-            // An inert object's requests must be ignored, not rejected.
-            // Register New IDs without acquiring roles, grabs or events.
+        let blocked_grab = owns_instance
+            && matches!(&request, zwp_input_method_v2::Request::GrabKeyboard { .. })
+            && data
+                .keyboard_handle
+                .with_grab(|_, grab| grab.downcast_ref::<InputMethodKeyboardGrab>().is_none())
+                .unwrap_or(false);
+        if !owns_instance || blocked_grab {
+            // Unavailable objects and a grab denied by current compositor
+            // ownership remain inert. Register NewIDs without taking roles,
+            // replacing the seat grab or sending keyboard metadata.
             match request {
                 zwp_input_method_v2::Request::GetInputPopupSurface { id, .. } => {
                     let child = data_init.init(
