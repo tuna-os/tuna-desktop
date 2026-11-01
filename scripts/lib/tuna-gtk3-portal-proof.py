@@ -45,7 +45,7 @@ def run_case(directory, method, decision, lifetime):
             str(prefix), method, decision, "wayland", "gtk3", lifetime],
             env=environment, stdout=client_log, stderr=subprocess.STDOUT)
         try:
-            end = time.monotonic() + 45
+            end = time.monotonic() + 30
             while not prefix.with_suffix(".waiting.json").is_file():
                 if client.poll() is not None:
                     raise RuntimeError(f"GTK3 client exited {client.returncode} before real chooser readiness: {prefix}.log")
