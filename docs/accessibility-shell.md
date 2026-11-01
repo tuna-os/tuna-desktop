@@ -63,10 +63,57 @@ Scope and remaining differences from GNOME 51:
 
 `crates/shell-gtk/src/osk.rs` ports gnome-shell 51.0's `js/ui/keyboard.js`. Layouts are GNOME's own `data/osk-layouts` JSON (bundled as a GResource, `crates/shell-gtk/osk-layouts/`), resolved as `_updateLayout` does: the current input source's group, then the group without its variant, then `us`, with the `digits`, `number`, `phone`, `email` and `url` models and `-extended` layouts by content purpose (`osk_layout.rs`). Key behaviour (`osk_model.rs`) follows `_addRowKeys`: levels and their latch, long-press extended keys, modifiers, the emoji pager and the language menu; open and close keep GNOME's 300 ms rest time and the 50 ms focus-out delay.
 
-The keyboard shows when `screen-keyboard-enabled` is set or the compositor reports touch-mode auto-show (mutter's `update_touch_mode` with a touchscreen last used), and the focused field asks for the input panel: mutter treats enabling an already focused text-input-v3 (version 1) as that request, which GTK sends on a click into its field. The compositor tracks text-input-v3 itself (`crates/compositor/src/osk.rs`), independent of IBus; Smithay now always sends text-input enter/leave (`third-party/smithay/TEXT-INPUT-FOCUS-API-PATCH.diff`). The session keyboard is a layer surface with no keyboard interactivity, so the field keeps focus. Typing goes through the control socket (`OskInput`, wire 0.43) as `KeyboardController` does: a key's string is committed to the focused text input, or (no input-method focus, or modifiers latched) pressed as keysyms on the active layout with Shift or AltGr for their level, which also reaches X11 clients. It hides on the hide key, focus loss, `on_screen_input_provided` and when the setting goes off.
+The keyboard shows when `screen-keyboard-enabled` is set or the compositor reports touch-mode auto-show (mutter's `update_touch_mode` with a touchscreen last used), and the focused field asks for the input panel: mutter treats enabling an already focused text-input-v3 (version 1) as that request, which GTK sends on a click into its field. The compositor tracks text-input-v3 itself (`crates/compositor/src/osk.rs`), independent of IBus; Smithay now always sends text-input enter/leave (`third-party/smithay/TEXT-INPUT-FOCUS-API-PATCH.diff`). The session keyboard is a layer surface with no keyboard interactivity, so the field keeps focus. Typing retains the public `OskInput::Commit`/`Keyval` control schema. Without input-method focus, or with modifiers latched, keysyms use the active layout with Shift or AltGr for their level, including X11 clients. It hides on the hide key, focus loss, `on_screen_input_provided` and when the setting goes off.
+
+Modifier-free native text follows GNOME 51's [`KeyboardController.commit`](https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/ui/keyboard.js#L1946) and [`handleVirtualKey`](https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/misc/inputMethod.js#L448). `runtime/osk.rs` transfers the owned string to `osk_ime.rs` over `tuna_osk_input_v1`, visible only to the existing supervised IBus client. Its events share the input-method-v2 connection and carry that instance's done epoch. `tuna-ibus-bridge.rs` queries `GetEngine` on the actual focused context: confirmed `xkb:` sources commit directly; other engines receive each Unicode keysym with physical keycode zero. A persistent IM keyboard grab is not evidence of an IBus source. Explicitly declined or unavailable presses fall back to one raw key pair, in protocol order and without re-entering the grab. An already-consumed press is never replayed if its release fails. Sessions without IBus retain direct native commit; a configured but unavailable context uses raw keys, not a fabricated engine commit.
+
+Focus retirement destroys the old IBus context and its owned signal subscription while retaining the keyboard grab. Delayed old-context output cannot acquire the next field's epoch. The compositor rejects stale fallback epochs and locked or no-longer-focused fields. `INPUT-METHOD-EPOCH-API-PATCH.diff` records the additive Smithay owner-checked serial accessor. Actual Wayland consumers cover ordinary-client discovery/bind denial, interleaved raw/commit ordering, non-recursive fallback with grab restoration, and focus/lock rejection. The bridge's private-D-Bus fault test covers GetEngine failure, declined/error presses, exact Unicode/keycode-zero calls and consumed presses whose release fails; those fixtures do not establish real composition.
+
+Held raw keys, including OSK BackSpace during preedit, use the IM-grab's
+advertised `repeat_info` delay/rate. The bridge excludes keys for which the
+active XKB keymap disables repeat, and cancels on release, field/context
+retirement, replacement keymap, or repeat disabling. Repeat requests are
+asynchronous and single-flight; canceled generations cannot complete a later
+hold. Queued Wayland releases and focus changes are dispatched before a due
+repeat, including input that arrived during a synchronous initial key call.
+Context-specific signal queues prevent already dispatched old-context
+callbacks from reaching a new field. Live repeat settings and replacement
+keymaps/modifiers are broadcast to the existing IM grab, recorded in
+`INPUT-METHOD-REPEAT-API-PATCH.diff`.
+
+This follows Mutter 51's
+[`meta-seat-impl.c` native repeat clock](https://gitlab.gnome.org/GNOME/mutter/-/blob/51.0/src/backends/native/meta-seat-impl.c#L694)
+and [`meta-wayland-keyboard.c` repeated-event forwarding](https://gitlab.gnome.org/GNOME/mutter/-/blob/51.0/src/wayland/meta-wayland-keyboard.c#L278).
+The seat exposes `wl_keyboard` versions below 10: a synthetic repeat is offered
+to IBus, but an explicitly declined repeat is **not** forwarded as another
+virtual-keyboard press. Ordinary clients already repeat the original declined
+physical press themselves. This avoids duplicate native repeats without
+bypassing composition with surrounding-text deletion or clearing preedit.
+
+Focused evidence: the bridge's 10-test suite includes real private-D-Bus
+delayed-reply retirement and actual XKB repeatability; all seven Wayland input
+protocol tests pass, including live repeat settings and usable replacement
+keymaps. A separate headless real-Wayland consumer with the production bridge
+and distribution libpinyin observed successive held-BackSpace engine edits
+(`你好` → `你哈` → `你和` → `你` → `年` → empty), partial-composition release stop,
+modifier exclusion, native declined press/release edges only, and focus
+retirement. No graphical session ran for that smoke. The graphical
+G-OSK-IBUS-REPEAT extension now holds the real OSK key against GTK preedit and
+requires committed text to remain intact, but still requires exact-head CI
+qualification alongside G-OSK-IBUS/G-OSK-LOCK. No installed-session or hardware
+claim is added.
+
 
 On the lock screen each lock window embeds its own keyboard, opened by the unlock prompt's focus, that edits only that prompt; the compositor reports no text-input focus and refuses `OskInput` while locked, and the session keyboard is hidden.
 
 Proof (`scripts/tuna-osk-proof`, nested winit session, real xdotool clicks through the nested window on a GTK 4 probe with two entries and on the keys the shell's AT-SPI tree names): G-OSK-SHOW (with `screen-keyboard-enabled` off a click into an entry shows nothing; on, the click shows the keyboard no sooner than the 300 ms rest time, focus moving between entries keeps it up through the 50 ms focus-out delay, and focus on a button hides it no sooner than that delay), G-OSK-TYPE (tapped keys reach the client's entry, which keeps the focus), G-OSK-SHIFT (shift types one uppercase letter; the long-press caps latch types uppercase until tapped off) and G-OSK-LOCK (locked, the session keyboard is hidden and never maps, the lock screen's keyboard taps the password into the unlock prompt and unlocks through PAM, and the session's entries see no change).
 
-Open: auto-capitalisation from surrounding text, IBus-routed keys for IBus sources, word-wise delete, shifting the focused window above the keyboard, and GNOME's bottom-edge touch drag.
+The separate G-OSK-IBUS runtime gate in the same script requires the distribution's `ibus-libpinyin`, not the fixture engine. Actual OSK `nihao` taps must create GTK preedit and visible `你好` candidates without inserting literal letters; Space must commit `你好`. A declined digit must produce exactly one client key press, recreated field contexts must retain the selected engine without carrying old composition, and confirmed XKB text must commit without a raw client key press. G-OSK-LOCK also retires unfinished IBus composition. These are nested runtime assertions, not installed-package or hardware qualification; protocol/private-bus test results alone cannot satisfy them.
+
+The probe observes `GtkText::preedit-changed` through each entry's editable delegate; `GtkEntry` itself does not expose that signal. Source `9b81bf24` run `41234070381` stopped before the probe mapped because it connected the signal to the entry. That run therefore established none of the real-engine composition, candidate, commit, field-recreation or lock-retirement assertions; its socket/private-bus results are not a substitute.
+
+Source `8840a74e` run `41247262911` passed SHOW/TYPE/SHIFT but stopped at engine selection: the `ibus engine NAME` CLI also attempts XKB layout setup, returning failure silently for libpinyin's `default` layout. A real private-daemon witness reproduced exit 1 with empty diagnostics while independent engine readback was already `libpinyin`. The proof now calls private-bus `SetGlobalEngine` directly and checks the selected engine independently; it neither ignores a failed selection nor configures the outer X server.
+
+Source `515cbbc3` run `41251923829` reached real libpinyin composition: GTK reported `年` → `你` → `你和` → `你哈` → `你好`, and the shell exposed the matching candidate list. It stopped before commit because GTK 4.14's automatic button `labelled-by` relation overrode the space key's explicit accessible name with its blank visual caption. Key buttons now retire that automatic relation when their semantic name differs from the caption; the unchanged AT-SPI `Space` click is the consumer regression. The graphical lane also installs CJK fonts: the retained capture had correct candidate text in AT-SPI but missing-glyph boxes on screen. Commit, held-repeat, focus recreation and lock retirement still require a subsequent exact-head result.
+
+Open: auto-capitalisation from surrounding text, word-wise delete, shifting the focused window above the keyboard, and GNOME's bottom-edge touch drag. The IBus route's graphical qualification is the required G-OSK-IBUS runtime gate above, separate from the socket and fault-boundary tests.

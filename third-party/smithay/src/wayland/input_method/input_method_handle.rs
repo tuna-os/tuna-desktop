@@ -55,6 +55,13 @@ pub struct InputMethodHandle {
 }
 
 impl InputMethodHandle {
+    /// The current done epoch, only for the connection owning this instance.
+    pub fn instance_serial(&self, client: &wayland_server::Client) -> Option<u32> {
+        let inner = self.inner.lock().unwrap();
+        let instance = inner.instance.as_ref()?;
+        (instance.object.client().as_ref() == Some(client)).then_some(instance.serial)
+    }
+
     pub(super) fn add_instance(&self, instance: &ZwpInputMethodV2) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(instance) = inner.instance.as_mut() {
@@ -292,6 +299,7 @@ where
                 keyboard.grab = Some(instance.clone());
                 keyboard.text_input_handle = data.text_input_handle.clone();
                 let guard = data.keyboard_handle.arc.internal.lock().unwrap();
+                *data.keyboard_handle.arc.known_im_grab.lock().unwrap() = Some(instance.downgrade());
                 instance.repeat_info(guard.repeat_rate, guard.repeat_delay);
                 let keymap_file = data.keyboard_handle.arc.keymap.lock().unwrap();
                 let res = keymap_file.with_fd(false, |fd, size| {
