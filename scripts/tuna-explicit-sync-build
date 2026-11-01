@@ -14,7 +14,7 @@ printf '' > "$output_root/protocol-xml.sha256"
 protocols=(
     'xdg-shell:stable/xdg-shell/xdg-shell.xml'
     'presentation-time:stable/presentation-time/presentation-time.xml'
-    'linux-dmabuf:unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml'
+    'linux-dmabuf:stable/linux-dmabuf/linux-dmabuf-v1.xml'
     'linux-drm-syncobj:staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml'
 )
 sources=()
