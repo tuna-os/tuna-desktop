@@ -7,4 +7,4 @@ set -euo pipefail
 script_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 exec env LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
     xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 +extension GLX -nolisten tcp' \
-    "$script_root/tuna-vm-lane" --profile explicit-sync "$@"
+    "$script_root/tuna-vm-lane" "$@" --profile explicit-sync

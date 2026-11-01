@@ -608,7 +608,11 @@ fn xdg_required_negative_size_hints_use_the_toplevel_error() {
 fn xdg_required_conflicting_size_hints_fail_on_surface_commit() {
     for version in [7, 6] {
         for minimum_first in [false, true] {
-            for (width, height) in [(500, 100), (100, 500)] {
+            for ((width, height), maximum) in [
+                ((500, 100), (400, 400)),
+                ((100, 500), (400, 400)),
+                ((700, 0), (400, 0)),
+            ] {
                 required_error(
                     version,
                     false,
@@ -616,9 +620,9 @@ fn xdg_required_conflicting_size_hints_fail_on_surface_commit() {
                     |w, _| {
                         if minimum_first {
                             w.top.set_min_size(width, height);
-                            w.top.set_max_size(400, 400);
+                            w.top.set_max_size(maximum.0, maximum.1);
                         } else {
-                            w.top.set_max_size(400, 400);
+                            w.top.set_max_size(maximum.0, maximum.1);
                             w.top.set_min_size(width, height);
                         }
                         w.surface.commit();

@@ -5710,11 +5710,11 @@ fn strip_columns_honour_client_min_and_max_sizes() {
     assert_eq!((b.loc.y, b.size.h), (48 + 500 + 16, 736 - 500 - 16));
 
     // A column never gets narrower than its client allows or wider than
-    // it asks for; a conflicting minimum wins.
+    // it asks for. Clear the old maximum in the minimum-raising transaction.
     let id_c = f.id_c;
     set_size_limits(&mut f, id_c, (0, 0), (400, 0));
     assert_eq!(f.manager.geometry(f.id_c).unwrap().size.w, 400);
-    set_size_limits(&mut f, id_c, (700, 0), (400, 0));
+    set_size_limits(&mut f, id_c, (700, 0), (0, 0));
     assert_eq!(f.manager.geometry(f.id_c).unwrap().size.w, 700);
     set_size_limits(&mut f, id_c, (0, 0), (0, 0));
     assert_eq!(f.manager.geometry(f.id_c).unwrap().size.w, 616);
