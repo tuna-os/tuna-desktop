@@ -319,6 +319,36 @@ rm -rf gtk-shell-artifacts
 TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts
 ```
 
+`--sound-alerts-only` runs just the bell and sound-feedback gates after the
+session starts (`just proof gtk-shell-proof --sound-alerts-only`):
+G-VISUAL-BELL (a real xdg-system-bell client; host pixels of the frame and
+whole-output flashes, none with `visual-bell` off, the original pixels after
+every case; `bell-window-system` only with `audible-bell` and
+`event-sounds`), G-X11-BELL (an X11 client's `XkbBell` through Xwayland, the
+same policy, Mutter's 100 ms repeat drop), G-XSETTINGS-SOUNDS (the
+distribution gsd-xsettings owns XSETTINGS and publishes
+`input-feedback-sounds` as `Net/EnableInputFeedbackSounds`) and
+G-QS-VOLUME-FEEDBACK (a real drag of the quick-settings volume slider sounds
+once at its end, a scroll once, a playing sink or `event-sounds` off never).
+A `canberra-gtk-play` stand-in logs every event sound to `canberra-calls`;
+none of these gates plays or captures audio.
+The `gtk-shell` CI job runs this focused slice before the full shell proof,
+so an unrelated earlier full-shell gate cannot prevent sound qualification.
+Its `sound-alerts/` artifacts and the retained `bin/examples/tuna-bell-client`
+belong to the same exact PR head as the compositor and shell binaries.
+
+The bell timeline presents each 50 ms leg's endpoint before reversing,
+including when a frame arrives late, as Mutter's Clutter timeline does.
+Deterministic bell tests cover delayed samples and a first frame after the
+nominal flash lifetime; the host-pixel coverage and intensity gates remain
+unchanged.
+
+The full GTK proof's media callback barrier waits at most 25 seconds:
+one key can execute four serialized `wpctl` subprocesses with five-second
+production timeouts, plus callback dispatch. It still requires accepted
+tokens to finish successfully and the actual scheduler to be idle; a
+fixture volume write alone never proves completion.
+
 `scripts/tuna-drm-smoke` loads a kernel module and starts seatd as root.
 Run it in a VM or a disposable machine rather than your desktop session.
 The Ubuntu setup helper first checks whether vkms is already installed for

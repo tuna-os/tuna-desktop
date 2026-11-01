@@ -149,7 +149,10 @@ def main():
     parser.add_argument('--receipt', type=Path, required=True)
     args = parser.parse_args()
     expected = json.loads(args.owner.read_text())
-    end = time.monotonic() + 3
+    # A volume key completes four serialized wpctl subprocesses, each with
+    # a five-second production timeout. Allow that chain plus callback
+    # dispatch headroom; acceptance/terminal/scheduler assertions stay strict.
+    end = time.monotonic() + 25
     while True:
         if owner(args.pid) != expected:
             raise ValueError('owned shell process changed')

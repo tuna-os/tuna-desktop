@@ -425,19 +425,19 @@ jobs:
       - name: Install exact Debian-format candidate and isolated companion fixtures
         run: |
           sudo apt-get install -y --no-install-recommends ./package-artifacts/*.deb
-          cargo build --locked --release -p tuna-compositor --example icon-probe --example shortcut-inhibit-client
+          cargo build --locked --release -p tuna-compositor --example icon-probe --example shortcut-inhibit-client --example tuna-bell-client
           mkdir -p package-artifacts/installed
           cp /etc/os-release package-artifacts/installed/os-release
           dpkg-query -W > package-artifacts/installed/dpkg-versions.txt
           apt-cache policy libgtk4-layer-shell0 libgtk-4-1 libadwaita-1-0 > package-artifacts/installed/apt-policy.txt
           sha256sum package-artifacts/*.deb > package-artifacts/installed/package.sha256
           sudo install -d -m0755 /usr/libexec/tuna-deb-proof
-          sudo install -m0755 target/release/examples/icon-probe target/release/examples/shortcut-inhibit-client /usr/libexec/tuna-deb-proof/
+          sudo install -m0755 target/release/examples/icon-probe target/release/examples/shortcut-inhibit-client target/release/examples/tuna-bell-client /usr/libexec/tuna-deb-proof/
           python3 - <<'PY'
           import hashlib, json, os
           from pathlib import Path
           root = Path('target/release/examples')
-          value = {'commit': os.environ['GITHUB_SHA'], 'files': {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in ('icon-probe', 'shortcut-inhibit-client')}}
+          value = {'commit': os.environ['GITHUB_SHA'], 'files': {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in ('icon-probe', 'shortcut-inhibit-client', 'tuna-bell-client')}}
           Path('package-artifacts/installed/companions.json').write_text(json.dumps(value) + '\n')
           PY
           sudo install -m0644 package-artifacts/installed/companions.json /usr/libexec/tuna-deb-proof/provenance.json
@@ -926,6 +926,14 @@ jobs:
       - run: /usr/bin/python3 scripts/lib/gtk-folder-watch-proof-tests.py
       - run: /usr/bin/python3 scripts/lib/lock-curtain-proof-tests.py
       - run: /usr/bin/python3 scripts/lib/gsd-media-keys-bus-tests.py
+      # Qualify sound gates before unrelated full-shell stages can stop them.
+      - name: Prove visual bells and output-slider feedback independently
+        run: scripts/tuna-gtk-shell-proof --sound-alerts-only --artifacts gtk-shell-artifacts/sound-alerts
+        env:
+          TUNA_REQUIRE_PAM_WRAPPER: "1"
+          TUNA_REQUIRE_IBUS: "1"
+          TUNA_REQUIRE_WAYLAND_INFO: "1"
+          TUNA_REQUIRE_GSD_MEDIA_KEYS: "1"
       - run: scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts
         env:
           TUNA_REQUIRE_PAM_WRAPPER: "1"
@@ -963,8 +971,9 @@ jobs:
       # Keep runnable binaries even when a later live proof assertion fails.
       - if: always()
         run: |
-          mkdir -p gtk-shell-artifacts/bin
+          mkdir -p gtk-shell-artifacts/bin/examples
           cp target/debug/tuna-compositor target/debug/tuna-shell-gtk target/debug/tuna-wallpaper-svg gtk-shell-artifacts/bin/
+          cp target/debug/examples/tuna-bell-client gtk-shell-artifacts/bin/examples/
           cp /usr/local/lib/*/libgtk4-layer-shell.so* gtk-shell-artifacts/bin/ 2>/dev/null || cp /usr/local/lib/libgtk4-layer-shell.so* gtk-shell-artifacts/bin/
       # G-WS-INSERT publishes the targeted insertion frame/state. Full
       # parity captures need native fonts, wallpapers and installed apps;

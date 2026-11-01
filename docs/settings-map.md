@@ -94,7 +94,7 @@ Proof V-GSD-PLUGINS checks every started plugin's process, user, unit and bus na
 | ScreensaverProxy | services | Started by gsd (forwards `org.freedesktop.ScreenSaver` inhibits to the compositor's session manager) |
 | Sound | services | Started by gsd |
 | Wwan | services | Started by gsd |
-| XSettings | x11-services | Started by gsd when Xwayland is ready (`DISPLAY` published then); `org.gnome.Mutter.X11` is not served, so X11 scale falls back to 1 |
+| XSettings | x11-services | Started by gsd when Xwayland is ready (`DISPLAY` published then); the X11 window manager leaves `_XSETTINGS_S0` to it, as Mutter does, so it publishes GTK settings (`input-feedback-sounds` as `Net/EnableInputFeedbackSounds`, GTK modules) to X11 clients (G-XSETTINGS-SOUNDS); `org.gnome.Mutter.X11` is not served, so X11 scale falls back to 1 |
 | Color | services | Reimplemented by Tuna: the compositor owns the bus name (Night Light); ICC profiles are missing (P-DS-03) |
 | MediaKeys | basic-services | Started by gsd. The shell binds none of the media-keys schema's keys while gsd-media-keys owns its bus name, and serves what it calls: `org.gnome.Shell` `GrabAccelerators`, `UngrabAccelerators`, `ShowOSD`, `FocusSearch`, `AcceleratorActivated`; `org.gnome.ScreenSaver.Lock`; `org.gnome.Shell.AudioDeviceSelection`; and the end-session dialog through the compositor's `org.gnome.SessionManager`. The screen brightness keys are GNOME Shell's own in GNOME 51 and stay the shell's |
 | A11ySettings | basic-services | Reimplemented by Tuna: the compositor runs Orca and the shell sets `toolkit-accessibility`; gsd would start a second Orca |

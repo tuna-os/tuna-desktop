@@ -2197,6 +2197,27 @@ impl WindowManager {
                         self.set_fullscreen(state, model, on);
                     }
                 }
+                // Mutter 51 `notify_bell` (src/x11/events.c): the window
+                // the bell names, else the focused X11 window when Mutter
+                // frames it (no client-side decorations through Motif
+                // hints); `meta_bell_notify` then applies the one policy.
+                X11ManagerEvent::Bell { window, time } => {
+                    if !state.protocols.bell.admit_x11(time) {
+                        continue;
+                    }
+                    let target = window
+                        .and_then(|xid| self.x11_index.get(&xid).copied())
+                        .or_else(|| {
+                            self.model.focused().filter(|id| {
+                                self.windows
+                                    .get(id)
+                                    .and_then(|w| w.surface.x11_surface())
+                                    .is_some_and(|s| !s.is_decorated() && !s.is_override_redirect())
+                            })
+                        });
+                    let surface = target.and_then(|id| self.surface_of(id));
+                    state.protocols.bell.ring(surface);
+                }
             }
         }
     }
