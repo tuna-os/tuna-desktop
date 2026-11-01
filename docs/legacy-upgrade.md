@@ -141,14 +141,61 @@ absence on disk. This repair adds no cleanup hooks and does not pass
 
 ### Arch replacement
 
-Both services are listed in `backup`. Pacman's old/current/new comparisons may
-preserve a modified file and produce `.pacnew`; replacement from a differently
-named package needs its own test, not an assumption that it behaves like dpkg.
-An intentionally missing file is not guaranteed to remain absent. Administrators
-who require omission can review pacman's explicit `NoExtract` policy for the
-exact path; this repair does not alter that configuration. Avoid automatically
-restoring or deleting their policy. [pacman configuration handling](https://man.archlinux.org/man/pacman.8.en#HANDLING_CONFIG_FILES),
-[NoExtract](https://man.archlinux.org/man/pacman.conf.5.en#OPTIONS)
+The product PKGBUILD declares both services in `backup`; verify the metadata of
+the actual archive before relying on that declaration. The signed original
+`roost 0.1.0-3`, transition beta1 and public beta2 archives lack `backup`.
+Public beta2 also lacks the replacement/conflict metadata. Native transactions
+exposed those differences; [factory PR #962](https://github.com/tuna-os/tunaos-packages/pull/962)
+repairs the producer, but cannot retroactively change an installed old package.
+
+An old package without `backup` can lose edited policy during replacement,
+even when the new archive declares it. The native negative controls also show
+that `NoExtract` alone does not protect an edited old file from removal.
+`NoUpgrade` alone preserves an existing file, with a genuine `.pacnew` when
+appropriate, but does not preserve deliberate absence. Do not treat either
+option alone, a new backup declaration, or a successful package installation as
+policy-preservation evidence.
+
+### Operator-selected native policy precondition
+
+The separately reviewed preparatory route uses **both** native options for the
+exact protected paths:
+
+```ini
+[options]
+NoUpgrade = etc/pam.d/roost-lock etc/pam.d/tuna-lock
+NoExtract = etc/pam.d/roost-lock etc/pam.d/tuna-lock
+```
+
+Before the transaction, establish an independently usable recovery login,
+archive the policy bytes and metadata, and explicitly choose the intended
+policy or absence for **each** service. An old-only installation's missing
+`tuna-lock` is not evidence that an administrator chose denial. Protecting that
+missing path can leave the new session without its intended authentication
+service. Review the actual current service policy before using Tuna, and
+qualify a real correct-password unlock and wrong-password denial; a private
+permit/deny probe is not that proof. Never use a test-only `pam_permit` stack
+as a production recommendation.
+
+Place the exact rules after other patterns and includes that could negate
+them. Inspect the effective `NoUpgrade` and `NoExtract` output with native
+`pacman-conf --config` before removal starts, and pass that same reviewed
+configuration to the actual pacman transaction. The native manager, not a
+post-install recovery promise, enforces these choices. Retain the protections
+for reinstall, downgrade, removal and subsequent installation while the chosen
+policy or absence must remain; dropping them after one successful upgrade is
+not qualified. This repair does not edit the global pacman configuration,
+restore policy, alter the local package database or install migration hooks.
+
+The recorded native lifecycle covers these controls with genuine old and
+CI-built candidate archives, including preservation across all five package
+operations above. It is **not final signed-release qualification**. Review the
+[actual receipts and unsafe controls](https://github.com/tuna-os/tuna-desktop/issues/505#issuecomment-6551267030)
+and the final artifact boundary below before proceeding.
+[pacman configuration handling](https://man.archlinux.org/man/pacman.8.en#HANDLING_CONFIG_FILES),
+[NoUpgrade and NoExtract](https://man.archlinux.org/man/pacman.conf.5.en#OPTIONS),
+[installed-version libalpm removal](https://gitlab.archlinux.org/pacman/pacman/-/raw/54d9411/lib/libalpm/remove.c)
+and [extraction](https://gitlab.archlinux.org/pacman/pacman/-/raw/54d9411/lib/libalpm/add.c).
 
 ### Marlin transactional deployments
 
@@ -185,10 +232,10 @@ the login choice; do not purge configuration as a recovery shortcut.
 | Native compositor startup/readers | Source ordering reviewed and [native CI workspace formatting, clippy and tests pass](https://github.com/tuna-os/tuna-desktop/actions/runs/39347223962/job/118382996345); this does not establish legacy settings-reader or old-session upgrade behavior |
 | Debian lifecycle | 12 actual dpkg cases pass with the pinned published beta and exact built CI candidate; original archive hashes, version ordering and administrator-policy outcomes are recorded. Synthetic packages isolate pre-rename, removed-layout and changed-policy controls |
 | Private PAM | Three disposable-container cases pass with verified native-library provenance: retained service permits, administrator denial persists, and a missing service reaches private denial. The prestarted executable is a synthetic old-service helper, not an old compositor |
-| GDM saved login/reselection/second login | **Unqualified: requires native GDM evidence** |
-| Running pre-rename compositor lock/unlock | **Unqualified: requires actual old compositor** |
-| Arch replacement/deletion/downgrade | **Unqualified: requires native pacman transactions** |
-| Marlin activation, policy preservation and rollback | **Unqualified: requires native deployment tests** |
+| GDM saved login/reselection/second login | Native GDM 51.1.1 starts actual current Tuna from a genuinely saved `roost` identifier; the record remains `roost`. **Unqualified:** visible user-specific reselection, next remembered login, beta-never-launched route and final signed candidate remain open |
+| Running pre-rename compositor lock/unlock | Actual original `roost 0.1.0-3` retains its PID, executable inode and ELF hash across native replacement, initializes PAM afterward, rejects a wrong password and unlocks with the correct one. Preserved intentional denial/absence stays locked with independent recovery. **Unqualified for the final signed candidate** |
+| Arch replacement/deletion/downgrade | Actual signed-archive unsafe controls and genuine CI-built metadata-repair transactions, `.pacnew`, effective combined native protections, reinstall, downgrade, removal and recovery are recorded. **Unqualified for the final signed candidate; unrestricted old-policy replacement is unsafe** |
+| Marlin activation, policy preservation and rollback | **Unqualified: requires final artifact-bound native deployment tests**, independently of pacman or compositor evidence |
 
 The scoped [CI evidence from head `5764d543`](https://github.com/tuna-os/tuna-desktop/actions/runs/39347223962/artifacts/12231976713)
 records all 15 lifecycle/private-PAM cases passing. Its ZIP SHA-256 is
@@ -211,6 +258,43 @@ replacement and initializes PAM afterward. The artifact exports only bounded,
 typed results, hashes and metadata after fixture teardown; private configuration
 bytes and arbitrary command output are excluded. This scoped evidence does not
 replace the remaining PR checks or the four unqualified native routes above.
+
+### Native preparatory receipts, not final release approval
+
+The [2026-11-01 native receipt](https://github.com/tuna-os/tuna-desktop/issues/505#issuecomment-6551267030)
+records actual disposable karnataka VMs and preserves failed controls. The genuine
+old native archive is `roost 0.1.0-3`, SHA-256
+`38c7a587fe5e0654fffc04d0ef2e753911aaa06eda7bde8eadbc73661df9a96f`,
+from source `9e3de927f6730191ff93ddfa96c0fcdb9a08c8f6`. Its real compositor
+ELF SHA-256 is
+`edd5bb3f841e6bd9a9406774194681bec32df6fac7a0d42ed4924e5895fbd34e`.
+Both published beta1 packages are post-rename; neither is a substitute for
+that old compiled consumer.
+
+The live-process observation used actual source-CI beta3 archive SHA-256
+`bc1e4e8be793544ee65c027701682cb0241785774837d06481bba4d54610ac26`,
+source `cad152015353b2fc9ee0b584333f997a0605d6b2`. The factory metadata
+controls used the actual [PR #962 CI archive](https://github.com/tuna-os/tunaos-packages/actions/runs/41253051114/artifacts/13061618788),
+SHA-256 `cb8ff8aa3d6240ebe4c1a6fc259cc0765854460c8edbfb44183dc7e8abf0bdfe`.
+These are real built archives with different evidence purposes, **not signed
+published final inputs**. Native version comparison orders the beta3 candidate
+above the original old package; it does not change the earlier dpkg downgrade
+result.
+
+The old compositor first loaded PAM after replacement and remained alive
+through intentional denial and removal. A separate real GDM login started
+current Tuna through the saved legacy identifier while that old session stayed
+locked. The operator-selected current policy used the real `login` stack, not
+`pam_permit`; actual current Tuna rejected a wrong password and granted the
+correct-password unlock. Named Linux uinput keyboard events supplied part of
+the UI input: this is **emulated-device**, not physical-device, evidence.
+Neither old administrator policy nor its deliberate absence was restored.
+
+Visible reselection and a subsequent remembered login remain distinct gates:
+the successful bridge login still left `Session=roost`. Final signed-package,
+current shipped-image, beta-never-launched and Marlin deployment evidence
+remain required. The original helper-only private-PAM result above has not been
+reclassified as an old-compositor pass, and no bridge-removal gate is waived.
 
 Source checks, byte-path tests and a compiled old-service fixture cannot replace
 the last four rows. Record exact source/package/image hashes, tool/library
