@@ -1284,11 +1284,17 @@ jobs:
     # GDM starts the Tuna Desktop hardware session on the DRM/KMS backend. The
     # image is rebuilt rootful here (bootc install reads it from root's storage),
     # in parallel with marlin-image rather than after it.
-    name: ${{ matrix.orca == 'distribution' && 'marlin-vm' || 'marlin-vm-orca51' }}
+    name: ${{ matrix.artifact }}
     strategy:
       fail-fast: false
       matrix:
-        orca: [distribution, upstream51]
+        include:
+          - profile: lifecycle
+            orca: distribution
+            artifact: marlin-vm
+          - profile: lifecycle
+            orca: upstream51
+            artifact: marlin-vm-orca51
     runs-on: ubuntu-26.04
     needs: [select-lanes, arch-package]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm')
@@ -1406,7 +1412,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
-          name: ${{ matrix.orca == 'distribution' && 'marlin-vm' || 'marlin-vm-orca51' }}
+          name: ${{ matrix.artifact }}
           path: |
             vm-lane-artifacts/
             !vm-lane-artifacts/tour/

@@ -19,6 +19,9 @@ journal stream for `gdm-wayland-session`, which the fixture forwards to the
 serial port. The fixture's session environment comes from `environment.d`,
 which gdm-wayland-session imports from the user manager; the per-login Orca
 test secret comes from a user environment generator.
+The ordinary CLI profile is `--profile lifecycle` (the default); its two
+matrix members keep their original distribution/upstream51 Orca contracts
+and `marlin-vm`/`marlin-vm-orca51` artifact identities.
 
 ## Record-free fresh accounts (tunaOS#4092)
 
