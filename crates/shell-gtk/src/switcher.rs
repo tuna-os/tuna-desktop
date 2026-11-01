@@ -5,7 +5,6 @@
 //! (control model `switcher_*`); this module only draws it.
 
 use std::cell::{Cell, RefCell};
-use std::io::Write;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -169,10 +168,7 @@ fn log_fade(name: &str, animated: Option<bool>) {
     let Some(record) = fade_record(name, animated) else {
         return;
     };
-    // write_all receives a contiguous buffer instead of emitting formatted
-    // fragments. These fixed short records fit within a pipe's PIPE_BUF.
-    // Diagnostics must not abort an animation if stderr is closed.
-    let _ = std::io::stderr().lock().write_all(record.as_bytes());
+    let _ = crate::stderr_record(&record);
 }
 
 /// Ease `widget`'s opacity to `to` (instantly when the motion policy

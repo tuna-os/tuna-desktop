@@ -513,7 +513,7 @@ class TransportAndCleanup(unittest.TestCase):
                  'base_image': 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'c' * 64,
                  'package_sha256': 'd' * 64, 'member_sha256': {
                      '/usr/libexec/' + name: hashlib.sha256((root / 'packaging/marlin/vm-lane' / name).read_bytes()).hexdigest()
-                     for name in ('tuna-vm-input', 'tuna-vm-lifecycle')}}
+                     for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus')}}
         original_error = RuntimeError('lost owned launch acknowledgment')
         calls = []
         class Original:
@@ -551,7 +551,7 @@ class TransportAndCleanup(unittest.TestCase):
                  'base_image': 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'c' * 64,
                  'package_sha256': 'd' * 64, 'member_sha256': {
                      '/usr/libexec/' + name: hashlib.sha256((root / 'packaging/marlin/vm-lane' / name).read_bytes()).hexdigest()
-                     for name in ('tuna-vm-input', 'tuna-vm-lifecycle')}}
+                     for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus')}}
         original_error = RuntimeError('guest lifecycle strip-start failed (exit=1)')
         calls = []
         class Original:

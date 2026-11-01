@@ -1,5 +1,24 @@
 //! The compositor never initializes GdkPixbuf, librsvg or FontConfig. This
 //! single-use process decodes a stream without a base URI, like GNOME's loader.
+
+/// Writes a complete, newline-terminated stderr record with one `write_all`,
+/// so this helper cannot split another process's record on the proof log.
+fn stderr_record(record: &str) -> std::io::Result<()> {
+    std::io::Write::write_all(&mut std::io::stderr().lock(), record.as_bytes())
+}
+
+/// Shadows `std::eprintln!` in every module: format one String including the
+/// newline, then write it whole. Ignore closed-stderr errors.
+macro_rules! eprintln {
+    () => {
+        eprintln!("")
+    };
+    ($($arg:tt)*) => {{
+        let record = ::std::format!("{}\n", ::std::format_args!($($arg)*));
+        let _ = $crate::stderr_record(&record);
+    }};
+}
+
 mod hash;
 mod modern;
 mod provenance;

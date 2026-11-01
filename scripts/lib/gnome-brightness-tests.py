@@ -230,8 +230,8 @@ class IdleRestoreAdmission(unittest.TestCase):
             self.message=f'GDBus.Error:{remote}: {message}'
             super().__init__(self.message)
 
-    def helper(self,clock=lambda:0):
-        scope=dict(namespace,time=SimpleNamespace(monotonic=clock,monotonic_ns=lambda:100),
+    def helper(self,clock=lambda:0,sleep=lambda seconds:None):
+        scope=dict(namespace,time=SimpleNamespace(monotonic=clock,monotonic_ns=lambda:100,sleep=sleep),
                    GLib=SimpleNamespace(Error=self.WireError),
                    Gio=SimpleNamespace(DBusError=SimpleNamespace(get_remote_error=lambda error:error.remote)))
         node=next(node for node in parsed.body if isinstance(node,ast.FunctionDef) and node.name=='idle_restore_call')
@@ -254,19 +254,69 @@ class IdleRestoreAdmission(unittest.TestCase):
             self.helper()(invoke,lambda deadline:None,attempts)
         self.assertEqual(invoke.call_count,100)
         self.assertEqual(len(attempts),100)
-        ticks=iter([0,0,0,5]);invoke.reset_mock();attempts=[]
+        clock=[0];invoke.reset_mock();attempts=[]
+        def expires(timeout):
+            clock[0]=5
+            raise self.WireError()
+        invoke.side_effect=expires
         with self.assertRaisesRegex(RuntimeError,'within bounds'):
-            self.helper(lambda:next(ticks))(invoke,lambda deadline:None,attempts)
+            self.helper(lambda:clock[0])(invoke,lambda deadline:None,attempts)
         self.assertEqual(invoke.call_count,1)
+
+    def test_busy_admissions_are_paced_until_completion(self):
+        clock=[0.0];sleeps=[];attempts=[];checks=[]
+        def sleep(seconds):
+            sleeps.append(seconds);clock[0]+=seconds
+        def invoke(timeout):
+            self.assertGreater(timeout,0)
+            if clock[0]<0.15:raise self.WireError()
+            return 'accepted'
+        value=self.helper(lambda:clock[0],sleep)(invoke,checks.append,attempts)
+        self.assertEqual(value,'accepted')
+        self.assertTrue(all(0<delay<=0.05 for delay in sleeps))
+        self.assertGreaterEqual(clock[0],0.15)
+        self.assertLessEqual(clock[0],0.20)
+        self.assertTrue(all(row['busy_refused'] for row in attempts[:-1]))
+        self.assertIsNone(attempts[-1]['error'])
+        self.assertEqual(set(checks),{5.0})
+
+    def test_busy_sleep_is_clamped_to_original_deadline(self):
+        clock=[0.0];sleeps=[];attempts=[]
+        def sleep(seconds):
+            sleeps.append(seconds);clock[0]+=seconds
+        def busy(timeout):
+            clock[0]=4.99
+            raise self.WireError()
+        invoke=mock.Mock(side_effect=busy)
+        with self.assertRaisesRegex(RuntimeError,'within bounds'):
+            self.helper(lambda:clock[0],sleep)(invoke,lambda deadline:None,attempts)
+        invoke.assert_called_once()
+        self.assertEqual(len(sleeps),1)
+        self.assertAlmostEqual(sleeps[0],0.01)
+        self.assertEqual(clock[0],5.0)
+
+    def test_persistent_busy_uses_deadline_without_hammering_admission(self):
+        clock=[0.0];sleeps=[];attempts=[]
+        def sleep(seconds):
+            sleeps.append(seconds);clock[0]+=seconds
+        invoke=mock.Mock(side_effect=self.WireError())
+        with self.assertRaisesRegex(RuntimeError,'within bounds'):
+            self.helper(lambda:clock[0],sleep)(invoke,lambda deadline:None,attempts)
+        self.assertLessEqual(invoke.call_count,100)
+        self.assertEqual(len(sleeps),invoke.call_count)
+        self.assertTrue(all(0<delay<=0.05 for delay in sleeps))
+        self.assertGreaterEqual(clock[0],4.99)
+        self.assertLessEqual(clock[0],5.0)
 
     def test_unrelated_or_lookalike_error_is_not_retried(self):
         for error in (self.WireError('hardware failure'),self.WireError('brightness update already pending extra'),
                       self.WireError(remote='org.other.Failed')):
-            invoke=mock.Mock(side_effect=error);attempts=[]
+            invoke=mock.Mock(side_effect=error);attempts=[];sleep=mock.Mock()
             with self.subTest(error=error),self.assertRaises(self.WireError):
-                self.helper()(invoke,lambda deadline:None,attempts)
+                self.helper(sleep=sleep)(invoke,lambda deadline:None,attempts)
             self.assertEqual(invoke.call_count,1)
             self.assertNotIn('busy_refused',attempts[0])
+            sleep.assert_not_called()
 
     def test_principal_or_signal_failure_blocks_admission(self):
         invoke=mock.Mock();attempts=[]

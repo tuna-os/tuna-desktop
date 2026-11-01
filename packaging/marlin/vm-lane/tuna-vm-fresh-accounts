@@ -30,3 +30,29 @@ if ! id -u tunaseeded >/dev/null 2>&1; then
 	printf '[User]\nSystemAccount=false\n' >/var/lib/AccountsService/users/tunaseeded
 	chmod 0600 /var/lib/AccountsService/users/tunaseeded
 fi
+# GDM's user list order depends on when AccountsService loads each account,
+# so Tab-counting to "Not listed?" can select tunaseeded and type the target
+# name as its password (run 41230684089). This credential-only boot asks for
+# the name directly instead. Preserve GDM's profile databases, but insert
+# a credential-only database before their defaults. The vendor profile need
+# not contain system-db:gdm (run 41234017707); writing gdm.d alone is not enough.
+profile=/etc/dconf/profile/gdm
+if [ ! -f "$profile" ]; then
+	profile=/usr/share/dconf/profile/gdm
+fi
+install -d -m 0755 /etc/dconf/profile /etc/dconf/db/tuna-vm-fresh-accounts.d
+{
+	printf 'user-db:user\nsystem-db:tuna-vm-fresh-accounts\n'
+	while IFS= read -r line || [ -n "$line" ]; do
+		case "$line" in
+		user-db:* | system-db:tuna-vm-fresh-accounts) continue ;;
+		esac
+		printf '%s\n' "$line"
+	done <"$profile"
+} >/run/tuna-vm-fresh-gdm-profile
+install -m 0644 /run/tuna-vm-fresh-gdm-profile /etc/dconf/profile/gdm
+rm /run/tuna-vm-fresh-gdm-profile
+printf '[org/gnome/login-screen]\ndisable-user-list=true\n' >/etc/dconf/db/tuna-vm-fresh-accounts.d/00-login
+dconf update
+# Read through the actual profile/backend, not merely the source file.
+test "$(DCONF_PROFILE=gdm gsettings get org.gnome.login-screen disable-user-list)" = true

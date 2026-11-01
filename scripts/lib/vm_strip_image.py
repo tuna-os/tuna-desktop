@@ -23,7 +23,7 @@ def admission(package, observed, root, commit, image_id, base_image):
         raise ValueError('image inspection identity differs')
     expected = {'/' + name: data['sha256'] for name, data in package['required_members'].items()
                 if name.startswith('usr/bin/')}
-    for name in ('tuna-vm-input', 'tuna-vm-lifecycle'):
+    for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus'):
         path = Path(root) / 'packaging/marlin/vm-lane' / name
         expected['/usr/libexec/' + name] = hashlib.sha256(path.read_bytes()).hexdigest()
     if observed.get('member_sha256') != expected:
@@ -41,7 +41,7 @@ def admission(package, observed, root, commit, image_id, base_image):
 # Executed inside the final immutable image by the existing CI job. No host
 # filesystem mounts, guest configuration changes, or credentials are required.
 IMAGE_INSPECTION = '''import hashlib,json,os,stat,sys
-names=["/usr/bin/tuna-"+n for n in ("compositor","session","shell-host","shell-gtk","ibus-bridge")]+["/usr/libexec/tuna-vm-input","/usr/libexec/tuna-vm-lifecycle"]
+names=["/usr/bin/tuna-"+n for n in ("compositor","session","shell-host","shell-gtk","ibus-bridge")]+["/usr/libexec/tuna-vm-input","/usr/libexec/tuna-vm-lifecycle","/usr/libexec/tuna-vm-shell-focus"]
 result={}
 for name in names:
  fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW)

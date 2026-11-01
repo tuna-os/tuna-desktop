@@ -173,11 +173,15 @@ where
     fn bind(
         _: &mut D,
         _: &DisplayHandle,
-        _: &Client,
+        client: &Client,
         resource: New<ZwpInputMethodManagerV2>,
-        _: &InputMethodManagerGlobalData,
+        global_data: &InputMethodManagerGlobalData,
         data_init: &mut DataInit<'_, D>,
     ) {
+        if !(global_data.filter)(client) {
+            data_init.post_error(resource, 0u32, "input-method manager access denied");
+            return;
+        }
         data_init.init(resource, ());
     }
 
@@ -211,14 +215,12 @@ where
                 user_data.insert_if_missing(InputMethodHandle::default);
                 let handle = user_data.get::<InputMethodHandle>().unwrap();
                 let text_input_handle = user_data.get::<TextInputHandle>().unwrap();
-                text_input_handle.with_focused_text_input(|ti, surface| {
-                    ti.enter(surface);
-                });
                 let keyboard_handle = seat.get_keyboard().unwrap();
                 let instance = data_init.init(
                     input_method,
                     InputMethodUserData {
                         handle: handle.clone(),
+                        children: Default::default(),
                         text_input_handle: text_input_handle.clone(),
                         keyboard_handle,
                         popup_geometry_callback: D::parent_geometry,
@@ -227,7 +229,11 @@ where
                         dismiss_popup: D::dismiss_popup,
                     },
                 );
-                handle.add_instance(&instance);
+                if handle.add_instance(&instance) {
+                    text_input_handle.with_focused_text_input(|ti, surface| {
+                        ti.enter(surface);
+                    });
+                }
             }
             zwp_input_method_manager_v2::Request::Destroy => {
                 // Nothing to do

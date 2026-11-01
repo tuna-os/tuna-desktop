@@ -14,6 +14,26 @@
 //! Stability: internal. This crate is not published and makes no SemVer
 //! promise; see `docs/api-stability.md` in the repository.
 
+/// Writes a complete, newline-terminated stderr record with one `write_all`
+/// (see `tuna_compositor::stderr_record`).
+#[doc(hidden)]
+pub fn stderr_record(record: &str) -> std::io::Result<()> {
+    std::io::Write::write_all(&mut std::io::stderr().lock(), record.as_bytes())
+}
+
+/// Shadows `std::eprintln!` here and in importing binaries: format one String
+/// including the newline, then write it whole. Ignore closed-stderr errors.
+#[macro_export]
+macro_rules! eprintln {
+    () => {
+        $crate::eprintln!("")
+    };
+    ($($arg:tt)*) => {{
+        let record = ::std::format!("{}\n", ::std::format_args!($($arg)*));
+        let _ = $crate::stderr_record(&record);
+    }};
+}
+
 pub mod apps;
 pub mod control;
 pub mod dock;

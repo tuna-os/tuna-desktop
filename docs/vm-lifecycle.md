@@ -20,6 +20,23 @@ serial port. The fixture's session environment comes from `environment.d`,
 which gdm-wayland-session imports from the user manager; the per-login Orca
 test secret comes from a user environment generator.
 
+## Installed strip captures
+
+The strip probe binds the original native processes and all three installed
+fixture helpers to the selected package, source and final image. Both PNG and
+PPM acquisitions must pass all 25 original body-color samples; the captures
+remain separate acquisitions, not presentation-latency proof.
+
+A real notification can cover those pixels. On the first mismatch, the probe
+retains the original frames and may acknowledge the visible banner through
+ordinary QMP input: Super+N, Tab, then Space only after the original shell's
+public Close button is observed focused and enabled. The read-only AT-SPI
+observer records fixed public controls and original process/bus identities,
+not notification summaries or bodies. Every pixel check and the existing
+10-second capture and 120-second phase deadlines remain unchanged. No updater
+service, notification policy or failure log is disabled; acknowledging a banner
+does not qualify the update operation that produced it.
+
 ## Record-free fresh accounts (tunaOS#4092)
 
 `tuna-test` above has a session-less AccountsService record, so it proves
@@ -30,20 +47,145 @@ is a separate boot of the same disk (QEMU `-snapshot`) that passes the
 installer would: `tunastd` (standard), `tunaadmin` (`wheel`), and the
 control `tunaseeded`, whose record is pre-seeded. `tunastd` and `tunaadmin`
 get no AccountsService record, no Session preselection and no autologin.
+For this credential-only boot the fixture also sets GDM's own
+`org.gnome.login-screen disable-user-list=true` in its own
+`tuna-vm-fresh-accounts` dconf database, explicitly inserted into the GDM
+profile ahead of the preserved vendor defaults. The fixture requires a real
+`gsettings get` readback of `true` before it finishes. Run 41234017707 showed
+the vendor profile need not include `system-db:gdm`, so writing `gdm.d`
+without installing a profile does not apply the setting. The greeter then
+asks for the user name. In run 41230684089 the old Tab count to
+"Not listed?" instead selected the listed `tunaseeded`, typed `tunastd` as
+its failed password, then authenticated `tunaseeded` with the fixture
+password. The setting does not create account records or select a session.
+
+The process/logind greeter predicate is not an input-readiness predicate.
+In [run 41248530233](https://github.com/tuna-os/tuna-desktop/actions/runs/41248530233),
+artifact `marlin-vm-orca51` (ID `13061267386`, SHA-256
+`1de554a272722c7640b767cde1f75cfa7603910bd7c0c3cda4b4895f38d79af2`)
+retains a black `fresh-accounts/fresh-greeter.png`; its
+`tunastd-first-password.png` still shows **Username**, not Password, when
+the old driver sends the password. The serial journal records
+`pam_faillock(gdm-password:auth): User unknown` at 19.270579 seconds and no
+user session. The standard counterpart reaches a visible Password prompt
+and authenticates both accounts; its later admin sudo failure is separate.
+The run's PR source is `df05bde92cd4392871db9d36d3d3a21ce43b846b`;
+workflow checkout/manifest metadata is the synthetic merge
+`b4d42581e7299323fd6ead9f76dcd94862990f1c`. Both use published Marlin
+base `sha256:6c1e25b1fa9ddc07d7e71f767456839676333d3ebdc332b642a467f56c8ff71b`;
+the Orca test-layer image ID is
+`sha256:0e3b49a6df3ee644fb9ec4f1dc5b0971da0e6d67b4aedbbc0bedcb5ff116b2e8`.
+
+The fresh-account driver now waits for the actual greeter's focused,
+visible, showing, editable, sensitive and enabled AT-SPI entry before
+typing each credential. The probe runs as the active non-root greeter UID,
+binds the accessibility bus PID/UID to the original `gnome-shell` process
+and start time, and distinguishes text from password-text roles without
+reading names or entry contents or invoking accessibility actions.
+Prompt receipts and pre-input frames are retained. Initial readiness uses
+the existing greeter deadline; name, password and session readiness share
+one existing login deadline. There is one credential pair per login, no
+fixed-sleep increase and no retry. This fixes wrong-phase input; the old
+receipts alone do not identify which input was lost during startup.
+
+The first native observer run found 1267 distinct GNOME greeter actors,
+exceeding the unchanged 512-node observation budget when hidden actors were
+enumerated. This was not a cycle (maximum depth 15, no duplicate objects).
+The actual focused username entry had all required flags, and every
+non-root ancestor was SHOWING/VISIBLE. Pruning non-SHOWING branches visits
+131 nodes instead, including hidden branch roots, without changing the
+node/depth/time limits. The application metadata root is exempt from this
+prune because it is not a visible component. This follows the existing
+shell-focus observer's SHOWING traversal rule.
+
 
 | Gate | Actual operation and evidence |
 | --- | --- |
 | V-FRESH-RECORD-FREE-<user> | Before any login: account exists with a home, no `/var/lib/AccountsService/users/<user>`, no GDM automatic/timed login, `wheel` only for the admin |
 | V-FRESH-CONTROL | The same probe classifies the pre-seeded `tunaseeded` as NOT record-free |
-| V-FRESH-LOGIN-<user>-{first,second,reboot} | GDM "Not listed?" name and password typed through QMP; exactly one `gdm-password` VT session runs `tuna-compositor` and no `gnome-shell`/`gnome-session` |
-| V-FRESH-RECORD-CREATED-<user> | After the first login AccountsService wrote the record; any saved `Session` is `tuna` |
+| V-FRESH-LOGIN-<user>-{first,second,reboot} | Owner-bound focused editable GDM text prompt, then password-text prompt, observed before each credential is typed through QMP; exactly one `gdm-password` VT session of that account runs `tuna-compositor` and no `gnome-shell`/`gnome-session` |
+| V-FRESH-SESSION-<user>-{first,second,reboot} | Read AccountsService's effective `Session` over the system bus: it must be `tuna`; if a cache record exists, any saved `Session` must also be `tuna` |
 | V-FRESH-SUDO-<user> | `sudo -S -k true` as the account with its password: admin succeeds, standard is refused by sudo policy |
 | V-FRESH-LOGOUT-<user>-<round> | logind ends the session and the greeter is ready again |
-| V-FRESH-REBOOT / V-FRESH-RECORD-KEPT-<user> | In-guest reboot (new `boot_id`), records survive, then both accounts log in again |
+| V-FRESH-REBOOT / V-FRESH-SESSION-RELOADED-<user> | In-guest reboot (new `boot_id`), effective AccountsService `Session=tuna` reloads before login, then both accounts authenticate into Tuna again |
 
-Receipts are in `fresh-accounts-receipts.json`; frames per attempt and
-session. Only Arch/GDM 51 is covered here; pre-51 GDM is not exercised by
-this lane.
+Receipts are in `fresh-accounts-receipts.json`; frames before each input,
+on prompt timeout and at each session. Only Arch/GDM 51 is covered here;
+pre-51 GDM is not exercised by this lane.
+
+The in-guest reboot uses a fixed transient systemd timer, queued two seconds
+ahead as in the Corral session driver. This lets the guest-exec receipt finish
+before shutdown stops its QGA service. Queue acknowledgement is not reboot
+proof: the host still requires a different `boot_id`, effective session reload
+and both real password logins after reboot, within the unchanged journey bounds.
+
+### Why a first login need not create a cache file
+
+PR #931 incorrectly required a physical cache file after the first login.
+The direct [GNOME reference receipt](../scripts/lib/fixtures/fresh-account-gnome51-reference.json)
+boots the **same pinned published Marlin GNOME base** as failed diagnostic
+run [41223633281](https://github.com/tuna-os/tuna-desktop/actions/runs/41223633281):
+`ghcr.io/tuna-os/marlin:gnome@sha256:8d71660f78120a141e9ae8e620bd66645c6bfb52f1ab4cd663f9672aaa0b0b94`.
+It ran on an owned Corral VM on `karnataka`, without a Tuna package or the
+VM-lane layer. `useradd -m` created separate standard and wheel accounts;
+neither had a cache record, `.dmrc`, preselected session or autologin.
+Both first successful GDM password logins started stock GNOME Shell 51.1
+with gnome-session 51.0, GDM 51.1.1 and AccountsService 26.27.3, in active
+Wayland `gdm-password` sessions on VT2. **Both cache files remained absent**;
+AccountsService exported empty `Session` and `Saved=false`. The monitored
+system bus contained lookups but no `SetSession` or `CacheUser` calls before
+the explicitly labelled post-observation intervention. The receipt retains
+actual package/template/session identities, navigation distinctions and
+successful VM/disk deletion plus exact-name inventory absence.
+
+This matches upstream, rather than a missing Tuna session-start method:
+
+- [AccountsService 26.27.3 `user_update_from_template`](https://gitlab.freedesktop.org/accountsservice/accountsservice/-/blob/26.27.3/src/user.c#L330-414)
+  applies the template to in-memory/exported properties without saving a
+  file. Its `user_change_session_authorized_cb` writes extra data only when
+  the normalized new session differs from the current property.
+- [GDM 51.1.1 session settings](https://github.com/GNOME/gdm/blob/d643e68963ab74564955025b554ec23cd794770d/daemon/gdm-session-settings.c#L300-L320)
+  explicitly loads properties even without saved state. Its
+  [`gdm_session_settings_save`](https://github.com/GNOME/gdm/blob/d643e68963ab74564955025b554ec23cd794770d/daemon/gdm-session-settings.c#L373-L415)
+  only sends non-NULL session/type/language values, and caches only non-local
+  users. Loading a local account is not `CacheUser`. Tuna's existing
+  templates supply `Session=tuna`; setting that same value is not a reason
+  for AccountsService to materialize a cache file.
+- [GNOME Shell 51.1](https://github.com/GNOME/gnome-shell/blob/33da06854e229c256afd5872fedd83c28cbfa176/js/gdm/loginDialog.js#L535-L554)
+  can request `SelectSession` when the session menu's active item changes;
+  this is not a guarantee that every default login changes an account
+  property. Its user/session UI reads AccountsService users; the observed
+  GNOME login does not cache them. [gnome-session 51.0](https://github.com/GNOME/gnome-session/tree/aed00cf18229a98231c23e14f5798ddb918c4956)
+  has no AccountsService mutation API.
+- GNOME Initial Setup is a **different account-creation/property-writing
+  path**, not installed in this Marlin reference. Its [51.0 account page](https://github.com/GNOME/gnome-initial-setup/blob/51.0/gnome-initial-setup/pages/account/gis-account-page-local.c#L447-L488)
+  calls `CreateUser` and sets an icon; its [language page](https://github.com/GNOME/gnome-initial-setup/blob/51.0/gnome-initial-setup/pages/language/gis-language-page.c#L100-L153)
+  writes the language. AccountsService's `CreateUser` path calls
+  `cache_user`, unlike an installer using `useradd`. A record produced there
+  must not be misattributed to the first ordinary GDM login.
+
+The corrected proof does not write a record, call `SetSession`, preseed a
+choice or add product-side cache writes. It reads the effective
+AccountsService session with `FindUserByName`/`Get(Session)` and requires
+`tuna` after **every** login and after reboot, while still rejecting a saved
+GNOME choice. The record-free preflight, seeded negative control, real
+authentication, standard/admin sudo policy, logout and reboot remain gates.
+
+### Original #931 merge audit
+
+[#931](https://github.com/tuna-os/tuna-desktop/pull/931) did **not** have green
+exact-head CI. Head `d62ec870c0f402c22fbae6719afd227cd0353b81` was merged by
+`hanthor` at `2026-10-31T15:42:38Z` as
+`cba3cdbd5cd629d42c2512124f3fe7e35c117b55`, while its
+[exact-head run 41215443626](https://github.com/tuna-os/tuna-desktop/actions/runs/41215443626)
+was unfinished. `check` failed at 16:00:23Z, `marlin-vm` at 16:27:14Z,
+`marlin-vm-orca51` at 16:30:35Z and `ci-gate` at 18:14:39Z.
+An earlier PR comment already documented the missing-record failure as a
+merge blocker. At investigation time the branch protection endpoint returned
+“Branch not protected”; the effective organization ruleset required only
+deletion/non-fast-forward protection, not successful status checks. These
+observations explain why an ordinary merge was possible; they do not prove
+an administrator bypass was used.
 
 The Debian package journey must retain the original beta package's
 `share/pam.d/tuna-lock` conffile bytes, including its comment. Run

@@ -1,0 +1,271 @@
+{
+  "schema": 1,
+  "purpose": "Direct record-free standard/admin first stock-GDM GNOME login comparison for tuna-desktop#931",
+  "image": "ghcr.io/tuna-os/marlin:gnome@sha256:8d71660f78120a141e9ae8e620bd66645c6bfb52f1ab4cd663f9672aaa0b0b94",
+  "boot_id": "fcfab79b-aaed-4033-b850-8779089cb5f2",
+  "vm": {
+    "name": "tuna-q-fresh-gnome-1031",
+    "namespace": "corral-vms",
+    "backend": "kubevirt",
+    "status": "Running",
+    "ready": true,
+    "node": "karnataka",
+    "cpu": {
+      "vcpus": 4,
+      "sockets": 4,
+      "cores": 1,
+      "threads": 1,
+      "model": "host-passthrough",
+      "dedicatedCpuPlacement": false,
+      "isolateEmulatorThread": false
+    },
+    "memory": "6Gi",
+    "disks": [
+      {
+        "name": "rootdisk",
+        "type": "disk",
+        "bus": "virtio",
+        "source": "persistentVolumeClaim",
+        "claim": "tuna-q-fresh-gnome-1031-bootc-disk",
+        "size": "40Gi"
+      }
+    ],
+    "inputs": [
+      {
+        "name": "tablet",
+        "type": "tablet",
+        "bus": "usb"
+      }
+    ],
+    "firmware": {
+      "type": "uefi",
+      "secureBoot": false,
+      "machine": "q35"
+    },
+    "ips": [
+      "10.42.0.202"
+    ],
+    "tagValues": {
+      "purpose": "fresh-account-gnome-reference"
+    },
+    "labels": {
+      "corral": "tuna-q-fresh-gnome-1031",
+      "corral-bootc-image": "",
+      "corral.dev/tag.purpose": "fresh-account-gnome-reference"
+    },
+    "image": "ghcr.io/tuna-os/marlin:gnome@sha256:8d71660f78120a141e9ae8e620bd66645c6bfb52f1ab4cd663f9672aaa0b0b94"
+  },
+  "packages": [
+    "gdm 51.1.1-1",
+    "gnome-shell 1:51.1-1",
+    "gnome-session 51.0-1",
+    "accountsservice 26.27.3-1"
+  ],
+  "gnome_initial_setup_installed": false,
+  "setup": {
+    "account_creation": [
+      "systemctl stop gdm.service",
+      "useradd -m -U -s /bin/bash gnomestd",
+      "useradd -m -U -s /bin/bash -G wheel gnomeadmin",
+      "chpasswd with public fixture password tuna",
+      "systemctl start gdm.service"
+    ],
+    "gdm_conf": "# GDM configuration storage\n\n[daemon]\n\n[security]\n\n[debug]\n# Uncomment the line below to turn on debugging\n#Enable=true\n",
+    "templates": {
+      "/run/accountsservice/user-templates/standard": null,
+      "/run/accountsservice/user-templates/administrator": null,
+      "/etc/accountsservice/user-templates/standard": null,
+      "/etc/accountsservice/user-templates/administrator": null,
+      "/usr/share/accountsservice/user-templates/standard": "[Template]\n#EnvironmentFiles=/etc/os-release;\n\n[User]\nSession=\nIcon=${HOME}/.face\n",
+      "/usr/share/accountsservice/user-templates/administrator": "[Template]\n#EnvironmentFiles=/etc/os-release;\n\n[User]\nSession=\nIcon=${HOME}/.face\n"
+    },
+    "no_user_record_or_session_preselection_injected": true,
+    "navigation_notes": "Standard first authentication used its GDM user row. A later attempted admin console navigation accidentally reauthenticated standard; that is not counted as admin evidence. The genuine admin first login used Not listed? with typed gnomeadmin and its password. No session menu selection, autologin or template edits."
+  },
+  "first_logins": [
+    {
+      "user": "gnomestd",
+      "captured_utc": "2026-10-31T18:34:00Z",
+      "uid": 1000,
+      "groups": "uid=1000(gnomestd) gid=1000(gnomestd) groups=1000(gnomestd)",
+      "home": "/var/home/gnomestd",
+      "record_before": null,
+      "record_after": null,
+      "dmrc_before": null,
+      "effective_properties": [
+        "s \"\"",
+        "s \"\"",
+        "b true",
+        "b false"
+      ],
+      "session": {
+        "Id": "6",
+        "User": "1000",
+        "VTNr": "2",
+        "Service": "gdm-password",
+        "Type": "wayland",
+        "Class": "user",
+        "State": "active"
+      },
+      "desktop": [
+        "gnome-session",
+        "gnome-shell"
+      ],
+      "desktop_process_evidence": [
+        "3221 gdm-wayland-ses /usr/lib/gdm-wayland-session /usr/bin/gnome-session",
+        "3281 gnome-session-s /usr/lib/gnome-session-service --session=gnome",
+        "3290 gnome-shell     /usr/bin/gnome-shell --mode=user"
+      ]
+    },
+    {
+      "user": "gnomeadmin",
+      "captured_utc": "2026-10-31T18:37:15Z",
+      "uid": 1001,
+      "groups": "uid=1001(gnomeadmin) gid=1001(gnomeadmin) groups=1001(gnomeadmin),998(wheel)",
+      "home": "/var/home/gnomeadmin",
+      "record_before": null,
+      "record_after": null,
+      "dmrc_before": null,
+      "effective_properties": [
+        "s \"\"",
+        "s \"\"",
+        "b true",
+        "b false"
+      ],
+      "session": {
+        "Id": "14",
+        "User": "1001",
+        "VTNr": "2",
+        "Service": "gdm-password",
+        "Type": "wayland",
+        "Class": "user",
+        "State": "active"
+      },
+      "desktop": [
+        "gnome-session",
+        "gnome-shell"
+      ],
+      "desktop_process_evidence": [
+        "6409 gdm-wayland-ses /usr/lib/gdm-wayland-session /usr/bin/gnome-session",
+        "6467 gnome-session-s /usr/lib/gnome-session-service --session=gnome",
+        "6474 gnome-shell     /usr/bin/gnome-shell --mode=user"
+      ]
+    }
+  ],
+  "standard_settled": {
+    "captured_utc": "2026-10-31T18:34:29Z",
+    "record": null
+  },
+  "account_bus_methods_before_intervention": {
+    "ListCachedUsers": 6,
+    "UserDeleted": 4,
+    "UserAdded": 5,
+    "Changed": 23,
+    "FindUserById": 15,
+    "FindUserByName": 14
+  },
+  "post_observation_intervention": {
+    "note": "Not baseline login evidence: explicit root SetSession calls made only after both first-login receipts. Empty string is normalized to NULL by AccountsService, so it is not asserted to equal its exported empty-string default.",
+    "commands": [
+      "busctl --system call org.freedesktop.Accounts /org/freedesktop/Accounts/User1001 org.freedesktop.Accounts.User SetSession s \"\"",
+      "busctl --system call org.freedesktop.Accounts /org/freedesktop/Accounts/User1001 org.freedesktop.Accounts.User SetSession s gnome"
+    ],
+    "record_after_empty_SetSession": "[User]\nIcon=/var/home/gnomeadmin/.face\nSystemAccount=false\n",
+    "record_after_gnome_SetSession": "[User]\nSession=gnome\nIcon=/var/home/gnomeadmin/.face\nSystemAccount=false\n"
+  },
+  "cleanup": {
+    "returncode": 0,
+    "result": [
+      {
+        "name": "tuna-q-fresh-gnome-1031",
+        "deleted": true,
+        "removed": [
+          "virtualmachine.kubevirt.io/tuna-q-fresh-gnome-1031",
+          "virtualmachineinstance.kubevirt.io/tuna-q-fresh-gnome-1031",
+          "persistentvolumeclaim/tuna-q-fresh-gnome-1031-bootc-disk"
+        ]
+      }
+    ],
+    "exact_name_remaining": [],
+    "console_service_stopped": true
+  },
+  "failing_before": {
+    "run": 41223633281,
+    "head": "05149acf6a62edc6c7b8bd7c96df7ff3faf80ce5",
+    "jobs": [
+      124605519843,
+      124605519848
+    ],
+    "artifacts": [
+      13051694193,
+      13051113998
+    ]
+  },
+  "original_pr_merge_audit": {
+    "number": 931,
+    "head": "d62ec870c0f402c22fbae6719afd227cd0353b81",
+    "merge": "cba3cdbd5cd629d42c2512124f3fe7e35c117b55",
+    "merged_at": "2026-10-31T15:42:38Z",
+    "merged_by": "hanthor",
+    "exact_head_run": 41215443626,
+    "check_completed": "2026-10-31T16:00:23Z failure",
+    "marlin_vm_completed": "2026-10-31T16:27:14Z failure",
+    "marlin_vm_orca51_completed": "2026-10-31T16:30:35Z failure",
+    "ci_gate_completed": "2026-10-31T18:14:39Z failure",
+    "current_enforced_rules": [
+      "deletion",
+      "non_fast_forward"
+    ]
+  },
+  "upstream": {
+    "gdm": {
+      "commit": "d643e68963ab74564955025b554ec23cd794770d",
+      "release": "51.1.1",
+      "load": "daemon/gdm-session-settings.c:300-320 loads account Session even without saved state",
+      "save": "daemon/gdm-session-settings.c:390-405 only sets non-NULL properties; CacheUser only for non-local user"
+    },
+    "accountsservice": {
+      "release": "26.27.3",
+      "template": "src/user.c:330-414 loads template into exported properties without save_extra_data",
+      "lookup": "src/daemon.c:1419-1490 creates/registers in-memory object without cache_user",
+      "set_session": "src/user.c user_change_session_authorized_cb compares effective property; saves only on change",
+      "create_user": "src/daemon.c daemon_create_user_backend invokes cache_user after useradd"
+    },
+    "gnome_shell": {
+      "commit": "33da06854e229c256afd5872fedd83c28cbfa176",
+      "release": "51.1",
+      "session_choices": "js/gdm/loginDialog.js:543-551 and authMenuButton.js:394-414 may call SelectSession when active menu changes; not evidence of physical cache write",
+      "account_actors": "systemActions, endSessionDialog, screenShield, unlockDialog, polkitAgent use get_user; no cache_user/set_session found in js/src"
+    },
+    "gnome_session": {
+      "commit": "aed00cf18229a98231c23e14f5798ddb918c4956",
+      "release": "51.0",
+      "account_actors": "No AccountsService/org.freedesktop.Accounts/CacheUser/SetSession/act_user/accountsservice matches in upstream release tree"
+    },
+    "gnome_initial_setup": {
+      "release": "51.0",
+      "account_page": "pages/account/gis-account-page-local.c:485 CreateUser async; :447 sets icon file",
+      "language_page": "pages/language/gis-language-page.c:108,148 sets language; these are state-mutating setup operations, distinct from ordinary login"
+    }
+  },
+  "raw_receipts_directory": "/tmp/fresh-account-gnome-reference-1031",
+  "raw_receipt_sha256": {
+    "reference-meta.json": "b5412ef63bda10fa85962f6872283fd1a01ee4faebc5bd8d7841dfcf0ca9a3f2",
+    "standard-before-auth-command.json": "7f4cd8ab28fc201ab78f452eae6804d5fa8ab1cbfa992900f78d80e6be0bdd22",
+    "standard-session-and-bus-command.json": "aa456af26603766ebc8676234f9ddcc65d414a43537de136c77ea7fa4fd96a0b",
+    "initial-command.json": "02aacf77198c2ae8d5461b7b5d1012e285ff4c789c393847fd04c477653fcaf7",
+    "vm-info-command.json": "bb1ea020b03b91f5047741341e72f271f1152095fbf3c5f986b24c54cd345283",
+    "setup-command.json": "3bd7a898a8ff20810e1050180537ff44e93e6c55c984df82b6bcfb6d0d7e6eb4",
+    "post-observation-causal-intervention-command.json": "0890a7f8e71c1178f51f2000de02d6df28ea21e5b4c9e7c4218de0fff62b919f",
+    "preflight-command.json": "79ccf9c99c760a1cbd982b14c53cbc66785c0ffd0bde094e0b07e6ae25691c5f",
+    "upstream-source-paths.json": "8c3fa11b78a197c2ed37d952f984c2b97649607ed261c7673aae6bd6cf48f21d",
+    "admin-after-auth-command.json": "c500483cb0c55eda30b2e0f6eb4b68b0f1832b0d9f1e8bc10827add7c7826b12",
+    "cleanup-command.json": "0e0dfcc7e6350a3b0b3fe998013fb3cc5623df865856a9aaafb513fbbd092e41",
+    "admin-before-auth-command.json": "43d133c47984af05f4d48882b836e80dfef345f60b4a3b1df5d2a863e972ed8b",
+    "standard-after-auth-command.json": "a3fb531ee83e6e7f1c0153fa353c26ea2c5f8ccd58a64a5a3ff91b3425e5807e",
+    "admin-session-and-bus-command.json": "d2a942f7b68ef84df0dc3459d19ae243d380c2a76ddd4acdb127f2fa76f0e6e6",
+    "admin-first-auth-command.json": "37723e85e7079c5ad5d3a4266ea06855f357edace5d148e18b5dfb8d60981860",
+    "cleanup-inventory.json": "9eac15387b2bf3c40b922e3cff90dd03435e8bff44709e4e7dacb8fb77705183",
+    "standard-settled-command.json": "9f9c58ceae761e401eef37529368b52bf9bcc865980453bc258f7dbd604f0bc7"
+  }
+}

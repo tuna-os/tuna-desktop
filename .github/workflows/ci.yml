@@ -106,6 +106,8 @@ jobs:
           sparse-checkout: |
             /.github/actions/ci-tool/
             /scripts/ci-install-gtk4-layer-shell
+            /scripts/ci-install-gtk4-atspi-root
+            /scripts/gtk-atspi-root-proof
       - uses: ./.ci-workflow-tools/.github/actions/ci-tool
         with:
           tool: gtk4-layer-shell
@@ -648,6 +650,14 @@ jobs:
         with:
           tool: gtk4-layer-shell
           version: 4867d7b85cdf1e829fc1fd6f1d5f04c42cc99389
+      - name: Install controlled GTK build and private proof dependencies
+        run: sudo apt-get install -y --no-install-recommends quilt gettext sassc libvulkan-dev glslc libtiff-dev libjpeg-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev python3-gi gir1.2-gtk-4.0 dbus-x11 xauth
+      - uses: ./.ci-workflow-tools/.github/actions/ci-tool
+        with:
+          tool: gtk4-atspi-root
+          version: 4.14.5+ds-0ubuntu0.10+21d3eb76
+      - name: Prove real stock failure and repaired AT-SPI root references
+        run: /usr/bin/python3 .ci-workflow-tools/scripts/gtk-atspi-root-proof --artifacts "$RUNNER_TEMP/gtk-atspi-root-proof"
       - name: Check exact source/build/negative-verdict admission
         run: |
           /usr/bin/python3 scripts/tests/test_grid_cancel_proof.py
@@ -668,6 +678,8 @@ jobs:
             ${{ runner.temp }}/grid-cancel-comparison/*.txt
             ${{ runner.temp }}/grid-cancel-comparison/old/
             ${{ runner.temp }}/grid-cancel-comparison/fixed/
+            ${{ runner.temp }}/gtk-atspi-root-proof/
+            ${{ runner.temp }}/ci-tool-gtk4-atspi-root/usr/local/share/doc/tuna-ci-gtk4-atspi-root/
           retention-days: 14
 
   gtk-shell:
@@ -745,7 +757,7 @@ jobs:
           path: ${{ runner.temp }}/native-minimize/
           retention-days: 14
       # A small failure-only subset can be retrieved without the full binaries.
-      # Keep the full native-minimize-proof upload above unchanged.
+      # The full upload retains the single frozen role set plus both mode proofs.
       - name: Collect bounded native minimize failure diagnostics
         id: minimize_failure_bundle
         if: failure() && steps.native_minimize.outcome == 'failure'
@@ -932,6 +944,15 @@ jobs:
           TUNA_REQUIRE_IBUS: "1"
           TUNA_REQUIRE_WAYLAND_INFO: "1"
           TUNA_REQUIRE_GSD_MEDIA_KEYS: "1"
+      # Initial DnD target focus must not wait for another physical motion.
+      # Run the unchanged shared hover/reorder assertions independently of
+      # unrelated full-suite assertions, using this job's just-built binaries.
+      - name: Stationary-start native DnD grid hover
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: scripts/tuna-gtk-shell-proof --grid-hover-only --artifacts gtk-shell-artifacts/grid-hover
       # Native/X11 geometry and physical input at all required virtual scales.
       - run: |
           for scale in 1 1.25 1.5 2; do
@@ -1020,7 +1041,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          factory_commit=c0998b94bd7b4fbc67360c239e439de6debf539b
+          factory_commit=01d74f3c354fe8219ccf21acd4122273b6984588
           factory=$(mktemp -d "$RUNNER_TEMP/orca-factory.XXXXXX")
           artifacts="$GITHUB_WORKSPACE/orca-speech-artifacts"
           mkdir -p "$artifacts"

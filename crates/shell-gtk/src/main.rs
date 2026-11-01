@@ -13,6 +13,24 @@
 //! The compositor runs one supervised shell; select this one with
 //! `TUNA_SHELL_BIN=tuna-shell-gtk` while it grows to parity.
 
+/// Writes a complete, newline-terminated stderr record with one `write_all`
+/// (see `tuna_compositor::stderr_record`).
+fn stderr_record(record: &str) -> std::io::Result<()> {
+    std::io::Write::write_all(&mut std::io::stderr().lock(), record.as_bytes())
+}
+
+/// Shadows `std::eprintln!` in every module: format one String including the
+/// newline, then write it whole. Ignore closed-stderr errors.
+macro_rules! eprintln {
+    () => {
+        eprintln!("")
+    };
+    ($($arg:tt)*) => {{
+        let record = ::std::format!("{}\n", ::std::format_args!($($arg)*));
+        let _ = $crate::stderr_record(&record);
+    }};
+}
+
 mod accessibility;
 mod anim_clock;
 mod audio_selection;
@@ -464,25 +482,32 @@ impl shell_dbus::ShellActions for GnomeShellDbus {
             .is_some_and(|c| c.model().is_overview_open())
     }
 
-    fn set_accelerator_grabs(&self, grabs: Vec<tuna_shell_control::AcceleratorGrab>) {
-        if let Some(control) = self.shell.borrow_mut().control.as_mut() {
-            let locked = control.locked();
-            let subset = media_keys::trace_enabled().then(|| {
-                let accelerators: Vec<_> = grabs.iter().map(|g| g.accelerator).collect();
-                media_keys::media_subset(&accelerators)
-            });
-            let result = control.set_accelerator_grabs(grabs);
-            if let Some(subset) = subset {
-                media_keys::trace(
-                    "accelerators-send",
-                    serde_json::json!({
-                        "request_id": result.as_ref().ok(), "write_ok": result.is_ok(),
-                        "media": subset,
-                    }),
-                    locked,
-                );
-            }
+    fn set_accelerator_grabs(
+        &self,
+        grabs: Vec<tuna_shell_control::AcceleratorGrab>,
+    ) -> Option<shell_dbus::AcceleratorRequest> {
+        let mut shell = self.shell.borrow_mut();
+        let control = shell.control.as_mut()?;
+        let locked = control.locked();
+        let subset = media_keys::trace_enabled().then(|| {
+            let accelerators: Vec<_> = grabs.iter().map(|g| g.accelerator).collect();
+            media_keys::media_subset(&accelerators)
+        });
+        let result = control.set_accelerator_grabs(grabs);
+        if let Some(subset) = subset {
+            media_keys::trace(
+                "accelerators-send",
+                serde_json::json!({
+                    "request_id": result.as_ref().ok(), "write_ok": result.is_ok(),
+                    "media": subset,
+                }),
+                locked,
+            );
         }
+        result.ok().map(|id| shell_dbus::AcceleratorRequest {
+            generation: control.connection_generation(),
+            id,
+        })
     }
 }
 
@@ -3644,6 +3669,7 @@ fn build(app: &adw::Application) {
             let (osd_ui, pad_osd_ui, pad_osd_service) =
                 (osd_ui.clone(), pad_osd_ui.clone(), pad_osd_service.clone());
             let resync_after = resync_after.clone();
+            let gnome_shell = gnome_shell.clone();
             Rc::new(move |drained: Drained| {
                 let Drained {
                     results,
@@ -3805,6 +3831,8 @@ fn build(app: &adw::Application) {
                     );
                     lock_ui.command_result(id, applied);
                     pad_osd_service.command_result(id, applied);
+                    // The compositor installs a grab table before it answers.
+                    gnome_shell.command_result(id, applied);
                 }
                 // The bar goes see-through and Activities shows as checked
                 // while the overview is open, as GNOME draws them; it is a
@@ -3900,7 +3928,12 @@ fn build(app: &adw::Application) {
         sync(Drained::default());
         // Every frame the socket holds, then what the connection is now.
         let pump = {
-            let (shell, notify, sync) = (shell_rc.clone(), notify.clone(), sync.clone());
+            let (shell, notify, sync, gnome_shell) = (
+                shell_rc.clone(),
+                notify.clone(),
+                sync.clone(),
+                gnome_shell.clone(),
+            );
             move || {
                 let mut drained = Drained::default();
                 let mut shell = shell.borrow_mut();
@@ -3923,6 +3956,12 @@ fn build(app: &adw::Application) {
                 drop(shell);
                 // A hang-up or a redial changes what the views may trust
                 // (lock authority, input-method admission) without a frame.
+                if closed {
+                    gnome_shell.release_replies();
+                } else {
+                    // A send may have redialed between pump calls already.
+                    gnome_shell.control_changed(Some(generation));
+                }
                 if handled || generation != before || closed != was_closed {
                     sync(drained);
                 }

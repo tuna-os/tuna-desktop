@@ -28,18 +28,14 @@ pub(crate) fn trace_media(stage: &str, details: serde_json::Value, locked: bool)
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
         return;
     }
-    // One write per record, like the shell's: eprintln! of a JSON value
-    // issues many small writes that the shell's records on the same pipe
-    // can split (journey 38757056152 failed G-MEDIA-VOLUME on that).
-    let line = format!(
-        "tuna-media-diagnostic: {}\n",
+    eprintln!(
+        "tuna-media-diagnostic: {}",
         serde_json::json!({
             "actor": "compositor", "pid": std::process::id(), "stage": stage,
             "monotonic_ns": now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64,
             "details": details,
         })
     );
-    let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
 }
 
 fn media_trace_enabled() -> bool {
@@ -3267,6 +3263,15 @@ impl WindowManager {
     /// Whether an interactive move/resize is in progress.
     pub fn grab_active(&self) -> bool {
         self.grab.is_some()
+    }
+
+    /// The window owning a native move, not a pending client request or resize.
+    pub(crate) fn interactive_move_window(&self) -> Option<u64> {
+        match self.grab? {
+            PointerGrab::Move { id, .. } => Some(id),
+            PointerGrab::StripMove { owner, .. } => Some(owner.id),
+            _ => None,
+        }
     }
 
     /// The pointer cursor of an interactive grab (#342): move, or

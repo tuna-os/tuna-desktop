@@ -53,6 +53,31 @@ use smithay::{
     },
 };
 
+/// Writes a complete, newline-terminated stderr record with one `write_all`.
+///
+/// The nested proofs parse one log shared by the compositor, the shell, the
+/// IBus bridge and their helpers. `std::eprintln!` writes formatted pieces
+/// separately, so another process's piece can land inside a record (#922,
+/// G-LOCK-CURTAIN-CLOCK). Whole records up to `PIPE_BUF` bytes cannot split.
+#[doc(hidden)]
+pub fn stderr_record(record: &str) -> std::io::Result<()> {
+    std::io::Write::write_all(&mut std::io::stderr().lock(), record.as_bytes())
+}
+
+/// Shadows `std::eprintln!` here and in importing binaries: format one String
+/// including the newline, then write it whole. Ignore closed-stderr errors;
+/// diagnostics must not abort the session.
+#[macro_export]
+macro_rules! eprintln {
+    () => {
+        $crate::eprintln!("")
+    };
+    ($($arg:tt)*) => {{
+        let record = ::std::format!("{}\n", ::std::format_args!($($arg)*));
+        let _ = $crate::stderr_record(&record);
+    }};
+}
+
 pub mod a11y_keyboard;
 mod a11y_shadow;
 pub mod animation;
@@ -134,6 +159,7 @@ pub mod sleep;
 pub mod slideshow;
 pub mod spring;
 pub mod state;
+mod state_snapshot;
 pub mod supervise;
 pub mod tablet;
 pub mod tablet_actions;
@@ -1390,6 +1416,16 @@ impl TestCompositor {
         self.display
             .handle()
             .insert_client(stream, Arc::new(ClientState::default()))
+            .unwrap()
+    }
+
+    /// Attach the private server-owned input-method connection in native
+    /// protocol fixtures. Public clients must use `add_client`; executable
+    /// names, PIDs and application metadata do not grant this authority.
+    pub fn add_ime_bridge_client(&mut self, stream: UnixStream) -> Client {
+        self.display
+            .handle()
+            .insert_client(stream, Arc::new(ClientState::ime_bridge()))
             .unwrap()
     }
 

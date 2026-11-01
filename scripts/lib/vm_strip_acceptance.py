@@ -437,7 +437,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
     if not re.fullmatch('(sha256:)?[0-9a-f]{64}', image['image_id']) or '@sha256:' not in image['base_image']:
         raise RuntimeError('immutable image/base identity missing')
     root = Path(__file__).resolve().parents[2]
-    for name in ('tuna-vm-input', 'tuna-vm-lifecycle'):
+    for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus'):
         local = root / 'packaging/marlin/vm-lane' / name
         if image['member_sha256'].get('/usr/libexec/' + name) != hashlib.sha256(local.read_bytes()).hexdigest():
             raise RuntimeError('installed fixture/observer differs from exact executing source')
@@ -505,6 +505,52 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
     def chord(*keys):
         transport.command('send-key', keys=[{'type': 'qcode', 'data': key} for key in keys], **{'hold-time': 80})
 
+    def dismiss_visible_banner(label, capture_deadline, capture_transport):
+        def observe():
+            remaining = min(4, capture_deadline - time.monotonic())
+            if remaining <= 0:
+                raise TimeoutError('installed banner interaction exceeded capture deadline')
+            value = agent.run('strip-banner', nonce, timeout=remaining)
+            if value.get('owner') != original:
+                raise RuntimeError('banner observer differs from original fixture ownership')
+            notification = value['notification']
+            banner = notification['banner']
+            if (notification.get('observation_only') is not True
+                    or any(type(banner.get(key)) is not bool for key in ('visible', 'focused', 'close_ready'))):
+                raise RuntimeError('actual public banner observation is incomplete')
+            return notification
+
+        before = observe()
+        if not before['banner']['visible']:
+            return
+        interaction = {'capture': label, 'before': before, 'steps': [], 'completed': False,
+                       'scope': 'ordinary public Close interaction; updater result is not qualified'}
+        receipt.setdefault('banner_interference', []).append(interaction)
+        # Never mute a service, dismiss through private state, or relax a pixel
+        # check. Focus the actual visible banner and its observed Close button.
+        for keys, expected in ((('meta_l', 'n'), 'focused'), (('tab',), 'close_ready'), (('spc',), None)):
+            capture_transport.command('send-key', keys=[{'type': 'qcode', 'data': key} for key in keys],
+                                      **{'hold-time': 80})
+            step = {'keys': list(keys), 'observations': []}
+            interaction['steps'].append(step)
+            while time.monotonic() < capture_deadline:
+                actual = observe()
+                step['observations'].append(actual)
+                if len(step['observations']) > 32:
+                    raise RuntimeError('public banner observation count exceeded bound')
+                banner = actual['banner']
+                if not banner['visible']:
+                    interaction['completed'] = True
+                    return
+                if expected is not None and banner[expected]:
+                    sample = read(capture_deadline)
+                    if sample['inventory']['state']['seat_pressed_key_count'] == 0:
+                        break
+                time.sleep(min(.05, max(0, capture_deadline - time.monotonic())))
+            else:
+                raise TimeoutError('actual public banner did not reach its input endpoint')
+        raise RuntimeError('public Close did not remove the visible notification')
+
     def capture(label, sample, role='alpha'):
         found = windows(sample, original, edge=edge)
         png = destination / (label + '.png')
@@ -541,6 +587,8 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
                 if attempts == 1:
                     png.replace(destination / (label + '-not-ready.png'))
                     ppm.replace(destination / (label + '-not-ready.ppm'))
+                if attempts == 1:
+                    dismiss_visible_banner(label, capture_deadline, capture_transport)
                 remaining = capture_deadline - time.monotonic()
                 if remaining <= 0:
                     raise

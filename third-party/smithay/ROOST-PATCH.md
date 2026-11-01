@@ -139,3 +139,61 @@ meta_x11_display_set_input_focus does; enter/leave are unchanged. The
 nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
 The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
 version stays 0.7.0.
+
+Issue #364 additionally changes `src/wayland/input_method/{mod.rs,
+input_method_handle.rs,input_method_keyboard_grab.rs}`. Registry visibility
+and forced binds both enforce the compositor's input-method admission
+filter. A seat belongs to one exact live input-method resource, not to all
+resources sharing its connection. Unavailable resources ignore requests;
+their popup/grab NewIDs are initialized inertly without assigning roles,
+installing grabs or emitting events, and destroying them cannot retire
+the real owner or its grab. `tests/input_protocols.rs` uses actual Wayland
+connections for admitted/public clients, same-connection duplicates,
+replacement, child-resource teardown, spoofed application metadata and a
+copied native client executable in a separate process. The copy is the
+protocol test executable, not an installed IBus package qualification.
+
+The focused source-consumer command is `cargo test --locked --offline -p
+tuna-compositor --test input_protocols --test protocols`, using the normal
+native features. These protocol/socket tests do not qualify an installed
+package, image, supervised production IBus process or graphical IME journey;
+those still require the installed native OSK/IBus producer and exact binary
+and image identities. A rejection can be reported by libwayland as a fatal
+I/O error for `wl_display.invalid_object` (code zero), so the negative
+consumers assert terminal connection failure, not only `ProtocolError`.
+
+Destroying any input-method parent also destroys its associated popup/grab
+resources, including inert child IDs. Active-owner retirement detaches its
+popup and grab before any callback, without holding IM or grab locks across
+callouts. Keyboard-grab `unset` clears its recorded ownership, and teardown
+checks the installed grab's serial before releasing it: a compositor-owned
+replacement or a new input method must not be canceled by old child cleanup.
+The native consumers retain child proxies across parent destruction, check
+the actual server objects are gone, and exercise both parent-first and
+child-first destruction, continued compositor-grab key delivery and a fresh
+input method's typing/grab after retirement.
+
+Trusted virtual-keyboard returned keys must not temporarily unset and
+reinstall an input-method grab: `unset` now really retires its resource
+ownership. `KeyboardHandle::input_forward_to_focus` preserves ordinary
+forwarded-key and modifier bookkeeping while delivering directly through the
+normal focus/keymap path. Only an active input-method grab takes that route;
+compositor-owned grabs keep normal dispatch. The native returned-key consumer
+forwards the actual IM keymap FD, returns press/release events over the
+trusted virtual keyboard, then exercises further physical input, IM typing
+and a compositor-owned grab without loopback or lost ownership.
+
+Permanent grab replacement also sends the retiring live IM grab
+`repeat_info(0, 0)` after releasing its state lock. Returned-key forwarding
+does not send a pause or change the live repeat rate. The consumer checks
+the actual pause event and that a later keyboard repeat-settings change
+does not rearm the retired grab. This baseline has no IM weak repeat
+registration; integrations which add one must clear only the retiring
+resource's registration, never a replacement's.
+
+A standard `grab_keyboard` request from the admitted current IM also
+rechecks actual seat ownership: it cannot replace a non-IM compositor grab.
+Such a late request receives a tracked inert child without metadata; its
+release and parent teardown cannot unset the compositor owner. The returned-
+key consumer exercises this race with actual standard requests and verifies
+continued physical-key delivery to the compositor grab.
