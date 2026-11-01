@@ -61,11 +61,16 @@ Homebrew and its normal command-line-tool prerequisites). It obtains the
 checksum-pinned Sigstore verifier itself and acquires QEMU plus amd64 UEFI
 through native package trust, including when QEMU exists but firmware is
 missing. Linux without caller access to `/dev/kvm` explicitly uses TCG.
-Cancellation waits for an already-started native package transaction to
-finish safely; it does not start a VM afterward. No Podman or guest disk
-build belongs in this consumer. An artifact directory changes only where
-the same signed bytes are read; it does not replace identities, trust roots
-or descriptors, and is not a promise of network-free dependency bootstrap.
+Interactive Linux hosts use their normal sudo authentication, with its password
+input connected directly to the real terminal; the wrapper never reads or stores
+that password. Without a terminal, sudo must permit noninteractive installation
+or acquisition fails closed. Cancellation waits for an already-started native
+package transaction (and its normal authentication prompt) to finish safely;
+it does not start a VM afterward.
+No Podman or guest disk build belongs in this consumer. An artifact directory
+changes only where the same signed bytes are read; it does not replace
+identities, trust roots or descriptors, and is not a promise of network-free
+dependency bootstrap.
 
 The existing public wrapper is not cut over until a real signed disk and
 manifest pass all four native firstboot/browser/lifecycle qualifications.

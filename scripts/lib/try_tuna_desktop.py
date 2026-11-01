@@ -306,15 +306,31 @@ def package_present(command, expected=None):
 def package_transaction(command):
     """Do not SIGKILL a native package database transaction on wrapper deadlines."""
     require(not CANCELLED, "cancelled before native package transaction; VM was not started")
-    process = subprocess.Popen([str(value) for value in command], stdout=sys.stderr, stderr=sys.stderr,
-                               env=trusted_environment(), start_new_session=True)
+    command = [str(value) for value in command]
+    terminal = None
+    if command[0] == "sudo":
+        try:
+            # The child has its own session so terminal cancellation cannot
+            # interrupt a package database transaction. Let normal sudo read
+            # the real user's terminal directly; Python never reads a password.
+            terminal = open("/dev/tty", "rb", buffering=0)
+        except OSError:
+            command.insert(1, "-n")
+        else:
+            command.insert(1, "-S")
     try:
-        returncode = process.wait()
+        process = subprocess.Popen(command, stdin=terminal if terminal is not None else subprocess.DEVNULL,
+                                   stdout=sys.stderr, stderr=sys.stderr,
+                                   env=trusted_environment(), start_new_session=True)
+        try:
+            returncode = process.wait()
+        finally:
+            # Even an unrelated exception must not kill the native installer.
+            if process.poll() is None:
+                process.wait()
     finally:
-        # The CLI's signal handler defers cancellation. Even an unrelated
-        # exception must not turn that into a forced package-manager kill.
-        if process.poll() is None:
-            process.wait()
+        if terminal is not None:
+            terminal.close()
     if returncode:
         raise CommandFailure(command, returncode, b"native package manager failed; see its output above")
 
