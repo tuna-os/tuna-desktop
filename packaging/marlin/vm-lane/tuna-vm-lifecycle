@@ -1962,7 +1962,7 @@ def strip_client(action, nonce):
             raise RuntimeError("unknown fixture launch prevents confirmed cleanup")
         return {"nonce": nonce, "boot_id": owner["boot_id"], "owned_processes": records,
                 "cleanup_confirmed": True, "descendant_group_retirement_qualified": False}
-    if action != "state" or owner.get("launch_state") != "known":
+    if action not in ("state", "banner") or owner.get("launch_state") != "known":
         raise RuntimeError("strip fixture ownership not admitted")
     fixture = strip_json(receipt_path, OWNER.pw_uid)
     if strip_validate_client(fixture, nonce, owner["launcher"], mode) != owner["client"]:
@@ -1970,6 +1970,14 @@ def strip_client(action, nonce):
     current = inventory()
     if strip_core(current) != owner["core"]:
         raise RuntimeError("native compositor/shell identity changed since original fixture admission")
+    if action == "banner":
+        shell = owner["core"][SHELL_GTK]
+        display = f"{NESTED}{owner['core'][COMPOSITOR]['pid']}"
+        observed = json.loads(call("/usr/libexec/tuna-vm-shell-focus", str(shell["pid"]),
+                                   str(shell["start_ticks"]), SHELL_GTK, display, "banner", user=True))
+        if strip_core(inventory()) != owner["core"]:
+            raise RuntimeError("original native pair changed during banner observation")
+        return {"owner": owner, "notification": observed}
     summary = strip_json(STATE, OWNER.pw_uid)
     current["state"].update({key: summary.get(key) for key in
                            ("session_mode", "strip_offset", "strip_view", "strip_animating", "rendered_frames", "tile_preview",
@@ -2327,7 +2335,7 @@ def main():
         if len(sys.argv) != 4:
             raise ValueError("soak-read takes a file name and offset")
         result = soak_read(sys.argv[2], int(sys.argv[3]))
-    elif action in ("strip-start", "strip-edge-start", "strip-state", "strip-stop"):
+    elif action in ("strip-start", "strip-edge-start", "strip-state", "strip-banner", "strip-stop"):
         if len(sys.argv) != 3:
             raise ValueError("strip action requires exactly one nonce")
         try:
@@ -2957,7 +2965,10 @@ print(json.dumps(result))
         result = FRESH_ACTIONS[action](sys.argv[2])
     elif action == "reboot":
         boot_id = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-        call("systemctl", "reboot", "--no-block")
+        # Let the guest-exec receipt finish before reboot stops its QGA service.
+        # Match the existing deferred reboot used by the Corral session driver.
+        call("systemd-run", "--quiet", "--collect", "--unit=tuna-vm-lane-reboot",
+             "--on-active=2s", "/usr/bin/systemctl", "reboot")
         result = {"requested": "reboot", "boot_id": boot_id}
     elif action == "payload":
         payload = pathlib.Path("/usr/share/tuna-vm/shipped-payload.sha256")

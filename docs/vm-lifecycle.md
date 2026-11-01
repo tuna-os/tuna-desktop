@@ -20,6 +20,23 @@ serial port. The fixture's session environment comes from `environment.d`,
 which gdm-wayland-session imports from the user manager; the per-login Orca
 test secret comes from a user environment generator.
 
+## Installed strip captures
+
+The strip probe binds the original native processes and all three installed
+fixture helpers to the selected package, source and final image. Both PNG and
+PPM acquisitions must pass all 25 original body-color samples; the captures
+remain separate acquisitions, not presentation-latency proof.
+
+A real notification can cover those pixels. On the first mismatch, the probe
+retains the original frames and may acknowledge the visible banner through
+ordinary QMP input: Super+N, Tab, then Space only after the original shell's
+public Close button is observed focused and enabled. The read-only AT-SPI
+observer records fixed public controls and original process/bus identities,
+not notification summaries or bodies. Every pixel check and the existing
+10-second capture and 120-second phase deadlines remain unchanged. No updater
+service, notification policy or failure log is disabled; acknowledging a banner
+does not qualify the update operation that produced it.
+
 ## Record-free fresh accounts (tunaOS#4092)
 
 `tuna-test` above has a session-less AccountsService record, so it proves
@@ -95,6 +112,12 @@ shell-focus observer's SHOWING traversal rule.
 Receipts are in `fresh-accounts-receipts.json`; frames before each input,
 on prompt timeout and at each session. Only Arch/GDM 51 is covered here;
 pre-51 GDM is not exercised by this lane.
+
+The in-guest reboot uses a fixed transient systemd timer, queued two seconds
+ahead as in the Corral session driver. This lets the guest-exec receipt finish
+before shutdown stops its QGA service. Queue acknowledgement is not reboot
+proof: the host still requires a different `boot_id`, effective session reload
+and both real password logins after reboot, within the unchanged journey bounds.
 
 ### Why a first login need not create a cache file
 

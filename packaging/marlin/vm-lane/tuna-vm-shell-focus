@@ -3,8 +3,9 @@
 
 Default observation has no text/value/description queries. The explicit controlled
 overview mode compares only the known five-character fixture query in scratch
-memory; no buffer is retained. No synthetic AT-SPI actions, focus changes or
-arbitrary names are recorded. Native QMP input performs every action.
+memory; no buffer is retained. Banner mode observes only the original shell's
+visible Notifications frame and public Close button. No synthetic AT-SPI actions,
+focus changes or arbitrary names are recorded. Native QMP input performs every action.
 Primary API: https://gnome.pages.gitlab.gnome.org/at-spi2-core/libatspi/
 """
 import json
@@ -129,15 +130,16 @@ def catalog_receipt(pid, uid, ticks):
             "sample_scope":"original-show-results","authentication_boundary":False}
 
 
-def observe(pid, ticks, executable, display, controlled=False):
+def observe(pid, ticks, executable, display, controlled=False, banner=False):
     global FOCUS_OPERATION
     FOCUS_OPERATION = "imports"
     import gi
     gi.require_version("Atspi", "2.0")
     from gi.repository import Atspi, Gio, GLib
     uid = os.getuid()
-    if type(controlled) is not bool or (controlled and executable != "tuna-shell-gtk"):
-        raise RuntimeError("fixed controlled overview mode required")
+    if (type(controlled) is not bool or type(banner) is not bool or (controlled and banner)
+            or ((controlled or banner) and executable != "tuna-shell-gtk")):
+        raise RuntimeError("fixed shell observation mode required")
     if uid == 0 or executable not in {"tuna-shell-gtk", "gnome-disks"}:
         raise RuntimeError("probe requires the original non-root session principal")
     state = pathlib.Path(f"/run/user/{uid}/tuna-vm-state.json")
@@ -147,7 +149,7 @@ def observe(pid, ticks, executable, display, controlled=False):
     original = process_identity(pid, uid, ticks, executable, display)
     FOCUS_OPERATION = "atspi-timeout"
     Atspi.set_timeout(500, 500)
-    deadline = time.monotonic() + 8
+    deadline = time.monotonic() + (3 if banner else 8)
     def remaining_budget():
         if json.loads(state.read_text())["locked"]:
             raise RuntimeError("locked accessibility trees are never queried")
@@ -214,6 +216,7 @@ def observe(pid, ticks, executable, display, controlled=False):
     nodes, pending, visited = [], [(app, 0)], 0
     search_entries, target = [], {"showing":0,"focused":0,"present":0}
     focused_roles = []
+    banner_focused = False
     while pending:
         if json.loads(state.read_text())["locked"]:
             raise RuntimeError("locked accessibility trees are never queried")
@@ -233,6 +236,10 @@ def observe(pid, ticks, executable, display, controlled=False):
             continue
         FOCUS_OPERATION = "tree-role"
         role = canonical_role(accessibility_query(node.get_role_name))
+        if banner and depth == 1 and (role != "frame" or accessibility_query(node.get_name) != "Notifications"):
+            continue
+        if banner and depth:
+            banner_focused |= states.contains(Atspi.StateType.FOCUSED)
         if role in PUBLIC_ROLES:
             FOCUS_OPERATION = "tree-name"
             name = accessibility_query(node.get_name)
@@ -240,7 +247,15 @@ def observe(pid, ticks, executable, display, controlled=False):
             focused = states.contains(Atspi.StateType.FOCUSED)
             active = states.contains(Atspi.StateType.ACTIVE)
             FOCUS_OPERATION = "tree-public-control"
-            record = public_node(name, role, showing, focused, active)
+            if banner:
+                record = None
+                if (role, name) in {("frame", "Notifications"), ("push button", "Close")}:
+                    record = {"label": name, "role": role, "focused": bool(focused), "active": bool(active)}
+                    if role == "push button":
+                        record["ready"] = bool(focused and states.contains(Atspi.StateType.SENSITIVE)
+                                               and states.contains(Atspi.StateType.ENABLED))
+            else:
+                record = public_node(name, role, showing, focused, active)
             if record is not None:
                 nodes.append(record)
             if controlled:
@@ -283,6 +298,13 @@ def observe(pid, ticks, executable, display, controlled=False):
     result = {"principal": original, "atspi_owner": owner, "credentials_before": before,
             "credentials_after": after, "public_controls": nodes, "visited": visited,
             "guest_monotonic": time.monotonic(), "observation_only": True}
+    if banner:
+        frames = [node for node in nodes if node["role"] == "frame"]
+        closes = [node for node in nodes if node["role"] == "push button"]
+        if len(frames) > 1 or len(closes) > 1 or (closes and not frames):
+            raise RuntimeError("visible notification controls are ambiguous")
+        result["banner"] = {"visible": len(frames) == 1, "focused": bool(banner_focused),
+                            "close_ready": len(closes) == 1 and closes[0]["ready"]}
     if controlled:
         if diagnostic is not None and type(diagnostic.get("catalog")) is dict and "sample" in diagnostic["catalog"]:
             sample = diagnostic["catalog"]["sample"]
@@ -297,9 +319,11 @@ def observe(pid, ticks, executable, display, controlled=False):
 
 if __name__ == "__main__":
     try:
-        if len(sys.argv) not in (5,6) or (len(sys.argv)==6 and sys.argv[5]!="controlled-overview"):
+        if len(sys.argv) not in (5,6) or (len(sys.argv)==6 and sys.argv[5] not in {"controlled-overview", "banner"}):
             raise ValueError("fixed observation mode")
-        receipt = observe(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4], len(sys.argv)==6)
+        mode = sys.argv[5] if len(sys.argv) == 6 else None
+        receipt = observe(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4],
+                          controlled=mode == "controlled-overview", banner=mode == "banner")
         FOCUS_OPERATION = "serialization"
         print(json.dumps(receipt))
     except Exception as error:
