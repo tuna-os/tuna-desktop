@@ -26,7 +26,7 @@ xdg_toplevel_drag_manager_v1	1	capture	match
 zwp_primary_selection_device_manager_v1	1	capture	match
 wl_subcompositor	1	capture	match
 xdg_wm_base	7	capture	match
-gtk_shell1	7	capture	absent:not planned, GTK4 needs none of it
+gtk_shell1	7	capture	absent:deliberate GTK own-modal/titlebar/DBus-metadata difference; portal parenting is separate
 wp_viewporter	1	capture	match
 wp_fractional_scale_manager_v1	1	capture	match
 zwp_pointer_gestures_v1	3	capture	match
