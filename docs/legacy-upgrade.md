@@ -232,7 +232,7 @@ the login choice; do not purge configuration as a recovery shortcut.
 | Native compositor startup/readers | Source ordering reviewed and [native CI workspace formatting, clippy and tests pass](https://github.com/tuna-os/tuna-desktop/actions/runs/39347223962/job/118382996345); this does not establish legacy settings-reader or old-session upgrade behavior |
 | Debian lifecycle | 12 actual dpkg cases pass with the pinned published beta and exact built CI candidate; original archive hashes, version ordering and administrator-policy outcomes are recorded. Synthetic packages isolate pre-rename, removed-layout and changed-policy controls |
 | Private PAM | Three disposable-container cases pass with verified native-library provenance: retained service permits, administrator denial persists, and a missing service reaches private denial. The prestarted executable is a synthetic old-service helper, not an old compositor |
-| GDM saved login/reselection/second login | Native GDM 51.1.1 starts actual current Tuna from saved `roost`, then explicit visible Tuna reselection changes the record to `tuna`; the next username/password-only login remembers it. **Unqualified for the beta-never-launched route and final signed candidate** |
+| GDM saved login/reselection/second login | Native GDM 51.1.1 covers direct and genuine beta-installed-but-never-launched routes: saved `roost` starts current Tuna, explicit visible Tuna selection changes the record to `tuna`, and the next username/password-only login retains it. **Unqualified for the final signed candidate** |
 | Running pre-rename compositor lock/unlock | Actual original `roost 0.1.0-3` retains its PID, executable inode and ELF hash across native replacement, initializes PAM afterward, rejects a wrong password and unlocks with the correct one. Preserved intentional denial/absence stays locked with independent recovery. **Unqualified for the final signed candidate** |
 | Arch replacement/deletion/downgrade | Actual signed-archive unsafe controls and genuine CI-built metadata-repair transactions, `.pacnew`, effective combined native protections, reinstall, downgrade, removal and recovery are recorded. **Unqualified for the final signed candidate; unrestricted old-policy replacement is unsafe** |
 | Marlin activation, policy preservation and rollback | **Unqualified: requires final artifact-bound native deployment tests**, independently of pacman or compositor evidence |
@@ -296,10 +296,16 @@ left `Session=roost`. The [native continuation receipt](https://github.com/tuna-
 records the named account's visible Tuna selection, GDM changing its record to
 `Session=tuna`, and a different current compositor on the next
 username/password-only login with that selection retained. The old compositor
-stayed alive and locked. Final signed-package, current shipped-image,
-beta-never-launched and Marlin deployment evidence remain required. The
-original helper-only private-PAM result above has not been reclassified as an
-old-compositor pass, and no bridge-removal gate is waived.
+stayed alive and locked. The [beta-never-launched receipt](https://github.com/tuna-os/tuna-desktop/issues/505#issuecomment-6551932843)
+adds actual signed beta1 installation, no account process or autologin before
+the native upgrade, and the same bridge, explicit selection and next-login
+sequence afterward. The candidate remains the real unsigned source-CI beta3
+archive, not a final signed release. Native GDM/session identities are recorded;
+no new framebuffer or VNC qualification is claimed from that continuation.
+Final signed-package, current shipped-image and remaining Marlin deployment
+evidence remain required. The original helper-only private-PAM result above
+has not been reclassified as an old-compositor pass, and no bridge-removal gate
+is waived.
 
 Source checks, byte-path tests and a compiled old-service fixture cannot replace
 the last four rows. Record exact source/package/image hashes, tool/library
