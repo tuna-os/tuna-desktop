@@ -22,6 +22,40 @@ def save_identity(path, state):
     temporary.replace(path)
 
 
+def safe_delete_output(value):
+    """Project only Kubernetes identity/Status fields before retaining output."""
+    receipt = {'present': bool(value), 'redacted': True}
+    try:
+        payload = json.loads(value) if value else None
+    except (ValueError, TypeError, UnicodeError):
+        payload = None
+    if not isinstance(payload, dict):
+        return json.dumps(receipt)
+    receipt['json_object'] = True
+    kind = payload.get('kind')
+    if kind not in ('Status', 'Secret', 'VirtualMachine', 'PersistentVolumeClaim'):
+        return json.dumps(receipt)
+    projection = {'kind': kind}
+    metadata = payload.get('metadata')
+    if isinstance(metadata, dict):
+        projection['metadata'] = {key: metadata[key] for key in
+            ('name', 'namespace', 'uid', 'deletionTimestamp') if isinstance(metadata.get(key), str)}
+    if kind == 'Status':
+        if payload.get('status') in ('Success', 'Failure'):
+            projection['status'] = payload['status']
+        code = payload.get('code')
+        if type(code) is int and 100 <= code <= 599:
+            projection['code'] = code
+        if payload.get('reason') in (
+                'Unauthorized', 'Forbidden', 'NotFound', 'AlreadyExists', 'Conflict', 'Gone',
+                'Invalid', 'ServerTimeout', 'Timeout', 'TooManyRequests', 'BadRequest',
+                'MethodNotAllowed', 'NotAcceptable', 'RequestEntityTooLarge',
+                'UnsupportedMediaType', 'InternalError', 'Expired', 'ServiceUnavailable', 'Unknown'):
+            projection['reason'] = payload['reason']
+    receipt['projection'] = projection
+    return json.dumps(receipt)
+
+
 class Identity:
     def __init__(self, command, state, persist=lambda state: None):
         self.command, self.state, self.persist = command, state, persist
@@ -42,7 +76,19 @@ class Identity:
                       'stdout': text(error.stdout), 'stderr': text(error.stderr)}
         except OSError as error:
             result = {'argv': argv, 'exit': None, 'stdout': '', 'stderr': str(error)}
-        result = dict(result, argv=argv)
+        if argv[0] == 'kubectl' and 'delete' in argv and '--raw' in argv:
+            # A foreground DELETE can return the full Secret, including data and
+            # kubectl's last-applied annotation. Sanitize BOTH streams and timeout
+            # partials before state persistence, returned receipts, or exceptions.
+            safe = {'argv': argv, 'exit': result['exit'],
+                    'stdout': safe_delete_output(result.get('stdout')),
+                    'stderr': safe_delete_output(result.get('stderr')),
+                    'raw_delete_output_sanitized': True}
+            if 'timeout' in result:
+                safe['timeout'] = timeout
+            result = safe
+        else:
+            result = dict(result, argv=argv)
         self.state.setdefault('commands', []).append(result)
         self.save()
         if result['exit'] != 0:

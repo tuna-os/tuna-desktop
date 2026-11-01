@@ -3,6 +3,7 @@
 import copy
 import json
 from pathlib import Path
+import subprocess
 import sys
 import unittest
 from urllib.parse import unquote
@@ -187,6 +188,78 @@ class IdentityTests(unittest.TestCase):
                 self.assertNotIn('last-applied', argv[-1])
                 self.assertNotIn('.data', argv[-1])
 
+    def test_raw_delete_projects_secret_and_status_before_any_retention_or_exception(self):
+        for outcome in ('success', 'error', 'timeout', 'non-json', 'unknown-json', 'unknown-status'):
+            with self.subTest(outcome=outcome):
+                fake = FakeCorral()
+                identity = fake.prepare()
+                name = fake.name + '-bootc-builder-cloudinit'
+                fake.add_resource('secret', name)
+                secret_values = ('PRIVATE-DATA-MARKER', 'PRIVATE-STRINGDATA-MARKER',
+                                 'PRIVATE-LAST-APPLIED-MARKER', 'PRIVATE-ERROR-MARKER')
+                payload = {'apiVersion': 'v1', 'kind': 'Secret',
+                    'metadata': {'name': name, 'namespace': fake.namespace,
+                        'uid': fake.resources['secret', name]['uid'], 'deletionTimestamp': '2099-01-01T00:00:01Z',
+                        'annotations': {'kubectl.kubernetes.io/last-applied-configuration': secret_values[2]}},
+                    'data': {'token': secret_values[0]}, 'stringData': {'password': secret_values[1]}}
+                status = {'kind': 'Status', 'status': 'Failure', 'reason': 'Conflict', 'code': 409,
+                          'message': secret_values[3], 'details': {'causes': [{'message': secret_values[0]}]},
+                          'metadata': {'annotations': {'last-applied': secret_values[2]}}}
+                encoded = json.dumps(payload)
+                attempts = []
+                def response(argv, **kwargs):
+                    if '--raw' not in argv:
+                        return fake.command(argv, **kwargs)
+                    attempts.append(argv)
+                    if outcome == 'success':
+                        fake.command(argv, **kwargs)
+                        return {'exit': 0, 'stdout': encoded, 'stderr': encoded, 'unexpected': payload}
+                    if outcome == 'timeout':
+                        raise subprocess.TimeoutExpired(argv, kwargs['timeout'],
+                            output=encoded.encode(), stderr=json.dumps(status).encode())
+                    if outcome == 'non-json':
+                        return {'exit': 1, 'stdout': secret_values[0], 'stderr': secret_values[3]}
+                    if outcome == 'unknown-json':
+                        return {'exit': 1, 'stdout': json.dumps({'arbitrary': payload}),
+                                'stderr': json.dumps({'kind': secret_values[0], 'body': payload})}
+                    if outcome == 'unknown-status':
+                        return {'exit': 1, 'stdout': json.dumps(dict(status, reason=secret_values[0])),
+                                'stderr': encoded}
+                    return {'exit': 1, 'stdout': encoded, 'stderr': json.dumps(status), 'unexpected': payload}
+                identity.command = response
+                report = {'result': []}
+                identity.state['cleanup'] = report
+                error_text = ''
+                if outcome == 'success':
+                    identity.delete_resource('secret', name, report)
+                    retained = report['result'][0]['response']
+                    projection = json.loads(retained['stdout'])['projection']
+                    self.assertEqual(projection['kind'], 'Secret')
+                    self.assertEqual(set(projection['metadata']), {'name', 'namespace', 'uid', 'deletionTimestamp'})
+                    self.assertTrue(identity.cleanup()['deleted'])
+                else:
+                    with self.assertRaises(RuntimeError) as caught:
+                        identity.delete_resource('secret', name, report)
+                    error_text = str(caught.exception)
+                    self.assertIn(('secret', name), fake.resources)
+                self.assertEqual(len(attempts), 1)
+                serialized = json.dumps({'state': identity.state, 'cleanup': report,
+                                         'persisted': fake.snapshots, 'exception': error_text})
+                for value in secret_values:
+                    self.assertNotIn(value, serialized)
+                raw_receipts = [record for record in identity.state['commands']
+                                if '--raw' in record['argv']]
+                self.assertEqual(len(raw_receipts), 1)
+                self.assertTrue(raw_receipts[0]['raw_delete_output_sanitized'])
+                self.assertNotIn('unexpected', raw_receipts[0])
+                for stream in ('stdout', 'stderr'):
+                    safe = json.loads(raw_receipts[0][stream])
+                    self.assertTrue(safe['present'])
+                    self.assertTrue(safe['redacted'])
+                if outcome == 'timeout':
+                    self.assertIsNone(raw_receipts[0]['exit'])
+                    self.assertEqual(raw_receipts[0]['timeout'], 120)
+
     def test_vmi_foreign_owner_refuses_all_deletion_and_exact_dv_is_not_guessed_owned(self):
         for kind in ('vmi', 'dv'):
             with self.subTest(kind=kind):
@@ -212,7 +285,9 @@ class IdentityTests(unittest.TestCase):
             if '--raw' in argv:
                 attempted.append((argv, json.loads(kwargs['input'])))
                 fake.resources['vm', fake.name]['uid'] = 'replacement-at-api'
-                return {'exit': 1, 'stdout': '', 'stderr': 'Conflict: UID precondition failed'}
+                return {'exit': 1, 'stdout': '', 'stderr': json.dumps({
+                    'kind': 'Status', 'status': 'Failure', 'reason': 'Conflict', 'code': 409,
+                    'message': 'PRIVATE-UID-CONFLICT-DETAIL', 'data': {'token': 'PRIVATE-UID-CONFLICT-TOKEN'}})}
             return fake.command(argv, **kwargs)
         identity.command = race
         result = identity.cleanup()
@@ -220,7 +295,9 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(len(attempted), 1)
         self.assertEqual(attempted[0][1]['preconditions']['uid'], expected)
         self.assertEqual(identity.state['identities'][fake.name]['expectedUID'], expected)
-        self.assertIn('UID precondition failed', result['failures'][0])
+        self.assertIn('Conflict', result['failures'][0])
+        self.assertNotIn('PRIVATE-UID-CONFLICT', json.dumps({'state': identity.state,
+                                                          'cleanup': result, 'persisted': fake.snapshots}))
 
     def test_unproven_or_replaced_leftover_prevents_all_cleanup_deletes(self):
         for failure in ('foreign-label', 'old-created', 'uid-replaced'):
