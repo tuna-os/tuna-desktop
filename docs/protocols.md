@@ -63,6 +63,10 @@ The comparison source is [Mutter 51.0](https://github.com/GNOME/mutter/tree/138a
 Actual locked generator inputs are `wayland-server 0.31.14` (core XML maxima:
 seat/keyboard 11, fixes 2) and `wayland-protocols 0.32.13` (xdg-shell 7,
 text-input-v3 2, dmabuf 6; the other new extension managers are version 1).
+`scripts/tuna-protocol-xml-stage` verifies the actual cached `.crate` against
+Cargo.lock and compares every resolved protocol file with that archive before
+staging the exact checked bytes. It does not require Cargo's optional
+`.cargo-checksum.json` sidecar or substitute the distro's protocol XML.
 These library maxima are not permission to advertise unimplemented behavior.
 This native candidate deliberately retains seat 9, text-input manager 1 and
 ShellControl 0.47 until the ordered input/OSK cutover is integrated.

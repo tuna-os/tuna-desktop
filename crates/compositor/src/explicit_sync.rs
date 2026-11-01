@@ -218,9 +218,9 @@ fn acquire_failure(state: &State, surface: &WlSurface, message: String) {
         client.kill(
             &state.dh,
             smithay::reexports::wayland_server::backend::protocol::ProtocolError {
-                code:
-                    smithay::reexports::wayland_server::protocol::wl_display::Error::Implementation
-                        as u32,
+                // Core wayland.xml's wl_display.error.implementation.
+                // The server API deliberately has no generated WlDisplay.
+                code: 3,
                 object_id: 1,
                 object_interface: "wl_display".into(),
                 message,
