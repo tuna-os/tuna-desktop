@@ -234,20 +234,82 @@ fn real_dmabuf_identity_component_import_qualification() {
     };
     let node =
         std::env::var_os("TUNA_COLOR_DRM_RENDER_NODE").expect("explicit DRM render node required");
+    eprintln!("YUV-QUAL stage=device-open begin node={node:?}");
     let node = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(node)
+        .open(&node)
         .unwrap();
+    eprintln!("YUV-QUAL stage=device-open end node={node:?}");
+    for name in [
+        "GBM_BACKEND",
+        "LIBGL_ALWAYS_SOFTWARE",
+        "MESA_LOADER_DRIVER_OVERRIDE",
+        "GALLIUM_DRIVER",
+        "DRI_PRIME",
+    ] {
+        eprintln!("YUV-QUAL environment {name}={:?}", std::env::var_os(name));
+    }
+    eprintln!("YUV-QUAL stage=gbm-create begin");
     let gbm = smithay::backend::allocator::gbm::GbmDevice::new(node).unwrap();
+    eprintln!("YUV-QUAL stage=gbm-create end");
+    eprintln!("YUV-QUAL stage=egl-display-create begin");
     let display = unsafe { smithay::backend::egl::EGLDisplay::new(gbm) }.unwrap();
+    eprintln!("YUV-QUAL stage=egl-display-create end");
+    eprintln!("YUV-QUAL stage=egl-context-create begin");
     let context = smithay::backend::egl::EGLContext::new(&display).unwrap();
+    eprintln!("YUV-QUAL stage=egl-context-create end");
+    eprintln!("YUV-QUAL stage=gles-renderer-create begin");
     let mut renderer = unsafe { GlesRenderer::new(context) }.unwrap();
+    eprintln!("YUV-QUAL stage=gles-renderer-create end");
+    eprintln!("YUV-QUAL stage=gl-identify begin");
+    renderer
+        .with_context(|gl| {
+            for (name, token) in [
+                ("vendor", ffi::VENDOR),
+                ("renderer", ffi::RENDERER),
+                ("version", ffi::VERSION),
+            ] {
+                let value = unsafe { gl.GetString(token) };
+                if value.is_null() {
+                    eprintln!("YUV-QUAL GL {name}=<null>");
+                } else {
+                    let value = unsafe { std::ffi::CStr::from_ptr(value.cast()) };
+                    eprintln!("YUV-QUAL GL {name}={}", value.to_string_lossy());
+                }
+            }
+        })
+        .unwrap();
+    eprintln!("YUV-QUAL stage=gl-identify end");
+    for code in [
+        Fourcc::R8,
+        Fourcc::Gr88,
+        Fourcc::R16,
+        Fourcc::Gr1616,
+        Fourcc::Argb8888,
+    ] {
+        let format = smithay::backend::allocator::Format {
+            code,
+            modifier: Modifier::Linear,
+        };
+        eprintln!(
+            "YUV-QUAL raw-view {code:?} linear non-external={}",
+            display.dmabuf_render_formats().contains(&format)
+        );
+    }
+    eprintln!("YUV-QUAL stage=colour-program-compile begin");
+    assert!(
+        program(&mut renderer).is_some(),
+        "colour shader unavailable"
+    );
+    eprintln!("YUV-QUAL stage=colour-program-compile end");
+    eprintln!("YUV-QUAL stage=dma-heap-open begin");
     let heap = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(heap)
         .unwrap();
+    eprintln!("YUV-QUAL stage=dma-heap-open end");
     for format in [
         Fourcc::Nv12,
         Fourcc::Nv21,
@@ -267,10 +329,14 @@ fn real_dmabuf_identity_component_import_qualification() {
             [60, 25, 90, 128],
             [99, 45, 223, 0],
         ] {
+            eprintln!("YUV-QUAL stage=fixture-allocate begin format={format:?} input={input:?}");
             let buffer = dma_fixture(&heap, format, input);
+            eprintln!("YUV-QUAL stage=fixture-allocate end format={format:?}");
+            eprintln!("YUV-QUAL stage=raw-import begin format={format:?}");
             let raw = raw_planes(&mut renderer, &buffer).unwrap_or_else(|error| {
                 panic!("{format:?}: raw component import unavailable: {error}")
             });
+            eprintln!("YUV-QUAL stage=raw-import end format={format:?}");
             let expected = [
                 input[0],
                 input[1],
@@ -283,8 +349,11 @@ fn real_dmabuf_identity_component_import_qualification() {
             ];
             for limited in [false, true] {
                 let dummy = vec![[177, 3, 42, 255]; (SIDE * SIDE) as usize];
+                eprintln!("YUV-QUAL stage=draw-readback begin format={format:?} limited={limited}");
                 let got = draw_raw(&mut renderer, &dummy, None, true, limited, Some(&raw));
+                eprintln!("YUV-QUAL stage=draw-readback end format={format:?} limited={limited}");
                 assert_pixels(&got, expected, None, true, limited);
+                eprintln!("YUV-QUAL stage=pixel-assert end format={format:?} limited={limited}");
             }
             let mut unsupported = Dmabuf::builder(
                 (SIDE, SIDE),
@@ -308,6 +377,12 @@ fn real_dmabuf_identity_component_import_qualification() {
             assert!(!identity_ycbcr_supported(&unsupported.build().unwrap()));
         }
     }
+    eprintln!("YUV-QUAL stage=renderer-drop begin");
+    drop(renderer);
+    eprintln!("YUV-QUAL stage=renderer-drop end");
+    eprintln!("YUV-QUAL stage=display-drop begin");
+    drop(display);
+    eprintln!("YUV-QUAL stage=display-drop end");
 }
 
 #[test]

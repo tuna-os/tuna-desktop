@@ -591,9 +591,17 @@ jobs:
           tool: gtk4-layer-shell
           version: 4867d7b85cdf1e829fc1fd6f1d5f04c42cc99389
       - name: Install real colour capture consumers
-        run: sudo apt-get install -y xvfb xdotool pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good python3-pil gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0
+        run: sudo apt-get install -y gdb xvfb xdotool pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good python3-pil gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0
       - run: shellcheck scripts/ci-install-vkms scripts/tuna-drm-smoke scripts/tuna-frame-pacer-build
       - run: scripts/ci-install-vkms
+      # Installer/helper qualification above deliberately uses the merge ref.
+      # Pixel receipts below must instead name the exact candidate commit.
+      - name: Freeze exact candidate source for native colour pixel consumers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          clean: false
       - run: scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts
       - name: Retain privileged colour failure artifacts as runner-owned files
         if: always()
@@ -638,6 +646,7 @@ jobs:
       - name: Install native colour proof prerequisites
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils ovmf gnupg podman skopeo python3-pil libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libpipewire-0.3-dev libclang-dev pkg-config libegl1 libgl1-mesa-dri libfontconfig1-dev librsvg2-common
       - name: Freeze exact colour executables and source payload
+        id: colour_build
         run: |
           cargo build --locked -p tuna-compositor --bin tuna-compositor --example tuna-color-pixel-client --example tuna-color-yuv-client --example tuna-color-cast-client --message-format=json > "$RUNNER_TEMP/colour-build.json"
           payload="$RUNNER_TEMP/colour-payload"
@@ -678,6 +687,7 @@ jobs:
                   (root / target).write_bytes(archive.extractfile(member).read())
           PY
       - name: Compare real GNOME 51 native colour pixels from the independently verified Marlin image
+        if: ${{ !cancelled() && steps.colour_build.outcome == 'success' }}
         run: sudo env PATH="$PATH" scripts/tuna-color-gnome-reference-ci --color-client "$(pwd)/target/debug/examples/tuna-color-pixel-client" --artifacts "$(pwd)/colour-native-artifacts/gnome"
       - name: Restore ownership of this job's proof artifacts
         if: always()

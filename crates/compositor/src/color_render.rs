@@ -653,13 +653,15 @@ pub(crate) const PROGRAM: &str = r#"#version 100
 #endif
 #ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#define TUNA_SAMPLER_PRECISION highp
 #else
 precision mediump float;
+#define TUNA_SAMPLER_PRECISION
 #endif
 #if defined(EXTERNAL)
-uniform highp samplerExternalOES tex;
+uniform TUNA_SAMPLER_PRECISION samplerExternalOES tex;
 #else
-uniform highp sampler2D tex;
+uniform TUNA_SAMPLER_PRECISION sampler2D tex;
 #endif
 uniform float alpha;
 varying vec2 v_coords;
@@ -674,16 +676,16 @@ uniform float decode_power;
 uniform mat3 color_matrix;
 uniform float encode;
 uniform float encode_power;
-uniform highp sampler2D lut;
+uniform TUNA_SAMPLER_PRECISION sampler2D lut;
 uniform float lut_size;
 uniform float brightness;
 uniform vec3 nl_gains;
 uniform float desaturation;
 uniform float wellbeing_brightness;
 uniform float raw_layout;
-uniform highp sampler2D plane0;
-uniform highp sampler2D plane1;
-uniform highp sampler2D plane2;
+uniform TUNA_SAMPLER_PRECISION sampler2D plane0;
+uniform TUNA_SAMPLER_PRECISION sampler2D plane1;
+uniform TUNA_SAMPLER_PRECISION sampler2D plane2;
 
 vec3 gamma_power(vec3 color, float power) {
     vec3 is_negative = vec3(lessThan(color, vec3(0.0)));
