@@ -83,12 +83,21 @@ does not by itself prove a consent prompt, ScreenCast stream or revocation.
 The separate ScreenCast requester consumes the real remote PipeWire stream and
 holds it until the actual Super+L step. Its existing two-second withdrawal
 observer is armed before the key, never replaced with explicit Session.Close.
-Once the native requester reports a consumed frame and caller isolation, the
-journey checks that the session is still unlocked, arms that observer and sends
-Super+L immediately, before collecting per-step screenshots/journals. The lock
-step then validates withdrawal and retrieves the response, PNG and hashes. This
-keeps host SSH/PNG transfer overhead out of the requester's unchanged 30-second
-active-grant wait as well as its unchanged two-second withdrawal deadline.
+The guest-side coordinator batches launch, ready/exit status and the initial
+ScreenSaver state into one SSH exchange. After the host retains the prompt,
+one further exchange checks that the same requester is still pending,
+activates only its expected control (Screenshot Allow or ScreenCast Share),
+and returns the helper tree, native status and response. For ScreenCast that
+same guest operation observes the native active marker, checks unlocked state
+and arms withdrawal. The very next host input is actual noVNC Super+L; PNGs
+and per-step journals are collected afterwards. There are no intervening
+SSH probes for exit, tree, active state, hashes or the revoke marker.
+The native 60-second request/30-second grant hold and two-second withdrawal
+bounds are unchanged, including arming the observer before the actual key.
+The coordinator is frozen with the native requester sources, and receipts
+retain their exact argv, source hashes, output and exit status. A failed or
+expired requester never authorizes clicking a stale picker from another kind
+of request; failure cleanup targets only its pinned, owned process group.
 
 Capture probes require `org.gnome.ScreenSaver.GetActive=false` before the
 request and after its response; both replies are retained in `session_state`.
@@ -106,6 +115,11 @@ a real Screenshot URI and PipeWire frame when unlocked, but denies capture
 when locked. GNOME's backend translates the locked Shell Screenshot
 `(false, "")` into portal Response 0 with an empty URI; that is not an image
 delivery. AT-SPI activation behind the curtain is not visible user consent.
+
+Provisioning retains complete bootc builder stdout/stderr and exit status
+(including partial output on the unchanged outer timeout), rather than only a
+truncated exception. Console-start failure retains the complete Corral stderr;
+long-lived console output is backed by a file, not an undrained stderr pipe.
 
 ## Limits
 

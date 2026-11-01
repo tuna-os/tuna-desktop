@@ -69,7 +69,8 @@ def main():
         source_root = Path(__file__).resolve().parent
         report['harness_sha256'] = {}
         for name in ('tuna-corral-journey', 'lib/tuna-portal-screenshot-client.py', 'lib/tuna-portal-consent.py',
-                     'lib/tuna-portal-capture-client.py', 'lib/tuna-pipewire-dump.py'):
+                     'lib/tuna-portal-capture-client.py', 'lib/tuna-pipewire-dump.py',
+                     'lib/tuna-portal-journey-client.py'):
             data = (source_root / name).read_bytes()
             target = harness / name
             target.parent.mkdir(parents=True, exist_ok=True)
