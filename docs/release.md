@@ -188,6 +188,12 @@ Do not send a schema/example document as a handoff. Required identities are:
    that independently confirmed normal-main descendant; its binary checksum,
    signer, issuer and transparency requirements are unchanged. Neither failed
    run reached guest boot or constitutes pristine firstboot qualification.
+   Run `41255019047` then verified both signatures and built the keyless
+   pristine disk, but `corral start` failed before a console frame. That
+   failure is not boot evidence. Diagnostics now retain every Corral command's
+   output and early QEMU logs, use the real user-manager HOME with an
+   exclusively reserved VM directory, and obtain process identity from the
+   Linux QMP socket's kernel peer credentials rather than a PID file.
 6. `finalize --output DIR --evidence-dir ROOT` admits the same signed bytes
    through the consumer's `inspect` command and requires each platform's
    `qualification.json`: exact manifest/disk/host-Corral/producer hashes and run,

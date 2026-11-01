@@ -13,6 +13,7 @@ import platform
 import selectors
 import signal
 import shutil
+import struct
 import socket
 import subprocess
 import tempfile
@@ -42,6 +43,17 @@ def process_identity(pid):
                 "executable": os.readlink(root / "exe")}
     except FileNotFoundError:
         return None
+
+
+def qmp_process_identity(directory):
+    with socket.socket(socket.AF_UNIX) as peer:
+        peer.settimeout(10)
+        peer.connect(str(directory / "qmp.sock"))
+        pid, uid, _gid = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+    need(uid == os.getuid(), "QMP peer belongs to a different user")
+    identity = process_identity(pid)
+    need(identity is not None and identity["state"] != "Z", "kernel-identified QMP process is not live")
+    return identity
 
 
 def event(process, seconds=30):
@@ -83,14 +95,30 @@ def diagnose(args):
     started = False
     error = None
     env = {key: value for key, value in os.environ.items() if not key.startswith(("CORRAL_", "COSIGN_", "SIGSTORE_"))}
-    home = work / "home"
-    home.mkdir(mode=0o700)
-    env["HOME"] = str(home)
+    # Match the real consumer: systemd's user manager reads its real HOME,
+    # not a temporary alternative HOME. Only this random VM is job-owned.
+    home = Path.home()
     corral = work / "corral-linux-amd64"
     name = "tuna-pristine-" + uuid.uuid4().hex[:16]
     ref = "//local/" + name
+    command_index = 0
     def cli(*values, timeout=120):
-        return run([corral, "--backend", "qemu", *values], env=env, timeout=timeout)
+        nonlocal command_index
+        command_index += 1
+        argv = [corral, "--backend", "qemu", *values]
+        record = {"argv": [str(value) for value in argv]}
+        try:
+            result = run(argv, env=env, timeout=timeout)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as caught:
+            record.update({"returncode": getattr(caught, "returncode", None),
+                           "error": type(caught).__name__,
+                           "stdout": (caught.stdout or b"").decode(errors="replace"),
+                           "stderr": (caught.stderr or b"").decode(errors="replace")})
+            write(output / f"command-{command_index:02d}.json", record)
+            raise
+        record.update({"returncode": 0, "stdout": result.decode(errors="replace")})
+        write(output / f"command-{command_index:02d}.json", record)
+        return result
     try:
         raw_index = run(["skopeo", "inspect", "--raw", "docker://" + IMAGE + "@" + INDEX])
         need("sha256:" + hashlib.sha256(raw_index).hexdigest() == INDEX, "immutable index bytes differ")
@@ -112,7 +140,7 @@ def diagnose(args):
         receipt["corral"] = {"source": CORRAL_SOURCE, "sha256": CORRAL_SHA256, "identity": CORRAL_IDENTITY,
                               "scope": "normal main CI artifact for diagnosis; NOT final tagged-release consumer admission"}
         # Inventory runs no service/entrypoint and changes no image or disk.
-        inventory_script = "set -eu; echo '=== normal users ==='; awk -F: '$3 >= 1000 && $3 != 65534 {print $1, $3}' /etc/passwd; echo '=== initial setup package ==='; if pacman -Q gnome-initial-setup; then :; else status=$?; test \"$status\" = 1; fi; echo '=== root credentials ==='; awk -F: '$1==\"root\" {if ($2 ~ /^[!*]/) print \"root-locked\"; else exit 1}' /etc/shadow; test ! -s /root/.ssh/authorized_keys"
+        inventory_script = "set -eu; echo '=== normal users ==='; awk -F: '$3 >= 1000 && $3 != 65534 {print $1, $3}' /etc/passwd; echo '=== initial setup package ==='; if pacman -Q gnome-initial-setup; then :; else status=$?; test \"$status\" = 1; echo 'gnome-initial-setup absent'; fi; echo '=== root credentials ==='; awk -F: '$1==\"root\" {if ($2 ~ /^[!*]/) print \"root-locked\"; else exit 1}' /etc/shadow; test ! -s /root/.ssh/authorized_keys"
         inventory = run(["sudo", "podman", "run", "--rm", "--entrypoint", "/bin/sh", IMAGE + "@" + PLATFORM, "-c", inventory_script], timeout=300)
         (output / "pristine-image-inventory.txt").write_bytes(inventory)
         receipt["keylessBuilderSourceSha256"] = sha256(args.helper)
@@ -142,16 +170,18 @@ def diagnose(args):
         before = sha256(pristine)
         receipt["pristineDiskSha256"] = before
         (output / "disk-info.json").write_bytes(run(["qemu-img", "info", "--output=json", pristine]))
-        cli("create", name, "--qcow", pristine, "--firmware", "uefi", "--disk", "40G", "--mem", "4G", "--cpu", "4", timeout=600)
         vm_directory = home / ".local/share/corral/vms" / name
+        vm_directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        vm_directory.mkdir(mode=0o700)
         inode = vm_directory.stat()
         receipt["vmDirectoryIdentity"] = [inode.st_dev, inode.st_ino]
+        need(not (home / ".config/systemd/user" / ("corral-" + name + ".service")).exists(), "unit name already owned")
+        cli("create", name, "--force", "--qcow", pristine, "--firmware", "uefi", "--disk", "40G", "--mem", "4G", "--cpu", "4", timeout=600)
         started = True
         cli("start", ref)
         meta = json.loads(cli("info", ref))
         receipt["vmMetadata"] = meta
-        pid = int((vm_directory / "qemu.pid").read_text())
-        identity = process_identity(pid)
+        identity = qmp_process_identity(vm_directory)
         need(identity is not None and identity["state"] != "Z", "QEMU process is not live")
         receipt["processBefore"] = identity
         log = (output / "console.log").open("wb")
@@ -204,8 +234,20 @@ def diagnose(args):
                     console.kill()
                     console.wait(timeout=5)
             console.stdout.close()
+        if vm_directory is not None:
+            try:
+                info = vm_directory.lstat()
+                need([info.st_dev, info.st_ino] == receipt["vmDirectoryIdentity"], "owned VM directory changed")
+                for filename in ("qemu.log", "serial.log", "command.json"):
+                    source = vm_directory / filename
+                    if source.is_file():
+                        shutil.copyfile(source, output / filename)
+            except Exception as caught:
+                cleanup_errors.append("owned diagnostic evidence capture: " + str(caught))
         if started and vm_directory is not None:
             try:
+                if identity is None:
+                    identity = qmp_process_identity(vm_directory)
                 # Legacy normal-main stop uses PID files; do not call it.
                 # Authorize this VM's quit by its private QMP name instead.
                 response = json.loads(cli("qmp", ref, "query-name"))
@@ -227,9 +269,16 @@ def diagnose(args):
                     with socket.socket() as probe:
                         probe.settimeout(2)
                         need(probe.connect_ex(("127.0.0.1", parsed.port)) != 0, "owned console listener remains")
-                serial = vm_directory / "serial.log"
-                if serial.exists():
-                    shutil.copyfile(serial, output / "serial.log")
+                # Never enter the old PID-signalling stop path. Only remove its
+                # record after the kernel-identified original process retired.
+                pid_path = vm_directory / "qemu.pid"
+                if pid_path.exists():
+                    need(int(pid_path.read_text()) == identity["pid"], "PID record differs from owned QMP process")
+                    pid_path.unlink()
+                info = vm_directory.lstat()
+                need([info.st_dev, info.st_ino] == receipt["vmDirectoryIdentity"], "owned VM directory changed before deletion")
+                cli("delete", ref, "--force")
+                need(not vm_directory.exists(), "owned diagnostic VM directory remains")
             except Exception as caught:
                 cleanup_errors.append(str(caught))
         receipt["cleanupErrors"] = cleanup_errors
