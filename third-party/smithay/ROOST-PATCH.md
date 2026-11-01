@@ -172,3 +172,21 @@ The native consumers retain child proxies across parent destruction, check
 the actual server objects are gone, and exercise both parent-first and
 child-first destruction, continued compositor-grab key delivery and a fresh
 input method's typing/grab after retirement.
+
+Trusted virtual-keyboard returned keys must not temporarily unset and
+reinstall an input-method grab: `unset` now really retires its resource
+ownership. `KeyboardHandle::input_forward_to_focus` preserves ordinary
+forwarded-key and modifier bookkeeping while delivering directly through the
+normal focus/keymap path. Only an active input-method grab takes that route;
+compositor-owned grabs keep normal dispatch. The native returned-key consumer
+forwards the actual IM keymap FD, returns press/release events over the
+trusted virtual keyboard, then exercises further physical input, IM typing
+and a compositor-owned grab without loopback or lost ownership.
+
+Permanent grab replacement also sends the retiring live IM grab
+`repeat_info(0, 0)` after releasing its state lock. Returned-key forwarding
+does not send a pause or change the live repeat rate. The consumer checks
+the actual pause event and that a later keyboard repeat-settings change
+does not rearm the retired grab. This baseline has no IM weak repeat
+registration; integrations which add one must clear only the retiring
+resource's registration, never a replacement's.

@@ -808,14 +808,21 @@ impl Dispatch<
                 let Some(keyboard) = state.seat.get_keyboard() else { return };
                 // The physical event has already updated XKB. Do not update
                 // it twice or send it back into the IM grab recursively.
-                let grab = keyboard.with_grab(|serial, grab| {
-                    grab.downcast_ref::<InputMethodKeyboardGrab>().cloned().map(|grab| (serial, grab))
-                }).flatten();
-                if grab.is_some() { keyboard.unset_grab(state); }
-                keyboard.input_forward(state, key.saturating_add(8).into(),
-                    if pressed == 1 { smithay::backend::input::KeyState::Pressed } else { smithay::backend::input::KeyState::Released },
-                    smithay::utils::SERIAL_COUNTER.next_serial(), time, false);
-                if let Some((serial, grab)) = grab { keyboard.set_grab(state, grab, serial); }
+                let ime_grab = keyboard.with_grab(|_, grab| {
+                    grab.downcast_ref::<InputMethodKeyboardGrab>().is_some()
+                }).unwrap_or(false);
+                let key = key.saturating_add(8).into();
+                let pressed = if pressed == 1 {
+                    smithay::backend::input::KeyState::Pressed
+                } else {
+                    smithay::backend::input::KeyState::Released
+                };
+                let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                if ime_grab {
+                    keyboard.input_forward_to_focus(state, key, pressed, serial, time, false);
+                } else {
+                    keyboard.input_forward(state, key, pressed, serial, time, false);
+                }
             }
             // Preserve the bridge's event order: newer physical events may
             // already have updated the compositor state while IBus replies.
