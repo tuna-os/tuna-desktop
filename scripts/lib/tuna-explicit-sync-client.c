@@ -179,13 +179,33 @@ static void configure(void *data, struct xdg_surface *proxy, uint32_t serial) {
     (void)data; xdg_surface_ack_configure(proxy, serial); configured = true;
 }
 static const struct xdg_surface_listener xdg_listener = { .configure = configure };
+static void top_configure(void *data, struct xdg_toplevel *proxy, int32_t width, int32_t height, struct wl_array *states) {
+    (void)data; (void)proxy; (void)width; (void)height; (void)states;
+}
+static void top_close(void *data, struct xdg_toplevel *proxy) { (void)data; (void)proxy; fail("native proof window unexpectedly closed"); }
+static const struct xdg_toplevel_listener top_listener = { .configure = top_configure, .close = top_close };
+static void shm_format(void *data, struct wl_shm *proxy, uint32_t format) { (void)data; (void)proxy; (void)format; }
+static const struct wl_shm_listener shm_listener = { .format = shm_format };
+static void clock_id(void *data, struct wp_presentation *proxy, uint32_t id) {
+    (void)data; (void)proxy;
+    printf("{\"event\":\"presentation-clock\",\"clock_id\":%u}\n", id);
+}
+static const struct wp_presentation_listener clock_listener = { .clock_id = clock_id };
+static void buffer_release(void *data, struct wl_buffer *proxy) { (void)data; (void)proxy; }
+static const struct wl_buffer_listener buffer_listener = { .release = buffer_release };
 static void global(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
     (void)data;
     if (!strcmp(interface, "wl_compositor")) compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 4);
-    else if (!strcmp(interface, "wl_shm")) shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+    else if (!strcmp(interface, "wl_shm")) {
+        shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+        wl_shm_add_listener(shm, &shm_listener, NULL);
+    }
     else if (!strcmp(interface, "xdg_wm_base")) {
         wm = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1); xdg_wm_base_add_listener(wm, &wm_listener, NULL);
-    } else if (!strcmp(interface, "wp_presentation")) presentation = wl_registry_bind(registry, name, &wp_presentation_interface, 1);
+    } else if (!strcmp(interface, "wp_presentation")) {
+        presentation = wl_registry_bind(registry, name, &wp_presentation_interface, 1);
+        wp_presentation_add_listener(presentation, &clock_listener, NULL);
+    }
     else if (!strcmp(interface, "zwp_linux_dmabuf_v1") && version >= 4)
         dmabuf = wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface, 4);
     else if (!strcmp(interface, "wp_linux_drm_syncobj_manager_v1")) {
@@ -236,17 +256,23 @@ static struct format choose_format(struct buffer *buffer) {
     for (size_t i = 0; i < local.count; ++i) {
         struct format f = local.offers[i].format;
         if (!same_device(local.offers[i].target) || !default_offers(f) ||
-            (f.fourcc != DRM_FORMAT_ARGB8888 && f.fourcc != DRM_FORMAT_XRGB8888) || f.modifier == DRM_FORMAT_MOD_INVALID) continue;
-        struct gbm_bo *bo = gbm_bo_create_with_modifiers2(gbm, SIDE, SIDE, f.fourcc, &f.modifier, 1, GBM_BO_USE_RENDERING);
+            (f.fourcc != DRM_FORMAT_ARGB8888 && f.fourcc != DRM_FORMAT_XRGB8888)) continue;
+        struct gbm_bo *bo = f.modifier == DRM_FORMAT_MOD_INVALID
+            ? gbm_bo_create(gbm, SIDE, SIDE, f.fourcc, GBM_BO_USE_RENDERING)
+            : gbm_bo_create_with_modifiers2(gbm, SIDE, SIDE, f.fourcc, &f.modifier, 1, GBM_BO_USE_RENDERING);
         if (!bo) continue;
-        REQUIRE(gbm_bo_get_modifier(bo) == f.modifier, "allocator changed advertised modifier");
+        REQUIRE(f.modifier == DRM_FORMAT_MOD_INVALID || gbm_bo_get_modifier(bo) == f.modifier, "allocator changed advertised explicit modifier");
         buffer->bo = bo; return f;
     }
     fail("no allocatable common advertised surface/default ARGB/XRGB modifier"); return (struct format){0};
 }
 static void buffer_new(struct buffer *b, struct format format) {
-    if (!b->bo) b->bo = gbm_bo_create_with_modifiers2(gbm, SIDE, SIDE, format.fourcc, &format.modifier, 1, GBM_BO_USE_RENDERING);
-    REQUIRE(b->bo && gbm_bo_get_modifier(b->bo) == format.modifier, "allocate actual offered DRM buffer");
+    if (!b->bo) b->bo = format.modifier == DRM_FORMAT_MOD_INVALID
+        ? gbm_bo_create(gbm, SIDE, SIDE, format.fourcc, GBM_BO_USE_RENDERING)
+        : gbm_bo_create_with_modifiers2(gbm, SIDE, SIDE, format.fourcc, &format.modifier, 1, GBM_BO_USE_RENDERING);
+    REQUIRE(b->bo && (format.modifier == DRM_FORMAT_MOD_INVALID || gbm_bo_get_modifier(b->bo) == format.modifier), "allocate actual offered DRM buffer");
+    printf("{\"event\":\"allocated-dmabuf\",\"fourcc\":%u,\"offered_modifier\":%" PRIu64 ",\"allocated_modifier\":%" PRIu64 "}\n",
+           format.fourcc, format.modifier, gbm_bo_get_modifier(b->bo));
     unsigned count = gbm_bo_get_plane_count(b->bo); REQUIRE(count > 0 && count <= 4, "dmabuf plane count");
     struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(dmabuf);
     const EGLint plane_fd[4] = { EGL_DMA_BUF_PLANE0_FD_EXT, EGL_DMA_BUF_PLANE1_FD_EXT, EGL_DMA_BUF_PLANE2_FD_EXT, EGL_DMA_BUF_PLANE3_FD_EXT };
@@ -261,14 +287,17 @@ static void buffer_new(struct buffer *b, struct format format) {
         attributes[n++] = plane_fd[p]; attributes[n++] = fds[p];
         attributes[n++] = plane_offset[p]; attributes[n++] = offset;
         attributes[n++] = plane_pitch[p]; attributes[n++] = stride;
-        attributes[n++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT + 2 * p; attributes[n++] = (uint32_t)format.modifier;
-        attributes[n++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT + 2 * p; attributes[n++] = format.modifier >> 32;
+        if (format.modifier != DRM_FORMAT_MOD_INVALID) {
+            attributes[n++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT + 2 * p; attributes[n++] = (uint32_t)format.modifier;
+            attributes[n++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT + 2 * p; attributes[n++] = format.modifier >> 32;
+        }
     }
     attributes[n++] = EGL_NONE;
     b->image = create_image(egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attributes);
     for (unsigned p = 0; p < count; ++p) close(fds[p]);
     REQUIRE(b->image != EGL_NO_IMAGE_KHR, "producer EGL import of actual dmabuf");
     b->wl = zwp_linux_buffer_params_v1_create_immed(params, SIDE, SIDE, format.fourcc, 0);
+    wl_buffer_add_listener(b->wl, &buffer_listener, NULL);
     zwp_linux_buffer_params_v1_destroy(params);
     glGenRenderbuffers(1, &b->rb); glBindRenderbuffer(GL_RENDERBUFFER, b->rb);
     image_storage(GL_RENDERBUFFER, b->image);
@@ -350,7 +379,7 @@ static void initialize(const char *device_path) {
     egl_display = eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm, NULL); EGLint major, minor;
     REQUIRE(egl_display != EGL_NO_DISPLAY && eglInitialize(egl_display, &major, &minor), "initialize native GBM/EGL renderer");
     const char *extensions = eglQueryString(egl_display, EGL_EXTENSIONS);
-    REQUIRE(extensions && strstr(extensions, "EGL_ANDROID_native_fence_sync") && strstr(extensions, "EGL_EXT_image_dma_buf_import_modifiers"), "native EGL fence and dmabuf modifier extensions");
+    REQUIRE(extensions && strstr(extensions, "EGL_ANDROID_native_fence_sync") && strstr(extensions, "EGL_EXT_image_dma_buf_import"), "native EGL fence and dmabuf import extensions");
     REQUIRE(eglBindAPI(EGL_OPENGL_ES_API), "bind GLES API");
     EGLint config_attributes[] = { EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_NONE };
     EGLConfig config; EGLint count;
@@ -422,6 +451,7 @@ int main(int argc, char **argv) {
             int fd = memfd_create("actual-shm-negative-control", MFD_CLOEXEC); REQUIRE(fd >= 0 && ftruncate(fd, SIDE * SIDE * 4) == 0, "create actual shm negative control");
             struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, SIDE * SIDE * 4); close(fd);
             struct wl_buffer *unsupported = wl_shm_pool_create_buffer(pool, 0, SIDE, SIDE, SIDE * 4, WL_SHM_FORMAT_ARGB8888);
+            wl_buffer_add_listener(unsupported, &buffer_listener, NULL);
             wl_surface_attach(surface, unsupported, 0, 0); wl_surface_commit(surface); error = 2;
         } else fail("unknown case");
         REQUIRE(wl_display_flush(display) >= 0, "flush invalid request"); expect_error(interface, error);
@@ -429,6 +459,7 @@ int main(int argc, char **argv) {
     }
     buffer_new(&b, format); xdg = xdg_wm_base_get_xdg_surface(wm, surface);
     xdg_surface_add_listener(xdg, &xdg_listener, NULL); toplevel = xdg_surface_get_toplevel(xdg);
+    xdg_toplevel_add_listener(toplevel, &top_listener, NULL);
     xdg_toplevel_set_title(toplevel, "Tuna actual explicit-sync dmabuf proof");
     xdg_toplevel_set_app_id(toplevel, "org.tuna.ExplicitSyncProof");
     xdg_toplevel_set_min_size(toplevel, SIDE, SIDE); xdg_toplevel_set_max_size(toplevel, SIDE, SIDE);
