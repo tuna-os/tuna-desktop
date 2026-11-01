@@ -53,6 +53,21 @@ dropping a protocol updates the test and this page together. The one
 Xwayland-only global is not in that list; its own tests assert that
 ordinary clients never see it.
 
+**Qualification boundary for #364.** This branch contains new implementation
+and consumer source, not a completed qualification receipt. No builds, tests,
+graphical journeys, installed native-package proof or exact-head CI were run
+for this integrated stack. The retained captures above describe their recorded
+older revisions only. P-SY-09 remains partial.
+
+The comparison source is [Mutter 51.0](https://github.com/GNOME/mutter/tree/138a14fbeef09d49ebf5be8a0cb83b042dd5c841).
+Actual locked generator inputs are `wayland-server 0.31.14` (core XML maxima:
+seat/keyboard 11, fixes 2) and `wayland-protocols 0.32.13` (xdg-shell 7,
+text-input-v3 2, dmabuf 6; the other new extension managers are version 1).
+These library maxima are not permission to advertise unimplemented behavior.
+This native candidate deliberately retains seat 9, text-input manager 1 and
+ShellControl 0.47 until the ordered input/OSK cutover is integrated.
+
+
 ## Advertised by Tuna Desktop
 
 | Global | Version | Notes |
@@ -90,14 +105,14 @@ ordinary clients never see it.
 | zxdg_exporter_v1, zxdg_importer_v1 | 1 | GTK 3's xdg-foreign: one handle table with v2, as Mutter, so the portal's v2 import parents its dialogs to a GTK 3 window; revoking an export destroys its imports and clears their parents (`third-party/smithay/XDG-FOREIGN-V1-PATCH.diff`) |
 | xdg_system_bell_v1 | 1 | plays GNOME's `bell-window-system` sound through `canberra-gtk-play` when installed (Mutter's audible bell); a burst of rings is one sound |
 | xdg_toplevel_tag_manager_v1 | 1 | each window keeps its tag and description |
-| xdg_toplevel_drag_manager_v1 | 1 | as Mutter's meta-wayland-toplevel-drag.c: a toplevel attached during its source's drag-and-drop follows the pointer at the attach offset (relative to its window geometry); one attached before it is shown appears under the pointer at that offset; it takes no part in choosing the drop target, is raised and focused like a window drag, stays where it is dropped (tiled or maximized on a screen edge) and returns to its start on Escape. Release reports `dnd_drop_performed` before the drop resolves, then `cancelled` if nothing accepted (`third-party/smithay/XDG-TOPLEVEL-DRAG-PATCH.diff`). Errors as Mutter: `invalid_source` for a source that already has a toplevel drag, `toplevel_attached` while a live toplevel is attached; no `ongoing_drag`. As in Mutter, a shown window attached before `start_drag` does not move; scroll-mode columns stay put; a maximized or tiled window floats as its drag starts (Mutter waits for the shake-loose threshold) |
+| xdg_toplevel_drag_manager_v1 | 1 | attached windows follow the actual DND pointer in floating and scroll layouts; attach-before-start, null-buffer unmap, source/owner exit, drop and Escape follow the source lifetime. Implements XML-required `invalid_source`, `toplevel_attached` and `ongoing_drag`, including selection-source ordering and actual implicit-grab/client ownership. Mutter 51 omits some of these errors; that source difference is not an exception to the XML contract. `scripts/tuna-toplevel-drag-proof` is an unexecuted real-Chromium consumer, not a browser pass |
 | xdg_session_manager_v1 | 1 | window session save and restore as in Mutter 51 (P-SY-08): a client that opens a session gets its windows back after logout or reboot (workspace, position and size, maximized, tiled, fullscreen, output; minimized is not restored, as in Mutter); store `$XDG_DATA_HOME/tuna/window-sessions.json`, written 3 s after a change and at exit (`crates/compositor/src/xdg_session.rs`) |
 | zwp_keyboard_shortcuts_inhibit_manager_v1 | 1 | after Allow, the focused window gets every key, the shell's grabs, Super and Alt+Tab included; Super+Escape (Mutter's restore-shortcuts) takes them back until the window is focused again |
 | zwp_xwayland_keyboard_grab_manager_v1 | 1 | Xwayland only, as Mutter (hidden from every other client, so `wayland-info` and the golden list never see it). Rootless Xwayland asks for a grab when an X11 client grabs the keyboard. Grants follow Mutter's `meta_xwayland_grab_is_granted`: see below |
 | wp_pointer_warp_v1 | 1 | honoured while the surface has pointer focus from the enter serial it names; nested, the host pointer stays where it is |
 | wl_fixes | 1 | `destroy_registry` destroys the registry as Mutter does: the client's id is freed and that registry hears no more globals |
-| ext_background_effect_manager_v1 | 1 | capabilities `blur` at bind; one effect object per surface (`background_effect_exists`), `set_blur_region` double-buffered on commit, NULL removes it, `surface_destroyed` once the surface is gone; destroying the object unsets the region on the next commit (meta-wayland-background-effect.c). Drawn as Mutter 51's meta-background-effect.c and clutter-blur.c: the scene beneath the surface, clipped to the surface and its region, blurred (separable gaussian, sigma = radius / 2, radius 24 logical px times the surface's scale, downscaled by powers of two while sigma > 6 and both sides > 256 px), saturation 1.25 and 0.015 grain, at the surface's opacity, under its content; a repaint touching the sample area (region + 2 × radius) repaints all of it, and windows beneath an opaque blurred window still draw there. Not applied to overview previews or Alt+Tab thumbnails (Mutter also blurs behind clones) |
-| wp_drm_lease_device_v1 | 1 | native DRM backend only, as Mutter (`meta-wayland-drm-lease.c`): one global for the session's DRM device, advertised even with nothing to lease; absent nested and headless, so the golden list does not include it. A connected connector is for lease when the kernel marks it `non-desktop` (VR headsets) or `TUNA_DEBUG_LEASE_CONNECTORS` names it (Mutter's `MUTTER_DEBUG_LEASE_CONNECTORS`: colon-separated connector names; the `MUTTER_` name is not read, so a value set for GNOME cannot take a monitor off Tuna Desktop). Such a connector is never a desktop output; when every connected connector is for lease the session starts with no monitor, as Mutter runs. A lease takes per connector a CRTC no desktop output or other lease uses, its primary plane and, when there is one, its cursor plane, else `finished` (`meta-drm-lease.c` `find_resources_to_lease`); leased connectors are withdrawn and offered again when the client destroys the lease or closes the lease fd (the kernel's lease uevent; `update_leases`). Connector hotplug (udev change events) offers and withdraws connectors for lease, ending a lease whose connector went away (`update_connectors`); desktop outputs still do not follow hotplug, and vkms cannot hotplug, so no proof covers this path. A VT switch withdraws every connector and ends every lease, and activation offers them again. Clients get a non-master fd the compositor opens on the card itself, as Mutter does (the session user needs logind's uaccess ACL on the card); a binding that cannot get one stays pending without events until the session is next activated (Mutter's pending resources). Mutter's monitors.xml `for-lease` option and lease devices for a second GPU are not implemented. Vendored Smithay changes: `third-party/smithay/DRM-LEASE-PATCH.diff`. drm-smoke D-LEASE proves advertisement, the empty case and real leases on vkms; leasing to a real headset is hardware-only |
+| ext_background_effect_manager_v1 | 1 | empty capabilities until real bound-framebuffer/shader admission, then `blur`; capabilities are revoked on render failure. Double-buffered copied regions, synchronized subsurfaces, clipping/subtraction and object destruction drive the actual GLES blur. Floating-point scenes use precision-keyed FP16 intermediates without clipping extended values; admission/drawing must remain before HDR final output conversion. The actual-output consumer `scripts/tuna-background-effect-proof` is prepared but unexecuted; unsupported exit 77 is not a pass. Overview/Alt+Tab clone blur remains unqualified |
+| wp_drm_lease_device_v1 | 1 | native only, after a master-only kernel lease ioctl establishes actual support/authority. Confirmed connected non-desktop or explicitly named connectors stay off the desktop. Leases claim eligible free CRTC/primary/cursor resources, withdraw connectors and revoke before DRM master is dropped; failed kernel revocation cannot report completion or re-offer resources. Prepared D-LEASE checks real vkms lessee FD/ioctls, non-master device FD, independent-client withdrawal, empty/duplicate/stale denial, owner-loss revocation with the FD retained, and actual emulated sysfs disconnect/reappearance. These additions have not run on this integrated head. Physical headsets, monitors.xml `for-lease`, and secondary-GPU lease devices are not qualified |
 
 ### xdg-activation policy
 
@@ -137,28 +152,24 @@ mint its way to the front.
   the release point (`conflicting_points`); a point with no buffer (or a
   null one) is `no_buffer`. The vendored Smithay carries this check
   (`third-party/smithay/DRM-SYNCOBJ-PATCH.diff`).
-- **Acquire and release.** A commit is held until its acquire point
-  signals, through the point's eventfd on the event loop (Mutter's
-  transaction waits the same way); a point already signalled applies at
-  once. The release point is signalled when the compositor lets go of the
-  buffer.
-- **Deviations.** Mutter posts `surface_exists` on the `wl_surface`; Tuna
-  Desktop posts it on the manager, as the protocol defines the error. Mutter
-  signals the release point with the GPU fence of the last frame that read
-  the buffer; Tuna Desktop signals it from the CPU once the renderer has
-  dropped the buffer. An invalid commit disconnects the client in both, but
-  Mutter also skips applying it.
-- **Not exercised without a GPU.** CI and the local machines have no
-  timeline-capable device, so the advertised path, a real timeline import,
-  the acquire wait and the release signal run only on hardware. To verify
-  on a GPU session (Mesa radeonsi/iris, or NVIDIA 555 or newer): the
-  compositor log shows `explicit sync (linux-drm-syncobj v1) on
-  /dev/dri/renderD*`; `wayland-info` lists
-  `wp_linux_drm_syncobj_manager_v1` v1; a Vulkan client through Mesa 24.1
-  or newer's WSI (`vkcube`) or an X11 app under Xwayland 24.1 or newer
-  animates without stalls or corruption, and `WAYLAND_DEBUG=1` shows
-  `set_acquire_point` and `set_release_point` before each buffer commit,
-  with no protocol error.
+- **Acquire and release.** Valid acquire points hold real commits with Smithay
+  blockers/eventfds; already-signalled points apply immediately. Destroyed
+  surfaces and failed watch registration retire pending waits. Invalid
+  transactions are rejected before they can apply.
+- **GPU-safe release.** Frame buffer-access tracking retains the original
+  Wayland buffer through rendering. The final GPU fence is exported, imported
+  into DRM and transferred to the release timeline; absence of this complete
+  path disables the global. Capability probing exercises that actual route,
+  not just extension strings.
+- **Not yet qualified on this head.** `scripts/tuna-explicit-sync-proof` uses
+  real DRM timeline ioctls, offered feedback formats/modifiers, GBM/EGL buffers,
+  presentation and independent output captures, including blocked-acquire and
+  teardown/error controls. Its existence is not a pass. Named virtio/virgl
+  native emulation under approved CI is being prepared; vkms/Bochs disabled
+  observations cannot qualify successful timeline import or release ordering.
+  ADR 0008 permits named actual emulation, not stand-in devices or manifests.
+- **Protocol error placement.** `surface_exists` is posted on the manager,
+  as the XML defines it; Mutter 51 posts it on the surface.
 
 ### Frame timing
 
@@ -243,12 +254,12 @@ GNOME's version.
 
 | Protocol | GNOME 51 | Tuna Desktop | Why, and where tracked |
 |---|---|---|---|
-| wl_seat | 10 | 9 | Smithay 0.7 creates the seat at 9 and implements nothing newer; bumps with Smithay (#89) |
-| zwp_text_input_manager_v3 | 2 | 1 | Smithay 0.7 implements v1 only; bumps with Smithay (#60) |
+| wl_seat | 10 | 9 | negotiated v10 repeat ownership is prepared separately and must integrate with the authoritative IBus repeat/context bridge before advertisement; old clients retain their own repeat policy (#364) |
+| zwp_text_input_manager_v3 | 2 | 1 | complete actions/panel semantics and privileged attributed-preedit integration remain on the input/OSK stack; panel OFF needs the single ordered final ShellControl cutover, not text-input disable or a guessed parallel minor (#364) |
 | wp_color_manager_v1 (v2), wp_color_representation_manager_v1 | 2, 1 | missing | not in Smithay 0.7: needs a colour-managed renderer (ICC/HDR, YUV conversion); the GLES path is sRGB only (#89) |
 
 | zwp_linux_dmabuf_feedback_v1 scanout tranches | per-surface feedback adds a scanout tranche for a direct-scanout candidate (`meta_wayland_dma_buf_surface_feedback`) | default feedback only | Tuna Desktop has no direct scanout of client buffers: every surface is composited, so a scanout tranche would point clients at planes nothing uses; it comes with direct scanout (perf lane) |
-| gtk_shell1 | 7 | missing | not planned: GTK4 needs none of it on a GNOME session |
+| gtk_shell1 | 7 | missing | deliberate optional GTK compatibility difference, not “GTK4 needs none”: GTK3 own-modal hints, shell D-Bus metadata and decorated titlebar gesture forwarding are not qualified; see below |
 
 ## Deliberate differences
 
@@ -256,5 +267,27 @@ GNOME's version.
   decorations only, and the golden test asserts the absence.
 - **layer-shell is present,** unlike Mutter. Tuna Desktop's shell is a separate
   process and draws its panel, overview and banners through it.
+
+### GTK and rootless Xwayland boundaries
+
+[GTK 3.24.49](https://github.com/GNOME/gtk/blob/3.24.49/gdk/wayland/gdkwindow-wayland.c)
+prefers xdg-foreign v2 and falls back to v1. The real GTK3/Nautilus portal
+consumer records the observed wire version; a v2 journey cannot certify v1.
+Socket clients separately exercise cross-version handles, invalid roles,
+revocation, unmap and teardown. Neither prepared suite has run on this head.
+
+GTK3's optional `maybe_set_gtk_surface_modal` and D-Bus metadata paths return
+when no gtk surface exists, and its titlebar gesture forwarding returns false.
+[Mutter's GTK shell implementation](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-gtk-shell.c)
+does implement those behaviors. Portal parenting through xdg-foreign is not
+proof of GTK3's own-modal, titlebar or global-menu metadata parity.
+
+The old “rootful `-host-grab` only” explanation for omitting Xwayland keyboard
+grabs was incorrect: rootless `XGrabKeyboard` also uses this private protocol.
+It is now implemented and offered only to the supervised Xwayland client.
+Tuna still launches rootless Xwayland, not a rootful nested X server; the
+override-redirect focus-lock difference is described above rather than hidden
+by advertising an unexercised rootful mode.
+
 
 `xdg_toplevel_icon_manager_v1` v1 accepts square SHM icons and sanitized theme names, applied on the next surface commit. PNGs live in a private, bounded compositor cache. X11 `_NET_WM_ICON` and legacy square TrueColor `WM_HINTS` pixmaps (24/32-bit color, optional 1-bit transparency mask) are read on a bounded worker for mapped window identities. Palette and unsupported visuals fall back to a generic app icon.
