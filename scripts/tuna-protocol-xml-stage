@@ -1,0 +1,55 @@
+#!/usr/bin/python3
+"""Stage actual locked Cargo wayland-protocols XML for native C consumers.
+
+Run in the source checkout after the normal locked dependency acquisition/build;
+this never fetches dependencies, substitutes distro XML, or edits Cargo.lock.
+The output can be an ordinary CI artifact consumed by an image producer.
+"""
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tomllib
+
+if len(sys.argv) != 2:
+    raise SystemExit('usage: tuna-protocol-xml-stage OUTPUT_DIRECTORY')
+root = Path(__file__).resolve().parent.parent
+lock_bytes = (root / 'Cargo.lock').read_bytes()
+lock = tomllib.loads(lock_bytes.decode())
+locked = [package for package in lock['package'] if package['name'] == 'wayland-protocols']
+if len(locked) != 1:
+    raise SystemExit('one exact locked wayland-protocols package required')
+package = locked[0]
+metadata = json.loads(subprocess.check_output(
+    ['cargo', 'metadata', '--locked', '--offline', '--format-version', '1'], cwd=root))
+resolved = [entry for entry in metadata['packages']
+            if entry['name'] == package['name'] and entry['version'] == package['version']]
+if len(resolved) != 1 or not resolved[0]['source'] or not resolved[0]['source'].startswith('registry+'):
+    raise SystemExit('actual locked registry package path is unavailable')
+source = Path(resolved[0]['manifest_path']).resolve().parent
+checksums = json.loads((source / '.cargo-checksum.json').read_text())
+if checksums.get('package') != package['checksum']:
+    raise SystemExit('registry package checksum differs from Cargo.lock')
+protocols = source / 'protocols'
+files = sorted(path for path in protocols.rglob('*') if path.is_file())
+if not files:
+    raise SystemExit('locked Cargo protocol XML source is empty')
+observed = {}
+for path in files:
+    relative = path.relative_to(source).as_posix()
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if checksums['files'].get(relative) != actual:
+        raise SystemExit('locked registry protocol source changed: ' + relative)
+    observed[relative] = actual
+out = Path(sys.argv[1]).resolve()
+out.mkdir(mode=0o700, parents=True, exist_ok=False)
+shutil.copytree(protocols, out / 'protocols')
+(out / 'source.json').write_text(json.dumps({
+    'package': package['name'], 'version': package['version'],
+    'registry_package_sha256': package['checksum'],
+    'cargo_lock_sha256': hashlib.sha256(lock_bytes).hexdigest(),
+    'metadata_package_id': resolved[0]['id'], 'file_sha256': observed,
+}, indent=2) + '\n')
+print(out)

@@ -6,9 +6,11 @@ if [[ $# != 1 ]]; then
     exit 2
 fi
 script_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-protocol_root=$(pkg-config --variable=pkgdatadir wayland-protocols)
+protocol_root=${WAYLAND_PROTOCOLS_DIR:?set WAYLAND_PROTOCOLS_DIR to the staged locked Cargo package protocols directory}
 mkdir -p -- "$1"
 output_root=$(cd -- "$1" && pwd)
+cp -- "$protocol_root/../source.json" "$output_root/protocol-source.json"
+printf '' > "$output_root/protocol-xml.sha256"
 protocols=(
     'xdg-shell:stable/xdg-shell/xdg-shell.xml'
     'presentation-time:stable/presentation-time/presentation-time.xml'
@@ -19,6 +21,7 @@ sources=()
 for protocol in "${protocols[@]}"; do
     name=${protocol%%:*}
     xml=$protocol_root/${protocol#*:}
+    sha256sum "$xml" >> "$output_root/protocol-xml.sha256"
     wayland-scanner client-header "$xml" "$output_root/$name-client-protocol.h"
     wayland-scanner private-code "$xml" "$output_root/$name-protocol.c"
     sources+=("$output_root/$name-protocol.c")

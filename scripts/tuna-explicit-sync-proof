@@ -135,6 +135,8 @@ def run_case(case):
             while b'\n' in remaining:
                 line, remaining = remaining.split(b'\n', 1)
                 row = json.loads(line)
+                if row.get('event') == 'wayland-peer' and row.get('pid') != args.compositor_pid:
+                    raise AssertionError('Wayland consumer connected to a different compositor')
                 rows.append(row)
                 if row.get('event') == 'checkpoint':
                     capture(row)

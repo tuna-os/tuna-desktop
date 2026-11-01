@@ -16,6 +16,7 @@
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 #include <xf86drm.h>
@@ -395,6 +396,10 @@ static void initialize(const char *device_path) {
     image_storage = (PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC)eglGetProcAddress("glEGLImageTargetRenderbufferStorageOES");
     REQUIRE(create_image && destroy_image && create_sync && destroy_sync && dup_fence && image_storage, "native fence/image entry points");
     display = wl_display_connect(NULL); REQUIRE(display, "connect actual native compositor");
+    struct ucred peer; socklen_t peer_size = sizeof(peer);
+    REQUIRE(getsockopt(wl_display_get_fd(display), SOL_SOCKET, SO_PEERCRED, &peer, &peer_size) == 0,
+            "actual Wayland socket peer credentials");
+    printf("{\"event\":\"wayland-peer\",\"pid\":%d,\"uid\":%u}\n", peer.pid, peer.uid);
     struct wl_registry *registry = wl_display_get_registry(display); wl_registry_add_listener(registry, &registry_listener, NULL);
     REQUIRE(wl_display_roundtrip(display) >= 0 && compositor && shm && wm && dmabuf && sync_manager && presentation, "native advertised globals unavailable (no forced global permitted)");
     surface = wl_compositor_create_surface(compositor);
