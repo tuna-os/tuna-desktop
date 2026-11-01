@@ -843,6 +843,111 @@ fn gtk3_v1_exports_import_through_either_version_and_revoke() {
 }
 
 #[test]
+fn foreign_exports_revoke_when_the_surface_or_toplevel_role_goes_away() {
+    for destroy_role in [false, true] {
+        let (mut comp, mut manager) = compositor();
+        let mut app = connect(&mut comp, &mut manager);
+        let mut portal = connect(&mut comp, &mut manager);
+        let exporter: ZxdgExporterV1 = app.bind(1);
+        let importer: ZxdgImporterV2 = portal.bind(1);
+        let (parent_surface, parent_role) = window(&mut app, "exported parent");
+        let (child_surface, _) = window(&mut portal, "foreign child");
+        pump(&mut comp, &mut manager, &mut [&mut app, &mut portal]);
+        let _exported = exporter.export(&parent_surface, &app.qh(), ());
+        pump(&mut comp, &mut manager, &mut [&mut app, &mut portal]);
+        let handle = app.client.handle.take().unwrap();
+        let imported = importer.import_toplevel(handle.clone(), &portal.qh(), ());
+        imported.set_parent_of(&child_surface);
+        pump(&mut comp, &mut manager, &mut [&mut app, &mut portal]);
+        assert!(parented(&comp, "foreign child", "exported parent"));
+        if destroy_role {
+            parent_role.destroy();
+        } else {
+            parent_surface.destroy();
+        }
+        pump(&mut comp, &mut manager, &mut [&mut app, &mut portal]);
+        assert_eq!(portal.client.imports_destroyed, 1);
+        assert!(!parented(&comp, "foreign child", "exported parent"));
+        let _stale = importer.import_toplevel(handle, &portal.qh(), ());
+        pump(&mut comp, &mut manager, &mut [&mut app, &mut portal]);
+        assert_eq!(portal.client.imports_destroyed, 2);
+    }
+}
+
+#[test]
+fn foreign_unmapping_revokes_the_handle_without_destroying_the_surface() {
+    let (mut comp, mut manager) = compositor();
+    let mut app = connect(&mut comp, &mut manager);
+    let mut portal = connect(&mut comp, &mut manager);
+    let exporter: ZxdgExporterV2 = app.bind(1);
+    let importer: ZxdgImporterV1 = portal.bind(1);
+    let (parent_surface, _) = window(&mut app, "unmapping parent");
+    let (child_surface, _) = window(&mut portal, "unmapping child");
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut portal]);
+    let _exported = exporter.export_toplevel(&parent_surface, &app.qh(), ());
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut portal]);
+    let handle = app.client.handle.take().unwrap();
+    let imported = importer.import(handle.clone(), &portal.qh(), ());
+    imported.set_parent_of(&child_surface);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut portal]);
+    assert!(parented(&comp, "unmapping child", "unmapping parent"));
+    parent_surface.attach(None, 0, 0);
+    parent_surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut portal]);
+    assert_eq!(portal.client.imports_destroyed, 1);
+    assert!(!parented(&comp, "unmapping child", "unmapping parent"));
+    let _stale = importer.import(handle, &portal.qh(), ());
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut portal]);
+    assert_eq!(portal.client.imports_destroyed, 2);
+}
+
+#[test]
+fn foreign_rejects_non_toplevel_exports_and_children() {
+    for version in [1, 2] {
+        for export_invalid in [false, true] {
+            let (mut comp, mut manager) = compositor();
+            let mut app = connect(&mut comp, &mut manager);
+            let mut portal = connect(&mut comp, &mut manager);
+            let (parent_surface, _) = window(&mut app, "valid parent");
+            let compositor: WlCompositor = portal.bind(6);
+            let invalid = compositor.create_surface(&portal.qh(), ());
+            pump(&mut comp, &mut manager, &mut [&mut app, &mut portal]);
+            let interface = if export_invalid {
+                if version == 1 {
+                    let exporter: ZxdgExporterV1 = portal.bind(1);
+                    let _exported = exporter.export(&invalid, &portal.qh(), ());
+                    "zxdg_exporter_v1"
+                } else {
+                    let exporter: ZxdgExporterV2 = portal.bind(1);
+                    let _exported = exporter.export_toplevel(&invalid, &portal.qh(), ());
+                    "zxdg_exporter_v2"
+                }
+            } else {
+                let exporter: ZxdgExporterV2 = app.bind(1);
+                let _exported = exporter.export_toplevel(&parent_surface, &app.qh(), ());
+                pump(&mut comp, &mut manager, &mut [&mut app, &mut portal]);
+                let handle = app.client.handle.take().unwrap();
+                if version == 1 {
+                    let importer: ZxdgImporterV1 = portal.bind(1);
+                    let imported = importer.import(handle, &portal.qh(), ());
+                    imported.set_parent_of(&invalid);
+                    "zxdg_imported_v1"
+                } else {
+                    let importer: ZxdgImporterV2 = portal.bind(1);
+                    let imported = importer.import_toplevel(handle, &portal.qh(), ());
+                    imported.set_parent_of(&invalid);
+                    "zxdg_imported_v2"
+                }
+            };
+            let error = pump_to_error(&mut comp, &mut manager, &mut portal);
+            assert_eq!(error.object_interface, interface);
+            assert_eq!(error.code, 0);
+            assert!(app._conn.protocol_error().is_none(), "other clients stay live");
+        }
+    }
+}
+
+#[test]
 fn running_app_eligibility_follows_real_transient_parent_changes() {
     let (mut comp, mut manager) = compositor();
     let mut app = connect(&mut comp, &mut manager);

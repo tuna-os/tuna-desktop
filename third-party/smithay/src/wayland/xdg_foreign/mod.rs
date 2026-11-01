@@ -50,6 +50,16 @@ mod handlers;
 pub trait XdgForeignHandler: 'static {
     /// Returns the xdg foreign state.
     fn xdg_foreign_state(&mut self) -> &mut XdgForeignState;
+
+    /// Invalidate exports and imported relationships when a toplevel role
+    /// is destroyed while its wl_surface is still alive. Surface destruction
+    /// itself is observed automatically.
+    fn foreign_toplevel_destroyed(&mut self, surface: &WlSurface)
+    where
+        Self: Sized + crate::wayland::shell::xdg::XdgShellHandler,
+    {
+        handlers::revoke_surface(self, surface);
+    }
 }
 
 /// The handle contains the unique handle of exported surface.

@@ -68,9 +68,18 @@ where
     }
 }
 
+/// One destruction hook per exported surface, even if it has many handles.
+struct ForeignSurfaceHook;
+
 /// Record a new export under a fresh handle, unique across both
 /// protocol versions: either version's importer finds it.
-fn export<D: XdgForeignHandler>(state: &mut D, surface: WlSurface) -> XdgForeignHandle {
+fn export<D: XdgForeignHandler + XdgShellHandler>(state: &mut D, surface: WlSurface) -> XdgForeignHandle {
+    let first = compositor::with_states(&surface, |states| {
+        states.data_map.insert_if_missing_threadsafe(|| ForeignSurfaceHook)
+    });
+    if first {
+        compositor::add_destruction_hook::<D, _>(&surface, revoke_surface::<D>);
+    }
     let exported = &mut state.xdg_foreign_state().exported;
     let handle = loop {
         let handle = XdgForeignHandle::new();
@@ -88,15 +97,38 @@ fn export<D: XdgForeignHandler>(state: &mut D, surface: WlSurface) -> XdgForeign
     handle
 }
 
+pub(super) fn revoke_surface<D: XdgForeignHandler + XdgShellHandler>(
+    state: &mut D,
+    surface: &WlSurface,
+) {
+    let handles: Vec<_> = state
+        .xdg_foreign_state()
+        .exported
+        .iter()
+        .filter(|(_, exported)| exported.exported_surface == *surface)
+        .map(|(handle, _)| handle.clone())
+        .collect();
+    for handle in handles {
+        revoke(state, &handle);
+    }
+    for exported in state.xdg_foreign_state().exported.values_mut() {
+        for child in exported.imported_by.values_mut() {
+            if child.as_ref() == Some(surface) {
+                *child = None;
+            }
+        }
+    }
+}
+
 impl<D> Dispatch<ZxdgExporterV2, (), D> for XdgForeignState
 where
     D: Dispatch<ZxdgExportedV2, XdgExportedUserData>,
-    D: XdgForeignHandler,
+    D: XdgForeignHandler + XdgShellHandler,
 {
     fn request(
         state: &mut D,
         _client: &Client,
-        _resource: &ZxdgExporterV2,
+        resource: &ZxdgExporterV2,
         request: zxdg_exporter_v2::Request,
         _data: &(),
         _dhandle: &DisplayHandle,
@@ -104,6 +136,10 @@ where
     ) {
         match request {
             zxdg_exporter_v2::Request::ExportToplevel { id, surface } => {
+                if !is_toplevel(state, &surface) {
+                    resource.post_error(zxdg_exporter_v2::Error::InvalidSurface, "surface is not an xdg_toplevel");
+                    return;
+                }
                 let handle = export(state, surface);
                 let exported = data_init.init(
                     id,
@@ -122,12 +158,12 @@ where
 impl<D> Dispatch<ZxdgExporterV1, (), D> for XdgForeignState
 where
     D: Dispatch<ZxdgExportedV1, XdgExportedUserData>,
-    D: XdgForeignHandler,
+    D: XdgForeignHandler + XdgShellHandler,
 {
     fn request(
         state: &mut D,
         _client: &Client,
-        _resource: &ZxdgExporterV1,
+        resource: &ZxdgExporterV1,
         request: zxdg_exporter_v1::Request,
         _data: &(),
         _dhandle: &DisplayHandle,
@@ -135,6 +171,12 @@ where
     ) {
         match request {
             zxdg_exporter_v1::Request::Export { id, surface } => {
+                if !is_toplevel(state, &surface) {
+                    // The legacy interface has no error enum; Mutter uses
+                    // the same invalid-surface value as the v2 exporter.
+                    resource.post_error(0u32, "surface is not an xdg_toplevel");
+                    return;
+                }
                 let handle = export(state, surface);
                 let exported = data_init.init(
                     id,
@@ -368,6 +410,14 @@ where
     }
 }
 
+fn is_toplevel<D: XdgShellHandler>(state: &mut D, surface: &WlSurface) -> bool {
+    state
+        .xdg_shell_state()
+        .toplevel_surfaces()
+        .iter()
+        .any(|toplevel| toplevel.wl_surface() == surface && toplevel.alive())
+}
+
 /// Make the exported surface `child`'s parent. Each import parents at
 /// most one child at a time (Mutter's `imported->parent_of`): a second
 /// call moves the relationship.
@@ -384,6 +434,10 @@ where
         return;
     };
     let parent = exported.exported_surface.clone();
+    if !is_toplevel(state, &child) {
+        imported.post_invalid_surface("surface is not an xdg_toplevel");
+        return;
+    }
 
     let mut invalid = false;
     let mut changed = false;

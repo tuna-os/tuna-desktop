@@ -462,6 +462,10 @@ impl XdgShellHandler for State {
             self.closed_toplevel_parents
                 .insert(surface.wl_surface().clone(), parent);
         }
+        smithay::wayland::xdg_foreign::XdgForeignHandler::foreign_toplevel_destroyed(
+            self,
+            surface.wl_surface(),
+        );
     }
 
     fn parent_changed(&mut self, surface: ToplevelSurface) {
@@ -669,7 +673,22 @@ impl CompositorHandler for State {
 
     fn commit(&mut self, surface: &wl_surface::WlSurface) {
         self.pointer_scene_dirty = true;
+        let unmapped = smithay::wayland::compositor::with_states(surface, |states| {
+            matches!(
+                states
+                    .cached_state
+                    .get::<smithay::wayland::compositor::SurfaceAttributes>()
+                    .current()
+                    .buffer,
+                Some(smithay::wayland::compositor::BufferAssignment::Removed)
+            )
+        });
         on_commit_buffer_handler::<State>(surface);
+        if unmapped {
+            smithay::wayland::xdg_foreign::XdgForeignHandler::foreign_toplevel_destroyed(
+                self, surface,
+            );
+        }
         self.window_icons.commit(surface);
         self.popups.commit(surface);
         if let Some(smithay::desktop::PopupKind::Xdg(popup)) = self.popups.find_popup(surface) {
