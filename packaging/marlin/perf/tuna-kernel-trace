@@ -25,6 +25,36 @@ EVENTS = ('drm/drm_vblank_event', 'drm/drm_vblank_event_queued',
           'timer/hrtimer_expire_entry', 'timer/hrtimer_expire_exit',
           'timer/hrtimer_cancel')
 
+BPF_COLLECTOR = Path('/usr/libexec/tuna-kernel-bpf')
+BPF_OBJECT = Path('/usr/libexec/tuna-kernel-bpf.bpf.o')
+BPF_RING_BYTES = 1024 * 1024
+BPF_RECORD = struct.Struct('<QQIIQ20QQII')
+BPF_SCHEMA = 1
+BPF_BACKEND = 'bpf-fentry-fexit-v1'
+EVENT_NAMES = ('flush', 'arm', 'arm_return', 'accurate', 'accurate_return',
+               'timeout', 'timeout_return', 'timer', 'timer_return', 'send')
+FIELD_NAMES = ('crtc', 'object', 'pipe', 'dev', 'minor', 'commit', 'event',
+               'file', 'userdata', 'target', 'event_pipe', 'count', 'output',
+               'value', 'timer', 'interval', 'expires', 'restart', 'sequence',
+               'timestamp')
+CRTC_FIELDS = ('crtc', 'object', 'pipe', 'dev', 'minor')
+PENDING_FIELDS = ('event', 'file', 'userdata')
+TIMER_FIELDS = ('timer', 'crtc', 'interval', 'expires', 'object', 'pipe', 'dev', 'minor')
+EVENT_FIELDS = (CRTC_FIELDS + ('commit',), CRTC_FIELDS + PENDING_FIELDS,
+                CRTC_FIELDS + PENDING_FIELDS + ('target', 'event_pipe'),
+                CRTC_FIELDS, CRTC_FIELDS + ('count',),
+                CRTC_FIELDS + ('output',), CRTC_FIELDS + ('output', 'value'),
+                TIMER_FIELDS, TIMER_FIELDS + ('restart',),
+                ('dev', 'minor') + PENDING_FIELDS + ('sequence', 'timestamp', 'event_pipe'))
+SIGNED_FIELDS = {'minor', 'value', 'interval', 'expires', 'restart', 'timestamp'}
+EXPECTED_KERNEL_RELEASE = '7.2.9-arch1-1'
+EXPECTED_KERNEL_SHA256 = 'd02afb36d5f99390fdd8d04dedf8894354f4bbdc5e7d44afa5b897639bb3707c'
+EXPECTED_BTF = {
+    'vmlinux': 'e707a907dffccbfd0e3e6caa1ab7c9bec6d7f1466235f4ce4e217837cb95fc42',
+    'virtio_gpu': '0cfe2a20701f443b51fba9847c5fff7cf2561b13e2e609d76d527be019be5112',
+}
+KERNEL_SOURCE = 'https://github.com/archlinux/linux/tree/811a830af7e795834eb65ea419afe08153d57720'
+
 
 def bounded(path, limit):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -44,24 +74,24 @@ def save(path, value):
         json.dump(value, stream, indent=2)
 
 
+def save_atomic(path, value):
+    """Publish a complete supervisor receipt, never a visible partial JSON."""
+    pending = path.with_name(path.name + '.pending')
+    fd = os.open(pending, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(value, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(pending, path, follow_symlinks=False)
+    finally:
+        pending.unlink()
+
+
 def read_json(path):
     return json.loads(bounded(path, 2 * 1024 * 1024))
 
 
-def probe_command(command):
-    # FileIO append initialization seeks SEEK_END, which seq_lseek rejects.
-    # Raw append preserves other observers' definitions without that seek or
-    # O_TRUNC (the latter deletes every kprobe owned by the tracefs control).
-    raw = (command + '\n').encode('ascii')
-    if len(raw) > 4096 or '\n' in command:
-        raise ValueError('invalid bounded probe command')
-    fd = os.open(TRACE / 'kprobe_events',
-                 os.O_WRONLY | os.O_APPEND | os.O_CLOEXEC | os.O_NOFOLLOW)
-    try:
-        if os.write(fd, raw) != len(raw):
-            raise OSError('short actual probe command write')
-    finally:
-        os.close(fd)
 
 
 class Btf:
@@ -202,7 +232,7 @@ class Btf:
                     raise ValueError(f'BTF argument target differs: {name}')
 
 
-def build_probes(base, drm, virtio, group, drm_module=True):
+def build_layout(base, drm, virtio, drm_module=True):
     offsets = {}
     def field(owner, typename, path, size):
         offset, actual = owner.offset(typename, *path.split('.'))
@@ -237,22 +267,24 @@ def build_probes(base, drm, virtio, group, drm_module=True):
     arg = drm.types[drm.unwrap(timer_arg)]
     if arg['kind'] != 2 or drm.types[drm.unwrap(arg['size_type'])]['name'] != 'hrtimer':
         raise ValueError('BTF timer callback argument differs')
-    drm_owner = 'drm:' if drm_module else ''
-    crtc = f'crtc=$arg1:x64 object=+{crtc_id}($arg1):u32 pipe=+{index}($arg1):u32 dev=+{dev}($arg1):x64 minor=+{minor_index}(+{primary}(+{dev}($arg1))):s32'
-    pending = f'event=$arg2:x64 file=+{file}($arg2):x64 userdata=+{userdata}($arg2):x64'
-    timer = f'timer=$arg1:x64 crtc=+{timer_crtc}($arg1):x64 interval=+{interval}($arg1):s64 expires=+{expires}($arg1):s64 object=+{crtc_id}(+{timer_crtc}($arg1)):u32 pipe=+{index}(+{timer_crtc}($arg1)):u32 dev=+{dev}(+{timer_crtc}($arg1)):x64 minor=+{minor_index}(+{primary}(+{dev}(+{timer_crtc}($arg1)))):s32'
-    return [
-        f'p:{group}/{group}_flush virtio_gpu:virtio_gpu_crtc_atomic_flush {crtc} commit=$arg2:x64',
-        f'p:{group}/{group}_arm {drm_owner}drm_crtc_arm_vblank_event {crtc} {pending}',
-        f'r64:{group}/{group}_arm_return {drm_owner}drm_crtc_arm_vblank_event {crtc} {pending} target=+{sequence}($arg2):u64 event_pipe=+{pipe}($arg2):u32',
-        f'p:{group}/{group}_accurate {drm_owner}drm_crtc_accurate_vblank_count {crtc}',
-        f'r64:{group}/{group}_accurate_return {drm_owner}drm_crtc_accurate_vblank_count {crtc} count=$retval:u64',
-        f'p:{group}/{group}_timeout {drm_owner}drm_crtc_vblank_get_vblank_timeout {crtc} output=$arg2:x64',
-        f'r64:{group}/{group}_timeout_return {drm_owner}drm_crtc_vblank_get_vblank_timeout {crtc} output=$arg2:x64 value=+0($arg2):s64',
-        f'p:{group}/{group}_timer {drm_owner}drm_vblank_timer_function {timer}',
-        f'r64:{group}/{group}_timer_return {drm_owner}drm_vblank_timer_function {timer} restart=$retval:s32',
-        f'p:{group}/{group}_send {drm_owner}send_vblank_event dev=$arg1:x64 minor=+{minor_index}(+{primary}($arg1)):s32 {pending} sequence=$arg3:u64 timestamp=$arg4:s64 event_pipe=+{pipe}($arg2):u32',
-    ], offsets
+    returned = drm.types[drm.unwrap(timer_proto['size_type'])]
+    if returned['kind'] not in (1, 6) or returned['size_type'] != 4:
+        raise ValueError('BTF timer callback return differs')
+    functions = ('virtio_gpu_crtc_atomic_flush', 'drm_crtc_arm_vblank_event',
+                 'drm_crtc_arm_vblank_event', 'drm_crtc_accurate_vblank_count',
+                 'drm_crtc_accurate_vblank_count', 'drm_crtc_vblank_get_vblank_timeout',
+                 'drm_crtc_vblank_get_vblank_timeout', 'drm_vblank_timer_function',
+                 'drm_vblank_timer_function', 'send_vblank_event')
+    return {
+        'offsets': offsets,
+        'values': [crtc_id, index, dev, primary, minor_index, sequence, pipe,
+                   userdata, file, timer_offset, interval, timer_crtc, expires],
+        'functions': [{'event': number, 'name': EVENT_NAMES[number],
+                       'symbol': symbol,
+                       'attach_owner': 'virtio_gpu' if number == 0 else 'drm' if drm_module else 'vmlinux',
+                       'attach_btf_id': (virtio if number == 0 else drm).named(symbol, 12)}
+                      for number, symbol in enumerate(functions)],
+    }
 
 
 def write(path, value):
@@ -260,37 +292,56 @@ def write(path, value):
         stream.write(value + '\n')
 
 
-def profiles(group):
-    raw = bounded(TRACE / 'kprobe_profile', 1024 * 1024).decode()
-    result = {}
-    for line in raw.splitlines():
-        columns = line.split()
-        if len(columns) == 3 and columns[0].startswith(group + '_'):
-            if not all(value.isdigit() for value in columns[1:]):
-                raise RuntimeError('invalid actual probe profile')
-            result[columns[0]] = {'hits': int(columns[1]), 'misses': int(columns[2])}
+def cpu_inventory(path, maximum):
+    raw = bounded(path, 4096).decode().strip()
+    if not re.fullmatch(r'[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*', raw):
+        raise ValueError('actual CPU inventory is malformed')
+    result = []
+    for part in raw.split(','):
+        ends = [int(value) for value in part.split('-')]
+        first, last = ends[0], ends[-1]
+        if (last < first or last >= 65536 or last - first + 1 + len(result) > maximum
+                or result and first <= result[-1]):
+            raise ValueError('actual CPU inventory exceeds bound')
+        result.extend(range(first, last + 1))
     return result
 
 
-def validate_trace_fields(raw, group, definitions):
-    text = raw.decode('utf-8', errors='strict')
-    required = {}
-    for definition in definitions:
-        name = definition.split()[0].split('/', 1)[1]
-        required[name] = set(re.findall(r" ([a-z_]+)=", definition))
-    counts = {name: 0 for name in required}
-    for line in text.splitlines():
-        matched = re.search(r"\b(" + re.escape(group) + r"_[a-z_]+):", line)
-        if not matched:
-            continue
-        name = matched[1]
-        if name not in required:
-            raise ValueError('unexpected observer probe record')
-        fields = dict((key, int(value, 16) if value.lower().startswith('0x') else int(value))
-                      for key, value in re.findall(r"\b([a-z_]+)=(-?0x[0-9a-fA-F]+|-?[0-9]+)(?=\s|$)", line))
-        if set(fields) != required[name]:
-            raise ValueError('actual probe field is missing or faulted: ' + name)
-        for key in ('crtc', 'dev', 'object', 'event', 'file', 'commit', 'timer', 'output', 'expires', 'timestamp', 'value', 'target'):
+def online_cpu_ids():
+    return cpu_inventory(Path('/sys/devices/system/cpu/online'), 8)
+
+
+def bpf_records(raw, cpu_ids):
+    """Decode only actual fixed-schema bytes; no replacement or inferred event."""
+    if (not isinstance(cpu_ids, list) or not 1 <= len(cpu_ids) <= 8
+            or any(type(cpu) is not int or not 0 <= cpu < 65536 for cpu in cpu_ids)
+            or cpu_ids != sorted(set(cpu_ids))):
+        raise ValueError('actual online CPU inventory differs')
+    if not raw or len(raw) % BPF_RECORD.size:
+        raise ValueError('actual BPF record extent is missing or incomplete')
+    records = []
+    previous = {}
+    for row in BPF_RECORD.iter_unpack(raw):
+        monotonic_ns, sequence, event, cpu, pid_tgid = row[:5]
+        values, mask, faults, reserved = row[5:25], row[25], row[26], row[27]
+        if event >= len(EVENT_NAMES) or cpu not in cpu_ids or not monotonic_ns or not sequence or reserved:
+            raise ValueError('actual BPF record header differs')
+        expected = sum(1 << FIELD_NAMES.index(key) for key in EVENT_FIELDS[event])
+        if mask != expected or faults:
+            raise ValueError('actual BPF field is missing or faulted: ' + EVENT_NAMES[event])
+        fields = {}
+        for number, key in enumerate(FIELD_NAMES):
+            value = values[number]
+            if not mask & (1 << number):
+                if value:
+                    raise ValueError('actual BPF record has an unexpected field')
+                continue
+            if key in SIGNED_FIELDS and value & (1 << 63):
+                value -= 1 << 64
+            fields[key] = value
+        name = EVENT_NAMES[event]
+        for key in ('crtc', 'dev', 'object', 'event', 'file', 'commit', 'timer',
+                    'output', 'expires', 'timestamp', 'value', 'target'):
             if key in fields and fields[key] <= 0:
                 raise ValueError('invalid actual pointer/time probe field: ' + name + '.' + key)
         for key in ('pipe', 'event_pipe', 'minor'):
@@ -300,28 +351,36 @@ def validate_trace_fields(raw, group, definitions):
             raise ValueError('invalid timer callback return value')
         if 'interval' in fields and fields['interval'] < 0:
             raise ValueError('invalid observed timer interval')
-        counts[name] += 1
-    if not any(counts.values()):
-        raise ValueError('trace lacks any actual observer records')
+        key = (cpu, event)
+        if key in previous:
+            old_sequence, old_time = previous[key]
+            if sequence != old_sequence + 1 or monotonic_ns < old_time:
+                raise ValueError('actual BPF per-CPU sequence is lost or reordered')
+        previous[key] = (sequence, monotonic_ns)
+        records.append({'event': name, 'cpu': cpu, 'pid_tgid': pid_tgid,
+                        'monotonic_ns': monotonic_ns, 'sequence': sequence, 'fields': fields})
+    return records
+
+
+def record_counts(records):
+    counts = dict.fromkeys(EVENT_NAMES, 0)
+    for row in records:
+        counts[row['event']] += 1
     return counts
 
 
-def timer_mappings(raw, group, expected=None):
+def timer_mappings(records, expected=None):
     mappings = {}
     crtcs = {}
-    for line in raw.decode('utf-8', errors='strict').splitlines():
-        if expected is not None and re.search(r'\b' + re.escape(group) + r'_[a-z_]+:', line):
-            observed = {key: int(value, 16) if value.startswith('0x') else int(value)
-                        for key, value in re.findall(r'\b([a-z_]+)=(0x[0-9a-fA-F]+|[0-9]+)(?=\s|$)', line)}
-            if 'crtc' in observed and not any(all(observed.get(key) == identity[key] for key in ('crtc', 'object', 'pipe', 'dev', 'minor')) for identity in expected.values()):
+    for record in records:
+        fields = record['fields']
+        if expected is not None:
+            if 'crtc' in fields and not any(all(fields.get(key) == identity[key] for key in CRTC_FIELDS) for identity in expected.values()):
                 raise ValueError('measurement CRTC escaped discovered timer inventory')
-            if 'event_pipe' in observed and not any(all(observed.get(key) == identity[target] for key, target in [('dev', 'dev'), ('minor', 'minor'), ('event_pipe', 'pipe')]) for identity in expected.values()):
+            if 'event_pipe' in fields and not any(all(fields.get(key) == identity[target] for key, target in [('dev', 'dev'), ('minor', 'minor'), ('event_pipe', 'pipe')]) for identity in expected.values()):
                 raise ValueError('measurement event escaped discovered timer inventory')
-        matched = re.search(r'\b' + re.escape(group) + r'_(timer|timer_return):', line)
-        if not matched:
+        if record['event'] not in ('timer', 'timer_return'):
             continue
-        fields = {key: int(value, 16) if value.startswith('0x') else int(value)
-                  for key, value in re.findall(r'\b([a-z_]+)=(0x[0-9a-fA-F]+|[0-9]+)(?=\s|$)', line)}
         required = {'timer', 'crtc', 'object', 'pipe', 'dev', 'minor'}
         if not required <= fields.keys():
             raise ValueError('actual timer identity fields are missing')
@@ -354,14 +413,16 @@ def timer_filter(timer_inventory, actual_format):
 BUFFER_DATA_PAGE_BOUND = 2 * 1024 * 1024
 
 
-def buffer_allocation(header_page, subbuffer_kb, page_bytes):
+def buffer_allocation(header_page, subbuffer_kb, page_bytes, bound_bytes=BUFFER_DATA_PAGE_BOUND):
     """Account for Linux ring payload rounding and its separate reader page."""
     if not isinstance(page_bytes, int) or page_bytes < 4096 or page_bytes & (page_bytes - 1):
         raise ValueError('actual kernel page size is invalid')
+    if type(bound_bytes) is not int or not 0 < bound_bytes <= BUFFER_DATA_PAGE_BOUND or bound_bytes % page_bytes:
+        raise ValueError('actual native ring budget is invalid')
     if not re.fullmatch(r'[1-9][0-9]*', subbuffer_kb):
         raise ValueError('actual trace subbuffer size is invalid')
     subbuffer_bytes = int(subbuffer_kb) * 1024
-    if (subbuffer_bytes < page_bytes or subbuffer_bytes > BUFFER_DATA_PAGE_BOUND
+    if (subbuffer_bytes < page_bytes or subbuffer_bytes > bound_bytes
             or subbuffer_bytes & (subbuffer_bytes - 1) or subbuffer_bytes % page_bytes):
         raise ValueError('actual trace subbuffer/page layout is inconsistent')
     data = re.findall(r'field:\s*char data;\s*offset:([0-9]+);\s*size:([0-9]+);\s*signed:[01];', header_page)
@@ -372,10 +433,10 @@ def buffer_allocation(header_page, subbuffer_kb, page_bytes):
         raise ValueError('actual trace header/data extent differs from subbuffer size')
     # ring_buffer_resize rounds requested bytes UP by the reported payload.
     # rb_allocate_cpu_buffer allocates one additional reader data page.
-    max_ring_pages = BUFFER_DATA_PAGE_BOUND // subbuffer_bytes - 1
+    max_ring_pages = bound_bytes // subbuffer_bytes - 1
     request_kb = max_ring_pages * payload_bytes // 1024
     ring_pages = (request_kb * 1024 + payload_bytes - 1) // payload_bytes
-    if request_kb < 1 or ring_pages < 2 or (ring_pages + 1) * subbuffer_bytes > BUFFER_DATA_PAGE_BOUND:
+    if request_kb < 1 or ring_pages < 2 or (ring_pages + 1) * subbuffer_bytes > bound_bytes:
         raise ValueError('actual trace layout cannot fit ring and reader within fixed bound')
     return {'page_bytes': page_bytes, 'subbuffer_kb': subbuffer_kb,
             'subbuffer_bytes': subbuffer_bytes, 'header_page': header_page,
@@ -384,19 +445,70 @@ def buffer_allocation(header_page, subbuffer_kb, page_bytes):
             'event_payload_bytes_per_cpu': ring_pages * payload_bytes,
             'expected_readback_kb': str(ring_pages * payload_bytes // 1024),
             'data_page_bytes_per_cpu': (ring_pages + 1) * subbuffer_bytes,
-            'bound_bytes_per_cpu': BUFFER_DATA_PAGE_BOUND,
+            'bound_bytes_per_cpu': bound_bytes,
             'limitation': 'Bound covers ring and reader data pages, not allocator metadata or total kernel heap.'}
 
 
-def actual_buffer_layout(instance):
+def buffer_budget(base, cpus, page_bytes):
+    """Charge shared BPF pages once and both private tracefs instances."""
+    if type(cpus) is not int or not 1 <= cpus <= 8 or page_bytes < 4096 or page_bytes & (page_bytes - 1):
+        raise ValueError('actual observer CPU/page inventory exceeds bound')
+    ring = base.named('bpf_ringbuf', 4)
+    consumer, _ = base.member(ring, 'consumer_pos')
+    producer, _ = base.member(ring, 'producer_pos')
+    data, _ = base.member(ring, 'data')
+    if (consumer <= 0 or consumer % page_bytes or producer != consumer + page_bytes
+            or data != consumer + 2 * page_bytes or BPF_RING_BYTES % page_bytes):
+        raise ValueError('actual BPF ring data/control page layout differs')
+    map_bytes = base.types[base.named('bpf_ringbuf_map', 4)]['size_type']
+    if not 0 < map_bytes <= page_bytes:
+        raise ValueError('actual BPF ring map header exceeds charged page')
+    pointer_array = (data // page_bytes + 2 * BPF_RING_BYTES // page_bytes) * 8
+    pointer_array_bound = max(page_bytes, 1 << (pointer_array - 1).bit_length())
+    shared = BPF_RING_BYTES + data + pointer_array_bound + page_bytes
+    # A fresh inactive snapshot has two data pages plus its reader. The
+    # separate cleanup barrier has the same minimum main ring AND snapshot.
+    snapshot = 3 * page_bytes
+    barrier = 6 * page_bytes
+    total = BUFFER_DATA_PAGE_BOUND * cpus
+    native_per_cpu = ((total - shared - cpus * (snapshot + barrier)) // cpus // page_bytes) * page_bytes
+    if native_per_cpu < 3 * page_bytes:
+        raise ValueError('shared BPF and private trace rings cannot fit original total bound')
+    return {'total_bound_bytes': total, 'actual_cpus': cpus, 'page_bytes': page_bytes,
+            'bpf_ring_data_bytes': BPF_RING_BYTES, 'bpf_control_prefix_bytes': data,
+            'bpf_pointer_array_requested_bytes': pointer_array,
+            'bpf_pointer_array_allocation_bound_bytes': pointer_array_bound,
+            'bpf_ring_map_header_btf_bytes': map_bytes,
+            'bpf_ring_map_header_allocation_bound_bytes': page_bytes,
+            'bpf_ring_allocation_bytes': shared,
+            'native_inactive_snapshot_bytes_per_cpu': snapshot,
+            'barrier_ring_reader_snapshot_bytes_per_cpu': barrier,
+            'native_bound_bytes_per_cpu': native_per_cpu,
+            'maximum_accounted_ring_bytes': shared + cpus * (native_per_cpu + snapshot + barrier),
+            'limitation': 'Counts physical ring/reader/control pages plus conservative BPF pointer-array/map-header charges. Excludes generic allocator/page-table metadata, other BPF programs/maps and userspace virtual aliases; not total kernel heap.'}
+
+
+def snapshot_inventory(instance):
+    raw = bounded(instance / 'snapshot', 65536)
+    text = raw.decode('utf-8', errors='strict')
+    if text.count('# * Snapshot is freed *') != 1 or '# * Snapshot is allocated *' in text:
+        raise ValueError('fresh private inactive snapshot is not at its source-defined minimum')
+    return {'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest(), 'text': text,
+            'minimum_ring_reader_pages_per_cpu': 3,
+            'allocation_source': KERNEL_SOURCE.replace('/tree/', '/blob/') + '/kernel/trace/trace_snapshot.c'}
+
+
+def actual_buffer_layout(instance, native_bound):
     return buffer_allocation(bounded(instance / 'events/header_page', 16384).decode(),
                              bounded(instance / 'buffer_subbuf_size_kb', 4096).decode().strip(),
-                             os.sysconf('SC_PAGE_SIZE'))
+                             os.sysconf('SC_PAGE_SIZE'), native_bound)
 
 
-def buffer_readbacks(instance, cpus, expected):
+def buffer_readbacks(instance, possible_cpus, expected):
+    # tracefs creates per_cpu files for possible CPUs, even when offline.
+    # Its all-CPU resize propagates the actual CPU0 ring payload readback.
     paths = sorted((instance / 'per_cpu').glob('cpu[0-9]*'))
-    if len(paths) != cpus:
+    if len(paths) != possible_cpus:
         raise RuntimeError('actual per-CPU buffer sizes are incomplete')
     values = {'all': bounded(instance / 'buffer_size_kb', 4096).decode().strip()}
     values.update({cpu.name: bounded(cpu / 'buffer_size_kb', 4096).decode().strip() for cpu in paths})
@@ -405,7 +517,7 @@ def buffer_readbacks(instance, cpus, expected):
     return values
 
 
-def cpu_stats(instance, cpus):
+def cpu_stats(instance, possible_cpus):
     stats = {}
     for cpu in sorted((instance / 'per_cpu').glob('cpu[0-9]*')):
         values = {}
@@ -414,7 +526,7 @@ def cpu_stats(instance, cpus):
                 key, value = (part.strip() for part in line.split(':', 1))
                 values[key] = value
         stats[cpu.name] = values
-    if len(stats) != cpus:
+    if len(stats) != possible_cpus:
         raise RuntimeError('actual per-CPU trace statistics are incomplete')
     return stats
 
@@ -426,26 +538,318 @@ def retain_raw(path, raw):
     return {'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
 
 
+def fingerprint(path, limit):
+    raw = bounded(path, limit)
+    return {'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
+
+
+def process_identity(pid):
+    try:
+        raw = bounded(Path('/proc') / str(pid) / 'stat', 16384).decode()
+    except FileNotFoundError:
+        return None
+    fields = raw[raw.rfind(')') + 2:].split()
+    if len(fields) < 20:
+        raise RuntimeError('native BPF process identity is incomplete')
+    if fields[0] == 'Z':
+        return None
+    try:
+        executable = (Path('/proc') / str(pid) / 'exe').stat()
+    except FileNotFoundError:
+        return None
+    return {'start_ticks': int(fields[19]), 'executable_device': executable.st_dev,
+            'executable_inode': executable.st_ino}
+
+
+def stop_native(marker):
+    # Publish cancellation before checking the process receipt. The supervisor
+    # checks it after publishing that receipt, closing the launch/cleanup race.
+    try:
+        retain_raw(ROOT / 'native-cancel', b'cancel\n')
+    except FileExistsError:
+        pass
+    if not marker.get('native_pid') and (ROOT / 'native-process.json').exists():
+        process = read_json(ROOT / 'native-process.json')
+        if process.get('group') != marker['group']:
+            raise RuntimeError('native BPF supervisor process belongs to another acquisition')
+        marker['native_pid'] = process['pid']
+        marker['native_process_identity'] = process['identity']
+    if not marker.get('native_pid'):
+        return None
+    pid = marker['native_pid']
+    if not (ROOT / 'native-exit.json').exists():
+        actual = process_identity(pid)
+        if actual is not None:
+            if actual != marker['native_process_identity']:
+                raise RuntimeError('native BPF process ownership changed; refusing unrelated signal')
+            os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 5
+    while not (ROOT / 'native-exit.json').exists():
+        actual = process_identity(pid)
+        if actual is not None and actual != marker['native_process_identity']:
+            raise RuntimeError('native BPF PID identity changed while stopping')
+        if time.monotonic() >= deadline:
+            raise RuntimeError('native BPF collector lacks physically observed terminal status')
+        time.sleep(.02)
+    terminal = read_json(ROOT / 'native-exit.json')
+    if (terminal.get('schema') != 1 or terminal.get('group') != marker['group']
+            or terminal.get('pid') != pid or terminal.get('terminal_observed') is not True
+            or type(terminal.get('exitcode')) is not int):
+        raise RuntimeError('native BPF child exit status is not original or physically observed')
+    marker['native_exit'] = terminal
+    marker['native_terminal_observed'] = True
+    if not (ROOT / 'bpf-result.json').exists():
+        raise RuntimeError('native BPF collector exited without whole result receipt')
+    return read_json(ROOT / 'bpf-result.json')
+
+
+def program_inventory(programs, layout):
+    if not isinstance(programs, list) or len(programs) != len(EVENT_NAMES):
+        raise ValueError('actual BPF program inventory is incomplete')
+    ids = set()
+    for number, (program, expected) in enumerate(zip(programs, layout['functions'])):
+        if not isinstance(program, dict):
+            raise ValueError('actual BPF program inventory is malformed')
+        if (program.get('event') != number or program.get('name') != EVENT_NAMES[number]
+                or program.get('attach_owner') != expected['attach_owner']
+                or program.get('attach_btf_id') != expected['attach_btf_id']):
+            raise ValueError('actual BPF attachment differs from validated live BTF')
+        for key in ('id', 'attach_btf_obj_id', 'attach_btf_id'):
+            if type(program.get(key)) is not int or program[key] <= 0:
+                raise ValueError('actual BPF attachment identity is missing')
+        if program['id'] in ids:
+            raise ValueError('actual BPF program identity is duplicated')
+        ids.add(program['id'])
+        for key in ('run_cnt', 'run_time_ns', 'recursion_misses'):
+            if type(program.get(key)) is not int or not 0 <= program[key] < 1 << 64:
+                raise ValueError('actual BPF readable runtime statistics are missing')
+        if program['recursion_misses']:
+            raise ValueError('actual BPF program missed recursive invocations')
+    return programs
+
+
+def native_qualification(native, marker, records, raw_bytes):
+    if not isinstance(native, dict) or type(native.get('schema')) is not int or native['schema'] != BPF_SCHEMA:
+        raise ValueError('native BPF receipt schema is unsupported')
+    terminal = marker.get('native_exit')
+    if (native.get('qualified_acquisition') is not True or native.get('errors') != []
+            or native.get('cleanup_errors') != [] or not isinstance(terminal, dict)
+            or type(terminal.get('exitcode')) is not int or terminal.get('exitcode') != 0):
+        raise ValueError('native BPF collector reports loss, unsupported counters or cleanup/exit failure')
+    possible = native.get('possible_cpu_count')
+    if (native.get('online_cpu_ids') != marker['online_cpu_ids']
+            or type(possible) is not int or not len(marker['online_cpu_ids']) <= possible <= 65536
+            or possible != marker['native_ready']['possible_cpu_count']):
+        raise ValueError('actual BPF online/possible CPU inventory changed')
+    before = program_inventory(native.get('programs_before'), marker['layout'])
+    after = program_inventory(native.get('programs_after'), marker['layout'])
+    if before != marker['native_ready']['programs_before']:
+        raise ValueError('actual BPF initial program identities/counters changed')
+    counts = record_counts(records)
+    for initial, final in zip(before, after):
+        for key in ('event', 'name', 'id', 'attach_btf_obj_id', 'attach_btf_id', 'attach_owner'):
+            if initial[key] != final[key]:
+                raise ValueError('actual BPF program/source identity changed')
+        if final['run_cnt'] < initial['run_cnt'] or final['run_time_ns'] < initial['run_time_ns']:
+            raise ValueError('actual BPF runtime counters regressed')
+        for key in ('calls', 'disabled', 'emitted', 'reserve_failed', 'read_failed', 'retained_records'):
+            if type(final.get(key)) is not int or not 0 <= final[key] < 1 << 64:
+                raise ValueError('actual BPF loss/record accounting is incomplete')
+        if (final['calls'] != final['run_cnt']
+                or final['calls'] != final['disabled'] + final['emitted'] + final['reserve_failed']
+                or final['emitted'] != final['retained_records']
+                or final['emitted'] != counts[final['name']]
+                or final['reserve_failed'] or final['read_failed']):
+            raise ValueError('actual BPF run/call/emission/whole-byte counts do not reconcile')
+    if native.get('raw', {}).get('bytes') != raw_bytes:
+        raise ValueError('actual BPF retained byte extent differs from native receipt')
+    clocks = [native.get(key) for key in ('capture_enable_begin_monotonic_ns',
+              'capture_started_monotonic_ns', 'capture_stop_begin_monotonic_ns',
+              'capture_stopped_monotonic_ns', 'quiescence_begin_monotonic_ns',
+              'quiescence_end_monotonic_ns', 'detached_monotonic_ns')]
+    if not all(type(value) is int and value > 0 for value in clocks) or clocks != sorted(clocks):
+        raise ValueError('actual BPF control/detachment boundaries are incomplete or regressed')
+    if (native.get('quiescence_backend') != 'tracefs-function-ops-tasks-rcu-v1'
+            or native.get('quiescence_completed') is not True):
+        raise ValueError('actual native BPF Tasks-RCU quiescence is unsupported or incomplete')
+    registration = []
+    for stage in ('before', 'active', 'after'):
+        proof = native.get('quiescence_registration_' + stage)
+        if (not isinstance(proof, dict) or type(proof.get('count')) is not int
+                or not 0 <= proof['count'] < 1 << 32 or 'raw_line' not in proof):
+            raise ValueError('actual Tasks-RCU registration evidence is missing')
+        line = proof.get('raw_line')
+        if (proof['count'] == 0 and line is not None) or (proof['count'] and (
+                not isinstance(line, str) or len(line) >= 1024
+                or not re.match(r'drm_crtc_arm_vblank_event(?: \[drm\])? \('
+                                + str(proof['count']) + r'\)', line))):
+            raise ValueError('actual Tasks-RCU registration line differs from count')
+        registration.append(proof['count'])
+    if registration[1] != registration[0] + 1 or registration[2] != registration[0]:
+        raise ValueError('actual dynamic function tracer registration did not complete')
+    if any(not clocks[0] <= row['monotonic_ns'] <= clocks[-1] for row in records):
+        raise ValueError('actual BPF record escaped physical acquisition boundaries')
+    return counts
+
+
+def native_timer_reconciliation(raw, records, marker, native, stop_begin_ns):
+    """Count actual calls in the definite common window, not hashed pointers."""
+    begin = max(marker['filters_ready_monotonic_ns'], native['capture_started_monotonic_ns'])
+    end = min(stop_begin_ns, native['capture_stop_begin_monotonic_ns'])
+    if begin >= end:
+        raise ValueError('native and BPF observers have no definite shared active window')
+    sources, by_cpu = [], {}
+    for line in raw.decode('utf-8', errors='strict').splitlines():
+        matched = re.search(r'\[([0-9]+)\].*?\s([0-9]+)\.([0-9]{6,9}): hrtimer_expire_entry:', line)
+        if not matched:
+            continue
+        if not re.search(r'\bfunction=drm_vblank_timer_function(?:\s|$)', line):
+            raise ValueError('native callback filter admitted another function')
+        cpu = int(matched[1])
+        precision = 10 ** (9 - len(matched[3]))
+        low = int(matched[2]) * 1_000_000_000 + int(matched[3]) * precision
+        source = {'cpu': cpu, 'lower_ns': low, 'upper_ns': low + precision, 'matches': 0}
+        if cpu not in marker['online_cpu_ids']:
+            raise ValueError('native callback CPU escaped actual inventory')
+        by_cpu.setdefault(cpu, []).append(len(sources))
+        sources.append(source)
+    if not sources:
+        raise ValueError('whole native trace lacks filtered actual timer callbacks')
+    positions = dict.fromkeys(by_cpu, 0)
+    active_entries = 0
+    for row in sorted((row for row in records if row['event'] == 'timer'),
+                      key=lambda row: row['monotonic_ns']):
+        indexes = by_cpu.get(row['cpu'], [])
+        position = positions.get(row['cpu'], 0)
+        while position + 1 < len(indexes) and sources[indexes[position + 1]]['lower_ns'] <= row['monotonic_ns']:
+            position += 1
+        positions[row['cpu']] = position
+        source = sources[indexes[position]] if indexes and sources[indexes[position]]['lower_ns'] <= row['monotonic_ns'] else None
+        inside = begin <= row['monotonic_ns'] < end
+        if source is not None and (inside or not source['matches']):
+            source['matches'] += 1
+        if inside:
+            active_entries += 1
+            if source is None:
+                raise ValueError('actual BPF timer entry has no independent native source')
+    active_sources = [source for source in sources if begin <= source['lower_ns'] and source['upper_ns'] <= end]
+    if not active_sources or any(source['matches'] != 1 for source in active_sources):
+        raise ValueError('actual native callback and BPF entry counts disagree')
+    pending, boundary_returns = {}, []
+    pairs = 0
+    for row in sorted((row for row in records if row['event'] in ('timer', 'timer_return')),
+                      key=lambda row: row['monotonic_ns']):
+        key = (row['cpu'], row['fields']['timer'])
+        if row['event'] == 'timer':
+            if key in pending:
+                raise ValueError('actual timer entry overlaps an unmatched same-CPU call')
+            pending[key] = row
+        else:
+            entry = pending.pop(key, None)
+            if entry is None:
+                if begin <= row['monotonic_ns'] < end:
+                    raise ValueError('actual active-window BPF timer return lacks its retained entry')
+                boundary_returns.append({'cpu': row['cpu'], 'monotonic_ns': row['monotonic_ns'],
+                                         'timer': row['fields']['timer']})
+            elif begin <= entry['monotonic_ns'] < end:
+                pairs += 1
+    if any(begin <= row['monotonic_ns'] < end for row in pending.values()) or pairs != active_entries:
+        raise ValueError('actual active-window timer entries/returns do not reconcile')
+    return {'active_window_begin_ns': begin, 'active_window_end_ns': end,
+            'native_callbacks_total': len(sources), 'native_callbacks_definitely_inside': len(active_sources),
+            'bpf_timer_entries_inside': active_entries, 'complete_timer_pairs_inside': pairs,
+            'boundary_native_callbacks': [source for source in sources if not begin <= source['lower_ns'] or source['upper_ns'] > end],
+            'boundary_bpf_returns_without_entry': boundary_returns,
+            'boundary_bpf_entries_without_return': [{'cpu': row['cpu'], 'monotonic_ns': row['monotonic_ns'],
+                                                     'timer': row['fields']['timer']} for row in pending.values()],
+            'limitation': 'All sources retained. Native text times are intervals. Boundary/transition records are explicit, never trimmed, synthesized or hash-to-pointer joined.'}
+
+
+def function_pair_reconciliation(records, begin, end):
+    """Require real returns for every entry in the definite common window."""
+    pairs = {'arm': CRTC_FIELDS + PENDING_FIELDS,
+             'accurate': CRTC_FIELDS,
+             'timeout': CRTC_FIELDS + ('output',),
+             'timer': CRTC_FIELDS + ('timer',)}
+    pending = {}
+    entries = dict.fromkeys(pairs, 0)
+    complete = dict.fromkeys(pairs, 0)
+    boundary = {'returns_without_entry': [], 'entries_without_return': [],
+                'pairs_crossing_start': [], 'pairs_crossing_stop': []}
+
+    def location(index, row):
+        return {**{key: row[key] for key in ('event', 'cpu', 'pid_tgid', 'monotonic_ns', 'sequence')},
+                'record_index': index}
+
+    for index, row in sorted(enumerate(records), key=lambda item: (item[1]['monotonic_ns'], item[0])):
+        name = row['event'].removesuffix('_return')
+        if name not in pairs:
+            continue
+        # A task can migrate; its full pid/tgid is the causal key. Idle tasks
+        # share pid0 across CPUs, so only those require a CPU-qualified key.
+        task = ('task', row['pid_tgid']) if row['pid_tgid'] else ('idle', row['cpu'])
+        stack = pending.setdefault((name, task), [])
+        inside = begin <= row['monotonic_ns'] < end
+        if row['event'] == name:
+            stack.append((index, row))
+            entries[name] += inside
+            continue
+        if not stack:
+            if inside:
+                raise ValueError('actual active-window function return lacks retained entry: ' + name)
+            boundary['returns_without_entry'].append(location(index, row))
+            continue
+        first_index, first = stack.pop()
+        if any(first['fields'][key] != row['fields'][key] for key in pairs[name]):
+            raise ValueError('actual function arguments/nested identity changed across return: ' + name)
+        first_inside = begin <= first['monotonic_ns'] < end
+        if first_inside:
+            complete[name] += 1
+            if row['monotonic_ns'] >= end:
+                boundary['pairs_crossing_stop'].append(
+                    {'entry': location(first_index, first), 'return': location(index, row)})
+        elif inside:
+            boundary['pairs_crossing_start'].append(
+                {'entry': location(first_index, first), 'return': location(index, row)})
+    for stack in pending.values():
+        for index, row in stack:
+            if begin <= row['monotonic_ns'] < end:
+                raise ValueError('actual active-window function entry lacks retained return: ' + row['event'])
+            boundary['entries_without_return'].append(location(index, row))
+    if entries != complete:
+        raise ValueError('actual active-window function pairs do not reconcile')
+    return {'active_window_begin_ns': begin, 'active_window_end_ns': end,
+            'entries_inside': entries, 'complete_pairs_by_entry_inside': complete,
+            'boundary': boundary,
+            'limitation': 'Whole source records retained; no pending active entry is excused by stop/detach. Boundary records outside this common native/BPF window are explicit and are not claimed complete.'}
+
+
 def cleanup(marker):
-    instance = TRACE / 'instances' / marker['group']
+    instances = [(marker.get('instance_created'), TRACE / 'instances' / marker['group']),
+                 (marker.get('barrier_instance_created'), TRACE / 'instances' / (marker['group'] + '_barrier'))]
     errors = []
-    if marker.get('instance_created') and instance.exists():
+    if marker.get('native_launched'):
+        try:
+            stop_native(marker)
+        except Exception as error:
+            errors.append(str(error)[:2048])
+        if not marker.get('native_terminal_observed'):
+            # A blocked barrier may hold trace_types_lock. Never hide it by
+            # blocking again in tracefs rmdir or claiming physical retirement.
+            errors.append('native process not terminal; private trace instances retained')
+            return errors
+    if instances[0][0] and instances[0][1].exists():
         for path in ('tracing_on', 'events/enable'):
             try:
-                write(instance / path, '0')
+                write(instances[0][1] / path, '0')
             except OSError as error:
                 errors.append(str(error))
-    for definition in marker['definitions']:
-        event = definition.split()[0].split(':', 1)[1]
+    for created, instance in instances:
         try:
-            probe_command(f'-:{event}')
+            if created and instance.exists():
+                instance.rmdir()
         except OSError as error:
             errors.append(str(error))
-    try:
-        if marker.get('instance_created') and instance.exists():
-            instance.rmdir()
-    except OSError as error:
-        errors.append(str(error))
     return errors
 
 
@@ -480,7 +884,7 @@ def start():
             metadata = ROOT.stat()
             if metadata.st_uid == 0 and not metadata.st_mode & 0o077 and not ROOT.is_symlink():
                 preflight = {}
-                for name in ('inventory', 'vmlinux', 'virtio_gpu', 'drm'):
+                for name in ('inventory', 'kernel', 'vmlinux', 'virtio_gpu', 'drm'):
                     path = ROOT / ('preflight-' + name + '.json')
                     if path.exists():
                         preflight[name] = read_json(path)
@@ -496,6 +900,12 @@ def start_observer():
         group = previous['group']
         if not re.fullmatch(r'tuna_vblank_[0-9a-f]{16}', group):
             raise RuntimeError('invalid completed observer identity')
+        terminal = previous.get('native_exit')
+        if previous.get('native_launched') and (
+                not isinstance(terminal, dict) or terminal.get('terminal_observed') is not True):
+            raise RuntimeError('previous acquisition lacks physical native retirement evidence')
+        if any((TRACE / 'instances' / name).exists() for name in (group, group + '_barrier')):
+            raise RuntimeError('previous private trace rings were not physically removed')
         if len(list(ROOT.parent.glob('tuna-kernel-trace-complete-*'))) >= 16:
             raise RuntimeError('retained observer session count exceeds bound')
         ROOT.rename(ROOT.parent / ('tuna-kernel-trace-complete-' + group))
@@ -505,10 +915,17 @@ def start_observer():
         raise RuntimeError('unsafe observer root')
     if os.uname().machine != 'x86_64':
         raise RuntimeError('observer ABI is qualified only for x86-64')
+    cpu_ids = online_cpu_ids()
     cpus = os.cpu_count()
-    if not cpus or cpus > 8:
-        raise RuntimeError('observer CPU count exceeds fixed allocation bound')
-    if not (TRACE / 'kprobe_events').exists():
+    if cpus != len(cpu_ids):
+        raise RuntimeError('observer online CPU count differs from actual inventory')
+    possible_ids = cpu_inventory(Path('/sys/devices/system/cpu/possible'), 65536)
+    possible_cpus = len(possible_ids)
+    if not set(cpu_ids) <= set(possible_ids):
+        raise RuntimeError('online CPU IDs escaped the kernel possible inventory')
+    if cpu_inventory(Path('/sys/devices/system/cpu/present'), 65536) != cpu_ids:
+        raise RuntimeError('offline present CPUs do not satisfy the fixed online ring-allocation contract')
+    if not (TRACE / 'trace_clock').exists():
         subprocess.run(['/usr/bin/mount', '-t', 'tracefs', '-o', 'nosuid,nodev,noexec', 'tracefs', str(TRACE)],
                        check=True, capture_output=True, timeout=5)
     observer_raw = bounded(Path(__file__), 1024 * 1024)
@@ -521,71 +938,141 @@ def start_observer():
     if 'virtio_gpu' not in module_names:
         raise RuntimeError('actual virtio_gpu module is not loaded')
     inventory = {'kernel_release': os.uname().release, 'proc_modules': module_inventory,
-                 'drm_owner': 'drm' if drm_module else 'vmlinux', 'virtio_owner': 'virtio_gpu'}
+                 'drm_owner': 'drm' if drm_module else 'vmlinux', 'virtio_owner': 'virtio_gpu',
+                 'kernel_source': KERNEL_SOURCE, 'cmdline': bounded(Path('/proc/cmdline'), 16384).decode()}
     save(ROOT / 'preflight-inventory.json', inventory)
+    if os.uname().release != EXPECTED_KERNEL_RELEASE or drm_module:
+        raise RuntimeError('native BPF source is qualified only for the original stock 7.2.9 built-in DRM kernel')
+    if re.search(r'(?:^|\s)(?:alloc_snapshot|ftrace_boot_snapshot|trace_buf_size)(?:=|\s|$)', inventory['cmdline']):
+        raise RuntimeError('boot trace-allocation overrides exceed the fresh-instance default peak contract')
+    kernel_image = Path('/usr/lib/modules') / os.uname().release / 'vmlinuz'
+    inventory['kernel_image'] = fingerprint(kernel_image, 128 * 1024 * 1024)
+    save(ROOT / 'preflight-kernel.json', inventory['kernel_image'])
+    if inventory['kernel_image']['sha256'] != EXPECTED_KERNEL_SHA256:
+        raise RuntimeError('installed stock kernel image differs from the qualified original source')
+    inventory['kernel_notes'] = fingerprint(Path('/sys/kernel/notes'), 1024 * 1024)
+    inventory['virtio_gpu_notes'] = fingerprint(Path('/sys/module/virtio_gpu/notes/.note.gnu.build-id'), 65536)
     btf_sources = {}
     loaded = {}
     for name in ('vmlinux', 'virtio_gpu') + (('drm',) if drm_module else ()):
         raw = bounded(Path('/sys/kernel/btf') / name, 64 * 1024 * 1024)
         btf_sources[name] = {'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
         save(ROOT / ('preflight-' + name + '.json'), btf_sources[name])
+        if btf_sources[name]['sha256'] != EXPECTED_BTF.get(name):
+            raise RuntimeError('live BTF differs from the qualified original kernel source: ' + name)
         loaded[name] = Btf(raw, loaded.get('vmlinux'))
     group = 'tuna_vblank_' + os.urandom(8).hex()
-    definitions, offsets = build_probes(loaded['vmlinux'], loaded['drm'] if drm_module else loaded['vmlinux'],
-                                      loaded['virtio_gpu'], group, drm_module=drm_module)
-    marker = {'group': group, 'definitions': [], 'offsets': offsets, 'btf': btf_sources, 'source_inventory': inventory,
-              'started_monotonic_ns': time.monotonic_ns(), 'cpus': cpus,
+    layout = build_layout(loaded['vmlinux'], loaded['vmlinux'], loaded['virtio_gpu'], drm_module=False)
+    budget = buffer_budget(loaded['vmlinux'], cpus, os.sysconf('SC_PAGE_SIZE'))
+    marker = {'group': group, 'layout': layout, 'btf': btf_sources, 'source_inventory': inventory,
+              'started_monotonic_ns': time.monotonic_ns(), 'cpus': cpus, 'online_cpu_ids': cpu_ids,
+              'possible_cpu_count': possible_cpus,
+              'present_cpu_ids': cpu_ids,
               'limit_seconds': MAX_SECONDS, 'buffer_data_page_bound_bytes_per_cpu': BUFFER_DATA_PAGE_BOUND,
+              'buffer_budget': budget, 'acquisition_backend': BPF_BACKEND, 'bpf_schema': BPF_SCHEMA,
               'observer': {'bytes': len(observer_raw), 'sha256': hashlib.sha256(observer_raw).hexdigest(), 'python': sys.version},
-              'return_argument_provenance': {'source': 'https://github.com/archlinux/linux/blob/v7.2.9-arch1/kernel/trace/trace_kprobe.c',
-                  'mechanism': 'trace_kprobe_entry_handler saves arguments in ri->data; __kretprobe_trace_func consumes that exact instance data'},
-              'diagnostic_only': True, 'overhead': 'tracepoints and entry/return probes; not final performance parity'}
+              'native_collector': fingerprint(BPF_COLLECTOR, 1024 * 1024),
+              'native_object': fingerprint(BPF_OBJECT, 1024 * 1024),
+              'return_argument_provenance': {'source': KERNEL_SOURCE.replace('/tree/', '/blob/') + '/kernel/bpf/trampoline.c',
+                  'mechanism': 'BPF fexit context supplies the preserved function arguments and actual return value; no saved kretprobe instance or synthetic recovery'},
+              'diagnostic_only': True, 'overhead': 'native tracepoints, BPF fentry/fexit, scoped runtime statistics and a root collector; never final performance parity'}
     instance = TRACE / 'instances' / group
+    barrier = TRACE / 'instances' / (group + '_barrier')
     try:
+        # Resize the initially default-sized barrier BEFORE either other ring
+        # exists, so creation itself cannot exceed the original total cap.
+        barrier.mkdir()
+        marker['barrier_instance_created'] = True
+        write(barrier / 'tracing_on', '0')
+        write(barrier / 'events/enable', '0')
+        write(barrier / 'current_tracer', 'nop')
+        barrier_layout = actual_buffer_layout(barrier, 3 * budget['page_bytes'])
+        marker['barrier_buffer_layout'] = barrier_layout
+        write(barrier / 'buffer_size_kb', str(barrier_layout['requested_kb']))
+        marker['barrier_buffer_readbacks'] = buffer_readbacks(barrier, possible_cpus, barrier_layout['expected_readback_kb'])
+        marker['barrier_snapshot'] = snapshot_inventory(barrier)
+        write(barrier / 'set_ftrace_filter', 'drm_crtc_arm_vblank_event')
         instance.mkdir()
         marker['instance_created'] = True
         write(instance / 'tracing_on', '0')
         write(instance / 'current_tracer', 'nop')
-        marker['buffer_layout'] = actual_buffer_layout(instance)
+        marker['buffer_layout'] = actual_buffer_layout(instance, budget['native_bound_bytes_per_cpu'])
         write(instance / 'buffer_size_kb', str(marker['buffer_layout']['requested_kb']))
-        marker['buffer_readbacks'] = buffer_readbacks(instance, cpus, marker['buffer_layout']['expected_readback_kb'])
+        marker['buffer_readbacks'] = buffer_readbacks(instance, possible_cpus, marker['buffer_layout']['expected_readback_kb'])
+        marker['native_snapshot'] = snapshot_inventory(instance)
         write(instance / 'options/overwrite', '0')
         write(instance / 'trace_clock', 'mono')
         clock = bounded(instance / 'trace_clock', 4096).decode()
         if '[mono]' not in clock:
             raise RuntimeError('actual trace clock is not mono')
+        marker['native_trace_clock'] = clock
         formats = {}
         for event in EVENTS:
             formats[event] = bounded(instance / 'events' / event / 'format', 65536).decode()
             if not event.startswith('timer/'):
                 write(instance / 'events' / event / 'enable', '1')
-        for definition in definitions:
-            probe_command(definition)
-            marker['definitions'].append(definition)
-            event = definition.split()[0].split(':', 1)[1]
-            formats[event] = bounded(instance / 'events' / event / 'format', 65536).decode()
-            write(instance / 'events' / event / 'enable', '1')
-        marker['profiles_before'] = profiles(group)
-        if len(marker['profiles_before']) != len(definitions):
-            raise RuntimeError('actual probe profile inventory is incomplete')
+        formats['bpf_binary'] = {'schema': BPF_SCHEMA, 'record_bytes': BPF_RECORD.size,
+                                 'encoding': 'little-endian <QQIIQ20QQII', 'fields': FIELD_NAMES,
+                                 'header_fields': ('monotonic_ns', 'per_cpu_program_call_sequence',
+                                                   'event_id', 'cpu_id', 'pid_tgid'),
+                                 'tail_fields': ('present_field_mask', 'failed_read_count', 'reserved_zero'),
+                                 'signed_value_fields': sorted(SIGNED_FIELDS),
+                                 'events': [{'name': name, 'fields': EVENT_FIELDS[number]}
+                                            for number, name in enumerate(EVENT_NAMES)],
+                                 'clock': 'bpf_ktime_get_ns / trace_clock mono',
+                                 'layout': layout}
         save(ROOT / 'formats.json', formats)
         formats_raw = bounded(ROOT / 'formats.json', 2 * 1024 * 1024)
         marker['formats'] = {'bytes': len(formats_raw), 'sha256': hashlib.sha256(formats_raw).hexdigest()}
+        marker['layout_input'] = retain_raw(ROOT / 'layout.bin', struct.pack('<13I', *(value & 0xffffffff for value in layout['values'])))
+        save(ROOT / 'native-launch.json', marker)
+        marker['native_launched'] = True
+        subprocess.Popen([sys.executable, __file__, 'watchdog', '--group', group],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        ready_deadline = time.monotonic() + 10
+        while not (ROOT / 'bpf-ready.json').exists():
+            if (ROOT / 'native-exit.json').exists() or (ROOT / 'supervisor-error.json').exists():
+                raise RuntimeError('native BPF collector failed before complete ready receipt')
+            if time.monotonic() >= ready_deadline:
+                raise RuntimeError('native BPF collector readiness exceeded bounded deadline')
+            time.sleep(.02)
+        process = read_json(ROOT / 'native-process.json')
+        if process.get('group') != group or type(process.get('pid')) is not int or process['pid'] <= 0:
+            raise RuntimeError('native BPF child identity is not original')
+        marker['native_pid'] = process['pid']
+        marker['native_process_identity'] = process['identity']
+        if process_identity(process['pid']) != process['identity']:
+            raise RuntimeError('native BPF collector is not physically present at ready')
+        ready = read_json(ROOT / 'bpf-ready.json')
+        if ready.get('schema') != BPF_SCHEMA or ready.get('buffer_accounting', {}).get('ring_data_bytes') != BPF_RING_BYTES:
+            raise RuntimeError('native BPF ready schema/allocation is unsupported')
+        possible = ready.get('possible_cpu_count')
+        if (ready.get('online_cpu_ids') != cpu_ids or type(possible) is not int
+                or possible != possible_cpus):
+            raise RuntimeError('native BPF actual CPU inventory is unsupported')
+        program_inventory(ready.get('programs_before'), layout)
+        marker['native_ready'] = ready
         marker['capture_filter'] = 'actual-native-timer-inventory-v1'
         marker['discovery_started_monotonic_ns'] = time.monotonic_ns()
         write(instance / 'tracing_on', '1')
+        marker['native_trace_started_monotonic_ns'] = time.monotonic_ns()
         # Observe actual native timers before profiler Start. No injected
         # event, guessed address, buffer reset, consuming read or scope trim.
         time.sleep(.5)
         discovery = bounded(instance / 'trace', 2 * 1024 * 1024)
         marker['discovery_raw'] = retain_raw(ROOT / 'discovery.txt', discovery)
+        discovery_bpf = bounded(ROOT / 'bpf.bin', 2 * 1024 * 1024)
         marker['discovery_finished_monotonic_ns'] = time.monotonic_ns()
         if marker['discovery_finished_monotonic_ns'] - marker['discovery_started_monotonic_ns'] > 1_000_000_000:
             raise RuntimeError('actual timer discovery exceeded its one-second bound')
-        marker['discovery_cpu_stats'] = cpu_stats(instance, cpus)
-        marker['discovery_profiles'] = profiles(group)
-        validate_trace_fields(discovery, group, marker['definitions'])
-        inventory = timer_mappings(discovery, group)
+        marker['discovery_cpu_stats'] = cpu_stats(instance, possible_cpus)
+        observed = bpf_records(discovery_bpf, cpu_ids)
+        marker['discovery_bpf'] = {'bytes': len(discovery_bpf), 'sha256': hashlib.sha256(discovery_bpf).hexdigest(),
+                                   'records': len(observed)}
+        if (ROOT / 'native-exit.json').exists():
+            raise RuntimeError('native BPF collector physically exited during discovery')
+        inventory = timer_mappings(observed)
         marker['timer_inventory'] = inventory
         marker['timer_filters'] = {}
         for event in EVENTS:
@@ -601,13 +1088,42 @@ def start_observer():
         marker['filters_ready_monotonic_ns'] = time.monotonic_ns()
         marker['generic_pointer_limitation'] = 'Generic trace text prints hashed %p; kernel filters compare actual raw hrtimer fields. No hash-to-pointer causal join is inferred.'
         save(ROOT / 'marker.json', marker)
-        subprocess.Popen([sys.executable, __file__, 'watchdog', '--group', group],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
         return marker
     except BaseException as error:
+        errors = [str(error)[:2048]]
+        retained = {}
+        if marker.get('native_launched'):
+            try:
+                stop_native(marker)
+            except Exception as retirement_error:
+                errors.append(str(retirement_error)[:2048])
+        if not marker.get('native_launched') or marker.get('native_terminal_observed'):
+            if marker.get('instance_created') and instance.exists():
+                # On failed start, first retire a potentially failing native
+                # collector. Its barrier may own trace_types_lock. Freeze and
+                # retain the WHOLE native tail before deleting either instance.
+                retained['start_failure_native_trace_stop_begin_monotonic_ns'] = time.monotonic_ns()
+                for path in ('tracing_on', 'events/enable'):
+                    try:
+                        write(instance / path, '0')
+                    except OSError as freeze_error:
+                        errors.append(str(freeze_error)[:2048])
+                retained['native_trace_stopped_monotonic_ns'] = time.monotonic_ns()
+                try:
+                    retained['raw'] = retain_raw(ROOT / 'capture.txt', bounded(instance / 'trace', MAX_RAW))
+                    retained['cpu_stats'] = cpu_stats(instance, possible_cpus)
+                    retained['native_trace_clock_after'] = bounded(instance / 'trace_clock', 4096).decode()
+                except Exception as retention_error:
+                    errors.append(str(retention_error)[:2048])
+            if (ROOT / 'bpf.bin').exists():
+                retained['bpf_raw'] = fingerprint(ROOT / 'bpf.bin', MAX_RAW)
+        else:
+            errors.append('native process unretired; whole live sources remain in their original private locations')
         cleanup_errors = cleanup(marker)
-        result = dict(marker, qualified_acquisition=False, errors=[str(error)[:2048]], cleanup_errors=cleanup_errors)
+        result = dict(marker, **retained, qualified_acquisition=False, errors=errors, cleanup_errors=cleanup_errors)
+        for key, name in (('native_bpf', 'bpf-result.json'), ('native_exit', 'native-exit.json')):
+            if (ROOT / name).exists():
+                result[key] = read_json(ROOT / name)
         save(ROOT / 'result.json', result)
         raise
 
@@ -617,67 +1133,106 @@ def stop(watchdog=False):
         return read_json(ROOT / 'result.json')
     marker = read_json(ROOT / 'marker.json')
     instance = TRACE / 'instances' / marker['group']
-    result = dict(marker, stopped_monotonic_ns=time.monotonic_ns(), watchdog_expired=watchdog)
+    stop_begin = time.monotonic_ns()
+    result = dict(marker, stopped_monotonic_ns=stop_begin, watchdog_expired=watchdog)
     errors = []
     for path in ('tracing_on', 'events/enable'):
         try:
             write(instance / path, '0')
         except OSError as error:
             errors.append(str(error))
-    # Retain whole raw bytes before counter/provenance/semantic validation.
+    result['native_trace_stopped_monotonic_ns'] = time.monotonic_ns()
+    # Retain both whole sources before admission/provenance/semantic validation.
+    raw = bpf_raw = None
     try:
         raw = bounded(instance / 'trace', MAX_RAW)
         result['raw'] = retain_raw(ROOT / 'capture.txt', raw)
-        formats_raw = bounded(ROOT / 'formats.json', 2 * 1024 * 1024)
-        result['formats'] = {'bytes': len(formats_raw), 'sha256': hashlib.sha256(formats_raw).hexdigest()}
+        result['formats'] = fingerprint(ROOT / 'formats.json', 2 * 1024 * 1024)
     except Exception as error:
         errors.append(str(error)[:2048])
-        raw = None
     try:
-        result['profiles_after'] = profiles(marker['group'])
-        observer_raw = bounded(Path(__file__), 1024 * 1024)
-        if hashlib.sha256(observer_raw).hexdigest() != marker['observer']['sha256']:
+        result['native_bpf'] = stop_native(marker)
+        result['native_exit'] = marker.get('native_exit')
+    except Exception as error:
+        errors.append(str(error)[:2048])
+        if (ROOT / 'bpf-result.json').exists():
+            result['native_bpf'] = read_json(ROOT / 'bpf-result.json')
+    try:
+        bpf_raw = bounded(ROOT / 'bpf.bin', MAX_RAW)
+        result['bpf_raw'] = {'bytes': len(bpf_raw), 'sha256': hashlib.sha256(bpf_raw).hexdigest()}
+        if raw is not None and len(raw) + len(bpf_raw) > MAX_RAW:
+            errors.append('combined whole native/BPF sources exceed original raw byte bound')
+    except Exception as error:
+        errors.append(str(error)[:2048])
+    try:
+        if fingerprint(Path(__file__), 1024 * 1024)['sha256'] != marker['observer']['sha256']:
             errors.append('installed observer changed during capture')
+        for key, path in (('native_collector', BPF_COLLECTOR), ('native_object', BPF_OBJECT),
+                          ('layout_input', ROOT / 'layout.bin')):
+            if fingerprint(path, 1024 * 1024) != marker[key]:
+                errors.append('installed native BPF source/layout changed: ' + key)
         for name, original in marker['btf'].items():
-            raw_btf = bounded(Path('/sys/kernel/btf') / name, 64 * 1024 * 1024)
-            if len(raw_btf) != original['bytes'] or hashlib.sha256(raw_btf).hexdigest() != original['sha256']:
+            if fingerprint(Path('/sys/kernel/btf') / name, 64 * 1024 * 1024) != original:
                 errors.append('live BTF changed during capture: ' + name)
-        result['buffer_layout_after'] = actual_buffer_layout(instance)
+        inventory = marker['source_inventory']
+        for key, path in (('kernel_image', Path('/usr/lib/modules') / EXPECTED_KERNEL_RELEASE / 'vmlinuz'),
+                          ('kernel_notes', Path('/sys/kernel/notes')),
+                          ('virtio_gpu_notes', Path('/sys/module/virtio_gpu/notes/.note.gnu.build-id'))):
+            if fingerprint(path, 128 * 1024 * 1024) != inventory[key]:
+                errors.append('actual kernel source identity changed: ' + key)
+        if os.uname().release != inventory['kernel_release']:
+            errors.append('actual kernel release changed during capture')
+        result['buffer_layout_after'] = actual_buffer_layout(instance, marker['buffer_budget']['native_bound_bytes_per_cpu'])
         if result['buffer_layout_after'] != marker['buffer_layout']:
             errors.append('actual trace data page layout changed during capture')
-        result['buffer_readbacks_after'] = buffer_readbacks(
-            instance, marker['cpus'], marker['buffer_layout']['expected_readback_kb'])
+        result['buffer_readbacks_after'] = buffer_readbacks(instance, marker['possible_cpu_count'], marker['buffer_layout']['expected_readback_kb'])
         if result['buffer_readbacks_after'] != marker['buffer_readbacks']:
             errors.append('actual per-CPU buffer allocation changed during capture')
-        stats = cpu_stats(instance, marker['cpus'])
-        result['cpu_stats'] = stats
+        if online_cpu_ids() != marker['online_cpu_ids']:
+            errors.append('actual online CPU inventory changed during capture')
+        if cpu_inventory(Path('/sys/devices/system/cpu/present'), 65536) != marker['present_cpu_ids']:
+            errors.append('actual present CPU inventory changed during capture')
+        result['native_snapshot_after'] = snapshot_inventory(instance)
+        barrier = TRACE / 'instances' / (marker['group'] + '_barrier')
+        result['barrier_buffer_readbacks_after'] = buffer_readbacks(
+            barrier, marker['possible_cpu_count'], marker['barrier_buffer_layout']['expected_readback_kb'])
+        result['barrier_snapshot_after'] = snapshot_inventory(barrier)
+        result['cpu_stats'] = cpu_stats(instance, marker['possible_cpu_count'])
+        result['native_trace_clock_after'] = bounded(instance / 'trace_clock', 4096).decode()
+        if result['native_trace_clock_after'] != marker['native_trace_clock']:
+            errors.append('actual native trace clock changed during capture')
         result['timer_filters_after'] = {}
         for event, proof in marker['timer_filters'].items():
             actual = bounded(instance / 'events' / event / 'filter', 65536).decode().strip()
             result['timer_filters_after'][event] = actual
             if actual != proof['actual']:
                 errors.append('actual kernel timer filter changed during measurement')
-        if raw is not None:
-            try:
-                counts = validate_trace_fields(raw, marker['group'], marker['definitions'])
-                result['actual_record_counts'] = counts
-                result['unobserved_branches'] = [name for name, count in counts.items() if not count]
-                timer_mappings(raw, marker['group'], marker['timer_inventory'])
-            except ValueError as error:
-                errors.append(str(error))
-        if watchdog or (result['stopped_monotonic_ns'] - marker['started_monotonic_ns']) > MAX_SECONDS * 1_000_000_000:
-            errors.append('observer exceeded its real duration bound')
-        for values in stats.values():
+        for values in result['cpu_stats'].values():
             for key in ('overrun', 'commit overrun', 'dropped events'):
                 if key not in values or not values[key].isdigit() or int(values[key]) != 0:
                     errors.append('actual trace buffer loss/missing loss field')
-        for name, before in marker['profiles_before'].items():
-            after = result['profiles_after'].get(name)
-            if not after or after['misses'] != before['misses'] or after['hits'] < before['hits']:
-                errors.append('actual probe missed events or counters regressed: ' + name)
+        if bpf_raw is not None:
+            discovery = marker['discovery_bpf']
+            if (len(bpf_raw) < discovery['bytes']
+                    or hashlib.sha256(bpf_raw[:discovery['bytes']]).hexdigest() != discovery['sha256']):
+                errors.append('whole BPF source no longer contains the original discovery prefix')
+            records = bpf_records(bpf_raw, marker['online_cpu_ids'])
+            counts = native_qualification(result.get('native_bpf'), marker, records, len(bpf_raw))
+            result['actual_record_counts'] = counts
+            result['unobserved_branches'] = [name for name, count in counts.items() if not count]
+            timer_mappings(records, marker['timer_inventory'])
+            if raw is not None:
+                result['native_timer_reconciliation'] = native_timer_reconciliation(
+                    raw, records, marker, result['native_bpf'], stop_begin)
+                proof = result['native_timer_reconciliation']
+                result['function_pair_reconciliation'] = function_pair_reconciliation(
+                    records, proof['active_window_begin_ns'], proof['active_window_end_ns'])
+        if watchdog or stop_begin - marker['started_monotonic_ns'] > MAX_SECONDS * 1_000_000_000:
+            errors.append('observer exceeded its real duration bound')
     except Exception as error:
         errors.append(str(error)[:2048])
     result['cleanup_errors'] = cleanup(marker)
+    result['native_exit'] = marker.get('native_exit')
     errors.extend(result['cleanup_errors'])
     result['qualified_acquisition'] = not errors
     result['errors'] = errors
@@ -686,24 +1241,68 @@ def stop(watchdog=False):
 
 
 def watchdog(group):
-    marker = read_json(ROOT / 'marker.json')
-    if marker['group'] != group:
-        raise RuntimeError('watchdog does not own observer')
-    while not (ROOT / 'result.json').exists():
-        if read_json(ROOT / 'marker.json')['group'] != group:
+    """Own waitpid across separate Start/Stop invocations; never infer exit0."""
+    launch = read_json(ROOT / 'native-launch.json')
+    if launch.get('group') != group or not re.fullmatch(r'tuna_vblank_[0-9a-f]{16}', group):
+        raise RuntimeError('native supervisor does not own this acquisition')
+    child = None
+    try:
+        if (ROOT / 'native-cancel').exists() or (ROOT / 'result.json').exists():
             return
-        if time.monotonic_ns() - marker['started_monotonic_ns'] > MAX_SECONDS * 1_000_000_000:
+        deadline_ns = launch['started_monotonic_ns'] + MAX_SECONDS * 1_000_000_000
+        with (ROOT / 'native-stderr.txt').open('xb') as stderr:
+            os.chmod(ROOT / 'native-stderr.txt', 0o600)
+            child = subprocess.Popen([str(BPF_COLLECTOR), '--root', str(ROOT),
+                    '--object', str(BPF_OBJECT), '--deadline-ns', str(deadline_ns),
+                    '--drm-owner', launch['source_inventory']['drm_owner'],
+                    '--barrier-instance', str(TRACE / 'instances' / (group + '_barrier'))],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr)
+            identity = process_identity(child.pid)
+            if identity is None:
+                raise RuntimeError('native BPF process exited before original identity observation')
+            save_atomic(ROOT / 'native-process.json', {'schema': 1, 'group': group,
+                                                'pid': child.pid, 'identity': identity})
+            if (ROOT / 'native-cancel').exists():
+                child.terminate()
+            try:
+                code = child.wait(timeout=max(.01, (deadline_ns - time.monotonic_ns()) / 1_000_000_000 + 5))
+            except subprocess.TimeoutExpired:
+                child.terminate()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=5)
+                raise RuntimeError('native BPF process exceeded physical retirement deadline')
+        save_atomic(ROOT / 'native-exit.json', {'schema': 1, 'group': group, 'pid': child.pid,
+             'terminal_observed': True, 'exitcode': code, 'observed_exit_monotonic_ns': time.monotonic_ns()})
+        if (ROOT / 'marker.json').exists() and not (ROOT / 'result.json').exists():
             with lock():
-                if read_json(ROOT / 'marker.json')['group'] == group:
-                    stop(watchdog=True)
-            return
-        time.sleep(.2)
+                marker = read_json(ROOT / 'marker.json')
+                if marker['group'] == group and not (ROOT / 'result.json').exists():
+                    stop(watchdog=time.monotonic_ns() >= deadline_ns)
+    except BaseException as error:
+        if child is not None and child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
+        try:
+            still_owned = read_json(ROOT / 'native-launch.json').get('group') == group
+        except (OSError, ValueError):
+            still_owned = False
+        if still_owned and not (ROOT / 'supervisor-error.json').exists():
+            save_atomic(ROOT / 'supervisor-error.json', {'group': group, 'error': str(error)[:2048],
+                         'terminal_observed': child is not None and child.returncode is not None})
+        raise
 
 
 def read(index, kind):
     if type(index) is not int or not 0 <= index < 1024:
         raise ValueError('invalid kernel trace chunk index')
-    paths = {'trace': 'capture.txt', 'formats': 'formats.json', 'discovery': 'discovery.txt'}
+    paths = {'trace': 'capture.txt', 'formats': 'formats.json', 'discovery': 'discovery.txt', 'bpf': 'bpf.bin'}
     path = ROOT / paths[kind]
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, 'rb') as stream:
@@ -721,7 +1320,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=('start', 'stop', 'read', 'watchdog'))
     parser.add_argument('--index', type=int, default=0)
-    parser.add_argument('--kind', choices=('trace', 'formats', 'discovery'), default='trace')
+    parser.add_argument('--kind', choices=('trace', 'formats', 'discovery', 'bpf'), default='trace')
     parser.add_argument('--group')
     args = parser.parse_args()
     if os.geteuid() != 0:

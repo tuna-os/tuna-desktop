@@ -22,7 +22,7 @@ MAX_OUTPUT = 8*1024*1024
 ACTIONS = frozenset(('clock','notify','frames','reference-image','stock-reference',
  'gnome-trace-start','gnome-trace-stop','gnome-trace-read','gnome-trace-failed-stop',
  'gnome-trace-failed-stop-read','kernel-trace-stop','kernel-trace-read',
- 'kernel-formats-read','kernel-discovery-read','tuna-overview-start','tuna-overview-stop'))
+ 'kernel-formats-read','kernel-discovery-read','kernel-bpf-read','tuna-overview-start','tuna-overview-stop'))
 
 # Host timeout is backed by a guest-owned timeout, so losing SSH cannot leave an
 # unbounded phase child behind. stdout/stderr go to bounded temporary files via

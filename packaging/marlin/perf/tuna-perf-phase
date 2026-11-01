@@ -256,7 +256,9 @@ def guest_kernel_provenance():
 
 def kernel_trace(action, index=0):
     command = ["/usr/libexec/tuna-kernel-trace"]
-    if action in ("trace-read", "formats-read", "discovery-read"):
+    if action in ("trace-read", "formats-read", "discovery-read", "bpf-read"):
+        if type(index) is not int or not 0 <= index < 1024:
+            raise ValueError("kernel capture chunk index outside the bounded file")
         command += ["read", "--kind", action.removesuffix("-read"), "--index", str(index)]
     else:
         command.append("stop" if action == "trace-stop" else action)
@@ -527,7 +529,7 @@ def main():
     parser.add_argument("action", choices=("clock", "notify", "frames", "reference-image", "stock-reference",
                                           "gnome-trace-start", "gnome-trace-stop", "gnome-trace-read",
                                           "gnome-trace-failed-stop", "gnome-trace-failed-stop-read",
-                                           "kernel-trace-stop", "kernel-trace-read", "kernel-formats-read", "kernel-discovery-read",
+                                          "kernel-trace-stop", "kernel-trace-read", "kernel-formats-read", "kernel-discovery-read", "kernel-bpf-read",
                                           "tuna-overview-start", "tuna-overview-stop"))
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--supervised-start", action="store_true")

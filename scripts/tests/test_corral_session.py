@@ -33,6 +33,19 @@ class Tests(unittest.TestCase):
   s=m.Session.__new__(m.Session)
   for args in [dict(path='/bin/sh',arg=['clock'],**{'capture-output':True}),dict(path='/usr/libexec/tuna-perf-phase',arg=['injected'],**{'capture-output':True}),dict(path='/usr/libexec/tuna-perf-phase',arg=['clock',';touch /tmp/x'],**{'capture-output':True})]:
    with self.assertRaises(ValueError):s.command('guest-exec',**args)
+ def test_fixed_bpf_read_action_uses_existing_phase_transport(self):
+  for index in ('0','1023'):
+   with self.subTest(index=index):
+    s=m.Session.__new__(m.Session);s.counter=0;s.responses={}
+    status={'exited':True,'exitcode':0,'transport_boot_id':'original-boot'}
+    args=['kernel-bpf-read','--index',index]
+    with patch.object(s,'python',return_value=status.copy()) as execute,patch.object(s,'check_boot') as boot:
+     self.assertEqual(s.command('guest-exec',path='/usr/libexec/tuna-perf-phase',arg=args,**{'capture-output':True}),{'pid':1})
+     execute.assert_called_once_with(m.PHASE,args);boot.assert_called_once_with('original-boot')
+     self.assertEqual(s.command('guest-exec-status',pid=1),{'exited':True,'exitcode':0})
+  for action in ('kernel-bpf-read-extra','kernel-arbitrary-read'):
+   with self.assertRaises(ValueError):
+    s.command('guest-exec',path='/usr/libexec/tuna-perf-phase',arg=[action,'--index','0'],**{'capture-output':True})
  def test_status_token_once(self):
   s=m.Session.__new__(m.Session);s.responses={1:{'exited':True}}
   self.assertTrue(s.command('guest-exec-status',pid=1)['exited'])

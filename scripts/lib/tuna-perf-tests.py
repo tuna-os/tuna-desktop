@@ -1423,7 +1423,8 @@ class KernelTraceDispatch(unittest.TestCase):
     def test_read_actions_map_to_observer_kinds(self):
         for lane_action, observer_action in (("kernel-trace-read", "trace-read"),
                                              ("kernel-formats-read", "formats-read"),
-                                             ("kernel-discovery-read", "discovery-read")):
+                                             ("kernel-discovery-read", "discovery-read"),
+                                             ("kernel-bpf-read", "bpf-read")):
             calls, result = self.run_main(lane_action, "--index", "3")
             self.assertEqual(calls, [(observer_action, 3)])
             self.assertEqual(result["kernel_trace"], {"index": 3, "data": "AA=="})
@@ -1438,6 +1439,30 @@ class KernelTraceDispatch(unittest.TestCase):
              redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, "observer offline"):
                 phase.main()
+    def test_bpf_read_invokes_fixed_helper_kind_with_bounded_index(self):
+        for index in (0, 3, 1023):
+            with self.subTest(index=index), \
+                 patch.object(phase.subprocess, "run", return_value=SimpleNamespace(
+                     returncode=0, stdout=json.dumps({"index":index,"data":"AA=="}))) as run:
+                self.assertEqual(phase.kernel_trace("bpf-read", index), {"index":index,"data":"AA=="})
+                self.assertEqual(run.call_args.args[0], [
+                    "/usr/libexec/tuna-kernel-trace", "read", "--kind", "bpf", "--index", str(index)])
+                self.assertFalse(run.call_args.kwargs["check"])
+                self.assertLessEqual(run.call_args.kwargs["timeout"], 15)
+
+    def test_kernel_read_indices_refuse_before_helper_execution(self):
+        for action in ("trace-read", "formats-read", "discovery-read", "bpf-read"):
+            for index in (-1, 1024, True, None, "0", 1.0):
+                with self.subTest(action=action,index=index), patch.object(phase.subprocess, "run") as run:
+                    with self.assertRaises(ValueError):
+                        phase.kernel_trace(action, index)
+                    run.assert_not_called()
+
+    def test_bpf_read_helper_failure_propagates(self):
+        with patch.object(phase.subprocess, "run", return_value=SimpleNamespace(
+                returncode=1, stdout="", stderr="BPF artifact changed")):
+            with self.assertRaisesRegex(RuntimeError, "actual kernel observer failed"):
+                phase.kernel_trace("bpf-read", 0)
 
 if __name__ == "__main__":
     unittest.main()

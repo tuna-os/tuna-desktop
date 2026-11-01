@@ -1,5 +1,13 @@
 # CI-only identical image, different GDM session; no shipping defaults changed.
 ARG BASE_IMAGE=localhost/marlin-tuna-preview:perf
+FROM ${BASE_IMAGE} AS kernel-observer-build
+COPY scripts/tuna-kernel-bpf-build /build/scripts/tuna-kernel-bpf-build
+COPY packaging/marlin/perf/tuna-kernel-bpf.c packaging/marlin/perf/tuna-kernel-bpf.bpf.c /build/packaging/marlin/perf/
+RUN /usr/libexec/tuna-pinned-baseline && \
+    pacman -S --needed --noconfirm gcc clang libbpf libelf zlib pkgconf && \
+    /usr/libexec/tuna-pinned-baseline && \
+    bash /build/scripts/tuna-kernel-bpf-build /build/out
+
 FROM ${BASE_IMAGE}
 ARG DESKTOP
 ARG PAIRED_SESSION=false
@@ -20,6 +28,8 @@ COPY packaging/marlin/perf/tuna-perf-session /usr/libexec/tuna-perf-session
 COPY scripts/lib/tuna_overview_receipts.py /usr/libexec/tuna_overview_receipts.py
 COPY packaging/marlin/perf/tuna-perf-phase /usr/libexec/tuna-perf-phase
 COPY packaging/marlin/perf/tuna-kernel-trace /usr/libexec/tuna-kernel-trace
+COPY --from=kernel-observer-build /build/out/tuna-kernel-bpf /usr/libexec/tuna-kernel-bpf
+COPY --from=kernel-observer-build /build/out/tuna-kernel-bpf.bpf.o /usr/libexec/tuna-kernel-bpf.bpf.o
 COPY packaging/marlin/perf/tuna-gnome-profiler /usr/libexec/tuna-gnome-profiler
 COPY scripts/lib/gnome_reference.py /usr/libexec/gnome_reference.py
 COPY packaging/marlin/perf/tuna-gnome-reference /usr/libexec/tuna-gnome-reference
@@ -30,7 +40,7 @@ COPY packaging/marlin/perf/tuna-perf.service /usr/lib/systemd/system/tuna-perf.s
 RUN case "$DESKTOP" in gnome|tuna) ;; *) exit 1 ;; esac && \
     case "$PAIRED_SESSION" in true|false) ;; *) exit 1 ;; esac && \
     /usr/libexec/tuna-pinned-baseline && \
-    pacman -S --needed --noconfirm python python-gobject wayland-utils qemu-guest-agent gcc pkgconf wayland-protocols && \
+    pacman -S --needed --noconfirm python python-gobject wayland-utils qemu-guest-agent gcc pkgconf wayland-protocols libbpf && \
     /usr/libexec/tuna-pinned-baseline && \
     bash /tmp/frame-pacer/scripts/tuna-frame-pacer-build /tmp/frame-pacer/build && \
     install -Dm755 /tmp/frame-pacer/build/tuna-frame-pacer /usr/libexec/tuna-frame-pacer && \

@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import statistics
 import subprocess
 import sys
@@ -40,7 +41,7 @@ def guest_probe(agent, action, index=None, out=None, start_owner=None):
                       "gnome-trace-stop", "gnome-trace-read",
                       "gnome-trace-failed-stop", "gnome-trace-failed-stop-read",
                       "kernel-trace-stop", "kernel-trace-read", "kernel-formats-read",
-                      "kernel-discovery-read", "tuna-overview-start", "tuna-overview-stop"):
+                      "kernel-discovery-read", "kernel-bpf-read", "tuna-overview-start", "tuna-overview-stop"):
         raise ValueError("unsupported performance probe")
     arguments = [action]
     if action == "notify":
@@ -51,7 +52,7 @@ def guest_probe(agent, action, index=None, out=None, start_owner=None):
         if type(index) is not int or not 0 <= index < 128:
             raise ValueError("capture chunk index outside the bounded file")
         arguments += ["--index", str(index)]
-    if action in ("kernel-trace-read", "kernel-formats-read", "kernel-discovery-read"):
+    if action in ("kernel-trace-read", "kernel-formats-read", "kernel-discovery-read", "kernel-bpf-read"):
         if type(index) is not int or not 0 <= index < 1024:
             raise ValueError("kernel capture chunk index outside the bounded file")
         arguments += ["--index", str(index)]
@@ -187,27 +188,44 @@ def distribution(values):
 
 
 def retain_kernel_trace(agent, out, metadata):
-    """Retain the whole observer before rejecting loss or invalid acquisition."""
+    """Retain independent whole sources before rejecting invalid acquisition."""
     (out / "kernel-vblank-source.json").write_text(json.dumps(metadata, indent=2))
+    raw_limit = 64 * 1024 * 1024
     artifacts = [
-        ("raw", "kernel-trace-read", "kernel-vblank-trace.txt", 1, 64 * 1024 * 1024),
+        ("raw", "kernel-trace-read", "kernel-vblank-trace.txt", 1, raw_limit),
         ("formats", "kernel-formats-read", "kernel-vblank-formats.json", 1, 2 * 1024 * 1024),
     ]
-    if "discovery_raw" in metadata:
+    if "discovery_raw" in metadata or metadata.get("acquisition_backend") == "bpf-fentry-fexit-v1":
         artifacts.insert(0, ("discovery_raw", "kernel-discovery-read", "kernel-vblank-discovery.txt", 1, 2 * 1024 * 1024))
+    if "bpf_raw" in metadata or metadata.get("acquisition_backend") == "bpf-fentry-fexit-v1":
+        artifacts.append(("bpf_raw", "kernel-bpf-read", "kernel-vblank-bpf.bin", 1, raw_limit))
     errors = []
+    raw_bytes = 0
     for kind, action, name, minimum, maximum in artifacts:
         try:
             source = metadata.get(kind, {})
-            size, digest = source.get("bytes"), source.get("sha256")
-            if type(size) is not int or not minimum <= size <= maximum or not isinstance(digest, str):
+            if not isinstance(source, dict):
                 raise ValueError("kernel observer artifact metadata is missing or invalid")
+            size, digest = source.get("bytes"), source.get("sha256")
+            if (type(size) is not int or not minimum <= size <= maximum
+                    or type(digest) is not str or len(digest) != 64
+                    or any(char not in "0123456789abcdef" for char in digest)):
+                raise ValueError("kernel observer artifact metadata is missing or invalid")
+            if kind in ("raw", "bpf_raw"):
+                if raw_bytes + size > raw_limit:
+                    raise ValueError("combined native and BPF raw artifacts exceed 64 MiB bound")
+                # Reserve the declared whole size even if transfer later fails.
+                # A failed source never grants additional transfer allowance.
+                raw_bytes += size
             with (out / name).open("wb") as stream:
                 hashed = hashlib.sha256()
                 for index in range((size + 65535) // 65536):
                     row = guest_probe(agent, action, index)["kernel_trace"]
+                    if (type(row.get("index")) is not int or row["index"] != index
+                            or type(row.get("data")) is not str or len(row["data"]) > 87384):
+                        raise ValueError("incomplete actual kernel observer chunk")
                     chunk = base64.b64decode(row["data"], validate=True)
-                    if row["index"] != index or len(chunk) != min(65536, size - index * 65536):
+                    if len(chunk) != min(65536, size - index * 65536):
                         raise ValueError("incomplete actual kernel observer chunk")
                     stream.write(chunk)
                     hashed.update(chunk)
@@ -220,12 +238,191 @@ def retain_kernel_trace(agent, out, metadata):
         raise ValueError('incomplete independent kernel artifacts: ' + json.dumps(errors))
     if metadata.get("qualified_acquisition") is not True or metadata.get("errors") or metadata.get("cleanup_errors"):
         raise ValueError("kernel observer reports actual loss, missing probes or invalid acquisition")
-    if metadata.get("capture_filter") == "actual-native-timer-inventory-v1":
-        times = [metadata.get(name) for name in ('discovery_started_monotonic_ns', 'discovery_finished_monotonic_ns', 'filters_ready_monotonic_ns')]
-        if not all(type(value) is int for value in times) or not times[0] < times[1] <= times[2] or times[1] - times[0] > 1_000_000_000:
-            raise ValueError('actual kernel filter/discovery boundaries are invalid')
-        if not metadata.get('discovery_raw') or not metadata.get('timer_inventory') or len(metadata.get('timer_filters', {})) != 4:
-            raise ValueError('actual kernel filter/discovery evidence is incomplete')
+    if (metadata.get("acquisition_backend") != "bpf-fentry-fexit-v1"
+            or type(metadata.get("bpf_schema")) is not int or metadata["bpf_schema"] != 1
+            or not isinstance(metadata.get("bpf_raw"), dict)):
+        raise ValueError("kernel observer lacks supported complete BPF source evidence")
+    discovery = metadata.get("discovery_bpf")
+    if (not isinstance(discovery, dict) or type(discovery.get("bytes")) is not int
+            or not 208 <= discovery["bytes"] <= min(2 * 1024 * 1024, metadata["bpf_raw"]["bytes"])
+            or type(discovery.get("records")) is not int
+            or discovery["bytes"] != discovery["records"] * 208
+            or type(discovery.get("sha256")) is not str):
+        raise ValueError("kernel observer BPF discovery prefix evidence is incomplete")
+    with (out / "kernel-vblank-bpf.bin").open("rb") as stream:
+        prefix = stream.read(discovery["bytes"])
+    if len(prefix) != discovery["bytes"] or hashlib.sha256(prefix).hexdigest() != discovery["sha256"]:
+        raise ValueError("kernel observer BPF discovery prefix differs from whole source")
+    native = metadata.get("native_bpf")
+    if (not isinstance(native, dict) or type(native.get("schema")) is not int or native["schema"] != 1
+            or native.get("qualified_acquisition") is not True
+            or native.get("errors") != [] or native.get("cleanup_errors") != []
+            or metadata.get("errors") != [] or metadata.get("cleanup_errors") != []):
+        raise ValueError("kernel observer native BPF receipt is missing or unqualified")
+    times = [native.get(key) for key in ("capture_enable_begin_monotonic_ns", "capture_started_monotonic_ns",
+                                       "capture_stop_begin_monotonic_ns", "capture_stopped_monotonic_ns",
+                                       "quiescence_begin_monotonic_ns", "quiescence_end_monotonic_ns",
+                                       "detached_monotonic_ns")]
+    if (not all(type(value) is int for value in times) or not 0 < times[0] <= times[1] < times[2]
+            or times != sorted(times)
+            or not isinstance(native.get("raw"), dict)
+            or type(native["raw"].get("bytes")) is not int
+            or native["raw"]["bytes"] != metadata["bpf_raw"]["bytes"]):
+        raise ValueError("kernel observer native BPF capture evidence is incomplete")
+    terminal = metadata.get("native_exit")
+    if (not isinstance(terminal, dict) or type(terminal.get("schema")) is not int or terminal["schema"] != 1
+            or type(metadata.get("group")) is not str or not metadata["group"]
+            or terminal.get("group") != metadata["group"]
+            or type(metadata.get("native_pid")) is not int or metadata["native_pid"] <= 0
+            or type(terminal.get("pid")) is not int or terminal["pid"] != metadata["native_pid"]
+            or terminal.get("terminal_observed") is not True
+            or type(terminal.get("exitcode")) is not int or terminal["exitcode"] != 0
+            or type(terminal.get("observed_exit_monotonic_ns")) is not int
+            or terminal["observed_exit_monotonic_ns"] < times[-1]):
+        raise ValueError("kernel observer native BPF physical exit evidence is missing or unsuccessful")
+    cpu_ids = metadata.get("online_cpu_ids")
+    if (type(cpu_ids) is not list or not 1 <= len(cpu_ids) <= 8
+            or any(type(cpu) is not int or not 0 <= cpu < 65536 for cpu in cpu_ids)
+            or cpu_ids != sorted(set(cpu_ids)) or type(metadata.get("cpus")) is not int
+            or metadata["cpus"] != len(cpu_ids)
+            or native.get("online_cpu_ids") != cpu_ids
+            or type(native.get("possible_cpu_count")) is not int
+            or not len(cpu_ids) <= native["possible_cpu_count"] <= 65536
+            or native["possible_cpu_count"] != metadata.get("possible_cpu_count")
+            or metadata.get("present_cpu_ids") != cpu_ids):
+        raise ValueError("kernel observer actual CPU identity is incomplete")
+    clock = metadata.get("native_trace_clock")
+    if (type(clock) is not str or "[mono]" not in clock
+            or metadata.get("native_trace_clock_after") != clock):
+        raise ValueError("kernel observer actual native clock readbacks are missing or changed")
+    stats = metadata.get("cpu_stats")
+    if (type(stats) is not dict or len(stats) != native["possible_cpu_count"]
+            or any("cpu" + str(cpu) not in stats for cpu in cpu_ids)
+            or any(not re.fullmatch(r"cpu[0-9]+", cpu) or type(values) is not dict
+                   or any(type(values.get(key)) is not str or not values[key].isdigit() or int(values[key]) != 0
+                          for key in ("overrun", "commit overrun", "dropped events"))
+                   for cpu, values in stats.items())):
+        raise ValueError("kernel observer native ring loss counters are missing or nonzero")
+    budget = metadata.get("buffer_budget")
+    budget_fields = ("actual_cpus", "page_bytes", "total_bound_bytes", "bpf_ring_data_bytes", "bpf_control_prefix_bytes",
+                     "bpf_pointer_array_allocation_bound_bytes", "bpf_ring_map_header_allocation_bound_bytes",
+                     "bpf_ring_allocation_bytes", "native_inactive_snapshot_bytes_per_cpu",
+                     "barrier_ring_reader_snapshot_bytes_per_cpu", "native_bound_bytes_per_cpu",
+                     "maximum_accounted_ring_bytes")
+    if (type(budget) is not dict
+            or any(type(budget.get(key)) is not int or budget[key] <= 0 for key in budget_fields)
+            or budget["page_bytes"] < 4096 or budget["page_bytes"] & (budget["page_bytes"] - 1)
+            or budget["actual_cpus"] != len(cpu_ids)
+            or budget["total_bound_bytes"] != 2 * 1024 * 1024 * len(cpu_ids)
+            or budget["bpf_ring_data_bytes"] != 1024 * 1024
+            or budget["bpf_control_prefix_bytes"] < 3 * budget["page_bytes"]
+            or budget["bpf_control_prefix_bytes"] % budget["page_bytes"]
+            or budget["bpf_ring_map_header_allocation_bound_bytes"] < budget["page_bytes"]
+            or budget["bpf_pointer_array_allocation_bound_bytes"] <
+                (budget["bpf_control_prefix_bytes"] // budget["page_bytes"]
+                 + 2 * budget["bpf_ring_data_bytes"] // budget["page_bytes"]) * 8
+            or budget["native_bound_bytes_per_cpu"] % budget["page_bytes"]
+            or budget["native_inactive_snapshot_bytes_per_cpu"] < 3 * budget["page_bytes"]
+            or budget["barrier_ring_reader_snapshot_bytes_per_cpu"] < 6 * budget["page_bytes"]
+            or budget["bpf_ring_allocation_bytes"] != sum(budget[key] for key in (
+                "bpf_ring_data_bytes", "bpf_control_prefix_bytes", "bpf_pointer_array_allocation_bound_bytes",
+                "bpf_ring_map_header_allocation_bound_bytes"))
+            or budget["maximum_accounted_ring_bytes"] != budget["bpf_ring_allocation_bytes"] + len(cpu_ids) * sum(
+                budget[key] for key in ("native_bound_bytes_per_cpu", "native_inactive_snapshot_bytes_per_cpu",
+                                        "barrier_ring_reader_snapshot_bytes_per_cpu"))
+            or budget["maximum_accounted_ring_bytes"] > budget["total_bound_bytes"]):
+        raise ValueError("kernel observer shared/private ring allocation exceeds original total bound")
+    if (native.get("quiescence_backend") != "tracefs-function-ops-tasks-rcu-v1"
+            or native.get("quiescence_completed") is not True):
+        raise ValueError("kernel observer synchronous Tasks-RCU evidence is missing")
+    registrations = []
+    for stage in ("before", "active", "after"):
+        proof = native.get("quiescence_registration_" + stage)
+        if (not isinstance(proof, dict) or type(proof.get("count")) is not int
+                or not 0 <= proof["count"] < 1 << 32 or "raw_line" not in proof):
+            raise ValueError("kernel observer Tasks-RCU registration evidence is incomplete")
+        line = proof["raw_line"]
+        if (proof["count"] == 0 and line is not None) or (proof["count"] and (
+                type(line) is not str or len(line) >= 1024
+                or not re.match(r"drm_crtc_arm_vblank_event(?: \[drm\])? \("
+                                + str(proof["count"]) + r"\)", line))):
+            raise ValueError("kernel observer Tasks-RCU registration line differs")
+        registrations.append(proof["count"])
+    if registrations[1] != registrations[0] + 1 or registrations[2] != registrations[0]:
+        raise ValueError("kernel observer dynamic function tracer did not retire")
+    identity_fields = ("id", "attach_btf_obj_id", "attach_btf_id")
+    info_fields = identity_fields + ("run_cnt", "recursion_misses", "run_time_ns")
+    counter_fields = ("calls", "disabled", "emitted", "reserve_failed", "read_failed", "retained_records")
+    event_names = ("flush", "arm", "arm_return", "accurate", "accurate_return",
+                   "timeout", "timeout_return", "timer", "timer_return", "send")
+    inventories = []
+    for key in ("programs_before", "programs_after"):
+        programs = native.get(key)
+        if type(programs) is not list or len(programs) != 10:
+            raise ValueError("kernel observer native BPF program inventory is incomplete")
+        for event, program in enumerate(programs):
+            fields = info_fields + (counter_fields if key == "programs_after" else ())
+            if (not isinstance(program, dict) or type(program.get("event")) is not int
+                    or program["event"] != event or program.get("name") != event_names[event]
+                    or program.get("attach_owner") not in (("virtio_gpu",) if event == 0 else ("vmlinux", "drm"))
+                    or any(type(program.get(field)) is not int or program[field] < 0 for field in fields)
+                    or any(program[field] == 0 for field in identity_fields)
+                    or program["recursion_misses"] != 0
+                    or (key == "programs_after" and (program["reserve_failed"] != 0 or program["read_failed"] != 0))):
+                raise ValueError("kernel observer native BPF program evidence is invalid")
+        if len({program["id"] for program in programs}) != 10:
+            raise ValueError("kernel observer native BPF program identities are incomplete")
+        inventories.append(programs)
+    for before, after in zip(*inventories):
+        if any(before[field] != after[field] for field in ("event", "name", "attach_owner") + identity_fields):
+            raise ValueError("kernel observer native BPF program identity changed")
+    counts = metadata.get("actual_record_counts")
+    if (type(counts) is not dict or set(counts) != set(event_names)
+            or any(type(value) is not int or value < 0 for value in counts.values())
+            or sum(counts.values()) * 208 != metadata["bpf_raw"]["bytes"]):
+        raise ValueError("kernel observer complete record counts differ from whole bytes")
+    for program in inventories[1]:
+        if (program["calls"] != program["run_cnt"]
+                or program["calls"] != program["disabled"] + program["emitted"] + program["reserve_failed"]
+                or program["emitted"] != program["retained_records"]
+                or program["emitted"] != counts[program["name"]]):
+            raise ValueError("kernel observer run/call/emitted/retained counts disagree")
+    timer = metadata.get("native_timer_reconciliation")
+    pairs = metadata.get("function_pair_reconciliation")
+    if (type(timer) is not dict or type(pairs) is not dict
+            or type(timer.get("native_callbacks_definitely_inside")) is not int
+            or timer["native_callbacks_definitely_inside"] < 1
+            or type(timer.get("bpf_timer_entries_inside")) is not int
+            or timer["bpf_timer_entries_inside"] < 1
+            or timer["bpf_timer_entries_inside"] != timer.get("complete_timer_pairs_inside")
+            or any(type(timer.get(key)) is not int or timer[key] != pairs.get(key)
+                   for key in ("active_window_begin_ns", "active_window_end_ns"))
+            or not times[1] <= timer["active_window_begin_ns"] < timer["active_window_end_ns"] <= times[2]):
+        raise ValueError("kernel observer independent native/BPF common-window proof is incomplete")
+    entries = pairs.get("entries_inside")
+    complete = pairs.get("complete_pairs_by_entry_inside")
+    if (type(entries) is not dict or set(entries) != {"arm", "accurate", "timeout", "timer"}
+            or type(complete) is not dict or complete != entries
+            or any(type(value) is not int for value in complete.values())
+            or any(type(value) is not int or not 0 <= value <= counts[name] for name, value in entries.items())
+            or entries["timer"] != timer["bpf_timer_entries_inside"]):
+        raise ValueError("kernel observer actual entry/return pair proof is incomplete")
+    if metadata.get("capture_filter") != "actual-native-timer-inventory-v1":
+        raise ValueError("actual native timer discovery/filter provenance is missing")
+    native_times = [metadata.get(name) for name in (
+        "discovery_started_monotonic_ns", "native_trace_started_monotonic_ns",
+        "discovery_finished_monotonic_ns", "filters_ready_monotonic_ns",
+        "stopped_monotonic_ns", "native_trace_stopped_monotonic_ns")]
+    if (not all(type(value) is int and value > 0 for value in native_times)
+            or native_times != sorted(native_times) or native_times[0] >= native_times[2]
+            or native_times[2] - native_times[0] > 1_000_000_000
+            or not native_times[3] < native_times[4]
+            or timer["active_window_begin_ns"] != max(native_times[3], times[1])
+            or timer["active_window_end_ns"] != min(native_times[4], times[2])):
+        raise ValueError("actual native/BPF filter, enable and stop boundaries are inconsistent")
+    if (not metadata.get("discovery_raw") or not metadata.get("timer_inventory")
+            or len(metadata.get("timer_filters", {})) != 4):
+        raise ValueError("actual kernel filter/discovery evidence is incomplete")
 
 
 def retain_gnome_trace(agent, out, metadata):

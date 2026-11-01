@@ -130,6 +130,81 @@ scripts/tuna-perf-gate check --artifacts perf-artifacts
 
 `check` exits 1 on a regression. Add `--report-only` to only print the tables. A full paired measurement needs KVM, rootful podman and about 40 GB of disk. Follow `performance-baseline.yml` step by step: build the shared preview images, then run `scripts/tuna-perf-profile-pairs stock`, which writes the `perf-artifacts/stock` tree that `check` reads. On a workstation, `scripts/tuna-vm-perf --disk disk.raw --desktop tuna --out <dir>` measures one session, and its `report.json` includes the per-phase, per-role breakdown.
 
+### Bounded kernel acquisition (diagnostic profile only)
+
+`tuna-kernel-trace` keeps the original discovery/start/stop/read lifecycle and
+whole, non-consuming native DRM/hrtimer trace. Its ten function observations use
+typed BPF fentry/fexit programs on the **same functions**, not a reduced set of
+static tracepoints. The schema retains all original nested CRTC/device/minor,
+pending-event/file/userdata, commit/target, timer/interval/expiry, output,
+sequence/timestamp and return-value fields. The recorded BTF layout is validated
+and frozen before program verification; an unknown ABI, source identity,
+capability or missing field fails acquisition rather than selecting a fallback.
+The supported reference is the original signed stock `7.2.9-arch1-1` kernel,
+with the original vmlinuz and live vmlinux/module BTF hashes checked separately.
+This does not require a custom kernel.
+
+The compiler stage in `packaging/marlin/perf/Containerfile` builds
+`tuna-kernel-bpf` and its object with `scripts/tuna-kernel-bpf-build`. Both session
+images receive identical binaries and runtime dependencies. The collector uses a
+scoped `BPF_ENABLE_STATS` FD, not a system-wide stats sysctl. Each of the ten
+programs must reconcile kernel runs, calls while disabled, emitted/retained
+records, recursion misses, reservation failures and kernel-read failures.
+Unsupported counters, any missed/read/reservation event, native ring loss,
+identity mismatch or cleanup failure keeps `qualified_acquisition` false.
+Balanced counters alone do not establish complete entry/return pairs.
+
+The host retains `kernel-vblank-bpf.bin` (schema 1, fixed 208-byte records),
+`kernel-vblank-trace.txt`, `kernel-vblank-formats.json` and the whole discovery
+receipt before semantic admission. These root-owned diagnostic records contain
+kernel identity pointers; they are not added to the per-second UID observer,
+journald or serial-console channel. The shared non-overwriting BPF data ring is
+1 MiB. Its actual data/control prefix, pointer-array allocation and conservative
+map-header charge are counted **once**, together with the native main/reader,
+inactive-snapshot and private shutdown-barrier rings, against the existing
+`2 MiB * actual online CPUs` total. The native ring is reduced and page-aligned
+to fit; CPU inventory and actual allocation readbacks must agree. Collector
+arrays/scratch are accounted separately and identically for both sessions.
+This is a ring-allocation bound, not a claim about total kernel heap or RSS.
+The 120-second deadline, discovery bound, combined 64 MiB raw-retention bound,
+repeat counts and comparison floors are not increased.
+
+Shutdown disables collection, physically detaches all ten links, then registers
+and unregisters a function tracer in a **separate owned tracefs instance** while
+tracing remains off. Registration is checked through the selected function's
+actual enabled-ops count, not merely a successful write. On the pinned
+[Arch source](https://github.com/archlinux/linux/tree/811a830af7e795834eb65ea419afe08153d57720),
+`function_trace_reset()` calls `unregister_ftrace_function()` for the instance's
+dynamically allocated ops; `ftrace_shutdown()` waits both
+`synchronize_rcu_tasks_rude()` and `synchronize_rcu_tasks()`.
+This retires old nonsleepable BPF executions/prologues before ring draining and
+final stats, while program/map/stats handles remain alive. No global tracer,
+sysctl or native-instance reset is used. `bpf_tramp_image_put()` separately
+patches old fexit paths to bypass programs before its asynchronous Tasks-RCU
+retirement. Therefore the consumer additionally requires every entry in the
+common native/BPF active window to have its **actual retained return**, with
+original nested identity/argument matching, plus one-to-one native timer
+reconciliation. It never invents a return at stop or treats counter stability
+as pair completeness.
+
+The original third-GNOME failure in
+[run 41199901354](https://github.com/tuna-os/tuna-desktop/actions/runs/41199901354)
+remains invalid: timer and timeout entry/return probes each missed once despite
+zero native buffer loss. The pinned x86 kprobe recursion guard can skip all
+nested observers while another kprobe is active; increasing return-probe
+`maxactive` or accepting loss cannot repair those missing entry records.
+[Issue #782](https://github.com/tuna-os/tuna-desktop/issues/782#issuecomment-6545083240)
+preserves the source-backed diagnosis and original evidence.
+
+An observer-only smoke, including an unmodified stock 7.2.9 kernel kexec'd into
+a 7.2.11 root image's userspace, is **not** a coherent comparison image or performance-parity
+result. Final paired eligibility still requires the authoritative full dated
+Arch snapshot, GNOME 51.0/Mutter 51.0, and a fully qualified current-main package
+from the existing candidate pipeline. Diagnostic captures cannot fill missing
+stock repeats, rescue the old failure, or turn a stale package's measurements
+into claims about current main. Normal matched stock measurement is separate
+and must follow qualified acquisition and current input qualification.
+
 ### Bounded per-thread idle diagnostics (diagnostic profile, opt-in)
 
 The CI-only sampler takes `--thread-diagnostics` only when a dispatch sets

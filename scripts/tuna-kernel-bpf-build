@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Build both fixed-purpose kernel observer artifacts; do not run the observer.
+set -euo pipefail
+if [[ $# != 1 ]]; then
+    echo 'usage: tuna-kernel-bpf-build OUTPUT_DIRECTORY' >&2
+    exit 2
+fi
+script_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source_root="$script_root/../packaging/marlin/perf"
+mkdir -p -- "$1"
+output_root=$(cd -- "$1" && pwd)
+cc=${CC:-cc}
+clang=${CLANG:-clang}
+# pkg-config emits compiler/linker arguments, intentionally split into arrays.
+read -r -a compile_flags <<< "$(pkg-config --cflags libbpf libelf zlib)"
+read -r -a link_flags <<< "$(pkg-config --libs libbpf libelf zlib)"
+bpf_flags=()
+# Debian-style UAPI asm headers live in a native multiarch directory. Arch's do not.
+multiarch=$("$cc" -print-multiarch)
+if [[ -n "$multiarch" && -d "/usr/include/$multiarch" ]]; then
+    bpf_flags+=(-I "/usr/include/$multiarch")
+fi
+"$clang" -target bpf -std=gnu11 -O2 -g -Wall -Wextra -Werror \
+    "${compile_flags[@]}" "${bpf_flags[@]}" \
+    -c "$source_root/tuna-kernel-bpf.bpf.c" -o "$output_root/tuna-kernel-bpf.bpf.o"
+"$cc" -std=gnu11 -O2 -g -Wall -Wextra -Werror "${compile_flags[@]}" \
+    "$source_root/tuna-kernel-bpf.c" "${link_flags[@]}" -o "$output_root/tuna-kernel-bpf"
