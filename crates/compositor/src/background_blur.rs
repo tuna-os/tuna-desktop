@@ -1010,7 +1010,9 @@ mod tests {
         };
         let mut bound = renderer.bind(&mut target).unwrap();
         let mut frame = renderer.render(&mut bound, (64, 64).into(), Transform::Normal).unwrap();
-        assert!(supported(&mut frame).unwrap(), "FP16 scene exists but blur is unsupported");
+        // Do not run the 4x4 admission probe between the SDR warmup and
+        // this draw: equal-size target reuse must be tested by precision,
+        // not accidentally forced by a different intermediate size.
         let full = rect(0, 0, 64, 64);
         let source = [-0.25f32, 1.5, 2.0];
         frame.clear(Color32F::BLACK, &[full]).unwrap();
