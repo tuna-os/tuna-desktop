@@ -118,6 +118,18 @@ ShellControl 0.47 until the ordered input/OSK cutover is integrated.
 | ext_background_effect_manager_v1 | 1 | empty capabilities until real bound-framebuffer/shader admission, then `blur`; capabilities are revoked on render failure. Double-buffered copied regions, synchronized subsurfaces, clipping/subtraction and object destruction drive the actual GLES blur. Floating-point scenes use precision-keyed FP16 intermediates without clipping extended values; admission/drawing must remain before HDR final output conversion. The actual-output consumer `scripts/tuna-background-effect-proof` is prepared but unexecuted; unsupported exit 77 is not a pass. Overview/Alt+Tab clone blur remains unqualified |
 | wp_drm_lease_device_v1 | 1 | native only, after a master-only kernel lease ioctl establishes actual support/authority. Confirmed connected non-desktop or explicitly named connectors stay off the desktop. Leases claim eligible free CRTC/primary/cursor resources, withdraw connectors and revoke before DRM master is dropped; failed kernel revocation cannot report completion or re-offer resources. Prepared D-LEASE checks real vkms lessee FD/ioctls, non-master device FD, independent-client withdrawal, empty/duplicate/stale denial, owner-loss revocation with the FD retained, and actual emulated sysfs disconnect/reappearance. These additions have not run on this integrated head. Physical headsets, monitors.xml `for-lease`, and secondary-GPU lease devices are not qualified |
 
+The negotiated xdg-shell consumer tests use actual v7 and v6 connections and
+configure events through tiling, maximize, fullscreen, floating/scroll layout,
+repeated requests and role replacement. A v6 bind must not change another
+client's v7 edge states or receive the v7-only constrained-state values.
+Required XML errors reject nonpositive window geometry on `xdg_surface`,
+negative min/max hints on `xdg_toplevel`, and inconsistent final limits only
+when the double-buffered state commits. Zero maxima remain unbounded. Unknown,
+consumed and stale configure ACKs report `xdg_surface.invalid_serial`.
+These required geometry/ACK errors are deliberately stricter than the pinned
+Mutter implementation's warning/ignore behavior; they are not claimed as
+identical Mutter error handling.
+
 Toplevel-drag source reservations survive cancellation and factory/child
 destruction while the data source lives; they do not permit later clipboard
 repurposing or a second toplevel-drag association. Incompatible selection use

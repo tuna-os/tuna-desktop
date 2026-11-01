@@ -147,9 +147,23 @@ every state a client's bind can name and drops the rest: tiled states below
 version 2, suspended below 6 and constrained below 7, the same version
 gates as Mutter's fill_states (meta-wayland-xdg-shell.c). Roost sets the
 states from Mutter's edge constraints. Real-client tests in
-crates/compositor/tests/windows.rs bind versions 7 and 6 and read the
-configure states. The isolated diff is retained in
-XDG-WM-BASE-7-PATCH.diff; the pinned version stays 0.7.0.
+crates/compositor/tests/windows.rs and
+crates/compositor/tests/support/xdg_version_boundaries.rs bind versions 7 and 6
+and consume actual configure arrays through layout changes, repeated requests,
+simultaneous binds and teardown/replacement.
+
+The same patch validates the locked XML's required request/error boundaries in
+handlers/surface.rs and handlers/surface/toplevel.rs. Nonpositive window
+geometry reports xdg_surface.InvalidSize; negative min/max hints report
+xdg_toplevel.InvalidSize before constructing a Size. Final double-buffered
+min/max relations are checked at commit, not eagerly between valid requests;
+zero maxima remain unbounded. Unknown, consumed or stale configure serials
+report xdg_surface.InvalidSerial on the actual surface. The pinned Mutter
+source instead warns/ignores invalid geometry and handles ACKs differently;
+these XML-required errors are not claimed to match that implementation.
+Socket consumers exercise the exact error target/code and valid double-buffered
+changes, rather than constructing expected enum sets. The isolated diff is
+retained in XDG-WM-BASE-7-PATCH.diff; the pinned version stays 0.7.0.
 
 Issue #364 additionally changes src/wayland/xdg_foreign/mod.rs and
 handlers.rs: zxdg_exporter_v1 and zxdg_importer_v1 join the v2 globals,

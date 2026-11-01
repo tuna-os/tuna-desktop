@@ -121,6 +121,7 @@ where
                 });
 
                 if initial {
+                    compositor::add_pre_commit_hook::<D, _>(surface, toplevel::validate_size_hints::<D>);
                     compositor::add_post_commit_hook::<D, _>(
                         surface,
                         super::super::ToplevelSurface::commit_hook,
@@ -251,6 +252,15 @@ where
                         xdg_wm_base::Error::Role,
                         "xdg_surface must have a role of xdg_toplevel or xdg_popup.",
                     );
+                    return;
+                }
+
+                if width <= 0 || height <= 0 {
+                    xdg_surface.post_error(
+                        xdg_surface::Error::InvalidSize,
+                        "window geometry width and height must be positive",
+                    );
+                    return;
                 }
 
                 compositor::with_states(surface, |states| {
@@ -310,8 +320,8 @@ where
                 let configure = match found_configure {
                     Ok(Some(configure)) => configure,
                     Ok(None) => {
-                        data.wm_base.post_error(
-                            xdg_wm_base::Error::InvalidSurfaceState,
+                        xdg_surface.post_error(
+                            xdg_surface::Error::InvalidSerial,
                             format!("wrong configure serial: {}", <u32>::from(serial)),
                         );
                         return;

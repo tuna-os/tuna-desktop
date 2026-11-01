@@ -118,11 +118,25 @@ where
                 }
             }
             xdg_toplevel::Request::SetMaxSize { width, height } => {
+                if width < 0 || height < 0 {
+                    toplevel.post_error(
+                        xdg_toplevel::Error::InvalidSize,
+                        "max size width and height must not be negative",
+                    );
+                    return;
+                }
                 with_toplevel_pending_state(data, |toplevel_data| {
                     toplevel_data.max_size = (width, height).into();
                 });
             }
             xdg_toplevel::Request::SetMinSize { width, height } => {
+                if width < 0 || height < 0 {
+                    toplevel.post_error(
+                        xdg_toplevel::Error::InvalidSize,
+                        "min size width and height must not be negative",
+                    );
+                    return;
+                }
                 with_toplevel_pending_state(data, |toplevel_data| {
                     toplevel_data.min_size = (width, height).into();
                 });
@@ -183,6 +197,38 @@ where
                 *guard.pending() = Default::default();
                 *guard.current() = Default::default();
             })
+        }
+    }
+}
+
+pub(super) fn validate_size_hints<D: XdgShellHandler>(
+    state: &mut D,
+    _dh: &DisplayHandle,
+    surface: &wl_surface::WlSurface,
+) {
+    // Size limits are double buffered: only the final pending pair must be
+    // consistent. Checking each request would reject legal transactions that
+    // replace both limits. A zero maximum means that axis has no upper limit.
+    let invalid = compositor::with_states(surface, |states| {
+        let mut cached = states.cached_state.get::<SurfaceCachedState>();
+        let pending = cached.pending();
+        (pending.max_size.w != 0 && pending.min_size.w > pending.max_size.w)
+            || (pending.max_size.h != 0 && pending.min_size.h > pending.max_size.h)
+    });
+    if invalid {
+        // The hook belongs to the wl_surface, not a particular role instance.
+        // Resolve the current live resource only on the error path, so normal
+        // commits allocate nothing and destroyed/recreated roles stay correct.
+        if let Some(toplevel) = state
+            .xdg_shell_state()
+            .known_toplevels
+            .iter()
+            .find(|toplevel| toplevel.wl_surface() == surface)
+        {
+            toplevel.shell_surface.post_error(
+                xdg_toplevel::Error::InvalidSize,
+                "min size must not exceed a nonzero max size",
+            );
         }
     }
 }

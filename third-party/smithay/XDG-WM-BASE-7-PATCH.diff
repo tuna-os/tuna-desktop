@@ -88,3 +88,111 @@ index 97874352..070acc1c 100644
  
          XdgShellState {
              known_toplevels: Vec::new(),
+diff --git a/src/wayland/shell/xdg/handlers/surface.rs b/src/wayland/shell/xdg/handlers/surface.rs
+index 3ae3a79e..71575a6f 100644
+--- a/src/wayland/shell/xdg/handlers/surface.rs
++++ b/src/wayland/shell/xdg/handlers/surface.rs
+@@ -121,6 +121,7 @@ where
+                 });
+ 
+                 if initial {
++                    compositor::add_pre_commit_hook::<D, _>(surface, toplevel::validate_size_hints::<D>);
+                     compositor::add_post_commit_hook::<D, _>(
+                         surface,
+                         super::super::ToplevelSurface::commit_hook,
+@@ -251,6 +252,15 @@ where
+                         xdg_wm_base::Error::Role,
+                         "xdg_surface must have a role of xdg_toplevel or xdg_popup.",
+                     );
++                    return;
++                }
++
++                if width <= 0 || height <= 0 {
++                    xdg_surface.post_error(
++                        xdg_surface::Error::InvalidSize,
++                        "window geometry width and height must be positive",
++                    );
++                    return;
+                 }
+ 
+                 compositor::with_states(surface, |states| {
+@@ -310,8 +320,8 @@ where
+                 let configure = match found_configure {
+                     Ok(Some(configure)) => configure,
+                     Ok(None) => {
+-                        data.wm_base.post_error(
+-                            xdg_wm_base::Error::InvalidSurfaceState,
++                        xdg_surface.post_error(
++                            xdg_surface::Error::InvalidSerial,
+                             format!("wrong configure serial: {}", <u32>::from(serial)),
+                         );
+                         return;
+diff --git a/src/wayland/shell/xdg/handlers/surface/toplevel.rs b/src/wayland/shell/xdg/handlers/surface/toplevel.rs
+index 17bd3b9b..698b53d8 100644
+--- a/src/wayland/shell/xdg/handlers/surface/toplevel.rs
++++ b/src/wayland/shell/xdg/handlers/surface/toplevel.rs
+@@ -118,11 +118,25 @@ where
+                 }
+             }
+             xdg_toplevel::Request::SetMaxSize { width, height } => {
++                if width < 0 || height < 0 {
++                    toplevel.post_error(
++                        xdg_toplevel::Error::InvalidSize,
++                        "max size width and height must not be negative",
++                    );
++                    return;
++                }
+                 with_toplevel_pending_state(data, |toplevel_data| {
+                     toplevel_data.max_size = (width, height).into();
+                 });
+             }
+             xdg_toplevel::Request::SetMinSize { width, height } => {
++                if width < 0 || height < 0 {
++                    toplevel.post_error(
++                        xdg_toplevel::Error::InvalidSize,
++                        "min size width and height must not be negative",
++                    );
++                    return;
++                }
+                 with_toplevel_pending_state(data, |toplevel_data| {
+                     toplevel_data.min_size = (width, height).into();
+                 });
+@@ -187,6 +201,38 @@ where
+     }
+ }
+ 
++pub(super) fn validate_size_hints<D: XdgShellHandler>(
++    state: &mut D,
++    _dh: &DisplayHandle,
++    surface: &wl_surface::WlSurface,
++) {
++    // Size limits are double buffered: only the final pending pair must be
++    // consistent. Checking each request would reject legal transactions that
++    // replace both limits. A zero maximum means that axis has no upper limit.
++    let invalid = compositor::with_states(surface, |states| {
++        let mut cached = states.cached_state.get::<SurfaceCachedState>();
++        let pending = cached.pending();
++        (pending.max_size.w != 0 && pending.min_size.w > pending.max_size.w)
++            || (pending.max_size.h != 0 && pending.min_size.h > pending.max_size.h)
++    });
++    if invalid {
++        // The hook belongs to the wl_surface, not a particular role instance.
++        // Resolve the current live resource only on the error path, so normal
++        // commits allocate nothing and destroyed/recreated roles stay correct.
++        if let Some(toplevel) = state
++            .xdg_shell_state()
++            .known_toplevels
++            .iter()
++            .find(|toplevel| toplevel.wl_surface() == surface)
++        {
++            toplevel.shell_surface.post_error(
++                xdg_toplevel::Error::InvalidSize,
++                "min size must not exceed a nonzero max size",
++            );
++        }
++    }
++}
++
+ // Utility functions allowing to factor out a lot of the upcoming logic
+ fn with_surface_toplevel_role_data<F, T>(toplevel: &xdg_toplevel::XdgToplevel, f: F) -> T
+ where
