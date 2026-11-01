@@ -158,6 +158,9 @@ their original sampler declarations. Fragment highp is optional under
 [GLSL ES 1.00 §§4.5.2–4.5.4 and §8](https://registry.khronos.org/OpenGL/specs/es/2.0/GLSL_ES_Specification_1.00.pdf).
 Native HDR separately requires a successful high-precision arithmetic probe.
 
+The native DMA-BUF diagnostic disables core files and bounds backtraces and
+printed values; raw core dumps are never qualification artifacts.
+
 Qualification receipts must name the emulation and exact executable/source/image
 identities. `D-COLOR-HDR`, `D-COLOR-HDR-KMS`, `D-COLOR-HDR-CAPTURE`,
 `D-COLOR-HDR-RESTART`, `D-COLOR-HDR-HOTPLUG`, `D-COLOR-HDR-REJECT`,

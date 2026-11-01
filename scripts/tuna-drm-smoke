@@ -204,8 +204,10 @@ pass D-COLOR-HDR "emulated EGL GPU: production FP16 blending and ten-bit PQ read
 if ! {
     sudo env -u DISPLAY -u WAYLAND_DISPLAY TUNA_REQUIRE_COLOR_GL=1 \
         TUNA_COLOR_DMABUF_HEAP=/dev/dma_heap/system TUNA_COLOR_DRM_RENDER_NODE="$CARD" \
-        gdb --batch --return-child-result -ex 'set pagination off' -ex run \
-        -ex 'thread apply all bt full' -ex 'info sharedlibrary' --args \
+        prlimit --core=0:0 -- gdb --batch --return-child-result \
+        -ex 'set pagination off' -ex 'set print elements 16' \
+        -ex 'set print max-depth 3' -ex run \
+        -ex 'thread apply all bt full 32' -ex 'info sharedlibrary' --args \
         "$COLOR_TESTS" --exact color_render::raw_tests::real_dmabuf_identity_component_import_qualification \
         --nocapture
 } >"$ARTIFACTS/color-yuv-import.log" 2>&1; then
