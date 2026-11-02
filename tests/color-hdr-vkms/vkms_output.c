@@ -110,6 +110,14 @@ int vkms_output_init(struct vkms_device *vkmsdev, int index)
 		writeback = vkms_enable_writeback_connector(vkmsdev);
 		if (writeback)
 			DRM_ERROR("Failed to init writeback connector\n");
+		else {
+			u32 clones = drm_encoder_mask(encoder) |
+				     drm_encoder_mask(&output->wb_connector.encoder);
+
+			/* Both encoders consume the same composed CRTC output. */
+			encoder->possible_clones = clones;
+			output->wb_connector.encoder.possible_clones = clones;
+		}
 	}
 
 	drm_mode_config_reset(dev);

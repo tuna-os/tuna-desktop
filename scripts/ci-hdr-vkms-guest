@@ -23,8 +23,8 @@ an ordinary qualification-fixture delta, not a replacement image/release claim.
 
 Payload tar is extracted into /home/ubuntu/payload. Prepare binaries/assets there
 before calling; no repository/managed-store traversal is performed by this tool.
-The native command runs in that directory, under owned seatd-launch, inside the
-HDR module endpoint, with CARD/TUNA_HDR_* and ARTIFACTS=/home/ubuntu/artifacts.
+The native command runs in that directory, under an owned private seatd endpoint,
+with CARD/TUNA_HDR_* and ARTIFACTS=/home/ubuntu/artifacts.
 The helper always performs the real kernel XR30 flip/writeback/negative-atomic
 selftest first. Optional --negative-command runs in a fresh unsupported SDR
 endpoint (default is identity only). A default identity is not a compositor or
@@ -150,6 +150,10 @@ def retained_kernel_proof(archive_path):
             endpoint_receipt = receipt(endpoint_name + '/endpoint.json')
             if endpoint_receipt.get('status') != 'unloaded' or endpoint_receipt.get('command_exit') != 0:
                 raise RuntimeError(f'owned endpoint cleanup/command failed: {endpoint_name}')
+            if endpoint_name != 'kernel-endpoint' and (
+                    endpoint_receipt.get('seatd_stopped') is not True or
+                    endpoint_receipt.get('seatd_socket_removed') is not True):
+                raise RuntimeError(f'owned seatd cleanup failed: {endpoint_name}')
             if endpoint_receipt.get('kernel') != EXPECTED_KERNEL:
                 raise RuntimeError('retained endpoint kernel differs from authenticated image')
         unsupported = receipt('unsupported-endpoint/identity.json')
@@ -311,19 +315,19 @@ def main():
             call([*ssh, 'bash -lc ' + shlex.quote(prepare)], stdout=log, stderr=subprocess.STDOUT, timeout=args.proof_timeout)
         positive = ('set -eu; export ARTIFACTS=/home/ubuntu/artifacts; '
                     'cd /home/ubuntu/payload; export LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD"; '
-                    'exec seatd-launch -- bash -lc ' + shlex.quote(args.guest_command))
+                    'exec bash -lc ' + shlex.quote(args.guest_command))
         endpoint = 'sudo python3 /home/ubuntu/hdr-source/scripts/ci-install-hdr-vkms run --build-dir /home/ubuntu/hdr-module'
         kernel_proof = ('export ARTIFACTS=/home/ubuntu/artifacts; '
                         'exec "$TUNA_HDR_PROBE" selftest "$CARD" "$ARTIFACTS/kernel-selftest.json" "$ARTIFACTS/kernel-writeback.xr30"')
         # Reload between driver selftest and compositor: no stale HDR property
         # blob/framebuffer from the selftest may satisfy a production assertion.
         proof = endpoint + ' --state-dir /home/ubuntu/artifacts/kernel-endpoint -- bash -lc ' + shlex.quote(kernel_proof) + '; '
-        proof += endpoint + ' --state-dir /home/ubuntu/artifacts/hdr-endpoint -- bash -lc ' + shlex.quote(positive) + '; '
+        proof += endpoint + ' --state-dir /home/ubuntu/artifacts/hdr-endpoint --seatd -- bash -lc ' + shlex.quote(positive) + '; '
         # set -e prevents negative identity from masking a positive failure.
         negative = ('export ARTIFACTS=/home/ubuntu/artifacts; cd /home/ubuntu/payload; '
                     'export LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD"; '
-                    'exec seatd-launch -- bash -lc ' + shlex.quote(args.negative_command))
-        proof += endpoint + ' --state-dir /home/ubuntu/artifacts/unsupported-endpoint --unsupported -- bash -lc ' + shlex.quote(negative)
+                    'exec bash -lc ' + shlex.quote(args.negative_command))
+        proof += endpoint + ' --state-dir /home/ubuntu/artifacts/unsupported-endpoint --unsupported --seatd -- bash -lc ' + shlex.quote(negative)
         identity['status'] = 'running-proofs'
         (artifacts / 'guest-identity.json').write_text(json.dumps(identity, indent=2) + '\n')
         with (artifacts / 'guest-proof.log').open('wb') as log:
@@ -335,6 +339,15 @@ def main():
                 # Retain, but never extract, this guest-produced archive on host.
                 archive_path = artifacts / 'guest-artifacts.tar.gz'
                 try:
+                    # Keep actual kernel diagnostics even when a failed ioctl
+                    # prevents the selftest JSON/raw receipt from being written.
+                    try:
+                        with (artifacts / 'guest-kernel.log').open('wb') as log:
+                            diagnostics = subprocess.run([*ssh, 'sudo dmesg --color=never'],
+                                                         stdout=log, stderr=subprocess.STDOUT, timeout=30)
+                        identity['kernel_diagnostics_exit'] = diagnostics.returncode
+                    except (OSError, subprocess.TimeoutExpired) as error:
+                        identity['kernel_diagnostics_error'] = str(error)
                     with archive_path.open('wb') as output:
                         result = subprocess.run([*ssh, 'sudo tar -czf - -C /home/ubuntu artifacts'], stdout=output, stderr=subprocess.DEVNULL, timeout=60)
                     identity['artifact_copy_exit'] = result.returncode

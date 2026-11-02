@@ -292,12 +292,14 @@ static void selftest(const char *json, const char *raw)
 	add(req, plane, DRM_MODE_OBJECT_PLANE, "CRTC_Y", 0);
 	add(req, plane, DRM_MODE_OBJECT_PLANE, "CRTC_W", mode.hdisplay);
 	add(req, plane, DRM_MODE_OBJECT_PLANE, "CRTC_H", mode.vdisplay);
-	require(drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL) == 0, "real HDR modeset");
+	if (drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL) != 0)
+		fail("real HDR modeset");
 	drmModeAtomicFree(req);
 	req = drmModeAtomicAlloc();
 	require(req != NULL, "atomic allocation");
 	add(req, plane, DRM_MODE_OBJECT_PLANE, "FB_ID", second.fb);
-	require(drmModeAtomicCommit(fd, req, DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK, NULL) == 0, "real XR30 page flip");
+	if (drmModeAtomicCommit(fd, req, DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK, NULL) != 0)
+		fail("real XR30 page flip");
 	drmModeAtomicFree(req);
 	wait_flip();
 	int fence = -1;
@@ -306,7 +308,12 @@ static void selftest(const char *json, const char *raw)
 	add(req, writeback, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID", crtc);
 	add(req, writeback, DRM_MODE_OBJECT_CONNECTOR, "WRITEBACK_FB_ID", wb.fb);
 	add(req, writeback, DRM_MODE_OBJECT_CONNECTOR, "WRITEBACK_OUT_FENCE_PTR", (uintptr_t)&fence);
-	require(drmModeAtomicCommit(fd, req, 0, NULL) == 0, "real composed writeback commit");
+	/* Attaching the writeback connector changes CRTC routing, even though
+	 * the display mode and primary plane stay unchanged. DRM's atomic
+	 * helpers require ALLOW_MODESET for that first connector attachment.
+	 */
+	if (drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL) != 0)
+		fail("real composed writeback commit");
 	drmModeAtomicFree(req);
 	require(fence >= 0, "real writeback fence fd");
 	struct pollfd completion = {.fd = fence, .events = POLLIN};

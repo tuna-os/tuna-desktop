@@ -11,9 +11,12 @@ ci-hdr-vkms-guest: it boots its own pinned Noble guest without host kernel chang
   # Add --unsupported before -- to expose the SDR negative control instead.
 
 COMMAND receives CARD, TUNA_HDR_CARD, TUNA_HDR_SINK, TUNA_HDR_EDID_SHA256,
-TUNA_HDR_ENDPOINT, TUNA_HDR_PROBE, TUNA_HDR_CONNECTED_CONTROL. It owns its seat (e.g. seatd-launch); no
-system seatd/display manager is stopped. run unloads only tuna_hdr_vkms, never
-vkms, on success/failure/signals. A busy module is an error, never force-unloaded.
+TUNA_HDR_ENDPOINT, TUNA_HDR_PROBE, TUNA_HDR_CONNECTED_CONTROL. With --seatd,
+run owns a private seatd daemon/socket and sets LIBSEAT_BACKEND/SEATD_SOCK;
+no system seatd/display manager is stopped. Noble seatd 0.8 hardcodes its socket,
+so only that daemon gets a private mount namespace with state-dir bound at /run.
+run unloads only tuna_hdr_vkms, never vkms, on success/failure/signals. A busy
+module is an error, never force-unloaded.
 The endpoint JSON records real module/kernel/card/EDID identity, not proof of
 HDR pixels; use TUNA_HDR_PROBE and the native compositor/capture proofs for that.
 Write 0/1 to TUNA_HDR_CONNECTED_CONTROL as root to unplug/replug the same
@@ -28,6 +31,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import select
 import signal
 import subprocess
 import sys
@@ -163,6 +167,7 @@ def endpoint(args):
         run(['modprobe', 'drm_shmem_helper'])
         loaded = False
         child = None
+        seat = None
         record = {'emulated': True, 'sink': sink, 'kernel': os.uname().release,
                   'module': MODULE, 'module_sha256': sha(module), 'build': built,
                   'edid_sha256': hashlib.sha256(fixture).hexdigest(), 'status': 'loading'}
@@ -198,6 +203,26 @@ def endpoint(args):
                        TUNA_HDR_SINK=sink, TUNA_HDR_EDID_SHA256=record['edid_sha256'],
                        TUNA_HDR_ENDPOINT=str(record_path), TUNA_HDR_PROBE=str(dest / 'tuna-hdr-probe'),
                        TUNA_HDR_CONNECTED_CONTROL=control)
+            if args.seatd:
+                ready_read, ready_write = os.pipe()
+                try:
+                    try:
+                        with (state_dir / 'seatd.log').open('wb') as log:
+                            seat = subprocess.Popen(
+                                ['unshare', '--mount', '--propagation', 'private', '--', 'sh', '-ec',
+                                 'mount --bind "$1" /run; exec seatd -z -n "$2"',
+                                 'tuna-hdr-seatd', str(state_dir), str(ready_write)],
+                                pass_fds=(ready_write,), start_new_session=True,
+                                stdout=log, stderr=subprocess.STDOUT)
+                    finally:
+                        os.close(ready_write)
+                    if not select.select([ready_read], [], [], 15)[0] or os.read(ready_read, 1) != b'\n':
+                        raise RuntimeError('owned seatd did not signal readiness; see seatd.log')
+                finally:
+                    os.close(ready_read)
+                env.update(LIBSEAT_BACKEND='seatd', SEATD_SOCK=str(state_dir / 'seatd.sock'))
+                record['seatd_socket'] = env['SEATD_SOCK']
+                record_path.write_text(json.dumps(record, indent=2) + '\n')
             child = subprocess.Popen(command, env=env, start_new_session=True)
             status = child.wait()
             record['command_exit'] = status
@@ -211,6 +236,16 @@ def endpoint(args):
                 except subprocess.TimeoutExpired:
                     os.killpg(child.pid, signal.SIGKILL)
                     child.wait()
+            if seat is not None:
+                if seat.poll() is None:
+                    os.killpg(seat.pid, signal.SIGTERM)
+                    try:
+                        seat.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(seat.pid, signal.SIGKILL)
+                        seat.wait()
+                (state_dir / 'seatd.sock').unlink(missing_ok=True)
+                record.update(seatd_stopped=True, seatd_socket_removed=True)
             if loaded:
                 # No force, no deletion of module files, no stock-module changes.
                 run(['rmmod', MODULE])
@@ -229,6 +264,7 @@ def main():
     r.add_argument('--build-dir', required=True)
     r.add_argument('--state-dir', required=True)
     r.add_argument('--unsupported', action='store_true')
+    r.add_argument('--seatd', action='store_true', help='own a private seatd socket without touching the system service')
     r.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
