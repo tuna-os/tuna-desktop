@@ -40,7 +40,7 @@ use wayland_client::{
         wl_seat::WlSeat,
         wl_surface::WlSurface,
     },
-    Connection, Dispatch, EventQueue, QueueHandle, WEnum,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
 };
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gesture_swipe_v1::{Event as SwipeEvent, ZwpPointerGestureSwipeV1},
