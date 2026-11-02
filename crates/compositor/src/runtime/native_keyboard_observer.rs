@@ -39,9 +39,7 @@ fn credentials(client: &Client) -> Result<(u32, u32), &'static str> {
         .ok_or("original-credentials-unavailable")?;
     let pid = crate::capture_security::pinned_process_id(original)
         .ok_or("original-process-pin-unavailable")?;
-    let uid = original
-        .unix_user_id()
-        .ok_or("original-user-unavailable")?;
+    let uid = original.unix_user_id().ok_or("original-user-unavailable")?;
     Ok((pid, uid))
 }
 

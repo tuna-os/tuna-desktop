@@ -325,14 +325,14 @@ fn observer_service_focus_uses_live_original_caller_not_socketpair_creator() {
         data
     });
     let surface = app.surface(&comp);
-    keyboard.set_focus(
-        &mut comp.state,
-        Some(surface),
-        SERIAL_COUNTER.next_serial(),
-    );
+    keyboard.set_focus(&mut comp.state, Some(surface), SERIAL_COUNTER.next_serial());
     let mut doc = serde_json::json!({});
     super::publish(&manager, &comp.state, &mut doc);
-    let socket_creator = app.owner.get_credentials(&comp.display.handle()).unwrap().pid;
+    let socket_creator = app
+        .owner
+        .get_credentials(&comp.display.handle())
+        .unwrap()
+        .pid;
     child.kill().unwrap();
     child.wait().unwrap();
     assert_eq!(socket_creator, std::process::id() as i32);
@@ -361,12 +361,16 @@ fn observer_missing_original_credentials_or_pin_never_uses_socketpair_creator() 
     .unwrap();
     for original in [
         None,
-        Some(zbus::fdo::ConnectionCredentials::default()
-            .set_process_id(std::process::id())
-            .set_unix_user_id(rustix::process::getuid().as_raw())),
-        Some(zbus::fdo::ConnectionCredentials::default()
-            .set_process_id(std::process::id())
-            .set_process_fd(descriptor.into())),
+        Some(
+            zbus::fdo::ConnectionCredentials::default()
+                .set_process_id(std::process::id())
+                .set_unix_user_id(rustix::process::getuid().as_raw()),
+        ),
+        Some(
+            zbus::fdo::ConnectionCredentials::default()
+                .set_process_id(std::process::id())
+                .set_process_fd(descriptor.into()),
+        ),
     ] {
         let mut comp = TestCompositor::new();
         let manager = comp.window_manager();
@@ -381,16 +385,15 @@ fn observer_missing_original_credentials_or_pin_never_uses_socketpair_creator() 
             data
         });
         let surface = app.surface(&comp);
-        keyboard.set_focus(
-            &mut comp.state,
-            Some(surface),
-            SERIAL_COUNTER.next_serial(),
-        );
+        keyboard.set_focus(&mut comp.state, Some(surface), SERIAL_COUNTER.next_serial());
         let mut doc = serde_json::json!({});
         super::publish(&manager, &comp.state, &mut doc);
         assert_eq!(doc["native_keyboard_focus"]["evaluable"], false);
         assert!(doc["native_keyboard_focus"]["client_pid"].is_null());
         assert!(doc["native_keyboard_focus"]["client_uid"].is_null());
-        assert_ne!(doc["native_keyboard_focus"]["error"], serde_json::Value::Null);
+        assert_ne!(
+            doc["native_keyboard_focus"]["error"],
+            serde_json::Value::Null
+        );
     }
 }
