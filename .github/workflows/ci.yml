@@ -1041,7 +1041,7 @@ jobs:
             env CELL_ID=tideforge-orca-ubuntu-amd64 ENGINE=tideforge TARGET=ubuntu \
               ARCHITECTURE=amd64 FORMAT=deb RECIPE=packages/orca/package.yaml \
               IMAGE=docker.io/library/ubuntu:26.04 OUT_DIR="$factory/output" \
-              SOURCE_DATE_EPOCH="$source_date_epoch" scripts/run-package-factory-cell.sh
+              SOURCE_DATE_EPOCH="$source_date_epoch" bash scripts/run-package-factory-cell.sh
           ) 2>&1 | tee "$artifacts/native-orca-factory.log"
           shopt -s nullglob
           debs=("$factory/output/artifacts"/orca_*_all.deb)

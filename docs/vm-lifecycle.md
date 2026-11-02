@@ -24,6 +24,10 @@ The ordinary CLI profile is `--profile lifecycle` (the default); its two
 matrix members keep their original distribution/upstream51 Orca contracts
 and `marlin-vm`/`marlin-vm-orca51` artifact identities.
 
+The speech lane invokes the pinned package factory through `bash`; the
+factory checkout's script execute bit is not an admission prerequisite.
+Its actual native package build and all speech gates remain required.
+
 ## Record-free fresh accounts (tunaOS#4092)
 
 `tuna-test` above has a session-less AccountsService record, so it proves
