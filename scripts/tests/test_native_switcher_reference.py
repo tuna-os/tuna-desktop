@@ -551,6 +551,13 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
                     proof.verify_platform_image('/unused-controlled-output', invalid)
                 run.assert_not_called()
 
+    def test_process_without_actual_positive_elapsed_time_is_not_verified_evidence(self):
+        output = json.dumps(self.cosign).encode()
+        witness = json.loads(self.verification(output))
+        witness['end_host_monotonic_ns'] = witness['begin_host_monotonic_ns']
+        with self.assertRaisesRegex(ValueError, 'process/output'):
+            proof.validate_platform_verification(output, json.dumps(witness).encode(), proof.PINNED_PLATFORM)
+
     def test_shared_platform_parser_requires_modern_envelope_and_matching_witness(self):
         platform = 'sha256:' + 'a' * 64
         signatures = copy.deepcopy(self.cosign)

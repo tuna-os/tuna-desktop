@@ -805,7 +805,7 @@ def validate_platform_verification(cosign_bytes, verification_bytes, platform_di
             'verification does not retain the actual pinned native cosign tool')
     require(type(witness.get('begin_host_monotonic_ns')) is int
             and type(witness.get('end_host_monotonic_ns')) is int
-            and 0 < witness['begin_host_monotonic_ns'] <= witness['end_host_monotonic_ns']
+            and 0 < witness['begin_host_monotonic_ns'] < witness['end_host_monotonic_ns']
             and witness.get('stdout_sha256') == digest(cosign_bytes)
             and type(witness.get('stdout_bytes')) is int and witness['stdout_bytes'] == len(cosign_bytes)
             and isinstance(witness.get('stderr'), str),
