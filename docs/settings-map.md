@@ -71,10 +71,11 @@ targets below; the compositor holds gnome-session's leader FIFO so the targets
 and plugins stop with the session, and starts
 `gnome-session-x11-services-ready.target` when Xwayland is up, as GNOME Shell
 51 does. The compositor serves the `org.gnome.SessionManager` subset the
-plugins use (`InhibitedActions`, `SessionIsActive`, `Inhibit`, `Uninhibit`,
-`IsInhibited`, `GetInhibitors`, and `Shutdown`, `Reboot` and `Logout`, which
-open the shell's `org.gnome.SessionManager.EndSessionDialog`); idle inhibitors
-also hold off Tuna's idle lock.
+plugins and the shell's power menu use (`InhibitedActions`, `SessionIsActive`,
+`Inhibit`, `Uninhibit`, `IsInhibited`, `GetInhibitors`, `Suspend`, and
+`Shutdown`, `Reboot` and `Logout`, which open the shell's
+`org.gnome.SessionManager.EndSessionDialog` and carry its confirmation out);
+idle inhibitors also hold off Tuna's idle lock.
 Its `RestoreSupported` is false, as gnome-session 51 reports it, so GNOME
 Settings hides "Reopen Windows After Login"; window restoration is the client
 opt-in of `xdg_session_manager_v1` (P-SY-08).
