@@ -172,7 +172,8 @@ def valid_core_apps_error(value):
     if (type(value) is not dict or not {'domain', 'operation', 'exception_type', 'sites'} <= set(value)
             or not set(value) <= {'domain', 'operation', 'exception_type', 'sites', 'returncode', 'errno'}):
         return False
-    if value['domain'] not in {'arguments', 'desktop', 'basic', 'data', 'media', 'system', 'web', 'autotz'}:
+    if (type(value['domain']) is not str
+            or value['domain'] not in {'arguments', 'desktop', 'basic', 'data', 'media', 'system', 'web', 'autotz'}):
         return False
     if (type(value['operation']) is not str or re.fullmatch(r'[a-z][a-z0-9-]{0,63}', value['operation']) is None
             or type(value['exception_type']) is not str
@@ -353,6 +354,9 @@ class GuestAgent:
 
     def command(self, name, *, deadline=None, **arguments):
         deadline = deadline if deadline is not None else time.monotonic() + 5
+        caller_deadline = getattr(self, "_caller_deadline", None)
+        if caller_deadline is not None:
+            deadline = min(deadline, caller_deadline)
         if getattr(self, "poisoned", False):
             raise RuntimeError("guest-agent transport poisoned")
         try:
@@ -377,6 +381,8 @@ class GuestAgent:
         return result["return"]
 
     def run(self, action, *arguments, timeout=30):
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("finite positive guest-agent operation timeout required")
         deadline = time.monotonic() + timeout
         if self._caller_deadline is not None:
             deadline = min(deadline, self._caller_deadline)

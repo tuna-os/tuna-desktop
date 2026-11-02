@@ -1295,6 +1295,9 @@ jobs:
           - profile: lifecycle
             orca: upstream51
             artifact: marlin-vm-orca51
+          - profile: core-apps
+            orca: distribution
+            artifact: native-core-apps
     runs-on: ubuntu-26.04
     needs: [select-lanes, arch-package]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm')
@@ -1338,6 +1341,12 @@ jobs:
             sudo podman rm "$probe_container"
             sudo chown -R "$(id -u):$(id -g)" orca51-package-provenance
           fi
+          if [[ '${{ matrix.profile }}' == core-apps ]]; then
+            sudo podman build -f packaging/marlin/vm-lane/Containerfile.core-apps \
+              --build-arg CORE_APPS=1 --build-arg "CORE_APPS_SOURCE_COMMIT=$GITHUB_SHA" \
+              -t localhost/marlin-tuna-vm-core-apps:ci .
+            sudo podman tag localhost/marlin-tuna-vm-core-apps:ci localhost/marlin-tuna-vm:ci
+          fi
           sudo podman image inspect ghcr.io/tuna-os/marlin:gnome --format '{{.Digest}}' | tee /mnt/vm/base-digest
           sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}' > /mnt/vm/image-id-observed
           scripts/tuna-vm-strip-image --canonical-image-id "$(cat /mnt/vm/image-id-observed)" | tee /mnt/vm/image-id
@@ -1354,11 +1363,11 @@ jobs:
           image_id=$(cat /mnt/vm/image-id)
           owned_container="tuna-strip-inspect-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           trap 'sudo podman rm -f "$owned_container" >/dev/null 2>&1 || true' EXIT
-          scripts/tuna-vm-strip-image --inspection-program > /mnt/vm/strip-inspect.py
+          scripts/tuna-vm-strip-image --fixture '${{ matrix.profile }}' --inspection-program > /mnt/vm/strip-inspect.py
           timeout --kill-after=5s 60s sudo podman run --rm --name "$owned_container" -i \
             --entrypoint /usr/bin/python3 "$image_id" - "$image_id" \
             < /mnt/vm/strip-inspect.py > /mnt/vm/strip-image-observed.json
-          scripts/tuna-vm-strip-image --package tuna.pkg.tar.zst \
+          scripts/tuna-vm-strip-image --fixture '${{ matrix.profile }}' --package tuna.pkg.tar.zst \
             --observed /mnt/vm/strip-image-observed.json --commit "$GITHUB_SHA" \
             --image-id "$image_id" \
             --base-image "ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)" \
@@ -1390,9 +1399,20 @@ jobs:
       # After the assertions, --tour drives a scripted feature tour
       # through QMP input and records it to tour/tuna-tour.webm.
       - name: Boot the disk, assert the Tuna Desktop hardware session, record the tour
+        if: matrix.profile == 'lifecycle'
         run: >-
-          scripts/tuna-vm-lane --disk /mnt/vm/disk.raw --out vm-lane-artifacts --boots 5 --tour --orca-contract ${{ matrix.orca }}
+          scripts/tuna-vm-lane --profile lifecycle --disk /mnt/vm/disk.raw --out vm-lane-artifacts --boots 5 --tour --orca-contract ${{ matrix.orca }}
           --strip-image vm-lane-artifacts/strip-image.json --strip-edge
+          --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
+          --meta "test_image_id=$(cat /mnt/vm/image-id)"
+          --meta "tuna_package=$(basename arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)"
+          --meta "commit=${{ github.sha }}"
+      - name: Complete required original native Core applications
+        if: matrix.profile == 'core-apps'
+        run: >-
+          scripts/tuna-vm-lane --profile core-apps --require-kvm --boots 1
+          --disk /mnt/vm/disk.raw --out vm-lane-artifacts
+          --strip-image vm-lane-artifacts/strip-image.json
           --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
           --meta "tuna_package=$(basename arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)"
@@ -1402,7 +1422,7 @@ jobs:
       # first GDM login, logout, login, reboot and login. Separate from the
       # session-less tuna-test case above; -snapshot leaves the disk pristine.
       - name: Fresh-account GDM journey (record-free standard and admin)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.profile == 'lifecycle' }}
         run: >-
           test -f /mnt/vm/disk.raw &&
           scripts/tuna-vm-lane --fresh-accounts --disk /mnt/vm/disk.raw --out vm-lane-artifacts/fresh-accounts

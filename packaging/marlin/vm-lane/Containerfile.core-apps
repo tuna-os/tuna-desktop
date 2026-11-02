@@ -1,0 +1,12 @@
+# Full Core dependencies and preboot role preparation never affect ordinary
+# lifecycle rows or the independently routed native clock fixture.
+ARG BASE_IMAGE=localhost/marlin-tuna-vm:ci
+FROM ${BASE_IMAGE}
+ARG CORE_APPS=1
+ARG CORE_APPS_SOURCE_COMMIT
+COPY packaging/marlin/vm-lane/core-apps /usr/libexec/tuna-core-apps
+COPY packaging/marlin/vm-lane/tuna-native-session/native_session.py /usr/libexec/tuna-native-session/native_session.py
+COPY packaging/marlin/vm-lane/tuna-core-apps-install /usr/libexec/tuna-core-apps-install
+RUN test "$CORE_APPS" = 1 \
+    && chmod 0755 /usr/libexec/tuna-core-apps-install \
+    && TUNA_CI_ONLY=1 TUNA_SOURCE_COMMIT="$CORE_APPS_SOURCE_COMMIT" /usr/libexec/tuna-core-apps-install

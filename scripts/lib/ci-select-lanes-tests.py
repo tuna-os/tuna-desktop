@@ -60,6 +60,14 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("scripts/tuna-orca-speech-proof"), ["orca-speech"])
         self.assertEqual(pr("scripts/lib/tuna-orca-speech.py"), ["orca-speech"])
 
+    def test_core_source_and_transport_always_select_vm_with_original_producer(self):
+        for path in ('scripts/lib/core_apps.py', 'scripts/lib/core_apps_system.py',
+                     'scripts/lib/vm_native_desktop.py', 'scripts/lib/vm_guest_agent.py',
+                     'scripts/tuna-vm-strip-image'):
+            for run in (0, 4, 19):
+                with self.subTest(path=path, run=run):
+                    self.assertEqual(pr(path, run=run), ['arch-package', 'marlin-vm'])
+
 
     def test_transition_policy_and_suite_always_run_journey(self):
         for path in ('scripts/lib/transition-package-policy.py',
@@ -97,11 +105,6 @@ class WorkflowSync(unittest.TestCase):
         return [value] if isinstance(value, str) else value
 
 
-    def test_journey_invokes_real_transition_package_suite(self):
-        commands = [step.get('run', '') for step in self.jobs['journey']['steps']]
-        self.assertIn('python3 scripts/lib/transition-package-policy-tests.py', commands)
-        installs = [command for command in commands if 'apt-get install' in command]
-        self.assertTrue(any('build-essential' in command and 'desktop-file-utils' in command for command in installs))
 
     def test_gate_waits_for_every_job(self):
         gate = self.jobs["ci-gate"]

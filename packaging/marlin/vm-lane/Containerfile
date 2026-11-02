@@ -41,8 +41,6 @@ RUN pacman -S --needed --noconfirm gcc pkgconf wayland wayland-protocols wlr-pro
     && TUNA_CI_ONLY=1 /build/tuna-vm-constraints-build
 
 FROM ${BASE_IMAGE}
-ARG CORE_APPS=0
-ARG CORE_APPS_SOURCE_COMMIT
 COPY --from=constraint-builder /usr/libexec/tuna-vm-constraints /usr/libexec/tuna-vm-constraints
 COPY --from=constraint-builder /usr/share/tuna-vm-constraints /usr/share/tuna-vm-constraints
 
@@ -52,9 +50,6 @@ COPY scripts/lib/gnome-brightness-proof.py /usr/libexec/tuna-brightness-proof
 COPY scripts/lib/tuna-datetime-proof.py /usr/libexec/tuna-datetime-proof
 COPY packaging/marlin/vm-lane/tuna-vm-input /usr/libexec/tuna-vm-input
 COPY packaging/marlin/vm-lane/tuna-vm-shell-focus /usr/libexec/tuna-vm-shell-focus
-COPY packaging/marlin/vm-lane/core-apps /usr/libexec/tuna-core-apps
-COPY packaging/marlin/vm-lane/tuna-native-session /usr/libexec/tuna-native-session
-COPY packaging/marlin/vm-lane/tuna-core-apps-install /usr/libexec/tuna-core-apps-install
 COPY packaging/marlin/vm-lane/tuna-vm-orca-token /usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token
 COPY packaging/marlin/vm-lane/tuna-vm-gdm.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
 COPY packaging/marlin/vm-lane/journald.conf /usr/lib/systemd/journald.conf.d/90-tuna-vm-lane.conf
@@ -68,8 +63,6 @@ COPY packaging/marlin/vm-lane/tuna-vm-fresh-accounts.service /usr/lib/systemd/sy
 # /home is a symlink to /var/home on bootc systems and /var is only
 # seeded at install time, so the home directory and the AccountsService
 # record come from tmpfiles.d on every boot rather than from this layer.
-RUN case "$CORE_APPS" in 0|1) ;; *) echo "CORE_APPS must be 0 or 1" >&2; exit 1 ;; esac
-
 # The payload hashes cover the same login-path files Containerfile.published
 # pins, taken after the tunaOS steps; the booted lane re-checks them before
 # it types into GDM.
@@ -99,7 +92,6 @@ RUN mkdir -p /usr/share/tuna-vm \
     && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test \
     && echo 'tuna-test:tuna' | chpasswd \
     && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-fresh-accounts /usr/libexec/tuna-vm-input /usr/libexec/tuna-vm-shell-focus \
-         /usr/libexec/tuna-core-apps-install \
          /usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token \
     && printf 'TUNA_COMPOSITOR_STATE=/run/user/%s/tuna-vm-state.json\nTUNA_LOCK_TRACE=1\nTUNA_POINTER_TRACE=1\n' \
          "$(id -u tuna-test)" > /usr/share/tuna-vm/environment.conf \
@@ -115,11 +107,6 @@ RUN mkdir -p /usr/share/tuna-vm \
     && systemctl add-wants multi-user.target qemu-guest-agent.service \
     && sha256sum --check /usr/share/tuna-vm/shipped-payload.sha256 \
     && pacman -Q > /usr/share/tuna-vm/fixture-packages.txt
-
-# Optional current-build DEV fixture only: normal native apps/dependencies and
-# an explicitly ordinary nonroot primary-admin account. Default lifecycle rows
-# retain the original standard-user fixture; no shipping image is enlarged.
-RUN if [ "$CORE_APPS" = 1 ]; then TUNA_CI_ONLY=1 TUNA_SOURCE_COMMIT="$CORE_APPS_SOURCE_COMMIT" /usr/libexec/tuna-core-apps-install; fi
 
 LABEL org.opencontainers.image.title="marlin-tuna-vm-lane" \
       org.opencontainers.image.description="CI-only Marlin Tuna Desktop test layer: stock GDM with tunaOS's tuna-flavor login path, real lifecycle probes, journal on serial"

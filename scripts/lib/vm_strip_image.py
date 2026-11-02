@@ -4,6 +4,24 @@ import json
 from pathlib import Path
 import re
 
+def fixture_members(fixture):
+    """Fixed source observers required by this branch's native consumer."""
+    if fixture == 'lifecycle':
+        return {}
+    if fixture != 'core-apps':
+        raise ValueError('unknown native image fixture')
+    members = {
+        '/usr/libexec/tuna-core-apps-install': 'packaging/marlin/vm-lane/tuna-core-apps-install',
+        '/usr/libexec/tuna-geoclue-agent-policy': 'packaging/marlin/tuna-geoclue-agent-policy',
+        '/usr/libexec/tuna-native-session/native_session.py':
+            'packaging/marlin/vm-lane/tuna-native-session/native_session.py'}
+    for name in ('guest', 'native', 'basic', 'data', 'media', 'system', 'web',
+                 'autotz', 'geoclue_fixture'):
+        members['/usr/libexec/tuna-core-apps/' + name + '.py'] = (
+            'packaging/marlin/vm-lane/core-apps/' + name + '.py')
+    return members
+
+
 
 def canonical_image_id(observed):
     """Canonicalize Podman's full image ID without admitting tags or short IDs."""
@@ -12,7 +30,7 @@ def canonical_image_id(observed):
     return observed if observed.startswith('sha256:') else 'sha256:' + observed
 
 
-def admission(package, observed, root, commit, image_id, base_image):
+def admission(package, observed, root, commit, image_id, base_image, *, fixture='lifecycle'):
     if not re.fullmatch(r'[0-9a-f]{40}', commit):
         raise ValueError('exact source commit missing')
     if not re.fullmatch(r'sha256:[0-9a-f]{64}', image_id):
@@ -26,6 +44,8 @@ def admission(package, observed, root, commit, image_id, base_image):
     for name in ('tuna-vm-input', 'tuna-vm-lifecycle'):
         path = Path(root) / 'packaging/marlin/vm-lane' / name
         expected['/usr/libexec/' + name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    for installed, source in fixture_members(fixture).items():
+        expected[installed] = hashlib.sha256((Path(root) / source).read_bytes()).hexdigest()
     if observed.get('member_sha256') != expected:
         raise ValueError('final image installed executables differ from package/source bytes')
     digest = package['package']['sha256']
@@ -40,9 +60,7 @@ def admission(package, observed, root, commit, image_id, base_image):
 
 # Executed inside the final immutable image by the existing CI job. No host
 # filesystem mounts, guest configuration changes, or credentials are required.
-IMAGE_INSPECTION = '''import hashlib,json,os,stat,sys
-names=["/usr/bin/tuna-"+n for n in ("compositor","session","shell-host","shell-gtk","ibus-bridge")]+["/usr/libexec/tuna-vm-input","/usr/libexec/tuna-vm-lifecycle"]
-result={}
+_INSPECTION_BODY = '''result={}
 for name in names:
  fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW)
  try:
@@ -59,3 +77,11 @@ for name in names:
  finally: os.close(fd)
 print(json.dumps({"schema":1,"image_id":sys.argv[1],"member_sha256":result}))
 '''
+
+
+def inspection_program(fixture='lifecycle'):
+    names = ['/usr/bin/tuna-' + name for name in
+             ('compositor', 'session', 'shell-host', 'shell-gtk', 'ibus-bridge')]
+    names += ['/usr/libexec/tuna-vm-input', '/usr/libexec/tuna-vm-lifecycle']
+    names += list(fixture_members(fixture))
+    return 'import hashlib,json,os,stat,sys\nnames=' + repr(names) + '\n' + _INSPECTION_BODY

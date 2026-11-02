@@ -14,7 +14,7 @@ types the fixture password exactly as the published-flavor nightly does
 (`V-GREETER-LIST`, `V-GDM-FALLBACK`, `V-GDM-LOGIN`;
 `docs/marlin-tuna-nightly.md`), from the same `scripts/tuna-vm-lane` code.
 Logout must return to that GDM greeter. This changes neither the shipped
-preview image nor the number of CI VM profiles. GDM's session worker opens a
+preview image nor the two ordinary lifecycle profiles. GDM's session worker opens a
 journal stream for `gdm-wayland-session`, which the fixture forwards to the
 serial port. The fixture's session environment comes from `environment.d`,
 which gdm-wayland-session imports from the user manager; the per-login Orca
@@ -22,6 +22,48 @@ test secret comes from a user environment generator.
 The ordinary CLI profile is `--profile lifecycle` (the default); its two
 matrix members keep their original distribution/upstream51 Orca contracts
 and `marlin-vm`/`marlin-vm-orca51` artifact identities.
+
+## Required native Core applications
+
+Whenever `marlin-vm` is selected, its matrix also requires `native-core-apps`,
+using the original same-run `arch-package` producer. This branch exposes only
+`--profile lifecycle` and `--profile core-apps`: it has no Colour, protocol or
+reference-pair dependency. Full Core does not gate the independently routed
+native AutoTZ clock branch.
+
+The Core row adds `Containerfile.core-apps` after the ordinary fixture layer.
+Only that layer installs all 28 original applications and their full domain
+dependencies through the guarded installer, with `CORE_APPS=1` and the actual
+`CORE_APPS_SOURCE_COMMIT`. The installer records the standard UID1000 account
+baseline and the preboot addition of only `wheel`; it adds no polkit rules.
+The two lifecycle/Orca rows retain their standard account, five pristine boots,
+default GPU, feature tour, fresh-account journeys and aggregate gates.
+Normal preview installation still invokes the packaged GeoClue policy helper
+after package installation, before the fixtures are layered.
+
+Core requires `--require-kvm --boots 1 --strip-image …`, without a tour,
+published-image mode, fresh-account journey or soak. Before QEMU starts the
+host generates one nonce and one new blank 512 MiB removable USB disk with
+serial `TC397-<nonce[:14]>`; the complete Core consumer receives that same
+nonce. Original system disks and default devices are unchanged.
+
+Final immutable-image inspection admits the original package ELFs, lifecycle
+and input helpers, all nine Core guest modules, the guarded installer, packaged
+GeoClue policy helper and native-session observer against exact executing
+source hashes. The actual stock-GDM, nonroot session and original running ELFs,
+installed observer bytes and installer source receipt must agree before real
+domain operations qualify. Root dispatch accepts the existing fixed
+`core-apps DOMAIN OPERATION JSON` API; diagnostics expose only bounded,
+sanitized operation/type/site records. QGA acquisition and execution share
+finite absolute deadlines; uncertain child retirement is never replayed.
+
+`V-CORE-APPS` passes only after the entire unchanged 28-application consumer
+and owned-fixture cleanup complete. A missing run or any failed domain is
+fatal and reaches the existing aggregate CI gate. Receipts and frames live
+under `vm-lane-artifacts/core-apps/`. This is DEV same-run package/image/source
+admission, not signed-release qualification or a claim of native runtime
+success; the real admitted Core run remains required.
+
 
 ## Record-free fresh accounts (tunaOS#4092)
 
