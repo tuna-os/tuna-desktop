@@ -11,6 +11,22 @@ and on GitHub-hosted runners for forks; the steps and assertions are the
 same on both. See [CI runners](ci-runners.md) for what runs where and the
 switch back to GitHub-hosted runners.
 
+## Slideshow paint identities
+
+`/usr/bin/python3 scripts/tests/test_stock_slideshow_proof.py` exercises the
+stock slideshow proof's deadline and receipt boundaries. Paint receipts
+carry structured file identities: canonical path, device/inode/size,
+mtime/ctime pairs and the cached 32-byte SHA-256 digest. The consumer
+checks live regular-file metadata and content, including metadata before
+and after reading and the path's final identity. It does not parse Rust
+`Debug` output or accept metadata-only identity after the bytes change.
+
+The real `portal-security` slideshow journey remains required: original
+session ownership, the independent GNOME reference, naturally advancing
+static/blend phases, cycle wrap, restart, and every timing and pixel
+threshold are unchanged. Boundary tests are not graphical qualification.
+
+
 ## Which lanes a pull request runs
 
 Every push to `main`, the nightly schedule and `workflow_dispatch` run

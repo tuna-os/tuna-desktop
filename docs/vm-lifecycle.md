@@ -45,6 +45,13 @@ comparison is retained. This control exercises the recovery path even when
 the updater happens to show no banner; it shares the same capture deadline
 and still requires every original PNG and PPM color sample afterward.
 
+Close readiness uses GTK4's actual AT-SPI state mapping: an interactive
+control advertises `SENSITIVE`, the inverse of its `DISABLED` accessibility
+state. GTK4 does not advertise `ENABLED`; requiring that additional bit
+would reject a genuinely focused, interactive button. Both observed bits
+remain in the receipt, but disabled controls remain ineligible. See the
+[GTK4 state mapping](https://github.com/GNOME/gtk/blob/main/gtk/a11y/gtkatspicontext.c).
+
 ## Record-free fresh accounts (tunaOS#4092)
 
 `tuna-test` above has a session-less AccountsService record, so it proves

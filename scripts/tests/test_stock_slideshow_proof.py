@@ -5,14 +5,17 @@ XML slideshow proof (360).
 wait_for/budget nest by tightening (a nested wait can never extend
 its parent), slow-true predicates fail instead of passing late, and
 every accepted paint record is typed, ranged and provenance-bound:
-exact source URI, generation epoch prefix, live stat cross-check of
-parsed FileIdentity dev/ino/size/mtime/ctime, duplicate-free source
+exact source URI, generation epoch prefix, live stat and content-hash
+cross-check of structured file identities, duplicate-free source
 references, and the exact 1280x800@1.0 producer viewport.
 
 Runs without a compositor/gi/pyatspi: the pure functions are
 AST-extracted from the proof script into a stub namespace.
 """
 import ast
+import hashlib
+import os
+import stat
 import tempfile
 import time
 import unittest
@@ -23,7 +26,7 @@ PROOF = ROOT / 'scripts' / 'lib' / 'tuna-stock-slideshow-proof.py'
 
 WANT_FUNCS = {'wait_for', 'budget', 'check_paint', 'check_file_identity',
               'is_plain_int'}
-WANT_GLOBALS = ('_ACTIVE_END', '_FILE_IDENTITY', 'SHOT_W', 'SHOT_H')
+WANT_GLOBALS = ('_ACTIVE_END', 'SHOT_W', 'SHOT_H')
 
 
 def load_proof(tmp):
@@ -48,7 +51,7 @@ def load_proof(tmp):
     out = Path(tmp)
     ns = {'time': time, 'math': __import__('math'), 're': __import__('re'),
           'json': __import__('json'), 'subprocess': __import__('subprocess'),
-          'Path': Path, 'OUT': out,
+          'hashlib': hashlib, 'os': os, 'stat': stat, 'Path': Path, 'OUT': out,
           'XML': {'light': out / 'light-timeline.xml',
                   'dark': out / 'dark-timeline.xml'},
           'COLORS': {'light-a': (240, 0, 0), 'light-b': (0, 0, 240)},
@@ -59,18 +62,18 @@ def load_proof(tmp):
 
 def identity_of(path):
     st = Path(path).stat()
-    mt, ct = st.st_mtime_ns, st.st_ctime_ns
-    return (f'Some(FileIdentity {{ path: "{path}", dev: {st.st_dev}, '
-            f'ino: {st.st_ino}, bytes: {st.st_size}, '
-            f'modified: ({mt // 1_000_000_000}, {mt % 1_000_000_000}), '
-            f'changed: ({ct // 1_000_000_000}, {ct % 1_000_000_000}) }})')
+    return {'path': str(path),
+            'metadata': {'dev': st.st_dev, 'ino': st.st_ino, 'bytes': st.st_size,
+                         'modified': list(divmod(st.st_mtime_ns, 1_000_000_000)),
+                         'changed': list(divmod(st.st_ctime_ns, 1_000_000_000))},
+            'sha256': list(hashlib.sha256(Path(path).read_bytes()).digest())}
 
 
 def stale_identity_of(path):
-    st = Path(path).stat()
-    return (f'Some(FileIdentity {{ path: "{path}", dev: {st.st_dev}, '
-            f'ino: {st.st_ino}, bytes: {st.st_size}, '
-            f'modified: (1, 2), changed: (3, 4) }})')
+    identity = identity_of(path)
+    identity['metadata']['modified'] = [1, 2]
+    identity['metadata']['changed'] = [3, 4]
+    return identity
 
 
 class DeadlineDiscipline(unittest.TestCase):
@@ -231,7 +234,7 @@ class PaintReceipt(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.check(paint, fixed=True)
         paint = self.good_paint()
-        paint['root_identity'] = 'None'
+        paint['root_identity'] = None
         with self.assertRaises(RuntimeError):
             self.check(paint, fixed=True)
 
@@ -249,15 +252,40 @@ class PaintReceipt(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.check(paint, fixed=True)
         paint = self.good_paint()
-        tampered = identity_of(self.frames['light-a']).replace(
-            f'ino: {Path(self.frames["light-a"]).stat().st_ino}',
-            'ino: 999999999')
+        tampered = identity_of(self.frames['light-a'])
+        tampered['metadata']['ino'] = 999999999
         paint['source_identities'] = [
             {'path': frm, 'identity': tampered},
             {'path': self.frames['light-b'],
              'identity': identity_of(self.frames['light-b'])}]
         with self.assertRaises(RuntimeError):
             self.check(paint, fixed=True)
+
+    def test_content_hash_rejects_changed_bytes_with_current_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source.png'
+            source.write_bytes(b'first image')
+            previous_digest = identity_of(source)['sha256']
+            source.write_bytes(b'other image')
+            current = identity_of(source)
+            current['sha256'] = previous_digest
+            with self.assertRaises(RuntimeError):
+                self.ns['check_file_identity'](current, 'source', str(source))
+
+    def test_hash_and_metadata_require_typed_complete_identities(self):
+        for digest in (None, [], [0] * 31, [True] * 32, [256] * 32):
+            with self.subTest(digest=digest):
+                paint = self.good_paint()
+                paint['root_identity']['sha256'] = digest
+                with self.assertRaises(RuntimeError):
+                    self.check(paint)
+        for key, value in (('dev', True), ('ino', -1), ('bytes', '130'),
+                           ('modified', [1, True]), ('changed', [1, 1_000_000_000])):
+            with self.subTest(key=key, value=value):
+                paint = self.good_paint()
+                paint['root_identity']['metadata'][key] = value
+                with self.assertRaises(RuntimeError):
+                    self.check(paint)
 
     def test_reference_list_shape_and_duplicates(self):
         with self.assertRaises(RuntimeError):

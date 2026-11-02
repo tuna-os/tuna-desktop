@@ -272,8 +272,10 @@ def observe(pid, ticks, executable, display, controlled=False, end_session=False
                 if (role, name) in {("frame", "Notifications"), ("push button", "Close")}:
                     record = {"label": name, "role": role, "focused": bool(focused), "active": bool(active)}
                     if role == "push button":
-                        record["ready"] = bool(focused and states.contains(Atspi.StateType.SENSITIVE)
-                                               and states.contains(Atspi.StateType.ENABLED))
+                        record["sensitive"] = bool(states.contains(Atspi.StateType.SENSITIVE))
+                        record["enabled_state"] = bool(states.contains(Atspi.StateType.ENABLED))
+                        # GTK4 maps !DISABLED to SENSITIVE; it does not emit ENABLED.
+                        record["ready"] = bool(focused and record["sensitive"])
             else:
                 record = public_node(name, role, showing, focused, active, end_session)
             if record is not None:

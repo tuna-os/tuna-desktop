@@ -525,8 +525,8 @@ impl Wallpaper {
             let paint_record = paint.animation.as_ref().map(|(sample,references)| serde_json::json!({
                 "sample_wall": sample.wall, "progress": sample.progress, "interval": sample.interval,
                 "from": sample.from, "to": sample.to, "slide": sample.slide,
-                "generation": epoch, "source_uri": paint.uri, "root_identity": format!("{:?}",paint.identity),
-                "source_identities": references.iter().map(|(path,id)| serde_json::json!({"path":path.to_string_lossy(),"identity":format!("{id:?}")})).collect::<Vec<_>>(), "geometry": {"physical":geometry.physical,
+                "generation": epoch, "source_uri": paint.uri, "root_identity": paint.identity,
+                "source_identities": references.iter().map(|(path,id)| serde_json::json!({"path":path.to_string_lossy(),"identity":id})).collect::<Vec<_>>(), "geometry": {"physical":geometry.physical,
                     "origin":geometry.origin,"desktop":geometry.desktop,"scale":geometry.scale()},
             }));
             let job = paint;
@@ -1285,7 +1285,7 @@ fn card_placement(
     (at.into(), Some(size.into()))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 struct FileMetadata {
     dev: u64,
     ino: u64,
@@ -1314,6 +1314,17 @@ struct FileIdentity {
     metadata: FileMetadata,
     sha256: [u8; 32],
 }
+impl serde::Serialize for FileIdentity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut record = serializer.serialize_struct("FileIdentity", 3)?;
+        record.serialize_field("path", &self.path.to_string_lossy())?;
+        record.serialize_field("metadata", &self.metadata)?;
+        record.serialize_field("sha256", &self.sha256)?;
+        record.end()
+    }
+}
+
 impl FileIdentity {
     fn for_uri(uri: &str) -> Option<Self> {
         Self::for_path(&wallpaper_uri_to_path(uri)?)
