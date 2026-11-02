@@ -332,10 +332,16 @@ def _configuration(session):
     try:
         policies = {app: _policy(effective, app) for app in _APPS}
         sources = {source: _source(effective, source) for source in _SOURCES}
+        agents = [entry.strip() for entry in effective.get("agent", "whitelist", fallback="").split(";")
+                  if entry.strip()]
     except (configparser.Error, ValueError):
         raise RuntimeError("invalid effective GeoClue configuration values") from None
     return {"main_package": main_package, "files": files,
-            "application_policy": policies, "source_coverage": sources}
+            "application_policy": policies, "source_coverage": sources,
+            "agent_admission": {"agent_id": "tuna-shell", "effective_whitelist": agents,
+                                "admitted": "tuna-shell" in agents,
+                                "gnome_identity_spoofed": False,
+                                "fixture_changes_agent_or_application_policy": False}}
 
 
 def _executable(session, path):
@@ -550,6 +556,10 @@ def prepare(context):
             if session.conf_path.exists() or session.conf_path.is_symlink():
                 raise RuntimeError("unowned same-nonce GeoClue source configuration already exists")
             original = _observation(session)
+            admission = original["configuration"]["agent_admission"]
+            if admission["admitted"] is not True:
+                raise RuntimeError("effective original image GeoClue policy does not admit tuna-shell; "
+                                   "fixture will not change the agent whitelist or spoof gnome-shell")
             location = _read_file(_LOCATION, absent=True)
             if _file_receipt(_LOCATION, location) != original["geolocation"]:
                 raise RuntimeError("original geolocation changed before durable backup")

@@ -344,6 +344,18 @@ def _mapped_libraries(context, gsd):
         with path.open('rb') as stream:
             if stream.read(4) != b'\x7fELF':
                 raise RuntimeError('mapped datetime dependency is not ELF: ' + filename)
+        if mapping['component'] == 'geocode_glib':
+            # Record the real mapped backend's default; never redirect the
+            # daemon to an observer-owned reverse-geocode provider.
+            import mmap
+            with path.open('rb') as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as code:
+                if code.find(b'https://nominatim.gnome.org\0') < 0:
+                    raise RuntimeError('actual mapped geocode default provider was not identified')
+            mapping['default_reverse_backend'] = {
+                'base_url': 'https://nominatim.gnome.org',
+                'source': 'literal in original mapped packaged GeocodeNominatim ELF',
+                'provider_overridden': False,
+                'scope': 'backend-provenance-not-a-substitute-for-original-daemon-outcome'}
         ownership = _command(context, ['pacman', '-Qqo', filename])
         package = ownership.stdout.strip()
         if re.fullmatch(r'[A-Za-z0-9@._+-]+', package) is None:
@@ -374,12 +386,12 @@ def _mapped_libraries(context, gsd):
 
 
 def _location_agent_registration(context, identity):
-    pattern = r'^tuna-shell-gtk: location agent (not registered|interface|object):'
+    pattern = r'^tuna-shell-gtk: location agent (registered|not registered|interface|object):'
     pid = identity['shell']['pid']
     argv = ['journalctl', '-b', '_PID=' + str(pid), '--grep=' + pattern,
             '--output=json', '--no-pager', '-n20']
     receipt = {'command': {'argv': argv}, 'records': [],
-               'interpretation': 'Matching records are observed registration errors; absence is not registration success.'}
+               'interpretation': 'Only the actual successful AddAgent completion record establishes registration.'}
     try:
         observed = context.command(argv, timeout=5, check=False)
     except subprocess.TimeoutExpired as error:
@@ -395,13 +407,118 @@ def _location_agent_registration(context, identity):
             if (not isinstance(message, str) or re.match(pattern, message) is None
                     or row['_PID'] != str(pid)
                     or row['_BOOT_ID'] != identity['boot_id'].replace('-', '')):
-                raise ValueError('journal record is not the exact original-shell boot/PID/error prefix')
+                raise ValueError('journal record is not the exact original-shell boot/PID/registration prefix')
             receipt['records'].append({key: row[key] for key in
                                        ('MESSAGE', '__MONOTONIC_TIMESTAMP', '_BOOT_ID', '_PID')})
         except (ValueError, KeyError, TypeError) as error:
             receipt['error'] = 'registration journal evidence malformed: ' + str(error)
             break
+    Gio, _ = _gio()
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    names = _call(bus, 'org.freedesktop.DBus', '/org/freedesktop/DBus',
+                  'org.freedesktop.DBus', 'ListNames', reply='(as)')[0]
+    exports = []
+    for name in names:
+        if not name.startswith(':'):
+            continue
+        try:
+            owner_pid = _daemon(bus, 'GetConnectionUnixProcessID', name, '(u)')
+            owner_uid = _daemon(bus, 'GetConnectionUnixUser', name, '(u)')
+        except Exception:
+            # Unrelated connections can depart between ListNames and lookup.
+            continue
+        if (owner_pid, owner_uid) != (pid, identity['uid']):
+            continue
+        values = _call(bus, name, '/org/freedesktop/GeoClue2/Agent',
+                       'org.freedesktop.DBus.Properties', 'GetAll', '(s)',
+                       ('org.freedesktop.GeoClue2.Agent',), '(a{sv})')[0]
+        accuracy = values.get('MaxAccuracyLevel')
+        if type(accuracy) is not int or accuracy not in (0, 1, 4, 5, 6, 8):
+            raise RuntimeError('original shell GeoClue agent accuracy property malformed')
+        exports.append({'unique_owner': name, 'pid': owner_pid, 'uid': owner_uid,
+                        'max_accuracy_level': accuracy})
+    if len(exports) != 1:
+        raise RuntimeError('original shell GeoClue Agent export not unique/reachable')
+    receipt['original_shell_agent_export'] = exports[0]
+    receipt['registration_success_inferred_from_error_absence'] = False
+    receipt['registered'] = (observed.returncode == 0 and 'error' not in receipt
+                             and bool(receipt['records'])
+                             and receipt['records'][-1]['MESSAGE']
+                             == 'tuna-shell-gtk: location agent registered: tuna-shell')
     return receipt
+
+
+def _monitor_liveness(monitor, readiness, *, expected_uid=0):
+    """Check the original process and the acknowledged, nonrenewable interval."""
+    if not isinstance(readiness, dict) or readiness.get('ready') is not True:
+        raise RuntimeError('owned monitor readiness is missing or unacknowledged')
+    for key in ('pid', 'start_ticks', 'exe', 'exe_device', 'exe_inode',
+                'argv', 'nonce', 'boot_id'):
+        if readiness.get(key) != monitor.get(key) or monitor.get(key) is None:
+            raise RuntimeError('owned monitor readiness identity differs: ' + key)
+    if (monitor.get('stopped') or monitor.get('lifetime_seconds') != MONITOR_SECONDS
+            or readiness.get('lifetime_seconds') != MONITOR_SECONDS):
+        raise RuntimeError('owned monitor is retired or its fixed lifetime differs')
+    now = time.monotonic()
+    launch = monitor.get('launch_monotonic')
+    start = readiness.get('started_monotonic')
+    acknowledged = readiness.get('monotonic')
+    deadline = readiness.get('deadline_monotonic')
+    if (any(type(value) not in (int, float) for value in (launch, start, acknowledged, deadline))
+            or not launch <= start <= acknowledged <= now < deadline
+            or not deadline <= start + MONITOR_SECONDS - 1
+            or not deadline <= launch + MONITOR_SECONDS):
+        raise RuntimeError('owned monitor admitted observation deadline is expired or invalid')
+    descriptor = os.pidfd_open(monitor['pid'])
+    try:
+        poller = select.poll()
+        poller.register(descriptor, select.POLLIN)
+        actual = _proc_identity(monitor['pid'])
+        if actual['state'] in ('Z', 'X') or actual['uid'] != expected_uid:
+            raise RuntimeError('original owned monitor is not live under its admitted UID')
+        for key in ('pid', 'start_ticks', 'exe', 'exe_device', 'exe_inode', 'argv'):
+            if actual[key] != monitor[key]:
+                raise RuntimeError('original owned monitor process identity differs: ' + key)
+        checked = time.monotonic()
+        if poller.poll(0) or checked >= deadline:
+            raise RuntimeError('original owned monitor exited or expired during liveness observation')
+    finally:
+        os.close(descriptor)
+    return {'process': actual, 'checked_monotonic': checked,
+            'started_monotonic': start, 'deadline_monotonic': deadline}
+
+
+def _require_live_monitor(monitor):
+    if monitor is None or monitor.get('ready') is not True or monitor.get('live') is not True:
+        raise RuntimeError('automatic-timezone observation unevaluable: original monitor is not live: ' +
+                           json.dumps(monitor))
+
+
+def _monitor_status(directory, state):
+    monitor = state.get('monitor')
+    if monitor is None:
+        return None
+    result = dict(monitor)
+    result['ready'] = False
+    result['live'] = False
+    if (directory / 'ready.json').exists():
+        result['readiness'] = _read_json(directory / 'ready.json')
+    if (directory / 'monitor-error.json').exists():
+        result['error'] = _read_json(directory / 'monitor-error.json')
+    if (directory / 'monitor-ended.json').exists():
+        result['ended'] = _read_json(directory / 'monitor-ended.json')
+    try:
+        if (monitor.get('nonce') != state['nonce'] or monitor.get('boot_id') != state['boot_id']
+                or monitor.get('argv', [])[-2:] != ['--monitor', state['nonce']]):
+            raise RuntimeError('original monitor belongs to another boot/run/nonce')
+        if 'error' in result or 'ended' in result:
+            raise RuntimeError('owned monitor has failed or ended')
+        result['liveness'] = _monitor_liveness(monitor, result.get('readiness'))
+        result['ready'] = True
+        result['live'] = True
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+        result['unevaluable_reason'] = str(error)
+    return result
 
 
 def _calls(directory, state):
@@ -423,24 +540,22 @@ def _calls(directory, state):
                 if record['boot_id'] != state['boot_id'] or record['nonce'] != state['nonce']:
                     raise RuntimeError('monitor log belongs to another boot/run')
                 calls.append(record)
-    result = dict(monitor)
-    if (directory / 'ready.json').exists():
-        result['readiness'] = _read_json(directory / 'ready.json')
-        result['ready'] = result['readiness'].get('ready') is True
-    else:
-        result['ready'] = False
-    if (directory / 'monitor-error.json').exists():
-        result['error'] = _read_json(directory / 'monitor-error.json')
-    if (directory / 'monitor-ended.json').exists():
-        result['ended'] = _read_json(directory / 'monitor-ended.json')
+    result = _monitor_status(directory, state)
+    if result['live']:
+        interval = result['liveness']
+        for call in calls:
+            if (type(call.get('monotonic')) not in (int, float)
+                    or not interval['started_monotonic'] <= call['monotonic']
+                    <= interval['checked_monotonic'] < interval['deadline_monotonic']):
+                raise RuntimeError('SetTimezone observation lies outside the admitted live interval')
     return calls, result
 
 
 def _merge_geoclue_observation(geoclue, directory, state, monitor, restoration=False):
     if monitor is None:
         return geoclue
-    if monitor.get('error') and not restoration:
-        raise RuntimeError('owned passive timezone/GeoClue monitor failed: ' + json.dumps(monitor['error']))
+    if not restoration:
+        _require_live_monitor(monitor)
     ready = monitor.get('readiness', {})
     expected_service = ready.get('geoclue_service')
     if not restoration and expected_service is not None and geoclue.get('service') != expected_service:
@@ -463,15 +578,27 @@ def _merge_geoclue_observation(geoclue, directory, state, monitor, restoration=F
                         or event['gsd_uid'] != state['gsd']['uid']):
                     raise RuntimeError('passive GeoClue evidence belongs to another service/process/run')
                 events.append(event)
+    # Passive replies describe what the exact client owner observed in this
+    # interval. They are never a root-authorized read of current private state.
+    geoclue['historical_observation_events'] = events
     if restoration:
-        geoclue['historical_observation_events'] = events
         return geoclue
-    geoclue['observation_events'] = events
-    if events:
-        observed = {row['path']: row for row in geoclue['clients']}
-        for row in events[-1]['clients']:
-            observed[row['path']] = row
-        geoclue['clients'] = list(observed.values())
+    monitor = _monitor_status(directory, state)
+    _require_live_monitor(monitor)
+    liveness = monitor['liveness']
+    start, deadline = liveness['started_monotonic'], liveness['deadline_monotonic']
+    acknowledged = ready['monotonic']
+    for event in events:
+        if (type(event.get('monotonic')) not in (int, float)
+                or not start <= event['monotonic'] <= liveness['checked_monotonic'] < deadline):
+            raise RuntimeError('passive GeoClue event lies outside the admitted live interval')
+    geoclue['interval_observation'] = {
+        'source': 'passive-original-gsd-system-bus',
+        'semantics': 'observed-within-interval-not-current-properties',
+        'started_monotonic': start, 'acknowledged_monotonic': acknowledged,
+        'deadline_monotonic': deadline,
+        'observed_through_monotonic': liveness['checked_monotonic'],
+        'events': events, 'clients': events[-1]['clients'] if events else []}
     return geoclue
 
 
@@ -483,26 +610,39 @@ def _snapshot(context, directory=None, state=None, restoration=False):
         if actual_gsd != state['gsd']:
             raise RuntimeError('original datetime unit PID/start/executable/bus owner changed')
     calls, monitor = _calls(directory, state) if state is not None else ([], None)
+    if state is not None and 'monitor' in state and not restoration:
+        _require_live_monitor(monitor)
     shell = context.identity()
     geoclue = _geoclue(bus)
     if state is not None:
         geoclue = _merge_geoclue_observation(geoclue, directory, state, monitor, restoration=restoration)
-    return {'identity': shell, 'settings': _settings(context), 'timedate': _timedate(bus),
-            'phase': 'restoration' if restoration else 'observation',
-            'gsd': actual_gsd, 'geoclue': geoclue,
-            'mapped_libraries': _mapped_libraries(context, actual_gsd),
-            'location_agent_registration': _location_agent_registration(context, shell),
-            'clock': {'source': 'actual native shell process; rendering observed separately by host AT-SPI',
-                      'process': shell['shell'], 'timezone_file': '/etc/localtime'},
-            'source_packages': _sources(context), 'timezone_calls': calls, 'monitor': monitor,
-            'commands': list(state.get('commands', [])) if state else []}
+    result = {'identity': shell, 'settings': _settings(context), 'timedate': _timedate(bus),
+              'phase': 'restoration' if restoration else 'observation',
+              'gsd': actual_gsd, 'geoclue': geoclue,
+              'mapped_libraries': _mapped_libraries(context, actual_gsd),
+              'location_agent_registration': _location_agent_registration(context, shell),
+              'clock': {'source': 'actual native shell process; rendering observed separately by host AT-SPI',
+                        'process': shell['shell'], 'timezone_file': '/etc/localtime'},
+              'source_packages': _sources(context), 'timezone_calls': calls, 'monitor': monitor,
+              'commands': list(state.get('commands', [])) if state else []}
+    if restoration:
+        result['historical_timezone_calls'] = result.pop('timezone_calls')
+    elif state is not None and 'monitor' in state:
+        # Slow package/service observations must not return a stale ready pass.
+        result['monitor'] = _monitor_status(directory, state)
+        _require_live_monitor(result['monitor'])
+    return result
 
 
 def _proc_identity(pid):
     root = Path('/proc') / str(pid)
     fields = (root / 'stat').read_text().rsplit(')', 1)[1].split()
+    executable = None if fields[0] in ('Z', 'X') else (root / 'exe').stat()
     return {'pid': pid, 'start_ticks': int(fields[19]), 'state': fields[0],
             'uid': root.stat().st_uid,
+            'exe': os.readlink(root / 'exe') if executable is not None else None,
+            'exe_device': executable.st_dev if executable is not None else None,
+            'exe_inode': executable.st_ino if executable is not None else None,
             'argv': [word.decode() for word in (root / 'cmdline').read_bytes().split(b'\0') if word]}
 
 
@@ -531,8 +671,9 @@ def _stop_monitor(directory, state):
             return
         if actual['start_ticks'] != monitor['start_ticks'] or actual['uid'] != 0:
             raise RuntimeError('refusing to signal reused/foreign monitor PID')
-        if actual['state'] != 'Z' and actual['argv'] != monitor['argv']:
-            raise RuntimeError('refusing to signal monitor with foreign nonce/argv')
+        if actual['state'] != 'Z' and any(
+                actual[key] != monitor[key] for key in ('argv', 'exe', 'exe_device', 'exe_inode')):
+            raise RuntimeError('refusing to signal monitor with foreign nonce/argv/executable')
         if actual['state'] != 'Z':
             try:
                 signal.pidfd_send_signal(descriptor, signal.SIGTERM)
@@ -560,13 +701,16 @@ def _watch_start(context, directory, state):
                      os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     process = None
     try:
+        launch = time.monotonic()
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
                                    close_fds=True, start_new_session=True)
         actual = _proc_identity(process.pid)
-        state['monitor'] = {'pid': process.pid, 'start_ticks': actual['start_ticks'],
-                            'argv': argv, 'nonce': context.nonce, 'boot_id': _boot(),
-                            'lifetime_seconds': MONITOR_SECONDS, 'log': str(directory / 'calls.jsonl'),
-                            'ready_path': str(directory / 'ready.json')}
+        state['monitor'] = {
+            key: actual[key] for key in ('pid', 'start_ticks', 'exe', 'exe_device', 'exe_inode')}
+        state['monitor'].update(
+            argv=argv, nonce=context.nonce, boot_id=_boot(), launch_monotonic=launch,
+            lifetime_seconds=MONITOR_SECONDS, log=str(directory / 'calls.jsonl'),
+            ready_path=str(directory / 'ready.json'))
         _persist(directory, state)
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
@@ -759,13 +903,15 @@ def _monitor(nonce):
                     if path != GEO_PATH + '/Manager' or member not in ('GetClient', 'CreateClient'):
                         return GLib.SOURCE_REMOVE
                 elif interface == 'org.freedesktop.GeoClue2.Client':
-                    if path not in clients or member not in ('Start', 'Stop'):
+                    if (path not in clients or clients[path]['owner_bus_name'] != sender
+                            or member not in ('Start', 'Stop')):
                         return GLib.SOURCE_REMOVE
                 elif interface == 'org.freedesktop.DBus.Properties':
                     target = values[0] if values else None
                     if target not in ('org.freedesktop.GeoClue2.Client', 'org.freedesktop.GeoClue2.Location'):
                         return GLib.SOURCE_REMOVE
-                    if target.endswith('.Client') and path not in clients:
+                    if target.endswith('.Client') and (
+                            path not in clients or clients[path]['owner_bus_name'] != sender):
                         return GLib.SOURCE_REMOVE
                     if target.endswith('.Location'):
                         bound_clients = location_clients.get(path, set())
@@ -814,7 +960,8 @@ def _monitor(nonce):
                         'requested_accuracy_level': None, 'location': None,
                         'owner_bus_name': destination, 'owner_pid': state['gsd']['pid'],
                         'owner_uid': state['gsd']['uid'],
-                        'evidence_source': 'passive-original-gsd-system-bus'}
+                        'evidence_source': 'passive-original-gsd-system-bus',
+                        'observation_semantics': 'observed-within-interval-not-current-properties'}
                     details['client_path'] = client_path
                 elif method in ('Start', 'Stop'):
                     if values:
@@ -897,30 +1044,38 @@ def _monitor(nonce):
               'org.freedesktop.DBus.Monitoring', 'BecomeMonitor', '(asu)', (rules, 0), '()')
         # call_sync has returned the daemon's acknowledgement, not merely queued a request.
         actual = _proc_identity(os.getpid())
+        admitted_deadline = absolute_start + MONITOR_SECONDS - 1
         _write_json(directory / 'ready.json',
-                    {'ready': True, 'pid': os.getpid(), 'start_ticks': actual['start_ticks'],
-                     'nonce': nonce, 'boot_id': state['boot_id'], 'rules': rules,
+                    {key: actual[key] for key in
+                     ('pid', 'start_ticks', 'exe', 'exe_device', 'exe_inode', 'argv')} |
+                    {'ready': True, 'nonce': nonce, 'boot_id': state['boot_id'], 'rules': rules,
                      'epoch': time.time(), 'monotonic': time.monotonic(),
+                     'started_monotonic': absolute_start, 'deadline_monotonic': admitted_deadline,
                      'lifetime_seconds': MONITOR_SECONDS, 'service': service,
                      'geoclue_service': geo_service}, exclusive=True)
 
         def finish():
+            _write_json(directory / 'monitor-ended.json',
+                        {'pid': os.getpid(), 'nonce': nonce, 'boot_id': state['boot_id'],
+                         'epoch': time.time(), 'monotonic': time.monotonic()})
             loop.quit()
             return GLib.SOURCE_REMOVE
 
-        remaining = MONITOR_SECONDS - 1 - (time.monotonic() - absolute_start)
+        remaining = admitted_deadline - time.monotonic()
         GLib.timeout_add(max(1, int(remaining * 1000)), finish)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, finish)
-        monitor.connect('closed', lambda *unused: loop.quit())
+        monitor.connect('closed', lambda *unused: finish())
         loop.run()
     finally:
+        # Publish retirement before closing connections/descriptors; even a
+        # still-running process in teardown is no longer an observation source.
+        _write_json(directory / 'monitor-ended.json',
+                    {'pid': os.getpid(), 'nonce': nonce, 'boot_id': state['boot_id'],
+                     'epoch': time.time(), 'monotonic': time.monotonic()})
         monitor.close_sync(None)
         credentials.close_sync(None)
         os.close(descriptor)
         os.close(geo_descriptor)
-        _write_json(directory / 'monitor-ended.json',
-                    {'pid': os.getpid(), 'nonce': nonce, 'boot_id': state['boot_id'],
-                     'epoch': time.time(), 'monotonic': time.monotonic()})
 
 
 def _restore(context, directory, state):
