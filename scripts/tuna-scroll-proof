@@ -226,7 +226,7 @@ toggle_mode() {
     want="$1"
     xdotool windowfocus --sync "$WID"
     xdotool key Super_L+Shift+t
-    for i in $(seq 1 40); do
+    for _ in $(seq 1 40); do
         [ "$(grep -c "session mode now $want" "$LOG")" -ge "$2" ] && return 0
         kill -0 "$COMPOSITOR_PID" 2>/dev/null || return 1
         sleep 0.5
