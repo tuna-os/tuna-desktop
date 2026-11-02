@@ -4,6 +4,7 @@
 # Usage:
 #   scripts/tuna-capture [--bin-dir DIR] [--display :N] [--artifacts DIR] [--socket NAME]
 #   scripts/tuna-capture --render-walkthrough vX.Y.Z [--artifacts DIR]
+#   scripts/tuna-capture --readme-overview [--artifacts DIR]
 #
 # --render-walkthrough stamps docs/walkthrough-template.md into
 # ARTIFACTS/walkthrough.md for the release tag, to upload with its media.
@@ -16,8 +17,7 @@
 # under stable names; the same feature yields the same shots every release
 # unless the feature changed.
 #
-# Requires ffmpeg for clips; stills fall back to scrot alone when ffmpeg is
-# absent (clips are then skipped, not faked).
+# ffmpeg is required: successful capture always includes every requested video.
 set -eu
 
 unset CDPATH
@@ -31,6 +31,7 @@ WIDTH=1280
 HEIGHT=800
 
 RENDER_TAG=""
+README_OVERVIEW=0
 # Overridable descriptions for the captured GTK shell.
 QUICK_SETTINGS_BLURB="${QUICK_SETTINGS_BLURB:-The panel status button opens quick settings with sliders and toggles.}"
 NOTIFICATIONS_BLURB="${NOTIFICATIONS_BLURB:-Notification banners stack over the session.}"
@@ -72,6 +73,7 @@ while [ $# -gt 0 ]; do
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --socket) SOCKET="$2"; shift 2 ;;
         --bin-dir) BIN_DIR="$2"; shift 2 ;;
+        --readme-overview) README_OVERVIEW=1; shift ;;
         --render-walkthrough) RENDER_TAG="$2"; shift 2 ;;
         --help | -h) sed -n '2,14p' "$0"; exit 0 ;;
         *) echo "tuna-capture: unknown argument $1" >&2; exit 1 ;;
@@ -93,6 +95,13 @@ if [ -n "$RENDER_TAG" ]; then
     check_rendered "$ARTIFACTS/walkthrough.md"
     echo "tuna-capture: rendered $ARTIFACTS/walkthrough.md for $RENDER_TAG"
     exit 0
+fi
+if [ "$README_OVERVIEW" = 1 ]; then
+    if [ -n "$BIN_DIR" ] || [ -n "$DISPLAY_ARG" ]; then
+        echo "tuna-capture: maintained overview requires its own source build and private display" >&2
+        exit 1
+    fi
+    unset DISPLAY
 fi
 
 mkdir -p "$ARTIFACTS"
@@ -169,14 +178,15 @@ rm -f "$PROBE_HOME/tuna-shell/notifications.json"
 COMPOSITOR_PID=""
 OWNED_XVFB=""
 BUS_PID=""
-HAVE_FFMPEG=""
 PROBE_PID=""
+PROBE_PIDS=""
 REC_PID=""
 REC_FEATURE=""
 
-if command -v ffmpeg >/dev/null 2>&1; then
-    HAVE_FFMPEG=1
-fi
+command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1 || {
+    echo "tuna-capture: ffmpeg and ffprobe are required for real video capture" >&2
+    exit 1
+}
 
 cleanup() {
     if [ -n "$REC_PID" ]; then
@@ -187,6 +197,10 @@ cleanup() {
         kill "$PROBE_PID" 2>/dev/null || true
         wait "$PROBE_PID" 2>/dev/null || true
     fi
+    for pid in $PROBE_PIDS; do
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
     if [ -n "$COMPOSITOR_PID" ] && kill -0 "$COMPOSITOR_PID" 2>/dev/null; then
         kill "$COMPOSITOR_PID" 2>/dev/null || true
         wait "$COMPOSITOR_PID" 2>/dev/null || true
@@ -322,6 +336,20 @@ grep -q 'tuna-shell-gtk: keybindings:' "$LOG" || {
 }
 xdotool key Escape
 assert_state C-DESKTOP '.overview_open == false and .locked == false' "GTK desktop ready"
+if [ "$README_OVERVIEW" = 1 ]; then
+    for title in Alpha Beta Gamma; do
+        env -u DISPLAY WAYLAND_DISPLAY="$SOCKET" /usr/bin/python3 \
+            "$ROOT/scripts/lib/tuna-test-window.py" "$title" \
+            >"$ARTIFACTS/$title.log" 2>&1 &
+        PROBE_PIDS="$PROBE_PIDS $!"
+    done
+    assert_state C-README-WINDOWS \
+        '(.windows | length) == 3 and ([.windows[].app_id] | sort) == ["tuna-test-alpha","tuna-test-beta","tuna-test-gamma"]' \
+        "three original libadwaita fixture windows mapped"
+    python3 "$ROOT/scripts/lib/overview_demo.py" "$ROOT" "$ARTIFACTS" "$TUNA_COMPOSITOR_STATE" \
+        "$WID" "$COMPOSITOR_PID" "$BIN_DIR" "$OWNED_XVFB"
+    exit 0
+fi
 env -u DISPLAY WAYLAND_DISPLAY="$SOCKET" /usr/bin/python3 \
     "$PROBE_HOME/application.py" "$ARTIFACTS/seed-marker" "Tuna Desktop capture fixture" \
     >"$ARTIFACTS/application.log" 2>&1 &
@@ -345,9 +373,6 @@ sleep 1
 
 record_start() {
     REC_FEATURE="$1"
-    if [ -z "$HAVE_FFMPEG" ]; then
-        return 0
-    fi
     ffmpeg -hide_banner -loglevel error -y -f x11grab -framerate 15 \
         -video_size "${WIDTH}x${HEIGHT}" -i "$DISPLAY" \
         -c:v libx264 -preset veryfast -pix_fmt yuv420p \
@@ -358,9 +383,7 @@ record_start() {
 }
 
 record_stop() {
-    if [ -z "$HAVE_FFMPEG" ] || [ -z "$REC_PID" ]; then
-        return 0
-    fi
+    test -n "$REC_PID"
     kill -INT "$REC_PID" 2>/dev/null || true
     wait "$REC_PID" 2>/dev/null || true
     mv "$ARTIFACTS/$REC_FEATURE.raw.mp4" "$ARTIFACTS/$REC_FEATURE.mp4"
@@ -372,14 +395,10 @@ shot() {
     # Stills come from the clip, not scrot: scrot reads back black for the
     # GL-rendered nested window, while x11grab sees full content. This also
     # guarantees each still matches its clip.
-    if [ -n "$HAVE_FFMPEG" ]; then
-        # Settle one second before the end: every segment holds its final
-        # state (open menu, up banner, engaged lock) through record_stop.
-        ffmpeg -hide_banner -loglevel error -y -sseof -1 -i "$ARTIFACTS/$1.mp4" \
-            -frames:v 1 "$ARTIFACTS/$1.png" >/dev/null 2>&1
-    else
-        scrot "$ARTIFACTS/$1.png" >/dev/null
-    fi
+    # Settle one second before the end: every segment holds its final
+    # state (open menu, up banner, engaged lock) through record_stop.
+    ffmpeg -hide_banner -loglevel error -y -sseof -1 -i "$ARTIFACTS/$1.mp4" \
+        -frames:v 1 "$ARTIFACTS/$1.png" >/dev/null 2>&1
     echo "tuna-capture: still $1.png"
 }
 
@@ -498,9 +517,7 @@ for seg in $SEGMENTS; do
     STILLS="$STILLS $seg.png"
 done
 # shellcheck disable=SC2086
-if [ -n "$HAVE_FFMPEG" ]; then
-    check_media $CLIPS
-fi
+check_media $CLIPS
 # shellcheck disable=SC2086
 check_media $STILLS
 check_walkthrough
