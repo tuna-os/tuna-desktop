@@ -525,8 +525,8 @@ impl Wallpaper {
             let paint_record = paint.animation.as_ref().map(|(sample,references)| serde_json::json!({
                 "sample_wall": sample.wall, "progress": sample.progress, "interval": sample.interval,
                 "from": sample.from, "to": sample.to, "slide": sample.slide,
-                "generation": epoch, "source_uri": paint.uri, "root_identity": format!("{:?}",paint.identity),
-                "source_identities": references.iter().map(|(path,id)| serde_json::json!({"path":path.to_string_lossy(),"identity":format!("{id:?}")})).collect::<Vec<_>>(), "geometry": {"physical":geometry.physical,
+                "generation": epoch, "source_uri": paint.uri, "root_identity": paint.identity,
+                "source_identities": references.iter().map(|(path,id)| serde_json::json!({"path":path.to_string_lossy(),"identity":id})).collect::<Vec<_>>(), "geometry": {"physical":geometry.physical,
                     "origin":geometry.origin,"desktop":geometry.desktop,"scale":geometry.scale()},
             }));
             let job = paint;
@@ -1285,7 +1285,7 @@ fn card_placement(
     (at.into(), Some(size.into()))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 struct FileMetadata {
     dev: u64,
     ino: u64,
@@ -1313,6 +1313,19 @@ struct FileIdentity {
     path: PathBuf,
     metadata: FileMetadata,
     sha256: [u8; 32],
+}
+impl serde::Serialize for FileIdentity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        let mut receipt = serializer.serialize_struct("FileIdentity", 3)?;
+        // A native non-UTF8 path stays unrepresentable, never a lossy alias.
+        // Such a receipt cannot qualify the UTF8 public proof fixtures.
+        receipt.serialize_field("path", &self.path.to_str())?;
+        receipt.serialize_field("metadata", &self.metadata)?;
+        receipt.serialize_field("sha256", &self.sha256)?;
+        receipt.end()
+    }
 }
 impl FileIdentity {
     fn for_uri(uri: &str) -> Option<Self> {
@@ -1712,6 +1725,35 @@ fn cache_path(path: &std::path::Path, w: u32, h: u32) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_identity_receipts_are_typed_metadata_and_content_digest() {
+        let identity = FileIdentity {
+            path: PathBuf::from("/out/light-timeline.xml"),
+            metadata: FileMetadata {
+                dev: 1,
+                ino: 2,
+                bytes: 3,
+                modified: (4, 5),
+                changed: (6, 7),
+            },
+            sha256: [8; 32],
+        };
+        let expected = serde_json::json!({
+            "path": "/out/light-timeline.xml",
+            "metadata": {"dev": 1, "ino": 2, "bytes": 3, "modified": [4, 5], "changed": [6, 7]},
+            "sha256": vec![8u8; 32],
+        });
+        assert_eq!(serde_json::to_value(Some(&identity)).unwrap(), expected);
+        assert!(serde_json::to_value(None::<&FileIdentity>)
+            .unwrap()
+            .is_null());
+        let native_path = FileIdentity {
+            path: PathBuf::from(OsString::from_vec(vec![0xff])),
+            ..identity
+        };
+        assert!(serde_json::to_value(native_path).unwrap()["path"].is_null());
+    }
+
     #[test]
     fn malformed_current_wallpaper_policy_retires_old_maintenance_eligibility() {
         let _serial = RUNTIME_DIR_LOCK.lock().unwrap();
