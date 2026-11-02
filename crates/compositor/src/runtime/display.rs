@@ -243,24 +243,13 @@ impl Runtime {
             .collect();
             let primary = self.state.primary_output_name();
             let fallback = crate::drm::fallback_scale();
-            let mut layouts = display_config::hotplug_layouts(
+            let layouts = display_config::hotplug_layouts(
                 stored.as_ref(),
                 &existing,
                 &connectors,
                 primary.as_deref(),
                 fallback,
             );
-            // The sensor wins on unlocked built-in panels; the
-            // configured transform stays in manual_transforms.
-            for layout in &mut layouts {
-                if let Some(enabled) = &mut layout.enabled {
-                    self.manual_transforms
-                        .insert(layout.connector.clone(), enabled.transform);
-                    enabled.transform = self
-                        .orientation
-                        .effective(&layout.connector, enabled.transform);
-                }
-            }
             if let Err(error) = drm.apply_layout(&layouts) {
                 eprintln!("tuna-compositor: drm: hotplug configuration not applied: {error}");
                 let linear = display_config::hotplug_layouts(
@@ -282,6 +271,7 @@ impl Runtime {
         if let Some(scale) = primary_scale {
             self.state.set_preferred_scale(scale);
         }
+        self.on_display_hotplug_orientation();
         let live = self.display_state().live_config();
         self.display_configs.configured(live);
         self.publish_display_state();

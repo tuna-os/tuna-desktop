@@ -84,6 +84,23 @@ impl Runtime {
         self.sync_orientation();
     }
 
+    /// Re-evaluate the sensor-managed built-in panel after a connector
+    /// hotplug has replaced the display state. A locked panel retains its
+    /// configuration; an unlocked managed panel applies the current sensor
+    /// reading without persisting it.
+    pub(super) fn on_display_hotplug_orientation(&mut self) {
+        self.sync_orientation();
+        if self.orientation.lock {
+            return;
+        }
+        if let Some(transform) = self
+            .orientation
+            .orientation_changed(self.builtin_portrait())
+        {
+            self.rotate_builtin(transform);
+        }
+    }
+
     /// `handle_orientation_change`: the lit built-in panel's logical
     /// monitor takes `transform` through a temporary configuration.
     fn rotate_builtin(&mut self, transform: u32) {
