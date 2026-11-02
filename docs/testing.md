@@ -28,6 +28,10 @@ base, and picks the proof lanes the change can affect:
   `NO_LANE`) is the authoritative, ordered mapping.
 - a lane's own proof script, reference fixtures or packaging: that lane
   (plus the lanes whose artifacts it needs).
+- a packaged conffile (`share/pam.d/`, installed as `/etc/pam.d/tuna-lock`):
+  `journey`, whose disposable Debian lifecycle fails when its bytes drift
+  from the released package's, plus the core lanes and every package
+  consumer.
 - anything else (crates, `share/`, other scripts): `gtk-shell` plus a
   round-robin slice of the other end-to-end lanes, rotated by run number.
   The slice size is the repository variable `CI_ROUND_ROBIN_SIZE`
