@@ -368,7 +368,10 @@ fn main() {
         last = client.presented.take().unwrap();
         frames += 1;
     }
-    println!("PRESENTED-CLOCK {first} {last} {frames}");
+    println!(
+        "PRESENTED-CLOCK {first} {last} {frames} {}",
+        wayland_client::Proxy::id(&surface).protocol_id()
+    );
     let [er, eg, eb] = expected(source, code);
     println!("READY {} {} {} {er} {eg} {eb}", code[0], code[1], code[2]);
     let [hr, hg, hb] = expected_hdr(source, code);

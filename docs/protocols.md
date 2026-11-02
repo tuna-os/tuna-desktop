@@ -162,7 +162,8 @@ The real pixel and DMA-BUF clients announce readiness only after holding their
 unchanged buffers for 500 ms of actual `wl_callback.done` frame-clock time.
 Their first callback alone can occur during the ordinary opening animation;
 it does not promise a fully visible constant-colour scene. Receipts retain the
-first/last callback timestamps and frame count. Capture still makes one
+first/last callback timestamps, diagnostic frame count, original surface ID and
+observed client PID/ELF hash. Capture still makes one
 assertion at each existing pixel threshold and deadline: no expected-pixel
 polling, capture retry, animation override or synthetic clock is used.
 

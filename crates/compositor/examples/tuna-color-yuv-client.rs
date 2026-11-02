@@ -497,7 +497,10 @@ fn main() {
         last = client.presented.take().unwrap();
         frames += 1;
     }
-    println!("PRESENTED-CLOCK {first} {last} {frames}");
+    println!(
+        "PRESENTED-CLOCK {first} {last} {frames} {}",
+        surface.id().protocol_id()
+    );
     let [r, g, b] = options.expected();
     let [y, u, v] = options.code;
     println!("READY {y} {u} {v} {r} {g} {b}");

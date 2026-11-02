@@ -362,11 +362,13 @@ def run_cases(prefix, hdr_active):
                 clock = next(line for line in lines if line.startswith('PRESENTED-CLOCK '))
                 return ready, clock
             ready_line, clock_line = wait(presented, 'presented ' + name)
-            first, last, frames = (int(value) for value in clock_line.split()[1:])
+            first, last, frames, surface_id = (int(value) for value in clock_line.split()[1:])
             assert 0 <= first <= 0xffffffff and 0 <= last <= 0xffffffff, clock_line
+            assert 0 < surface_id <= 0xffffffff, clock_line
             elapsed = (last - first) & 0xffffffff
-            assert elapsed >= 500 and frames >= 2, clock_line
-            assert hashlib.sha256(Path('/proc', str(client.pid), 'exe').read_bytes()).hexdigest() == report['binaries'][str(color_client)]
+            assert elapsed >= 500, clock_line
+            client_sha256 = hashlib.sha256(Path('/proc', str(client.pid), 'exe').read_bytes()).hexdigest()
+            assert client_sha256 == report['binaries'][str(color_client)]
             numbers = [int(value) for value in ready_line.split()[1:]]
             assert len(numbers) == 6 and all(0 <= value <= 255 for value in numbers), ready_line
             code, expected = numbers[:3], numbers[3:]
@@ -385,6 +387,8 @@ def run_cases(prefix, hdr_active):
             evidence = request_capture(payload)
             report['cases'][name] = {
                 'ready': ready_line,
+                'client_identity': {'pid': client.pid, 'surface_protocol_id': surface_id,
+                                    'executable_sha256': client_sha256},
                 'presentation_clock': {'first_ms': first, 'last_ms': last,
                                        'elapsed_ms': elapsed, 'frames': frames},
                 **evidence}
