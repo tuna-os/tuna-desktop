@@ -1243,6 +1243,13 @@ jobs:
           name: tuna-arch
           path: arch-artifacts/
           retention-days: 14
+      - name: Fetch locked workspace inputs for offline protocol metadata
+        if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm')
+        run: |
+          # Native makepkg need not fetch other-target workspace dependencies.
+          # Offline cargo metadata still resolves them; hydrate the same cache
+          # explicitly without a target filter before immutable XML admission.
+          su builder -c "cd '$GITHUB_WORKSPACE' && CARGO_HOME='$CARGO_HOME' RUSTUP_TOOLCHAIN=stable cargo fetch --locked"
       - name: Stage the exact locked native protocol XML
         if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm')
         run: pacman -S --needed --noconfirm python && python3 scripts/tuna-protocol-xml-stage protocol-xml/wayland-protocols

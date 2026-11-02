@@ -67,6 +67,12 @@ text-input-v3 2, dmabuf 6; the other new extension managers are version 1).
 Cargo.lock and compares every resolved protocol file with that archive before
 staging the exact checked bytes. It does not require Cargo's optional
 `.cargo-checksum.json` sidecar or substitute the distro's protocol XML.
+Arch CI first runs `cargo fetch --locked` as its existing builder using the
+same `CARGO_HOME`, without a target filter. Native package compilation alone
+does not populate other-target dependencies needed by full-workspace Cargo
+metadata. The XML stager remains offline, locked and archive-verified; cache
+hydration is an explicit preceding network prerequisite, not an offline
+fallback or a replacement source.
 These library maxima are not permission to advertise unimplemented behavior.
 This native candidate deliberately retains seat 9, text-input manager 1 and
 ShellControl 0.47 until the ordered input/OSK cutover is integrated.
