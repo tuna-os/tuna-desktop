@@ -13,9 +13,10 @@ No autologin or initial session exists: the lane drives GDM's user list and
 types the fixture password exactly as the published-flavor nightly does
 (`V-GREETER-LIST`, `V-GDM-FALLBACK`, `V-GDM-LOGIN`;
 `docs/marlin-tuna-nightly.md`), from the same `scripts/tuna-vm-lane` code.
-Logout must return to that GDM greeter. This changes neither the shipped
-preview image nor the number of CI VM profiles. GDM's session worker opens a
-journal stream for `gdm-wayland-session`, which the fixture forwards to the
+Logout must return to that GDM greeter. These ordinary lifecycle fixtures do
+not change the shipped preview image; the independent paired DEV profiles
+below are separate members of the same existing VM producer. GDM's session
+worker opens a journal stream for `gdm-wayland-session`, forwarded to the
 serial port. The fixture's session environment comes from `environment.d`,
 which gdm-wayland-session imports from the user manager; the per-login Orca
 test secret comes from a user environment generator.
@@ -58,6 +59,66 @@ The Python lane.boot API keeps its original four-value return and original
 VM device profile by default. Lifecycle callers explicitly request
 `guest_agent=True` to add the QGA transport and receive its socket as a fifth
 value; existing performance callers keep working without a guest agent.
+
+## Paired stock-GNOME switcher reference (P-WM01)
+
+The independent DEV profiles `--profile gnome-reference` and
+`--profile tuna-reference` use the existing `scripts/tuna-vm-lane.boot()`,
+raw-disk installer, QMP/QGA transport, native KVM requirement and unchanged
+1280×800 GPU topology. They do not replace either ordinary five-boot Tuna
+lifecycle/Orca row, its tour, fresh-account journey or any existing gate.
+Whenever lane selection includes `marlin-vm`, both paired DEV members and
+their artifact-context consumer are required by the normal aggregate gate.
+There is no dispatch-only, repository-variable or credential skip for them.
+Neither profile is a shipping image or a performance-lane substitute.
+
+`packaging/marlin/vm-lane/Containerfile.reference` derives both members from
+the actual published GNOME 51.1 amd64 manifest
+`sha256:104870f1a05fa0a75649ee4ed9952027b29ab12e53af83931ae69e8636e44c3f`,
+which belongs to index
+`sha256:29097ba660d6f9f7c35c2063b83cf7bbe830202a497852b9b1869bb84dfd6aa5`
+(tunaOS publication 41254872557, source
+`07022c9fb853fcd36aa27098d50c38a8be0d18ac`). Both add the same current-source
+Tuna package and fixture dependencies using the image's retained package
+databases, never a rolling repository refresh. The build retains the
+original package inventory and GNOME/GDM/session/PAM/application file hashes,
+then refuses any original package-version or file-byte change. Only the
+CI fixture's `tuna-test` UID 1000 AccountsService session selection differs:
+`gnome` versus `tuna`. No automatic login, GNOME keybinding write, GDM theme
+replacement, hidden-session rewrite or Shell.Eval admission is involved.
+
+Before either image build or boot, the normal CI path must verify the exact
+platform digest under the existing TunaOS cosign subject/issuer policy and
+retain its real `platform-cosign.json` output and the exact `index.json`
+bytes, including the unique linux/amd64 membership. Supply that directory
+as `--reference-base-evidence`; copied JSON alone is not cryptographic
+verification. The published wheel-policy receipt identifies the image but
+does not itself contain a signature-verification result.
+
+The fixed route
+`GuestAgent.run("gnome-reference", OP, JSON)` executes only
+`/usr/libexec/tuna-vm-gnome-reference OP JSON`; `OP` is one of `admit`,
+`prepare`, `observe`, `file` or `stop`, with the existing transport deadline
+capped at 30 seconds. Original stock-GDM and logind/native session admission
+comes from this observer. The GNOME path branches before all Tuna DRM-log
+and `TUNA_COMPOSITOR_STATE` readiness loops, without a Tuna fallback.
+After password submission it waits for the same session's actual compositor,
+bus and DRM admission within the existing login deadline. A partially
+started session never causes another password to be typed into the desktop.
+
+The paired consumer owns its real two Files windows and one Settings window,
+original process/ELF identities, read-only settings, public AT-SPI snapshots,
+physical QMP held-key/Down actions and bracketed framebuffer captures.
+`wm-reference/member.json` and the paired context receipt describe those
+actual observations. AT-SPI bus/object identities are not WM or kernel
+window identities. Context readiness is not a visual-parity verdict and
+does not close P-WM01; the actual paired visual assessment remains required.
+Source changes and controlled transport tests establish no native runtime
+pass. Missing admission, evidence, held-phase observations or strict owned
+cleanup must fail rather than silently skip a member.
+
+
+## Native lifecycle observations
 
 QEMU's guest agent executes a fixed probe with a root UID, while the
 compositor, shell and application clients must belong to the non-root
