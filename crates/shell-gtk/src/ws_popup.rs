@@ -29,6 +29,36 @@ pub fn fade_at(from: f64, to: f64, elapsed_ms: f64, enabled: bool) -> f64 {
     from + (to - from) * (1.0 - (1.0 - p).powi(2))
 }
 
+/// An opacity transition starts when requested, not at its first tick.
+/// Both timestamps use GLib's monotonic microseconds (the GDK frame clock
+/// uses that timebase too). GNOME's ease is requested by display() /
+/// _onTimeout(), workspaceSwitcherPopup.js:103-109,115-120.
+struct Fade {
+    from: f64,
+    to: f64,
+    requested_us: i64,
+}
+
+impl Fade {
+    fn new(from: f64, to: f64, requested_us: i64) -> Self {
+        Self {
+            from,
+            to,
+            requested_us,
+        }
+    }
+
+    /// Sample a frame, including time spent waiting for its first tick.
+    fn at(&self, frame_us: i64, slowdown: f64, enabled: bool) -> (f64, bool) {
+        let elapsed_ms =
+            frame_us.saturating_sub(self.requested_us).max(0) as f64 / 1000.0 / slowdown;
+        (
+            fade_at(self.from, self.to, elapsed_ms, enabled),
+            !enabled || elapsed_ms >= FADE_MS,
+        )
+    }
+}
+
 /// The fade is opacity, so it runs under fade-only motion too.
 fn animations_enabled() -> bool {
     crate::motion::current().allows_fades()
@@ -157,7 +187,7 @@ impl WorkspacePopup {
             return;
         }
         let weak = Rc::downgrade(self);
-        let started = Cell::new(None);
+        let fade = Fade::new(from, to, glib::monotonic_time());
         self.pill.add_tick_callback(move |_, clock| {
             let Some(ui) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
@@ -165,19 +195,18 @@ impl WorkspacePopup {
             if ui.fade.get() != generation {
                 return glib::ControlFlow::Break;
             }
-            let start = started.get().unwrap_or_else(|| {
-                started.set(Some(clock.frame_time()));
-                clock.frame_time()
-            });
-            // GNOME's slow-down factor stretches the fade.
-            let elapsed =
-                (clock.frame_time() - start) as f64 / 1000.0 / crate::motion::current().slowdown();
-            let enabled = animations_enabled();
-            if !enabled || elapsed >= FADE_MS {
+            // A busy first frame must not restart the 100 ms fade: the
+            // unscaled 600 ms hide timer is already running.
+            let (opacity, done) = fade.at(
+                clock.frame_time(),
+                crate::motion::current().slowdown(),
+                animations_enabled(),
+            );
+            if done {
                 finish(&ui);
                 return glib::ControlFlow::Break;
             }
-            ui.pill.set_opacity(fade_at(from, to, elapsed, enabled));
+            ui.pill.set_opacity(opacity);
             glib::ControlFlow::Continue
         });
     }
@@ -201,5 +230,23 @@ mod tests {
         assert_eq!(fade_at(0.0, 1.0, 100.0, true), 1.0);
         assert_eq!(fade_at(1.0, 0.0, 50.0, true), 0.25);
         assert_eq!(fade_at(0.0, 1.0, 0.0, false), 1.0);
+    }
+
+    #[test]
+    fn a_late_first_frame_samples_the_requested_fade_not_a_new_one() {
+        let fade = Fade::new(0.0, 1.0, 1_000_000);
+        // No frame was delivered for 300 ms. The 100 ms fade has ended;
+        // starting a new clock on this first callback would yield 0.
+        assert_eq!(fade.at(1_300_000, 1.0, true), (1.0, true));
+        assert_eq!(fade.at(1_050_000, 1.0, true), (0.75, false));
+        assert_eq!(fade.at(1_100_000, 2.0, true), (0.75, false));
+        assert_eq!(fade.at(1_200_000, 2.0, true), (1.0, true));
+        assert_eq!(fade.at(1_000_000, 1.0, false), (1.0, true));
+        // Fade-out likewise charges the wait and begins at drawn opacity.
+        let out = Fade::new(0.75, 0.0, 2_000_000);
+        assert_eq!(out.at(2_050_000, 1.0, true), (0.1875, false));
+        assert_eq!(out.at(2_300_000, 1.0, true), (0.0, true));
+        // A predicted frame earlier than the request must not extrapolate.
+        assert_eq!(out.at(1_999_999, 1.0, true), (0.75, false));
     }
 }
