@@ -248,6 +248,33 @@ deadline remains a proof failure, not evidence by itself of a compositor focus
 bug or permission to increase the deadline; inspect the retained baseline and
 observations before attributing it to scheduling or blocked client work.
 
+## Slideshow receipt identity
+
+The naturally advancing GNOME background proof consumes typed
+`root_identity` and per-reference `identity` objects from the compositor's
+`background_paint` receipt. Each contains `path`, `metadata` (device, inode,
+byte length, modified and changed `[seconds, nanoseconds]`) and the 32
+SHA256 bytes. Missing identities and non-UTF8 native paths serialize as
+unqualified nulls, never lossy path aliases. Rust Debug strings are not an
+accepted machine schema.
+
+The consumer binds the exact owned XML/public-frame paths to regular,
+no-follow descriptors, checks the producer's 64 MiB source bound, hashes
+bounded reads, and rechecks descriptor/path metadata. A matching stat tuple
+cannot substitute for matching content. Existing original-process ownership,
+natural-reference timing, viewport, two-channel-value pixel tolerance and
+85-second phase observation bounds remain unchanged.
+
+In [CI 41390839901](https://github.com/tuna-os/tuna-desktop/actions/runs/41390839901),
+the old Debug parser rejected 404 of 448 retained samples for the producer's
+new nested metadata/digest representation; no reference phase qualified.
+That actual failure is not a passing slideshow proof. The producer and all
+machine consumers now share the typed schema without an old-string fallback.
+`scripts/tests/test_stock_slideshow_proof.py` exercises typed schema, metadata,
+digest, mutation, ownership-path and deadline refusals; the native serializer
+regression is `wallpaper::tests::file_identity_receipts_are_typed_metadata_and_content_digest`.
+Those checks do not substitute for a new genuine chooser/pixel journey.
+
 ## Before opening a PR
 
 Run the workspace checks locally before opening a PR (`just check`):

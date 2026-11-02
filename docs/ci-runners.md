@@ -93,6 +93,19 @@ not by unprivileged `kill -0` of a potentially root-owned sudo launcher
 (which can return EPERM for a live process). There is no unbounded wait.
 The private bus and every colour, gamma and restart assertion remain required.
 
+The changed-source hosted run
+[`41390839901`](https://github.com/tuna-os/tuna-desktop/actions/runs/41390839901)
+subsequently passed all 19 DRM assertions, including the actual colord,
+gamma, calibration and restart gates. It exposed two separate prerequisite
+defects: `check` reached its real strip-capture tests but lacked Pillow
+(`ModuleNotFoundError: PIL`), and the pinned Orca factory entry point was
+invoked as an executable despite its non-executable source mode
+(`Permission denied`, exit 126). Declare `python3-pil` in the check job's
+existing apt dependencies and run that consumer with `/usr/bin/python3`.
+Invoke the unchanged pinned factory through Bash, like the GDM native
+factory. Neither a self-hosted preinstalled dependency nor a cache hit is a
+dependency declaration; do not skip the consumer or replace the pinned build.
+
 ## Queue supersession and closed pull requests
 
 Every PR-triggered workflow already has native workflow/ref (or PR-number)
