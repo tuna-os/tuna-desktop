@@ -165,6 +165,45 @@ class Tests(unittest.TestCase):
                     refresh.download_artifacts(10, 2, Path(scratch), mapping)
                 self.assertFalse((Path(scratch) / 'gtk-shell').exists())
 
+    def test_hero_download_reassembles_authenticated_vm_evidence_and_tour(self):
+        mapping = refresh.inventory()
+        tour_name = mapping['vm-tour'][0][0].removeprefix('tour/')
+        uploads = {'marlin-vm': {'media-receipt.json': b'original native receipt',
+                                 'media-source.json': b'original native source'},
+                   'tuna-tour': {tour_name: b'original hero bytes',
+                                 'tuna-tour.webm': b'original walkthrough video'}}
+        members, archives = [], {}
+        for identifier, (name, files) in enumerate(uploads.items(), 1):
+            stream = io.BytesIO()
+            with zipfile.ZipFile(stream, 'w') as archive:
+                for path, data in files.items():
+                    archive.writestr(path, data)
+            archives[identifier] = stream.getvalue()
+            members.append({'id': identifier, 'name': name, 'expired': False,
+                            'workflow_run': {'id': 10}, 'size_in_bytes': len(stream.getvalue()),
+                            'digest': 'sha256:' + hashlib.sha256(stream.getvalue()).hexdigest()})
+        downloaded = []
+        def transfer(argv, *, stdout, **kwargs):
+            identifier = int(argv[-1].split('/')[-2])
+            downloaded.append(identifier)
+            stdout.write(archives[identifier])
+            return subprocess.CompletedProcess(argv, 0)
+        with patch.object(refresh, 'api', return_value={'total_count': 2, 'artifacts': members}), \
+                patch.object(refresh.subprocess, 'run', side_effect=transfer):
+            with tempfile.TemporaryDirectory() as scratch:
+                roots, receipts = refresh.download_artifacts(10, 2, Path(scratch), mapping, vm_tour_only=True)
+                self.assertEqual(downloaded, [1, 2])
+                self.assertEqual(set(receipts), {'marlin-vm', 'tuna-tour'})
+                native = roots['marlin-vm']
+                self.assertEqual((native / 'media-receipt.json').read_bytes(), b'original native receipt')
+                self.assertEqual((native / 'tour' / tour_name).read_bytes(), b'original hero bytes')
+                self.assertEqual((native / 'tour/tuna-tour.webm').read_bytes(), b'original walkthrough video')
+            archives[2] += b'forged outside upload digest'
+            with tempfile.TemporaryDirectory() as scratch:
+                with self.assertRaisesRegex(ValueError, 'differs from upload digest'):
+                    refresh.download_artifacts(10, 2, Path(scratch), mapping, vm_tour_only=True)
+                self.assertFalse((Path(scratch) / 'marlin-vm/tour').exists())
+
     def test_ordinary_and_automation_branches_cannot_change_unproven_canonical_pixels(self):
         for branch in ('ordinary-doc-fix', 'automation/maintained-media-10-2'):
             with self.subTest(branch=branch), tempfile.TemporaryDirectory() as scratch:

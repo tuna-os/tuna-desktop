@@ -102,6 +102,18 @@ After canonical adoption changes only generated media, that exact product
 image can be requalified again without a recursive documentation commit.
 Original actual build commit/tree/image/package identities remain recorded;
 the new capture's actual commit/tree and run are distinct, never relabelled.
+Ordinary native consumers include push, pull-request, manual full-CI dispatch
+and scheduled CI; none changes the trusted successful-main producer rule.
+The capsule's original strip receipt remains inside its authenticated
+selection evidence. It is not restored into the current admission output:
+the independent current image inspection must create that new receipt
+exclusively before boot and fresh capture.
+
+`scripts/tuna-hero-media` uses the same exact-run API identity, whole-upload
+digest and bounded ZIP downloader as automatic intake. It downloads the
+`marlin-vm` evidence and reconstructs `tuna-tour` beneath `tour/` before
+validating the six canonical heroes; flattened tour-only downloads are
+not accepted as a complete native receipt root.
 
 ## Receipts and explicit freshness
 

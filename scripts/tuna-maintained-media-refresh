@@ -111,7 +111,7 @@ def generated_paths(mapping):
     return paths | {manifest_name(kind) for kind in mapping}
 
 
-def download_artifacts(run_id, attempt, output, mapping):
+def download_artifacts(run_id, attempt, output, mapping, *, vm_tour_only=False):
     """Authenticate exact GitHub-uploaded bytes before admitting any media."""
     artifacts, page = [], 1
     while True:
@@ -135,6 +135,8 @@ def download_artifacts(run_id, attempt, output, mapping):
                           | {'overview-demo.raw.mp4', 'overview-demo-actions.json', 'assertions.txt',
                              'media-source.json', 'media-receipt.json'}),
     }
+    if vm_tour_only:
+        sources = {name: sources[name] for name in ('marlin-vm', 'tuna-tour')}
     for name, allowlist in sources.items():
         members = [row for row in artifacts if row.get('name') == name and not row.get('expired')]
         if not members:

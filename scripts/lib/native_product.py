@@ -398,7 +398,7 @@ def podman(root, *args):
 
 def restore_metadata(root, directory, files):
     for name in files:
-        if name == 'strip-image.json' or name.startswith('gdm51/'):
+        if name.startswith('gdm51/'):
             destination = Path(root) / 'vm-lane-artifacts' / name
         elif name.startswith('orca51-package-provenance/'):
             destination = Path(root) / name
@@ -530,7 +530,7 @@ def select(root, profile, out, current_package, *, expected_base_index, expected
                     require(os.environ.get('GITHUB_WORKFLOW') == 'ci'
                             and os.environ.get('GITHUB_JOB') == 'marlin-vm'
                             and os.environ.get('GITHUB_REPOSITORY') == REPOSITORY
-                            and os.environ.get('GITHUB_EVENT_NAME') in ('push', 'pull_request'),
+                            and os.environ.get('GITHUB_EVENT_NAME') in ('push', 'pull_request', 'workflow_dispatch', 'schedule'),
                             'OCI load is allowed only in the ordinary native CI job')
                     podman(root, 'load', '--input', directory / 'product-image.oci.tar')
                     loaded = podman(root, 'image', 'inspect', provenance['image_id'], '--format', '{{.Id}}')

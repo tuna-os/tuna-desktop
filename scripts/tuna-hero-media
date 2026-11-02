@@ -6,9 +6,9 @@
 #       --expect-tree TREE --expect-source-inputs DIGEST --expect-image sha256:DIGEST \
 #       --expect-package DIGEST [--repo OWNER/REPO] [--dest REPOSITORY_OR_STAGING_ROOT]
 #
-# The normal main CI run must be complete and successful. The root-preserving
-# tuna-tour artifact must contain media-receipt.json, media-source.json,
-# manifest.json, strip-image.json and the actual tour video, timing and stills.
+# The normal main CI run must be complete and successful. Authenticated
+# marlin-vm evidence and tuna-tour media are reassembled into the original
+# receipt-root/tour layout before intake, using the shared bounded downloader.
 # Shared intake validates all hashes/outcomes/identities before copying only
 # the six canonical heroes. It neither rewrites historical receipts nor changes
 # the PNG bytes through recompression. No nested/old footage qualifies as native
@@ -27,6 +27,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
 # Preserve argument boundaries instead of collecting flags in a shell string.
 python3 - "$ROOT" "$WORK" "$REPO" "$RUN" "$@" <<'PROMOTE'
 import json
+import runpy
 from pathlib import Path
 import subprocess
 import sys
@@ -41,17 +42,19 @@ def argument(name):
     if name not in arguments or arguments.index(name) + 1 >= len(arguments):
         sys.exit("tuna-hero-media: required " + name)
     return arguments[arguments.index(name) + 1]
-status = json.loads(subprocess.check_output([
-    "gh", "run", "view", run, "--repo", repo, "--json",
-    "databaseId,attempt,headSha,headBranch,status,conclusion,event",
-], text=True))
-if not (str(status["databaseId"]) == run and str(status["attempt"]) == argument("--attempt")
-        and status["headSha"] == argument("--expect-merge")
-        and status["headBranch"] == "main" and status["event"] == "push"
-        and status["status"] == "completed" and status["conclusion"] == "success"):
-    sys.exit("tuna-hero-media: only the exact completed successful normal-main run can promote heroes")
-subprocess.run(["gh", "run", "download", run, "--repo", repo,
-                "--name", "tuna-tour", "--dir", work], check=True)
+refresh = runpy.run_path(str(Path(root) / "scripts/tuna-maintained-media-refresh"))
+if repo != refresh["REPOSITORY"]:
+    sys.exit("tuna-hero-media: only the trusted repository can promote heroes")
+workflow = refresh["api"]("actions/workflows/ci.yml")
+refresh["require"](workflow.get("path") == ".github/workflows/ci.yml" and workflow.get("name") == "ci",
+                   "unexpected source workflow identity")
+source_run = refresh["api"]("actions/runs/" + run)
+refresh["inspect_run"](source_run, workflow["id"], int(run), int(argument("--attempt")),
+                       argument("--expect-merge"))
+refresh["latest_is"](argument("--expect-merge"))
+roots, _ = refresh["download_artifacts"](int(run), int(argument("--attempt")),
+                                       Path(work), refresh["inventory"](), vm_tour_only=True)
+refresh["fetch_source_commits"]([json.loads((roots["marlin-vm"] / "media-source.json").read_bytes())])
 subprocess.run([sys.executable, str(Path(root) / "scripts/lib/maintained_media.py"),
-                "intake", work, "--bundle", "vm-tour", "--run-id", run, *arguments], check=True)
+                "intake", str(roots["marlin-vm"]), "--bundle", "vm-tour", "--run-id", run, *arguments], check=True)
 PROMOTE

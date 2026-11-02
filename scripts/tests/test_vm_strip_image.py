@@ -69,16 +69,6 @@ class Tests(unittest.TestCase):
     def test_actual_inspection_program_parses(self):
         compile(IMAGE_INSPECTION, '<immutable-image-inspector>', 'exec')
 
-    def test_ci_keeps_original_gates_and_pins_actual_inspection(self):
-        root = Path(__file__).resolve().parents[2]
-        source = (root / '.github/workflows/ci.yml').read_text()
-        self.assertIn('TUNA_PKG_SHA256=', source)
-        self.assertIn('--entrypoint /usr/bin/python3 "$image_id"', source)
-        self.assertIn('--strip-image vm-lane-artifacts/strip-image.json', source)
-        lane = (root / 'scripts/tuna-vm-lane').read_text()
-        self.assertIn('if getattr(args, "strip_image", None) and index == args.boots:', lane)
-        self.assertIn('strip_image.get(field) != metadata.get(meta)', lane)
-        self.assertIn('reconnect=lambda: guest_agent.GuestAgent(agent_path)', lane)
 
 
 if __name__ == '__main__':

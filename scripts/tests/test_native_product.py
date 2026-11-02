@@ -233,12 +233,34 @@ class NativeProductTests(unittest.TestCase):
         self.assertEqual(base64.b64decode(original_receipt['raw_base64']), api.data_files['strip-image.json'])
         self.assertEqual(calls[0][0], 'load')
         self.assertEqual(calls[2], ('tag', IMAGE, product.IMAGE_TAG))
-        self.assertEqual((self.root / 'vm-lane-artifacts/strip-image.json').read_bytes(), api.data_files['strip-image.json'])
+        # Original bytes stay authenticated in the capsule/origin evidence.
+        # The ordinary native admission writer exclusively creates this path.
+        admission = self.root / 'vm-lane-artifacts/strip-image.json'
+        self.assertFalse(admission.exists())
+        with admission.open('x') as stream:
+            stream.write('current independent native admission')
+        self.assertEqual((self.out / 'strip-image.json').read_bytes(), api.data_files['strip-image.json'])
         outputs = product.github_outputs(result, self.out)
         self.assertEqual(outputs['restored'], 'true')
         self.assertEqual(outputs['product_commit'], self.original['commit'])
         self.assertEqual(outputs['package_path'], str(self.out / 'tuna.pkg.tar.zst'))
         self.assertEqual(outputs['product_origin_path'], str(self.out / 'selection.json'))
+
+    def test_ordinary_dispatch_and_schedule_reuse_keep_current_admission_new(self):
+        for event in ('workflow_dispatch', 'schedule'):
+            with self.subTest(event=event), patch.dict(os.environ, {'GITHUB_EVENT_NAME': event}):
+                self.out = self.directory / ('selected-' + event)
+                selected, calls = self.choose(capsule(self.original))
+                self.assertEqual(selected['mode'], 'reused')
+                self.assertEqual(calls[0][0], 'load')
+                self.assertFalse((self.root / 'vm-lane-artifacts/strip-image.json').exists())
+
+    def test_privileged_and_unknown_events_never_load_authenticated_oci(self):
+        for event in ('workflow_run', 'pull_request_target', 'unknown'):
+            with self.subTest(event=event), patch.dict(os.environ, {'GITHUB_EVENT_NAME': event}):
+                with self.assertRaisesRegex(ValueError, 'ordinary native CI job'):
+                    self.choose(capsule(self.original))
+                self.assertFalse(self.out.exists())
 
     def test_real_non_generated_change_does_not_download_large_data(self):
         api = capsule(self.original)
