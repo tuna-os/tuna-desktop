@@ -12,9 +12,11 @@ their first login. packaging/marlin/vm-lane/tuna-vm-fresh-accounts creates
 
 and the journey drives real GDM password logins for tunastd and tunaadmin:
 first login, logout, second login, logout, reboot, login, logout. Each login
-must start the Tuna Desktop compositor and no GNOME session; AccountsService
-must have written each record after the first login; the administrator must
-authenticate through sudo and the standard account must be refused.
+must start the Tuna Desktop compositor and no GNOME session. AccountsService's
+effective Session must remain tuna, whether supplied by its account template
+or a saved record; admin sudo must authenticate and standard sudo be refused.
+An admitted private native candidate additionally requires the original
+physical record-created and record-kept gates; diagnostics cannot replace them.
 """
 import configparser
 import json
@@ -135,6 +137,9 @@ def native_installed_pair(policy):
         versions[name] = NATIVE_VERSION
     return versions
 
+# Without an admitted native candidate, the fixture asks for a username
+# directly via GDM's disable-user-list setting. Native uses the stock list.
+
 
 def parse_record(text):
     """The [User] keys of an AccountsService cache record, or None."""
@@ -189,6 +194,23 @@ def record_created(state):
     if session not in (None, "tuna"):
         return False, f"AccountsService saved Session={session!r} for {state.get('user')}"
     return True, f"AccountsService record for {state.get('user')}: {keys}"
+
+
+def session_state(state):
+    """(ok, detail): the effective session and any saved choice are Tuna.
+
+    AccountsService 26.27.3 loads templates without writing a cache file,
+    and GDM 51 only saves selected/nonempty account properties. The stock
+    GNOME reference also leaves record-free accounts record-free on login.
+    See docs/vm-lifecycle.md for the direct reference receipt and sources.
+    """
+    user = state.get("user")
+    if state.get("effective_session") != "tuna":
+        return False, f"AccountsService effective Session={state.get('effective_session')!r} for {user}"
+    keys = parse_record(state.get("record"))
+    if keys is not None and keys.get("Session") not in (None, "tuna"):
+        return False, f"AccountsService saved Session={keys['Session']!r} for {user}"
+    return True, f"AccountsService effective Session=tuna for {user}; cache record: {keys}"
 
 
 def session_ok(observed):
@@ -247,6 +269,7 @@ class Journey:
         self.agent = None
         self.receipts = []
         self.gdm_trace, self.trace_active = gdm_trace, False
+        self.native_required = False
 
     def _run(self, action, *args):
         if self.agent is None:
@@ -300,6 +323,8 @@ class Journey:
         self.qmp.frame(os.path.join(self.out, f"{name}.png"))
 
     def _login(self, user, step):
+        if not self.native_required:
+            return self._login_direct(user, step)
         tracing = self.gdm_trace and user == STANDARD and step == f"{STANDARD}-first"
         if tracing:
             self.trace_active = True
@@ -349,6 +374,34 @@ class Journey:
             self.sleep(1)
         return False, f"{user}: no {LOGIN_SERVICE} session after {MAX_LOGIN_ATTEMPTS} GDM attempts"
 
+    def _login_direct(self, user, step):
+        self.qmp.keys("esc")
+        self.sleep(2)
+        self.qmp.type_text(user)
+        self.qmp.keys("ret")
+        self.sleep(2)
+        self._frame(f"{step}-password")
+        self.qmp.type_text(PASSWORD)
+        self.qmp.keys("ret")
+        deadline = self.clock() + self.login_timeout
+        observed = None
+        while self.clock() < deadline:
+            try:
+                observed = self._run("fresh-session", user)
+            except (OSError, RuntimeError, ValueError):
+                observed = None
+            if observed is not None and not no_session(observed):
+                ok, detail = session_ok(observed)
+                if ok or any(name in GNOME_DESKTOP for name in observed.get("desktop", [])):
+                    self._receipt(f"{step}-session", observed)
+                    self._frame(f"{step}-session")
+                    return ok, detail
+            self.sleep(1)
+        if observed is not None and not no_session(observed):
+            self._receipt(f"{step}-session", observed)
+            return session_ok(observed)
+        return False, f"{user}: no {LOGIN_SERVICE} session after GDM name and password entry"
+
     def _logout(self, user, step):
         self._run("fresh-logout", user)
         self._greeter(f"{step}-logout")
@@ -369,11 +422,15 @@ class Journey:
             if not ok:
                 self._diagnostic_state(f"{step}-failure-state", user)
                 return False
+            state = self._run("fresh-state", user)
+            self._receipt(f"{step}-state", state)
+            ok, detail = session_state(state)
+            self.record(f"V-FRESH-SESSION-{step}", ok, detail)
             if round_name == "first":
-                state = self._run("fresh-state", user)
-                self._receipt(f"{step}-state", state)
-                ok, detail = record_created(state)
-                self.record(f"V-FRESH-RECORD-CREATED-{user}", ok, detail)
+                if self.native_required:
+                    ok_record, detail = record_created(state)
+                    self.record(f"V-FRESH-RECORD-CREATED-{user}", ok_record, detail)
+                    ok = ok and ok_record
                 result = self._run("fresh-sudo", user)
                 self._receipt(f"{step}-sudo", result)
                 ok_sudo, detail = sudo_ok(result, user == ADMIN)
@@ -417,6 +474,7 @@ class Journey:
                         f"private GDM installed pair not proven ({type(error).__name__})")
             return False
         self._receipt("preflight-gdm-native-installed", versions)
+        self.native_required = True
         self.record("V-FRESH-GDM-NATIVE-CANDIDATE", True,
                     f"private GDM candidate {NATIVE_SOURCE_SHA}: gdm and libgdm {NATIVE_VERSION}")
         return True
@@ -451,8 +509,12 @@ class Journey:
         states = {user: self._run("fresh-state", user) for user in JOURNEY_USERS}
         self._receipt("reboot-state", states)
         for user in JOURNEY_USERS:
-            ok, detail = record_created(states[user])
-            self.record(f"V-FRESH-RECORD-KEPT-{user}", ok, detail)
+            ok, detail = session_state(states[user])
+            self.record(f"V-FRESH-SESSION-RELOADED-{user}", ok, detail)
+            if self.native_required:
+                ok_record, detail = record_created(states[user])
+                self.record(f"V-FRESH-RECORD-KEPT-{user}", ok_record, detail)
+                ok = ok and ok_record
             if not ok:
                 return False
         return self._cycle("reboot")

@@ -40,15 +40,34 @@ even when that session has `NoDisplay=true`. An absent or unparseable GDM
 version must not opt into the empty-template policy. Neither policy edits
 existing per-user records or replaces a valid saved session choice.
 
+For the general credential-only fixture, GDM's own
+`org.gnome.login-screen disable-user-list=true` in the `gdm` dconf database
+asks directly for the user name. In run 41230684089 the old Tab count to
+"Not listed?" selected the listed `tunaseeded` instead. The private native
+candidate image retains the normal user list and the separately proven
+bounded navigation reset: the native package repair must qualify the
+ordinary greeter, not that fixture shortcut. The native image's installed
+manifest controls only this setup choice; strict candidate and installed-pair
+admission is still required before any native persistence gate.
+
 | Gate | Actual operation and evidence |
 | --- | --- |
 | V-FRESH-RECORD-FREE-<user> | Before any login: account exists with a home, no `/var/lib/AccountsService/users/<user>`, no GDM automatic/timed login, `wheel` only for the admin |
 | V-FRESH-CONTROL | The same probe classifies the pre-seeded `tunaseeded` as NOT record-free |
-| V-FRESH-LOGIN-<user>-{first,second,reboot} | GDM "Not listed?" name and password typed through QMP; exactly one `gdm-password` VT session runs `tuna-compositor` and no `gnome-shell`/`gnome-session` |
-| V-FRESH-RECORD-CREATED-<user> | After the first login AccountsService wrote the record; any saved `Session` is `tuna` |
+| V-FRESH-LOGIN-<user>-{first,second,reboot} | GDM's user-name prompt, then the password, typed through QMP; exactly one `gdm-password` VT session of that account runs `tuna-compositor` and no `gnome-shell`/`gnome-session` |
+| V-FRESH-SESSION-<user>-{first,second,reboot} | Read AccountsService's effective `Session` over the system bus: it must be `tuna`; if a cache record exists, any saved `Session` must also be `tuna` |
+| V-FRESH-RECORD-CREATED-<user> | Verified private native candidate only: a physical AccountsService record must exist during the first logged-in session; any saved `Session` must be `tuna` |
 | V-FRESH-SUDO-<user> | `sudo -S -k true` as the account with its password: admin succeeds, standard is refused by sudo policy |
 | V-FRESH-LOGOUT-<user>-<round> | logind ends the session and the greeter is ready again |
-| V-FRESH-REBOOT / V-FRESH-RECORD-KEPT-<user> | Observe a different `boot_id` and ready greeter, then physical records for both accounts; both must log in and log out again |
+| V-FRESH-REBOOT / V-FRESH-SESSION-RELOADED-<user> | A different `boot_id` and ready greeter, then effective AccountsService `Session=tuna` reloads before login; both accounts authenticate into Tuna again |
+| V-FRESH-RECORD-KEPT-<user> | Verified private native candidate only: physical records for both accounts remain before either post-reboot login |
+
+Every path retains the effective-session checks from #989, including the
+GNOME reference's valid record-free general case. Explicitly admitted native
+candidates additionally retain every original physical record creation and
+retention criterion; an absent or invalid candidate cannot opt into native
+qualification. The private candidate's 24 original gates are not replaced
+by the additional effective-session coverage.
 
 The controller reads a nonempty old boot ID through the read-only `greeter`
 action, then calls `GuestAgent.request_reboot()` once.
@@ -60,8 +79,9 @@ A return is not an acknowledgement or proof of reboot.
 The controller reconnects at once, with no extra sleep.
 It retains the 180-second limit for a new boot and ready greeter.
 A boot ID that did not change cannot pass, nor can a greeter that is not ready.
-Physical record retention and both post-reboot logins and logouts remain mandatory.
-The 60-second login limit, two authentication tries and 90-second trace stay unchanged.
+Both post-reboot logins and logouts remain mandatory, as does physical record
+retention in the admitted native campaign. The native 60-second login limit,
+two authentication tries and 90-second trace stay unchanged.
 
 Run 41215443626 failed both native VM jobs with the AccountsService record
 still missing after a real record-free `tunastd` manual GDM login on
@@ -545,6 +565,74 @@ Later Orca and GDM layers must preserve that complete receipt.
 These source and parser checks do not qualify the runtime gates.
 
 
+### Why a first login need not create a cache file
+
+PR #931 incorrectly required a physical cache file after the first login.
+The direct [GNOME reference receipt](../scripts/lib/fixtures/fresh-account-gnome51-reference.json)
+boots the **same pinned published Marlin GNOME base** as failed diagnostic
+run [41223633281](https://github.com/tuna-os/tuna-desktop/actions/runs/41223633281):
+`ghcr.io/tuna-os/marlin:gnome@sha256:8d71660f78120a141e9ae8e620bd66645c6bfb52f1ab4cd663f9672aaa0b0b94`.
+It ran on an owned Corral VM on `karnataka`, without a Tuna package or the
+VM-lane layer. `useradd -m` created separate standard and wheel accounts;
+neither had a cache record, `.dmrc`, preselected session or autologin.
+Both first successful GDM password logins started stock GNOME Shell 51.1
+with gnome-session 51.0, GDM 51.1.1 and AccountsService 26.27.3, in active
+Wayland `gdm-password` sessions on VT2. **Both cache files remained absent**;
+AccountsService exported empty `Session` and `Saved=false`. The monitored
+system bus contained lookups but no `SetSession` or `CacheUser` calls before
+the explicitly labelled post-observation intervention. The receipt retains
+actual package/template/session identities, navigation distinctions and
+successful VM/disk deletion plus exact-name inventory absence.
+
+This matches upstream, rather than a missing Tuna session-start method:
+
+- [AccountsService 26.27.3 `user_update_from_template`](https://gitlab.freedesktop.org/accountsservice/accountsservice/-/blob/26.27.3/src/user.c#L330-414)
+  applies the template to in-memory/exported properties without saving a
+  file. Its `user_change_session_authorized_cb` writes extra data only when
+  the normalized new session differs from the current property.
+- [GDM 51.1.1 session settings](https://github.com/GNOME/gdm/blob/d643e68963ab74564955025b554ec23cd794770d/daemon/gdm-session-settings.c#L300-L320)
+  explicitly loads properties even without saved state. Its
+  [`gdm_session_settings_save`](https://github.com/GNOME/gdm/blob/d643e68963ab74564955025b554ec23cd794770d/daemon/gdm-session-settings.c#L373-L415)
+  only sends non-NULL session/type/language values, and caches only non-local
+  users. Loading a local account is not `CacheUser`. Tuna's existing
+  templates supply `Session=tuna`; setting that same value is not a reason
+  for AccountsService to materialize a cache file.
+- [GNOME Shell 51.1](https://github.com/GNOME/gnome-shell/blob/33da06854e229c256afd5872fedd83c28cbfa176/js/gdm/loginDialog.js#L535-L554)
+  can request `SelectSession` when the session menu's active item changes;
+  this is not a guarantee that every default login changes an account
+  property. Its user/session UI reads AccountsService users; the observed
+  GNOME login does not cache them. [gnome-session 51.0](https://github.com/GNOME/gnome-session/tree/aed00cf18229a98231c23e14f5798ddb918c4956)
+  has no AccountsService mutation API.
+- GNOME Initial Setup is a **different account-creation/property-writing
+  path**, not installed in this Marlin reference. Its [51.0 account page](https://github.com/GNOME/gnome-initial-setup/blob/51.0/gnome-initial-setup/pages/account/gis-account-page-local.c#L447-L488)
+  calls `CreateUser` and sets an icon; its [language page](https://github.com/GNOME/gnome-initial-setup/blob/51.0/gnome-initial-setup/pages/language/gis-language-page.c#L100-L153)
+  writes the language. AccountsService's `CreateUser` path calls
+  `cache_user`, unlike an installer using `useradd`. A record produced there
+  must not be misattributed to the first ordinary GDM login.
+
+The corrected proof does not write a record, call `SetSession`, preseed a
+choice or add product-side cache writes. It reads the effective
+AccountsService session with `FindUserByName`/`Get(Session)` and requires
+`tuna` after **every** login and after reboot, while still rejecting a saved
+GNOME choice. The record-free preflight, seeded negative control, real
+authentication, standard/admin sudo policy, logout and reboot remain gates.
+
+### Original #931 merge audit
+
+[#931](https://github.com/tuna-os/tuna-desktop/pull/931) did **not** have green
+exact-head CI. Head `d62ec870c0f402c22fbae6719afd227cd0353b81` was merged by
+`hanthor` at `2026-10-31T15:42:38Z` as
+`cba3cdbd5cd629d42c2512124f3fe7e35c117b55`, while its
+[exact-head run 41215443626](https://github.com/tuna-os/tuna-desktop/actions/runs/41215443626)
+was unfinished. `check` failed at 16:00:23Z, `marlin-vm` at 16:27:14Z,
+`marlin-vm-orca51` at 16:30:35Z and `ci-gate` at 18:14:39Z.
+An earlier PR comment already documented the missing-record failure as a
+merge blocker. At investigation time the branch protection endpoint returned
+“Branch not protected”; the effective organization ruleset required only
+deletion/non-fast-forward protection, not successful status checks. These
+observations explain why an ordinary merge was possible; they do not prove
+an administrator bypass was used.
+
 The Debian package journey must retain the original beta package's
 `share/pam.d/tuna-lock` conffile bytes, including its comment. Run
 41151873648's `journey` failed on dpkg's conffile prompt before the
@@ -584,7 +672,9 @@ feature tour:
 | V-GSD-POWER-IDLE | With `idle-delay` set to 20 s and no input, dbus-monitor records gsd-power's own `SetDimming(true)` before its `PowerSaveMode=3`; the compositor snapshot reports locked and `power_save_mode` 3; Return wakes it to 0 and gsd-power undims; the original delay is restored (lifecycle/gsd-power-idle.json, #355) |
 | V-LOCKED-HINT | logind's `LockedHint` for the login session reads `no`; the session user's `loginctl lock-session` locks the compositor and the hint turns `yes`; the real password unlocks and it reads `no`; Super+L locks with `yes`; `loginctl unlock-session` unlocks with `no`, as GNOME 51's `screenShield.js` does (lifecycle/locked-hint.json, #846). The published flavor predates the integration and defers to the current-build lane |
 | V-POWER-BUTTON | gsd-media-keys (its unit's main PID, the session user) holds logind's `block` inhibitor on `handle-power-key:handle-suspend-key:handle-hibernate-key` with Why "GNOME handling keypresses". On a fixture desktop chassis, after each gsd restart a new gsd-media-keys must own its name, hold that inhibitor, have `XF86PowerOff` granted by `GrabAccelerators` and the shell must log that it yielded the bindings. QMP `system_powerdown` (ACPI power button) with `power-button-action` `interactive`: `AcceleratorActivated` reaches gsd, gsd calls `org.gnome.SessionManager.Shutdown`, the compositor calls `EndSessionDialog.Open(1, …)` and the `tuna-shell-end-session` layer shows within 15 s; 5 s after the press QEMU is `running` with the same compositor process and logind session and no logind power request; Escape (always sent, far inside the 60 s countdown) removes the layer, the shell emits `Canceled` and logs its D-Bus Power Off dialog. `nothing`: gsd receives the key, and for at least 8 s no Shutdown, dialog call, layer or logind request follows. On the image's `vm` chassis with a fixture `shutdown` block inhibitor held by root: the key reaches gsd and gsd's own process calls logind `PowerOffWithFlags(0)`; gsd sends it without a reply callback (NO_REPLY_EXPECTED), so logind's refusal has no bus reply, and 5 s later logind has emitted no `PrepareForShutdown`/`PrepareForSleep`, `PreparingForShutdown` is still false with the fixture inhibitor held, no other logind request or non-error reply followed, no dialog opened and QEMU, compositor and session are unchanged. Setting, chassis and `/etc/machine-info` are restored (lifecycle/power-button.json, #353, #589) |
-| V-LOGOUT | The product's Log Out: `org.gnome.SessionManager.Logout(1)` on the session bus, which ends the compositor (the session leader) through its orderly shutdown, as gnome-session's exit ends a GNOME session; a published guest that predates that manager logs out as its shell did, through logind `Session.Terminate`. Within 30 s GDM's non-root gnome-shell greeter in its active gdm-launch-environment session repaints the greeter frame captured before login and no original compositor survives. logind's Terminate signals GDM's session worker together with the compositor; the worker's switch to the login VT could then be cancelled by logind restoring the session VT, leaving GDM without a greeter on the session VT (published nightly runs 40883859027 and 40940329310 attempt 1) |
+| V-RESTART-DIALOG | The shell's own power menu by physical keys, on the unlocked desktop after V-POWER-BUTTON (#589): Super+S opens quick settings; physical Tab moves until the shell's AT-SPI tree (`tuna-vm-shell-focus` end-session mode, observation only) reports Power Off Menu focused, Return opens the menu with Suspend, Restart…, Power Off… and Log Out… showing, and Tab/Return chooses Restart…. Within 15 s the shell (the `org.gnome.Shell` owner, not the compositor) has called `org.gnome.SessionManager.Reboot` and the compositor's manager has answered with the shell's `EndSessionDialog.Open(2, 0, 60, …)`, with the `tuna-shell-end-session` layer up; the dialog reads "The system will restart automatically in 60 seconds" with Cancel focused, as GNOME 51's endSessionDialog.js. It steps to 50 seconds with QEMU running, the session and compositor identity unchanged, no logind power request, `PrepareFor*` signal or `PreparingForShutdown`, and the request still unanswered; Return on the focused Cancel then emits the shell's `Canceled`, fails `Reboot` with gnome-session's `G_IO_ERROR_CANCELLED` and takes the layer down, still with logind untouched. Any failure presses Escape so no countdown is left running (lifecycle/end-session-menu.json). The published guest's shell predates the session manager and defers to the current-build lane |
+| V-POWER-OFF-DIALOG | As V-RESTART-DIALOG for Power Off…: `org.gnome.SessionManager.Shutdown`, `Open(1, 0, 60, …)`, "The system will power off automatically in 60 seconds" stepping to 50, Cancel by Return, `Shutdown` failed as cancelled, logind untouched |
+| V-LOGOUT | The product's Log Out, on the session bus through `org.gnome.SessionManager`, which ends the compositor (the session leader) through its orderly shutdown, as gnome-session's exit ends a GNOME session. The current-build lane logs out from the shell's power menu by physical keys (#589), as V-RESTART-DIALOG runs Restart…: the shell must ask `Logout(0)`, the compositor's manager must answer it once its `Open(0, 0, 60, …)` has put the dialog up, counting down from 60 with Cancel focused, and the session must outlive that countdown, whose expiry confirms the logout (the greeter may only return at least 55 s after the dialog opened). The published lane calls `Logout(1)` (no confirmation); a published guest that predates that manager logs out as its shell did, through logind `Session.Terminate`. Within 30 s of the logout taking effect (90 s from the menu dialog's opening) GDM's non-root gnome-shell greeter in its active gdm-launch-environment session repaints the greeter frame captured before login and no original compositor survives. logind's Terminate signals GDM's session worker together with the compositor; the worker's switch to the login VT could then be cancelled by logind restoring the session VT, leaving GDM without a greeter on the session VT (published nightly runs 40883859027 and 40940329310 attempt 1) |
 
 The original tour's `V-LOCK` still requires exactly unlocked → locked →
 unlocked. Its observations end before lifecycle operations add their own

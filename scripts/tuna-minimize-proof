@@ -27,7 +27,7 @@ from minimize_body_pixel import (unobscured_body_point, require_rgb, require_res
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument("--bin-dir", type=Path, required=True)
 p.add_argument("--artifacts", type=Path, required=True)
-p.add_argument("--display", default=":95")
+p.add_argument("--display", help="explicit private X display; default: Xvfb picks a free one")
 p.add_argument("--rtl",action="store_true")
 a = p.parse_args()
 root = Path(__file__).resolve().parent.parent
@@ -43,11 +43,13 @@ clock.write_text("0\n")
 (art / "assertions.txt").unlink(missing_ok=True)
 state.unlink(missing_ok=True)
 command.unlink(missing_ok=True)
-env = dict(os.environ, DISPLAY=a.display, XDG_RUNTIME_DIR=str(runtime),
+env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime),
            XDG_CONFIG_HOME=str(art / "config"), XDG_DATA_HOME=str(art / "data"), GSETTINGS_BACKEND="keyfile",
            TUNA_COMPOSITOR_STATE=str(state), TUNA_ANIMATION_CLOCK=str(clock),
            TUNA_XWAYLAND="0", LIBGL_ALWAYS_SOFTWARE="1", ADW_DISABLE_PORTAL="1", GSK_RENDERER="cairo", TUNA_LIFECYCLE_COMMAND=str(command))
 if a.rtl: env["GTK_DEBUG"]="invert-text-dir"
+env.pop("DISPLAY", None)
+if a.display: env["DISPLAY"] = a.display
 # Give the actual GTK dash a distinctive real desktop-entry icon, so its
 # published bounds can be checked against visible pixels rather than only
 # trusting the geometry reported by the compositor.
@@ -91,10 +93,10 @@ assert manifest["cargo_lock_sha256"] == digest(a.bin_dir / "Cargo.lock") == free
 (art / "manifest.json").write_text(json.dumps(manifest,indent=2))
 processes = []
 logs = []
-def spawn(args, name, extra=None):
+def spawn(args, name, extra=None, **kw):
     log = (art / f"{name}.log").open("w")
     logs.append(log)
-    proc = subprocess.Popen(args, env=env | (extra or {}), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    proc = subprocess.Popen(args, env=env | (extra or {}), stdout=log, stderr=subprocess.STDOUT, start_new_session=True, **kw)
     processes.append(proc)
     return proc
 def wait(check, label):
@@ -165,10 +167,25 @@ try:
         "accessibility_launcher_pid":launcher.pid,"accessibility_bus_pid":bus_pid,
     }
     (art / "manifest.json").write_text(json.dumps(manifest,indent=2))
-    # Refuse an existing display; never point the proof at a user's session.
-    if Path(f"/tmp/.X11-unix/X{a.display.lstrip(':')}").exists():
-        raise RuntimeError("display already in use; choose a private unused display")
-    spawn(["Xvfb", a.display, "-screen", "0", "1280x800x24"], "xvfb")
+    if a.display:
+        # Refuse an existing display; never point the proof at a user's session.
+        if Path(f"/tmp/.X11-unix/X{a.display.lstrip(':')}").exists():
+            raise RuntimeError("display already in use; choose a private unused display")
+        spawn(["Xvfb", a.display, "-screen", "0", "1280x800x24", "-nolisten", "tcp"], "xvfb")
+    else:
+        # tuna-xvfb picks a free display and locks it, so concurrent proofs never collide.
+        r, w = os.pipe()
+        spawn([str(root / "scripts/lib/tuna-xvfb"), "-displayfd", str(w), "-screen", "0", "1280x800x24", "-nolisten", "tcp"], "xvfb", pass_fds=(w,))
+        os.close(w)
+        number, deadline = b"", time.monotonic() + 30
+        while not number.endswith(b"\n"):
+            assert select.select([r], [], [], max(0, deadline - time.monotonic()))[0], "Xvfb readiness timeout"
+            chunk = os.read(r, 32)
+            assert chunk, "Xvfb exited before choosing a display"
+            number += chunk
+        os.close(r)
+        assert number.strip().isdigit(), "Xvfb reported no display number"
+        env["DISPLAY"] = ":" + number.decode().strip()
     for _ in range(100):
         if subprocess.run(["xdotool", "getdisplaygeometry"], env=env, capture_output=True).returncode == 0:
             break

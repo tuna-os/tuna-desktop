@@ -1446,6 +1446,151 @@ class PublicOrcaNavigation(unittest.TestCase):
         for key, invalid in (("GetNameOwner", ":1.28"), ("GetConnectionUnixProcessID", 934), ("GetConnectionUnixUser", 0)):
             self.assertTrue(eval(predicate, {**scope, "values": {**values, key: invalid}}))
 
+    def test_focus_cli_admits_each_mode_separately_without_changing_default(self):
+        from contextlib import redirect_stdout
+        module = self.focus_module()
+        tree = ast.parse(Path(module.__file__).read_text())
+        entry = next(n for n in tree.body if isinstance(n, ast.If)
+                     and ast.unparse(n.test) == "__name__ == '__main__'")
+        code = compile(ast.Module(body=entry.body, type_ignores=[]), module.__file__, "exec")
+        for mode in (None, "controlled-overview", "end-session", "notification-banner"):
+            calls = []
+            def observe(*args, **kwargs):
+                calls.append((args, kwargs))
+                return {"observation_only": True}
+            scope = {**vars(module), "sys": SimpleNamespace(argv=[
+                module.__file__, "933", "57", "tuna-shell-gtk", "wayland-0"
+            ] + ([] if mode is None else [mode])), "observe": observe}
+            stream = io.StringIO()
+            with self.subTest(mode=mode), redirect_stdout(stream):
+                exec(code, scope)
+            self.assertEqual(calls, [((933, 57, "tuna-shell-gtk", "wayland-0"),
+                                     {"controlled": mode == "controlled-overview",
+                                      "end_session": mode == "end-session",
+                                      "notification": mode == "notification-banner"})])
+            self.assertEqual(json.loads(stream.getvalue()), {"observation_only": True})
+        for extra in (["private mode"], ["end-session", "notification-banner"],
+                      ["controlled-overview", "end-session"]):
+            calls = []
+            scope = {**vars(module), "sys": SimpleNamespace(argv=[
+                module.__file__, "933", "57", "tuna-shell-gtk", "wayland-0", *extra
+            ]), "observe": lambda *args, **kwargs: calls.append(args)}
+            stream = io.StringIO()
+            with self.subTest(extra=extra), redirect_stdout(stream), self.assertRaises(SystemExit) as caught:
+                exec(code, scope)
+            self.assertEqual(caught.exception.code, 1)
+            self.assertEqual(calls, [])
+            self.assertEqual(json.loads(stream.getvalue()),
+                             {"focus_error_type": "ValueError", "focus_operation": "arguments"})
+
+    def test_focus_observer_refuses_combined_or_nonboolean_modes(self):
+        module = self.focus_module()
+        tree = ast.parse(Path(module.__file__).read_text())
+        observe = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "observe")
+        guard = next(n for n in observe.body if isinstance(n, ast.If))
+        code = compile(ast.Module(body=[guard], type_ignores=[]), module.__file__, "exec")
+        for controlled, end_session, notification in (
+                (False, False, False), (True, False, False),
+                (False, True, False), (False, False, True)):
+            exec(code, {"controlled": controlled, "end_session": end_session,
+                        "notification": notification, "executable": "tuna-shell-gtk"})
+        for modes in ((True, True, False), (True, False, True), (False, True, True),
+                      (True, True, True), (1, False, False), (False, 1, False),
+                      (False, False, 1)):
+            with self.subTest(modes=modes), self.assertRaisesRegex(RuntimeError, "fixed controlled"):
+                exec(code, dict(zip(("controlled", "end_session", "notification"), modes),
+                                executable="tuna-shell-gtk"))
+        for flag in ("controlled", "notification"):
+            with self.subTest(flag=flag), self.assertRaises(RuntimeError):
+                exec(code, {**dict.fromkeys(("controlled", "end_session", "notification"), False),
+                            flag: True, "executable": "gnome-disks"})
+
+    def focus_mode_tree(self, mode):
+        """Execute the actual traversal with public controls and private banner bait."""
+        module = self.focus_module()
+        tree = ast.parse(Path(module.__file__).read_text())
+        observe = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "observe")
+        traversal = next(n for n in observe.body if isinstance(n, ast.While))
+        calls = []
+        class Node:
+            def __init__(self, key, role, name, children=()):
+                self.key, self.role, self.name, self.children = key, role, name, children
+            def clear_cache(self):
+                pass
+            def get_state_set(self):
+                return SimpleNamespace(contains=lambda flag: flag in {"showing", "sensitive", "focused"})
+            def get_role_name(self):
+                return self.role
+            def get_name(self):
+                calls.append((self.key, "name"))
+                if mode == "notification-banner" and self.key in {"title", "body", "text"}:
+                    raise AssertionError("notification content must never be queried")
+                return self.name
+            def get_child_count(self):
+                return len(self.children)
+            def get_child_at_index(self, index):
+                return self.children[index]
+            def get_component_iface(self):
+                calls.append((self.key, "component"))
+                return self
+            def get_text_iface(self):
+                raise AssertionError("no mode in this traversal may query text")
+        banner = Node("banner", "frame", "Notifications", [
+            Node("title", "label", "private notification title"),
+            Node("body", "label", "private notification body"),
+            Node("text", "text", "private text buffer"),
+            Node("close", "button", "Close")])
+        countdown = "The system will restart automatically in 60 seconds"
+        app = Node("app", "application", "private application name", [
+            banner, Node("countdown", "label", countdown),
+            Node("restart", "button", "Restart…"), Node("search", "entry", "Search")])
+        scope = {**vars(module), "nodes": [], "pending": [(app, 0, False)], "visited": 0,
+                 "notification_frames": [], "notification_closes": [], "search_entries": [],
+                 "target": {"showing": 0, "focused": 0, "present": 0}, "focused_roles": [],
+                 "controlled": False, "end_session": mode == "end-session",
+                 "notification": mode == "notification-banner", "deadline": 8,
+                 "time": SimpleNamespace(monotonic=lambda: 0), "unlocked": lambda: None,
+                 "accessibility_query": lambda method, *args: method(*args),
+                 "Atspi": SimpleNamespace(
+                     StateType=SimpleNamespace(SHOWING="showing", FOCUSED="focused",
+                                               ACTIVE="active", SENSITIVE="sensitive"),
+                     CoordType=SimpleNamespace(WINDOW="window"),
+                     Component=SimpleNamespace(get_extents=lambda node, coord:
+                                               SimpleNamespace(x=10, y=20, width=30, height=40)))}
+        exec(compile(ast.Module(body=[traversal], type_ignores=[]), module.__file__, "exec"), scope)
+        return scope, calls, countdown
+
+    def test_default_traversal_never_queries_countdown_or_retains_notification_ui(self):
+        scope, calls, countdown = self.focus_mode_tree(None)
+        self.assertEqual([node["label"] for node in scope["nodes"]], ["Search"])
+        self.assertNotIn(("countdown", "name"), calls)
+        self.assertEqual(scope["notification_frames"], [])
+        self.assertEqual(scope["notification_closes"], [])
+        self.assertNotIn(countdown, json.dumps(scope["nodes"]))
+
+    def test_notification_traversal_queries_only_fixed_frame_and_close_not_content(self):
+        scope, calls, countdown = self.focus_mode_tree("notification-banner")
+        self.assertEqual(calls, [("banner", "name"), ("banner", "component"),
+                                 ("close", "name"), ("close", "component")])
+        self.assertEqual(scope["nodes"], [])
+        self.assertEqual(scope["notification_frames"], [[10, 20, 30, 40]])
+        self.assertEqual(scope["notification_closes"],
+                         [{"rect": [10, 20, 30, 40], "focused": True}])
+        retained = json.dumps([scope["nodes"], scope["notification_frames"], scope["notification_closes"]])
+        for private in ("private", "title", "body", "text buffer", countdown, "Restart…"):
+            self.assertNotIn(private, retained)
+
+    def test_end_session_traversal_keeps_countdown_without_notification_receipts(self):
+        scope, calls, countdown = self.focus_mode_tree("end-session")
+        self.assertEqual([node["label"] for node in scope["nodes"]], ["Search", "Restart…", countdown])
+        self.assertIn(("countdown", "name"), calls)
+        self.assertFalse(any(query == "component" for key, query in calls))
+        self.assertEqual(scope["notification_frames"], [])
+        self.assertEqual(scope["notification_closes"], [])
+        for private in ("private", "Notifications", "Close"):
+            self.assertNotIn(private, json.dumps(scope["nodes"]))
+        # Injected-tree policy coverage only, not native AT-SPI or VM qualification.
+
     def test_public_speech_tokens_never_retain_arbitrary_presenter_text(self):
         entries = [{"kind": "speech", "text": "Search entry private trailing text"},
                    {"kind": "speech", "text": "Take Screenshot button"},
@@ -3820,7 +3965,8 @@ class FixtureLoginSession(unittest.TestCase):
             with self.subTest(fixture=name):
                 containerfile = self.fixture(name)
                 self.assertIn("COPY packaging/marlin/vm-lane/tuna-vm-gdm.tmpfiles", containerfile)
-                body = containerfile.split("RUN mkdir -p /usr/share/tuna-vm", 1)[1]
+                # The published fixture's RUN carries a --mount flag before its body.
+                body = containerfile.split("mkdir -p /usr/share/tuna-vm", 1)[1]
                 for absent in ("greetd", "gtkgreet", "cage", "systemctl disable gdm"):
                     self.assertNotIn(absent, body)
                 for path in ("/usr/lib/pam.d/gdm-password", "/etc/gdm/custom.conf", "/etc/pam.d/tuna-lock",
@@ -3929,6 +4075,68 @@ class FixtureLoginSession(unittest.TestCase):
             self.assertEqual("ORCA_TEST_RPC_SECRET=" + (runtime / "tuna-vm-orca-token").read_text() + "\n", first)
             self.assertEqual((runtime / "tuna-vm-orca-token").stat().st_mode & 0o777, 0o600)
         # Fixture setup policy only, not a genuine reader proof.
+
+
+class PublishedFixturePackages(unittest.TestCase):
+    """Run 41230683948: `pacman -Sy` before the fixture install pulled
+    core/python 3.14.9-1 over the shipped 3.14.8-1. The fixture resolves
+    against the image's own sync databases instead."""
+    LANE = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane"
+
+    def run_helper(self, *args):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # The helper's /etc paths are rewritten to these files below.
+            (root / "pacman.conf").write_text(
+                "[options]\nDBPath = /usr/lib/sysimage/lib/pacman/\n"
+                f"[core]\nInclude = {root}/mirrorlist\n"
+                f"[extra]\nInclude = {root}/mirrorlist\n"
+                "[tunaos]\nServer = https://repo.tunaos.org/pacman/arch/$arch\n")
+            (root / "mirrorlist").write_text("Server = https://fastly.mirror.pkgbuild.com/$repo/os/$arch\n")
+            stubs = root / "bin"
+            stubs.mkdir()
+            (stubs / "pacman").write_text(
+                "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CALL/args\"\n"
+                "cp \"$2\" \"$CALL/conf\"\n"
+                "cp \"$(sed -n 's/^Include = //p' \"$2\" | head -1)\" \"$CALL/mirrorlist\"\n")
+            (stubs / "pacman").chmod(0o755)
+            script = ((self.LANE / "tuna-vm-published-pacman").read_text()
+                      .replace("/etc/pacman.conf", str(root / "pacman.conf"))
+                      .replace("/etc/pacman.d/mirrorlist", str(root / "mirrorlist")))
+            result = subprocess.run(["bash", "-c", script, "tuna-vm-published-pacman", *args],
+                env={**os.environ, "CALL": str(root), "PATH": str(stubs) + os.pathsep + os.environ["PATH"]},
+                capture_output=True, text=True, timeout=10)
+            called = (root / "args").exists()
+            return (result, (root / "args").read_text().splitlines() if called else None,
+                    (root / "conf").read_text() if called else None,
+                    (root / "mirrorlist").read_text() if called else None)
+
+    def test_install_uses_shipped_databases_with_archive_backing(self):
+        result, args, conf, mirrors = self.run_helper("qemu-guest-agent", "python")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(args[2:], ["-S", "--needed", "--noconfirm", "qemu-guest-agent", "python"])
+        self.assertEqual(args[0], "--config")
+        self.assertIn("DBPath = /usr/lib/sysimage/lib/pacman/", conf)
+        self.assertEqual(conf.count("Include = "), 2)
+        self.assertEqual(mirrors.splitlines(), [
+            "Server = https://fastly.mirror.pkgbuild.com/$repo/os/$arch",
+            "Server = https://archive.archlinux.org/packages/.all"])
+
+    def test_pacman_options_are_refused(self):
+        for option in ("-y", "-Syu", "--refresh"):
+            with self.subTest(option=option):
+                result, args, _, _ = self.run_helper("python", option)
+                self.assertEqual(result.returncode, 2)
+                self.assertIsNone(args)
+
+    def test_containerfile_never_resyncs_before_the_version_gate(self):
+        containerfile = (self.LANE / "Containerfile.published").read_text()
+        self.assertNotRegex(containerfile, r"pacman\s+-S\w*y")
+        self.assertEqual(containerfile.count("tuna-vm-published-pacman gcc"), 1)
+        install = containerfile.index("/run/tuna-vm-published-pacman qemu-guest-agent")
+        self.assertLess(containerfile.index("pacman -Q > /usr/share/tuna-vm/shipped-packages.txt"), install)
+        self.assertLess(install, containerfile.index('"fixture installation changed shipped package versions"'))
+
 
 
 class GdmGreeterReadiness(unittest.TestCase):
@@ -4687,6 +4895,293 @@ printf 'fixture: startup sleeps=%s\n' "$sleeps"
         for name in ("calendar", "portal", "portal-gnome", "portal-screenshot", "portal-screencast"):
             self.assertIn(f"tuna-vm-health: {name} ready", output)
         self.assertNotIn("failed", output)
+class FakeEndSessionGuest:
+    """A guest whose shell, session manager and logind answer the lane's
+    physical keys the way #589 requires, unless `fault` breaks one link.
+    It is the lane's QMP, guest agent and clock at once."""
+    SHELL = [":1.20", 2000]
+    MANAGER = [":1.5", 1000]
+    QUICK = ["Take Screenshot", "Settings", "Lock", "Power Off Menu"]
+    ROWS = ["Suspend", "Restart…", "Power Off…", "Log Out…"]
+    TYPES = {"restart": 2, "power-off": 1, "log-out": 0}
+    METHODS = {"restart": "Reboot", "power-off": "Shutdown", "log-out": "Logout"}
+    ROW_CASE = {"Restart…": "restart", "Power Off…": "power-off", "Log Out…": "log-out"}
+    TITLES = {"restart": "Restart", "power-off": "Power Off", "log-out": "Log Out"}
+    COUNTDOWN = {"restart": "The system will restart automatically in {} seconds",
+                 "power-off": "The system will power off automatically in {} seconds",
+                 "log-out": "You will be logged out automatically in {} seconds"}
+
+    def __init__(self, fault=None):
+        self.fault, self.clock, self.pressed, self.frames = fault, 100.0, [], []
+        self.quick = self.menu = False
+        self.focus = 0
+        self.messages, self.requests, self.system = [], [], []
+        self.dialog = None
+        self.compositor = 1000
+
+    # The lane's clock.
+    def monotonic(self):
+        return self.clock
+
+    def sleep(self, seconds):
+        self.clock += seconds
+        self.tick()
+
+    # QMP.
+    def cmd(self, name, **_):
+        assert name == "query-status"
+        return {"status": "shutdown" if self.fault == "vm-stopped" and self.dialog else "running"}
+
+    def keys(self, *names, **_):
+        self.pressed.append(names)
+        self.clock += 0.2
+        controls = self.focusable()
+        if names == ("meta_l", "s"):
+            self.quick, self.focus = True, 0
+        elif names == ("tab",) and controls:
+            self.focus = (self.focus + 1) % len(controls)
+        elif names == ("esc",):
+            if self.dialog:
+                self.answer("Cancel")
+            self.quick = self.menu = False
+        elif names == ("ret",) and controls:
+            label = self.dialog["focus"] if self.dialog else controls[self.focus]
+            if self.dialog:
+                self.answer(label)
+            elif label == "Power Off Menu":
+                self.menu = True
+            elif label in self.ROW_CASE:
+                self.quick = self.menu = False
+                self.ask(self.ROW_CASE[label])
+
+    # The shell, its session manager and logind.
+    def message(self, **fields):
+        fields["index"] = len(self.messages)
+        self.messages.append(fields)
+        return fields
+
+    def ask(self, case):
+        sender = ":1.99" if self.fault == "request-not-from-shell" else self.SHELL[0]
+        request = self.message(kind="request", sender=sender, destination="org.gnome.SessionManager",
+                               member=self.METHODS[case], args=["uint32 0"] if case == "log-out" else [],
+                               reply=None)
+        self.requests.append(request)
+        if self.fault == "no-dialog":
+            return
+        seconds = 30 if self.fault == "short-countdown" else 60
+        self.message(kind="dialog", type="method call", sender=self.MANAGER[0], destination="org.gnome.Shell",
+                     member="Open", args=[f"uint32 {self.TYPES[case]}", "uint32 0", f"uint32 {seconds}"])
+        self.dialog = {"case": case, "opened": self.clock,
+                       "focus": self.TITLES[case] if self.fault == "cancel-unfocused" else "Cancel"}
+        if case == "log-out":
+            request["reply"] = ({"type": "error", "error_name": "org.freedesktop.DBus.Error.Failed"}
+                                if self.fault == "logout-refused" else {"type": "method return", "error_name": None})
+
+    def answer(self, label):
+        case = self.dialog["case"]
+        if label == "Cancel" and self.fault != "cancel-confirms":
+            self.message(kind="dialog", type="signal", sender=self.SHELL[0], destination=None,
+                         member="Canceled", args=[])
+            if case != "log-out":
+                self.requests[-1]["reply"] = {"type": "error", "error_name": lane.END_SESSION_CANCELLED}
+        else:
+            self.message(kind="dialog", type="signal", sender=self.SHELL[0], destination=None,
+                         member="ConfirmedReboot", args=[])
+            self.requests[-1]["reply"] = {"type": "method return", "error_name": None}
+            self.system.append({"index": len(self.system), "member": "Reboot", "sender": self.MANAGER[0]})
+        if self.fault == "session-replaced":
+            self.compositor = 1001
+        self.dialog = None
+
+    def tick(self):
+        if (self.fault == "logind-during-countdown" and self.dialog
+                and self.clock - self.dialog["opened"] >= 5 and not self.system):
+            self.system.append({"index": 0, "member": "RebootWithFlags", "sender": ":1.99"})
+
+    def shown(self):
+        # endSessionDialog.js: 60 for the first ten seconds, then steps of ten.
+        if self.fault == "frozen-countdown":
+            return 60
+        left = 60 - int(self.clock - self.dialog["opened"])
+        return left if left <= 10 else min(60, (left + 9) - (left + 9) % 10)
+
+    def focusable(self):
+        if self.dialog:
+            return ["Cancel", self.TITLES[self.dialog["case"]]]
+        if self.quick:
+            rows = [row for row in self.ROWS if not (self.fault == "no-restart-row" and row == "Restart…")]
+            return self.QUICK + (rows if self.menu else [])
+        return []
+
+    # The guest agent.
+    def run(self, action, *arguments):
+        self.clock += 0.3
+        self.tick()
+        if action == "shell-controls":
+            focusable = self.focusable()
+            focused = self.dialog["focus"] if self.dialog else (focusable[self.focus] if focusable else None)
+            controls = [{"label": label, "role": "push button", "focused": label == focused, "active": True}
+                        for label in focusable]
+            if self.dialog and self.fault != "no-countdown-label":
+                controls.append({"label": self.COUNTDOWN[self.dialog["case"]].format(self.shown()),
+                                 "role": "label", "focused": False, "active": True})
+            return {"public_controls": controls}
+        assert action == "power-button-observe", action
+        manager = [self.MANAGER[0], 3000] if self.fault == "manager-not-compositor" else self.MANAGER
+        strip = lambda m: {key: value for key, value in m.items() if key != "kind"}
+        return {"session_count": len(self.messages), "system_count": len(self.system),
+                "end_session": [strip(m) for m in self.messages if m["kind"] == "request"],
+                "dialog": [strip(m) for m in self.messages if m["kind"] == "dialog"],
+                "system": list(self.system), "prepare": [], "preparing_for_shutdown": False,
+                "owners": {"shell": self.SHELL, "session_manager": manager},
+                "layers": ["tuna-shell-panel"] + ([lane.END_SESSION_LAYER] if self.dialog else [])}
+
+    def identity(self):
+        return {"session": "2", "compositor": [(self.compositor, 77)]}
+
+    def frame(self, label):
+        self.frames.append(label)
+
+
+class ShellMenuEndSession(unittest.TestCase):
+    """#589 on the installed image: Restart…, Power Off… and Log Out… from
+    the shell's own power menu by physical keys, judged against the session
+    manager's 60 s end-session dialog (V-RESTART-DIALOG, V-POWER-OFF-DIALOG,
+    V-LOGOUT)."""
+
+    def drive(self, name, fault=None):
+        guest = FakeEndSessionGuest(fault)
+        with patch.object(lane, "time", guest):
+            result = lane.end_session_menu_case(guest, guest, name, guest.identity, guest.frame)
+        return guest, result
+
+    def fails(self, name, fault, message):
+        guest = FakeEndSessionGuest(fault)
+        with patch.object(lane, "time", guest), self.assertRaisesRegex(RuntimeError, message):
+            lane.end_session_menu_case(guest, guest, name, guest.identity, guest.frame)
+        return guest
+
+    def test_restart_and_power_off_open_the_60_s_dialog_hold_and_cancel(self):
+        for name, method, kind in (("restart", "Reboot", 2), ("power-off", "Shutdown", 1)):
+            with self.subTest(name=name):
+                guest, result = self.drive(name)
+                self.assertEqual(guest.pressed[0], ("meta_l", "s"))
+                self.assertEqual(guest.pressed[-1], ("ret",), "Return on the focused Cancel")
+                self.assertNotIn(("esc",), guest.pressed)
+                self.assertEqual(result["opened"]["request"]["member"], method)
+                self.assertEqual(result["opened"]["open"]["args"], [f"uint32 {kind}", "uint32 0", "uint32 60"])
+                self.assertGreaterEqual(result["held_after"], 10, "held past the countdown's first step")
+                self.assertEqual(result["reply"]["error_name"], lane.END_SESSION_CANCELLED)
+                self.assertEqual(guest.system, [], "logind never asked")
+                self.assertEqual(guest.frames, [f"end-session-{name}-dialog", f"end-session-{name}-held",
+                                                f"end-session-{name}-cancelled"])
+
+    def test_log_out_opens_the_dialog_and_is_left_to_its_countdown(self):
+        guest, result = self.drive("log-out")
+        self.assertEqual(result["opened"]["request"]["args"], ["uint32 0"])
+        self.assertEqual(result["opened"]["open"]["args"], ["uint32 0", "uint32 0", "uint32 60"])
+        self.assertEqual(result["reply"]["type"], "method return")
+        self.assertIsNotNone(guest.dialog, "the countdown keeps running")
+        self.assertNotIn(("esc",), guest.pressed)
+        self.assertTrue(0 <= result["opened_at"] - guest.dialog["opened"] < 1)
+
+    def test_every_broken_link_fails_and_leaves_no_countdown_running(self):
+        for name, fault, message in (
+                ("restart", "no-restart-row", "power menu's rows"),
+                ("restart", "no-dialog", "did not open"),
+                ("restart", "short-countdown", "did not open"),
+                ("power-off", "request-not-from-shell", "did not open"),
+                ("power-off", "manager-not-compositor", "did not open"),
+                ("restart", "no-countdown-label", "60 s countdown"),
+                ("power-off", "cancel-unfocused", "Cancel focused"),
+                ("restart", "frozen-countdown", "stepping to 50"),
+                ("power-off", "logind-during-countdown", "did not hold"),
+                ("restart", "vm-stopped", "did not hold"),
+                ("log-out", "logout-refused", "Logout\\(0\\) failed"),
+                ("log-out", "no-countdown-label", "60 s countdown")):
+            with self.subTest(fault=fault):
+                guest = self.fails(name, fault, message)
+                self.assertEqual(guest.pressed[-1], ("esc",), "Escape on every failure")
+                self.assertIsNone(guest.dialog, "no countdown left running")
+
+    def test_cancel_that_confirms_or_replaces_the_session_fails(self):
+        guest = self.fails("restart", "cancel-confirms", "Cancel did not cancel")
+        self.assertEqual(guest.system[0]["member"], "Reboot")
+        self.fails("power-off", "session-replaced", "disturbed the session")
+
+    def test_agent_observation_feeds_the_lane_from_dbus_monitor_text(self):
+        """The guest agent's own power_button_observe parses dbus-monitor
+        output into the end-session records the lane judges."""
+        import pathlib
+        source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+        wanted = {"dbus_monitor_messages", "power_button_observe", "END_SESSION_METHODS",
+                  "POWER_BUTTON_LOGIND_CALLS", "POWER_BUTTON_LOGIND_PREPARE"}
+        body = [node for node in ast.parse(source.read_text()).body
+                if (isinstance(node, ast.FunctionDef) and node.name in wanted)
+                or (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id in wanted
+                                                         for target in node.targets))]
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            session, system = temp / "session.log", temp / "system.log"
+            state, saved = temp / "state.json", temp / "saved.json"
+            state.write_text(json.dumps({"layers": [{"namespace": lane.END_SESSION_LAYER}]}))
+            saved.write_text(json.dumps({"session_monitor": os.getpid(), "system_monitor": os.getpid()}))
+            system.write_text("")
+            session.write_text(
+                "method call time=1.0 sender=:1.20 -> destination=org.gnome.SessionManager serial=12 "
+                "path=/org/gnome/SessionManager; interface=org.gnome.SessionManager; member=Reboot\n"
+                "method call time=1.1 sender=:1.5 -> destination=org.gnome.Shell serial=40 "
+                "path=/org/gnome/SessionManager/EndSessionDialog; "
+                "interface=org.gnome.SessionManager.EndSessionDialog; member=Open\n"
+                "   uint32 2\n   uint32 0\n   uint32 60\n   array [\n   ]\n"
+                "method return time=1.2 sender=:1.20 -> destination=:1.5 serial=41 reply_serial=40\n"
+                "signal time=9.0 sender=:1.20 -> destination=(null destination) serial=42 "
+                "path=/org/gnome/SessionManager/EndSessionDialog; "
+                "interface=org.gnome.SessionManager.EndSessionDialog; member=Canceled\n"
+                f"error time=9.1 sender=:1.5 -> destination=:1.20 error_name={lane.END_SESSION_CANCELLED} "
+                "reply_serial=12\n   string \"Operation was cancelled\"\n")
+            owners = {"org.gnome.Shell": [":1.20", 2000], "org.gnome.SessionManager": [":1.5", 1000]}
+            scope = {"json": json, "pathlib": pathlib, "POWER_BUTTON_SESSION_LOG": session,
+                     "POWER_BUTTON_SYSTEM_LOG": system, "POWER_BUTTON_STATE": saved, "STATE": state,
+                     "power_button_log": lambda path: scope["dbus_monitor_messages"](path.read_text()),
+                     "system_bus_pid": lambda name: None, "gsd_plugin_row": lambda plugin: {"ok": True},
+                     "logind_inhibitors": lambda: [], "logind_preparing_for_shutdown": lambda: False,
+                     "bus_owner": owners.get, "OWNER": SimpleNamespace(pw_name="tuna-test", pw_uid=1000)}
+            exec(compile(ast.Module(body=body, type_ignores=[]), str(source), "exec"), scope)
+            observed = scope["power_button_observe"]()
+        case = lane.END_SESSION_CASES["restart"]
+        mark = {"session_count": 0, "system_count": 0}
+        opened = lane.end_session_opened(observed, mark, case, 1000)
+        self.assertIsNotNone(opened)
+        self.assertEqual(lane.end_session_reply(observed, opened)["error_name"], lane.END_SESSION_CANCELLED)
+        self.assertEqual(observed["shutdowns"], [], "the power key's Shutdown records stay separate")
+        # Controls: another case, a compositor that is not the manager and a
+        # mark after the request all see nothing.
+        self.assertIsNone(lane.end_session_opened(observed, mark, lane.END_SESSION_CASES["power-off"], 1000))
+        self.assertIsNone(lane.end_session_opened(observed, mark, case, 999))
+        self.assertIsNone(lane.end_session_opened(observed, {"session_count": 1, "system_count": 0}, case, 1000))
+
+    def test_focus_helper_reports_countdown_labels_only_in_end_session_mode(self):
+        path = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-shell-focus"
+        loader = importlib.machinery.SourceFileLoader("end_session_focus_policy", str(path))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        countdown = "The system will restart automatically in 60 seconds"
+        self.assertEqual(module.public_node(countdown, "label", True, False, True, end_session=True),
+                         {"label": countdown, "role": "label", "focused": False, "active": True})
+        self.assertIsNotNone(module.public_node("You will be logged out automatically in 1 second", "label",
+                                                True, False, True, end_session=True))
+        self.assertIsNotNone(module.public_node("Restart…", "push button", True, True, True, end_session=True))
+        # Controls: the default mode, private label text, a hidden dialog and
+        # another role keep nothing.
+        self.assertIsNone(module.public_node(countdown, "label", True, False, True))
+        self.assertIsNone(module.public_node("Restart…", "push button", True, True, True))
+        self.assertIsNone(module.public_node("Meeting notes from Alice", "label", True, False, True,
+                                             end_session=True))
+        self.assertIsNone(module.public_node(countdown + ". Unsaved: diary.txt", "label", True, False, True,
+                                             end_session=True))
+        self.assertIsNone(module.public_node(countdown, "label", False, False, True, end_session=True))
+        self.assertIsNone(module.public_node(countdown, "push button", True, False, True, end_session=True))
 
 
 if __name__ == "__main__":

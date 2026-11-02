@@ -24,6 +24,7 @@ import fresh_accounts  # noqa: E402
 
 GUEST = ROOT / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
 ADMIN_POLICY = runpy.run_path(str(ROOT / "packaging/marlin/vm-lane/tuna-vm-admin-policy"))
+FIXTURE = ROOT / "packaging/marlin/vm-lane/tuna-vm-fresh-accounts"
 CONF = "[daemon]\nFallbackSession=tuna\n"
 NATIVE_SOURCE = "7b52bdf34be22bc60fef62b157be64b589b13f6a"
 
@@ -55,8 +56,9 @@ class FakeGuest:
     """Stock GNOME 51 root focus ring and username/password prompts, plus
     guest observations. Group membership and sudo authorization are separate."""
 
-    def __init__(self, **faults):
+    def __init__(self, native=True, **faults):
         self.faults = faults
+        self.native = native
         self.boot = 1
         self.records = {"tunaseeded": "[User]\nSystemAccount=false\n"}
         self.records.update(faults.get("records", {}))
@@ -93,7 +95,7 @@ class FakeGuest:
         fixtures = ("tuna-test", "tunaseeded", "tunastd", "tunaadmin")
         self.initial_cached = fixtures[:faults.get("cached_users", 2)]
         self._show_list()
-        self.mode = faults.get("initial_mode", "list")
+        self.mode = faults.get("initial_mode", "list" if native else "username")
         self.selected_user = "tuna-test" if self.mode == "password" else None
         self.manual_username = self.mode == "password"
 
@@ -109,7 +111,7 @@ class FakeGuest:
             self.focus = self.faults.get("hover_focus", 0) % len(self.focus_ring)
 
     def _show_list(self):
-        self.mode, self.entry, self.focus = "list", "", 0
+        self.mode, self.entry, self.focus = "list" if self.native else "username", "", 0
         self._hover()
         self.root_views.append(self.focus_ring)
 
@@ -132,6 +134,9 @@ class FakeGuest:
         if self.mode == "list":
             self._hover()
         if names == ("esc",):
+            if not self.native:
+                self.mode, self.entry = "username", ""
+                return
             if self.mode == "password" and self.manual_username:
                 self.mode, self.entry = "username", ""
             elif self.mode in ("username", "password", "a11y"):
@@ -162,7 +167,8 @@ class FakeGuest:
                 if self.logged_in is None and not self.faults.get("reject_login"):
                     self.logged_in, self.logged_out, self.mode = user, None, "desktop"
                     self.logins.append((self.boot, user))
-                    if not (self.faults.get("no_record") or self.faults.get("record_on_logout")):
+                    if ((self.native or self.faults.get("write_record") or "saved" in self.faults)
+                            and not (self.faults.get("no_record") or self.faults.get("record_on_logout"))):
                         self.records[user] = self.faults.get("saved", "[User]\nSession=tuna\nSystemAccount=false\n")
 
     def type_text(self, text):
@@ -254,6 +260,9 @@ class FakeGuest:
                 return {"user": user, "exists": False}
             return {"user": user, "exists": True, "uid": self.uids[user], "groups": self.groups[user],
                     "home": f"/var/home/{user}", "home_exists": True, "record": self.records.get(user),
+                    "effective_session": (None if self.faults.get("lost_session") and self.boot > 1
+                                          else self.faults.get("effective_by_login", {}).get(
+                                              len(self.logins), self.faults.get("effective_session", "tuna"))),
                     "custom_conf": self.faults.get("custom_conf", CONF)}
         if action == "fresh-session":
             user = args[0]
@@ -280,6 +289,18 @@ class FakeGuest:
 
 
 def journey(guest, gdm_trace=False, candidate_env=None):
+    # Historical native tests use the real manifest and installed-pair admission,
+    # never a patched predicate or a production boolean override.
+    with tempfile.TemporaryDirectory() as root:
+        if guest.native and candidate_env is None:
+            path = pathlib.Path(root) / "manifest.json"
+            path.write_text(json.dumps(candidate_manifest()))
+            candidate_env = {"TUNA_VM_GDM_NATIVE_CANDIDATE": str(path),
+                             "TUNA_VM_GDM_NATIVE_SOURCE_SHA": NATIVE_SOURCE}
+        return _journey(guest, gdm_trace=gdm_trace, candidate_env=candidate_env)
+
+
+def _journey(guest, gdm_trace=False, candidate_env=None):
     results = {}
     clock = [0.0]
 
@@ -309,6 +330,7 @@ def journey(guest, gdm_trace=False, candidate_env=None):
         path = pathlib.Path(out) / "fresh-accounts-receipts.json"
         receipts = json.loads(path.read_text()) if path.exists() else None
         guest.elapsed = clock[0]
+        guest.native_required = run.native_required
     return passed, results, error, receipts
 
 
@@ -474,7 +496,8 @@ class JourneyTest(unittest.TestCase):
                                         (2, "tunastd"), (2, "tunaadmin")])
         for name in ("V-FRESH-RECORD-FREE-tunastd", "V-FRESH-RECORD-FREE-tunaadmin", "V-FRESH-CONTROL",
                      "V-FRESH-RECORD-CREATED-tunastd", "V-FRESH-SUDO-tunaadmin", "V-FRESH-SUDO-tunastd",
-                     "V-FRESH-REBOOT"):
+                     "V-FRESH-SESSION-tunastd-first", "V-FRESH-RECORD-KEPT-tunaadmin",
+                     "V-FRESH-REBOOT", "V-FRESH-SESSION-RELOADED-tunaadmin", "V-FRESH-LOGOUT-tunaadmin-reboot"):
             self.assertIn(name, results)
         retained = next(receipt["value"] for receipt in receipts if receipt["step"] == "reboot-state")
         for user in fresh_accounts.JOURNEY_USERS:
@@ -487,6 +510,16 @@ class JourneyTest(unittest.TestCase):
         self.assertEqual(len(guest.connections), 2)
         self.assertNotIn("reboot", guest.actions)
         self.assertNotIn(10, guest.sleeps)
+        original = {"V-FRESH-CONTROL", "V-FRESH-REBOOT"}
+        for user in ("tunastd", "tunaadmin"):
+            original.update(f"V-FRESH-{kind}-{user}"
+                            for kind in ("RECORD-FREE", "RECORD-CREATED", "RECORD-KEPT", "SUDO"))
+            for round_name in ("first", "second", "reboot"):
+                original.update(f"V-FRESH-{kind}-{user}-{round_name}" for kind in ("LOGIN", "LOGOUT"))
+                self.assertIn(f"V-FRESH-SESSION-{user}-{round_name}", results)
+            self.assertIn(f"V-FRESH-SESSION-RELOADED-{user}", results)
+        self.assertTrue(original.issubset(results), original - results.keys())
+        self.assertTrue(guest.native_required)
 
     def test_first_round_records_state_after_each_logout(self):
         _, _, _, receipts = journey(FakeGuest())
@@ -604,7 +637,7 @@ class JourneyTest(unittest.TestCase):
     def test_saved_gnome_session_fails(self):
         passed, results, _, _ = journey(FakeGuest(saved="[User]\nSession=gnome\n"))
         self.assertFalse(passed)
-        self.assertFailed(results, "V-FRESH-RECORD-CREATED-tunastd")
+        self.assertFailed(results, "V-FRESH-SESSION-tunastd-first")
 
     def test_standard_sudo_fails(self):
         passed, results, _, _ = journey(FakeGuest(std_sudo=True))
@@ -747,6 +780,88 @@ class JourneyTest(unittest.TestCase):
                 self.assertEqual(len(guest.logins), 4)
                 self.assertNotIn("V-FRESH-LOGIN-tunastd-reboot", results)
                 self.assertNotIn("V-FRESH-LOGIN-tunaadmin-reboot", results)
+
+
+class GenericJourneyTest(unittest.TestCase):
+    def test_record_free_login_matches_gnome_reference(self):
+        reference = json.loads((ROOT / "scripts/lib/fixtures/fresh-account-gnome51-reference.json").read_text())
+        for account in reference["first_logins"]:
+            self.assertIsNone(account["record_before"])
+            self.assertIsNone(account["record_after"])
+            self.assertEqual(account["session"]["Service"], "gdm-password")
+            self.assertIn("gnome-shell", account["desktop"])
+        guest = FakeGuest(native=False)
+        passed, results, error, receipts = journey(guest)
+        self.assertTrue(passed, (results, error))
+        self.assertFalse(guest.native_required)
+        self.assertNotIn("tunastd", guest.records)
+        self.assertNotIn("tunaadmin", guest.records)
+        self.assertFalse(any("RECORD-CREATED" in name or "RECORD-KEPT" in name for name in results))
+        self.assertFalse(any("gdm-native" in name for name in steps(receipts)))
+        self.assertEqual(guest.pointer_events, [])
+        self.assertEqual(guest.key_calls, [("esc",), ("ret",), ("ret",)] * 6)
+        self.assertEqual(guest.sleeps, [2, 2] * 6)
+        self.assertEqual(len(guest.logins), 6)
+        for user in ("tunastd", "tunaadmin"):
+            for round_name in ("first", "second", "reboot"):
+                for kind in ("LOGIN", "SESSION", "LOGOUT"):
+                    self.assertTrue(results[f"V-FRESH-{kind}-{user}-{round_name}"][0])
+            self.assertTrue(results[f"V-FRESH-SESSION-RELOADED-{user}"][0])
+        request = guest.transport_events.index(("request_reboot", 1))
+        self.assertEqual(guest.transport_events[request - 1:request + 4],
+                         [("run", 1, "greeter"), ("request_reboot", 1), ("close", 1),
+                          ("connect", 2), ("run", 2, "greeter")])
+        self.assertEqual(guest.reboot_requests, 1)
+        self.assertNotIn("reboot", guest.actions)
+        self.assertNotIn(10, guest.sleeps)
+
+    def test_saved_tuna_record_is_supported(self):
+        passed, results, error, _ = journey(FakeGuest(native=False, write_record=True))
+        self.assertTrue(passed, (results, error))
+
+    def test_effective_session_must_be_tuna_in_both_modes(self):
+        for native in (False, True):
+            for session in ("", None, "gnome"):
+                with self.subTest(native=native, session=session):
+                    passed, results, _, _ = journey(FakeGuest(native=native, effective_session=session))
+                    self.assertFalse(passed)
+                    self.assertFalse(results["V-FRESH-SESSION-tunastd-first"][0])
+
+    def test_effective_session_is_checked_on_each_login_in_both_modes(self):
+        rounds = ("first", "first", "second", "second", "reboot", "reboot")
+        for native in (False, True):
+            for index, round_name in enumerate(rounds, 1):
+                with self.subTest(native=native, login=index):
+                    user = "tunastd" if index % 2 else "tunaadmin"
+                    guest = FakeGuest(native=native, effective_by_login={index: "gnome"})
+                    passed, results, _, _ = journey(guest)
+                    self.assertFalse(passed)
+                    self.assertFalse(results[f"V-FRESH-SESSION-{user}-{round_name}"][0])
+                    self.assertEqual(len(guest.logins), index)
+
+    def test_effective_session_must_reload_after_reboot_in_both_modes(self):
+        for native in (False, True):
+            with self.subTest(native=native):
+                guest = FakeGuest(native=native, lost_session=True)
+                passed, results, _, _ = journey(guest)
+                self.assertFalse(passed)
+                self.assertFalse(results["V-FRESH-SESSION-RELOADED-tunastd"][0])
+                self.assertEqual(len(guest.logins), 4)
+
+    def test_saved_gnome_session_fails_without_native_candidate(self):
+        passed, results, _, _ = journey(FakeGuest(native=False, saved="[User]\nSession=gnome\n"))
+        self.assertFalse(passed)
+        self.assertFalse(results["V-FRESH-SESSION-tunastd-first"][0])
+
+    def test_generic_rejection_has_one_sixty_second_attempt(self):
+        guest = FakeGuest(native=False, reject_login=True)
+        passed, results, error, _ = journey(guest)
+        self.assertFalse(passed)
+        self.assertIsNone(error)
+        self.assertFalse(results["V-FRESH-LOGIN-tunastd-first"][0])
+        self.assertEqual(guest.auth_attempts, [("tunastd", "tuna")])
+        self.assertEqual(len(guest.session_polls), 60)
+        self.assertEqual(guest.pointer_events, [])
 
 
 class NativeCandidateManifestTest(unittest.TestCase):
@@ -948,7 +1063,7 @@ class NativeCandidateJourneyTest(unittest.TestCase):
             self.assertNotIn(private, rendered)
 
     def test_no_manifest_does_not_probe_or_add_candidate_gate_or_receipts(self):
-        guest = FakeGuest(policy_error=True)
+        guest = FakeGuest(native=False, policy_error=True)
         passed, results, error, receipts = journey(guest)
         self.assertTrue(passed, (results, error))
         self.assertEqual(guest.policy_calls, [])
@@ -970,6 +1085,7 @@ class NativeCandidateJourneyTest(unittest.TestCase):
                 self.assertFalse(results["V-FRESH-GDM-NATIVE-CANDIDATE"][0])
                 self.assertEqual(guest.actions, ["greeter"])
                 self.assertEqual(guest.input_calls, 0)
+                self.assertFalse(guest.native_required)
         self.path.write_text('{"schema":1,"schema":1}')
         guest = FakeGuest()
         passed, results, error, receipts = journey(guest, candidate_env=self.env)
@@ -978,6 +1094,7 @@ class NativeCandidateJourneyTest(unittest.TestCase):
         self.assertEqual(guest.actions, ["greeter"])
         self.assertEqual(guest.input_calls, 0)
         self.assertNotIn("preflight-gdm-native-candidate", steps(receipts))
+        self.assertFalse(guest.native_required)
 
     def test_wrong_missing_truncated_or_failed_guest_pair_stops_before_input(self):
         policies = [None, {}, {"packages": None}, {"packages": {}}, {"packages": []}]
@@ -1012,6 +1129,7 @@ class NativeCandidateJourneyTest(unittest.TestCase):
                 self.assertEqual(guest.input_calls, 0)
                 self.assertEqual(guest.state_calls, [])
                 self.assertNotIn("PRIVATE", json.dumps((receipts, results)))
+                self.assertFalse(guest.native_required)
 
     def test_guest_probe_exception_is_sanitized_and_not_retried(self):
         guest = FakeGuest(policy_error=True)
@@ -1037,6 +1155,35 @@ class NativeCandidateJourneyTest(unittest.TestCase):
                 self.assertEqual(guest.logins, [(1, "tunastd")])
                 state = receipts[steps(receipts).index("tunastd-first-state")]["value"]
                 self.assertIsNone(state["record"])
+
+    def test_malformed_candidate_never_falls_back_to_generic_acceptance(self):
+        self.path.write_text("false")
+        guest = FakeGuest(native=False)
+        passed, results, error, receipts = journey(guest, candidate_env=self.env)
+        self.assertFalse(passed)
+        self.assertIsNone(error)
+        self.assertFalse(results["V-FRESH-GDM-NATIVE-CANDIDATE"][0])
+        self.assertFalse(guest.native_required)
+        self.assertEqual(guest.actions, ["greeter"])
+        self.assertEqual(guest.input_calls, 0)
+        self.assertEqual(guest.logins, [])
+        self.assertEqual(steps(receipts), ["preflight-greeter"])
+
+    def test_native_required_is_set_only_after_installed_pair_admission(self):
+        guest = FakeGuest()
+        with tempfile.TemporaryDirectory() as out, mock.patch.dict(os.environ, self.env, clear=True):
+            run = fresh_accounts.Journey(guest, guest.connect, lambda value: value["ready"], out,
+                                         lambda *args: None)
+            original = guest.run
+
+            def observe(action, *args):
+                self.assertFalse(run.native_required)
+                return original(action, *args)
+
+            with mock.patch.object(guest, "run", side_effect=observe):
+                self.assertTrue(run._native_preflight())
+            self.assertTrue(run.native_required)
+            run.agent.close()
 
 
 GUEST_FUNCTIONS = {"fresh_state", "record_presence", "template_observation", "accounts_get",
@@ -1140,7 +1287,7 @@ class GuestStateTest(unittest.TestCase):
     """The guest probe itself reports a record exactly when the file exists,
     and its diagnostics never read as the persistence the gates require."""
 
-    def probe(self, records, bus=None, templates=(), during_get=None):
+    def probe(self, records, bus=None, templates=(), during_get=None, during_lookup=None):
         with tempfile.TemporaryDirectory() as root:
             users = pathlib.Path(root, "users")
             users.mkdir()
@@ -1154,11 +1301,24 @@ class GuestStateTest(unittest.TestCase):
             if during_get is not None:
                 bus.during_get = lambda: during_get(users)
             entry = SimpleNamespace(pw_uid=1001, pw_dir=root)
+            calls = []
+
+            def call(*args):
+                calls.append(args)
+                if args[0] == "id":
+                    return "tunastd"
+                if "FindUserByName" in args:
+                    if during_lookup is not None:
+                        during_lookup(users)
+                    return json.dumps({"type": "o", "data": ["/org/freedesktop/Accounts/User1001"]})
+                return json.dumps({"type": "s", "data": "tuna"})
+
             scope = guest_scope(pwd=SimpleNamespace(getpwnam=lambda name: entry), ACCOUNTS_RECORD_DIR=users,
-                                GDM_CUSTOM_CONF=conf, call=lambda *args: "tunastd",
+                                GDM_CUSTOM_CONF=conf, call=call,
                                 ACCOUNTS_TEMPLATE_DIRS=template_roots(root))
             with fake_gi(bus):
                 state = scope["fresh_state"]("tunastd")
+            self.probe_calls = calls
             json.dumps(state)  # The receipt must serialize.
         return state
 
@@ -1167,6 +1327,16 @@ class GuestStateTest(unittest.TestCase):
         self.assertIsNone(state["record"])
         self.assertEqual(state["accounts"]["record_before"], {"present": False})
         self.assertEqual(state["accounts"]["record_after"], {"present": False})
+        self.assertEqual(state["effective_session"], "tuna")
+
+    def test_effective_session_uses_only_main_read_only_calls(self):
+        self.probe({})
+        self.assertEqual(self.probe_calls, [
+            ("busctl", "--system", "--json=short", "call", "org.freedesktop.Accounts",
+             "/org/freedesktop/Accounts", "org.freedesktop.Accounts", "FindUserByName", "s", "tunastd"),
+            ("busctl", "--system", "--json=short", "get-property", "org.freedesktop.Accounts",
+             "/org/freedesktop/Accounts/User1001", "org.freedesktop.Accounts.User", "Session"),
+            ("id", "-nG", "tunastd")])
 
     def test_present_record_detected(self):
         state = self.probe({"tunastd": "[User]\nSystemAccount=false\n"})
@@ -1221,6 +1391,18 @@ class GuestStateTest(unittest.TestCase):
         self.assertEqual(state["accounts"]["record_before"], {"present": False})
         self.assertEqual(state["accounts"]["record_after"], {"present": True, "regular": True})
         # Neither the later file nor Saved=true substitutes for the gate's record.
+        self.assertFalse(fresh_accounts.record_created(state)[0])
+
+    def test_physical_record_precedes_explicit_effective_session_lookup(self):
+        def create(users):
+            (users / "tunastd").write_text("[User]\nSession=tuna\n")
+
+        state = self.probe({}, during_lookup=create)
+        self.assertIsNone(state["record"])
+        self.assertEqual(state["accounts"]["record_before"], {"present": False})
+        self.assertEqual(state["accounts"]["record_after"], {"present": True, "regular": True})
+        self.assertEqual(state["effective_session"], "tuna")
+        self.assertTrue(fresh_accounts.session_state(state)[0])
         self.assertFalse(fresh_accounts.record_created(state)[0])
 
     def test_templates_follow_precedence_and_allowlist(self):
@@ -1589,6 +1771,52 @@ class AdminImagePolicyTest(unittest.TestCase):
         self.assertEqual(receipt.read_bytes(), original)
 
 
+
+
+class FixtureTest(unittest.TestCase):
+    def test_fresh_boot_asks_for_user_name_without_session_state(self):
+        text = FIXTURE.read_text()
+        self.assertIn("grep -qx 'system-db:gdm' /usr/share/dconf/profile/gdm", text)
+        self.assertIn("[org/gnome/login-screen]\\ndisable-user-list=true\\n", text)
+        self.assertIn("dconf update", text)
+        self.assertNotIn("Session=", text)
+        self.assertNotIn("AutomaticLogin", text)
+
+    def test_native_marker_preserves_stock_list_while_generic_configures_direct_prompt(self):
+        for native in (False, True):
+            with self.subTest(native=native), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                binaries = root / "bin"
+                binaries.mkdir()
+                # All fixture users already exist; any attempted account write
+                # is a failure, not something the test silently accepts.
+                for name, body in (("id", "exit 0"), ("useradd", "exit 91"), ("chpasswd", "exit 92"),
+                                   ("dconf", 'printf "dconf %s\\n" "$*"')):
+                    path = binaries / name
+                    path.write_text(f"#!/bin/sh\n{body}\n")
+                    path.chmod(0o755)
+                profile = root / "gdm-profile"
+                profile.write_text("user-db:user\nsystem-db:gdm\n")
+                manifest = root / "native-manifest.json"
+                if native:
+                    # Presence is a UI marker only, not valid native admission.
+                    manifest.write_text("not an admission manifest")
+                dconf = root / "dconf"
+                source = FIXTURE.read_text().replace(
+                    "/usr/share/tuna-vm-gdm51/manifest.json", str(manifest)).replace(
+                    "/usr/share/dconf/profile/gdm", str(profile)).replace(
+                    "/etc/dconf", str(dconf))
+                environment = dict(os.environ, PATH=f"{binaries}:{os.environ.get('PATH', '/usr/bin:/bin')}")
+                result = subprocess.run(["sh", "-eu"], input=source, text=True, capture_output=True,
+                                        env=environment, check=True)
+                setting = dconf / "db/gdm.d/90-tuna-vm-fresh-accounts"
+                if native:
+                    self.assertFalse(setting.exists())
+                    self.assertEqual(result.stdout, "")
+                else:
+                    self.assertEqual(setting.read_text(), "[org/gnome/login-screen]\ndisable-user-list=true\n")
+                    self.assertEqual(result.stdout, "dconf update\n")
+                self.assertEqual(result.stderr, "")
 
 
 if __name__ == "__main__":

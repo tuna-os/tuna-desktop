@@ -30,3 +30,13 @@ if ! id -u tunaseeded >/dev/null 2>&1; then
 	printf '[User]\nSystemAccount=false\n' >/var/lib/AccountsService/users/tunaseeded
 	chmod 0600 /var/lib/AccountsService/users/tunaseeded
 fi
+# Generic fresh boots ask for the name directly using GDM's own login-screen
+# setting. The native layer keeps its approved stock user-list traversal.
+# Manifest presence here is only a UI setup marker, never candidate admission.
+# No account, session or autologin state changes.
+if [ ! -e /usr/share/tuna-vm-gdm51/manifest.json ]; then
+	grep -qx 'system-db:gdm' /usr/share/dconf/profile/gdm
+	install -d -m 0755 /etc/dconf/db/gdm.d
+	printf '[org/gnome/login-screen]\ndisable-user-list=true\n' >/etc/dconf/db/gdm.d/90-tuna-vm-fresh-accounts
+	dconf update
+fi
