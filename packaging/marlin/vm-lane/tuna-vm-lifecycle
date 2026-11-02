@@ -2221,7 +2221,15 @@ def main():
     if os.geteuid() != 0 or OWNER.pw_uid == 0:
         raise RuntimeError("probe must be root and session owner must not be root")
     action = sys.argv[1]
-    if action == "background-diagnostics":
+    if action == "autotz":
+        sys.path.insert(0, "/usr/libexec/tuna-native-session")
+        import autotz_guest
+        try:
+            result = autotz_guest.execute(sys.argv[2:], OWNER, inventory, STATE)
+        except Exception as error:
+            print(json.dumps({"autotz_error": autotz_guest.error_receipt(error, sys.argv[2:])}))
+            raise SystemExit(1) from None
+    elif action == "background-diagnostics":
         inventory()  # Verify the original actual login owner before re-exec.
         result = json.loads(call(sys.executable, __file__, "background-user-diagnostics", user=True))
     elif action == "inventory":

@@ -4041,6 +4041,8 @@ def main():
                     help="after the assertions, record the feature tour video")
     ap.add_argument("--strip-edge", action="store_true", help="explicit four-actor stationary edge consumer on final boot")
     ap.add_argument("--strip-image", help="exact same-run package/final-image receipt; installed strip acceptance on final tour boot")
+    ap.add_argument("--profile", choices=("lifecycle", "autotz"), default="lifecycle",
+                    help="required independent native automatic-timezone consumer")
     ap.add_argument("--published", action="store_true",
                     help="the disk holds the published marlin:tuna flavor; released-build gaps qualify "
                          "where the current-build lanes prove the newer behavior")
@@ -4062,6 +4064,10 @@ def main():
                     help="tunaOS#4092: run only the record-free standard/admin account GDM journey "
                          "(first login, logout, login, reboot, login), not the tuna-test lane")
     a = ap.parse_args()
+    if a.profile == "autotz":
+        if (not a.require_kvm or not a.strip_image or a.tour or a.boots != 1
+                or a.soak or a.fresh_accounts or a.published or a.strip_edge):
+            ap.error("native autotz requires KVM, exact installed image admission and one pristine boot")
     if a.fresh_accounts:
         if a.tour or a.boots != 1 or a.soak or a.strip_image or a.published:
             ap.error("--fresh-accounts is its own single current-build boot")
@@ -4078,8 +4084,8 @@ def main():
     if a.strip_edge and not a.strip_image:
         ap.error("--strip-edge requires exact installed image admission")
     if a.strip_image:
-        if not a.tour:
-            ap.error("--strip-image requires --tour lifecycle")
+        if not a.tour and a.profile != "autotz":
+            ap.error("--strip-image requires --tour lifecycle or explicit native autotz consumer")
         with open(a.strip_image, "rb") as stream:
             raw = stream.read(1048577)
         if len(raw) > 1048576:
@@ -4199,6 +4205,17 @@ def main():
             finally:
                 if agent is not None:
                     agent.close()
+            if a.profile == "autotz":
+                try:
+                    if not manager_ready:
+                        raise RuntimeError("original installed native session owner admission failed")
+                    from core_apps_autotz import run_native
+                    factory = lambda *, deadline: guest_agent.GuestAgent(agent_path, deadline=deadline)
+                    consumer = run_native(qmp, factory, out, strip_image)
+                    record("V-AUTOTZ", isinstance(consumer, dict) and consumer.get("qualified") is True,
+                           "required independent native automatic-timezone consumer completed")
+                except Exception as error:
+                    record("V-AUTOTZ", False, f"native automatic-timezone consumer failed: {type(error).__name__}")
             if a.soak and manager_ready:
                 run_soak(qmp, vm, agent_path, out, record, a.soak, a.soak_warmup, a.soak_interval,
                          a.soak_revision)
@@ -4248,6 +4265,8 @@ def main():
            "tuna-shell-gtk started under supervision" if shell
            else "no tuna-shell-gtk: keybindings line")
     results.setdefault("V-PANEL", (False, "session never came up, no screendump checked"))
+    if a.profile == "autotz":
+        results.setdefault("V-AUTOTZ", (False, "native session never admitted; required consumer did not run"))
     if a.soak:
         results.setdefault("V-SOAK", (False, "the session never became ready, so the soak did not run"))
     # GDM starting its greeter on the login VT takes DRM master from the
@@ -4283,6 +4302,7 @@ def main():
                                   text=True).stdout.splitlines()[0]
     manifest = {
         "lane": "marlin-vm",
+        "profile": a.profile,
         "orca_contract": a.orca_contract,
         "session": ("published Tuna Desktop flavor" if a.published else "source-built Tuna Desktop")
                    + " via shipped GDM PAM login, DRM/KMS backend",

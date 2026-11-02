@@ -9,7 +9,7 @@ import sys
 sys.dont_write_bytecode = True
 root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root / 'scripts/lib'))
-from vm_strip_image import IMAGE_INSPECTION, admission, canonical_image_id
+from vm_strip_image import admission, canonical_image_id, inspection_program
 
 
 def main():
@@ -22,15 +22,16 @@ def main():
     parser.add_argument('--image-id')
     parser.add_argument('--base-image')
     parser.add_argument('--out')
+    parser.add_argument('--fixture', choices=('lifecycle', 'autotz'), default='lifecycle')
     args = parser.parse_args()
     if args.canonical_image_id is not None:
-        if args.inspection_program or any(getattr(args, name) is not None for name in
+        if args.fixture != 'lifecycle' or args.inspection_program or any(getattr(args, name) is not None for name in
                 ('package', 'observed', 'commit', 'image_id', 'base_image', 'out')):
             parser.error('image ID canonicalization requires a separate invocation')
         print(canonical_image_id(args.canonical_image_id))
         return
     if args.inspection_program:
-        print(IMAGE_INSPECTION, end='')
+        print(inspection_program(args.fixture), end='')
         return
     if any(getattr(args, name) is None for name in ('package', 'observed', 'commit', 'image_id', 'base_image', 'out')):
         parser.error('complete original package/image/source inputs required')
@@ -45,7 +46,8 @@ def main():
         raw = stream.read(16385)
     if len(raw) > 16384:
         raise ValueError('image inspection receipt bound exceeded')
-    receipt = admission(package, json.loads(raw), root, head, args.image_id, args.base_image)
+    receipt = admission(package, json.loads(raw), root, head, args.image_id, args.base_image,
+                        fixture=args.fixture)
     with open(args.out, 'x') as output:
         json.dump(receipt, output, indent=2)
         output.write('\n')

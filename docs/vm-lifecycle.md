@@ -13,12 +13,42 @@ No autologin or initial session exists: the lane drives GDM's user list and
 types the fixture password exactly as the published-flavor nightly does
 (`V-GREETER-LIST`, `V-GDM-FALLBACK`, `V-GDM-LOGIN`;
 `docs/marlin-tuna-nightly.md`), from the same `scripts/tuna-vm-lane` code.
-Logout must return to that GDM greeter. This changes neither the shipped
-preview image nor the number of CI VM profiles. GDM's session worker opens a
-journal stream for `gdm-wayland-session`, which the fixture forwards to the
-serial port. The fixture's session environment comes from `environment.d`,
+Logout must return to that GDM greeter. The ordinary two lifecycle/Orca rows
+retain five pristine boots, the default GPU, fresh-account journeys and all
+aggregate gates. GDM's session worker opens a journal stream for
+`gdm-wayland-session`, which the fixture forwards to the serial port.
+The fixture's session environment comes from `environment.d`,
 which gdm-wayland-session imports from the user manager; the per-login Orca
 test secret comes from a user environment generator.
+
+## Required independent native automatic timezone
+
+Whenever `marlin-vm` is selected, its matrix also requires `marlin-vm-autotz`.
+This uses the same original package producer and VM image recipe, with
+`--profile autotz --require-kvm --boots 1`: one pristine snapshot boot,
+stock GDM and the original non-root standard account, unchanged default GPU,
+and no disposable disk or full Core application installer/inventory.
+There is no dispatch, secret or repository-variable waiver.
+
+The final immutable image receipt binds the exact executing source commit,
+original package hash and original installed ELF hashes, lifecycle helper,
+normal GeoClue policy helper and four fixed native-session observers:
+`native_session.py`, `autotz_guest.py`, `autotz.py`, `geoclue_fixture.py`.
+The latter two are installed from the clock-only source files, not the
+full Core guest. The ordinary preview policy invocation remains unchanged.
+This is same-run source/image admission, **not signed release proof**.
+
+The root `autotz DOMAIN OPERATION JSON` route delegates to the installed
+standalone observer. QGA acquisition and nested commands share finite
+absolute deadlines; reconnecting cannot renew them. Failure diagnostics
+contain only bounded domain/operation/type/sites and optional numeric codes,
+never raw arguments or exception text. Unconfirmed guest-child retirement
+remains fatal. `V-AUTOTZ` requires the consumer's explicit complete qualified
+result; an exception, missing native session or missing result fails the
+row and therefore the existing aggregate CI gate. The consumer retains its
+actual original-shell AddAgent, source/provider, daemon location/timezone
+and panel-clock gates and restoration requirements. Routing implementation
+alone claims no native runtime qualification.
 
 ## Record-free fresh accounts (tunaOS#4092)
 

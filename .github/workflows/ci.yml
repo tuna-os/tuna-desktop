@@ -1284,11 +1284,20 @@ jobs:
     # GDM starts the Tuna Desktop hardware session on the DRM/KMS backend. The
     # image is rebuilt rootful here (bootc install reads it from root's storage),
     # in parallel with marlin-image rather than after it.
-    name: ${{ matrix.orca == 'distribution' && 'marlin-vm' || 'marlin-vm-orca51' }}
+    name: ${{ matrix.artifact }}
     strategy:
       fail-fast: false
       matrix:
-        orca: [distribution, upstream51]
+        include:
+          - profile: lifecycle
+            orca: distribution
+            artifact: marlin-vm
+          - profile: lifecycle
+            orca: upstream51
+            artifact: marlin-vm-orca51
+          - profile: autotz
+            orca: distribution
+            artifact: marlin-vm-autotz
     runs-on: ubuntu-26.04
     needs: [select-lanes, arch-package]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm')
@@ -1348,11 +1357,11 @@ jobs:
           image_id=$(cat /mnt/vm/image-id)
           owned_container="tuna-strip-inspect-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           trap 'sudo podman rm -f "$owned_container" >/dev/null 2>&1 || true' EXIT
-          scripts/tuna-vm-strip-image --inspection-program > /mnt/vm/strip-inspect.py
+          scripts/tuna-vm-strip-image --fixture '${{ matrix.profile }}' --inspection-program > /mnt/vm/strip-inspect.py
           timeout --kill-after=5s 60s sudo podman run --rm --name "$owned_container" -i \
             --entrypoint /usr/bin/python3 "$image_id" - "$image_id" \
             < /mnt/vm/strip-inspect.py > /mnt/vm/strip-image-observed.json
-          scripts/tuna-vm-strip-image --package tuna.pkg.tar.zst \
+          scripts/tuna-vm-strip-image --fixture '${{ matrix.profile }}' --package tuna.pkg.tar.zst \
             --observed /mnt/vm/strip-image-observed.json --commit "$GITHUB_SHA" \
             --image-id "$image_id" \
             --base-image "ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)" \
@@ -1384,6 +1393,7 @@ jobs:
       # After the assertions, --tour drives a scripted feature tour
       # through QMP input and records it to tour/tuna-tour.webm.
       - name: Boot the disk, assert the Tuna Desktop hardware session, record the tour
+        if: matrix.profile == 'lifecycle'
         run: >-
           scripts/tuna-vm-lane --disk /mnt/vm/disk.raw --out vm-lane-artifacts --boots 5 --tour --orca-contract ${{ matrix.orca }}
           --strip-image vm-lane-artifacts/strip-image.json --strip-edge
@@ -1391,12 +1401,21 @@ jobs:
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
           --meta "tuna_package=$(basename arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)"
           --meta "commit=${{ github.sha }}"
+      - name: Required independent native automatic timezone
+        if: matrix.profile == 'autotz'
+        run: >-
+          scripts/tuna-vm-lane --profile autotz --require-kvm --boots 1
+          --disk /mnt/vm/disk.raw --out vm-lane-artifacts
+          --strip-image vm-lane-artifacts/strip-image.json
+          --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
+          --meta "test_image_id=$(cat /mnt/vm/image-id)"
+          --meta "commit=${{ github.sha }}"
       # tunaOS#4092: record-free standard/admin accounts (useradd at boot, no
       # AccountsService record, no Session preselection, no autologin) through
       # first GDM login, logout, login, reboot and login. Separate from the
       # session-less tuna-test case above; -snapshot leaves the disk pristine.
       - name: Fresh-account GDM journey (record-free standard and admin)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.profile == 'lifecycle' }}
         run: >-
           test -f /mnt/vm/disk.raw &&
           scripts/tuna-vm-lane --fresh-accounts --disk /mnt/vm/disk.raw --out vm-lane-artifacts/fresh-accounts
@@ -1406,13 +1425,13 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
-          name: ${{ matrix.orca == 'distribution' && 'marlin-vm' || 'marlin-vm-orca51' }}
+          name: ${{ matrix.artifact }}
           path: |
             vm-lane-artifacts/
             !vm-lane-artifacts/tour/
           retention-days: 14
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        if: always()
+        if: always() && matrix.profile == 'lifecycle'
         with:
           name: ${{ matrix.orca == 'distribution' && 'tuna-tour' || 'tuna-tour-orca51' }}
           path: vm-lane-artifacts/tour/
