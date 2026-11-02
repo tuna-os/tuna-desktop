@@ -1313,7 +1313,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
-      - run: pacman -Syu --noconfirm --needed base-devel git rust pkgconf clang pipewire gtk4 gtk4-layer-shell libadwaita libsecret libcanberra sound-theme-freedesktop libxkbcommon libxkbcommon-x11 mesa wayland dbus glib2 gnome-settings-daemon gnome-session colord gnome-color-manager seatd libinput systemd-libs libdrm librsvg glycin gdk-pixbuf2 fontconfig adwaita-fonts namcap
+      - run: pacman -Syu --noconfirm --needed base-devel git rust python pkgconf clang pipewire gtk4 gtk4-layer-shell libadwaita libsecret libcanberra sound-theme-freedesktop libxkbcommon libxkbcommon-x11 mesa wayland dbus glib2 gnome-settings-daemon gnome-session colord gnome-color-manager seatd libinput systemd-libs libdrm librsvg glycin gdk-pixbuf2 fontconfig adwaita-fonts namcap
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
@@ -1338,7 +1338,11 @@ jobs:
       - run: |
           useradd -m builder
           chown -R builder "$GITHUB_WORKSPACE" "$CARGO_HOME"
-          su builder -c "cd '$GITHUB_WORKSPACE/packaging/arch' && CARGO_HOME='$CARGO_HOME' CARGO_TARGET_DIR='$CARGO_TARGET_DIR' RUSTUP_TOOLCHAIN=stable TUNA_LOCAL_SRC='$GITHUB_WORKSPACE' makepkg -f --noconfirm"
+          colour_out=""
+          if [[ '${{ contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm') }}' == true ]]; then
+            colour_out="$GITHUB_WORKSPACE/native-colour-overlay"
+          fi
+          su builder -c "cd '$GITHUB_WORKSPACE/packaging/arch' && CARGO_HOME='$CARGO_HOME' CARGO_TARGET_DIR='$CARGO_TARGET_DIR' RUSTUP_TOOLCHAIN=stable TUNA_LOCAL_SRC='$GITHUB_WORKSPACE' TUNA_NATIVE_COLOUR_OUT='$colour_out' makepkg -f --noconfirm"
       - run: |
           pkg=$(ls packaging/arch/tuna-desktop-[0-9]*.pkg.tar.zst)
           namcap "$pkg" || true
@@ -1357,6 +1361,13 @@ jobs:
         with:
           name: tuna-arch
           path: arch-artifacts/
+          retention-days: 14
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm')
+        with:
+          name: native-colour-overlay
+          path: native-colour-overlay/
+          if-no-files-found: error
           retention-days: 14
 
   marlin-image:
@@ -1418,11 +1429,20 @@ jobs:
     # GDM starts the Tuna Desktop hardware session on the DRM/KMS backend. The
     # image is rebuilt rootful here (bootc install reads it from root's storage),
     # in parallel with marlin-image rather than after it.
-    name: ${{ matrix.orca == 'distribution' && 'marlin-vm' || 'marlin-vm-orca51' }}
+    name: ${{ matrix.artifact }}
     strategy:
       fail-fast: false
       matrix:
-        orca: [distribution, upstream51]
+        include:
+          - profile: lifecycle
+            orca: distribution
+            artifact: marlin-vm
+          - profile: lifecycle
+            orca: upstream51
+            artifact: marlin-vm-orca51
+          - profile: colour
+            orca: distribution
+            artifact: native-colour
     runs-on: ubuntu-26.04
     needs: [select-lanes, arch-package]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm')
@@ -1435,6 +1455,11 @@ jobs:
         with:
           name: tuna-arch
           path: arch-artifacts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        if: matrix.profile == 'colour'
+        with:
+          name: native-colour-overlay
+          path: native-colour-overlay
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -1447,6 +1472,9 @@ jobs:
           sudo mkdir -p /mnt/vm && sudo chown "$(id -u):$(id -g)" /mnt/vm
           df -h / /mnt
       - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core zstd
+      - name: Install the owned virgl DEV launcher
+        if: matrix.profile == 'colour'
+        run: sudo apt-get install -y --no-install-recommends qemu-system-gui xvfb xauth libgl1-mesa-dri libegl-mesa0
       - name: Build the Marlin Tuna Desktop image and the VM test layer
         run: |
           cp arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst ./tuna.pkg.tar.zst
@@ -1456,6 +1484,11 @@ jobs:
             -t localhost/marlin-tuna-preview:ci .
           sudo podman build -f packaging/marlin/vm-lane/Containerfile \
             -t localhost/marlin-tuna-vm:ci .
+          if [[ '${{ matrix.profile }}' == colour ]]; then
+            sudo podman build -f packaging/marlin/vm-lane/Containerfile.colour \
+              -t localhost/marlin-tuna-vm-colour:ci .
+            sudo podman tag localhost/marlin-tuna-vm-colour:ci localhost/marlin-tuna-vm:ci
+          fi
           if [[ '${{ matrix.orca }}' == upstream51 ]]; then
             sudo podman build -f packaging/marlin/vm-lane/orca51/Containerfile \
               -t localhost/marlin-tuna-vm-orca51:ci .
@@ -1482,11 +1515,11 @@ jobs:
           image_id=$(cat /mnt/vm/image-id)
           owned_container="tuna-strip-inspect-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           trap 'sudo podman rm -f "$owned_container" >/dev/null 2>&1 || true' EXIT
-          scripts/tuna-vm-strip-image --inspection-program > /mnt/vm/strip-inspect.py
+          scripts/tuna-vm-strip-image --fixture '${{ matrix.profile }}' --inspection-program > /mnt/vm/strip-inspect.py
           timeout --kill-after=5s 60s sudo podman run --rm --name "$owned_container" -i \
             --entrypoint /usr/bin/python3 "$image_id" - "$image_id" \
             < /mnt/vm/strip-inspect.py > /mnt/vm/strip-image-observed.json
-          scripts/tuna-vm-strip-image --package tuna.pkg.tar.zst \
+          scripts/tuna-vm-strip-image --fixture '${{ matrix.profile }}' --package tuna.pkg.tar.zst \
             --observed /mnt/vm/strip-image-observed.json --commit "$GITHUB_SHA" \
             --image-id "$image_id" \
             --base-image "ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)" \
@@ -1518,6 +1551,7 @@ jobs:
       # After the assertions, --tour drives a scripted feature tour
       # through QMP input and records it to tour/tuna-tour.webm.
       - name: Boot the disk, assert the Tuna Desktop hardware session, record the tour
+        if: matrix.profile == 'lifecycle'
         run: >-
           scripts/tuna-vm-lane --disk /mnt/vm/disk.raw --out vm-lane-artifacts --boots 5 --tour --orca-contract ${{ matrix.orca }}
           --strip-image vm-lane-artifacts/strip-image.json --strip-edge
@@ -1525,12 +1559,22 @@ jobs:
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
           --meta "tuna_package=$(basename arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)"
           --meta "commit=${{ github.sha }}"
+      - name: Prove all native colour DMA and production capture consumers
+        if: matrix.profile == 'colour'
+        run: >-
+          xvfb-run -a -s '-screen 0 1280x800x24'
+          env LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
+          scripts/tuna-vm-lane --disk /mnt/vm/disk.raw --out vm-lane-artifacts
+          --profile colour --require-kvm --strip-image vm-lane-artifacts/strip-image.json
+          --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
+          --meta "test_image_id=$(cat /mnt/vm/image-id)"
+          --meta "commit=${{ github.sha }}"
       # tunaOS#4092: record-free standard/admin accounts (useradd at boot, no
       # AccountsService record, no Session preselection, no autologin) through
       # first GDM login, logout, login, reboot and login. Separate from the
       # session-less tuna-test case above; -snapshot leaves the disk pristine.
       - name: Fresh-account GDM journey (record-free standard and admin)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.profile == 'lifecycle' }}
         run: >-
           test -f /mnt/vm/disk.raw &&
           scripts/tuna-vm-lane --fresh-accounts --disk /mnt/vm/disk.raw --out vm-lane-artifacts/fresh-accounts
@@ -1540,13 +1584,13 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
-          name: ${{ matrix.orca == 'distribution' && 'marlin-vm' || 'marlin-vm-orca51' }}
+          name: ${{ matrix.artifact }}
           path: |
             vm-lane-artifacts/
             !vm-lane-artifacts/tour/
           retention-days: 14
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        if: always()
+        if: ${{ always() && matrix.profile == 'lifecycle' }}
         with:
           name: ${{ matrix.orca == 'distribution' && 'tuna-tour' || 'tuna-tour-orca51' }}
           path: vm-lane-artifacts/tour/
@@ -1605,6 +1649,10 @@ jobs:
         with:
           name: colour-native
           path: ledger-in/colour-native
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: native-colour
+          path: ledger-in/native-colour
       - run: >-
           scripts/tuna-ledger check --tests ledger-in/test-list.txt
           --assertions ledger-in/journey/assertions.txt
@@ -1623,6 +1671,7 @@ jobs:
           --assertions ledger-in/colour-native/hdr/capture-assertions.txt
           --assertions ledger-in/colour-native/hdr/unsupported-assertions.txt
           --assertions ledger-in/colour-native/gnome/assertions.txt
+          --assertions ledger-in/native-colour/colour/native-colour-capture/assertions.txt
 
   docs-shots:
     timeout-minutes: 20

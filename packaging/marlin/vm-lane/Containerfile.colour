@@ -1,0 +1,16 @@
+# Additional required DEV colour consumer; never replaces the primary package.
+# The overlay is produced by that same Arch makepkg build's opted-in tail hook.
+ARG BASE_IMAGE=localhost/marlin-tuna-vm:ci
+FROM ${BASE_IMAGE}
+COPY native-colour-overlay/usr/ /usr/
+RUN pacman -S --needed --noconfirm python-gobject python-pillow dbus pipewire wireplumber \
+    && sha256sum --check /usr/share/tuna-vm/shipped-payload.sha256 \
+    && test "$(pacman -Q tuna-desktop)" = "$(cat /usr/share/tuna-vm/shipped-package.txt)" \
+    && test -s /usr/share/tuna-colour/source.json \
+    && test -x /usr/libexec/tuna-colour/unit \
+    && test -x /usr/libexec/tuna-colour/pixel \
+    && test -x /usr/libexec/tuna-colour/yuv \
+    && test -x /usr/libexec/tuna-colour/cast \
+    && test -x /usr/libexec/tuna-vm-colour
+LABEL org.opencontainers.image.title="marlin-tuna-native-colour-fixture" \
+      org.opencontainers.image.description="Required same-source DEV native all-format YUV and screenshot/cast consumers; no physical-HDR or signed-release claim"

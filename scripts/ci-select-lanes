@@ -51,8 +51,9 @@ ROTATION = [
     "marlin-vm",
 ]
 
-# Lanes that download other lanes' artifacts.
+# Qualification closure includes the required native replacement consumer.
 NEEDS = {
+    "drm-smoke": ["marlin-vm"],
     "portal-security": ["arch-package"],
     "remote-security": ["arch-package"],
     "niri-parity": ["arch-package"],

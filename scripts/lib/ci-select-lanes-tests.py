@@ -74,7 +74,8 @@ class Selection(unittest.TestCase):
         for path in ("scripts/tuna-color-gnome-reference-ci",
                      "tests/color-hdr-vkms/tuna_hdr_vkms.c",
                      "tests/color-dmabuf/r8-import.c"):
-            self.assertEqual(pr(path, size=0), ["drm-smoke"], path)
+            selected = set(pr(path, size=0))
+            self.assertTrue({'drm-smoke', 'marlin-vm', 'arch-package'} <= selected, path)
 
     def test_native_colour_payload_always_requires_the_existing_vm_producer(self):
         for path in ("scripts/tuna-colour-build", "scripts/lib/colour_vm.py"):

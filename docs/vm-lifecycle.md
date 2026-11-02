@@ -13,12 +13,34 @@ No autologin or initial session exists: the lane drives GDM's user list and
 types the fixture password exactly as the published-flavor nightly does
 (`V-GREETER-LIST`, `V-GDM-FALLBACK`, `V-GDM-LOGIN`;
 `docs/marlin-tuna-nightly.md`), from the same `scripts/tuna-vm-lane` code.
-Logout must return to that GDM greeter. This changes neither the shipped
-preview image nor the number of CI VM profiles. GDM's session worker opens a
-journal stream for `gdm-wayland-session`, which the fixture forwards to the
-serial port. The fixture's session environment comes from `environment.d`,
+Logout must return to that GDM greeter. The ordinary two lifecycle/Orca rows,
+their five pristine boots and default GPU remain unchanged. A separate required
+DEV colour row below does not change the shipped preview. GDM's session worker
+opens a journal stream for `gdm-wayland-session`, forwarded to the serial port.
+The fixture's session environment comes from `environment.d`,
 which gdm-wayland-session imports from the user manager; the per-login Orca
 test secret comes from a user environment generator.
+
+## Required DEV virgl colour consumer
+
+Whenever `marlin-vm` is selected, its additional `native-colour` matrix member
+builds the opted-in overlay in the **same primary Arch makepkg stage**, retaining
+that build's exact source, native compiler, features, package and ELF receipts.
+The final image admission checks the original package, fixed guest helper,
+four native proof ELFs and source receipt after overlay installation.
+
+`--profile colour --require-kvm --strip-image ...` uses a separate pristine
+boot with virtio-vga-gl and an owned Xvfb/llvmpipe launcher. Ordinary rows keep
+their default GPU and repeat count. The same stock GDM login and original
+nonroot native compositor must be admitted before the finite root dispatcher
+can invoke `init/start/state/ack/finish/cleanup/file` on the fixed helper.
+
+The real unit/pixel and all 18 NV12/P010 coefficient capture cases remain
+mandatory, including all-format YUV positives, screenshot/PipeWire consumers
+and strict cleanup. `drm-smoke` selection also requires this native row; its
+ordinary software DRM and SDR/calibration checks remain required. Failure or
+missing evidence fails the matrix, parity ledger and aggregate gate. These
+are DEV virgl receipts, not physical-HDR or signed-release qualification.
 
 ## Record-free fresh accounts (tunaOS#4092)
 

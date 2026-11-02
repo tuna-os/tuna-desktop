@@ -5,6 +5,7 @@ Protocol: https://www.qemu.org/docs/master/interop/qemu-ga-ref.html
 import base64
 import binascii
 import json
+import math
 import re
 import socket
 import time
@@ -242,7 +243,12 @@ class GuestAgent:
     """
     MAX_REPLY = 1024 * 1024
 
-    def __init__(self, path):
+    # The consumer's absolute deadline covers acquisition and all nested QGA
+    # operations; reconnecting cannot reset its finite action budget.
+    def __init__(self, path, *, deadline=None):
+        if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
+            raise ValueError("finite absolute guest-agent acquisition/command deadline required")
+        self._caller_deadline = deadline
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.buffer = bytearray()
         self.poisoned = False
@@ -250,7 +256,8 @@ class GuestAgent:
         self.guest_exec_state = "none"
         self.command_nonce = f"tuna-qga-{time.time_ns()}"
         self.command_sequence = 0
-        deadline = time.monotonic() + 5
+        acquisition_deadline = time.monotonic() + 5
+        deadline = min(acquisition_deadline, deadline) if deadline is not None else acquisition_deadline
         try:
             self.socket.settimeout(self._remaining(deadline))
             self.socket.connect(path)
@@ -325,6 +332,9 @@ class GuestAgent:
 
     def command(self, name, *, deadline=None, **arguments):
         deadline = deadline if deadline is not None else time.monotonic() + 5
+        caller_deadline = getattr(self, "_caller_deadline", None)
+        if caller_deadline is not None:
+            deadline = min(deadline, caller_deadline)
         if getattr(self, "poisoned", False):
             raise RuntimeError("guest-agent transport poisoned")
         try:
@@ -349,7 +359,13 @@ class GuestAgent:
         return result["return"]
 
     def run(self, action, *arguments, timeout=30):
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("finite positive guest-agent operation timeout required")
         deadline = time.monotonic() + timeout
+        caller_deadline = getattr(self, "_caller_deadline", None)
+        if caller_deadline is not None:
+            deadline = min(deadline, caller_deadline)
+        self._remaining(deadline)
         if getattr(self, "guest_exec_state", "none") != "none":
             raise RuntimeError("previous guest-exec retirement unconfirmed")
         # Set uncertainty before sending: a lost initial acknowledgement
