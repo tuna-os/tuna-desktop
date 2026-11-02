@@ -800,6 +800,26 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
             with self.subTest(failure=failure), self.assertRaises(ValueError):
                 proof.guest_call(guest, 'prepare', 'gnome', 'a' * 32)
 
+    def test_causal_failure_is_retained_before_any_missing_prepare_or_snapshot_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = {'error': {'message': 'prepare failed'}, 'cleanup_errors': [],
+                       'retrieval_errors': [], 'guest_files': {}}
+            original = json.dumps({'operation': 'prepare', 'error': 'original causal failure'}).encode()
+            calls = []
+            def retrieve(agent, profile, nonce, name):
+                calls.append(name)
+                if name == 'failure.json':
+                    return original
+                raise FileNotFoundError(name)
+            with patch.object(proof, 'retrieve_guest_file', side_effect=retrieve):
+                proof.retain_guest_files(object(), 'gnome', 'a' * 32, root, receipt)
+            self.assertEqual(calls[0], 'failure.json')
+            self.assertEqual((root / 'guest/failure.json').read_bytes(), original)
+            self.assertEqual(receipt['guest_files']['failure.json']['sha256'], proof.digest(original))
+            self.assertEqual({error['name'] for error in receipt['retrieval_errors']},
+                             {'claim.json', 'prepare.json', 'snapshot.json', 'stop.json'})
+
     def test_network_panel_requires_actual_selected_gtk_ancestry_not_a_window_title(self):
         value = snapshot()
         settings = next(w for w in value['windows'] if w['role'] == 'settings')

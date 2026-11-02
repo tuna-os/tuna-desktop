@@ -6,6 +6,7 @@ root controller owns private receipts; a finite unprivileged child reads the
 already-existing user and accessibility buses.  No Tuna state files are read.
 """
 import base64
+import array
 import ctypes
 import fcntl
 import gzip
@@ -24,6 +25,7 @@ import stat
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 ROOT = Path('/run/tuna-vm-gnome-reference')
@@ -548,6 +550,16 @@ def save(directory, name, value):
         temporary.unlink(missing_ok=True)
         raise
 
+def retain_failure(directory, operation, result):
+    """Preserve the first terminal operation failure through cleanup/retrieval."""
+    if operation == 'file':
+        return
+    try:
+        read_bytes(directory / 'failure.json')
+    except FileNotFoundError:
+        save(directory, 'failure.json', result)
+
+
 
 def retained_files(directory, pending=()):
     names = {entry.name for entry in directory.iterdir() if allowed_receipt(entry.name)}
@@ -666,6 +678,9 @@ def check_socket_peer(path, uid, deadline):
         stream.settimeout(min(1, deadline.remaining()))
         stream.connect(path)
         pid, peer_uid, _ = struct.unpack('3i', stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+    after = Path(path).lstat()
+    if (info.st_dev, info.st_ino, info.st_uid, info.st_mode) != (after.st_dev, after.st_ino, after.st_uid, after.st_mode):
+        raise RuntimeError('public socket changed during kernel peer observation')
     if peer_uid != uid:
         raise RuntimeError('bus server peer has foreign UID')
     return proc_identity(pid, uid)
@@ -691,7 +706,218 @@ def read_gio_settings(Gio):
     }
 
 
-def session_observe(args, deadline):
+def bus_path(address):
+    match = re.fullmatch(r'unix:path=([^,;]+)(?:,guid=[0-9a-f]+)?', address)
+    if not match or not match[1].startswith('/run/user/1000/'):
+        raise RuntimeError('public bus address is not the existing owned runtime socket')
+    return match[1]
+
+
+def dbus_call(connection, bus, path, interface, method, parameters, deadline, Gio):
+    millis = max(1, min(2000, int(deadline.remaining() * 1000)))
+    return connection.call_sync(bus, path, interface, method, parameters, None,
+        Gio.DBusCallFlags.NO_AUTO_START, millis, None).unpack()
+
+
+def bus_connection(address, deadline, Gio):
+    cancellable = Gio.Cancellable()
+    timer = threading.Timer(deadline.remaining(), cancellable.cancel)
+    timer.daemon = True
+    timer.start()
+    try:
+        return Gio.DBusConnection.new_for_address_sync(address,
+            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT |
+            Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, cancellable)
+    finally:
+        timer.cancel()
+
+
+def connection_identity(stream, path):
+    """Read the actual connected descriptor, never a caller-supplied PID."""
+    if stream.family != socket.AF_UNIX or stream.type != socket.SOCK_STREAM or stream.getpeername() != path:
+        raise RuntimeError('descriptor is not connected to the fixed public bus socket')
+    pid, uid, _ = struct.unpack('3i', stream.getsockopt(
+        socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+    if uid != UID:
+        raise RuntimeError('public bus connected descriptor has foreign UID')
+    return proc_identity(pid, UID)
+
+
+class IdentityObserver:
+    """Root-only identity observation, scoped to this finite child's two buses."""
+    def __init__(self, admitted, deadline):
+        if os.geteuid() != 0:
+            raise RuntimeError('identity observation requires root controller')
+        import gi
+        gi.require_version('Gio', '2.0')
+        from gi.repository import Gio, GLib
+        self.Gio, self.GLib = Gio, GLib
+        self.admitted, self.deadline = admitted, deadline
+        self.connections = {}
+        self.pinned = {}
+        self.socket_identities = {}
+        self.principals = {}
+        self.allowed = {'unix:path=/run/user/1000/bus'}
+        self.requests = 0
+        self.a11y_address = None
+
+    def call(self, connection, bus, path, interface, method, parameters=None):
+        return dbus_call(connection, bus, path, interface, method, parameters,
+                         self.deadline, self.Gio)
+
+    def connection(self, address):
+        if address not in self.allowed:
+            raise RuntimeError('identity request names an unobserved public bus')
+        path = bus_path(address)
+        peer = check_socket_peer(path, UID, self.deadline)
+        info = Path(path).lstat()
+        socket_identity = (info.st_dev, info.st_ino, info.st_uid, info.st_mode)
+        if address not in self.connections:
+            connection = bus_connection(address, self.deadline, self.Gio)
+            with socket.socket(fileno=os.dup(connection.get_stream().get_socket().get_fd())) as stream:
+                same_process(peer, connection_identity(stream, path))
+            if address == 'unix:path=/run/user/1000/bus':
+                same_process(self.admitted['session']['user_bus']['peer'], peer)
+            self.connections[address] = connection
+            self.pinned[address] = peer
+            self.socket_identities[address] = socket_identity
+        same_process(self.pinned[address], peer)
+        if self.socket_identities[address] != socket_identity:
+            raise RuntimeError('pinned public bus socket identity changed')
+        return self.connections[address]
+
+    def owner(self, address, name):
+        connection = self.connection(address)
+        def query(method, value):
+            return self.call(connection, 'org.freedesktop.DBus', '/org/freedesktop/DBus',
+                'org.freedesktop.DBus', method, self.GLib.Variant('(s)', (value,)))[0]
+        unique = query('GetNameOwner', name)
+        pid = query('GetConnectionUnixProcessID', unique)
+        if query('GetConnectionUnixUser', unique) != UID:
+            raise RuntimeError('AT-SPI/public session peer is not actual UID1000')
+        principal = proc_identity(pid, UID)
+        if query('GetNameOwner', name) != unique or query('GetConnectionUnixProcessID', unique) != pid:
+            raise RuntimeError('public bus owner changed during identity observation')
+        same_process(principal, proc_identity(pid, UID))
+        self.connection(address)
+        previous = self.principals.setdefault(principal['pid'], principal)
+        same_process(previous, principal)
+        return unique, principal
+
+    def request(self, value, descriptor=None):
+        if not isinstance(value, dict) or set(value) != {'operation', 'address', 'name'}:
+            raise RuntimeError('invalid fixed identity request')
+        operation, address, name = (value[key] for key in ('operation', 'address', 'name'))
+        self.deadline.remaining()
+        self.requests += 1
+        if self.requests > 12010 or not isinstance(address, str) or address not in self.allowed:
+            raise RuntimeError('identity request exceeds fixed bus/observation bound')
+        if operation == 'socket' and name is None and descriptor is not None:
+            self.connection(address)
+            with socket.socket(fileno=os.dup(descriptor)) as stream:
+                principal = connection_identity(stream, bus_path(address))
+            same_process(self.pinned[address], principal)
+            self.connection(address)
+            self.principals.setdefault(principal['pid'], principal)
+            return principal
+        if operation == 'owner' and descriptor is None and isinstance(name, str):
+            if address == 'unix:path=/run/user/1000/bus':
+                allowed = name in ('org.a11y.Bus', 'org.gnome.Mutter.DisplayConfig')
+            else:
+                allowed = name == 'org.a11y.atspi.Registry'
+                if not allowed and re.fullmatch(r':[0-9]+\.[0-9]+', name):
+                    registry, principal = self.owner(address, 'org.a11y.atspi.Registry')
+                    roots = self.call(self.connections[address], registry,
+                        '/org/a11y/atspi/accessible/root', 'org.a11y.atspi.Accessible', 'GetChildren')[0]
+                    if len(roots) > 6000:
+                        raise RuntimeError('actual registry exceeds finite public tree bound')
+                    allowed = name in {bus for bus, path in roots}
+                    same_process(principal, self.owner(address, 'org.a11y.atspi.Registry')[1])
+            if not allowed:
+                raise RuntimeError('identity request names a non-observation principal')
+            unique, principal = self.owner(address, name)
+            if address == 'unix:path=/run/user/1000/bus' and name == 'org.a11y.Bus':
+                actual = self.call(self.connections[address], unique, '/org/a11y/bus',
+                                   'org.a11y.Bus', 'GetAddress')[0]
+                bus_path(actual)
+                if self.a11y_address is not None and self.a11y_address != actual:
+                    raise RuntimeError('independently observed accessibility bus address changed')
+                self.a11y_address = actual
+                self.allowed.add(actual)
+            return [unique, principal]
+        raise RuntimeError('unsupported fixed identity request')
+
+    def verify(self, observation):
+        for address in self.connections:
+            self.connection(address)
+        atspi = observation['atspi']
+        values = [atspi[key] for key in ('registry', 'session_bus_peer', 'bus_peer', 'launcher')]
+        values.extend(atspi['peers'])
+        values.extend(node['process'] for node in flatten(observation['trees']))
+        for principal in values:
+            expected = self.principals.get(principal['pid'])
+            if expected is None:
+                raise RuntimeError('child returned an independently unobserved principal')
+            same_process(expected, principal)
+        for principal in self.principals.values():
+            self.deadline.remaining()
+            same_process(principal, proc_identity(principal['pid'], UID))
+
+    def close(self):
+        for connection in self.connections.values():
+            connection.close_sync(None)
+
+
+def dispatch_identity(channel, observer, worker_identity, worker_gid, deadline):
+    """Authenticate each sender using kernel per-message credentials, not socketpair creator."""
+    descriptors = array.array('i')
+    space = socket.CMSG_SPACE(4 * descriptors.itemsize) + socket.CMSG_SPACE(struct.calcsize('3i'))
+    raw, ancillary, flags, _ = channel.recvmsg(65536, space)
+    try:
+        credentials = []
+        invalid_ancillary = False
+        for level, kind, data in ancillary:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                descriptors.frombytes(data)
+            elif level == socket.SOL_SOCKET and kind == socket.SCM_CREDENTIALS and len(data) == struct.calcsize('3i'):
+                credentials.append(struct.unpack('3i', data))
+            else:
+                invalid_ancillary = True
+        if not raw and not ancillary and not flags:
+            return False
+        if flags or invalid_ancillary or len(credentials) != 1:
+            raise RuntimeError('truncated or unauthenticated identity request')
+        if credentials[0] != (worker_identity['pid'], UID, worker_gid):
+            raise RuntimeError('identity request sender is not the pinned observation child')
+        same_process(worker_identity, proc_identity(worker_identity['pid'], UID))
+        value = json.loads(raw)
+        expected_descriptors = 1 if isinstance(value, dict) and value.get('operation') == 'socket' else 0
+        if len(descriptors) != expected_descriptors:
+            raise RuntimeError('identity request has missing or excessive descriptors')
+        result = observer.request(value, descriptors[0] if descriptors else None)
+        same_process(worker_identity, proc_identity(worker_identity['pid'], UID))
+        channel.settimeout(deadline.remaining())
+        channel.sendall(json.dumps({'value': result}).encode())
+        return True
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
+def identity_request(channel, deadline, operation, address, name=None, descriptor=None):
+    channel.settimeout(deadline.remaining())
+    data = json.dumps({'operation': operation, 'address': address, 'name': name}).encode()
+    ancillary = [] if descriptor is None else [
+        (socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [descriptor]))]
+    if channel.sendmsg([data], ancillary) != len(data):
+        raise RuntimeError('short identity request')
+    result = json.loads(channel.recv(65536))
+    if set(result) != {'value'}:
+        raise RuntimeError('root identity observation rejected request')
+    return result['value']
+
+
+def session_observe(args, deadline, channel):
     """Read Gio and AT-SPI only, as the existing session owner (no autolaunch)."""
     if os.geteuid() != UID:
         raise RuntimeError('public observation requires actual UID1000')
@@ -703,31 +929,23 @@ def session_observe(args, deadline):
         return GLib.Variant(signature, values)
 
     def connect(address):
-        # Addresses come only from fixed existing user bus or public a11y Bus.
-        match = re.fullmatch(r'unix:path=([^,;]+)(?:,guid=[0-9a-f]+)?', address)
-        if not match or not match[1].startswith('/run/user/1000/'):
-            raise RuntimeError('public bus address is not the existing owned runtime socket')
-        peer = check_socket_peer(match[1], UID, deadline)
-        connection = Gio.DBusConnection.new_for_address_sync(address,
-            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+        bus_path(address)
+        connection = bus_connection(address, deadline, Gio)
+        peer = identity_request(channel, deadline, 'socket', address,
+                                descriptor=connection.get_stream().get_socket().get_fd())
         return connection, peer
 
     def call(connection, bus, path, interface, method, parameters=None):
-        millis = max(1, min(2000, int(deadline.remaining() * 1000)))
-        return connection.call_sync(bus, path, interface, method, parameters, None,
-            Gio.DBusCallFlags.NO_AUTO_START, millis, None).unpack()
+        return dbus_call(connection, bus, path, interface, method, parameters, deadline, Gio)
 
     def owner(connection, bus):
-        unique = call(connection, 'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'GetNameOwner', variant('(s)', (bus,)))[0]
-        pid = call(connection, 'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'GetConnectionUnixProcessID', variant('(s)', (unique,)))[0]
-        uid = call(connection, 'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'GetConnectionUnixUser', variant('(s)', (unique,)))[0]
-        if uid != UID:
-            raise RuntimeError('AT-SPI/public session peer is not actual UID1000')
-        return unique, proc_identity(pid, UID)
+        address = 'unix:path=/run/user/1000/bus' if connection is session_bus else a11y_address
+        return identity_request(channel, deadline, 'owner', address, bus)
 
     session_bus, session_peer = connect('unix:path=/run/user/1000/bus')
     a11y_owner, a11y_launcher = owner(session_bus, 'org.a11y.Bus')
     address = call(session_bus, a11y_owner, '/org/a11y/bus', 'org.a11y.Bus', 'GetAddress')[0]
+    a11y_address = address
     bus, bus_peer = connect(address)
     registry_name, registry = owner(bus, 'org.a11y.atspi.Registry')
     peers = {p['pid']: p for p in (session_peer, a11y_launcher, bus_peer, registry)}
@@ -876,22 +1094,54 @@ def window_context(trees, fixture, shell):
 def public_observation(environment, admitted, deadline):
     worker_args = {'compositor': admitted['session']['compositor']}
     owner = pwd.getpwnam('tuna-test')
-    command = ['/usr/bin/python3', str(Path(__file__).resolve()), '_observe']
-    worker = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              env=environment, user=UID, group=owner.pw_gid, extra_groups=[], start_new_session=True)
+    observer = IdentityObserver(admitted, deadline)
+    controller, child_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    controller.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    command = ['/usr/bin/python3', str(Path(__file__).resolve()), '_observe', str(child_channel.fileno())]
+    worker = None
     try:
-        remaining = deadline.remaining()
-        raw, errors = worker.communicate(json.dumps(dict(worker_args, budget_s=min(25, remaining))).encode(),
-                                         timeout=max(0.001, remaining - 0.1))
-    except BaseException:
-        worker.kill()
-        worker.communicate(timeout=0.1)
-        raise
-    if worker.returncode:
-        raise RuntimeError('finite UID1000 public observation failed: ' + errors.decode(errors='replace')[:3000])
-    if len(raw) > MAX_BYTES:
-        raise RuntimeError('public observation exceeded byte bound')
-    return json.loads(raw)
+        worker = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=environment, user=UID, group=owner.pw_gid, extra_groups=[], start_new_session=True,
+            pass_fds=(child_channel.fileno(),))
+        child_channel.close()
+        worker_identity = proc_identity(worker.pid, UID)
+        worker.stdin.write(json.dumps(dict(worker_args, budget_s=min(25, deadline.remaining()))).encode())
+        worker.stdin.close()
+        streams = {worker.stdout: bytearray(), worker.stderr: bytearray()}
+        pending = [controller, *streams]
+        while pending:
+            ready, _, _ = select.select(pending, [], [], deadline.remaining())
+            if not ready:
+                raise TimeoutError('finite public observation deadline expired')
+            for stream in ready:
+                if stream is controller:
+                    if not dispatch_identity(controller, observer, worker_identity, owner.pw_gid, deadline):
+                        pending.remove(controller)
+                else:
+                    data = os.read(stream.fileno(), 65536)
+                    if not data:
+                        pending.remove(stream)
+                    else:
+                        streams[stream].extend(data)
+                        if len(streams[stream]) > MAX_BYTES:
+                            raise RuntimeError('public observation exceeded byte bound')
+        worker.wait(timeout=deadline.remaining())
+        if worker.returncode:
+            raise RuntimeError('finite UID1000 public observation failed: ' +
+                               streams[worker.stderr].decode(errors='replace')[:3000])
+        observation = json.loads(streams[worker.stdout])
+        observer.verify(observation)
+        return observation
+    finally:
+        if worker is not None:
+            if worker.poll() is None:
+                worker.kill()
+                worker.wait(timeout=0.1)
+            for stream in (worker.stdin, worker.stdout, worker.stderr):
+                stream.close()
+        controller.close()
+        child_channel.close()
+        observer.close()
 
 
 def snapshot(args, claim, admitted, environment, deadline, cache):
@@ -1074,13 +1324,9 @@ def prepare(args, directory, deadline, cache):
                 status = child.poll()
                 if status not in (None, 0):
                     raise RuntimeError('fixture launcher failed: ' + str(status)) from error
-            save(directory, 'failure.json', {'schema': 1, 'ready': False,
-                'operation': 'prepare', 'nonce': args['nonce'], 'profile': args['profile'],
-                'error': str(error), 'observed_monotonic_ns': time.monotonic_ns(), 'clock_domain': CLOCK})
             if deadline.end - time.monotonic() < 0.2:
                 raise RuntimeError('actual fixture observation never became ready: ' + str(error)) from error
             time.sleep(min(0.1, deadline.remaining()))
-    (directory / 'failure.json').unlink(missing_ok=True)
     result['files'] = retained_files(directory, ('snapshot.json',))
     save(directory, 'snapshot.json', result)
     response = {'schema': 1, 'nonce': args['nonce'], 'profile': args['profile'], 'ready': True,
@@ -1091,11 +1337,12 @@ def prepare(args, directory, deadline, cache):
 
 
 def main():
-    if len(sys.argv) == 2 and sys.argv[1] == '_observe':
+    if len(sys.argv) == 3 and sys.argv[1] == '_observe':
         value = json.loads(sys.stdin.buffer.read(65537))
         if set(value) != {'compositor', 'budget_s'}:
             raise ValueError('fixed observation arguments required')
-        result = session_observe(value, Deadline(value['budget_s']))
+        with socket.socket(fileno=int(sys.argv[2])) as channel:
+            result = session_observe(value, Deadline(value['budget_s']), channel)
         print(json.dumps(result))
         return
     if os.geteuid() != 0 or len(sys.argv) != 3:
@@ -1150,7 +1397,7 @@ def main():
         if owned_directory and directory is not None:
             try:
                 private_directory(directory, 0)
-                save(directory, 'failure.json', result)
+                retain_failure(directory, operation, result)
                 result['files'] = retained_files(directory)
             except (OSError, RuntimeError) as saving:
                 result['retention_error'] = str(saving)
