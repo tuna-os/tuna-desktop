@@ -66,6 +66,33 @@ remote-security, niri-parity) use the pods' rootless podman.
 Other workflows (`stress`, `fuzz`, `baseline`, …) still use GitHub-hosted
 runners; the same aliases can move them.
 
+## Keep required checks on the workflow's tested source
+
+The `check` job uses `actions/checkout`'s default PR merge ref, like the
+native DRM and VM lanes. Its workflow and required test scripts must come
+from that same tree. In run
+[`41274593021`](https://github.com/tuna-os/tuna-desktop/actions/runs/41274593021),
+the merge-ref workflow invoked `scripts/lib/a11y-focus-proof-tests.py`,
+but the explicit older head checkout lacked it, so `check` stopped with
+`[Errno 2] No such file or directory`. Checking out the merge ref preserves
+the real predicate suite instead of adding a placeholder or making it
+optional. The check job exports its actual checked commit as `tested_sha`;
+the authentication, fingerprint and grid comparison proofs check out that
+exact output. Their admission receipts bind it to the checkout and commit
+tree separately from the API's triggering `head_sha` (the PR head, not its
+merge tree). Lane selection remains head-only because it computes the PR
+diff. Record the actual tested commit in evidence, never interchange it with
+the triggering head.
+
+The same run's `drm-smoke` passed output, shell, idle, frame pacing, scale
+and monitor-mode gates, then failed `D-COLORD` before its private colour
+service became ready; `colord.log` was empty. That does not establish a
+compositor colour regression or a passing colour gate. Readiness is judged
+by the real private-bus `GetDevices` reply within the unchanged 30 seconds,
+not by unprivileged `kill -0` of a potentially root-owned sudo launcher
+(which can return EPERM for a live process). There is no unbounded wait.
+The private bus and every colour, gamma and restart assertion remain required.
+
 ## Queue supersession and closed pull requests
 
 Every PR-triggered workflow already has native workflow/ref (or PR-number)
@@ -489,6 +516,19 @@ Every job evaluated afterwards uses its original GitHub-hosted label
 (`ubuntu-latest` / `ubuntu-26.04`); assertions are identical on both.
 Re-run queued runs as in [Drain](#drain-maintenance-on-karnataka).
 `gh variable delete CI_RUNNERS -R tuna-os/tuna-desktop` switches back.
+
+On 2026-11-02, the five `tuna-ci-26.04` jobs in PR #985's run
+`41274593021` remained queued without an assigned runner. Read-only ARC
+inspection found all four existing 26.04 runner pods in `ErrImageNeverPull`
+for approximately 24 hours: their `imagePullPolicy: Never` image
+`localhost/tuna-ci-runner:26.04-2.338.2-202610310435` was absent on
+`karnataka`. This is a runner-image provisioning failure, not evidence that
+the queued journey, Orca, portal, remote or niri gates passed or failed.
+The existing `CI_RUNNERS=hosted` rollback switch was enabled for newly
+evaluated jobs, without creating runners, loading images or changing gate
+coverage. That switch does not repair ARC or move already queued jobs.
+The reviewed source correction must get a new changed-head run; retain its
+predecessor's actual VM receipts before retiring only that obsolete PR run.
 
 Full removal:
 

@@ -62,12 +62,19 @@ jobs:
     # Typically 10 min, slowest seen 16; a hung test must not hold a runner 6 h.
     timeout-minutes: 45
     runs-on: *runner-24
+    outputs:
+      tested_sha: ${{ steps.checked-source.outputs.sha }}
     steps:
+      # The workflow and its required scripts belong to the same merge ref.
+      # An older PR head can lack tests already invoked by the base workflow.
+      # Keep head-only checkout in select-lanes, where the PR diff needs it.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
+      - name: Record the checked source revision
+        id: checked-source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
@@ -310,11 +317,13 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/ci-fprint
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
+      TUNA_CI_CHECKED_SHA: ${{ needs.check.outputs.tested_sha }}
+      TUNA_CI_EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ needs.check.outputs.tested_sha }}
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
@@ -602,6 +611,8 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/ci-grid
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
+      TUNA_CI_CHECKED_SHA: ${{ needs.check.outputs.tested_sha }}
+      TUNA_CI_EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     # Source-only real headed old/fixed comparison; the full GTK journey stays required.
     runs-on: *runner-24
     needs: [select-lanes, check]
@@ -614,7 +625,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ needs.check.outputs.tested_sha }}
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
@@ -683,11 +694,14 @@ jobs:
     needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'gtk-shell')
     timeout-minutes: 60
+    env:
+      TUNA_CI_CHECKED_SHA: ${{ needs.check.outputs.tested_sha }}
+      TUNA_CI_EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ needs.check.outputs.tested_sha }}
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable

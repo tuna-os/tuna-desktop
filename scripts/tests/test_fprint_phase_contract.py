@@ -40,7 +40,7 @@ class LiveIdentity(unittest.TestCase):
                      head_sha=sha, run_id=100, run_attempt=1)]
         commit = dict(sha=sha, tree=dict(sha="b" * 40))
         def validate(r=run, j=jobs, source=commit):
-            return c.validate_identity(r, j, source, sha, 100, 1, "workflow_dispatch")
+            return c.validate_identity(r, j, source, sha, 100, 1, "workflow_dispatch", sha, sha)
         self.assertEqual(validate()["job_id"], 200)
         for index, key, value in ((0, "status", "queued"), (0, "status", "completed"),
                                  (0, "conclusion", "success"), (0, "head_sha", "c" * 40),
@@ -64,6 +64,69 @@ class LiveIdentity(unittest.TestCase):
                 validate(r=dict(run, **{key: value}))
         with self.assertRaises(ValueError):
             validate(source=dict(commit, sha="c" * 40))
+    def test_pull_request_merge_checkout_and_explicit_provenance(self):
+        event_head, checked = "a" * 40, "c" * 40
+        run = dict(id=100, run_attempt=1, repository=dict(full_name=c.REPO),
+                   head_sha=event_head, path=c.WORKFLOW, event="pull_request",
+                   status="queued", conclusion=None)
+        jobs = [dict(id=200, name=c.JOB, status="in_progress", conclusion=None,
+                     head_sha=event_head, run_id=100, run_attempt=1),
+                dict(id=201, name="check", status="completed", conclusion="success",
+                     head_sha=event_head, run_id=100, run_attempt=1)]
+        commit = dict(sha=checked, tree=dict(sha="b" * 40))
+        def validate(r=run, j=jobs, source=commit, checkout=checked,
+                     event_sha=event_head, checked_sha=checked):
+            return c.validate_identity(r, j, source, checkout, 100, 1,
+                                       "pull_request", event_sha, checked_sha)
+        identity = validate()
+        self.assertEqual(identity["head"], checked)
+        self.assertEqual(identity["event_head"], event_head)
+        for field in ("event_sha", "checked_sha"):
+            for value in (None, "", "bad", "g" * 40, "a" * 39, "a" * 41):
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    validate(**{field: value})
+        for kwargs in (dict(checked_sha=event_head), dict(checkout=event_head),
+                       dict(source=dict(commit, sha=event_head)),
+                       dict(r=dict(run, head_sha=checked)), dict(event_sha=checked)):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                validate(**kwargs)
+        for index in (0, 1):
+            wrong = copy.deepcopy(jobs)
+            wrong[index]["head_sha"] = checked
+            with self.subTest(job=index), self.assertRaises(ValueError):
+                validate(j=wrong)
+
+    def test_current_identity_reads_explicit_provenance_and_checks_tree(self):
+        event_head, checked, tree = "a" * 40, "c" * 40, "b" * 40
+        env = dict(GITHUB_RUN_ID="100", GITHUB_RUN_ATTEMPT="1",
+                   GITHUB_REPOSITORY=c.REPO, GITHUB_JOB=c.JOB,
+                   GITHUB_EVENT_NAME="pull_request", TUNA_CI_EVENT_HEAD_SHA=event_head,
+                   TUNA_CI_CHECKED_SHA=checked, GITHUB_SHA=checked)
+        source = dict(sha=checked, tree=tree)
+        jobs = dict(total_count=2, jobs=[])
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(c, "source_tuple", return_value=source), \
+                mock.patch.object(c, "api", side_effect=lambda path: jobs if "/jobs?" in path else {}), \
+                mock.patch.object(c, "validate_identity", return_value=dict(tree=tree)) as validate:
+            c.current_identity(Path("."))
+            self.assertEqual(validate.call_args.args[-2:], (event_head, checked))
+            self.assertEqual(validate.call_args.args[3], checked)
+            validate.return_value = dict(tree="d" * 40)
+            with self.assertRaises(ValueError):
+                c.current_identity(Path("."))
+            for field in ("TUNA_CI_EVENT_HEAD_SHA", "TUNA_CI_CHECKED_SHA", "GITHUB_SHA"):
+                with mock.patch.dict(os.environ, env, clear=True):
+                    del os.environ[field]
+                    with self.assertRaises(KeyError):
+                        c.current_identity(Path("."))
+            validate.return_value = dict(tree=tree)
+            for field in ("GITHUB_SHA", "TUNA_CI_CHECKED_SHA"):
+                with mock.patch.dict(os.environ, {field: event_head}), \
+                        mock.patch.object(c, "api") as api:
+                    with self.assertRaises(ValueError):
+                        c.current_identity(Path("."))
+                    api.assert_not_called()
+
     def test_schedule_event_admitted(self):
         sha = "a" * 40
         run = dict(id=100, run_attempt=1, repository=dict(full_name=c.REPO),
@@ -74,7 +137,7 @@ class LiveIdentity(unittest.TestCase):
                 dict(id=201, name="check", status="completed", conclusion="success",
                      head_sha=sha, run_id=100, run_attempt=1)]
         commit = dict(sha=sha, tree=dict(sha="b" * 40))
-        self.assertEqual(c.validate_identity(run, jobs, commit, sha, 100, 1, "schedule")["job_id"], 200)
+        self.assertEqual(c.validate_identity(run, jobs, commit, sha, 100, 1, "schedule", sha, sha)["job_id"], 200)
     def test_unsupported_event_rejected(self):
         sha = "a" * 40
         run = dict(id=100, run_attempt=1, repository=dict(full_name=c.REPO),
@@ -86,7 +149,7 @@ class LiveIdentity(unittest.TestCase):
                      head_sha=sha, run_id=100, run_attempt=1)]
         commit = dict(sha=sha, tree=dict(sha="b" * 40))
         with self.assertRaises(ValueError):
-            c.validate_identity(run, jobs, commit, sha, 100, 1, "fork")
+            c.validate_identity(run, jobs, commit, sha, 100, 1, "fork", sha, sha)
 
 
 class Contract(unittest.TestCase):
@@ -96,7 +159,7 @@ class Contract(unittest.TestCase):
                    head_sha=sha, path=c.WORKFLOW, event="workflow_dispatch",
                    status="completed", conclusion=None, private_payload="excluded fixture value")
         with self.assertRaises(ValueError) as error:
-            c.validate_identity(run, [], dict(sha=sha), sha, 100, 1, "workflow_dispatch")
+            c.validate_identity(run, [], dict(sha=sha), sha, 100, 1, "workflow_dispatch", sha, sha)
         receipt = json.loads(str(error.exception).split(": ", 1)[1])
         self.assertEqual(receipt["expected"]["status"], ["in_progress", "queued"])
         self.assertEqual(receipt["observed"]["status"], "completed")
@@ -223,13 +286,13 @@ class Contract(unittest.TestCase):
         run=dict(id=1,run_attempt=1,repository=dict(full_name=c.REPO),head_sha=sha,path=c.WORKFLOW,event="workflow_dispatch",status="in_progress",conclusion=None)
         jobs=[dict(id=2,name=c.JOB,status="in_progress",conclusion=None,head_sha=sha,run_id=1,run_attempt=1),dict(id=3,name="check",status="completed",conclusion="success",head_sha=sha,run_id=1,run_attempt=1)]
         commit=dict(sha=sha,tree=dict(sha="b"*40))
-        c.validate_identity(run,jobs,commit,sha,1,1,"workflow_dispatch")
+        c.validate_identity(run,jobs,commit,sha,1,1,"workflow_dispatch",sha,sha)
         for key,value in (("head_sha","wrong"),("path","wrong"),("id",2),("run_attempt",2),("event","push"),("status","completed")):
             bad=copy.deepcopy(run);bad[key]=value
-            with self.assertRaises(ValueError):c.validate_identity(bad,jobs,commit,sha,1,1,"workflow_dispatch")
+            with self.assertRaises(ValueError):c.validate_identity(bad,jobs,commit,sha,1,1,"workflow_dispatch",sha,sha)
         for index in (0,1):
             for key in ("head_sha","run_id","run_attempt","conclusion"):
                 bad=copy.deepcopy(jobs);bad[index][key]="wrong"
-                with self.assertRaises(ValueError):c.validate_identity(run,bad,commit,sha,1,1,"workflow_dispatch")
+                with self.assertRaises(ValueError):c.validate_identity(run,bad,commit,sha,1,1,"workflow_dispatch",sha,sha)
 
 if __name__=="__main__":unittest.main()
