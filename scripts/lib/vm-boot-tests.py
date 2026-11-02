@@ -1060,6 +1060,7 @@ class OrcaReadFailure(unittest.TestCase):
 
     def test_failed_read_rejects_arbitrary_private_or_invalid_schema(self):
         actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        actor._caller_deadline = None
         invalid = [{"exception_type": "private-token"},
                    {"exception_type": "CalledProcessError", "argv": "private-token"},
                    {"exception_type": "CalledProcessError", "returncode": True},
@@ -1112,6 +1113,7 @@ class OrcaReadFailure(unittest.TestCase):
                   "out-data": base64.b64encode(json.dumps(diagnostic).encode()).decode(),
                   "err-data": base64.b64encode(b"private arbitrary traceback").decode()}
         actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        actor._caller_deadline = None
         for action in ("orca-read", "orca-speech-start"):
             with patch.object(actor, "command", side_effect=[{"pid": 10}, failed]):
                 with self.assertRaises(RuntimeError) as caught:
@@ -1133,6 +1135,7 @@ class OrcaReadFailure(unittest.TestCase):
 
     def test_strip_stop_failure_record_reaches_the_lane_error(self):
         actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        actor._caller_deadline = None
         record = {"exception_type": "FileNotFoundError", "errno": 2, "stage": "launcher",
                   "message": "[Errno 2] No such file or directory: '/proc/11088/exe'"}
         failed = {"exited": True, "exitcode": 1,
@@ -2107,6 +2110,7 @@ class OrcaLifecycleAuthority(unittest.TestCase):
                   "out-data": base64.b64encode(json.dumps(diagnostic).encode()).decode(),
                   "err-data": base64.b64encode(b"private arbitrary traceback").decode()}
         actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        actor._caller_deadline = None
         for action in ("orca-read", "orca-speech-start"):
             with patch.object(actor, "command", side_effect=[{"pid": 10}, failed]):
                 with self.assertRaises(RuntimeError) as caught:
@@ -4004,6 +4008,7 @@ class DelayedAuthFailureDiagnostics(unittest.TestCase):
     def transport_error(self, payload, **status):
         import contextlib
         actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        actor._caller_deadline = None
         output = base64.b64encode(json.dumps(payload).encode()).decode()
         failure = {"exited": True, "exitcode": 1, "out-data": output,
                    "err-data": base64.b64encode(b"private arbitrary traceback").decode(), **status}
@@ -4271,6 +4276,7 @@ class InventoryProcessRaces(unittest.TestCase):
     def transport(self, output, **status):
         import contextlib
         actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        actor._caller_deadline = None
         failure = {"exited": True, "exitcode": 1, "out-data": base64.b64encode(output.encode()).decode(),
                    "err-data": base64.b64encode(b"private traceback text").decode(), **status}
         log = io.StringIO()
