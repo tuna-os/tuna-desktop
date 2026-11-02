@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from maintained_media import required_source_inputs
+from overview_recording import FrameRecorder, bind_recorded_interval, recording_command
 
 
 def sha(path):
@@ -69,48 +70,58 @@ def run(root, out, state_path, window, compositor_pid, binaries):
                'clock_domain': 'host CLOCK_MONOTONIC', 'source': source, 'window': int(window),
                'events': [], 'snapshots': {}, 'complete': False}
     recorder = None
-    begin = time.monotonic()
+    journey_begin_ns = None
     def original():
         if ((proc / 'stat').read_text().rsplit(')', 1)[1].split()[19] != start
                 or sha(proc / 'exe') != principal['exe_sha256']):
             raise RuntimeError('original nested compositor changed during recording')
-    def observe(label, predicate):
-        end = min(begin + 10.5, time.monotonic() + 3)
-        while time.monotonic() < end:
+    def observe(label, predicate, deadline_offset):
+        end = min(journey_begin_ns + int(min(10.5, deadline_offset) * 1e9),
+                  time.monotonic_ns() + 3_000_000_000)
+        while time.monotonic_ns() < end:
             original()
+            lower = time.monotonic_ns()
             value = json.loads(state_path.read_bytes())
-            if predicate(value):
-                actions['snapshots'][label] = {'observed_host_monotonic': time.monotonic(), 'state': value}
+            upper = time.monotonic_ns()
+            if predicate(value) and upper < end:
+                actions['snapshots'][label] = {
+                    'observed_host_monotonic': upper / 1e9, 'state': value,
+                    'observed_host_monotonic_lower_ns': lower, 'observed_host_monotonic_upper_ns': upper}
                 return value
             time.sleep(.05)
         raise RuntimeError('real overview state did not arrive inside the recording: ' + label)
     def input_action(label, *argv):
         original()
-        event = {'action': label, 'begin': time.monotonic(), 'argv': list(argv)}
+        if recorder.ready_ack is None or recorder.process.poll() is not None:
+            raise RuntimeError('physical input requires the original live recorded-frame acknowledgement')
+        lower = time.monotonic_ns()
+        event = {'action': label, 'begin': lower / 1e9, 'begin_host_monotonic_ns': lower, 'argv': list(argv)}
         actions['events'].append(event)
         command('xdotool', *argv)
-        event['end'] = time.monotonic()
+        upper = time.monotonic_ns()
+        event.update(end=upper / 1e9, end_host_monotonic_ns=upper)
     def pause_until(offset):
-        time.sleep(max(0, begin + offset - time.monotonic()))
+        remaining = journey_begin_ns + int(offset * 1e9) - time.monotonic_ns()
+        if remaining <= 0:
+            raise RuntimeError('recording readiness/UI observation missed the original journey schedule')
+        time.sleep(remaining / 1e9)
     try:
         for name in ('overview-demo.raw.mp4', 'overview-demo.mp4', 'overview-demo.gif'):
             if (out / name).exists():
                 raise ValueError('refusing to overwrite a previous overview recording')
-        recorder = subprocess.Popen(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error',
-            '-f', 'x11grab', '-framerate', '15', '-video_size', '1280x800', '-i', os.environ['DISPLAY'],
-            '-t', '12', '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
-            str(out / 'overview-demo.raw.mp4')], stdout=subprocess.DEVNULL,
-            stderr=(out / 'overview-demo-ffmpeg.log').open('wb'))
-        actions['capture_begin'] = begin
-        time.sleep(1)
-        if recorder.poll() is not None:
-            raise RuntimeError('actual screen recorder failed before input')
+        journey_begin_ns = time.monotonic_ns()
+        raw_path = out / 'overview-demo.raw.mp4'
+        recorder = FrameRecorder(recording_command(raw_path,
+            ['-f', 'x11grab', '-framerate', '15', '-video_size', '1280x800', '-i', os.environ['DISPLAY']]),
+            raw_path, out / 'overview-demo-ffmpeg.log')
+        recorder.wait_ready(journey_begin_ns + 1_000_000_000)
         expected = {'tuna-test-alpha', 'tuna-test-beta', 'tuna-test-gamma'}
         observe('before', lambda s: not s['overview_open'] and not s['locked']
-                and len(s['windows']) == 3 and {w['app_id'] for w in s['windows']} == expected)
+                and len(s['windows']) == 3 and {w['app_id'] for w in s['windows']} == expected, 1)
+        pause_until(1)
         input_action('open-overview', 'key', 'Super_L')
         opened = observe('opened', lambda s: s['overview_progress'] == 1 and len(s['previews']) == 3
-                         and {w['app_id'] for w in s['previews']} == expected)
+                         and {w['app_id'] for w in s['previews']} == expected, 3)
         pause_until(3)
         beta = [w for w in opened['previews'] if w['app_id'] == 'tuna-test-beta']
         if len(beta) != 1:
@@ -120,16 +131,15 @@ def run(root, out, state_path, window, compositor_pid, binaries):
             raise RuntimeError('actual Beta preview rectangle is invalid')
         input_action('select-beta', 'mousemove', '--window', window,
                      str(math.floor(x + width / 2)), str(math.floor(y + height / 2)), 'click', '1')
-        observe('selected-beta', lambda s: not s['overview_open'] and s['focused_app_id'] == 'tuna-test-beta')
+        observe('selected-beta', lambda s: not s['overview_open'] and s['focused_app_id'] == 'tuna-test-beta', 5)
         pause_until(5)
         input_action('reopen-overview', 'key', 'Super_L')
-        observe('reopened', lambda s: s['overview_progress'] == 1 and len(s['previews']) == 3)
+        observe('reopened', lambda s: s['overview_progress'] == 1 and len(s['previews']) == 3, 7)
         pause_until(7)
         input_action('dismiss-overview', 'key', 'Escape')
-        observe('dismissed', lambda s: not s['overview_open'] and s['focused_app_id'] == 'tuna-test-beta')
-        if recorder.wait(timeout=15) != 0:
-            raise RuntimeError('actual screen recording failed')
-        recorder = None
+        observe('dismissed', lambda s: not s['overview_open'] and s['focused_app_id'] == 'tuna-test-beta', 10.5)
+        recorder.finish()
+        bind_recorded_interval(actions, recorder.receipt(journey_begin_ns))
         command('ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', out / 'overview-demo.raw.mp4',
                 '-c', 'copy', '-movflags', '+faststart', out / 'overview-demo.mp4')
         command('ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', out / 'overview-demo.mp4',
@@ -149,14 +159,11 @@ def run(root, out, state_path, window, compositor_pid, binaries):
             for name in ('OPEN', 'SELECT-BETA', 'REOPEN', 'DISMISS', 'VIDEO', 'GIF'):
                 assertions.write('C-README-' + name + ' pass actual recorded three-window journey\n')
     finally:
-        if recorder is not None and recorder.poll() is None:
-            recorder.terminate()
-            try:
-                recorder.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                recorder.kill()
-                recorder.wait(timeout=5)
-        save(out / 'overview-demo-actions.json', actions)
+        try:
+            if recorder is not None:
+                recorder.stop()
+        finally:
+            save(out / 'overview-demo-actions.json', actions)
 
 
 if __name__ == '__main__':
