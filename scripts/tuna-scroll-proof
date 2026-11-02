@@ -114,6 +114,14 @@ echo "tuna-scroll-proof: building"
 cargo build --quiet --manifest-path "$ROOT/Cargo.toml" \
     -p tuna-compositor -p tuna-shell-host
 
+# One browser, three green pages: three xdg-toplevels in map order.
+PW_ENV="${RUNNER_TEMP:-/tmp}/tuna-pw-scroll-$$"
+python3 -m venv "$PW_ENV"
+"$PW_ENV/bin/pip" install --quiet playwright pillow
+"$PW_ENV/bin/python" -m playwright install --with-deps chromium
+# Finish network/package preparation before starting a real session. A slow
+# download must not leave it idle through the unchanged five-minute lock.
+#
 echo "tuna-scroll-proof: starting compositor on socket $SOCKET"
 "$ROOT/target/debug/tuna-compositor" --socket "$SOCKET" \
     --shell-bin "$ROOT/target/debug/tuna-shell-host" \
@@ -149,11 +157,6 @@ WAYLAND_DISPLAY="$SOCKET" cargo run --quiet --manifest-path "$ROOT/Cargo.toml" \
     -p tuna-compositor --example frame_callback_clock -- "$ARTIFACTS/frame-probe.shm" \
     >"$ARTIFACTS/frame-callback-clock.log" 2>&1
 
-# One browser, three green pages: three xdg-toplevels in map order.
-PW_ENV="${RUNNER_TEMP:-/tmp}/tuna-pw-scroll-$$"
-python3 -m venv "$PW_ENV"
-"$PW_ENV/bin/pip" install --quiet playwright pillow
-"$PW_ENV/bin/python" -m playwright install --with-deps chromium
 
 READY="$ARTIFACTS/chromium-ready"
 rm -f "$READY"
@@ -217,21 +220,15 @@ scrot "$ARTIFACTS/01-float.png" >/dev/null
 echo "tuna-scroll-proof: shot 01-float.png"
 
 # Whole-session toggle into the strip.
-# Deterministic wait (docs/development.md timing rule): a busy runner
-# with Chromium starting can take well over a fixed sleep to apply it.
-# A key can be lost while the nested window is still settling its X
-# focus: with no mode line after 10 s, press once more (a second press
-# only after silence, so a slow first one is not undone).
+# Submit one physical chord and wait for its observed mode transition. Do not
+# toggle again on silence: that can undo an already accepted slow transition.
 toggle_mode() {
     want="$1"
     xdotool windowfocus --sync "$WID"
     xdotool key Super_L+Shift+t
     for i in $(seq 1 40); do
         [ "$(grep -c "session mode now $want" "$LOG")" -ge "$2" ] && return 0
-        if [ "$i" = 20 ]; then
-            xdotool windowfocus --sync "$WID"
-            xdotool key Super_L+Shift+t
-        fi
+        kill -0 "$COMPOSITOR_PID" 2>/dev/null || return 1
         sleep 0.5
     done
     return 1
