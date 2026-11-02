@@ -160,9 +160,10 @@ class Identity(unittest.TestCase):
         }
         with patch.dict(os.environ, environment, clear=True), \
                 patch.object(contract, "source_tuple", return_value=source), \
-                patch.object(contract, "api", side_effect=responses.__getitem__):
+                patch.object(contract, "api", side_effect=responses.__getitem__) as api:
             result = contract.current_identity(ROOT)
         self.assertEqual((result["head"], result["event_head"]), (self.sha, event_head))
+        self.assertEqual(api.call_args_list[-1].args, (f"git/commits/{self.sha}",))
 
     def test_current_identity_requires_both_env_shas_and_matching_checkout_tree(self):
         source = dict(sha=self.sha, tree=self.commit["tree"]["sha"], lock_sha256="lock")
@@ -204,8 +205,9 @@ class Identity(unittest.TestCase):
         for page in (dict(total_count=101, jobs=self.jobs), dict(jobs=self.jobs)):
             with self.subTest(page=page), patch.dict(os.environ, environment, clear=True), \
                     patch.object(contract, "source_tuple", return_value=dict(sha=self.sha)), \
-                    patch.object(contract, "api", return_value=page), self.assertRaises(ValueError):
+                    patch.object(contract, "api", return_value=page) as api, self.assertRaises(ValueError):
                 contract.current_identity(ROOT)
+            self.assertEqual(api.call_count, 1)
 
 
 class BuildRoles(unittest.TestCase):

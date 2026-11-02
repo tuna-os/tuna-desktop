@@ -93,6 +93,48 @@ not by unprivileged `kill -0` of a potentially root-owned sudo launcher
 (which can return EPERM for a live process). There is no unbounded wait.
 The private bus and every colour, gamma and restart assertion remain required.
 
+The changed-source hosted run
+[`41390839901`](https://github.com/tuna-os/tuna-desktop/actions/runs/41390839901)
+subsequently passed all 19 DRM assertions, including the actual colord,
+gamma, calibration and restart gates. It exposed two separate prerequisite
+defects: `check` reached its real strip-capture tests but lacked Pillow
+(`ModuleNotFoundError: PIL`), and the pinned Orca factory entry point was
+invoked as an executable despite its non-executable source mode
+(`Permission denied`, exit 126). Declare `python3-pil` in the check job's
+existing apt dependencies and run that consumer with `/usr/bin/python3`.
+Invoke the unchanged pinned factory through Bash, like the GDM native
+factory. Neither a self-hosted preinstalled dependency nor a cache hit is a
+dependency declaration; do not skip the consumer or replace the pinned build.
+
+In [CI 41395937699](https://github.com/tuna-os/tuna-desktop/actions/runs/41395937699),
+both native profiles passed all 32 fresh-account gates and 14 strip cases,
+and the real typed slideshow/SVG and pinned Orca journeys passed. The
+required check still failed
+`control::tests::native_outputs_cleared_on_failed_redial_and_transport_loss`:
+the fixture merely dropped one peer descriptor, then treated any polling
+error as proof of transport loss. An open duplicate instead means transient
+`WouldBlock`, for which retaining the current inventory is correct.
+
+Deliberate peer-loss fixtures must use the file's existing `shutdown(Both)`
+convention before dropping the descriptor: a concurrent fork can retain a
+copy until exec. The regression now deliberately retains a duplicate,
+distinguishes open-endpoint `WouldBlock` from actual shutdown/EOF, and
+requires terminal failed-redial I/O before judging native-output revocation.
+All eleven deliberate closure fixtures use that convention. No production
+state transition, polling interval, acceptance guard or test is removed.
+
+The maintained-media check additionally needs read-only Actions access to
+authenticate the exact uploaded source-artifact bytes before replaying
+receipts against proposed canonical media; dependency auditing remains
+tokenless and fatal. Its real recording tests require FFmpeg (including
+`ffprobe`) and Pillow in the check job, not just in a capture producer.
+The GDM 51 final overlay belongs to the lifecycle images after the
+distribution/Orca branches. The paired GNOME/Tuna reference rows retain
+their separately admitted immutable base, while lifecycle image receipts
+retain the verified native platform digest rather than rereading a mutable
+tag after the build. These are source and admission contracts, not a claim
+that this merge has runtime or current-image qualification.
+
 ## Queue supersession and closed pull requests
 
 Every PR-triggered workflow already has native workflow/ref (or PR-number)

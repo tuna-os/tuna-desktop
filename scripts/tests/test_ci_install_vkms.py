@@ -209,6 +209,24 @@ class VkmsSetup(unittest.TestCase):
         self.assertNotIn("cargo", [call[0] for call in self.calls])
         self.assertEqual((self.root / "artifacts/assertions.txt").read_text(), "")
 
+    def test_workflow_keeps_tests_and_setup_on_merge_ref_before_native_proof(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        drm_job = workflow.split("\n  drm-smoke:", 1)[1].split("\n  grid-cancel-comparison:", 1)[0]
+        self.assertNotIn('"linux-modules-extra-$(uname -r)"', drm_job)
+        self.assertIn("shellcheck scripts/ci-install-vkms", drm_job)
+        self.assertLess(drm_job.index("run: scripts/ci-install-vkms"),
+                        drm_job.index("run: scripts/tuna-drm-smoke --artifacts"))
+        self.assertNotIn("continue-on-error", drm_job)
+        check_job = workflow.split("\n  check:", 1)[1].split("\n  fprint-phase-proof:", 1)[0]
+        test_command = "run: /usr/bin/python3 scripts/tests/test_ci_install_vkms.py"
+        self.assertNotIn("scripts/tests/test_ci_install_vkms.py", check_job)
+        # actions/checkout's default is the event's merge ref on a PR.
+        # An older PR head need not contain a helper added on the base branch.
+        checkout = drm_job.split("- uses: actions/checkout@", 1)[1].split(test_command, 1)[0]
+        self.assertNotIn("ref:", checkout)
+        self.assertLess(drm_job.index(test_command),
+                        drm_job.index("name: Use the Ubuntu archive for DRM dependencies"))
+        self.assertLess(drm_job.index(test_command), drm_job.index("apt-get"))
 
 
 class ColordReadiness(unittest.TestCase):

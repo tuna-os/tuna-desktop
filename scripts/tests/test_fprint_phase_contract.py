@@ -109,6 +109,8 @@ class LiveIdentity(unittest.TestCase):
                 mock.patch.object(c, "api", side_effect=lambda path: jobs if "/jobs?" in path else {}), \
                 mock.patch.object(c, "validate_identity", return_value=dict(tree=tree)) as validate:
             c.current_identity(Path("."))
+            self.assertEqual(validate.call_args.args[-2:], (event_head, checked))
+            self.assertEqual(validate.call_args.args[3], checked)
             validate.return_value = dict(tree="d" * 40)
             with self.assertRaises(ValueError):
                 c.current_identity(Path("."))
@@ -120,9 +122,10 @@ class LiveIdentity(unittest.TestCase):
             validate.return_value = dict(tree=tree)
             for field in ("GITHUB_SHA", "TUNA_CI_CHECKED_SHA"):
                 with mock.patch.dict(os.environ, {field: event_head}), \
-                        mock.patch.object(c, "api"):
+                        mock.patch.object(c, "api") as api:
                     with self.assertRaises(ValueError):
                         c.current_identity(Path("."))
+                    api.assert_not_called()
 
     def test_schedule_event_admitted(self):
         sha = "a" * 40
