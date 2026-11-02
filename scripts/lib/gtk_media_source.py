@@ -11,7 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from maintained_media import assertions, digest, inventory
+from maintained_media import assertions, digest, inventory, required_source_inputs
 
 
 def git(root, *args):
@@ -23,6 +23,7 @@ def source(root):
     return {"merged_commit": os.environ["GITHUB_SHA"],
             "built_commit": git(root, "rev-parse", "HEAD"),
             "built_tree": git(root, "rev-parse", "HEAD^{tree}"),
+            "required_source_inputs_sha256": required_source_inputs(root),
             "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"]}
 
 

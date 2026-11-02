@@ -3,8 +3,8 @@
 #
 # Usage:
 #   scripts/tuna-hero-media RUN --attempt N --expect-merge SHA --expect-head SHA \
-#       --expect-tree TREE --expect-image sha256:DIGEST --expect-package DIGEST \
-#       [--repo OWNER/REPO] [--dest REPOSITORY_OR_STAGING_ROOT]
+#       --expect-tree TREE --expect-source-inputs DIGEST --expect-image sha256:DIGEST \
+#       --expect-package DIGEST [--repo OWNER/REPO] [--dest REPOSITORY_OR_STAGING_ROOT]
 #
 # The normal main CI run must be complete and successful. The root-preserving
 # tuna-tour artifact must contain media-receipt.json, media-source.json,

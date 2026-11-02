@@ -18,7 +18,7 @@ set -eu
 unset CDPATH
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 case "${1:-}" in
-    receipt|intake|freshness) exec python3 "$ROOT/scripts/lib/maintained_media.py" "$@" ;;
+    receipt|intake|freshness|source-inputs) exec python3 "$ROOT/scripts/lib/maintained_media.py" "$@" ;;
 esac
 DEST="$ROOT/target/docs-shots"
 

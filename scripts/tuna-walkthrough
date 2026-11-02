@@ -43,7 +43,7 @@ set -eu
 unset CDPATH
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 case "${1:-}" in
-    receipt|intake) exec python3 "$ROOT/scripts/lib/maintained_media.py" "$@" ;;
+    receipt|intake|source-inputs) exec python3 "$ROOT/scripts/lib/maintained_media.py" "$@" ;;
     refresh)
         if [ -f "${2:-}/media-receipt.json" ]; then
             shift

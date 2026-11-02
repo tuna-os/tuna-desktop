@@ -6,19 +6,30 @@ schema tuna-maintained-media-v1 records exact run/attempt, merged/built commit
 and tree, real producer exit status, hashed source/outcome evidence and hashes
 of the underlying media bytes. VM receipts additionally bind strip-image.json,
 actual manifest image metadata and capture-timing.json. Nested GTK/proof frames
-are never installed-native or signed-release qualification. Neither file ages
-nor documentation-only source drift qualify media.
+are never installed-native or signed-release qualification. File ages and
+broad documentation/path drift exemptions never qualify media.
 
 receipt ARTIFACT --bundle KIND --producer-exit-code 0 <identity flags>
 intake ARTIFACT... <identity flags> [--dest REPOSITORY_OR_STAGING_ROOT]
 freshness --bundle KIND [--bundle KIND...] <identity flags> [--dest ROOT]
+source-inputs [--source-root ROOT]
 
 Required identity flags: --run-id ID --attempt N --expect-merge COMMIT
---expect-head COMMIT --expect-tree TREE. VM intake/freshness also require
---expect-image sha256:DIGEST --expect-package DIGEST. receipt obtains the VM
-image/package from strip-image.json, never from a filename or timestamp.
-media-source.json must come from the actual build/launch boundary and contain
-merged_commit, built_commit, built_tree, run_id, run_attempt. Producers must
+--expect-head COMMIT --expect-tree TREE --expect-source-inputs DIGEST.
+The commit/tree pins ALWAYS name the actual captured build, not a manufactured
+latest SHA. Independently compute the required-input pin on the clean current
+main HEAD with source-inputs: only the exact inventory media destinations and
+three generated media manifests are excluded, all other tracked Git input
+mode/type/object/path records participate. A generated-media-only adoption
+commit therefore preserves source identity without relabeling the capture.
+VM intake/freshness also require --expect-image sha256:DIGEST and
+--expect-package DIGEST; optional --expect-base-index and --expect-base-platform
+pin full immutable base references. receipt obtains image/package from the
+actual strip-image.json and validates retained raw OCI index and successful
+exact-policy platform cosign output (not a new cryptographic verification).
+media-source.json comes from the actual build/launch boundary and contains
+merged_commit, built_commit, built_tree, required_source_inputs_sha256,
+run_id, run_attempt. Producers must
 write receipts only after the actual command succeeds; a receipt is evidence,
 not authorization to publish, bypass CI gates, or qualify a signed release.
 """
@@ -33,6 +44,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from vm_gnome_reference import BASE_REPOSITORY, CERTIFICATE_SUBJECT, CERTIFICATE_ISSUER
 
 ROOT = Path(__file__).resolve().parents[2]
 INVENTORY = Path(__file__).with_name("maintained-media.tsv")
@@ -78,10 +90,10 @@ def confined(root, name):
     return path
 
 
-def inventory():
+def inventory_rows(text):
     result = {}
     destinations = set()
-    for number, line in enumerate(INVENTORY.read_text().splitlines(), 1):
+    for number, line in enumerate(text.splitlines(), 1):
         if not line.strip() or line.startswith("#"):
             continue
         fields = line.split("\t")
@@ -97,6 +109,36 @@ def inventory():
         destinations.add(destination)
         result.setdefault(kind, []).append((source, destination))
     return result
+
+
+def inventory():
+    return inventory_rows(INVENTORY.read_text())
+
+
+def required_source_inputs(root):
+    """Hash actual clean HEAD inputs, excluding only registered generated media.
+
+    Git mode/type/object/path records are hashed verbatim, NUL-delimited, with
+    a domain separator. Read the exemption inventory from that very HEAD, not
+    from an uncommitted map or a manifest supplied by an artifact.
+    """
+    root = str(Path(root).resolve())
+    subprocess.run(["git", "-C", root, "diff", "--quiet", "HEAD", "--"], check=True)
+    text = subprocess.check_output(
+        ["git", "-C", root, "show", "HEAD:scripts/lib/maintained-media.tsv"], text=True)
+    mapping = inventory_rows(text)
+    excluded = {destination.encode() for rows in mapping.values() for _, destination in rows}
+    excluded.update(manifest_name(kind).encode() for kind in mapping)
+    entries = subprocess.check_output(["git", "-C", root, "ls-tree", "-r", "-z", "HEAD"])
+    checksum = hashlib.sha256(b"tuna-required-source-inputs-v1\0")
+    for entry in entries.split(b"\0"):
+        if not entry:
+            continue
+        metadata, separator, path = entry.partition(b"\t")
+        require(bool(separator) and len(metadata.split(b" ")) == 3, "invalid Git tree entry")
+        if path not in excluded:
+            checksum.update(entry + b"\0")
+    return checksum.hexdigest()
 
 
 def json_blob(blob):
@@ -145,9 +187,11 @@ def identity(args):
         require(sha(getattr(args, name), 40), "invalid " + name)
     require(args.expect_merge == args.expect_head,
             "promotion requires the exact merged commit to be the built commit")
+    require(sha(args.expect_source_inputs), "missing/invalid required source inputs pin")
     return {"id": args.run_id, "attempt": args.attempt}, {
         "merged_commit": args.expect_merge, "built_commit": args.expect_head,
         "built_tree": args.expect_tree,
+        "required_source_inputs_sha256": args.expect_source_inputs,
     }
 
 
@@ -174,6 +218,7 @@ def evidence_files(kind):
         files["capture_receipt"] = "media-capture.json"
     elif kind == "vm-tour":
         files.update(image_receipt="strip-image.json", capture_timing="tour/capture-timing.json")
+        files.update(base_index="native-base/index.json", base_platform="native-base/platform-cosign.json")
     elif kind == "overview-demo":
         files["action_receipt"] = "overview-demo-actions.json"
     return files
@@ -193,7 +238,8 @@ def validate_receipt(receipt, blobs, args, mapping):
     needed = evidence_files(kind)
     require(set(blobs) == set(needed), "missing or unexpected producer evidence")
     for key, filename in needed.items():
-        entry = receipt.get(key, {})
+        entry = (receipt.get("base_verification", {}).get(key.removeprefix("base_"), {})
+                 if key in ("base_index", "base_platform") else receipt.get(key, {}))
         require(entry.get("file") == filename, "unexpected producer evidence path: " + key)
         require(sha(entry.get("sha256")) and digest(blobs[key]) == entry["sha256"],
                 "producer evidence hash mismatch: " + key)
@@ -252,6 +298,7 @@ def validate_receipt(receipt, blobs, args, mapping):
             isinstance(strip.get("member_sha256"), dict) and bool(strip["member_sha256"]) and
             all(sha(value) for value in strip["member_sha256"].values()),
             "actual VM image receipt disagrees with media identity")
+    validate_base_verification(receipt, blobs, source_evidence, args)
     outcome = json_blob(blobs["outcomes"])
     checks = outcome.get("assertions")
     require(isinstance(checks, dict) and bool(checks) and
@@ -279,6 +326,39 @@ def validate_receipt(receipt, blobs, args, mapping):
             tour.get("capture_timing") == receipt["capture_timing"]["file"] and
             type(tour.get("frames")) is int and tour["frames"] > 0,
             "VM producer did not report the actual tour video")
+
+
+def validate_base_verification(receipt, blobs, source, args):
+    """Validate retained successful verification output, not a new crypto verify."""
+    base = source.get("base", {})
+    index_ref, platform_ref = base.get("index"), base.get("platform")
+    index_digest = "sha256:" + digest(blobs["base_index"])
+    require(index_ref == BASE_REPOSITORY + "@" + index_digest,
+            "native base index does not match the retained actual raw index bytes")
+    index = json_blob(blobs["base_index"])
+    require(index.get("schemaVersion") == 2 and isinstance(index.get("manifests"), list),
+            "native base evidence is not an OCI image index")
+    members = [entry for entry in index["manifests"]
+               if entry.get("platform", {}).get("os") == "linux" and
+               entry.get("platform", {}).get("architecture") == "amd64"]
+    require(len(members) == 1 and re.fullmatch(r"sha256:[0-9a-f]{64}", members[0].get("digest", "")),
+            "native base index lacks a unique immutable linux/amd64 platform member")
+    platform_digest = members[0]["digest"]
+    require(platform_ref == BASE_REPOSITORY + "@" + platform_digest and
+            receipt["image"]["base"] in (platform_ref, BASE_REPOSITORY + ":gnome@" + platform_digest),
+            "actual source/base image does not name that verified platform member")
+    require((not args.expect_base_index or args.expect_base_index == index_ref) and
+            (not args.expect_base_platform or args.expect_base_platform == platform_ref),
+            "native base differs from independently pinned expected index/platform")
+    signatures = json.loads(blobs["base_platform"])
+    require(isinstance(signatures, list) and bool(signatures), "missing retained successful cosign output")
+    for signature in signatures:
+        critical, optional = signature.get("critical", {}), signature.get("optional", {})
+        require(critical.get("image", {}).get("docker-manifest-digest") == platform_digest and
+                critical.get("identity", {}).get("docker-reference") == BASE_REPOSITORY and
+                critical.get("type") == "cosign container image signature" and
+                optional.get("Subject") == CERTIFICATE_SUBJECT and optional.get("Issuer") == CERTIFICATE_ISSUER,
+                "native base verification output has wrong digest/repository/exact certificate policy")
 
 
 def load_artifact(root):
@@ -415,6 +495,8 @@ def emit(args, mapping):
     for key, filename in evidence_files(kind).items():
         receipt[key], blobs[key] = evidence(root, filename)
     if kind == "vm-tour":
+        receipt["base_verification"] = {
+            "index": receipt.pop("base_index"), "platform": receipt.pop("base_platform")}
         strip = json_blob(blobs["image_receipt"])
         receipt["image"] = {"id": strip.get("image_id"), "base": strip.get("base_image"),
                             "package_sha256": strip.get("package_sha256")}
@@ -527,6 +609,18 @@ def freshness(args, mapping):
 
 
 def main(argv=None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "source-inputs":
+        parser = argparse.ArgumentParser(description=required_source_inputs.__doc__)
+        parser.add_argument("command", choices=("source-inputs",))
+        parser.add_argument("--source-root", default=str(ROOT))
+        args = parser.parse_args(arguments)
+        try:
+            print(required_source_inputs(args.source_root))
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            print("tuna-maintained-media: source inputs refused: " + str(error), file=sys.stderr)
+            return 1
+        return 0
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=("receipt", "intake", "freshness"))
     parser.add_argument("artifacts", nargs="*")
@@ -536,12 +630,15 @@ def main(argv=None):
     parser.add_argument("--expect-merge", required=True)
     parser.add_argument("--expect-head", required=True)
     parser.add_argument("--expect-tree", required=True)
+    parser.add_argument("--expect-source-inputs", required=True)
     parser.add_argument("--expect-image")
     parser.add_argument("--expect-package")
+    parser.add_argument("--expect-base-index")
+    parser.add_argument("--expect-base-platform")
     parser.add_argument("--producer-exit-code", type=int)
     parser.add_argument("--dest", default=str(ROOT))
     parser.add_argument("--source-artifact", action="append", default=[])
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
     try:
         identity(args)
         mapping = inventory()

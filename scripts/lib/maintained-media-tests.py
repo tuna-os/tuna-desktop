@@ -27,8 +27,9 @@ TREE = "2" * 40
 IMAGE = "sha256:" + "3" * 64
 PACKAGE = "4" * 64
 BASE = "ghcr.io/tuna-os/marlin@sha256:" + "5" * 64
+SOURCE_INPUTS = "b" * 64
 PINS = ["--run-id", "39123456789", "--attempt", "2", "--expect-merge", COMMIT,
-        "--expect-head", COMMIT, "--expect-tree", TREE]
+        "--expect-head", COMMIT, "--expect-tree", TREE, "--expect-source-inputs", SOURCE_INPUTS]
 VM_PINS = ["--expect-image", IMAGE, "--expect-package", PACKAGE]
 
 
@@ -62,6 +63,7 @@ class MediaIntake(unittest.TestCase):
             artifact.mkdir()
             source = {"merged_commit": COMMIT, "built_commit": COMMIT, "built_tree": TREE,
                       "run_id": "39123456789", "run_attempt": "2"}
+            source["required_source_inputs_sha256"] = SOURCE_INPUTS
             if kind == "gtk-walkthrough":
                 source.update(environment="nested-gtk", tracked_source_clean=True,
                               launched_elfs={name: {"pid": index + 100, "start_ticks": index + 1000,
@@ -70,6 +72,20 @@ class MediaIntake(unittest.TestCase):
             else:
                 source.update(environment="installed-vm", tracked_source_clean=True,
                               original_session={"fixture": "temporary parser test owner inventory"})
+                index = {"schemaVersion": 2, "manifests": [
+                    {"digest": "sha256:" + "5" * 64, "platform": {"os": "linux", "architecture": "amd64"}}]}
+                put_json(artifact / "native-base/index.json", index)
+                # Retained verifier-output parser fixture, NOT a real signature
+                # or cryptographic native-image qualification.
+                put_json(artifact / "native-base/platform-cosign.json", [{
+                    "critical": {"image": {"docker-manifest-digest": "sha256:" + "5" * 64},
+                                 "identity": {"docker-reference": contract.BASE_REPOSITORY},
+                                 "type": "cosign container image signature"},
+                    "optional": {"Subject": contract.CERTIFICATE_SUBJECT, "Issuer": contract.CERTIFICATE_ISSUER},
+                }])
+                source["base"] = {
+                    "index": contract.BASE_REPOSITORY + "@sha256:" + contract.digest(
+                        (artifact / "native-base/index.json").read_bytes()), "platform": BASE}
             put_json(artifact / "media-source.json", source)
             for filename, _ in cls.mapping[kind]:
                 path = artifact / filename
@@ -385,6 +401,97 @@ class MediaIntake(unittest.TestCase):
                     sha256=contract.digest(path.read_bytes())))
                 self.assertEqual(self.intake(self.overview).returncode, 1)
                 self.assertFalse(self.dest.exists())
+
+    def test_required_inputs_pin_cannot_be_relabelled_as_latest_source(self):
+        result = self.intake(self.vm, extra=("--expect-source-inputs", "c" * 64))
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(self.dest.exists())
+        self.mutate_receipt(self.vm, lambda r: r["source"].update(required_source_inputs_sha256="c" * 64))
+        result = self.intake(self.vm, extra=("--expect-source-inputs", "c" * 64))
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(self.dest.exists())
+
+    def test_rehashed_wrong_native_certificate_policy_is_not_verified_evidence(self):
+        path = self.vm / "native-base/platform-cosign.json"
+        signatures = json.loads(path.read_text())
+        signatures[0]["optional"]["Subject"] = "https://github.com/untrusted/workflow"
+        put_json(path, signatures)
+        self.mutate_receipt(self.vm, lambda r: r["base_verification"]["platform"].update(
+            sha256=contract.digest(path.read_bytes())))
+        self.assertEqual(self.intake(self.vm).returncode, 1)
+        self.assertFalse(self.dest.exists())
+
+    def test_actual_raw_native_index_and_independent_platform_pin_are_required(self):
+        result = self.intake(self.vm, extra=("--expect-base-platform", contract.BASE_REPOSITORY + "@sha256:" + "a" * 64))
+        self.assertEqual(result.returncode, 1)
+        (self.vm / "native-base/index.json").write_bytes(b"unretained prior index")
+        self.assertEqual(self.intake(self.vm).returncode, 1)
+        self.assertFalse(self.dest.exists())
+
+
+class RequiredSourceInputs(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name)
+        self.git("init", "-q")
+        inventory = self.repo / "scripts/lib/maintained-media.tsv"
+        inventory.parent.mkdir(parents=True)
+        shutil.copyfile(contract.INVENTORY, inventory)
+        (self.repo / "source.rs").write_text("fn main() {}\n")
+        self.media = self.repo / "docs/walkthrough/panel.png"
+        self.media.parent.mkdir(parents=True)
+        self.media.write_bytes(png("initial"))
+        self.commit()
+
+    def git(self, *args):
+        return subprocess.check_output(["git", "-C", str(self.repo), *args], text=True).strip()
+
+    def commit(self):
+        self.git("add", ".")
+        self.git("-c", "user.name=MediaTest", "-c", "user.email=media@example.test",
+                 "commit", "-qm", "temporary source identity fixture")
+
+    def test_only_exact_registered_generated_outputs_do_not_self_invalidate(self):
+        initial_head = self.git("rev-parse", "HEAD")
+        initial_tree = self.git("rev-parse", "HEAD^{tree}")
+        initial = contract.required_source_inputs(self.repo)
+        self.media.write_bytes(png("fresh real media bytes"))
+        for kind in contract.inventory():
+            put_json(self.repo / contract.manifest_name(kind), {"fixture": "new generated output"})
+        self.commit()
+        self.assertNotEqual(initial_head, self.git("rev-parse", "HEAD"))
+        self.assertNotEqual(initial_tree, self.git("rev-parse", "HEAD^{tree}"))
+        self.assertEqual(initial, contract.required_source_inputs(self.repo))
+
+    def test_every_other_tracked_source_including_docs_map_and_mode_is_required(self):
+        previous = contract.required_source_inputs(self.repo)
+        for filename, blob in (
+            ("source.rs", b"fn main() { println!(\"changed\"); }\n"),
+            ("docs/input.txt", b"not a generated media output\n"),
+            ("docs/walkthrough/unregistered.png", png("unregistered input")),
+            ("scripts/lib/maintained-media.tsv", contract.INVENTORY.read_bytes() + b"# changed source map\n"),
+        ):
+            path = self.repo / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(blob)
+            self.commit()
+            current = contract.required_source_inputs(self.repo)
+            self.assertNotEqual(previous, current, filename)
+            previous = current
+        os.chmod(self.repo / "source.rs", 0o755)
+        self.commit()
+        self.assertNotEqual(previous, contract.required_source_inputs(self.repo))
+
+    def test_dirty_tracked_source_is_not_a_clean_head_identity(self):
+        (self.repo / "source.rs").write_text("dirty input\n")
+        with self.assertRaises(subprocess.CalledProcessError):
+            contract.required_source_inputs(self.repo)
+
+    def test_independent_cli_hashes_the_actual_requested_clean_head(self):
+        result = command("tuna-docs-shots", "source-inputs", "--source-root", self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), contract.required_source_inputs(self.repo))
 
 
 if __name__ == "__main__":
