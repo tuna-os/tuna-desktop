@@ -1317,14 +1317,16 @@ struct FileIdentity {
 impl serde::Serialize for FileIdentity {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut record = serializer.serialize_struct("FileIdentity", 3)?;
-        record.serialize_field("path", &self.path.to_string_lossy())?;
-        record.serialize_field("metadata", &self.metadata)?;
-        record.serialize_field("sha256", &self.sha256)?;
-        record.end()
+
+        let mut receipt = serializer.serialize_struct("FileIdentity", 3)?;
+        // A native non-UTF8 path stays unrepresentable, never a lossy alias.
+        // Such a receipt cannot qualify the UTF8 public proof fixtures.
+        receipt.serialize_field("path", &self.path.to_str())?;
+        receipt.serialize_field("metadata", &self.metadata)?;
+        receipt.serialize_field("sha256", &self.sha256)?;
+        receipt.end()
     }
 }
-
 impl FileIdentity {
     fn for_uri(uri: &str) -> Option<Self> {
         Self::for_path(&wallpaper_uri_to_path(uri)?)
@@ -1723,6 +1725,35 @@ fn cache_path(path: &std::path::Path, w: u32, h: u32) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_identity_receipts_are_typed_metadata_and_content_digest() {
+        let identity = FileIdentity {
+            path: PathBuf::from("/out/light-timeline.xml"),
+            metadata: FileMetadata {
+                dev: 1,
+                ino: 2,
+                bytes: 3,
+                modified: (4, 5),
+                changed: (6, 7),
+            },
+            sha256: [8; 32],
+        };
+        let expected = serde_json::json!({
+            "path": "/out/light-timeline.xml",
+            "metadata": {"dev": 1, "ino": 2, "bytes": 3, "modified": [4, 5], "changed": [6, 7]},
+            "sha256": vec![8u8; 32],
+        });
+        assert_eq!(serde_json::to_value(Some(&identity)).unwrap(), expected);
+        assert!(serde_json::to_value(None::<&FileIdentity>)
+            .unwrap()
+            .is_null());
+        let native_path = FileIdentity {
+            path: PathBuf::from(OsString::from_vec(vec![0xff])),
+            ..identity
+        };
+        assert!(serde_json::to_value(native_path).unwrap()["path"].is_null());
+    }
+
     #[test]
     fn malformed_current_wallpaper_policy_retires_old_maintenance_eligibility() {
         let _serial = RUNTIME_DIR_LOCK.lock().unwrap();

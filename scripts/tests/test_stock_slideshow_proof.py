@@ -5,8 +5,8 @@ XML slideshow proof (360).
 wait_for/budget nest by tightening (a nested wait can never extend
 its parent), slow-true predicates fail instead of passing late, and
 every accepted paint record is typed, ranged and provenance-bound:
-exact source URI, generation epoch prefix, live stat and content-hash
-cross-check of structured file identities, duplicate-free source
+exact source URI, generation epoch prefix, typed FileIdentity metadata,
+stable live stat and SHA256 content checks, duplicate-free owned source
 references, and the exact 1280x800@1.0 producer viewport.
 
 Runs without a compositor/gi/pyatspi: the pure functions are
@@ -20,13 +20,15 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 PROOF = ROOT / 'scripts' / 'lib' / 'tuna-stock-slideshow-proof.py'
 
 WANT_FUNCS = {'wait_for', 'budget', 'check_paint', 'check_file_identity',
               'is_plain_int'}
-WANT_GLOBALS = ('_ACTIVE_END', 'SHOT_W', 'SHOT_H')
+WANT_GLOBALS = ('_ACTIVE_END', '_MAX_IDENTITY_BYTES', 'SHOT_W', 'SHOT_H')
 
 
 def load_proof(tmp):
@@ -49,9 +51,9 @@ def load_proof(tmp):
     code = compile(ast.Module(body=[n for n in tree.body if keep(n)],
                               type_ignores=[]), str(PROOF), 'exec')
     out = Path(tmp)
-    ns = {'time': time, 'math': __import__('math'), 're': __import__('re'),
-          'json': __import__('json'), 'subprocess': __import__('subprocess'),
-          'hashlib': hashlib, 'os': os, 'stat': stat, 'Path': Path, 'OUT': out,
+    ns = {'time': time, 'math': __import__('math'), 'hashlib': hashlib,
+          'os': os, 'stat': stat, 'json': __import__('json'), 'subprocess': __import__('subprocess'),
+          'Path': Path, 'OUT': out,
           'XML': {'light': out / 'light-timeline.xml',
                   'dark': out / 'dark-timeline.xml'},
           'COLORS': {'light-a': (240, 0, 0), 'light-b': (0, 0, 240)},
@@ -62,17 +64,17 @@ def load_proof(tmp):
 
 def identity_of(path):
     st = Path(path).stat()
+    mt, ct = st.st_mtime_ns, st.st_ctime_ns
     return {'path': str(path),
             'metadata': {'dev': st.st_dev, 'ino': st.st_ino, 'bytes': st.st_size,
-                         'modified': list(divmod(st.st_mtime_ns, 1_000_000_000)),
-                         'changed': list(divmod(st.st_ctime_ns, 1_000_000_000))},
+                         'modified': [mt // 1_000_000_000, mt % 1_000_000_000],
+                         'changed': [ct // 1_000_000_000, ct % 1_000_000_000]},
             'sha256': list(hashlib.sha256(Path(path).read_bytes()).digest())}
 
 
 def stale_identity_of(path):
     identity = identity_of(path)
-    identity['metadata']['modified'] = [1, 2]
-    identity['metadata']['changed'] = [3, 4]
+    identity['metadata'].update(modified=[1, 2], changed=[3, 4])
     return identity
 
 
@@ -272,20 +274,42 @@ class PaintReceipt(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.ns['check_file_identity'](current, 'source', str(source))
 
-    def test_hash_and_metadata_require_typed_complete_identities(self):
-        for digest in (None, [], [0] * 31, [True] * 32, [256] * 32):
-            with self.subTest(digest=digest):
-                paint = self.good_paint()
-                paint['root_identity']['sha256'] = digest
-                with self.assertRaises(RuntimeError):
-                    self.check(paint)
-        for key, value in (('dev', True), ('ino', -1), ('bytes', '130'),
-                           ('modified', [1, True]), ('changed', [1, 1_000_000_000])):
-            with self.subTest(key=key, value=value):
-                paint = self.good_paint()
-                paint['root_identity']['metadata'][key] = value
-                with self.assertRaises(RuntimeError):
-                    self.check(paint)
+    def test_debug_strings_and_incomplete_or_mistyped_identity_are_refused(self):
+        for bad in (None, 'None', 'Some(FileIdentity { path: "/out/light-timeline.xml" })',
+                    {}, {'path': str(self.xml)}, {'path': str(self.xml), 'metadata': {}, 'sha256': []}):
+            with self.subTest(identity=bad), self.assertRaises(RuntimeError):
+                self.check(self.mutate(root_identity=bad))
+        for key, value in (('path', None), ('sha256', [0] * 31), ('sha256', [True] * 32),
+                           ('sha256', [256] * 32), ('sha256', '00' * 32)):
+            identity = identity_of(self.xml)
+            identity[key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(RuntimeError):
+                self.check(self.mutate(root_identity=identity))
+        for key, value in (('dev', True), ('ino', -1), ('bytes', 64 * 1024 * 1024 + 1),
+                           ('modified', [1, 1_000_000_000]), ('changed', [True, 0])):
+            identity = identity_of(self.xml)
+            identity['metadata'][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(RuntimeError):
+                self.check(self.mutate(root_identity=identity))
+
+    def test_file_metadata_drift_during_digest_is_refused(self):
+        identity = identity_of(self.xml)
+        info = self.xml.stat()
+        changed = SimpleNamespace(**{name: getattr(info, name) for name in
+                                  ('st_mode', 'st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')})
+        changed.st_ctime_ns += 1
+        with mock.patch.object(os, 'fstat', side_effect=[info, changed]):
+            with self.assertRaisesRegex(RuntimeError, 'content'):
+                self.ns['check_file_identity'](identity, 'root', expect_path=str(self.xml))
+
+    def test_foreign_reference_is_refused_before_any_foreign_file_open(self):
+        paint = self.good_paint()
+        foreign = str(Path(self.tmp).parent / 'not-an-owned-frame.png')
+        paint['source_identities'].append({'path': foreign, 'identity': {'path': foreign}})
+        with mock.patch.object(os, 'open', wraps=os.open) as opened:
+            with self.assertRaisesRegex(RuntimeError, 'owned public fixture'):
+                self.check(paint)
+        self.assertNotIn(foreign, [call.args[0] for call in opened.call_args_list])
 
     def test_reference_list_shape_and_duplicates(self):
         with self.assertRaises(RuntimeError):
