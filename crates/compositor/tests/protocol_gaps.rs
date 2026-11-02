@@ -1034,7 +1034,10 @@ fn wire_display_error(events: &[u8]) -> Option<(u32, u32, String)> {
         let object = word(offset);
         let header = word(offset + 4);
         let length = (header >> 16) as usize;
-        assert!(length >= 8 && length % 4 == 0, "invalid Wayland frame size");
+        assert!(
+            length >= 8 && length.is_multiple_of(4),
+            "invalid Wayland frame size"
+        );
         if length > events.len() - offset {
             return None;
         }

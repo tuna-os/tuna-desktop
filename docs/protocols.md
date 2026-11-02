@@ -192,8 +192,9 @@ their original sampler declarations. Fragment highp is optional under
 [GLSL ES 1.00 §§4.5.2–4.5.4 and §8](https://registry.khronos.org/OpenGL/specs/es/2.0/GLSL_ES_Specification_1.00.pdf).
 Native HDR separately requires a successful high-precision arithmetic probe.
 
-The native DMA-BUF diagnostic disables core files and bounds backtraces and
-printed values; raw core dumps are never qualification artifacts.
+The private capture process disables core files for its entire owned descendant
+tree. Native DMA-BUF diagnostics additionally bound backtraces and printed
+values; raw core dumps are never qualification artifacts.
 The independent GPL-3.0-or-later driver oracle,
 [`r8-import.c`](../tests/color-dmabuf/r8-import.c), uses GBM/EGL/GLES and the
 actual Linux DMA heap without Rust, Smithay, auxiliary samplers or colour math.

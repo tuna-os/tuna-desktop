@@ -48,12 +48,17 @@ import os
 from pathlib import Path
 import select
 import re
+import resource
 import struct
 import signal
 import shutil
 import subprocess
 import tempfile
 import time
+
+# All descendants belong to this private proof. Preserve failures and bounded
+# debugger diagnostics, never raw process memory dumps in guest artifacts.
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--compositor', type=Path, required=True)

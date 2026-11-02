@@ -565,7 +565,8 @@ pub struct DrmBackend {
     input_settings: tuna_shell_control::InputSettings,
     /// Drawing tablets and pads (P-IN-05).
     tablets: tablet::Tablets,
-    /// Bumped by every applied layout or reverted mode (#340).
+    /// Bumped by every applied layout, reverted mode or connector
+    /// hotplug (#340).
     layout_generation: u64,
     rollback_layout: Option<Vec<crate::display_config::OutputLayout>>,
     connectors_changed: bool,
@@ -575,6 +576,19 @@ pub struct DrmBackend {
     privacy_read_pending: Option<bool>,
     /// A setting write the runtime owes GSettings (the hotkey).
     privacy_write: Option<bool>,
+}
+
+/// Connectors a hotplug rescan found connected or gone, by name.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ConnectorChanges {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+impl ConnectorChanges {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
 }
 
 /// Event sources the runtime installs on its loop.
@@ -647,6 +661,29 @@ pub fn clamp_to_outputs(
         }
     }
     best
+}
+
+/// The connected connectors of `outputs` with their modes.
+fn startup_connectors(outputs: &[DrmOutput]) -> Vec<crate::display_config::StartupConnector> {
+    outputs
+        .iter()
+        .map(|o| crate::display_config::StartupConnector {
+            name: o.name.clone(),
+            modes: o.modes.iter().map(|(spec, _)| *spec).collect(),
+            preferred: o.preferred_mode,
+            supported_color_modes: o.supported_color_modes().to_vec(),
+        })
+        .collect()
+}
+
+/// The scale of a monitor without a stored configuration: `TUNA_SCALE`,
+/// else 1.
+pub fn fallback_scale() -> f64 {
+    std::env::var("TUNA_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(crate::runtime::clamp_scale)
+        .unwrap_or(1.0)
 }
 
 impl DrmBackend {
@@ -733,22 +770,10 @@ impl DrmBackend {
         // GNOME's configuration for exactly these connectors (#59,
         // #340): modes, scale, position, rotation, mirrors and switched
         // off monitors; the rest at TUNA_SCALE (or 1), left to right.
-        let names: Vec<String> = outputs.iter().map(|o| o.name.clone()).collect();
+        let connectors = startup_connectors(&outputs);
+        let names: Vec<String> = connectors.iter().map(|c| c.name.clone()).collect();
         let stored = crate::monitors::load(&names);
-        let fallback_scale = std::env::var("TUNA_SCALE")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .map(crate::runtime::clamp_scale)
-            .unwrap_or(1.0);
-        let connectors: Vec<crate::display_config::StartupConnector> = outputs
-            .iter()
-            .map(|o| crate::display_config::StartupConnector {
-                name: o.name.clone(),
-                modes: o.modes.iter().map(|(spec, _)| *spec).collect(),
-                preferred: o.preferred_mode,
-                supported_color_modes: o.supported_color_modes().to_vec(),
-            })
-            .collect();
+        let fallback_scale = fallback_scale();
         let layouts =
             crate::display_config::startup_layouts(stored.as_ref(), &connectors, fallback_scale);
 
@@ -757,11 +782,6 @@ impl DrmBackend {
             .udev_assign_seat(&seat)
             .map_err(|()| DrmInitError(format!("libinput: cannot assign seat {seat}")))?;
         let input = LibinputInputBackend::new(libinput.clone());
-        let udev = smithay::backend::udev::UdevBackend::new(&seat)
-            .inspect_err(|e| {
-                eprintln!("tuna-compositor: drm: udev monitor unavailable: {e}; privacy screen hotkeys are not followed");
-            })
-            .ok();
         let mut backend = Self {
             session,
             drm,
@@ -801,7 +821,46 @@ impl DrmBackend {
                 .apply_layout(&linear)
                 .map_err(|e| DrmInitError(format!("output layout: {e}")))?;
         }
-        for out in &backend.outputs {
+        backend.log_outputs();
+        let (first_w, first_h) = backend.outputs[0].logical_size();
+        let first_loc = backend.outputs[0].loc;
+        backend.pointer = (
+            f64::from(first_loc.0) + f64::from(first_w) / 2.0,
+            f64::from(first_loc.1) + f64::from(first_h) / 2.0,
+        )
+            .into();
+        // Connector hotplug arrives as a udev change of the DRM device,
+        // as Mutter's MetaUdev reports it (`hotplug` signal).
+        let udev = match smithay::backend::udev::UdevBackend::new(&seat) {
+            Ok(udev) => {
+                let device = backend.drm.device_id();
+                if !udev.device_list().any(|(id, _)| id == device) {
+                    eprintln!(
+                        "tuna-compositor: drm: {} is not a GPU of seat {seat}; connector hotplug is not followed",
+                        path.display()
+                    );
+                }
+                Some(udev)
+            }
+            Err(error) => {
+                eprintln!("tuna-compositor: drm: udev monitor: {error}; connector hotplug is not followed");
+                None
+            }
+        };
+        Ok((
+            backend,
+            DrmSources {
+                session: session_notifier,
+                drm: drm_notifier,
+                input,
+                udev,
+            },
+        ))
+    }
+
+    /// The lit outputs in the log, as the DRM smoke proof reads them.
+    pub fn log_outputs(&self) {
+        for out in &self.outputs {
             if !out.enabled {
                 eprintln!("tuna-compositor: drm: connector {} switched off", out.name);
                 continue;
@@ -821,22 +880,93 @@ impl DrmBackend {
                     .unwrap_or_default(),
             );
         }
-        let (first_w, first_h) = backend.outputs[0].logical_size();
-        let first_loc = backend.outputs[0].loc;
-        backend.pointer = (
-            f64::from(first_loc.0) + f64::from(first_w) / 2.0,
-            f64::from(first_loc.1) + f64::from(first_h) / 2.0,
-        )
-            .into();
-        Ok((
-            backend,
-            DrmSources {
-                session: session_notifier,
-                drm: drm_notifier,
-                input,
-                udev,
-            },
-        ))
+    }
+
+    /// Whether a udev change concerns this backend's DRM device.
+    pub fn is_device(&self, device_id: u64) -> bool {
+        self.drm.device_id() == device_id
+    }
+
+    /// The connected connectors with their modes, for choosing a
+    /// configuration.
+    pub fn startup_connectors(&self) -> Vec<crate::display_config::StartupConnector> {
+        startup_connectors(&self.outputs)
+    }
+
+    /// Reprobe every connector on-seat, using the same EDID, format and
+    /// renderer admission as startup. Replaced sinks cannot retain a cached
+    /// HDR capability. Runtime owns the stored/current/previous layout policy.
+    pub fn rescan_connectors(&mut self) -> ConnectorChanges {
+        let mut changes = ConnectorChanges::default();
+        if !self.active || !self.drm.is_active() {
+            return changes;
+        }
+        let resources = match self.drm.resource_handles() {
+            Ok(resources) => resources,
+            Err(error) => {
+                eprintln!("tuna-compositor: drm: hotplug: resources: {error}");
+                return changes;
+            }
+        };
+        let mut protocol_outputs = Vec::new();
+        self.outputs.retain_mut(|out| {
+            let connected = self
+                .drm
+                .get_connector(out.connector, true)
+                .is_ok_and(|info| info.state() == connector::State::Connected);
+            let edid = connected
+                .then(|| color::connector_edid(&self.drm, out.connector))
+                .flatten();
+            let caps =
+                color::ConnectorColor::discover(&self.drm, out.connector, edid.as_deref()).caps;
+            if !connected || out.edid != edid || out.connector_color.caps != caps {
+                if connected {
+                    protocol_outputs.push((out.connector, out.output.clone()));
+                }
+                for mut feedback in out.surface.discard_pending_frames() {
+                    feedback.discarded();
+                }
+                out.switch_off();
+                changes.removed.push(out.name.clone());
+                false
+            } else {
+                true
+            }
+        });
+        let mut used: Vec<_> = self.outputs.iter().map(|out| out.crtc).collect();
+        for handle in resources.connectors() {
+            if self.outputs.iter().any(|out| out.connector == *handle) {
+                continue;
+            }
+            match discover_output(
+                &mut self.drm,
+                &self.gbm,
+                &mut self.renderer,
+                &resources,
+                *handle,
+                &used,
+            ) {
+                Ok(Some(mut output)) => {
+                    if let Some((_, protocol)) = protocol_outputs
+                        .iter()
+                        .find(|(connector, _)| connector == handle)
+                    {
+                        output.output = protocol.clone();
+                    }
+                    used.push(output.crtc);
+                    changes.added.push(output.name.clone());
+                    self.outputs.push(output);
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!("tuna-compositor: drm: hotplug connector: {error}"),
+            }
+        }
+        if !changes.is_empty() {
+            self.rollback_layout = None;
+            self.connectors_changed = true;
+            self.layout_generation += 1;
+        }
+        changes
     }
 
     /// Apply a layout (#340), all or nothing. Every new mode is tested
@@ -1126,107 +1256,8 @@ impl DrmBackend {
         if device != self.drm.device_id() || !self.privacy_programmable() {
             return;
         }
-        self.refresh_connectors();
         if self.privacy_refresh() {
             self.privacy_step(|policy, targets| policy.hardware_changed(targets));
-        }
-    }
-
-    /// Rebuild changed sinks through the same EDID, format and renderer
-    /// admission used at startup. A cached HDR capability never survives a
-    /// different sink being attached to the same connector.
-    fn refresh_connectors(&mut self) {
-        let Ok(resources) = self.drm.resource_handles() else {
-            return;
-        };
-        let live = self.display_state().live_config();
-        let fallback_scale = self.outputs.first().map(|out| out.scale).unwrap_or(1.0);
-        let mut changed = false;
-        let mut protocol_outputs = Vec::new();
-        self.outputs.retain_mut(|out| {
-            let connected = self
-                .drm
-                .get_connector(out.connector, true)
-                .is_ok_and(|info| info.state() == connector::State::Connected);
-            let edid = connected
-                .then(|| color::connector_edid(&self.drm, out.connector))
-                .flatten();
-            let caps =
-                color::ConnectorColor::discover(&self.drm, out.connector, edid.as_deref()).caps;
-            if !connected || out.edid != edid || out.connector_color.caps != caps {
-                if connected {
-                    protocol_outputs.push((out.connector, out.output.clone()));
-                }
-                out.switch_off();
-                changed = true;
-                false
-            } else {
-                true
-            }
-        });
-        let mut used: Vec<_> = self.outputs.iter().map(|out| out.crtc).collect();
-        for handle in resources.connectors() {
-            if self.outputs.iter().any(|out| out.connector == *handle) {
-                continue;
-            }
-            match discover_output(
-                &mut self.drm,
-                &self.gbm,
-                &mut self.renderer,
-                &resources,
-                *handle,
-                &used,
-            ) {
-                Ok(Some(mut output)) => {
-                    // Existing wl_output resources for a changed sink keep
-                    // their object; its mode/state is replaced by apply_layout.
-                    if let Some((_, protocol)) = protocol_outputs
-                        .iter()
-                        .find(|(connector, _)| connector == handle)
-                    {
-                        output.output = protocol.clone();
-                    }
-                    used.push(output.crtc);
-                    self.outputs.push(output);
-                    changed = true;
-                }
-                Ok(None) => {}
-                Err(error) => eprintln!("tuna-compositor: drm: hotplug connector: {error}"),
-            }
-        }
-        if !changed {
-            return;
-        }
-        self.rollback_layout = None;
-        self.connectors_changed = true;
-        self.layout_generation += 1;
-        if self.outputs.is_empty() {
-            return;
-        }
-        let names: Vec<_> = self.outputs.iter().map(|out| out.name.clone()).collect();
-        let stored = crate::monitors::load(&names);
-        let connectors: Vec<_> = self
-            .outputs
-            .iter()
-            .map(|out| crate::display_config::StartupConnector {
-                name: out.name.clone(),
-                modes: out.modes.iter().map(|(spec, _)| *spec).collect(),
-                preferred: out.preferred_mode,
-                supported_color_modes: out.supported_color_modes().to_vec(),
-            })
-            .collect();
-        let layouts = crate::display_config::startup_layouts(
-            stored.as_ref().or(Some(&live)),
-            &connectors,
-            fallback_scale,
-        );
-        if let Err(error) = self.apply_layout(&layouts) {
-            eprintln!("tuna-compositor: drm: hotplug layout refused: {error}");
-            let fallback =
-                crate::display_config::startup_layouts(None, &connectors, fallback_scale);
-            if let Err(error) = self.apply_layout(&fallback) {
-                eprintln!("tuna-compositor: drm: hotplug fallback refused: {error}");
-            }
         }
     }
 
@@ -1236,9 +1267,6 @@ impl DrmBackend {
     /// reprograms every output's privacy screen after
     /// `meta_onscreen_native_invalidate`).
     fn privacy_resume(&mut self) {
-        if self.privacy_programmable() && !self.sleep_reset_pending {
-            self.refresh_connectors();
-        }
         let refreshed = self.privacy_programmable() && self.privacy_refresh();
         if let Some(value) = self.privacy_read_pending.take() {
             self.privacy_setting_read(value);
@@ -1545,7 +1573,6 @@ impl DrmBackend {
             return;
         }
         self.wake_scanout_blocked = false;
-        self.refresh_connectors();
         if trace {
             for out in &self.outputs {
                 eprintln!(

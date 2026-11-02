@@ -551,6 +551,7 @@ mod tests {
             argv: Vec::new(),
             icon: None,
             categories: Vec::new(),
+            new_window: Default::default(),
         }
     }
 

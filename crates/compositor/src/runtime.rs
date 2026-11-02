@@ -609,6 +609,9 @@ struct RemoteHeld {
     grant: std::sync::Arc<std::sync::atomic::AtomicBool>,
     keys: std::collections::HashSet<u32>,
     buttons: std::collections::HashSet<u32>,
+    /// NotifyKeyboardKeysym presses: keysym to its key and the level
+    /// modifier this grant pressed around it (evdev).
+    keysyms: std::collections::HashMap<u32, (u32, Option<u32>)>,
 }
 
 struct PendingScreenshotReply {
@@ -970,11 +973,18 @@ impl Runtime {
                 let handle = event_loop.handle();
                 handle
                     .insert_source(sources.session, |event, _, rt: &mut Runtime| {
+                        let activated =
+                            matches!(event, smithay::backend::session::Event::ActivateSession);
                         if matches!(event, smithay::backend::session::Event::PauseSession) {
                             rt.manager.cancel_strip_pointer(&mut rt.state);
                         }
                         if let Backend::Drm(drm) = &mut rt.backend {
                             drm.on_session_event(event);
+                        }
+                        // Monitors may have come or gone while another VT
+                        // owned the device.
+                        if activated {
+                            rt.on_drm_hotplug();
                         }
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
@@ -989,6 +999,23 @@ impl Runtime {
                         }
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                if let Some(udev) = sources.udev {
+                    handle
+                        .insert_source(udev, |event, _, rt: &mut Runtime| {
+                            let smithay::backend::udev::UdevEvent::Changed { device_id } = event
+                            else {
+                                return;
+                            };
+                            if let Backend::Drm(drm) = &mut rt.backend {
+                                drm.on_device_changed(device_id);
+                            }
+                            if matches!(&rt.backend, Backend::Drm(drm) if drm.is_device(device_id))
+                            {
+                                rt.on_drm_hotplug();
+                            }
+                        })
+                        .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                }
                 handle
                     .insert_source(sources.input, |event, _, rt: &mut Runtime| {
                         // A VT switch revokes the evdev fds before libseat's
@@ -1070,20 +1097,6 @@ impl Runtime {
                         }
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
-                if let Some(udev) = sources.udev {
-                    // Privacy screen hw-state changes (#356) arrive as
-                    // DRM `change` uevents.
-                    handle
-                        .insert_source(udev, |event, _, rt: &mut Runtime| {
-                            if let smithay::backend::udev::UdevEvent::Changed { device_id } = event
-                            {
-                                if let Backend::Drm(drm) = &mut rt.backend {
-                                    drm.on_device_changed(device_id);
-                                }
-                            }
-                        })
-                        .map_err(|e| RuntimeError::Loop(e.to_string()))?;
-                }
                 Some(Backend::Drm(Box::new(drm)))
             }
             _ => None,
@@ -1732,7 +1745,8 @@ impl Runtime {
         self.control.cancel_pending_accelerators();
         self.cursor.on_lock();
         self.control.set_locked(true);
-        let remote_ids: Vec<_> = self.remote_held.keys().copied().collect();
+        let mut remote_ids: Vec<_> = self.remote_held.keys().copied().collect();
+        remote_ids.extend(self.state.remote_clipboard.sessions());
         for id in remote_ids {
             self.stop_remote_input(id);
         }
@@ -2735,6 +2749,33 @@ impl Runtime {
         // GNOME Settings' display configuration (#340): modes, the
         // kernel's CRTC modes on hardware, pending confirmation.
         doc["display_config"] = self.display_config_diagnostics();
+        // The window manager's outputs (wl_outputs) and the output each
+        // window returns to, for the hotplug storm.
+        let primary_output = self.state.primary_output_name();
+        doc["outputs"] = self
+            .state
+            .output_slices()
+            .into_iter()
+            .map(|(name, r)| {
+                serde_json::json!({
+                    "primary": primary_output.as_deref() == Some(name.as_str()),
+                    "name": name,
+                    "rect": [r.loc.x, r.loc.y, r.size.w, r.size.h],
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+        doc["window_outputs"] = snapshot
+            .windows
+            .iter()
+            .map(|w| {
+                (
+                    w.id.to_string(),
+                    serde_json::json!(self.manager.preferred_output(w.id)),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into();
         doc["color"] = self.color_diagnostics();
         let motion = self.input_settings.motion;
         doc["motion_policy"] = serde_json::json!(motion.level.as_str());
@@ -4063,6 +4104,7 @@ impl Runtime {
 
     /// One D-Bus screen-cast request.
     fn stop_remote_input(&mut self, session_id: u64) {
+        self.state.revoke_remote_clipboard(session_id);
         let Some(held) = self.remote_held.remove(&session_id) else {
             return;
         };
@@ -4104,6 +4146,11 @@ impl Runtime {
             return;
         }
         let time = self.lock_now_ms() as u32;
+        use crate::mutter::RemoteInput;
+        if let RemoteInput::Keysym { keysym, pressed } = input {
+            self.remote_keysym(session_id, grant, keysym, pressed);
+            return;
+        }
         let held = self
             .remote_held
             .entry(session_id)
@@ -4111,8 +4158,8 @@ impl Runtime {
                 grant,
                 keys: Default::default(),
                 buttons: Default::default(),
+                keysyms: Default::default(),
             });
-        use crate::mutter::RemoteInput;
         let input = match input {
             RemoteInput::Key { evdev, pressed } => {
                 // ManagerInput uses evdev; WindowManager adds the XKB offset
@@ -4129,6 +4176,7 @@ impl Runtime {
                     time,
                 }
             }
+            RemoteInput::Keysym { .. } => return,
             RemoteInput::Button { button, pressed } => {
                 if (pressed && !held.buttons.insert(button))
                     || (!pressed && !held.buttons.remove(&button))
@@ -4185,6 +4233,66 @@ impl Runtime {
         self.on_manager_input(input);
     }
 
+    /// mutter's `notify_keyval` (meta-virtual-input-device-native.c):
+    /// the keysym's first key in the effective layout, with Shift or
+    /// AltGr pressed before it for its level and released after it. A
+    /// keysym the layout lacks types nothing. Keys go through the grant's
+    /// held set, so Stop and lock release them like keycode input.
+    fn remote_keysym(
+        &mut self,
+        session_id: u64,
+        grant: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        keysym: u32,
+        pressed: bool,
+    ) {
+        use crate::mutter::RemoteInput;
+        let key = |evdev, pressed| RemoteInput::Key { evdev, pressed };
+        if !pressed {
+            let Some((code, modifier)) = self
+                .remote_held
+                .get_mut(&session_id)
+                .and_then(|held| held.keysyms.remove(&keysym))
+            else {
+                return;
+            };
+            self.remote_input(session_id, grant.clone(), key(code, false));
+            if let Some(modifier) = modifier {
+                self.remote_input(session_id, grant, key(modifier, false));
+            }
+            return;
+        }
+        let held = self.remote_held.get(&session_id);
+        if held.is_some_and(|held| held.keysyms.contains_key(&keysym)) {
+            return;
+        }
+        let Some((code, level)) = self.manager.keycode_for_keysym(&mut self.state, keysym) else {
+            eprintln!(
+                "tuna-compositor: remote: no keycode for keysym {keysym:#x} in the current layout"
+            );
+            return;
+        };
+        if crate::mutter::remote_desktop::valid_key(code).is_err() {
+            return;
+        }
+        // A level modifier the grant already holds stays the grant's.
+        let modifier = crate::osk::level_modifier(level)
+            .and_then(|modifier| self.manager.keycode_for_keysym(&mut self.state, modifier))
+            .map(|(modifier, _)| modifier)
+            .filter(|modifier| {
+                !self
+                    .remote_held
+                    .get(&session_id)
+                    .is_some_and(|held| held.keys.contains(modifier))
+            });
+        if let Some(modifier) = modifier {
+            self.remote_input(session_id, grant.clone(), key(modifier, true));
+        }
+        self.remote_input(session_id, grant, key(code, true));
+        if let Some(held) = self.remote_held.get_mut(&session_id) {
+            held.keysyms.insert(keysym, (code, modifier));
+        }
+    }
+
     fn on_screencast_request(&mut self, request: crate::mutter::ToLoop) {
         match request {
             crate::mutter::ToLoop::RemoteInput {
@@ -4197,6 +4305,10 @@ impl Runtime {
                 self.remote_input(session_id, grant, input);
             }
             crate::mutter::ToLoop::RemoteStop { session_id } => self.stop_remote_input(session_id),
+            crate::mutter::ToLoop::RemoteClipboard(request) => {
+                let locked = self.is_locked();
+                self.state.remote_clipboard_request(request, locked);
+            }
             crate::mutter::ToLoop::RemoteKeymap { reply } => {
                 let keymap = self
                     .state
@@ -4214,6 +4326,7 @@ impl Runtime {
             }
             crate::mutter::ToLoop::StartCast {
                 session_id,
+                stream_id,
                 grant,
                 target,
                 signal,
@@ -4252,7 +4365,15 @@ impl Runtime {
                 let Some(pw) = self.pipewire.as_ref() else {
                     return;
                 };
-                match pw.start_cast(session_id, target, width, height, hdr_available, signal) {
+                match pw.start_cast(
+                    session_id,
+                    stream_id,
+                    target,
+                    width,
+                    height,
+                    hdr_available,
+                    signal,
+                ) {
                     Some(cast) => self.casts.push(cast),
                     None => eprintln!("tuna-compositor: screen cast: stream failed to start"),
                 }
@@ -4260,6 +4381,13 @@ impl Runtime {
             crate::mutter::ToLoop::StopCast { session_id } => {
                 self.casts.retain(|cast| cast.session_id != session_id);
                 self.cast_grants.remove(&session_id);
+            }
+            crate::mutter::ToLoop::StopStream {
+                session_id,
+                stream_id,
+            } => {
+                self.casts
+                    .retain(|cast| cast.session_id != session_id || cast.stream_id != stream_id);
             }
             crate::mutter::ToLoop::SensorSample {
                 present,
@@ -8344,6 +8472,7 @@ fn run_loop(
                 if let Backend::Drm(drm) = &mut runtime.backend {
                     drm.resume_from_sleep();
                 }
+                runtime.on_drm_hotplug();
             }
         }
         #[cfg(feature = "drm")]
