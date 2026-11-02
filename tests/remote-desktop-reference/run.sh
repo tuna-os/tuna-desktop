@@ -68,4 +68,4 @@ wait "$client"
 [ ! -f /out/locked.png ]
 pw-dump > /out/locked-pipewire.json
 jq -e 'all(.[]; .type != "PipeWire:Interface:Node" or (.info.props["node.name"] // "" | contains("tuna-screen-cast") | not))' /out/locked-pipewire.json >/dev/null
-printf '%s\n' 'GNOME51 genuine RemoteDesktop portal: Cancel, keyboard/pointer grant, linked PipeWire frame, foreign input denial, legacy GTK delivery, libei GTK delivery/FD revocation, Close/client/backend disconnect, active lock revocation and locked denial; touch/clipboard unsupported' > /out/assertions.txt
+printf '%s\n' 'GNOME51 genuine RemoteDesktop portal: Cancel, keyboard/pointer grant, linked PipeWire frame, foreign input denial, legacy GTK delivery, libei GTK delivery/FD revocation, Close/client/backend disconnect, active lock revocation and locked denial; touch unsupported' > /out/assertions.txt

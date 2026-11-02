@@ -227,6 +227,9 @@ pub struct State {
     )>,
     /// Middle-click primary selection beside the clipboard.
     primary_selection_state: PrimarySelectionState,
+    /// RemoteDesktop sessions with the clipboard enabled, and who owns
+    /// the clipboard as they see it (mutter's MetaClipboardSession).
+    pub(crate) remote_clipboard: crate::mutter::remote_clipboard::Registry,
     pub(crate) panel_surfaces: Vec<layer::PanelSurface>,
     /// Ids of `wl_surface`s whose layer-shell role was destroyed.
     /// Smithay 0.7 keeps validating them on commit against reset
@@ -691,11 +694,39 @@ impl OutputHandler for State {}
 /// Clipboard/drag-and-drop: advertised so toolkit clients accept the
 /// display. Client copy/paste and primary selection round-trip
 /// through the smithay selection state; both focuses mirror keyboard
-/// focus (see [`State::sync_selection_focus`]). Server-initiated
-/// selection content and drag-and-drop pointer grabs are not served
-/// yet.
+/// focus (see [`State::sync_selection_focus`]). The only
+/// compositor-provided selection is a RemoteDesktop session's
+/// (SetSelection); its user data is the session id. Drag-and-drop
+/// pointer grabs are not served yet.
 impl SelectionHandler for State {
-    type SelectionUserData = ();
+    type SelectionUserData = u64;
+
+    fn new_selection(
+        &mut self,
+        ty: smithay::wayland::selection::SelectionTarget,
+        source: Option<smithay::wayland::selection::SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        if ty == smithay::wayland::selection::SelectionTarget::Clipboard {
+            self.remote_clipboard
+                .client_selection(source.map(|source| source.mime_types()));
+        }
+    }
+
+    /// A client pastes a remote session's selection: mutter's
+    /// `meta_selection_source_remote_read_async`.
+    fn send_selection(
+        &mut self,
+        ty: smithay::wayland::selection::SelectionTarget,
+        mime_type: String,
+        fd: std::os::fd::OwnedFd,
+        _seat: Seat<Self>,
+        session_id: &u64,
+    ) {
+        if ty == smithay::wayland::selection::SelectionTarget::Clipboard {
+            self.remote_clipboard.transfer(*session_id, &mime_type, fd);
+        }
+    }
 }
 
 impl ClientDndGrabHandler for State {
@@ -1017,6 +1048,7 @@ impl State {
             tablet_cursor_images: std::collections::HashMap::new(),
             tablet_pads: Vec::new(),
             primary_selection_state: PrimarySelectionState::new::<State>(dh),
+            remote_clipboard: Default::default(),
             panel_surfaces: Vec::new(),
             dead_layer_surfaces: std::collections::HashSet::new(),
             popups: smithay::desktop::PopupManager::default(),
