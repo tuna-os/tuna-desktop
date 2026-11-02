@@ -11,6 +11,11 @@ rpm -q xdg-desktop-portal-gnome xdg-desktop-portal pipewire gtk4 libadwaita libe
 # pkg-config deliberately returns separate compiler arguments.
 # shellcheck disable=SC2046
 gcc -Wall -Wextra -Werror /repo/scripts/lib/tuna-remote-ei.c -o /out/remote-ei $(pkg-config --cflags --libs libei-1.0)
+# This independent real-library regression delays consumption past the old
+# sender sleep, then requires delivery before the acknowledged disconnect.
+# shellcheck disable=SC2046
+gcc -Wall -Wextra -Werror /repo/tests/remote-desktop-reference/eis-lifetime.c -o /out/eis-lifetime $(pkg-config --cflags --libs libeis-1.0)
+/out/eis-lifetime /out/remote-ei >/out/eis-lifetime.log 2>&1
 pids=""
 cleanup() { for pid in $pids; do kill "$pid" 2>/dev/null || true; done; }
 trap cleanup EXIT
