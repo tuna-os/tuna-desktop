@@ -127,18 +127,25 @@ struct Peer {
 
 impl Peer {
     fn connect(comp: &mut TestCompositor, bridge: bool) -> Self {
+        Self::connect_with_data(comp, |server| {
+            if bridge {
+                ClientState::ime_bridge()
+            } else {
+                ClientState::native_connection(server)
+            }
+        })
+    }
+
+    fn connect_with_data(
+        comp: &mut TestCompositor,
+        data: impl FnOnce(&UnixStream) -> ClientState,
+    ) -> Self {
         let (server, socket) = UnixStream::pair().unwrap();
+        let data = data(&server);
         let owner = comp
             .display
             .handle()
-            .insert_client(
-                server,
-                Arc::new(if bridge {
-                    ClientState::ime_bridge()
-                } else {
-                    ClientState::default()
-                }),
-            )
+            .insert_client(server, Arc::new(data))
             .unwrap();
         let conn = Connection::from_socket(socket).unwrap();
         let queue = conn.new_event_queue();
@@ -286,4 +293,104 @@ fn keyboard_delivery_observer_counts_real_virtual_socket_sends_to_actual_focus_o
         libc::getuid()
     });
     assert_eq!(doc["keyboard_delivery_observer"]["evaluable"], true);
+}
+
+#[test]
+fn observer_service_focus_uses_live_original_caller_not_socketpair_creator() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let descriptor = rustix::process::pidfd_open(
+        rustix::process::Pid::from_raw(pid as i32).unwrap(),
+        rustix::process::PidfdFlags::empty(),
+    )
+    .unwrap();
+    let uid = rustix::process::getuid().as_raw();
+    let original = zbus::fdo::ConnectionCredentials::default()
+        .set_process_id(pid)
+        .set_unix_user_id(uid)
+        .set_process_fd(descriptor.into());
+    let mut comp = TestCompositor::new();
+    let manager = comp.window_manager();
+    let keyboard = comp.test_seat().get_keyboard().unwrap();
+    keyboard.enable_delivery_observer();
+    let app = Peer::connect_with_data(&mut comp, |_| {
+        let mut data = ClientState::service_connection(
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            None,
+        );
+        data.original_credentials = Some(Arc::new(original));
+        data
+    });
+    let surface = app.surface(&comp);
+    keyboard.set_focus(
+        &mut comp.state,
+        Some(surface),
+        SERIAL_COUNTER.next_serial(),
+    );
+    let mut doc = serde_json::json!({});
+    super::publish(&manager, &comp.state, &mut doc);
+    let socket_creator = app.owner.get_credentials(&comp.display.handle()).unwrap().pid;
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(socket_creator, std::process::id() as i32);
+    assert_ne!(pid, std::process::id());
+    assert_eq!(doc["native_keyboard_focus"]["client_pid"], pid);
+    assert_eq!(doc["native_keyboard_focus"]["client_uid"], uid);
+    assert_eq!(doc["native_keyboard_focus"]["evaluable"], true);
+
+    // Retaining the connection or reusing a numeric PID cannot revive its pin.
+    super::publish(&manager, &comp.state, &mut doc);
+    assert_eq!(doc["native_keyboard_focus"]["evaluable"], false);
+    assert!(doc["native_keyboard_focus"]["client_pid"].is_null());
+    assert!(doc["native_keyboard_focus"]["client_uid"].is_null());
+    assert_eq!(
+        doc["native_keyboard_focus"]["error"],
+        "original-process-pin-unavailable"
+    );
+}
+
+#[test]
+fn observer_missing_original_credentials_or_pin_never_uses_socketpair_creator() {
+    let descriptor = rustix::process::pidfd_open(
+        rustix::process::Pid::from_raw(std::process::id() as i32).unwrap(),
+        rustix::process::PidfdFlags::empty(),
+    )
+    .unwrap();
+    for original in [
+        None,
+        Some(zbus::fdo::ConnectionCredentials::default()
+            .set_process_id(std::process::id())
+            .set_unix_user_id(rustix::process::getuid().as_raw())),
+        Some(zbus::fdo::ConnectionCredentials::default()
+            .set_process_id(std::process::id())
+            .set_process_fd(descriptor.into())),
+    ] {
+        let mut comp = TestCompositor::new();
+        let manager = comp.window_manager();
+        let keyboard = comp.test_seat().get_keyboard().unwrap();
+        keyboard.enable_delivery_observer();
+        let app = Peer::connect_with_data(&mut comp, |_| {
+            let mut data = ClientState::service_connection(
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                None,
+            );
+            data.original_credentials = original.map(Arc::new);
+            data
+        });
+        let surface = app.surface(&comp);
+        keyboard.set_focus(
+            &mut comp.state,
+            Some(surface),
+            SERIAL_COUNTER.next_serial(),
+        );
+        let mut doc = serde_json::json!({});
+        super::publish(&manager, &comp.state, &mut doc);
+        assert_eq!(doc["native_keyboard_focus"]["evaluable"], false);
+        assert!(doc["native_keyboard_focus"]["client_pid"].is_null());
+        assert!(doc["native_keyboard_focus"]["client_uid"].is_null());
+        assert_ne!(doc["native_keyboard_focus"]["error"], serde_json::Value::Null);
+    }
 }

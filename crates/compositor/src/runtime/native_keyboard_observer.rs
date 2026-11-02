@@ -1,13 +1,13 @@
 //! Owner-only state-file evidence for actual server keyboard emissions.
 //!
 //! This records neither keys nor application consumption. The root fixture must
-//! independently join socket credentials to process start/ELF and app content.
+//! independently join pinned caller credentials to process start/ELF and app content.
 
 use std::os::unix::fs::MetadataExt;
 
-use smithay::reexports::wayland_server::Resource;
+use smithay::reexports::wayland_server::{Client, Resource};
 
-use crate::{windows::WindowManager, State};
+use crate::{windows::WindowManager, ClientState, State};
 
 pub(super) fn enable(state: &State) {
     let private_path = std::env::var_os("TUNA_COMPOSITOR_STATE")
@@ -24,6 +24,25 @@ pub(super) fn enable(state: &State) {
             keyboard.enable_delivery_observer();
         }
     }
+}
+
+fn credentials(client: &Client) -> Result<(u32, u32), &'static str> {
+    let data = client
+        .get_data::<ClientState>()
+        .ok_or("client-state-unavailable")?;
+    // ServiceChannel creates the socket pair in the compositor and passes its
+    // peer over D-Bus. SO_PEERCRED identifies that creator, not the app. Both
+    // service and accepted native clients already retain original credentials.
+    let original = data
+        .original_credentials
+        .as_ref()
+        .ok_or("original-credentials-unavailable")?;
+    let pid = crate::capture_security::pinned_process_id(original)
+        .ok_or("original-process-pin-unavailable")?;
+    let uid = original
+        .unix_user_id()
+        .ok_or("original-user-unavailable")?;
+    Ok((pid, uid))
 }
 
 // Called only from the already opt-in publish_state path, outside input dispatch
@@ -52,19 +71,14 @@ pub(super) fn publish(manager: &WindowManager, state: &State, doc: &mut serde_js
     doc["native_keyboard_focus"] = match focus.as_ref() {
         Some(surface) => {
             let client = surface.client();
-            let credentials =
-                client
-                    .as_ref()
-                    .ok_or("focus-client-unavailable")
-                    .and_then(|client| {
-                        client
-                            .get_credentials(&state.dh)
-                            .map_err(|_| "focus-credentials-unavailable")
-                    });
+            let credentials = client
+                .as_ref()
+                .ok_or("focus-client-unavailable")
+                .and_then(credentials);
             serde_json::json!({
                 "surface_object_id": surface.id().protocol_id(),
-                "client_pid": credentials.as_ref().ok().map(|credentials| credentials.pid),
-                "client_uid": credentials.as_ref().ok().map(|credentials| credentials.uid),
+                "client_pid": credentials.as_ref().ok().map(|&(pid, _)| pid),
+                "client_uid": credentials.as_ref().ok().map(|&(_, uid)| uid),
                 "evaluable": credentials.is_ok(),
                 "error": credentials.err(),
             })
@@ -90,11 +104,7 @@ pub(super) fn publish(manager: &WindowManager, state: &State, doc: &mut serde_js
         let credentials = client
             .as_ref()
             .ok_or("window-client-unavailable")
-            .and_then(|client| {
-                client
-                    .get_credentials(&state.dh)
-                    .map_err(|_| "window-credentials-unavailable")
-            });
+            .and_then(credentials);
         let delivery = client
             .as_ref()
             .ok_or("window-client-unavailable")
@@ -122,8 +132,8 @@ pub(super) fn publish(manager: &WindowManager, state: &State, doc: &mut serde_js
         windows.push(serde_json::json!({
             "window_id": window.id,
             "surface_object_id": surface.id().protocol_id(),
-            "client_pid": credentials.as_ref().ok().map(|credentials| credentials.pid),
-            "client_uid": credentials.as_ref().ok().map(|credentials| credentials.uid),
+            "client_pid": credentials.as_ref().ok().map(|&(pid, _)| pid),
+            "client_uid": credentials.as_ref().ok().map(|&(_, uid)| uid),
             "connection_id": delivery.as_ref().ok().map(|delivery|
                 format!("observer-connection-{}", delivery.connection_generation)),
             "connection_generation": delivery.as_ref().ok().map(|delivery| delivery.connection_generation),

@@ -388,6 +388,11 @@ cannot satisfy the gate.
 
 `app-content` and `scroll-proof` download Playwright and Chromium into a
 temporary venv on every run, so they need network access.
+`scroll-proof` completes those downloads before launching its compositor:
+the normal five-minute idle lock remains enabled, so dependency latency is
+not part of the live input journey. Each mode change sends exactly one
+physical key chord and waits for the compositor's observed transition;
+silence fails rather than resending a toggle that could undo a slow change.
 
 **Start `tuna-gtk-shell-proof` from a fresh artifacts directory.** The
 script points `XDG_STATE_HOME` at `gtk-shell-artifacts/state`, and the
@@ -509,8 +514,15 @@ The private `TUNA_COMPOSITOR_STATE` opt-in additionally exposes per-live-binding
 **server emission**, not application-consumption, counters at the actual
 `WlSurface::key` → `WlKeyboard.key` send path. The default does not count keys,
 allocate observer storage, or take observer snapshots. Evidence joins actual
-server socket PID/UID, generational connection/resource identity, native window,
-and seat focus to the original installed process. Every app requires a fresh
+kernel-accepted or D-Bus-admitted original PID/UID with a live process pin,
+generational connection/resource identity, native window, and seat focus to
+the original installed process. Mutter ServiceChannel sockets are created
+by the compositor and passed to the admitted application; their raw
+`SO_PEERCRED` identifies the socket-pair creator, not the application.
+Both window and focus observer records therefore use the original pinned
+caller credentials already retained at connection admission. Missing
+credentials, missing UID/pin, and exited peers are unevaluable; there is no
+fallback to the compositor PID or a later numeric-PID lookup. Every app requires a fresh
 prelock positive delta, unchanged counters during locked negative input and
 unlock, and another fresh postunlock positive delta. Missing, recreated,
 retired, late-enabled or overflowing bindings are unevaluable, never zero
@@ -547,6 +559,21 @@ service traffic through timedated, `/etc/localtime` and the panel, including
 both disabled controls and restoration. Absent inputs fail the full run;
 source coverage, counter tests and the old nine-operation archive cannot
 close #397 or #359.
+
+The [native Core job in CI run 41464650830](https://github.com/tuna-os/tuna-desktop/actions/runs/41464650830/job/125362607498)
+failed at `desktop.discover` (`guest.py:142`) before completing the matrix.
+Its retained `native-core-apps` artifact `13156997730`,
+`core-apps/00025-normal-launch-org.gnome.Nautilus.json`, records Nautilus
+window 2 with `client_pid=1935`; `session-owner.json` identifies PID 1935 as
+the original compositor. This exposed the observer's use of socket-pair
+creator credentials on the service connection. The correction preserves
+the strict app bus/PID/UID join and actual server-emission requirements.
+Socket regression controls cover the separate live admitted process,
+expired pins, and absent original credentials/pin/UID, but do not qualify
+Nautilus or any of the 28 applications. A fresh source-bound native Core
+matrix on the installed app/service/reference-GDM path is still required;
+the failed run is not a pass and must not be retried merely for green.
+
 
 ## Marlin VM lane
 
