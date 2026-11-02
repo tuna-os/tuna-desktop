@@ -217,6 +217,7 @@ def observe(pid, ticks, executable, display, controlled=False, banner=False):
     search_entries, target = [], {"showing":0,"focused":0,"present":0}
     focused_roles = []
     banner_focused = False
+    banner_control = False
     while pending:
         if json.loads(state.read_text())["locked"]:
             raise RuntimeError("locked accessibility trees are never queried")
@@ -240,6 +241,9 @@ def observe(pid, ticks, executable, display, controlled=False, banner=False):
             continue
         if banner and depth:
             banner_focused |= states.contains(Atspi.StateType.FOCUSED)
+        if banner and role in {"alert", "notification"}:
+            FOCUS_OPERATION = "tree-name"
+            banner_control |= accessibility_query(node.get_name) == "Installed strip framebuffer control"
         if role in PUBLIC_ROLES:
             FOCUS_OPERATION = "tree-name"
             name = accessibility_query(node.get_name)
@@ -304,7 +308,8 @@ def observe(pid, ticks, executable, display, controlled=False, banner=False):
         if len(frames) > 1 or len(closes) > 1 or (closes and not frames):
             raise RuntimeError("visible notification controls are ambiguous")
         result["banner"] = {"visible": len(frames) == 1, "focused": bool(banner_focused),
-                            "close_ready": len(closes) == 1 and closes[0]["ready"]}
+                            "close_ready": len(closes) == 1 and closes[0]["ready"],
+                            "control_visible": bool(banner_control)}
     if controlled:
         if diagnostic is not None and type(diagnostic.get("catalog")) is dict and "sample" in diagnostic["catalog"]:
             sample = diagnostic["catalog"]["sample"]

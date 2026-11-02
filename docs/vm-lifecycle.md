@@ -27,8 +27,8 @@ fixture helpers to the selected package, source and final image. Both PNG and
 PPM acquisitions must pass all 25 original body-color samples; the captures
 remain separate acquisitions, not presentation-latency proof.
 
-A real notification can cover those pixels. On the first mismatch, the probe
-retains the original frames and may acknowledge the visible banner through
+A real notification can cover those pixels. On a mismatch, the probe
+retains the original first frames and may acknowledge the visible banner through
 ordinary QMP input: Super+N, Tab, then Space only after the original shell's
 public Close button is observed focused and enabled. The read-only AT-SPI
 observer records fixed public controls and original process/bus identities,
@@ -36,6 +36,14 @@ not notification summaries or bodies. Every pixel check and the existing
 10-second capture and 120-second phase deadlines remain unchanged. No updater
 service, notification policy or failure log is disabled; acknowledging a banner
 does not qualify the update operation that produced it.
+
+The column-height capture also submits a real critical notification through
+the session's public notification service. It cannot pass until the original
+shell shows the fixed public fixture title, its enabled Close button receives
+the actual QMP Space action, and the banner disappears. Only a boolean title
+comparison is retained. This control exercises the recovery path even when
+the updater happens to show no banner; it shares the same capture deadline
+and still requires every original PNG and PPM color sample afterward.
 
 ## Record-free fresh accounts (tunaOS#4092)
 

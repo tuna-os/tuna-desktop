@@ -516,7 +516,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
             notification = value['notification']
             banner = notification['banner']
             if (notification.get('observation_only') is not True
-                    or any(type(banner.get(key)) is not bool for key in ('visible', 'focused', 'close_ready'))):
+                    or any(type(banner.get(key)) is not bool for key in ('visible', 'focused', 'close_ready', 'control_visible'))):
                 raise RuntimeError('actual public banner observation is incomplete')
             return notification
 
@@ -541,7 +541,8 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
                 banner = actual['banner']
                 if not banner['visible']:
                     interaction['completed'] = True
-                    return
+                    interaction['public_close_activated'] = expected is None
+                    return interaction
                 if expected is not None and banner[expected]:
                     sample = read(capture_deadline)
                     if sample['inventory']['state']['seat_pressed_key_count'] == 0:
@@ -551,7 +552,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
                 raise TimeoutError('actual public banner did not reach its input endpoint')
         raise RuntimeError('public Close did not remove the visible notification')
 
-    def capture(label, sample, role='alpha'):
+    def capture(label, sample, role='alpha', *, notification_control=False):
         found = windows(sample, original, edge=edge)
         png = destination / (label + '.png')
         ppm = destination / (label + '.ppm')
@@ -561,6 +562,14 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         capture_transport = QmpDeadline(qmp, capture_deadline)
         attempts = 0
         last_error = None
+        control_closed = False
+        if notification_control:
+            control = guest('strip-banner-control', nonce,
+                            budget=min(4, capture_deadline - time.monotonic()))
+            if control.get('owner') != original:
+                raise RuntimeError('notification control differs from original fixture owner')
+            receipt['notification_control'] = {'id': control['notification_id'],
+                                               'closed_by_public_button': False}
         while time.monotonic() < capture_deadline:
             attempts += 1
             capture_transport.command('screendump', filename=str(png), format='png')
@@ -579,6 +588,8 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
                     png_image = frame.convert('RGB')
                     colored_frame((png_image.width, png_image.height, png_image.tobytes()),
                                   found[role]['rect'], COLORS[role])
+                if notification_control and not control_closed:
+                    raise NotReady('controlled critical banner has not reached its public Close endpoint')
                 if time.monotonic() >= capture_deadline:
                     raise TimeoutError('installed framebuffer capture exceeded deadline')
                 break
@@ -587,8 +598,12 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
                 if attempts == 1:
                     png.replace(destination / (label + '-not-ready.png'))
                     ppm.replace(destination / (label + '-not-ready.ppm'))
-                if attempts == 1:
-                    dismiss_visible_banner(label, capture_deadline, capture_transport)
+                interaction = dismiss_visible_banner(label, capture_deadline, capture_transport)
+                if (notification_control and interaction is not None
+                        and interaction['before']['banner']['control_visible']
+                        and interaction.get('public_close_activated') is True):
+                    control_closed = True
+                    receipt['notification_control']['closed_by_public_button'] = True
                 remaining = capture_deadline - time.monotonic()
                 if remaining <= 0:
                     raise
@@ -881,7 +896,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         ready('scroll', grip, extra=heights_moved)
         button(False)
         heights = ready('scroll', extra=heights_moved)
-        capture('10-column-height', heights, 'beta')
+        capture('10-column-height', heights, 'beta', notification_control=True)
         # Super+] on the shared, focused Beta expels it into a new column on
         # the right with the column's width; both are full height again.
         if heights['inventory']['state']['focused'] != stacked['beta']['id']:
