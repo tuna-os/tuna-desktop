@@ -139,3 +139,13 @@ meta_x11_display_set_input_focus does; enter/leave are unchanged. The
 nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
 The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
 version stays 0.7.0.
+
+Issue #495 adds `_NET_WM_ICON_GEOMETRY` to src/xwayland/xwm/mod.rs and
+surface.rs. X11Surface reads it at map and on PropertyNotify (reported as
+the new WmWindowProperty::IconGeometry) and exposes it as
+`icon_geometry()` in logical coordinates, with Mutter's
+`reload_icon_geometry` semantics: a missing or non-CARDINAL property
+unsets it, a value of other than four cardinals keeps the previous one.
+Roost minimizes toward it as GNOME Shell 51's `_minimizeWindow` does. No
+match in the tree is exhaustive over WmWindowProperty. The isolated diff
+is retained in ICON-GEOMETRY-API-PATCH.diff; the pinned version stays 0.7.0.

@@ -1,0 +1,561 @@
+#!/usr/bin/python3
+"""Paired GNOME 51 window-motion gate (#493 #494 #495 #496 #498).
+
+Run under dbus-run-session:
+
+    tuna-motion-pairing-proof --bin-dir BUNDLE --artifacts DIR [--display :112] [--require-clean]
+
+BUNDLE holds tuna-compositor, tuna-shell-gtk and tuna-modal-dim-client (a
+scripts/tuna-minimize-ci-proof freeze, whose manifest.json is verified when
+present). The proof replays tests/gnome-reference/motion.js on Tuna Desktop:
+the same GTK client (scripts/lib/tuna-window-lifecycle-client.py) maps,
+minimizes, restores, maximizes, tiles, fullscreens and closes; the native
+xdg-dialog client opens and closes an attached modal over its parent. Each
+effect starts on a frozen TUNA_ANIMATION_CLOCK and is sampled at exactly the
+delays GNOME 51 was captured at. Compositor state and actual screenshots are
+reduced by scripts/lib/motion_pairing.py and compared with
+tests/gnome-reference/motion-reference.json (scripts/tuna-motion-reference):
+opacity, drawn geometry, minimize progress, dim multiplier, size-change
+snapshot progress/opacity/live size, and pixel-measured body opacity and
+parent brightness, plus effects GNOME skips (animations off, reduced-motion
+and monitor-sized restore). It writes comparison.json and assertions.txt.
+Private display, runtime directory, settings and accessibility bus.
+"""
+import argparse
+import hashlib
+import json
+import os
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import gi  # noqa: F401
+from gi.repository import Gio, GLib
+from PIL import Image
+
+sys.dont_write_bytecode = True
+root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(root / "scripts/lib"))
+import motion_pairing as mp  # noqa: E402
+from minimize_body_pixel import wait_clock_frames  # noqa: E402
+
+p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+p.add_argument("--bin-dir", type=Path, required=True)
+p.add_argument("--artifacts", type=Path, required=True)
+p.add_argument("--display", default=":112")
+p.add_argument("--reference", type=Path, default=root / "tests/gnome-reference/motion-reference.json")
+p.add_argument("--require-clean", action="store_true", help="refuse dirty source (CI qualification)")
+a = p.parse_args()
+reference = json.loads(a.reference.read_text())
+art = a.artifacts.resolve()
+art.mkdir(parents=True, exist_ok=True)
+runtime = art / "runtime"
+runtime.mkdir(mode=0o700, exist_ok=True)
+os.chmod(runtime, 0o700)
+state = art / "state.json"
+clock = art / "clock"
+command = art / "command.json"
+clock.write_text("0\n")
+(art / "assertions.txt").unlink(missing_ok=True)
+state.unlink(missing_ok=True)
+command.unlink(missing_ok=True)
+env = dict(os.environ, DISPLAY=a.display, XDG_RUNTIME_DIR=str(runtime),
+           XDG_CONFIG_HOME=str(art / "config"), XDG_DATA_HOME=str(art / "data"), GSETTINGS_BACKEND="keyfile",
+           TUNA_COMPOSITOR_STATE=str(state), TUNA_ANIMATION_CLOCK=str(clock),
+           TUNA_XWAYLAND="0", LIBGL_ALWAYS_SOFTWARE="1", ADW_DISABLE_PORTAL="1", GSK_RENDERER="cairo",
+           TUNA_LIFECYCLE_COMMAND=str(command))
+
+
+def digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+frozen = art / "bin"
+frozen.mkdir(exist_ok=True)
+binaries = {}
+for name in ("tuna-compositor", "tuna-shell-gtk", "tuna-modal-dim-client"):
+    shutil.copy2(a.bin_dir.resolve() / name, frozen / name)
+    binaries[name] = {"source_path": str(a.bin_dir.resolve() / name), "sha256": digest(frozen / name)}
+git = lambda *args: subprocess.check_output(["git", *args], cwd=root, text=True).strip()  # noqa: E731
+manifest = {
+    "source_revision": git("rev-parse", "HEAD"),
+    "source_dirty": bool(git("status", "--porcelain")),
+    "binaries": binaries,
+    "proof_sha256": digest(Path(__file__).resolve()),
+    "metrics_sha256": digest(root / "scripts/lib/motion_pairing.py"),
+    "client_sha256": digest(root / "scripts/lib/tuna-window-lifecycle-client.py"),
+    "reference_sha256": digest(a.reference),
+    "gnome_reference": reference["gnome"],
+    "backend": "winit/Xvfb/llvmpipe",
+}
+freeze = a.bin_dir / "manifest.json"
+if freeze.exists():
+    frozen_manifest = json.loads(freeze.read_text())
+    manifest["binary_source_revision"] = frozen_manifest["source_commit"]
+    assert frozen_manifest["source_commit"] == manifest["source_revision"], "bundle built from other source"
+    for name, record in binaries.items():
+        assert record["sha256"] == frozen_manifest["sha256"][name], f"{name} differs from its freeze"
+if a.require_clean:
+    assert not manifest["source_dirty"], "qualification requires clean source"
+    assert freeze.exists(), "qualification requires a frozen bundle manifest"
+(art / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+processes, logs = [], []
+
+
+def spawn(args, name, extra=None):
+    log = (art / f"{name}.log").open("w")
+    logs.append(log)
+    proc = subprocess.Popen(args, env=env | (extra or {}), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    processes.append(proc)
+    return proc
+
+
+def wait(check, label, timeout=25):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        try:
+            data = json.loads(state.read_text())
+            if check(data):
+                (art / "states").mkdir(exist_ok=True)
+                (art / "states" / f"{label}.json").write_text(json.dumps(data, indent=1))
+                return data
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            pass
+        time.sleep(.05)
+    raise AssertionError(f"timed out: {label}; see {art}")
+
+
+def screenshot(name):
+    path = art / "frames" / f"{name}.png"
+    path.parent.mkdir(exist_ok=True)
+    subprocess.run(["scrot", "-o", str(path)], env=env, check=True)
+    return path.name
+
+
+frames = mp.Frames(art / "frames")
+clock_base = 0
+now = 0  # animation milliseconds since the clock froze
+
+
+def move(ms):
+    """Set the frozen animation clock and wait until two frames drew it."""
+    global now
+    now = ms
+    temp = art / "clock.tmp"
+    temp.write_text(str(ms))
+    temp.replace(clock)
+    return wait_clock_frames(wait, clock_base + ms, f"clock-{ms}")
+
+
+generation = 0
+
+
+def action(name):
+    global generation
+    generation += 1
+    temp = art / "command.tmp"
+    temp.write_text(json.dumps({"action": name, "generation": generation}))
+    temp.replace(command)
+
+
+def keys(*args):
+    subprocess.run(["xdotool", *args], env=env, check=True)
+
+
+
+measured = {}
+monitor_w = int(reference["gnome"]["monitor"].split("x")[0])
+
+
+def samples_for(name):
+    return [s["t_ms"] for s in reference["families"][name]["samples"]]
+
+
+def run_family(name, trigger, started):
+    """Trigger at a frozen clock, then sample at each GNOME delay."""
+    start = now
+    trigger()
+    wait(started, f"{name}-start")
+    rows = []
+    for t in samples_for(name):
+        scene = move(start + t)
+        rows.append({"t_ms": t, "png": screenshot(f"{name}-{t:04d}"), "scene": scene})
+    move(start + max(samples_for(name)) + 200)
+    measured[name] = {"samples": rows}
+
+
+def reduce(name, measure):
+    """Reduce a sampled family once its settled geometry is known."""
+    for row in measured[name]["samples"]:
+        scene = row.pop("scene")
+        (art / "states" / f"{name}-{row['t_ms']:04d}.json").write_text(json.dumps(scene, indent=1))
+        row.update(measure(scene, row["t_ms"], row["png"]))
+
+
+def transform_measure(wid, buffer, frame, without, full, destroying=False):
+    def measure(scene, t, png):
+        life = scene["window_lifecycle"]
+        entry = next((e for e in (life["destroying"] if destroying else life["opening"]) if e["window"] == wid), None)
+        if entry is None:
+            # The effect has finished: a mapped window rests on its buffer,
+            # a destroyed one is gone.
+            if destroying:
+                return {"visible": False}
+            opacity, drawn = 1.0, buffer
+        else:
+            opacity, drawn = entry["frame"]["alpha"], entry["drawn"]
+        return {"opacity": opacity, "rect": mp.normalise(drawn, buffer), "visible": mp.visible(opacity, drawn),
+                "body_alpha": mp.body_alpha(frames(png), frames(without), frames(full),
+                                            mp.frame_drawn(drawn, buffer, frame), frame)}
+    return measure
+
+
+def dim_of(scene, parent):
+    entry = next((e for e in scene["modal_dim"]["parents"] if e["parent"] == parent), None)
+    return entry["multiplier"] if entry else 1.0
+
+
+cleanup_errors = []
+success = False
+owned_pidfds = []
+accessibility = None
+try:
+    launcher = spawn(["/usr/libexec/at-spi-bus-launcher", "--launch-immediately"], "atspi")
+    session_bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            address = session_bus.call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress", None, None,
+                                            Gio.DBusCallFlags.NO_AUTO_START, 2000, None).unpack()[0]
+            break
+        except Exception:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(.1)
+    assert str(runtime) in address, "accessibility bus escaped private runtime"
+    env["AT_SPI_BUS_ADDRESS"] = address
+    accessibility = Gio.DBusConnection.new_for_address_sync(
+        address, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+    bus_pid = accessibility.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                                      "GetConnectionUnixProcessID", GLib.Variant("(s)", ("org.freedesktop.DBus",)),
+                                      None, Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+    owned_pidfds.append(os.pidfd_open(bus_pid))
+    manifest["session_isolation"] = {"runtime_directory": str(runtime), "session_bus": env.get("DBUS_SESSION_BUS_ADDRESS"),
+                                     "accessibility_bus": address, "accessibility_bus_pid": bus_pid}
+    if Path(f"/tmp/.X11-unix/X{a.display.lstrip(':')}").exists():
+        raise RuntimeError("display already in use; choose a private unused display")
+    spawn(["Xvfb", a.display, "-screen", "0", reference["gnome"]["monitor"] + "x24"], "xvfb")
+    for _ in range(100):
+        if subprocess.run(["xdotool", "getdisplaygeometry"], env=env, capture_output=True).returncode == 0:
+            break
+        time.sleep(.05)
+    schemas = art / "schemas"
+    fixtures = []
+    for schema, key, fixture in (("org.gnome.desktop.a11y.interface", "reduced-motion", "gnome51-a11y-interface.gschema.xml"),
+                                 ("org.gnome.mutter", "attach-modal-dialogs", "gnome51-mutter.gschema.xml")):
+        if subprocess.run(["gsettings", "range", schema, key], env=env, capture_output=True).returncode:
+            schemas.mkdir(exist_ok=True)
+            shutil.copy(root / "tests/settings" / fixture, schemas)
+            fixtures.append(f"{schema}:{key}")
+    if fixtures:
+        subprocess.run(["glib-compile-schemas", str(schemas)], check=True)
+        env["GSETTINGS_SCHEMA_DIR"] = str(schemas)
+    manifest["settings_fixture_keys"] = fixtures
+
+    def gset(schema, key, value):
+        subprocess.run(["gsettings", "set", schema, key, value], env=env, check=True)
+
+    gset("org.gnome.mutter", "attach-modal-dialogs", "true")
+    gset("org.gnome.desktop.a11y.interface", "reduced-motion", "no-preference")
+    gset("org.gnome.desktop.interface", "enable-animations", "true")
+    compositor = spawn([str(frozen / "tuna-compositor"), "--socket", "motion-pairing", "--shell-bin",
+                        str(frozen / "tuna-shell-gtk")], "compositor")
+    ready = wait(lambda d: d["animation_clock_manual"] and d["rendered_frames"] >= 5
+                 and d["wallpaper_diagnostics"]["decode_result_count"] > 0
+                 and any(layer["namespace"] == "tuna-panel" for layer in d["layers"]), "ready")
+    clock_base = ready["animation_clock_ms"]
+    host = subprocess.check_output(["xdotool", "search", "--pid", str(compositor.pid), "--name", "Smithay"],
+                                   env=env, text=True).splitlines()
+    assert len(host) == 1, host
+    keys("windowfocus", "--sync", host[0])
+    # Settle the wallpaper crossfade so frames differ only by the windows.
+    move(1000)
+    time.sleep(1)
+    screenshot("baseline")
+    gtk = {"WAYLAND_DISPLAY": "motion-pairing", "GDK_BACKEND": "wayland"}
+
+    def gtk_client(label):
+        command.unlink(missing_ok=True)
+        global generation
+        generation = 0
+        return spawn(["/usr/bin/python3", str(root / "scripts/lib/tuna-window-lifecycle-client.py")], label, gtk)
+
+    def settled_window(label):
+        scene = wait(lambda d: len(d["windows"]) == 1 and d["windows"][0]["buffer_rect"] and not d["window_lifecycle"]["opening"]
+                     and not d["size_changes"]["in_flight"], label)
+        return scene["windows"][0]
+
+    def restore_trigger():
+        # GNOME's switcher activation restores the minimized window.
+        keys("keydown", "Alt_L", "key", "Tab")
+        time.sleep(.7)
+        keys("keyup", "Alt_L")
+
+    def instant_restore(wid, name):
+        restore_trigger()
+        # The model unminimizes a frame before the lifecycle records it.
+        scene = wait(lambda d: wid not in d["minimized"] and any(
+            e["window"] == wid and e["effect"] == "unminimize" and e["at_ms"] == clock_base + now
+            for e in d["window_lifecycle"]["history"]), f"{name}-shown")
+        measured[name] = {"instant": not any(e["window"] == wid for e in scene["window_lifecycle"]["restoring"])
+                          and any(e["window"] == wid and e["effect"] == "unminimize" and e["outcome"] == "instant"
+                                  and e["at_ms"] == clock_base + now for e in scene["window_lifecycle"]["history"])}
+
+    def motion_families(prefix, client_label):
+        """Map, minimize/restore, size changes and destroy of the GTK client."""
+        target = mp.corner(monitor_w)
+        clients, started = [], {}
+
+        def map_started(d):
+            if len(d["windows"]) == 1 and d["windows"][0]["buffer_rect"] and d["window_lifecycle"]["opening"]:
+                started["wid"] = d["windows"][0]["id"]
+                return True
+            return False
+
+        run_family(f"{prefix}map", lambda: clients.append(gtk_client(client_label)), map_started)
+        wid = started["wid"]
+        win = settled_window(f"{prefix}map-settled")
+        geometry = {"buffer": win["buffer_rect"], "frame": win["rect"]}
+        full = screenshot(f"{prefix}map-settled")
+        reduce(f"{prefix}map", transform_measure(wid, geometry["buffer"], geometry["frame"], "baseline.png", full))
+
+        def minimize_family(name, motion):
+            before = screenshot(f"{name}-before")
+            run_family(name, lambda: action("minimize"),
+                       lambda d: any(e["window"] == wid for e in d["window_lifecycle"]["minimizing"]))
+            wait(lambda d: wid in d["minimized"] and not d["window_lifecycle"]["minimizing"], f"{name}-hidden")
+            hidden = screenshot(f"{name}-hidden")
+            b, f = geometry["buffer"], geometry["frame"]
+
+            def measure(scene, t, png):
+                entry = next((e for e in scene["window_lifecycle"]["minimizing"] if e["window"] == wid), None)
+                if entry is None:
+                    return {"visible": False}
+                row = {"opacity": entry["alpha"], "visible": mp.visible(entry["alpha"], entry["rect"])}
+                if motion:
+                    row["progress"] = mp.toward(entry["rect"], b, target)
+                else:
+                    row["rect"] = mp.normalise(entry["rect"], b)
+                row["body_alpha"] = mp.body_alpha(frames(png), frames(hidden), frames(before),
+                                                  mp.frame_drawn(entry["rect"], b, f), f)
+                return row
+            reduce(name, measure)
+            return hidden, before
+
+        hidden, before = minimize_family(f"{prefix}minimize", motion=not prefix)
+        name = f"{prefix}unminimize"
+        if reference["families"][name]["class"] == "instant":
+            instant_restore(wid, name)
+        else:
+            run_family(name, restore_trigger,
+                       lambda d: any(e["window"] == wid for e in d["window_lifecycle"]["restoring"]))
+            b, f = geometry["buffer"], geometry["frame"]
+
+            def restore_measure(scene, t, png):
+                entry = next((e for e in scene["window_lifecycle"]["restoring"] if e["window"] == wid), None)
+                drawn = entry["drawn"] if entry else b
+                return {"opacity": 1.0, "visible": mp.visible(1.0, drawn), "progress": mp.toward(drawn, b, target),
+                        "body_alpha": mp.body_alpha(frames(png), frames(hidden), frames(before),
+                                                    mp.frame_drawn(drawn, b, f), f)}
+            reduce(name, restore_measure)
+        settled_window(f"{name}-settled")
+
+        def size_family(name, trigger):
+            run_family(name, trigger,
+                       lambda d: any(e["window"] == wid and e["phase"] == "animating" for e in d["size_changes"]["in_flight"]))
+            settled_window(f"{name}-settled")
+
+            def measure(scene, t, png):
+                entry = next((e for e in scene["size_changes"]["in_flight"] if e["window"] == wid), None)
+                if entry is None:
+                    return {"progress": 0.0 if name.startswith("reduced-") else 1.0,
+                            "snapshot_alpha": 0.0, "live_size": [1.0, 1.0]}
+                return mp.size_metrics(entry["snapshot"], entry["snapshot_alpha"], entry["live"], entry["from"], entry["to"])
+            reduce(name, measure)
+
+        chords = [("maximize", "super+Up"), ("unmaximize", "super+Down")]
+        if not prefix:
+            chords += [("tile-left", "super+Left"), ("untile-left", "super+Down"),
+                       ("tile-right", "super+Right"), ("untile-right", "super+Down")]
+        for name, chord in chords:
+            size_family(prefix + name, lambda chord=chord: keys("key", chord))
+        if not prefix:
+            size_family("fullscreen", lambda: action("fullscreen"))
+            fs = settled_window("fullscreen-window")
+            assert fs["rect"] == [0, 0, monitor_w, int(reference["gnome"]["monitor"].split("x")[1])], fs
+            normal = dict(geometry)
+            geometry.update(buffer=fs["buffer_rect"], frame=fs["rect"])
+            # Monitor-sized: minimize only fades and the restore is instant.
+            minimize_family("fullscreen-minimize", motion=False)
+            instant_restore(wid, "fullscreen-unminimize")
+            settled_window("fullscreen-unminimize-settled")
+            size_family("unfullscreen", lambda: action("unfullscreen"))
+            geometry.update(normal)
+        win = settled_window(f"{prefix}destroy-before")
+        assert win["buffer_rect"] == geometry["buffer"], (win, geometry)
+        full = screenshot(f"{prefix}destroy-full")
+        run_family(f"{prefix}destroy", lambda: action("close"),
+                   lambda d: not d["windows"] and any(e["window"] == wid for e in d["window_lifecycle"]["destroying"]))
+        clients[0].wait(timeout=10)
+        wait(lambda d: not d["window_lifecycle"]["destroying"], f"{prefix}destroy-gone")
+        gone = screenshot(f"{prefix}destroy-settled")
+        reduce(f"{prefix}destroy", transform_measure(wid, geometry["buffer"], geometry["frame"], gone, full, destroying=True))
+
+    def dialog_families(prefix):
+        """An attached xdg-dialog modal over its native parent."""
+        command.unlink(missing_ok=True)
+        global generation
+        generation = 0
+        client = spawn([str(frozen / "tuna-modal-dim-client")], f"{prefix}dim-client", {"WAYLAND_DISPLAY": "motion-pairing"})
+        parent = wait(lambda d: len(d["windows"]) == 1, f"{prefix}dim-parent")["windows"][0]["id"]
+        move(now + 1000)
+        parent_win = settled_window(f"{prefix}dim-parent-settled")
+        undimmed = screenshot(f"{prefix}dialog-undimmed")
+        info = {}
+
+        def dialog_started(d):
+            if len(d["windows"]) == 2 and any(e["parent"] == parent for e in d["modal_dim"]["parents"]):
+                info["dialog"] = next(w["id"] for w in d["windows"] if w["id"] != parent)
+                return True
+            return False
+
+        def dialog_measure(buffer, destroying, unchanged):
+            def measure(scene, t, png):
+                life = scene["window_lifecycle"]
+                entry = next((e for e in (life["destroying"] if destroying else life["opening"])
+                              if e["window"] == info["dialog"]), None)
+                row = {"multiplier": dim_of(scene, parent),
+                       "pixel_multiplier": mp.pixel_multiplier(frames(png), frames(unchanged),
+                                                               mp.parent_probe(parent_win["rect"]))}
+                if entry is not None:
+                    row.update(opacity=entry["frame"]["alpha"], rect=mp.normalise(entry["drawn"], buffer),
+                               visible=mp.visible(entry["frame"]["alpha"], entry["drawn"]))
+                elif destroying:
+                    row["visible"] = False
+                else:
+                    row.update(opacity=1.0, rect=[0.0, 0.0, 1.0, 1.0], visible=True)
+                return row
+            return measure
+
+        name = f"{prefix}dialog-map-dim"
+        run_family(name, lambda: action("dialog"), dialog_started)
+        scene = wait(lambda d: len(d["windows"]) == 2 and not d["window_lifecycle"]["opening"] and not d["modal_dim"]["running"],
+                     f"{name}-settled")
+        buffer = next(w for w in scene["windows"] if w["id"] == info["dialog"])["buffer_rect"]
+        reduce(name, dialog_measure(buffer, False, undimmed))
+        name = f"{prefix}dialog-destroy-undim"
+        run_family(name, lambda: action("close-dialog"),
+                   lambda d: len(d["windows"]) == 1 and d["modal_dim"]["running"])
+        wait(lambda d: not d["modal_dim"]["parents"] and not d["window_lifecycle"]["destroying"], f"{name}-settled")
+        reduce(name, dialog_measure(buffer, True, screenshot(f"{name}-settled")))
+        action("close")
+        client.wait(timeout=10)
+        move(now + 500)
+        wait(lambda d: not d["windows"] and not d["window_lifecycle"]["destroying"], f"{prefix}dim-client-gone")
+
+    motion_families("", "client")
+    dialog_families("")
+    gset("org.gnome.desktop.a11y.interface", "reduced-motion", "reduce")
+    wait(lambda d: d["motion_policy"] == "fade-only", "reduced-motion")
+    motion_families("reduced-", "reduced-client")
+    dialog_families("reduced-")
+    gset("org.gnome.desktop.a11y.interface", "reduced-motion", "no-preference")
+    gset("org.gnome.desktop.interface", "enable-animations", "false")
+    wait(lambda d: d["motion_policy"] == "off", "animations-off")
+    client = gtk_client("off-client")
+    scene = wait(lambda d: len(d["windows"]) == 1 and d["windows"][0]["buffer_rect"], "off-map")
+    measured["off-map"] = {"instant": not scene["window_lifecycle"]["opening"]}
+    action("close")
+    client.wait(timeout=10)
+    scene = wait(lambda d: not d["windows"], "off-destroy")
+    measured["off-destroy"] = {"instant": not scene["window_lifecycle"]["destroying"]
+                               and scene["window_lifecycle"]["retained_destroy_bytes"] == 0}
+    gset("org.gnome.desktop.interface", "enable-animations", "true")
+    assert compositor.poll() is None, "compositor exited during the pairing"
+    success = True
+finally:
+    owned = [manifest["session_isolation"]["accessibility_bus_pid"]] if "session_isolation" in manifest else []
+    if accessibility:
+        try:
+            owned.append(accessibility.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                                                 "GetConnectionUnixProcessID", GLib.Variant("(s)", ("org.a11y.atspi.Registry",)),
+                                                 None, Gio.DBusCallFlags.NONE, 2000, None).unpack()[0])
+        except GLib.Error as error:
+            if Gio.DBusError.get_remote_error(error) != "org.freedesktop.DBus.Error.NameHasNoOwner":
+                cleanup_errors.append(str(error))
+    for pid in owned[1:]:
+        try:
+            owned_pidfds.append(os.pidfd_open(pid))
+        except ProcessLookupError:
+            pass
+    for proc in reversed(processes):
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+    stopped = True
+    for pidfd in owned_pidfds:
+        poller = select.poll()
+        poller.register(pidfd, select.POLLIN)
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        if not poller.poll(1000):
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            stopped = bool(poller.poll(1000)) and stopped
+        os.close(pidfd)
+    if accessibility:
+        try:
+            accessibility.close_sync(None)
+        except GLib.Error:
+            pass
+    shutil.rmtree(runtime, ignore_errors=True)
+    manifest["owned_cleanup"] = {"runtime_removed": not runtime.exists(), "accessibility_pids": owned,
+                                 "accessibility_processes_stopped": stopped, "query_errors": cleanup_errors}
+    (art / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (art / "measured.json").write_text(json.dumps(measured, indent=1))
+    for log in logs:
+        log.close()
+
+cleanup = manifest["owned_cleanup"]
+if not (cleanup["runtime_removed"] and cleanup["accessibility_processes_stopped"] and not cleanup["query_errors"]):
+    raise SystemExit("owned proof session cleanup failed")
+report, failures = mp.compare(reference, measured)
+(art / "comparison.json").write_text(json.dumps({"gnome": reference["gnome"], "tolerance": reference["tolerance"],
+                                                 "failures": failures, "families": report}, indent=1))
+if failures:
+    print("\n".join(failures), file=sys.stderr)
+    raise SystemExit(f"motion pairing: {len(failures)} differences from GNOME {reference['gnome']['gnome_shell']}; see {art}/comparison.json")
+classes = {}
+for name, fam in report.items():
+    classes.setdefault(fam["class"], []).append(name)
+label = {"transform": "MP-OPEN-CLOSE", "dialog": "MP-DIALOG-DIM", "minimize": "MP-MINIMIZE",
+         "size": "MP-SIZE-CHANGE", "instant": "MP-INSTANT"}
+lines = [f"{label[c]} pass {', '.join(sorted(n))} match GNOME {reference['gnome']['gnome_shell']} at every captured delay"
+         for c, n in sorted(classes.items())]
+lines.append("MP-CLEANUP pass private runtime and accessibility processes removed")
+(art / "assertions.txt").write_text("\n".join(lines) + "\n")
+print(f"motion pairing proof passed: {art}")

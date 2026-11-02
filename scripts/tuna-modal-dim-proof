@@ -186,7 +186,8 @@ try:
     started = wait(lambda d:len(d["modal_dim"]["parents"]) == 1 and d["modal_dim"]["running"],"dim-start")
     assert started["modal_dim"]["parents"][0]["duration_ms"] == 500
     move(500)
-    half = wait(lambda d:abs(factor(d)-(1.0+(88/127-1.0)*.75))<1e-5,"dim-half-250ms")
+    # Clutter's 8-bit brightness byte: floor(127 - 39 * 0.75) = 97.
+    half = wait(lambda d:abs(factor(d)-97/127)<1e-5,"dim-half-250ms")
     pixel_factor(screenshot("02-dim-half"),factor(half))
     move(750)
     full = wait(lambda d:not d["modal_dim"]["running"] and factor(d)<.7,"dim-full-500ms")
@@ -205,7 +206,7 @@ try:
     started = wait(lambda d:len(d["windows"]) == 1 and d["modal_dim"]["running"],"undim-start")
     assert started["modal_dim"]["parents"][0]["duration_ms"] == 250
     move(1075)
-    half = wait(lambda d:abs(factor(d)-(88/127+(1.0-88/127)*.75))<1e-5,"undim-half-125ms")
+    half = wait(lambda d:abs(factor(d)-117/127)<1e-5,"undim-half-125ms")
     pixel_factor(screenshot("04-undim-half"),factor(half))
     move(1200)
     wait(lambda d:not d["modal_dim"]["parents"],"undim-full-250ms")
@@ -215,7 +216,7 @@ try:
     action("dialog",6)
     wait(lambda d:len(d["modal_dim"]["parents"]) == 1,"reduced-modal")
     move(1450)
-    half=wait(lambda d:abs(factor(d)-(1.0+(88/127-1.0)*.75))<1e-5,"reduced-dim-half")
+    half=wait(lambda d:abs(factor(d)-97/127)<1e-5,"reduced-dim-half")
     pixel_factor(screenshot("06-reduced-dim-half"),factor(half))
     subprocess.run(["gsettings","set","org.gnome.desktop.interface","enable-animations","false"],env=env,check=True)
     snapped = wait(lambda d:d["motion_policy"] == "off" and not d["modal_dim"]["running"] and factor(d)<.7,"off-snap-dim")

@@ -47,15 +47,24 @@ mkdir -p /run/systemd/seats
 # clients need more than the stubs offer).
 TUNA_STUB_SERVICES=ppd,logind,gdm python3 /proof-lib/tuna-service-stubs.py /tmp/backlight >/tmp/stubs.log 2>&1 &
 sleep 1
+# GREF_SCRIPT picks the automation script: capture.js (still frames,
+# animations off) or motion.js (window effects, animations on). GNOME
+# inhibits animations without hardware rendering (main.js
+# _shouldEnableAnimations); motion.js forces them on as GNOME's own
+# gnome-shell-test-tool does, so llvmpipe shows hardware-session motion.
+export GREF_SCRIPT="${GREF_SCRIPT:-capture.js}"
+GREF_FLAGS=""
+[ "$GREF_SCRIPT" != motion.js ] || GREF_FLAGS="--force-animations"
+export GREF_FLAGS
 # shellcheck disable=SC2016 # expands in the inner shell
 exec dbus-run-session -- sh -c '
-  gsettings set org.gnome.desktop.interface enable-animations false
+  [ "$GREF_SCRIPT" = motion.js ] || gsettings set org.gnome.desktop.interface enable-animations false
   gsettings set org.gnome.desktop.interface toolkit-accessibility true
   /usr/libexec/at-spi-bus-launcher --launch-immediately >/tmp/atspi.log 2>&1 &
   gsettings set org.gnome.shell welcome-dialog-last-shown-version "999"
   # Search shows apps only: the host and the image have different
   # search providers installed.
   gsettings set org.gnome.desktop.search-providers disable-external true
-  timeout 240 gnome-shell --headless --wayland --virtual-monitor "${GREF_SIZE:-1280x800}" \
-      --automation-script /gref/capture.js
+  timeout 240 gnome-shell --headless --wayland --virtual-monitor "${GREF_SIZE:-1280x800}" $GREF_FLAGS \
+      --automation-script "/gref/$GREF_SCRIPT"
 '

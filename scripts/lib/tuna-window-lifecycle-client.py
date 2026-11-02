@@ -1,5 +1,6 @@
 #!/usr/bin/python3
-"""Commanded native normal/dialog client for the map/destroy proof."""
+"""Commanded native normal/dialog client for the map/destroy proof and the
+paired GNOME 51 motion capture (tests/gnome-reference/motion.js)."""
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,12 @@ def poll():
         elif data["action"] == "close-dialog":
             dialog.destroy()
             dialog = None
+        elif data["action"] == "minimize":
+            parent.minimize()
+        elif data["action"] == "fullscreen":
+            parent.fullscreen()
+        elif data["action"] == "unfullscreen":
+            parent.unfullscreen()
         elif data["action"] == "close":
             parent.destroy()
             loop.quit()
