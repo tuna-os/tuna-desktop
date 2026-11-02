@@ -62,6 +62,23 @@ follow an actual current RFB connection in native Chromium. Its retained
 executable/profile identity and actual owned-child wait/exit receipt must agree;
 a pre-browser cancellation or a stale readiness receipt cannot pass.
 
+Native qualification also retains current noVNC milestone PNGs and four
+bounded actual-guest video clips: pristine setup, the first Tuna session,
+passworded re-login, and the post-reboot session. It reuses the VM lane's QMP
+recorder and VP9 encoder, not a slideshow of stills. Each clip contains at most
+the first 30 seconds of its observed UI journey, with capture timing retained;
+it does not claim to show every account-setup or boot step. The PNGs are actual
+noVNC canvas pixels; the clips are actual owned-guest QMP pixels, not browser
+chrome. The qualification hosts require ffmpeg with `libvpx-vp9` in addition to
+their existing browser observation tools; normal launcher users do not.
+
+`media.json` binds those files to the signed manifest and pristine disk hashes,
+desktop/package source, immutable image index and platform digest, exact signed
+Corral release and binary, observer source, and native host. Failed or incomplete
+qualification records `qualified: false`; neither historical diagnosis frames
+nor before-fix firstboot screenshots may be promoted as current documentation
+proof. Documentation intake must retain these identities and all native gates.
+
 The consumer requires Python 3 and the native package manager (on macOS,
 Homebrew and its normal command-line-tool prerequisites). It obtains the
 checksum-pinned Sigstore verifier itself and acquires QEMU plus amd64 UEFI

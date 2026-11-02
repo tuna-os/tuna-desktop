@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real native CLI/noVNC/pristine-account qualification for the Tuna launcher."""
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import try_tuna_desktop as launcher
@@ -164,7 +166,6 @@ class Screen:
 
 
 def setup_account(screen, user, password, full_name):
-    screen.wait_text(r"Welcome|Language|Start Setup", milestone="01-pristine-firstboot")
     for step in range(24):
         text, rows = screen.observe(f"setup-{step:02d}")
         lower = text.lower()
@@ -253,7 +254,7 @@ def session_probe(screen, user, package_version, nonce, *, persisted=False, rebo
                    milestone="session-probe-" + ("persistent" if persisted else "initial"))
 
 
-def session_ui(screen, milestone):
+def session_ui(screen, milestone, capture):
     # Activate the real user's verified logind desktop, not a hardcoded VT.
     # The query is deliberately shorter than the expected application result:
     # a screenshot of typed input alone cannot satisfy this UI assertion.
@@ -261,12 +262,13 @@ def session_ui(screen, milestone):
                  " case \"$(loginctl show-session \"$candidate\" -p Desktop --value)\" in [Tt]una) session=$candidate;; esac\ndone\n"
                  "test -n \"$session\"\nloginctl activate \"$session\"\n")
     screen.wait_text(r"\b[0-2]?[0-9]:[0-5][0-9]\b", timeout=600, milestone=milestone + "-desktop")
-    screen.key("Escape")
-    screen.key("Meta")
-    screen.text("sett")
-    screen.wait_text(r"\bSettings\b", timeout=120, milestone=milestone + "-settings-result")
-    screen.key("Escape")
-    screen.observe(milestone + "-restored")
+    with capture(milestone):
+        screen.key("Escape")
+        screen.key("Meta")
+        screen.text("sett")
+        screen.wait_text(r"\bSettings\b", timeout=120, milestone=milestone + "-settings-result")
+        screen.key("Escape")
+        screen.observe(milestone + "-restored")
     screen.key("Control+Alt+F3", wait=3000)
 
 
@@ -321,6 +323,56 @@ def qualify(options):
     known_records = []
     failure = None
     admitted = None
+    media = {"schema": 1, "qualified": False, "clips": {}, "screenshots": {}}
+    @contextmanager
+    def capture_ui(label):
+        # Reuse the VM lane's actual bounded QMP recorder, not a montage of
+        # milestone stills. Browser evidence remains the noVNC PNGs below.
+        directory = Path(vm_record["directory"])
+        info = directory.lstat()
+        launcher.require([info.st_dev, info.st_ino] == vm_record["directoryIdentity"]
+                         and json.loads(launcher.safe_file(directory / ".try-tuna-owner.json", 65536)) == vm_record,
+                         "native media VM ownership changed")
+        lane = runpy.run_path(str(ROOT / "scripts/tuna-vm-lane"))
+        clip = output / "media" / label
+        clip.mkdir(parents=True, exist_ok=False)
+        qmp = lane["baseline"].Qmp(str(directory / "qmp.sock"), timeout=10)
+        recorder = None
+        timer = None
+        try:
+            recorder = lane["Recorder"](qmp, str(clip))
+            # A documentation clip is limited to the first 30 real seconds of
+            # this observed UI journey, without altering any qualification wait.
+            timer = threading.Timer(30, recorder.stop.set)
+            timer.start()
+            recorder.thread.start()
+            yield
+        finally:
+            try:
+                if timer is not None:
+                    timer.cancel()
+                    timer.join()
+                if recorder is not None:
+                    recorder.close()
+            finally:
+                qmp.file.close()
+                qmp.sock.close()
+        launcher.require(recorder.n >= 2, "native UI clip did not capture multiple actual frames")
+        timing = {"schema": 1, "frames": recorder.frames, "periodicTargetFps": lane["TOUR_FPS"],
+                  "uniformCaptureIntervals": False, "maximumCaptureSeconds": 30,
+                  "recorderSourceSha256": launcher.sha256(ROOT / "scripts/tuna-vm-lane")}
+        launcher.atomic_json(clip / "capture-timing.json", timing)
+        video = clip / (label + ".webm")
+        launcher.run(["ffmpeg", "-nostdin", "-loglevel", "warning", "-y",
+                      "-framerate", str(lane["TOUR_FPS"]), "-i", clip / "frames/f%06d.png",
+                      "-c:v", "libvpx-vp9", "-crf", "36", "-b:v", "0", "-row-mt", "1",
+                      "-cpu-used", "4", "-pix_fmt", "yuv420p", video], timeout=600)
+        launcher.require(video.stat().st_size > 0, "native UI clip encoder produced no video")
+        media["clips"][label] = {"path": str(video.relative_to(output)), "sha256": launcher.sha256(video),
+                                  "frameCount": recorder.n, "playbackFps": lane["TOUR_FPS"],
+                                  "captureTiming": str((clip / "capture-timing.json").relative_to(output)),
+                                  "scope": "actual owned guest QMP pixels during browser-driven UI; not browser chrome"}
+        shutil.rmtree(clip / "frames")
     consumer_log = (output / "launcher.log").open("ab")
     def command(*args):
         return launcher.run([corral, "--backend", "qemu", *args], cancellable=False)
@@ -457,6 +509,7 @@ def qualify(options):
             launcher.require(json.loads(command("qmp", guard, "query-status"))["running"] is True, "launcher stopped the unrelated guard VM")
         return value
     try:
+        launcher.require(shutil.which("ffmpeg"), "native documentation clips require ffmpeg with libvpx-vp9")
         admitted = launcher.admit(options.artifact_dir / "manifest.json", options.artifact_dir / "manifest.json.sigstore.json", state, options.artifact_dir)
         manifest, manifest_sha, corral, pristine, tools = admitted
         launcher.require(os.environ.get("GITHUB_SHA") == manifest["producer"]["commit"], "native observer source differs from signed producer source")
@@ -495,11 +548,13 @@ def qualify(options):
             launcher.atomic_json(output / "browser-runtime.json", {"version": browser.version, "nativePlatform": options.platform})
             checks["browserRfbConnected"] = True
             screen = Screen(console, output)
-            setup_account(screen, user, password, full_name)
+            screen.wait_text(r"Welcome|Language|Start Setup", milestone="01-pristine-firstboot")
+            with capture_ui("01-pristine-firstboot"):
+                setup_account(screen, user, password, full_name)
             tty_login(screen, user, password)
             checks["pristineFirstbootAccountCreated"] = True
             session_probe(screen, user, manifest["package"]["version"], nonce)
-            session_ui(screen, "02-first-tuna-session")
+            session_ui(screen, "02-first-tuna-session", capture_ui)
             checks["pristineTunaSession"] = True
             sudo_authenticate(screen, password)
             checks["adminWheelPasswordRequired"] = True
@@ -510,7 +565,7 @@ def qualify(options):
             gdm_login(screen, user, password, full_name, "logout-login")
             tty_login(screen, user, password, existing=True)
             session_probe(screen, user, manifest["package"]["version"], nonce, persisted=True)
-            session_ui(screen, "03-tuna-after-password-login")
+            session_ui(screen, "03-tuna-after-password-login", capture_ui)
             checks["pristineLogoutLogin"] = True
             sudo_authenticate(screen, password)
             screen.shell("sudo -n systemctl reboot\n")
@@ -518,7 +573,7 @@ def qualify(options):
             gdm_login(screen, user, password, full_name, "reboot-login")
             tty_login(screen, user, password)
             session_probe(screen, user, manifest["package"]["version"], nonce, persisted=True, rebooted=True)
-            session_ui(screen, "04-tuna-after-reboot")
+            session_ui(screen, "04-tuna-after-reboot", capture_ui)
             checks["rebootPersistence"] = True
             screen.observe("03-created-user-persisted")
             # CDP Browser.close targets the real Chromium process; the
@@ -651,6 +706,18 @@ def qualify(options):
             (output / "failure.txt").write_text(f"{type(failure).__name__}: {failure}\n")
         for identity_file in list(work.glob("browser-*-identity.json")) + list(work.glob("browser-*-exit.json")):
             shutil.copyfile(identity_file, output / identity_file.name)
+        if admitted is not None:
+            manifest = admitted[0]
+            media.update(qualified=failure is None and all(checks.values()),
+                         host=receipt["host"], platform=options.platform,
+                         producer=manifest["producer"], release=manifest["release"],
+                         image=manifest["image"], corral=manifest["corral"],
+                         manifestSha256=receipt["manifestSha256"], diskSha256=receipt["diskSha256"],
+                         corralSha256=receipt["corralSha256"],
+                         observerSourceSha256=launcher.sha256(Path(__file__)))
+            media["screenshots"] = {str(path.relative_to(output)): launcher.sha256(path)
+                                    for path in sorted(output.glob("*.png"))}
+            launcher.atomic_json(output / "media.json", media)
         receipt["files"] = {str(path.relative_to(output)): launcher.sha256(path) for path in sorted(output.rglob("*")) if path.is_file()}
         launcher.atomic_json(output / "qualification.json", receipt)
         if failure is None:
