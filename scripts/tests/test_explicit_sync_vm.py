@@ -2,6 +2,7 @@
 """Finite native action/unit security boundaries, NOT installed/native proof."""
 import importlib.machinery
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -29,6 +30,12 @@ guest = module('explicit_sync_guest_tests', ROOT / 'scripts/lib/tuna-explicit-sy
 host = module('explicit_sync_host_tests', ROOT / 'scripts/lib/explicit_sync_vm.py')
 NONCE = 'a' * 32
 ATTEMPT = 'b' * 32
+ADMITTED_PROOF_FILES = (
+    ('client_sha256', '/usr/libexec/tuna-explicit-sync-client'),
+    ('background_client_sha256', '/usr/libexec/tuna-background-effect-client'),
+    ('protocol_xml_hash_list_sha256', '/usr/share/tuna-explicit-sync/protocol-xml.sha256'),
+    ('protocol_source_sha256', '/usr/share/tuna-explicit-sync/protocol-source.json'),
+)
 
 
 class FiniteActionSchema(unittest.TestCase):
@@ -81,6 +88,43 @@ class FiniteActionSchema(unittest.TestCase):
             guest.start(Path('/unused'), state, 'ordering')
         with self.assertRaises(RuntimeError):
             guest.start(Path('/unused'), state, 'disconnect')
+
+
+class OriginalBuildBindings(unittest.TestCase):
+    def test_replaced_guest_artifact_cannot_echo_its_way_into_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = {'member_sha256': {}}
+            state = {}
+            running = {}
+            for key, path in ADMITTED_PROOF_FILES:
+                original = Path(directory, 'image', path.lstrip('/'))
+                actual = Path(directory, 'guest', path.lstrip('/'))
+                original.parent.mkdir(parents=True, exist_ok=True)
+                actual.parent.mkdir(parents=True, exist_ok=True)
+                original.write_bytes(('original unit artifact: ' + path).encode())
+                actual.write_bytes(original.read_bytes())
+                image['member_sha256'][path] = hashlib.sha256(original.read_bytes()).hexdigest()
+                state[key] = hashlib.sha256(actual.read_bytes()).hexdigest()
+                running[key] = actual
+            host.verify_native_payload(image, state)
+            for key, path in ADMITTED_PROOF_FILES:
+                with self.subTest(path=path):
+                    original = running[key].read_bytes()
+                    running[key].write_bytes(original + b' replaced in guest')
+                    state[key] = hashlib.sha256(running[key].read_bytes()).hexdigest()
+                    with self.assertRaisesRegex(RuntimeError, 'admitted original build'):
+                        host.verify_native_payload(image, state)
+                    running[key].write_bytes(original)
+                    state[key] = hashlib.sha256(original).hexdigest()
+
+    def test_missing_original_output_hash_is_rejected_before_guest_actions(self):
+        members = {path: hashlib.sha256(path.encode()).hexdigest() for _, path in ADMITTED_PROOF_FILES}
+        for _, path in ADMITTED_PROOF_FILES:
+            with self.subTest(path=path):
+                incomplete = dict(members)
+                del incomplete[path]
+                with self.assertRaisesRegex(RuntimeError, 'original build hash'):
+                    host.verify_native_payload({'member_sha256': incomplete})
 
 
 class FilesystemBoundaries(unittest.TestCase):
@@ -221,6 +265,8 @@ class HostTransportBoundaries(unittest.TestCase):
             image = {'schema': 1, 'commit': 'a' * 40, 'image_id': 'sha256:' + 'b' * 64,
                      'package_sha256': 'c' * 64,
                      'member_sha256': {'/usr/bin/tuna-compositor': 'd' * 64}}
+            image['member_sha256'].update({
+                path: hashlib.sha256(path.encode()).hexdigest() for _, path in ADMITTED_PROOF_FILES})
             inventory = {'session_uid': 1000, 'processes': [
                 {'pid': 123, 'uid': 1000, 'start_ticks': 456, 'executable': 'tuna-compositor'}]}
             before = time.monotonic()

@@ -24,6 +24,26 @@ ARTIFACTS = ('events.jsonl', 'stderr.log', 'default-format-table.bin', 'surface-
              'producer-red.ppm', 'producer-green.ppm', 'producer-blue.ppm', 'producer-legacy-v3-red.ppm')
 CHECKPOINTS = {'red-presented': [240, 16, 16], 'green-blocked': [240, 16, 16],
                'green-presented': [16, 240, 16], 'blue-presented': [16, 16, 240]}
+NATIVE_MEMBERS = {
+    'client_sha256': '/usr/libexec/tuna-explicit-sync-client',
+    'background_client_sha256': '/usr/libexec/tuna-background-effect-client',
+    'protocol_xml_hash_list_sha256': '/usr/share/tuna-explicit-sync/protocol-xml.sha256',
+    'protocol_source_sha256': '/usr/share/tuna-explicit-sync/protocol-source.json',
+}
+
+
+def verify_native_payload(image, state=None):
+    """Bind guest facts to fixed outputs independently admitted from the build."""
+    members = image.get('member_sha256')
+    if type(members) is not dict:
+        raise RuntimeError('native admission lacks original build member hashes')
+    for key, path in NATIVE_MEMBERS.items():
+        expected = members.get(path)
+        if type(expected) is not str or re.fullmatch('[0-9a-f]{64}', expected) is None:
+            raise RuntimeError('native admission lacks original build hash: ' + path)
+        if state is not None and state.get(key) != expected:
+            raise RuntimeError('native guest artifact differs from admitted original build: ' + path)
+
 
 
 def gpu_devices(width, height):
@@ -41,6 +61,7 @@ def run(qmp, agent_factory, out, image, inventory, vm):
     expected = image.get('member_sha256', {}).get('/usr/bin/tuna-compositor', '')
     if re.fullmatch('[0-9a-f]{64}', expected) is None:
         raise RuntimeError('admission lacks installed compositor hash')
+    verify_native_payload(image)
     owners = [row for row in inventory['processes'] if row['executable'] == 'tuna-compositor'
               and row['uid'] == inventory['session_uid'] and row['uid'] != 0]
     if len(owners) != 1:
@@ -113,9 +134,7 @@ def run(qmp, agent_factory, out, image, inventory, vm):
             raise RuntimeError('installed proof helper differs from exact source')
         if state['background_oracle_sha256'] != oracle_hash:
             raise RuntimeError('installed background oracle differs from exact source')
-        if any(re.fullmatch('[0-9a-f]{64}', state[key]) is None
-               for key in ('client_sha256', 'protocol_xml_hash_list_sha256', 'background_client_sha256')):
-            raise RuntimeError('native client/XML artifact facts missing')
+        verify_native_payload(image, state)
         system = state['system']
         if (not system['kernel_release'] or not system['machine']
                 or set(system['packages']) != {'mesa', 'libdrm', 'wayland', 'tuna-desktop'}

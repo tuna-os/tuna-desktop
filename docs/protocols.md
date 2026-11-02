@@ -233,6 +233,15 @@ not qualification.
   has run on the integrated installed image. vkms/Bochs disabled observations
   cannot qualify successful timeline import or release ordering. ADR 0008
   permits named actual emulation, not stand-in devices or manifests.
+- **Original-build binding.** The native builder emits `native-build.json` with
+  exactly four source-input hashes and four fixed output-member hashes: both C
+  consumers, the protocol XML hash list and the staged protocol-source receipt.
+  Image admission must independently check those inputs against its checkout,
+  the source receipt against archive-verified staged XML, and all four final
+  image members against the original builder outputs. The VM consumer requires
+  those four admitted member hashes before any guest action and compares every
+  observed artifact hash with them, including the exact bytes parsed as the
+  protocol-source receipt. A valid-looking guest hash alone is not admission.
 - **Protocol error placement.** `surface_exists` is posted on the manager,
   as the XML defines it; Mutter 51 posts it on the surface.
 

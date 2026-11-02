@@ -9,6 +9,7 @@ script_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 protocol_root=${WAYLAND_PROTOCOLS_DIR:?set WAYLAND_PROTOCOLS_DIR to the staged locked Cargo package protocols directory}
 mkdir -p -- "$1"
 output_root=$(cd -- "$1" && pwd)
+rm -f -- "$output_root/native-build.json"
 cp -- "$protocol_root/../source.json" "$output_root/protocol-source.json"
 printf '' > "$output_root/protocol-xml.sha256"
 protocols=(
@@ -34,3 +35,42 @@ cc -std=c11 -O2 -Wall -Wextra -Werror "${compile_flags[@]}" -I "$output_root" \
 "$script_root/tuna-background-effect-client-build" "$output_root"
 sha256sum "$protocol_root/staging/ext-background-effect/ext-background-effect-v1.xml" \
     >> "$output_root/protocol-xml.sha256"
+python3 - "$script_root" "$output_root" "$protocol_root" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+scripts, output, protocols = map(Path, sys.argv[1:])
+sources = (
+    "scripts/tuna-explicit-sync-build",
+    "scripts/tuna-background-effect-client-build",
+    "scripts/lib/tuna-explicit-sync-client.c",
+    "scripts/lib/tuna-background-effect-client.c",
+)
+members = {
+    "/usr/libexec/tuna-explicit-sync-client": "tuna-explicit-sync-client",
+    "/usr/libexec/tuna-background-effect-client": "tuna-background-effect-client",
+    "/usr/share/tuna-explicit-sync/protocol-xml.sha256": "protocol-xml.sha256",
+    "/usr/share/tuna-explicit-sync/protocol-source.json": "protocol-source.json",
+}
+digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+# A source receipt alone must not authorize different XML bytes in the image
+# build context. Validate every actual generator input before emitting proof.
+staged = json.loads((output / "protocol-source.json").read_bytes())
+for relative in (
+    "stable/xdg-shell/xdg-shell.xml",
+    "stable/presentation-time/presentation-time.xml",
+    "stable/linux-dmabuf/linux-dmabuf-v1.xml",
+    "staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml",
+    "staging/ext-background-effect/ext-background-effect-v1.xml",
+):
+    if digest(protocols / relative) != staged["file_sha256"].get("protocols/" + relative):
+        raise SystemExit("native build XML differs from archive-verified source: " + relative)
+receipt = {
+    "schema": 1,
+    "source_sha256": {name: digest(scripts / name.removeprefix("scripts/")) for name in sources},
+    "member_sha256": {name: digest(output / filename) for name, filename in members.items()},
+}
+(output / "native-build.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+PY

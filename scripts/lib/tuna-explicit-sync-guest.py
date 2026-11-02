@@ -177,11 +177,13 @@ def initialize(value):
         text=True, timeout=1).splitlines())
     if set(packages) != {'mesa', 'libdrm', 'wayland', 'tuna-desktop'}:
         raise RuntimeError('actual installed native graphics/package facts unavailable')
+    protocol_source = Path('/usr/share/tuna-explicit-sync/protocol-source.json').read_bytes()
     state = {'schema': 1, 'nonce': value['nonce'], 'compositor': owner,
              'backend': 'drm', 'client_sha256': digest(CLIENT), 'guest_helper_sha256': digest(__file__),
              'background_client_sha256': digest(BACKGROUND_CLIENT),
              'background_oracle_sha256': digest(background.__file__),
-             'protocol_source': json.loads(Path('/usr/share/tuna-explicit-sync/protocol-source.json').read_text()),
+             'protocol_source': json.loads(protocol_source),
+             'protocol_source_sha256': hashlib.sha256(protocol_source).hexdigest(),
              'protocol_xml_hash_list_sha256': digest('/usr/share/tuna-explicit-sync/protocol-xml.sha256'),
              'system': {'kernel_release': os.uname().release, 'machine': os.uname().machine,
                         'packages': packages},
