@@ -14,7 +14,12 @@ fn connect_with_wire(comp: &mut TestCompositor, manager: &mut WindowManager) -> 
     let conn = Connection::from_socket(stream).unwrap();
     let queue = conn.new_event_queue();
     let registry = conn.display().get_registry(&queue.handle(), ());
-    let mut peer = Peer { _conn: conn, queue, registry, client: Client::default() };
+    let mut peer = Peer {
+        _conn: conn,
+        queue,
+        registry,
+        client: Client::default(),
+    };
     pump(comp, manager, &mut [&mut peer]);
     (peer, wire)
 }
@@ -23,7 +28,10 @@ fn raw_region(wire: &mut UnixStream, effect: &ExtBackgroundEffectSurfaceV1, regi
     // ext_background_effect_surface_v1.set_blur_region: opcode 1, 12 bytes.
     // Raw wire is essential: the typed API rejects foreign/stale proxies itself.
     let mut bytes = [0_u8; 12];
-    for (index, word) in [effect.id().protocol_id(), (12_u32 << 16) | 1, region].into_iter().enumerate() {
+    for (index, word) in [effect.id().protocol_id(), (12_u32 << 16) | 1, region]
+        .into_iter()
+        .enumerate()
+    {
         bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_ne_bytes());
     }
     wire.write_all(&bytes).unwrap();
@@ -36,7 +44,9 @@ fn background_effect_foreign_region_id_is_rejected_without_touching_owner() {
     let compositor: WlCompositor = owner.bind(6);
     let owner_qh = owner.qh();
     // Make the foreign id unambiguously absent from the attacker's namespace.
-    let regions: Vec<_> = (0..64).map(|_| compositor.create_region(&owner_qh, ())).collect();
+    let regions: Vec<_> = (0..64)
+        .map(|_| compositor.create_region(&owner_qh, ()))
+        .collect();
     let foreign = regions.last().unwrap();
     foreign.add(0, 0, 40, 40);
     pump(&mut comp, &mut manager, &mut [&mut owner]);
@@ -49,7 +59,10 @@ fn background_effect_foreign_region_id_is_rejected_without_touching_owner() {
     raw_region(&mut wire, &effect, foreign.id().protocol_id());
     let error = pump_to_error(&mut comp, &mut manager, &mut attacker);
     assert_eq!(error.object_interface, "wl_display");
-    assert_eq!(error.code, wayland_client::protocol::wl_display::Error::InvalidObject as u32);
+    assert_eq!(
+        error.code,
+        wayland_client::protocol::wl_display::Error::InvalidObject as u32
+    );
     // The foreign client and its region still work after the other disconnect.
     foreign.add(-10, -10, 10, 10);
     pump(&mut comp, &mut manager, &mut [&mut owner]);
@@ -73,7 +86,10 @@ fn background_effect_stale_region_id_is_rejected_at_socket_boundary() {
     raw_region(&mut wire, &effect, stale);
     let error = pump_to_error(&mut comp, &mut manager, &mut peer);
     assert_eq!(error.object_interface, "wl_display");
-    assert_eq!(error.code, wayland_client::protocol::wl_display::Error::InvalidObject as u32);
+    assert_eq!(
+        error.code,
+        wayland_client::protocol::wl_display::Error::InvalidObject as u32
+    );
 }
 
 #[test]
@@ -99,24 +115,35 @@ fn background_effect_negative_region_is_copied_and_subsurface_state_waits_for_pa
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     let server_parent = comp.state.toplevels()[0].wl_surface().clone();
     let mut server_child = None;
-    with_surface_tree_downward(&server_parent, (), |_, _, _| TraversalAction::DoChildren(()),
+    with_surface_tree_downward(
+        &server_parent,
+        (),
+        |_, _, _| TraversalAction::DoChildren(()),
         |surface, _, _| {
             if surface.id().protocol_id() == child.id().protocol_id() {
                 server_child = Some(surface.clone());
             }
-        }, |_, _, _| true);
+        },
+        |_, _, _| true,
+    );
     let server_child = server_child.expect("real child in server surface tree");
     assert_eq!(blur_area(&server_child), None);
     child.commit();
     pump(&mut comp, &mut manager, &mut [&mut peer]);
-    assert_eq!(blur_area(&server_child), None, "synchronized state waits for parent");
+    assert_eq!(
+        blur_area(&server_child),
+        None,
+        "synchronized state waits for parent"
+    );
     parent.commit();
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert_eq!(blur_area(&server_child), Some(100 * 80 - 10 * 10));
     // Introspection is intentionally unclipped; the rendered consumer proof
     // separately checks clipping to the actual 384x256 committed shm buffer.
     let committed = tuna_compositor::background_effect::blur_region(&server_child).unwrap();
-    assert!(committed.iter().any(|rect| rect.loc.x < 0 || rect.loc.y < 0));
+    assert!(committed
+        .iter()
+        .any(|rect| rect.loc.x < 0 || rect.loc.y < 0));
     effect.destroy();
     child.commit();
     pump(&mut comp, &mut manager, &mut [&mut peer]);

@@ -176,7 +176,11 @@ impl GlSupport {
         // ES3 guarantees both the query and half-float linear sampling.
         // GetString(EXTENSIONS) is deliberately not used on ES3.
         if es3 {
-            return Ok(Self { es3, component_query: true, half_float_linear: true });
+            return Ok(Self {
+                es3,
+                component_query: true,
+                half_float_linear: true,
+            });
         }
         let extensions = gl.GetString(ffi::EXTENSIONS);
         if extensions.is_null() {
@@ -206,7 +210,11 @@ impl GlSupport {
         if self.component_query {
             gl.GetFramebufferAttachmentParameteriv(
                 ffi::FRAMEBUFFER,
-                if framebuffer == 0 { ffi::BACK } else { ffi::COLOR_ATTACHMENT0 },
+                if framebuffer == 0 {
+                    ffi::BACK
+                } else {
+                    ffi::COLOR_ATTACHMENT0
+                },
                 ffi::FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE,
                 &mut component,
             );
@@ -221,11 +229,19 @@ impl GlSupport {
                     "GL_OES_texture_half_float_linear",
                 ]));
             }
-            Ok(if self.es3 { TargetFormat::Rgba16F } else { TargetFormat::Rgba16FOes })
+            Ok(if self.es3 {
+                TargetFormat::Rgba16F
+            } else {
+                TargetFormat::Rgba16FOes
+            })
         } else {
             // Without either ES3 or a color-buffer-float extension, an
             // FP16 renderable attachment cannot exist in this context.
-            Ok(if rgb { TargetFormat::Rgb8 } else { TargetFormat::Rgba8 })
+            Ok(if rgb {
+                TargetFormat::Rgb8
+            } else {
+                TargetFormat::Rgba8
+            })
         }
     }
 }
@@ -541,7 +557,11 @@ unsafe fn quad(
 pub(crate) fn supported(frame: &mut GlesFrame<'_, '_>) -> Result<bool, GlesError> {
     let user_data = frame.egl_context().user_data();
     user_data.insert_if_missing_threadsafe(|| CacheData(Arc::new(Mutex::new(Cache::default()))));
-    let cache = user_data.get::<CacheData>().ok_or(GlesError::FramebufferBindingError)?.0.clone();
+    let cache = user_data
+        .get::<CacheData>()
+        .ok_or(GlesError::FramebufferBindingError)?
+        .0
+        .clone();
     let blit = frame.capabilities().contains(&Capability::Blit);
     frame.with_context(|gl| unsafe {
         let mut cache = cache.lock().unwrap();
@@ -566,7 +586,11 @@ pub(crate) fn supported(frame: &mut GlesFrame<'_, '_>) -> Result<bool, GlesError
         if cache.programs.is_none() {
             cache.programs = Some(programs(gl));
         }
-        let pass_format = if format.floating() { format } else { TargetFormat::Rgba8 };
+        let pass_format = if format.floating() {
+            format
+        } else {
+            TargetFormat::Rgba8
+        };
         let [copy, vertical, horizontal] = &mut cache.targets;
         let targets = ensure(gl, copy, (4, 4), format)
             && ensure(gl, vertical, (4, 4), pass_format)
@@ -642,7 +666,11 @@ pub(crate) fn draw_behind(
             ((source.size.h as f32 / factor).floor() as i32).max(1),
         );
         let [copy, vertical, horizontal] = &mut cache.targets;
-        let pass_format = if format.floating() { format } else { TargetFormat::Rgba8 };
+        let pass_format = if format.floating() {
+            format
+        } else {
+            TargetFormat::Rgba8
+        };
         if !ensure(gl, copy, (source.size.w, source.size.h), format)
             || !ensure(gl, vertical, scaled, pass_format)
             || !ensure(gl, horizontal, scaled, pass_format)
@@ -1001,7 +1029,15 @@ mod tests {
         };
         // Populate all three intermediates as 8-bit first. Their precision
         // must be replaced, even if the HDR sample has exactly the same size.
-        let _ = draw(&mut renderer, (64, 64), Transform::Normal, &[rect(0, 0, 64, 64)], 8.0, 1.0, None);
+        let _ = draw(
+            &mut renderer,
+            (64, 64),
+            Transform::Normal,
+            &[rect(0, 0, 64, 64)],
+            8.0,
+            1.0,
+            None,
+        );
         let target: Result<smithay::backend::renderer::gles::GlesTexture, _> =
             renderer.create_buffer(Fourcc::Abgr16161616f, (64, 64).into());
         let Ok(mut target) = target else {
@@ -1009,26 +1045,50 @@ mod tests {
             return;
         };
         let mut bound = renderer.bind(&mut target).unwrap();
-        let mut frame = renderer.render(&mut bound, (64, 64).into(), Transform::Normal).unwrap();
+        let mut frame = renderer
+            .render(&mut bound, (64, 64).into(), Transform::Normal)
+            .unwrap();
         // Do not run the 4x4 admission probe between the SDR warmup and
         // this draw: equal-size target reuse must be tested by precision,
         // not accidentally forced by a different intermediate size.
         let full = rect(0, 0, 64, 64);
         let source = [-0.25f32, 1.5, 2.0];
         frame.clear(Color32F::BLACK, &[full]).unwrap();
-        frame.draw_solid(full, &[full], Color32F::new(source[0], source[1], source[2], 1.0)).unwrap();
+        frame
+            .draw_solid(
+                full,
+                &[full],
+                Color32F::new(source[0], source[1], source[2], 1.0),
+            )
+            .unwrap();
         draw_behind(&mut frame, &[full], 8.0, 1.0, full).unwrap();
         let mut pixel = [0.0f32; 4];
-        frame.with_context(|gl| unsafe {
-            gl.ReadPixels(32, 32, 1, 1, ffi::RGBA, ffi::FLOAT, pixel.as_mut_ptr().cast());
-            assert_eq!(gl.GetError(), ffi::NO_ERROR, "FP16 readback failed");
-        }).unwrap();
+        frame
+            .with_context(|gl| unsafe {
+                gl.ReadPixels(
+                    32,
+                    32,
+                    1,
+                    1,
+                    ffi::RGBA,
+                    ffi::FLOAT,
+                    pixel.as_mut_ptr().cast(),
+                );
+                assert_eq!(gl.GetError(), ffi::NO_ERROR, "FP16 readback failed");
+            })
+            .unwrap();
         let luma = source[0] * 0.299 + source[1] * 0.587 + source[2] * 0.114;
         for channel in 0..3 {
             let expected = luma + (source[channel] - luma) * BLUR_SATURATION;
-            assert!((pixel[channel] - expected).abs() < 0.03, "HDR channel clipped/quantized: {pixel:?}, expected {expected}");
+            assert!(
+                (pixel[channel] - expected).abs() < 0.03,
+                "HDR channel clipped/quantized: {pixel:?}, expected {expected}"
+            );
         }
-        assert!(pixel[0] < 0.0 && pixel[1] > 1.0 && pixel[2] > 1.0, "{pixel:?}");
+        assert!(
+            pixel[0] < 0.0 && pixel[1] > 1.0 && pixel[2] > 1.0,
+            "{pixel:?}"
+        );
         frame.finish().unwrap().wait().unwrap();
         drop(bound);
         // Feed the actual blurred FP16 scene to the production final
@@ -1039,16 +1099,25 @@ mod tests {
             .create_buffer(Fourcc::Abgr2101010, (64, 64).into())
             .unwrap();
         let mut bound = renderer.bind(&mut encoded).unwrap();
-        let mut frame = renderer.render(&mut bound, (64, 64).into(), Transform::Normal).unwrap();
+        let mut frame = renderer
+            .render(&mut bound, (64, 64).into(), Transform::Normal)
+            .unwrap();
         hdr.present(&mut frame).unwrap();
         frame.finish().unwrap().wait().unwrap();
         use smithay::backend::renderer::ExportMem;
-        let mapping = renderer.copy_framebuffer(&bound, full, Fourcc::Abgr2101010).unwrap();
+        let mapping = renderer
+            .copy_framebuffer(
+                &bound,
+                Rectangle::from_size((64, 64).into()),
+                Fourcc::Abgr2101010,
+            )
+            .unwrap();
         let bytes = renderer.map_texture(&mapping).unwrap();
         let offset = (32 * 64 + 32) * 4;
         let packed = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
         let actual = [packed & 1023, (packed >> 10) & 1023, (packed >> 20) & 1023];
-        let output = crate::color_state::ColorState::params(crate::color_state::hdr_output_params());
+        let output =
+            crate::color_state::ColorState::params(crate::color_state::hdr_output_params());
         let encode = crate::color_state::transform(&hdr.blending, &output).unwrap();
         let expected = encode.apply(pixel);
         for channel in 0..3 {
@@ -1060,6 +1129,14 @@ mod tests {
         eprintln!("HDR_BLUR_FP16_PQ scene={pixel:?} ten_bit={actual:?}");
         drop(bound);
         // And restore the original SDR path and clamp after the FP16 frame.
-        let _ = draw(&mut renderer, (64, 64), Transform::Normal, &[full], 8.0, 1.0, None);
+        let _ = draw(
+            &mut renderer,
+            (64, 64),
+            Transform::Normal,
+            &[full],
+            8.0,
+            1.0,
+            None,
+        );
     }
 }

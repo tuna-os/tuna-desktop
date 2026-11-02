@@ -34,9 +34,17 @@ type Outcome = Rc<RefCell<Option<Result<Value, String>>>>;
 
 fn video_format(hdr: bool) -> pod::Object {
     let (format, primaries, transfer) = if hdr {
-        (VideoFormat::xBGR_210LE, SPA_VIDEO_COLOR_PRIMARIES_BT2020, TRANSFER_SMPTE2084)
+        (
+            VideoFormat::xBGR_210LE,
+            SPA_VIDEO_COLOR_PRIMARIES_BT2020,
+            TRANSFER_SMPTE2084,
+        )
     } else {
-        (VideoFormat::BGRx, SPA_VIDEO_COLOR_PRIMARIES_BT709, SPA_VIDEO_TRANSFER_GAMMA22)
+        (
+            VideoFormat::BGRx,
+            SPA_VIDEO_COLOR_PRIMARIES_BT709,
+            SPA_VIDEO_TRANSFER_GAMMA22,
+        )
     };
     pod::object!(
         SpaTypes::ObjectParamFormat,
@@ -75,9 +83,17 @@ fn parse_video(pod: &Pod, hdr: bool) -> Result<VideoInfoRaw, String> {
     info.parse(pod)
         .map_err(|error| format!("video format: {error:?}"))?;
     let (format, primaries, transfer) = if hdr {
-        (VideoFormat::xBGR_210LE, SPA_VIDEO_COLOR_PRIMARIES_BT2020, TRANSFER_SMPTE2084)
+        (
+            VideoFormat::xBGR_210LE,
+            SPA_VIDEO_COLOR_PRIMARIES_BT2020,
+            TRANSFER_SMPTE2084,
+        )
     } else {
-        (VideoFormat::BGRx, SPA_VIDEO_COLOR_PRIMARIES_BT709, SPA_VIDEO_TRANSFER_GAMMA22)
+        (
+            VideoFormat::BGRx,
+            SPA_VIDEO_COLOR_PRIMARIES_BT709,
+            SPA_VIDEO_TRANSFER_GAMMA22,
+        )
     };
     if info.format() != format
         || info.color_range() != SPA_VIDEO_COLOR_RANGE_0_255
@@ -313,7 +329,11 @@ fn main() {
         return;
     }
     let hdr = first != "--sdr";
-    let node_arg = if hdr { first } else { args.next().expect("--sdr NODE_ID RAW_PATH") };
+    let node_arg = if hdr {
+        first
+    } else {
+        args.next().expect("--sdr NODE_ID RAW_PATH")
+    };
     let node: u32 = node_arg
         .to_str()
         .expect("numeric NODE_ID")

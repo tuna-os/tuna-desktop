@@ -5598,7 +5598,10 @@ impl Runtime {
         if result.is_err() {
             // A failed render cannot keep promising a working effect. In
             // particular shader/FBO/copy failures are never a silent no-op.
-            self.state.protocols.background_effects.set_blur_supported(false);
+            self.state
+                .protocols
+                .background_effects
+                .set_blur_supported(false);
             let _ = self.display.flush_clients();
         }
         result
@@ -7734,7 +7737,17 @@ fn draw_scene(
         None,
     )
     .map_err(error)?;
-    draw_slots(frame, output, scale, scene, &under, &under_plan, tint, colors).map_err(error)?;
+    draw_slots(
+        frame,
+        output,
+        scale,
+        scene,
+        &under,
+        &under_plan,
+        tint,
+        colors,
+    )
+    .map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, tile, &tile_plan).map_err(error)?;
     draw_slots(frame, output, scale, scene, &over, &over_plan, tint, colors).map_err(error)?;
     crate::color_render::draw_planned(frame, scale, &scene.top, &top_plan, colors, tint, 1.0, None)

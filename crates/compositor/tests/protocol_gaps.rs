@@ -1033,10 +1033,7 @@ fn background_blur_regions_apply_on_commit_like_mutter() {
     let (surface, _toplevel) = window(&mut peer, "terminal");
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     // A headless protocol fixture has no admitted scene framebuffer.
-    assert_eq!(
-        peer.client.background_effects,
-        Some(0)
-    );
+    assert_eq!(peer.client.background_effects, Some(0));
     let server = comp.state.toplevels()[0].wl_surface().clone();
     assert_eq!(blur_area(&server), None, "no effect until asked");
 
