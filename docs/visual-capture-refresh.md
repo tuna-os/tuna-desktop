@@ -25,6 +25,10 @@ These are different scopes: nested fixtures never qualify an installed
 native image, and DEV native media never qualifies a signed shipping release.
 Title cards in the tour are not screenshots of the product.
 
+The normal check job installs FFmpeg (`ffmpeg` and `ffprobe`) and Python
+Pillow explicitly, so receipt and freshness tests exercise real byte decoding
+rather than skipping unavailable video tools.
+
 `maintained-media.yml` accepts only a successful `ci.yml` main-push run from
 the trusted repository. It rechecks workflow identity, run and attempt,
 source, artifact upload digests, decoded media, UI outcomes and immutable
