@@ -80,6 +80,126 @@ class Tests(unittest.TestCase):
             actor.command('guest-ping', deadline=time.monotonic() + .05)
         self.assertTrue(actor.poisoned)
 
+    def test_reboot_transmits_once_without_reply_and_retires_transport(self):
+        actor, peer = self.actor()
+        received = bytearray()
+        retired = threading.Event()
+        def silent(peer, stop):
+            while True:
+                data = peer.recv(65536)
+                if not data:
+                    retired.set()
+                    return
+                received.extend(data)
+        self.server(peer, silent)
+        with mock.patch.object(actor, '_send', wraps=actor._send) as send, \
+                mock.patch.object(actor, '_read', wraps=actor._read) as read, \
+                mock.patch.object(actor, 'command', wraps=actor.command) as command:
+            self.assertIsNone(actor.request_reboot(timeout=.1))
+            send.assert_called_once()
+            read.assert_not_called()
+            command.assert_not_called()
+        self.assertTrue(retired.wait(1), 'reboot transport did not close')
+        self.assertEqual(bytes(received),
+                         b'{"execute": "guest-shutdown", "arguments": {"mode": "reboot"}}\n')
+        self.assertTrue(actor.poisoned)
+        self.assertEqual(actor.socket.fileno(), -1)
+        self.assertIsNone(actor.pending_guest_pid)
+        self.assertEqual(getattr(actor, 'guest_exec_state', 'none'), 'none')
+        for operation in (actor.request_reboot, lambda: actor.command('guest-ping')):
+            with self.subTest(operation=operation):
+                with self.assertRaisesRegex(RuntimeError, 'poisoned'):
+                    operation()
+        self.assertEqual(bytes(received).count(b'\n'), 1)
+
+    def test_reboot_send_failure_propagates_and_retires_transport(self):
+        actor, peer = self.actor()
+        peer.close()
+        with mock.patch.object(actor, '_send', wraps=actor._send) as send:
+            with self.assertRaises(BrokenPipeError):
+                actor.request_reboot()
+            send.assert_called_once()
+        self.assertTrue(actor.poisoned)
+        self.assertEqual(actor.socket.fileno(), -1)
+        self.assertIsNone(actor.pending_guest_pid)
+        with self.assertRaisesRegex(RuntimeError, 'poisoned'):
+            actor.request_reboot()
+
+    def test_reboot_expired_absolute_deadline_sends_nothing_and_retires(self):
+        actor, peer = self.actor()
+        # The deadline expires between its creation and the real _send check.
+        with mock.patch('vm_guest_agent.time.monotonic', side_effect=[10., 11.]), \
+                mock.patch.object(actor, '_send', wraps=actor._send) as send:
+            with self.assertRaisesRegex(TimeoutError, 'absolute guest-agent deadline'):
+                actor.request_reboot(timeout=.5)
+            send.assert_called_once_with(
+                b'{"execute": "guest-shutdown", "arguments": {"mode": "reboot"}}\n', 10.5)
+        self.assertTrue(actor.poisoned)
+        self.assertEqual(actor.socket.fileno(), -1)
+        peer.settimeout(.5)
+        self.assertEqual(peer.recv(65536), b'')
+        with self.assertRaisesRegex(RuntimeError, 'poisoned'):
+            actor.request_reboot()
+
+    def test_reboot_refuses_owned_exec_without_sending_or_clearing_ownership(self):
+        for state, pid in (('known', 51), ('unknown', None), ('none', 51)):
+            with self.subTest(state=state, pid=pid):
+                actor, peer = self.actor()
+                actor.guest_exec_state = state
+                actor.pending_guest_pid = pid
+                actor.buffer.extend(b'owned transport data')
+                with mock.patch.object(actor, '_send', wraps=actor._send) as send:
+                    with self.assertRaisesRegex(RuntimeError, 'retirement unconfirmed'):
+                        actor.request_reboot()
+                    send.assert_not_called()
+                self.assertEqual(actor.guest_exec_state, state)
+                self.assertEqual(actor.pending_guest_pid, pid)
+                self.assertEqual(actor.buffer, b'owned transport data')
+                self.assertFalse(actor.poisoned)
+                self.assertNotEqual(actor.socket.fileno(), -1)
+                peer.setblocking(False)
+                with self.assertRaises(BlockingIOError):
+                    peer.recv(65536)
+
+    def test_reboot_refuses_poisoned_actor_without_sending_or_clearing_ownership(self):
+        actor, peer = self.actor()
+        actor.guest_exec_state = 'known'
+        actor.pending_guest_pid = 51
+        actor.close()
+        with mock.patch.object(actor, '_send', wraps=actor._send) as send:
+            with self.assertRaisesRegex(RuntimeError, 'poisoned'):
+                actor.request_reboot()
+            send.assert_not_called()
+        self.assertEqual(actor.guest_exec_state, 'known')
+        self.assertEqual(actor.pending_guest_pid, 51)
+        self.assertEqual(actor.socket.fileno(), -1)
+        peer.settimeout(.5)
+        self.assertEqual(peer.recv(65536), b'')
+
+    def test_ordinary_shutdown_command_still_requires_a_reply(self):
+        actor, peer = self.actor()
+        received = bytearray()
+        retired = threading.Event()
+        def silent(peer, stop):
+            while True:
+                data = peer.recv(65536)
+                if not data:
+                    retired.set()
+                    return
+                received.extend(data)
+        self.server(peer, silent)
+        with self.assertRaises(TimeoutError):
+            actor.command('guest-shutdown', mode='reboot', deadline=time.monotonic() + .05)
+        self.assertTrue(retired.wait(1), 'timed-out ordinary transport did not close')
+        request = json.loads(received)
+        self.assertEqual(set(request), {'execute', 'arguments', 'id'})
+        self.assertEqual(request['execute'], 'guest-shutdown')
+        self.assertEqual(request['arguments'], {'mode': 'reboot'})
+        self.assertIsInstance(request['id'], str)
+        self.assertEqual(bytes(received).count(b'\n'), 1)
+        self.assertTrue(actor.poisoned)
+        self.assertEqual(actor.socket.fileno(), -1)
+
     def test_actual_bounded_reply_success_and_oversize_refusal(self):
         actor, peer = self.actor()
         def reply(peer, stop):

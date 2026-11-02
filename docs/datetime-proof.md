@@ -74,6 +74,15 @@ role. The separate typed lifecycle action is `autotz DOMAIN OPERATION JSON`;
 the shared router owns its image/member admission and `V-AUTOTZ` result.
 Actual original-user policy failures remain failures, not root positives.
 
+The required `marlin-vm-autotz` matrix row keeps its own one-boot KVM
+consumer and exact final-image receipt. Its four installed native observers
+remain `native_session.py`, `autotz_guest.py`, `autotz.py` and
+`geoclue_fixture.py`; no full Core-app payload or account-role changes are
+required. The image includes the source-pinned GDM 51 overlay after every
+package update, before final-image admission. The traced record-free
+first-login journey retains its native candidate manifest/source binding in
+the separate lifecycle rows; it is not an automatic-timezone prerequisite.
+
 The source is GeoClue's **named New York static-location emulation, not GPS**:
 its documented `static-source` reads latitude, longitude, altitude and accuracy
 from `/etc/geolocation`. See the upstream
