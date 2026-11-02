@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -262,18 +263,77 @@ static int connect_client(void) {
     return 0;
 }
 
-static int expect_request_error(uint32_t expected) {
+static uint32_t wire_word(const unsigned char *bytes) {
+    uint32_t value;
+    memcpy(&value, bytes, sizeof(value));
+    return value;
+}
+
+static int expect_request_error(uint32_t request_id, uint32_t expected) {
+    /* submit is a destructor: libwayland has already retired the request's
+     * proxy when its error arrives, so its cached interface can be NULL.
+     * Capture the typed request's ID before submit and inspect the actual
+     * display.error instead. No roundtrip may consume that event first.
+     * EOF, I/O failures and errors targeting another object are not evidence. */
+    unsigned char bytes[65536];
+    size_t used = 0;
+    int fd = wl_display_get_fd(display);
+    if (wl_display_flush(display) < 0) return fail("cannot flush invalid lease request");
     double end = now_ms() + DEADLINE_MS;
-    while (now_ms() < end) {
-        if (wl_display_roundtrip(display) < 0) {
-            const struct wl_interface *interface = NULL;
-            uint32_t code = wl_display_get_protocol_error(display, &interface, NULL);
-            if (!interface || strcmp(interface->name, "wp_drm_lease_request_v1") != 0 || code != expected)
-                return fail("wrong lease request protocol error");
-            printf("{\"event\":\"request-error\",\"code\":%u}\n", code);
-            wl_display_disconnect(display);
-            return 0;
+    for (;;) {
+        double remaining = end - now_ms();
+        if (remaining <= 0) break;
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int ready = poll(&pfd, 1, (int)remaining);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) return fail("cannot poll lease request error");
+        if (ready == 0) break;
+        ssize_t count = recv(fd, bytes + used, sizeof(bytes) - used, MSG_DONTWAIT);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (count < 0) return fail("cannot read lease request error");
+        if (count == 0) return fail("lease request closed without display.error");
+        used += (size_t)count;
+        size_t offset = 0;
+        while (used - offset >= 8) {
+            const unsigned char *frame = bytes + offset;
+            uint32_t header = wire_word(frame + 4);
+            uint32_t size = header >> 16;
+            uint32_t opcode = header & 0xffff;
+            if (size < 8 || size % 4 != 0)
+                return fail("malformed lease request error frame");
+            if (size > used - offset) break;
+            if (wire_word(frame) != 1)
+                return fail("unexpected object event before lease request error");
+            if (opcode == 0) { /* wl_display.error(object_id, code, message) */
+                if (size < 24) return fail("truncated lease request error");
+                uint32_t object_id = wire_word(frame + 8);
+                uint32_t code = wire_word(frame + 12);
+                uint32_t length = wire_word(frame + 16);
+                if (length < 2 || length > size - 20 ||
+                    20 + ((length + 3) & ~3u) != size ||
+                    (const unsigned char *)memchr(frame + 20, '\0', length) != frame + 20 + length - 1)
+                    return fail("malformed lease request error message");
+                if (object_id != request_id || code != expected)
+                    return fail("wrong lease request protocol error target or code");
+                printf("{\"event\":\"request-error\",\"object_id\":%u,\"code\":%u,\"message\":",
+                       object_id, code);
+                json_string((const char *)frame + 20);
+                printf("}\n");
+                wl_display_disconnect(display);
+                return 0;
+            }
+            /* A completed initial roundtrip can leave its callback's
+             * wl_display.delete_id in flight. It is not an error receipt. */
+            if (opcode != 1 || size != 12 ||
+                wire_word(frame + 8) < 2 || wire_word(frame + 8) >= 0xff000000u)
+                return fail("unexpected display event before lease request error");
+            offset += size;
         }
+        if (offset != 0) {
+            used -= offset;
+            memmove(bytes, bytes + offset, used);
+        }
+        if (used == sizeof(bytes)) return fail("oversized lease request error frame");
     }
     return fail("invalid lease request did not produce a protocol error");
 }
@@ -321,8 +381,9 @@ int main(int argc, char **argv) {
     if (empty) {
         if (!n_devices) return fail("no lease device for empty request");
         struct wp_drm_lease_request_v1 *request = wp_drm_lease_device_v1_create_lease_request(devices[0].proxy);
+        uint32_t request_id = wl_proxy_get_id((struct wl_proxy *)request);
         wp_drm_lease_request_v1_submit(request);
-        return expect_request_error(WP_DRM_LEASE_REQUEST_V1_ERROR_EMPTY_LEASE);
+        return expect_request_error(request_id, WP_DRM_LEASE_REQUEST_V1_ERROR_EMPTY_LEASE);
     }
     if (!lease_name) return 0;
 
@@ -340,8 +401,9 @@ int main(int argc, char **argv) {
     struct wp_drm_lease_request_v1 *request = wp_drm_lease_device_v1_create_lease_request(dev->proxy);
     wp_drm_lease_request_v1_request_connector(request, target->proxy);
     if (duplicate) {
+        uint32_t request_id = wl_proxy_get_id((struct wl_proxy *)request);
         wp_drm_lease_request_v1_request_connector(request, target->proxy);
-        return expect_request_error(WP_DRM_LEASE_REQUEST_V1_ERROR_DUPLICATE_CONNECTOR);
+        return expect_request_error(request_id, WP_DRM_LEASE_REQUEST_V1_ERROR_DUPLICATE_CONNECTOR);
     }
     struct wp_drm_lease_v1 *lease = wp_drm_lease_request_v1_submit(request);
     wp_drm_lease_v1_add_listener(lease, &lease_listener, NULL);

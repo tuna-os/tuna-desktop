@@ -191,6 +191,14 @@ One device-change source services monitor, privacy and lease changes; the
 shared renderer/backend guard ends before monitor publication or lease events.
 These source contracts still require the actual native D-LEASE lifecycle proof.
 
+The native negative consumer captures the typed lease request's object ID
+before `submit` retires its client proxy. It requires a correctly framed
+`wl_display.error` on the original socket, targeting that same request ID with
+the exact `empty_lease` or `duplicate_connector` code and a valid message.
+Its receipt records the actual target, code and message. A destroyed proxy's
+missing cached interface, an unrelated object error, malformed wire data or
+an I/O close cannot substitute for that protocol error.
+
 ### Explicit sync
 
 `wp_linux_drm_syncobj_manager_v1` follows Mutter 51's
