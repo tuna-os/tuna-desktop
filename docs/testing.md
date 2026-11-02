@@ -502,6 +502,15 @@ hardware session. A CI-only guest service probes the calendar and portal
 on the test user bus; the runner reads the serial log and takes QMP
 screendumps from outside.
 
+The paired native GNOME/Tuna reference consumers separately bind the original
+compositor's open DRM character devices to their actual PCI ancestor and QMP
+topology. The graphics driver's name comes from the read-only kernel
+`DRM_IOCTL_VERSION` query on that same character device, not from its sysfs
+parent's `driver` link: the latter can correctly name the `virtio-pci` bus
+driver rather than the DRM `virtio_gpu` driver. Missing, changed, non-DRM or
+malformed device observations fail admission; the required virtio GPU,
+connected output and preserved PCI checks remain unchanged.
+
 1. It builds `packaging/marlin/Containerfile` (Marlin GNOME 51 plus the
    Tuna Desktop Arch package from `arch-package`) with rootful podman. On top of
    that it builds the CI-only layer `packaging/marlin/vm-lane/Containerfile`.

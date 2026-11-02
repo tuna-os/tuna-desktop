@@ -6,6 +6,8 @@ root controller owns private receipts; a finite unprivileged child reads the
 already-existing user and accessibility buses.  No Tuna state files are read.
 """
 import base64
+import ctypes
+import fcntl
 import gzip
 import hashlib
 import json
@@ -329,6 +331,42 @@ def pci_identity(device):
     raise RuntimeError('actual native DRM node has no PCI ancestor')
 
 
+class DrmVersion(ctypes.Structure):
+    _fields_ = [('major', ctypes.c_int), ('minor', ctypes.c_int), ('patchlevel', ctypes.c_int),
+                ('name_len', ctypes.c_size_t), ('name', ctypes.c_void_p),
+                ('date_len', ctypes.c_size_t), ('date', ctypes.c_void_p),
+                ('desc_len', ctypes.c_size_t), ('desc', ctypes.c_void_p)]
+
+
+def drm_driver(entry):
+    """Read the kernel DRM driver's name, not its sysfs bus parent's driver."""
+    expected = entry.stat()
+    descriptor = os.open(entry, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        actual = os.fstat(descriptor)
+        if not stat.S_ISCHR(actual.st_mode) or (actual.st_rdev, actual.st_dev, actual.st_ino) != (
+                expected.st_rdev, expected.st_dev, expected.st_ino):
+            raise RuntimeError('DRM driver query changed the original device identity')
+        # Linux DRM_IOCTL_VERSION is _IOWR('d', 0, struct drm_version).
+        request = 0xC0006400 | (ctypes.sizeof(DrmVersion) << 16)
+        version = DrmVersion()
+        fcntl.ioctl(descriptor, request, version, True)
+        length = version.name_len
+        if not 0 < length <= 256:
+            raise RuntimeError('actual DRM driver name length exceeds bound')
+        name = ctypes.create_string_buffer(length + 1)
+        version.name = ctypes.addressof(name)
+        fcntl.ioctl(descriptor, request, version, True)
+        if version.name_len != length:
+            raise RuntimeError('actual DRM driver name changed during query')
+        driver = name.raw[:length].decode('ascii')
+        if not re.fullmatch('[A-Za-z0-9_-]{1,256}', driver):
+            raise RuntimeError('actual DRM driver name malformed')
+        return driver
+    finally:
+        os.close(descriptor)
+
+
 def native_gpu(compositor, deadline):
     same_process(compositor, proc_identity(compositor['pid'], UID))
     devices = []
@@ -354,7 +392,7 @@ def native_gpu(compositor, deadline):
                     'enabled': (connector / 'enabled').read_text().strip(),
                     'modes': (connector / 'modes').read_text().splitlines()})
         devices.append({'fd': int(entry.name), 'path': target, 'major': major, 'minor': minor,
-            'sysfs_device': str(device), 'driver': (device / 'driver').resolve(strict=True).name,
+            'sysfs_device': str(device), 'driver': drm_driver(entry),
             'pci': pci_identity(device), 'connectors': connectors})
     if not any(Path(d['path']).name.startswith('card') and any(c['status'] == 'connected' and c['enabled'] == 'enabled' and c['modes'] for c in d['connectors']) for d in devices):
         raise RuntimeError('original compositor lacks actual native DRM card fd with connected enabled output')

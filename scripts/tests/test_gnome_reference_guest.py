@@ -90,6 +90,48 @@ class Arguments(unittest.TestCase):
             GUEST.wire_bytes({'controlled_large_value': 'x' * (GUEST.MAX_WIRE_BYTES + 1)}, 'admit')
 
 
+class DrmDriverObservation(unittest.TestCase):
+    def test_actual_character_device_ioctl_uses_kernel_name_not_bus_driver(self):
+        calls = []
+        def kernel_version(descriptor, request, version, mutate):
+            self.assertTrue(stat.S_ISCHR(os.fstat(descriptor).st_mode))
+            self.assertTrue(mutate)
+            calls.append(request)
+            if version.name:
+                GUEST.ctypes.memmove(version.name, b'virtio_gpu', 10)
+            version.name_len = 10
+            return 0
+        with mock.patch.object(GUEST.fcntl, 'ioctl', side_effect=kernel_version):
+            self.assertEqual(GUEST.drm_driver(Path('/dev/null')), 'virtio_gpu')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+
+    def test_real_non_drm_ioctl_failure_has_no_sysfs_or_bus_fallback(self):
+        with self.assertRaises(OSError):
+            GUEST.drm_driver(Path('/dev/null'))
+
+    def test_regular_device_substitution_is_rejected_before_ioctl(self):
+        with tempfile.NamedTemporaryFile() as file:
+            with mock.patch.object(GUEST.fcntl, 'ioctl') as query:
+                with self.assertRaisesRegex(RuntimeError, 'original device identity'):
+                    GUEST.drm_driver(Path(file.name))
+                query.assert_not_called()
+
+    def test_driver_query_bounds_and_changed_length_fail_closed(self):
+        for length in (0, 257):
+            with self.subTest(length=length):
+                def malformed(descriptor, request, version, mutate):
+                    version.name_len = length
+                with mock.patch.object(GUEST.fcntl, 'ioctl', side_effect=malformed):
+                    with self.assertRaisesRegex(RuntimeError, 'length exceeds bound'):
+                        GUEST.drm_driver(Path('/dev/null'))
+        def changed(descriptor, request, version, mutate):
+            version.name_len = 11 if version.name else 10
+        with mock.patch.object(GUEST.fcntl, 'ioctl', side_effect=changed):
+            with self.assertRaisesRegex(RuntimeError, 'changed during query'):
+                GUEST.drm_driver(Path('/dev/null'))
+
+
 class RealFilesystem(unittest.TestCase):
     def test_metadata_is_exclusive_private_and_not_followed(self):
         with tempfile.TemporaryDirectory() as temporary:
