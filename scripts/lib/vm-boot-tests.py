@@ -3199,9 +3199,8 @@ class TourPublicConfirmationTests(unittest.TestCase):
 
     CONTROLS = {
         "app-grid": [("frame", "App Grid")],
-        "quick-settings": [("slider", "Volume"), ("push button", "Settings"), ("push button", "Lock")],
-        "calendar": [("push button", "Previous month"), ("push button", "Next month"),
-                     ("push button", "Open Calendar")],
+        "quick-settings": [("slider", "Volume"), ("push button", "Settings"), ("push button", "Lock Screen")],
+        "calendar": [("push button", "Previous month"), ("push button", "Next month")],
         "lock": [("frame", "Lock Screen")],
     }
 
@@ -3247,6 +3246,24 @@ class TourPublicConfirmationTests(unittest.TestCase):
             self.assertEqual(recorder.unconfirmed, [] if confirmed else [card])
             recorder.close()
             return confirmed, receipt
+
+    def test_real_quick_settings_accessible_lock_screen_label_confirms_exact_capture(self):
+        self.assertTrue(self.capture("quick-settings")[0])
+        def obsolete_label(values):
+            for value in values:
+                for control in value["controls"]:
+                    if control["label"] == "Lock Screen":
+                        control["label"] = "Lock"
+        self.assertFalse(self.capture("quick-settings", obsolete_label)[0])
+
+    def test_calendar_without_optional_events_card_still_has_positive_navigation(self):
+        self.assertTrue(self.capture("calendar")[0])
+        for label in ("Previous month", "Next month"):
+            def missing(values, label=label):
+                for value in values:
+                    value["controls"] = [control for control in value["controls"] if control["label"] != label]
+            with self.subTest(missing=label):
+                self.assertFalse(self.capture("calendar", missing)[0])
 
     def test_each_public_hero_requires_positive_visible_capture_bracket(self):
         for card in self.CONTROLS:

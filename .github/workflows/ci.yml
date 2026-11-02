@@ -136,6 +136,7 @@ jobs:
       - run: python3 scripts/tests/test_overview_recording.py
       - run: python3 scripts/lib/maintained-media-tests.py
       - run: python3 scripts/lib/tuna-walkthrough-freshness-tests.py
+      - run: python3 scripts/tests/test_native_product.py
       - run: python3 scripts/tests/test_maintained_media_refresh.py
       - name: Reject stale proposed canonical media against actual main source inputs
         env:
@@ -1628,6 +1629,11 @@ jobs:
           PY
           python3 scripts/lib/vm_gnome_reference.py verify-platform \
             --platform-digest "$(cat /mnt/vm/base-digest)" --out vm-lane-artifacts/native-base
+      - name: Test actual immutable OCI export and load identity
+        if: matrix.profile == 'lifecycle' && matrix.orca == 'distribution'
+        env:
+          TUNA_NATIVE_PRODUCT_PODMAN_CONTROL: '1'
+        run: python3 scripts/tests/test_native_product.py
       - name: Select the authenticated final native product or ordinary fresh build
         id: native-product
         if: matrix.profile == 'lifecycle'

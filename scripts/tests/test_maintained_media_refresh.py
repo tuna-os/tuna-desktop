@@ -34,6 +34,7 @@ def fixture_repository(root):
     git(root, 'init', '-q')
     git(root, 'config', 'user.name', 'Controlled media regression')
     git(root, 'config', 'user.email', 'controlled@example.invalid')
+    git(root, 'config', 'diff.renames', 'true')
     inventory = root / 'scripts/lib/maintained-media.tsv'
     inventory.parent.mkdir(parents=True)
     inventory.write_bytes(maintained_media.INVENTORY.read_bytes())
@@ -192,6 +193,30 @@ class Tests(unittest.TestCase):
                 with self.assertRaises(FileNotFoundError):
                     refresh.verify_if_changed(base)
 
+    def test_real_renames_cannot_hide_native_hero_video_or_manifest_removal(self):
+        mapping = refresh.inventory()
+        destinations = (mapping['vm-tour'][0][1], mapping['overview-demo'][0][1],
+                        refresh.manifest_name('vm-tour'))
+        for destination in destinations:
+            with self.subTest(destination=destination), tempfile.TemporaryDirectory() as scratch:
+                root = Path(scratch)
+                _, inventory, _ = fixture_repository(root)
+                original = root / destination
+                original.parent.mkdir(parents=True, exist_ok=True)
+                original.write_bytes(b'Controlled exact bytes for the Git rename detector, not UI proof.\n')
+                git(root, 'add', '.')
+                git(root, 'commit', '-qm', 'Controlled canonical path')
+                base = git(root, 'rev-parse', 'HEAD')
+                moved = root / 'outside-inventory' / original.name
+                moved.parent.mkdir()
+                git(root, 'mv', destination, str(moved.relative_to(root)))
+                git(root, 'commit', '-qm', 'Move canonical bytes outside the inventory')
+                self.assertIn('R100', git(root, 'diff', '--name-status', base + '...HEAD'))
+                with patch.object(refresh, 'ROOT', root), patch.object(maintained_media, 'INVENTORY', inventory):
+                    self.assertIn(destination, refresh.canonical_changes(base))
+                    with self.assertRaises(FileNotFoundError):
+                        refresh.verify_if_changed(base)
+
     def test_unrelated_source_change_is_not_a_generated_media_replacement(self):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
@@ -202,20 +227,24 @@ class Tests(unittest.TestCase):
             with patch.object(refresh, 'ROOT', root), patch.object(maintained_media, 'INVENTORY', inventory):
                 self.assertFalse(refresh.verify_if_changed(base))
 
-    def test_media_only_equivalence_preserves_original_identity_but_not_changed_product(self):
+    def test_selected_elf_equality_cannot_prove_whole_image_or_requested_base_currentness(self):
         original = {'base_image': {'reference': 'immutable-base'},
                     'member_sha256': {'usr/bin/tuna-desktop': 'a' * 64},
-                    'image_id': 'old-image', 'package_sha256': 'old-package'}
-        documents = [{'receipt': {'bundle': 'vm-tour'},
+                    'image_id': 'sha256:' + '1' * 64, 'package_sha256': '2' * 64}
+        index = 'sha256:' + '3' * 64
+        documents = [{'receipt': {'bundle': 'vm-tour', 'base_verification': {'index': {'sha256': '3' * 64}}},
                       'evidence': {'image_receipt': base64.b64encode(json.dumps(original).encode()).decode()}}]
-        current = dict(original, image_id='new-build-timestamp-image', package_sha256='new-archive-timestamp-package')
-        self.assertTrue(refresh.same_native_product(current, documents))
-        for key, replacement in (('base_image', {'reference': 'different-immutable-base'}),
-                                 ('member_sha256', {'usr/bin/tuna-desktop': 'b' * 64})):
+        self.assertTrue(refresh.same_native_product(original, documents, index))
+        for key, replacement in (
+                ('image_id', 'sha256:' + '4' * 64),  # GTK/Mesa/fonts may differ despite identical selected ELFs.
+                ('package_sha256', '5' * 64),
+                ('base_image', {'reference': 'different-immutable-base'}),
+                ('member_sha256', {'usr/bin/tuna-desktop': 'b' * 64})):
             with self.subTest(key=key):
-                changed = copy.deepcopy(current)
+                changed = copy.deepcopy(original)
                 changed[key] = replacement
-                self.assertFalse(refresh.same_native_product(changed, documents))
+                self.assertFalse(refresh.same_native_product(changed, documents, index))
+        self.assertFalse(refresh.same_native_product(original, documents, 'sha256:' + '6' * 64))
         self.assertEqual(json.loads(base64.b64decode(documents[0]['evidence']['image_receipt'])), original)
 
 

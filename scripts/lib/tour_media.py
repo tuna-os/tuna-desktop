@@ -42,9 +42,8 @@ def desktop_shown(px):
 
 TOUR_PUBLIC_CONTROLS = {
     "app-grid": {("frame", "App Grid")},
-    "quick-settings": {("slider", "Volume"), ("push button", "Settings"), ("push button", "Lock")},
-    "calendar": {("push button", "Previous month"), ("push button", "Next month"),
-                 ("push button", "Open Calendar")},
+    "quick-settings": {("slider", "Volume"), ("push button", "Settings"), ("push button", "Lock Screen")},
+    "calendar": {("push button", "Previous month"), ("push button", "Next month")},
     "lock": {("frame", "Lock Screen")},
 }
 

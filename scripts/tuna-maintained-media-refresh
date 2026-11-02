@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -15,7 +16,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts/lib'))
-from maintained_media import inventory, inventory_rows, manifest_name, required_source_inputs
+from maintained_media import confined, inventory, inventory_rows, manifest_name, required_source_inputs
 
 REPOSITORY = 'tuna-os/tuna-desktop'
 MAX_ARCHIVE = 512 * 1024 * 1024
@@ -25,6 +26,28 @@ MAX_EXPANDED = 4 * 1024 * 1024 * 1024
 def require(value, message):
     if not value:
         raise ValueError(message)
+
+
+class ArtifactUnavailable(ValueError):
+    """No retained original evidence exists; this never authorizes reuse."""
+
+
+def fetch_source_commits(sources):
+    commits = set()
+    for source in sources:
+        for key in ('built_commit', 'capture_commit'):
+            commit = source.get(key, '')
+            require(isinstance(commit, str) and re.fullmatch('[0-9a-f]{40}', commit),
+                    'missing strict actual build/capture Git commit')
+            commits.add(commit)
+    missing = [commit for commit in sorted(commits)
+               if subprocess.run(['git', 'cat-file', '-e', commit + '^{commit}'], cwd=ROOT,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode]
+    if missing:
+        require(command('git', 'remote', 'get-url', 'origin') in {
+            'https://github.com/tuna-os/tuna-desktop.git', 'https://github.com/tuna-os/tuna-desktop',
+            'git@github.com:tuna-os/tuna-desktop.git'}, 'source origin must be the trusted repository')
+        command('git', 'fetch', '--no-tags', 'origin', *missing)
 
 
 def command(*args, **kwargs):
@@ -114,6 +137,8 @@ def download_artifacts(run_id, attempt, output, mapping):
     }
     for name, allowlist in sources.items():
         members = [row for row in artifacts if row.get('name') == name and not row.get('expired')]
+        if not members:
+            raise ArtifactUnavailable('missing/expired exact-run artifact: ' + name)
         require(len(members) == 1, 'missing or ambiguous exact-run artifact: ' + name)
         member = members[0]
         require(member.get('workflow_run', {}).get('id') == run_id
@@ -140,12 +165,21 @@ def download_artifacts(run_id, attempt, output, mapping):
     return roots, artifact_receipts
 
 
-def authenticated_freshness(roots, pins):
+def authenticated_freshness(roots, pins, destination=None):
     subprocess.run([sys.executable, str(ROOT / 'scripts/lib/maintained_media.py'),
-                    'freshness', *pins,
+                    'freshness', *pins, '--dest', str(ROOT if destination is None else destination),
                     *[item for name in ('gtk-shell', 'marlin-vm', 'overview-demo')
                       for item in ('--source-artifact', str(roots[name]))]],
                    cwd=ROOT, check=True, timeout=600)
+
+
+def admit_current_capture(roots, pins, staging):
+    """Validate real current-run bytes even when exact canonical image reuse is possible."""
+    subprocess.run([sys.executable, str(ROOT / 'scripts/lib/maintained_media.py'),
+                    'intake', str(roots['gtk-shell']), str(roots['marlin-vm']),
+                    str(roots['overview-demo']), *pins, '--dest', str(staging)],
+                   cwd=ROOT, check=True, timeout=600)
+    authenticated_freshness(roots, pins, staging)
 
 
 def verify_canonical():
@@ -155,25 +189,28 @@ def verify_canonical():
     receipts = [document['receipt'] for document in documents]
     original = receipts[0]
     source, run = original['source'], original['run']
-    require(all(row['source']['built_commit'] == source['built_commit']
-                and row['source']['built_tree'] == source['built_tree'] and row['run'] == run
-                for row in receipts), 'mixed canonical media capture identities')
+    require(all(row['source']['capture_commit'] == source['capture_commit']
+                and row['source']['capture_tree'] == source['capture_tree']
+                and row['source']['merged_commit'] == source['merged_commit']
+                and row['source']['required_source_inputs_sha256'] == source['required_source_inputs_sha256']
+                and row['run'] == run for row in receipts), 'mixed canonical media capture identities')
     workflow = api('actions/workflows/ci.yml')
     require(workflow.get('path') == '.github/workflows/ci.yml' and workflow.get('name') == 'ci',
             'unexpected source workflow identity')
     inspect_run(api('actions/runs/' + run['id']), workflow['id'], int(run['id']),
-                int(run['attempt']), source['built_commit'])
+                int(run['attempt']), source['capture_commit'])
+    fetch_source_commits([row['source'] for row in receipts])
     latest = api('git/ref/heads/main')['object']['sha']
     command('git', 'fetch', '--no-tags', 'origin', latest)
-    drift = set(filter(None, command('git', 'diff', '--name-only', '-z',
-                                    source['built_commit'], latest).split('\0')))
+    drift = set(filter(None, command('git', 'diff', '--no-renames', '--name-only', '-z',
+                                    source['capture_commit'], latest).split('\0')))
     require(drift <= generated_paths(mapping), 'STALE: canonical media source differs from actual current main inputs')
-    require(command('git', 'rev-parse', source['built_commit'] + '^{tree}') == source['built_tree'],
-            'canonical source tree is not the actual captured Git commit tree')
+    require(command('git', 'rev-parse', source['capture_commit'] + '^{tree}') == source['capture_tree'],
+            'canonical capture tree is not the actual producer Git commit tree')
     image = next(row['image'] for row in receipts if row['bundle'] == 'vm-tour')
     pins = ['--run-id', run['id'], '--attempt', run['attempt'],
-            '--expect-merge', source['merged_commit'], '--expect-head', source['built_commit'],
-            '--expect-tree', source['built_tree'], '--expect-source-inputs', required_source_inputs(ROOT),
+            '--expect-merge', source['merged_commit'], '--expect-head', source['capture_commit'],
+            '--expect-tree', source['capture_tree'], '--expect-source-inputs', required_source_inputs(ROOT),
             '--expect-image', image['id'], '--expect-package', image['package_sha256']]
     pins += [item for row in receipts for item in ('--bundle', row['bundle'])]
     # PR-local manifests may name a genuine run while forging all local hashes.
@@ -184,14 +221,19 @@ def verify_canonical():
     return documents
 
 
-def same_native_product(image, documents):
+def same_native_product(image, documents, current_base_index):
     document = next(row for row in documents if row['receipt']['bundle'] == 'vm-tour')
     original = json.loads(base64.b64decode(document['evidence']['image_receipt'], validate=True))
-    # Build/archive timestamps can change image/package IDs after a media-only
-    # commit. Never relabel them: reuse only the authenticated original capture
-    # when its immutable base and every original installed member still agree.
-    return (original['base_image'] == image['base_image']
-            and original['member_sha256'] == image['member_sha256'])
+    # Selected ELFs cannot prove that GTK/Mesa/fonts or other runtime inputs
+    # stayed unchanged. Reuse only the exact authenticated final immutable
+    # image/package and the independently current requested base pair.
+    require(re.fullmatch('sha256:[0-9a-f]{64}', current_base_index or ''),
+            'actual current requested native base index required')
+    return (original['image_id'] == image['image_id']
+            and original['package_sha256'] == image['package_sha256']
+            and original['base_image'] == image['base_image']
+            and original['member_sha256'] == image['member_sha256']
+            and 'sha256:' + document['receipt']['base_verification']['index']['sha256'] == current_base_index)
 
 
 def canonical_changes(base):
@@ -200,7 +242,7 @@ def canonical_changes(base):
     inventory_path = 'scripts/lib/maintained-media.tsv'
     if command('git', 'ls-tree', '--name-only', base, '--', inventory_path):
         protected |= generated_paths(inventory_rows(command('git', 'show', base + ':' + inventory_path)))
-    changed = set(filter(None, command('git', 'diff', '--name-only', '-z', base + '...HEAD').split('\0')))
+    changed = set(filter(None, command('git', 'diff', '--no-renames', '--name-only', '-z', base + '...HEAD').split('\0')))
     return changed & protected
 
 
@@ -246,6 +288,8 @@ def main():
     args.output.mkdir(parents=True, mode=0o700)
     mapping = inventory()
     roots, artifact_receipts = download_artifacts(args.run_id, args.attempt, args.output, mapping)
+    fetch_source_commits([json.loads((roots[name] / 'media-source.json').read_bytes())
+                          for name in ('gtk-shell', 'marlin-vm', 'overview-demo')])
     image = json.loads((roots['marlin-vm'] / 'strip-image.json').read_bytes())
     source_inputs = required_source_inputs(ROOT)
     pins = ['--run-id', str(args.run_id), '--attempt', str(args.attempt),
@@ -254,29 +298,41 @@ def main():
             '--expect-source-inputs', source_inputs,
             '--expect-image', image['image_id'], '--expect-package', image['package_sha256']]
     bundles = [item for kind in ('gtk-walkthrough', 'vm-tour', 'overview-demo') for item in ('--bundle', kind)]
-    cli = [sys.executable, str(ROOT / 'scripts/lib/maintained_media.py')]
     generated = generated_paths(mapping)
-    changed_source = set(filter(None, command('git', 'diff-tree', '--no-commit-id', '--name-only',
+    changed_source = set(filter(None, command('git', 'diff-tree', '--no-renames', '--no-commit-id', '--name-only',
                                              '-z', '-r', 'HEAD^', 'HEAD').split('\0')))
-    media_only = bool(changed_source) and changed_source <= generated
-    # Suppress recursion only for already authenticated committed canonical
-    # bytes, before intake can replace them with this run's new captures.
-    if media_only:
-        media_only = same_native_product(image, verify_canonical())
+    generated_only = changed_source <= generated
+    media_only = False
+    prior_unavailable = None
+    # Never overwrite old canonical bytes before independently authenticating
+    # them. Expired/missing evidence earns no reuse: genuinely validated new
+    # current-run media may replace it only through an ordinary fresh PR.
+    if generated_only:
+        try:
+            current_base_index = 'sha256:' + hashlib.sha256(
+                (roots['marlin-vm'] / 'native-base/index.json').read_bytes()).hexdigest()
+            media_only = same_native_product(image, verify_canonical(), current_base_index)
+        except (ArtifactUnavailable, FileNotFoundError) as error:
+            prior_unavailable = str(error)
     latest_is(args.source_sha)
+    staging = args.output / 'current-capture'
+    admit_current_capture(roots, [*bundles, *pins], staging)
     if not media_only:
-        subprocess.run([*cli, 'intake', str(roots['gtk-shell']), str(roots['marlin-vm']),
-                        str(roots['overview-demo']), *bundles, *pins], cwd=ROOT, check=True, timeout=600)
-        authenticated_freshness(roots, [*bundles, *pins])
+        for name in sorted(generated):
+            source, destination = confined(staging, name), confined(ROOT, name)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
     result = {'run_id': args.run_id, 'run_attempt': args.attempt, 'source_commit': args.source_sha,
               'source_inputs_sha256': source_inputs, 'image_id': image['image_id'],
               'package_sha256': image['package_sha256'], 'canonical_paths': sorted(generated),
               'artifacts': artifact_receipts,
               'historical_receipts_overwritten': False, 'installed_signed_release_qualified': False,
+              'prior_canonical_unavailable': prior_unavailable,
+              'validated_current_capture': str(staging),
               'status': 'validated-current-run-media; not yet normal-merged canonical media'}
     if media_only:
-        result['status'] = ('validated-current-run-media; generated-media-only source evolution; '
-                            'no recursive media PR and no manufactured latest-source/image equivalence')
+        result['status'] = ('validated actual current-run capture and authenticated canonical media; '
+                            'exact final immutable image/package/current-base identity retained; no recursive PR')
     elif args.create_pr:
         latest_is(args.source_sha)
         branch = 'automation/maintained-media-%d-%d' % (args.run_id, args.attempt)

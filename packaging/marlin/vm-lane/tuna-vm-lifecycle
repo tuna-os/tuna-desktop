@@ -1798,9 +1798,8 @@ def tour_public_ui():
 
     authority = credentials()
     allowed = {("frame", "App Grid"), ("frame", "Lock Screen"), ("slider", "Volume"),
-               ("push button", "Settings"), ("push button", "Lock"),
-               ("push button", "Previous month"), ("push button", "Next month"),
-               ("push button", "Open Calendar")}
+               ("push button", "Settings"), ("push button", "Lock Screen"),
+               ("push button", "Previous month"), ("push button", "Next month")}
     controls, pending, visited = [], [(app, 0)], 0
     while pending:
         node, depth = pending.pop()

@@ -57,6 +57,7 @@ jobs:
           name: maintained-media-intake-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
           path: |
             ${{ runner.temp }}/maintained-refresh/refresh-result.json
+            ${{ runner.temp }}/maintained-refresh/current-capture/
             docs/walkthrough/media-manifests/
           if-no-files-found: warn
           retention-days: 90

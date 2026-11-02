@@ -7,6 +7,8 @@ asserts against source text or changes checked-in media/diagnostic receipts.
 import hashlib
 import io
 import base64
+import importlib.machinery
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -28,6 +30,11 @@ from PIL import Image, ImageDraw
 from overview_recording import FrameRecorder, recording_command, bind_recorded_interval
 from tour_media import TOUR_PUBLIC_CONTROLS
 from vm_gnome_reference import cosign_argv
+
+REFRESH_LOADER = importlib.machinery.SourceFileLoader("maintained_refresh_stage", str(ROOT / "scripts/tuna-maintained-media-refresh"))
+REFRESH_SPEC = importlib.util.spec_from_loader(REFRESH_LOADER.name, REFRESH_LOADER)
+refresh = importlib.util.module_from_spec(REFRESH_SPEC)
+REFRESH_LOADER.exec_module(refresh)
 
 COMMIT = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
 TREE = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD^{tree}"], text=True).strip()
@@ -311,6 +318,29 @@ class MediaIntake(unittest.TestCase):
         self.assertIn("CURRENT gtk-walkthrough", result.stdout)
         self.assertIn("environment nested-gtk", result.stdout)
         self.assertFalse((self.dest / "docs/walkthrough/tuna-tour.webm").exists())
+
+    def test_current_capture_is_revalidated_in_retained_staging_without_canonical_overwrite(self):
+        self.assertEqual(self.intake(self.gtk, self.vm, self.overview).returncode, 0)
+        canonical = {name: (self.dest / name).read_bytes() for name in refresh.generated_paths(self.mapping)}
+        roots = {"gtk-shell": self.gtk, "marlin-vm": self.vm, "overview-demo": self.overview}
+        pins = [*PINS, *VM_PINS, *[item for kind in self.mapping for item in ("--bundle", kind)]]
+        staging = self.root / "current-capture"
+        refresh.admit_current_capture(roots, pins, staging)
+        self.assertEqual((staging / self.mapping["overview-demo"][0][1]).read_bytes(),
+                         (self.overview / self.mapping["overview-demo"][0][0]).read_bytes())
+        self.assertEqual({name: (self.dest / name).read_bytes() for name in canonical}, canonical)
+        timing_path = self.vm / "tour/capture-timing.json"
+        timing = json.loads(timing_path.read_bytes())
+        for side in ("before", "after"):
+            for control in timing["still_confirmations"]["quick-settings"]["evidence"][side]["observation"]["controls"]:
+                if control["label"] == "Lock Screen":
+                    control["label"] = "Lock"
+        put_json(timing_path, timing)
+        self.mutate_receipt(self.vm, lambda receipt: receipt["capture_timing"].update(
+            sha256=contract.digest(timing_path.read_bytes())))
+        with self.assertRaises(subprocess.CalledProcessError):
+            refresh.admit_current_capture(roots, pins, self.root / "rejected-current-capture")
+        self.assertEqual({name: (self.dest / name).read_bytes() for name in canonical}, canonical)
 
     def test_rehashed_canonical_pixels_and_embedded_evidence_cannot_forge_uploaded_source(self):
         self.assertEqual(self.intake(self.gtk).returncode, 0)
