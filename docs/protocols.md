@@ -206,7 +206,7 @@ missing cached interface, an unrelated object error, malformed wire data or
 an I/O close cannot substitute for that protocol error.
 
 Native revocation is checked against the same still-open lessee FD:
-`DRM_IOCTL_MODE_GETLEASE` must observe held objects before revocation and no
+`DRM_IOCTL_MODE_GET_LEASE` must observe held objects before revocation and no
 held objects afterward, including planes. `GETRESOURCES` must also expose no
 leased connector or CRTC afterward. Its encoder list is device-global, not
 lease-filtered: Linux [`drm_mode_getresources`](https://github.com/torvalds/linux/blob/v7.0/drivers/gpu/drm/drm_mode_config.c)

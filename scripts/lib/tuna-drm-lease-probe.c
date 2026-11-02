@@ -340,7 +340,7 @@ static int expect_request_error(uint32_t request_id, uint32_t expected) {
 
 static bool lease_revoked(int fd, struct drm_mode_card_res *visible) {
     struct drm_mode_get_lease authority = { 0 };
-    if (ioctl(fd, DRM_IOCTL_MODE_GETLEASE, &authority) != 0 ||
+    if (ioctl(fd, DRM_IOCTL_MODE_GET_LEASE, &authority) != 0 ||
         ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, visible) != 0) {
         fprintf(stderr, "tuna-drm-lease-probe: native revocation ioctl failed: %s\n", strerror(errno));
         return false;
@@ -430,7 +430,7 @@ int main(int argc, char **argv) {
     if (!leased) return fail(lease_finished ? "the lease was refused (finished)" : "no lease_fd");
     if (drmIsMaster(lease_fd) != 1) return fail("the lease FD is not a DRM lessee master");
     struct drm_mode_get_lease authority = { 0 };
-    if (ioctl(lease_fd, DRM_IOCTL_MODE_GETLEASE, &authority) != 0 || authority.count_objects == 0)
+    if (ioctl(lease_fd, DRM_IOCTL_MODE_GET_LEASE, &authority) != 0 || authority.count_objects == 0)
         return fail("the lease FD does not hold native lease authority");
 
     /* The lessee's fd shows exactly the leased connector and one CRTC. */
