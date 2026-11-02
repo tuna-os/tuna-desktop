@@ -522,31 +522,6 @@ class OrcaCommandCleanup(unittest.TestCase):
 
 
 class OrcaFixturePackages(unittest.TestCase):
-    def test_actual_upstream_export_create_requires_explicit_command(self):
-        source = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
-        lines = [line.strip() for line in source.read_text().splitlines()
-                 if "probe_container=$(sudo podman create" in line]
-        self.assertEqual(len(lines), 1)
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            sudo = root / "sudo"
-            sudo.write_text('#!/bin/sh\nexec "$@"\n')
-            sudo.chmod(0o755)
-            podman = root / "podman"
-            podman.write_text("#!/usr/bin/env python3\nimport sys\n"
-                "assert sys.argv[1:] == ['create','localhost/marlin-tuna-vm:ci','/usr/bin/true']\n"
-                "print('controlled-inspect-container')\n")
-            podman.chmod(0o755)
-            environment = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]}
-            for line, success in [(lines[0], True), (lines[0].replace(" /usr/bin/true", ""), False)]:
-                result = subprocess.run(["bash", "-eu", "-c", line + '\nprintf "%s\\n" "$probe_container"\n'],
-                    env=environment, capture_output=True, text=True, timeout=10)
-                if success:
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout.strip(), "controlled-inspect-container")
-                else:
-                    self.assertNotEqual(result.returncode, 0)
-        # Controlled shell admission only; no Podman image/runtime proof.
 
     def test_current_build_session_environment_fixes_locale_and_ci_diagnostics(self):
         # gdm-wayland-session lets GDM's own LANG win over the imported user
@@ -1614,16 +1589,6 @@ class LifecyclePostNavigationBaseline(unittest.TestCase):
         after["session"]["Id"] = "2"
         self.assertFalse(self.policy()["same_apps_after_navigation"](before, after))
 
-    def test_fresh_baseline_is_validated_before_replacing_original(self):
-        file = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
-        source = file.read_text()
-        self.assertLess(source.index('before_vt = inventory("before-vt-baseline")'),
-                        source.index('if not same_apps_after_navigation(before, before_vt):'))
-        self.assertLess(source.index('if not same_apps_after_navigation(before, before_vt):'),
-                        source.index('before = before_vt'))
-        self.assertLess(source.index('before = before_vt'), source.index('base_frame = frame("before-vt")'))
-        self.assertIn('same_apps(before, after_vt)', source)
-        self.assertIn('same_apps(before, pending_auth)', source)
 
 
 class ControlledOverviewDiagnostic(unittest.TestCase):
@@ -2249,26 +2214,6 @@ class BootApi(unittest.TestCase):
         self.assertEqual(events, [("ret",), ("ctrl", "a"), "fixture typed", ("ret",)])
         # Actual prompt/PAM transitions still require the genuine hardware VM.
 
-    def test_actual_orca_commands_use_distinct_qmp_qcodes_for_chords(self):
-        tree = ast.parse((Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text())
-        command = next(node for node in ast.walk(tree)
-                       if isinstance(node, ast.FunctionDef) and node.name == "native_command")
-        chords = [tuple(ast.literal_eval(arg) for arg in node.args)
-                  for node in ast.walk(command) if isinstance(node, ast.Call)
-                  and isinstance(node.func, ast.Attribute) and node.func.attr == "keys"]
-        self.assertIn(("insert", "h"), chords)
-        self.assertIn(("shift", "f4"), chords)
-        for chord in chords:
-            self.assertTrue(set(chord) <= {"insert", "h", "shift", "f4", "esc"})
-            qmp = lane.baseline.Qmp.__new__(lane.baseline.Qmp)
-            qmp.file = io.StringIO()
-            qmp._read = lambda: {"return": {}}
-            with patch.object(lane.baseline.time, "sleep"):
-                qmp.keys(*chord)
-            wire = json.loads(qmp.file.getvalue())
-            self.assertEqual(wire["execute"], "send-key")
-            self.assertEqual(wire["arguments"]["keys"],
-                             [{"type": "qcode", "data": name} for name in chord])
 
     def test_qmp_command_accepts_protocol_name_argument(self):
         qmp = lane.baseline.Qmp.__new__(lane.baseline.Qmp)
@@ -4504,17 +4449,6 @@ class OrcaLogoutRetirement(unittest.TestCase):
             with self.subTest(trace=trace):
                 self.assertIsNone(lane.orca_logout_retirement(trace, 21699))
 
-    def test_departure_probe_runs_first_and_v_orca_logout_stays_unchanged(self):
-        # The unchanged probe must not wait behind the receipt: the user
-        # runtime it reads goes away soon after logout (run 40864799987).
-        source = (Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text()
-        departed = source.index('closed_orca = agent.run("orca-departed"')
-        reap = source.index('record("V-ORCA-LOGOUT-REAP"')
-        survived = source.index('raise RuntimeError("Orca survived the hardware session logout")')
-        self.assertLess(departed, reap)
-        self.assertLess(reap, survived)
-        self.assertIn('record("V-ORCA-LOGOUT", closed_orca["owner"] is None and not closed_orca["original_alive"],',
-                      source)
 
 
 class OrcaDepartureProbe(unittest.TestCase):

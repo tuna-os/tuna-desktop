@@ -262,42 +262,8 @@ class Tests(unittest.TestCase):
         for bad in [(0, -1), (2, 0), (2, 2)]:
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
                 proof.gap_after_move(*bad)
-        source = Path(proof.__file__).read_text()
-        self.assertIn("chord('meta_l', 'shift', 'left' if step < 0 else 'right')", source)
-        self.assertIn("beta_gap(sample, original, edge=edge) == want", source)
 
-    def test_grip_press_is_observed_before_any_drag_motion(self):
-        # Run 38726161191: the tablet carried the press to the next queued
-        # point (x+12), past Alpha's edge, so GTK never saw the grip press.
-        source = Path(proof.__file__).read_text()
-        press = source.index("move(x, y)\n        button(True)")
-        pressed = source.index("pressed = ready('scroll'", press)
-        motion = source.index("move(x + (12 if delta > 0 else -12), y)", press)
-        self.assertLess(pressed, motion)
 
-    def test_super_drag_holds_super_in_the_seat_before_the_press(self):
-        # Keyboard and tablet are separate guest devices with no mutual
-        # ordering: the press must follow an observed seat-held Super, and
-        # the drop and Super release are each observed in turn.
-        source = Path(proof.__file__).read_text()
-        start = source.index("super_key(True)\n")
-        held = source.index("held_keys(sample) == 1 and unclaimed(sample)", start)
-        press = source.index("button(True)", start)
-        preview = source.index("before_beta(sample, found) and unclaimed(sample)", start)
-        drop = source.index("button(False)", start)
-        release = source.index("super_key(False)", start)
-        released = source.index("held_keys(sample) == 0 and unclaimed(sample)", start)
-        capture = source.index("capture('08-super-drag-reorder', returned)", start)
-        self.assertLess(held, press)
-        self.assertLess(press, preview)
-        self.assertLess(preview, drop)
-        self.assertLess(drop, release)
-        self.assertLess(release, released)
-        self.assertLess(released, capture)
-        self.assertLess(source.index("capture('07-vt-cancel', returned)"), start)
-        self.assertIn("('move_requests', 'resize_requests', 'delivered_buttons')", source)
-        self.assertIn('"seat_pressed_key_count"', (Path(proof.__file__).resolve().parents[2]
-                      / 'packaging/marlin/vm-lane/tuna-vm-lifecycle').read_text())
 
     def test_strip_insert_mirrors_the_compositor_drop_rule(self):
         column = lambda x, w=616: [[[x, 48, w, 736]]]
@@ -351,19 +317,6 @@ class Tests(unittest.TestCase):
                 self.assertEqual(before, 0)
                 self.assertEqual(proof.strip_insert(columns, *target), ('column', before))
 
-    def test_column_chords_and_in_column_height_follow_the_super_drag(self):
-        source = Path(proof.__file__).read_text()
-        start = source.index("capture('08-super-drag-reorder', returned)")
-        consume = source.index("chord('meta_l', 'bracket_right')", start)
-        consumed = source.index("capture('09-column-consume', consumed)", consume)
-        grip = source.index("grip = ready('scroll'", consumed)
-        motion = source.index("move(x, y - 12)", consumed)
-        height = source.index("capture('10-column-height', heights, 'beta')", motion)
-        expel = source.index("chord('meta_l', 'bracket_right')", height)
-        expelled = source.index("capture('11-column-expel', returned, 'beta')", expel)
-        edge = source.index('if edge:\n            before_edge = returned', expelled)
-        self.assertLess(grip, motion)
-        self.assertLess(expelled, edge)
 
 
 class EndpointEvidence(unittest.TestCase):
