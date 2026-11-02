@@ -4003,7 +4003,7 @@ def native_media_source(out, image, owner):
     """Bind real current-source tour media to its original admitted session."""
     root = os.path.dirname(HERE)
     from maintained_media import git_source, required_source_inputs
-    from vm_strip_image import validate_product_origin
+    from vm_strip_image import validate_base_origin, validate_product_origin
     def git(*arguments):
         return subprocess.check_output(["git", "-C", root, *arguments], text=True, timeout=5).strip()
     head, tree = git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}")
@@ -4034,6 +4034,8 @@ def native_media_source(out, image, owner):
         raise RuntimeError("native media image does not match the actual original base index/platform")
     base = {"index": "ghcr.io/tuna-os/marlin@sha256:" + hashlib.sha256(index_bytes).hexdigest(),
             "platform": "ghcr.io/tuna-os/marlin@" + members[0]["digest"]}
+    if origin is not None:
+        validate_base_origin(origin, image["base_image"], index_bytes)
     with open(os.path.join(out, "media-source.json"), "x") as stream:
         json.dump({"merged_commit": head, "capture_commit": head, "capture_tree": tree,
                    "built_commit": product["commit"], "built_tree": product["tree"],

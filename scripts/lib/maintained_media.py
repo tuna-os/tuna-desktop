@@ -331,7 +331,7 @@ def validate_receipt(receipt, blobs, args, mapping):
             isinstance(strip.get("member_sha256"), dict) and bool(strip["member_sha256"]) and
             all(sha(value) for value in strip["member_sha256"].values()),
             "actual VM image receipt disagrees with media identity")
-    from vm_strip_image import validate_product_origin
+    from vm_strip_image import validate_base_origin, validate_product_origin
     require(strip.get("capture_commit") == source["capture_commit"] and
             strip.get("capture_tree") == source["capture_tree"] and
             strip.get("built_tree") == source["built_tree"] and
@@ -342,10 +342,7 @@ def validate_receipt(receipt, blobs, args, mapping):
             "VM source and loaded-image capsule lineage differ")
     if origin is not None or source["built_commit"] != source["capture_commit"]:
         validate_product_origin(origin, strip, ROOT)
-        if origin["mode"] == "reused":
-            require(source_evidence.get("base", {}).get("index") ==
-                    BASE_REPOSITORY + "@" + origin["base"]["index_digest"],
-                    "native source base index differs from authenticated product origin")
+        validate_base_origin(origin, strip["base_image"], blobs["base_index"])
     validate_base_verification(receipt, blobs, source_evidence, args)
     outcome = json_blob(blobs["outcomes"])
     checks = outcome.get("assertions")

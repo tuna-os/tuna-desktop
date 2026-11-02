@@ -101,7 +101,13 @@ def native_fixture_timing(artifact, mapping):
                         "started_monotonic_ns": start, "completed_monotonic_ns": start + 1,
                         "controls": [{"role": role, "label": label, "showing": True, "visible": True,
                                       "extents": [10, 10, 100, 50]}
-                                     for role, label in TOUR_PUBLIC_CONTROLS[tag]]}
+                                     for role, label in {
+                                         "app-grid": [("frame", "App Grid")],
+                                         "quick-settings": [("slider", "Volume"), ("push button", "Settings"),
+                                                            ("push button", "Lock Screen")],
+                                         "calendar": [("push button", "Previous month"), ("push button", "Next month")],
+                                         "lock": [("frame", "Lock Screen")],
+                                     }[tag]]}
             confirmation.update(method="public-at-spi", evidence={
                 "before": {"requested_monotonic_ns": stamp, "completed_monotonic_ns": stamp + 1,
                            "observation": observation(stamp)},
@@ -750,11 +756,18 @@ class RequiredSourceInputs(unittest.TestCase):
                    "data_artifact": {"id": 2, "name": "native-product-DATA-distribution",
                                      "digest": "sha256:" + "b" * 64},
                    "provenance": {"sha256": "c" * 64, "bytes": 1024}}
+        evidence = tempfile.TemporaryDirectory()
+        self.addCleanup(evidence.cleanup)
+        self.base_evidence = Path(evidence.name)
+        put_json(self.base_evidence / "index.json", {"schemaVersion": 2, "manifests": [
+            {"digest": "sha256:" + "5" * 64, "platform": {"os": "linux", "architecture": "amd64"}}]})
+        base_index = "sha256:" + contract.digest((self.base_evidence / "index.json").read_bytes())
         origin = {"schema": "tuna-native-product-selection-v1", "mode": "reused", "profile": "distribution",
                   "current_capture_source": capture, "product_source": product, "image_id": IMAGE,
                   "package": {"file": "/controlled/tuna.pkg.tar.zst", "basename": "tuna-1-1-x86_64.pkg.tar.zst",
                               "sha256": PACKAGE},
-                  "base": {"platform": "sha256:" + "5" * 64, "index_digest": "sha256:" + "d" * 64},
+                  "base_index": base_index, "base_platform": "sha256:" + "5" * 64,
+                  "base": {"platform": "sha256:" + "5" * 64, "index_digest": base_index},
                   "authenticated_origin": lineage,
                   "strip_image": {"sha256": contract.digest(raw), "bytes": len(raw)},
                   "original_image_receipt": {"sha256": contract.digest(raw), "bytes": len(raw),
@@ -775,7 +788,8 @@ class RequiredSourceInputs(unittest.TestCase):
         contract.validate_source(source, pins, "vm-tour", self.repo)
         package["package"].update(device=9, inode=10)
         receipt = admission(package, observed, self.repo, source["built_commit"], IMAGE, base,
-                            capture_commit=source["capture_commit"], product_origin=origin)
+                            capture_commit=source["capture_commit"], product_origin=origin,
+                            base_evidence=self.base_evidence)
         self.assertEqual(receipt["commit"], source["built_commit"])
         self.assertEqual(receipt["capture_commit"], source["capture_commit"])
         self.assertEqual(receipt["product_origin"], origin)
@@ -795,7 +809,8 @@ class RequiredSourceInputs(unittest.TestCase):
         origin["current_capture_source"] = capture
         with self.assertRaisesRegex(ValueError, "inputs differ"):
             admission(package, observed, self.repo, source["built_commit"], IMAGE, base,
-                      capture_commit=capture["commit"], product_origin=origin)
+                      capture_commit=capture["commit"], product_origin=origin,
+                      base_evidence=self.base_evidence)
 
     def test_forged_build_capture_trees_and_missing_capture_fail_closed(self):
         _, _, _, _, source, pins = self.product_pair()
@@ -823,6 +838,8 @@ class RequiredSourceInputs(unittest.TestCase):
             lambda o: o["authenticated_origin"].update(repository="attacker/repo"),
             lambda o: o["authenticated_origin"]["data_artifact"].update(name="other"),
             lambda o: o["base"].update(platform="sha256:" + "0" * 64),
+            lambda o: o.update(base_index="sha256:" + "0" * 64),
+            lambda o: o.update(base_platform="sha256:" + "0" * 64),
             lambda o: o["original_image_receipt"].update(raw_base64=base64.b64encode(b"{}").decode()),
             lambda o: o["original_image_receipt"]["receipt"].update(commit=source["capture_commit"]),
             lambda o: o.update(mode="fresh"),
@@ -832,18 +849,43 @@ class RequiredSourceInputs(unittest.TestCase):
             mutate(forged)
             with self.subTest(mutation=mutate), self.assertRaises(ValueError):
                 admission(package, observed, self.repo, source["built_commit"], IMAGE, base,
-                          capture_commit=source["capture_commit"], product_origin=forged)
+                          capture_commit=source["capture_commit"], product_origin=forged,
+                          base_evidence=self.base_evidence)
         with self.assertRaisesRegex(ValueError, "explicit authenticated"):
             admission(package, observed, self.repo, source["built_commit"], IMAGE, base,
                       capture_commit=source["capture_commit"])
         forged_observed = dict(observed, image_id="sha256:" + "0" * 64)
         with self.assertRaises(ValueError):
             admission(package, forged_observed, self.repo, source["built_commit"], IMAGE, base,
-                      capture_commit=source["capture_commit"], product_origin=origin)
+                      capture_commit=source["capture_commit"], product_origin=origin,
+                      base_evidence=self.base_evidence)
         package["package"]["sha256"] = "0" * 64
         with self.assertRaises(ValueError):
             admission(package, observed, self.repo, source["built_commit"], IMAGE, base,
+                      capture_commit=source["capture_commit"], product_origin=origin,
+                      base_evidence=self.base_evidence)
+
+    def test_explicit_origin_requires_actual_current_raw_base_index(self):
+        from vm_strip_image import admission, validate_base_origin
+        package, observed, base, origin, source, _ = self.product_pair()
+        with self.assertRaisesRegex(ValueError, "requires current base evidence"):
+            admission(package, observed, self.repo, source["built_commit"], IMAGE, base,
                       capture_commit=source["capture_commit"], product_origin=origin)
+        index_path = self.base_evidence / "index.json"
+        index = json.loads(index_path.read_bytes())
+        # Even a changed index retaining the same amd64 platform is a new input.
+        index["annotations"] = {"controlled": "different current mutable tag index"}
+        put_json(index_path, index)
+        for mode in ("fresh", "reused"):
+            candidate = dict(origin, mode=mode)
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "actual current raw"):
+                validate_base_origin(candidate, base, index_path.read_bytes())
+        with self.assertRaisesRegex(ValueError, "actual current raw"):
+            admission(package, observed, self.repo, source["built_commit"], IMAGE, base,
+                      capture_commit=source["capture_commit"], product_origin=origin,
+                      base_evidence=self.base_evidence)
+        with self.assertRaisesRegex(ValueError, "chosen immutable image platform"):
+            validate_base_origin(origin, "ghcr.io/tuna-os/marlin:gnome@sha256:" + "0" * 64)
 
     def test_original_ref_is_strict_not_an_alias_or_revision_expression(self):
         for ref in ("main", "HEAD~0", "--all", "a" * 39):

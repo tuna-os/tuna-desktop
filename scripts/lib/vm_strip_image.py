@@ -13,6 +13,29 @@ def canonical_image_id(observed):
     return observed if observed.startswith('sha256:') else 'sha256:' + observed
 
 
+def validate_base_origin(origin, base_image, index_bytes=None):
+    """Bind selection to the actual chosen platform and current raw OCI index."""
+    from maintained_media import json_blob, require
+    base = origin.get("base", {})
+    require(isinstance(base, dict) and
+            re.fullmatch(r"sha256:[0-9a-f]{64}", origin.get("base_index", "")) and
+            re.fullmatch(r"sha256:[0-9a-f]{64}", origin.get("base_platform", "")) and
+            base.get("index_digest") == origin["base_index"] and
+            base.get("platform") == origin["base_platform"] and
+            base_image == "ghcr.io/tuna-os/marlin:gnome@" + origin["base_platform"],
+            "product origin base differs from actual chosen immutable image platform")
+    if index_bytes is not None:
+        index = json_blob(index_bytes)
+        require(index.get("schemaVersion") == 2 and isinstance(index.get("manifests"), list),
+                "current base evidence is not an OCI index")
+        members = [member for member in index["manifests"]
+                   if member.get("platform", {}).get("os") == "linux" and
+                   member.get("platform", {}).get("architecture") == "amd64"]
+        require(origin["base_index"] == "sha256:" + hashlib.sha256(index_bytes).hexdigest() and
+                len(members) == 1 and members[0].get("digest") == origin["base_platform"],
+                "product origin differs from actual current raw base index/platform")
+
+
 def validate_product_origin(origin, image, root):
     """Check the authenticated selection's immutable product and source bindings.
 
@@ -37,16 +60,12 @@ def validate_product_origin(origin, image, root):
             isinstance(package.get("basename"), str) and
             re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+:-]*\.pkg\.tar\.(?:zst|xz|gz)", package["basename"]),
             "product origin original package differs")
+    validate_base_origin(origin, image.get("base_image"))
     if origin["mode"] == "fresh":
         require(product == capture and origin.get("image_id") in ("", None, image.get("image_id")) and
                 not origin.get("authenticated_origin"), "fresh product cannot claim an older build")
         return
     require(origin.get("image_id") == image.get("image_id"), "reused loaded image differs from origin")
-    base = origin.get("base", {})
-    require(isinstance(base, dict) and
-            base.get("platform") == image.get("base_image", "").rsplit("@", 1)[-1] and
-            re.fullmatch(r"sha256:[0-9a-f]{64}", base.get("index_digest", "")),
-            "reused original base differs")
     lineage = origin.get("authenticated_origin", {})
     require(isinstance(lineage, dict) and lineage.get("repository") == "tuna-os/tuna-desktop" and
             lineage.get("workflow_path") == ".github/workflows/ci.yml" and
@@ -93,7 +112,8 @@ def validate_product_origin(origin, image, root):
             "actual original package inspection differs from authenticated capsule")
 
 
-def admission(package, observed, root, commit, image_id, base_image, *, capture_commit=None, product_origin=None):
+def admission(package, observed, root, commit, image_id, base_image, *, capture_commit=None,
+              product_origin=None, base_evidence=None):
     if not re.fullmatch(r'[0-9a-f]{40}', commit):
         raise ValueError('exact source commit missing')
     if not re.fullmatch(r'sha256:[0-9a-f]{64}', image_id):
@@ -131,6 +151,11 @@ def admission(package, observed, root, commit, image_id, base_image, *, capture_
                'scope': 'original CI package and exact final image, not signed release or kernel presentation'}
     if product_origin is not None:
         validate_product_origin(product_origin, receipt, root)
+        from maintained_media import confined
+        require(base_evidence is not None, "explicit product origin requires current base evidence")
+        index_path = confined(Path(base_evidence), "index.json")
+        require(index_path.stat().st_size <= 1048576, "current base index exceeds admission bound")
+        validate_base_origin(product_origin, base_image, index_path.read_bytes())
         receipt['product_origin'] = product_origin
     return receipt
 
