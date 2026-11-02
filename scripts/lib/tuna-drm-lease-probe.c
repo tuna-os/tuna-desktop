@@ -338,6 +338,22 @@ static int expect_request_error(uint32_t request_id, uint32_t expected) {
     return fail("invalid lease request did not produce a protocol error");
 }
 
+static bool lease_revoked(int fd, struct drm_mode_card_res *visible) {
+    struct drm_mode_get_lease authority = { 0 };
+    if (ioctl(fd, DRM_IOCTL_MODE_GETLEASE, &authority) != 0 ||
+        ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, visible) != 0) {
+        fprintf(stderr, "tuna-drm-lease-probe: native revocation ioctl failed: %s\n", strerror(errno));
+        return false;
+    }
+    /* GETLEASE enumerates actual held authority, including planes.
+     * GETRESOURCES filters CRTCs/connectors by that lease, but its encoder
+     * list is device-global even after revocation (Linux drm_mode_getresources).
+     * Global encoder visibility is not permission to use a leased object. */
+    fprintf(stderr, "tuna-drm-lease-probe: revoked FD held_objects=%u connectors=%u crtcs=%u global_encoders=%u\n",
+            authority.count_objects, visible->count_connectors, visible->count_crtcs, visible->count_encoders);
+    return authority.count_objects == 0 && visible->count_connectors == 0 && visible->count_crtcs == 0;
+}
+
 int main(int argc, char **argv) {
     const char *lease_name = NULL;
     const char *await_name = NULL;
@@ -413,6 +429,9 @@ int main(int argc, char **argv) {
         if (wl_display_roundtrip(display) < 0) return fail("lease roundtrip failed");
     if (!leased) return fail(lease_finished ? "the lease was refused (finished)" : "no lease_fd");
     if (drmIsMaster(lease_fd) != 1) return fail("the lease FD is not a DRM lessee master");
+    struct drm_mode_get_lease authority = { 0 };
+    if (ioctl(lease_fd, DRM_IOCTL_MODE_GETLEASE, &authority) != 0 || authority.count_objects == 0)
+        return fail("the lease FD does not hold native lease authority");
 
     /* The lessee's fd shows exactly the leased connector and one CRTC. */
     struct drm_mode_card_res res = { 0 };
@@ -428,7 +447,7 @@ int main(int argc, char **argv) {
     json_string(lease_name);
     printf(",\"lessee_connectors\":[");
     for (uint32_t i = 0; i < res.count_connectors; i++) printf("%s%u", i ? "," : "", connectors[i]);
-    printf("],\"lessee_crtcs\":%u}\n", n_crtcs);
+    printf("],\"lessee_crtcs\":%u,\"lessee_objects\":%u}\n", n_crtcs, authority.count_objects);
     fflush(stdout);
     if (res.count_connectors != 1 || connectors[0] != target_id || n_crtcs != 1)
         return fail("the lease fd does not hold exactly the leased connector and a CRTC");
@@ -443,13 +462,13 @@ int main(int argc, char **argv) {
         if (!dispatch_until(&lease_finished))
             return fail("connector unplug did not finish its active lease");
         struct drm_mode_card_res revoked = { 0 };
-        if (ioctl(lease_fd, DRM_IOCTL_MODE_GETRESOURCES, &revoked) != 0 ||
-            revoked.count_connectors || revoked.count_crtcs || revoked.count_encoders)
+        if (!lease_revoked(lease_fd, &revoked))
             return fail("connector unplug did not revoke the native lease FD");
         /* Drain the withdrawal batch before inspecting available objects. */
         if (wl_display_roundtrip(display) < 0) return fail("unplug roundtrip failed");
         if (find_live(dev, lease_name)) return fail("unplugged connector is still offered");
-        printf("{\"event\":\"unplug-revoked\"}\n");
+        printf("{\"event\":\"unplug-revoked\",\"held_objects\":0,\"global_encoders\":%u}\n",
+               revoked.count_encoders);
         fflush(stdout);
         close(lease_fd);
         wp_drm_lease_v1_destroy(lease);
@@ -476,10 +495,10 @@ int main(int argc, char **argv) {
         if (!n_devices || !find_live(&devices[0], lease_name))
             return fail("owner exit did not re-offer its connector to a new client");
         struct drm_mode_card_res revoked = { 0 };
-        if (ioctl(lease_fd, DRM_IOCTL_MODE_GETRESOURCES, &revoked) != 0 ||
-            revoked.count_connectors || revoked.count_crtcs || revoked.count_encoders)
+        if (!lease_revoked(lease_fd, &revoked))
             return fail("Wayland owner exit did not revoke the still-open lease FD");
-        printf("{\"event\":\"owner-revoked\"}\n");
+        printf("{\"event\":\"owner-revoked\",\"held_objects\":0,\"global_encoders\":%u}\n",
+               revoked.count_encoders);
         print_devices("reoffered");
         close(lease_fd);
         wl_display_disconnect(display);

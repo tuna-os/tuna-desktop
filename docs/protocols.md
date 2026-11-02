@@ -205,6 +205,16 @@ Its receipt records the actual target, code and message. A destroyed proxy's
 missing cached interface, an unrelated object error, malformed wire data or
 an I/O close cannot substitute for that protocol error.
 
+Native revocation is checked against the same still-open lessee FD:
+`DRM_IOCTL_MODE_GETLEASE` must observe held objects before revocation and no
+held objects afterward, including planes. `GETRESOURCES` must also expose no
+leased connector or CRTC afterward. Its encoder list is device-global, not
+lease-filtered: Linux [`drm_mode_getresources`](https://github.com/torvalds/linux/blob/v7.0/drivers/gpu/drm/drm_mode_config.c)
+enumerates encoders without `drm_lease_held`, unlike CRTCs and connectors.
+The consumer records that real global encoder count rather than treating
+visibility of non-leaseable metadata as surviving lease authority. Failed
+native ioctls still fail the proof.
+
 ### Explicit sync
 
 `wp_linux_drm_syncobj_manager_v1` follows Mutter 51's
