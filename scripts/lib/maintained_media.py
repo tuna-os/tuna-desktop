@@ -45,6 +45,8 @@ import subprocess
 import sys
 import tempfile
 from vm_gnome_reference import BASE_REPOSITORY, CERTIFICATE_SUBJECT, CERTIFICATE_ISSUER
+from tour_media import validate_still_confirmations
+from overview_recording import validate_recording
 
 ROOT = Path(__file__).resolve().parents[2]
 INVENTORY = Path(__file__).with_name("maintained-media.tsv")
@@ -312,10 +314,7 @@ def validate_receipt(receipt, blobs, args, mapping):
             isinstance(timing.get("frames"), list) and bool(timing["frames"]) and
             isinstance(timing.get("stills"), dict) and bool(timing["stills"]),
             "tour has missing/unconfirmed real capture outcomes")
-    for entry in files:
-        leaf = Path(entry["source"]).name
-        if leaf.startswith("T-") and leaf.endswith(".png"):
-            require(leaf[2:-4] in timing["stills"], "tour still lacks actual capture outcome: " + leaf)
+    validate_still_confirmations(timing, files, source_evidence["original_session"])
     tour = outcome.get("tour", {})
     video = receipt.get("video", {})
     require(video.get("file") == "tour/tuna-tour.webm" and sha(video.get("sha256")) and
@@ -370,6 +369,7 @@ def load_artifact(root):
 
 def validate_overview(receipt, blobs, source):
     actions = json_blob(blobs["action_receipt"])
+    validate_recording(actions)
     require(actions.get("schema") == 1 and actions.get("complete") is True and
             actions.get("source") == source and actions.get("clock_domain") == "host CLOCK_MONOTONIC" and
             type(actions.get("window")) is int and actions["window"] > 0,
@@ -454,6 +454,15 @@ def validate_auxiliary(root, receipt):
         blob = path.read_bytes()
         require(len(blob) == entry["bytes"] and digest(blob) == entry["sha256"] and
                 media(path) == entry["probe"], "actual source video differs from producer receipt")
+    for entry in receipt["files"]:
+        confined(root, entry["source"])
+    if receipt["bundle"] == "vm-tour":
+        timing = json_blob(confined(root, evidence_files("vm-tour")["capture_timing"]).read_bytes())
+        source = json_blob(confined(root, "media-source.json").read_bytes())
+        validate_still_confirmations(timing, receipt["files"], source["original_session"], root)
+    elif receipt["bundle"] == "overview-demo":
+        actions = json_blob(confined(root, evidence_files("overview-demo")["action_receipt"]).read_bytes())
+        validate_recording(actions, confined(root, receipt["raw_video"]["file"]))
 
 
 def atomic_write(path, blob):
@@ -520,6 +529,7 @@ def emit(args, mapping):
         receipt["files"].append({"source": source_file, "destination": destination,
                                  "sha256": digest(blob), "bytes": len(blob), "probe": probe})
     validate_receipt(receipt, blobs, args, mapping)
+    validate_auxiliary(root, receipt)
     atomic_write(confined(root, "media-receipt.json"), encoded(receipt))
     print("RECEIPT %s: %d actual media files" % (kind, len(receipt["files"])))
 
@@ -581,7 +591,7 @@ def freshness(args, mapping):
             blob = path.read_bytes()
             require(len(blob) == entry["bytes"] and digest(blob) == entry["sha256"] and
                     media(path) == entry["probe"], "actual source artifact media differs from receipt")
-        source_artifacts[receipt["bundle"]] = receipt
+        source_artifacts[receipt["bundle"]] = (receipt, blobs)
     for kind in args.bundle:
         document = json_blob(confined(dest, manifest_name(kind)).read_bytes())
         require(document.get("schema") == SCHEMA and document.get("installed_signed_release_qualified") is False,
@@ -591,7 +601,8 @@ def freshness(args, mapping):
         blobs = {key: base64.b64decode(value, validate=True) for key, value in document["evidence"].items()}
         validate_receipt(receipt, blobs, args, mapping)
         if source_artifacts:
-            require(source_artifacts.get(kind) == receipt, "source artifact differs from canonical receipt")
+            require(source_artifacts.get(kind) == (receipt, blobs),
+                    "authenticated source artifact differs from canonical receipt/evidence")
         for entry in receipt["files"]:
             path = confined(dest, entry["destination"])
             blob = path.read_bytes()

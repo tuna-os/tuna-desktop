@@ -5,6 +5,8 @@ All media are temporary test fixtures, not production UI qualification. No test
 asserts against source text or changes checked-in media/diagnostic receipts.
 """
 import hashlib
+import io
+import base64
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import zlib
 
@@ -21,6 +24,9 @@ ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 import maintained_media as contract
 import gtk_media_source
+from PIL import Image, ImageDraw
+from overview_recording import FrameRecorder, recording_command, bind_recorded_interval
+from tour_media import TOUR_PUBLIC_CONTROLS
 
 COMMIT = "1" * 40
 TREE = "2" * 40
@@ -51,6 +57,65 @@ def command(script, *arguments):
                           capture_output=True, text=True, timeout=180)
 
 
+def native_fixture_owner():
+    return {"session_uid": 1000, "session": {
+                "Id": "3", "User": "1000", "Type": "wayland", "Class": "user",
+                "Service": "gdm-password", "VTNr": "2"},
+            "processes": [{"pid": 110, "uid": 1000, "start_ticks": 500, "executable": "tuna-shell-gtk"}]}
+
+
+def native_fixture_png(tag):
+    # Synthetic parser inputs, never product screenshots or UI proof.
+    image = Image.new("RGB", (1280, 800), "white")
+    draw = ImageDraw.Draw(image)
+    if tag == "overview-windows":
+        draw.rectangle((0, 690, 169, 779), fill=(48, 48, 48))
+    elif tag == "alt-tab":
+        draw.rectangle((380, 300, 899, 301), fill=(48, 48, 48))
+    stream = io.BytesIO()
+    image.save(stream, format="PNG")
+    return stream.getvalue()
+
+
+def native_fixture_timing(artifact, mapping):
+    frames, confirmations, stills = [], {}, {}
+    for index, (filename, _) in enumerate(mapping):
+        tag, stamp = Path(filename).stem[2:], 1000 + index * 100
+        checksum = contract.digest((artifact / filename).read_bytes())
+        frame = {"index": index, "mode": "still", "requested_monotonic_ns": stamp + 2,
+                 "completed_monotonic_ns": stamp + 3, "sha256": checksum}
+        frames.append(frame)
+        stills[tag] = index
+        confirmation = {"schema": 1, "tag": tag, "frame_index": index, "png_sha256": checksum,
+                        "confirmed": True, "capture_requested_monotonic_ns": stamp + 2,
+                        "capture_completed_monotonic_ns": stamp + 3}
+        if tag in TOUR_PUBLIC_CONTROLS:
+            def observation(start):
+                return {"schema": 1, "method": "public-at-spi",
+                        "session": native_fixture_owner()["session"],
+                        "principal": {"pid": 110, "uid": 1000, "start_ticks": 500,
+                                      "executable": "/usr/bin/tuna-shell-gtk", "display": "wayland-0",
+                                      "session_id": "3"},
+                        "atspi": {"owner": ":1.7", "bus_pid": 110, "bus_uid": 1000},
+                        "started_monotonic_ns": start, "completed_monotonic_ns": start + 1,
+                        "controls": [{"role": role, "label": label, "showing": True, "visible": True,
+                                      "extents": [10, 10, 100, 50]}
+                                     for role, label in TOUR_PUBLIC_CONTROLS[tag]]}
+            confirmation.update(method="public-at-spi", evidence={
+                "before": {"requested_monotonic_ns": stamp, "completed_monotonic_ns": stamp + 1,
+                           "observation": observation(stamp)},
+                "after": {"requested_monotonic_ns": stamp + 4, "completed_monotonic_ns": stamp + 5,
+                          "observation": observation(stamp + 4)},
+                "same_original_session": True, "within_deadline": True})
+        else:
+            confirmation.update(method="calibrated-framebuffer", evidence={
+                "predicate": "overview_windows_shown" if tag == "overview-windows" else "switcher_shown",
+                "exact_png": True, "within_deadline": True})
+        confirmations[tag] = confirmation
+    return {"schema": 1, "frames": frames, "stills": stills,
+            "unconfirmed_stills": [], "still_confirmations": confirmations}
+
+
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "real media parsers required")
 class MediaIntake(unittest.TestCase):
     @classmethod
@@ -71,7 +136,7 @@ class MediaIntake(unittest.TestCase):
                                              for index, name in enumerate(("tuna-compositor", "tuna-shell-gtk"))})
             else:
                 source.update(environment="installed-vm", tracked_source_clean=True,
-                              original_session={"fixture": "temporary parser test owner inventory"})
+                              original_session=native_fixture_owner())
                 index = {"schemaVersion": 2, "manifests": [
                     {"digest": "sha256:" + "5" * 64, "platform": {"os": "linux", "architecture": "amd64"}}]}
                 put_json(artifact / "native-base/index.json", index)
@@ -90,7 +155,7 @@ class MediaIntake(unittest.TestCase):
             for filename, _ in cls.mapping[kind]:
                 path = artifact / filename
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(png(filename))
+                path.write_bytes(native_fixture_png(Path(filename).stem[2:]) if kind == "vm-tour" else png(filename))
             if kind == "gtk-walkthrough":
                 (artifact / "assertions.txt").write_text("G-PANEL pass original test fixture producer\nG-END pass completed\n")
                 capture = {"schema": 1, "status": "ok", "exit_code": 0,
@@ -112,9 +177,7 @@ class MediaIntake(unittest.TestCase):
                          "base_image": BASE, "assertions": {"V-SESSION": {"pass": True}},
                          "tour": {"video": "tour/tuna-tour.webm", "frames": 2,
                                   "capture_timing": "tour/capture-timing.json"}})
-                put_json(artifact / "tour/capture-timing.json", {"schema": 1, "frames": [{"index": 0}],
-                         "stills": {Path(filename).stem[2:]: 0 for filename, _ in cls.mapping[kind]},
-                         "unconfirmed_stills": []})
+                put_json(artifact / "tour/capture-timing.json", native_fixture_timing(artifact, cls.mapping[kind]))
             result = command("tuna-docs-shots", "receipt", artifact, "--bundle", kind,
                              "--producer-exit-code", "0", *PINS, *(VM_PINS if kind == "vm-tour" else []))
             if result.returncode:
@@ -122,41 +185,55 @@ class MediaIntake(unittest.TestCase):
         artifact = cls.fixtures / "overview-demo"
         artifact.mkdir()
         shutil.copyfile(cls.fixtures / "gtk-walkthrough/media-source.json", artifact / "media-source.json")
-        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i",
-                        "color=c=blue:size=1280x800:rate=15", "-t", "12", "-c:v", "libx264",
-                        "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(artifact / "overview-demo.raw.mp4")],
-                       check=True, capture_output=True)
+        windows = [{"app_id": "tuna-test-" + name, "id": index, "rect": [0, 0, 20, 40]}
+                   for index, name in enumerate(("alpha", "beta", "gamma"))]
+        closed = {"overview_open": False, "locked": False, "windows": windows, "focused_app_id": "tuna-test-beta"}
+        opened = dict(closed, overview_open=True, overview_progress=1, previews=windows)
+        actions = {"schema": 1, "complete": True,
+                   "source": json.loads((artifact / "media-source.json").read_text()),
+                   "clock_domain": "host CLOCK_MONOTONIC", "window": 42, "events": [], "snapshots": {}}
+        def snapshot(label, state):
+            lower = time.monotonic_ns()
+            actions["snapshots"][label] = {"state": state, "observed_host_monotonic_lower_ns": lower}
+            upper = time.monotonic_ns()
+            actions["snapshots"][label].update(observed_host_monotonic_upper_ns=upper,
+                                                observed_host_monotonic=upper / 1e9)
+        origin = time.monotonic_ns()
+        recorder = FrameRecorder(recording_command(artifact / "overview-demo.raw.mp4", [
+            "-use_wallclock_as_timestamps", "1", "-f", "lavfi", "-i",
+            "color=c=blue:size=1280x800:rate=15:duration=12,realtime,settb=AVTB"]),
+            artifact / "overview-demo.raw.mp4", artifact / "ffmpeg.log")
+        try:
+            recorder.wait_ready(origin + 1_000_000_000)
+            snapshot("before", closed)
+            for offset, action, label, state, argv in (
+                    (1, "open-overview", "opened", opened, ["key", "Super_L"]),
+                    (3, "select-beta", "selected-beta", closed, ["mousemove", "--window", "42", "10", "20", "click", "1"]),
+                    (5, "reopen-overview", "reopened", opened, ["key", "Super_L"]),
+                    (7, "dismiss-overview", "dismissed", closed, ["key", "Escape"])):
+                time.sleep(max(0, (origin + offset * 1_000_000_000 - time.monotonic_ns()) / 1e9))
+                lower, upper = time.monotonic_ns(), time.monotonic_ns()
+                actions["events"].append({"action": action, "argv": argv, "begin": lower / 1e9,
+                                          "end": upper / 1e9, "begin_host_monotonic_ns": lower,
+                                          "end_host_monotonic_ns": upper})
+                snapshot(label, state)
+            recorder.finish()
+            bind_recorded_interval(actions, recorder.receipt(origin))
+        finally:
+            recorder.stop()
         subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(artifact / "overview-demo.raw.mp4"),
                         "-c", "copy", "-movflags", "+faststart", str(artifact / "overview-demo.mp4")],
                        check=True, capture_output=True)
         subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(artifact / "overview-demo.mp4"),
                         "-filter_complex", "fps=8,scale=640:400:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse",
                         "-loop", "0", str(artifact / "overview-demo.gif")], check=True, capture_output=True)
-        windows = [{"app_id": "tuna-test-" + name, "id": index, "rect": [0, 0, 20, 40]}
-                   for index, name in enumerate(("alpha", "beta", "gamma"))]
-        closed = {"overview_open": False, "locked": False, "windows": windows, "focused_app_id": "tuna-test-beta"}
-        opened = dict(closed, overview_open=True, overview_progress=1, previews=windows)
-        states = [closed, opened, closed, opened, closed]
-        observations = [100.5, 101.2, 103.2, 105.2, 107.2]
-        events = [{"action": action, "begin": begin, "end": begin + .1, "argv": argv}
-                  for action, begin, argv in (
-                      ("open-overview", 101., ["key", "Super_L"]),
-                      ("select-beta", 103., ["mousemove", "--window", "42", "10", "20", "click", "1"]),
-                      ("reopen-overview", 105., ["key", "Super_L"]),
-                      ("dismiss-overview", 107., ["key", "Escape"]))]
-        actions = {"schema": 1, "complete": True, "source": json.loads((artifact / "media-source.json").read_text()),
-                   "clock_domain": "host CLOCK_MONOTONIC", "window": 42, "capture_begin": 100.,
-                   "events": events, "snapshots": {
-                       label: {"observed_host_monotonic": observed, "state": state}
-                       for label, observed, state in zip(
-                           ("before", "opened", "selected-beta", "reopened", "dismissed"), observations, states)},
-                   "video": {"file": "overview-demo.mp4",
+        actions.update(video={"file": "overview-demo.mp4",
                              "sha256": contract.digest((artifact / "overview-demo.mp4").read_bytes()),
                              "raw_sha256": contract.digest((artifact / "overview-demo.raw.mp4").read_bytes())},
-                   "derivative": {"file": "overview-demo.gif",
-                                  "sha256": contract.digest((artifact / "overview-demo.gif").read_bytes()),
-                                  "input_sha256": contract.digest((artifact / "overview-demo.mp4").read_bytes()),
-                                  "fps": 8, "size": [640, 400]}}
+                       derivative={"file": "overview-demo.gif",
+                                   "sha256": contract.digest((artifact / "overview-demo.gif").read_bytes()),
+                                   "input_sha256": contract.digest((artifact / "overview-demo.mp4").read_bytes()),
+                                   "fps": 8, "size": [640, 400]})
         put_json(artifact / "overview-demo-actions.json", actions)
         (artifact / "assertions.txt").write_text("".join(
             "C-README-" + name + " pass actual parser test fixture\n"
@@ -210,6 +287,26 @@ class MediaIntake(unittest.TestCase):
         self.assertIn("CURRENT gtk-walkthrough", result.stdout)
         self.assertIn("environment nested-gtk", result.stdout)
         self.assertFalse((self.dest / "docs/walkthrough/tuna-tour.webm").exists())
+
+    def test_rehashed_canonical_pixels_and_embedded_evidence_cannot_forge_uploaded_source(self):
+        self.assertEqual(self.intake(self.gtk).returncode, 0)
+        path = self.dest / contract.manifest_name("gtk-walkthrough")
+        document = json.loads(path.read_bytes())
+        entry = document["receipt"]["files"][0]
+        forged = png("valid but never uploaded by this producer")
+        (self.dest / entry["destination"]).write_bytes(forged)
+        entry.update(sha256=contract.digest(forged), bytes=len(forged))
+        capture = json.loads(base64.b64decode(document["evidence"]["capture_receipt"]))
+        capture["files"][entry["source"]] = {"sha256": entry["sha256"], "bytes": entry["bytes"]}
+        blob = json.dumps(capture).encode()
+        document["evidence"]["capture_receipt"] = base64.b64encode(blob).decode()
+        document["receipt"]["capture_receipt"]["sha256"] = contract.digest(blob)
+        put_json(path, document)
+        result = command("tuna-docs-shots", "freshness", "--bundle", "gtk-walkthrough", *PINS,
+                         "--dest", self.dest, "--source-artifact", self.gtk)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("authenticated source artifact differs", result.stderr)
+        self.assertNotIn("CURRENT", result.stdout)
 
     def test_bad_bundle_prevents_all_writes(self):
         (self.vm / "tour/T-lock.png").write_bytes(b"not an image")
@@ -287,6 +384,44 @@ class MediaIntake(unittest.TestCase):
         put_json(path, value)
         self.mutate_receipt(self.vm, lambda r: r["capture_timing"].update(sha256=contract.digest(path.read_bytes())))
         self.assertEqual(self.intake(self.vm).returncode, 1)
+
+    def test_named_stills_without_positive_public_capture_proof_are_rejected(self):
+        path = self.vm / "tour/capture-timing.json"
+        original = path.read_bytes()
+        for change in (
+                lambda r: r.pop("still_confirmations"),
+                lambda r: r["still_confirmations"]["lock"]["evidence"]["before"]["observation"].update(controls=[]),
+                lambda r: r["still_confirmations"]["calendar"]["evidence"]["after"]["observation"]["principal"].update(pid=999),
+                lambda r: r["still_confirmations"]["app-grid"].update(capture_completed_monotonic_ns=999999)):
+            with self.subTest(change=change):
+                value = json.loads(original)
+                change(value)
+                put_json(path, value)
+                self.mutate_receipt(self.vm, lambda r: r["capture_timing"].update(sha256=contract.digest(path.read_bytes())))
+                result = self.intake(self.vm)
+                self.assertEqual(result.returncode, 1)
+                self.assertFalse(self.dest.exists())
+
+    def test_rehashed_confirmed_tag_cannot_replace_exact_public_framebuffer_view(self):
+        path = self.vm / "tour/T-alt-tab.png"
+        wrong = native_fixture_png("not-a-switcher")
+        path.write_bytes(wrong)
+        checksum = contract.digest(wrong)
+        timing_path = self.vm / "tour/capture-timing.json"
+        timing = json.loads(timing_path.read_bytes())
+        confirmation = timing["still_confirmations"]["alt-tab"]
+        confirmation["png_sha256"] = checksum
+        timing["frames"][confirmation["frame_index"]]["sha256"] = checksum
+        put_json(timing_path, timing)
+        def forge(receipt):
+            receipt["capture_timing"]["sha256"] = contract.digest(timing_path.read_bytes())
+            entry = next(row for row in receipt["files"] if row["source"] == "tour/T-alt-tab.png")
+            entry.update(sha256=checksum, bytes=len(wrong), probe=contract.media(path))
+        self.mutate_receipt(self.vm, forge)
+        result = self.intake(self.vm)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("wrong public view", result.stderr)
+        self.assertFalse(self.dest.exists())
 
     def test_nested_frames_cannot_claim_vm_or_native_environment(self):
         self.mutate_receipt(self.gtk, lambda r: r["producer"].update(environment="installed-vm"))
@@ -390,6 +525,9 @@ class MediaIntake(unittest.TestCase):
             lambda r: r["derivative"].update(input_sha256="f" * 64),
             lambda r: r["events"][1].update(argv=["key", "Escape"]),
             lambda r: r.update(complete=False),
+            lambda r: r.pop("recording"),
+            lambda r: r["recording"].pop("ready_ack"),
+            lambda r: r["recording"]["ready_ack"].update(host_monotonic_ns=0),
             lambda r: r["events"][0].update(begin=99.),
         )
         for mutate in mutations:

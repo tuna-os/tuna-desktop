@@ -75,6 +75,8 @@ guest_agent = importlib.util.module_from_spec(_guest_spec)
 _guest_loader.exec_module(guest_agent)
 import soak_report  # noqa: E402  (scripts/lib, on sys.path above)
 import fresh_accounts  # noqa: E402  (scripts/lib, on sys.path above)
+from tour_media import (TOUR_PUBLIC_CONTROLS, desktop_shown, grey_share,
+                        overview_windows_shown, switcher_shown, tour_public_view)
 
 WIDTH, HEIGHT = baseline.WIDTH, baseline.HEIGHT
 DRM_RE = re.compile(r"tuna-compositor: drm: output (\S+) (\d+)x(\d+)")
@@ -3204,42 +3206,6 @@ def gdm_login(qmp, agent_path, out, record, *, reference_profile=None):
         agent.close()
 
 
-def grey_share(px, rect, step=6):
-    """Share of sampled pixels in rect (WIDTH x HEIGHT RGB bytes) that are
-    the shell's dark neutral grey; the Marlin wallpaper's dark areas are
-    saturated navy, and windows are light, so neither counts."""
-    x0, y0, x1, y1 = rect
-    total = grey = 0
-    for y in range(y0, y1, step):
-        for x in range(x0, x1, step):
-            i = (y * WIDTH + x) * 3
-            r, g, b = px[i], px[i + 1], px[i + 2]
-            total += 1
-            grey += max(r, g, b) - min(r, g, b) < 14 and 45 < r + g + b < 225
-    return grey / total if total else 0.0
-
-
-# Calibrated on Marlin VM frames (runs 37937493915, 38878636595 and
-# 38887426688): the overview backdrop fills the bottom-left corner, where
-# the desktop shows wallpaper; window previews keep the centre off-grey,
-# unlike the search and app-grid views. The Alt+Tab popup is a dark grey
-# island whose top and bottom padding span a full row over the windows.
-CORNER, CENTRE = (0, 690, 170, 780), (340, 250, 940, 550)
-
-
-def overview_windows_shown(px):
-    return grey_share(px, CORNER) > 0.85 and grey_share(px, CENTRE) < 0.5
-
-
-def switcher_shown(px):
-    return (grey_share(px, CORNER) < 0.2 and grey_share(px, CENTRE) < 0.6
-            and any(grey_share(px, (380, y, 900, y + 1), step=4) >= 0.9
-                    for y in range(280, 520, 2)))
-
-
-def desktop_shown(px):
-    return grey_share(px, CORNER) < 0.2 and not switcher_shown(px)
-
 
 def ppm_pixels(path):
     """RGB bytes of a binary WIDTH x HEIGHT PPM, or None while incomplete."""
@@ -3251,55 +3217,6 @@ def ppm_pixels(path):
     return data[len(header):]
 
 
-TOUR_PUBLIC_CONTROLS = {
-    "app-grid": {("frame", "App Grid")},
-    "quick-settings": {("slider", "Volume"), ("push button", "Settings"), ("push button", "Lock")},
-    "calendar": {("push button", "Previous month"), ("push button", "Next month"),
-                 ("push button", "Open Calendar")},
-    "lock": {("frame", "Lock Screen")},
-}
-
-
-def tour_public_view(card, observation):
-    """Positive visible public controls, not a requested tag or private state."""
-    if (type(observation) is not dict or observation.get("schema") != 1
-            or observation.get("method") != "public-at-spi"):
-        return False
-    session, principal, atspi = (observation.get(key) for key in ("session", "principal", "atspi"))
-    if not all(type(value) is dict for value in (session, principal, atspi)):
-        return False
-    if (any(type(principal.get(key)) is not int or principal[key] <= 0
-            for key in ("pid", "uid", "start_ticks"))
-            or principal.get("executable") != "/usr/bin/tuna-shell-gtk"
-            or type(principal.get("display")) is not str or not principal["display"]
-            or type(session.get("Id")) is not str or not session["Id"]
-            or principal.get("session_id") != session["Id"]
-            or session.get("User") != str(principal["uid"])
-            or session.get("Type") != "wayland" or session.get("Class") != "user"
-            or session.get("Service") != "gdm-password"
-            or type(session.get("VTNr")) is not str or not session["VTNr"].isdigit()
-            or int(session["VTNr"]) <= 0
-            or type(atspi.get("owner")) is not str or re.fullmatch(r":\d+\.\d+", atspi["owner"]) is None
-            or atspi.get("bus_pid") != principal["pid"] or atspi.get("bus_uid") != principal["uid"]):
-        return False
-    started, completed = (observation.get(key) for key in
-                          ("started_monotonic_ns", "completed_monotonic_ns"))
-    if type(started) is not int or type(completed) is not int or not 0 < started <= completed:
-        return False
-    controls = observation.get("controls")
-    if type(controls) is not list:
-        return False
-    found = set()
-    for node in controls:
-        if type(node) is not dict or node.get("showing") is not True or node.get("visible") is not True:
-            continue
-        rect = node.get("extents")
-        if (type(rect) is not list or len(rect) != 4 or any(type(value) is not int for value in rect)):
-            continue
-        x, y, width, height = rect
-        if width > 0 and height > 0 and x < WIDTH and y < HEIGHT and x + width > 0 and y + height > 0:
-            found.add((node.get("role"), node.get("label")))
-    return card in TOUR_PUBLIC_CONTROLS and TOUR_PUBLIC_CONTROLS[card] <= found
 
 
 class Recorder:

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Promote only successful trusted main-CI media through an ordinary pull request."""
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -10,10 +11,11 @@ import stat
 import subprocess
 import sys
 import zipfile
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts/lib'))
-from maintained_media import inventory, manifest_name, required_source_inputs
+from maintained_media import inventory, inventory_rows, manifest_name, required_source_inputs
 
 REPOSITORY = 'tuna-os/tuna-desktop'
 MAX_ARCHIVE = 512 * 1024 * 1024
@@ -81,37 +83,142 @@ def latest_is(head):
             'STALE: newer main exists; no older capture may overwrite or claim current media')
 
 
+def generated_paths(mapping):
+    paths = {destination for rows in mapping.values() for _, destination in rows}
+    return paths | {manifest_name(kind) for kind in mapping}
+
+
+def download_artifacts(run_id, attempt, output, mapping):
+    """Authenticate exact GitHub-uploaded bytes before admitting any media."""
+    artifacts, page = [], 1
+    while True:
+        result = api('actions/runs/%d/artifacts?per_page=100&page=%d' % (run_id, page))
+        artifacts.extend(result['artifacts'])
+        require(len(artifacts) <= 1000, 'artifact listing bound')
+        if len(artifacts) >= result['total_count']:
+            break
+        require(bool(result['artifacts']), 'incomplete artifact listing')
+        page += 1
+    roots, artifact_receipts = {}, {}
+    sources = {
+        'gtk-shell': ({name for name, _ in mapping['gtk-walkthrough']}
+                      | {'assertions.txt', 'media-source.json', 'media-capture.json', 'media-receipt.json'}),
+        'marlin-vm': {'manifest.json', 'repeat-manifest.json', 'strip-image.json', 'media-source.json',
+                      'media-receipt.json', 'native-base/index.json', 'native-base/platform-cosign.json'},
+        'tuna-tour': ({name.removeprefix('tour/') for name, _ in mapping['vm-tour']}
+                      | {'tuna-tour.webm', 'capture-timing.json'}),
+        'overview-demo': ({name for name, _ in mapping['overview-demo']}
+                          | {'overview-demo.raw.mp4', 'overview-demo-actions.json', 'assertions.txt',
+                             'media-source.json', 'media-receipt.json'}),
+    }
+    for name, allowlist in sources.items():
+        members = [row for row in artifacts if row.get('name') == name and not row.get('expired')]
+        require(len(members) == 1, 'missing or ambiguous exact-run artifact: ' + name)
+        member = members[0]
+        require(member.get('workflow_run', {}).get('id') == run_id
+                and 0 < member.get('size_in_bytes', 0) <= MAX_ARCHIVE,
+                'artifact run identity/size mismatch')
+        expected_digest = member.get('digest', '')
+        require(re.fullmatch('sha256:[0-9a-f]{64}', expected_digest), 'artifact lacks actual upload digest')
+        artifact_receipts[name] = {'id': member['id'], 'digest': expected_digest,
+                                  'run_id': run_id, 'run_attempt': attempt}
+        archive = output / (name + '.zip')
+        with archive.open('xb') as stream:
+            subprocess.run(['gh', 'api', 'repos/' + REPOSITORY + '/actions/artifacts/%d/zip' % member['id']],
+                           cwd=ROOT, stdout=stream, check=True, timeout=180)
+        require(archive.stat().st_size <= MAX_ARCHIVE, 'actual archive exceeds bound')
+        hasher = hashlib.sha256()
+        with archive.open('rb') as stream:
+            while chunk := stream.read(1024 * 1024):
+                hasher.update(chunk)
+        require('sha256:' + hasher.hexdigest() == expected_digest, 'actual archive differs from upload digest')
+        target = output / name
+        extract_selected(archive, target, allowlist)
+        roots[name] = target
+    roots['tuna-tour'].rename(roots['marlin-vm'] / 'tour')
+    return roots, artifact_receipts
+
+
+def authenticated_freshness(roots, pins):
+    subprocess.run([sys.executable, str(ROOT / 'scripts/lib/maintained_media.py'),
+                    'freshness', *pins,
+                    *[item for name in ('gtk-shell', 'marlin-vm', 'overview-demo')
+                      for item in ('--source-artifact', str(roots[name]))]],
+                   cwd=ROOT, check=True, timeout=600)
+
+
 def verify_canonical():
     mapping = inventory()
-    receipts = [json.loads((ROOT / manifest_name(kind)).read_bytes())['receipt']
-                for kind in ('gtk-walkthrough', 'vm-tour', 'overview-demo')]
+    documents = [json.loads((ROOT / manifest_name(kind)).read_bytes())
+                 for kind in ('gtk-walkthrough', 'vm-tour', 'overview-demo')]
+    receipts = [document['receipt'] for document in documents]
     original = receipts[0]
     source, run = original['source'], original['run']
     require(all(row['source']['built_commit'] == source['built_commit']
                 and row['source']['built_tree'] == source['built_tree'] and row['run'] == run
                 for row in receipts), 'mixed canonical media capture identities')
     workflow = api('actions/workflows/ci.yml')
+    require(workflow.get('path') == '.github/workflows/ci.yml' and workflow.get('name') == 'ci',
+            'unexpected source workflow identity')
     inspect_run(api('actions/runs/' + run['id']), workflow['id'], int(run['id']),
                 int(run['attempt']), source['built_commit'])
     latest = api('git/ref/heads/main')['object']['sha']
     command('git', 'fetch', '--no-tags', 'origin', latest)
-    generated = {destination for rows in mapping.values() for _, destination in rows}
-    generated.update(manifest_name(kind) for kind in mapping)
-    drift = set(command('git', 'diff', '--name-only', source['built_commit'], latest).splitlines())
-    require(drift <= generated, 'STALE: canonical media source differs from actual current main inputs')
+    drift = set(filter(None, command('git', 'diff', '--name-only', '-z',
+                                    source['built_commit'], latest).split('\0')))
+    require(drift <= generated_paths(mapping), 'STALE: canonical media source differs from actual current main inputs')
+    require(command('git', 'rev-parse', source['built_commit'] + '^{tree}') == source['built_tree'],
+            'canonical source tree is not the actual captured Git commit tree')
     image = next(row['image'] for row in receipts if row['bundle'] == 'vm-tour')
     pins = ['--run-id', run['id'], '--attempt', run['attempt'],
             '--expect-merge', source['merged_commit'], '--expect-head', source['built_commit'],
             '--expect-tree', source['built_tree'], '--expect-source-inputs', required_source_inputs(ROOT),
             '--expect-image', image['id'], '--expect-package', image['package_sha256']]
-    bundles = [item for row in receipts for item in ('--bundle', row['bundle'])]
-    subprocess.run([sys.executable, str(ROOT / 'scripts/lib/maintained_media.py'),
-                    'freshness', *bundles, *pins], cwd=ROOT, check=True, timeout=600)
+    pins += [item for row in receipts for item in ('--bundle', row['bundle'])]
+    # PR-local manifests may name a genuine run while forging all local hashes.
+    # Independently retrieve and replay that run's authenticated original bytes.
+    with tempfile.TemporaryDirectory(prefix='tuna-media-verify-') as directory:
+        roots, _ = download_artifacts(int(run['id']), int(run['attempt']), Path(directory), mapping)
+        authenticated_freshness(roots, pins)
+    return documents
+
+
+def same_native_product(image, documents):
+    document = next(row for row in documents if row['receipt']['bundle'] == 'vm-tour')
+    original = json.loads(base64.b64decode(document['evidence']['image_receipt'], validate=True))
+    # Build/archive timestamps can change image/package IDs after a media-only
+    # commit. Never relabel them: reuse only the authenticated original capture
+    # when its immutable base and every original installed member still agree.
+    return (original['base_image'] == image['base_image']
+            and original['member_sha256'] == image['member_sha256'])
+
+
+def canonical_changes(base):
+    require(re.fullmatch('[0-9a-f]{40}', base or ''), 'exact canonical comparison base required')
+    protected = generated_paths(inventory())
+    inventory_path = 'scripts/lib/maintained-media.tsv'
+    if command('git', 'ls-tree', '--name-only', base, '--', inventory_path):
+        protected |= generated_paths(inventory_rows(command('git', 'show', base + ':' + inventory_path)))
+    changed = set(filter(None, command('git', 'diff', '--name-only', '-z', base + '...HEAD').split('\0')))
+    return changed & protected
+
+
+def verify_if_changed(base):
+    if not base:
+        base = api('git/ref/heads/main')['object']['sha']
+        command('git', 'fetch', '--no-tags', 'origin', base)
+    changed = canonical_changes(base)
+    if changed:
+        verify_canonical()
+    return bool(changed)
 
 
 def main():
     if sys.argv[1:] == ['--verify-canonical']:
         verify_canonical()
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == '--verify-if-changed':
+        verify_if_changed(sys.argv[2])
         return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-id', required=True, type=int)
@@ -137,54 +244,7 @@ def main():
     latest_is(args.source_sha)
     args.output.mkdir(parents=True, mode=0o700)
     mapping = inventory()
-    artifacts, page = [], 1
-    while True:
-        result = api('actions/runs/%d/artifacts?per_page=100&page=%d' % (args.run_id, page))
-        artifacts.extend(result['artifacts'])
-        require(len(artifacts) <= 1000, 'artifact listing bound')
-        if len(artifacts) >= result['total_count']:
-            break
-        require(bool(result['artifacts']), 'incomplete artifact listing')
-        page += 1
-    roots, artifact_receipts = {}, {}
-    sources = {
-        'gtk-shell': ({name for name, _ in mapping['gtk-walkthrough']}
-                      | {'assertions.txt', 'media-source.json', 'media-capture.json', 'media-receipt.json'}),
-        'marlin-vm': {'manifest.json', 'repeat-manifest.json', 'strip-image.json', 'media-source.json',
-                      'media-receipt.json', 'native-base/index.json', 'native-base/platform-cosign.json'},
-        'tuna-tour': ({name.removeprefix('tour/') for name, _ in mapping['vm-tour']}
-                      | {'tuna-tour.webm', 'capture-timing.json'}),
-        'overview-demo': ({name for name, _ in mapping['overview-demo']}
-                          | {'overview-demo.raw.mp4', 'overview-demo-actions.json', 'assertions.txt',
-                             'media-source.json', 'media-receipt.json'}),
-    }
-    for name, allowlist in sources.items():
-        members = [row for row in artifacts if row.get('name') == name and not row.get('expired')]
-        require(len(members) == 1, 'missing or ambiguous exact-run artifact: ' + name)
-        member = members[0]
-        require(member.get('workflow_run', {}).get('id') == args.run_id
-                and 0 < member.get('size_in_bytes', 0) <= MAX_ARCHIVE,
-                'artifact run identity/size mismatch')
-        expected_digest = member.get('digest', '')
-        require(re.fullmatch('sha256:[0-9a-f]{64}', expected_digest), 'artifact lacks actual upload digest')
-        artifact_receipts[name] = {'id': member['id'], 'digest': expected_digest,
-                                  'run_id': args.run_id, 'run_attempt': args.attempt}
-        archive = args.output / (name + '.zip')
-        with archive.open('xb') as output:
-            subprocess.run(['gh', 'api', 'repos/' + REPOSITORY + '/actions/artifacts/%d/zip' % member['id']],
-                           cwd=ROOT, stdout=output, check=True, timeout=180)
-        require(archive.stat().st_size <= MAX_ARCHIVE, 'actual archive exceeds bound')
-        hasher = hashlib.sha256()
-        with archive.open('rb') as stream:
-            while chunk := stream.read(1024 * 1024):
-                hasher.update(chunk)
-        require('sha256:' + hasher.hexdigest() == expected_digest, 'actual archive differs from upload digest')
-        target = args.output / name
-        extract_selected(archive, target, allowlist)
-        roots[name] = target
-    # The tour is a separate existing artifact; keep its producer-relative root.
-    tour = roots['marlin-vm'] / 'tour'
-    roots['tuna-tour'].rename(tour)
+    roots, artifact_receipts = download_artifacts(args.run_id, args.attempt, args.output, mapping)
     image = json.loads((roots['marlin-vm'] / 'strip-image.json').read_bytes())
     source_inputs = required_source_inputs(ROOT)
     pins = ['--run-id', str(args.run_id), '--attempt', str(args.attempt),
@@ -194,21 +254,26 @@ def main():
             '--expect-image', image['image_id'], '--expect-package', image['package_sha256']]
     bundles = [item for kind in ('gtk-walkthrough', 'vm-tour', 'overview-demo') for item in ('--bundle', kind)]
     cli = [sys.executable, str(ROOT / 'scripts/lib/maintained_media.py')]
+    generated = generated_paths(mapping)
+    changed_source = set(filter(None, command('git', 'diff-tree', '--no-commit-id', '--name-only',
+                                             '-z', '-r', 'HEAD^', 'HEAD').split('\0')))
+    media_only = bool(changed_source) and changed_source <= generated
+    # Suppress recursion only for already authenticated committed canonical
+    # bytes, before intake can replace them with this run's new captures.
+    if media_only:
+        media_only = same_native_product(image, verify_canonical())
     latest_is(args.source_sha)
-    subprocess.run([*cli, 'intake', str(roots['gtk-shell']), str(roots['marlin-vm']),
-                    str(roots['overview-demo']), *bundles, *pins], cwd=ROOT, check=True, timeout=600)
-    subprocess.run([*cli, 'freshness', *bundles, *pins], cwd=ROOT, check=True, timeout=600)
-    generated = {destination for rows in mapping.values() for _, destination in rows}
-    generated.update(manifest_name(kind) for kind in mapping)
-    changed_source = set(command('git', 'diff-tree', '--no-commit-id', '--name-only', '-r',
-                                 'HEAD^', 'HEAD').splitlines())
+    if not media_only:
+        subprocess.run([*cli, 'intake', str(roots['gtk-shell']), str(roots['marlin-vm']),
+                        str(roots['overview-demo']), *bundles, *pins], cwd=ROOT, check=True, timeout=600)
+        authenticated_freshness(roots, [*bundles, *pins])
     result = {'run_id': args.run_id, 'run_attempt': args.attempt, 'source_commit': args.source_sha,
               'source_inputs_sha256': source_inputs, 'image_id': image['image_id'],
               'package_sha256': image['package_sha256'], 'canonical_paths': sorted(generated),
               'artifacts': artifact_receipts,
               'historical_receipts_overwritten': False, 'installed_signed_release_qualified': False,
               'status': 'validated-current-run-media; not yet normal-merged canonical media'}
-    if changed_source and changed_source <= generated:
+    if media_only:
         result['status'] = ('validated-current-run-media; generated-media-only source evolution; '
                             'no recursive media PR and no manufactured latest-source/image equivalence')
     elif args.create_pr:

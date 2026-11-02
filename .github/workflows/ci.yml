@@ -133,14 +133,15 @@ jobs:
       - run: python3 scripts/tests/test_vm_reference_login.py
       - run: python3 scripts/tests/test_gnome_reference_guest.py
       - run: python3 scripts/tests/test_native_switcher_reference.py
+      - run: python3 scripts/tests/test_overview_recording.py
       - run: python3 scripts/lib/maintained-media-tests.py
       - run: python3 scripts/lib/tuna-walkthrough-freshness-tests.py
       - run: python3 scripts/tests/test_maintained_media_refresh.py
       - name: Reject stale proposed canonical media against actual main source inputs
-        if: startsWith(github.head_ref || github.ref_name, 'automation/maintained-media-')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/tuna-maintained-media-refresh --verify-canonical
+          MEDIA_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 scripts/tuna-maintained-media-refresh --verify-if-changed "$MEDIA_BASE_SHA"
       - run: python3 scripts/tests/test_disk_guard.py
       - run: python3 scripts/tests/test_vm_strip_acceptance.py
       - run: python3 scripts/tests/test_vm_strip_fixture_owner.py

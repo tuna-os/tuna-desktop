@@ -34,8 +34,8 @@ class RealRecordingTests(unittest.TestCase):
         cls.raw = cls.root / 'overview-demo.raw.mp4'
         cls.origin = time.monotonic_ns()
         argv = recording.recording_command(cls.raw, [
-            '-re', '-use_wallclock_as_timestamps', '1', '-f', 'lavfi', '-i',
-            'testsrc2=size=32x32:rate=15:duration=12'])
+            '-use_wallclock_as_timestamps', '1', '-f', 'lavfi', '-i',
+            'testsrc2=size=32x32:rate=15:duration=12,realtime,settb=AVTB'])
         recorder = recording.FrameRecorder(argv, cls.raw, cls.root / 'ffmpeg.log')
         cls.addClassCleanup(recorder.stop)
         original_pid = recorder.process.pid
