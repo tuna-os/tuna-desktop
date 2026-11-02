@@ -1306,7 +1306,10 @@ fn wire_display_error(events: &[u8]) -> Option<(u32, u32, String)> {
         let object = word(offset);
         let header = word(offset + 4);
         let length = (header >> 16) as usize;
-        assert!(length >= 8 && length % 4 == 0, "invalid Wayland frame size");
+        assert!(
+            length >= 8 && length.is_multiple_of(4),
+            "invalid Wayland frame size"
+        );
         if length > events.len() - offset {
             return None;
         }
@@ -2194,8 +2197,10 @@ fn toplevel_drag_foreign_source_and_toplevel_ids_are_client_local() {
         let mut body = vec![global, len];
         body.extend(
             bytes
-                .chunks_exact(4)
-                .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap())),
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&chunk| u32::from_ne_bytes(chunk)),
         );
         body.extend([version, id]);
         request(stream, 2, 0, &body);

@@ -49,8 +49,10 @@ impl Dispatch<XdgToplevel, ()> for Client {
                     width,
                     height,
                     states: states
-                        .chunks_exact(4)
-                        .map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap()))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|&bytes| u32::from_ne_bytes(bytes))
                         .collect(),
                 });
         }
