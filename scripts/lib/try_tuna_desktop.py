@@ -201,8 +201,14 @@ def atomic_json(path, value):
 
 
 def trusted_environment():
+    # Keep listener authentication intact; local backend/plugin discovery must
+    # not replace the explicit owned-QEMU target or artifact trust policy.
     return {key: value for key, value in os.environ.items()
-            if not key.startswith(("COSIGN_", "SIGSTORE_", "CORRAL_", "LD_", "DYLD_"))
+            if not key.startswith(("COSIGN_", "SIGSTORE_", "LD_", "DYLD_"))
+            and key not in ("CORRAL_DEFAULT_BACKEND", "CORRAL_KUBE_CONTEXT",
+                            "CORRAL_INCUS_REMOTE", "CORRAL_LIBVIRT_URI", "CORRAL_CT_BACKEND",
+                            "CORRAL_FIRMWARE_DEFAULT", "CORRAL_TAILNET_EXPOSE", "CORRAL_TAILNET_TAGS",
+                            "CORRAL_PLUGIN_DIR", "CORRAL_MARKETPLACE_URL", "CORRAL_MARKETPLACE_URLS")
             and key not in ("SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
             and key not in PROOF_DEBUG_KEYS}
 

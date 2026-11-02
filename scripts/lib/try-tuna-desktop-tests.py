@@ -532,15 +532,28 @@ class PlatformAndTrustTests(unittest.TestCase):
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                 launcher.validate_runtime(dict(runtime, **{key: value}), "amd64", "linux-amd64")
 
-    def test_verifier_and_corral_trust_overrides_are_removed(self):
+    def test_trust_overrides_do_not_disable_listener_authentication(self):
         untrusted = {"COSIGN_REPOSITORY": "attacker", "COSIGN_EXPERIMENTAL": "1", "SIGSTORE_ROOT_FILE": "/evil/root",
-                     "CORRAL_BACKEND": "remote", "CORRAL_CONTEXT": "foreign", "LD_PRELOAD": "/evil/library",
-                     "DYLD_INSERT_LIBRARIES": "/evil/library", "SSL_CERT_FILE": "/evil/ca", "SSL_CERT_DIR": "/evil/cas",
+                     "CORRAL_DEFAULT_BACKEND": "kubevirt", "CORRAL_KUBE_CONTEXT": "foreign",
+                     "CORRAL_INCUS_REMOTE": "foreign", "CORRAL_LIBVIRT_URI": "qemu+ssh://foreign/system",
+                     "CORRAL_CT_BACKEND": "incus", "CORRAL_FIRMWARE_DEFAULT": "bios",
+                     "CORRAL_TAILNET_EXPOSE": "true", "CORRAL_TAILNET_TAGS": "tag:foreign",
+                     "CORRAL_PLUGIN_DIR": "/evil/plugins", "CORRAL_MARKETPLACE_URL": "https://evil.invalid",
+                     "CORRAL_MARKETPLACE_URLS": "https://evil.invalid/index.json",
+                     "LD_PRELOAD": "/evil/library", "DYLD_INSERT_LIBRARIES": "/evil/library",
+                     "SSL_CERT_FILE": "/evil/ca", "SSL_CERT_DIR": "/evil/cas",
                      "REQUESTS_CA_BUNDLE": "/evil/ca", "CURL_CA_BUNDLE": "/evil/ca", "WAYLAND_DEBUG": "1",
                      "PWDEBUG": "1", "DEBUG": "pw:api"}
-        with mock.patch.dict(os.environ, dict(untrusted, HOME="/safe/home", PATH="/safe/bin", DISPLAY=":1"), clear=True):
-            self.assertEqual(launcher.trusted_environment(), {"HOME": "/safe/home", "PATH": "/safe/bin", "DISPLAY": ":1"})
+        preserved = {"HOME": "/safe/home", "PATH": "/safe/bin", "DISPLAY": ":1",
+                     "CORRAL_AUTH_REQUIRED": "true", "CORRAL_ADMINS": "admin@example.invalid",
+                     "CORRAL_PEER_TOKEN": "listener-policy-token", "CORRAL_AUTH_COOKIE_SECRET": "listener-policy-cookie",
+                     "CORRAL_OIDC_ISSUER": "https://identity.example.invalid",
+                     "CORRAL_URL": "https://corral.example.invalid", "CORRAL_TOKEN": "caller-policy-token",
+                     "CORRAL_PLUGIN_TOKEN": "caller-plugin-token"}
+        with mock.patch.dict(os.environ, dict(untrusted, **preserved), clear=True):
+            self.assertEqual(launcher.trusted_environment(), preserved)
             self.assertEqual(os.environ["SIGSTORE_ROOT_FILE"], "/evil/root")
+            self.assertEqual(os.environ["CORRAL_KUBE_CONTEXT"], "foreign")
 
 
 class ProcessAndConsoleTests(unittest.TestCase):

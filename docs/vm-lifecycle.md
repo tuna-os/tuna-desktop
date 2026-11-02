@@ -78,6 +78,13 @@ changes only where the same signed bytes are read; it does not replace
 identities, trust roots or descriptors, and is not a promise of network-free
 dependency bootstrap.
 
+Corral keeps its normal policy for listener authentication.
+The consumer preserves `CORRAL_AUTH_REQUIRED`, `CORRAL_ADMINS`,
+`CORRAL_PEER_TOKEN`. It also preserves Corral's ordinary settings for URLs and tokens.
+It never clears authentication to make a readiness report succeed.
+It excludes overrides for backend discovery and plugin acquisition, not
+Corral authentication. Each lifecycle command names QEMU and the exact owned VM.
+
 The existing public wrapper is not cut over until a real signed disk and
 manifest pass all four native firstboot/browser/lifecycle qualifications.
 Private helper code or fixture receipts alone do not establish that result.
