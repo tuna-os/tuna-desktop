@@ -192,11 +192,11 @@ impl PipeWire {
         session_id: u64,
         stream_id: u64,
         target: CastTarget,
-        width: i32,
-        height: i32,
+        size: (i32, i32),
         hdr_available: bool,
         signal: crate::mutter::CastSignals,
     ) -> Option<Cast> {
+        let (width, height) = size;
         let session_signal = signal.clone();
         let stream = StreamRc::new(
             self.core.clone(),

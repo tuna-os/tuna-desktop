@@ -286,6 +286,16 @@ Guest prerequisites use an authenticated immutable official archive snapshot.
 Kernel ABI admission compares generated `UTS_RELEASE`, packaged `kernel.release`
 and actual module vermagic with the running kernel, not the upstream Makefile's
 base version; source and native package receipts are retained on failure.
+
+The source `0854f3f0` immutable Noble component run loaded the real endpoint
+and passed XR30 flip, composed writeback/fence/all pixels, PQ metadata and
+eight-bit/non-PQ kernel rejection controls. Its production compositor then
+faulted in llvmpipe before supervised capture readiness on Mesa
+`25.2.8-0ubuntu0.24.04.4`; that failed userspace phase is neither HDR capture
+qualification nor a generic driver-capability verdict. The kernel receipt
+does not substitute for the still-required compositor pixel, capture and
+native virgl/source/image gates.
+
 [ADR 0008 item 5](adr/0008-v1-beta-track-and-release-scope.md) permits the v1 row
 to pass on actual named emulated-device evidence; physical HDR link quality,
 instrumented calibration accuracy and physical hotplug remain unqualified until

@@ -4369,8 +4369,7 @@ impl Runtime {
                     session_id,
                     stream_id,
                     target,
-                    width,
-                    height,
+                    (width, height),
                     hdr_available,
                     signal,
                 ) {
