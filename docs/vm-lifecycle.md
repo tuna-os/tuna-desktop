@@ -172,6 +172,8 @@ bytes, including the unique linux/amd64 membership. Supply that directory
 as `--reference-base-evidence`; copied JSON alone is not cryptographic
 verification. The published wheel-policy receipt identifies the image but
 does not itself contain a signature-verification result.
+CI acquires the pinned cosign binary through the existing Sigstore installer
+action; it does not assume Go is installed on the native runner.
 
 The fixed route
 `GuestAgent.run("gnome-reference", OP, JSON)` executes only

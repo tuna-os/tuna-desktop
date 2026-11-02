@@ -1344,11 +1344,14 @@ jobs:
           sudo mkdir -p /mnt/vm && sudo chown "$(id -u):$(id -g)" /mnt/vm
           df -h / /mnt
       - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core zstd
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: matrix.profile != 'lifecycle'
+        with:
+          cosign-release: v3.1.4
       - name: Verify the original paired reference base before building or booting
         if: matrix.profile != 'lifecycle'
         run: |
           sudo apt-get install -y --no-install-recommends skopeo
-          GOBIN="$RUNNER_TEMP/reference-bin" go install github.com/sigstore/cosign/v2/cmd/cosign@v2.6.5
           mkdir -p vm-lane-artifacts/reference-base
           index=ghcr.io/tuna-os/marlin@sha256:29097ba660d6f9f7c35c2063b83cf7bbe830202a497852b9b1869bb84dfd6aa5
           platform=ghcr.io/tuna-os/marlin@sha256:104870f1a05fa0a75649ee4ed9952027b29ab12e53af83931ae69e8636e44c3f
@@ -1365,7 +1368,7 @@ jobs:
           if len(members) != 1 or members[0]['digest'] != 'sha256:104870f1a05fa0a75649ee4ed9952027b29ab12e53af83931ae69e8636e44c3f':
               raise SystemExit('reference index does not uniquely own the admitted amd64 platform')
           PY
-          "$RUNNER_TEMP/reference-bin/cosign" verify "$platform" \
+          cosign verify "$platform" \
             --certificate-identity "https://github.com/tuna-os/tunaOS/.github/workflows/reusable-build-image.yml@refs/heads/main" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             > vm-lane-artifacts/reference-base/platform-cosign.json
