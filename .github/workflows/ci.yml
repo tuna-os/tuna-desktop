@@ -62,6 +62,9 @@ jobs:
     # Typically 10 min, slowest seen 16; a hung test must not hold a runner 6 h.
     timeout-minutes: 45
     runs-on: *runner-24
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -123,6 +126,14 @@ jobs:
       - run: python3 scripts/tests/test_vm_reference_login.py
       - run: python3 scripts/tests/test_gnome_reference_guest.py
       - run: python3 scripts/tests/test_native_switcher_reference.py
+      - run: python3 scripts/lib/maintained-media-tests.py
+      - run: python3 scripts/lib/tuna-walkthrough-freshness-tests.py
+      - run: python3 scripts/tests/test_maintained_media_refresh.py
+      - name: Reject stale proposed canonical media against actual main source inputs
+        if: startsWith(github.head_ref || github.ref_name, 'automation/maintained-media-')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/tuna-maintained-media-refresh --verify-canonical
       - run: python3 scripts/tests/test_disk_guard.py
       - run: python3 scripts/tests/test_vm_strip_acceptance.py
       - run: python3 scripts/tests/test_vm_strip_fixture_owner.py
@@ -976,6 +987,27 @@ jobs:
       # The feature walkthrough from this run's frames: every frame the
       # manifest names must still be taken, and the bundle is what a
       # docs refresh commits (scripts/tuna-walkthrough).
+      - name: Seal actual current-build walkthrough screenshots
+        run: |
+          scripts/tuna-docs-shots receipt gtk-shell-artifacts --bundle gtk-walkthrough --producer-exit-code 0 \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --expect-merge "$GITHUB_SHA" --expect-head "$(git rev-parse HEAD)" \
+            --expect-tree "$(git rev-parse 'HEAD^{tree}')" \
+            --expect-source-inputs "$(python3 scripts/lib/maintained_media.py source-inputs)"
+      - name: Record the maintained real three-window overview journey
+        run: |
+          scripts/tuna-capture --readme-overview --artifacts overview-demo
+          scripts/tuna-docs-shots receipt overview-demo --bundle overview-demo --producer-exit-code 0 \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --expect-merge "$GITHUB_SHA" --expect-head "$(git rev-parse HEAD)" \
+            --expect-tree "$(git rev-parse 'HEAD^{tree}')" \
+            --expect-source-inputs "$(python3 scripts/lib/maintained_media.py source-inputs)"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: overview-demo
+          path: overview-demo/
+          if-no-files-found: error
+          retention-days: 90
       - run: scripts/tuna-walkthrough build gtk-shell-artifacts --dest walkthrough
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -1330,11 +1362,13 @@ jobs:
           sudo mkdir -p /mnt/vm && sudo chown "$(id -u):$(id -g)" /mnt/vm
           df -h / /mnt
       - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core zstd
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.4
       - name: Verify the original paired reference base before building or booting
         if: matrix.profile != 'lifecycle'
         run: |
           sudo apt-get install -y --no-install-recommends skopeo
-          GOBIN="$RUNNER_TEMP/reference-bin" go install github.com/sigstore/cosign/v2/cmd/cosign@v2.6.5
           mkdir -p vm-lane-artifacts/reference-base
           index=ghcr.io/tuna-os/marlin@sha256:29097ba660d6f9f7c35c2063b83cf7bbe830202a497852b9b1869bb84dfd6aa5
           platform=ghcr.io/tuna-os/marlin@sha256:104870f1a05fa0a75649ee4ed9952027b29ab12e53af83931ae69e8636e44c3f
@@ -1351,7 +1385,7 @@ jobs:
           if len(members) != 1 or members[0]['digest'] != 'sha256:104870f1a05fa0a75649ee4ed9952027b29ab12e53af83931ae69e8636e44c3f':
               raise SystemExit('reference index does not uniquely own the admitted amd64 platform')
           PY
-          "$RUNNER_TEMP/reference-bin/cosign" verify "$platform" \
+          cosign verify "$platform" \
             --certificate-identity "https://github.com/tuna-os/tunaOS/.github/workflows/reusable-build-image.yml@refs/heads/main" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             > vm-lane-artifacts/reference-base/platform-cosign.json
@@ -1369,11 +1403,36 @@ jobs:
             -t localhost/marlin-tuna-vm:ci .
           printf '%s\n' sha256:104870f1a05fa0a75649ee4ed9952027b29ab12e53af83931ae69e8636e44c3f > /mnt/vm/base-digest
           sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}' > /mnt/vm/image-id
+      - name: Verify and pin the actual native media base index and platform
+        if: matrix.profile == 'lifecycle'
+        run: |
+          sudo apt-get install -y --no-install-recommends skopeo
+          mkdir -p vm-lane-artifacts/native-base
+          skopeo inspect --raw docker://ghcr.io/tuna-os/marlin:gnome > vm-lane-artifacts/native-base/index.json
+          python3 - <<'PY'
+          import hashlib, json, re
+          from pathlib import Path
+          raw = Path('vm-lane-artifacts/native-base/index.json').read_bytes()
+          entries = [row for row in json.loads(raw)['manifests']
+                     if row.get('platform', {}).get('os') == 'linux'
+                     and row.get('platform', {}).get('architecture') == 'amd64']
+          if len(entries) != 1 or not re.fullmatch(r'sha256:[0-9a-f]{64}', entries[0]['digest']):
+              raise SystemExit('native base index does not uniquely admit linux/amd64')
+          Path('/mnt/vm/base-index-digest').write_text('sha256:' + hashlib.sha256(raw).hexdigest() + '\n')
+          Path('/mnt/vm/base-digest').write_text(entries[0]['digest'] + '\n')
+          PY
+          platform="ghcr.io/tuna-os/marlin@$(cat /mnt/vm/base-digest)"
+          cosign verify "$platform" \
+            --certificate-identity "https://github.com/tuna-os/tunaOS/.github/workflows/reusable-build-image.yml@refs/heads/main" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            > vm-lane-artifacts/native-base/platform-cosign.json
+          sudo podman pull --platform linux/amd64 "$platform"
       - name: Build the Marlin Tuna Desktop image and the VM test layer
         if: matrix.profile == 'lifecycle'
         run: |
           cp arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst ./tuna.pkg.tar.zst
           sudo podman build -f packaging/marlin/Containerfile \
+            --build-arg "BASE_IMAGE=ghcr.io/tuna-os/marlin@$(cat /mnt/vm/base-digest)" \
             --build-arg TUNA_PKG=tuna.pkg.tar.zst \
             --build-arg "TUNA_PKG_SHA256=$(sha256sum tuna.pkg.tar.zst | cut -d' ' -f1)" \
             -t localhost/marlin-tuna-preview:ci .
@@ -1389,7 +1448,6 @@ jobs:
             sudo podman rm "$probe_container"
             sudo chown -R "$(id -u):$(id -g)" orca51-package-provenance
           fi
-          sudo podman image inspect ghcr.io/tuna-os/marlin:gnome --format '{{.Digest}}' | tee /mnt/vm/base-digest
           sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}' > /mnt/vm/image-id-observed
           scripts/tuna-vm-strip-image --canonical-image-id "$(cat /mnt/vm/image-id-observed)" | tee /mnt/vm/image-id
           mkdir -p vm-lane-artifacts/image-kernels
@@ -1450,6 +1508,16 @@ jobs:
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
           --meta "tuna_package=$(basename arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)"
           --meta "commit=${{ github.sha }}"
+      - name: Seal real native screenshots and video only after all five boots succeed
+        if: matrix.profile == 'lifecycle'
+        run: |
+          scripts/tuna-docs-shots receipt vm-lane-artifacts --bundle vm-tour --producer-exit-code 0 \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --expect-merge "$GITHUB_SHA" --expect-head "$(git rev-parse HEAD)" \
+            --expect-tree "$(git rev-parse 'HEAD^{tree}')" \
+            --expect-source-inputs "$(python3 scripts/lib/maintained_media.py source-inputs)" \
+            --expect-image "$(cat /mnt/vm/image-id)" \
+            --expect-package "$(sha256sum tuna.pkg.tar.zst | cut -d' ' -f1)"
       - name: Observe the actual paired native switcher member
         if: matrix.profile != 'lifecycle'
         env:

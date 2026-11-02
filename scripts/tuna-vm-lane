@@ -3945,6 +3945,39 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
     return (*result, agent_path) if guest_agent else result
 
 
+def native_media_source(out, image, owner):
+    """Bind real current-source tour media to its original admitted session."""
+    root = os.path.dirname(HERE)
+    from maintained_media import required_source_inputs
+    def git(*arguments):
+        return subprocess.check_output(["git", "-C", root, *arguments], text=True, timeout=5).strip()
+    head, tree = git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}")
+    if (head != image["commit"] or head != os.environ.get("GITHUB_SHA")
+            or not re.fullmatch("[0-9a-f]{40}", head) or not re.fullmatch("[0-9a-f]{40}", tree)
+            or git("diff", "HEAD", "--")):
+        raise RuntimeError("tour source/image differs from the actual clean workflow checkout")
+    run_id, attempt = os.environ.get("GITHUB_RUN_ID", ""), os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    if not all(re.fullmatch("[1-9][0-9]*", value) for value in (run_id, attempt)):
+        raise RuntimeError("actual workflow run and attempt required for maintained native media")
+    if (not isinstance(owner, dict) or owner.get("session_uid", 0) == 0
+            or owner.get("session", {}).get("Service") != LOGIN_SERVICE):
+        raise RuntimeError("maintained media requires the original admitted nonroot GDM session")
+    with open(os.path.join(out, "native-base", "index.json"), "rb") as stream:
+        index_bytes = stream.read()
+    members = [member for member in json.loads(index_bytes)["manifests"]
+               if member.get("platform", {}).get("os") == "linux"
+               and member.get("platform", {}).get("architecture") == "amd64"]
+    if len(members) != 1 or image["base_image"] != "ghcr.io/tuna-os/marlin:gnome@" + members[0]["digest"]:
+        raise RuntimeError("native media image does not match the actual original base index/platform")
+    base = {"index": "ghcr.io/tuna-os/marlin@sha256:" + hashlib.sha256(index_bytes).hexdigest(),
+            "platform": "ghcr.io/tuna-os/marlin@" + members[0]["digest"]}
+    with open(os.path.join(out, "media-source.json"), "x") as stream:
+        json.dump({"merged_commit": head, "built_commit": head, "built_tree": tree,
+                   "run_id": run_id, "run_attempt": attempt, "environment": "installed-vm",
+                   "tracked_source_clean": True, "original_session": owner, "base": base,
+                   "required_source_inputs_sha256": required_source_inputs(root)}, stream, indent=2)
+
+
 def run_wm_reference(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
     """Retain the genuine paired consumer's actual member receipt."""
     from vm_gnome_reference import run
@@ -4310,6 +4343,8 @@ def main():
                          a.soak_revision)
             if a.tour:
                 try:
+                    if strip_image is not None and os.environ.get("GITHUB_RUN_ID"):
+                        native_media_source(out, strip_image, owner)
                     older_guest = bool(owner and owner.get("state")) and predates_newer_snapshot(owner["state"])
                     tour_info = run_tour(qmp, out, serial_path, older_guest)
                     tour_serial_end = len(read_text(serial_path))

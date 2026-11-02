@@ -1,0 +1,62 @@
+name: maintained-media
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maintained-media-main
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    if: >-
+      github.repository == 'tuna-os/tuna-desktop' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.repository.full_name == 'tuna-os/tuna-desktop' &&
+      github.event.workflow_run.head_repository.full_name == 'tuna-os/tuna-desktop'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      # The repository token's PR does not recursively emit pull_request CI.
+      # Dispatch the existing full CI for the exact proposed media head.
+      actions: write
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install real media inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg python3-pil
+      - name: Validate exact successful main artifacts and request ordinary media intake
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          SOURCE_HEAD: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          python3 scripts/tuna-maintained-media-refresh \
+            --run-id "$SOURCE_RUN_ID" --attempt "$SOURCE_RUN_ATTEMPT" \
+            --source-sha "$SOURCE_HEAD" --output "$RUNNER_TEMP/maintained-refresh" \
+            --create-pr
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: maintained-media-intake-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          path: |
+            ${{ runner.temp }}/maintained-refresh/refresh-result.json
+            docs/walkthrough/media-manifests/
+          if-no-files-found: warn
+          retention-days: 90
