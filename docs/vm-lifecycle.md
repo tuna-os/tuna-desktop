@@ -696,6 +696,17 @@ signature-verification result.
 CI acquires the pinned cosign binary through the existing Sigstore installer
 action; it does not assume Go is installed on the native runner.
 
+The ordinary platform path uses the same verifier via
+`scripts/lib/vm_gnome_reference.py verify-platform --platform-digest sha256:… --out DIR`:
+it retains the two platform files for the supplied strict digest in
+`ghcr.io/tuna-os/marlin`, with one actual verification invocation and the same
+certificate policy. The shared `validate_platform_verification` consumer binds
+that modern envelope to its process witness without imposing the stock index.
+In contrast, `verify-base --out DIR` and `validate_base_bytes` remain strict
+stock-reference operations: they additionally require exact index29097 bytes
+and unique platform104870 linux/amd64 membership. A different ordinary platform
+witness cannot qualify the paired stock reference.
+
 The fixed route
 `GuestAgent.run("gnome-reference", OP, JSON)` executes only
 `/usr/libexec/tuna-vm-gnome-reference OP JSON`; `OP` is one of `admit`,

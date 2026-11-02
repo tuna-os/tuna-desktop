@@ -724,20 +724,24 @@ def validate_provenance(value):
             'missing actual source/test-image identity')
 
 
-def cosign_argv(executable):
-    return [executable, 'verify', BASE_REPOSITORY + '@' + PINNED_PLATFORM,
+def cosign_argv(executable, platform_digest):
+    require(isinstance(platform_digest, str) and re.fullmatch(r'sha256:[0-9a-f]{64}', platform_digest) is not None,
+            'platform digest must be strict sha256 lowercase hex')
+    return [executable, 'verify', BASE_REPOSITORY + '@' + platform_digest,
             '--certificate-identity', CERTIFICATE_SUBJECT,
             '--certificate-oidc-issuer', CERTIFICATE_ISSUER, '--output', 'json']
 
 
-def verify_base_image(directory):
-    """Retain actual cryptographic process evidence, not invented certificate claims."""
+def verify_platform_image(directory, platform_digest):
+    """Retain one actual platform verification, not invented certificate claims."""
+    cosign_argv('cosign', platform_digest)
     directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
     executable = shutil.which('cosign')
     require(executable is not None, 'pinned native cosign executable unavailable')
     executable = str(Path(executable).resolve(strict=True))
     version = subprocess.check_output([executable, 'version'], timeout=30, text=True)
-    argv = cosign_argv(executable)
+    argv = cosign_argv(executable, platform_digest)
     begin = time.monotonic_ns()
     result = subprocess.run(argv, capture_output=True, timeout=180)
     end = time.monotonic_ns()
@@ -753,7 +757,14 @@ def verify_base_image(directory):
     }
     witness_bytes = (json.dumps(witness, sort_keys=True) + '\n').encode()
     (directory / 'platform-verification.json').write_bytes(witness_bytes)
-    validate_base_bytes((directory / 'index.json').read_bytes(), result.stdout, witness_bytes)
+    validate_platform_verification(result.stdout, witness_bytes, platform_digest)
+
+
+def verify_base_image(directory):
+    """Verify only the pinned stock reference and its exact index membership."""
+    directory = Path(directory)
+    verify_platform_image(directory, PINNED_PLATFORM)
+    validate_base_bytes(*((directory / name).read_bytes() for name in BASE_FILES))
 
 
 def validate_base_bytes(index_bytes, cosign_bytes, verification_bytes):
@@ -764,22 +775,31 @@ def validate_base_bytes(index_bytes, cosign_bytes, verification_bytes):
                and m.get('platform', {}).get('architecture') == 'amd64']
     require(len(members) == 1 and members[0].get('digest') == PINNED_PLATFORM,
             'required platform104870 is not the unique linux/amd64 index member')
+    validate_platform_verification(cosign_bytes, verification_bytes, PINNED_PLATFORM)
+
+
+def validate_platform_verification(cosign_bytes, verification_bytes, platform_digest):
+    cosign_argv('cosign', platform_digest)
     signatures = json.loads(cosign_bytes)
     require(isinstance(signatures, list) and bool(signatures), 'no retained real cosign verify output')
     for signature in signatures:
-        critical, optional = signature.get('critical', {}), signature.get('optional', {})
-        require(critical.get('image', {}).get('docker-manifest-digest') == PINNED_PLATFORM
-                and critical.get('identity', {}).get('docker-reference') == BASE_REPOSITORY + '@' + PINNED_PLATFORM
+        require(isinstance(signature, dict), 'cosign output is not a signature object')
+        critical, optional = signature.get('critical', {}), signature.get('optional')
+        require(critical.get('image', {}).get('docker-manifest-digest') == platform_digest
+                and critical.get('identity', {}).get('docker-reference') == BASE_REPOSITORY + '@' + platform_digest
                 and critical.get('type') == 'https://sigstore.dev/cosign/sign/v1'
                 and isinstance(optional, dict),
                 'cosign output does not name required actual platform image')
     witness = json.loads(verification_bytes)
+    require(isinstance(witness, dict), 'actual cosign verification process witness is missing')
     tool = witness.get('tool', {})
+    require(isinstance(tool, dict), 'actual cosign verification tool witness is missing')
     executable = tool.get('executable', '')
     require(witness.get('schema') == 1 and isinstance(executable, str) and executable.startswith('/')
-            and witness.get('argv') == cosign_argv(executable) and witness.get('exit_code') == 0,
+            and witness.get('argv') == cosign_argv(executable, platform_digest)
+            and type(witness.get('exit_code')) is int and witness['exit_code'] == 0,
             'actual successful cosign invocation with exact certificate subject/issuer is missing')
-    require(re.fullmatch('[0-9a-f]{64}', tool.get('sha256', '')) is not None
+    require(isinstance(tool.get('sha256'), str) and re.fullmatch('[0-9a-f]{64}', tool['sha256']) is not None
             and isinstance(tool.get('version'), str)
             and re.search(r'(?m)^GitVersion:\s+v3\.1\.4\s*$', tool['version']) is not None,
             'verification does not retain the actual pinned native cosign tool')
@@ -787,7 +807,7 @@ def validate_base_bytes(index_bytes, cosign_bytes, verification_bytes):
             and type(witness.get('end_host_monotonic_ns')) is int
             and 0 < witness['begin_host_monotonic_ns'] <= witness['end_host_monotonic_ns']
             and witness.get('stdout_sha256') == digest(cosign_bytes)
-            and witness.get('stdout_bytes') == len(cosign_bytes)
+            and type(witness.get('stdout_bytes')) is int and witness['stdout_bytes'] == len(cosign_bytes)
             and isinstance(witness.get('stderr'), str),
             'verification process/output identity differs from retained actual cosign bytes')
 
@@ -1195,9 +1215,15 @@ def main(argv=None):
     paired.add_argument('--out', required=True, type=Path)
     verification = operations.add_parser('verify-base')
     verification.add_argument('--out', required=True, type=Path)
+    platform = operations.add_parser('verify-platform')
+    platform.add_argument('--platform-digest', required=True)
+    platform.add_argument('--out', required=True, type=Path)
     args = parser.parse_args(argv)
     if args.operation == 'verify-base':
         verify_base_image(args.out)
+        return 0
+    if args.operation == 'verify-platform':
+        verify_platform_image(args.out, args.platform_digest)
         return 0
     value = compare(args.gnome, args.tuna, args.out)
     print(json.dumps(value, sort_keys=True))
