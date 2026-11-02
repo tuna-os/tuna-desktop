@@ -3050,7 +3050,7 @@ impl Runtime {
         let mut renderer = self.backend.renderer();
         crate::size_change::step_frame(
             &mut self.manager,
-            &mut *renderer,
+            &mut renderer,
             &self.state,
             now,
             policy,
@@ -3698,7 +3698,7 @@ impl Runtime {
         let mut texture: smithay::backend::renderer::gles::GlesTexture =
             renderer.create_buffer(fourcc, buffer_size).ok()?;
         let mut elements = scene_elements(
-            &mut *renderer,
+            &mut renderer,
             &self.manager,
             &self.menu_close,
             &self.state,
@@ -3719,13 +3719,13 @@ impl Runtime {
                 .extend(focus_ring_elements(&self.manager, view, None));
         }
         elements.top = previews_to_elements(
-            &mut *renderer,
+            &mut renderer,
             &self.manager,
             view,
             &switcher_previews(&self.manager, &self.switcher_thumbnails),
         );
         elements.top.extend(dnd_icon_elements(
-            &mut *renderer,
+            &mut renderer,
             &self.state,
             view,
             self.manager.pointer_pos(),
@@ -3735,7 +3735,7 @@ impl Runtime {
         let previews = preview_elements(&mut renderer, &self.manager, view, cards);
         let paper = backdrop(
             &mut self.wallpaper,
-            &mut *renderer,
+            &mut renderer,
             background_geometry(size, view, desktop),
             view,
             overview.is_none(),
@@ -3762,7 +3762,7 @@ impl Runtime {
         let zoomed = match zoom_plan.as_ref() {
             Some(plan) => {
                 let (scene, zoom, _) = zoom_passes(
-                    &mut *renderer,
+                    &mut renderer,
                     &mut self.zoom_targets,
                     &mut self.cursor,
                     &output_name,
@@ -5766,7 +5766,7 @@ impl Runtime {
         );
         crate::window_lifecycle::step_frame(
             &mut self.manager,
-            &mut *renderer,
+            &mut renderer,
             &self.state,
             now,
             self.input_settings.motion,
@@ -5774,7 +5774,7 @@ impl Runtime {
             self.input_settings.right_to_left,
         );
         self.menu_close.step(
-            &mut *renderer,
+            &mut renderer,
             &self.state,
             now,
             self.input_settings.motion,
@@ -5783,7 +5783,7 @@ impl Runtime {
         // The tint program is compiled once per renderer and cached;
         // a compile failure draws this frame untinted.
         let night_tint = crate::wellbeing_effects::FrameColor::new(
-            &mut *renderer,
+            &mut renderer,
             wellbeing,
             night_gains.filter(|_| tint_needed),
         );

@@ -347,20 +347,19 @@ impl Dispatch<XdgToplevelDragV1, ()> for State {
                 record.mapped = surface_mapped(surface.wl_surface());
                 record.dragged = Some(surface);
             }
-            xdg_toplevel_drag_v1::Request::Destroy => {
+            xdg_toplevel_drag_v1::Request::Destroy
                 if state
                     .protocols
                     .toplevel_drag
                     .records
                     .iter()
                     .find(|record| record.resource.as_ref() == Some(resource))
-                    .is_some_and(|record| record.live_source().is_some())
-                {
-                    resource.post_error(
-                        xdg_toplevel_drag_v1::Error::OngoingDrag,
-                        "underlying data-source drag has not ended",
-                    );
-                }
+                    .is_some_and(|record| record.live_source().is_some()) =>
+            {
+                resource.post_error(
+                    xdg_toplevel_drag_v1::Error::OngoingDrag,
+                    "underlying data-source drag has not ended",
+                );
             }
             _ => {}
         }
