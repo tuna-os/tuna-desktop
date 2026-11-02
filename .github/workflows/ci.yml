@@ -1753,6 +1753,7 @@ jobs:
             --capture-commit "$(git rev-parse HEAD)" --product-origin "$PRODUCT_ORIGIN" \
             --image-id "$image_id" \
             --base-image "ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)" \
+            --base-evidence vm-lane-artifacts/native-base \
             --out vm-lane-artifacts/strip-image.json
       - name: Retain the exact final native product before deleting image storage
         if: matrix.profile == 'lifecycle' && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'tuna-os/tuna-desktop'
