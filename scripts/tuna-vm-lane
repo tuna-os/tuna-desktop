@@ -3121,16 +3121,19 @@ def gdm_login(qmp, agent_path, out, record, *, reference_profile=None):
     agent = None
     deadline = time.monotonic() + 120
     greeter = {}
+    greeter_error = None
     while time.monotonic() < deadline:
         try:
             if agent is None:
                 agent = guest_agent.GuestAgent(agent_path)
             greeter = (session_status(agent, profile=reference_profile) if reference_profile is not None
                        else agent.run("greeter"))
+            greeter_error = None
             ready = greeter["gdm"]["ready"] if reference_profile is not None else greeter_ready(greeter)
             if ready:
                 break
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, ValueError) as error:
+            greeter_error = str(error)
             if agent is not None:
                 agent.close()
                 agent = None
@@ -3138,6 +3141,8 @@ def gdm_login(qmp, agent_path, out, record, *, reference_profile=None):
     else:
         if agent is not None:
             agent.close()
+        with open(os.path.join(out, "greeter-before-login.json"), "w") as stream:
+            json.dump({"last_observation": greeter, "last_error": greeter_error}, stream, indent=2)
         raise RuntimeError("shipped GDM greeter did not become ready")
     try:
         provenance = greeter if reference_profile is not None else agent.run("payload")
