@@ -1236,7 +1236,25 @@ fn keyboard_delivery_observer_rejects_retired_and_reused_binding_identity() {
     release(&mut f.manager, &mut f.comp, KEY_A);
     sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
     assert_eq!(f.client_a.keys.len(), 2);
-    f.client_a.keyboard = Some(f.client_a.seat.as_ref().unwrap().get_keyboard(&qh, ()));
+    // Sync callbacks have their own reusable IDs. Fill the allocator's actual
+    // free cohort without another sync between allocations, so this test does
+    // not assume which hole a callback consumed or when delete_id arrived.
+    let mut other_bindings = Vec::new();
+    for _ in 0..256 {
+        let binding = f.client_a.seat.as_ref().unwrap().get_keyboard(&qh, ());
+        if binding.id().protocol_id() == protocol_id {
+            f.client_a.keyboard = Some(binding);
+            break;
+        }
+        other_bindings.push(binding);
+    }
+    assert!(
+        f.client_a.keyboard.is_some(),
+        "actual allocator did not reuse retired keyboard ID"
+    );
+    for binding in other_bindings {
+        binding.release();
+    }
     sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
     let recreated = keyboard.delivery_snapshot(&owner).unwrap();
     assert_eq!(

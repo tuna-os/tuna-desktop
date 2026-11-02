@@ -126,6 +126,7 @@ def main():
     observer_files.extend(Path('/usr/libexec') / name
                           for name in ('tuna-core-apps-install', 'tuna-vm-lifecycle'))
     observer_files.append(Path('/usr/libexec/tuna-geoclue-agent-policy'))
+    observer_files.append(Path('/usr/libexec/tuna-native-session/native_session.py'))
     observer_sha256 = {str(file): sha256(file) for file in observer_files}
     receipt = {
         'schema': 1, 'scope': 'explicit CI-only normal Arch app/tool installation, not default shipping image',

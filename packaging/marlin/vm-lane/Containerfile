@@ -53,6 +53,7 @@ COPY scripts/lib/tuna-datetime-proof.py /usr/libexec/tuna-datetime-proof
 COPY packaging/marlin/vm-lane/tuna-vm-input /usr/libexec/tuna-vm-input
 COPY packaging/marlin/vm-lane/tuna-vm-shell-focus /usr/libexec/tuna-vm-shell-focus
 COPY packaging/marlin/vm-lane/core-apps /usr/libexec/tuna-core-apps
+COPY packaging/marlin/vm-lane/tuna-native-session /usr/libexec/tuna-native-session
 COPY packaging/marlin/vm-lane/tuna-core-apps-install /usr/libexec/tuna-core-apps-install
 COPY packaging/marlin/vm-lane/tuna-vm-orca-token /usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token
 COPY packaging/marlin/vm-lane/tuna-vm-gdm.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf

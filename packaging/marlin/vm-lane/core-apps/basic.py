@@ -6,7 +6,8 @@ import signal
 import sys
 import time
 
-from guest import digest, process
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tuna-native-session'))
+from native_session import digest, process
 
 
 def user(operation, arguments):

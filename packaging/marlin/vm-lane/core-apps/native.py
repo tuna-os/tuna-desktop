@@ -8,7 +8,8 @@ import subprocess
 import sys
 import time
 
-from guest import MODULE, RUN_STATE, digest, process
+from guest import MODULE, RUN_STATE
+from native_session import digest, process
 
 PORTAL_LOG = Path('/run/tuna-core-apps-portal.jsonl')
 IME_LOG = Path('/run/tuna-core-apps-ime.jsonl')
