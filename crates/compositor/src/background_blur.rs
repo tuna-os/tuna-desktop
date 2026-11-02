@@ -1029,7 +1029,35 @@ mod tests {
             assert!((pixel[channel] - expected).abs() < 0.03, "HDR channel clipped/quantized: {pixel:?}, expected {expected}");
         }
         assert!(pixel[0] < 0.0 && pixel[1] > 1.0 && pixel[2] > 1.0, "{pixel:?}");
-        let _ = frame.finish().unwrap();
+        frame.finish().unwrap().wait().unwrap();
+        drop(bound);
+        // Feed the actual blurred FP16 scene to the production final
+        // BT.2020/PQ pass, not a second copy of the unblurred source.
+        let mut hdr = crate::color_output::HdrBuffer::new(&mut renderer, (64, 64).into()).unwrap();
+        std::mem::swap(&mut hdr.texture, &mut target);
+        let mut encoded: smithay::backend::renderer::gles::GlesTexture = renderer
+            .create_buffer(Fourcc::Abgr2101010, (64, 64).into())
+            .unwrap();
+        let mut bound = renderer.bind(&mut encoded).unwrap();
+        let mut frame = renderer.render(&mut bound, (64, 64).into(), Transform::Normal).unwrap();
+        hdr.present(&mut frame).unwrap();
+        frame.finish().unwrap().wait().unwrap();
+        use smithay::backend::renderer::ExportMem;
+        let mapping = renderer.copy_framebuffer(&bound, full, Fourcc::Abgr2101010).unwrap();
+        let bytes = renderer.map_texture(&mapping).unwrap();
+        let offset = (32 * 64 + 32) * 4;
+        let packed = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let actual = [packed & 1023, (packed >> 10) & 1023, (packed >> 20) & 1023];
+        let output = crate::color_state::ColorState::params(crate::color_state::hdr_output_params());
+        let encode = crate::color_state::transform(&hdr.blending, &output).unwrap();
+        let expected = encode.apply(pixel);
+        for channel in 0..3 {
+            assert!(
+                (actual[channel] as f32 / 1023.0 - expected[channel]).abs() <= 3.0 / 1023.0,
+                "blurred FP16 scene was not encoded once into PQ: {actual:?} != {expected:?}"
+            );
+        }
+        eprintln!("HDR_BLUR_FP16_PQ scene={pixel:?} ten_bit={actual:?}");
         drop(bound);
         // And restore the original SDR path and clamp after the FP16 frame.
         let _ = draw(&mut renderer, (64, 64), Transform::Normal, &[full], 8.0, 1.0, None);

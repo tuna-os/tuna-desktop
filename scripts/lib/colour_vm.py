@@ -1,7 +1,7 @@
-"""Additional DEV virgl colour proof on the existing admitted native VM.
+"""Required DEV virgl colour proof on the existing admitted native VM.
 
-No replacement for the mandatory DRM/YUV lane and no signed-release claim.
-The shared router owns VM boot/GDM admission/retirement and GPU selection.
+The unchanged YUV positives migrate from the classified VKMS imported-GEM
+fixture; ordinary software DRM/calibration and both normal GPU rows remain.
 """
 import base64
 import hashlib
@@ -244,3 +244,8 @@ def run(qmp, agent_factory, out, image, inventory, vm):
             raise
         finally:
             (destination / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+            if receipt['complete']:
+                (destination / 'assertions.txt').write_text(
+                    'D-COLOR-YUV pass REQUIRED DEV virgl: unchanged all-format native DMA-heap import, identity full/limited, alpha/layout pixel boundaries and negative controls\n'
+                    'D-COLOR-YUV-CAPTURE pass REQUIRED DEV virgl: all NV12/P010 identity, BT.601/709/2020 full/limited and unset live screenshot/PipeWire consumers\n'
+                    'D-COLOR-CAPTURE pass REQUIRED DEV virgl: supervised PQ/SDR/unmanaged input screenshots and negotiated SDR PipeWire frames; not HDR output or signed-release qualification\n')

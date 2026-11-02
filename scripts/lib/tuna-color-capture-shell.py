@@ -20,16 +20,11 @@ import subprocess
 import time
 import threading
 
-import gi
-gi.require_version('Gst', '1.0')
-gi.require_version('GstVideo', '1.0')
-gi.require_version('GstApp', '1.0')
-from gi.repository import Gio, GLib, Gst, GstVideo, GstApp
+from gi.repository import Gio, GLib
 from PIL import Image
 
 ART = Path(os.environ['TUNA_COLOR_CAPTURE_ARTIFACTS'])
 BUS = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-Gst.init(None)
 CONTROL = None
 CONTROL_EVENTS = queue.Queue()
 CONTROL_COMMAND_ID = 0
@@ -90,53 +85,11 @@ def png_evidence(path, expected):
             'chromaticities_scaled': list(struct.unpack('>8I', chunks[b'cHRM']))}
 
 
-def capture_pipeline_failure(pipeline, prefix, target, node, phase):
-    # Read the real bus before NULL flushes it. Bound both the wait and the
-    # retained messages; a state-change return alone loses the plugin's cause.
-    result, current, pending = pipeline.get_state(0)
-    source = pipeline.get_by_name('producer')
-    pad = source.get_static_pad('src')
-    current_caps = pad.get_current_caps()
-    queried_caps = pad.query_caps(None)
-    evidence = {
-        'node': node, 'target': target, 'phase': phase,
-        'state_result': result.value_nick, 'current_state': current.value_nick,
-        'pending_state': pending.value_nick,
-        'source_path': source.get_property('path'),
-        'source_fd': source.get_property('fd'),
-        'source_current_caps': current_caps.to_string()[:4096] if current_caps else None,
-        'source_query_caps': queried_caps.to_string()[:4096] if queried_caps else None,
-        'messages': [],
-    }
-    bus = pipeline.get_bus()
-    kinds = Gst.MessageType.ERROR | Gst.MessageType.WARNING | Gst.MessageType.EOS
-    message = bus.timed_pop_filtered(Gst.SECOND, kinds)
-    for _ in range(8):
-        if message is None:
-            break
-        entry = {
-            'type': Gst.MessageType.get_name(message.type),
-            'source': message.src.get_path_string()[:1024] if message.src else None,
-        }
-        if message.type in (Gst.MessageType.ERROR, Gst.MessageType.WARNING):
-            error, debug = (message.parse_error() if message.type == Gst.MessageType.ERROR
-                            else message.parse_warning())
-            entry.update(domain=error.domain, code=error.code,
-                         message=error.message[:2048], debug=(debug or '')[:4096])
-        evidence['messages'].append(entry)
-        message = bus.pop_filtered(kinds)
-    if not evidence['messages']:
-        evidence['bus_diagnostic'] = 'no error, warning or EOS queued within one second'
-    publish(f'{prefix}-cast-{target}-gstreamer-error.json', evidence)
-    return RuntimeError('PipeWire capture failed: ' + json.dumps(evidence))
-
-
 def capture_stream(prefix, target, connector, window, expected, hdr=False):
     destination = 'org.gnome.Mutter.ScreenCast'
     session_interface = destination + '.Session'
     session, = call(destination, '/org/gnome/Mutter/ScreenCast', destination,
                     'CreateSession', '(a{sv})', ({},))
-    pipeline = None
     subscription = None
     try:
         if target == 'window':
@@ -158,91 +111,46 @@ def capture_stream(prefix, target, connector, window, expected, hdr=False):
             Gio.DBusSignalFlags.NONE, added)
         call(destination, session, session_interface, 'Start')
         node = wait(lambda: nodes[0] if nodes else None, 'PipeWire node')
+        assert not hdr or target == 'monitor', 'Mutter 51 HDR offer policy is monitor-only'
+        raw_path = ART / f'{prefix}-cast-{target}.{"xb30" if hdr else "bgrx"}'
+        arguments = [os.environ['TUNA_COLOR_CAST_CONSUMER']]
+        if not hdr:
+            arguments.append('--sdr')
+        arguments.extend((str(node), str(raw_path)))
+        # Inspect the real SPA Format event. PipeWire 1.0's GStreamer
+        # plugin drops RGB colour fields, so GstVideoInfo defaults are not
+        # evidence of the producer's negotiated colour state.
+        result = subprocess.run(arguments, capture_output=True, text=True, timeout=20)
+        (ART / f'{prefix}-cast-{target}-consumer.log').write_text(result.stdout + result.stderr)
+        assert result.returncode == 0, result.stderr
+        evidence = json.loads(result.stdout)
+        assert evidence['color_range'] == 1 and evidence['color_matrix'] == 1, evidence
+        assert evidence['color_primaries'] == (7 if hdr else 1), evidence
+        assert evidence['transfer_function'] == (14 if hdr else 4), evidence
+        assert evidence['format'] == ('xBGR_210LE' if hdr else 'BGRx'), evidence
+        raw = raw_path.read_bytes()
+        assert len(raw) == evidence['raw_bytes'], evidence
+        centre = ((evidence['height'] // 2) * evidence['stride']
+                  + (evidence['width'] // 2) * 4)
         if hdr:
-            assert target == 'monitor', 'Mutter 51 HDR offer policy is monitor-only'
-            raw_path = ART / f'{prefix}-cast-monitor.xb30'
-            result = subprocess.run(
-                [os.environ['TUNA_HDR_CAPTURE_CONSUMER'], str(node), str(raw_path)],
-                capture_output=True, text=True, timeout=20)
-            (ART / f'{prefix}-hdr-consumer.log').write_text(result.stdout + result.stderr)
-            assert result.returncode == 0, result.stderr
-            evidence = json.loads(result.stdout)
-            assert evidence['color_range'] == 1 and evidence['color_matrix'] == 1, evidence
-            assert evidence['color_primaries'] == 7 and evidence['transfer_function'] == 14, evidence
-            assert evidence['format'] == 'xBGR_210LE', evidence
-            raw = raw_path.read_bytes()
-            centre = ((evidence['height'] // 2) * evidence['stride']
-                      + (evidence['width'] // 2) * 4)
             word = struct.unpack_from('<I', raw, centre)[0]
             actual = [word & 1023, (word >> 10) & 1023, (word >> 20) & 1023]
             assert actual == evidence['centre_rgb10'], evidence
             assert all(abs(a - b) <= 4 for a, b in zip(actual, expected)), (actual, expected)
-            return {**evidence, 'node': node, 'expected_rgb10': expected,
-                    'raw_sha256': hashlib.sha256(raw).hexdigest(),
-                    'consumer_stderr': result.stderr}
-        # Direct Mutter ScreenCast supplies a node on the session remote,
-        # not a portal OpenPipeWireRemote FD; pipewiresrc's default fd=-1
-        # connects to that same inherited private PipeWire session.
-        # Both bare pipewiresrc and appsink advertise ANY. PipeWire's
-        # gst_caps_to_format_all(ANY) emits no EnumFormat, so the stream
-        # gets media.class=Stream/Input/Unknown and WirePlumber's media-type
-        # check rejects the Video target. Request the actual SDR format,
-        # but never inject colourimetry or use a conversion/filter to fix it.
-        pipeline = Gst.parse_launch(
-            f'pipewiresrc name=producer path={node} num-buffers=1 ! '
-            'video/x-raw,format=BGRx ! '
-            'appsink name=capture sync=false max-buffers=1 drop=false')
-        deadline = time.monotonic() + 15
-        if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
-            raise capture_pipeline_failure(pipeline, prefix, target, node, 'set-playing')
-        result, current, _ = pipeline.get_state(
-            max(0, int((deadline - time.monotonic()) * Gst.SECOND)))
-        if result == Gst.StateChangeReturn.FAILURE or current != Gst.State.PLAYING:
-            raise capture_pipeline_failure(pipeline, prefix, target, node, 'wait-playing')
-        sink = pipeline.get_by_name('capture')
-        sample = sink.emit('try-pull-sample',
-                           max(0, int((deadline - time.monotonic()) * Gst.SECOND)))
-        if sample is None:
-            raise capture_pipeline_failure(pipeline, prefix, target, node, 'pull-sample')
-        caps = sample.get_caps()
-        info = GstVideo.VideoInfo.new_from_caps(caps)
-        assert caps.get_structure(0).get_string('format') == 'BGRx', caps.to_string()
-        # GST_VIDEO_COLOR_RANGE_0_255 is 1 (video-color.h); using its
-        # value avoids Python GI's leading-digit enum-name differences.
-        assert int(info.colorimetry.range) == 1, caps.to_string()
-        assert info.colorimetry.matrix == GstVideo.VideoColorMatrix.RGB, caps.to_string()
-        assert info.colorimetry.transfer == GstVideo.VideoTransferFunction.GAMMA22, caps.to_string()
-        assert info.colorimetry.primaries == GstVideo.VideoColorPrimaries.BT709, caps.to_string()
-        buffer = sample.get_buffer()
-        meta = GstVideo.buffer_get_video_meta(buffer)
-        stride = meta.stride[0] if meta else info.stride[0]
-        offset = meta.offset[0] if meta else info.offset[0]
-        mapped, mapping = buffer.map(Gst.MapFlags.READ)
-        assert mapped, 'PipeWire buffer is not readable'
-        try:
-            raw = bytes(mapping.data)
-            at = offset + (info.height // 2) * stride + (info.width // 2) * 4
-            b, g, r = raw[at:at + 3]
-            got = [r, g, b]
-            match_pixel(got, expected)
-            raw_path = ART / f'{prefix}-cast-{target}.bgrx'
-            raw_path.write_bytes(raw)
-            # This is only a viewing aid. Production colour metadata is
-            # recorded from the negotiated caps, not invented for this PNG.
+        else:
+            b, g, r = raw[centre:centre + 3]
+            actual = [r, g, b]
+            assert actual == evidence['centre_rgb'], evidence
+            match_pixel(actual, expected)
             preview = ART / f'{prefix}-cast-{target}-preview.png'
-            Image.frombytes('RGB', (info.width, info.height), raw[offset:],
-                            'raw', 'BGRX', stride).save(preview)
-        finally:
-            buffer.unmap(mapping)
-        return {'node': node, 'target': target, 'caps': caps.to_string(),
-                'centre_rgb': got, 'width': info.width, 'height': info.height,
-                'stride': stride, 'offset': offset, 'raw_path': str(raw_path),
+            Image.frombytes('RGB', (evidence['width'], evidence['height']), raw,
+                            'raw', 'BGRX', evidence['stride']).save(preview)
+            evidence['preview_only'] = str(preview)
+        return {**evidence, 'node': node, 'target': target,
+                'expected_rgb10' if hdr else 'expected_rgb': expected,
                 'raw_sha256': hashlib.sha256(raw).hexdigest(),
-                'preview_only': str(preview), 'full_range_rgb_bt709_gamma22': True}
+                'consumer_stderr': result.stderr}
     finally:
-        if pipeline is not None:
-            pipeline.set_state(Gst.State.NULL)
-            pipeline.get_state(3 * Gst.SECOND)
         if subscription is not None:
             BUS.signal_unsubscribe(subscription)
         call(destination, session, session_interface, 'Stop')
@@ -250,7 +158,7 @@ def capture_stream(prefix, target, connector, window, expected, hdr=False):
 
 def control_codec(*arguments, frame=None):
     return subprocess.check_output(
-        [os.environ['TUNA_HDR_CAPTURE_CONSUMER'], *arguments],
+        [os.environ['TUNA_COLOR_CAST_CONSUMER'], *arguments],
         input=frame, timeout=5)
 
 
@@ -400,7 +308,7 @@ def capture(request):
     return evidence
 
 
-control_hello = connect_control() if os.environ.get('TUNA_HDR_CAPTURE_CONSUMER') else None
+control_hello = connect_control()
 publish('consumer-ready.json', {'pid': os.getpid(), 'control_hello': control_hello})
 seen = None
 deadline = time.monotonic() + 300

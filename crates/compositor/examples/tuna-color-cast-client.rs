@@ -1,12 +1,12 @@
-//! Actual ten-bit HDR PipeWire consumer for the colour capture qualification.
+//! Native SDR/HDR PipeWire consumer for colour capture qualification.
 //!
-//! Usage: tuna-color-cast-client NODE_ID RAW_PATH
+//! Usage: tuna-color-cast-client [--sdr] NODE_ID RAW_PATH
 //! The authorized supervised shell creates the capture session and delegates
 //! its node to this consumer. This program acquires no D-Bus role or grant.
-//! It negotiates xBGR_210LE / full-range RGB / BT.2020 / SMPTE ST 2084,
-//! validates the actual Format event, saves one mapped frame and prints JSON.
-//! There is deliberately no GStreamer colour conversion: its PipeWire plugin
-//! does not map this packed format on all supported distributions.
+//! It validates actual Format events and mapped pixels for full-range RGB:
+//! SDR BGRx/BT.709/gamma22 or HDR xBGR_210LE/BT.2020/SMPTE ST 2084.
+//! No GStreamer conversion or synthesized caps establish colour metadata:
+//! older PipeWire GStreamer plugins omit SPA colourimetry on RGB streams.
 //! The supervised Python fixture also uses --shell-hello,
 //! --keep-display-change ID and --inspect-shell-frame as canonical wire
 //! codecs. These modes never connect a socket or acquire shell authority.
@@ -32,13 +32,18 @@ use serde_json::{json, Value};
 const TRANSFER_SMPTE2084: u32 = 14;
 type Outcome = Rc<RefCell<Option<Result<Value, String>>>>;
 
-fn hdr_format() -> pod::Object {
+fn video_format(hdr: bool) -> pod::Object {
+    let (format, primaries, transfer) = if hdr {
+        (VideoFormat::xBGR_210LE, SPA_VIDEO_COLOR_PRIMARIES_BT2020, TRANSFER_SMPTE2084)
+    } else {
+        (VideoFormat::BGRx, SPA_VIDEO_COLOR_PRIMARIES_BT709, SPA_VIDEO_TRANSFER_GAMMA22)
+    };
     pod::object!(
         SpaTypes::ObjectParamFormat,
         ParamType::EnumFormat,
         pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
         pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
-        pod::property!(FormatProperties::VideoFormat, Id, VideoFormat::xBGR_210LE),
+        pod::property!(FormatProperties::VideoFormat, Id, format),
         Property::new(
             SPA_FORMAT_VIDEO_colorRange,
             pod::Value::Id(Id(SPA_VIDEO_COLOR_RANGE_0_255))
@@ -50,17 +55,17 @@ fn hdr_format() -> pod::Object {
         Property {
             key: SPA_FORMAT_VIDEO_colorPrimaries,
             flags: pod::PropertyFlags::MANDATORY,
-            value: pod::Value::Id(Id(SPA_VIDEO_COLOR_PRIMARIES_BT2020)),
+            value: pod::Value::Id(Id(primaries)),
         },
         Property {
             key: SPA_FORMAT_VIDEO_transferFunction,
             flags: pod::PropertyFlags::MANDATORY,
-            value: pod::Value::Id(Id(TRANSFER_SMPTE2084)),
+            value: pod::Value::Id(Id(transfer)),
         },
     )
 }
 
-fn parse_hdr(pod: &Pod) -> Result<VideoInfoRaw, String> {
+fn parse_video(pod: &Pod, hdr: bool) -> Result<VideoInfoRaw, String> {
     if parse_format(pod).map_err(|error| format!("media format: {error:?}"))?
         != (MediaType::Video, MediaSubtype::Raw)
     {
@@ -69,16 +74,21 @@ fn parse_hdr(pod: &Pod) -> Result<VideoInfoRaw, String> {
     let mut info = VideoInfoRaw::new();
     info.parse(pod)
         .map_err(|error| format!("video format: {error:?}"))?;
-    if info.format() != VideoFormat::xBGR_210LE
+    let (format, primaries, transfer) = if hdr {
+        (VideoFormat::xBGR_210LE, SPA_VIDEO_COLOR_PRIMARIES_BT2020, TRANSFER_SMPTE2084)
+    } else {
+        (VideoFormat::BGRx, SPA_VIDEO_COLOR_PRIMARIES_BT709, SPA_VIDEO_TRANSFER_GAMMA22)
+    };
+    if info.format() != format
         || info.color_range() != SPA_VIDEO_COLOR_RANGE_0_255
         || info.color_matrix() != SPA_VIDEO_COLOR_MATRIX_RGB
-        || info.color_primaries() != SPA_VIDEO_COLOR_PRIMARIES_BT2020
-        || info.transfer_function() != TRANSFER_SMPTE2084
+        || info.color_primaries() != primaries
+        || info.transfer_function() != transfer
         || info.size().width == 0
         || info.size().height == 0
     {
         return Err(format!(
-            "consumer did not negotiate ten-bit BT.2020/PQ RGB: {info:?}"
+            "consumer did not negotiate the requested native RGB colour state: {info:?}"
         ));
     }
     Ok(info)
@@ -107,17 +117,22 @@ fn consume(
         .ok_or("missing centre pixel")?
         .try_into()
         .map_err(|_| "invalid packed pixel")?;
-    let word = u32::from_le_bytes(pixel);
-    let rgb = [word & 1023, (word >> 10) & 1023, (word >> 20) & 1023];
     std::fs::write(raw_path, frame).map_err(|error| error.to_string())?;
-    Ok(json!({
-        "format": "xBGR_210LE", "format_id": info.format().as_raw(),
+    let hdr = info.format() == VideoFormat::xBGR_210LE;
+    let mut evidence = json!({
+        "format": if hdr { "xBGR_210LE" } else { "BGRx" }, "format_id": info.format().as_raw(),
         "color_range": info.color_range(), "color_matrix": info.color_matrix(),
         "color_primaries": info.color_primaries(), "transfer_function": info.transfer_function(),
         "width": width, "height": height, "stride": stride,
-        "source_chunk_offset": offset, "raw_bytes": size,
-        "centre_rgb10": rgb, "raw_path": raw_path,
-    }))
+        "source_chunk_offset": offset, "raw_bytes": size, "raw_path": raw_path,
+    });
+    if hdr {
+        let word = u32::from_le_bytes(pixel);
+        evidence["centre_rgb10"] = json!([word & 1023, (word >> 10) & 1023, (word >> 20) & 1023]);
+    } else {
+        evidence["centre_rgb"] = json!([pixel[2], pixel[1], pixel[0]]);
+    }
+    Ok(evidence)
 }
 
 #[derive(Default)]
@@ -125,7 +140,7 @@ struct Negotiated {
     info: Option<VideoInfoRaw>,
 }
 
-fn capture(node: u32, raw_path: PathBuf) -> Result<Value, String> {
+fn capture(node: u32, raw_path: PathBuf, hdr: bool) -> Result<Value, String> {
     pw::init();
     let main_loop = pw::main_loop::MainLoopRc::new(None).map_err(|error| error.to_string())?;
     let context =
@@ -135,7 +150,7 @@ fn capture(node: u32, raw_path: PathBuf) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
     let stream = pw::stream::StreamRc::new(
         core,
-        "tuna-colour-hdr-consumer",
+        "tuna-colour-native-consumer",
         pw::properties::PropertiesBox::from_iter([
             ("media.type", "Video"),
             ("media.category", "Capture"),
@@ -167,7 +182,7 @@ fn capture(node: u32, raw_path: PathBuf) -> Result<Value, String> {
                     negotiated.info = None;
                     return;
                 };
-                match parse_hdr(pod) {
+                match parse_video(pod, hdr) {
                     Ok(info) => negotiated.info = Some(info),
                     Err(error) => {
                         *outcome.borrow_mut() = Some(Err(error));
@@ -205,7 +220,7 @@ fn capture(node: u32, raw_path: PathBuf) -> Result<Value, String> {
         move |_| {
             if outcome.borrow().is_none() {
                 *outcome.borrow_mut() =
-                    Some(Err("timed out waiting for an actual HDR frame".into()));
+                    Some(Err("timed out waiting for an actual capture frame".into()));
             }
             main_loop.quit();
         }
@@ -216,7 +231,7 @@ fn capture(node: u32, raw_path: PathBuf) -> Result<Value, String> {
         .map_err(|error| format!("consumer timer: {error:?}"))?;
     let bytes = pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
-        &pod::Value::Object(hdr_format()),
+        &pod::Value::Object(video_format(hdr)),
     )
     .map_err(|error| format!("consumer format: {error:?}"))?
     .0
@@ -297,17 +312,19 @@ fn main() {
         println!("{evidence}");
         return;
     }
-    let node: u32 = first
+    let hdr = first != "--sdr";
+    let node_arg = if hdr { first } else { args.next().expect("--sdr NODE_ID RAW_PATH") };
+    let node: u32 = node_arg
         .to_str()
         .expect("numeric NODE_ID")
         .parse()
         .expect("numeric NODE_ID");
     let path = PathBuf::from(args.next().expect("NODE_ID RAW_PATH"));
     assert!(args.next().is_none(), "NODE_ID RAW_PATH");
-    match capture(node, path) {
+    match capture(node, path, hdr) {
         Ok(evidence) => println!("{evidence}"),
         Err(error) => {
-            eprintln!("HDR PipeWire consumer failed: {error}");
+            eprintln!("native PipeWire consumer failed: {error}");
             std::process::exit(1);
         }
     }

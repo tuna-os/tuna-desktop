@@ -700,7 +700,7 @@ jobs:
           tar -cf "$RUNNER_TEMP/colour-payload.tar" -C "$payload" .
       - name: Prove admitted HDR scanout signaling and negotiated capture on an emulated KMS sink
         run: |
-          python3 scripts/ci-hdr-vkms-guest --work-dir "$RUNNER_TEMP/colour-hdr-vm" --artifacts "$(pwd)/colour-native-artifacts/hdr" --payload-tar "$RUNNER_TEMP/colour-payload.tar" --prepare-command 'sudo apt-get install -y python3-pil gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-pipewire gstreamer1.0-plugins-good' --guest-command 'python3 scripts/tuna-color-capture-proof --backend drm --hdr --hdr-consumer target/debug/examples/tuna-color-cast-client --compositor target/debug/tuna-compositor --color-client target/debug/examples/tuna-color-pixel-client --source-receipt source.json --artifacts "$ARTIFACTS/colour-hdr"' --negative-command 'python3 scripts/tuna-color-capture-proof --backend drm --expect-unsupported-hdr --compositor target/debug/tuna-compositor --color-client target/debug/examples/tuna-color-pixel-client --source-receipt source.json --artifacts "$ARTIFACTS/colour-unsupported"'
+          python3 scripts/ci-hdr-vkms-guest --work-dir "$RUNNER_TEMP/colour-hdr-vm" --artifacts "$(pwd)/colour-native-artifacts/hdr" --payload-tar "$RUNNER_TEMP/colour-payload.tar" --prepare-command 'sudo apt-get install -y python3-pil' --guest-command 'python3 scripts/tuna-color-capture-proof --backend drm --hdr --cast-consumer target/debug/examples/tuna-color-cast-client --compositor target/debug/tuna-compositor --color-client target/debug/examples/tuna-color-pixel-client --source-receipt source.json --artifacts "$ARTIFACTS/colour-hdr"' --negative-command 'python3 scripts/tuna-color-capture-proof --backend drm --expect-unsupported-hdr --compositor target/debug/tuna-compositor --color-client target/debug/examples/tuna-color-pixel-client --source-receipt source.json --artifacts "$ARTIFACTS/colour-unsupported"'
       - name: Retain only bounded known guest assertion files
         run: |
           python3 - <<'PY'
@@ -1064,7 +1064,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           sudo apt-get install -y gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0
-          cargo build --locked -p tuna-compositor --bin tuna-compositor --example tuna-color-pixel-client
+          cargo build --locked -p tuna-compositor --bin tuna-compositor --example tuna-color-pixel-client --example tuna-color-cast-client
           /usr/bin/python3 scripts/tuna-color-capture-proof --compositor target/debug/tuna-compositor --color-client target/debug/examples/tuna-color-pixel-client --artifacts gtk-shell-artifacts/colour
       # Native/X11 geometry and physical input at all required virtual scales.
       - run: |

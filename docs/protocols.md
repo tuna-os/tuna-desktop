@@ -88,7 +88,7 @@ and this page together.
 | xdg_session_manager_v1 | 1 | window session save and restore as in Mutter 51 (P-SY-08): a client that opens a session gets its windows back after logout or reboot (workspace, position and size, maximized, tiled, fullscreen, output; minimized is not restored, as in Mutter); store `$XDG_DATA_HOME/tuna/window-sessions.json`, written 3 s after a change and at exit (`crates/compositor/src/xdg_session.rs`) |
 | zwp_keyboard_shortcuts_inhibit_manager_v1 | 1 | after Allow, the focused window gets every key, the shell's grabs, Super and Alt+Tab included; Super+Escape (Mutter's restore-shortcuts) takes them back until the window is focused again |
 | wp_pointer_warp_v1 | 1 | honoured while the surface has pointer focus from the enter serial it names; nested, the host pointer stays where it is |
-| ext_background_effect_manager_v1 | 1 | capabilities `blur` at bind; one effect object per surface (`background_effect_exists`), `set_blur_region` double-buffered on commit, NULL removes it, `surface_destroyed` once the surface is gone; destroying the object unsets the region on the next commit (meta-wayland-background-effect.c). Drawn as Mutter 51's meta-background-effect.c and clutter-blur.c: the scene beneath the surface, clipped to the surface and its region, blurred (separable gaussian, sigma = radius / 2, radius 24 logical px times the surface's scale, downscaled by powers of two while sigma > 6 and both sides > 256 px), saturation 1.25 and 0.015 grain, at the surface's opacity, under its content; a repaint touching the sample area (region + 2 × radius) repaints all of it, and windows beneath an opaque blurred window still draw there. Not applied to overview previews or Alt+Tab thumbnails (Mutter also blurs behind clones) |
+| ext_background_effect_manager_v1 | 1 | capabilities reflect admission of the actual bound scene framebuffer, and are revoked on rendering failure; one effect object per surface (`background_effect_exists`), `set_blur_region` double-buffered on commit, NULL removes it, `surface_destroyed` once the surface is gone; destroying the object unsets the region on the next commit (meta-wayland-background-effect.c). The scene beneath the surface is clipped to its blur region, blurred with Mutter 51's separable gaussian (sigma = radius / 2, radius 24 logical px times surface scale, downscaled while sigma > 6 and both sides > 256 px), saturation 1.25 and 0.015 grain, then painted at surface opacity under its content. HDR intermediate precision follows the bound FP16 scene, preserving negative and above-one channels before the sole BT.2020/PQ output pass; normalized scanout is not an admission override. Damage touching the sample area (region + 2 × radius) repaints all of it and the scene beneath. Not applied to overview previews or Alt+Tab thumbnails (Mutter also blurs behind clones) |
 
 ### Colour reference and source notices
 
@@ -147,6 +147,24 @@ profile or HDR state. Following Mutter's monitor-format policy, an active
 qualified HDR monitor additionally offers a ten-bit BT.2020/PQ capture; window
 and area streams remain SDR. The negotiated encoding drives a real FP16 render
 and final output pass, not metadata attached to eight-bit SDR bytes.
+
+The proof's same-source `tuna-color-cast-client` consumes both SDR and HDR
+through native PipeWire. It validates the actual SPA Format event and mapped
+frame, including range, matrix, primaries, transfer function and packed pixel
+layout; it never injects colourimetry or converts pixels to make an assertion
+pass. PipeWire 1.0's GStreamer format adapter
+([upstream source](https://github.com/PipeWire/pipewire/blob/1.0.5/src/gst/gstpipewireformat.c))
+does not map RGB colour fields, so its `GstVideoInfo` defaults cannot prove the
+producer's gamma-2.2 state. `--cast-consumer` selects the native consumer path;
+the installed DEV helper passes the exact same-source `/usr/libexec/tuna-colour/cast`.
+
+The opt-in Arch `TUNA_NATIVE_COLOUR_OUT` build-tail hook stages this consumer,
+the native YUV/pixel callers and the exact compositor unit ELF in the original
+primary package checkout with its compiler, flags, target directory and version.
+The overlay receipt binds source hashes and pacman-owned Cargo/rustc/libstd,
+and requires the primary compositor bytes to remain unchanged. An unset
+destination leaves normal package building and package contents unchanged;
+the separate DEV overlay is not a shipping package or release qualification.
 
 EGL's YCbCr import hints do not include identity coefficients and permit driver
 guesses when no hint is supplied. Applying an inverse matrix to an already
@@ -209,11 +227,20 @@ explicitly reject imported objects in the generic GEM dumb-map helper.
 This establishes the local importer/kernel mapping blocker, not a compositor
 lifetime defect or universal R8/YUV incapability. The CI crash is consistent
 with that source path but its original receipt did not trace the ioctl.
-The imported positive remains failed, not qualified. A virgl result is
-additional named-device evidence, never a replacement for the original
-required device proof without an owner decision.
+The imported positive remains failed, not qualified. Following review of that
+independent causal evidence, its unchanged all-format YUV and live-capture
+positive gates move to the additional **required** native DEV virgl colour
+profile whenever the colour/DRM lane is selected. Missing formats, samples,
+readbacks, captures or source/package/ELF admission are fatal in the normal
+aggregate; a component compile or renderer name cannot qualify that route.
+Ordinary software DRM presentation, colord and calibration remain required,
+and the two normal Tuna GPU rows are unchanged.
+[`fixture-incompatibility.json`](../tests/color-dmabuf/fixture-incompatibility.json)
+preserves the original fatal assertion and source/log/artifact identities as
+a classified imported-GEM/MAP_DUMB fixture incompatibility, never as a pass,
+generic unsupported-R8 verdict, production blacklist or capture fallback.
 
-The isolated `colour` guest route uses the shared VM producer and an opt-in
+The isolated `colour` guest route uses the shared VM producer and a dedicated
 virgl device profile, not a second producer or a normal release-admission override.
 Its fixed `init/start/state/ack/finish/cleanup/file` operations execute owned,
 finite cases; artifact export cannot select arbitrary guest paths or commands.

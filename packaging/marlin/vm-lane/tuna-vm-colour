@@ -186,6 +186,7 @@ def worker(directory, case, attempt, gate, ready):
             argv = ['/usr/bin/python3', str(PAYLOAD / 'scripts/tuna-color-capture-proof'),
                     '--compositor', '/usr/bin/tuna-compositor', '--color-client',
                     str(ELF / ('pixel' if case == 'pixel' else 'yuv')),
+                    '--cast-consumer', str(ELF / 'cast'),
                     '--artifacts', str(target / 'capture'), '--source-receipt', str(PAYLOAD / 'source.json'),
                     '--host-wayland-socket', state['host_socket']]
             if case != 'pixel':

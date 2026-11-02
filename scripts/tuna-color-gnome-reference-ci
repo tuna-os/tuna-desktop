@@ -381,7 +381,13 @@ done
             uid = ssh('id -u tuna-test').stdout.decode().strip()
             if not uid.isdigit() or uid == '0':
                 raise RuntimeError('nonroot graphical account missing')
-            display = ssh(f'find /run/user/{uid} -maxdepth 1 -type s -name "wayland-*" -printf "%f\\n"').stdout.decode().splitlines()
+            # Inspect only candidate socket names. Traversing the runtime
+            # directory with find also stats the user's private gvfs mount,
+            # which root cannot access through its FUSE admission policy.
+            display = ssh(
+                f'for socket in /run/user/{uid}/wayland-*; do '
+                'if [ -S "$socket" ]; then printf "%s\\n" "${socket##*/}"; fi; done'
+            ).stdout.decode().splitlines()
             if len(display) != 1:
                 raise RuntimeError('ambiguous graphical Wayland socket')
             from PIL import Image
