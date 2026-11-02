@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "source_revision": "1a97af58d2fd180250fbce5993e55f1d244ddbb7",
+  "command": "/home/ubuntu/.cache/tuna-journey-venv/bin/python -m unittest discover -s scripts/tests -p test_variant_qualification.py",
+  "exit": 0,
+  "tests": 5,
+  "result": "OK",
+  "runtime_seconds": 0.01,
+  "limit": "classification/immutable-ref/cleanup safety regressions only; not native portal or image runtime qualification"
+}
