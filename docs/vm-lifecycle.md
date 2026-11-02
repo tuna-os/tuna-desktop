@@ -183,6 +183,10 @@ and `TUNA_COMPOSITOR_STATE` readiness loops, without a Tuna fallback.
 After password submission it waits for the same session's actual compositor,
 bus and DRM admission within the existing login deadline. A partially
 started session never causes another password to be typed into the desktop.
+If that unchanged greeter deadline expires, `greeter-before-login.json`
+retains the last actual admission observation and latest transport error,
+including missing original-principal or payload-integrity prerequisites.
+The diagnostic is failure evidence, never admission or a deadline extension.
 
 The paired consumer owns its real two Files windows and one Settings window,
 original process/ELF identities, read-only settings, public AT-SPI snapshots,
