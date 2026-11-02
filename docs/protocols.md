@@ -158,6 +158,14 @@ does not map RGB colour fields, so its `GstVideoInfo` defaults cannot prove the
 producer's gamma-2.2 state. `--cast-consumer` selects the native consumer path;
 the installed DEV helper passes the exact same-source `/usr/libexec/tuna-colour/cast`.
 
+The real pixel and DMA-BUF clients announce readiness only after holding their
+unchanged buffers for 500 ms of actual `wl_callback.done` frame-clock time.
+Their first callback alone can occur during the ordinary opening animation;
+it does not promise a fully visible constant-colour scene. Receipts retain the
+first/last callback timestamps and frame count. Capture still makes one
+assertion at each existing pixel threshold and deadline: no expected-pixel
+polling, capture retry, animation override or synthetic clock is used.
+
 The opt-in Arch `TUNA_NATIVE_COLOUR_OUT` build-tail hook stages this consumer,
 the native YUV/pixel callers and the exact compositor unit ELF in the original
 primary package checkout with its compiler, flags, target directory and version.

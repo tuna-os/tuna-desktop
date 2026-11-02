@@ -356,8 +356,16 @@ def run_cases(prefix, hdr_active):
                 if client.poll() is not None:
                     raise RuntimeError('colour client exited: client-' + name + '.log')
                 lines = (art / ('client-' + name + '.log')).read_text().splitlines()
-                return next((line for line in lines if line.startswith('READY ')), None)
-            ready_line = wait(presented, 'presented ' + name)
+                ready = next((line for line in lines if line.startswith('READY ')), None)
+                if ready is None:
+                    return None
+                clock = next(line for line in lines if line.startswith('PRESENTED-CLOCK '))
+                return ready, clock
+            ready_line, clock_line = wait(presented, 'presented ' + name)
+            first, last, frames = (int(value) for value in clock_line.split()[1:])
+            assert 0 <= first <= 0xffffffff and 0 <= last <= 0xffffffff, clock_line
+            elapsed = (last - first) & 0xffffffff
+            assert elapsed >= 500 and frames >= 2, clock_line
             assert hashlib.sha256(Path('/proc', str(client.pid), 'exe').read_bytes()).hexdigest() == report['binaries'][str(color_client)]
             numbers = [int(value) for value in ready_line.split()[1:]]
             assert len(numbers) == 6 and all(0 <= value <= 255 for value in numbers), ready_line
@@ -375,7 +383,11 @@ def run_cases(prefix, hdr_active):
                 payload['expected_hdr10'] = hdr_expected
                 scanout = native_snapshot(name, hdr_expected)
             evidence = request_capture(payload)
-            report['cases'][name] = {'ready': ready_line, **evidence}
+            report['cases'][name] = {
+                'ready': ready_line,
+                'presentation_clock': {'first_ms': first, 'last_ms': last,
+                                       'elapsed_ms': elapsed, 'frames': frames},
+                **evidence}
             if hdr_active:
                 report['cases'][name]['native_scanout'] = scanout
         finally:

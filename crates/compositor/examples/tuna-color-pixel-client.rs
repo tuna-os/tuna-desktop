@@ -2,7 +2,8 @@
 //! SHM window filled with one BT.2020/PQ code value and tagged with that
 //! parametric image description through wp_color_manager_v1.
 //!
-//! Prints one line once the tagged frame was presented to the client:
+//! Prints readiness after the same tagged frame has remained presented for
+//! 500 ms of actual compositor frame-clock callbacks (including map animation):
 //! `READY <code r g b> <expected r g b>`, where the expected 8-bit
 //! scanout colour is the Mutter 51 transform to the SDR output
 //! ([`tuna_compositor::color_state`]). Then stays mapped until killed.
@@ -52,7 +53,7 @@ struct Client {
     size: Option<(i32, i32)>,
     configured: bool,
     described: Option<Result<(), String>>,
-    presented: bool,
+    presented: Option<u32>,
 }
 
 impl Client {
@@ -166,8 +167,8 @@ impl Dispatch<WlCallback, ()> for Client {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_callback::Event::Done { .. } = event {
-            state.presented = true;
+        if let wl_callback::Event::Done { callback_data } = event {
+            state.presented = Some(callback_data);
         }
     }
 }
@@ -349,9 +350,25 @@ fn main() {
     surface.damage_buffer(0, 0, width, height);
     surface.frame(&qh, ());
     surface.commit();
-    while !client.presented {
+    while client.presented.is_none() {
         queue.blocking_dispatch(&mut client).unwrap();
     }
+    // The first frame can be inside the compositor's real opening fade.
+    // Hold the same pixels for half a second of compositor frame-clock time
+    // before announcing capture readiness; do not retry or inspect captures.
+    let first = client.presented.take().unwrap();
+    let mut last = first;
+    let mut frames = 1u32;
+    while last.wrapping_sub(first) < 500 {
+        surface.frame(&qh, ());
+        surface.commit();
+        while client.presented.is_none() {
+            queue.blocking_dispatch(&mut client).unwrap();
+        }
+        last = client.presented.take().unwrap();
+        frames += 1;
+    }
+    println!("PRESENTED-CLOCK {first} {last} {frames}");
     let [er, eg, eb] = expected(source, code);
     println!("READY {} {} {} {er} {eg} {eb}", code[0], code[1], code[2]);
     let [hr, hg, hb] = expected_hdr(source, code);

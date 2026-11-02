@@ -11,8 +11,9 @@
 //!         bt709-full|bt709-limited|bt2020-full|bt2020-limited|unset
 //!         (or TUNA_COLOR_YUV_COEFFICIENTS), --code Y,U,V.
 //! Default: NV12 identity-full, code 48,201,91. Prints the existing
-//! READY code_y code_u code_v expected_r expected_g expected_b contract and
-//! remains mapped. Expected RGB is independently derived from the declared
+//! READY code_y code_u code_v expected_r expected_g expected_b contract after
+//! 500 ms of real frame callbacks, then remains mapped. Expected RGB is
+//! independently derived from the declared
 //! coefficients/range, not read back from the producer or compositor.
 use smithay::backend::allocator::Fourcc;
 use std::collections::{HashMap, HashSet};
@@ -161,7 +162,7 @@ struct Client {
     formats: HashSet<(u32, u64)>,
     size: Option<(i32, i32)>,
     configured: bool,
-    presented: bool,
+    presented: Option<u32>,
 }
 impl Client {
     fn bind<I: Proxy + 'static>(
@@ -281,8 +282,8 @@ impl Dispatch<WlCallback, ()> for Client {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_callback::Event::Done { .. } = event {
-            state.presented = true;
+        if let wl_callback::Event::Done { callback_data } = event {
+            state.presented = Some(callback_data);
         }
     }
 }
@@ -479,9 +480,24 @@ fn main() {
     surface.damage_buffer(0, 0, width, height);
     surface.frame(&qh, ());
     surface.commit();
-    while !client.presented {
+    while client.presented.is_none() {
         queue.blocking_dispatch(&mut client).unwrap();
     }
+    // Capture the fully presented constant buffer, not an opening-fade frame.
+    // This is an actual frame-clock barrier, never a pixel retry or a sleep.
+    let first = client.presented.take().unwrap();
+    let mut last = first;
+    let mut frames = 1u32;
+    while last.wrapping_sub(first) < 500 {
+        surface.frame(&qh, ());
+        surface.commit();
+        while client.presented.is_none() {
+            queue.blocking_dispatch(&mut client).unwrap();
+        }
+        last = client.presented.take().unwrap();
+        frames += 1;
+    }
+    println!("PRESENTED-CLOCK {first} {last} {frames}");
     let [r, g, b] = options.expected();
     let [y, u, v] = options.code;
     println!("READY {y} {u} {v} {r} {g} {b}");
