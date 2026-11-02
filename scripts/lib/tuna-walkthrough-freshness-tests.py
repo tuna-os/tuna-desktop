@@ -12,6 +12,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import struct
+import zlib
 import unittest
 from pathlib import Path
 
@@ -23,6 +25,16 @@ RUN_ID = "38240110439"
 EVENT_SHA = "7b6c85922af14f4c239a4f958262b657adc6b03f"
 HEAD_SHA = "9dc2efb27f20087301abf3c6dbc65fe02294cfcb"
 TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+def png_blob(ident):
+    """Small real PNG fixture, decoded by the production media parser."""
+    color = hashlib.sha256(ident.encode()).digest()[:3]
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    return (b"\x89PNG\r\n\x1a\n" +
+            chunk(b"IHDR", struct.pack(">IIBBBBB", 4, 4, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress((b"\0" + color * 4) * 4)) + chunk(b"IEND", b""))
 
 
 def tsv_ids(path):
@@ -81,7 +93,7 @@ class FreshnessCase(unittest.TestCase):
             for ident, (mapped_stage, frame) in mapping.items():
                 if mapped_stage != stage:
                     continue
-                blob = b"PNG:" + ident.encode()
+                blob = png_blob(ident)
                 (stagedir / frame).write_bytes(blob)
                 entries.append({"file": frame, "sha256": hashlib.sha256(blob).hexdigest()})
             (stagedir / "frames.json").write_text(
@@ -193,7 +205,7 @@ class FreshnessCase(unittest.TestCase):
             self.assertEqual(entry["label"], "duplicate")
             self.assertEqual(entry["resolved_from"], "00-baseline-desktop.png")
             self.assertEqual((dest / "walkthrough" / "panel.png").read_bytes(),
-                             b"PNG:panel")
+                             png_blob("panel"))
 
     def test_refresh_refuses_unverified_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -333,7 +345,7 @@ class FreshnessCase(unittest.TestCase):
                                 capture_output=True, text=True, timeout=60).stdout.strip()
         return repo, head_a, tree_a, head_b, tree_b, tree_c
 
-    def test_freshness_accepts_walkthrough_only_drift(self):
+    def test_freshness_rejects_walkthrough_only_drift(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, head_a, tree_a, head_b, tree_b, _ = self.make_git_repo(directory)
             bundle = self.make_bundle(directory, heads={s: head_a for s in
@@ -346,8 +358,8 @@ class FreshnessCase(unittest.TestCase):
                 [str(SCRIPT), "freshness", "--dest", str(dest),
                  "--expect-head", head_b, "--expect-tree", tree_b],
                 capture_output=True, text=True, env={**dict(os.environ), **env}, timeout=60)
-            self.assertEqual(result.returncode, 0, result.stdout)
-            self.assertIn("adopt drift", result.stdout)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertNotIn("CURRENT", result.stdout)
 
     def test_freshness_rejects_product_drift(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -406,23 +418,28 @@ class FreshnessCase(unittest.TestCase):
             self.assertIn("every frame is STALE", result.stdout)
             self.assertNotIn("CURRENT", result.stdout)
 
-    def test_existing_check_ignores_freshness(self):
-        # Pin the gate-safe contract: `check` still validates only the
-        # markdown text and image existence, so a bogus manifest cannot
-        # change its verdict.
-        manifest_path = ROOT / "docs" / "walkthrough" / "manifest.json"
-        had_manifest = manifest_path.exists()
-        saved = manifest_path.read_bytes() if had_manifest else None
-        try:
-            manifest_path.write_bytes(b"not json")
-            check = subprocess.run(
-                [str(SCRIPT), "check"], capture_output=True, text=True, timeout=60)
-            self.assertEqual(check.returncode, 0, check.stderr)
-        finally:
-            if saved is None:
-                manifest_path.unlink(missing_ok=True)
-            else:
-                manifest_path.write_bytes(saved)
+    def test_existing_check_remains_page_existence_only(self):
+        # This diagnostic command never grants canonical freshness. Do not
+        # rewrite the repository's historical receipt while exercising it.
+        result = subprocess.run([str(SCRIPT), "check"], capture_output=True,
+                                text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_refresh_refuses_missing_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self.make_bundle(directory, attempts={"panel": ""})
+            dest = Path(directory) / "dest"
+            result = self.refresh(bundle, dest)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("missing attempt", result.stderr)
+            self.assertFalse(dest.exists())
+
+    def test_legacy_freshness_cannot_qualify_canonical_history(self):
+        result = subprocess.run([str(SCRIPT), "freshness"], capture_output=True,
+                                text=True, timeout=60)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("CURRENT", result.stdout)
+        self.assertIn("receipted intake", result.stderr)
 
 
 if __name__ == "__main__":

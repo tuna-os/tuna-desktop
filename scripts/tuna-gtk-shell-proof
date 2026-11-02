@@ -1132,6 +1132,20 @@ export TUNA_PROOF_SWIPE_INPUT
 TUNA_ANIMATION_CLOCK="$ARTIFACTS/animation-clock"
 rm -f "$TUNA_ANIMATION_CLOCK"
 export TUNA_ANIMATION_CLOCK
+# Only the ordinary complete clean source build can supply current-run media
+# provenance. Comparison binaries, installed/partial proofs and inherited shell
+# overrides remain useful diagnostics but cannot qualify canonical media.
+MEDIA_SOURCE=0
+"$PY" "$ROOT/scripts/lib/gtk_media_source.py" invalidate "$ROOT" "$ARTIFACTS"
+if [ "$INSTALLED_PACKAGE" = 0 ] && [ "$SCREENSHOT_KEYS_ONLY" = 0 ] &&
+   [ "$A11Y_FOCUS_ONLY" = 0 ] && [ "$KEYBOARD_ROUTES_ONLY" = 0 ] &&
+   [ "$GRID_CANCEL_ONLY" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ] &&
+   [ -z "${TUNA_PROOF_SHELL_BIN:-}" ] && [ -z "${TUNA_SHELL_BIN:-}" ] &&
+   [ -n "${GITHUB_RUN_ID:-}" ] && [ -n "${GITHUB_RUN_ATTEMPT:-}" ] &&
+   [ -n "${GITHUB_SHA:-}" ]; then
+    "$PY" "$ROOT/scripts/lib/gtk_media_source.py" begin "$ROOT" "$ARTIFACTS"
+    MEDIA_SOURCE=1
+fi
 if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
     cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host
     if [ "$SCREENSHOT_KEYS_ONLY" = 0 ] && [ "$A11Y_FOCUS_ONLY" = 0 ]; then
@@ -1169,6 +1183,9 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 [ -n "$WID" ] || fail G-PANEL "no nested window"
+if [ "$MEDIA_SOURCE" = 1 ]; then
+    "$PY" "$ROOT/scripts/lib/gtk_media_source.py" launch "$ROOT" "$ARTIFACTS" "$COMPOSITOR_PID"
+fi
 if [ "$INSTALLED_PACKAGE" = 1 ]; then
     # The installed launcher intentionally opens GNOME's startup overview.
     # Authenticate the original installed session before any physical input.
@@ -11468,6 +11485,10 @@ if [ -n "${x11_display:-}" ]; then
         fail G-X11-CLEANUP "owned socket or display lock survived shutdown"
     fi
     pass G-X11-CLEANUP "graceful shutdown removes owned listening sockets and display lock"
+fi
+
+if [ "$MEDIA_SOURCE" = 1 ]; then
+    "$PY" "$ROOT/scripts/lib/gtk_media_source.py" finish "$ROOT" "$ARTIFACTS"
 fi
 
 echo "tuna-gtk-shell-proof: OK, artifacts in $ARTIFACTS"
