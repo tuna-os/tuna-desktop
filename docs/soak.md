@@ -4,6 +4,16 @@
 
 The root observer reads complete PSS/RSS and fd counts for the session UID. It requires exactly one live compositor and GTK shell, records their PID/start-time identities (the legacy shell host is an alternative renderer, not a concurrent process), and fails if any exits or restarts. Each sample makes bounded calls on the user's real bus to the screen saver, calendar server, portal settings and GNOME portal backend. Missing counters and unreadable live processes fail instead of counting as zero. Departed noncritical processes and zombies are excluded; process identity changes during sampling fail.
 
+Health helpers and the native workload are spawned directly with the account's UID,
+primary GID and resolved supplementary groups. Only the child drops credentials;
+the observer stays root. Their explicit environment contains the ordinary account's
+home/name, fixed executable path and actual runtime/user bus (plus the session
+Wayland socket for the native workload), not inherited root credentials or bus
+overrides. No helper opens a PAM/logind session. Each health call still has the
+same 10-second deadline and 64 KiB output budget; a failure names its endpoint
+and method. Removing helper-created PAM session churn is a harness correction,
+not proof that PAM/audit activity caused an earlier service timeout.
+
 After a ten-minute warmup, every sample must remain below the baseline PSS multiplied by 1.5 plus 16 MiB, the baseline fd count multiplied by 1.5 plus 32, and the baseline process count plus 12. These explicit endurance limits detect large growth; they are not a performance parity threshold. The baseline includes that UID's activated services and applications, so use a controlled, unchanged workload. The optional native workload below adds actual frame pacing. The observer cannot measure compositor object counts, GPU memory, input latency or service fault recovery. Issues #203 and #73 remain open for the remaining requirements and for the completed actual 24-hour report.
 
 Copy the script to the VM and run it as a root transient service, supplying the UID's account and the exact source revision from the deployment record:
