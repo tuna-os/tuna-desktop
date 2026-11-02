@@ -75,10 +75,10 @@ and this page together.
 | zwp_relative_pointer_manager_v1 | 1 | raw motion from the DRM backend |
 | zwp_tablet_manager_v2 | 2 | tablets, tools (pressure, tilt, distance, buttons, tool cursors) and pads (buttons, rings, strips, mode groups, application labels shown on the pad OSD) from libinput on the DRM backend; the vendored Smithay adds pads, labels and version 2 (`third-party/smithay/TABLET-PAD-API-PATCH.diff`); pad dials need libinput 1.26 (the `input` crate's `libinput_1_26` feature), newer than Ubuntu 24.04's 1.25 (#344) |
 | zwp_pointer_constraints_v1 | 1 | a locked pointer stays put; a confined one stays in its window |
-| ext_session_lock_manager_v1 | 1 | the shell's lock screen; only the supervised shell's lock is granted, and only a password the compositor verified unlocks |
+| ext_session_lock_manager_v1 | 1 | the shell's lock screen; only the supervised shell's lock is granted, and only a password the compositor verified unlocks; while locked, input goes only to the lock surface (or nowhere without one), keyboard focus leaves applications as the session locks and returns to the focused window on unlock; duplicate_output is checked per lock object, so a refused or superseded lock does not make the shell's next lock on the same output a protocol error (`third-party/smithay/SESSION-LOCK-OUTPUTS-PATCH.diff`) |
 | wp_presentation | 2 | CLOCK_MONOTONIC, as Mutter; see frame timing below |
 | wp_fifo_manager_v1 | 1 | a barrier is released on the next refresh cycle |
-| wp_commit_timing_manager_v1 | 1 | a timed update applies on the refresh cycle whose next presentation reaches its time |
+| wp_commit_timing_manager_v1 | 1 | a timed update applies on the refresh cycle whose next presentation reaches its time; a tv_nsec of a second or more is an invalid_timestamp error, as in Mutter |
 | xdg_wm_dialog_v1 | 1 | a modal dialog is attached to its parent: focusing the parent focuses the dialog (GNOME's attach-modal-dialogs) |
 | zxdg_exporter_v2, zxdg_importer_v2 | 1 | xdg-foreign: the portal parents its dialogs to the app's window, which centres and attaches them like the app's own |
 | xdg_system_bell_v1 | 1 | plays GNOME's `bell-window-system` sound through `canberra-gtk-play` when installed (Mutter's audible bell); a burst of rings is one sound |
