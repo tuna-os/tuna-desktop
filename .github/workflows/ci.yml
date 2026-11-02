@@ -1551,9 +1551,9 @@ jobs:
     # layer in packaging/marlin/vm-lane: tunaOS's tuna-flavor GDM login path,
     # fixture account, serial journal) to a raw disk with bootc, boot it in
     # QEMU/KVM, type the fixture password into stock GDM's user list, and prove
-    # GDM starts the Tuna Desktop hardware session on the DRM/KMS backend. The
-    # image is rebuilt rootful here (bootc install reads it from root's storage),
-    # in parallel with marlin-image rather than after it.
+    # GDM starts the Tuna Desktop hardware session on the DRM/KMS backend.
+    # Build rootful (bootc reads root's storage), or load the exact authenticated
+    # source-input-equivalent lifecycle image and requalify it without mutation.
     name: ${{ matrix.artifact }}
     strategy:
       fail-fast: false
@@ -1577,10 +1577,14 @@ jobs:
     needs: [select-lanes, arch-package, gdm51-native-package]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm')
     timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: tuna-arch
@@ -1604,6 +1608,27 @@ jobs:
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: v3.1.4
+      - name: Select the authenticated final native product or ordinary fresh build
+        id: native-product
+        if: matrix.profile == 'lifecycle'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRODUCT_PROFILE: ${{ matrix.orca }}
+        run: |
+          shopt -s nullglob
+          packages=(arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)
+          test "${#packages[@]}" -eq 1
+          scripts/tuna-native-product select --profile "$PRODUCT_PROFILE" \
+            --current-package "${packages[0]}" --out /mnt/vm/native-product \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Restore the original loaded product base identity
+        if: matrix.profile == 'lifecycle' && steps.native-product.outputs.restored == 'true'
+        env:
+          BASE_PLATFORM: ${{ steps.native-product.outputs.base_platform }}
+          BASE_INDEX: ${{ steps.native-product.outputs.base_index }}
+        run: |
+          printf '%s\n' "$BASE_PLATFORM" > /mnt/vm/base-digest
+          printf '%s\n' "$BASE_INDEX" > /mnt/vm/base-index-digest
       - name: Verify the original paired reference base before building or booting
         if: matrix.profile != 'lifecycle'
         run: |
@@ -1640,7 +1665,7 @@ jobs:
           printf '%s\n' sha256:104870f1a05fa0a75649ee4ed9952027b29ab12e53af83931ae69e8636e44c3f > /mnt/vm/base-digest
           sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}' > /mnt/vm/image-id
       - name: Verify and pin the actual native media base index and platform
-        if: matrix.profile == 'lifecycle'
+        if: matrix.profile == 'lifecycle' && steps.native-product.outputs.restored == 'false'
         run: |
           sudo apt-get install -y --no-install-recommends skopeo
           mkdir -p vm-lane-artifacts/native-base
@@ -1662,9 +1687,11 @@ jobs:
             --platform-digest "$(cat /mnt/vm/base-digest)" --out vm-lane-artifacts/native-base
           sudo podman pull --platform linux/amd64 "$platform"
       - name: Build the Marlin Tuna Desktop image and the VM test layer
-        if: matrix.profile == 'lifecycle'
+        if: matrix.profile == 'lifecycle' && steps.native-product.outputs.restored == 'false'
+        env:
+          PRODUCT_PACKAGE: ${{ steps.native-product.outputs.package_path }}
         run: |
-          cp arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst ./tuna.pkg.tar.zst
+          cp "$PRODUCT_PACKAGE" ./tuna.pkg.tar.zst
           sudo podman build -f packaging/marlin/Containerfile \
             --build-arg "BASE_IMAGE=ghcr.io/tuna-os/marlin@$(cat /mnt/vm/base-digest)" \
             --build-arg TUNA_PKG=tuna.pkg.tar.zst \
@@ -1701,6 +1728,9 @@ jobs:
           sudo podman rm "$provenance_container"
           trap - EXIT
           sudo chown -R "$(id -u):$(id -g)" vm-lane-artifacts/gdm51
+      - name: Inspect the actual final native image without rebuilding it
+        if: matrix.profile == 'lifecycle'
+        run: |
           sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}' > /mnt/vm/image-id-observed
           scripts/tuna-vm-strip-image --canonical-image-id "$(cat /mnt/vm/image-id-observed)" | tee /mnt/vm/image-id
           mkdir -p vm-lane-artifacts/image-kernels
@@ -1713,6 +1743,10 @@ jobs:
           df -h / /mnt
       - name: Bind installed acceptance to the original package and immutable final image
         if: matrix.profile == 'lifecycle'
+        env:
+          PRODUCT_PACKAGE: ${{ steps.native-product.outputs.package_path }}
+          PRODUCT_COMMIT: ${{ steps.native-product.outputs.product_commit }}
+          PRODUCT_ORIGIN: ${{ steps.native-product.outputs.product_origin_path }}
         run: |
           image_id=$(cat /mnt/vm/image-id)
           owned_container="tuna-strip-inspect-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -1721,11 +1755,24 @@ jobs:
           timeout --kill-after=5s 60s sudo podman run --rm --name "$owned_container" -i \
             --entrypoint /usr/bin/python3 "$image_id" - "$image_id" \
             < /mnt/vm/strip-inspect.py > /mnt/vm/strip-image-observed.json
-          scripts/tuna-vm-strip-image --package tuna.pkg.tar.zst \
-            --observed /mnt/vm/strip-image-observed.json --commit "$GITHUB_SHA" \
+          scripts/tuna-vm-strip-image --package "$PRODUCT_PACKAGE" \
+            --observed /mnt/vm/strip-image-observed.json --commit "$PRODUCT_COMMIT" \
+            --capture-commit "$(git rev-parse HEAD)" --product-origin "$PRODUCT_ORIGIN" \
             --image-id "$image_id" \
             --base-image "ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)" \
             --out vm-lane-artifacts/strip-image.json
+      - name: Retain the exact final native product before deleting image storage
+        if: matrix.profile == 'lifecycle' && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'tuna-os/tuna-desktop'
+        env:
+          PRODUCT_PROFILE: ${{ matrix.orca }}
+          PRODUCT_PACKAGE: ${{ steps.native-product.outputs.package_path }}
+          PRODUCT_PACKAGE_BASENAME: ${{ steps.native-product.outputs.package_basename }}
+          PRODUCT_COMMIT: ${{ steps.native-product.outputs.product_commit }}
+        run: |
+          scripts/tuna-native-product retain --profile "$PRODUCT_PROFILE" \
+            --image-id "$(cat /mnt/vm/image-id)" --package "$PRODUCT_PACKAGE" \
+            --package-basename "$PRODUCT_PACKAGE_BASENAME" --product-commit "$PRODUCT_COMMIT" \
+            --out /mnt/vm/native-product
       - name: Install the image to a raw disk with bootc
         run: |
           # Marlin boots with systemd-boot, not bootupd, so it installs
@@ -1754,15 +1801,21 @@ jobs:
       # through QMP input and records it to tour/tuna-tour.webm.
       - name: Boot the disk, assert the Tuna Desktop hardware session, record the tour
         if: matrix.profile == 'lifecycle'
+        env:
+          PRODUCT_PACKAGE_BASENAME: ${{ steps.native-product.outputs.package_basename }}
+          PRODUCT_COMMIT: ${{ steps.native-product.outputs.product_commit }}
         run: >-
           scripts/tuna-vm-lane --disk /mnt/vm/disk.raw --out vm-lane-artifacts --boots 5 --tour --orca-contract ${{ matrix.orca }}
           --strip-image vm-lane-artifacts/strip-image.json --strip-edge
           --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
-          --meta "tuna_package=$(basename arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)"
-          --meta "commit=${{ github.sha }}"
+          --meta "tuna_package=$PRODUCT_PACKAGE_BASENAME"
+          --meta "commit=$PRODUCT_COMMIT"
+          --meta "capture_commit=$(git rev-parse HEAD)"
       - name: Seal real native screenshots and video only after all five boots succeed
         if: matrix.profile == 'lifecycle'
+        env:
+          PRODUCT_PACKAGE: ${{ steps.native-product.outputs.package_path }}
         run: |
           scripts/tuna-docs-shots receipt vm-lane-artifacts --bundle vm-tour --producer-exit-code 0 \
             --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
@@ -1770,7 +1823,7 @@ jobs:
             --expect-tree "$(git rev-parse 'HEAD^{tree}')" \
             --expect-source-inputs "$(python3 scripts/lib/maintained_media.py source-inputs)" \
             --expect-image "$(cat /mnt/vm/image-id)" \
-            --expect-package "$(sha256sum tuna.pkg.tar.zst | cut -d' ' -f1)"
+            --expect-package "$(sha256sum "$PRODUCT_PACKAGE" | cut -d' ' -f1)"
       - name: Observe the actual paired native switcher member
         if: matrix.profile != 'lifecycle'
         env:
@@ -1793,12 +1846,14 @@ jobs:
         env:
           TUNA_VM_GDM_NATIVE_CANDIDATE: vm-lane-artifacts/gdm51/manifest.json
           TUNA_VM_GDM_NATIVE_SOURCE_SHA: 7b52bdf34be22bc60fef62b157be64b589b13f6a
+          PRODUCT_COMMIT: ${{ steps.native-product.outputs.product_commit }}
         run: >-
           test -f /mnt/vm/disk.raw &&
           scripts/tuna-vm-lane --fresh-accounts --fresh-gdm-trace --disk /mnt/vm/disk.raw --out vm-lane-artifacts/fresh-accounts
           --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
-          --meta "commit=${{ github.sha }}"
+          --meta "commit=$PRODUCT_COMMIT"
+          --meta "capture_commit=$(git rev-parse HEAD)"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
@@ -1822,6 +1877,41 @@ jobs:
           path: orca51-package-provenance/
           if-no-files-found: error
           retention-days: 14
+      # Retention is not publication: only fully qualified trusted Main data is
+      # uploaded, and readers also require success of the entire original run.
+      - name: Retain the qualified native product data
+        id: native-product-data
+        if: success() && matrix.profile == 'lifecycle' && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'tuna-os/tuna-desktop'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: native-product-DATA-${{ matrix.orca }}
+          path: |
+            /mnt/vm/native-product/product-image.oci.tar
+            /mnt/vm/native-product/tuna.pkg.tar.zst
+            /mnt/vm/native-product/product-provenance.json
+            /mnt/vm/native-product/strip-image.json
+            /mnt/vm/native-product/native-base/
+            /mnt/vm/native-product/gdm51/
+            /mnt/vm/native-product/orca51-package-provenance/
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+      - name: Bind the native identity pointer to the actual data upload
+        if: success() && matrix.profile == 'lifecycle' && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'tuna-os/tuna-desktop'
+        env:
+          DATA_ARTIFACT_ID: ${{ steps.native-product-data.outputs.artifact-id }}
+          DATA_ARTIFACT_DIGEST: ${{ steps.native-product-data.outputs.artifact-digest }}
+        run: |
+          scripts/tuna-native-product pointer --out /mnt/vm/native-product \
+            --data-artifact-id "$DATA_ARTIFACT_ID" --data-artifact-digest "$DATA_ARTIFACT_DIGEST"
+      - name: Retain the authenticated native product identity pointer
+        if: success() && matrix.profile == 'lifecycle' && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'tuna-os/tuna-desktop'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: native-product-${{ matrix.orca }}
+          path: /mnt/vm/native-product/product-identity.json
+          if-no-files-found: error
+          retention-days: 90
 
   native-reference-context:
     # Artifact-only consumer of the two DEV members, not another VM producer.
