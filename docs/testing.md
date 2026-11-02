@@ -89,8 +89,13 @@ Tool consumers sparsely check out `.ci-workflow-tools` at the immutable
 `github.workflow_sha`, separate from the candidate source checkout. The
 action invokes its paired installer through `GITHUB_ACTION_PATH` and hashes
 those actual workflow-owned files, not similarly named candidate files.
-Older PR heads need not contain the cache action or staged installer;
-exact-head jobs still test the PR head, not the tooling checkout.
+Older PR heads need not contain the cache action or staged installer.
+The required `check` job tests the PR merge ref and exports its actual
+`tested_sha`; GTK authentication, fingerprint and grid comparison proofs
+check out that exact revision. Admission separately validates the workflow
+event commit, checked output, clean checkout/tree and API triggering head,
+so a green job's `head_sha` is never mistaken for its tested merge tree.
+The tooling checkout remains separate and is never presented as tested source.
 Before source scans, the action appends only `/.ci-workflow-tools/` to the
 candidate repository's local Git excludes, preserving existing rules. This
 also works on older heads with no matching `.gitignore` entry; genuinely
