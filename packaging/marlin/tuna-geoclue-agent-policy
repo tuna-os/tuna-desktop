@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 
@@ -47,14 +48,25 @@ def command(*argv):
 def vendor_package(raw):
     """Use the actual native package database; never bless modified /etc bytes."""
     original = []
-    if Path('/var/lib/pacman/local').is_dir():
+    database_path = None
+    if shutil.which('pacman') is not None:
+        # Immutable images relocate DBPath into /usr. Query pacman's effective
+        # configuration instead of assuming the mutable Arch filesystem layout.
+        configured = command('pacman-conf', 'DBPath')
+        database_path = Path(configured)
+        if (not configured or '\n' in configured or '\0' in configured
+                or not database_path.is_absolute() or '..' in database_path.parts):
+            raise RuntimeError('configured pacman database path is malformed')
+        metadata = database_path.stat()
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            raise RuntimeError('configured pacman database is not immutable root-owned metadata')
         version = command('pacman', '-Q', 'geoclue').split()
         if (len(version) != 2 or version[0] != 'geoclue'
                 or re.fullmatch(r'[A-Za-z0-9:.+_-]+', version[1]) is None):
             raise RuntimeError('installed production GeoClue package identity malformed')
         if command('pacman', '-Qqo', str(MAIN)) != 'geoclue':
             raise RuntimeError('GeoClue main policy has another package owner')
-        database = Path('/var/lib/pacman/local') / ('geoclue-' + version[1]) / 'files'
+        database = database_path / 'local' / ('geoclue-' + version[1]) / 'files'
         lines = immutable(database).decode().splitlines()
         try:
             start = lines.index('%BACKUP%') + 1
@@ -113,7 +125,8 @@ def vendor_package(raw):
     if algorithm is None or hashlib.new(algorithm, raw, usedforsecurity=False).hexdigest() != original[0]:
         raise RuntimeError('administrator-modified GeoClue main policy; refusing to override its whitelist')
     return {'backend': backend, 'identity': package, 'original_digest': original[0],
-            'original_digest_algorithm': algorithm}
+            'original_digest_algorithm': algorithm,
+            'database_path': str(database_path) if database_path is not None else None}
 
 
 def main():

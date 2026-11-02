@@ -96,6 +96,17 @@ record and its exported Agent object's bus PID/UID; an absence of errors is
 not registration proof. This package/production hook still requires normal
 qualified-source intake; the old beta.2 archive contains no such helper.
 
+For pacman, the helper reads the effective database location from
+`pacman-conf DBPath`; immutable Marlin relocates it beneath `/usr`, so assuming
+`/var/lib/pacman/local` rejects a genuine installed package. The configured
+database and its package metadata must still be root-owned and immutable,
+the real file owner must be `geoclue`, and the current configuration must
+match that package's recorded backup checksum. A missing or malformed
+configured database is a failure, never a default-path fallback. Its actual
+database path is retained in the policy receipt. The isolated native-database
+regressions use genuine pacman queries and declared synthetic control packages;
+they do not qualify a signed image or the GeoClue runtime.
+
 The observer requires the session's genuine packaged `gsd-datetime` and
 GeoClue. [GNOME 51.1's actual timezone consumer](https://github.com/GNOME/gnome-settings-daemon/blob/51.1/plugins/datetime/gsd-timezone-monitor.c)
 obtains a city-level GeoClue location, then performs real reverse geocoding
