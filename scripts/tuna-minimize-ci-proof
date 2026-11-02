@@ -53,5 +53,5 @@ manifest = {
 }
 (frozen / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 PY
-dbus-run-session -- /usr/bin/python3 scripts/tuna-minimize-proof --bin-dir "$art/frozen" --artifacts "$art/ltr" --display :109
-dbus-run-session -- /usr/bin/python3 scripts/tuna-minimize-proof --bin-dir "$art/frozen" --artifacts "$art/rtl" --display :110 --rtl
+dbus-run-session -- /usr/bin/python3 scripts/tuna-minimize-proof --bin-dir "$art/frozen" --artifacts "$art/ltr"
+dbus-run-session -- /usr/bin/python3 scripts/tuna-minimize-proof --bin-dir "$art/frozen" --artifacts "$art/rtl" --rtl

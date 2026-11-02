@@ -1,0 +1,1364 @@
+{
+  "schema": 2,
+  "started": "2026-10-31T19:19:36+00:00",
+  "runner": "scripts/tuna-corral-journey",
+  "runner_sha256": "f247e93cc5a9951b40929872fbc60a66e27d60316a704b03eee5dcb83120b719",
+  "scope": "qualification-core",
+  "corral": "corral v0.7.0+36.g76b6dd5 (commit 76b6dd52d35d, built 2026-10-30T08:31:57Z, go1.27.0)",
+  "image": {
+    "ref": "ghcr.io/tuna-os/yellowfin@sha256:64e7a29a9d832c0d021d3023ee825c07d37676d722dca59b31a2dfe492e5d0b0",
+    "booted": "ghcr.io/tuna-os/yellowfin@sha256:64e7a29a9d832c0d021d3023ee825c07d37676d722dca59b31a2dfe492e5d0b0",
+    "booted_manifest_digest": "sha256:1ca595e2ab421861a51e293e99a15481553be2f3772f8f39c9617bda93d84fb6"
+  },
+  "vm": {
+    "name": "tuna-q-variant-yellowfin-31191923",
+    "namespace": "corral-vms",
+    "backend": "kubevirt",
+    "requested": {
+      "cpu": 4,
+      "mem": "6G",
+      "disk": "40Gi",
+      "node": "karnataka"
+    },
+    "node": "karnataka",
+    "cpu": {
+      "vcpus": 4,
+      "sockets": 4,
+      "cores": 1,
+      "threads": 1,
+      "model": "host-passthrough",
+      "dedicatedCpuPlacement": false,
+      "isolateEmulatorThread": false
+    },
+    "memory": "6Gi",
+    "firmware": {
+      "type": "uefi",
+      "secureBoot": false,
+      "machine": "q35"
+    },
+    "inputs": [
+      {
+        "name": "tablet",
+        "type": "tablet",
+        "bus": "usb"
+      }
+    ],
+    "disks": [
+      {
+        "name": "rootdisk",
+        "type": "disk",
+        "bus": "virtio",
+        "source": "persistentVolumeClaim",
+        "claim": "tuna-q-variant-yellowfin-31191923-bootc-disk",
+        "size": "40Gi"
+      }
+    ],
+    "tagValues": {
+      "purpose": "tuna-corral-journey"
+    },
+    "image": "ghcr.io/tuna-os/yellowfin@sha256:64e7a29a9d832c0d021d3023ee825c07d37676d722dca59b31a2dfe492e5d0b0"
+  },
+  "console": "corral console page (noVNC), Playwright Chromium, 1:1; frames are the canvas pixels",
+  "steps": [
+    {
+      "id": "greeter-user-list",
+      "title": "GDM shows the user list",
+      "started": "2026-10-31T19:35:59+00:00",
+      "checks": [
+        {
+          "name": "console size",
+          "ok": true,
+          "observed": [
+            1280,
+            800
+          ]
+        },
+        {
+          "name": "GDM greeter session on seat0",
+          "ok": true,
+          "observed": "c1"
+        },
+        {
+          "name": "no user session yet",
+          "ok": true,
+          "observed": null
+        }
+      ],
+      "result": "pass",
+      "frame": "01-greeter-user-list.png",
+      "frame_sha256": "f61b91bb44de251a7fac35cf81c1c2109925a68aa8b1f822e4b409592dc2d5d9",
+      "crosscheck": {
+        "identical": true,
+        "corral_png_sha256": "f43ad345ab55dd9f82c518312ec809484483ebcc09a951449e2ee49667cf2531"
+      },
+      "journal": [],
+      "finished": "2026-10-31T19:36:35+00:00"
+    },
+    {
+      "id": "greeter-password",
+      "title": "Select the user; GDM asks for the password",
+      "started": "2026-10-31T19:36:35+00:00",
+      "checks": [
+        {
+          "name": "password prompt requested",
+          "ok": true,
+          "observed": "Enter changed nothing; clicked the user row instead"
+        }
+      ],
+      "result": "pass",
+      "frame": "02-greeter-password.png",
+      "frame_sha256": "d20c662970527c7f9973cfd7959f9964291b5486f7d639f14ff5f6e1eee21b74",
+      "journal": [],
+      "finished": "2026-10-31T19:37:21+00:00"
+    },
+    {
+      "id": "session-is-tuna",
+      "title": "Password login starts Tuna Desktop (lands in the overview)",
+      "started": "2026-10-31T19:37:21+00:00",
+      "checks": [
+        {
+          "name": "logind session via gdm-password",
+          "ok": true,
+          "observed": {
+            "Service": "gdm-password",
+            "Desktop": "",
+            "Type": "wayland",
+            "Class": "user",
+            "State": "active",
+            "LockedHint": "no"
+          }
+        },
+        {
+          "name": "Tuna compositor and shell run",
+          "ok": true,
+          "observed": [
+            "tuna-compositor",
+            "tuna-ibus-bridg",
+            "tuna-shell-gtk"
+          ]
+        },
+        {
+          "name": "no gnome-shell for the user",
+          "ok": true,
+          "observed": false
+        },
+        {
+          "name": "session desktop is tuna",
+          "ok": true,
+          "observed": [
+            "XDG_CURRENT_DESKTOP=Tuna:GNOME",
+            "XDG_SESSION_DESKTOP=tuna",
+            "XDG_SESSION_TYPE=wayland"
+          ]
+        }
+      ],
+      "result": "pass",
+      "frame": "03-session-is-tuna.png",
+      "frame_sha256": "ff8e10ded4d87111f9858f32a0492a3290fd026b246f9397b644bdcedc25cd24",
+      "crosscheck": {
+        "identical": true,
+        "corral_png_sha256": "8c9c5c0d01b1505883afa05396a61d2cd195f9f6002a4b2c436e083bcb07b163"
+      },
+      "journal": [
+        "tuna-compositor: serving org.gnome.Mutter.RemoteDesktop",
+        "tuna-compositor: serving org.gnome.Mutter.IdleMonitor",
+        "tuna-compositor: serving org.gnome.Mutter.ServiceChannel",
+        "tuna-compositor: serving org.gnome.SettingsDaemon.Color",
+        "tuna-compositor: serving org.gnome.SessionManager (inhibitors, session activity)",
+        "tuna-compositor: session services: display environment imported (systemd=true bus=true)",
+        "tuna-compositor: ime: IBus bridge started",
+        "tuna-compositor: session services: holding the session leader FIFO",
+        "tuna-ibus-bridge: input context /org/freedesktop/IBus/InputContext_2",
+        "tuna-ibus-bridge: ready",
+        "tuna-shell-gtk: OpenGL is llvmpipe (LLVM 22.1.8, 256 bits); drawing with cairo",
+        "tuna-compositor: switcher keys:",
+        "tuna-shell-gtk: keybindings:",
+        "tuna-compositor: session services: graphical target active",
+        "tuna-compositor: overview focus parked",
+        "tuna-compositor: session services: portals refreshed",
+        "tuna-shell-gtk: search providers: org.gnome.Settings.desktop, org.gnome.Nautilus.desktop",
+        "tuna-shell-gtk: IBus panel: owns org.freedesktop.IBus.Panel on the IBus bus",
+        "tuna-shell-gtk: media keys: gsd-media-keys owns the media-keys bindings",
+        "tuna-ibus-bridge: text field focused",
+        "tuna-shell-gtk: keybindings: 69 grabs, maximize on [\"<Super>Up\"]",
+        "tuna-compositor: switcher keys: 12 chords, cycle-group Some(SwitcherKey { keysym: 65475, mods: 8, kind: CycleGroup }), cycle-windows Some(SwitcherKey { keysym: 65307, mods: 8, kind: CycleWindows })",
+        "tuna-shell-gtk: polkit agent registered",
+        "tuna-compositor: wallpaper decoded for 1280x800 in 101 ms",
+        "tuna-shell-gtk: network agent registered"
+      ],
+      "finished": "2026-10-31T19:41:18+00:00"
+    },
+    {
+      "id": "portal-availability",
+      "title": "Published portal interfaces respond (not capture consent)",
+      "started": "2026-10-31T19:41:18+00:00",
+      "checks": [
+        {
+          "name": "settings portal responds",
+          "ok": true,
+          "observed": {
+            "exit": 0,
+            "stdout": "(<<uint32 0>>,)",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "screenshot portal responds",
+          "ok": true,
+          "observed": {
+            "exit": 0,
+            "stdout": "(<uint32 2>,)",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "screencast portal responds",
+          "ok": true,
+          "observed": {
+            "exit": 0,
+            "stdout": "(<uint32 7>,)",
+            "stderr": ""
+          }
+        }
+      ],
+      "result": "pass",
+      "frame": "04-portal-availability.png",
+      "frame_sha256": "11a07f2b80b67b7a9d72b239bb1102e19d11e5c60838ddffd5f6aafdc37708db",
+      "journal": [],
+      "finished": "2026-10-31T19:42:46+00:00"
+    },
+    {
+      "id": "portal-screenshot",
+      "title": "Request Screenshot through the actual published frontend",
+      "started": "2026-10-31T19:42:46+00:00",
+      "checks": [
+        {
+          "name": "native requester launched",
+          "ok": true,
+          "observed": {
+            "exit": 0,
+            "pid": "5663",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "actual portal consent control activated",
+          "ok": true,
+          "observed": {
+            "method": "AT-SPI action on the visible GNOME portal consent control",
+            "helper_sha256": "6706470ffc0fefbac9cf7989c72f6c2982e0d267b4019fcd1baf531dff508f1f",
+            "exit": 0,
+            "stdout": "actual portal picker: Allow",
+            "stderr": "",
+            "accessible_tree": [
+              {
+                "role": "application",
+                "name": "xdg-desktop-portal-gtk",
+                "showing": false
+              },
+              {
+                "role": "alert",
+                "name": "Question",
+                "showing": true
+              },
+              {
+                "role": "filler",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "",
+                "showing": false
+              },
+              {
+                "role": "filler",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "filler",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "icon",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "filler",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "Allow Applications to Take Screenshots?",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "An application wants to be able to take screenshots at any time.",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "This permission can be changed at any time from the privacy settings.",
+                "showing": true
+              },
+              {
+                "role": "filler",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "filler",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "button",
+                "name": "Deny",
+                "showing": true
+              },
+              {
+                "role": "button",
+                "name": "Allow",
+                "showing": true
+              }
+            ]
+          }
+        },
+        {
+          "name": "native consent and image proof exits successfully",
+          "ok": false,
+          "observed": [
+            "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"<string>\", line 71, in <module>\nRuntimeError: Screenshot did not return a local file URI",
+            ""
+          ]
+        }
+      ],
+      "result": "fail",
+      "frame": "05-portal-screenshot.png",
+      "frame_sha256": "d4cacf4c183194915c8ba5701a5314b6a0186ea4d9be756362a46df3bba0a8b3",
+      "journal": [
+        "tuna-compositor: window 1 unmapped"
+      ],
+      "finished": "2026-10-31T19:44:11+00:00"
+    },
+    {
+      "id": "desktop",
+      "title": "Escape leaves the overview for the desktop",
+      "started": "2026-10-31T19:44:11+00:00",
+      "checks": [
+        {
+          "name": "overview closed",
+          "ok": true,
+          "observed": "Escape from the login overview (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "06-desktop.png",
+      "frame_sha256": "c0440acda54ac002ebf52f746849b279b06526cbeb1a6f743b1ff9a162034e1f",
+      "journal": [
+        "tuna-compositor: libinput: scroll-wheel emulation button rejected for QEMU QEMU USB Tablet: Unsupported",
+        "tuna-compositor: display power save mode 0",
+        "tuna-ibus-bridge: text field focused"
+      ],
+      "finished": "2026-10-31T19:44:39+00:00"
+    },
+    {
+      "id": "portal-screencast",
+      "title": "Consume a real frontend stream before locking",
+      "started": "2026-10-31T19:44:48+00:00",
+      "checks": [
+        {
+          "name": "native ScreenCast requester launched",
+          "ok": true,
+          "observed": {
+            "exit": 0,
+            "pid": "6244",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "actual portal consent control activated",
+          "ok": true,
+          "observed": {
+            "method": "AT-SPI action on the visible GNOME portal consent control",
+            "helper_sha256": "6706470ffc0fefbac9cf7989c72f6c2982e0d267b4019fcd1baf531dff508f1f",
+            "exit": 0,
+            "stdout": "actual portal picker: Share",
+            "stderr": "",
+            "accessible_tree": [
+              {
+                "role": "application",
+                "name": "xdg-desktop-portal-gnome",
+                "showing": false
+              },
+              {
+                "role": "frame",
+                "name": "Share Screen",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "grouping",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "scroll pane",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "grouping",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "An app wants to share your screen. Choose what you'd like to share.",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "grouping",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "_Entire Screen",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "toggle button",
+                "name": "Virtual-1",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "Virtual-1",
+                "showing": true
+              },
+              {
+                "role": "grouping",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "grouping",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "button",
+                "name": "Cancel",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "Cancel",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "Share Screen",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "button",
+                "name": "Share",
+                "showing": true
+              },
+              {
+                "role": "label",
+                "name": "Share",
+                "showing": true
+              },
+              {
+                "role": "grouping",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              },
+              {
+                "role": "panel",
+                "name": "",
+                "showing": true
+              }
+            ]
+          }
+        },
+        {
+          "name": "native frame and caller isolation reached active grant",
+          "ok": false,
+          "observed": {
+            "requester_sha256": {
+              "tuna-portal-capture-client.py": "6a3e82bdbf988153feae702fb927f867ff435a56558aef392b382c5d94c15c3c",
+              "tuna-pipewire-dump.py": "a63c93d72b90be6b649909b034d3a241e79eea9daae3b1b64f9f05ba3db05b4f"
+            },
+            "frame": "portal-screencast-prompt.png",
+            "frame_sha256": "f184e838bbdd120413e70adfb3d297fdf54ebec390958eb08cfa64aef5bb6d2d",
+            "meaning": "console at Start; consent visibility requires visual review",
+            "input": {
+              "method": "AT-SPI action on the visible GNOME portal consent control",
+              "helper_sha256": "6706470ffc0fefbac9cf7989c72f6c2982e0d267b4019fcd1baf531dff508f1f",
+              "exit": 0,
+              "stdout": "actual portal picker: Share",
+              "stderr": "",
+              "accessible_tree": [
+                {
+                  "role": "application",
+                  "name": "xdg-desktop-portal-gnome",
+                  "showing": false
+                },
+                {
+                  "role": "frame",
+                  "name": "Share Screen",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "scroll pane",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "An app wants to share your screen. Choose what you'd like to share.",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "_Entire Screen",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "toggle button",
+                  "name": "Virtual-1",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "Virtual-1",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "button",
+                  "name": "Cancel",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "Cancel",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "Share Screen",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "button",
+                  "name": "Share",
+                  "showing": true
+                },
+                {
+                  "role": "label",
+                  "name": "Share",
+                  "showing": true
+                },
+                {
+                  "role": "grouping",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                },
+                {
+                  "role": "panel",
+                  "name": "",
+                  "showing": true
+                }
+              ]
+            },
+            "log": [
+              "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"<frozen runpy>\", line 287, in run_path\n  File \"<frozen runpy>\", line 98, in _run_module_code\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/run/user/1000/tuna-variant-capture-111280903490713/tuna-portal-capture-client.py\", line 49, in <module>\n    if code != 0: raise RuntimeError(\"Start failed \" + str(code))\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nRuntimeError: Start failed 2",
+              ""
+            ],
+            "response": {
+              "mode": "revoke",
+              "response": 2,
+              "results": {}
+            }
+          }
+        }
+      ],
+      "result": "fail",
+      "frame": "07-portal-screencast.png",
+      "frame_sha256": "f184e838bbdd120413e70adfb3d297fdf54ebec390958eb08cfa64aef5bb6d2d",
+      "journal": [
+        "tuna-ibus-bridge: text field left",
+        "tuna-compositor: window 2 unmapped"
+      ],
+      "finished": "2026-10-31T19:46:42+00:00"
+    },
+    {
+      "id": "lock",
+      "title": "Super+L locks the screen",
+      "started": "2026-10-31T19:46:42+00:00",
+      "checks": [
+        {
+          "name": "ScreenSaver.GetActive is true",
+          "ok": true,
+          "observed": "(true,)"
+        },
+        {
+          "name": "logind LockedHint is yes",
+          "ok": false,
+          "observed": "no"
+        }
+      ],
+      "result": "fail",
+      "frame": "08-lock.png",
+      "frame_sha256": "f184e838bbdd120413e70adfb3d297fdf54ebec390958eb08cfa64aef5bb6d2d",
+      "crosscheck": {
+        "identical": true,
+        "corral_png_sha256": "28fe32ab00c7560449c462516b352935139d6a70956b9f61ea7a18f8fbf39e80"
+      },
+      "journal": [
+        "tuna-compositor: display power save mode 0",
+        "tuna-ibus-bridge: text field focused",
+        "tuna-ibus-bridge: text field left",
+        "tuna-ibus-bridge: text field focused",
+        "tuna-compositor: display power save mode 3"
+      ],
+      "finished": "2026-10-31T19:47:48+00:00"
+    },
+    {
+      "id": "unlock-refused",
+      "title": "A wrong password is refused",
+      "started": "2026-10-31T19:47:48+00:00",
+      "checks": [
+        {
+          "name": "still locked after a wrong password",
+          "ok": true,
+          "observed": "(true,)"
+        }
+      ],
+      "result": "pass",
+      "frame": "09-unlock-refused.png",
+      "frame_sha256": "3089e8ebd0d3043090203966dcdccfc0c571367c763e3c729a61e5f95bff909d",
+      "journal": [
+        "tuna-compositor: display power save mode 0",
+        "tuna-ibus-bridge: text field left",
+        "tuna-ibus-bridge: text field focused"
+      ],
+      "finished": "2026-10-31T19:48:22+00:00"
+    },
+    {
+      "id": "unlock",
+      "title": "The right password unlocks",
+      "started": "2026-10-31T19:48:22+00:00",
+      "checks": [
+        {
+          "name": "ScreenSaver.GetActive is false",
+          "ok": true,
+          "observed": "(false,)"
+        }
+      ],
+      "result": "pass",
+      "frame": "10-unlock.png",
+      "frame_sha256": "5732d760fce2e40994bbc16e4b805925f3762b95aa0bc45cfaabbea03f39f827",
+      "journal": [
+        "tuna-ibus-bridge: text field left"
+      ],
+      "finished": "2026-10-31T19:49:02+00:00"
+    },
+    {
+      "id": "power-menu",
+      "title": "Quick settings power menu",
+      "started": "2026-10-31T19:49:02+00:00",
+      "checks": [
+        {
+          "name": "power menu opened",
+          "ok": true,
+          "observed": "quick settings power button (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "11-power-menu.png",
+      "frame_sha256": "935c81869fe34b2d6c7bc99cac67dabd1fae9fdb0b40cc1a84f5adb7bceb4df1",
+      "journal": [],
+      "finished": "2026-10-31T19:49:23+00:00"
+    },
+    {
+      "id": "logout-dialog",
+      "title": "Log Out asks for confirmation",
+      "started": "2026-10-31T19:49:23+00:00",
+      "checks": [
+        {
+          "name": "end-session dialog shown",
+          "ok": true,
+          "observed": "Log Out... (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "12-logout-dialog.png",
+      "frame_sha256": "71f53aad9a52a832b33b3c64873d58c3ed10f03b75aab2cc2dda19583d960b5b",
+      "journal": [],
+      "finished": "2026-10-31T19:49:33+00:00"
+    },
+    {
+      "id": "logout",
+      "title": "Logging out returns to GDM",
+      "started": "2026-10-31T19:49:33+00:00",
+      "checks": [
+        {
+          "name": "user seat session ended",
+          "ok": true,
+          "observed": "no seat0 session for the user"
+        },
+        {
+          "name": "GDM greeter back on seat0",
+          "ok": true,
+          "observed": "c1"
+        }
+      ],
+      "result": "pass",
+      "frame": "13-logout.png",
+      "frame_sha256": "23d764c4e359856b33ae64e3dbbb8f886d8a19629e5e4f827ef9eaa5a98fc2ab",
+      "journal": [
+        "tuna-compositor: shutdown after 2689 frames, 8 clients, 0 shell restarts"
+      ],
+      "finished": "2026-10-31T19:49:59+00:00"
+    }
+  ],
+  "ready": {
+    "vm": "tuna-q-variant-yellowfin-31191923",
+    "ready": true,
+    "elapsed_seconds": 184.4,
+    "boot_id": "36de7012-ee57-40e5-9625-0edc78d1800f",
+    "conditions": [
+      {
+        "name": "running",
+        "ok": true,
+        "elapsed_seconds": 8,
+        "observed": "Running"
+      },
+      {
+        "name": "ssh",
+        "ok": true,
+        "elapsed_seconds": 31.5,
+        "observed": "boot 36de7012-ee57-40e5-9625-0edc78d1800f"
+      },
+      {
+        "name": "boot-complete",
+        "ok": true,
+        "elapsed_seconds": 182.6,
+        "observed": "running"
+      },
+      {
+        "name": "unit:gdm.service",
+        "ok": true,
+        "elapsed_seconds": 182.8,
+        "observed": "active"
+      },
+      {
+        "name": "exec:loginctl list-sessions --no-legend | awk '$6==\"greeter\" && $4==\"seat0\"' | grep -q .",
+        "ok": true,
+        "elapsed_seconds": 183.4,
+        "observed": "exit status 0"
+      },
+      {
+        "name": "paint",
+        "ok": true,
+        "elapsed_seconds": 184.4,
+        "observed": "painted 1280x800 (deviation 0.0514)"
+      }
+    ]
+  },
+  "guest": {
+    "packages": [
+      "tuna-desktop-1.0.0~beta.2-2.el10.x86_64",
+      "gdm-47.0-32.el10.x86_64",
+      "gnome-shell-49.5-18.el10.alma.1.x86_64",
+      "gnome-control-center-47.7-18.el10.x86_64",
+      "nautilus-47.6-3.el10.x86_64"
+    ],
+    "tuna_payload_sha256": [
+      "bece8dd89f202d36414dd0183b350e8ce3d0fdae2326e8a52eadfab35c7a47fc  /usr/bin/tuna-session",
+      "addd99478870b9d0a73f2a4f4c79a5b71878952588a12fbb62f25a81bfd18fa6  /usr/bin/tuna-compositor",
+      "dcf1133a966ea089d3b1d727ccdf77952d146c55a22a43242a450042fb6ebd44  /usr/bin/tuna-shell-gtk",
+      "67aeabd23f9857f693e280a7010449ba41bb45f82dd897e1d5296f8b688c2640  /usr/bin/tuna-ibus-bridge"
+    ],
+    "kernel": "6.12.0-273.el10.x86_64",
+    "drm_driver": "bochs-drm",
+    "modes": [
+      "1280x800",
+      "1920x1440",
+      "2560x1080"
+    ],
+    "sessions_offered": [
+      "Name=Tuna Desktop"
+    ],
+    "gdm_custom_conf": [
+      "FallbackSession=tuna"
+    ],
+    "boot_id": "36de7012-ee57-40e5-9625-0edc78d1800f",
+    "account": "tuna-test:x:1000:1000::/var/home/tuna-test:/bin/bash"
+  },
+  "account": {
+    "user": "tuna-test",
+    "password": "public fixture password (packaging/marlin/vm-lane)",
+    "provisioned": "corral bootc create --user --password-stdin; image unchanged"
+  },
+  "console_endpoint": {
+    "vm": "tuna-q-variant-yellowfin-31191923",
+    "namespace": "corral-vms",
+    "url": "http://127.0.0.1:45805/console/corral-vms/tuna-q-variant-yellowfin-31191923",
+    "websocket": "ws://127.0.0.1:45805/api/vnc/corral-vms/tuna-q-variant-yellowfin-31191923"
+  },
+  "portal_requester_sha256": "69de07c8d3dc1d2914fd96dfd82995dca6bdab0092001cde149982d08ba61dcb",
+  "portal_request_console": {
+    "frame": "portal-screenshot-prompt.png",
+    "sha256": "d4cacf4c183194915c8ba5701a5314b6a0186ea4d9be756362a46df3bba0a8b3",
+    "meaning": "console after request; prompt visibility requires visual review",
+    "input": {
+      "method": "AT-SPI action on the visible GNOME portal consent control",
+      "helper_sha256": "6706470ffc0fefbac9cf7989c72f6c2982e0d267b4019fcd1baf531dff508f1f",
+      "exit": 0,
+      "stdout": "actual portal picker: Allow",
+      "stderr": "",
+      "accessible_tree": [
+        {
+          "role": "application",
+          "name": "xdg-desktop-portal-gtk",
+          "showing": false
+        },
+        {
+          "role": "alert",
+          "name": "Question",
+          "showing": true
+        },
+        {
+          "role": "filler",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "",
+          "showing": false
+        },
+        {
+          "role": "filler",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "filler",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "icon",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "filler",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "Allow Applications to Take Screenshots?",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "An application wants to be able to take screenshots at any time.",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "This permission can be changed at any time from the privacy settings.",
+          "showing": true
+        },
+        {
+          "role": "filler",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "filler",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "button",
+          "name": "Deny",
+          "showing": true
+        },
+        {
+          "role": "button",
+          "name": "Allow",
+          "showing": true
+        }
+      ]
+    }
+  },
+  "portal_screenshot": {
+    "response": 0,
+    "results": {
+      "uri": ""
+    }
+  },
+  "portal_screencast": {
+    "requester_sha256": {
+      "tuna-portal-capture-client.py": "6a3e82bdbf988153feae702fb927f867ff435a56558aef392b382c5d94c15c3c",
+      "tuna-pipewire-dump.py": "a63c93d72b90be6b649909b034d3a241e79eea9daae3b1b64f9f05ba3db05b4f"
+    },
+    "frame": "portal-screencast-prompt.png",
+    "frame_sha256": "f184e838bbdd120413e70adfb3d297fdf54ebec390958eb08cfa64aef5bb6d2d",
+    "meaning": "console at Start; consent visibility requires visual review",
+    "input": {
+      "method": "AT-SPI action on the visible GNOME portal consent control",
+      "helper_sha256": "6706470ffc0fefbac9cf7989c72f6c2982e0d267b4019fcd1baf531dff508f1f",
+      "exit": 0,
+      "stdout": "actual portal picker: Share",
+      "stderr": "",
+      "accessible_tree": [
+        {
+          "role": "application",
+          "name": "xdg-desktop-portal-gnome",
+          "showing": false
+        },
+        {
+          "role": "frame",
+          "name": "Share Screen",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "grouping",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "scroll pane",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "grouping",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "An app wants to share your screen. Choose what you'd like to share.",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "grouping",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "_Entire Screen",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "toggle button",
+          "name": "Virtual-1",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "Virtual-1",
+          "showing": true
+        },
+        {
+          "role": "grouping",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "grouping",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "button",
+          "name": "Cancel",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "Cancel",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "Share Screen",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "button",
+          "name": "Share",
+          "showing": true
+        },
+        {
+          "role": "label",
+          "name": "Share",
+          "showing": true
+        },
+        {
+          "role": "grouping",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        },
+        {
+          "role": "panel",
+          "name": "",
+          "showing": true
+        }
+      ]
+    },
+    "log": [
+      "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"<frozen runpy>\", line 287, in run_path\n  File \"<frozen runpy>\", line 98, in _run_module_code\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/run/user/1000/tuna-variant-capture-111280903490713/tuna-portal-capture-client.py\", line 49, in <module>\n    if code != 0: raise RuntimeError(\"Start failed \" + str(code))\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nRuntimeError: Start failed 2",
+      ""
+    ],
+    "response": {
+      "mode": "revoke",
+      "response": 2,
+      "results": {}
+    }
+  },
+  "cleanup": {
+    "deleted": true,
+    "result": [
+      {
+        "name": "tuna-q-variant-yellowfin-31191923",
+        "deleted": true,
+        "removed": [
+          "virtualmachine.kubevirt.io/tuna-q-variant-yellowfin-31191923",
+          "virtualmachineinstance.kubevirt.io/tuna-q-variant-yellowfin-31191923",
+          "persistentvolumeclaim/tuna-q-variant-yellowfin-31191923-bootc-disk"
+        ]
+      }
+    ],
+    "still_listed": [],
+    "failures": []
+  },
+  "finished": "2026-10-31T19:50:49+00:00"
+}

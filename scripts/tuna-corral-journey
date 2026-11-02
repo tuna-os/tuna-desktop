@@ -27,9 +27,13 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 
 from PIL import Image, ImageChops
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
+from corral_identity import Identity, save_identity
 
 USER, PASSWORD = 'tuna-test', 'tuna'  # public fixture account, as in packaging/marlin/vm-lane
 WIDTH, HEIGHT = 1280, 800
@@ -45,6 +49,11 @@ POINTS = {
     'gdm-user': (640, 349),             # GDM user list, the only row
 }
 CROSSCHECK = {'greeter-user-list', 'session-is-tuna', 'lock'}
+QUALIFICATION_CORE = {
+    'greeter-user-list', 'greeter-password', 'session-is-tuna', 'portal-availability', 'portal-screenshot',
+    'portal-screencast',
+    'desktop', 'lock', 'unlock-refused', 'unlock', 'power-menu', 'logout-dialog', 'logout',
+}
 # Ready means: boot finished, GDM active, its greeter session on seat0, and
 # something painted on the console.
 GREETER = 'loginctl list-sessions --no-legend | awk \'$6=="greeter" && $4=="seat0"\' | grep -q .'
@@ -61,7 +70,8 @@ def now():
 def run(cmd, timeout=120, check=True, input=None):
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input)
     if check and r.returncode:
-        raise RuntimeError(f'{shlex.join(cmd)} exited {r.returncode}: {r.stderr.strip()[-800:]}')
+        raise RuntimeError(json.dumps({'argv': cmd, 'exit': r.returncode,
+                                       'stdout': r.stdout, 'stderr': r.stderr}))
     return r
 
 
@@ -74,8 +84,12 @@ def corral_json(argv, timeout=120, check=True, input=None):
 class Guest:
     """Root shell in the VM over `corral ssh` (virtctl ssh on KubeVirt)."""
 
-    def __init__(self, vm):
-        self.vm = vm
+    def __init__(self, identity):
+        self.identity = identity
+
+    @property
+    def vm(self):
+        return self.identity.target
 
     def sh(self, script, user=False, timeout=120):
         if user:
@@ -86,9 +100,7 @@ class Guest:
             r = run(['corral', 'ssh', self.vm, '-u', 'root', '-c', script], timeout=timeout, check=False)
         except subprocess.TimeoutExpired:
             return 124, '', f'corral ssh timed out after {timeout}s'
-        err = '\n'.join(line for line in r.stderr.splitlines()
-                        if not re.search(r'virtctl version|Client Version|Server Version|^exit status', line))
-        return r.returncode, r.stdout.strip(), err.strip()
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
 
     def out(self, script, user=False):
         code, out, err = self.sh(script, user)
@@ -170,21 +182,71 @@ class Console:
     def wait(self, ms):
         self.page.wait_for_timeout(ms)
 
+    def activity(self):
+        """Real pointer motion keeps an unlocked session active, never unlocks it."""
+        box = self.page.locator('#vnc-canvas').bounding_box()
+        for x in (10, 11):
+            self.page.mouse.move(box['x'] + x * box['width'] / WIDTH,
+                                 box['y'] + (HEIGHT - 10) * box['height'] / HEIGHT)
+
     def close(self):
         self.browser.close()
 
 
-def start_console(vm):
+def start_console(identity):
     """`corral console` serves the VM's console page on a port the OS picks.
 
     Its first stdout line is JSON that names the page's URL."""
-    proc = subprocess.Popen(['corral', '--json', 'console', vm], stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, text=True)
-    line = proc.stdout.readline()
-    if not line:
+    # A file retains complete startup diagnostics without a PIPE filling while
+    # the long-lived console runs. The child keeps its inherited descriptor.
+    with tempfile.TemporaryFile(mode='w+t') as errors:
+        argv = ['corral', '--json', 'console', identity.target]
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                stderr=errors, text=True)
+        line = proc.stdout.readline()
+        if not line:
+            proc.wait(timeout=30)
+            errors.seek(0)
+            raise RuntimeError(f'{shlex.join(argv)} exited {proc.returncode} before it printed a URL; '
+                               f'stderr: {errors.read()}')
+    endpoint = json.loads(line)
+    try:
+        identity.validate_endpoint(endpoint)
+    except Exception:
+        proc.terminate()
         proc.wait(timeout=30)
-        raise RuntimeError(f'corral console exited {proc.returncode} before it printed a URL')
-    return proc, json.loads(line)
+        raise
+    return proc, endpoint
+
+
+def require_report_unlocked(record, phase):
+    states = [state for state in record.get('session_state', []) if state['phase'] == phase]
+    if not states or states[-1]['exit'] != 0 or states[-1]['stdout'] != '(false,)':
+        raise RuntimeError(f'portal {phase} requires an unlocked session: {states}')
+
+
+def portal_exchange(guest, record, operation, values, timeout):
+    """One SSH exchange per boundary, never one exchange per bookkeeping file."""
+    source = (Path(__file__).with_name('lib') / 'tuna-portal-journey-client.py').read_bytes()
+    launch = 'exec(__import__("base64").b64decode(' + repr(base64.b64encode(source).decode()) + '))'
+    code, stdout, stderr = guest.sh(
+        f'python3 -c {shlex.quote(launch)} {operation} {shlex.quote(json.dumps(values))}',
+        user=True, timeout=timeout)
+    record['coordinator_sha256'] = hashlib.sha256(source).hexdigest()
+    try:
+        report = json.loads(stdout)
+    except (ValueError, TypeError):
+        record.setdefault('exchange_errors', []).append(
+            {'operation': operation, 'exit': code, 'stdout': stdout, 'stderr': stderr})
+        raise RuntimeError(f'portal {operation} did not return a structured receipt')
+    record.setdefault('exchanges', []).append(
+        {'operation': operation, 'at': now(), 'exit': code, 'stderr': stderr,
+         'report': {key: value for key, value in report.items() if key != 'frame'}})
+    record.setdefault('session_state', []).extend(report.get('session_state', []))
+    for key in ('requester_exit', 'log', 'response', 'argv', 'pid', 'source_sha256', 'input'):
+        if key in report:
+            record[key] = report[key]
+    return report
 
 
 def wait_for(predicate, timeout, what, interval=5):
@@ -200,29 +262,56 @@ def wait_for(predicate, timeout, what, interval=5):
     raise RuntimeError(f'timed out waiting for {what}')
 
 
-def provision(args, guest, receipt):
+def provision(args, guest, receipt, identity):
     if not args.reuse:
         # The account is created in the installed system at build time; the
         # password goes in on stdin, never in argv.
-        run(['corral', 'bootc', 'create', args.vm, '--image', args.image, '--cpu', str(args.cpu),
-             '--mem', args.mem, '--disk', args.disk, '-n', args.namespace,
-             '--user', USER, '--password-stdin', '--tag', 'purpose=tuna-corral-journey']
-            + (['--node', args.node] if args.node else []), timeout=3600, input=PASSWORD + '\n')
-    info = corral_json(['info', args.vm])
-    wait = ['wait', args.vm, '--boot-complete', '--unit', 'gdm.service', '--exec', GREETER, '--paint',
+        argv = ['corral', 'bootc', 'create', args.vm, '--image', args.image, '--cpu', str(args.cpu),
+                '--mem', args.mem, '--disk', args.disk, '-n', identity.scope['namespace'],
+                '--context', identity.scope['corral_context_alias'],
+                '--user', USER, '--password-stdin', '--tag', 'purpose=tuna-corral-journey']
+        argv += ['--node', args.node] if args.node else []
+        try:
+            result = run(argv, timeout=3600, input=PASSWORD + '\n', check=False)
+        except subprocess.TimeoutExpired as error:
+            receipt['provision'] = {'argv': argv, 'timeout': 3600,
+                                    'stdout': error.stdout.decode() if isinstance(error.stdout, bytes) else error.stdout,
+                                    'stderr': error.stderr.decode() if isinstance(error.stderr, bytes) else error.stderr}
+            raise
+        receipt['provision'] = {'argv': argv, 'exit': result.returncode,
+                                'stdout': result.stdout, 'stderr': result.stderr}
+        # Resolve immediately after create, including failures which left a VM.
+        # Never replace failed resolution with a bare-name selector.
+        try:
+            identity.acquire(required=result.returncode == 0, boundary='after-create')
+        except Exception as error:
+            receipt['identity_resolution_error'] = f'{type(error).__name__}: {error}'
+            raise
+        if result.returncode:
+            raise RuntimeError(f'corral bootc create exited {result.returncode}; '
+                               'complete output retained in provision receipt')
+    info = identity.acquire(boundary='before-start')
+    receipt['vm'].update(identity.state['identities'][args.vm])
+    wait = ['wait', identity.target, '--boot-complete', '--unit', 'gdm.service', '--exec', GREETER, '--paint',
             '--timeout', '15m']
     if info.get('status') == 'Running':
         # `corral restart` returns before the guest reboots; wait for a boot
         # other than this one.
         wait += ['--boot-id', guest.out('cat /proc/sys/kernel/random/boot_id')]
-        run(['corral', 'restart', args.vm], timeout=300)
+        run(['corral', 'restart', identity.target], timeout=300)
     else:
-        run(['corral', 'start', args.vm], timeout=300)
-    ready = corral_json(wait, timeout=1000, check=False)
+        run(['corral', 'start', identity.target], timeout=300)
+    argv = ['corral', '--json', *wait]
+    result = run(argv, timeout=1000, check=False)
+    receipt['ready_command'] = {'argv': argv, 'exit': result.returncode,
+                                 'stdout': result.stdout, 'stderr': result.stderr}
+    ready = json.loads(result.stdout) if result.stdout.strip() else None
     receipt['ready'] = ready
     if not (ready or {}).get('ready'):
         raise RuntimeError(f'corral wait: VM not ready: {json.dumps(ready)[-800:]}')
-    info = corral_json(['info', args.vm])
+    info = corral_json(['info', identity.target])
+    if not identity.matches(info, args.vm) or (args.node and info.get('node') != args.node):
+        raise RuntimeError(f'post-wait VM identity/placement mismatch: {json.dumps(info)}')
     receipt['vm'].update({k: info.get(k) for k in ('node', 'cpu', 'memory', 'firmware', 'inputs', 'disks',
                                                    'tagValues', 'image')})
     if not any(i.get('type') == 'tablet' for i in info.get('inputs') or []):
@@ -233,7 +322,13 @@ def provision(args, guest, receipt):
     if booted['image']['image'] != args.image:
         raise RuntimeError(f"booted {booted['image']['image']}, not {args.image}")
     receipt['guest'] = {
-        'packages': guest.out('pacman -Q tuna-desktop gdm gnome-shell gnome-control-center nautilus libnotify').splitlines(),
+        'packages': guest.out(
+            'if command -v pacman >/dev/null; then pacman -Q tuna-desktop gdm gnome-shell gnome-control-center nautilus; '
+            'elif command -v rpm >/dev/null; then rpm -q tuna-desktop gdm gnome-shell gnome-control-center nautilus; '
+            'elif command -v dpkg-query >/dev/null; then dpkg-query -W tuna-desktop gdm3 gnome-shell gnome-control-center nautilus; '
+            'else echo "no supported native package query" >&2; exit 1; fi').splitlines(),
+        'tuna_payload_sha256': guest.out(
+            'sha256sum /usr/bin/tuna-session /usr/bin/tuna-compositor /usr/bin/tuna-shell-gtk /usr/bin/tuna-ibus-bridge').splitlines(),
         'kernel': guest.out('uname -r'),
         'drm_driver': guest.out('basename "$(readlink /sys/class/drm/card0/device/driver)"'),
         'modes': guest.out('cat /sys/class/drm/card0-*/modes | head -3').splitlines(),
@@ -250,8 +345,11 @@ def provision(args, guest, receipt):
 class Journey:
     def __init__(self, args, guest, console, receipt, out):
         self.args, self.guest, self.console, self.receipt, self.out = args, guest, console, receipt, out
+        self.capture_pending = None
 
     def step(self, sid, title, action):
+        if self.args.qualification_only and sid not in QUALIFICATION_CORE:
+            return
         record = {'id': sid, 'title': title, 'started': now(), 'checks': [], 'result': 'fail'}
         self.receipt['steps'].append(record)
         cursor = self.guest.cursor()
@@ -292,12 +390,14 @@ class Journey:
         The capture is kept only when its pixels differ from the frame."""
         other = self.out / 'crosscheck' / f'{frame.stem}-corral.png'
         other.parent.mkdir(exist_ok=True)
-        r = run(['corral', 'screenshot', self.args.vm, '-o', str(other)], check=False)
+        argv = ['corral', 'screenshot', self.guest.vm, '-o', str(other)]
+        r = run(argv, check=False)
         # KubeVirt keeps one VNC session; the screenshot's session ends the
         # page's, and the page reconnects by itself.
         self.console.connected()
         if r.returncode:
-            return {'identical': False, 'observed': r.stderr.strip()[-300:]}
+            return {'identical': False, 'argv': argv, 'exit': r.returncode,
+                    'stdout': r.stdout, 'stderr': r.stderr, 'observed': r.stderr.strip()}
         digest = hashlib.sha256(other.read_bytes()).hexdigest()
         box = ImageChops.difference(Image.open(frame).convert('RGB'), Image.open(other).convert('RGB')).getbbox()
         if box is None:
@@ -336,6 +436,7 @@ class Journey:
             session = wait_for(g.seat_session, 90, 'user session')
             wait_for(lambda: g.sh(f'pgrep -u {USER} -x tuna-shell-gtk')[0] == 0, 90, 'tuna-shell-gtk')
             c.wait(6000)
+            c.activity()
             check('logind session via gdm-password', session.get('Service') == 'gdm-password', session)
             procs = g.out(f'ps -u {USER} -o comm= | sort -u').split()
             check('Tuna compositor and shell run', {'tuna-compositor', 'tuna-shell-gtk'} <= set(procs),
@@ -345,6 +446,113 @@ class Journey:
                         ' | grep -E "^XDG_(SESSION_DESKTOP|CURRENT_DESKTOP|SESSION_TYPE)="')
             check('session desktop is tuna', 'XDG_SESSION_DESKTOP=tuna' in env, env.splitlines())
         self.step('session-is-tuna', 'Password login starts Tuna Desktop (lands in the overview)', login)
+
+        def portals(check):
+            # Availability is not a successful capture/consent flow. Keep the
+            # distinction in the receipt and in the variant qualification report.
+            probes = [
+                ('settings', 'org.freedesktop.portal.Settings.Read org.freedesktop.appearance color-scheme'),
+                ('screenshot', 'org.freedesktop.DBus.Properties.Get org.freedesktop.portal.Screenshot version'),
+                ('screencast', 'org.freedesktop.DBus.Properties.Get org.freedesktop.portal.ScreenCast AvailableSourceTypes'),
+            ]
+            for name, method in probes:
+                c.activity()
+                code, stdout, stderr = g.sh(
+                    'timeout 30s gdbus call --session --dest org.freedesktop.portal.Desktop '
+                    '--object-path /org/freedesktop/portal/desktop --method ' + method, user=True)
+                check(name + ' portal responds', code == 0, {'exit': code, 'stdout': stdout, 'stderr': stderr})
+        self.step('portal-availability', 'Published portal interfaces respond (not capture consent)', portals)
+
+        def launch_capture(kind, record, check):
+            library = Path(__file__).with_name('lib')
+            names = ['tuna-portal-consent.py', 'tuna-portal-screenshot-client.py'] if kind == 'screenshot' else [
+                'tuna-portal-consent.py', 'tuna-portal-capture-client.py', 'tuna-pipewire-dump.py']
+            sources = {name: (library / name).read_bytes() for name in names}
+            record['requester_sha256'] = {name: hashlib.sha256(data).hexdigest() for name, data in sources.items()}
+            c.activity()
+            report = portal_exchange(g, record, 'launch', {
+                'kind': kind, 'directory': f'tuna-variant-{kind}-{time.monotonic_ns()}',
+                'sources': {name: base64.b64encode(data).decode() for name, data in sources.items()}},
+                timeout=120 if kind == 'screenshot' else 240)
+            if not check('native requester awaiting matching consent',
+                         report.get('ready') and not report.get('finished') and not report.get('error'), report):
+                return None
+            require_report_unlocked(record, 'before-request')
+            return report['root']
+
+        def consent_capture(kind, record, root):
+            report = portal_exchange(g, record, 'consent', {'kind': kind, 'root': root}, timeout=180)
+            if 'input' in record:
+                record['input'].update(
+                    method='AT-SPI action on the matching visible GNOME portal consent control',
+                    helper_sha256=record['requester_sha256']['tuna-portal-consent.py'])
+            return report
+
+        def portal_screenshot(check):
+            record = self.receipt['portal_request_console'] = {}
+            root = launch_capture('screenshot', record, check)
+            self.receipt['portal_requester_sha256'] = record['requester_sha256']['tuna-portal-screenshot-client.py']
+            if root is None:
+                if record.get('response') is not None:
+                    self.receipt['portal_screenshot'] = record['response']
+                return
+            prompt = self.out / 'portal-screenshot-prompt.png'
+            c.grab(prompt)
+            record.update(frame=prompt.name, sha256=hashlib.sha256(prompt.read_bytes()).hexdigest(),
+                          meaning='console after request; prompt visibility requires visual review')
+            # No SSH test-exit round trip here: the guest checks the requester
+            # immediately before dispatching only a Screenshot Allow action.
+            report = consent_capture('screenshot', record, root)
+            if report.get('response') is not None:
+                self.receipt['portal_screenshot'] = report['response']
+            consent_ok = check('actual portal consent control activated',
+                               record.get('input', {}).get('exit') == 0, record.get('input'))
+            native_ok = check('native consent and image proof exits successfully',
+                              report.get('requester_exit') == '0' and not report.get('error'),
+                              {'exit': report.get('requester_exit'), 'log': report.get('log'), 'error': report.get('error')})
+            # Diagnostics above are retained even when this precondition fails.
+            require_report_unlocked(record, 'after-response')
+            if not consent_ok or not native_ok:
+                return
+            result = self.receipt['portal_screenshot']
+            check('portal Response is successful', result.get('response') == 0, result)
+            frame = report['frame']
+            data = base64.b64decode(frame['base64'])
+            Image.open(io.BytesIO(data)).verify()
+            check('retained portal PNG matches guest hash',
+                  hashlib.sha256(data).hexdigest() == frame['sha256'], frame['sha256'])
+            result['retained_sha256'] = frame['sha256']
+            (self.out / 'portal-captured.png').write_bytes(data)
+        self.step('portal-screenshot', 'Request Screenshot through the actual published frontend', portal_screenshot)
+
+        def portal_screencast(check):
+            record = self.receipt['portal_screencast'] = {'frame_validated': False}
+            root = launch_capture('screencast', record, check)
+            if root is None:
+                return
+            prompt = self.out / 'portal-screencast-prompt.png'
+            c.grab(prompt)
+            record.update(frame=prompt.name, frame_sha256=hashlib.sha256(prompt.read_bytes()).hexdigest(),
+                          meaning='console at Start; consent visibility requires visual review')
+            # One guest exchange performs kind-specific consent, waits for the
+            # native active marker, checks unlocked state and arms withdrawal.
+            # It returns no PNG; the next host operation is the real lock key.
+            report = consent_capture('screencast', record, root)
+            if not check('actual portal consent control activated',
+                         record.get('input', {}).get('exit') == 0, record.get('input')):
+                return
+            if not check('native frame and caller isolation reached active grant',
+                         report.get('active') and not report.get('error'), report):
+                return
+            require_report_unlocked(record, 'after-response')
+            armed = check('arm lock stream-withdrawal observation', report.get('observer_armed') is True,
+                          {'armed_at': report.get('armed_at')})
+            if not armed:
+                return
+            self.capture_pending = {'root': root, 'record': record}
+            record['lock_input'] = {'method': 'real noVNC Super+L', 'at': now(),
+                                    'observer_armed': True, 'armed_at': report.get('armed_at')}
+            c.key('Meta+l', wait=0)
 
         def desktop(check):
             c.key('Escape', wait=3000)
@@ -473,15 +681,44 @@ class Journey:
             c.key('Meta+v', wait=2000)
             check('date menu opened while the banner is up', True, 'GNOME 51 blocks the banner here (see frame)')
         self.step('date-menu', 'Super+V lists the notification', date_menu)
+        self.step('portal-screencast', 'Start frontend stream before lock (frame validated during lock)', portal_screencast)
 
         def lock(check):
-            c.key('Escape', wait=6000)
-            c.key('Meta+l', wait=4000)
+            pending = self.capture_pending
+            self.capture_pending = None
+            if not pending:
+                c.key('Escape', wait=6000)
+                c.key('Meta+l', wait=4000)
             active = g.out('gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver '
                            '--method org.gnome.ScreenSaver.GetActive', user=True)
             check('ScreenSaver.GetActive is true', active == '(true,)', active)
             hint = (g.seat_session() or {}).get('LockedHint')
             check('logind LockedHint is yes', hint == 'yes', hint)
+            if pending:
+                record = pending['record']
+                report = portal_exchange(g, record, 'collect', {'root': pending['root']}, timeout=150)
+                verified = check('lock withdraws the real portal stream within the existing bound',
+                                 report.get('requester_exit') == '0' and record['lock_input']['observer_armed'], record)
+                record['lock_withdrawal_verified'] = verified
+                if verified and 'revoked' in report:
+                    (self.out / 'portal-screencast-revoked.json').write_text(
+                        json.dumps(report['revoked'], indent=2) + '\n')
+                check('ScreenCast Start returned a stream', (record.get('response') or {}).get('response') == 0,
+                      record.get('response'))
+                if not check('native captured frame was retained', 'frame' in report, report.get('error')):
+                    return
+                frame = report['frame']
+                data = base64.b64decode(frame['base64'])
+                image = Image.open(io.BytesIO(data)).convert('RGB')
+                geometry_ok = check('ScreenCast frame matches output geometry', image.size == (WIDTH, HEIGHT), image.size)
+                extrema = image.getextrema()
+                pixels_ok = check('ScreenCast frame contains varied desktop pixels',
+                                  any(high - low >= 16 for low, high in extrema), extrema)
+                hash_ok = check('retained ScreenCast frame matches guest hash',
+                                hashlib.sha256(data).hexdigest() == frame['sha256'], frame['sha256'])
+                record['frame_validated'] = bool(geometry_ok and pixels_ok and hash_ok)
+                (self.out / 'portal-screencast-frame.png').write_bytes(data)
+                record['retained_sha256'] = frame['sha256']
         self.step('lock', 'Super+L locks the screen', lock)
 
         def wrong_password(check):
@@ -528,63 +765,94 @@ class Journey:
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--image', required=True, help='bootc image pinned by digest: REPO@sha256:...')
-    p.add_argument('--vm', default='tuna-q-' + datetime.date.today().strftime('%Y%m%d'))
+    p.add_argument('--vm', default='tuna-q-variant-' + datetime.date.today().strftime('%Y%m%d'))
     p.add_argument('--out', required=True, help='new evidence directory')
     p.add_argument('--namespace', default='corral-vms')
-    p.add_argument('--node', help='KubeVirt node to schedule on')
+    p.add_argument('--node', required=True, help='KubeVirt node to schedule on and retain in the identity receipt')
     p.add_argument('--cpu', type=int, default=4)
     p.add_argument('--mem', default='6G')
     p.add_argument('--disk', default='40Gi')
     p.add_argument('--reuse', action='store_true', help='VM already built from --image; restart it instead')
     p.add_argument('--keep', action='store_true', help='leave the VM and its disk in place')
+    p.add_argument('--qualification-only', action='store_true',
+                   help='real GDM/session/portal availability/lock/unlock/logout only; not the full daily-driver tour')
     args = p.parse_args()
     if not re.fullmatch(r'[^@\s]+@sha256:[0-9a-f]{64}', args.image):
         p.error('--image must be pinned by digest (REPO@sha256:...)')
-    if not args.vm.startswith('tuna-q-'):
-        p.error('--vm must start with tuna-q- so it never names somebody else\'s VM')
+    if not args.vm.startswith('tuna-q-variant-'):
+        p.error('--vm must start with tuna-q-variant- so it never names somebody else\'s VM')
+    # Corral labels its builder Secret `<vm>-bootc-builder-cloudinit`; Kubernetes
+    # rejects label values above 63 bytes after the disk PVC already exists.
+    if len(args.vm + '-bootc-builder-cloudinit') > 63:
+        p.error('--vm is too long for the Corral bootc builder labels (max 39 characters)')
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
     from playwright.sync_api import sync_playwright
 
     receipt = {'schema': 2, 'started': now(), 'runner': 'scripts/tuna-corral-journey',
                'runner_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+               'scope': 'qualification-core' if args.qualification_only else 'daily-driver',
                'corral': run(['corral', 'version']).stdout.strip(),
                'image': {'ref': args.image},
                'vm': {'name': args.vm, 'namespace': args.namespace, 'backend': 'kubevirt',
                       'requested': {'cpu': args.cpu, 'mem': args.mem, 'disk': args.disk, 'node': args.node}},
                'console': 'corral console page (noVNC), Playwright Chromium, 1:1; frames are the canvas pixels',
                'steps': []}
-    guest, console_proc = Guest(args.vm), None
+    identity, console_proc = None, None
+    identity_path = out / 'identity.json'
+    # Both the normal runner and an interrupted-run driver use this same receipt.
+    # The first scoped metadata snapshot is durable before bootc create starts.
+    def command(argv, timeout=120, input=None):
+        result = run(argv, timeout=timeout, input=input, check=False)
+        return {'argv': argv, 'exit': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}
+
     try:
-        provision(args, guest, receipt)
-        console_proc, endpoint = start_console(args.vm)
+        identity = Identity.prepare(command, args.vm, args.namespace, args.node, args.image,
+                                    lambda state: save_identity(identity_path, state), reuse=args.reuse)
+        receipt['identity'] = identity.state
+        guest = Guest(identity)
+        provision(args, guest, receipt, identity)
+        identity.acquire(boundary='before-console-journey')
+        console_proc, endpoint = start_console(identity)
         receipt['console_endpoint'] = endpoint
         with sync_playwright() as pw:
             console = Console(pw, endpoint['url'])
             console.open()
             Journey(args, guest, console, receipt, out).run()
             console.close()
+    except Exception as error:
+        receipt['error'] = f'{type(error).__name__}: {error}'
+        # A failed install/readiness gate must retain its console evidence too.
+        # Do not turn inability to obtain a frame into a passing readiness gate.
+        try:
+            if identity is None:
+                raise RuntimeError('no scoped identity receipt; failure screenshot refused')
+            identity.acquire(boundary='before-failure-capture')
+            frame = out / 'failure-console.png'
+            argv = ['corral', 'screenshot', identity.target, '-o', str(frame)]
+            capture = run(argv, timeout=90, check=False)
+            receipt['failure_capture'] = {'argv': argv, 'exit': capture.returncode,
+                                          'stdout': capture.stdout, 'stderr': capture.stderr}
+            if capture.returncode == 0:
+                receipt['failure_capture'].update(
+                    frame=frame.name, sha256=hashlib.sha256(frame.read_bytes()).hexdigest())
+        except Exception as capture_error:
+            receipt['failure_capture'] = {'error': f'{type(capture_error).__name__}: {capture_error}'}
+        raise
     finally:
         if console_proc:
             console_proc.terminate()
             console_proc.wait(timeout=30)
         if not args.keep:
-            try:
-                r = run(['corral', '--json', 'delete', args.vm, '-f', '--wait', '--timeout', '10m'],
-                        timeout=900, check=False)
-                result = json.loads(r.stdout) if r.stdout.strip() else []
-                left = [v['name'] for v in corral_json(['list', '--prefix', args.vm]) or [] if v['name'] == args.vm]
-                receipt['cleanup'] = {'deleted': r.returncode == 0 and not left, 'result': result,
-                                      'still_listed': left, 'stderr': r.stderr.strip()[-400:]}
-            except (subprocess.TimeoutExpired, RuntimeError, ValueError) as e:
-                receipt['cleanup'] = {'deleted': False, 'output': f'{type(e).__name__}: {e}'}
+            receipt['cleanup'] = (identity.cleanup() if identity is not None else
+                                  {'deleted': False, 'output': 'no prepared scoped identity; cleanup refused'})
         receipt['finished'] = now()
         (out / 'manifest.json').write_text(json.dumps(receipt, indent=2) + '\n')
     failed = [s['id'] for s in receipt['steps'] if s['result'] == 'fail']
     counts = {r: sum(s['result'] == r for s in receipt['steps']) for r in ('pass', 'fail', 'not-exercised')}
     print(f"{counts['pass']} passed, {counts['fail']} failed, {counts['not-exercised']} not exercised"
           + (f"; failed: {', '.join(failed)}" if failed else ''))
-    return 1 if failed else 0
+    return 1 if failed or (not args.keep and not receipt.get('cleanup', {}).get('deleted')) else 0
 
 
 if __name__ == '__main__':
