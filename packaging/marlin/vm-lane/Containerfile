@@ -3,11 +3,13 @@
 # Derives from the marlin-tuna-preview image (packaging/marlin/Containerfile)
 # and gives it the published marlin:tuna login path: stock GDM with tunaOS's
 # tuna-flavor GDM steps (tunaos.toml [desktops.tuna] after_install, run in that
-# order), vendored byte-for-byte in tunaos/ from tuna-os/tunaOS 193cc0ef:
+# order), vendored byte-for-byte in tunaos/ from tuna-os/tunaOS d98ed1e09b61635a2a9b115ce559944e42f97d74:
 #
 #   - tuna-gdm-theme.sh: the greeter-only GNOME Shell stylesheet overlay;
-#   - tuna-gdm-default-session.sh: [daemon] FallbackSession=tuna and
-#     Session=tuna AccountsService user templates;
+#   - tuna-gdm-default-session.sh: [daemon] FallbackSession=tuna, with
+#     explicit empty [User] Session= in global AccountsService templates
+#     only for installed GDM 51+ with that fallback capability; legacy GDM
+#     keeps Session=tuna (NoDisplay does not prevent its GNOME preference);
 #   - tuna-hide-other-sessions.sh: NoDisplay on every non-Tuna session;
 #
 # on the package's own "Tuna Desktop" session entry (the preview image's
@@ -17,6 +19,8 @@
 #
 #   - a test user, tuna-test (password "tuna"), with no saved session, so
 #     GDM's configuration alone decides what starts;
+#     this account already has a session-less record, unlike the separate
+#     --fresh-accounts journey's initially record-free standard/admin users;
 #   - its session telemetry environment through environment.d, plus this
 #     lane's overview trace, public-search diagnostics and fixed C locale, and
 #     a per-login Orca test secret (tuna-vm-orca-token);
@@ -46,6 +50,7 @@ COPY --from=constraint-builder /usr/share/tuna-vm-constraints /usr/share/tuna-vm
 
 COPY packaging/marlin/vm-lane/tunaos /tmp/tunaos
 COPY packaging/marlin/vm-lane/tuna-vm-lifecycle /usr/libexec/tuna-vm-lifecycle
+COPY packaging/marlin/vm-lane/tuna-vm-gdm-trace /usr/libexec/tuna-vm-gdm-trace
 COPY scripts/lib/gnome-brightness-proof.py /usr/libexec/tuna-brightness-proof
 COPY scripts/lib/tuna-datetime-proof.py /usr/libexec/tuna-datetime-proof
 COPY packaging/marlin/vm-lane/tuna-vm-input /usr/libexec/tuna-vm-input
@@ -59,10 +64,23 @@ COPY packaging/marlin/vm-lane/tuna-vm-health /usr/libexec/tuna-vm-health
 COPY packaging/marlin/vm-lane/tuna-vm-health.service /usr/lib/systemd/system/tuna-vm-health.service
 COPY packaging/marlin/vm-lane/tuna-vm-fresh-accounts /usr/libexec/tuna-vm-fresh-accounts
 COPY packaging/marlin/vm-lane/tuna-vm-fresh-accounts.service /usr/lib/systemd/system/tuna-vm-fresh-accounts.service
+# Configure the global image role, not individual fresh accounts or probes.
+COPY --chown=0:0 --chmod=0755 packaging/marlin/vm-lane/tuna-vm-admin-policy /tmp/tuna-vm-admin-policy
 
 # /home is a symlink to /var/home on bootc systems and /var is only
 # seeded at install time, so the home directory and the AccountsService
 # record come from tmpfiles.d on every boot rather than from this layer.
+# Empty global templates do not create per-user records. The fresh-account
+# journey must observe stock AccountsService creating each record after a
+# real manual GDM login, then retain its sudo, logout, second-login and
+# reboot gates. Fixture setup must not seed those users' records or fake
+# persistence; a successful ordinary tuna-test login is not that proof.
+# The helper is silent about which template policy it chose, so after it
+# runs, `tuna-vm-lifecycle gdm-policy` prints one read-only JSON line to the
+# build log: the gdm binary the helper resolves and its realpath, bounded
+# --version output/status and parse, the FallbackSession literal-probe
+# status, the derived policy, pacman versions/ownership and only allowlisted
+# [User] keys of the global templates. It is a diagnostic, never a gate.
 # The payload hashes cover the same login-path files Containerfile.published
 # pins, taken after the tunaOS steps; the booted lane re-checks them before
 # it types into GDM.
@@ -93,6 +111,7 @@ RUN mkdir -p /usr/share/tuna-vm \
     && echo 'tuna-test:tuna' | chpasswd \
     && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-fresh-accounts /usr/libexec/tuna-vm-input /usr/libexec/tuna-vm-shell-focus \
          /usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token \
+    && /usr/libexec/tuna-vm-lifecycle gdm-policy \
     && printf 'TUNA_COMPOSITOR_STATE=/run/user/%s/tuna-vm-state.json\nTUNA_LOCK_TRACE=1\nTUNA_POINTER_TRACE=1\n' \
          "$(id -u tuna-test)" > /usr/share/tuna-vm/environment.conf \
     && printf '%s\n' \
@@ -107,6 +126,10 @@ RUN mkdir -p /usr/share/tuna-vm \
     && systemctl add-wants multi-user.target qemu-guest-agent.service \
     && sha256sum --check /usr/share/tuna-vm/shipped-payload.sha256 \
     && pacman -Q > /usr/share/tuna-vm/fixture-packages.txt
+
+# The real helper proves ordered unique policy inclusion and extends, never
+# regenerates, the receipt before later Orca/GDM upgrades must preserve it.
+RUN python3 /tmp/tuna-vm-admin-policy && rm /tmp/tuna-vm-admin-policy
 
 LABEL org.opencontainers.image.title="marlin-tuna-vm-lane" \
       org.opencontainers.image.description="CI-only Marlin Tuna Desktop test layer: stock GDM with tunaOS's tuna-flavor login path, real lifecycle probes, journal on serial"
