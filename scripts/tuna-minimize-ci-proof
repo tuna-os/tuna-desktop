@@ -53,5 +53,5 @@ manifest = {
 }
 (frozen / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 PY
-dbus-run-session -- /usr/bin/python3 scripts/tuna-minimize-proof --bundle-root "$art" --display :109
-dbus-run-session -- /usr/bin/python3 scripts/tuna-minimize-proof --bundle-root "$art" --display :110 --rtl
+dbus-run-session -- /usr/bin/python3 scripts/tuna-minimize-proof --bundle-root "$art"
+dbus-run-session -- /usr/bin/python3 scripts/tuna-minimize-proof --bundle-root "$art" --rtl

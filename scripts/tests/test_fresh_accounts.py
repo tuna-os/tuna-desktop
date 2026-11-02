@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "scripts/lib"))
 import fresh_accounts  # noqa: E402
 
 GUEST = ROOT / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+FIXTURE = ROOT / "packaging/marlin/vm-lane/tuna-vm-fresh-accounts"
 CONF = "[daemon]\nFallbackSession=tuna\n"
 
 
@@ -235,6 +236,7 @@ class JourneyTest(unittest.TestCase):
         self.assertFalse(passed)
         self.assertFailed(results, "V-FRESH-LOGIN-tunastd-first")
 
+
     def test_saved_tuna_record_is_supported(self):
         passed, results, _, _ = journey(FakeGuest(write_record=True))
         self.assertTrue(passed, results)
@@ -387,6 +389,7 @@ class GuestStateTest(unittest.TestCase):
 
     def test_absent_record_is_record_free(self):
         self.assertTrue(fresh_accounts.record_free(self.probe({}), False)[0])
+
 
 
 

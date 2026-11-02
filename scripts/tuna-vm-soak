@@ -83,10 +83,25 @@ def sample(uid, proc_root=Path('/proc')):
     return totals | {'critical': critical}
 
 
-def call(command, timeout=10):
+def user_context(account, wayland_display=None):
+    """Drop only child credentials, without creating a PAM/logind session."""
+    runtime = f'/run/user/{account.pw_uid}'
+    environment = {'PATH': '/usr/bin:/bin', 'HOME': account.pw_dir,
+                   'USER': account.pw_name, 'LOGNAME': account.pw_name,
+                   'XDG_RUNTIME_DIR': runtime,
+                   'DBUS_SESSION_BUS_ADDRESS': f'unix:path={runtime}/bus'}
+    if wayland_display is not None:
+        environment['WAYLAND_DISPLAY'] = wayland_display
+    return {'user': account.pw_uid, 'group': account.pw_gid,
+            'extra_groups': os.getgrouplist(account.pw_name, account.pw_gid),
+            'env': environment}
+
+
+def call(command, timeout=10, *, context=None):
     # Kill the whole helper group on timeout, and bound captured output.
     with tempfile.TemporaryFile() as output:
-        process = subprocess.Popen(command, stdout=output, stderr=output, start_new_session=True)
+        process = subprocess.Popen(command, stdout=output, stderr=output, start_new_session=True,
+                                   **(context or {}))
         deadline = time.monotonic() + timeout
         try:
             while process.poll() is None:
@@ -110,12 +125,37 @@ def call(command, timeout=10):
             process.wait()
 
 
+def session_health(context):
+    replies = {}
+    for name, destination, object_path, method, parameters in (
+        ('lock', 'org.gnome.ScreenSaver', '/org/gnome/ScreenSaver',
+         'org.gnome.ScreenSaver.GetActive', []),
+        ('calendar', 'org.gnome.Shell.CalendarServer', '/org/gnome/Shell/CalendarServer',
+         'org.freedesktop.DBus.Peer.Ping', []),
+        ('portal', 'org.freedesktop.portal.Desktop', '/org/freedesktop/portal/desktop',
+         'org.freedesktop.portal.Settings.Read', ['org.freedesktop.appearance', 'color-scheme']),
+        ('portal_gnome', 'org.freedesktop.impl.portal.desktop.gnome', '/org/freedesktop/portal/desktop',
+         'org.freedesktop.DBus.Peer.Ping', []),
+    ):
+        try:
+            replies[name + '_reply'] = call(
+                ['gdbus', 'call', '--session', '--dest', destination, '--object-path', object_path,
+                 '--method', method] + parameters, context=context)
+        except RuntimeError as error:
+            raise RuntimeError(f'{name} health check ({destination}, {method}): {error}') from error
+        if name == 'lock' and replies['lock_reply'] not in ('(true,)', '(false,)'):
+            raise RuntimeError('unexpected screen-saver health reply')
+    return replies
+
+
 def main(args):
     if os.geteuid() != 0:
         raise RuntimeError('run the observer as root to read complete PSS counters')
-    uid = pwd.getpwnam(args.user).pw_uid
+    account = pwd.getpwnam(args.user)
+    uid = account.pw_uid
     if uid == 0:
         raise RuntimeError('observe a non-root session UID')
+    context = user_context(account)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     if any(out.iterdir()):
@@ -159,11 +199,10 @@ def main(args):
         probe_output = (out / 'presentation.jsonl').open('wb')
         try:
             with (out / 'presentation.stderr').open('wb') as errors:
-                probe = subprocess.Popen([
-                    'runuser', '-u', args.user, '--', 'env', '-i', 'PATH=/usr/bin:/bin',
-                    f'XDG_RUNTIME_DIR=/run/user/{uid}', f'WAYLAND_DISPLAY={args.wayland_display}',
-                    str(executable), '--endurance-seconds', str(args.seconds)],
-                    stdout=probe_output, stderr=errors, start_new_session=True)
+                probe = subprocess.Popen(
+                    [str(executable), '--endurance-seconds', str(args.seconds)],
+                    stdout=probe_output, stderr=errors, start_new_session=True,
+                    **user_context(account, args.wayland_display))
             presentation = Reader((out / 'presentation.jsonl').open('rb'), args.seconds)
         except BaseException:
             if probe is not None:
@@ -199,27 +238,7 @@ def main(args):
                     original = value['critical']
                 if value['critical'] != original:
                     raise RuntimeError('critical process exited or restarted')
-                command = ['runuser', '-u', args.user, '--', 'env',
-                           f'XDG_RUNTIME_DIR=/run/user/{uid}',
-                           f'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus',
-                           'gdbus', 'call', '--session', '--dest', 'org.gnome.ScreenSaver',
-                           '--object-path', '/org/gnome/ScreenSaver', '--method',
-                           'org.gnome.ScreenSaver.GetActive']
-                value['lock_reply'] = call(command)
-                if value['lock_reply'] not in ('(true,)', '(false,)'):
-                    raise RuntimeError('unexpected screen-saver health reply')
-                user_bus = command[:7]
-                for name, destination, method, parameters in (
-                    ('calendar', 'org.gnome.Shell.CalendarServer', 'org.freedesktop.DBus.Peer.Ping', []),
-                    ('portal', 'org.freedesktop.portal.Desktop', 'org.freedesktop.portal.Settings.Read',
-                     ['org.freedesktop.appearance', 'color-scheme']),
-                    ('portal_gnome', 'org.freedesktop.impl.portal.desktop.gnome',
-                     'org.freedesktop.DBus.Peer.Ping', []),
-                ):
-                    object_path = '/org/gnome/Shell/CalendarServer' if name == 'calendar' else '/org/freedesktop/portal/desktop'
-                    value[name + '_reply'] = call(user_bus + ['gdbus', 'call', '--session', '--dest',
-                                                            destination, '--object-path', object_path,
-                                                            '--method', method] + parameters)
+                value.update(session_health(context))
                 value['elapsed_s'] = round(elapsed, 3)
                 stream.write(json.dumps(value) + '\n')
                 report['samples'] += 1

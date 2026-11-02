@@ -1,26 +1,32 @@
-//! Power menu and end-session dialog (GNOME 51 shape, #62).
+//! Power menu and end-session dialog (GNOME 51 shape, #62, #589).
 //!
 //! The quick-settings power button opens an in-panel menu: Suspend,
-//! Restart…, Power Off…, Log Out. The "…" actions open GNOME's
-//! end-session dialog: a dimmed full-screen layer with a 60-second
-//! countdown, Cancel, and the action; the countdown runs the action.
-//! Suspend, restart and power off go through logind on the system bus.
-//! Log Out ends the compositor, the session leader, as gnome-session's
-//! exit ends a GNOME session; its orderly SIGTERM shutdown ends the display
-//! manager's session (see the compositor's `session_manager::perform`).
+//! Restart…, Power Off…, Log Out. As GNOME Shell 51's `systemActions.js`,
+//! each row asks the session manager on the session bus
+//! (`org.gnome.SessionManager`: the compositor's `session_manager`, or
+//! gnome-session where it runs): `Suspend()`, `Reboot()`, `Shutdown()`
+//! and `Logout(0)`. The manager suspends at once; for the rest it checks
+//! `disable-log-out`, `logout-prompt` and its logout inhibitors and opens
+//! the dialog below, and it carries the confirmed end of the session out
+//! itself (logind's `PowerOff`/`Reboot`, or the session leader's exit).
 //!
-//! The same dialog serves GNOME Shell 51's
-//! `org.gnome.SessionManager.EndSessionDialog` on the shell's bus
-//! connection (endSessionDialog.js), which the session manager opens for
-//! `Shutdown`, `Reboot` and `Logout`: gnome-settings-daemon's power key
-//! with `power-button-action` interactive, and its logout, reboot and
-//! shutdown keys. As in GNOME, Cancel emits `Canceled` then `Closed`,
-//! a confirmation emits `ConfirmedShutdown`, `ConfirmedReboot` or
-//! `ConfirmedLogout`, and `Close` emits `Closed`. The confirmed action
-//! runs here, as the menu's does.
+//! The dialog is GNOME Shell 51's `org.gnome.SessionManager.EndSessionDialog`
+//! on the shell's bus connection (endSessionDialog.js): a dimmed
+//! full-screen layer with the 60-second countdown (shown in steps of ten
+//! until the last ten seconds), the applications whose logout inhibitors
+//! the manager passed ("Some applications are busy or have unsaved
+//! work"), Cancel, and the action. The manager opens it for the menu and
+//! for gnome-settings-daemon's power, logout, reboot and shutdown keys.
+//! As in GNOME, Cancel emits `Canceled` then `Closed`, a confirmation or
+//! the countdown's end emits `ConfirmedShutdown`, `ConfirmedReboot` or
+//! `ConfirmedLogout`, and `Close` emits `Closed`; the shell itself never
+//! ends the session.
 //!
 //! In the nested preview (`TUNA_SESSION_KIND=nested`) logind's session
-//! is the host's: only Log Out is offered, and it ends this compositor,
+//! is the host's: only Log Out is offered. It goes through the session
+//! manager when that is this compositor's (the compositor's manager ends
+//! only itself there); inside a host desktop whose session manager owns
+//! the name, the dialog opens locally and Log Out ends this compositor,
 //! never the host session.
 //!
 //! Before sleep, logind's `PrepareForSleep(true)` locks the screen, so
@@ -40,6 +46,31 @@ const MANAGER_PATH: &str = "/org/freedesktop/login1";
 const MANAGER_IFACE: &str = "org.freedesktop.login1.Manager";
 /// GNOME's end-session countdown.
 pub const COUNTDOWN_S: u32 = 60;
+
+/// The session manager the menu asks (systemActions.js `_session`).
+const SESSION_MANAGER: &str = "org.gnome.SessionManager";
+const SESSION_MANAGER_PATH: &str = "/org/gnome/SessionManager";
+const INHIBITOR_IFACE: &str = "org.gnome.SessionManager.Inhibitor";
+/// `GnomeSession.InhibitFlags.LOGOUT`.
+const INHIBIT_LOGOUT: u32 = 1;
+/// GNOME's application section title (endSessionDialog.js).
+pub const BUSY_APPLICATIONS: &str = "Some applications are busy or have unsaved work";
+
+/// The seconds the countdown shows with `left` of `total` remaining:
+/// endSessionDialog.js `_roundSecondsToInterval(total, left, 10)`, which
+/// steps by ten (rounding up) until the last ten seconds.
+pub fn display_seconds(total: u32, left: u32) -> u32 {
+    const INTERVAL: u32 = 10;
+    if left <= INTERVAL {
+        return left;
+    }
+    let time = left + INTERVAL - 1;
+    if time > total {
+        total
+    } else {
+        time - time % INTERVAL
+    }
+}
 
 /// GNOME Shell's end-session dialog object on the shell's connection.
 pub const END_SESSION_DIALOG_PATH: &str = "/org/gnome/SessionManager/EndSessionDialog";
@@ -171,24 +202,70 @@ pub fn is_nested() -> bool {
     std::env::var("TUNA_SESSION_KIND").map_or(true, |kind| kind != "hardware")
 }
 
-/// An interactive logind manager call on the system bus.
-fn system_call(conn: &gio::DBusConnection, method: &str) {
-    conn.call(
-        Some(LOGIND),
-        MANAGER_PATH,
-        MANAGER_IFACE,
+/// The session manager method a menu row calls and its arguments
+/// (systemActions.js `activateSuspend`, `activateRestart`,
+/// `activatePowerOff`, `activateLogout`).
+pub fn manager_call(action: Action) -> (&'static str, Option<glib::Variant>) {
+    match action {
+        Action::Suspend => ("Suspend", None),
+        Action::Restart => ("Reboot", None),
+        Action::PowerOff => ("Shutdown", None),
+        Action::LogOut => ("Logout", Some((0u32,).to_variant())),
+    }
+}
+
+/// Ask the session manager for `action`. `Shutdown` and `Reboot` answer
+/// once the dialog is confirmed or cancelled, so the call never times
+/// out; a cancelled request is quiet (`logErrorUnlessCancelled`).
+fn call_manager(bus: &gio::DBusConnection, action: Action) {
+    let (method, args) = manager_call(action);
+    eprintln!("tuna-shell-gtk: power menu: {method} via {SESSION_MANAGER}");
+    bus.call(
+        Some(SESSION_MANAGER),
+        SESSION_MANAGER_PATH,
+        SESSION_MANAGER,
         method,
-        Some(&(true,).to_variant()),
+        args.as_ref(),
         None,
         gio::DBusCallFlags::NONE,
-        5000,
+        i32::MAX,
         None::<&gio::Cancellable>,
-        |reply| {
-            if let Err(e) = reply {
-                eprintln!("tuna-shell-gtk: logind call failed: {e}");
+        move |reply| match reply {
+            Ok(_) => {}
+            Err(e) if e.matches(gio::IOErrorEnum::Cancelled) => {
+                eprintln!("tuna-shell-gtk: power menu: {method} cancelled");
             }
+            Err(e) => eprintln!("tuna-shell-gtk: power menu: {method} failed: {e}"),
         },
     );
+}
+
+/// Whether the session manager on `bus` is this shell's compositor
+/// (the parent process), whose manager ends only itself in a nested
+/// preview; a host desktop's would end the host session.
+async fn manager_is_compositors(bus: &gio::DBusConnection) -> bool {
+    let call = |method: &'static str, arg: String| {
+        bus.call_future(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            method,
+            Some(&(arg,).to_variant()),
+            None,
+            gio::DBusCallFlags::NONE,
+            5000,
+        )
+    };
+    let Ok(owner) = call("GetNameOwner", SESSION_MANAGER.to_owned()).await else {
+        return false;
+    };
+    let Some(owner) = owner.child_value(0).get::<String>() else {
+        return false;
+    };
+    let Ok(pid) = call("GetConnectionUnixProcessID", owner).await else {
+        return false;
+    };
+    pid.child_value(0).get::<u32>() == Some(unsafe { libc::getppid() } as u32)
 }
 
 /// End the supervising compositor, this process's parent, which shuts
@@ -212,33 +289,70 @@ fn is_compositor_comm(comm: &str) -> bool {
     comm.trim_end() == "tuna-compositor"
 }
 
-/// Carry out `action` now.
-fn perform(action: Action, nested: bool, conn: Option<&gio::DBusConnection>) {
-    let method = match action {
-        Action::LogOut => return end_compositor(),
-        _ if nested => return,
-        Action::Suspend => "Suspend",
-        Action::Restart => "Reboot",
-        Action::PowerOff => "PowerOff",
+/// The nested preview's own Log Out, when the session manager on its bus
+/// is a host desktop's: end this compositor, never the host session.
+/// Nothing else is offered there.
+fn perform_local(action: Action) {
+    if action == Action::LogOut {
+        end_compositor();
+    }
+}
+
+/// One inhibitor the manager passed `Open`, as endSessionDialog.js
+/// `_onInhibitorLoaded` lists it: an installed application (its app id
+/// names a desktop file) holding a logout inhibitor, with its reason.
+/// Services and other flags are left out.
+async fn inhibiting_app(
+    bus: &gio::DBusConnection,
+    path: &str,
+) -> Option<(tuna_shell_host::apps::AppEntry, String)> {
+    let get = |method: &'static str| {
+        bus.call_future(
+            Some(SESSION_MANAGER),
+            path,
+            INHIBITOR_IFACE,
+            method,
+            None,
+            None,
+            gio::DBusCallFlags::NONE,
+            5000,
+        )
     };
-    let Some(conn) = conn else {
-        eprintln!("tuna-shell-gtk: no system bus for {action:?}");
-        return;
-    };
-    system_call(conn, method);
+    let app_id = get("GetAppId").await.ok()?.child_value(0).get::<String>()?;
+    let app = crate::notify::desktop_app(app_id.trim_end_matches(".desktop"))?;
+    let flags = get("GetFlags").await.ok()?.child_value(0).get::<u32>()?;
+    if flags & INHIBIT_LOGOUT == 0 {
+        return None;
+    }
+    let reason = get("GetReason")
+        .await
+        .ok()?
+        .child_value(0)
+        .get::<String>()?;
+    Some((app, reason))
 }
 
 /// The power surfaces: the menu rows for quick settings, the dialog.
 pub struct PowerUi {
     nested: bool,
-    conn: Rc<RefCell<Option<gio::DBusConnection>>>,
     dialog: gtk::ApplicationWindow,
     /// The modal fade in and out (`ModalDialog`, 100 ms).
     fade: crate::transient::ModalFade,
     title: gtk::Label,
     body: gtk::Label,
     confirm: gtk::Button,
+    /// "Some applications are busy or have unsaved work" and its list.
+    applications: gtk::Box,
+    application_list: gtk::Box,
+    /// Inhibitors still listed or loading (`_applications.length`).
+    inhibitors: Cell<usize>,
     pending: Cell<Option<Action>>,
+    /// The open dialog is the nested preview's own (no manager waits on
+    /// its answer; it acts itself).
+    local: Cell<bool>,
+    /// Counts dialogs opened, so a stale inhibitor load is dropped.
+    serial: Cell<u64>,
+    total: Cell<u32>,
     left: Cell<u32>,
     timer: RefCell<Option<glib::SourceId>>,
     /// The session bus, where the dialog's D-Bus signals go.
@@ -289,19 +403,46 @@ impl PowerUi {
         confirm.add_css_class("modal-dialog-button");
         buttons.append(&cancel);
         buttons.append(&confirm);
+        // endSessionDialog.js `_applicationSection`: a Dialog.ListSection
+        // under the message, shown while inhibitors are listed.
+        let applications = gtk::Box::new(gtk::Orientation::Vertical, 18);
+        applications.add_css_class("dialog-list");
+        let applications_title = gtk::Label::new(Some(BUSY_APPLICATIONS));
+        applications_title.add_css_class("dialog-list-title");
+        applications_title.set_wrap(true);
+        applications_title.set_max_width_chars(1);
+        applications_title.set_hexpand(true);
+        applications_title.set_justify(gtk::Justification::Center);
+        let application_list = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        application_list.add_css_class("dialog-list-box");
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.add_css_class("dialog-list-scrollview");
+        scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+        scroll.set_propagate_natural_height(true);
+        scroll.set_max_content_height(200);
+        scroll.set_child(Some(&application_list));
+        applications.append(&applications_title);
+        applications.append(&scroll);
+        applications.set_visible(false);
         card.append(&content);
+        card.append(&applications);
         card.append(&buttons);
         dialog.set_child(Some(&card));
 
         let ui = Rc::new(Self {
             fade: crate::transient::ModalFade::new(&dialog),
             nested,
-            conn: Rc::new(RefCell::new(None)),
             dialog,
             title,
             body,
             confirm,
+            applications,
+            application_list,
+            inhibitors: Cell::new(0),
             pending: Cell::new(None),
+            local: Cell::new(false),
+            serial: Cell::new(0),
+            total: Cell::new(0),
             left: Cell::new(0),
             timer: RefCell::new(None),
             bus: RefCell::new(None),
@@ -327,39 +468,37 @@ impl PowerUi {
             });
             ui.dialog.add_controller(keys);
         }
-        // System bus: logind for actions and the before-sleep lock.
-        {
-            let conn_slot = ui.conn.clone();
-            gio::bus_get(
-                gio::BusType::System,
-                None::<&gio::Cancellable>,
-                move |conn| {
-                    let Ok(conn) = conn else {
-                        return;
-                    };
-                    let sub = conn.subscribe_to_signal(
-                        Some(LOGIND),
-                        Some(MANAGER_IFACE),
-                        Some("PrepareForSleep"),
-                        Some(MANAGER_PATH),
-                        None,
-                        gio::DBusSignalFlags::NONE,
-                        move |signal| {
-                            let going = signal
-                                .parameters
-                                .try_child_value(0)
-                                .and_then(|v| v.get::<bool>())
-                                .unwrap_or(false);
-                            if going {
-                                lock();
-                            }
-                        },
-                    );
-                    std::mem::forget(sub);
-                    *conn_slot.borrow_mut() = Some(conn);
-                },
-            );
-        }
+        // System bus: the before-sleep lock.
+        gio::bus_get(
+            gio::BusType::System,
+            None::<&gio::Cancellable>,
+            move |conn| {
+                let Ok(conn) = conn else {
+                    return;
+                };
+                let sub = conn.subscribe_to_signal(
+                    Some(LOGIND),
+                    Some(MANAGER_IFACE),
+                    Some("PrepareForSleep"),
+                    Some(MANAGER_PATH),
+                    None,
+                    gio::DBusSignalFlags::NONE,
+                    move |signal| {
+                        let going = signal
+                            .parameters
+                            .try_child_value(0)
+                            .and_then(|v| v.get::<bool>())
+                            .unwrap_or(false);
+                        if going {
+                            lock();
+                        }
+                    },
+                );
+                // Held for the session, with the subscription.
+                std::mem::forget(sub);
+                std::mem::forget(conn);
+            },
+        );
         // Administrative lockdown (#357 follow-up): a pending Log Out,
         // Restart or Power Off dialog dies when `disable-log-out`
         // engages, so an already-open countdown can never end the
@@ -385,39 +524,65 @@ impl PowerUi {
         menu_actions(self.nested)
     }
 
-    /// Run a menu choice: Suspend at once, the rest through GNOME's
-    /// countdown dialog.
+    /// Run a menu choice through the session manager, as GNOME Shell
+    /// 51's `systemActions.js`: Suspend at once, the rest through the
+    /// manager's end-session dialog. A Log Out, Restart or Power Off
+    /// while `disable-log-out` denies is refused (the action is not
+    /// available), live per activation.
     pub fn activate(self: &Rc<Self>, action: Action) {
-        if action == Action::Suspend {
-            self.perform(Action::Suspend);
-        } else {
-            self.ask(action);
+        if !action_allowed(action, crate::lockdown::read().entry_visibility().log_out) {
+            eprintln!("tuna-shell-gtk: {action:?} refused by administrator policy");
+            return;
         }
+        let Some(bus) = self.bus.borrow().clone() else {
+            eprintln!("tuna-shell-gtk: no session bus for {action:?}");
+            return;
+        };
+        if !self.nested {
+            call_manager(&bus, action);
+            return;
+        }
+        let me = self.clone();
+        glib::spawn_future_local(async move {
+            if manager_is_compositors(&bus).await {
+                call_manager(&bus, action);
+            } else {
+                eprintln!(
+                    "tuna-shell-gtk: power menu: the session manager is not this compositor's; {action:?} stays local"
+                );
+                me.ask_for(action, COUNTDOWN_S, Vec::new(), true);
+            }
+        });
     }
 
-    fn perform(&self, action: Action) {
-        perform(action, self.nested, self.conn.borrow().as_ref());
-    }
-
-    /// Open the dialog for `action` with a fresh countdown. A Log Out,
-    /// Restart or Power Off request while `disable-log-out` denies never
-    /// opens (live read per open, so no stale menu path can bypass it).
-    pub fn ask(self: &Rc<Self>, action: Action) {
-        self.ask_for(action, COUNTDOWN_S);
-    }
-
-    /// [`Self::ask`] with the caller's countdown (`seconds`, as
-    /// `Open`'s `seconds_to_stay_open`); whether it opened.
-    fn ask_for(self: &Rc<Self>, action: Action, seconds: u32) -> bool {
+    /// Open the dialog for `action` with a fresh countdown of `seconds`
+    /// (`Open`'s `seconds_to_stay_open`), listing the applications behind
+    /// `inhibitors`; `local` when the nested preview opens it itself.
+    /// A Log Out, Restart or Power Off request while `disable-log-out`
+    /// denies never opens (live read per open, so no stale path can
+    /// bypass it). Whether it opened.
+    fn ask_for(
+        self: &Rc<Self>,
+        action: Action,
+        seconds: u32,
+        inhibitors: Vec<String>,
+        local: bool,
+    ) -> bool {
         if !action_allowed(action, crate::lockdown::read().entry_visibility().log_out) {
             return false;
         }
         self.stop_timer();
+        let serial = self.serial.get() + 1;
+        self.serial.set(serial);
         self.pending.set(Some(action));
+        self.local.set(local);
+        self.total.set(seconds);
         self.left.set(seconds);
         self.title.set_text(action.title());
         self.confirm.set_label(action.title());
-        self.body.set_text(&action.countdown_text(seconds));
+        self.body
+            .set_text(&action.countdown_text(display_seconds(seconds, seconds)));
+        self.list_inhibitors(inhibitors, serial);
         self.fade.present();
         // Cancel holds the focus when the dialog opens, as in GNOME.
         if let Some(cancel) = self.confirm.prev_sibling().and_downcast::<gtk::Button>() {
@@ -428,7 +593,8 @@ impl PowerUi {
             let left = me.left.get().saturating_sub(1);
             me.left.set(left);
             if let Some(action) = me.pending.get() {
-                me.body.set_text(&action.countdown_text(left));
+                me.body
+                    .set_text(&action.countdown_text(display_seconds(me.total.get(), left)));
             }
             if left == 0 {
                 me.timer.borrow_mut().take();
@@ -441,13 +607,77 @@ impl PowerUi {
         true
     }
 
+    /// Fill the application section from the manager's inhibitors
+    /// (endSessionDialog.js `OpenAsync`, `_onInhibitorLoaded`): shown
+    /// while any is still loading or names an application that inhibits
+    /// logging out.
+    fn list_inhibitors(self: &Rc<Self>, inhibitors: Vec<String>, serial: u64) {
+        while let Some(row) = self.application_list.first_child() {
+            self.application_list.remove(&row);
+        }
+        self.inhibitors.set(inhibitors.len());
+        self.applications.set_visible(!inhibitors.is_empty());
+        let Some(bus) = self.bus.borrow().clone() else {
+            return;
+        };
+        for path in inhibitors {
+            let (me, bus) = (self.clone(), bus.clone());
+            glib::spawn_future_local(async move {
+                let app = inhibiting_app(&bus, &path).await;
+                if me.serial.get() != serial {
+                    return;
+                }
+                match app {
+                    Some((app, reason)) => me.add_application(&app, &reason),
+                    None => {
+                        let left = me.inhibitors.get().saturating_sub(1);
+                        me.inhibitors.set(left);
+                        me.applications.set_visible(left > 0);
+                    }
+                }
+            });
+        }
+    }
+
+    /// One Dialog.ListSectionItem: the app's 64 px icon, name and reason.
+    fn add_application(&self, app: &tuna_shell_host::apps::AppEntry, reason: &str) {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        row.add_css_class("dialog-list-item");
+        let icon = app
+            .icon
+            .as_deref()
+            .and_then(crate::notify::source_icon)
+            .map(|icon| gtk::Image::from_gicon(&icon))
+            .unwrap_or_else(|| gtk::Image::from_icon_name("application-x-executable"));
+        icon.set_pixel_size(64);
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        text.set_valign(gtk::Align::Center);
+        let name = gtk::Label::new(Some(&app.name));
+        name.add_css_class("dialog-list-item-title");
+        name.set_xalign(0.0);
+        let description = gtk::Label::new(Some(reason));
+        description.add_css_class("dialog-list-item-description");
+        description.set_xalign(0.0);
+        description.set_wrap(true);
+        text.append(&name);
+        text.append(&description);
+        row.append(&icon);
+        row.append(&text);
+        self.application_list.append(&row);
+    }
+
     fn stop_timer(&self) {
         if let Some(id) = self.timer.borrow_mut().take() {
             id.remove();
         }
     }
 
+    /// A signal for the session manager awaiting this dialog's answer;
+    /// the nested preview's own dialog has none.
     fn emit(&self, signal: &str) {
+        if self.local.get() {
+            return;
+        }
         if let Some(bus) = self.bus.borrow().as_ref() {
             let _ = bus.emit_signal(
                 None,
@@ -504,7 +734,11 @@ impl PowerUi {
             if let Some(signal) = confirmed_signal(action) {
                 self.emit(signal);
             }
-            self.perform(action);
+            // The manager ends the session on the confirmation; only the
+            // nested preview's own dialog acts here.
+            if self.local.get() {
+                perform_local(action);
+            }
         }
     }
 }
@@ -544,7 +778,7 @@ fn serve_end_session_dialog(ui: &Rc<PowerUi>) {
                     };
                     match method {
                         "Open" => {
-                            let Some((kind, seconds)) = open_args(&params) else {
+                            let Some((kind, seconds, inhibitors)) = open_args(&params) else {
                                 invocation.return_dbus_error(
                                     "org.freedesktop.DBus.Error.InvalidArgs",
                                     "Open takes (uuuao)",
@@ -559,7 +793,7 @@ fn serve_end_session_dialog(ui: &Rc<PowerUi>) {
                                 );
                                 return;
                             };
-                            if ui.ask_for(action, seconds) {
+                            if ui.ask_for(action, seconds, inhibitors, false) {
                                 eprintln!(
                                     "tuna-shell-gtk: end-session dialog: {} opened over D-Bus",
                                     action.title()
@@ -588,12 +822,22 @@ fn serve_end_session_dialog(ui: &Rc<PowerUi>) {
     );
 }
 
-/// `Open`'s dialog type and seconds to stay open, when the call is `(uuuao)`.
-fn open_args(params: &glib::Variant) -> Option<(u32, u32)> {
+/// `Open`'s dialog type, seconds to stay open and inhibitor object
+/// paths, when the call is `(uuuao)`.
+fn open_args(params: &glib::Variant) -> Option<(u32, u32, Vec<String>)> {
     if params.type_().as_str() != "(uuuao)" {
         return None;
     }
-    Some((params.child_value(0).get()?, params.child_value(2).get()?))
+    let inhibitors = params
+        .child_value(3)
+        .iter()
+        .filter_map(|path| path.str().map(str::to_owned))
+        .collect();
+    Some((
+        params.child_value(0).get()?,
+        params.child_value(2).get()?,
+        inhibitors,
+    ))
 }
 
 #[cfg(test)]
@@ -700,7 +944,10 @@ mod tests {
             60u32.to_variant(),
             inhibitors,
         ]);
-        assert_eq!(open_args(&open), Some((1, 60)));
+        assert_eq!(
+            open_args(&open),
+            Some((1, 60, vec!["/org/gnome/SessionManager/Inhibitor1".into()]))
+        );
         assert_eq!(open_args(&(1u32, 0u32, 60u32).to_variant()), None);
         for signal in [
             "ConfirmedLogout",
@@ -726,6 +973,39 @@ mod tests {
         assert_eq!(
             Action::LogOut.countdown_text(5),
             "You will be logged out automatically in 5 seconds"
+        );
+    }
+
+    #[test]
+    fn countdown_steps_by_ten_until_the_last_ten_seconds_like_gnome() {
+        // endSessionDialog.js _roundSecondsToInterval(60, left, 10).
+        let shown: Vec<u32> = (1..=60)
+            .rev()
+            .map(|left| display_seconds(60, left))
+            .collect();
+        let mut expected = Vec::new();
+        for step in [60, 50, 40, 30, 20] {
+            expected.extend(std::iter::repeat_n(step, 10));
+        }
+        expected.extend((1..=10).rev());
+        assert_eq!(shown, expected);
+        // A shorter Open rounds up no higher than its own total.
+        assert_eq!(display_seconds(15, 15), 15);
+        assert_eq!(display_seconds(15, 12), 15);
+        assert_eq!(display_seconds(15, 10), 10);
+        assert_eq!(display_seconds(60, 0), 0);
+    }
+
+    #[test]
+    fn menu_rows_ask_the_session_manager_like_system_actions() {
+        // systemActions.js: SuspendAsync(), RebootAsync(), ShutdownAsync()
+        // and LogoutAsync(0) on org.gnome.SessionManager.
+        assert_eq!(manager_call(Action::Suspend), ("Suspend", None));
+        assert_eq!(manager_call(Action::Restart), ("Reboot", None));
+        assert_eq!(manager_call(Action::PowerOff), ("Shutdown", None));
+        assert_eq!(
+            manager_call(Action::LogOut),
+            ("Logout", Some((0u32,).to_variant()))
         );
     }
 }

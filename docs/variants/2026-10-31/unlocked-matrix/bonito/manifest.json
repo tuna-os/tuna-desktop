@@ -1,0 +1,166 @@
+{
+  "schema": 2,
+  "started": "2026-10-31T23:17:46+00:00",
+  "runner": "scripts/tuna-corral-journey",
+  "runner_sha256": "97721d7a15781fb2f46ebd3f034715de616a9371bb1ed40f0747da628ab7c1a9",
+  "scope": "qualification-core",
+  "corral": "corral v0.7.0+36.g76b6dd5 (commit 76b6dd52d35d, built 2026-10-30T08:31:57Z, go1.27.0)",
+  "image": {
+    "ref": "ghcr.io/tuna-os/bonito@sha256:be9f1ab12a76482dd90f2a5d70215ad4dc1e1c3fdd6e1d13f83cfe0733d89da1",
+    "booted": "ghcr.io/tuna-os/bonito@sha256:be9f1ab12a76482dd90f2a5d70215ad4dc1e1c3fdd6e1d13f83cfe0733d89da1",
+    "booted_manifest_digest": "sha256:ffbac562398d18c5f3271c2c975c5e8e814e1d3198803c34e90d462725c300b4"
+  },
+  "vm": {
+    "name": "tuna-q-variant-bonito-31215908",
+    "namespace": "corral-vms",
+    "backend": "kubevirt",
+    "requested": {
+      "cpu": 4,
+      "mem": "6G",
+      "disk": "40Gi",
+      "node": "karnataka"
+    },
+    "node": "karnataka",
+    "cpu": {
+      "vcpus": 4,
+      "sockets": 4,
+      "cores": 1,
+      "threads": 1,
+      "model": "host-passthrough",
+      "dedicatedCpuPlacement": false,
+      "isolateEmulatorThread": false
+    },
+    "memory": "6Gi",
+    "firmware": {
+      "type": "uefi",
+      "secureBoot": false,
+      "machine": "q35"
+    },
+    "inputs": [
+      {
+        "name": "tablet",
+        "type": "tablet",
+        "bus": "usb"
+      }
+    ],
+    "disks": [
+      {
+        "name": "rootdisk",
+        "type": "disk",
+        "bus": "virtio",
+        "source": "persistentVolumeClaim",
+        "claim": "tuna-q-variant-bonito-31215908-bootc-disk",
+        "size": "40Gi"
+      }
+    ],
+    "tagValues": {
+      "purpose": "tuna-corral-journey"
+    },
+    "image": "ghcr.io/tuna-os/bonito@sha256:be9f1ab12a76482dd90f2a5d70215ad4dc1e1c3fdd6e1d13f83cfe0733d89da1"
+  },
+  "console": "corral console page (noVNC), Playwright Chromium, 1:1; frames are the canvas pixels",
+  "steps": [],
+  "ready": {
+    "vm": "tuna-q-variant-bonito-31215908",
+    "ready": true,
+    "elapsed_seconds": 61.9,
+    "boot_id": "89aa0ffc-a114-40c1-b634-2f777ef0d8f8",
+    "conditions": [
+      {
+        "name": "running",
+        "ok": true,
+        "elapsed_seconds": 14.6,
+        "observed": "Running"
+      },
+      {
+        "name": "ssh",
+        "ok": true,
+        "elapsed_seconds": 41.6,
+        "observed": "boot 89aa0ffc-a114-40c1-b634-2f777ef0d8f8"
+      },
+      {
+        "name": "boot-complete",
+        "ok": true,
+        "elapsed_seconds": 60.6,
+        "observed": "running"
+      },
+      {
+        "name": "unit:gdm.service",
+        "ok": true,
+        "elapsed_seconds": 60.8,
+        "observed": "active"
+      },
+      {
+        "name": "exec:loginctl list-sessions --no-legend | awk '$6==\"greeter\" && $4==\"seat0\"' | grep -q .",
+        "ok": true,
+        "elapsed_seconds": 61.2,
+        "observed": "exit status 0"
+      },
+      {
+        "name": "paint",
+        "ok": true,
+        "elapsed_seconds": 61.9,
+        "observed": "painted 1280x800 (deviation 0.0606)"
+      }
+    ]
+  },
+  "guest": {
+    "packages": [
+      "tuna-desktop-1.0.0~beta.2-2.fc44.x86_64",
+      "gdm-50.3-1.fc44.x86_64",
+      "gnome-shell-50.6-1.fc44.x86_64",
+      "gnome-control-center-50.4-1.fc44.x86_64",
+      "nautilus-50.4-1.fc44.x86_64"
+    ],
+    "tuna_payload_sha256": [
+      "2778debd15134a076630cded613b9586a360ebfc751cff6d2ad0ee5eef4ad8e1  /usr/bin/tuna-session",
+      "2585b6ee530797c6bde147b5c29753ebf8738ba41d206f2358b6a0fb0bb22188  /usr/bin/tuna-compositor",
+      "a7271fc09a501d6dcfe957288011f5d034e32cea39de04cc6576f1c87d977744  /usr/bin/tuna-shell-gtk",
+      "297ecb937953a1632ebcc6da45db9f76242db7aecf35b64969962aac14aa54f0  /usr/bin/tuna-ibus-bridge"
+    ],
+    "kernel": "7.2.13-200.fc44.x86_64",
+    "drm_driver": "bochs-drm",
+    "modes": [
+      "1280x800",
+      "1920x1440",
+      "2560x1080"
+    ],
+    "sessions_offered": [
+      "Name=Tuna Desktop"
+    ],
+    "gdm_custom_conf": [
+      "FallbackSession=tuna"
+    ],
+    "boot_id": "89aa0ffc-a114-40c1-b634-2f777ef0d8f8",
+    "account": "tuna-test:x:1000:1000::/var/home/tuna-test:/bin/bash"
+  },
+  "account": {
+    "user": "tuna-test",
+    "password": "public fixture password (packaging/marlin/vm-lane)",
+    "provisioned": "corral bootc create --user --password-stdin; image unchanged"
+  },
+  "error": "RuntimeError: corral console exited 1 before it printed a URL",
+  "failure_capture": {
+    "exit": 0,
+    "stderr": "",
+    "frame": "failure-console.png",
+    "sha256": "c01bb4dbd168f5a4a6b76ba5c0c13014d785465d8e2e2d037abe2b773e585b3c"
+  },
+  "cleanup": {
+    "deleted": true,
+    "result": [
+      {
+        "name": "tuna-q-variant-bonito-31215908",
+        "deleted": true,
+        "removed": [
+          "virtualmachine.kubevirt.io/tuna-q-variant-bonito-31215908",
+          "virtualmachineinstance.kubevirt.io/tuna-q-variant-bonito-31215908",
+          "persistentvolumeclaim/tuna-q-variant-bonito-31215908-bootc-disk"
+        ]
+      }
+    ],
+    "still_listed": [],
+    "failures": []
+  },
+  "finished": "2026-10-31T23:36:38+00:00"
+}

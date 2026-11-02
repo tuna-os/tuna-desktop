@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "/home/ubuntu/.cache/tuna-journey-venv/bin/python",
+    "/tmp/tuna-variant-unlocked-20261031/harness/tuna-corral-journey",
+    "--image",
+    "ghcr.io/tuna-os/wahoo@sha256:865ec5320f25ae368316f07b4d3b49b5e0600308e5bc50b973ace90a5b53a46d",
+    "--vm",
+    "tuna-q-variant-wahoo-31215908",
+    "--node",
+    "karnataka",
+    "--out",
+    "/tmp/tuna-variant-unlocked-20261031/wahoo",
+    "--qualification-only"
+  ],
+  "exit": 1,
+  "stdout": "",
+  "stderr": "Traceback (most recent call last):\n  File \"/tmp/tuna-variant-unlocked-20261031/harness/tuna-corral-journey\", line 833, in <module>\n    sys.exit(main())\n             ~~~~^^\n  File \"/tmp/tuna-variant-unlocked-20261031/harness/tuna-corral-journey\", line 779, in main\n    provision(args, guest, receipt)\n    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^\n  File \"/tmp/tuna-variant-unlocked-20261031/harness/tuna-corral-journey\", line 232, in provision\n    run(['corral', 'bootc', 'create', args.vm, '--image', args.image, '--cpu', str(args.cpu),\n    ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n         '--mem', args.mem, '--disk', args.disk, '-n', args.namespace,\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n         '--user', USER, '--password-stdin', '--tag', 'purpose=tuna-corral-journey']\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n        + (['--node', args.node] if args.node else []), timeout=3600, input=PASSWORD + '\\n')\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/tmp/tuna-variant-unlocked-20261031/harness/tuna-corral-journey\", line 69, in run\n    raise RuntimeError(f'{shlex.join(cmd)} exited {r.returncode}: {r.stderr.strip()[-800:]}')\nRuntimeError: corral bootc create tuna-q-variant-wahoo-31215908 --image ghcr.io/tuna-os/wahoo@sha256:865ec5320f25ae368316f07b4d3b49b5e0600308e5bc50b973ace90a5b53a46d --cpu 4 --mem 6G --disk 40Gi -n corral-vms --user tuna-test --password-stdin --tag purpose=tuna-corral-journey --node karnataka exited 1:  --storage-class string      StorageClass for the disk PVC (default: cluster preference)\n      --sudo                      Run the local build's podman under sudo \u2014 bootc install needs root (off-cluster backends only)\n      --tag stringArray           Tag the VM as key=value (key alone means key=true), stored as label corral.dev/tag.<key> (repeatable; KubeVirt only)\n      --user string               Create a login user in the installed image\n\nGlobal Flags:\n      --context string     Corral context to build for (default: the selected context)\n  -n, --namespace string   Namespace (KubeVirt only) (default \"corral-vms\")\n\nbootc build: bootc build failed: builder reported failure (CORRAL_BUILD_FAIL provision) \u2014 if the builder actually finished after this failed, retry with --resume\nexit status 1\n"
+}

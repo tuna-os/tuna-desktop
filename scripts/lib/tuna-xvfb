@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Usage: scripts/lib/tuna-xvfb -displayfd FD [Xvfb options...]
+#
+# `Xvfb -displayfd FD` on a display that other X servers on the machine
+# can see is taken: starts Xvfb on the first display from 120 up
+# (TUNA_XVFB_FIRST) whose /tmp/.X<n>-lock this process can create, and
+# writes the number and a newline to FD once Xvfb accepts clients.
+#
+# Xvfb's own -displayfd takes no lock, so Smithay's XWayland in any
+# nested compositor (which allocates displays 0-32 by lock file) may
+# claim the same number and replace the server's socket file; Xvfb's next
+# reset then leaves it accepting no clients. Displays from 120 up stay
+# clear of XWayland and of older scripts' fixed :95-:119.
+#
+# The lock names this process, which lives as long as Xvfb: TERM or INT
+# stops Xvfb and removes the lock. Exits with Xvfb's status.
+set -euo pipefail
+[ "${1:-}" = -displayfd ] && [[ "${2:-}" =~ ^[0-9]+$ ]] || { sed -n '2,16p' "$0" >&2; exit 2; }
+fd=$2
+shift 2
+n=${TUNA_XVFB_FIRST:-120}
+last=$((n + 1000))
+xvfb=""
+lock=""
+ready=$(mktemp "${TMPDIR:-/tmp}/tuna-xvfb.XXXXXX")
+# shellcheck disable=SC2329 # run by the EXIT trap
+cleanup() {
+    if [ -n "$xvfb" ]; then
+        kill "$xvfb" 2>/dev/null || true
+        wait "$xvfb" 2>/dev/null || true
+    fi
+    if [ -n "$lock" ]; then rm -f "$lock"; fi
+    rm -f "$ready"
+}
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+while [ "$n" -lt "$last" ]; do
+    # noclobber: created only if absent (O_EXCL), as X servers lock.
+    if (set -C && printf '%10d\n' "$$" >"/tmp/.X$n-lock") 2>/dev/null; then
+        lock=/tmp/.X$n-lock
+        : >"$ready"
+        # The caller's descriptor stays with this script, never with Xvfb.
+        rfd=9
+        [ "$fd" != 9 ] || rfd=8
+        eval 'Xvfb ":$n" -displayfd '"$rfd"' "$@" '"$rfd"'>"$ready" '"$fd"'>/dev/null &'
+        xvfb=$!
+        while kill -0 "$xvfb" 2>/dev/null && [ ! -s "$ready" ]; do sleep 0.1; done
+        if [ -s "$ready" ]; then
+            echo "$n" >&"$fd"
+            eval 'exec '"$fd"'>/dev/null'
+            status=0
+            wait "$xvfb" || status=$?
+            xvfb=""
+            exit "$status"
+        fi
+        # Another server already holds this display's sockets.
+        wait "$xvfb" 2>/dev/null || true
+        xvfb=""
+        rm -f "$lock"
+        lock=""
+    fi
+    n=$((n + 1))
+done
+echo "tuna-xvfb: no free display from ${TUNA_XVFB_FIRST:-120} to $((last - 1))" >&2
+exit 1

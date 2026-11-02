@@ -4,7 +4,9 @@
 Default observation has no text/value/description queries. The explicit controlled
 overview mode compares only the known five-character fixture query in scratch
 memory; no buffer is retained. Banner mode observes only the original shell's
-visible Notifications frame and public Close button. No synthetic AT-SPI actions,
+visible Notifications frame and public Close button. The explicit end-session
+mode adds the power menu and end-session dialog controls and keeps only label
+names that are the dialog's fixed countdown sentence. No synthetic AT-SPI actions,
 focus changes or arbitrary names are recorded. Native QMP input performs every action.
 Primary API: https://gnome.pages.gitlab.gnome.org/at-spi2-core/libatspi/
 """
@@ -19,6 +21,13 @@ import time
 
 PUBLIC_LABELS = {"Search", "Disks", "Take Screenshot", "Settings", "Lock", "Power Off Menu", "Mute", "Volume"}
 PUBLIC_ROLES = {"entry", "text", "push button", "slider", "frame"}
+# The end-session mode (#589) adds the power menu's rows, the end-session
+# dialog's buttons and its countdown: GNOME Shell 51's fixed sentences
+# (endSessionDialog.js), public text naming no user data. Only that mode
+# reads label names, and keeps none but a countdown.
+END_SESSION_LABELS = {"Suspend", "Restart…", "Power Off…", "Log Out…", "Cancel", "Restart", "Power Off", "Log Out"}
+COUNTDOWN = re.compile(r"(?:The system will (?:restart|power off)|You will be logged out) "
+                       r"automatically in [0-9]{1,2} seconds?")
 
 FOCUS_OPERATIONS = {"arguments", "imports", "process-identity", "atspi-timeout",
                     "desktop-enumeration", "atspi-owner", "bus-connection", "bus-credentials",
@@ -34,8 +43,14 @@ def canonical_role(role):
     return "push button" if role == "button" else role
 
 
-def public_node(name, role, showing, focused, active):
-    if name not in PUBLIC_LABELS or role not in PUBLIC_ROLES or not showing:
+def public_node(name, role, showing, focused, active, end_session=False):
+    if not showing:
+        return None
+    if role == "label":
+        if not end_session or type(name) is not str or COUNTDOWN.fullmatch(name) is None:
+            return None
+    elif role not in PUBLIC_ROLES or (name not in PUBLIC_LABELS
+                                      and not (end_session and name in END_SESSION_LABELS)):
         return None
     return {"label": name, "role": role, "focused": bool(focused), "active": bool(active)}
 
@@ -130,15 +145,16 @@ def catalog_receipt(pid, uid, ticks):
             "sample_scope":"original-show-results","authentication_boundary":False}
 
 
-def observe(pid, ticks, executable, display, controlled=False, banner=False):
+def observe(pid, ticks, executable, display, controlled=False, end_session=False, banner=False):
     global FOCUS_OPERATION
     FOCUS_OPERATION = "imports"
     import gi
     gi.require_version("Atspi", "2.0")
     from gi.repository import Atspi, Gio, GLib
     uid = os.getuid()
-    if (type(controlled) is not bool or type(banner) is not bool or (controlled and banner)
-            or ((controlled or banner) and executable != "tuna-shell-gtk")):
+    if (type(controlled) is not bool or type(end_session) is not bool or type(banner) is not bool
+            or sum((controlled, end_session, banner)) > 1
+            or ((controlled or end_session or banner) and executable != "tuna-shell-gtk")):
         raise RuntimeError("fixed shell observation mode required")
     if uid == 0 or executable not in {"tuna-shell-gtk", "gnome-disks"}:
         raise RuntimeError("probe requires the original non-root session principal")
@@ -244,7 +260,7 @@ def observe(pid, ticks, executable, display, controlled=False, banner=False):
         if banner and role in {"alert", "notification"}:
             FOCUS_OPERATION = "tree-name"
             banner_control |= accessibility_query(node.get_name) == "Installed strip framebuffer control"
-        if role in PUBLIC_ROLES:
+        if role in PUBLIC_ROLES or (end_session and role == "label"):
             FOCUS_OPERATION = "tree-name"
             name = accessibility_query(node.get_name)
             FOCUS_OPERATION = "tree-state-flags"
@@ -259,7 +275,7 @@ def observe(pid, ticks, executable, display, controlled=False, banner=False):
                         record["ready"] = bool(focused and states.contains(Atspi.StateType.SENSITIVE)
                                                and states.contains(Atspi.StateType.ENABLED))
             else:
-                record = public_node(name, role, showing, focused, active)
+                record = public_node(name, role, showing, focused, active, end_session)
             if record is not None:
                 nodes.append(record)
             if controlled:
@@ -324,11 +340,13 @@ def observe(pid, ticks, executable, display, controlled=False, banner=False):
 
 if __name__ == "__main__":
     try:
-        if len(sys.argv) not in (5,6) or (len(sys.argv)==6 and sys.argv[5] not in {"controlled-overview", "banner"}):
+        modes = {"controlled-overview", "end-session", "banner"}
+        if len(sys.argv) not in (5,6) or (len(sys.argv)==6 and sys.argv[5] not in modes):
             raise ValueError("fixed observation mode")
         mode = sys.argv[5] if len(sys.argv) == 6 else None
         receipt = observe(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4],
-                          controlled=mode == "controlled-overview", banner=mode == "banner")
+                          controlled=mode == "controlled-overview", end_session=mode == "end-session",
+                          banner=mode == "banner")
         FOCUS_OPERATION = "serialization"
         print(json.dumps(receipt))
     except Exception as error:
