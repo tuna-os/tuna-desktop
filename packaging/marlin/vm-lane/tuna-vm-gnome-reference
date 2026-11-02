@@ -183,8 +183,10 @@ def sessions(deadline):
         sid = line.split()[0]
         if not re.fullmatch('[A-Za-z0-9_-]+', sid):
             raise RuntimeError('malformed actual logind session ID')
-        keys = 'Id,User,Name,Type,Class,Active,Remote,Seat,VTNr,Service,Leader,State,Desktop,Scope'
-        result.append(properties(run(['/usr/bin/loginctl', 'show-session', sid, '--no-pager', '--property=' + keys], deadline)))
+        keys = ('Id', 'User', 'Name', 'Type', 'Class', 'Active', 'Remote', 'Seat',
+                'VTNr', 'Service', 'Leader', 'State', 'Desktop', 'Scope')
+        result.append(properties(run(['/usr/bin/loginctl', 'show-session', sid, '--no-pager',
+                                      *('--property=' + key for key in keys)], deadline)))
     return result
 
 

@@ -262,6 +262,26 @@ class RealProcess(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(RuntimeError):
                 GUEST.same_process(dict(actual, **{key: value}), actual)
 
+    def test_session_selector_matches_actual_unfiltered_logind_properties(self):
+        listed = subprocess.run(['/usr/bin/loginctl', 'list-sessions', '--no-legend', '--no-pager'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, timeout=3)
+        if listed.returncode or not listed.stdout.strip():
+            self.skipTest('no actual host logind session; installed native admission remains mandatory')
+        expected = {}
+        for line in listed.stdout.splitlines():
+            sid = line.split()[0]
+            raw = subprocess.check_output(['/usr/bin/loginctl', 'show-session', sid,
+                                           '--all', '--no-pager'], text=True, timeout=3)
+            expected[sid] = GUEST.properties(raw)
+        observed = GUEST.sessions(GUEST.Deadline(3))
+        self.assertEqual(len(observed), len(expected))
+        for session in observed:
+            self.assertIn(session.get('Id'), expected)
+            actual = expected[session['Id']]
+            self.assertEqual({key: session.get(key) for key in ('Id', 'User', 'Type', 'Class', 'Service')},
+                             {key: actual.get(key) for key in ('Id', 'User', 'Type', 'Class', 'Service')})
+
     @unittest.skipUnless(hasattr(os, 'pidfd_open'), 'kernel pidfd interface required')
     def test_pidfd_cleanup_retires_only_actual_owned_child(self):
         child = self.child()
