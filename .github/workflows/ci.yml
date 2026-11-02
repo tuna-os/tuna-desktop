@@ -1629,6 +1629,13 @@ jobs:
         run: |
           printf '%s\n' "$BASE_PLATFORM" > /mnt/vm/base-digest
           printf '%s\n' "$BASE_INDEX" > /mnt/vm/base-index-digest
+      - name: Reverify the loaded product immutable base under the current trust policy
+        if: matrix.profile == 'lifecycle' && steps.native-product.outputs.restored == 'true'
+        env:
+          BASE_PLATFORM: ${{ steps.native-product.outputs.base_platform }}
+        run: |
+          python3 scripts/lib/vm_gnome_reference.py verify-platform \
+            --platform-digest "$BASE_PLATFORM" --out vm-lane-artifacts/native-base
       - name: Verify the original paired reference base before building or booting
         if: matrix.profile != 'lifecycle'
         run: |
