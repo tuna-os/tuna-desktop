@@ -71,6 +71,24 @@ class Arguments(unittest.TestCase):
         for version in ('51.0-1', '51.10-1', '151.1', '51.1junk', ''):
             self.assertFalse(GUEST.version_51_1(version))
 
+    def test_socket_basename_does_not_misclassify_native_tuna_as_nested(self):
+        for value in ('wayland-0', 'tuna-nested-12345', 'native_display.sock', 'native:reference', 'native display'):
+            self.assertEqual(GUEST.wayland_basename(value), value)
+        for value in ('', '.', '..', '../wayland-0', '/run/user/1000/wayland-0', 'a/b', 'a\x00b', None):
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                GUEST.wayland_basename(value)
+
+    def test_chunk_arguments_and_immutable_allowlist_are_bounded(self):
+        value = {'nonce': NONCE, 'name': 'observe-000001.json', 'offset': 262144, 'limit': 262144}
+        self.assertGreater(GUEST.payload('file', value).remaining(), 0)
+        for key, bad in (('offset', -1), ('offset', True), ('offset', 1.5), ('limit', 0), ('limit', 262145), ('limit', True)):
+            with self.subTest(key=key, bad=bad), self.assertRaises(ValueError):
+                GUEST.payload('file', dict(value, **{key: bad}))
+        for name in ('observe-1.json', 'observe-000001.json/extra', '../observe-000001.json', 'exec-000001.json'):
+            self.assertFalse(GUEST.allowed_receipt(name))
+        with self.assertRaises(RuntimeError):
+            GUEST.wire_bytes({'controlled_large_value': 'x' * (GUEST.MAX_WIRE_BYTES + 1)}, 'admit')
+
 
 class RealFilesystem(unittest.TestCase):
     def test_metadata_is_exclusive_private_and_not_followed(self):
@@ -107,6 +125,64 @@ class RealFilesystem(unittest.TestCase):
             self.assertEqual(GUEST.retained_files(directory), ['snapshot.json'])
             with self.assertRaises(ValueError):
                 GUEST.retrieve_file(directory, '../snapshot.json')
+
+    def test_large_immutable_response_chunks_preserve_full_bytes_without_qga_overflow(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            response = {'schema': 1, 'profile': 'gnome', 'nonce': NONCE, 'ready': True,
+                        'controlled_transport_data': 'x' * (1024 * 1024 + 123)}
+            envelope = GUEST.response_envelope(directory, 'observe', response, GUEST.Deadline(5))
+            name = envelope['response_file']['name']
+            actual = (directory / name).read_bytes()
+            self.assertEqual((directory / 'snapshot.json').read_bytes(), actual)
+            self.assertEqual(json.loads(actual), response)
+            self.assertIn(name, response['files'])
+            self.assertNotIn('response_file', response)
+            self.assertLess(len(GUEST.wire_bytes(envelope, 'observe')), GUEST.MAX_WIRE_BYTES)
+            self.assertEqual(envelope['response_file']['sha256'], hashlib.sha256(actual).hexdigest())
+            assembled = bytearray()
+            actual_read = GUEST.read_bytes
+            with mock.patch.object(GUEST, 'read_bytes', side_effect=lambda path: actual_read(path, os.getuid())):
+                while len(assembled) < len(actual):
+                    chunk = GUEST.retrieve_file(directory, name, len(assembled), 262144)
+                    decoded = base64.b64decode(chunk['base64'], validate=True)
+                    self.assertEqual(chunk['length'], len(decoded))
+                    self.assertEqual(chunk['size'], len(actual))
+                    self.assertEqual(chunk['chunk_sha256'], hashlib.sha256(decoded).hexdigest())
+                    self.assertEqual(chunk['sha256'], envelope['response_file']['sha256'])
+                    self.assertEqual(chunk['offset'], len(assembled))
+                    self.assertLess(len(base64.b64encode(GUEST.wire_bytes(chunk, 'file'))), 1024 * 1024)
+                    assembled.extend(decoded)
+                    self.assertEqual(chunk['eof'], len(assembled) == len(actual))
+                final = GUEST.retrieve_file(directory, name, len(actual), 1)
+                self.assertEqual(final['length'], 0)
+                self.assertTrue(final['eof'])
+                with self.assertRaises(ValueError):
+                    GUEST.retrieve_file(directory, name, len(actual) + 1)
+            self.assertEqual(bytes(assembled), actual)
+            later = GUEST.response_envelope(directory, 'observe',
+                {'schema': 1, 'profile': 'gnome', 'nonce': NONCE, 'ready': False},
+                GUEST.Deadline(5))
+            self.assertNotEqual(later['response_file']['name'], name)
+            self.assertEqual((directory / name).read_bytes(), actual)
+            self.assertEqual(stat.S_IMODE((directory / name).stat().st_mode), 0o600)
+
+    def test_retained_file_replacement_during_read_cannot_mix_identity_or_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            path = directory / 'snapshot.json'
+            GUEST.save(directory, 'snapshot.json', {'original': True})
+            actual_read = os.read
+            def replace(fd, size):
+                data = actual_read(fd, size)
+                replacement = directory / 'replacement'
+                replacement.write_bytes(b'changed')
+                replacement.chmod(0o600)
+                replacement.replace(path)
+                return data
+            with mock.patch.object(GUEST.os, 'read', side_effect=replace):
+                with self.assertRaisesRegex(RuntimeError, 'changed'):
+                    GUEST.read_bytes(path, os.getuid())
 
     def test_receipt_rejects_foreign_mode_symlink_hardlink_and_large_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -496,7 +572,10 @@ class ControlledAtspi(unittest.TestCase):
         roots[0]['children'] = [node(10, '/shell/selected', 'Files', 'push button', [23, 25, 30])]
         roots[1]['children'] = [node(11, '/files/first', 'first', 'frame', [25, 30]),
                                 node(11, '/files/second', 'second', 'frame', [25, 30])]
-        roots[2]['children'] = [node(12, '/settings/network', 'Network', 'frame', [1, 25, 30])]
+        roots[2]['children'] = [node(12, '/settings/network', 'Settings', 'frame', [1, 25, 30])]
+        row = node(12, '/settings/network/nav', '', 'list item', [23, 25, 30])
+        row['children'] = [node(12, '/settings/network/nav/label', 'Network', 'label', [25, 30])]
+        roots[2]['children'][0]['children'] = [row]
         fixture = {'directories': ['/run/owned/first', '/run/owned/second'], 'processes': [files, settings]}
         return roots, fixture, shell
 
@@ -507,10 +586,33 @@ class ControlledAtspi(unittest.TestCase):
         self.assertEqual(selection['selected'][0]['atspi']['path'], '/shell/selected')
         self.assertEqual(selection['selected'][0]['process']['pid'], shell['pid'])
         self.assertEqual(selection['active_windows'][0]['role'], 'settings')
+        settings_window = selection['active_windows'][0]
+        self.assertEqual(settings_window['name'], 'Settings')
+        self.assertEqual(settings_window['panel_evidence'][0]['selected_object']['atspi']['path'], '/settings/network/nav')
+        self.assertEqual(settings_window['panel_evidence'][0]['label_objects'][0]['name'], 'Network')
+        self.assertEqual(settings_window['accessibility_tree'], trees[2]['children'][0])
         self.assertNotIn(selection['selected'][0]['atspi'], [w['atspi'] for w in windows])
         self.assertEqual(selection['objects'], [trees[0]])
         trees[0]['children'][0]['states'] = []
         self.assertEqual(GUEST.window_context(trees, fixture, shell)[1]['selected'], [])
+
+    def test_network_label_requires_selected_visible_original_descendant_not_window_title(self):
+        for change in ('unselected', 'hidden-label', 'foreign-label', 'title-only'):
+            trees, fixture, shell = self.context()
+            window = trees[2]['children'][0]
+            row = window['children'][0]
+            label = row['children'][0]
+            if change == 'unselected':
+                row['states'] = [25, 30]
+            elif change == 'hidden-label':
+                label['states'] = []
+            elif change == 'foreign-label':
+                label['process']['uid'] = 42
+            else:
+                window['name'] = 'Network'
+                window['children'] = []
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                GUEST.window_context(trees, fixture, shell)
 
     def test_missing_foreign_stale_duplicate_hidden_or_extra_context_fails(self):
         changes = ('missing-shell', 'stale-shell', 'foreign-app', 'missing-window',
@@ -533,7 +635,7 @@ class ControlledAtspi(unittest.TestCase):
             elif change == 'unowned-directory':
                 trees[1]['children'][0]['name'] = 'unrelated'
             elif change == 'wrong-panel':
-                trees[2]['children'][0]['name'] = 'Appearance'
+                trees[2]['children'][0]['children'][0]['children'][0]['name'] = 'Appearance'
             elif change == 'two-active':
                 trees[1]['children'][0]['states'].append(1)
             else:

@@ -30,6 +30,8 @@ APPS = ('/usr/bin/nautilus', '/usr/bin/gnome-control-center')
 BINDINGS = ('switch-applications', 'switch-applications-backward', 'switch-windows',
             'switch-windows-backward', 'switch-group', 'switch-group-backward')
 MAX_BYTES = 16 * 1024 * 1024
+MAX_CHUNK_BYTES = 262144
+MAX_WIRE_BYTES = 256 * 1024
 UID = 1000
 CLOCK = 'guest CLOCK_MONOTONIC'
 
@@ -51,10 +53,25 @@ class FixtureNotReady(RuntimeError):
     """Actual startup window inventory is incomplete, never native admission."""
 
 
+
+def allowed_receipt(name):
+    return isinstance(name, str) and (name in FILES or re.fullmatch(r'(prepare|observe|stop)-[0-9]{6}\.json', name) is not None)
+
+
+def file_range(offset, limit):
+    if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= MAX_CHUNK_BYTES:
+        raise ValueError('file offset must be nonnegative integer and limit 1..262144')
+
+
+def wayland_basename(value):
+    if not isinstance(value, str) or value in ('', '.', '..') or '/' in value or '\x00' in value or len(os.fsencode(value)) > 90:
+        raise RuntimeError('actual native Wayland socket is not a safe basename')
+    return value
+
 def payload(operation, value):
     if operation not in ('admit', 'prepare', 'observe', 'file', 'stop') or not isinstance(value, dict):
         raise ValueError('fixed operation and JSON object required')
-    allowed = {'budget_s', 'nonce', 'name'} if operation == 'file' else {'profile', 'budget_s'}
+    allowed = {'budget_s', 'nonce', 'name', 'offset', 'limit'} if operation == 'file' else {'profile', 'budget_s'}
     if operation in ('prepare', 'observe', 'stop'):
         allowed.add('nonce')
     if set(value) - allowed:
@@ -63,8 +80,10 @@ def payload(operation, value):
         raise ValueError('profile must be gnome or tuna')
     if operation != 'admit' and (not isinstance(value.get('nonce'), str) or not re.fullmatch('[0-9a-f]{32}', value['nonce'])):
         raise ValueError('fresh lowercase 32hex nonce required')
-    if operation == 'file' and value.get('name') not in FILES:
-        raise ValueError('receipt name is not allowlisted')
+    if operation == 'file':
+        if not allowed_receipt(value.get('name')):
+            raise ValueError('receipt name is not allowlisted')
+        file_range(value.get('offset', 0), value.get('limit', MAX_CHUNK_BYTES))
     return Deadline(value.get('budget_s', 20))
 
 
@@ -212,9 +231,7 @@ def session_environment(identity, logind, deadline):
         raise RuntimeError('existing user manager has no native Wayland environment')
     if actual.get('XDG_SESSION_ID', logind['Id']) != logind['Id']:
         raise RuntimeError('user manager exports a different session')
-    display = actual.get('WAYLAND_DISPLAY', '')
-    if not re.fullmatch('wayland-[A-Za-z0-9_-]+', display):
-        raise RuntimeError('actual native Wayland socket name unavailable')
+    display = wayland_basename(actual.get('WAYLAND_DISPLAY'))
     peer = check_socket_peer(str(runtime / display), UID, deadline)
     same_process(identity, peer)
     return dict(base, XDG_SESSION_ID=logind['Id'], XDG_SESSION_TYPE='wayland',
@@ -461,8 +478,13 @@ def read_bytes(path, uid=0):
         if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > MAX_BYTES:
             raise RuntimeError('unsafe receipt owner/mode/type/size')
         data = os.read(fd, MAX_BYTES + 1)
-        if len(data) > MAX_BYTES or len(data) != info.st_size or os.fstat(fd).st_mtime_ns != info.st_mtime_ns:
+        after = os.fstat(fd)
+        keys = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_nlink')
+        if len(data) > MAX_BYTES or len(data) != info.st_size or any(getattr(after, key) != getattr(info, key) for key in keys):
             raise RuntimeError('receipt changed or exceeds byte bound')
+        named = path.lstat()
+        if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
+            raise RuntimeError('receipt path identity changed during read')
         return data
     finally:
         os.close(fd)
@@ -488,15 +510,69 @@ def save(directory, name, value):
 
 
 def retained_files(directory, pending=()):
-    return [name for name in FILES if name in pending or (directory / name).exists()]
+    names = {entry.name for entry in directory.iterdir() if allowed_receipt(entry.name)}
+    names.update(pending)
+    return [name for name in FILES if name in names] + sorted(names - set(FILES))
 
 
-def retrieve_file(directory, name):
-    if name not in FILES:
+def retrieve_file(directory, name, offset=0, limit=MAX_CHUNK_BYTES):
+    if not allowed_receipt(name):
         raise ValueError('receipt name is not allowlisted')
+    file_range(offset, limit)
     data = read_bytes(directory / name)
-    return {'name': name, 'base64': base64.b64encode(data).decode(),
-            'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
+    if offset > len(data):
+        raise ValueError('file offset exceeds actual retained size')
+    chunk = data[offset:offset + limit]
+    return {'name': name, 'offset': offset, 'length': len(chunk), 'size': len(data),
+            'sha256': hashlib.sha256(data).hexdigest(),
+            'chunk_sha256': hashlib.sha256(chunk).hexdigest(),
+            'base64': base64.b64encode(chunk).decode(), 'eof': offset + len(chunk) == len(data)}
+
+
+def response_envelope(directory, operation, result, deadline):
+    if operation not in ('prepare', 'observe', 'stop'):
+        raise ValueError('only fixed fixture operations have response receipts')
+    names = retained_files(directory)
+    sequences = [int(name[-11:-5]) for name in names if name not in FILES]
+    sequence = max(sequences, default=0) + 1
+    while sequence <= 999999:
+        deadline.remaining()
+        name = f'{operation}-{sequence:06d}.json'
+        try:
+            fd = os.open(directory / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            break
+        except FileExistsError:
+            sequence += 1
+    else:
+        raise RuntimeError('immutable operation response sequence exhausted')
+    fixed = {'prepare': 'prepare.json', 'observe': 'snapshot.json', 'stop': 'stop.json'}[operation]
+    try:
+        result['files'] = retained_files(directory, (fixed,))
+        data = json.dumps(result, sort_keys=True).encode()
+        if len(data) > MAX_BYTES:
+            raise RuntimeError('complete operation response exceeds retained receipt byte bound')
+        with os.fdopen(fd, 'wb') as stream:
+            fd = None
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        (directory / name).unlink(missing_ok=True)
+        raise
+    save(directory, fixed, result)
+    return {'schema': 1, 'profile': result['profile'], 'nonce': result['nonce'],
+            'ready': result['ready'], 'response_file': {
+                'name': name, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}}
+
+
+def wire_bytes(result, operation):
+    data = json.dumps(result).encode()
+    limit = 384 * 1024 if operation == 'file' else MAX_WIRE_BYTES
+    if len(data) > limit:
+        raise RuntimeError('direct operation response exceeds fixed wire byte cap')
+    return data
 
 
 def validate_claim(claim, args):
@@ -660,9 +736,9 @@ def session_observe(args, deadline):
         node = {'atspi': {'bus_name': unique, 'path': path, 'id_domain': 'AT-SPI'},
                 'name': name, 'role_name': role, 'states': states, 'process': principal,
                 'children': []}
-        # Full original Shell tree; other apps need only their real top-level
-        # windows, not thousands of irrelevant document widget objects.
-        if principal['exe'] in ('/usr/bin/gnome-shell', '/usr/bin/tuna-shell-gtk') or role not in ('frame', 'window', 'dialog'):
+        # Full original Shell and Settings trees; Settings descendants establish
+        # the actual selected Network panel without relabeling its window title.
+        if principal['exe'] in ('/usr/bin/gnome-shell', '/usr/bin/tuna-shell-gtk', APPS[1]) or role not in ('frame', 'window', 'dialog'):
             for child_bus, child_path in children:
                 if child_path != '/org/a11y/atspi/null':
                     node['children'].append(tree(child_bus or unique, child_path, depth + 1))
@@ -683,6 +759,26 @@ def flatten(nodes):
     for node in nodes:
         yield node
         yield from flatten(node['children'])
+
+
+def network_panel_evidence(window):
+    evidence = []
+    keys = ('atspi', 'name', 'role_name', 'states', 'process')
+    for selected in flatten(window['children']):
+        if selected['role_name'] not in ('list item', 'page tab', 'tree item', 'radio button') or not {23, 25, 30} <= set(selected['states']):
+            continue
+        labels = [node for node in flatten([selected]) if node['name'].strip().casefold() == 'network'
+                  and {25, 30} <= set(node['states'])]
+        if not labels:
+            continue
+        same_process(window['process'], selected['process'])
+        for label in labels:
+            same_process(window['process'], label['process'])
+        evidence.append({'selected_object': {key: selected[key] for key in keys},
+                         'label_objects': [{key: label[key] for key in keys} for label in labels]})
+    if not evidence:
+        raise FixtureNotReady('original Settings descendants do not expose selected visible Network panel')
+    return evidence
 
 
 def window_context(trees, fixture, shell):
@@ -707,8 +803,8 @@ def window_context(trees, fixture, shell):
         record = {key: node[key] for key in ('atspi', 'name', 'role_name', 'states', 'process')}
         record['process'] = principals[principal['pid']]
         if principal['exe'] == APPS[1]:
-            if 'network' not in node['name'].casefold():
-                raise FixtureNotReady('Settings window does not actually expose Network panel identity')
+            record['panel_evidence'] = network_panel_evidence(node)
+            record['accessibility_tree'] = node
             record['role'] = 'settings'
         else:
             matches = [i for i, path in enumerate(fixture['directories']) if Path(path).name in node['name']]
@@ -994,7 +1090,7 @@ def main():
                 claim = load_claim(directory, args)
                 owned_directory = True
                 if operation == 'file':
-                    result = retrieve_file(directory, args['name'])
+                    result = retrieve_file(directory, args['name'], args.get('offset', 0), args.get('limit', MAX_CHUNK_BYTES))
                 elif operation == 'stop':
                     result = cleanup(args, claim, directory, deadline)
                 else:
@@ -1002,7 +1098,8 @@ def main():
                     result = snapshot(args, claim, admitted, environment, deadline, cache)
                     save(directory, 'snapshot.json', result)
         deadline.remaining()
-        print(json.dumps(result))
+        wire = response_envelope(directory, operation, result, deadline) if operation in ('prepare', 'observe', 'stop') else result
+        print(wire_bytes(wire, operation).decode())
         if not result.get('ready', True) and operation != 'admit':
             raise SystemExit(1)
     except Exception as error:
@@ -1017,7 +1114,13 @@ def main():
                 result['files'] = retained_files(directory)
             except (OSError, RuntimeError) as saving:
                 result['retention_error'] = str(saving)
-        print(json.dumps(result))
+        encoded = json.dumps(result).encode()
+        if len(encoded) > MAX_WIRE_BYTES:
+            result = {'schema': 1, 'ready': False, 'operation': operation,
+                      'error': 'full failure diagnostic exceeds fixed wire cap',
+                      'diagnostic_size': len(encoded), 'diagnostic_sha256': hashlib.sha256(encoded).hexdigest(),
+                      'retained_file': 'failure.json' if owned_directory and 'retention_error' not in result else None}
+        print(wire_bytes(result, 'admit').decode())
         raise SystemExit(1)
 
 

@@ -30,6 +30,7 @@ BASE_REPOSITORY = 'ghcr.io/tuna-os/marlin'
 CERTIFICATE_SUBJECT = 'https://github.com/tuna-os/tunaOS/.github/workflows/reusable-build-image.yml@refs/heads/main'
 CERTIFICATE_ISSUER = 'https://token.actions.githubusercontent.com'
 BASE_FILES = ('index.json', 'platform-cosign.json')
+FILE_CHUNK_BYTES = 262144
 
 
 def require(condition, message):
@@ -50,7 +51,7 @@ def profile_name(profile):
     return profile
 
 
-def guest_call(agent, op, profile, nonce=None, **payload):
+def guest_call(agent, op, profile, nonce=None, *, retention=None, **payload):
     require(op in ('admit', 'prepare', 'observe', 'file', 'stop'), 'unknown fixed operation')
     profile_name(profile)
     body = {'budget_s': 25, **payload}
@@ -61,7 +62,68 @@ def guest_call(agent, op, profile, nonce=None, **payload):
         body['nonce'] = nonce
     value = agent.run('gnome-reference', op, json.dumps(body, sort_keys=True), timeout=30)
     require(isinstance(value, dict), 'guest operation returned no object')
+    require(('response_file' in value) == (op in ('prepare', 'observe', 'stop')),
+            'fixed operation did not use its required immutable response-file envelope')
+    if 'response_file' in value:
+        require(op in ('prepare', 'observe', 'stop') and value.get('schema') == 1
+                and value.get('profile') == profile and value.get('nonce') == nonce
+                and type(value.get('ready')) is bool, 'invalid actual response-file envelope')
+        entry = value['response_file']
+        require(isinstance(entry, dict) and re.fullmatch(op + r'-[0-9]{6}\.json', entry.get('name', '')) is not None,
+                'response envelope does not name its fixed immutable operation receipt')
+        envelope = copy.deepcopy(value)
+        wire = {'operation': op, 'envelope': envelope}
+        if retention is not None:
+            out, receipt = retention
+            receipt.setdefault('wire_responses', []).append(wire)
+            require(entry['name'] not in receipt['guest_files'] and not (out / 'guest' / entry['name']).exists(),
+                    'immutable response filename was replayed or already retained')
+        data = retrieve_guest_file(agent, profile, nonce, entry['name'])
+        require(entry.get('size') == len(data) and entry.get('sha256') == digest(data),
+                'immutable full response differs from its actual envelope')
+        value = json.loads(data)
+        require(isinstance(value, dict) and 'response_file' not in value
+                and all(value.get(k) == envelope[k] for k in ('schema', 'profile', 'nonce', 'ready')),
+                'immutable full response disagrees with actual envelope')
+        if retention is not None:
+            directory = out / 'guest'
+            directory.mkdir(exist_ok=True)
+            (directory / entry['name']).write_bytes(data)
+            retained = {'path': 'guest/' + entry['name'], 'size': len(data), 'sha256': digest(data)}
+            receipt['guest_files'][entry['name']] = retained
+            wire['artifact'] = retained
     return value
+
+
+def guest_filename(name):
+    require(isinstance(name, str) and (name in FILES or re.fullmatch(r'(prepare|observe|stop)-[0-9]{6}\.json', name) is not None),
+            'guest receipt filename is not fixed/immutable allowlisted')
+    return name
+
+
+def retrieve_guest_file(agent, profile, nonce, name):
+    guest_filename(name)
+    data, offset, total, full_hash = bytearray(), 0, None, None
+    while True:
+        chunk = guest_call(agent, 'file', profile, nonce, name=name, offset=offset, limit=FILE_CHUNK_BYTES)
+        raw = base64.b64decode(chunk['base64'], validate=True)
+        require(chunk.get('name') == name and type(chunk.get('offset')) is int and chunk['offset'] == offset
+                and type(chunk.get('length')) is int and chunk['length'] == len(raw)
+                and 0 <= len(raw) <= FILE_CHUNK_BYTES and type(chunk.get('size')) is int
+                and chunk['size'] >= offset + len(raw)
+                and re.fullmatch('[0-9a-f]{64}', chunk.get('sha256', '')) is not None
+                and chunk.get('chunk_sha256') == digest(raw) and type(chunk.get('eof')) is bool,
+                'actual file chunk failed offset/length/hash/type validation')
+        if total is None:
+            total, full_hash = chunk['size'], chunk['sha256']
+        require(chunk['size'] == total and chunk['sha256'] == full_hash, 'retained guest file changed between chunks')
+        data.extend(raw)
+        offset += len(raw)
+        require(chunk['eof'] == (offset == total), 'actual file chunk EOF disagrees with full size')
+        if chunk['eof']:
+            require(digest(data) == full_hash, 'assembled actual guest file failed full SHA256')
+            return bytes(data)
+        require(bool(raw), 'actual file chunk made no progress before EOF')
 
 
 def session_status(agent, *, profile):
@@ -214,6 +276,41 @@ def native_gpu_context(snapshot):
                    if '/card' in d['path']})
 
 
+def validate_network_panel(window):
+    tree, owner = window.get('accessibility_tree'), window['process']
+    require(isinstance(tree, dict) and atspi_id(tree) == atspi_id(window), 'missing original Settings public window tree')
+    nodes = {}
+    def visit(node):
+        key = atspi_id(node)
+        require(node['process'] == owner and key not in nodes, 'foreign/duplicate Settings subtree object')
+        nodes[key] = node
+        for child in node.get('children', []):
+            visit(child)
+    visit(tree)
+    leaf = lambda node: {k: v for k, v in node.items() if k != 'children'}
+    require(all(tree[k] == window[k] for k in ('atspi', 'name', 'role_name', 'states', 'process')),
+            'original Settings tree root differs from actual window')
+    evidence = window.get('panel_evidence')
+    require(isinstance(evidence, list) and bool(evidence), 'missing observed selected Network panel evidence')
+    for entry in evidence:
+        selected = entry['selected_object']
+        node = nodes.get(atspi_id(selected))
+        require(node is not None and leaf(node) == selected
+                and selected['role_name'] in ('list item', 'page tab', 'tree item', 'radio button')
+                and {23, 25, 30} <= set(selected['states']),
+                'Network panel selection is not actual original navigation evidence')
+        descendants, pending = {}, [node]
+        while pending:
+            child = pending.pop()
+            descendants[atspi_id(child)] = leaf(child)
+            pending.extend(child.get('children', []))
+        labels = entry.get('label_objects')
+        require(isinstance(labels, list) and bool(labels), 'selected Network navigation has no observed labels')
+        for label in labels:
+            require(descendants.get(atspi_id(label)) == label and label['name'].strip().casefold() == 'network'
+                    and {25, 30} <= set(label['states']), 'Network label is not an actual selected-node descendant')
+
+
 def validate_snapshot(value, profile, nonce):
     require(value.get('schema') == 1 and value.get('profile') == profile and value.get('nonce') == nonce,
             'snapshot claim/profile mismatch')
@@ -275,6 +372,8 @@ def validate_snapshot(value, profile, nonce):
         require(window['role_name'].lower() in ('frame', 'window'), 'fixture object is not an actual window')
         require(25 in window['states'] and 30 in window['states'], 'fixture window is not showing and visible')
         app_identity(window['process'], 'gnome-control-center' if window['role'] == 'settings' else 'nautilus')
+        if window['role'] == 'settings':
+            validate_network_panel(window)
     require(len(set(ids)) == 3, 'duplicate accessibility window object')
     fixture = value['fixture']
     dirs = fixture.get('directories', [])
@@ -502,15 +601,27 @@ class PhysicalInput:
 def retain_guest_files(agent, profile, nonce, out, receipt):
     directory = out / 'guest'
     directory.mkdir(exist_ok=True)
-    names = list(FILES[:-1])
+    names = set(FILES[:-1])
     if receipt.get('error') or receipt['cleanup_errors']:
-        names.append('failure.json')
+        names.add('failure.json')
+    responses = [receipt.get('prepare', {}), receipt.get('cleanup', {}), *receipt.get('observations', [])]
+    responses.append(receipt.get('prepare', {}).get('snapshot', {}))
+    for response in responses:
+        manifest = response.get('files', [])
+        if not isinstance(manifest, list):
+            receipt['retrieval_errors'].append({'stage': 'guest-file-manifest', 'message': 'manifest is not a list'})
+            continue
+        for name in manifest:
+            try:
+                names.add(guest_filename(name))
+            except Exception as error:
+                receipt['retrieval_errors'].append({'stage': 'guest-file-manifest', 'message': str(error)})
     for name in names:
         try:
-            value = guest_call(agent, 'file', profile, nonce, name=name)
-            data = base64.b64decode(value['base64'], validate=True)
-            require(value.get('name') == name and value.get('size') == len(data)
-                    and value.get('sha256') == digest(data), 'guest retained bytes failed integrity')
+            if name not in FILES and name in receipt['guest_files']:
+                retained_file(out, receipt['guest_files'][name])
+                continue
+            data = retrieve_guest_file(agent, profile, nonce, name)
             (directory / name).write_bytes(data)
             receipt['guest_files'][name] = {'path': 'guest/' + name, 'sha256': digest(data), 'size': len(data)}
             if name == 'stop.json' and 'cleanup' not in receipt:
@@ -568,7 +679,7 @@ def pci_topology(buses):
             if 'pci_bridge' in item:
                 bridge = item['pci_bridge']['bus']
                 value['bridge'] = {k: bridge[k] for k in ('number', 'secondary', 'subordinate') if k in bridge}
-                value['bridge']['devices'] = devices(bridge['devices'])
+                value['bridge']['devices'] = devices(item['pci_bridge'].get('devices', []))
             result.append(value)
         return result
     return [{'bus': bus['bus'], 'devices': devices(bus['devices'])} for bus in buses]
@@ -590,10 +701,11 @@ def validate_topology(receipt):
     addresses = []
     def visit(devices):
         for device in devices:
-            if device.get('id') == {'vendor': 0x1af4, 'device': 0x1050} and device.get('class_info', {}).get('class') == 0x0300:
+            if (device.get('id', {}).get('vendor') == 0x1af4 and device['id'].get('device') == 0x1050
+                    and device.get('class_info', {}).get('class') == 0x0300):
                 addresses.append(f"0000:{device['bus']:02x}:{device['slot']:02x}.{device['function']}")
             if 'pci_bridge' in device:
-                visit(device['pci_bridge']['bus']['devices'])
+                visit(device['pci_bridge'].get('devices', []))
     for bus in receipt['native_topology']['query-pci']['result']:
         visit(bus['devices'])
     require(len(addresses) == 1, 'QMP does not observe exactly the preserved native virtio-vga PCI device')
@@ -663,7 +775,7 @@ def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
     initial = None
 
     def observe():
-        value = guest_call(agent, 'observe', profile, nonce)
+        value = guest_call(agent, 'observe', profile, nonce, retention=(out, receipt))
         receipt.setdefault('observations', []).append(value)
         validate_snapshot(value, profile, nonce)
         if initial is not None:
@@ -706,7 +818,7 @@ def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
         validate_admission(receipt['admission'], profile)
         validate_topology(receipt)
         attempted = True  # prepare may fail after claiming ownership.
-        prepared = guest_call(agent, 'prepare', profile, nonce)
+        prepared = guest_call(agent, 'prepare', profile, nonce, retention=(out, receipt))
         receipt['prepare'] = prepared
         require(prepared.get('ready') is True and prepared.get('nonce') == nonce, 'fixture prepare rejected')
         initial = validate_snapshot(prepared['snapshot'], profile, nonce)
@@ -743,7 +855,7 @@ def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
         receipt['cleanup_errors'].extend(physical.release())
         if attempted:
             try:
-                cleanup = guest_call(agent, 'stop', profile, nonce)
+                cleanup = guest_call(agent, 'stop', profile, nonce, retention=(out, receipt))
                 receipt['cleanup'] = cleanup
                 validate_cleanup(cleanup, profile, nonce, prepared)
             except Exception as error:
@@ -796,6 +908,28 @@ def validate_raw_receipts(receipt, root):
             require(raw == receipt['cleanup'], 'raw strict cleanup differs')
         else:
             require(raw == receipt['phases'][-1]['after'], 'last retained guest snapshot differs')
+    require('failure.json' not in receipt['guest_files'], 'ready member retained an actual guest operation failure')
+    observed = {'prepare': [receipt['prepare']], 'observe': receipt.get('observations', []), 'stop': [receipt['cleanup']]}
+    for name, entry in receipt['guest_files'].items():
+        guest_filename(name)
+        raw_bytes = retained_file(root, entry)
+        match = re.fullmatch(r'(prepare|observe|stop)-[0-9]{6}\.json', name)
+        if match:
+            require(json.loads(raw_bytes) in observed[match[1]], 'immutable operation receipt is not an actual observed response')
+    expected_wires = [('prepare', receipt['prepare'])]
+    expected_wires.extend(('observe', value) for value in receipt.get('observations', []))
+    expected_wires.append(('stop', receipt['cleanup']))
+    wires = receipt.get('wire_responses', [])
+    require(len(wires) == len(expected_wires), 'missing immutable envelope for an actual operation response')
+    for wire, (operation, observed_value) in zip(wires, expected_wires):
+        require(wire.get('operation') == operation, 'immutable response operation sequence differs')
+        envelope, artifact = wire['envelope'], wire['artifact']
+        name = guest_filename(envelope['response_file']['name'])
+        require(receipt['guest_files'].get(name) == artifact, 'actual response envelope artifact is not retained')
+        data = retained_file(root, artifact)
+        require(envelope['response_file'].get('size') == len(data)
+                and envelope['response_file'].get('sha256') == digest(data)
+                and json.loads(data) == observed_value, 'actual response envelope/full bytes disagree')
 
 
 def validate_member(path, expected):

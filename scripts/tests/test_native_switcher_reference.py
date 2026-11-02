@@ -79,11 +79,18 @@ def snapshot(profile='gnome', nonce='a' * 32, *, active='settings', held=False, 
     raw_peer = lambda p: {k: v for k, v in p.items() if k != 'package'}
     windows = []
     for role, name, owner in [('files-first', 'first', nautilus), ('files-second', 'second', nautilus),
-                              ('settings', 'Network', settings)]:
+                              ('settings', 'Settings', settings)]:
         window = node(owner, role, name)
         window['role'] = role
         if role == active:
             window['states'].append(1)
+        if role == 'settings':
+            network_label = node(owner, 'network-label', 'Network', 'label')
+            network_navigation = node(owner, 'network-navigation', 'Network navigation', 'list item', [23, 25, 30])
+            tree = {k: copy.deepcopy(window[k]) for k in ('atspi', 'name', 'role_name', 'states', 'process')}
+            tree['children'] = [{**copy.deepcopy(network_navigation), 'children': [copy.deepcopy(network_label)]}]
+            window['accessibility_tree'] = tree
+            window['panel_evidence'] = [{'selected_object': network_navigation, 'label_objects': [network_label]}]
         windows.append(window)
     base = '/run/user/1000/controlled-' + nonce
     directories = [{'path': path, 'device': 1, 'inode': index + 1000, 'uid': 1000, 'mode': 0o700}
@@ -155,9 +162,28 @@ class ControlledGuest:
         self.frame_count, self.stopped, self.capture_changed = 0, False, False
         self.stop_value = None
         self.expanded = False
+        self.sequence, self.file_requests, self.wire_sizes = 0, [], []
 
     def store(self, name, value):
         self.files[name] = json.dumps(value, sort_keys=True).encode()
+
+    def envelope(self, operation, value):
+        self.sequence += 1
+        name = f'{operation}-{self.sequence:06d}.json'
+        full = {**value, 'files': sorted(set(self.files) | {name})}
+        self.store(name, full)
+        data = self.files[name]
+        self.files[{'prepare': 'prepare.json', 'observe': 'snapshot.json', 'stop': 'stop.json'}[operation]] = data
+        wire = {'schema': 1, 'profile': self.profile, 'nonce': self.nonce, 'ready': full['ready'],
+                'response_file': {'name': name, 'size': len(data), 'sha256': proof.digest(data)}}
+        self.wire_sizes.append(len(json.dumps(wire).encode()))
+        if operation == 'stop':
+            self.stop_value = full
+        if self.failure == 'direct-response':
+            return full
+        if self.failure == 'envelope-hash':
+            wire['response_file']['sha256'] = '0' * 64
+        return wire
 
     def observe(self):
         self.stamp += 1
@@ -170,6 +196,11 @@ class ControlledGuest:
                 if window['role'].startswith('files-'):
                     window['process']['package']['version'] = '51.1-controlled-different'
             value['fixture']['processes'][0]['package']['version'] = '51.1-controlled-different'
+        elif self.failure == 'large':
+            owner = value['selection']['shell_process']
+            value['selection']['objects'][0]['children'].extend(
+                node(owner, 'controlled-label-' + str(i), 'controlled accessible label ' + str(i), 'label')
+                for i in range(600))
         if self.capture_changed:
             value['selection']['objects'][0]['name'] = 'changed across capture'
         self.store('snapshot.json', value)
@@ -182,7 +213,7 @@ class ControlledGuest:
         if args['budget_s'] > 25:
             raise AssertionError('unbounded guest request')
         if op == 'file':
-            if set(args) != {'nonce', 'name', 'budget_s'}:
+            if set(args) != {'nonce', 'name', 'offset', 'limit', 'budget_s'} or not 0 < args['limit'] <= 262144:
                 raise AssertionError('file operation accepts no profile or arbitrary fields')
         elif args.get('profile') != self.profile:
             raise AssertionError('foreign guest request')
@@ -198,9 +229,9 @@ class ControlledGuest:
                         'admission': value['admission'], 'processes': value['fixture']['processes'],
                         'fixture': value['fixture'], 'snapshot': value, 'files': list(self.files)}
             self.store('prepare.json', prepared)
-            return prepared
+            return self.envelope('prepare', prepared)
         if op == 'observe':
-            return self.observe()
+            return self.envelope('observe', self.observe())
         if op == 'stop':
             self.stopped = True
             fixture = json.loads(self.files['claim.json'])['fixture']
@@ -211,26 +242,37 @@ class ControlledGuest:
                      'directories': [{'original': d, 'removed': True} for d in fixture['directory_identities']]}
             if self.failure == 'cleanup':
                 value.update(ready=False, cleaned=False, errors=['controlled pidfd failure'])
-            self.stop_value = value
             self.store('stop.json', value)
-            return value
+            return self.envelope('stop', value)
         if op == 'file':
             data = self.files[args['name']]
             if self.failure == 'raw-snapshot' and args['name'] == 'snapshot.json':
                 value = json.loads(data)
                 value['nonce'] = 'b' * 32
                 data = json.dumps(value).encode()
-            return {'name': args['name'], 'base64': base64.b64encode(data).decode(),
-                    'sha256': proof.digest(data), 'size': len(data)}
+            offset, limit = args['offset'], args['limit']
+            self.file_requests.append((args['name'], offset, limit))
+            part = data[offset:offset + limit]
+            return {'name': args['name'], 'base64': base64.b64encode(part).decode(),
+                    'offset': offset, 'length': len(part), 'size': len(data),
+                    'sha256': proof.digest(data), 'chunk_sha256': proof.digest(part),
+                    'eof': offset + len(part) == len(data)}
         raise AssertionError('unknown operation')
 
     def cmd(self, command, **arguments):
         if command == 'query-kvm':
             return {'enabled': self.failure != 'kvm', 'present': True}
         if command == 'query-pci':
-            return [{'bus': 1, 'devices': [{'bus': 1, 'slot': 0, 'function': 0,
-                     'id': {'vendor': 0x1af4, 'device': 0x1050}, 'class_info': {'class': 0x0300},
-                     'qdev_id': 'controlled-native-vga'}]}]
+            return [{'bus': 0, 'devices': [
+                {'bus': 0, 'slot': 1, 'function': 0, 'id': {'vendor': 0x1b36, 'device': 0x000c},
+                 'class_info': {'class': 0x0604}, 'qdev_id': 'controlled-root-port',
+                 'pci_bridge': {'bus': {'number': 0, 'secondary': 1, 'subordinate': 1}, 'devices': [
+                     {'bus': 1, 'slot': 0, 'function': 0,
+                      'id': {'vendor': 0x1af4, 'device': 0x1050, 'subsystem': 0x1100, 'subsystem-vendor': 0x1af4},
+                      'class_info': {'class': 0x0300}, 'qdev_id': 'controlled-native-vga'}]}},
+                {'bus': 0, 'slot': 2, 'function': 0, 'id': {'vendor': 0x1b36, 'device': 0x000c},
+                 'class_info': {'class': 0x0604}, 'qdev_id': 'controlled-empty-port',
+                 'pci_bridge': {'bus': {'number': 0, 'secondary': 2, 'subordinate': 2}}}]}]
         if command != 'input-send-event':
             raise AssertionError('not physical input')
         for event in arguments['events']:
@@ -263,6 +305,44 @@ def provenance(profile):
     return {'base_image': proof.BASE_REPOSITORY + '@' + proof.PINNED_PLATFORM,
             'test_image_id': 'sha256:' + ('2' if profile == 'gnome' else '3') * 64,
             'commit': '4' * 40}
+
+
+class RetainedFileTransport:
+    """Read actual temporary receipt bytes; inject precise malformed chunk metadata."""
+    def __init__(self, path, fault=None):
+        self.path, self.fault, self.offsets = path, fault, []
+
+    def run(self, route, operation, payload, *, timeout):
+        args = json.loads(payload)
+        if route != 'gnome-reference' or operation != 'file' or timeout > 30:
+            raise AssertionError('not bounded fixed file transport')
+        if set(args) != {'nonce', 'name', 'offset', 'limit', 'budget_s'} or args['budget_s'] > 25:
+            raise AssertionError('invalid typed file request')
+        data = self.path.read_bytes()
+        offset, limit = args['offset'], args['limit']
+        self.offsets.append(offset)
+        if not 0 < limit <= 262144:
+            raise AssertionError('unbounded chunk')
+        part = data[offset:offset + limit]
+        if self.fault == 'no-progress':
+            part = b''
+        value = {'name': args['name'], 'offset': offset, 'length': len(part), 'size': len(data),
+                 'sha256': proof.digest(data), 'chunk_sha256': proof.digest(part),
+                 'base64': base64.b64encode(part).decode(), 'eof': offset + len(part) == len(data)}
+        if self.fault == 'offset':
+            value['offset'] += 1
+        elif self.fault == 'length':
+            value['length'] += 1
+        elif self.fault == 'chunk-hash':
+            value['chunk_sha256'] = '0' * 64
+        elif self.fault == 'full-hash':
+            value['sha256'] = '0' * 64
+        elif self.fault == 'changed-size' and offset:
+            value['size'] += 1
+            value['eof'] = False
+        elif self.fault == 'early-eof':
+            value['eof'] = True
+        return value
 
 
 class NativeSwitcherReferenceTests(unittest.TestCase):
@@ -341,7 +421,7 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
                 self.collect(Path(directory), failure='cleanup')
             receipt = json.loads((Path(directory) / 'member.json').read_bytes())
             raw = json.loads((Path(directory) / 'guest/stop.json').read_bytes())
-            self.assertEqual(receipt['cleanup'], raw)
+            self.assertEqual(raw, receipt['cleanup'])
             self.assertEqual(raw['errors'], ['controlled pidfd failure'])
             self.assertFalse(receipt['ready'])
 
@@ -532,6 +612,59 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
             self.assertFalse(receipt['ready'])
             self.assertEqual(receipt['cleanup_errors'][-1]['stage'], 'retained-receipt-validation')
             self.assertEqual(json.loads((root / 'guest/snapshot.json').read_bytes())['nonce'], 'b' * 32)
+
+    def test_large_full_trees_use_immutable_envelopes_and_lossless_bounded_chunks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt, guest, _ = self.collect(root, failure='large')
+            self.assertTrue(receipt['ready'])
+            self.assertTrue(all(size < 262144 for size in guest.wire_sizes))
+            self.assertTrue(any(offset > 0 for _, offset, _ in guest.file_requests))
+            self.assertTrue(all(limit <= 262144 for _, _, limit in guest.file_requests))
+            self.assertEqual(len(receipt['wire_responses']), 14)
+            first = receipt['wire_responses'][0]
+            raw = (root / first['artifact']['path']).read_bytes()
+            self.assertGreater(len(raw), 262144)
+            self.assertEqual(proof.digest(raw), first['envelope']['response_file']['sha256'])
+            body = json.loads(raw)
+            labels = body['snapshot']['selection']['objects'][0]['children']
+            self.assertEqual(len(labels), 600)
+            self.assertEqual(labels[-1]['name'], 'controlled accessible label 599')
+            proof.validate_member(root / 'member.json', 'gnome')
+
+    def test_chunk_assembly_validates_actual_file_offsets_hashes_eof_and_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'snapshot.json'
+            value = snapshot(held=True)
+            owner = value['selection']['shell_process']
+            value['selection']['objects'][0]['children'].extend(
+                node(owner, 'retained-row-' + str(i), 'retained accessible row ' + str(i), 'label')
+                for i in range(900))
+            data = json.dumps(value).encode()
+            path.write_bytes(data)
+            valid = RetainedFileTransport(path)
+            assembled = proof.retrieve_guest_file(valid, 'gnome', 'a' * 32, 'snapshot.json')
+            self.assertEqual(json.loads(assembled), value)
+            self.assertGreater(len(valid.offsets), 1)
+            self.assertEqual(valid.offsets, list(range(0, len(data), 262144)))
+            for fault in ('offset', 'length', 'chunk-hash', 'full-hash', 'changed-size', 'early-eof', 'no-progress'):
+                with self.subTest(fault=fault), self.assertRaises(ValueError):
+                    proof.retrieve_guest_file(RetainedFileTransport(path, fault), 'gnome', 'a' * 32, 'snapshot.json')
+
+    def test_direct_legacy_responses_and_foreign_envelope_hashes_have_no_fallback(self):
+        for failure in ('direct-response', 'envelope-hash'):
+            guest = ControlledGuest(failure=failure)
+            with self.subTest(failure=failure), self.assertRaises(ValueError):
+                proof.guest_call(guest, 'prepare', 'gnome', 'a' * 32)
+
+    def test_network_panel_requires_actual_selected_gtk_ancestry_not_a_window_title(self):
+        value = snapshot()
+        settings = next(w for w in value['windows'] if w['role'] == 'settings')
+        self.assertEqual(settings['name'], 'Settings')
+        proof.validate_network_panel(settings)
+        settings['panel_evidence'][0]['label_objects'][0]['atspi']['path'] = '/foreign/network-label'
+        with self.assertRaisesRegex(ValueError, 'descendant'):
+            proof.validate_network_panel(settings)
 
 
 if __name__ == '__main__':
