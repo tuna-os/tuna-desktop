@@ -178,7 +178,7 @@ if [ -x /usr/libexec/at-spi-bus-launcher ]; then
 fi
 [ -n "$DISPLAY_ARG" ] && DISPLAY="$DISPLAY_ARG" && export DISPLAY
 if ! xdotool getdisplaygeometry >/dev/null 2>&1; then
-    Xvfb -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" \
+    "$ROOT/scripts/lib/tuna-xvfb" -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" \
         3>"$ARTIFACTS/xvfb-display" >"$ARTIFACTS/xvfb.log" 2>&1 &
     OWNED_XVFB=$!
     for _ in $(seq 1 30); do [ -s "$ARTIFACTS/xvfb-display" ] && break; sleep 1; done

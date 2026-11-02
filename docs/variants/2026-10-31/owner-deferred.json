@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "variant": "albacore",
+  "flavor": "tuna",
+  "status": "owner-deferred",
+  "qualified": false,
+  "reason": "The owner permits temporary omission of Tuna on Albacore while its Mesa/GDM crash is fixed externally.",
+  "owner_exception": "https://github.com/tuna-os/tuna-desktop/issues/577#issuecomment-6550264429",
+  "tracking_issue": "https://github.com/tuna-os/tunaOS/issues/3969",
+  "scope": "Only albacore:tuna active graphical qualification/publication is deferred. Existing receipts remain unchanged. No new Albacore attempt or duplicate Mesa repair. Other ten published Tuna variants, Hummingbird/Guppy admission prerequisites, and Noble's unwaived native-compiler blocker remain in scope.",
+  "accounting": "Owner-deferred is neither qualified nor failed-required acceptance; never aggregate this row into all-fourteen-qualified."
+}

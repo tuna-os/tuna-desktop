@@ -280,6 +280,20 @@ pub fn load(connected: &[String]) -> Option<MonitorsConfig> {
         .find_map(|xml| choose(&parse(&xml), connected))
 }
 
+/// The user's configuration for exactly these connectors, Tuna Desktop's
+/// own first: the lookup Mutter's config store makes by monitor set when
+/// monitors are plugged in or unplugged.
+pub fn load_exact(connected: &[String]) -> Option<MonitorsConfig> {
+    let mut wanted: Vec<&str> = connected.iter().map(String::as_str).collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    [tuna_path(), path()]
+        .into_iter()
+        .flatten()
+        .filter_map(|file| std::fs::read_to_string(file).ok())
+        .find_map(|xml| parse(&xml).into_iter().find(|c| c.connectors() == wanted))
+}
+
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")

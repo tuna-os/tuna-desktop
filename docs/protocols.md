@@ -180,6 +180,17 @@ fixtures. Successful advertised-device, import, rendering and fencing proof is
 still required under the named native emulation; compiling this consumer is
 not qualification.
 
+### DRM leasing and connector changes
+
+Connected non-desktop or explicitly named lease connectors stay out of desktop
+lighting during startup and hotplug alike. A still-live lease, including one
+whose revocation failed, keeps its CRTCs out of newly lit desktop outputs.
+After a desktop connector change, the lease device refreshes its desktop
+CRTC/plane reservations before another lease request can be dispatched.
+One device-change source services monitor, privacy and lease changes; the
+shared renderer/backend guard ends before monitor publication or lease events.
+These source contracts still require the actual native D-LEASE lifecycle proof.
+
 ### Explicit sync
 
 `wp_linux_drm_syncobj_manager_v1` follows Mutter 51's

@@ -209,6 +209,21 @@ impl LeaseDevice {
         self.connectors.len()
     }
 
+    /// Keep newly lit desktop resources out of subsequent lease grants.
+    pub fn set_desktop_outputs(&mut self, outputs: &[super::DrmOutput]) {
+        self.desktop_crtcs.clear();
+        self.desktop_crtcs
+            .extend(outputs.iter().map(|output| output.crtc));
+        self.desktop_planes.clear();
+        self.desktop_planes
+            .extend(outputs.iter().map(|output| output.surface.plane()));
+    }
+
+    /// Even an unconfirmed revocation keeps its CRTCs out of desktop lighting.
+    pub fn leased_crtcs(&self) -> impl Iterator<Item = crtc::Handle> + '_ {
+        self.leases.iter().flat_map(|lease| lease.crtcs().copied())
+    }
+
     /// Mutter's `update_connectors`: offer new connectors for lease,
     /// withdraw vanished ones and end the leases holding them.
     pub fn update_connectors(&mut self) {
