@@ -167,11 +167,18 @@ replacement, hidden-session rewrite or Shell.Eval admission is involved.
 
 Before either image build or boot, the normal CI path must verify the exact
 platform digest under the existing TunaOS cosign subject/issuer policy and
-retain its real `platform-cosign.json` output and the exact `index.json`
-bytes, including the unique linux/amd64 membership. Supply that directory
-as `--reference-base-evidence`; copied JSON alone is not cryptographic
-verification. The published wheel-policy receipt identifies the image but
-does not itself contain a signature-verification result.
+retain its real `platform-cosign.json` output, actual
+`platform-verification.json` process witness and exact `index.json` bytes,
+including the unique linux/amd64 membership. The witness binds the pinned
+Cosign 3.1.4 executable/version, exact subject/issuer-constrained argv, actual
+exit status, command bounds, stderr and original stdout hash. Its successful
+cryptographic invocation remains mandatory; the consumer never treats copied
+JSON as signature verification. Modern Sigstore output names the exact
+repository-at-platform digest and `https://sigstore.dev/cosign/sign/v1`;
+its empty optional object is not fabricated into extracted certificate claims.
+Supply all three files as `--reference-base-evidence`. The published
+wheel-policy receipt identifies the image but does not itself contain a
+signature-verification result.
 CI acquires the pinned cosign binary through the existing Sigstore installer
 action; it does not assume Go is installed on the native runner.
 

@@ -1368,10 +1368,7 @@ jobs:
           if len(members) != 1 or members[0]['digest'] != 'sha256:104870f1a05fa0a75649ee4ed9952027b29ab12e53af83931ae69e8636e44c3f':
               raise SystemExit('reference index does not uniquely own the admitted amd64 platform')
           PY
-          cosign verify "$platform" \
-            --certificate-identity "https://github.com/tuna-os/tunaOS/.github/workflows/reusable-build-image.yml@refs/heads/main" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            > vm-lane-artifacts/reference-base/platform-cosign.json
+          python3 scripts/lib/vm_gnome_reference.py verify-base --out vm-lane-artifacts/reference-base
           sudo podman pull --platform linux/amd64 "$platform"
       - name: Build the paired native reference fixture
         if: matrix.profile != 'lifecycle'

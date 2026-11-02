@@ -13,6 +13,8 @@ import math
 from pathlib import Path
 import re
 import secrets
+import shutil
+import subprocess
 import struct
 import time
 import zlib
@@ -29,7 +31,7 @@ PINNED_PLATFORM = 'sha256:104870f1a05fa0a75649ee4ed9952027b29ab12e53af83931ae69e
 BASE_REPOSITORY = 'ghcr.io/tuna-os/marlin'
 CERTIFICATE_SUBJECT = 'https://github.com/tuna-os/tunaOS/.github/workflows/reusable-build-image.yml@refs/heads/main'
 CERTIFICATE_ISSUER = 'https://token.actions.githubusercontent.com'
-BASE_FILES = ('index.json', 'platform-cosign.json')
+BASE_FILES = ('index.json', 'platform-cosign.json', 'platform-verification.json')
 FILE_CHUNK_BYTES = 262144
 
 
@@ -722,7 +724,39 @@ def validate_provenance(value):
             'missing actual source/test-image identity')
 
 
-def validate_base_bytes(index_bytes, cosign_bytes):
+def cosign_argv(executable):
+    return [executable, 'verify', BASE_REPOSITORY + '@' + PINNED_PLATFORM,
+            '--certificate-identity', CERTIFICATE_SUBJECT,
+            '--certificate-oidc-issuer', CERTIFICATE_ISSUER, '--output', 'json']
+
+
+def verify_base_image(directory):
+    """Retain actual cryptographic process evidence, not invented certificate claims."""
+    directory = Path(directory)
+    executable = shutil.which('cosign')
+    require(executable is not None, 'pinned native cosign executable unavailable')
+    executable = str(Path(executable).resolve(strict=True))
+    version = subprocess.check_output([executable, 'version'], timeout=30, text=True)
+    argv = cosign_argv(executable)
+    begin = time.monotonic_ns()
+    result = subprocess.run(argv, capture_output=True, timeout=180)
+    end = time.monotonic_ns()
+    output = directory / 'platform-cosign.json'
+    output.write_bytes(result.stdout)
+    witness = {
+        'schema': 1, 'argv': argv, 'exit_code': result.returncode,
+        'begin_host_monotonic_ns': begin, 'end_host_monotonic_ns': end,
+        'tool': {'executable': executable, 'sha256': digest(Path(executable).read_bytes()), 'version': version},
+        'stdout_sha256': digest(result.stdout), 'stdout_bytes': len(result.stdout),
+        'stderr': result.stderr.decode('utf-8', errors='strict'),
+        'scope': 'actual successful verifier enforces certificate constraints; not an extracted certificate identity',
+    }
+    witness_bytes = (json.dumps(witness, sort_keys=True) + '\n').encode()
+    (directory / 'platform-verification.json').write_bytes(witness_bytes)
+    validate_base_bytes((directory / 'index.json').read_bytes(), result.stdout, witness_bytes)
+
+
+def validate_base_bytes(index_bytes, cosign_bytes, verification_bytes):
     require('sha256:' + digest(index_bytes) == PINNED_INDEX, 'raw base index does not hash to required index29097')
     index = json.loads(index_bytes)
     require(index.get('schemaVersion') == 2 and isinstance(index.get('manifests'), list), 'not an actual OCI image index')
@@ -735,11 +769,27 @@ def validate_base_bytes(index_bytes, cosign_bytes):
     for signature in signatures:
         critical, optional = signature.get('critical', {}), signature.get('optional', {})
         require(critical.get('image', {}).get('docker-manifest-digest') == PINNED_PLATFORM
-                and critical.get('identity', {}).get('docker-reference') == BASE_REPOSITORY
-                and critical.get('type') == 'cosign container image signature',
+                and critical.get('identity', {}).get('docker-reference') == BASE_REPOSITORY + '@' + PINNED_PLATFORM
+                and critical.get('type') == 'https://sigstore.dev/cosign/sign/v1'
+                and isinstance(optional, dict),
                 'cosign output does not name required actual platform image')
-        require(optional.get('Subject') == CERTIFICATE_SUBJECT and optional.get('Issuer') == CERTIFICATE_ISSUER,
-                'cosign output has wrong exact certificate subject/issuer')
+    witness = json.loads(verification_bytes)
+    tool = witness.get('tool', {})
+    executable = tool.get('executable', '')
+    require(witness.get('schema') == 1 and isinstance(executable, str) and executable.startswith('/')
+            and witness.get('argv') == cosign_argv(executable) and witness.get('exit_code') == 0,
+            'actual successful cosign invocation with exact certificate subject/issuer is missing')
+    require(re.fullmatch('[0-9a-f]{64}', tool.get('sha256', '')) is not None
+            and isinstance(tool.get('version'), str)
+            and re.search(r'(?m)^GitVersion:\s+v3\.1\.4\s*$', tool['version']) is not None,
+            'verification does not retain the actual pinned native cosign tool')
+    require(type(witness.get('begin_host_monotonic_ns')) is int
+            and type(witness.get('end_host_monotonic_ns')) is int
+            and 0 < witness['begin_host_monotonic_ns'] <= witness['end_host_monotonic_ns']
+            and witness.get('stdout_sha256') == digest(cosign_bytes)
+            and witness.get('stdout_bytes') == len(cosign_bytes)
+            and isinstance(witness.get('stderr'), str),
+            'verification process/output identity differs from retained actual cosign bytes')
 
 
 def retain_base_evidence(source, out):
@@ -752,7 +802,7 @@ def retain_base_evidence(source, out):
         (target / name).write_bytes(data)
         contents[name] = data
         entries[name] = {'path': 'base-verification/' + name, 'sha256': digest(data), 'size': len(data)}
-    validate_base_bytes(contents['index.json'], contents['platform-cosign.json'])
+    validate_base_bytes(*(contents[name] for name in BASE_FILES))
     return {'files': entries,
             'scope': 'retained actual normal-CI preflight output; JSON validation is not cryptographic signature verification'}
 
@@ -1138,11 +1188,17 @@ def compare(gnome_receipt_path, tuna_receipt_path, out):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('compare',))
-    parser.add_argument('--gnome', required=True, type=Path)
-    parser.add_argument('--tuna', required=True, type=Path)
-    parser.add_argument('--out', required=True, type=Path)
+    operations = parser.add_subparsers(dest='operation', required=True)
+    paired = operations.add_parser('compare')
+    paired.add_argument('--gnome', required=True, type=Path)
+    paired.add_argument('--tuna', required=True, type=Path)
+    paired.add_argument('--out', required=True, type=Path)
+    verification = operations.add_parser('verify-base')
+    verification.add_argument('--out', required=True, type=Path)
     args = parser.parse_args(argv)
+    if args.operation == 'verify-base':
+        verify_base_image(args.out)
+        return 0
     value = compare(args.gnome, args.tuna, args.out)
     print(json.dumps(value, sort_keys=True))
     return 0 if value['ready'] else 1
