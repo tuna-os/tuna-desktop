@@ -322,3 +322,60 @@ def run(desktop, *, manage_fixture=True):
     if cleanup_errors:
         raise RuntimeError("actual automatic-timezone fixture restoration failed: " + str(cleanup_errors))
     return result
+
+
+def run_native(qmp, agent_factory, out, metadata, *, nonce=None):
+    """Independent native clock consumer; no Core application inventory/gate."""
+    from vm_native_desktop import NativeDesktop
+    root = Path(__file__).resolve().parents[2]
+    directory = root / "packaging/marlin/vm-lane"
+    members = {
+        "/usr/libexec/tuna-native-session/" + name: directory / "tuna-native-session" / name
+        for name in ("native_session.py", "autotz_guest.py")}
+    members.update({
+        "/usr/libexec/tuna-native-session/" + name: directory / "core-apps" / name
+        for name in ("autotz.py", "geoclue_fixture.py")})
+    members["/usr/libexec/tuna-vm-lifecycle"] = directory / "tuna-vm-lifecycle"
+    members["/usr/libexec/tuna-geoclue-agent-policy"] = root / "packaging/marlin/tuna-geoclue-agent-policy"
+    desktop = NativeDesktop(qmp, agent_factory, out, metadata, action="autotz",
+                            source_members=members, nonce=nonce)
+    prepared = False
+    failure = None
+    result = None
+    cleanup_errors = []
+    try:
+        prepared = True
+        desktop.inventory = desktop.guest("desktop", "prepare")
+        desktop.fixture = desktop.inventory["fixture"]
+        if desktop.inventory["observer_sha256"] != desktop._observer_members:
+            raise RuntimeError("actual standalone observer differs from admitted source/image")
+        for role in ("compositor", "shell"):
+            process = desktop.inventory["identity"][role]
+            if metadata["member_sha256"].get(process["exe"]) != process["exe_sha256"]:
+                raise RuntimeError("original native clock process differs from admitted package/image")
+        desktop.retain("standalone-autotz-immutable-subject",
+                       {"source": metadata, "inventory": desktop.inventory})
+        result = run(desktop)
+    except Exception as error:
+        failure = error
+    finally:
+        if prepared:
+            if desktop._uncertain is not None:
+                cleanup_errors.append("original-VM-retirement-required-unconfirmed-guest-child")
+            else:
+                try:
+                    desktop.retain("standalone-autotz-session-preserved", desktop.guest("desktop", "finish"))
+                except Exception as error:
+                    cleanup_errors.append(type(error).__name__)
+        desktop.retain("standalone-autotz-result", {
+            "automatic_timezone": result, "cleanup_errors": cleanup_errors,
+            "qualified": failure is None and not cleanup_errors and result is not None
+                         and result.get("qualified") is True,
+            "failure_type": type(failure).__name__ if failure else None,
+            "source": metadata, "installed_signed_release_qualified": False,
+            "scope": "independent-current-build-native-clock-not-whole359-or-Core397"})
+    if failure is not None:
+        raise RuntimeError("standalone native automatic timezone failed; original evidence retained") from failure
+    if cleanup_errors:
+        raise RuntimeError("standalone native clock session restoration/retirement failed")
+    return result
