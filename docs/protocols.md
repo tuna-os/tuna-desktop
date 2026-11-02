@@ -263,9 +263,9 @@ context identity; a successful probe must not invent a different process's rende
 
 Capture's explicit `--host-wayland-socket` selects an actual Wayland host only
 for compositor launch; proof clients still use their new private socket.
-Default Xvfb/DRM fixture behavior is unchanged. The SDR GStreamer consumer
-requests raw BGRx media, but neither injects colourimetry nor converts pixels:
-actual negotiated metadata, raw bytes and a real sample remain the oracle.
+Default Xvfb/DRM fixture behavior is unchanged. The native PipeWire consumer
+requires the actual negotiated BGRx SPA colour fields and reads raw pixels;
+it neither injects colourimetry nor converts the captured bytes.
 GNOME comparison waits for the actual nonroot GDM greeter principal and loaded,
 notified Shell service, without assuming an account or service-instance name.
 
@@ -295,6 +295,16 @@ faulted in llvmpipe before supervised capture readiness on Mesa
 qualification nor a generic driver-capability verdict. The kernel receipt
 does not substitute for the still-required compositor pixel, capture and
 native virgl/source/image gates.
+
+The later `a023b59a8a2f4c724404fbc9037553a9b75bccf1` component run, before
+the landed GDM51 policy merge, passed the unchanged SDR PNG/SPA pixel checks
+but again faulted in the native Noble renderer. Its bounded GDB observation
+retained a llvmpipe JIT `vpgatherdd` fault with a non-NULL sampling base; the
+eight-frame main-thread trace did not reach the application caller and does
+not establish a driver, import or lifetime cause. Exact source, executable
+payload, guest identity and bounded trace are retained privately with raw
+cores disabled. This remains failed HDR userspace evidence, not native
+package, HDR capture or all-format qualification.
 
 [ADR 0008 item 5](adr/0008-v1-beta-track-and-release-scope.md) permits the v1 row
 to pass on actual named emulated-device evidence; physical HDR link quality,
