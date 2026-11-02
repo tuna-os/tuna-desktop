@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Stage DEV colour proof ELFs in the SAME native Arch package build checkout.
+
+Invoke only from the primary package's opt-in build-tail hook, with its exact
+CARGO_TARGET_DIR, flags, toolchain, TUNA_VERSION and release profile still in
+scope. Output is a DEV image overlay, not a package or signed-release
+qualification. The original primary compositor bytes must remain unchanged.
+No tests or graphics execute here.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+root = Path(__file__).resolve().parents[1]
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(root / 'scripts/lib'))
+from colour_vm import source_files, source_digest
+if len(sys.argv) != 2:
+    raise SystemExit('usage: tuna-colour-build NEW_OVERLAY_DIRECTORY')
+out = Path(sys.argv[1]).resolve()
+if (not Path(os.environ.get('TUNA_NATIVE_COLOUR_OUT', '')).is_absolute()
+        or Path(os.environ['TUNA_NATIVE_COLOUR_OUT']).resolve() != out):
+    raise RuntimeError('explicit absolute primary makepkg DEV staging destination required')
+out.mkdir(parents=True, exist_ok=False)
+share = out / 'usr/share/tuna-colour'
+libexec = out / 'usr/libexec/tuna-colour'
+share.mkdir(parents=True)
+libexec.mkdir(parents=True)
+build_os = Path('/etc/os-release').read_text()
+if 'ID=arch\n' not in build_os and 'ID="arch"\n' not in build_os:
+    raise RuntimeError('colour payload must be built in the original native Arch package stage')
+if (os.environ.get('RUSTUP_TOOLCHAIN') != 'stable'
+        or not os.environ.get('TUNA_VERSION', '').startswith('v')
+        or any(not Path(os.environ.get(key, '')).is_absolute()
+               for key in ('CARGO_HOME', 'CARGO_TARGET_DIR'))):
+    raise RuntimeError('original primary makepkg compiler/version/absolute Cargo directories required')
+event_path = os.environ.get('GITHUB_EVENT_PATH')
+event = json.loads(Path(event_path).read_text()) if event_path else {}
+event_head = event.get('pull_request', {}).get('head', {}).get('sha') or os.environ.get('GITHUB_SHA')
+if not event_head or len(event_head) != 40 or any(ch not in '0123456789abcdef' for ch in event_head):
+    raise RuntimeError('actual CI event head required, distinct from observed merge checkout')
+files = source_files(root)
+primary = Path(os.environ['CARGO_TARGET_DIR']) / 'release/tuna-compositor'
+primary_sha256 = hashlib.sha256(primary.read_bytes()).hexdigest()
+
+def command(argv):
+    return subprocess.check_output(argv, cwd=root, text=True)
+
+def native_member(path):
+    path = Path(path).resolve(strict=True)
+    owner = command(['pacman', '-Qqo', str(path)]).strip()
+    if not owner or owner == 'rustup':
+        raise RuntimeError('primary native package ownership required: ' + str(path))
+    return {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+            'owner': owner, 'package': command(['pacman', '-Q', owner]).strip()}
+
+native_toolchain = {}
+for name in ('cargo', 'rustc'):
+    executable = shutil.which(name)
+    if executable is None:
+        raise RuntimeError('missing primary native build tool: ' + name)
+    native_toolchain[name] = native_member(executable)
+stdlibs = sorted(Path(command(['rustc', '--print', 'target-libdir']).strip()).glob('libstd-*.rlib'))
+if len(stdlibs) != 1:
+    raise RuntimeError('one actual native standard-library archive required')
+native_toolchain['std'] = native_member(stdlibs[0])
+
+def build(arguments):
+    raw = command(['cargo', 'build', '--locked', '--release', '-p', 'tuna-compositor',
+                   '--message-format=json', *arguments])
+    return [json.loads(line) for line in raw.splitlines() if line.startswith('{')]
+
+# --no-run is essential: this creates the exact production unit-test ELF but
+# does not turn the image builder into an alternate graphics qualification.
+raw = command(['cargo', 'test', '--locked', '--release', '-p', 'tuna-compositor',
+               '--lib', '--no-run', '--message-format=json'])
+units = [row for row in map(json.loads, raw.splitlines())
+         if row.get('reason') == 'compiler-artifact' and row.get('executable')
+         and row.get('profile', {}).get('test') and row['target']['name'] == 'tuna_compositor']
+if len(units) != 1:
+    raise RuntimeError('one exact compositor unit ELF required')
+features = sorted(units[0]['features'])
+examples = build(['--example', 'tuna-color-pixel-client', '--example', 'tuna-color-yuv-client',
+                  '--example', 'tuna-color-cast-client'])
+executables = {'unit': units[0]['executable']}
+for name in ('pixel', 'yuv', 'cast'):
+    matches = [row for row in examples if row.get('reason') == 'compiler-artifact'
+               and row.get('executable') and row['target']['name'] == f'tuna-color-{name}-client']
+    if len(matches) != 1 or sorted(matches[0]['features']) != features:
+        raise RuntimeError('one same-feature exact example ELF required: ' + name)
+    executables[name] = matches[0]['executable']
+for name, path in executables.items():
+    with Path(path).open('rb') as stream:
+        header = stream.read(20)
+    if (os.uname().machine != 'x86_64' or header[:6] != b'\x7fELF\x02\x01'
+            or header[18:20] != b'\x3e\x00'):
+        raise RuntimeError('native Arch x86_64 ELF required: ' + name)
+    shutil.copy2(path, libexec / name)
+    (libexec / name).chmod(0o755)
+# Ship the exact shared source inventory, not a revision-only claim.
+if source_files(root) != files:
+    raise RuntimeError('compilation source changed during native payload build')
+for name in files:
+    source = root / name
+    target = share / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    target.chmod(0o644)
+    if hashlib.sha256(target.read_bytes()).hexdigest() != files[name]:
+        raise RuntimeError('source changed during payload staging: ' + name)
+if hashlib.sha256(primary.read_bytes()).hexdigest() != primary_sha256:
+    raise RuntimeError('proof compilation changed the original primary compositor executable')
+receipt = {'revision': command(['git', 'rev-parse', 'HEAD']).strip(), 'event_head': event_head,
+           'worktree_status': command(['git', 'status', '--porcelain=v1']), 'files': files,
+           'source_files_sha256': source_digest(files),
+           'compiler': command(['rustc', '-vV']), 'cargo': command(['cargo', '-V']),
+           'rustflags': os.environ.get('RUSTFLAGS'), 'features': features,
+           'native_toolchain': native_toolchain,
+           'encoded_rustflags': os.environ.get('CARGO_ENCODED_RUSTFLAGS'),
+           'rustdocflags': os.environ.get('RUSTDOCFLAGS'),
+           'encoded_rustdocflags': os.environ.get('CARGO_ENCODED_RUSTDOCFLAGS'),
+           'build_target': os.environ.get('CARGO_BUILD_TARGET'),
+           'primary_compositor_build_sha256': primary_sha256,
+           'tuna_version': os.environ.get('TUNA_VERSION'),
+           'rustup_toolchain': os.environ.get('RUSTUP_TOOLCHAIN'),
+           'cargo_home': os.environ.get('CARGO_HOME'), 'cargo_target_dir': os.environ.get('CARGO_TARGET_DIR'),
+           'build_os': build_os, 'cargo_profile': 'release',
+           'elf_sha256': {name: hashlib.sha256((libexec / name).read_bytes()).hexdigest()
+                          for name in executables},
+           'installed_signed_release_qualified': False}
+(share / 'source.json').write_text(json.dumps(receipt, indent=2) + '\n')
+(share / 'source.json').chmod(0o644)
+shutil.copy2(root / 'packaging/marlin/vm-lane/tuna-vm-colour', out / 'usr/libexec/tuna-vm-colour')
+(out / 'usr/libexec/tuna-vm-colour').chmod(0o755)
+# Normalize only this newly owned overlay, never the checkout or primary build.
+out.chmod(0o755)
+for directory in out.rglob('*'):
+    if directory.is_dir():
+        directory.chmod(0o755)

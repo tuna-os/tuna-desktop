@@ -1,0 +1,197 @@
+#!/usr/bin/python3
+"""Real Wayland shm blur proof in an already-owned graphical session.
+
+Requires Pillow, a built tuna-background-effect-client, and a capture command
+(JSON argv) containing {output}. That command must capture the actual compositor
+output to PNG, not a fixture/client buffer. No compositor or VM is started here.
+Run only in approved CI or the caller's owned Corral VM. Keep the cursor outside
+the proof window; disable animations, colour filters and scaling for this SDR
+pixel comparison. This is not an HDR-output/FP16 qualification receipt.
+
+Example capture argv: '["grim", "{output}"]' where screencopy is available;
+otherwise use the session's trusted portal/native output capture helper.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import select
+import subprocess
+import sys
+import time
+from PIL import Image
+
+WIDTH, HEIGHT = 384, 256
+
+
+def require(condition, message):
+    if not condition:
+        raise AssertionError(message)
+
+
+def locate(image):
+    """Find the unique unscaled client border in the real baseline capture."""
+    pixels = image.load()
+    matches = []
+    magenta = (255, 0, 255)
+    for y in range(image.height - HEIGHT + 1):
+        for x in range(image.width - WIDTH + 1):
+            if pixels[x, y] != magenta:
+                continue
+            if x and pixels[x - 1, y] == magenta:
+                continue
+            if y and pixels[x, y - 1] == magenta:
+                continue
+            if all(pixels[x + dx, y + dy] == magenta for dx, dy in (
+                (0, 0), (WIDTH - 1, 0), (0, HEIGHT - 1), (WIDTH - 1, HEIGHT - 1),
+                (WIDTH // 2, 0), (0, HEIGHT // 2))):
+                matches.append((x, y, x + WIDTH, y + HEIGHT))
+    require(len(matches) == 1, f"expected one unscaled, unfiltered checkerboard window; found {matches}")
+    return matches[0]
+
+
+def inside(x, y):
+    return x < 288 and y < 224 and not (128 <= x < 160 and 96 <= y < 128)
+
+
+def verify(images, rect):
+    """Reusable actual output pixel assertions; raises on any missing effect."""
+    crops = {name: image.crop(rect).convert("RGB") for name, image in images.items()}
+    sharp = crops["off"]
+    require(sharp.size == (WIDTH, HEIGHT), "content capture has wrong dimensions")
+    baseline = list(sharp.getdata())
+    for y in range(8, HEIGHT - 8):
+        for x in range(8, WIDTH - 8):
+            expected = (255, 255, 255) if (x // 4 + y // 4) % 2 else (0, 0, 0)
+            require(baseline[y * WIDTH + x] == expected, "baseline is not the actual sharp client checkerboard")
+    # Pending requests, copied region mutation, synchronized child commits,
+    # null and destructor all have independently captured output boundaries.
+    unchanged = ("on-pending", "on-child-cached", "unmapped", "null-committed", "destroy-committed")
+    for name in unchanged:
+        require(crops[name].tobytes() == sharp.tobytes(), f"{name}: output differs from OFF")
+    blurred = list(crops["on"].getdata())
+    changed = outside_changes = core = smoothed = 0
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            i = y * WIDTH + x
+            different = blurred[i] != baseline[i]
+            if inside(x, y):
+                changed += different
+                if 40 <= x < 272 and 40 <= y < 208:
+                    core += 1
+                    smoothed += all(80 <= value <= 176 for value in blurred[i])
+            else:
+                outside_changes += different
+    require(outside_changes == 0, f"blur leaks outside clipped/subtracted region: {outside_changes} pixels")
+    require(changed > 40000, f"ON does not change the committed region: {changed} pixels")
+    require(smoothed / core > .98, f"ON does not smooth checkerboard pixels: {smoothed}/{core}")
+    for name in ("remapped", "null-pending", "null-child-cached", "destroy-on", "destroy-pending", "destroy-child-cached"):
+        require(crops[name].tobytes() == crops["on"].tobytes(), f"{name}: double-buffered effect changed early")
+    return {"changed_region_pixels": changed, "outside_region_changed_pixels": outside_changes,
+            "smoothed_core_pixels": smoothed, "core_pixels": core,
+            "null_buffer_unmaps_effect": True, "reattach_restores_effect": True,
+            "null_restores_off": True, "destroy_restores_off": True,
+            "region_copy_negative_clip_subtract": True, "synchronized_subsurface": True}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--client", type=Path, required=True)
+    parser.add_argument("--artifacts", type=Path, required=True)
+    parser.add_argument("--capture-argv", required=True, help="JSON argv containing {output}; no shell")
+    args = parser.parse_args()
+    capture = json.loads(args.capture_argv)
+    require(isinstance(capture, list) and capture and all(isinstance(item, str) for item in capture), "invalid capture argv")
+    require(any("{output}" in item for item in capture), "capture argv lacks {output}")
+    artifact = args.artifacts.resolve()
+    artifact.mkdir(parents=True, exist_ok=False)
+    client_path = args.client.resolve(strict=True)
+    stderr = (artifact / "client.stderr").open("w")
+    receipts, images = [], {}
+    process = subprocess.Popen([str(client_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=stderr, text=True, bufsize=1)
+
+    def receipt():
+        ready, _, _ = select.select([process.stdout], [], [], 20)
+        require(ready, "timed out waiting for actual client frame/protocol receipt")
+        line = process.stdout.readline()
+        require(line, f"consumer exited without a receipt (status {process.poll()})")
+        result = json.loads(line)
+        receipts.append(result)
+        if result.get("result") == "unsupported":
+            raise Unsupported(result["reason"])
+        return result
+
+    def command(name):
+        process.stdin.write(name + "\n")
+        process.stdin.flush()
+        result = receipt()
+        require(result.get("command") == name and result.get("result") == "command-applied", "unexpected command receipt")
+
+    def screenshot(name):
+        # Callback precedes scanout on some paths; allow presentation/capture
+        # to settle. Pixel assertions, not this delay, decide success.
+        time.sleep(.15)
+        path = artifact / f"{name}.png"
+        subprocess.run([item.replace("{output}", str(path)) for item in capture], check=True, timeout=20)
+        with Image.open(path) as image:
+            images[name] = image.convert("RGB")
+
+    result = {"result": "failed", "qualification": "real-wayland-sdr-output-pixels",
+              "hdr_precision_qualified": False,
+              "client_sha256": hashlib.sha256(client_path.read_bytes()).hexdigest(),
+              "wayland_display": os.environ.get("WAYLAND_DISPLAY"), "capture_argv": capture}
+    code = 1
+    try:
+        require(receipt().get("result") == "ready", "consumer did not map real buffers")
+        screenshot("off")
+        rect = locate(images["off"])
+        for operation, name in (
+            ("on-pending", "on-pending"), ("child-commit", "on-child-cached"), ("parent-commit", "on"),
+            ("unmap", "unmapped"), ("remap", "remapped"),
+            ("null-pending", "null-pending"), ("child-commit", "null-child-cached"), ("parent-commit", "null-committed"),
+            ("on-pending", None), ("commit", "destroy-on"),
+            ("destroy-pending", "destroy-pending"), ("child-commit", "destroy-child-cached"), ("parent-commit", "destroy-committed"),
+        ):
+            command(operation)
+            if name:
+                screenshot(name)
+        result.update(verify(images, rect))
+        result.update(result="passed", content_rect=list(rect))
+        code = 0
+    except Unsupported as error:
+        result.update(result="unsupported", reason=str(error))
+        code = 77
+    except Exception as error:
+        result.update(result="failed", reason=str(error))
+    finally:
+        if process.poll() is None:
+            try:
+                process.stdin.write("quit\n")
+                process.stdin.flush()
+                process.wait(timeout=5)
+            except (BrokenPipeError, subprocess.TimeoutExpired):
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        stderr.close()
+        result["consumer_exit"] = process.returncode
+        if code == 0 and process.returncode != 0:
+            result.update(result="failed", reason="consumer failed during teardown")
+            code = 1
+        (artifact / "receipts.json").write_text(json.dumps(receipts, indent=2) + "\n")
+        (artifact / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(result))
+    return code
+
+
+class Unsupported(RuntimeError):
+    pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())

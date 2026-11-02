@@ -129,7 +129,7 @@ Version: 0.1.0~beta.1
 Architecture: amd64
 Maintainer: Tuna fixture <fixture@example.invalid>
 Description: disposable archive policy fixture
-Depends: libgtk4-layer-shell0 (>= 1.1), libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.0), libpam0g, gsettings-desktop-schemas, gnome-settings-daemon-common
+Depends: libgtk4-layer-shell0 (>= 1.1), libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.0), libpam0g, gsettings-desktop-schemas, gnome-settings-daemon-common, colord, gnome-color-manager
 Replaces: roost
 Conflicts: roost
 Provides: roost
@@ -174,6 +174,15 @@ Provides: roost
         for name in BINS:
             self.assertEqual(entries['usr/bin/' + name][1][:4], b'\x7fELF')
         self.assertEqual(next(body.decode() for item, body in self.control if item.name == './conffiles'), CONFFILES)
+
+    def test_native_colour_consumers_are_required_in_real_package_metadata(self):
+        control = next(body for item, body in self.control
+                       if item.name.removeprefix('./') == 'control')
+        for dependency in ('colord', 'gnome-color-manager'):
+            with self.subTest(dependency=dependency):
+                without_dependency = control.replace((', ' + dependency).encode(), b'')
+                changed = replace(self.control, 'control', member('control', without_dependency))
+                self.reject(control=changed, reason='missing runtime floor ' + dependency)
 
     def test_actual_release_builder_preserves_safe_archive_modes_under_umask_002(self):
         """Exercise production staging, with controlled build/tag/ABI delegates.

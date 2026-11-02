@@ -79,6 +79,8 @@ and this page together.
 | wp_presentation | 2 | CLOCK_MONOTONIC, as Mutter; see frame timing below |
 | wp_fifo_manager_v1 | 1 | a barrier is released on the next refresh cycle |
 | wp_commit_timing_manager_v1 | 1 | a timed update applies on the refresh cycle whose next presentation reaches its time |
+| wp_color_manager_v1 | 2 | parametric and ICC (matrix/TRC and 33³ LUT) source descriptions; output descriptions track the admitted per-output SDR or BT.2100/PQ encoding, with change events and surface preference feedback |
+| wp_color_representation_manager_v1 | 1 | premultiplied and straight alpha; identity and BT.601/709/2020 full/limited coefficients; identity YCbCr samples raw linear component views or is refused, never guessed through an EGL driver default |
 | xdg_wm_dialog_v1 | 1 | a modal dialog is attached to its parent: focusing the parent focuses the dialog (GNOME's attach-modal-dialogs) |
 | zxdg_exporter_v2, zxdg_importer_v2 | 1 | xdg-foreign: the portal parents its dialogs to the app's window, which centres and attaches them like the app's own |
 | xdg_system_bell_v1 | 1 | plays GNOME's `bell-window-system` sound through `canberra-gtk-play` when installed (Mutter's audible bell); a burst of rings is one sound |
@@ -86,6 +88,229 @@ and this page together.
 | xdg_session_manager_v1 | 1 | window session save and restore as in Mutter 51 (P-SY-08): a client that opens a session gets its windows back after logout or reboot (workspace, position and size, maximized, tiled, fullscreen, output; minimized is not restored, as in Mutter); store `$XDG_DATA_HOME/tuna/window-sessions.json`, written 3 s after a change and at exit (`crates/compositor/src/xdg_session.rs`) |
 | zwp_keyboard_shortcuts_inhibit_manager_v1 | 1 | after Allow, the focused window gets every key, the shell's grabs, Super and Alt+Tab included; Super+Escape (Mutter's restore-shortcuts) takes them back until the window is focused again |
 | wp_pointer_warp_v1 | 1 | honoured while the surface has pointer focus from the enter serial it names; nested, the host pointer stays where it is |
+| ext_background_effect_manager_v1 | 1 | capabilities reflect admission of the actual bound scene framebuffer, and are revoked on rendering failure; one effect object per surface (`background_effect_exists`), `set_blur_region` double-buffered on commit, NULL removes it, `surface_destroyed` once the surface is gone; destroying the object unsets the region on the next commit (meta-wayland-background-effect.c). The scene beneath the surface is clipped to its blur region, blurred with Mutter 51's separable gaussian (sigma = radius / 2, radius 24 logical px times surface scale, downscaled while sigma > 6 and both sides > 256 px), saturation 1.25 and 0.015 grain, then painted at surface opacity under its content. HDR intermediate precision follows the bound FP16 scene, preserving negative and above-one channels before the sole BT.2020/PQ output pass; normalized scanout is not an admission override. Damage touching the sample area (region + 2 × radius) repaints all of it and the scene beneath. Not applied to overview previews or Alt+Tab thumbnails (Mutter also blurs behind clones) |
+
+### Colour reference and source notices
+
+The colour protocol, transform and representation reference is official
+[Mutter 51.0, `138a14fbeef09d49ebf5be8a0cb83b042dd5c841`](https://gitlab.gnome.org/GNOME/mutter/-/tree/138a14fbeef09d49ebf5be8a0cb83b042dd5c841):
+`src/wayland/meta-wayland-color-{management,representation}.c`,
+`src/compositor/meta-multi-texture-format.c`, the `clutter/clutter/clutter-color-*`
+implementation, and `src/backends/meta-color-device.c`. The retained
+[native Marlin GNOME 51 identity](../tests/protocols/marlin-gnome51-source.json)
+records the comparison image/package digests; it is a historical protocol
+baseline, not an HDR/calibration measurement of this candidate.
+
+Rust adaptations retain the original copyright notices in the corresponding
+modules: Intel Corporation (2022), Red Hat (2023–2026), SUSE Software Solutions
+Germany GmbH (2024), and Barco NV (2018, Niels De Graef). Mutter's Wayland and
+multi-texture originals are GPL-2.0-or-later; the Clutter originals are
+LGPL-2.0-or-later. The adaptations select GPL-3.0-or-later (LGPL v2 section 3
+permits the GPL conversion), under the repository's [LICENSE](../LICENSE),
+without warranty. The independently licensed vendored Smithay additions and
+isolated patch records remain under its MIT terms; see
+[`ROOST-PATCH.md`](../third-party/smithay/ROOST-PATCH.md).
+`moxcms` 0.8.1, used to evaluate non-matrix ICC source profiles, is pinned by
+Cargo.lock and licensed BSD-3-Clause OR Apache-2.0.
+
+### Colour output and capture contract
+
+Native ICC assignment and calibration require colord's daemon and
+`org.freedesktop.ColorHelper`/`colord-session` activation; the compositor's
+Mutter-compatible calibration API is not an obsolete `gcm-calibrate` launcher.
+GNOME Settings' profile-view action separately requires `gcm-viewer`, supplied
+by `gnome-color-manager`. Native package dependencies declare both consumers.
+
+The native output path retains colord profile assignment, generated EDID/sRGB
+device profiles, imported ICC profiles and calibration sessions. Assigned VCGT
+curves reach the actual CRTC gamma ramp, separately from the output colour mode,
+as in Mutter 51; Night Light is not a substitute for profile/calibration support.
+Connector removal/replacement revokes calibration immediately, and generation
+fences prevent an older colord operation from restoring the previous sink's
+assignment. Unchanged monitors retain their registrations.
+
+`DisplayConfig` and `monitors.xml` carry default SDR and BT.2100 modes.
+Native-SDR mode 2 remains unsupported rather than being advertised with an
+incomplete asset-conversion path. HDR requires the intersection of checked CTA
+BT.2020 RGB/PQ/type-1 capabilities, atomic connector properties and discovered enum
+values, usable ≥10-bpc scanout, and successful FP16/ten-bit renderer probes.
+The complete scene blends in extended-range sRGB/gamma 2.2 FP16, then converts
+once to BT.2020/PQ. Output metadata, colorspace and bpc are staged with the
+atomic framebuffer transaction; SDR clears HDR metadata. Failed admission or
+commit retains/reverts the working configuration, and persistent confirmation
+waits for an actual hardware commit. Resume restores connector signaling.
+
+Screenshots declare their actual SDR BT.709 primaries/gamma-2.2 PNG encoding
+(`cHRM` and `gAMA`, not a false sRGB or HDR tag). Default screencasts likewise
+offer full-range BGRx/BT.709/gamma22 independently of the physical output's
+profile or HDR state. Following Mutter's monitor-format policy, an active
+qualified HDR monitor additionally offers a ten-bit BT.2020/PQ capture; window
+and area streams remain SDR. The negotiated encoding drives a real FP16 render
+and final output pass, not metadata attached to eight-bit SDR bytes.
+
+The proof's same-source `tuna-color-cast-client` consumes both SDR and HDR
+through native PipeWire. It validates the actual SPA Format event and mapped
+frame, including range, matrix, primaries, transfer function and packed pixel
+layout; it never injects colourimetry or converts pixels to make an assertion
+pass. PipeWire 1.0's GStreamer format adapter
+([upstream source](https://github.com/PipeWire/pipewire/blob/1.0.5/src/gst/gstpipewireformat.c))
+does not map RGB colour fields, so its `GstVideoInfo` defaults cannot prove the
+producer's gamma-2.2 state. `--cast-consumer` selects the native consumer path;
+the installed DEV helper passes the exact same-source `/usr/libexec/tuna-colour/cast`.
+
+The real pixel and DMA-BUF clients announce readiness only after holding their
+unchanged buffers for 500 ms of actual `wl_callback.done` frame-clock time.
+Their first callback alone can occur during the ordinary opening animation;
+it does not promise a fully visible constant-colour scene. Receipts retain the
+first/last callback timestamps, diagnostic frame count, original surface ID and
+observed client PID/ELF hash. Capture still makes one
+assertion at each existing pixel threshold and deadline: no expected-pixel
+polling, capture retry, animation override or synthetic clock is used.
+
+The opt-in Arch `TUNA_NATIVE_COLOUR_OUT` build-tail hook stages this consumer,
+the native YUV/pixel callers and the exact compositor unit ELF in the original
+primary package checkout with its compiler, flags, target directory and version.
+The overlay receipt binds source hashes and pacman-owned Cargo/rustc/libstd,
+and requires the primary compositor bytes to remain unchanged. An unset
+destination leaves normal package building and package contents unchanged;
+the separate DEV overlay is not a shipping package or release qualification.
+
+EGL's YCbCr import hints do not include identity coefficients and permit driver
+guesses when no hint is supplied. Applying an inverse matrix to an already
+converted/clipped RGB sample cannot recover the original channels. Identity
+YCbCr therefore uses zero-copy component views with retained texture lifetime
+and synchronization, rejecting unsupported layouts/modifiers or failed imports.
+The supported raw layouts are recorded in the vendor patch notes; this is not a
+claim that every EGL driver can import them. Mutter 51.0's three
+`identity_limited_to_rgb` assignments have unmatched opening parentheses;
+Tuna uses the intended `(255/219) * (channel - 16/255)` expression and tests
+distinct channels, range boundaries and alpha rather than matching that syntax
+error or special-casing neutral fixtures.
+Both the surface conversion shader and the final copy shader request highp
+samplers only with `GL_FRAGMENT_PRECISION_HIGH`; older GLES2 SDR contexts keep
+their original sampler declarations. Fragment highp is optional under
+[GLSL ES 1.00 §§4.5.2–4.5.4 and §8](https://registry.khronos.org/OpenGL/specs/es/2.0/GLSL_ES_Specification_1.00.pdf).
+Native HDR separately requires a successful high-precision arithmetic probe.
+
+The private capture process disables core files for its entire owned descendant
+tree. Native DMA-BUF diagnostics additionally bound backtraces and printed
+values; raw core dumps are never qualification artifacts.
+The independent GPL-3.0-or-later driver oracle,
+[`r8-import.c`](../tests/color-dmabuf/r8-import.c), uses GBM/EGL/GLES and the
+actual Linux DMA heap without Rust, Smithay, auxiliary samplers or colour math.
+It compares ordinary uploaded RGBA, ordinary uploaded R8 and imported linear
+R8 pixels with one shader while retaining every buffer/image/texture through
+GPU completion. The uploaded R8 control uses the identical nonconstant red
+values and checks all 64 RGBA pixels, distinguishing raw-channel sampling
+from the DMA-BUF importer without bypassing the imported positive.
+Its source, license, compiler/package identities and bounded GDB result accompany
+the original device receipt. A fault in the Rust control alone does not prove a
+driver cause; neither diagnostic can silently remove an existing required gate.
+
+The import follows
+[`EGL_EXT_image_dma_buf_import`](https://registry.khronos.org/EGL/extensions/EXT/EGL_EXT_image_dma_buf_import.txt):
+`EGL_NO_CONTEXT`, a NULL client buffer, one R8 plane, byte offset zero and
+eight-byte pitch for an 8×8 image, with explicit LINEAR modifiers checked
+against the driver's non-external-only advertisement. A page-sized real
+DMA-heap allocation is initialized between CPU WRITE START/END sync ioctls;
+the producer mapping and fd are retained as well as the EGL/GL objects.
+Successful image creation and binding do not establish successful sampling.
+CI run `41275157224` on Ubuntu Noble's Mesa `25.2.8-0ubuntu0.24.04.4`,
+llvmpipe/LLVM 20.1.2 and VKMS accepted that import, then faulted in a llvmpipe
+worker at the first imported-R8 `glFinish`, after the RGBA control passed.
+This failure precedes every auxiliary-sampler and YUV conversion operation.
+One bounded local native run on Linux `6.8.0-147-generic`, VKMS and the same
+runtime Mesa `25.2.8-0ubuntu0.24.04.4` additionally passed the uploaded R8
+control (64 pixels, zero mismatches). GDB observed the driver's own
+`PRIME_FD_TO_HANDLE` succeed with GEM handle 1, then its
+`DRM_IOCTL_MODE_MAP_DUMB` return `-22` (`EINVAL`) three times for that same
+handle before the imported-R8 draw faulted. The faulting byte load used a
+NULL address. No extra application import, GEM-handle close or alternative
+sampling path was introduced for that observation; core files were disabled.
+[Mesa 25.2.8 KMS swrast](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-25.2.8/src/gallium/winsys/sw/kms-dri/kms_dri_sw_winsys.c)
+imports a PRIME fd but later attempts that dumb-map ioctl, returning NULL on
+failure; [`llvmpipe_resource_map`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-25.2.8/src/gallium/drivers/llvmpipe/lp_texture.c)
+stores the returned map as texture data. Both
+[Linux 6.8](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/drm_gem.c#L324-L328)
+and [Linux 7.0](https://github.com/torvalds/linux/blob/v7.0/drivers/gpu/drm/drm_gem.c#L453-L457)
+explicitly reject imported objects in the generic GEM dumb-map helper.
+This establishes the local importer/kernel mapping blocker, not a compositor
+lifetime defect or universal R8/YUV incapability. The CI crash is consistent
+with that source path but its original receipt did not trace the ioctl.
+The imported positive remains failed, not qualified. Following review of that
+independent causal evidence, its unchanged all-format YUV and live-capture
+positive gates move to the additional **required** native DEV virgl colour
+profile whenever the colour/DRM lane is selected. Missing formats, samples,
+readbacks, captures or source/package/ELF admission are fatal in the normal
+aggregate; a component compile or renderer name cannot qualify that route.
+Ordinary software DRM presentation, colord and calibration remain required,
+and the two normal Tuna GPU rows are unchanged.
+[`fixture-incompatibility.json`](../tests/color-dmabuf/fixture-incompatibility.json)
+preserves the original fatal assertion and source/log/artifact identities as
+a classified imported-GEM/MAP_DUMB fixture incompatibility, never as a pass,
+generic unsupported-R8 verdict, production blacklist or capture fallback.
+
+The isolated `colour` guest route uses the shared VM producer and a dedicated
+virgl device profile, not a second producer or a normal release-admission override.
+Its fixed `init/start/state/ack/finish/cleanup/file` operations execute owned,
+finite cases; artifact export cannot select arbitrary guest paths or commands.
+The payload binds the original native Arch package to the same primary build
+environment, source, unit/example ELFs and observed final image members.
+`installed_signed_release_qualified=false` describes scope, not an admission
+shortcut. The existing all-format unit and NV12/P010 coefficient capture matrix
+remain required. Observed unit GL identity is separate from unobserved nested
+context identity; a successful probe must not invent a different process's renderer.
+
+Capture's explicit `--host-wayland-socket` selects an actual Wayland host only
+for compositor launch; proof clients still use their new private socket.
+Default Xvfb/DRM fixture behavior is unchanged. The native PipeWire consumer
+requires the actual negotiated BGRx SPA colour fields and reads raw pixels;
+it neither injects colourimetry nor converts the captured bytes.
+GNOME comparison waits for the actual nonroot GDM greeter principal and loaded,
+notified Shell service, without assuming an account or service-instance name.
+
+Qualification receipts must name the emulation and exact executable/source/image
+identities. `D-COLOR-HDR`, `D-COLOR-HDR-KMS`, `D-COLOR-HDR-CAPTURE`,
+`D-COLOR-HDR-RESTART`, `D-COLOR-HDR-HOTPLUG`, `D-COLOR-HDR-REJECT`,
+`D-COLOR-YUV`, `D-COLOR-YUV-CAPTURE`, `D-COLOR-CAPTURE` and
+`D-COLOR-GNOME` are executable pixel/consumer gates, not passes merely because
+the scripts exist. The active-primary snapshot reports the actual XR30 or AR30
+framebuffer and RGB channel bits, independently of the XR30 kernel writeback
+self-test. Proof cancellation unwinds owned-process cleanup before unloading
+its endpoint. Executables staged into the pinned Noble guest are built on its
+Ubuntu 24.04 ABI baseline. Existing vkms/real-colord gamma readback remains separate.
+This ABI-compatible CI-component proof is not native Noble package or signed
+release qualification: the primary Noble Rust compiler is below the locked GTK
+MSRV, and a foreign compiler does not repair that native package prerequisite.
+Guest prerequisites use an authenticated immutable official archive snapshot.
+Kernel ABI admission compares generated `UTS_RELEASE`, packaged `kernel.release`
+and actual module vermagic with the running kernel, not the upstream Makefile's
+base version; source and native package receipts are retained on failure.
+
+The source `0854f3f0` immutable Noble component run loaded the real endpoint
+and passed XR30 flip, composed writeback/fence/all pixels, PQ metadata and
+eight-bit/non-PQ kernel rejection controls. Its production compositor then
+faulted in llvmpipe before supervised capture readiness on Mesa
+`25.2.8-0ubuntu0.24.04.4`; that failed userspace phase is neither HDR capture
+qualification nor a generic driver-capability verdict. The kernel receipt
+does not substitute for the still-required compositor pixel, capture and
+native virgl/source/image gates.
+
+The later `a023b59a8a2f4c724404fbc9037553a9b75bccf1` component run, before
+the landed GDM51 policy merge, passed the unchanged SDR PNG/SPA pixel checks
+but again faulted in the native Noble renderer. Its bounded GDB observation
+retained a llvmpipe JIT `vpgatherdd` fault with a non-NULL sampling base; the
+eight-frame main-thread trace did not reach the application caller and does
+not establish a driver, import or lifetime cause. Exact source, executable
+payload, guest identity and bounded trace are retained privately with raw
+cores disabled. This remains failed HDR userspace evidence, not native
+package, HDR capture or all-format qualification.
+
+[ADR 0008 item 5](adr/0008-v1-beta-track-and-release-scope.md) permits the v1 row
+to pass on actual named emulated-device evidence; physical HDR link quality,
+instrumented calibration accuracy and physical hotplug remain unqualified until
+measured in the post-v1 hardware support matrix. Virtual/SDR captures never
+establish a physical HDR claim.
 
 ### xdg-activation policy
 
@@ -159,8 +384,6 @@ GNOME's version.
 | zwp_text_input_manager_v3 | 2 | 1 | Smithay 0.7 implements v1 only; bumps with Smithay (#60) |
 | zxdg_exporter_v1, zxdg_importer_v1 | 1 | missing | GTK3 exports with v1; Smithay 0.7 implements v2 only and keeps its handle table private, so a v1 handle could not be imported by the portal's v2 (#61) |
 | xdg_toplevel_drag_manager_v1 | 1 | missing | not in Smithay 0.7: a window attached to a drag-and-drop operation and moved with it (detachable browser tabs) (#89) |
-| wp_color_manager_v1 (v2), wp_color_representation_manager_v1 | 2, 1 | missing | not in Smithay 0.7: needs a colour-managed renderer (ICC/HDR, YUV conversion); the GLES path is sRGB only (#89) |
-| ext_background_effect_manager_v1 | 1 | missing | not in Smithay 0.7: needs a blur pass in the renderer (#89) |
 | wl_fixes | 1 | missing | not in wayland-server 0.31; its `destroy_registry` frees a registry object, which wayland-backend owns (#89) |
 | wp_drm_lease_device_v1 | 1 (native Marlin capture) | missing | lease needs connectors to hand out for VR headsets; recorded deviation, not exercised by the nested session (#68, #89) |
 | wp_linux_drm_syncobj_manager_v1 | source-derived floor 1; absent in this VM capture | missing | explicit sync needs the DRM backend's syncobj import; GPU-capable native acceptance remains open (#68, #89) |

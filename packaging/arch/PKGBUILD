@@ -24,8 +24,10 @@ arch=('x86_64')
 url='https://github.com/tuna-os/tuna-desktop'
 license=('GPL-3.0-or-later')
 depends=(
+    'colord'
     'dbus'
     'glib2'
+    'gnome-color-manager'
     'gnome-settings-daemon'
     'gnome-session'
     'gdk-pixbuf2'
@@ -91,6 +93,12 @@ build() {
     export TUNA_VERSION="v${_semver}"
     cargo build --frozen --release \
         -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-host -p tuna-shell-gtk
+    # DEV only: retain the original native package's compiler, flags,
+    # version and target directory while staging same-source proof ELFs.
+    # No hook runs or payload is installed when the destination is unset.
+    if [[ -n "${TUNA_NATIVE_COLOUR_OUT:-}" ]]; then
+        /usr/bin/python3 scripts/tuna-colour-build "$TUNA_NATIVE_COLOUR_OUT"
+    fi
 }
 
 check() {

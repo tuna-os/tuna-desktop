@@ -3865,21 +3865,37 @@ def run_soak(qmp, vm, agent_path, out, record, seconds, warmup, interval, revisi
 
 
 
+def native_gpu_devices(profile="lifecycle"):
+    if profile == "colour":
+        return ["-device", "pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1",
+                "-device", "virtio-vga-gl,bus=tuna-gpu-port,x-pcie-pm-no-soft-reset=on,"
+                           f"xres={WIDTH},yres={HEIGHT}"]
+    if profile != "lifecycle":
+        raise ValueError("unknown native VM profile")
+    return baseline.gpu_devices()
+
+
 def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, native_relative_mouse=False,
-         observer_records=None, credentials=()):
+         observer_records=None, credentials=(), profile="lifecycle"):
     ovmf = next((p for p in OVMF if os.path.exists(p)), None)
     if not ovmf:
         sys.exit("tuna-vm-lane: OVMF firmware not found (install ovmf)")
     kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
     if require_kvm and not kvm:
         sys.exit("tuna-vm-lane: KVM required but /dev/kvm is not accessible; refusing emulation")
+    display = "none"
+    if profile == "colour":
+        if (not os.environ.get("DISPLAY") or os.environ.get("LIBGL_ALWAYS_SOFTWARE") != "1"
+                or os.environ.get("GALLIUM_DRIVER") != "llvmpipe"):
+            raise RuntimeError("virgl DEV profile requires its owned Xvfb/software-GL launcher")
+        display = "gtk,gl=on"
     qmp_path = os.path.join(scratch, "qmp.sock")
     agent_path = os.path.join(scratch, "qga.sock")
     serial = os.path.join(out, "serial.log")
     qemu = ["qemu-system-x86_64", "-machine", "q35", "-m", "6144", "-smp", "4",
             "-bios", ovmf, "-snapshot",
             "-drive", f"file={disk},format=raw,if=virtio,cache=unsafe",
-            *baseline.gpu_devices(),
+            *native_gpu_devices(profile),
             "-device", "qemu-xhci", "-device", "usb-tablet", "-device", "usb-kbd",
             # The virtio keyboard carries multimedia evdev codes; USB's
             # boot-protocol keyboard has no consumer-control usages.
@@ -3887,7 +3903,7 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
             "-audiodev", "none,id=tuna-audio",
             "-device", "ich9-intel-hda",
             "-device", "hda-duplex,audiodev=tuna-audio",
-            "-display", "none", "-serial", f"file:{serial}",
+            "-display", display, "-serial", f"file:{serial}",
             "-qmp", f"unix:{qmp_path},server=on,wait=off",
             "-nic", "user,model=virtio-net-pci"]
     if native_relative_mouse:
@@ -4037,6 +4053,8 @@ def main():
     ap.add_argument("--disk", required=True)
     ap.add_argument("--out", default="vm-lane-artifacts")
     ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument("--profile", choices=("lifecycle", "colour"), default="lifecycle",
+                    help="additional required DEV colour consumer; ordinary lifecycle remains the default")
     ap.add_argument("--tour", action="store_true",
                     help="after the assertions, record the feature tour video")
     ap.add_argument("--strip-edge", action="store_true", help="explicit four-actor stationary edge consumer on final boot")
@@ -4065,6 +4083,10 @@ def main():
                     help="observe only the first tunastd login: bounded AccountsService call/reply headers "
                          "and pre-existing allowlisted worker markers; never enable GDM debug")
     a = ap.parse_args()
+    if a.profile == "colour":
+        if (not a.require_kvm or not a.strip_image or a.tour or a.boots != 1
+                or a.soak or a.fresh_accounts or a.published or a.strip_edge):
+            ap.error("native colour requires KVM, exact installed image admission and one pristine boot")
     if a.fresh_gdm_trace and not a.fresh_accounts:
         ap.error("--fresh-gdm-trace requires --fresh-accounts")
     if a.fresh_accounts:
@@ -4083,8 +4105,8 @@ def main():
     if a.strip_edge and not a.strip_image:
         ap.error("--strip-edge requires exact installed image admission")
     if a.strip_image:
-        if not a.tour:
-            ap.error("--strip-image requires --tour lifecycle")
+        if not a.tour and a.profile != "colour":
+            ap.error("--strip-image requires --tour lifecycle or explicit native colour consumer")
         with open(a.strip_image, "rb") as stream:
             raw = stream.read(1048577)
         if len(raw) > 1048576:
@@ -4108,7 +4130,9 @@ def main():
         results[test_id] = (ok, desc)
         log(f"{test_id} {'pass' if ok else 'FAIL'}: {desc}")
 
-    vm, qmp_path, serial_path, kvm, agent_path = boot(os.path.abspath(a.disk), out, scratch, a.timeout, a.require_kvm, guest_agent=True, native_relative_mouse=True)
+    vm, qmp_path, serial_path, kvm, agent_path = boot(
+        os.path.abspath(a.disk), out, scratch, a.timeout, a.require_kvm,
+        guest_agent=True, native_relative_mouse=True, profile=a.profile)
     start = time.time()
     drm = shell = None
     elapsed = 0.0
@@ -4204,6 +4228,16 @@ def main():
             finally:
                 if agent is not None:
                     agent.close()
+            if a.profile == "colour":
+                try:
+                    if not manager_ready:
+                        raise RuntimeError("original installed native session owner admission failed")
+                    from colour_vm import run as run_consumer
+                    factory = lambda *, deadline=None: guest_agent.GuestAgent(agent_path, deadline=deadline)
+                    run_consumer(qmp, factory, os.path.join(out, "colour"), strip_image, owner, vm)
+                    record("V-COLOUR", True, "complete installed DEV virgl consumer; not physical HDR or signed-release qualification")
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                    record("V-COLOUR", False, str(error))
             if a.soak and manager_ready:
                 run_soak(qmp, vm, agent_path, out, record, a.soak, a.soak_warmup, a.soak_interval,
                          a.soak_revision)
@@ -4253,6 +4287,8 @@ def main():
            "tuna-shell-gtk started under supervision" if shell
            else "no tuna-shell-gtk: keybindings line")
     results.setdefault("V-PANEL", (False, "session never came up, no screendump checked"))
+    if a.profile == "colour":
+        results.setdefault("V-COLOUR", (False, "native session never admitted; required colour consumer did not run"))
     if a.soak:
         results.setdefault("V-SOAK", (False, "the session never became ready, so the soak did not run"))
     # GDM starting its greeter on the login VT takes DRM master from the

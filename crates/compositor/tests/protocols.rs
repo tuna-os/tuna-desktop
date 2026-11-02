@@ -47,12 +47,15 @@ const ROUNDS: usize = 200;
 /// linux-dmabuf joins once a renderer reports formats (see below), and
 /// wl_output once an output is connected.
 const EXPECTED: &[(&str, u32)] = &[
+    ("ext_background_effect_manager_v1", 1),
     ("ext_session_lock_manager_v1", 1),
     ("wl_compositor", 6),
     ("wl_data_device_manager", 3),
     ("wl_seat", 9),
     ("wl_shm", 2),
     ("wl_subcompositor", 1),
+    ("wp_color_manager_v1", 2),
+    ("wp_color_representation_manager_v1", 1),
     ("wp_commit_timing_manager_v1", 1),
     ("wp_cursor_shape_manager_v1", 2),
     ("wp_fifo_manager_v1", 1),

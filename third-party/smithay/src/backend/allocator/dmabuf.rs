@@ -246,6 +246,11 @@ impl Dmabuf {
         self.0.planes.iter().map(|p| p.stride)
     }
 
+    /// Flags describing orientation and interlacing of this allocation.
+    pub fn flags(&self) -> DmabufFlags {
+        self.0.flags
+    }
+
     /// Returns if this buffer format has any vendor-specific modifiers set or is implicit/linear
     pub fn has_modifier(&self) -> bool {
         self.0.modifier != Modifier::Invalid && self.0.modifier != Modifier::Linear

@@ -177,6 +177,80 @@ pub fn md5_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// CTA-861 signal capabilities used to qualify BT.2100 output. These
+/// describe the sink, not the GPU/renderer's ability to drive it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HdrCapabilities {
+    pub bt2020_rgb: bool,
+    pub pq: bool,
+    pub static_metadata_type1: bool,
+}
+
+impl HdrCapabilities {
+    pub fn supports_bt2100(self) -> bool {
+        self.bt2020_rgb && self.pq && self.static_metadata_type1
+    }
+}
+
+/// Read CTA extended colorimetry (tag 5) and HDR static metadata (tag 6).
+/// Unlike identity parsing, capability admission requires intact checksums
+/// and the complete advertised extension list. A damaged EDID must not
+/// enable a link encoding the sink may not understand.
+pub fn hdr_capabilities(edid: &[u8]) -> HdrCapabilities {
+    let mut caps = HdrCapabilities::default();
+    if edid.len() < 128 || edid[..8] != HEADER {
+        return caps;
+    }
+    let blocks = usize::from(edid[126]) + 1;
+    let Some(data) = edid.get(..blocks * 128) else {
+        return caps;
+    };
+    if data
+        .as_chunks::<128>()
+        .0
+        .iter()
+        .any(|block| block.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) != 0)
+    {
+        return caps;
+    }
+    for block in data[128..].as_chunks::<128>().0 {
+        if block[0] != 0x02 || block[1] < 3 {
+            continue;
+        }
+        let end = usize::from(block[2]);
+        // Zero means no data-block collection or detailed timings.
+        if end == 0 {
+            continue;
+        }
+        if !(4..=127).contains(&end) {
+            return HdrCapabilities::default();
+        }
+        let mut at = 4;
+        while at < end {
+            let header = block[at];
+            let length = usize::from(header & 0x1f);
+            at += 1;
+            let next = at + length;
+            if next > end {
+                return HdrCapabilities::default();
+            }
+            if header >> 5 == 7 {
+                match &block[at..next] {
+                    // Extended tag, colorimetry flags, metadata profile.
+                    [5, flags, _, ..] => caps.bt2020_rgb |= flags & 0x80 != 0,
+                    [6, eotfs, descriptors, ..] => {
+                        caps.pq |= eotfs & 0x04 != 0;
+                        caps.static_metadata_type1 |= descriptors & 0x01 != 0;
+                    }
+                    _ => {}
+                }
+            }
+            at = next;
+        }
+    }
+    caps
+}
+
 /// One monitor as Mutter's colour manager sees it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MonitorIdentity {
@@ -347,6 +421,54 @@ pub(crate) mod tests {
         let sum: u8 = e[..127].iter().fold(0u8, |a, b| a.wrapping_add(*b));
         e[127] = 0u8.wrapping_sub(sum);
         e
+    }
+
+    fn checksum(block: &mut [u8]) {
+        block[127] = 0;
+        block[127] = 0u8.wrapping_sub(
+            block[..127]
+                .iter()
+                .fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+        );
+    }
+
+    pub(crate) fn hdr_edid() -> Vec<u8> {
+        let mut edid = sample_edid();
+        edid[126] = 1;
+        checksum(&mut edid);
+        let mut cta = [0u8; 128];
+        cta[..12].copy_from_slice(&[0x02, 0x03, 12, 0, 0xe3, 5, 0x80, 0, 0xe3, 6, 0x04, 1]);
+        checksum(&mut cta);
+        edid.extend_from_slice(&cta);
+        edid
+    }
+
+    #[test]
+    fn bt2100_requires_rgb_pq_and_static_metadata_type1() {
+        let edid = hdr_edid();
+        assert!(hdr_capabilities(&edid).supports_bt2100());
+        for (offset, mask) in [(134, 0x80), (138, 0x04), (139, 1)] {
+            let mut missing = edid.clone();
+            missing[offset] &= !mask;
+            checksum(&mut missing[128..]);
+            assert!(!hdr_capabilities(&missing).supports_bt2100());
+        }
+        assert_eq!(hdr_capabilities(&sample_edid()), HdrCapabilities::default());
+    }
+
+    #[test]
+    fn damaged_truncated_and_overrunning_cta_cannot_enable_hdr() {
+        let edid = hdr_edid();
+        for len in [0, 127, 128, 255] {
+            assert_eq!(hdr_capabilities(&edid[..len]), HdrCapabilities::default());
+        }
+        let mut damaged = edid.clone();
+        damaged[140] ^= 1;
+        assert_eq!(hdr_capabilities(&damaged), HdrCapabilities::default());
+        let mut overrun = edid;
+        overrun[132] = 0xff;
+        checksum(&mut overrun[128..]);
+        assert_eq!(hdr_capabilities(&overrun), HdrCapabilities::default());
     }
 
     #[test]

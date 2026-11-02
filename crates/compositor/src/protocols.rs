@@ -41,6 +41,8 @@
 //! - pointer-warp v1: a client may move the pointer within its own
 //!   surface while it has pointer focus (the enter serial must match).
 //! - presentation-time, fifo and commit-timing: see [`crate::frame_timing`].
+//! - ext-background-effect v1: the blur behind a surface's blur region
+//!   (`background_effect.rs`, drawn by `background_blur.rs`).
 //!
 //! Deliberately absent, matching Mutter: xdg-decoration (GNOME is
 //! client-side decorations only).
@@ -136,6 +138,8 @@ pub(crate) struct Protocols {
     shortcut_changed: bool,
     pub(crate) shortcut_locked: bool,
     _pointer_warp: GlobalId,
+    /// ext_background_effect_manager_v1 (blur behind surfaces).
+    pub(crate) background_effects: crate::background_effect::BackgroundEffects,
     /// Pointer warps clients asked for, drained by the window manager:
     /// surface, surface-local position, enter serial.
     pub(crate) pointer_warps: Vec<(WlSurface, Point<f64, Logical>, u32)>,
@@ -147,6 +151,9 @@ pub(crate) struct Protocols {
     pub(crate) preferred_scale: f64,
     /// Every text input's committed state, for the on-screen keyboard.
     pub(crate) text_inputs: crate::osk::TextInputs,
+    /// wp_color_manager_v1 and wp_color_representation_manager_v1
+    /// (P-DS-03, see [`crate::color_management`]).
+    pub(crate) color: crate::color_management::ColorManagement,
 }
 
 impl Protocols {
@@ -192,11 +199,13 @@ impl Protocols {
             #[cfg(feature = "xwayland")]
             x11_interop: crate::x11_interop::Interop::new(dh),
             _pointer_warp: dh.create_global::<State, WpPointerWarpV1, ()>(1, ()),
+            background_effects: crate::background_effect::BackgroundEffects::new(dh),
             pointer_warps: Vec::new(),
             bell: Bell::default(),
             inhibitors: Vec::new(),
             preferred_scale: 1.0,
             text_inputs: crate::osk::TextInputs::default(),
+            color: crate::color_management::ColorManagement::new(dh),
         }
     }
 }

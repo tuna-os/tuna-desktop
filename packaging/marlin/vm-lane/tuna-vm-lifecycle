@@ -2409,7 +2409,11 @@ def main():
     if os.geteuid() != 0 or OWNER.pw_uid == 0:
         raise RuntimeError("probe must be root and session owner must not be root")
     action = sys.argv[1]
-    if action == "background-diagnostics":
+    if action == "colour":
+        if len(sys.argv) != 4 or sys.argv[2] not in {"init", "start", "state", "ack", "finish", "cleanup", "file"}:
+            raise ValueError("colour requires one fixed operation and one JSON payload")
+        result = json.loads(call("/usr/libexec/tuna-vm-colour", sys.argv[2], sys.argv[3]))
+    elif action == "background-diagnostics":
         inventory()  # Verify the original actual login owner before re-exec.
         result = json.loads(call(sys.executable, __file__, "background-user-diagnostics", user=True))
     elif action == "inventory":

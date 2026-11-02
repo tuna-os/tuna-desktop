@@ -105,6 +105,8 @@ pub struct DrmOutput {
     /// The mode a just-applied mode change replaced, until its first
     /// commit succeeds: a refused commit returns to it.
     rollback_mode: Option<control::Mode>,
+    rollback_color_mode: Option<crate::display_config::ColorMode>,
+    awaiting_configuration_commit: bool,
     /// A refused commit restored the previous mode since the runtime
     /// last looked ([`DrmBackend::take_mode_reverted`]).
     mode_reverted: bool,
@@ -117,6 +119,9 @@ pub struct DrmOutput {
     color: color::CrtcColor,
     /// The connector's EDID blob, read at discovery.
     edid: Option<Vec<u8>>,
+    connector_color: color::ConnectorColor,
+    pub color_mode: crate::display_config::ColorMode,
+    pub(crate) hdr_buffer: Option<crate::color_output::HdrBuffer>,
     /// The white point programmed on the CRTC.
     white_point: crate::color_manager::WhitePoint,
     /// The connector's privacy screen (#356).
@@ -145,6 +150,32 @@ pub fn mode_spec(mode: &control::Mode) -> crate::display_config::ModeSpec {
 }
 
 impl DrmOutput {
+    pub fn supported_color_modes(&self) -> &'static [crate::display_config::ColorMode] {
+        use crate::display_config::ColorMode;
+        if self.connector_color.caps.supports_bt2100()
+            && is_ten_bit(self.surface.format())
+            && self.hdr_buffer.is_some()
+        {
+            &[ColorMode::Default, ColorMode::Bt2100]
+        } else {
+            &[ColorMode::Default]
+        }
+    }
+    fn stage_color_mode(&mut self, mode: crate::display_config::ColorMode) -> Result<(), String> {
+        if self.surface.surface().is_legacy() {
+            return if mode == crate::display_config::ColorMode::Default {
+                Ok(())
+            } else {
+                Err("HDR requires atomic KMS".into())
+            };
+        }
+        let color = self.connector_color.state(mode)?;
+        self.surface
+            .surface()
+            .set_connector_color(vec![color])
+            .map_err(|error| error.to_string())
+    }
+
     pub fn trace_wake_submission(&mut self) {
         if !std::mem::take(&mut self.wake_trace) {
             return;
@@ -220,6 +251,8 @@ impl DrmOutput {
         self.enabled = false;
         self.mirror_of = None;
         self.rollback_mode = None;
+        self.rollback_color_mode = None;
+        self.awaiting_configuration_commit = false;
         self.pending = false;
         self.last_frame = None;
         self.damage_tracker = None;
@@ -228,15 +261,32 @@ impl DrmOutput {
     /// A frame in a new mode reached the hardware: the mode stays.
     pub fn mode_committed(&mut self) {
         self.rollback_mode = None;
+        self.rollback_color_mode = None;
+        self.awaiting_configuration_commit = false;
     }
 
     /// The first commit in a new mode failed although the atomic test
     /// passed: return to the mode it replaced (Mutter falls back the
     /// same way when a modeset fails). Returns whether it did.
     pub fn revert_failed_mode(&mut self) -> bool {
-        let Some(old) = self.rollback_mode.take() else {
+        let old_color = self.rollback_color_mode.take();
+        let old_mode = self.rollback_mode.take();
+        if old_color.is_none() && old_mode.is_none() {
             return false;
-        };
+        }
+        self.mode_reverted = true;
+        let old = old_mode.unwrap_or_else(|| self.surface.pending_mode());
+        if let Some(mode) = old_color {
+            if let Err(error) = self.stage_color_mode(mode) {
+                eprintln!(
+                    "tuna-compositor: drm: {}: restoring connector encoding failed: {error}",
+                    self.name
+                );
+                return false;
+            }
+            self.color_mode = mode;
+        }
+        self.awaiting_configuration_commit = false;
         let failed = mode_spec(&self.surface.pending_mode()).id();
         if let Err(error) = self.surface.use_mode(old) {
             eprintln!(
@@ -252,7 +302,6 @@ impl DrmOutput {
         self.advertise_mode(old);
         self.last_frame = None;
         self.damage_tracker = None;
-        self.mode_reverted = true;
         eprintln!(
             "tuna-compositor: drm: {}: commit of {failed} failed; back to {}",
             self.name,
@@ -260,6 +309,224 @@ impl DrmOutput {
         );
         true
     }
+}
+
+fn is_ten_bit(format: Fourcc) -> bool {
+    matches!(
+        format,
+        Fourcc::Argb2101010 | Fourcc::Xrgb2101010 | Fourcc::Abgr2101010 | Fourcc::Xbgr2101010
+    )
+}
+
+/// A candidate is usable only after allocation, KMS testing and renderer
+/// binding succeed. The factory drops a failed candidate before retrying, so
+/// its DRM surface releases the CRTC/plane claim before the SDR replacement.
+fn negotiate_renderable_scanout<T>(
+    prefer_ten_bit: bool,
+    mut create_and_probe: impl FnMut(bool) -> Result<T, String>,
+) -> Result<T, String> {
+    if prefer_ten_bit {
+        match create_and_probe(true) {
+            Ok(surface) => return Ok(surface),
+            Err(error) => {
+                eprintln!("tuna-compositor: drm: ten-bit target unavailable; trying SDR: {error}")
+            }
+        }
+    }
+    create_and_probe(false)
+}
+
+/// Shared startup/hotplug discovery. High precision is negotiated once:
+/// capable outputs retain their ten-bit swapchain even in SDR mode.
+fn discover_output(
+    drm: &mut DrmDevice,
+    gbm: &GbmDevice<DrmDeviceFd>,
+    renderer: &mut GlesRenderer,
+    resources: &control::ResourceHandles,
+    handle: connector::Handle,
+    used: &[crtc::Handle],
+) -> Result<Option<DrmOutput>, String> {
+    use std::os::fd::AsFd;
+    let info = drm.get_connector(handle, true).map_err(|e| e.to_string())?;
+    if info.state() != connector::State::Connected {
+        return Ok(None);
+    }
+    let crtc_modes: Vec<_> = info
+        .modes()
+        .iter()
+        .map(|mode| crate::display_config::CrtcMode {
+            spec: mode_spec(mode),
+            flags: mode.flags().bits(),
+        })
+        .collect();
+    let preferred = info
+        .modes()
+        .iter()
+        .position(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED));
+    let Some(listed) = crate::display_config::monitor_modes(&crtc_modes, preferred) else {
+        return Ok(None);
+    };
+    let modes: Vec<_> = listed
+        .modes
+        .iter()
+        .map(|&i| (crtc_modes[i].spec, info.modes()[i]))
+        .collect();
+    let mode = modes[listed.preferred].1;
+    let Some(crtc) = info
+        .encoders()
+        .iter()
+        .filter_map(|encoder| drm.get_encoder(*encoder).ok())
+        .flat_map(|encoder| resources.filter_crtcs(encoder.possible_crtcs()))
+        .find(|crtc| !used.contains(crtc))
+    else {
+        return Ok(None);
+    };
+    let edid = color::connector_edid(drm, handle);
+    let mut connector_color = color::ConnectorColor::discover(drm, handle, edid.as_deref());
+    let mut surface =
+        negotiate_renderable_scanout(connector_color.caps.supports_bt2100(), |ten_bit| {
+            use smithay::backend::renderer::{Bind, Color32F, Frame, Renderer};
+            let surface = drm
+                .create_surface(crtc, mode, &[handle])
+                .map_err(|e| e.to_string())?;
+            // Clear inherited signaling with this session's first framebuffer.
+            // Calibration remains in the separate CRTC path below.
+            if drm.is_atomic() {
+                surface
+                    .set_connector_color(vec![
+                        connector_color.state(crate::display_config::ColorMode::Default)?
+                    ])
+                    .map_err(|e| e.to_string())?;
+            }
+            let formats: &[Fourcc] = if ten_bit {
+                &[
+                    Fourcc::Argb2101010,
+                    Fourcc::Abgr2101010,
+                    Fourcc::Xrgb2101010,
+                    Fourcc::Xbgr2101010,
+                ]
+            } else {
+                &[Fourcc::Argb8888, Fourcc::Xrgb8888]
+            };
+            let mut surface = GbmBufferedSurface::new(
+                surface,
+                GbmAllocator::new(
+                    gbm.clone(),
+                    GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+                ),
+                formats,
+                renderer
+                    .egl_context()
+                    .dmabuf_render_formats()
+                    .iter()
+                    .copied(),
+            )
+            .map_err(|e| e.to_string())?;
+            // GbmBufferedSurface tests KMS support, not EGL renderability. Probe
+            // every negotiated target independently of FP16/HDR shader support,
+            // including the SDR replacement, before retaining the surface.
+            let (mut dmabuf, _) = surface.next_buffer().map_err(|error| error.to_string())?;
+            let mut target = renderer
+                .bind(&mut dmabuf)
+                .map_err(|error| error.to_string())?;
+            let (w, h) = mode.size();
+            let size = (i32::from(w), i32::from(h)).into();
+            let mut frame = renderer
+                .render(&mut target, size, smithay::utils::Transform::Normal)
+                .map_err(|error| error.to_string())?;
+            frame
+                .clear(
+                    Color32F::new(0.0, 0.0, 0.0, 1.0),
+                    &[Rectangle::from_size(size)],
+                )
+                .map_err(|error| error.to_string())?;
+            frame
+                .finish()
+                .map_err(|error| error.to_string())?
+                .wait()
+                .map_err(|_| "scanout renderability probe was interrupted".to_owned())?;
+            Ok(surface)
+        })?;
+    let (w, h) = mode.size();
+    let size = (i32::from(w), i32::from(h)).into();
+    let hdr_buffer = if connector_color.caps.supports_bt2100() && is_ten_bit(surface.format()) {
+        let probe = crate::color_output::HdrBuffer::new(renderer, size).and_then(|buffer| {
+            let (mut dmabuf, _) = surface.next_buffer().map_err(|error| error.to_string())?;
+            buffer.probe_scanout(renderer, &mut dmabuf)?;
+            Ok(buffer)
+        });
+        match probe {
+            Ok(buffer) => Some(buffer),
+            Err(error) => {
+                eprintln!("tuna-compositor: drm: HDR unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut color = color::CrtcColor::new(drm, crtc);
+    color.reset(drm);
+    let privacy = privacy::discover(drm, handle);
+    let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
+    let (mm_w, mm_h) = info.size().unwrap_or((0, 0));
+    let output = Output::new(
+        name.clone(),
+        PhysicalProperties {
+            size: (mm_w as i32, mm_h as i32).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Tuna Desktop".to_owned(),
+            model: name.clone(),
+        },
+    );
+    let out_mode = Mode::from(mode);
+    output.change_current_state(Some(out_mode), None, None, None);
+    output.set_preferred(out_mode);
+    let native_owner = crate::native_output::device(drm.device_fd().as_fd())
+        .ok()
+        .filter(|device| *device == drm.device_id())
+        .and_then(|device| {
+            crate::native_output::resolve(
+                std::path::Path::new("/sys"),
+                device,
+                &name,
+                u32::from(handle),
+            )
+            .ok()
+        });
+    Ok(Some(DrmOutput {
+        name,
+        crtc,
+        connector: handle,
+        native_owner,
+        surface,
+        output,
+        modes,
+        preferred_mode: listed.preferred,
+        size_mm: (mm_w as i32, mm_h as i32),
+        size,
+        loc: (0, 0),
+        scale: 1.0,
+        transform: 0,
+        enabled: true,
+        mirror_of: None,
+        rollback_mode: None,
+        rollback_color_mode: None,
+        awaiting_configuration_commit: false,
+        mode_reverted: false,
+        pending: false,
+        last_frame: None,
+        damage_tracker: None,
+        wake_trace: false,
+        color,
+        edid,
+        connector_color,
+        color_mode: crate::display_config::ColorMode::Default,
+        hdr_buffer,
+        white_point: Default::default(),
+        privacy,
+        tint_fallback: false,
+    }))
 }
 
 /// Hardware session state.
@@ -270,6 +537,7 @@ pub struct DrmBackend {
     pub drm: DrmDevice,
     /// GLES renderer on the device's EGL display.
     pub renderer: GlesRenderer,
+    gbm: GbmDevice<DrmDeviceFd>,
     /// Lit outputs, primary first.
     pub outputs: Vec<DrmOutput>,
     /// libinput context, suspended while the session is paused.
@@ -300,16 +568,14 @@ pub struct DrmBackend {
     /// Bumped by every applied layout, reverted mode or connector
     /// hotplug (#340).
     layout_generation: u64,
+    rollback_layout: Option<Vec<crate::display_config::OutputLayout>>,
+    connectors_changed: bool,
     /// Mutter's privacy screen policy (#356).
     privacy: crate::privacy_screen::PrivacyScreens,
     /// A setting read that arrived off-seat, applied on activation.
     privacy_read_pending: Option<bool>,
     /// A setting write the runtime owes GSettings (the hotkey).
     privacy_write: Option<bool>,
-    /// What lighting a newly connected connector needs (hotplug).
-    gbm: GbmDevice<DrmDeviceFd>,
-    render_formats: smithay::backend::allocator::format::FormatSet,
-    native_device: Option<u64>,
 }
 
 /// Connectors a hotplug rescan found connected or gone, by name.
@@ -405,6 +671,7 @@ fn startup_connectors(outputs: &[DrmOutput]) -> Vec<crate::display_config::Start
             name: o.name.clone(),
             modes: o.modes.iter().map(|(spec, _)| *spec).collect(),
             preferred: o.preferred_mode,
+            supported_color_modes: o.supported_color_modes().to_vec(),
         })
         .collect()
 }
@@ -417,144 +684,6 @@ pub fn fallback_scale() -> f64 {
         .and_then(|v| v.parse::<f64>().ok())
         .map(crate::runtime::clamp_scale)
         .unwrap_or(1.0)
-}
-
-/// What lighting a connector needs from the device: at startup and on
-/// hotplug.
-struct Lighting<'a> {
-    gbm: &'a GbmDevice<DrmDeviceFd>,
-    render_formats: &'a smithay::backend::allocator::format::FormatSet,
-    native_device: Option<u64>,
-    resources: &'a control::ResourceHandles,
-}
-
-impl Lighting<'_> {
-    /// Light one connected connector at its preferred mode on a CRTC
-    /// not in `used`: Mutter's monitor modes, a GBM swapchain and the
-    /// wl_output it will be advertised as. `None` when it cannot be lit
-    /// (the reason is logged).
-    fn open(
-        &self,
-        drm: &mut DrmDevice,
-        handle: connector::Handle,
-        info: &connector::Info,
-        used: &[crtc::Handle],
-    ) -> Option<DrmOutput> {
-        // Mutter's monitor modes (#340): every connector mode,
-        // deduplicated and sorted; the output starts in the preferred
-        // one.
-        let crtc_modes: Vec<crate::display_config::CrtcMode> = info
-            .modes()
-            .iter()
-            .map(|m| crate::display_config::CrtcMode {
-                spec: mode_spec(m),
-                flags: m.flags().bits(),
-            })
-            .collect();
-        let kernel_preferred = info
-            .modes()
-            .iter()
-            .position(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED));
-        let listed = crate::display_config::monitor_modes(&crtc_modes, kernel_preferred)?;
-        let modes: Vec<(crate::display_config::ModeSpec, control::Mode)> = listed
-            .modes
-            .iter()
-            .map(|&i| (crtc_modes[i].spec, info.modes()[i]))
-            .collect();
-        let preferred_mode = listed.preferred;
-        let mode = modes[preferred_mode].1;
-        let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
-        let Some(crtc) = info
-            .encoders()
-            .iter()
-            .filter_map(|enc| drm.get_encoder(*enc).ok())
-            .flat_map(|enc| self.resources.filter_crtcs(enc.possible_crtcs()))
-            .find(|crtc| !used.contains(crtc))
-        else {
-            eprintln!("tuna-compositor: drm: skip connector {name}: no free CRTC");
-            return None;
-        };
-        let surface = match drm.create_surface(crtc, mode, &[handle]) {
-            Ok(surface) => surface,
-            Err(e) => {
-                eprintln!("tuna-compositor: drm: skip connector {name}: {e}");
-                return None;
-            }
-        };
-        let allocator = GbmAllocator::new(
-            self.gbm.clone(),
-            GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
-        );
-        let surface = match GbmBufferedSurface::new(
-            surface,
-            allocator,
-            &[Fourcc::Argb8888, Fourcc::Xrgb8888],
-            self.render_formats.iter().copied(),
-        ) {
-            Ok(surface) => surface,
-            Err(e) => {
-                eprintln!("tuna-compositor: drm: skip connector {name}: {e}");
-                return None;
-            }
-        };
-        // A ramp or matrix a previous owner left must not stay.
-        let mut color = color::CrtcColor::new(drm, crtc);
-        color.reset(drm);
-        let edid = color::connector_edid(drm, handle);
-        let privacy = privacy::discover(drm, handle);
-        let (w, h) = mode.size();
-        let size: Size<i32, Physical> = (i32::from(w), i32::from(h)).into();
-        let (mm_w, mm_h) = info.size().unwrap_or((0, 0));
-        let output = Output::new(
-            name.clone(),
-            PhysicalProperties {
-                size: (mm_w as i32, mm_h as i32).into(),
-                subpixel: Subpixel::Unknown,
-                make: "Tuna Desktop".to_owned(),
-                model: name.clone(),
-            },
-        );
-        let out_mode = Mode::from(mode);
-        output.change_current_state(Some(out_mode), None, None, None);
-        output.set_preferred(out_mode);
-        let native_owner = self.native_device.and_then(|device| {
-            crate::native_output::resolve(
-                std::path::Path::new("/sys"),
-                device,
-                &name,
-                u32::from(handle),
-            )
-            .ok()
-        });
-        Some(DrmOutput {
-            name,
-            crtc,
-            connector: handle,
-            native_owner,
-            surface,
-            output,
-            modes,
-            preferred_mode,
-            size_mm: (mm_w as i32, mm_h as i32),
-            size,
-            loc: (0, 0),
-            scale: 1.0,
-            transform: 0,
-            enabled: true,
-            mirror_of: None,
-            rollback_mode: None,
-            mode_reverted: false,
-            pending: false,
-            last_frame: None,
-            damage_tracker: None,
-            wake_trace: false,
-            color,
-            edid,
-            white_point: Default::default(),
-            privacy,
-            tint_fallback: false,
-        })
-    }
 }
 
 impl DrmBackend {
@@ -613,35 +742,23 @@ impl DrmBackend {
         let egl = unsafe { EGLDisplay::new(gbm.clone()) }
             .map_err(|e| err("egl display")(e.to_string()))?;
         let context = EGLContext::new(&egl).map_err(|e| err("egl context")(e.to_string()))?;
-        let render_formats = context.dmabuf_render_formats().clone();
         // SAFETY: the context is current on this thread only.
-        let renderer =
+        let mut renderer =
             unsafe { GlesRenderer::new(context) }.map_err(|e| err("gles")(e.to_string()))?;
 
         let resources = drm
             .resource_handles()
             .map_err(|e| err("drm resources")(e.to_string()))?;
-        use std::os::fd::AsFd;
-        let native_device = crate::native_output::device(drm.device_fd().as_fd())
-            .ok()
-            .filter(|device| *device == drm.device_id());
-        let mut outputs: Vec<DrmOutput> = Vec::new();
+        let mut used: Vec<crtc::Handle> = Vec::new();
+        let mut outputs = Vec::new();
         for handle in resources.connectors() {
-            let Ok(info) = drm.get_connector(*handle, false) else {
-                continue;
-            };
-            if info.state() != connector::State::Connected {
-                continue;
-            }
-            let used: Vec<crtc::Handle> = outputs.iter().map(|o| o.crtc).collect();
-            let lighting = Lighting {
-                gbm: &gbm,
-                render_formats: &render_formats,
-                native_device,
-                resources: &resources,
-            };
-            if let Some(out) = lighting.open(&mut drm, *handle, &info, &used) {
-                outputs.push(out);
+            match discover_output(&mut drm, &gbm, &mut renderer, &resources, *handle, &used) {
+                Ok(Some(output)) => {
+                    used.push(output.crtc);
+                    outputs.push(output);
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!("tuna-compositor: drm: skip connector: {error}"),
             }
         }
         if outputs.is_empty() {
@@ -669,6 +786,7 @@ impl DrmBackend {
             session,
             drm,
             renderer,
+            gbm,
             outputs,
             libinput,
             active: true,
@@ -688,12 +806,11 @@ impl DrmBackend {
             hot_corner_active: true,
             relative_motion_events: 0,
             layout_generation: 0,
+            rollback_layout: None,
+            connectors_changed: false,
             privacy: Default::default(),
             privacy_read_pending: None,
             privacy_write: None,
-            gbm,
-            render_formats,
-            native_device,
         };
         if let Err(error) = backend.apply_layout(&layouts) {
             // A stored mode the kernel refused: Mutter falls back to its
@@ -776,13 +893,9 @@ impl DrmBackend {
         startup_connectors(&self.outputs)
     }
 
-    /// Connector hotplug (Mutter's `meta_kms_update_states_sync` after
-    /// udev's change event): every connector is probed again; outputs
-    /// whose connector went away are dropped (queued frames discarded,
-    /// their CRTC switched off and free again) and newly connected
-    /// connectors are lit at their preferred mode. The runtime then
-    /// configures the new monitor set. Nothing is probed off-seat:
-    /// activation rescans.
+    /// Reprobe every connector on-seat, using the same EDID, format and
+    /// renderer admission as startup. Replaced sinks cannot retain a cached
+    /// HDR capability. Runtime owns the stored/current/previous layout policy.
     pub fn rescan_connectors(&mut self) -> ConnectorChanges {
         let mut changes = ConnectorChanges::default();
         if !self.active || !self.drm.is_active() {
@@ -795,45 +908,62 @@ impl DrmBackend {
                 return changes;
             }
         };
-        let mut index = 0;
-        while index < self.outputs.len() {
+        let mut protocol_outputs = Vec::new();
+        self.outputs.retain_mut(|out| {
             let connected = self
                 .drm
-                .get_connector(self.outputs[index].connector, true)
+                .get_connector(out.connector, true)
                 .is_ok_and(|info| info.state() == connector::State::Connected);
-            if connected {
-                index += 1;
-                continue;
+            let edid = connected
+                .then(|| color::connector_edid(&self.drm, out.connector))
+                .flatten();
+            let caps =
+                color::ConnectorColor::discover(&self.drm, out.connector, edid.as_deref()).caps;
+            if !connected || out.edid != edid || out.connector_color.caps != caps {
+                if connected {
+                    protocol_outputs.push((out.connector, out.output.clone()));
+                }
+                for mut feedback in out.surface.discard_pending_frames() {
+                    feedback.discarded();
+                }
+                out.switch_off();
+                changes.removed.push(out.name.clone());
+                false
+            } else {
+                true
             }
-            let mut gone = self.outputs.remove(index);
-            for mut feedback in gone.surface.discard_pending_frames() {
-                feedback.discarded();
-            }
-            changes.removed.push(gone.name.clone());
-        }
+        });
+        let mut used: Vec<_> = self.outputs.iter().map(|out| out.crtc).collect();
         for handle in resources.connectors() {
-            if self.outputs.iter().any(|o| o.connector == *handle) {
+            if self.outputs.iter().any(|out| out.connector == *handle) {
                 continue;
             }
-            let Ok(info) = self.drm.get_connector(*handle, true) else {
-                continue;
-            };
-            if info.state() != connector::State::Connected {
-                continue;
-            }
-            let used: Vec<crtc::Handle> = self.outputs.iter().map(|o| o.crtc).collect();
-            let lighting = Lighting {
-                gbm: &self.gbm,
-                render_formats: &self.render_formats,
-                native_device: self.native_device,
-                resources: &resources,
-            };
-            if let Some(out) = lighting.open(&mut self.drm, *handle, &info, &used) {
-                changes.added.push(out.name.clone());
-                self.outputs.push(out);
+            match discover_output(
+                &mut self.drm,
+                &self.gbm,
+                &mut self.renderer,
+                &resources,
+                *handle,
+                &used,
+            ) {
+                Ok(Some(mut output)) => {
+                    if let Some((_, protocol)) = protocol_outputs
+                        .iter()
+                        .find(|(connector, _)| connector == handle)
+                    {
+                        output.output = protocol.clone();
+                    }
+                    used.push(output.crtc);
+                    changes.added.push(output.name.clone());
+                    self.outputs.push(output);
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!("tuna-compositor: drm: hotplug connector: {error}"),
             }
         }
         if !changes.is_empty() {
+            self.rollback_layout = None;
+            self.connectors_changed = true;
             self.layout_generation += 1;
         }
         changes
@@ -853,6 +983,7 @@ impl DrmBackend {
         layouts: &[crate::display_config::OutputLayout],
     ) -> Result<(), String> {
         let mut plan = Vec::with_capacity(layouts.len());
+        let mut prepared_hdr = Vec::new();
         for layout in layouts {
             let index = self
                 .outputs
@@ -863,6 +994,12 @@ impl DrmBackend {
                 None => None,
                 Some(enabled) => {
                     let out = &self.outputs[index];
+                    if !out.supported_color_modes().contains(&enabled.color_mode) {
+                        return Err(format!(
+                            "{}: color mode {} is unsupported by the native pipeline",
+                            out.name, enabled.color_mode as u32
+                        ));
+                    }
                     let mode = match enabled.mode {
                         None => out.surface.pending_mode(),
                         Some(spec) => out
@@ -874,6 +1011,19 @@ impl DrmBackend {
                                 format!("mode {} not available on {}", spec.id(), out.name)
                             })?,
                     };
+                    let (w, h) = mode.size();
+                    let size = (i32::from(w), i32::from(h)).into();
+                    if enabled.color_mode == crate::display_config::ColorMode::Bt2100
+                        && !out
+                            .hdr_buffer
+                            .as_ref()
+                            .is_some_and(|buffer| buffer.fits(size))
+                    {
+                        prepared_hdr.push((
+                            index,
+                            crate::color_output::HdrBuffer::new(&mut self.renderer, size)?,
+                        ));
+                    }
                     Some((enabled, mode))
                 }
             };
@@ -882,35 +1032,54 @@ impl DrmBackend {
         if plan.iter().all(|(_, target)| target.is_none()) {
             return Err("at least one output must stay on".into());
         }
-        // Test phase: nothing visible changes yet.
-        let mut tested: Vec<(usize, control::Mode)> = Vec::new();
+        let previous = crate::display_config::output_layouts(&self.display_state().live_config());
+        // Nothing visible changes during preflight. Test connector metadata,
+        // colorspace, bit depth, mode and the real negotiated framebuffer in
+        // one atomic request, then undo every staged change on any refusal.
+        let mut tested = Vec::new();
         for (index, target) in &plan {
-            let Some((_, mode)) = target else {
+            let Some((enabled, mode)) = target else {
                 continue;
             };
-            let result = {
-                let out = &mut self.outputs[*index];
-                let old = out.surface.pending_mode();
-                if old == *mode && out.enabled {
-                    continue;
-                }
-                out.surface.use_mode(*mode).map(|()| old).map_err(|error| {
-                    format!(
-                        "{}: the kernel refused {}: {error}",
-                        out.name,
-                        mode_spec(mode).id()
-                    )
+            let out = &mut self.outputs[*index];
+            let old = out.surface.pending_mode();
+            let old_color = out.color_mode;
+            tested.push((*index, old, old_color));
+            let result = out
+                .stage_color_mode(enabled.color_mode)
+                .and_then(|()| {
+                    out.surface
+                        .use_mode(*mode)
+                        .map_err(|error| error.to_string())
                 })
-            };
-            match result {
-                Ok(old) => tested.push((*index, old)),
-                Err(message) => {
-                    for (index, old) in tested.into_iter().rev() {
-                        let _ = self.outputs[index].surface.use_mode(old);
+                .and_then(|()| {
+                    out.surface
+                        .test_next_buffer()
+                        .map_err(|error| error.to_string())
+                });
+            if let Err(error) = result {
+                for (index, old, old_color) in tested.into_iter().rev() {
+                    let output = &mut self.outputs[index];
+                    if let Err(rollback_error) = output.stage_color_mode(old_color).and_then(|()| {
+                        output
+                            .surface
+                            .use_mode(old)
+                            .map_err(|error| error.to_string())
+                    }) {
+                        eprintln!("tuna-compositor: drm: {}: rolling back tested configuration failed: {rollback_error}", output.name);
                     }
-                    return Err(message);
                 }
+                return Err(format!(
+                    "{}: native configuration refused: {error}",
+                    self.outputs[*index].name
+                ));
             }
+        }
+        if self.rollback_layout.is_none() {
+            self.rollback_layout = Some(previous);
+        }
+        for (index, buffer) in prepared_hdr {
+            self.outputs[index].hdr_buffer = Some(buffer);
         }
         // Commit phase.
         for (index, target) in plan {
@@ -919,17 +1088,15 @@ impl DrmBackend {
                 out.switch_off();
                 continue;
             };
-            let replaced = tested
-                .iter()
-                .find(|(i, _)| *i == index)
-                .map(|(_, old)| *old);
+            let replaced = tested.iter().find(|(i, _, _)| *i == index);
+            out.rollback_mode = replaced.map(|(_, mode, _)| *mode);
+            out.rollback_color_mode = replaced.map(|(_, _, color)| *color);
+            out.awaiting_configuration_commit = true;
             if !out.enabled {
                 out.surface.reset_buffers();
                 out.pending = false;
-                out.rollback_mode = None;
-            } else if replaced.is_some() {
-                out.rollback_mode = replaced;
             }
+            out.color_mode = layout.color_mode;
             out.enabled = true;
             out.mirror_of = layout.mirror_of.clone();
             let (w, h) = mode.size();
@@ -989,9 +1156,33 @@ impl DrmBackend {
             reverted |= std::mem::take(&mut out.mode_reverted);
         }
         if reverted {
+            if let Some(previous) = self.rollback_layout.take() {
+                if let Err(error) = self.apply_layout(&previous) {
+                    eprintln!(
+                        "tuna-compositor: drm: restoring display configuration failed: {error}"
+                    );
+                }
+                self.rollback_layout = None;
+            }
             self.layout_generation += 1;
+        } else if self
+            .outputs
+            .iter()
+            .all(|out| !out.awaiting_configuration_commit)
+        {
+            self.rollback_layout = None;
         }
         reverted
+    }
+
+    pub fn configuration_pending(&self) -> bool {
+        self.outputs
+            .iter()
+            .any(|out| out.awaiting_configuration_commit || out.mode_reverted)
+    }
+
+    pub fn take_connectors_changed(&mut self) -> bool {
+        std::mem::take(&mut self.connectors_changed)
     }
 
     /// Whether KMS properties can be programmed now (on-seat).
@@ -1118,6 +1309,8 @@ impl DrmBackend {
                     modes: out.modes.iter().map(|(spec, _)| *spec).collect(),
                     preferred: out.preferred_mode,
                     current: out.enabled.then(|| out.current_mode_index()).flatten(),
+                    color_mode: out.color_mode,
+                    supported_color_modes: out.supported_color_modes().to_vec(),
                     privacy_screen: out.privacy.state(),
                 }
             })
@@ -1230,6 +1423,23 @@ impl DrmBackend {
             .any(|o| o.name == output && o.tint_fallback)
     }
 
+    /// Only admitted native output encodings, for protocol descriptions.
+    pub fn output_colour_states(&self) -> Vec<(String, crate::color_state::Params)> {
+        self.outputs
+            .iter()
+            .map(|out| {
+                (
+                    out.name.clone(),
+                    if out.color_mode == crate::display_config::ColorMode::Bt2100 {
+                        crate::color_state::hdr_output_params()
+                    } else {
+                        crate::color_state::output_params()
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// The CRTC colour state as the kernel reports it, for the state
     /// file the DRM smoke proof reads (GAMMA_LUT readback).
     pub fn color_state(&self) -> Vec<serde_json::Value> {
@@ -1245,6 +1455,14 @@ impl DrmBackend {
                     "ctm": caps.ctm,
                     "edid_md5": out.edid.as_deref().map(crate::edid::md5_hex),
                     "tint_fallback": out.tint_fallback,
+                    "color_mode": out.color_mode as u32,
+                    "supported_color_modes": out.supported_color_modes().iter().map(|mode| *mode as u32).collect::<Vec<_>>(),
+                    "scanout_format": format!("{:?}", out.surface.format()),
+                    "fp16_composition": out.color_mode == crate::display_config::ColorMode::Bt2100 && out.hdr_buffer.is_some(),
+                    "connector_encoding": out.connector_color.readback(&self.drm),
+                    "sink_bt2020_rgb": out.connector_color.caps.edid.bt2020_rgb,
+                    "sink_pq": out.connector_color.caps.edid.pq,
+                    "sink_static_metadata_type1": out.connector_color.caps.edid.static_metadata_type1,
                     "gamma_lut": lut.map(|l| serde_json::json!({
                         "red": l.red, "green": l.green, "blue": l.blue,
                     })),
@@ -1306,6 +1524,17 @@ impl DrmBackend {
                     eprintln!("tuna-compositor: drm: activate failed: {e}");
                 }
                 for out in &mut self.outputs {
+                    // Another VT owner may have changed connector encoding
+                    // without changing EDID/capabilities. Re-read current KMS
+                    // state so the retained pending HDR properties are dirty
+                    // and are committed again with the next framebuffer.
+                    if let Err(error) = out.surface.surface().reset_state() {
+                        eprintln!(
+                            "tuna-compositor: drm: {}: restoring scanout state failed: {error}",
+                            out.name
+                        );
+                        self.wake_scanout_blocked = true;
+                    }
                     out.surface.reset_buffers();
                     out.pending = false;
                     out.last_frame = None;
@@ -1908,5 +2137,65 @@ mod tests {
         // Far left: onto the left edge of the first output.
         let left = clamp_to_outputs((-50.0, 10.0).into(), &outputs);
         assert_eq!(left, (0.0, 10.0).into());
+    }
+    #[test]
+    fn unusable_ten_bit_candidate_is_released_before_sdr_replacement() {
+        use std::cell::Cell;
+        struct Target<'a>(&'a Cell<usize>, bool);
+        impl Drop for Target<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let dropped = Cell::new(0);
+        let mut attempts = Vec::new();
+        let target = negotiate_renderable_scanout(true, |ten_bit| {
+            attempts.push(ten_bit);
+            if !ten_bit {
+                assert_eq!(
+                    dropped.get(),
+                    1,
+                    "old CRTC/plane claim must already be released"
+                );
+            }
+            let candidate = Target(&dropped, ten_bit);
+            if ten_bit {
+                Err("negotiated framebuffer cannot be rendered".to_owned())
+            } else {
+                Ok(candidate)
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, [true, false]);
+        assert!(
+            !target.1,
+            "the returned surface must actually be the SDR replacement"
+        );
+        drop(target);
+        assert_eq!(dropped.get(), 2);
+    }
+
+    #[test]
+    fn renderable_ten_bit_needs_no_fallback_and_failed_sdr_is_not_admitted() {
+        let mut attempts = Vec::new();
+        let target = negotiate_renderable_scanout(true, |ten_bit| {
+            attempts.push(ten_bit);
+            Ok(ten_bit)
+        })
+        .unwrap();
+        assert!(target);
+        assert_eq!(attempts, [true]);
+        let mut attempts = Vec::new();
+        let result = negotiate_renderable_scanout::<()>(true, |ten_bit| {
+            attempts.push(ten_bit);
+            Err(if ten_bit {
+                "ten-bit probe"
+            } else {
+                "SDR probe"
+            }
+            .to_owned())
+        });
+        assert_eq!(result, Err("SDR probe".to_owned()));
+        assert_eq!(attempts, [true, false]);
     }
 }
