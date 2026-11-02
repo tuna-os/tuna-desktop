@@ -177,7 +177,7 @@ def _user_bus(context, method, name, signature):
 
 
 def _gsd(context):
-    from guest import process
+    from native_session import process
     output = _command(context, ['systemctl', '--user', 'show', UNIT,
                                '--property=Id,LoadState,ActiveState,MainPID,FragmentPath'],
                       user=True).stdout
@@ -209,7 +209,7 @@ def _gsd(context):
 
 
 def _digest(path):
-    from guest import digest
+    from native_session import digest
     return digest(path)
 
 
@@ -308,7 +308,7 @@ def _sources(context):
 
 
 def _mapped_libraries(context, gsd):
-    from guest import process
+    from native_session import process
     before = process(gsd['pid'], context.uid)
     if before != {key: gsd[key] for key in before}:
         raise RuntimeError('datetime process changed before mapped-library observation')

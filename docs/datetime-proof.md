@@ -64,6 +64,16 @@ qualify automatic timezone or close #359: a current-build admitted image must
 actually run them, and retain its package, boot, original GDM user, service,
 input and screenshot receipts.
 
+`core_apps_autotz.run_native(qmp, agent_factory, out, metadata, nonce=...)`
+is the independent current-build native consumer. It uses shared
+`vm_native_desktop.NativeDesktop` bounded QGA transport and the installed
+`tuna-native-session/{native_session,autotz_guest}.py` original-session
+identity/AT-SPI primitives. It does not import or inventory the 28 applications,
+wait for their success, launch a substitute desktop, or change the account's
+role. The separate typed lifecycle action is `autotz DOMAIN OPERATION JSON`;
+the shared router owns its image/member admission and `V-AUTOTZ` result.
+Actual original-user policy failures remain failures, not root positives.
+
 The source is GeoClue's **named New York static-location emulation, not GPS**:
 its documented `static-source` reads latitude, longitude, altitude and accuracy
 from `/etc/geolocation`. See the upstream
