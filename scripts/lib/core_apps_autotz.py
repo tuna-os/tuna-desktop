@@ -20,6 +20,7 @@ NEGATIVE_SECONDS = 10
 LOCATION_SECONDS = 30
 PANEL_SECONDS = 10
 CLOCK_TOLERANCE_SECONDS = 120
+MONITOR_SECONDS = 45
 
 
 def require(condition, message):
@@ -66,13 +67,41 @@ def location_distance(latitude, longitude):
     return 6371000 * 2 * math.asin(math.sqrt(min(1, max(0, haversine))))
 
 
+def live_interval(observed):
+    """Passive history is positive evidence only inside its original live interval."""
+    monitor = observed.get("monitor") or {}
+    if monitor.get("ready") is not True or monitor.get("live") is not True:
+        return None
+    interval = observed.get("geoclue", {}).get("interval_observation") or {}
+    if (interval.get("source") != "passive-original-gsd-system-bus"
+            or interval.get("semantics") != "observed-within-interval-not-current-properties"):
+        return None
+    liveness = monitor.get("liveness") or {}
+    values = [interval.get(key) for key in ("started_monotonic", "acknowledged_monotonic",
+                                           "observed_through_monotonic", "deadline_monotonic")]
+    checked = liveness.get("checked_monotonic")
+    if any(type(value) not in (int, float) or not math.isfinite(value)
+           for value in (*values, checked)):
+        return None
+    started, acknowledged, through, deadline = values
+    if (liveness.get("started_monotonic") != started or liveness.get("deadline_monotonic") != deadline
+            or not started <= acknowledged <= through <= checked < deadline
+            or not 0 < deadline - started <= MONITOR_SECONDS - 1):
+        return None
+    return interval
+
+
 def datetime_location(observed):
-    """Admit the real daemon's client, not another app's GeoClue client."""
+    """Admit the daemon's actual interval, never another or stale private client."""
+    interval = live_interval(observed)
+    if interval is None:
+        return []
     matches = []
-    for client in observed.get("geoclue", {}).get("clients", []):
+    for client in interval.get("clients", []):
         if (client.get("desktop_id") != "gnome-datetime-panel"
                 or client.get("active") is not True
                 or client.get("evidence_source") != "passive-original-gsd-system-bus"
+                or client.get("observation_semantics") != "observed-within-interval-not-current-properties"
                 or client.get("owner_pid") != observed.get("gsd", {}).get("pid")
                 or client.get("owner_uid") != observed.get("gsd", {}).get("uid")
                 or not isinstance(client.get("owner_bus_name"), str)
@@ -99,18 +128,38 @@ def datetime_location(observed):
 
 
 def daemon_timezone_call(observed, original):
+    interval = live_interval(observed)
+    if interval is None:
+        return []
     return [call for call in observed.get("timezone_calls", [])
             if call.get("zone") == AUTOMATIC_ZONE
             and call.get("interactive") is True
             and isinstance(call.get("sender"), str)
             and call["sender"].startswith(":")
             and call.get("sender_pid") == original.get("pid")
-            and call.get("sender_uid") == original.get("uid")]
+            and call.get("sender_uid") == original.get("uid")
+            and type(call.get("monotonic")) in (int, float)
+            and interval["started_monotonic"] <= call["monotonic"]
+            <= interval["observed_through_monotonic"]]
+
+
+def registered_original_agent(observed):
+    registration = observed.get("location_agent_registration") or {}
+    exported = registration.get("original_shell_agent_export") or {}
+    shell = observed.get("identity", {}).get("shell", {})
+    return (registration.get("registered") is True
+            and registration.get("registration_success_inferred_from_error_absence") is False
+            and type(shell.get("pid")) is int and shell["pid"] > 1
+            and exported.get("pid") == shell["pid"]
+            and exported.get("uid") == shell.get("uid") == observed.get("gsd", {}).get("uid")
+            and isinstance(exported.get("unique_owner"), str)
+            and exported["unique_owner"].startswith(":"))
 
 
 def positive_ready(observed, original):
     return (observed.get("settings") == {"master": True, "automatic": True}
             and same_service(observed.get("gsd", {}), original)
+            and registered_original_agent(observed)
             and local_zone(observed, AUTOMATIC_ZONE)
             and bool(datetime_location(observed))
             and bool(daemon_timezone_call(observed, original)))

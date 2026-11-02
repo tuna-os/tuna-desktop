@@ -74,12 +74,29 @@ service state, and restores them afterward. It never changes an application
 authorization or agent whitelist. Maps/Weather reuse the same typed fixture
 operations; the stage does not create a fake provider or private service bus.
 
+The normal image, not this fixture, must admit the real `tuna-shell` agent.
+The packaged `tuna-geoclue-agent-policy` image-construction helper checks the
+native package database's original vendor-config checksum, retains its complete
+agent list and adds Tuna in an early fragment. It leaves later administrator
+overrides and every application grant untouched, refusing changed administrator
+main policy or an effective whitelist that still excludes Tuna. GeoClue
+whitelists replace rather than append, so a Tuna-only replacement is incorrect.
+The stage retains the actual original shell's successful `AddAgent` completion
+record and its exported Agent object's bus PID/UID; an absence of errors is
+not registration proof. This package/production hook still requires normal
+qualified-source intake; the old beta.2 archive contains no such helper.
+
 The observer requires the session's genuine packaged `gsd-datetime` and
-GeoClue. GNOME 51 `gsd-timezone-monitor.c` obtains a city-level GeoClue location,
-then performs real reverse geocoding before it calls timedate1. That external
-service must therefore be reachable too: a location file alone is not proof
-that a zone was applied, and an unavailable reverse lookup is a failure, not a
-hardware waiver.
+GeoClue. [GNOME 51.1's actual timezone consumer](https://github.com/GNOME/gnome-settings-daemon/blob/51.1/plugins/datetime/gsd-timezone-monitor.c)
+obtains a city-level GeoClue location, then performs real reverse geocoding
+before it calls timedate1. The
+[GeocodeNominatim GNOME backend](https://github.com/GNOME/geocode-glib/blob/master/geocode-glib/geocode-nominatim.c)
+uses `https://nominatim.gnome.org`; the observer identifies that default in the
+original daemon's mapped packaged ELF without redirecting it. This backend
+identity is not network or application proof. The real provider must be
+reachable and the daemon's actual outcome must follow: a location file alone
+cannot prove that a zone was applied. An unavailable lookup is a failure,
+not a hardware waiver.
 
 The ordinary original user seeds `Pacific/Auckland` only as a manual negative
 control. Automatic timezone with the location master off, and the location
