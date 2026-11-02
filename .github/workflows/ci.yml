@@ -1658,10 +1658,8 @@ jobs:
           Path('/mnt/vm/base-digest').write_text(entries[0]['digest'] + '\n')
           PY
           platform="ghcr.io/tuna-os/marlin@$(cat /mnt/vm/base-digest)"
-          cosign verify "$platform" \
-            --certificate-identity "https://github.com/tuna-os/tunaOS/.github/workflows/reusable-build-image.yml@refs/heads/main" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            > vm-lane-artifacts/native-base/platform-cosign.json
+          python3 scripts/lib/vm_gnome_reference.py verify-platform \
+            --platform-digest "$(cat /mnt/vm/base-digest)" --out vm-lane-artifacts/native-base
           sudo podman pull --platform linux/amd64 "$platform"
       - name: Build the Marlin Tuna Desktop image and the VM test layer
         if: matrix.profile == 'lifecycle'

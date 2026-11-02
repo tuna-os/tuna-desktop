@@ -83,7 +83,14 @@ Canonical receipts live separately under
 `docs/walkthrough/media-manifests/{gtk-walkthrough,vm-tour,overview-demo}.json`.
 They retain successful producer outcomes, actual source/run/attempt,
 original evidence hashes and exact output hashes. The VM receipt additionally
-retains verified OCI index/platform evidence and video hash/inspection.
+retains the raw OCI index, modern cosign platform output and
+`native-base/platform-verification.json`, plus video hash/inspection. The
+process witness binds the resolved immutable linux/amd64 digest to the actual
+pinned native cosign 3.1.4 executable/version/hash, exact certificate-identity
+and issuer argv, successful integer-zero exit, command bounds, stdout hash/size
+and stderr. Intake revalidates these retained bytes with the shared verifier;
+it does not perform another crypto verification or infer certificate claims
+from optional payload fields (which can be empty).
 The original tour video remains in the exact-run artifact, not an invented
 checked-in video destination.
 

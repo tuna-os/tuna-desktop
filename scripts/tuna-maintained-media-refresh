@@ -104,7 +104,8 @@ def download_artifacts(run_id, attempt, output, mapping):
         'gtk-shell': ({name for name, _ in mapping['gtk-walkthrough']}
                       | {'assertions.txt', 'media-source.json', 'media-capture.json', 'media-receipt.json'}),
         'marlin-vm': {'manifest.json', 'repeat-manifest.json', 'strip-image.json', 'media-source.json',
-                      'media-receipt.json', 'native-base/index.json', 'native-base/platform-cosign.json'},
+                      'media-receipt.json', 'native-base/index.json', 'native-base/platform-cosign.json',
+                      'native-base/platform-verification.json'},
         'tuna-tour': ({name.removeprefix('tour/') for name, _ in mapping['vm-tour']}
                       | {'tuna-tour.webm', 'capture-timing.json'}),
         'overview-demo': ({name for name, _ in mapping['overview-demo']}

@@ -23,6 +23,7 @@ SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 refresh = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(refresh)
 import maintained_media
+from vm_gnome_reference import cosign_argv
 
 
 def git(root, *arguments):
@@ -115,12 +116,30 @@ class Tests(unittest.TestCase):
         member_name = mapping['gtk-walkthrough'][0][0]
         image = io.BytesIO()
         Image.new('RGB', (8, 8), '#3584e4').save(image, format='PNG')
+        # Controlled modern output/process bytes for ZIP retention only, not
+        # an actual successful verifier or native-image qualification.
+        platform_digest = 'sha256:' + '5' * 64
+        cosign = json.dumps([{
+            'critical': {'image': {'docker-manifest-digest': platform_digest},
+                         'identity': {'docker-reference': maintained_media.BASE_REPOSITORY + '@' + platform_digest},
+                         'type': 'https://sigstore.dev/cosign/sign/v1'},
+            'optional': {},
+        }]).encode()
+        process = json.dumps({
+            'schema': 1, 'argv': cosign_argv('/usr/bin/cosign', platform_digest), 'exit_code': 0,
+            'begin_host_monotonic_ns': 100, 'end_host_monotonic_ns': 200,
+            'tool': {'executable': '/usr/bin/cosign', 'sha256': 'e' * 64, 'version': 'GitVersion: v3.1.4\n'},
+            'stdout_sha256': hashlib.sha256(cosign).hexdigest(), 'stdout_bytes': len(cosign), 'stderr': '',
+        }).encode()
         archives, members = {}, []
         for identifier, name in enumerate(('gtk-shell', 'marlin-vm', 'tuna-tour', 'overview-demo'), 1):
             stream = io.BytesIO()
             with zipfile.ZipFile(stream, 'w') as output:
                 output.writestr(member_name if name == 'gtk-shell' else 'unselected.txt', image.getvalue())
                 output.writestr('bin/untrusted', b'#!/bin/sh\nexit 0\n')
+                if name == 'marlin-vm':
+                    output.writestr('native-base/platform-cosign.json', cosign)
+                    output.writestr('native-base/platform-verification.json', process)
             archives[identifier] = stream.getvalue()
             members.append({'id': identifier, 'name': name, 'expired': False,
                             'workflow_run': {'id': 10}, 'size_in_bytes': len(archives[identifier]),
@@ -136,6 +155,9 @@ class Tests(unittest.TestCase):
                 self.assertEqual((roots['gtk-shell'] / member_name).read_bytes(), image.getvalue())
                 self.assertEqual(receipts['gtk-shell']['digest'], members[0]['digest'])
                 self.assertFalse((roots['gtk-shell'] / 'bin').exists())
+                self.assertEqual((roots['marlin-vm'] / 'native-base/platform-cosign.json').read_bytes(), cosign)
+                self.assertEqual((roots['marlin-vm'] / 'native-base/platform-verification.json').read_bytes(), process)
+                self.assertFalse((roots['marlin-vm'] / 'bin').exists())
             archives[1] += b'bytes not in the authenticated upload'
             with tempfile.TemporaryDirectory() as scratch:
                 with self.assertRaisesRegex(ValueError, 'differs from upload digest'):

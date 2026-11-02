@@ -27,6 +27,7 @@ import gtk_media_source
 from PIL import Image, ImageDraw
 from overview_recording import FrameRecorder, recording_command, bind_recorded_interval
 from tour_media import TOUR_PUBLIC_CONTROLS
+from vm_gnome_reference import cosign_argv
 
 COMMIT = "1" * 40
 TREE = "2" * 40
@@ -140,14 +141,23 @@ class MediaIntake(unittest.TestCase):
                 index = {"schemaVersion": 2, "manifests": [
                     {"digest": "sha256:" + "5" * 64, "platform": {"os": "linux", "architecture": "amd64"}}]}
                 put_json(artifact / "native-base/index.json", index)
-                # Retained verifier-output parser fixture, NOT a real signature
-                # or cryptographic native-image qualification.
-                put_json(artifact / "native-base/platform-cosign.json", [{
+                # Synthetic modern verifier-output/process parser fixtures,
+                # NOT actual signatures or cryptographic native-image qualification.
+                cosign_path = artifact / "native-base/platform-cosign.json"
+                put_json(cosign_path, [{
                     "critical": {"image": {"docker-manifest-digest": "sha256:" + "5" * 64},
-                                 "identity": {"docker-reference": contract.BASE_REPOSITORY},
-                                 "type": "cosign container image signature"},
-                    "optional": {"Subject": contract.CERTIFICATE_SUBJECT, "Issuer": contract.CERTIFICATE_ISSUER},
+                                 "identity": {"docker-reference": BASE},
+                                 "type": "https://sigstore.dev/cosign/sign/v1"},
+                    "optional": {},
                 }])
+                output = cosign_path.read_bytes()
+                put_json(artifact / "native-base/platform-verification.json", {
+                    "schema": 1, "argv": cosign_argv("/usr/bin/cosign", "sha256:" + "5" * 64),
+                    "exit_code": 0, "begin_host_monotonic_ns": 100, "end_host_monotonic_ns": 200,
+                    "tool": {"executable": "/usr/bin/cosign", "sha256": "e" * 64,
+                             "version": "GitVersion: v3.1.4\n"},
+                    "stdout_sha256": contract.digest(output), "stdout_bytes": len(output), "stderr": "",
+                })
                 source["base"] = {
                     "index": contract.BASE_REPOSITORY + "@sha256:" + contract.digest(
                         (artifact / "native-base/index.json").read_bytes()), "platform": BASE}
@@ -278,6 +288,11 @@ class MediaIntake(unittest.TestCase):
         for kind, artifact in (("gtk-walkthrough", self.gtk), ("vm-tour", self.vm), ("overview-demo", self.overview)):
             for source, target in self.mapping[kind]:
                 self.assertEqual((self.dest / target).read_bytes(), (artifact / source).read_bytes())
+        document = json.loads((self.dest / contract.manifest_name("vm-tour")).read_bytes())
+        self.assertEqual(document["receipt"]["base_verification"]["process"]["file"],
+                         "native-base/platform-verification.json")
+        self.assertEqual(base64.b64decode(document["evidence"]["base_process"]),
+                         (self.vm / "native-base/platform-verification.json").read_bytes())
         self.assertEqual(historical.read_bytes(), b"original immutable diagnostic")
         result = command("tuna-walkthrough", "freshness", "--bundle", "gtk-walkthrough",
                          "--bundle", "vm-tour", "--bundle", "overview-demo", *PINS, *VM_PINS, "--dest", self.dest,
@@ -549,15 +564,85 @@ class MediaIntake(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertFalse(self.dest.exists())
 
-    def test_rehashed_wrong_native_certificate_policy_is_not_verified_evidence(self):
+    def test_rehashed_wrong_native_certificate_constraint_argv_is_not_verified_evidence(self):
+        path = self.vm / "native-base/platform-verification.json"
+        original = path.read_bytes()
+        for flag, wrong in (("--certificate-identity", "https://github.com/untrusted/workflow"),
+                            ("--certificate-oidc-issuer", "https://untrusted.example")):
+            with self.subTest(flag=flag):
+                process = json.loads(original)
+                process["argv"][process["argv"].index(flag) + 1] = wrong
+                put_json(path, process)
+                self.mutate_receipt(self.vm, lambda r: r["base_verification"]["process"].update(
+                    sha256=contract.digest(path.read_bytes())))
+                self.assertEqual(self.intake(self.vm).returncode, 1)
+                self.assertFalse(self.dest.exists())
+
+    def test_native_process_witness_is_required_in_artifact_and_receipt(self):
+        path = self.vm / "native-base/platform-verification.json"
+        self.mutate_receipt(self.vm, lambda r: r["base_verification"].pop("process"))
+        self.assertEqual(self.intake(self.vm).returncode, 1)
+        path.unlink()
+        self.assertEqual(self.intake(self.vm).returncode, 1)
+        self.assertFalse(self.dest.exists())
+
+    def test_rehashed_failed_or_mismatched_native_process_is_rejected(self):
+        path = self.vm / "native-base/platform-verification.json"
+        original = path.read_bytes()
+        mutations = (
+            lambda p: p.update(exit_code=1),
+            lambda p: p.update(exit_code=False),
+            lambda p: p.update(stdout_sha256="f" * 64),
+            lambda p: p.update(stdout_bytes=p["stdout_bytes"] + 1),
+            lambda p: p.update(end_host_monotonic_ns=p["begin_host_monotonic_ns"]),
+            lambda p: p["tool"].update(version="GitVersion: v3.1.3\n"),
+            lambda p: p["tool"].update(sha256="not-a-tool-hash"),
+            lambda p: p["argv"].__setitem__(2, contract.BASE_REPOSITORY + ":gnome"),
+        )
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                process = json.loads(original)
+                mutate(process)
+                put_json(path, process)
+                self.mutate_receipt(self.vm, lambda r: r["base_verification"]["process"].update(
+                    sha256=contract.digest(path.read_bytes())))
+                self.assertEqual(self.intake(self.vm).returncode, 1)
+                self.assertFalse(self.dest.exists())
+
+    def test_rehashed_native_stdout_must_match_actual_process_witness(self):
         path = self.vm / "native-base/platform-cosign.json"
-        signatures = json.loads(path.read_text())
-        signatures[0]["optional"]["Subject"] = "https://github.com/untrusted/workflow"
-        put_json(path, signatures)
+        path.write_bytes(path.read_bytes() + b" ")
         self.mutate_receipt(self.vm, lambda r: r["base_verification"]["platform"].update(
             sha256=contract.digest(path.read_bytes())))
         self.assertEqual(self.intake(self.vm).returncode, 1)
         self.assertFalse(self.dest.exists())
+
+    def test_modern_native_envelope_must_name_the_resolved_platform(self):
+        path = self.vm / "native-base/platform-cosign.json"
+        process_path = self.vm / "native-base/platform-verification.json"
+        original = path.read_bytes()
+        mutations = (
+            lambda s: s["critical"]["image"].update(**{"docker-manifest-digest": "sha256:" + "6" * 64}),
+            lambda s: s["critical"]["identity"].update(
+                **{"docker-reference": contract.BASE_REPOSITORY + "@sha256:" + "6" * 64}),
+            lambda s: s["critical"].update(type="https://untrusted.example/signature"),
+            lambda s: s.update(optional=None),
+        )
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                signatures = json.loads(original)
+                mutate(signatures[0])
+                put_json(path, signatures)
+                output = path.read_bytes()
+                process = json.loads(process_path.read_bytes())
+                process.update(stdout_sha256=contract.digest(output), stdout_bytes=len(output))
+                put_json(process_path, process)
+                self.mutate_receipt(self.vm, lambda r: r["base_verification"]["platform"].update(
+                    sha256=contract.digest(output)))
+                self.mutate_receipt(self.vm, lambda r: r["base_verification"]["process"].update(
+                    sha256=contract.digest(process_path.read_bytes())))
+                self.assertEqual(self.intake(self.vm).returncode, 1)
+                self.assertFalse(self.dest.exists())
 
     def test_actual_raw_native_index_and_independent_platform_pin_are_required(self):
         result = self.intake(self.vm, extra=("--expect-base-platform", contract.BASE_REPOSITORY + "@sha256:" + "a" * 64))
