@@ -4002,14 +4002,23 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
 def native_media_source(out, image, owner):
     """Bind real current-source tour media to its original admitted session."""
     root = os.path.dirname(HERE)
-    from maintained_media import required_source_inputs
+    from maintained_media import git_source, required_source_inputs
+    from vm_strip_image import validate_product_origin
     def git(*arguments):
         return subprocess.check_output(["git", "-C", root, *arguments], text=True, timeout=5).strip()
     head, tree = git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}")
-    if (head != image["commit"] or head != os.environ.get("GITHUB_SHA")
+    if (head != image.get("capture_commit") or head != os.environ.get("GITHUB_SHA")
             or not re.fullmatch("[0-9a-f]{40}", head) or not re.fullmatch("[0-9a-f]{40}", tree)
             or git("diff", "HEAD", "--")):
         raise RuntimeError("tour source/image differs from the actual clean workflow checkout")
+    product = git_source(root, image.get("commit"))
+    if (image.get("built_tree") != product["tree"] or image.get("capture_tree") != tree
+            or image.get("required_source_inputs_sha256") != product["required_source_inputs_sha256"]
+            or required_source_inputs(root) != product["required_source_inputs_sha256"]):
+        raise RuntimeError("actual product and current capture Git source inputs differ")
+    origin = image.get("product_origin")
+    if origin is not None or image["commit"] != head:
+        validate_product_origin(origin, image, root)
     run_id, attempt = os.environ.get("GITHUB_RUN_ID", ""), os.environ.get("GITHUB_RUN_ATTEMPT", "")
     if not all(re.fullmatch("[1-9][0-9]*", value) for value in (run_id, attempt)):
         raise RuntimeError("actual workflow run and attempt required for maintained native media")
@@ -4026,10 +4035,12 @@ def native_media_source(out, image, owner):
     base = {"index": "ghcr.io/tuna-os/marlin@sha256:" + hashlib.sha256(index_bytes).hexdigest(),
             "platform": "ghcr.io/tuna-os/marlin@" + members[0]["digest"]}
     with open(os.path.join(out, "media-source.json"), "x") as stream:
-        json.dump({"merged_commit": head, "built_commit": head, "built_tree": tree,
+        json.dump({"merged_commit": head, "capture_commit": head, "capture_tree": tree,
+                   "built_commit": product["commit"], "built_tree": product["tree"],
+                   "product_origin": origin,
                    "run_id": run_id, "run_attempt": attempt, "environment": "installed-vm",
                    "tracked_source_clean": True, "original_session": owner, "base": base,
-                   "required_source_inputs_sha256": required_source_inputs(root)}, stream, indent=2)
+                   "required_source_inputs_sha256": product["required_source_inputs_sha256"]}, stream, indent=2)
 
 
 def run_wm_reference(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
@@ -4287,6 +4298,12 @@ def main():
         if any(strip_image.get(field) != metadata.get(meta) for field, meta in
                (("commit", "commit"), ("image_id", "test_image_id"), ("base_image", "base_image"))):
             ap.error("strip receipt differs from actual VM image/source metadata")
+        if (strip_image.get("product_origin") is not None or
+                strip_image.get("commit") != strip_image.get("capture_commit")):
+            if strip_image.get("capture_commit") != metadata.get("capture_commit"):
+                ap.error("strip receipt differs from actual current capture metadata")
+            from vm_strip_image import validate_product_origin
+            validate_product_origin(strip_image.get("product_origin"), strip_image, os.path.dirname(HERE))
     if not 1 <= a.boots <= 10:
         ap.error("--boots must be between 1 and 10")
     if a.boots > 1:

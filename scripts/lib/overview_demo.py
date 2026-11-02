@@ -57,6 +57,7 @@ def run(root, out, state_path, window, compositor_pid, binaries):
     if len(shells) != 1:
         raise ValueError('original current-source GTK shell process is absent or ambiguous')
     source = {'merged_commit': commit, 'built_commit': commit, 'built_tree': tree,
+              'capture_commit': commit, 'capture_tree': tree,
               'run_id': run_id, 'run_attempt': attempt, 'environment': 'nested-gtk',
               'tracked_source_clean': True,
               'required_source_inputs_sha256': required_source_inputs(root),

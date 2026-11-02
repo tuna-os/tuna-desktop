@@ -29,12 +29,12 @@ from overview_recording import FrameRecorder, recording_command, bind_recorded_i
 from tour_media import TOUR_PUBLIC_CONTROLS
 from vm_gnome_reference import cosign_argv
 
-COMMIT = "1" * 40
-TREE = "2" * 40
+COMMIT = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
+TREE = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD^{tree}"], text=True).strip()
 IMAGE = "sha256:" + "3" * 64
 PACKAGE = "4" * 64
 BASE = "ghcr.io/tuna-os/marlin@sha256:" + "5" * 64
-SOURCE_INPUTS = "b" * 64
+SOURCE_INPUTS = contract.required_source_inputs(ROOT, COMMIT)
 PINS = ["--run-id", "39123456789", "--attempt", "2", "--expect-merge", COMMIT,
         "--expect-head", COMMIT, "--expect-tree", TREE, "--expect-source-inputs", SOURCE_INPUTS]
 VM_PINS = ["--expect-image", IMAGE, "--expect-package", PACKAGE]
@@ -128,6 +128,7 @@ class MediaIntake(unittest.TestCase):
             artifact = cls.fixtures / kind
             artifact.mkdir()
             source = {"merged_commit": COMMIT, "built_commit": COMMIT, "built_tree": TREE,
+                      "capture_commit": COMMIT, "capture_tree": TREE,
                       "run_id": "39123456789", "run_attempt": "2"}
             source["required_source_inputs_sha256"] = SOURCE_INPUTS
             if kind == "gtk-walkthrough":
@@ -180,6 +181,8 @@ class MediaIntake(unittest.TestCase):
                                 "testsrc2=size=32x32:rate=2", "-t", "1", "-c:v", "libvpx-vp9",
                                 str(artifact / "tour/tuna-tour.webm")], check=True, capture_output=True)
                 put_json(artifact / "strip-image.json", {"schema": 1, "commit": COMMIT, "image_id": IMAGE,
+                         "built_tree": TREE, "capture_commit": COMMIT, "capture_tree": TREE,
+                         "required_source_inputs_sha256": SOURCE_INPUTS,
                          "base_image": BASE, "package_sha256": PACKAGE,
                          "member_sha256": {"usr/bin/tuna-compositor": "6" * 64},
                          "installed_signed_release_qualified": False})
@@ -715,6 +718,137 @@ class RequiredSourceInputs(unittest.TestCase):
         result = command("tuna-docs-shots", "source-inputs", "--source-root", self.repo)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), contract.required_source_inputs(self.repo))
+
+    def product_pair(self):
+        """Real Git lineage with controlled image bytes, not native GUI proof."""
+        from vm_strip_image import admission
+        for name in ("tuna-vm-input", "tuna-vm-lifecycle"):
+            path = self.repo / "packaging/marlin/vm-lane" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(("controlled " + name).encode())
+        self.commit()
+        product = contract.git_source(self.repo, self.git("rev-parse", "HEAD"))
+        package = {"package": {"sha256": PACKAGE, "size": 4096, "device": 1, "inode": 2},
+                   "required_members": {"usr/bin/tuna-compositor": {"sha256": "6" * 64}},
+                   "pkginfo": {"pkgname": "tuna"}, "member_count": 1, "decompressed_bytes": 8192}
+        members = {"/usr/bin/tuna-compositor": "6" * 64}
+        for name in ("tuna-vm-input", "tuna-vm-lifecycle"):
+            members["/usr/libexec/" + name] = contract.digest(
+                (self.repo / "packaging/marlin/vm-lane" / name).read_bytes())
+        observed = {"schema": 1, "image_id": IMAGE, "member_sha256": members}
+        base = "ghcr.io/tuna-os/marlin:gnome@sha256:" + "5" * 64
+        original = admission(package, observed, self.repo, product["commit"], IMAGE, base)
+        raw = json.dumps(original).encode()
+        self.media.write_bytes(png("new capture input excluded from product"))
+        self.commit()
+        capture = contract.git_source(self.repo, self.git("rev-parse", "HEAD"))
+        lineage = {"repository": "tuna-os/tuna-desktop", "workflow_id": 123,
+                   "workflow_path": ".github/workflows/ci.yml", "run_id": 1234, "run_attempt": 1,
+                   "head_sha": product["commit"],
+                   "pointer_artifact": {"id": 1, "name": "native-product-distribution",
+                                        "digest": "sha256:" + "a" * 64},
+                   "data_artifact": {"id": 2, "name": "native-product-DATA-distribution",
+                                     "digest": "sha256:" + "b" * 64},
+                   "provenance": {"sha256": "c" * 64, "bytes": 1024}}
+        origin = {"schema": "tuna-native-product-selection-v1", "mode": "reused", "profile": "distribution",
+                  "current_capture_source": capture, "product_source": product, "image_id": IMAGE,
+                  "package": {"file": "/controlled/tuna.pkg.tar.zst", "basename": "tuna-1-1-x86_64.pkg.tar.zst",
+                              "sha256": PACKAGE},
+                  "base": {"platform": "sha256:" + "5" * 64, "index_digest": "sha256:" + "d" * 64},
+                  "authenticated_origin": lineage,
+                  "strip_image": {"sha256": contract.digest(raw), "bytes": len(raw)},
+                  "original_image_receipt": {"sha256": contract.digest(raw), "bytes": len(raw),
+                                             "receipt": json.loads(raw),
+                                             "raw_base64": base64.b64encode(raw).decode()}}
+        source = {"merged_commit": capture["commit"], "capture_commit": capture["commit"],
+                  "capture_tree": capture["tree"], "built_commit": product["commit"],
+                  "built_tree": product["tree"], "required_source_inputs_sha256":
+                  product["required_source_inputs_sha256"]}
+        pins = {key: value for key, value in source.items() if key not in ("built_commit", "built_tree")}
+        return package, observed, base, origin, source, pins
+
+    def test_old_actual_product_current_capture_uses_equal_real_git_inputs(self):
+        from vm_strip_image import admission
+        package, observed, base, origin, source, pins = self.product_pair()
+        self.assertNotEqual(source["built_commit"], source["capture_commit"])
+        self.assertNotEqual(source["built_tree"], source["capture_tree"])
+        contract.validate_source(source, pins, "vm-tour", self.repo)
+        package["package"].update(device=9, inode=10)
+        receipt = admission(package, observed, self.repo, source["built_commit"], IMAGE, base,
+                            capture_commit=source["capture_commit"], product_origin=origin)
+        self.assertEqual(receipt["commit"], source["built_commit"])
+        self.assertEqual(receipt["capture_commit"], source["capture_commit"])
+        self.assertEqual(receipt["product_origin"], origin)
+        self.assertEqual(contract.required_source_inputs(self.repo, source["built_commit"]),
+                         contract.required_source_inputs(self.repo, source["capture_commit"]))
+        with self.assertRaises(ValueError):
+            contract.validate_source(source, pins, "gtk-walkthrough", self.repo)
+        with self.assertRaises(ValueError):
+            contract.validate_source(source, pins, "overview-demo", self.repo)
+
+    def test_changed_product_input_cannot_reuse_old_image(self):
+        from vm_strip_image import admission
+        package, observed, base, origin, source, pins = self.product_pair()
+        (self.repo / "source.rs").write_text("fn main() { panic!(); }\n")
+        self.commit()
+        capture = contract.git_source(self.repo, self.git("rev-parse", "HEAD"))
+        origin["current_capture_source"] = capture
+        with self.assertRaisesRegex(ValueError, "inputs differ"):
+            admission(package, observed, self.repo, source["built_commit"], IMAGE, base,
+                      capture_commit=capture["commit"], product_origin=origin)
+
+    def test_forged_build_capture_trees_and_missing_capture_fail_closed(self):
+        _, _, _, _, source, pins = self.product_pair()
+        for key in ("built_tree", "capture_tree", "required_source_inputs_sha256"):
+            forged = dict(source)
+            forged[key] = "0" * len(forged[key])
+            with self.subTest(field=key), self.assertRaises(ValueError):
+                contract.validate_source(forged, pins, "vm-tour", self.repo)
+        for key in ("capture_commit", "capture_tree"):
+            forged = dict(source)
+            del forged[key]
+            with self.subTest(missing=key), self.assertRaises(ValueError):
+                contract.validate_source(forged, pins, "vm-tour", self.repo)
+        forged = dict(source, built_commit="f" * 40)
+        with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+            contract.validate_source(forged, pins, "vm-tour", self.repo)
+
+    def test_forged_origin_loaded_image_package_and_original_receipt_rejected(self):
+        from vm_strip_image import admission
+        package, observed, base, origin, source, _ = self.product_pair()
+        mutations = (
+            lambda o: o.update(image_id="sha256:" + "0" * 64),
+            lambda o: o["package"].update(sha256="0" * 64),
+            lambda o: o["product_source"].update(tree="0" * 40),
+            lambda o: o["authenticated_origin"].update(repository="attacker/repo"),
+            lambda o: o["authenticated_origin"]["data_artifact"].update(name="other"),
+            lambda o: o["base"].update(platform="sha256:" + "0" * 64),
+            lambda o: o["original_image_receipt"].update(raw_base64=base64.b64encode(b"{}").decode()),
+            lambda o: o["original_image_receipt"]["receipt"].update(commit=source["capture_commit"]),
+            lambda o: o.update(mode="fresh"),
+        )
+        for mutate in mutations:
+            forged = json.loads(json.dumps(origin))
+            mutate(forged)
+            with self.subTest(mutation=mutate), self.assertRaises(ValueError):
+                admission(package, observed, self.repo, source["built_commit"], IMAGE, base,
+                          capture_commit=source["capture_commit"], product_origin=forged)
+        with self.assertRaisesRegex(ValueError, "explicit authenticated"):
+            admission(package, observed, self.repo, source["built_commit"], IMAGE, base,
+                      capture_commit=source["capture_commit"])
+        forged_observed = dict(observed, image_id="sha256:" + "0" * 64)
+        with self.assertRaises(ValueError):
+            admission(package, forged_observed, self.repo, source["built_commit"], IMAGE, base,
+                      capture_commit=source["capture_commit"], product_origin=origin)
+        package["package"]["sha256"] = "0" * 64
+        with self.assertRaises(ValueError):
+            admission(package, observed, self.repo, source["built_commit"], IMAGE, base,
+                      capture_commit=source["capture_commit"], product_origin=origin)
+
+    def test_original_ref_is_strict_not_an_alias_or_revision_expression(self):
+        for ref in ("main", "HEAD~0", "--all", "a" * 39):
+            with self.subTest(ref=ref), self.assertRaises(ValueError):
+                contract.required_source_inputs(self.repo, ref)
 
 
 if __name__ == "__main__":

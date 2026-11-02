@@ -2,8 +2,8 @@
 """Fail-closed current-run media receipts, promotion and freshness.
 
 The checked-in maintained-media.tsv is the ONLY destination authority. Receipt
-schema tuna-maintained-media-v1 records exact run/attempt, merged/built commit
-and tree, real producer exit status, hashed source/outcome evidence and hashes
+schema tuna-maintained-media-v1 records exact run/attempt, current capture commit
+and tree, actual product build commit/tree, real producer status and evidence
 of the underlying media bytes. VM receipts additionally bind strip-image.json,
 actual manifest image metadata and capture-timing.json. Nested GTK/proof frames
 are never installed-native or signed-release qualification. File ages and
@@ -12,24 +12,24 @@ broad documentation/path drift exemptions never qualify media.
 receipt ARTIFACT --bundle KIND --producer-exit-code 0 <identity flags>
 intake ARTIFACT... <identity flags> [--dest REPOSITORY_OR_STAGING_ROOT]
 freshness --bundle KIND [--bundle KIND...] <identity flags> [--dest ROOT]
-source-inputs [--source-root ROOT]
+source-inputs [--source-root ROOT] [--ref EXACT_COMMIT]
 
 Required identity flags: --run-id ID --attempt N --expect-merge COMMIT
 --expect-head COMMIT --expect-tree TREE --expect-source-inputs DIGEST.
-The commit/tree pins ALWAYS name the actual captured build, not a manufactured
-latest SHA. Independently compute the required-input pin on the clean current
-main HEAD with source-inputs: only the exact inventory media destinations and
-three generated media manifests are excluded, all other tracked Git input
-mode/type/object/path records participate. A generated-media-only adoption
-commit therefore preserves source identity without relabeling the capture.
+The commit/tree pins name the actual CURRENT CAPTURE checkout, never a fabricated
+latest build SHA. built_commit/tree independently retain the actual product
+source: only authenticated native images with strictly equal actual Git input
+hashes may have an older build. Nested GTK and overview builds equal capture.
+Only exact inventory media destinations and three generated manifests are
+excluded; all other tracked Git mode/type/object/path records participate.
 VM intake/freshness also require --expect-image sha256:DIGEST and
 --expect-package DIGEST; optional --expect-base-index and --expect-base-platform
 pin full immutable base references. receipt obtains image/package from the
 actual strip-image.json and validates retained raw OCI index, modern platform
 cosign output and exact-policy successful process witness (not a new crypto verify).
 media-source.json comes from the actual build/launch boundary and contains
-merged_commit, built_commit, built_tree, required_source_inputs_sha256,
-run_id, run_attempt. Producers must
+merged_commit, capture_commit, capture_tree, built_commit, built_tree,
+required_source_inputs_sha256, run_id, run_attempt. Producers must
 write receipts only after the actual command succeeds; a receipt is evidence,
 not authorization to publish, bypass CI gates, or qualify a signed release.
 """
@@ -117,21 +117,26 @@ def inventory():
     return inventory_rows(INVENTORY.read_text())
 
 
-def required_source_inputs(root):
-    """Hash actual clean HEAD inputs, excluding only registered generated media.
+def required_source_inputs(root, ref="HEAD"):
+    """Hash actual Git inputs at HEAD or a strict original commit.
 
     Git mode/type/object/path records are hashed verbatim, NUL-delimited, with
-    a domain separator. Read the exemption inventory from that very HEAD, not
+    a domain separator. Read the exemption inventory from that very commit, not
     from an uncommitted map or a manifest supplied by an artifact.
     """
     root = str(Path(root).resolve())
-    subprocess.run(["git", "-C", root, "diff", "--quiet", "HEAD", "--"], check=True)
+    require(ref == "HEAD" or sha(ref, 40), "source ref must be HEAD or an exact commit")
+    if ref == "HEAD":
+        subprocess.run(["git", "-C", root, "diff", "--quiet", "HEAD", "--"], check=True)
+    commit = subprocess.check_output(
+        ["git", "-C", root, "rev-parse", "--verify", ref + "^{commit}"], text=True).strip()
+    require(sha(commit, 40) and (ref == "HEAD" or commit == ref), "source ref is not an exact commit")
     text = subprocess.check_output(
-        ["git", "-C", root, "show", "HEAD:scripts/lib/maintained-media.tsv"], text=True)
+        ["git", "-C", root, "show", commit + ":scripts/lib/maintained-media.tsv"], text=True)
     mapping = inventory_rows(text)
     excluded = {destination.encode() for rows in mapping.values() for _, destination in rows}
     excluded.update(manifest_name(kind).encode() for kind in mapping)
-    entries = subprocess.check_output(["git", "-C", root, "ls-tree", "-r", "-z", "HEAD"])
+    entries = subprocess.check_output(["git", "-C", root, "ls-tree", "-r", "-z", commit])
     checksum = hashlib.sha256(b"tuna-required-source-inputs-v1\0")
     for entry in entries.split(b"\0"):
         if not entry:
@@ -141,6 +146,30 @@ def required_source_inputs(root):
         if path not in excluded:
             checksum.update(entry + b"\0")
     return checksum.hexdigest()
+
+
+def git_source(root, commit):
+    """Independently resolve an actual source tree and its required Git inputs."""
+    require(sha(commit, 40), "missing exact source commit")
+    tree = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "--verify", commit + "^{tree}"], text=True).strip()
+    require(sha(tree, 40), "invalid actual source tree")
+    return {"commit": commit, "tree": tree,
+            "required_source_inputs_sha256": required_source_inputs(root, commit)}
+
+
+def validate_source(source, pins, kind, root=ROOT):
+    require(isinstance(source, dict) and all(source.get(key) == value for key, value in pins.items()),
+            "receipt source differs from pinned current capture source")
+    capture = git_source(root, source.get("capture_commit"))
+    built = git_source(root, source.get("built_commit"))
+    require(source.get("capture_tree") == capture["tree"] and
+            source.get("built_tree") == built["tree"] and
+            built["required_source_inputs_sha256"] == capture["required_source_inputs_sha256"] ==
+            source.get("required_source_inputs_sha256"),
+            "actual build/capture Git trees or required source inputs differ")
+    require(kind == "vm-tour" or built == capture,
+            "nested media must launch a build from the actual current capture source")
 
 
 def json_blob(blob):
@@ -188,11 +217,11 @@ def identity(args):
     for name in ("expect_merge", "expect_head", "expect_tree"):
         require(sha(getattr(args, name), 40), "invalid " + name)
     require(args.expect_merge == args.expect_head,
-            "promotion requires the exact merged commit to be the built commit")
+            "promotion requires the exact merged commit to be the current capture commit")
     require(sha(args.expect_source_inputs), "missing/invalid required source inputs pin")
     return {"id": args.run_id, "attempt": args.attempt}, {
-        "merged_commit": args.expect_merge, "built_commit": args.expect_head,
-        "built_tree": args.expect_tree,
+        "merged_commit": args.expect_merge, "capture_commit": args.expect_head,
+        "capture_tree": args.expect_tree,
         "required_source_inputs_sha256": args.expect_source_inputs,
     }
 
@@ -232,7 +261,8 @@ def validate_receipt(receipt, blobs, args, mapping):
     require(receipt.get("schema") == SCHEMA and kind in mapping, "unknown media receipt/bundle")
     run, source = identity(args)
     require(receipt.get("run") == run, "receipt run/attempt differs from pinned CI run")
-    require(receipt.get("source") == source, "receipt source differs from exact merged/built source")
+    validate_source(receipt.get("source"), source, kind)
+    source = receipt["source"]
     name, environment = PRODUCERS[kind]
     producer = receipt.get("producer", {})
     require(producer == {"name": name, "environment": environment, "status": "ok", "exit_code": 0},
@@ -301,6 +331,21 @@ def validate_receipt(receipt, blobs, args, mapping):
             isinstance(strip.get("member_sha256"), dict) and bool(strip["member_sha256"]) and
             all(sha(value) for value in strip["member_sha256"].values()),
             "actual VM image receipt disagrees with media identity")
+    from vm_strip_image import validate_product_origin
+    require(strip.get("capture_commit") == source["capture_commit"] and
+            strip.get("capture_tree") == source["capture_tree"] and
+            strip.get("built_tree") == source["built_tree"] and
+            strip.get("required_source_inputs_sha256") == source["required_source_inputs_sha256"],
+            "VM admission source facts differ from actual build/capture")
+    origin = strip.get("product_origin")
+    require(source_evidence.get("product_origin") == origin,
+            "VM source and loaded-image capsule lineage differ")
+    if origin is not None or source["built_commit"] != source["capture_commit"]:
+        validate_product_origin(origin, strip, ROOT)
+        if origin["mode"] == "reused":
+            require(source_evidence.get("base", {}).get("index") ==
+                    BASE_REPOSITORY + "@" + origin["base"]["index_digest"],
+                    "native source base index differs from authenticated product origin")
     validate_base_verification(receipt, blobs, source_evidence, args)
     outcome = json_blob(blobs["outcomes"])
     checks = outcome.get("assertions")
@@ -496,6 +541,10 @@ def emit(args, mapping):
     blobs = {}
     for key, filename in evidence_files(kind).items():
         receipt[key], blobs[key] = evidence(root, filename)
+    source_evidence = json_blob(blobs["source_receipt"])
+    receipt["source"] = {key: source_evidence.get(key) for key in
+                         ("merged_commit", "capture_commit", "capture_tree", "built_commit",
+                          "built_tree", "required_source_inputs_sha256")}
     if kind == "vm-tour":
         receipt["base_verification"] = {
             "index": receipt.pop("base_index"), "platform": receipt.pop("base_platform"),
@@ -619,9 +668,10 @@ def main(argv=None):
         parser = argparse.ArgumentParser(description=required_source_inputs.__doc__)
         parser.add_argument("command", choices=("source-inputs",))
         parser.add_argument("--source-root", default=str(ROOT))
+        parser.add_argument("--ref", default="HEAD")
         args = parser.parse_args(arguments)
         try:
-            print(required_source_inputs(args.source_root))
+            print(required_source_inputs(args.source_root, args.ref))
         except (ValueError, OSError, subprocess.SubprocessError) as error:
             print("tuna-maintained-media: source inputs refused: " + str(error), file=sys.stderr)
             return 1
@@ -632,9 +682,9 @@ def main(argv=None):
     parser.add_argument("--bundle", action="append", default=[], choices=tuple(PRODUCERS))
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--attempt", required=True)
-    parser.add_argument("--expect-merge", required=True)
-    parser.add_argument("--expect-head", required=True)
-    parser.add_argument("--expect-tree", required=True)
+    parser.add_argument("--expect-merge", required=True, help="current checked capture merge commit")
+    parser.add_argument("--expect-head", required=True, help="actual current capture producer commit")
+    parser.add_argument("--expect-tree", required=True, help="actual current capture producer tree")
     parser.add_argument("--expect-source-inputs", required=True)
     parser.add_argument("--expect-image")
     parser.add_argument("--expect-package")

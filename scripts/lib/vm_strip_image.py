@@ -1,4 +1,5 @@
-"""Bind same-run package bytes to the exact final CI image; no release admission."""
+"""Bind original package bytes to the exact qualified image; no release admission."""
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -12,7 +13,87 @@ def canonical_image_id(observed):
     return observed if observed.startswith('sha256:') else 'sha256:' + observed
 
 
-def admission(package, observed, root, commit, image_id, base_image):
+def validate_product_origin(origin, image, root):
+    """Check the authenticated selection's immutable product and source bindings.
+
+    API authentication belongs to the native product selector. This receipt is
+    subsequently sealed inside the trusted CI source artifact, never accepted as
+    standalone authorization to load an image.
+    """
+    from maintained_media import git_source, json_blob, require, sha
+    require(isinstance(origin, dict) and
+            origin.get("schema") == "tuna-native-product-selection-v1" and
+            origin.get("mode") in ("fresh", "reused") and
+            origin.get("profile") in ("distribution", "upstream51"), "invalid explicit product origin")
+    product = git_source(root, image.get("commit"))
+    capture = git_source(root, image.get("capture_commit"))
+    require(origin.get("product_source") == product and origin.get("current_capture_source") == capture and
+            product["required_source_inputs_sha256"] == capture["required_source_inputs_sha256"] and
+            image.get("built_tree") == product["tree"] and image.get("capture_tree") == capture["tree"] and
+            image.get("required_source_inputs_sha256") == product["required_source_inputs_sha256"],
+            "product origin source differs from actual equivalent Git inputs")
+    package = origin.get("package", {})
+    require(isinstance(package, dict) and package.get("sha256") == image.get("package_sha256") and
+            isinstance(package.get("basename"), str) and
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+:-]*\.pkg\.tar\.(?:zst|xz|gz)", package["basename"]),
+            "product origin original package differs")
+    if origin["mode"] == "fresh":
+        require(product == capture and origin.get("image_id") in ("", None, image.get("image_id")) and
+                not origin.get("authenticated_origin"), "fresh product cannot claim an older build")
+        return
+    require(origin.get("image_id") == image.get("image_id"), "reused loaded image differs from origin")
+    base = origin.get("base", {})
+    require(isinstance(base, dict) and
+            base.get("platform") == image.get("base_image", "").rsplit("@", 1)[-1] and
+            re.fullmatch(r"sha256:[0-9a-f]{64}", base.get("index_digest", "")),
+            "reused original base differs")
+    lineage = origin.get("authenticated_origin", {})
+    require(isinstance(lineage, dict) and lineage.get("repository") == "tuna-os/tuna-desktop" and
+            lineage.get("workflow_path") == ".github/workflows/ci.yml" and
+            all(type(lineage.get(key)) is int and lineage[key] > 0
+                for key in ("workflow_id", "run_id", "run_attempt")) and
+            sha(lineage.get("head_sha"), 40), "missing authenticated native capsule lineage")
+    for key, name in (("pointer_artifact", "native-product-" + origin["profile"]),
+                      ("data_artifact", "native-product-DATA-" + origin["profile"])):
+        artifact = lineage.get(key, {})
+        require(isinstance(artifact, dict) and type(artifact.get("id")) is int and artifact["id"] > 0 and
+                artifact.get("name") == name and
+                re.fullmatch(r"sha256:[0-9a-f]{64}", artifact.get("digest", "")),
+                "invalid authenticated capsule artifact identity")
+    provenance = lineage.get("provenance", {})
+    require(isinstance(provenance, dict) and sha(provenance.get("sha256")) and
+            type(provenance.get("bytes")) is int and provenance["bytes"] > 0,
+            "missing authenticated capsule provenance identity")
+    original = origin.get("original_image_receipt", {})
+    require(isinstance(original, dict) and isinstance(original.get("raw_base64"), str),
+            "missing original image admission bytes")
+    try:
+        raw = base64.b64decode(original["raw_base64"], validate=True)
+    except ValueError as error:
+        raise ValueError("invalid original image receipt encoding") from error
+    require(len(raw) == original.get("bytes") and hashlib.sha256(raw).hexdigest() == original.get("sha256") and
+            origin.get("strip_image") == {"sha256": original["sha256"], "bytes": len(raw)},
+            "original authenticated image admission byte identity differs")
+    prior = json_blob(raw)
+    require(prior == original.get("receipt") and prior.get("schema") == 1 and
+            all(prior.get(key) == image.get(key) for key in
+                ("commit", "image_id", "base_image", "package_sha256", "member_sha256")),
+            "actual loaded image/package differs from original capsule admission")
+    prior_package, actual_package = prior.get("package_inspection", {}), image.get("package_inspection", {})
+    require(isinstance(prior_package, dict) and isinstance(actual_package, dict) and
+            prior_package.get("package", {}).get("sha256") == image.get("package_sha256") and
+            type(prior_package.get("package", {}).get("size")) is int and
+            prior_package["package"]["size"] > 0 and bool(prior_package.get("required_members")),
+            "original capsule lacks actual package inspection")
+    require(isinstance(prior_package, dict) and isinstance(actual_package, dict) and
+            all(prior_package.get(key) == actual_package.get(key) for key in
+                ("pkginfo", "required_members", "member_count", "decompressed_bytes")) and
+            all(prior_package.get("package", {}).get(key) == actual_package.get("package", {}).get(key)
+                for key in ("sha256", "size")),
+            "actual original package inspection differs from authenticated capsule")
+
+
+def admission(package, observed, root, commit, image_id, base_image, *, capture_commit=None, product_origin=None):
     if not re.fullmatch(r'[0-9a-f]{40}', commit):
         raise ValueError('exact source commit missing')
     if not re.fullmatch(r'sha256:[0-9a-f]{64}', image_id):
@@ -31,11 +112,27 @@ def admission(package, observed, root, commit, image_id, base_image):
     digest = package['package']['sha256']
     if not re.fullmatch(r'[0-9a-f]{64}', digest):
         raise ValueError('original package byte hash missing')
-    return {'schema': 1, 'commit': commit, 'image_id': image_id, 'base_image': base_image,
-            'package_sha256': digest, 'member_sha256': expected,
-            'package_inspection': package,
-            'installed_signed_release_qualified': False,
-            'scope': 'same-run CI package and final image, not signed release or kernel presentation'}
+    from maintained_media import git_source, require
+    import subprocess
+    head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+    capture_commit = head if capture_commit is None else capture_commit
+    require(capture_commit == head, "capture source differs from actual executing checkout")
+    product, capture = git_source(root, commit), git_source(root, capture_commit)
+    require(product["required_source_inputs_sha256"] == capture["required_source_inputs_sha256"],
+            "original product inputs differ from actual capture source")
+    require(commit == capture_commit or product_origin is not None,
+            "older product requires explicit authenticated product origin")
+    receipt = {'schema': 1, 'commit': commit, 'image_id': image_id, 'base_image': base_image,
+               'built_tree': product['tree'], 'capture_commit': capture_commit, 'capture_tree': capture['tree'],
+               'required_source_inputs_sha256': product['required_source_inputs_sha256'],
+               'package_sha256': digest, 'member_sha256': expected,
+               'package_inspection': package,
+               'installed_signed_release_qualified': False,
+               'scope': 'original CI package and exact final image, not signed release or kernel presentation'}
+    if product_origin is not None:
+        validate_product_origin(product_origin, receipt, root)
+        receipt['product_origin'] = product_origin
+    return receipt
 
 
 # Executed inside the final immutable image by the existing CI job. No host

@@ -21,6 +21,8 @@ def git(root, *args):
 def source(root):
     subprocess.run(["git", "-C", str(root), "diff", "--quiet", "HEAD", "--"], check=True)
     return {"merged_commit": os.environ["GITHUB_SHA"],
+            "capture_commit": git(root, "rev-parse", "HEAD"),
+            "capture_tree": git(root, "rev-parse", "HEAD^{tree}"),
             "built_commit": git(root, "rev-parse", "HEAD"),
             "built_tree": git(root, "rev-parse", "HEAD^{tree}"),
             "required_source_inputs_sha256": required_source_inputs(root),
