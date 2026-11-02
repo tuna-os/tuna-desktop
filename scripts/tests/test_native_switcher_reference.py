@@ -359,10 +359,10 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
         patched.start()
         self.addCleanup(patched.stop)
 
-    def verification(self, output=None):
+    def verification(self, output=None, platform_digest=proof.PINNED_PLATFORM):
         output = json.dumps(self.cosign).encode() if output is None else output
         return json.dumps({
-            'schema': 1, 'argv': proof.cosign_argv('/usr/bin/cosign'), 'exit_code': 0,
+            'schema': 1, 'argv': proof.cosign_argv('/usr/bin/cosign', platform_digest), 'exit_code': 0,
             'begin_host_monotonic_ns': 100, 'end_host_monotonic_ns': 200,
             'tool': {'executable': '/usr/bin/cosign', 'sha256': 'e' * 64, 'version': 'GitVersion: v3.1.4\n'},
             'stdout_sha256': proof.digest(output), 'stdout_bytes': len(output), 'stderr': '',
@@ -534,34 +534,150 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
                 self.assertFalse(result['ready'])
                 self.assertIn('differ' if difference == 'scale' else 'mismatch', result['error']['message'])
 
+    def test_platform_digest_argument_is_strict_and_argv_keeps_all_policy_flags(self):
+        platform = 'sha256:' + 'a' * 64
+        self.assertEqual(proof.cosign_argv('/usr/bin/cosign', platform), [
+            '/usr/bin/cosign', 'verify', 'ghcr.io/tuna-os/marlin@' + platform,
+            '--certificate-identity', proof.CERTIFICATE_SUBJECT,
+            '--certificate-oidc-issuer', proof.CERTIFICATE_ISSUER, '--output', 'json'])
+        for invalid in (None, '', 'a' * 64, 'sha256:' + 'A' * 64, 'sha256:' + 'a' * 63,
+                        platform + '\n', proof.BASE_REPOSITORY + '@' + platform):
+            with self.subTest(platform=invalid), self.assertRaisesRegex(ValueError, 'strict sha256'):
+                proof.cosign_argv('/usr/bin/cosign', invalid)
+            with self.assertRaisesRegex(ValueError, 'strict sha256'):
+                proof.validate_platform_verification(b'[]', b'{}', invalid)
+            with patch.object(proof.subprocess, 'run') as run:
+                with self.assertRaisesRegex(ValueError, 'strict sha256'):
+                    proof.verify_platform_image('/unused-controlled-output', invalid)
+                run.assert_not_called()
+
+    def test_shared_platform_parser_requires_modern_envelope_and_matching_witness(self):
+        platform = 'sha256:' + 'a' * 64
+        signatures = copy.deepcopy(self.cosign)
+        signatures[0]['critical']['image']['docker-manifest-digest'] = platform
+        signatures[0]['critical']['identity']['docker-reference'] = proof.BASE_REPOSITORY + '@' + platform
+        output = json.dumps(signatures).encode()
+        witness = self.verification(output, platform)
+        proof.validate_platform_verification(output, witness, platform)
+        with self.assertRaisesRegex(ValueError, 'actual platform'):
+            proof.validate_platform_verification(output, witness, proof.PINNED_PLATFORM)
+        with self.assertRaisesRegex(ValueError, 'subject/issuer'):
+            proof.validate_platform_verification(output, self.verification(output), platform)
+        for mutate in (
+                lambda row: row['critical']['image'].update({'docker-manifest-digest': proof.PINNED_PLATFORM}),
+                lambda row: row['critical']['identity'].update({'docker-reference': proof.BASE_REPOSITORY}),
+                lambda row: row['critical']['identity'].update({'docker-reference': 'ghcr.io/untrusted/image@' + platform}),
+                lambda row: row['critical'].update(type='cosign container image signature'),
+                lambda row: row.pop('optional'),
+                lambda row: row.update(optional=None)):
+            bad = copy.deepcopy(signatures)
+            mutate(bad[0])
+            bad_output = json.dumps(bad).encode()
+            with self.assertRaisesRegex(ValueError, 'actual platform'):
+                proof.validate_platform_verification(bad_output, self.verification(bad_output, platform), platform)
+        for missing in (b'', b'{}', b'null'):
+            with self.subTest(witness=missing), self.assertRaises(ValueError):
+                proof.validate_platform_verification(output, missing, platform)
+        for missing_output in (b'', b'[]', b'{}'):
+            with self.subTest(output=missing_output), self.assertRaises(ValueError):
+                proof.validate_platform_verification(missing_output, self.verification(missing_output, platform), platform)
+
+    def test_shared_platform_parser_rejects_failed_or_changed_process_evidence(self):
+        output = json.dumps(self.cosign).encode()
+        for mutate in (
+                lambda row: row.update(exit_code=1),
+                lambda row: row.update(exit_code=False),
+                lambda row: row.update(exit_code=0.0),
+                lambda row: row.pop('exit_code'),
+                lambda row: row['argv'].append('--insecure-ignore-tlog'),
+                lambda row: row['argv'].__setitem__(2, proof.BASE_REPOSITORY + '@sha256:' + 'a' * 64),
+                lambda row: row['argv'].__setitem__(-1, 'text'),
+                lambda row: row.update(stdout_sha256='f' * 64),
+                lambda row: row.update(stdout_bytes=len(output) + 1),
+                lambda row: row.pop('stdout_sha256'),
+                lambda row: row.pop('stdout_bytes'),
+                lambda row: row.pop('stderr'),
+                lambda row: row.update(begin_host_monotonic_ns=0),
+                lambda row: row.update(end_host_monotonic_ns=99),
+                lambda row: row.update(end_host_monotonic_ns=True),
+                lambda row: row['tool'].update(executable='cosign'),
+                lambda row: row['tool'].update(sha256='invalid'),
+                lambda row: row['tool'].update(version='GitVersion: v2.0.0\n'),
+                lambda row: row.pop('tool')):
+            bad = json.loads(self.verification())
+            mutate(bad)
+            with self.assertRaises(ValueError):
+                proof.validate_platform_verification(output, json.dumps(bad).encode(), proof.PINNED_PLATFORM)
+        for field in ('--certificate-identity', '--certificate-oidc-issuer'):
+            bad = json.loads(self.verification())
+            bad['argv'][bad['argv'].index(field) + 1] = 'untrusted-controlled-value'
+            with self.assertRaisesRegex(ValueError, 'subject/issuer'):
+                proof.validate_platform_verification(output, json.dumps(bad).encode(), proof.PINNED_PLATFORM)
+
+    def test_platform_and_strict_base_clis_retain_one_controlled_verification_process(self):
+        # Mocked process bytes exercise retention/dispatch only, never crypto or UI proof.
+        for operation in ('verify-platform', 'verify-base'):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                executable = root / 'controlled-cosign'
+                executable.write_bytes(b'controlled executable bytes, not a cosign binary')
+                out = root / 'output'
+                platform = 'sha256:' + 'a' * 64 if operation == 'verify-platform' else proof.PINNED_PLATFORM
+                signatures = copy.deepcopy(self.cosign)
+                signatures[0]['critical']['image']['docker-manifest-digest'] = platform
+                signatures[0]['critical']['identity']['docker-reference'] = proof.BASE_REPOSITORY + '@' + platform
+                output = json.dumps(signatures).encode()
+                argv = proof.cosign_argv(str(executable), platform)
+                result = proof.subprocess.CompletedProcess(argv, 0, output, b'controlled stderr\n')
+                version = 'GitVersion: v3.1.4\n'
+                args = [operation, '--out', str(out)]
+                if operation == 'verify-base':
+                    out.mkdir()
+                    (out / 'index.json').write_bytes(self.index_bytes)
+                else:
+                    args += ['--platform-digest', platform]
+                with patch.object(proof.shutil, 'which', return_value=str(executable)), \
+                        patch.object(proof.subprocess, 'check_output', return_value=version) as tool_version, \
+                        patch.object(proof.subprocess, 'run', return_value=result) as run, \
+                        patch.object(proof.time, 'monotonic_ns', side_effect=[100, 200]):
+                    self.assertEqual(proof.main(args), 0)
+                tool_version.assert_called_once_with([str(executable), 'version'], timeout=30, text=True)
+                run.assert_called_once_with(argv, capture_output=True, timeout=180)
+                self.assertEqual((out / 'platform-cosign.json').read_bytes(), output)
+                witness_bytes = (out / 'platform-verification.json').read_bytes()
+                witness = json.loads(witness_bytes)
+                self.assertEqual(witness['tool'], {'executable': str(executable),
+                                                  'sha256': proof.digest(executable.read_bytes()), 'version': version})
+                self.assertEqual(witness['argv'], argv)
+                self.assertEqual(witness['exit_code'], 0)
+                self.assertEqual(witness['begin_host_monotonic_ns'], 100)
+                self.assertEqual(witness['end_host_monotonic_ns'], 200)
+                self.assertEqual(witness['stdout_sha256'], proof.digest(output))
+                self.assertEqual(witness['stdout_bytes'], len(output))
+                self.assertEqual(witness['stderr'], 'controlled stderr\n')
+                proof.validate_platform_verification(output, witness_bytes, platform)
+                if operation == 'verify-platform':
+                    self.assertFalse((out / 'index.json').exists())
+
     def test_base_index_bytes_membership_and_actual_verified_envelope_are_required(self):
         original = json.dumps(self.cosign).encode()
         proof.validate_base_bytes(self.index_bytes, original, self.verification())
         with self.assertRaisesRegex(ValueError, 'index29097'):
             proof.validate_base_bytes(self.index_bytes + b' ', original, self.verification())
-        for field in ('--certificate-identity', '--certificate-oidc-issuer'):
-            bad = json.loads(self.verification())
-            bad['argv'][bad['argv'].index(field) + 1] = 'untrusted-controlled-value'
-            with self.assertRaisesRegex(ValueError, 'subject/issuer'):
-                proof.validate_base_bytes(self.index_bytes, original, json.dumps(bad).encode())
-        for mutate in (
-                lambda row: row.update(exit_code=1),
-                lambda row: row['argv'].append('--insecure-ignore-tlog'),
-                lambda row: row.update(stdout_sha256='f' * 64),
-                lambda row: row['tool'].update(version='GitVersion: v2.0.0\n')):
-            bad = json.loads(self.verification())
-            mutate(bad)
-            with self.assertRaises(ValueError):
-                proof.validate_base_bytes(self.index_bytes, original, json.dumps(bad).encode())
+        with self.assertRaisesRegex(ValueError, 'subject/issuer'):
+            proof.validate_base_bytes(self.index_bytes, original, b'{}')
         bad = copy.deepcopy(self.cosign)
         bad[0]['critical']['image']['docker-manifest-digest'] = 'sha256:' + '6' * 64
         with self.assertRaisesRegex(ValueError, 'actual platform'):
             proof.validate_base_bytes(self.index_bytes, json.dumps(bad).encode(), self.verification(json.dumps(bad).encode()))
-        wrong = json.dumps({'schemaVersion': 2, 'manifests': [
-            {'digest': proof.PINNED_PLATFORM, 'platform': {'os': 'linux', 'architecture': 'arm64'}}]}).encode()
-        with patch.object(proof, 'PINNED_INDEX', 'sha256:' + proof.digest(wrong)):
-            with self.assertRaisesRegex(ValueError, 'linux/amd64'):
-                proof.validate_base_bytes(wrong, original, self.verification())
+        for manifests in (
+                [{'digest': proof.PINNED_PLATFORM, 'platform': {'os': 'linux', 'architecture': 'arm64'}}],
+                [{'digest': proof.PINNED_PLATFORM, 'platform': {'os': 'linux', 'architecture': 'amd64'}}] * 2,
+                [{'digest': 'sha256:' + 'a' * 64, 'platform': {'os': 'linux', 'architecture': 'amd64'}}]):
+            wrong = json.dumps({'schemaVersion': 2, 'manifests': manifests}).encode()
+            with patch.object(proof, 'PINNED_INDEX', 'sha256:' + proof.digest(wrong)):
+                with self.assertRaisesRegex(ValueError, 'linux/amd64'):
+                    proof.validate_base_bytes(wrong, original, self.verification())
 
     def test_snapshot_version_and_unknown_profile_do_not_fall_back_to_tuna(self):
         value = snapshot()
