@@ -67,6 +67,7 @@ mod auth;
 mod color;
 mod display;
 mod motion;
+mod native_keyboard_observer;
 mod osk;
 
 /// Display-rate loop pacing: while anything moves, dispatch blocks at
@@ -1119,6 +1120,7 @@ impl Runtime {
             state.note_output_global("tuna-0", global);
         }
         let manager = WindowManager::new(&mut state);
+        native_keyboard_observer::enable(&state);
         let tokens = std::rc::Rc::new(TokenStore::new());
         let control_path = control_socket_path(&session.socket_name)
             .ok_or_else(|| RuntimeError::Socket("XDG_RUNTIME_DIR is unset".to_owned()))?;
@@ -2720,6 +2722,7 @@ impl Runtime {
             .workspace_slide()
             .snapshot(self.animation_clock.now());
         doc["transitions"] = self.transitions_diagnostics();
+        native_keyboard_observer::publish(&self.manager, &self.state, &mut doc);
         // GNOME Settings' display configuration (#340): modes, the
         // kernel's CRTC modes on hardware, pending confirmation.
         doc["display_config"] = self.display_config_diagnostics();

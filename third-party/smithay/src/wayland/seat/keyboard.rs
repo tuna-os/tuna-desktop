@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::HashMap, fmt, sync::atomic::Ordering};
 
 use tracing::{error, instrument, trace, warn};
 use wayland_server::{
@@ -20,6 +20,128 @@ use crate::{
     utils::{iter::new_locked_obj_iter_from_vec, Serial},
     wayland::{input_method::InputMethodSeat, text_input::TextInputSeat},
 };
+
+/// Read-only evidence for one live `wl_keyboard` binding, not client consumption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyboardDeliveryResource {
+    /// Actual backend-generational resource identity.
+    pub resource_id: ObjectId,
+    /// Observer generation, never reused within this keyboard handle.
+    pub binding_generation: u64,
+    /// Number of actual `wl_keyboard.key` server sends.
+    pub emitted_key_events: u64,
+}
+
+/// One live client's keyboard bindings. Consumers must compare the complete
+/// identity and binding set, not interpret missing/recreated bindings as zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyboardDeliverySnapshot {
+    /// Actual backend-generational connection identity.
+    pub client_id: ClientId,
+    /// Generation of this client's live binding cohort. Retiring its last
+    /// binding invalidates this generation even if the connection survives.
+    pub connection_generation: u64,
+    /// All live bindings, ordered by generation.
+    pub resources: Vec<KeyboardDeliveryResource>,
+}
+
+#[derive(Debug)]
+struct DeliveryBinding {
+    client_id: ClientId,
+    connection_generation: u64,
+    binding_generation: u64,
+    emitted_key_events: u64,
+    error: Option<&'static str>,
+    resource: wayland_server::Weak<WlKeyboard>,
+}
+
+/// Opt-in storage bounded by live keyboard resources. No callback or keyboard
+/// internal-state lock is involved in recording a send.
+#[derive(Debug, Default)]
+pub(crate) struct KeyboardDeliveryObserver {
+    bindings: HashMap<ObjectId, DeliveryBinding>,
+    generation: u64,
+    error: Option<&'static str>,
+}
+
+impl KeyboardDeliveryObserver {
+    fn next_generation(&mut self) -> Option<u64> {
+        match self.generation.checked_add(1) {
+            Some(next) => {
+                self.generation = next;
+                Some(next)
+            }
+            None => {
+                self.error = Some("generation-overflow");
+                None
+            }
+        }
+    }
+
+    fn bind(&mut self, keyboard: &WlKeyboard) {
+        if self.error.is_some() {
+            return;
+        }
+        let Some(client) = keyboard.client() else {
+            self.error = Some("binding-client-unavailable");
+            return;
+        };
+        let client_id = client.id();
+        let connection_generation = self
+            .bindings
+            .values()
+            .find(|binding| binding.client_id == client_id)
+            .map(|binding| binding.connection_generation)
+            .or_else(|| self.next_generation());
+        let Some(connection_generation) = connection_generation else {
+            return;
+        };
+        let Some(binding_generation) = self.next_generation() else {
+            return;
+        };
+        self.bindings.insert(
+            keyboard.id(),
+            DeliveryBinding {
+                client_id,
+                connection_generation,
+                binding_generation,
+                emitted_key_events: 0,
+                error: None,
+                resource: keyboard.downgrade(),
+            },
+        );
+    }
+
+    fn emitted(&mut self, id: ObjectId) {
+        if self.error.is_some() {
+            return;
+        }
+        let Some(binding) = self.bindings.get_mut(&id) else {
+            self.error = Some("unobserved-keyboard-binding");
+            return;
+        };
+        match binding.emitted_key_events.checked_add(1) {
+            Some(next) => binding.emitted_key_events = next,
+            None => binding.error = Some("key-event-counter-overflow"),
+        }
+    }
+}
+
+/// Record only after an actual `wl_keyboard.key` send. In particular, this
+/// must never call compositor code or reacquire the keyboard internal lock:
+/// both physical and virtual send paths can already hold that lock.
+#[inline]
+pub(crate) fn record_key_emission<D: SeatHandler + 'static>(keyboard: &WlKeyboard) {
+    if let Some(observer) = keyboard
+        .data::<KeyboardUserData<D>>()
+        .and_then(|data| data.handle.as_ref())
+        .and_then(|handle| handle.arc.delivery_observer.get())
+    {
+        if let Ok(mut observer) = observer.lock() {
+            observer.emitted(keyboard.id());
+        }
+    }
+}
 
 impl<D> KeyboardHandle<D>
 where
@@ -52,6 +174,12 @@ where
     /// This should be done first, before anything else is done with this keyboard.
     #[instrument(parent = &self.arc.span, skip(self))]
     pub(crate) fn new_kbd(&self, kbd: WlKeyboard) {
+        self.arc.keyboard_bindings_started.store(true, Ordering::Release);
+        if let Some(observer) = self.arc.delivery_observer.get() {
+            if let Ok(mut observer) = observer.lock() {
+                observer.bind(&kbd);
+            }
+        }
         trace!("Sending keymap to client");
 
         // prepare a tempfile with the keymap, to send it to the client
@@ -63,6 +191,13 @@ where
                 err = ?e,
                 "Failed write keymap to client in a tempfile"
             );
+            if let Some(observer) = self.arc.delivery_observer.get() {
+                if let Ok(mut observer) = observer.lock() {
+                    if let Some(binding) = observer.bindings.get_mut(&kbd.id()) {
+                        binding.error = Some("binding-keymap-unavailable");
+                    }
+                }
+            }
             return;
         };
 
@@ -85,6 +220,7 @@ where
                 );
             }
         }
+        drop(guard);
         self.arc.known_kbds.lock().unwrap().push(kbd.downgrade());
     }
 }
@@ -96,6 +232,66 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
     /// the keyboard capability.
     pub fn from_resource(seat: &WlKeyboard) -> Option<Self> {
         seat.data::<KeyboardUserData<D>>()?.handle.clone()
+    }
+
+    /// Enable send-only evidence before any keyboard binding exists.
+    ///
+    /// Repeated enable is idempotent. Late activation remains permanently
+    /// unevaluable: earlier emissions cannot be reconstructed.
+    pub fn enable_delivery_observer(&self) {
+        self.arc.delivery_observer.get_or_init(|| {
+            std::sync::Mutex::new(KeyboardDeliveryObserver {
+                error: self
+                    .arc
+                    .keyboard_bindings_started
+                    .load(Ordering::Acquire)
+                    .then_some("late-activation"),
+                ..KeyboardDeliveryObserver::default()
+            })
+        });
+    }
+
+    /// Observer availability, without allocating a resource snapshot.
+    pub fn delivery_observer_status(&self) -> Result<(), &'static str> {
+        let observer = self.arc.delivery_observer.get().ok_or("observer-disabled")?;
+        let observer = observer.lock().map_err(|_| "observer-poisoned")?;
+        observer.error.map_or(Ok(()), Err)
+    }
+
+    /// Snapshot only the specified live backend connection's actual bindings.
+    /// Missing/retired bindings are an error, never a zero-count baseline.
+    pub fn delivery_snapshot(&self, client: &Client) -> Result<KeyboardDeliverySnapshot, &'static str> {
+        let observer = self.arc.delivery_observer.get().ok_or("observer-disabled")?;
+        let observer = observer.lock().map_err(|_| "observer-poisoned")?;
+        if let Some(error) = observer.error {
+            return Err(error);
+        }
+        let mut resources = Vec::new();
+        let mut connection_generation = None;
+        for (id, binding) in &observer.bindings {
+            if binding.client_id != client.id() {
+                continue;
+            }
+            if !binding.resource.is_alive() {
+                return Err("retired-keyboard-binding");
+            }
+            if let Some(error) = binding.error {
+                return Err(error);
+            }
+            connection_generation = Some(binding.connection_generation);
+            resources.push(KeyboardDeliveryResource {
+                resource_id: id.clone(),
+                binding_generation: binding.binding_generation,
+                emitted_key_events: binding.emitted_key_events,
+            });
+        }
+        let connection_generation = connection_generation.ok_or("missing-live-keyboard-binding")?;
+        resources.sort_unstable_by_key(|resource| resource.binding_generation);
+        Ok(KeyboardDeliverySnapshot {
+            client_id: client.id(),
+            connection_generation,
+            resources,
+        })
     }
 }
 
@@ -135,7 +331,15 @@ where
                 .known_kbds
                 .lock()
                 .unwrap()
-                .retain(|k| k.id() != keyboard.id())
+                .retain(|k| k.id() != keyboard.id());
+            if let Some(observer) = handle.arc.delivery_observer.get() {
+                if let Ok(mut observer) = observer.lock() {
+                    observer.bindings.remove(&keyboard.id());
+                    // Do not retain a historical high-water allocation after
+                    // resource/connection retirement.
+                    observer.bindings.shrink_to_fit();
+                }
+            }
         }
     }
 }
@@ -216,7 +420,8 @@ impl<D: SeatHandler + 'static> KeyboardTarget<D> for WlSurface {
         time: u32,
     ) {
         for_each_focused_kbds(seat, self, |kbd| {
-            kbd.key(serial.into(), time, key.raw_code().raw() - 8, state.into())
+            kbd.key(serial.into(), time, key.raw_code().raw() - 8, state.into());
+            record_key_emission::<D>(&kbd);
         })
     }
 

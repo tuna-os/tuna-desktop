@@ -538,6 +538,10 @@ struct Fixture {
 }
 
 fn two_windows() -> Fixture {
+    two_windows_with_delivery_observer(false)
+}
+
+fn two_windows_with_delivery_observer(observe: bool) -> Fixture {
     let mut comp = TestCompositor::new();
     // The manager first: its seat capabilities must exist before the
     // clients' `get_keyboard`/`get_pointer` requests arrive, or smithay
@@ -545,6 +549,12 @@ fn two_windows() -> Fixture {
     // `Runtime::launch`, which builds the manager before accepting
     // clients.
     let mut manager = comp.window_manager();
+    if observe {
+        comp.test_seat()
+            .get_keyboard()
+            .unwrap()
+            .enable_delivery_observer();
+    }
     let (conn_a, mut queue_a, mut client_a) = connect(&mut comp);
     map_toplevel(&mut comp, &conn_a, &mut queue_a, &mut client_a, "alpha");
     let (conn_b, mut queue_b, mut client_b) = connect(&mut comp);
@@ -1106,6 +1116,275 @@ fn release(manager: &mut WindowManager, comp: &mut TestCompositor, keycode: u32)
 
 /// Evdev `a`: a bare key proving delivery by who records it.
 const KEY_A: u32 = 30;
+
+/// Real socket consumers establish positive delivery and the negative control:
+/// the lock owner receives physical input while the original app does not.
+#[test]
+fn keyboard_delivery_observer_tracks_sends_and_lock_recipient_separately() {
+    let mut f = two_windows_with_delivery_observer(true);
+    let keyboard = f.comp.test_seat().get_keyboard().unwrap();
+    let surface_a = f.manager.surface_of(f.id_a).unwrap();
+    let surface_b = f.manager.surface_of(f.id_b).unwrap();
+    let owner_a = surface_a.client().unwrap();
+    let owner_b = surface_b.client().unwrap();
+    assert_ne!(owner_a.id(), owner_b.id());
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    let before_a = keyboard.delivery_snapshot(&owner_a).unwrap();
+    let before_b = keyboard.delivery_snapshot(&owner_b).unwrap();
+    let heard_a = f.client_a.keys.len();
+    let heard_b = f.client_b.keys.len();
+    press(&mut f.manager, &mut f.comp, KEY_A);
+    release(&mut f.manager, &mut f.comp, KEY_A);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+    assert_eq!(
+        &f.client_a.keys[heard_a..],
+        &[(KEY_A, true), (KEY_A, false)]
+    );
+    assert_eq!(f.client_b.keys.len(), heard_b);
+    let positive_a = keyboard.delivery_snapshot(&owner_a).unwrap();
+    assert_eq!(positive_a.client_id, owner_a.id());
+    assert_eq!(
+        positive_a.connection_generation,
+        before_a.connection_generation
+    );
+    assert_eq!(
+        positive_a.resources[0].resource_id,
+        before_a.resources[0].resource_id
+    );
+    assert_eq!(
+        positive_a.resources[0].binding_generation,
+        before_a.resources[0].binding_generation
+    );
+    assert_eq!(
+        positive_a.resources[0].emitted_key_events,
+        before_a.resources[0].emitted_key_events + 2
+    );
+    assert_eq!(keyboard.delivery_snapshot(&owner_b).unwrap(), before_b);
+    for pressed in [true, false] {
+        f.manager.lock_input(
+            &mut f.comp.state,
+            &surface_b,
+            ManagerInput::Key {
+                keycode: KEY_A,
+                pressed,
+                time: 6000,
+            },
+        );
+    }
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+    assert_eq!(keyboard.current_focus(), Some(surface_b));
+    assert_eq!(keyboard.delivery_snapshot(&owner_a).unwrap(), positive_a);
+    assert_eq!(f.client_a.keys.len(), heard_a + 2);
+    assert_eq!(
+        &f.client_b.keys[heard_b..],
+        &[(KEY_A, true), (KEY_A, false)]
+    );
+    let locked_b = keyboard.delivery_snapshot(&owner_b).unwrap();
+    assert_eq!(
+        locked_b.resources[0].emitted_key_events,
+        before_b.resources[0].emitted_key_events + 2
+    );
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    press(&mut f.manager, &mut f.comp, KEY_A);
+    release(&mut f.manager, &mut f.comp, KEY_A);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    assert_eq!(keyboard.current_focus(), Some(surface_a));
+    assert_eq!(
+        &f.client_a.keys[heard_a + 2..],
+        &[(KEY_A, true), (KEY_A, false)]
+    );
+    assert_eq!(
+        keyboard.delivery_snapshot(&owner_a).unwrap().resources[0].emitted_key_events,
+        positive_a.resources[0].emitted_key_events + 2
+    );
+    assert_eq!(keyboard.delivery_snapshot(&owner_b).unwrap(), locked_b);
+}
+
+#[test]
+fn keyboard_delivery_observer_rejects_retired_and_reused_binding_identity() {
+    let mut f = two_windows_with_delivery_observer(true);
+    let keyboard = f.comp.test_seat().get_keyboard().unwrap();
+    let owner = f.manager.surface_of(f.id_a).unwrap().client().unwrap();
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    press(&mut f.manager, &mut f.comp, KEY_A);
+    release(&mut f.manager, &mut f.comp, KEY_A);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    assert_eq!(&f.client_a.keys[..], &[(KEY_A, true), (KEY_A, false)]);
+    let original = keyboard.delivery_snapshot(&owner).unwrap();
+    let protocol_id = original.resources[0].resource_id.protocol_id();
+    let qh = f.queue_a.handle();
+    // Occupy all earlier allocator holes so the actual client allocator reuses
+    // this binding's numeric protocol ID, not merely a new numeric ID.
+    let _reserved: Vec<_> = (0..protocol_id)
+        .map(|_| {
+            f.client_a
+                .compositor
+                .as_ref()
+                .unwrap()
+                .create_surface(&qh, ())
+        })
+        .collect();
+    f.client_a.keyboard.take().unwrap().release();
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    assert_eq!(
+        keyboard.delivery_snapshot(&owner),
+        Err("missing-live-keyboard-binding")
+    );
+    press(&mut f.manager, &mut f.comp, KEY_A);
+    release(&mut f.manager, &mut f.comp, KEY_A);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    assert_eq!(f.client_a.keys.len(), 2);
+    f.client_a.keyboard = Some(f.client_a.seat.as_ref().unwrap().get_keyboard(&qh, ()));
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    let recreated = keyboard.delivery_snapshot(&owner).unwrap();
+    assert_eq!(
+        recreated.resources[0].resource_id.protocol_id(),
+        protocol_id
+    );
+    assert_ne!(
+        recreated.resources[0].resource_id,
+        original.resources[0].resource_id
+    );
+    assert!(recreated.connection_generation > original.connection_generation);
+    assert!(recreated.resources[0].binding_generation > original.resources[0].binding_generation);
+    assert_eq!(recreated.resources[0].emitted_key_events, 0);
+    press(&mut f.manager, &mut f.comp, KEY_A);
+    release(&mut f.manager, &mut f.comp, KEY_A);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    assert_eq!(&f.client_a.keys[2..], &[(KEY_A, true), (KEY_A, false)]);
+    assert_eq!(
+        keyboard.delivery_snapshot(&owner).unwrap().resources[0].emitted_key_events,
+        2
+    );
+}
+
+#[test]
+fn keyboard_delivery_observer_rejects_retired_connection_after_new_client_reuses_ids() {
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    let keyboard = comp.test_seat().get_keyboard().unwrap();
+    keyboard.enable_delivery_observer();
+    let (conn, mut queue, mut client) = connect(&mut comp);
+    map_toplevel(&mut comp, &conn, &mut queue, &mut client, "original");
+    manager.reconcile(&mut comp.state);
+    sync_client(&mut comp, &conn, &mut queue, &mut client);
+    let original_surface = manager
+        .surface_of(manager.model().focused().unwrap())
+        .unwrap();
+    let original_owner = original_surface.client().unwrap();
+    press(&mut manager, &mut comp, KEY_A);
+    release(&mut manager, &mut comp, KEY_A);
+    sync_client(&mut comp, &conn, &mut queue, &mut client);
+    assert_eq!(&client.keys[..], &[(KEY_A, true), (KEY_A, false)]);
+    let original = keyboard.delivery_snapshot(&original_owner).unwrap();
+    drop(client);
+    drop(queue);
+    drop(conn);
+    comp.pump();
+    assert!(keyboard.delivery_snapshot(&original_owner).is_err());
+    manager.reconcile(&mut comp.state);
+    let (conn, mut queue, mut client) = connect(&mut comp);
+    map_toplevel(&mut comp, &conn, &mut queue, &mut client, "replacement");
+    manager.reconcile(&mut comp.state);
+    sync_client(&mut comp, &conn, &mut queue, &mut client);
+    let replacement_surface = manager
+        .surface_of(manager.model().focused().unwrap())
+        .unwrap();
+    let replacement_owner = replacement_surface.client().unwrap();
+    let replacement = keyboard.delivery_snapshot(&replacement_owner).unwrap();
+    assert_ne!(replacement.client_id, original.client_id);
+    assert!(replacement.connection_generation > original.connection_generation);
+    assert_eq!(
+        replacement.resources[0].resource_id.protocol_id(),
+        original.resources[0].resource_id.protocol_id()
+    );
+    assert!(replacement.resources[0].binding_generation > original.resources[0].binding_generation);
+    press(&mut manager, &mut comp, KEY_A);
+    release(&mut manager, &mut comp, KEY_A);
+    sync_client(&mut comp, &conn, &mut queue, &mut client);
+    assert_eq!(&client.keys[..], &[(KEY_A, true), (KEY_A, false)]);
+    assert_eq!(
+        keyboard
+            .delivery_snapshot(&replacement_owner)
+            .unwrap()
+            .resources[0]
+            .emitted_key_events,
+        2
+    );
+    assert!(keyboard.delivery_snapshot(&original_owner).is_err());
+}
+
+#[test]
+fn keyboard_delivery_observer_late_activation_never_reconstructs_a_zero_baseline() {
+    let mut f = two_windows();
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    let keyboard = f.comp.test_seat().get_keyboard().unwrap();
+    let owner = f.manager.surface_of(f.id_a).unwrap().client().unwrap();
+    press(&mut f.manager, &mut f.comp, KEY_A);
+    release(&mut f.manager, &mut f.comp, KEY_A);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    assert_eq!(&f.client_a.keys[..], &[(KEY_A, true), (KEY_A, false)]);
+    assert_eq!(keyboard.delivery_snapshot(&owner), Err("observer-disabled"));
+    keyboard.enable_delivery_observer();
+    assert_eq!(keyboard.delivery_observer_status(), Err("late-activation"));
+    assert_eq!(keyboard.delivery_snapshot(&owner), Err("late-activation"));
+    press(&mut f.manager, &mut f.comp, KEY_A);
+    release(&mut f.manager, &mut f.comp, KEY_A);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    assert_eq!(&f.client_a.keys[2..], &[(KEY_A, true), (KEY_A, false)]);
+    assert_eq!(keyboard.delivery_snapshot(&owner), Err("late-activation"));
+}
+
+#[test]
+fn keyboard_delivery_observer_tracks_each_live_binding_without_merging_counts() {
+    let mut f = two_windows_with_delivery_observer(true);
+    let keyboard = f.comp.test_seat().get_keyboard().unwrap();
+    let owner = f.manager.surface_of(f.id_a).unwrap().client().unwrap();
+    assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+    let original = keyboard.delivery_snapshot(&owner).unwrap();
+    let extra = f
+        .client_a
+        .seat
+        .as_ref()
+        .unwrap()
+        .get_keyboard(&f.queue_a.handle(), ());
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    let both = keyboard.delivery_snapshot(&owner).unwrap();
+    assert_eq!(both.connection_generation, original.connection_generation);
+    assert_eq!(both.resources.len(), 2);
+    assert_eq!(both.resources[0], original.resources[0]);
+    assert_ne!(both.resources[1].resource_id, both.resources[0].resource_id);
+    assert!(both.resources[1].binding_generation > both.resources[0].binding_generation);
+    press(&mut f.manager, &mut f.comp, KEY_A);
+    release(&mut f.manager, &mut f.comp, KEY_A);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    assert_eq!(
+        &f.client_a.keys[..],
+        &[(KEY_A, true), (KEY_A, true), (KEY_A, false), (KEY_A, false)]
+    );
+    let delivered = keyboard.delivery_snapshot(&owner).unwrap();
+    for resource in &delivered.resources {
+        assert_eq!(resource.emitted_key_events, 2);
+    }
+    extra.release();
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    let surviving = keyboard.delivery_snapshot(&owner).unwrap();
+    assert_eq!(
+        surviving.connection_generation,
+        original.connection_generation
+    );
+    assert_eq!(&surviving.resources[..], &delivered.resources[..1]);
+    press(&mut f.manager, &mut f.comp, KEY_A);
+    release(&mut f.manager, &mut f.comp, KEY_A);
+    sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+    assert_eq!(&f.client_a.keys[4..], &[(KEY_A, true), (KEY_A, false)]);
+    assert_eq!(
+        keyboard.delivery_snapshot(&owner).unwrap().resources[0].emitted_key_events,
+        4
+    );
+}
 
 /// One pump round across three clients (single `pump` calls run one
 /// round each, so three sequential calls drain one shared tick).

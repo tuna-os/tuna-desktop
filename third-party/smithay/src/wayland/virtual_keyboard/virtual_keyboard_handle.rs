@@ -20,7 +20,10 @@ use crate::input::keyboard::{KeyboardTarget, KeymapFile, ModifiersState};
 use crate::{
     input::{Seat, SeatHandler},
     utils::SERIAL_COUNTER,
-    wayland::seat::{keyboard::for_each_focused_kbds, WaylandFocus},
+    wayland::seat::{
+        keyboard::{for_each_focused_kbds, record_key_emission},
+        WaylandFocus,
+    },
 };
 
 use super::VirtualKeyboardManagerState;
@@ -118,6 +121,7 @@ where
                         };
 
                         kbd.key(SERIAL_COUNTER.next_serial().0, time, key, key_state);
+                        record_key_emission::<D>(&kbd);
                     });
                 }
             }

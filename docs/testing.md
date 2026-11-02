@@ -412,6 +412,60 @@ unreachable; final beta3 qualification inputs had not been supplied.
 No timeout, lock policy, host capacity setting or qualification floor was
 relaxed.
 
+The recovered current-build producer payload lives in
+`scripts/lib/core_apps.py` and the typed installed observers under
+`packaging/marlin/vm-lane/core-apps/`. It uses the existing native
+QMP/QGA/GDM lifecycle, not a second VM producer. Its explicit CI-only
+`CORE_APPS=1` image installs the 28 original distro applications and retains
+the installed package delta. Only that layer changes the preboot UID 1000
+account from its actual standard-user group baseline to `wheel`, recording
+both group sets and the exact delta; it does not install authorization rules
+or replace stock polkit/consent. The two ordinary lifecycle rows keep their
+original standard-user role.
+
+The private `TUNA_COMPOSITOR_STATE` opt-in additionally exposes per-live-binding
+**server emission**, not application-consumption, counters at the actual
+`WlSurface::key` → `WlKeyboard.key` send path. The default does not count keys,
+allocate observer storage, or take observer snapshots. Evidence joins actual
+server socket PID/UID, generational connection/resource identity, native window,
+and seat focus to the original installed process. Every app requires a fresh
+prelock positive delta, unchanged counters during locked negative input and
+unlock, and another fresh postunlock positive delta. Missing, recreated,
+retired, late-enabled or overflowing bindings are unevaluable, never zero
+passes. Independent application text/payload, frames, service outcomes,
+100%/150% scaling and restart persistence remain separate requirements.
+IME evidence is physical `nihao`/Space through installed libpinyin with visible
+preedit in the original packaged app, its exact commit and clipboard readback;
+a helper or file chooser cannot qualify the app's editable interface.
+
+This source payload is not a 28-app receipt. The fixture uses genuine packaged
+production Radicale inside the existing guest for authenticated CalDAV and
+CardDAV, original Calendar/Contacts UI and EDS consumption, independent DAV
+payload readback, wrong-password denial, and service/frontend persistence.
+Its owned loopback service is not an HTTP echo, host listener or shipping
+service. Software requires genuine signed previous/current Flathub objects
+for install/update/remove; maps, forecasts and reverse geocoding require
+their real providers. GeoClue's named New York static source is emulated
+input, not GPS.
+
+Normal image construction runs the packaged `tuna-geoclue-agent-policy`
+helper, which verifies the pristine packaged vendor main configuration and
+adds the real `tuna-shell` ID to its complete vendor agent list in an early
+fragment. It preserves later administrator overrides and refuses a modified
+administrator main configuration or a later policy that excludes Tuna.
+GeoClue's [whitelist replacement semantics](https://man.archlinux.org/man/geoclue.5.en.txt)
+require retaining that full list, not replacing it with only Tuna. The helper
+does not change application grants, vendor main bytes, or any live session.
+The qualification fixture only reads effective admission; it never spoofs
+`gnome-shell` or adds `allowed=true` for Maps/Weather. The actual shell logs
+successful `AddAgent` completion; absent errors alone do not prove acceptance.
+Automatic timezone
+requires the original active packaged `gsd-datetime` PID/UID and passive real
+service traffic through timedated, `/etc/localtime` and the panel, including
+both disabled controls and restoration. Absent inputs fail the full run;
+source coverage, counter tests and the old nine-operation archive cannot
+close #397 or #359.
+
 ## Marlin VM lane
 
 The `marlin-vm` job (#68) boots the real TunaOS Marlin image with Tuna Desktop

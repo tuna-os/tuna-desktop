@@ -20,6 +20,7 @@ class Tests(unittest.TestCase):
         actor.buffer = bytearray()
         actor.poisoned = False
         actor.pending_guest_pid = None
+        actor._caller_deadline = None
         self.addCleanup(right.close)
         self.addCleanup(actor.close)
         return actor, right
@@ -160,6 +161,55 @@ class Tests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'correlation'):
             actor.command('guest-ping')
         self.assertTrue(actor.poisoned)
+
+    def test_actual_silent_exec_obeys_original_caller_deadline(self):
+        actor, peer = self.actor()
+        actor._caller_deadline = time.monotonic() + .05
+        requests = []
+        def consume(peer, stop):
+            raw = bytearray()
+            while not raw.endswith(b'\n'):
+                raw.extend(peer.recv(4096))
+            requests.append(json.loads(raw))
+            stop.wait(.2)
+        self.server(peer, consume)
+        began = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            actor.run('inventory', timeout=30)
+        self.assertLess(time.monotonic() - began, .7)
+        self.assertEqual([value['execute'] for value in requests], ['guest-exec'])
+        self.assertEqual(actor.guest_exec_state, 'unknown')
+        self.assertTrue(actor.poisoned)
+
+    def test_actual_constructor_handshake_obeys_caller_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'qga.sock')
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(path)
+            listener.listen(1)
+            listener.settimeout(1)
+            stop = threading.Event()
+            errors = []
+            def stall():
+                try:
+                    with listener.accept()[0] as peer:
+                        peer.recv(4096)
+                        stop.wait(.2)
+                except BaseException as error:
+                    errors.append(error)
+            thread = threading.Thread(target=stall)
+            thread.start()
+            began = time.monotonic()
+            try:
+                with self.assertRaises(TimeoutError):
+                    GuestAgent(path, deadline=began + .05)
+                self.assertLess(time.monotonic() - began, .7)
+            finally:
+                stop.set()
+                listener.close()
+                thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
 
     def test_constructor_resets_partial_prefix_at_fragmented_delimiter(self):
         for fragmented in (False, True):
