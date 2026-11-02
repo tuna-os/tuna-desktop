@@ -54,35 +54,151 @@ pub trait OverviewActions {
     fn open_overview(&self);
 }
 
-/// Search activation follows the dash's existing-window route. Resolve the
-/// window at activation time, not while building a possibly stale result tile.
-/// The app ID selects a route; the compositor validates the window token.
-/// This uses the latest local snapshot and does not acknowledge actual focus.
-fn activate_search_app(
-    actions: &dyn OverviewActions,
-    entry: &AppEntry,
-    launch: impl FnOnce(&AppEntry) -> std::io::Result<()>,
-) -> std::io::Result<()> {
+/// What activating an app does: gnome-shell 51's `AppIcon.activate`
+/// (js/ui/appDisplay.js:3053-3071), which the grid, folder, dash
+/// (`DashIcon` inherits it) and search result tiles all share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Activation {
+    /// A stopped app: `app.activate()` launches it.
+    Launch,
+    /// A running app asked for another window (Ctrl or the middle
+    /// button) that `can_open_new_window` allows: `open_new_window`.
+    NewWindow,
+    /// A running app otherwise: `app.activate()` raises its window.
+    Raise(u64),
+}
+
+impl Activation {
+    /// `openNewWindow = can_open_new_window() && state === RUNNING &&
+    /// (isCtrlPressed || isMiddleButton)`, else `app.activate()`.
+    fn plan(window: Option<u64>, new_window_requested: bool, can_open_new_window: bool) -> Self {
+        match window {
+            None => Self::Launch,
+            Some(_) if new_window_requested && can_open_new_window => Self::NewWindow,
+            Some(window) => Self::Raise(window),
+        }
+    }
+
+    /// `animateLaunch()` runs only for a stopped app or a new window: a
+    /// raised window does not zoom.
+    fn zooms(self) -> bool {
+        !matches!(self, Self::Raise(_))
+    }
+}
+
+/// The running window `entry` raises: the dash's first match after
+/// sorting by window ID. The app ID selects a route; the compositor
+/// validates the window token.
+fn running_window(actions: &dyn OverviewActions, entry: &AppEntry) -> Option<u64> {
     let app_id = entry
         .app_id
         .strip_suffix(".desktop")
         .unwrap_or(&entry.app_id);
-    let window = actions
+    actions
         .running()
         .into_iter()
         .filter(|(_, app)| !app_id.is_empty() && app.as_deref() == Some(app_id))
         .map(|(id, _)| id)
-        // The dash also chooses the first match after sorting by window ID.
-        .min();
-    if let Some(window) = window {
+        .min()
+}
+
+/// `AppIcon.activate`: launch a stopped app, open another window of a
+/// running one when asked and allowed, else raise its window; then
+/// `activated` (the tile's launch zoom) and close the overview. Resolve
+/// the window at activation time, not while building a possibly stale
+/// tile; this uses the latest local snapshot and does not acknowledge
+/// actual focus. A failed spawn keeps the overview open.
+fn activate_app(
+    actions: &dyn OverviewActions,
+    entry: &AppEntry,
+    new_window_requested: bool,
+    spawn: impl FnOnce(&AppEntry, Activation) -> std::io::Result<()>,
+    activated: impl FnOnce(Activation),
+) -> std::io::Result<Activation> {
+    let activation = Activation::plan(
+        running_window(actions, entry),
+        new_window_requested,
+        entry.can_open_new_window(),
+    );
+    match activation {
         // Do not spawn a replacement after a stale/denied activation request.
-        // This uses the same token-validated path as a physical dash click.
-        actions.activate_window(window);
-    } else {
-        launch(entry)?;
+        Activation::Raise(window) => actions.activate_window(window),
+        Activation::Launch | Activation::NewWindow => spawn(entry, activation)?,
     }
+    activated(activation);
     actions.close_overview();
-    Ok(())
+    Ok(activation)
+}
+
+/// The spawn behind [`activate_app`]: `shell_app_launch` for a stopped
+/// app, `shell_app_open_new_window` for another window.
+fn spawn_app(entry: &AppEntry, activation: Activation) -> std::io::Result<()> {
+    match activation {
+        Activation::Launch => tuna_shell_host::apps::launch(entry).map(drop),
+        Activation::NewWindow => tuna_shell_host::apps::open_new_window(entry).map(drop),
+        Activation::Raise(_) => Ok(()),
+    }
+}
+
+/// AppIcon.activate's `isCtrlPressed`: Control held on the seat's
+/// keyboard as the tile activates (a click, or a key on a focused tile).
+fn control_held(widget: &impl IsA<gtk::Widget>) -> bool {
+    widget
+        .display()
+        .default_seat()
+        .and_then(|seat| seat.keyboard())
+        .is_some_and(|keyboard| {
+            keyboard
+                .modifier_state()
+                .contains(gtk::gdk::ModifierType::CONTROL_MASK)
+        })
+}
+
+/// Activate `entry` from `tile` as GNOME's AppIcon does: its St.Button
+/// takes the primary and the middle button (`button_mask: PRIMARY |
+/// MIDDLE`, appDisplay.js:1854; `vfunc_clicked(button)` →
+/// `activate(button)`, :3007), and Ctrl or the middle button asks for a
+/// new window. A launch zooms the tile out, then `closing` runs before
+/// the overview closes.
+fn connect_app_activation(
+    tile: &gtk::Button,
+    actions: Rc<dyn OverviewActions>,
+    entry: AppEntry,
+    closing: impl Fn() + 'static,
+) {
+    let activate = Rc::new(move |tile: &gtk::Button, new_window_requested: bool| {
+        let result = activate_app(
+            actions.as_ref(),
+            &entry,
+            new_window_requested,
+            spawn_app,
+            |activation| {
+                if activation.zooms() {
+                    crate::grid_animation::launch_zoom(tile);
+                }
+                closing();
+            },
+        );
+        if let Err(e) = result {
+            eprintln!("tuna-shell-gtk: launch {}: {e}", entry.app_id);
+        }
+    });
+    {
+        let activate = activate.clone();
+        tile.connect_clicked(move |tile| activate(tile, control_held(tile)));
+    }
+    let middle = gtk::GestureClick::new();
+    middle.set_button(gtk::gdk::BUTTON_MIDDLE);
+    let weak = tile.downgrade();
+    middle.connect_released(move |gesture, _, x, y| {
+        let Some(tile) = weak.upgrade() else { return };
+        // St.Button clicks on a release over the button.
+        if tile.contains(x, y) {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            activate(&tile, true);
+        }
+    });
+    tile.add_controller(middle);
 }
 
 /// One dash item (`#dash .overview-tile`): the 64px icon in a 76px
@@ -767,10 +883,26 @@ impl OverviewUi {
         }
     }
 
+    /// Enter: GNOME's `activateDefault` activates the first result's
+    /// AppIcon, which zooms out of its tile when it launches.
     fn launch(&self, entry: &AppEntry) {
-        if let Err(e) = activate_search_app(self.actions.as_ref(), entry, |entry| {
-            tuna_shell_host::apps::launch(entry).map(|_| ())
-        }) {
+        let tile = self
+            .results
+            .first_child()
+            .filter(|tile| self.results.is_visible() && tile.widget_name() == entry.app_id)
+            .and_downcast::<gtk::Button>();
+        let result = activate_app(
+            self.actions.as_ref(),
+            entry,
+            control_held(&self.entry),
+            spawn_app,
+            |activation| {
+                if let (true, Some(tile)) = (activation.zooms(), tile) {
+                    crate::grid_animation::launch_zoom(&tile);
+                }
+            },
+        );
+        if let Err(e) = result {
             eprintln!("tuna-shell-gtk: launch {}: {e}", entry.app_id);
         }
     }
@@ -793,15 +925,9 @@ impl OverviewUi {
             if i == 0 {
                 button.add_css_class("selected");
             }
-            let entry = (*hit).clone();
-            let apps = self.apps.clone();
-            let actions = self.actions.clone();
-            button.connect_clicked(move |_| {
-                let _ = apps;
-                let _ = activate_search_app(actions.as_ref(), &entry, |entry| {
-                    tuna_shell_host::apps::launch(entry).map(|_| ())
-                });
-            });
+            // Enter finds its tile by the app it shows.
+            button.set_widget_name(&hit.app_id);
+            connect_app_activation(&button, self.actions.clone(), (*hit).clone(), || {});
             self.results.append(&button);
         }
         self.results.set_visible(!hits.is_empty());
@@ -984,8 +1110,7 @@ impl OverviewUi {
                 separator.set_valign(gtk::Align::Center);
                 me.dash_row.append(&separator);
             }
-            let window = window_of(entry);
-            let (button, image) = dash_tile(entry, window.is_some());
+            let (button, image) = dash_tile(entry, window_of(entry).is_some());
             let ids = running
                 .iter()
                 .filter(|(_, app)| {
@@ -994,22 +1119,8 @@ impl OverviewUi {
                 .map(|(id, _)| *id)
                 .collect();
             me.dash_icons.push((ids, image));
-            let entry = entry.clone();
-            let actions = me.actions.clone();
-            // AppIcon.activate: a stopped app's launch zooms its icon out
-            // (animateLaunch); a running one is only activated.
-            button.connect_clicked(move |button| match window {
-                Some(id) => {
-                    actions.activate_window(id);
-                    actions.close_overview();
-                }
-                None => {
-                    if tuna_shell_host::apps::launch(&entry).is_ok() {
-                        crate::grid_animation::launch_zoom(button);
-                        actions.close_overview();
-                    }
-                }
-            });
+            // DashIcon inherits AppIcon.activate (dash.js:22).
+            connect_app_activation(&button, me.actions.clone(), entry.clone(), || {});
             me.dash_row.append(&button);
         }
         if orphans_need_separator {
@@ -1030,6 +1141,7 @@ impl OverviewUi {
                     .window_icon(window)
                     .or_else(|| Some("application-x-executable".to_owned())),
                 categories: Vec::new(),
+                new_window: Default::default(),
             };
             let (button, image) = dash_tile(&entry, true);
             me.dash_icons.push((vec![window], image));
@@ -1238,13 +1350,7 @@ impl OverviewUi {
                     Some(weak_ui.clone())
                 });
             }
-            let entry = entry.clone();
-            button.connect_clicked(move |button| {
-                if tuna_shell_host::apps::launch(&entry).is_ok() {
-                    crate::grid_animation::launch_zoom(button);
-                    actions.close_overview();
-                }
-            });
+            connect_app_activation(&button, actions, entry.clone(), || {});
             button
         };
         for (key, item) in items {
@@ -1334,15 +1440,15 @@ impl OverviewUi {
                                         format!("folder-app:{id}:{}", entry.app_id),
                                     );
                                     guard_drag_source(&source, &dragging);
-                                    let (entry, actions, dialog) =
-                                        (entry.clone(), actions.clone(), dialog.clone());
-                                    tile.connect_clicked(move |tile| {
-                                        if tuna_shell_host::apps::launch(&entry).is_ok() {
-                                            crate::grid_animation::launch_zoom(tile);
-                                            dialog.close_now();
-                                            actions.close_overview();
-                                        }
-                                    });
+                                    let dialog = dialog.clone();
+                                    // The zoom clones the tile before the
+                                    // dialog closes under it.
+                                    connect_app_activation(
+                                        &tile,
+                                        actions.clone(),
+                                        entry.clone(),
+                                        move || dialog.close_now(),
+                                    );
                                     tile.upcast::<gtk::Widget>()
                                 })
                                 .collect();
@@ -2768,8 +2874,8 @@ mod drag_edge_tests {
 }
 
 #[cfg(test)]
-mod search_activation_tests {
-    use super::{activate_search_app, AppEntry, OverviewActions};
+mod app_activation_tests {
+    use super::{activate_app, Activation, AppEntry, OverviewActions};
     use std::cell::RefCell;
 
     #[derive(Default)]
@@ -2791,6 +2897,14 @@ mod search_activation_tests {
         fn set_app_grid(&self, _: bool) {}
         fn open_overview(&self) {}
     }
+    impl Actions {
+        fn push(&self, event: &str) {
+            self.events.borrow_mut().push(event.into());
+        }
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.events.borrow_mut())
+        }
+    }
     fn entry(id: &str) -> AppEntry {
         AppEntry {
             app_id: id.into(),
@@ -2800,21 +2914,101 @@ mod search_activation_tests {
             argv: vec!["gnome-disks".into()],
             icon: None,
             categories: Vec::new(),
+            new_window: Default::default(),
+        }
+    }
+    /// Activate with a spawn that records what it was asked for and a
+    /// tile that records its launch zoom.
+    fn activate(
+        actions: &Actions,
+        entry: &AppEntry,
+        new_window_requested: bool,
+    ) -> std::io::Result<Activation> {
+        activate_app(
+            actions,
+            entry,
+            new_window_requested,
+            |actual, activation| {
+                assert_eq!(actual.argv, [std::ffi::OsString::from("gnome-disks")]);
+                actions.push(match activation {
+                    Activation::Launch => "launch",
+                    Activation::NewWindow => "new-window",
+                    Activation::Raise(_) => panic!("a raise must not spawn"),
+                });
+                Ok(())
+            },
+            |activation| {
+                if activation.zooms() {
+                    actions.push("zoom");
+                }
+            },
+        )
+    }
+    const DISKS: &str = "org.gnome.DiskUtility.desktop";
+
+    #[test]
+    fn the_plan_follows_app_icon_activate() {
+        // STOPPED: app.activate() launches, Ctrl or not.
+        assert_eq!(Activation::plan(None, false, true), Activation::Launch);
+        assert_eq!(Activation::plan(None, true, true), Activation::Launch);
+        assert_eq!(Activation::plan(None, true, false), Activation::Launch);
+        // RUNNING: raise, unless Ctrl/middle asks for a window it can open.
+        assert_eq!(Activation::plan(Some(3), false, true), Activation::Raise(3));
+        assert_eq!(Activation::plan(Some(3), true, true), Activation::NewWindow);
+        assert_eq!(Activation::plan(Some(3), true, false), Activation::Raise(3));
+        // Only a launch or a new window zooms (animateLaunch).
+        assert!(Activation::Launch.zooms());
+        assert!(Activation::NewWindow.zooms());
+        assert!(!Activation::Raise(3).zooms());
+    }
+
+    #[test]
+    fn a_stopped_app_launches_with_the_zoom_even_with_ctrl() {
+        let actions = Actions::default();
+        for new_window in [false, true] {
+            let result = activate(&actions, &entry(DISKS), new_window).unwrap();
+            assert_eq!(result, Activation::Launch);
+            assert_eq!(actions.take(), ["launch", "zoom", "close"]);
         }
     }
 
     #[test]
-    fn exact_running_app_activates_before_close_without_spawning() {
+    fn exact_running_app_activates_before_close_without_spawning_or_zooming() {
         let actions = Actions::default();
         *actions.windows.borrow_mut() = vec![
             (4, Some("org.tuna.VmInput".into())),
             (1, Some("org.gnome.DiskUtility".into())),
         ];
-        for id in ["org.gnome.DiskUtility.desktop", "org.gnome.DiskUtility"] {
-            actions.events.borrow_mut().clear();
-            activate_search_app(&actions, &entry(id), |_| panic!("must not respawn")).unwrap();
-            assert_eq!(*actions.events.borrow(), ["activate:1", "close"]);
+        for id in [DISKS, "org.gnome.DiskUtility"] {
+            let result = activate(&actions, &entry(id), false).unwrap();
+            assert_eq!(result, Activation::Raise(1));
+            assert_eq!(actions.take(), ["activate:1", "close"]);
         }
+    }
+
+    #[test]
+    fn ctrl_or_middle_on_a_running_app_opens_a_new_window_with_the_zoom() {
+        let actions = Actions::default();
+        *actions.windows.borrow_mut() = vec![(1, Some("org.gnome.DiskUtility".into()))];
+        let result = activate(&actions, &entry(DISKS), true).unwrap();
+        assert_eq!(result, Activation::NewWindow);
+        assert_eq!(actions.take(), ["new-window", "zoom", "close"]);
+    }
+
+    #[test]
+    fn ctrl_on_a_running_single_main_window_app_raises_it() {
+        let actions = Actions::default();
+        *actions.windows.borrow_mut() = vec![(1, Some("org.gnome.DiskUtility".into()))];
+        let mut single = entry(DISKS);
+        single.new_window.single_main_window = Some(true);
+        let result = activate(&actions, &single, true).unwrap();
+        assert_eq!(result, Activation::Raise(1));
+        assert_eq!(actions.take(), ["activate:1", "close"]);
+        // SingleMainWindow=false still opens one.
+        single.new_window.single_main_window = Some(false);
+        let result = activate(&actions, &single, true).unwrap();
+        assert_eq!(result, Activation::NewWindow);
+        assert_eq!(actions.take(), ["new-window", "zoom", "close"]);
     }
 
     #[test]
@@ -2828,44 +3022,43 @@ mod search_activation_tests {
             vec![(1, Some("Disks".into()))],
         ] {
             *actions.windows.borrow_mut() = windows;
-            actions.events.borrow_mut().clear();
-            activate_search_app(
+            activate_app(
                 &actions,
-                &entry("org.gnome.DiskUtility.desktop"),
-                |actual| {
-                    assert_eq!(actual.app_id, "org.gnome.DiskUtility.desktop");
+                &entry(DISKS),
+                false,
+                |actual, activation| {
+                    assert_eq!(activation, Activation::Launch);
+                    assert_eq!(actual.app_id, DISKS);
                     assert_eq!(actual.argv, [std::ffi::OsString::from("gnome-disks")]);
-                    actions.events.borrow_mut().push("launch".into());
+                    actions.push("launch");
                     Ok(())
                 },
+                |_| {},
             )
             .unwrap();
-            assert_eq!(*actions.events.borrow(), ["launch", "close"]);
+            assert_eq!(actions.take(), ["launch", "close"]);
         }
     }
 
     #[test]
     fn next_activation_uses_fresh_window_snapshot_not_render_time_identity() {
         let actions = Actions::default();
-        let entry = entry("org.gnome.DiskUtility.desktop");
+        let entry = entry(DISKS);
         for id in [1, 7] {
             *actions.windows.borrow_mut() = vec![(id, Some("org.gnome.DiskUtility".into()))];
-            activate_search_app(&actions, &entry, |_| panic!("must not respawn")).unwrap();
+            activate(&actions, &entry, false).unwrap();
         }
         actions.windows.borrow_mut().clear();
-        activate_search_app(&actions, &entry, |_| {
-            actions.events.borrow_mut().push("launch".into());
-            Ok(())
-        })
-        .unwrap();
+        activate(&actions, &entry, false).unwrap();
         assert_eq!(
-            *actions.events.borrow(),
+            actions.take(),
             [
                 "activate:1",
                 "close",
                 "activate:7",
                 "close",
                 "launch",
+                "zoom",
                 "close"
             ]
         );
@@ -2878,11 +3071,8 @@ mod search_activation_tests {
             (7, Some("org.gnome.DiskUtility".into())),
             (1, Some("org.gnome.DiskUtility".into())),
         ];
-        activate_search_app(&actions, &entry("org.gnome.DiskUtility.desktop"), |_| {
-            panic!("must not respawn")
-        })
-        .unwrap();
-        assert_eq!(*actions.events.borrow(), ["activate:1", "close"]);
+        activate(&actions, &entry(DISKS), false).unwrap();
+        assert_eq!(actions.take(), ["activate:1", "close"]);
     }
 
     #[test]
@@ -2893,24 +3083,28 @@ mod search_activation_tests {
             (2, Some("org.gnome.DiskUtility".into())),
         ];
         for id in ["", ".desktop", "org.gnome.DiskUtility.desktop.desktop"] {
-            actions.events.borrow_mut().clear();
-            activate_search_app(&actions, &entry(id), |_| {
-                actions.events.borrow_mut().push("launch".into());
-                Ok(())
-            })
-            .unwrap();
-            assert_eq!(*actions.events.borrow(), ["launch", "close"]);
+            activate(&actions, &entry(id), false).unwrap();
+            assert_eq!(actions.take(), ["launch", "zoom", "close"]);
         }
     }
 
     #[test]
-    fn failed_new_launch_keeps_overview_open() {
+    fn failed_spawn_keeps_overview_open_without_the_zoom() {
         let actions = Actions::default();
-        let result = activate_search_app(&actions, &entry("org.gnome.DiskUtility.desktop"), |_| {
+        let fail = |_: &AppEntry, _| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "missing launcher",
             ))
+        };
+        let result = activate_app(&actions, &entry(DISKS), false, fail, |_| {
+            actions.push("zoom")
+        });
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        // A failed new window, too.
+        *actions.windows.borrow_mut() = vec![(1, Some("org.gnome.DiskUtility".into()))];
+        let result = activate_app(&actions, &entry(DISKS), true, fail, |_| {
+            actions.push("zoom")
         });
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
         assert!(actions.events.borrow().is_empty());

@@ -30,3 +30,12 @@ if ! id -u tunaseeded >/dev/null 2>&1; then
 	printf '[User]\nSystemAccount=false\n' >/var/lib/AccountsService/users/tunaseeded
 	chmod 0600 /var/lib/AccountsService/users/tunaseeded
 fi
+# GDM's user list order depends on when AccountsService loads each account,
+# so Tab-counting to "Not listed?" can select tunaseeded and type the target
+# name as its password (run 41230684089). This credential-only boot asks for
+# the name directly instead: GDM's own login-screen setting, applied by its
+# system-db:gdm dconf profile. No account, session or autologin state changes.
+grep -qx 'system-db:gdm' /usr/share/dconf/profile/gdm
+install -d -m 0755 /etc/dconf/db/gdm.d
+printf '[org/gnome/login-screen]\ndisable-user-list=true\n' >/etc/dconf/db/gdm.d/90-tuna-vm-fresh-accounts
+dconf update

@@ -73,13 +73,48 @@ pub(crate) mod test_peer;
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
+
+    fn isolated(test: &str) -> bool {
+        const CHILD: &str = "TUNA_CONTROL_READINESS_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(test) {
+            return false;
+        }
+        // A sibling test's concurrent fork can inherit our socket until exec.
+        // Create the watched descriptors only after this exact-test child execs.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--test-threads=1"])
+            .env(CHILD, test)
+            .status()
+            .unwrap();
+        assert!(status.success(), "readiness child failed: {status}");
+        true
+    }
+
+    fn registered_fds(readiness: &ControlReadiness) -> Vec<RawFd> {
+        // Inspect only this still-owned epoll instance, never process-wide fd
+        // counts or a closed descriptor number that another thread could reuse.
+        std::fs::read_to_string(format!("/proc/self/fdinfo/{}", readiness.0.as_raw_fd()))
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("tfd:"))
+            .map(|entry| entry.split_whitespace().next().unwrap().parse().unwrap())
+            .collect()
+    }
+
     #[test]
     fn accepted_control_socket_wakes_drains_and_closure_retires_interest() {
+        if isolated(
+            "control_readiness::tests::accepted_control_socket_wakes_drains_and_closure_retires_interest",
+        ) {
+            return;
+        }
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
         receiver.set_nonblocking(true).unwrap();
         let readiness = ControlReadiness::new(&receiver).unwrap();
+        assert_eq!(registered_fds(&readiness), vec![receiver.as_raw_fd()]);
         let mut event_loop = calloop::EventLoop::<usize>::try_new().unwrap();
         event_loop
             .handle()
@@ -107,11 +142,41 @@ mod tests {
             .unwrap();
         assert_eq!(count, 2);
         drop(receiver);
+        assert!(
+            registered_fds(&readiness).is_empty(),
+            "closing the owned socket must retire its kernel registration"
+        );
         event_loop
             .dispatch(Some(Duration::ZERO), &mut count)
             .unwrap();
         assert_eq!(count, 2, "closed original fd must remove interest");
         test_peer::wait_for_peer_close(&mut sender, Duration::from_secs(1))
             .expect("watch must not hold the peer alive");
+    }
+
+    #[test]
+    fn retained_socket_reference_keeps_interest_until_last_close() {
+        if isolated(
+            "control_readiness::tests::retained_socket_reference_keeps_interest_until_last_close",
+        ) {
+            return;
+        }
+        let (receiver, mut sender) = UnixStream::pair().unwrap();
+        let readiness = ControlReadiness::new(&receiver).unwrap();
+        let registered = receiver.as_raw_fd();
+        let duplicate = receiver.try_clone().unwrap();
+        drop(receiver);
+        // A leaked socket reference must remain visible to both independent
+        // observations used by the retirement regression above.
+        assert_eq!(registered_fds(&readiness), vec![registered]);
+        assert_eq!(
+            test_peer::wait_for_peer_close(&mut sender, Duration::from_millis(20))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        drop(duplicate);
+        assert!(registered_fds(&readiness).is_empty());
+        test_peer::wait_for_peer_close(&mut sender, Duration::from_secs(1)).unwrap();
     }
 }
