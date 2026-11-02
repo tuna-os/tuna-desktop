@@ -81,7 +81,9 @@ where
                 if let Some(pointer) = seat.get_pointer() {
                     if pointer.has_grab(serial) {
                         let start_data = pointer.grab_start_data().unwrap();
-                        let owns_origin = start_data.focus.as_ref()
+                        let owns_origin = start_data
+                            .focus
+                            .as_ref()
                             .and_then(|(focus, _)| focus.wl_surface())
                             .is_some_and(|surface| surface.as_ref() == &origin);
                         if !owns_origin {
@@ -98,8 +100,13 @@ where
                         }
                         // The origin owns this implicit pointer grab.
                         if let Some(source) = &source {
-                            source.data::<super::DataSourceUserData>().unwrap()
-                                .inner.lock().unwrap().drag_started = true;
+                            source
+                                .data::<super::DataSourceUserData>()
+                                .unwrap()
+                                .inner
+                                .lock()
+                                .unwrap()
+                                .drag_started = true;
                         }
                         handler.started(source.clone(), icon.clone(), seat.clone());
                         pointer.set_grab(
@@ -114,7 +121,9 @@ where
                 if let Some(touch) = seat.get_touch() {
                     if touch.has_grab(serial) {
                         let start_data = touch.grab_start_data().unwrap();
-                        let owns_origin = start_data.focus.as_ref()
+                        let owns_origin = start_data
+                            .focus
+                            .as_ref()
                             .and_then(|(focus, _)| focus.wl_surface())
                             .is_some_and(|surface| surface.as_ref() == &origin);
                         if !owns_origin {
@@ -131,8 +140,13 @@ where
                         }
                         // The origin owns this implicit touch grab.
                         if let Some(source) = &source {
-                            source.data::<super::DataSourceUserData>().unwrap()
-                                .inner.lock().unwrap().drag_started = true;
+                            source
+                                .data::<super::DataSourceUserData>()
+                                .unwrap()
+                                .inner
+                                .lock()
+                                .unwrap()
+                                .drag_started = true;
                         }
                         handler.started(source.clone(), icon.clone(), seat.clone());
                         touch.set_grab(
@@ -163,8 +177,13 @@ where
                     }
                 };
                 if let Some(source) = &source {
-                    source.data::<super::DataSourceUserData>().unwrap()
-                        .inner.lock().unwrap().used_for_selection = true;
+                    source
+                        .data::<super::DataSourceUserData>()
+                        .unwrap()
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .used_for_selection = true;
                 }
                 let source = source.map(SelectionSourceProvider::DataDevice);
 

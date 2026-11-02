@@ -2335,7 +2335,12 @@ impl Frame for GlesFrame<'_, '_> {
         let Some(acquire) = buffer.acquire_point() else {
             return Ok(());
         };
-        if !self.renderer.accessed_buffers.iter().any(|held| held.same_commit(buffer)) {
+        if !self
+            .renderer
+            .accessed_buffers
+            .iter()
+            .any(|held| held.same_commit(buffer))
+        {
             self.renderer.wait(&SyncPoint::from(acquire.clone()))?;
             self.renderer.accessed_buffers.push(buffer.clone());
         }
