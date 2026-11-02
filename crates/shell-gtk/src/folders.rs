@@ -460,14 +460,12 @@ impl FolderCreateObservation {
     }
 
     fn emit(self) {
-        use std::io::Write;
         let record = serde_json::json!({"kind":"folder-create-observation", "pid":std::process::id(),
             "folder":self.id, "declared_source":self.declared_source,
             "source_binding":"external proof admission required; not authenticated by this environment",
             "expected_name":self.expected_name, "expected_apps":self.expected_apps,
             "events":self.events, "scope":"cached readback and bounded physical samples; no durability or cross-process atomicity claim"});
-        let bytes = format!("FOLDER-CREATE {record}\n");
-        let _ = std::io::stderr().lock().write_all(bytes.as_bytes());
+        eprintln!("FOLDER-CREATE {record}");
     }
 }
 

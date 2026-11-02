@@ -13,6 +13,24 @@
 //! The compositor runs one supervised shell; select this one with
 //! `TUNA_SHELL_BIN=tuna-shell-gtk` while it grows to parity.
 
+/// Writes a complete, newline-terminated stderr record with one `write_all`
+/// (see `tuna_compositor::stderr_record`).
+fn stderr_record(record: &str) -> std::io::Result<()> {
+    std::io::Write::write_all(&mut std::io::stderr().lock(), record.as_bytes())
+}
+
+/// Shadows `std::eprintln!` in every module: format one String including the
+/// newline, then write it whole. Ignore closed-stderr errors.
+macro_rules! eprintln {
+    () => {
+        eprintln!("")
+    };
+    ($($arg:tt)*) => {{
+        let record = ::std::format!("{}\n", ::std::format_args!($($arg)*));
+        let _ = $crate::stderr_record(&record);
+    }};
+}
+
 mod accessibility;
 mod anim_clock;
 mod audio_selection;
