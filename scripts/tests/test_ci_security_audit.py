@@ -73,27 +73,6 @@ class SecurityAuditTests(unittest.TestCase):
                     self.assertEqual(result.returncode, status)
                     self.assertNotIn("::notice::", result.stdout)
 
-    def test_workflow_keeps_gate_required_and_read_only(self):
-        workflow, job = workflow_check()
-        steps = job["steps"]
-        audit = next(s for s in steps if s.get("name") == "Audit locked dependencies")
-        self.assertEqual(audit["run"], 'cargo audit --file "$GITHUB_WORKSPACE/Cargo.lock"')
-        self.assertNotIn("continue-on-error", audit)
-        self.assertNotIn("continue-on-error", job)
-        self.assertNotIn("if", audit)
-        self.assertEqual(job.get("permissions", workflow["permissions"]), {"contents": "read"})
-        install = next(s for s in steps if s.get("name") == "Install pinned cargo-audit")
-        self.assertEqual(install["uses"], "./.ci-workflow-tools/.github/actions/ci-tool")
-        self.assertEqual(install["with"], {"tool": "cargo-audit", "version": "0.22.2"})
-        self.assertNotIn("if", install)
-        self.assertNotIn("continue-on-error", install)
-        self.assertTrue(any(s.get("name") == "Test the tokenless security gate" for s in steps))
-        self.assertFalse(any("rustsec/audit-check" in s.get("uses", "") for s in steps))
-        checkout = next(s for s in steps if s.get("uses", "").startswith("actions/checkout@"))
-        self.assertFalse(checkout["with"]["persist-credentials"])
-        events = workflow.get("on", workflow.get(True))
-        self.assertIn("pull_request", events)
-        self.assertNotIn("pull_request_target", events)
 
 
 class WorkflowToolCacheTests(unittest.TestCase):

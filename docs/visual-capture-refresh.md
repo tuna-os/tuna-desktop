@@ -35,6 +35,10 @@ source, artifact upload digests, decoded media, UI outcomes and immutable
 image/package/base evidence. ZIP paths, aliases, symlinks and nonregular
 members are rejected before only fixed media/evidence members are extracted.
 No artifact executable is extracted or run.
+The check job has only `contents: read` and `actions: read` for that API
+freshness admission; its dependency audit remains tokenless and fatal on
+failure. The separate trusted promotion workflow's PR-writing permissions
+do not expose a release credential or authorize downloaded code execution.
 
 The result enters an ordinary media-refresh PR and the existing full CI,
 never a direct-main commit or a gate/publication bypass. Newer main source
