@@ -220,10 +220,19 @@ not qualification.
 - **Not yet qualified on this head.** `scripts/tuna-explicit-sync-proof` uses
   real DRM timeline ioctls, offered feedback formats/modifiers, GBM/EGL buffers,
   presentation and independent output captures, including blocked-acquire and
-  teardown/error controls. Its existence is not a pass. Named virtio/virgl
-  native emulation under approved CI is being prepared; vkms/Bochs disabled
-  observations cannot qualify successful timeline import or release ordering.
-  ADR 0008 permits named actual emulation, not stand-in devices or manifests.
+  teardown/error controls. Its existence is not a pass. The finite native VM
+  consumer keeps all 19 sync/dmabuf cases and then drives the actual background
+  consumer on that same original admitted virtio/virgl DRM session. Independent
+  QMP captures check copied/clipped/subtracted blur regions, synchronized
+  child/parent commits, unmap/remap, null and destruction with the same oracle as
+  `scripts/tuna-background-effect-proof`. Actual EGL/GL/compiler/DRM driver,
+  kernel and installed package identities accompany the receipts. Missing blur
+  capability or a failed case is a failure, never an unsupported skip or a forced
+  scanout capability. This SDR output comparison does not qualify FP16/HDR
+  precision; the colour renderer owns that separate evidence. Neither consumer
+  has run on the integrated installed image. vkms/Bochs disabled observations
+  cannot qualify successful timeline import or release ordering. ADR 0008
+  permits named actual emulation, not stand-in devices or manifests.
 - **Protocol error placement.** `surface_exists` is posted on the manager,
   as the XML defines it; Mutter 51 posts it on the surface.
 

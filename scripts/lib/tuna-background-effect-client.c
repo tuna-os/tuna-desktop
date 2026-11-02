@@ -2,13 +2,14 @@
  * Commands on stdin; JSON receipts on stdout. A receipt is not pixel proof.
  * The proof driver captures the compositor output after the frame callback.
  */
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
@@ -115,12 +116,18 @@ static void set_region(struct client *c, struct ext_background_effect_surface_v1
     wl_region_destroy(region);
 }
 int main(int argc, char **argv) {
-    (void)argv;
-    if (argc != 1) { fprintf(stderr, "usage: tuna-background-effect-client < COMMANDS\n"); return 2; }
+    if (argc != 1 && !(argc == 2 && !strcmp(argv[1], "--attest-peer"))) {
+        fprintf(stderr, "usage: tuna-background-effect-client [--attest-peer] < COMMANDS\n"); return 2;
+    }
     setvbuf(stdout, NULL, _IOLBF, 0);
     struct client c = { .display = wl_display_connect(NULL) };
     if (!c.display) die("wl_display_connect");
     struct wl_registry *registry = wl_display_get_registry(c.display);
+    struct ucred peer; socklen_t peer_size = sizeof(peer);
+    if (getsockopt(wl_display_get_fd(c.display), SOL_SOCKET, SO_PEERCRED, &peer, &peer_size) < 0)
+        die("Wayland peer credentials");
+    if (argc == 2)
+        printf("{\"event\":\"wayland-peer\",\"pid\":%d,\"uid\":%u}\n", peer.pid, peer.uid);
     wl_registry_add_listener(registry, &registry_listener, &c);
     if (wl_display_roundtrip(c.display) < 0 || wl_display_roundtrip(c.display) < 0) die("registry");
     if (!c.effects || !(c.capabilities & EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR)) {

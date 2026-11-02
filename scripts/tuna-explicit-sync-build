@@ -31,3 +31,6 @@ read -r -a link_flags <<< "$(pkg-config --libs wayland-client libdrm gbm egl gle
 cc -std=c11 -O2 -Wall -Wextra -Werror "${compile_flags[@]}" -I "$output_root" \
     "$script_root/lib/tuna-explicit-sync-client.c" "${sources[@]}" \
     "${link_flags[@]}" -o "$output_root/tuna-explicit-sync-client"
+"$script_root/tuna-background-effect-client-build" "$output_root"
+sha256sum "$protocol_root/staging/ext-background-effect/ext-background-effect-v1.xml" \
+    >> "$output_root/protocol-xml.sha256"

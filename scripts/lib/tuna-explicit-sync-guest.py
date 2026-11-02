@@ -19,13 +19,16 @@ import stat
 import subprocess
 import sys
 import time
+import background_effect_oracle as background
 
 ROOT = Path('/run/tuna-explicit-sync-proof')
 CLIENT = Path('/usr/libexec/tuna-explicit-sync-client')
+BACKGROUND_CLIENT = Path('/usr/libexec/tuna-background-effect-client')
 CASES = ('ordering', 'destroy', 'unmap', 'disconnect', 'surface-exists', 'invalid-timeline',
          'no-surface', 'unsupported-buffer', 'no-buffer', 'no-acquire', 'no-release', 'conflicting-points',
          'failed-dmabuf', 'invalid-dmabuf', 'invalid-dmabuf-destroy-params', 'destroy-sync-shm',
          'legacy-v3', 'mixed-modifiers-v3', 'mixed-modifiers-v5')
+CONSUMERS = CASES + ('background-effect',)
 CHECKPOINTS = ('red-presented', 'green-blocked', 'green-presented', 'blue-presented')
 ARTIFACTS = ('events.jsonl', 'stderr.log', 'default-format-table.bin', 'surface-format-table.bin',
              'producer-red.ppm', 'producer-green.ppm', 'producer-blue.ppm', 'producer-legacy-v3-red.ppm')
@@ -98,16 +101,18 @@ def request(action, raw):
     if type(value) is not dict or set(value) != SCHEMAS[action]:
         raise ValueError('exact finite action schema required')
     require_nonce(value['nonce'])
-    if 'case' in value and (type(value['case']) is not str or value['case'] not in CASES):
-        raise ValueError('fixed native case required')
+    if 'case' in value and (type(value['case']) is not str or value['case'] not in CONSUMERS):
+        raise ValueError('fixed native consumer required')
     if action == 'init':
         if any(type(value[key]) is not int or value[key] <= 0 for key in ('pid', 'start_ticks', 'uid')):
             raise ValueError('original non-root compositor identity required')
     if 'sha256' in value and (type(value['sha256']) is not str or re.fullmatch('[0-9a-f]{64}', value['sha256']) is None):
         raise ValueError('exact compositor hash required')
     if action == 'ack':
-        if (type(value['attempt']) is not str or re.fullmatch('[0-9a-f]{32}', value['attempt']) is None
-                or type(value['name']) is not str or value['name'] not in CHECKPOINTS
+        if (value['case'] not in {'ordering', 'background-effect'}
+                or type(value['attempt']) is not str or re.fullmatch('[0-9a-f]{32}', value['attempt']) is None
+                or type(value['name']) is not str or value['name'] not in
+                    (CHECKPOINTS if value['case'] == 'ordering' else tuple(name for _, name in background.STEPS))
                 or type(value['png_sha256']) is not str or re.fullmatch('[0-9a-f]{64}', value['png_sha256']) is None):
             raise ValueError('exact independent capture acknowledgement required')
     if action == 'file' and (type(value['name']) is not str or value['name'] not in ARTIFACTS
@@ -167,10 +172,19 @@ def initialize(value):
     if (owner['start_ticks'] != value['start_ticks'] or owner['uid'] != value['uid']
             or owner['sha256'] != value['sha256'] or owner['executable'] != '/usr/bin/tuna-compositor'):
         raise RuntimeError('original installed session compositor does not match admission')
+    packages = dict(line.split(' ', 1) for line in subprocess.check_output(
+        ['pacman', '-Q', 'mesa', 'libdrm', 'wayland', 'tuna-desktop'],
+        text=True, timeout=1).splitlines())
+    if set(packages) != {'mesa', 'libdrm', 'wayland', 'tuna-desktop'}:
+        raise RuntimeError('actual installed native graphics/package facts unavailable')
     state = {'schema': 1, 'nonce': value['nonce'], 'compositor': owner,
              'backend': 'drm', 'client_sha256': digest(CLIENT), 'guest_helper_sha256': digest(__file__),
+             'background_client_sha256': digest(BACKGROUND_CLIENT),
+             'background_oracle_sha256': digest(background.__file__),
              'protocol_source': json.loads(Path('/usr/share/tuna-explicit-sync/protocol-source.json').read_text()),
              'protocol_xml_hash_list_sha256': digest('/usr/share/tuna-explicit-sync/protocol-xml.sha256'),
+             'system': {'kernel_release': os.uname().release, 'machine': os.uname().machine,
+                        'packages': packages},
              'deadline': time.monotonic() + 180, 'cases': {}, 'captures': {}, 'active': None,
              'checkpoint': None, 'complete': False}
     check_owner(state)
@@ -224,8 +238,11 @@ def worker(directory, case, attempt, gate, ready):
         devices = list(Path('/dev/dri').glob('renderD*'))
         if len(sockets) != 1 or len(devices) != 1:
             raise RuntimeError('one actual session Wayland socket and DRM render node required')
-        if digest(CLIENT) != state['client_sha256'] or digest(__file__) != state['guest_helper_sha256']:
-            raise RuntimeError('native helper/client bytes changed')
+        client = BACKGROUND_CLIENT if case == 'background-effect' else CLIENT
+        client_hash = state['background_client_sha256'] if case == 'background-effect' else state['client_sha256']
+        if (digest(client) != client_hash or digest(__file__) != state['guest_helper_sha256']
+                or digest(background.__file__) != state['background_oracle_sha256']):
+            raise RuntimeError('native helper/client/oracle bytes changed')
         env = {name: value for name, value in os.environ.items()
                if name not in {'WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'WAYLAND_DEBUG', 'DISPLAY',
                                'LIBGL_ALWAYS_SOFTWARE', 'GALLIUM_DRIVER', 'LD_PRELOAD', 'LD_LIBRARY_PATH'}}
@@ -238,9 +255,12 @@ def worker(directory, case, attempt, gate, ready):
         target = directory / case
         target.mkdir(mode=0o700)
         os.chown(target, uid, account.pw_gid)
-        argv = [str(CLIENT), '--device', str(devices[0]), '--artifacts', str(target), '--case', case]
+        argv = ([str(client), '--attest-peer'] if case == 'background-effect' else
+                [str(client), '--device', str(devices[0]), '--artifacts', str(target), '--case', case])
         if case == 'ordering':
             argv.append('--checkpoints')
+        checkpoints = (tuple(name for _, name in background.STEPS) if case == 'background-effect'
+                       else CHECKPOINTS if case == 'ordering' else ())
         rows = []
         seen = []
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
@@ -250,8 +270,8 @@ def worker(directory, case, attempt, gate, ready):
                                      env=env, preexec_fn=principal, start_new_session=True, bufsize=0)
             child_fd = os.pidfd_open(child.pid)
             result['client'] = process(child.pid)
-            if (result['client']['uid'] != uid or result['client']['executable'] != str(CLIENT)
-                    or result['client']['sha256'] != state['client_sha256']):
+            if (result['client']['uid'] != uid or result['client']['executable'] != str(client)
+                    or result['client']['sha256'] != client_hash):
                 raise RuntimeError('spawned native client does not match exact installed fixture')
             update(directory, active_client=result['client'], device=str(devices[0]))
             remaining = b''
@@ -271,11 +291,36 @@ def worker(directory, case, attempt, gate, ready):
                     row = json.loads(line)
                     if row.get('event') == 'wayland-peer' and (row.get('pid') != owner['pid'] or row.get('uid') != uid):
                         raise RuntimeError('native consumer connected to different compositor principal')
+                    if row.get('event') == 'device':
+                        if (row.get('path') != str(devices[0]) or row.get('driver') != 'virtio_gpu'
+                                or row.get('timeline') is not True or row.get('eventfd') is not True):
+                            raise RuntimeError('actual native device differs from the named virtio profile')
+                        result['device'] = row
+                    if row.get('event') == 'graphics':
+                        if (any(type(row.get(key)) is not str or not row[key] for key in
+                                ('egl_vendor', 'egl_version', 'gl_vendor', 'gl_renderer',
+                                 'gl_version', 'client_compiler'))
+                                or 'virgl' not in row['gl_renderer'].lower()):
+                            raise RuntimeError('named native virgl profile requires actual virgl rendering')
+                        result['graphics'] = row
                     rows.append(row)
+                    if case == 'background-effect' and 'result' in row:
+                        index = len(seen)
+                        if index >= len(background.STEPS):
+                            raise RuntimeError('unexpected extra background consumer receipt')
+                        operation, name = background.STEPS[index]
+                        if (row.get('result') != ('command-applied' if operation else 'ready')
+                                or (operation and (row.get('command') != operation or row.get('sequence') != index))):
+                            raise RuntimeError('actual background lifecycle receipt missing or out of order')
+                        row = {'event': 'checkpoint', 'name': name}
+                        # The client's frame callback may precede the KMS flip;
+                        # retain the existing standalone consumer's settle time.
+                        time.sleep(0.15)
+                        alive()
                     if row.get('event') != 'checkpoint':
                         continue
                     name = row.get('name')
-                    if case != 'ordering' or len(seen) >= len(CHECKPOINTS) or name != CHECKPOINTS[len(seen)]:
+                    if len(seen) >= len(checkpoints) or name != checkpoints[len(seen)]:
                         raise RuntimeError('unexpected or replayed native checkpoint')
                     seen.append(name)
                     checkpoint = dict(row, case=case, attempt=attempt)
@@ -295,7 +340,11 @@ def worker(directory, case, attempt, gate, ready):
                         current['captures'][name] = value
                         current['checkpoint'] = None
                         save(directory / 'state.json', current)
-                    child.stdin.write(b'continue\n')
+                    if case == 'background-effect':
+                        command = background.STEPS[len(seen)][0] if len(seen) < len(background.STEPS) else 'quit'
+                        child.stdin.write((command + '\n').encode())
+                    else:
+                        child.stdin.write(b'continue\n')
                     child.stdin.flush()
             if remaining:
                 raise RuntimeError('truncated actual native client event')
@@ -306,9 +355,11 @@ def worker(directory, case, attempt, gate, ready):
                 raise RuntimeError('exact native client departure unobserved')
             result['client_reaped'] = True
             alive()
-            if (code != 0 or not any(row == {'event': 'case-pass', 'case': case} for row in rows)
-                    or not any(row.get('event') == 'wayland-peer' for row in rows)
-                    or (case == 'ordering' and tuple(seen) != CHECKPOINTS)):
+            sync_pass = (any(row == {'event': 'case-pass', 'case': case} for row in rows)
+                         and 'device' in result and 'graphics' in result)
+            if (code != 0 or not any(row.get('event') == 'wayland-peer' for row in rows)
+                    or (case != 'background-effect' and not sync_pass)
+                    or tuple(seen) != checkpoints):
                 raise RuntimeError('actual native timeline/dmabuf case failed: ' + case)
     except BaseException as error:
         result['failure'] = type(error).__name__ + ': ' + str(error)
@@ -351,7 +402,7 @@ def worker(directory, case, attempt, gate, ready):
 
 def start(directory, state, case):
     if (state['active'] is not None or state.get('failure') or case in state['cases']
-            or len(state['cases']) >= len(CASES) or case != CASES[len(state['cases'])]
+            or len(state['cases']) >= len(CONSUMERS) or case != CONSUMERS[len(state['cases'])]
             or time.monotonic() >= state['deadline']):
         raise RuntimeError('native cases must start once, serially, within aggregate deadline')
     attempt = os.urandom(16).hex()
@@ -456,11 +507,11 @@ def retire(directory, state, cancel):
         state['active'] = None
         if cancel or row.get('failure') or row.get('exit_code') != 0:
             state['failure'] = row.get('failure', 'native case cancelled or failed')
-        if len(state['cases']) == len(CASES) and not state.get('failure'):
+        if len(state['cases']) == len(CONSUMERS) and not state.get('failure'):
             check_owner(state)
             if process(state['compositor']['pid']) != state['compositor']:
                 raise RuntimeError('original installed compositor bytes changed')
-            if set(state['captures']) != set(CHECKPOINTS):
+            if set(state['captures']) != set(CHECKPOINTS) | {name for _, name in background.STEPS}:
                 raise RuntimeError('missing independent native QMP captures')
             state['complete'] = True
         save(directory / 'state.json', state)

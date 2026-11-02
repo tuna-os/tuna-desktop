@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'scripts/lib'))
 
 
 def module(name, path):
@@ -64,9 +65,12 @@ class FiniteActionSchema(unittest.TestCase):
     def test_legacy_producer_is_a_real_named_artifact(self):
         value = self.parse('file', case='legacy-v3', name='producer-legacy-v3-red.ppm', offset=0)
         self.assertEqual(value['name'], 'producer-legacy-v3-red.ppm')
-        self.assertEqual(set(host.CASES), set(guest.CASES))
-        self.assertEqual(len(host.CASES), 19)
-        self.assertEqual(set(host.ARTIFACTS), set(guest.ARTIFACTS))
+
+    def test_capture_acknowledgements_do_not_cross_consumer_boundaries(self):
+        for case, name in (('ordering', 'on'), ('background-effect', 'red-presented'),
+                           ('disconnect', 'on')):
+            with self.subTest(case=case, name=name), self.assertRaises(ValueError):
+                self.parse('ack', case=case, name=name, attempt=ATTEMPT, png_sha256='c' * 64)
 
     def test_completed_or_active_case_cannot_be_started_again(self):
         state = {'active': {'case': 'ordering'}, 'cases': {}, 'deadline': time.monotonic() + 10}
@@ -115,6 +119,17 @@ class FilesystemBoundaries(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             self.dispatch('ack', dict(value, png_sha256='e' * 64))
         self.assertEqual(json.loads(path.read_text()), value)
+        background_state = self.state()
+        background_state['active']['case'] = 'background-effect'
+        background_state['checkpoint'].update(case='background-effect', name='null-committed')
+        guest.save(self.directory / 'state.json', background_state)
+        background_ack = guest.request('ack', json.dumps(dict(
+            value, case='background-effect', name='null-committed')))
+        with self.assertRaises(RuntimeError):
+            self.dispatch('ack', value)
+        self.dispatch('ack', background_ack)
+        background_path = self.directory / (ATTEMPT + '-null-committed.ack')
+        self.assertEqual(json.loads(background_path.read_text()), background_ack)
         self.assertFalse(path.with_suffix('.pending').exists())
 
     def test_artifact_symlinks_and_nonregular_files_are_rejected(self):

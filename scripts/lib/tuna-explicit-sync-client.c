@@ -92,6 +92,16 @@ static void fail(const char *message) {
             message, errno, strerror(errno), eglGetError(), glGetError());
     exit(1);
 }
+static void json_text(const char *text) {
+    REQUIRE(text && *text, "actual graphics identity string unavailable");
+    putchar('"');
+    for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
+        if (*p == '"' || *p == '\\') { putchar('\\'); putchar(*p); }
+        else if (*p < 0x20) printf("\\u%04x", *p);
+        else putchar(*p);
+    }
+    putchar('"');
+}
 static int64_t now_ns(void) {
     struct timespec t; REQUIRE(clock_gettime(CLOCK_MONOTONIC, &t) == 0, "clock");
     return (int64_t)t.tv_sec * INT64_C(1000000000) + t.tv_nsec;
@@ -440,7 +450,9 @@ static void initialize(const char *device_path) {
     REQUIRE(ev >= 0 && drmSyncobjCreate(drm_fd, 0, &timeline) == 0 && drmSyncobjEventfd(drm_fd, timeline, 1, ev, 0) == 0, "actual syncobj eventfd registration");
     drmSyncobjDestroy(drm_fd, timeline); close(ev);
     drmVersionPtr version = drmGetVersion(drm_fd); REQUIRE(version, "actual DRM driver identity");
-    printf("{\"event\":\"device\",\"path\":\"%s\",\"driver\":\"%.*s\",\"timeline\":true,\"eventfd\":true}\n", device_path, version->name_len, version->name); drmFreeVersion(version);
+    printf("{\"event\":\"device\",\"path\":\"%s\",\"device_id\":%ju,\"driver\":\"%.*s\",\"driver_version\":[%d,%d,%d],\"timeline\":true,\"eventfd\":true}\n",
+           device_path, (uintmax_t)render_device, version->name_len, version->name,
+           version->version_major, version->version_minor, version->version_patchlevel); drmFreeVersion(version);
     gbm = gbm_create_device(drm_fd); REQUIRE(gbm, "actual GBM device");
     egl_display = eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm, NULL); EGLint major, minor;
     REQUIRE(egl_display != EGL_NO_DISPLAY && eglInitialize(egl_display, &major, &minor), "initialize native GBM/EGL renderer");
@@ -453,6 +465,12 @@ static void initialize(const char *device_path) {
     EGLint context_attributes[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
     egl_context = eglCreateContext(egl_display, config, EGL_NO_CONTEXT, context_attributes);
     REQUIRE(egl_context != EGL_NO_CONTEXT && eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context), "native GLES context");
+    printf("{\"event\":\"graphics\",\"egl_vendor\":"); json_text(eglQueryString(egl_display, EGL_VENDOR));
+    printf(",\"egl_version\":"); json_text(eglQueryString(egl_display, EGL_VERSION));
+    printf(",\"gl_vendor\":"); json_text((const char *)glGetString(GL_VENDOR));
+    printf(",\"gl_renderer\":"); json_text((const char *)glGetString(GL_RENDERER));
+    printf(",\"gl_version\":"); json_text((const char *)glGetString(GL_VERSION));
+    printf(",\"client_compiler\":"); json_text(__VERSION__); puts("}");
     create_image = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
     destroy_image = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
     create_sync = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");

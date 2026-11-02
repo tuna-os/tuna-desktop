@@ -13,11 +13,13 @@ import time
 import tomllib
 
 from PIL import Image
+import background_effect_oracle as background
 
 CASES = ('ordering', 'destroy', 'unmap', 'disconnect', 'surface-exists', 'invalid-timeline',
          'no-surface', 'unsupported-buffer', 'no-buffer', 'no-acquire', 'no-release', 'conflicting-points',
          'failed-dmabuf', 'invalid-dmabuf', 'invalid-dmabuf-destroy-params', 'destroy-sync-shm',
          'legacy-v3', 'mixed-modifiers-v3', 'mixed-modifiers-v5')
+CONSUMERS = CASES + ('background-effect',)
 ARTIFACTS = ('events.jsonl', 'stderr.log', 'default-format-table.bin', 'surface-format-table.bin',
              'producer-red.ppm', 'producer-green.ppm', 'producer-blue.ppm', 'producer-legacy-v3-red.ppm')
 CHECKPOINTS = {'red-presented': [240, 16, 16], 'green-blocked': [240, 16, 16],
@@ -50,6 +52,7 @@ def run(qmp, agent_factory, out, image, inventory, vm):
     if len(locked) != 1:
         raise RuntimeError('one exact locked protocol source required')
     helper_hash = hashlib.sha256(Path(__file__).with_name('tuna-explicit-sync-guest.py').read_bytes()).hexdigest()
+    oracle_hash = hashlib.sha256(Path(background.__file__).read_bytes()).hexdigest()
     destination = Path(out) / 'explicit-sync'
     destination.mkdir(mode=0o700, exist_ok=False)
     nonce = secrets.token_hex(16)
@@ -60,6 +63,7 @@ def run(qmp, agent_factory, out, image, inventory, vm):
     latest = {}
     attempted = False
     transport_safe = True
+    background_images = {}
     deadline = time.monotonic() + 180
 
     def alive():
@@ -107,14 +111,28 @@ def run(qmp, agent_factory, out, image, inventory, vm):
             raise RuntimeError('native helper XML differs from exact archive-verified locked dependency')
         if state['guest_helper_sha256'] != helper_hash:
             raise RuntimeError('installed proof helper differs from exact source')
+        if state['background_oracle_sha256'] != oracle_hash:
+            raise RuntimeError('installed background oracle differs from exact source')
         if any(re.fullmatch('[0-9a-f]{64}', state[key]) is None
-               for key in ('client_sha256', 'protocol_xml_hash_list_sha256')):
+               for key in ('client_sha256', 'protocol_xml_hash_list_sha256', 'background_client_sha256')):
             raise RuntimeError('native client/XML artifact facts missing')
+        system = state['system']
+        if (not system['kernel_release'] or not system['machine']
+                or set(system['packages']) != {'mesa', 'libdrm', 'wayland', 'tuna-desktop'}
+                or any(type(value) is not str or not value for value in system['packages'].values())):
+            raise RuntimeError('actual guest kernel/Mesa/native package identities missing')
+        for case, row in state['cases'].items():
+            if case in CASES and row.get('finished') and not row.get('failure'):
+                if (row.get('device', {}).get('driver') != 'virtio_gpu'
+                        or 'virgl' not in row.get('graphics', {}).get('gl_renderer', '').lower()):
+                    raise RuntimeError('native case did not use the actual named virtio/virgl device')
 
     def acquire_pixels(checkpoint):
         name = checkpoint['name']
-        if (name not in CHECKPOINTS or checkpoint['case'] != 'ordering'
-                or checkpoint['rgb'] != CHECKPOINTS[name]):
+        is_background = checkpoint['case'] == 'background-effect'
+        if (not is_background and (name not in CHECKPOINTS or checkpoint['case'] != 'ordering'
+                                   or checkpoint.get('rgb') != CHECKPOINTS[name])
+                or is_background and name not in {step for _, step in background.STEPS}):
             raise RuntimeError('unexpected native output checkpoint')
         if name in receipt['captures']:
             if receipt['captures'][name]['attempt'] != checkpoint['attempt']:
@@ -126,6 +144,14 @@ def run(qmp, agent_factory, out, image, inventory, vm):
         alive()
         with Image.open(path) as captured:
             pixels = captured.convert('RGB')
+        if is_background:
+            background_images[name] = pixels
+            observed = {'name': name, 'attempt': checkpoint['attempt'],
+                        'png_sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+            invoke('ack', case='background-effect', attempt=checkpoint['attempt'], name=name,
+                   png_sha256=observed['png_sha256'])
+            receipt['captures'][name] = observed
+            return
         rgb = CHECKPOINTS[name]
         count = sum(1 for pixel in pixels.getdata()
                     if all(abs(actual - wanted) <= 8 for actual, wanted in zip(pixel, rgb)))
@@ -145,7 +171,7 @@ def run(qmp, agent_factory, out, image, inventory, vm):
         receipt['captures'][name] = observed
 
     def fetch_artifacts():
-        for case in CASES:
+        for case in CONSUMERS:
             if case not in latest.get('cases', {}):
                 continue
             target = destination / case
@@ -185,7 +211,7 @@ def run(qmp, agent_factory, out, image, inventory, vm):
         attempted = True
         latest = invoke('init', pid=owner['pid'], start_ticks=owner['start_ticks'], uid=owner['uid'], sha256=expected)
         facts(latest)
-        for case in CASES:
+        for case in CONSUMERS:
             latest = invoke('start', case=case)
             facts(latest)
             active = latest['active']
@@ -211,9 +237,13 @@ def run(qmp, agent_factory, out, image, inventory, vm):
                 time.sleep(0.01)
             else:
                 raise TimeoutError('native explicit-sync case deadline: ' + case)
-        if (not latest.get('complete') or set(receipt['captures']) != set(CHECKPOINTS)
-                or set(latest['cases']) != set(CASES)):
-            raise RuntimeError('actual native timeline/dmabuf acceptance incomplete')
+        if (not latest.get('complete')
+                or set(receipt['captures']) != set(CHECKPOINTS) | {name for _, name in background.STEPS}
+                or set(latest['cases']) != set(CONSUMERS)):
+            raise RuntimeError('actual native timeline/dmabuf/background acceptance incomplete')
+        rect = background.locate(background_images['off'])
+        receipt['background_effect'] = dict(background.verify(background_images, rect),
+                                            content_rect=list(rect), hdr_precision_qualified=False)
         receipt['behavior_complete'] = True
     except BaseException as error:
         receipt['failure'] = type(error).__name__ + ': ' + str(error)
