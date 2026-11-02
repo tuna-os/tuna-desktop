@@ -106,6 +106,23 @@ Invoke the unchanged pinned factory through Bash, like the GDM native
 factory. Neither a self-hosted preinstalled dependency nor a cache hit is a
 dependency declaration; do not skip the consumer or replace the pinned build.
 
+In [CI 41395937699](https://github.com/tuna-os/tuna-desktop/actions/runs/41395937699),
+both native profiles passed all 32 fresh-account gates and 14 strip cases,
+and the real typed slideshow/SVG and pinned Orca journeys passed. The
+required check still failed
+`control::tests::native_outputs_cleared_on_failed_redial_and_transport_loss`:
+the fixture merely dropped one peer descriptor, then treated any polling
+error as proof of transport loss. An open duplicate instead means transient
+`WouldBlock`, for which retaining the current inventory is correct.
+
+Deliberate peer-loss fixtures must use the file's existing `shutdown(Both)`
+convention before dropping the descriptor: a concurrent fork can retain a
+copy until exec. The regression now deliberately retains a duplicate,
+distinguishes open-endpoint `WouldBlock` from actual shutdown/EOF, and
+requires terminal failed-redial I/O before judging native-output revocation.
+All eleven deliberate closure fixtures use that convention. No production
+state transition, polling interval, acceptance guard or test is removed.
+
 ## Queue supersession and closed pull requests
 
 Every PR-triggered workflow already has native workflow/ref (or PR-number)
