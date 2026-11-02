@@ -823,11 +823,12 @@ class OrcaStagedDiagnostic(unittest.TestCase):
 
     def test_helper_error_serialization_never_emits_exception_details(self):
         from contextlib import redirect_stdout
+        import sys
         helper = PublicOrcaNavigation().focus_module()
         tree = ast.parse(Path(helper.__file__).read_text())
         main = next(n for n in tree.body if isinstance(n, ast.If) and "__name__" in ast.unparse(n.test))
         observed = []
-        def failed(*args):
+        def failed(*args, **kwargs):
             observed.append(args)
             raise TypeError("private query and field value")
         scope = {"__name__": "__main__", "json": json, "sys": SimpleNamespace(argv=["helper", "1083", "1187", "tuna-shell-gtk", "wayland-0"]),
@@ -839,6 +840,17 @@ class OrcaStagedDiagnostic(unittest.TestCase):
         self.assertEqual(len(observed), 1)
         self.assertEqual(json.loads(stream.getvalue()), {"focus_error_type": "TypeError", "focus_operation": "atspi-owner"})
         self.assertNotIn("private", stream.getvalue())
+        private = "private-query-and-field-value"
+        for arguments in ([private, "1187", "tuna-shell-gtk", "wayland-0"],
+                          ["1083", "1187", "tuna-shell-gtk", "wayland-0", private]):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([sys.executable, helper.__file__, *arguments],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(json.loads(result.stdout), {
+                    "focus_error_type": "ValueError", "focus_operation": "arguments"})
+                self.assertNotIn(private, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "")
 
     def test_speech_failure_schema_accepts_observation_stage(self):
         scope = self.agent_scope("speech_failure_diagnostic")
@@ -1470,6 +1482,151 @@ class PublicOrcaNavigation(unittest.TestCase):
         self.assertFalse(eval(predicate, scope))
         for key, invalid in (("GetNameOwner", ":1.28"), ("GetConnectionUnixProcessID", 934), ("GetConnectionUnixUser", 0)):
             self.assertTrue(eval(predicate, {**scope, "values": {**values, key: invalid}}))
+
+    def test_focus_cli_admits_each_mode_separately_without_changing_default(self):
+        from contextlib import redirect_stdout
+        module = self.focus_module()
+        tree = ast.parse(Path(module.__file__).read_text())
+        entry = next(n for n in tree.body if isinstance(n, ast.If)
+                     and ast.unparse(n.test) == "__name__ == '__main__'")
+        code = compile(ast.Module(body=entry.body, type_ignores=[]), module.__file__, "exec")
+        for mode in (None, "controlled-overview", "end-session", "notification-banner"):
+            calls = []
+            def observe(*args, **kwargs):
+                calls.append((args, kwargs))
+                return {"observation_only": True}
+            scope = {**vars(module), "sys": SimpleNamespace(argv=[
+                module.__file__, "933", "57", "tuna-shell-gtk", "wayland-0"
+            ] + ([] if mode is None else [mode])), "observe": observe}
+            stream = io.StringIO()
+            with self.subTest(mode=mode), redirect_stdout(stream):
+                exec(code, scope)
+            self.assertEqual(calls, [((933, 57, "tuna-shell-gtk", "wayland-0"),
+                                     {"controlled": mode == "controlled-overview",
+                                      "end_session": mode == "end-session",
+                                      "notification": mode == "notification-banner"})])
+            self.assertEqual(json.loads(stream.getvalue()), {"observation_only": True})
+        for extra in (["private mode"], ["end-session", "notification-banner"],
+                      ["controlled-overview", "end-session"]):
+            calls = []
+            scope = {**vars(module), "sys": SimpleNamespace(argv=[
+                module.__file__, "933", "57", "tuna-shell-gtk", "wayland-0", *extra
+            ]), "observe": lambda *args, **kwargs: calls.append(args)}
+            stream = io.StringIO()
+            with self.subTest(extra=extra), redirect_stdout(stream), self.assertRaises(SystemExit) as caught:
+                exec(code, scope)
+            self.assertEqual(caught.exception.code, 1)
+            self.assertEqual(calls, [])
+            self.assertEqual(json.loads(stream.getvalue()),
+                             {"focus_error_type": "ValueError", "focus_operation": "arguments"})
+
+    def test_focus_observer_refuses_combined_or_nonboolean_modes(self):
+        module = self.focus_module()
+        tree = ast.parse(Path(module.__file__).read_text())
+        observe = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "observe")
+        guard = next(n for n in observe.body if isinstance(n, ast.If))
+        code = compile(ast.Module(body=[guard], type_ignores=[]), module.__file__, "exec")
+        for controlled, end_session, notification in (
+                (False, False, False), (True, False, False),
+                (False, True, False), (False, False, True)):
+            exec(code, {"controlled": controlled, "end_session": end_session,
+                        "notification": notification, "executable": "tuna-shell-gtk"})
+        for modes in ((True, True, False), (True, False, True), (False, True, True),
+                      (True, True, True), (1, False, False), (False, 1, False),
+                      (False, False, 1)):
+            with self.subTest(modes=modes), self.assertRaisesRegex(RuntimeError, "fixed controlled"):
+                exec(code, dict(zip(("controlled", "end_session", "notification"), modes),
+                                executable="tuna-shell-gtk"))
+        for flag in ("controlled", "notification"):
+            with self.subTest(flag=flag), self.assertRaises(RuntimeError):
+                exec(code, {**dict.fromkeys(("controlled", "end_session", "notification"), False),
+                            flag: True, "executable": "gnome-disks"})
+
+    def focus_mode_tree(self, mode):
+        """Execute the actual traversal with public controls and private banner bait."""
+        module = self.focus_module()
+        tree = ast.parse(Path(module.__file__).read_text())
+        observe = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "observe")
+        traversal = next(n for n in observe.body if isinstance(n, ast.While))
+        calls = []
+        class Node:
+            def __init__(self, key, role, name, children=()):
+                self.key, self.role, self.name, self.children = key, role, name, children
+            def clear_cache(self):
+                pass
+            def get_state_set(self):
+                return SimpleNamespace(contains=lambda flag: flag in {"showing", "sensitive", "focused"})
+            def get_role_name(self):
+                return self.role
+            def get_name(self):
+                calls.append((self.key, "name"))
+                if mode == "notification-banner" and self.key in {"title", "body", "text"}:
+                    raise AssertionError("notification content must never be queried")
+                return self.name
+            def get_child_count(self):
+                return len(self.children)
+            def get_child_at_index(self, index):
+                return self.children[index]
+            def get_component_iface(self):
+                calls.append((self.key, "component"))
+                return self
+            def get_text_iface(self):
+                raise AssertionError("no mode in this traversal may query text")
+        banner = Node("banner", "frame", "Notifications", [
+            Node("title", "label", "private notification title"),
+            Node("body", "label", "private notification body"),
+            Node("text", "text", "private text buffer"),
+            Node("close", "button", "Close")])
+        countdown = "The system will restart automatically in 60 seconds"
+        app = Node("app", "application", "private application name", [
+            banner, Node("countdown", "label", countdown),
+            Node("restart", "button", "Restart…"), Node("search", "entry", "Search")])
+        scope = {**vars(module), "nodes": [], "pending": [(app, 0, False)], "visited": 0,
+                 "notification_frames": [], "notification_closes": [], "search_entries": [],
+                 "target": {"showing": 0, "focused": 0, "present": 0}, "focused_roles": [],
+                 "controlled": False, "end_session": mode == "end-session",
+                 "notification": mode == "notification-banner", "deadline": 8,
+                 "time": SimpleNamespace(monotonic=lambda: 0), "unlocked": lambda: None,
+                 "accessibility_query": lambda method, *args: method(*args),
+                 "Atspi": SimpleNamespace(
+                     StateType=SimpleNamespace(SHOWING="showing", FOCUSED="focused",
+                                               ACTIVE="active", SENSITIVE="sensitive"),
+                     CoordType=SimpleNamespace(WINDOW="window"),
+                     Component=SimpleNamespace(get_extents=lambda node, coord:
+                                               SimpleNamespace(x=10, y=20, width=30, height=40)))}
+        exec(compile(ast.Module(body=[traversal], type_ignores=[]), module.__file__, "exec"), scope)
+        return scope, calls, countdown
+
+    def test_default_traversal_never_queries_countdown_or_retains_notification_ui(self):
+        scope, calls, countdown = self.focus_mode_tree(None)
+        self.assertEqual([node["label"] for node in scope["nodes"]], ["Search"])
+        self.assertNotIn(("countdown", "name"), calls)
+        self.assertEqual(scope["notification_frames"], [])
+        self.assertEqual(scope["notification_closes"], [])
+        self.assertNotIn(countdown, json.dumps(scope["nodes"]))
+
+    def test_notification_traversal_queries_only_fixed_frame_and_close_not_content(self):
+        scope, calls, countdown = self.focus_mode_tree("notification-banner")
+        self.assertEqual(calls, [("banner", "name"), ("banner", "component"),
+                                 ("close", "name"), ("close", "component")])
+        self.assertEqual(scope["nodes"], [])
+        self.assertEqual(scope["notification_frames"], [[10, 20, 30, 40]])
+        self.assertEqual(scope["notification_closes"],
+                         [{"rect": [10, 20, 30, 40], "focused": True}])
+        retained = json.dumps([scope["nodes"], scope["notification_frames"], scope["notification_closes"]])
+        for private in ("private", "title", "body", "text buffer", countdown, "Restart…"):
+            self.assertNotIn(private, retained)
+
+    def test_end_session_traversal_keeps_countdown_without_notification_receipts(self):
+        scope, calls, countdown = self.focus_mode_tree("end-session")
+        self.assertEqual([node["label"] for node in scope["nodes"]], ["Search", "Restart…", countdown])
+        self.assertIn(("countdown", "name"), calls)
+        self.assertFalse(any(query == "component" for key, query in calls))
+        self.assertEqual(scope["notification_frames"], [])
+        self.assertEqual(scope["notification_closes"], [])
+        for private in ("private", "Notifications", "Close"):
+            self.assertNotIn(private, json.dumps(scope["nodes"]))
+        # Injected-tree policy coverage only, not native AT-SPI or VM qualification.
 
     def test_public_speech_tokens_never_retain_arbitrary_presenter_text(self):
         entries = [{"kind": "speech", "text": "Search entry private trailing text"},
@@ -3756,37 +3913,72 @@ class GdmSessionList(unittest.TestCase):
 
 class FixtureLoginSession(unittest.TestCase):
 
-    def test_tunaos_steps_give_the_preview_image_the_published_login_path(self):
+    def test_tunaos_steps_use_installed_gdm_for_global_template_policy(self):
         source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tunaos"
-        with tempfile.TemporaryDirectory() as root:
-            root = Path(root)
-            (root / "etc/gdm").mkdir(parents=True)
-            (root / "etc/gdm/custom.conf").write_text("[daemon]\nDefaultSession=gnome.desktop\n")
-            (root / "usr/share/accountsservice/user-templates").mkdir(parents=True)
-            (root / "usr/share/accountsservice/user-templates/standard").write_text("[User]\nSession=gnome\n")
-            sessions = root / "usr/share/wayland-sessions"
-            sessions.mkdir(parents=True)
-            (sessions / "tuna.desktop").write_text("[Desktop Entry]\nName=Tuna Desktop\nExec=tuna-session\n")
-            (sessions / "gnome.desktop").write_text("[Desktop Entry]\nName=GNOME\nExec=gnome-session\n")
-            environment = {**os.environ, "TUNAOS_GDM_DEFAULT_ROOT": str(root),
-                           "TUNAOS_GDM_SESSIONS_ROOT": str(root)}
-            for step in ("tuna-gdm-default-session.sh", "tuna-hide-other-sessions.sh"):
-                subprocess.run(["bash", str(source / step)], env=environment, check=True,
-                               capture_output=True, timeout=10)
-            scope = lifecycle_scope(*GdmSessionList.NAMES, "gdm_daemon_key", "gdm_fallback_session",
-                                    "GDM_LAUNCH_DIRS")
-            which = lambda program: program if program in ("tuna-session", "gnome-session") else None
-            offered = scope["gdm_sessions"](tuple(str(root) + d for d in scope["GDM_SESSION_DIRS"]), which=which)
-            fallback = scope["gdm_fallback_session"](root / "etc/gdm/custom.conf",
-                                                     tuple(str(root) + d for d in scope["GDM_LAUNCH_DIRS"]),
-                                                     which=which)
-            self.assertTrue(lane.greeter_list_ok({"sessions": offered})[0], offered)
-            self.assertTrue(lane.fallback_session_ok({"fallback_session": fallback})[0], fallback)
-            self.assertIn("NoDisplay=true", (sessions / "gnome.desktop").read_text())
-            self.assertNotIn("NoDisplay", (sessions / "tuna.desktop").read_text())
-            self.assertIn("Session=tuna", (root / "etc/accountsservice/user-templates/standard").read_text())
-            self.assertNotIn("DefaultSession", (root / "etc/gdm/custom.conf").read_text())
-        # Configuration-file policy only, not a booted GDM.
+        cases = (
+            ("usr/sbin/gdm", "GDM 48.0", True, "tuna"),
+            ("usr/bin/gdm", "GDM 50.0", True, "tuna"),
+            ("usr/bin/gdm", "GDM 51.1.1", True, ""),
+            ("usr/sbin/gdm3", "gdm3 51.1.1", True, ""),
+            ("usr/bin/gdm3", "GDM 51.1.1", True, ""),
+            ("usr/bin/gdm", "GDM 51.1.1", False, "tuna"),
+            ("usr/bin/gdm", "GDM unknown", True, "tuna"),
+            (None, None, False, "tuna"),
+        )
+        for binary_name, version, fallback_capability, expected_session in cases:
+            with self.subTest(binary=binary_name, version=version, capability=fallback_capability), \
+                    tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                if binary_name:
+                    binary = root / binary_name
+                    binary.parent.mkdir(parents=True)
+                    # An external installed-binary fixture, not a caller-supplied
+                    # version override: the real vendored helper runs --version
+                    # and checks the compiled daemon/FallbackSession key.
+                    capability = "# daemon/FallbackSession\n" if fallback_capability else ""
+                    binary.write_text("#!/bin/sh\n" + capability
+                                      + f'[ "$#" -eq 1 ] && [ "$1" = --version ] || exit 1\n'
+                                      + f"printf '%s\\n' {shlex.quote(version)}\n")
+                    binary.chmod(0o755)
+                (root / "etc/gdm").mkdir(parents=True)
+                (root / "etc/gdm/custom.conf").write_text("[daemon]\nDefaultSession=gnome.desktop\n")
+                templates = root / "usr/share/accountsservice/user-templates"
+                templates.mkdir(parents=True)
+                for account_type in ("standard", "administrator"):
+                    (templates / account_type).write_text(
+                        "[User]\nLanguage=en_US.UTF-8\nSession=gnome\n\n[Extension]\nSession=keep\n")
+                records = root / "var/lib/AccountsService/users"
+                records.mkdir(parents=True)
+                saved = b"[User]\nSession=gnome\nLanguage=fr_FR.UTF-8\n"
+                (records / "existing").write_bytes(saved)
+                sessions = root / "usr/share/wayland-sessions"
+                sessions.mkdir(parents=True)
+                (sessions / "tuna.desktop").write_text("[Desktop Entry]\nName=Tuna Desktop\nExec=tuna-session\n")
+                (sessions / "gnome.desktop").write_text("[Desktop Entry]\nName=GNOME\nExec=gnome-session\n")
+                environment = {**os.environ, "TUNAOS_GDM_DEFAULT_ROOT": str(root),
+                               "TUNAOS_GDM_SESSIONS_ROOT": str(root)}
+                for step in ("tuna-gdm-default-session.sh", "tuna-hide-other-sessions.sh"):
+                    subprocess.run(["bash", str(source / step)], env=environment, check=True,
+                                   capture_output=True, timeout=10)
+                scope = lifecycle_scope(*GdmSessionList.NAMES, "gdm_daemon_key", "gdm_fallback_session",
+                                        "GDM_LAUNCH_DIRS")
+                which = lambda program: program if program in ("tuna-session", "gnome-session") else None
+                offered = scope["gdm_sessions"](tuple(str(root) + d for d in scope["GDM_SESSION_DIRS"]), which=which)
+                fallback = scope["gdm_fallback_session"](root / "etc/gdm/custom.conf",
+                                                         tuple(str(root) + d for d in scope["GDM_LAUNCH_DIRS"]),
+                                                         which=which)
+                self.assertTrue(lane.greeter_list_ok({"sessions": offered})[0], offered)
+                self.assertTrue(lane.fallback_session_ok({"fallback_session": fallback})[0], fallback)
+                self.assertIn("NoDisplay=true", (sessions / "gnome.desktop").read_text())
+                self.assertNotIn("NoDisplay", (sessions / "tuna.desktop").read_text())
+                for account_type in ("standard", "administrator"):
+                    self.assertEqual((root / "etc/accountsservice/user-templates" / account_type).read_text(),
+                                     "[User]\nLanguage=en_US.UTF-8\n"
+                                     f"Session={expected_session}\n\n[Extension]\nSession=keep\n")
+                self.assertEqual({path.name: path.read_bytes() for path in records.iterdir()}, {"existing": saved})
+                self.assertNotIn("DefaultSession", (root / "etc/gdm/custom.conf").read_text())
+        # Real helper execution and configuration-file policy only, not a
+        # booted GDM/AccountsService persistence proof.
 
     def test_orca_secret_generator_serves_only_the_fixture_user_once_per_login(self):
         source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-orca-token"
