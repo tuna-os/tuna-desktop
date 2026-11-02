@@ -343,6 +343,8 @@ def qualify(options):
             recorder = lane["Recorder"](qmp, str(clip))
             # A documentation clip is limited to the first 30 real seconds of
             # this observed UI journey, without altering any qualification wait.
+            capture_started_ns = time.monotonic_ns()
+            capture_deadline_ns = capture_started_ns + 30_000_000_000
             timer = threading.Timer(30, recorder.stop.set)
             timer.start()
             recorder.thread.start()
@@ -357,19 +359,23 @@ def qualify(options):
             finally:
                 qmp.file.close()
                 qmp.sock.close()
-        launcher.require(recorder.n >= 2, "native UI clip did not capture multiple actual frames")
-        timing = {"schema": 1, "frames": recorder.frames, "periodicTargetFps": lane["TOUR_FPS"],
+        # stop prevents new work, but an already-running screendump may finish
+        # later. Never encode that tail or claim its pixels met the clip bound.
+        frames = [frame for frame in recorder.frames if frame["completed_monotonic_ns"] <= capture_deadline_ns]
+        launcher.require(len(frames) >= 2, "native UI clip did not capture multiple actual frames within 30 seconds")
+        timing = {"schema": 1, "frames": frames, "periodicTargetFps": lane["TOUR_FPS"],
                   "uniformCaptureIntervals": False, "maximumCaptureSeconds": 30,
+                  "captureStartedMonotonicNs": capture_started_ns, "captureDeadlineMonotonicNs": capture_deadline_ns,
                   "recorderSourceSha256": launcher.sha256(ROOT / "scripts/tuna-vm-lane")}
         launcher.atomic_json(clip / "capture-timing.json", timing)
         video = clip / (label + ".webm")
         launcher.run(["ffmpeg", "-nostdin", "-loglevel", "warning", "-y",
                       "-framerate", str(lane["TOUR_FPS"]), "-i", clip / "frames/f%06d.png",
                       "-c:v", "libvpx-vp9", "-crf", "36", "-b:v", "0", "-row-mt", "1",
-                      "-cpu-used", "4", "-pix_fmt", "yuv420p", video], timeout=600)
+                      "-cpu-used", "4", "-pix_fmt", "yuv420p", "-frames:v", str(len(frames)), video], timeout=600)
         launcher.require(video.stat().st_size > 0, "native UI clip encoder produced no video")
         media["clips"][label] = {"path": str(video.relative_to(output)), "sha256": launcher.sha256(video),
-                                  "frameCount": recorder.n, "playbackFps": lane["TOUR_FPS"],
+                                  "frameCount": len(frames), "playbackFps": lane["TOUR_FPS"],
                                   "captureTiming": str((clip / "capture-timing.json").relative_to(output)),
                                   "scope": "actual owned guest QMP pixels during browser-driven UI; not browser chrome"}
         shutil.rmtree(clip / "frames")
