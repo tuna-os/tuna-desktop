@@ -28,6 +28,10 @@ base, and picks the proof lanes the change can affect:
   `NO_LANE`) is the authoritative, ordered mapping.
 - a lane's own proof script, reference fixtures or packaging: that lane
   (plus the lanes whose artifacts it needs).
+- a packaged conffile (`share/pam.d/`, installed as `/etc/pam.d/tuna-lock`):
+  `journey`, whose disposable Debian lifecycle fails when its bytes drift
+  from the released package's, plus the core lanes and every package
+  consumer.
 - anything else (crates, `share/`, other scripts): `gtk-shell` plus a
   round-robin slice of the other end-to-end lanes, rotated by run number.
   The slice size is the repository variable `CI_ROUND_ROBIN_SIZE`
@@ -144,10 +148,24 @@ settings local builds need (`just` lists the recipes):
 | `just disk-guard [--watch [s]]` | frees disk now, or keeps checking every `s` seconds (below) |
 
 Every build uses its own checkout's `target/` (an inherited
-`CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one),
-two jobs, no incremental state, and waits on one machine-wide lock
-(`/tmp/tuna-local-build.lock`), so builds from parallel worktrees queue
-instead of exhausting memory.
+`CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one) and no
+incremental state, with half the host's CPUs as jobs. Builds from every
+worktree share two machine-wide build slots (one per 8 GiB of RAM, at most
+two: `/tmp/tuna-local-build.slot.N`, `TUNA_BUILD_SLOTS`), so two run at
+once and the rest queue instead of exhausting memory; a cold
+`cargo test --workspace` build at six jobs peaks at 6.4 GiB.
+
+When `sccache` is installed (`cargo install --locked sccache`, or a
+release binary on `PATH`) every recipe compiles through it, so a fresh
+worktree reuses the dependencies any other worktree already compiled from
+`~/.cache/sccache` (40 GiB cap): a cold `just build` in a fresh worktree
+takes about 39 s instead of 65 s once another worktree has filled the
+cache. The recipes start its server with no idle timeout;
+`sccache --show-stats` shows the hit rate. The workspace's own crates
+miss, since their paths differ per worktree, and the justfile exports no
+per-worktree `CARGO_*` variable, which would make every crate miss. A bare
+`cargo` in the same worktree reuses the recipes' build without the cache.
+See [environment](environment.md#justfile) for every knob.
 
 The polkit unit tests can be run with
 `timeout 15m just test -p tuna-shell-gtk polkit`. Their fake executable
@@ -160,18 +178,40 @@ also checks immediate execution, literal script bytes and exit status;
 the existing session tests still assert socket fallback and password
 handling.
 
+The compositor's `control_readiness::tests::` cases run their socket fixtures
+in exact-test child processes. Concurrent tests can fork between socket
+creation and close, temporarily retaining the socket and its epoll interest
+until exec. Isolation preserves the strict wake/drain/no-wake-after-close
+contract without serializing the suite or allowing extra callbacks. The
+tests inspect only the owned epoll instance's `/proc/self/fdinfo` registrations
+and observe peer closure, not process-wide descriptor counts. A retained
+socket-duplicate negative control must keep both the registration and peer
+alive until the last reference closes.
+
 Cleanup is automatic where it is safe:
 
-- `just proof` runs each proof with a fresh `HOME` and XDG directories
-  inside its artifact directory, as on a CI runner, so desktop state in
-  your own home can't leak in. One proof runs at a time machine-wide
-  (`/tmp/tuna-local-proof.lock`). Proofs that need another proof's
-  prebuilt binaries (`--bin-dir`) are refused with the name of their
-  caller. When the proof ends, pass or fail, any process it started is
-  stopped, including daemons that detached from it (`ibus-daemon
-  --daemonize`, `dbus-daemon --fork`): each carries a `TUNA_PROOF_RUN`
-  marker in its environment. A passing proof deletes its artifacts; a
-  failing one keeps them and prints the path;
+- `just proof` runs each proof with a fresh `HOME`, XDG directories and
+  `XDG_RUNTIME_DIR`, and without your `DISPLAY`, `WAYLAND_DISPLAY` or
+  session bus, as on a CI runner, so desktop state in your own session
+  can't leak in. Nested proofs start their own Xvfb through
+  `scripts/lib/tuna-xvfb`, which locks the first free display from `:120`
+  up (plain `Xvfb -displayfd` takes no lock and lands on the low numbers
+  every nested compositor's XWayland claims by lock file, which breaks
+  it), with per-run Wayland sockets, buses and runtime directories. One
+  runs at a time by default; `TUNA_PROOF_SLOTS=N` lets N run at once
+  (`/tmp/tuna-local-proof.slot.N`), but under that load the gtk-shell
+  proof's timing-sensitive stages fail intermittently. Proofs that touch
+  machine-wide state (vkms, seatd, uinput, `sudo` or apt, like
+  `drm-smoke`), and scripts that don't start an Xvfb, run one at a time
+  (`/tmp/tuna-local-proof.lock`). A proof's own `cargo build` waits for a
+  build slot. A proof still running after 45 minutes
+  (`TUNA_PROOF_TIMEOUT`) is stopped and its slot freed. Proofs that need
+  another proof's prebuilt binaries (`--bin-dir`) are refused with the
+  name of their caller. When the proof ends, pass or fail, any process it
+  started is stopped, including daemons that detached from it
+  (`ibus-daemon --daemonize`, `dbus-daemon --fork`): each carries a
+  `TUNA_PROOF_RUN` marker in its environment. A passing proof deletes its
+  artifacts; a failing one keeps them and prints the path;
 - `just gc` deletes the targets of worktrees whose pull request is merged
   or closed, removes those worktrees when they have no uncommitted
   changes, and expires `just ci-artifacts` downloads after six hours. It
@@ -192,6 +232,16 @@ Cleanup is automatic where it is safe:
 
 VM lanes need KVM, so they run in CI's `marlin-vm` jobs or on a Corral
 VM, not through these recipes.
+
+The portal file-picker's blocked-parent probe retains a `*.parent-probe.json`
+receipt on success **and failure**. Its baseline is read after the sole real
+click; ten further caller GLib heartbeat callbacks must arrive within the
+unchanged two-second bound, without parent click/key delivery or loss of dialog
+focus. Each caller receipt includes monotonic and process-CPU timestamps.
+Progress before injection cannot satisfy this boundary. A missed heartbeat
+deadline remains a proof failure, not evidence by itself of a compositor focus
+bug or permission to increase the deadline; inspect the retained baseline and
+observations before attributing it to scheduling or blocked client work.
 
 ## Before opening a PR
 
@@ -557,6 +607,38 @@ To drive the published image through GDM in a KubeVirt VM with keyboard
 and pointer input and save a console frame for every step, see
 [Published-image journey through Corral](corral-journey.md).
 
+## Pointer motion barriers and input aids
+
+Backend motion is coalesced once per output frame, but a raw non-motion
+input ends the run **before** accessibility filtering. Mouse Keys consumes
+its keypad release without forwarding a key to the window manager; it
+must still deliver any pending synthesized motion first. Otherwise a
+timer move can arrive a frame after release. Empty barriers do not touch
+the delivery clock, and consecutive absolute/relative motion remains
+coalesced with relative deltas summed.
+
+The `motion_coalesce::tests` unit tests cover a consumed keypad release
+with a pending timer move, all manager non-motion input kinds, empty
+barriers, and preservation of motion batching. For the actual nested
+backend → accessibility aids → client wire path, run:
+
+```sh
+PATH=/usr/bin:$PATH just build -p tuna-compositor -p tuna-shell-gtk
+PATH=/usr/bin:$PATH timeout 240 just proof motion-barriers-proof
+```
+
+This focused proof needs Xvfb, xdotool, a session bus, and Python GTK4
+bindings. It stops the compositor while queueing host motion, a Mouse Keys
+press/release, and another motion, so they reach the same backend dispatch.
+The real GTK client must see three exact positions and three pointer
+frames, with no leaked keypad keys. A second batch of 25 uninterrupted
+motions must still produce just its final position and one frame.
+`--bin-dir /absolute/path/to/old/target/debug` selects an old build without
+altering the assertions: the pre-fix runtime fails because it delivers only
+the final position, losing the consumed release's motion boundary.
+Processes are resumed, terminated, and reaped on exit; failed proof
+artifacts retain `barriers.json`, the compositor state, and the wire log.
+
 ## Animation clock and motion policy
 
 Compositor animations (the overview transition, the scroll-strip springs and
@@ -588,6 +670,15 @@ Proof `G-ANIMATION-CLOCK` samples the overview this way at 125 and 250 ms
 in both directions. `G-ANIMATIONS-OFF` and `G-INTROSPECT-MOTION` check the
 live motion policy: animations off snaps everything, Reduced Motion
 (fade-only) snaps overview and strip motion but keeps the idle-shield fade.
+
+The workspace popup's 100 ms fade starts at the display/fade request, not
+the first GTK tick. A delayed first frame therefore samples the fade's
+elapsed time rather than restarting it while the independent 600 ms hide
+timer is already running (GNOME 51 `workspaceSwitcherPopup.js:93-121`).
+`cargo:a_late_first_frame_samples_the_requested_fade_not_a_new_one` covers
+that boundary, slow-down scaling, animations off and fade-out.
+`G-WS-POPUP` keeps its original 300 ms capture delay and RGB thresholds;
+a partially faded pill is not accepted as an opaque one.
 
 The shell's Alt+Tab fades read the same clock (`crates/shell-gtk/src/anim_clock.rs`),
 and the compositor state lists `switcher_thumbnail_alphas`, the opacity each
@@ -624,6 +715,31 @@ it after a Num Lock change and before the next `gsettings set`. The
 `keyboard.keymap_generation` field goes up each time a keymap is
 applied. Wait for it after changing the input sources or `xkb-options`
 and before typing.
+
+The stock GNOME Settings journey (`tests/portal-reference/settings-run.sh`)
+instead uses a private **dconf** backend. Settings and Tuna's first-run
+app-folder initialization are independent writers: keyfile's stale whole-file
+rewrite can restore an old `enable-hot-corners` value after the UI has changed
+it. The genuine session-bus dconf service merges their writes, with its database
+under the fixture's `XDG_CONFIG_HOME`; per-step `*-settings.dconf` snapshots and
+fresh independent `gsettings get` reads retain persistence evidence. The
+disabled/enabled/cold-restart corner assertions remain unchanged.
+
+The shell-host real-camera lockdown test isolates the **bus daemon's**
+HOME/XDG environment as well as the portal child. D-Bus activation otherwise
+starts the permission store with the runner's home even though the portal has
+a private data directory. Its live permission-store regression calls the
+installed service and requires the resulting database inside the fixture.
+
+The main portal fixture also requires bounded child retirement **before**
+artifact ownership finalization. On a failed chooser UI step, SIGTERM takes
+the chooser owner's normal exit path so its `atexit` hook reaps the independent
+GTK input writer. The fixture waits for those direct children and the
+compositor's supervised GTK shell, then requires `process-retirement.json`
+before traversing artifacts. A missing or failed retirement receipt fails
+closed; finalizer inode/type/ownership checks and the primary UI error stay
+unchanged. Real-process regressions cover delayed descendant teardown,
+abnormal compositor exit, and preserving an existing proof failure.
 
 ## Parity ledger check
 
@@ -667,6 +783,62 @@ refreshed from it. The docs show the GTK shell through the
 `scripts/lib/tuna-parity-compare.py`. CI does not run it. The workflow and
 the states are in [pixel parity with GNOME 51](gnome-parity.md).
 
+## Output hotplug storm
+
+The nested backend has one fixed output, so hotplug runs on real DRM: the
+`hotplug` job of the `nested stress` workflow (nightly, on
+`workflow_dispatch`, and on pull requests touching
+`scripts/tuna-hotplug-stress` or the workflow). `scripts/tuna-hotplug-stress`
+creates a vkms configfs instance (Linux 6.19 or newer; the job pins
+`ubuntu-26.04`) with three CRTC/connector pipes. Connector A stays
+connected; writing a connector's configfs `status` plugs or unplugs B and
+C and makes the kernel send a real udev `HOTPLUG=1` change for the card.
+`tuna-compositor --backend drm` runs on that card under a private seatd
+and session bus with the GTK shell. Three GTK 4 clients animate every
+frame; each is placed on its own output by moving a uinput mouse there,
+as Mutter places new windows on the pointer's monitor.
+
+Each round plugs B and C, applies an `ApplyMonitorsConfig` (method 1)
+that moves B after C and gives B, or A on odd rounds, its largest
+supported scale, toggles the overview with a uinput Super and Escape,
+unplugs and replugs the primary every third round, writes a
+`monitors.xml` configuration for A+B and replugs B into it every other
+round, then unplugs C and B. After every step the compositor state must
+show:
+
+- `H-OUTPUTS`: the wl_outputs and DisplayConfig's monitors are exactly the
+  connected connectors;
+- `H-REHOME`: every window sits on its own output while that is
+  connected, else on the primary, and still prefers its own output
+  (Mutter's `meta_window_update_for_monitors_changed`);
+- `H-CLIENTS`: every client process is alive and keeps drawing frames;
+- `H-SCALE` and `H-STORED`: the applied scale and arrangement, and the
+  rewritten `monitors.xml`, reach the outputs;
+- `H-INPUT`, `H-LIVE`: the overview answers the keyboard, the compositor
+  never exits or panics and the shell never exits.
+
+`H-GROWTH` bounds the compositor and shell as the churn lane does: final
+PSS within round-0 PSS × 1.25 + 64 MiB and fds within round-0 + 32.
+Pull requests and dispatches run 4 rounds, nightly 30. The artifacts keep
+the compositor, shell and client logs, every step's outputs and window
+rectangles (`report.json`), the metrics and the state at a failure.
+
+To run it on a host with Linux 6.19+ and sudo, after building
+`tuna-compositor` and `tuna-shell-gtk`:
+
+```sh
+scripts/tuna-hotplug-stress --rounds 4 --out /tmp/tuna-hotplug-fresh
+```
+
+Configuration changes come from connector hotplug the way Mutter's
+`meta_monitor_manager_ensure_configured` picks them: a stored
+configuration for exactly the connected monitors, else the current or
+previous configuration covering them, else a linear one with the primary
+kept first. Unlike Mutter, which reads `monitors.xml` once at startup,
+the stored configuration is read from the file at each hotplug. Real
+panels, EDIDs, colord device registration on hotplug and multiple GPUs
+are not covered.
+
 ## When a run fails
 
 Read `nested.log` in the artifacts directory first (`compositor.log` for
@@ -698,11 +870,9 @@ Run it on a development host after building the compositor and GTK shell:
 scripts/tuna-stress --rounds 10 --out /tmp/tuna-stress-fresh
 ```
 
-Use a fresh empty artifact directory for each run. The harness starts its
-own Xvfb, session bus and private user state. It covers client churn and
-notification flood portions of #203; malformed Wayland requests, service
-faults, hotplug, locked-input adversaries and a measured 24-hour VM soak
-remain open.
+Use a fresh empty artifact directory for each run. Real output hotplug and
+the VM endurance soak (`scripts/tuna-vm-soak`, [soak.md](soak.md)) are
+separate lanes.
 
 ## Control decoder fuzzing
 
