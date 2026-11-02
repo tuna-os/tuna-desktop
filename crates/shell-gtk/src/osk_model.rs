@@ -479,8 +479,9 @@ impl Presence {
         }
     }
 
-    /// `open(true)`: what the timers see once a keyboard is on screen.
-    #[cfg(test)]
+    /// `open(true)`: shown at once, without a focused text field (the
+    /// bottom-edge drag's `gestureActivate`, and what the timers see once
+    /// a keyboard is on screen).
     pub fn open_now(&mut self, now: u64) {
         if self.enabled {
             self.open(true, now);

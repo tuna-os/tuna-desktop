@@ -139,3 +139,18 @@ meta_x11_display_set_input_focus does; enter/leave are unchanged. The
 nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
 The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
 version stays 0.7.0.
+
+Issue #345 additionally changes src/input/touch/grab.rs,
+src/input/touch/mod.rs and src/wayland/selection/data_device/device.rs
+so a touch drag-and-drop can start from any finger, as in Mutter
+(meta_wayland_seat_get_grab_info looks through every touch sequence).
+Upstream accepts only the serial of the touch grab itself, i.e. the first
+finger. TouchGrab gains sequence_start_data(serial), defaulting to None,
+and TouchHandle::sequence_start_data matches the grab's own serial or asks
+the grab; wl_data_device.start_drag uses it and starts the touch DnD from
+that sequence's slot, focus and location. Upstream's touch cancel also
+skipped every sequence whose events had been framed, so a cancel after
+wl_touch.frame (always the case with hardware) reached no client; it now
+cancels every focused sequence, still once per wl_touch for one cancel
+(meta_wayland_touch_cancel). The isolated diff is retained in
+TOUCH-SEQUENCE-API-PATCH.diff; the pinned version stays 0.7.0.
