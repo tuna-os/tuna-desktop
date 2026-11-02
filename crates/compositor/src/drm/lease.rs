@@ -229,13 +229,13 @@ impl LeaseDevice {
             .filter(|lease| lease.connectors().any(|c| gone.contains(c)))
             .map(DrmLease::id)
             .collect();
-        for id in ended {
-            self.end_lease(id);
-        }
         for handle in gone {
             eprintln!("tuna-compositor: drm-lease: withdrew connector {handle:?}");
             self.state.withdraw_connector(handle);
             self.connectors.retain(|c| *c != handle);
+        }
+        for id in ended {
+            self.end_lease(id);
         }
         for connector in wanted {
             if self.connectors.contains(&connector.handle) {
@@ -297,6 +297,15 @@ impl LeaseDevice {
             eprintln!("tuna-compositor: drm-lease: session has no lease authority: {error}");
             self.paused = true;
             return;
+        }
+        if self.paused {
+            // A revoke that lacked master authority during pause still owns
+            // its kernel resources. Complete that retirement before offering
+            // any reappearing connector under the restored authority.
+            for index in (0..self.leases.len()).rev() {
+                let id = self.leases[index].id();
+                self.end_lease(id);
+            }
         }
         self.paused = false;
         self.update_connectors();

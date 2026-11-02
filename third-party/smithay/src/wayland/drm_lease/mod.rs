@@ -486,32 +486,30 @@ impl DrmLeaseState {
             return;
         }
 
-        let mut instances = Vec::new();
-        for instance in &self.known_lease_devices {
-            if let Ok(client) = self.dh.get_client(instance.id()) {
-                if let Ok(lease_connector) = client
-                    .create_resource::<wp_drm_lease_connector_v1::WpDrmLeaseConnectorV1, _, D>(
-                        &self.dh, 1, self.node,
-                    )
-                {
-                    instance.connector(&lease_connector);
-                    lease_connector.name(name.clone());
-                    lease_connector.description(description.clone());
-                    lease_connector.connector_id(connector.into());
-                    instances.push(lease_connector);
-                    instance.done();
-                }
-            }
-        }
-
-        self.connectors.push(DrmLeaseConnector {
+        // Reconnecting a withdrawn connector does not cancel a kernel lease.
+        // Keep its description so successful revocation can offer it later,
+        // but never announce it while that authority is still outstanding.
+        let enabled = !self.active_leases.iter().any(|lease| lease.connectors.contains(&connector));
+        let mut connector = DrmLeaseConnector {
             name,
             description,
             node: self.node,
             handle: connector,
-            enabled: true,
-            known_instances: instances,
-        });
+            enabled,
+            known_instances: Vec::new(),
+        };
+        if enabled {
+            for instance in &self.known_lease_devices {
+                if let Some(client) = instance.client() {
+                    if let Some(resource) = connector.new_instance::<D>(&self.dh, &client) {
+                        instance.connector(&resource);
+                        connector.send_info(&resource);
+                        instance.done();
+                    }
+                }
+            }
+        }
+        self.connectors.push(connector);
     }
 
     /// Withdraw a connector from the set of connectors available for leasing
@@ -535,8 +533,8 @@ impl DrmLeaseState {
             }
         }
 
-        self.active_leases
-            .retain(|lease| !lease.connectors.contains(&connector));
+        // Withdrawing the offer is not evidence of kernel revocation.
+        // remove_lease retains this authority until force_close succeeds.
     }
 
     /// Suspend all connectors temporarily (e.g. upon loosing DRM master as the session becomes inactive)
@@ -595,6 +593,7 @@ impl DrmLeaseState {
             + Dispatch<wp_drm_lease_v1::WpDrmLeaseV1, DrmLeaseData, D>
             + 'static,
     {
+        let active_leases = &self.active_leases;
         for (instance, client) in self
             .known_lease_devices
             .iter()
@@ -602,9 +601,8 @@ impl DrmLeaseState {
         {
             let mut once = false;
             for connector in self.connectors.iter_mut().filter(|c| {
-                connectors
-                    .map(|filter| filter.contains(&c.handle))
-                    .unwrap_or(true)
+                !active_leases.iter().any(|lease| lease.connectors.contains(&c.handle))
+                    && connectors.map(|filter| filter.contains(&c.handle)).unwrap_or(true)
             }) {
                 if let Some(lease_connector) = connector.new_instance::<D>(&self.dh, &client) {
                     instance.connector(&lease_connector);
@@ -617,9 +615,8 @@ impl DrmLeaseState {
             }
         }
         for connector in self.connectors.iter_mut().filter(|c| {
-            connectors
-                .map(|filter| filter.contains(&c.handle))
-                .unwrap_or(true)
+            !active_leases.iter().any(|lease| lease.connectors.contains(&c.handle))
+                && connectors.map(|filter| filter.contains(&c.handle)).unwrap_or(true)
         }) {
             connector.enabled = true;
         }

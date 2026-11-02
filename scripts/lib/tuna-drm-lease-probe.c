@@ -143,7 +143,16 @@ static void device_connector(void *data, struct wp_drm_lease_device_v1 *d, struc
     wp_drm_lease_connector_v1_add_listener(c, &connector_listener, conn);
 }
 static void device_done(void *data, struct wp_drm_lease_device_v1 *d) {
-    (void)d; ((struct device *)data)->dones++;
+    (void)d;
+    struct device *dev = data;
+    for (unsigned i = 0; i < dev->n_connectors; ++i) {
+        struct connector *conn = &dev->connectors[i];
+        if (!conn->withdrawn && (!conn->done || !conn->id || !conn->name[0])) {
+            fprintf(stderr, "lease device done preceded live connector metadata/done\n");
+            exit(1);
+        }
+    }
+    dev->dones++;
 }
 static void device_released(void *data, struct wp_drm_lease_device_v1 *d) {
     (void)d; ((struct device *)data)->released = true;

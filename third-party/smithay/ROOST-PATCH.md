@@ -209,6 +209,15 @@ drm-smoke's D-LEASE leases the vkms connector through it with a real
 client. The isolated diff is retained in DRM-LEASE-PATCH.diff; the pinned
 version stays 0.7.0.
 
+Connector withdrawal only retires its public offer, never the active kernel
+lease reference. A failed revoke therefore keeps its resource ownership across
+unplug/reappearance and session resume; newly reappearing connectors stay
+disabled until revocation succeeds. The compositor withdraws disappeared offers
+before revoking their leases, avoiding a transient re-offer during unplug.
+Live connector announcements use the same metadata and connector `done`
+boundary as bind/resume. The real D-LEASE client rejects device `done` before
+every live connector has completed its own metadata.
+
 Issues #364 and #588 additionally change
 src/wayland/selection/data_device/mod.rs and dnd_grab.rs for
 xdg_toplevel_drag_v1, which Roost implements outside Smithay

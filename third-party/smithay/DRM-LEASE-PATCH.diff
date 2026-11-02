@@ -1,24 +1,22 @@
 diff --git a/src/backend/drm/device/mod.rs b/src/backend/drm/device/mod.rs
-index 2562a80f..9f3fb8bd 100644
 --- a/src/backend/drm/device/mod.rs
 +++ b/src/backend/drm/device/mod.rs
-@@ -287,6 +287,11 @@ impl DrmDevice {
+@@ -285,6 +285,11 @@
+     /// Returns `None` if the plane could not be claimed
+     pub fn claim_plane(&self, plane: plane::Handle, crtc: crtc::Handle) -> Option<PlaneClaim> {
          self.plane_claim_storage.claim(plane, crtc)
-     }
- 
++    }
++
 +    /// The device's plane claims, shared with lease builders.
 +    pub(crate) fn plane_claim_storage(&self) -> &PlaneClaimStorage {
 +        &self.plane_claim_storage
-+    }
-+
+     }
+ 
      /// Returns the size of the hardware cursor
-     ///
-     /// Note: In case of universal planes this is the
 diff --git a/src/backend/drm/mod.rs b/src/backend/drm/mod.rs
-index 2ccec8dc..dc348c39 100644
 --- a/src/backend/drm/mod.rs
 +++ b/src/backend/drm/mod.rs
-@@ -91,6 +91,7 @@ pub use device::{
+@@ -91,6 +91,7 @@
      DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmEvent, EventMetadata as DrmEventMetadata, PlaneClaim,
      Time as DrmEventTime, WeakDrmDeviceFd,
  };
@@ -27,10 +25,9 @@ index 2ccec8dc..dc348c39 100644
  use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
  pub use error::AccessError as DrmAccessError;
 diff --git a/src/wayland/drm_lease/mod.rs b/src/wayland/drm_lease/mod.rs
-index 47c57cac..56823067 100644
 --- a/src/wayland/drm_lease/mod.rs
 +++ b/src/wayland/drm_lease/mod.rs
-@@ -92,7 +92,7 @@ use wayland_protocols::wp::drm_lease::v1::server::*;
+@@ -92,7 +92,7 @@
  use wayland_server::backend::GlobalId;
  use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
  
@@ -39,7 +36,7 @@ index 47c57cac..56823067 100644
  
  /// Delegate type for a drm_lease global
  #[derive(Debug)]
-@@ -102,6 +102,10 @@ pub struct DrmLeaseState {
+@@ -102,6 +102,10 @@
      global: Option<GlobalId>,
      connectors: Vec<DrmLeaseConnector>,
      known_lease_devices: Vec<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1>,
@@ -50,7 +47,7 @@ index 47c57cac..56823067 100644
      active_leases: Vec<DrmLeaseRef>,
  }
  
-@@ -130,9 +134,13 @@ pub struct DrmLeaseRequest {
+@@ -130,9 +134,13 @@
  }
  
  /// Builder struct to collect DRM resources to be leased
@@ -65,7 +62,7 @@ index 47c57cac..56823067 100644
      planes: HashMap<plane::Handle, PlaneClaim>,
      connectors: HashSet<connector::Handle>,
      crtcs: HashSet<crtc::Handle>,
-@@ -143,12 +151,21 @@ impl DrmLeaseBuilder {
+@@ -143,10 +151,19 @@
      pub fn new(drm: &DrmDevice) -> DrmLeaseBuilder {
          DrmLeaseBuilder {
              drm: drm.device_fd().clone(),
@@ -74,20 +71,82 @@ index 47c57cac..56823067 100644
              connectors: HashSet::new(),
              crtcs: HashSet::new(),
          }
-     }
- 
++    }
++
 +    /// Claim a plane of the builder's device for a CRTC, as
 +    /// [`DrmDevice::claim_plane`] does.
 +    ///
 +    /// Returns `None` if the plane is claimed for a different CRTC.
 +    pub fn claim_plane(&self, plane: plane::Handle, crtc: crtc::Handle) -> Option<PlaneClaim> {
 +        self.claims.claim(plane, crtc)
-+    }
-+
+     }
+ 
      /// Add a CRTC to the to be leased resources
-     pub fn add_crtc(&mut self, crtc: crtc::Handle) {
-         self.crtcs.insert(crtc);
-@@ -417,12 +434,11 @@ impl DrmLeaseState {
+@@ -238,31 +255,46 @@
+     connectors: HashSet<connector::Handle>,
+ }
+ 
++fn revoke_kernel_lease(
++    drm: &DrmDeviceFd,
++    lease_id: NonZeroU32,
++    revoked: &AtomicBool,
++) -> io::Result<()> {
++    if !revoked.load(Ordering::Acquire) {
++        match drm.revoke_lease(lease_id) {
++            Ok(()) => {}
++            // The final lessee FD may already have closed.
++            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
++            Err(error) => return Err(error),
++        }
++        revoked.store(true, Ordering::Release);
++    }
++    Ok(())
++}
++
+ impl Drop for DrmLease {
+     fn drop(&mut self) {
+-        if let Some(obj) = &self.obj.lock().unwrap().take() {
+-            obj.finished();
+-        }
+-        if !self.revoked.swap(true, Ordering::SeqCst) {
+-            tracing::info!(?self.lease_id, "Revoking lease");
+-            if let Err(err) = self.drm.revoke_lease(self.lease_id) {
+-                tracing::warn!(?err, "Error revoking lease");
+-            };
++        if let Err(error) = revoke_kernel_lease(&self.drm, self.lease_id, &self.revoked) {
++            tracing::error!(?error, ?self.lease_id, "Kernel lease revocation failed");
++            return;
++        }
++        if let Some(obj) = self.obj.lock().unwrap().take() {
++            if obj.is_alive() {
++                obj.finished();
++            }
+         }
+     }
+ }
+ 
+ impl DrmLeaseRef {
+-    fn force_close(&self) {
++    fn force_close(&self) -> io::Result<()> {
++        revoke_kernel_lease(&self.drm, self.lease_id, &self.revoked)?;
+         if let Some(obj) = Weak::upgrade(&self.obj).and_then(|obj| obj.lock().unwrap().take()) {
+-            obj.finished();
+-        }
+-        if !self.revoked.swap(true, Ordering::SeqCst) {
+-            tracing::info!(?self.lease_id, "Revoking lease");
+-            if let Err(err) = self.drm.revoke_lease(self.lease_id) {
+-                tracing::warn!(?err, "Error revoking lease");
+-            };
+-        }
++            if obj.is_alive() {
++                obj.finished();
++            }
++        }
++        Ok(())
+     }
+ }
+ 
+@@ -417,12 +449,11 @@
              .dev_path_with_type(NodeType::Primary)
              .ok_or(Error::UnableToGetPath)?;
  
@@ -103,7 +162,7 @@ index 47c57cac..56823067 100644
              node: *drm_node,
          };
  
-@@ -434,6 +450,8 @@ impl DrmLeaseState {
+@@ -434,6 +465,8 @@
              global: Some(global),
              connectors: Vec::new(),
              known_lease_devices: Vec::new(),
@@ -112,10 +171,130 @@ index 47c57cac..56823067 100644
              active_leases: Vec::new(),
          })
      }
-@@ -619,6 +637,88 @@ impl DrmLeaseState {
-         Some(lease_ref)
+@@ -453,32 +486,30 @@
+             return;
+         }
+ 
+-        let mut instances = Vec::new();
+-        for instance in &self.known_lease_devices {
+-            if let Ok(client) = self.dh.get_client(instance.id()) {
+-                if let Ok(lease_connector) = client
+-                    .create_resource::<wp_drm_lease_connector_v1::WpDrmLeaseConnectorV1, _, D>(
+-                        &self.dh, 1, self.node,
+-                    )
+-                {
+-                    instance.connector(&lease_connector);
+-                    lease_connector.name(name.clone());
+-                    lease_connector.description(description.clone());
+-                    lease_connector.connector_id(connector.into());
+-                    instances.push(lease_connector);
+-                    instance.done();
+-                }
+-            }
+-        }
+-
+-        self.connectors.push(DrmLeaseConnector {
++        // Reconnecting a withdrawn connector does not cancel a kernel lease.
++        // Keep its description so successful revocation can offer it later,
++        // but never announce it while that authority is still outstanding.
++        let enabled = !self.active_leases.iter().any(|lease| lease.connectors.contains(&connector));
++        let mut connector = DrmLeaseConnector {
+             name,
+             description,
+             node: self.node,
+             handle: connector,
+-            enabled: true,
+-            known_instances: instances,
+-        });
++            enabled,
++            known_instances: Vec::new(),
++        };
++        if enabled {
++            for instance in &self.known_lease_devices {
++                if let Some(client) = instance.client() {
++                    if let Some(resource) = connector.new_instance::<D>(&self.dh, &client) {
++                        instance.connector(&resource);
++                        connector.send_info(&resource);
++                        instance.done();
++                    }
++                }
++            }
++        }
++        self.connectors.push(connector);
      }
  
+     /// Withdraw a connector from the set of connectors available for leasing
+@@ -502,8 +533,8 @@
+             }
+         }
+ 
+-        self.active_leases
+-            .retain(|lease| !lease.connectors.contains(&connector));
++        // Withdrawing the offer is not evidence of kernel revocation.
++        // remove_lease retains this authority until force_close succeeds.
+     }
+ 
+     /// Suspend all connectors temporarily (e.g. upon loosing DRM master as the session becomes inactive)
+@@ -562,6 +593,7 @@
+             + Dispatch<wp_drm_lease_v1::WpDrmLeaseV1, DrmLeaseData, D>
+             + 'static,
+     {
++        let active_leases = &self.active_leases;
+         for (instance, client) in self
+             .known_lease_devices
+             .iter()
+@@ -569,9 +601,8 @@
+         {
+             let mut once = false;
+             for connector in self.connectors.iter_mut().filter(|c| {
+-                connectors
+-                    .map(|filter| filter.contains(&c.handle))
+-                    .unwrap_or(true)
++                !active_leases.iter().any(|lease| lease.connectors.contains(&c.handle))
++                    && connectors.map(|filter| filter.contains(&c.handle)).unwrap_or(true)
+             }) {
+                 if let Some(lease_connector) = connector.new_instance::<D>(&self.dh, &client) {
+                     instance.connector(&lease_connector);
+@@ -584,9 +615,8 @@
+             }
+         }
+         for connector in self.connectors.iter_mut().filter(|c| {
+-            connectors
+-                .map(|filter| filter.contains(&c.handle))
+-                .unwrap_or(true)
++            !active_leases.iter().any(|lease| lease.connectors.contains(&c.handle))
++                && connectors.map(|filter| filter.contains(&c.handle)).unwrap_or(true)
+         }) {
+             connector.enabled = true;
+         }
+@@ -602,21 +632,101 @@
+             + Dispatch<wp_drm_lease_v1::WpDrmLeaseV1, DrmLeaseData, D>
+             + 'static,
+     {
+-        let lease_ref = {
+-            if let Some(pos) = self
+-                .active_leases
+-                .iter()
+-                .position(|lease| lease.lease_id.get() == id)
+-            {
+-                let lease = self.active_leases.remove(pos);
+-                self.resume_internal::<D>(Some(&lease.connectors));
+-                lease
++        let pos = self
++            .active_leases
++            .iter()
++            .position(|lease| lease.lease_id.get() == id)?;
++        // Never re-offer resources or report a completed revocation until
++        // the kernel has actually withdrawn the lessee's authority.
++        if let Err(error) = self.active_leases[pos].force_close() {
++            tracing::error!(?error, id, "Keeping resources withdrawn after failed lease revocation");
++            return None;
++        }
++        let lease = self.active_leases.remove(pos);
++        self.resume_internal::<D>(Some(&lease.connectors));
++        Some(lease)
++    }
++
 +    /// End an active lease from the compositor's side: the client gets
 +    /// `finished`, the kernel lease is revoked (unless it already was) and
 +    /// the lease's connectors are offered again.
@@ -158,7 +337,8 @@ index 47c57cac..56823067 100644
 +            };
 +            if self.send_bind_events::<D>(&device, &client) {
 +                self.known_lease_devices.push(device);
-+            } else {
+             } else {
+-                return None;
 +                self.pending_lease_devices.push(device);
 +            }
 +        }
@@ -185,8 +365,10 @@ index 47c57cac..56823067 100644
 +            Err(err) => {
 +                tracing::warn!(?err, "No DRM fd for a lease device binding yet");
 +                return false;
-+            }
-+        };
+             }
+         };
+-        lease_ref.force_close();
+-        Some(lease_ref)
 +        device.drm_fd(fd.as_fd());
 +        for connector in self.connectors.iter_mut().filter(|c| c.enabled) {
 +            if let Some(id) = connector.new_instance::<D>(&self.dh, client) {
@@ -196,12 +378,10 @@ index 47c57cac..56823067 100644
 +        }
 +        device.done();
 +        true
-+    }
-+
+     }
+ 
      /// [`DrmNode`] belonging to this DRM lease global
-     pub fn node(&self) -> DrmNode {
-         self.node
-@@ -707,7 +807,7 @@ where
+@@ -707,7 +817,7 @@
  {
      fn bind(
          state: &mut D,
@@ -210,7 +390,7 @@ index 47c57cac..56823067 100644
          client: &Client,
          resource: New<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1>,
          global_data: &DrmLeaseDeviceGlobalData,
-@@ -716,22 +816,14 @@ where
+@@ -716,22 +826,14 @@
          let drm_lease_state = state.drm_lease_state(global_data.node);
          let wp_drm_lease_device = data_init.init(resource, global_data.node);
  
@@ -226,6 +406,10 @@ index 47c57cac..56823067 100644
 -                wp_drm_lease_device.connector(&id);
 -                connector.send_info(&id);
 -            }
+-        }
+-        wp_drm_lease_device.done();
+-
+-        drm_lease_state.known_lease_devices.push(wp_drm_lease_device);
 +        // Mutter's lease_device_bind: without a DRM fd the binding stays
 +        // pending, silent. (Sending the `released` destructor from inside
 +        // the bind destroyed the object before the bind returned.)
@@ -233,14 +417,11 @@ index 47c57cac..56823067 100644
 +            drm_lease_state.known_lease_devices.push(wp_drm_lease_device);
 +        } else {
 +            drm_lease_state.pending_lease_devices.push(wp_drm_lease_device);
-         }
--        wp_drm_lease_device.done();
--
--        drm_lease_state.known_lease_devices.push(wp_drm_lease_device);
++        }
      }
  
      fn can_view(client: Client, global_data: &DrmLeaseDeviceGlobalData) -> bool {
-@@ -773,6 +865,9 @@ where
+@@ -773,6 +875,9 @@
                  drm_lease_state
                      .known_lease_devices
                      .retain(|device| device != resource);
@@ -250,7 +431,7 @@ index 47c57cac..56823067 100644
                  resource.released();
              }
              _ => {}
-@@ -835,43 +930,74 @@ where
+@@ -835,42 +940,73 @@
      ) {
          match request {
              wp_drm_lease_request_v1::Request::RequestConnector { connector } => {
@@ -321,7 +502,7 @@ index 47c57cac..56823067 100644
                      );
 +                    return;
                  }
- 
++
 +                // A connector withdrawn since the client requested it fails
 +                // the lease with `finished`, as in Mutter's
 +                // find_resources_to_lease.
@@ -348,7 +529,6 @@ index 47c57cac..56823067 100644
 +                    lease_obj.finished();
 +                    return;
 +                };
-+
+ 
                  match state.lease_request(
                      data.node,
-                     DrmLeaseRequest {
