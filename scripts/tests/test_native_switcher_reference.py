@@ -352,18 +352,28 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
         self.index_bytes = json.dumps({'schemaVersion': 2, 'manifests': [
             {'digest': proof.PINNED_PLATFORM, 'platform': {'os': 'linux', 'architecture': 'amd64'}}]}).encode()
         self.cosign = [{'critical': {'image': {'docker-manifest-digest': proof.PINNED_PLATFORM},
-                                     'identity': {'docker-reference': proof.BASE_REPOSITORY},
-                                     'type': 'cosign container image signature'},
-                        'optional': {'Subject': proof.CERTIFICATE_SUBJECT, 'Issuer': proof.CERTIFICATE_ISSUER}}]
+                                     'identity': {'docker-reference': proof.BASE_REPOSITORY + '@' + proof.PINNED_PLATFORM},
+                                     'type': 'https://sigstore.dev/cosign/sign/v1'},
+                        'optional': {}}]
         patched = patch.object(proof, 'PINNED_INDEX', 'sha256:' + proof.digest(self.index_bytes))
         patched.start()
         self.addCleanup(patched.stop)
+
+    def verification(self, output=None):
+        output = json.dumps(self.cosign).encode() if output is None else output
+        return json.dumps({
+            'schema': 1, 'argv': proof.cosign_argv('/usr/bin/cosign'), 'exit_code': 0,
+            'begin_host_monotonic_ns': 100, 'end_host_monotonic_ns': 200,
+            'tool': {'executable': '/usr/bin/cosign', 'sha256': 'e' * 64, 'version': 'GitVersion: v3.1.4\n'},
+            'stdout_sha256': proof.digest(output), 'stdout_bytes': len(output), 'stderr': '',
+        }).encode()
 
     def base_evidence(self, root):
         directory = Path(root) / 'controlled-base-input'
         directory.mkdir(parents=True, exist_ok=True)
         (directory / 'index.json').write_bytes(self.index_bytes)
         (directory / 'platform-cosign.json').write_bytes(json.dumps(self.cosign).encode())
+        (directory / 'platform-verification.json').write_bytes(self.verification())
         return directory
 
     def collect(self, root, profile='gnome', failure=None):
@@ -524,24 +534,34 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
                 self.assertFalse(result['ready'])
                 self.assertIn('differ' if difference == 'scale' else 'mismatch', result['error']['message'])
 
-    def test_base_index_bytes_membership_and_exact_cosign_claims_are_required(self):
-        proof.validate_base_bytes(self.index_bytes, json.dumps(self.cosign).encode())
+    def test_base_index_bytes_membership_and_actual_verified_envelope_are_required(self):
+        original = json.dumps(self.cosign).encode()
+        proof.validate_base_bytes(self.index_bytes, original, self.verification())
         with self.assertRaisesRegex(ValueError, 'index29097'):
-            proof.validate_base_bytes(self.index_bytes + b' ', json.dumps(self.cosign).encode())
-        for field in ('Subject', 'Issuer'):
-            bad = copy.deepcopy(self.cosign)
-            bad[0]['optional'][field] = 'untrusted-controlled-value'
+            proof.validate_base_bytes(self.index_bytes + b' ', original, self.verification())
+        for field in ('--certificate-identity', '--certificate-oidc-issuer'):
+            bad = json.loads(self.verification())
+            bad['argv'][bad['argv'].index(field) + 1] = 'untrusted-controlled-value'
             with self.assertRaisesRegex(ValueError, 'subject/issuer'):
-                proof.validate_base_bytes(self.index_bytes, json.dumps(bad).encode())
+                proof.validate_base_bytes(self.index_bytes, original, json.dumps(bad).encode())
+        for mutate in (
+                lambda row: row.update(exit_code=1),
+                lambda row: row['argv'].append('--insecure-ignore-tlog'),
+                lambda row: row.update(stdout_sha256='f' * 64),
+                lambda row: row['tool'].update(version='GitVersion: v2.0.0\n')):
+            bad = json.loads(self.verification())
+            mutate(bad)
+            with self.assertRaises(ValueError):
+                proof.validate_base_bytes(self.index_bytes, original, json.dumps(bad).encode())
         bad = copy.deepcopy(self.cosign)
         bad[0]['critical']['image']['docker-manifest-digest'] = 'sha256:' + '6' * 64
         with self.assertRaisesRegex(ValueError, 'actual platform'):
-            proof.validate_base_bytes(self.index_bytes, json.dumps(bad).encode())
+            proof.validate_base_bytes(self.index_bytes, json.dumps(bad).encode(), self.verification(json.dumps(bad).encode()))
         wrong = json.dumps({'schemaVersion': 2, 'manifests': [
             {'digest': proof.PINNED_PLATFORM, 'platform': {'os': 'linux', 'architecture': 'arm64'}}]}).encode()
         with patch.object(proof, 'PINNED_INDEX', 'sha256:' + proof.digest(wrong)):
             with self.assertRaisesRegex(ValueError, 'linux/amd64'):
-                proof.validate_base_bytes(wrong, json.dumps(self.cosign).encode())
+                proof.validate_base_bytes(wrong, original, self.verification())
 
     def test_snapshot_version_and_unknown_profile_do_not_fall_back_to_tuna(self):
         value = snapshot()
