@@ -189,6 +189,11 @@ If that unchanged greeter deadline expires, `greeter-before-login.json`
 retains the last actual admission observation and latest transport error,
 including missing original-principal or payload-integrity prerequisites.
 The diagnostic is failure evidence, never admission or a deadline extension.
+The observer queries each logind session property with its own `--property=`
+option, as the existing lifecycle probe does. `loginctl` treats a comma-joined
+value as one property name and returns no properties; it is not `systemctl`'s
+multi-property syntax. Original active-VT, native package and session-owner
+admission stay required; an empty observation is never accepted.
 
 The paired consumer owns its real two Files windows and one Settings window,
 original process/ELF identities, read-only settings, public AT-SPI snapshots,
