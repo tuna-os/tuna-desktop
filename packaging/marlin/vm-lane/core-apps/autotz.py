@@ -220,10 +220,20 @@ def _timedate(bus):
     if not isinstance(zone, str) or not zone or '..' in Path(zone).parts or Path(zone).is_absolute():
         raise RuntimeError('actual timedate1 Timezone malformed')
     localtime = Path('/etc/localtime')
+    try:
+        localtime.lstat()
+    except FileNotFoundError:
+        # systemd/glibc define an absent localtime as UTC. A dangling symlink
+        # is not absence: lstat succeeds and the mandatory digest below fails.
+        if zone != 'UTC':
+            raise RuntimeError('missing /etc/localtime disagrees with timedate1 Timezone')
+        return {'zone': zone, 'epoch': time.time(),
+                'localtime': {'present': False, 'resolved': None,
+                              'sha256': None, 'matches_zone': False}}
     zonefile = Path('/usr/share/zoneinfo') / zone
     actual_digest = _digest(localtime)
     return {'zone': zone, 'epoch': time.time(),
-            'localtime': {'resolved': str(localtime.resolve(strict=True)),
+            'localtime': {'present': True, 'resolved': str(localtime.resolve(strict=True)),
                           'sha256': actual_digest, 'matches_zone': actual_digest == _digest(zonefile)}}
 
 
@@ -1078,6 +1088,26 @@ def _monitor(nonce):
         os.close(geo_descriptor)
 
 
+def _restore_timezone(context, directory, state):
+    original = state['original']['timedate']
+    _command(context, ['busctl', '--system', 'call', TIME_NAME, TIME_PATH, TIME_NAME,
+                       'SetTimezone', 'sb', original['zone'], 'false'],
+             directory=directory, state=state)
+    if original['localtime']['present'] is False:
+        # SetTimezone("UTC") normally creates a UTC symlink. Restore the actual
+        # initial absence, not just equivalent wall time, only after readback.
+        if original['zone'] != 'UTC':
+            raise RuntimeError('saved absent localtime is not systemd default UTC')
+        Gio, _ = _gio()
+        actual = _timedate(Gio.bus_get_sync(Gio.BusType.SYSTEM, None))
+        if actual['zone'] != 'UTC':
+            raise RuntimeError('cleanup timezone did not return to UTC')
+        if actual['localtime']['present']:
+            if not actual['localtime']['matches_zone']:
+                raise RuntimeError('cleanup localtime does not match UTC')
+            Path('/etc/localtime').unlink()
+
+
 def _restore(context, directory, state):
     errors = []
     try:
@@ -1093,9 +1123,7 @@ def _restore(context, directory, state):
         except Exception as error:
             errors.append({'operation': 'disable-' + key, 'error': str(error)})
     try:
-        _command(context, ['busctl', '--system', 'call', TIME_NAME, TIME_PATH, TIME_NAME,
-                           'SetTimezone', 'sb', state['original']['timedate']['zone'], 'false'],
-                 directory=directory, state=state)
+        _restore_timezone(context, directory, state)
     except Exception as error:
         errors.append({'operation': 'restore-timezone-cleanup-only', 'error': str(error)})
     for key in _setting_order(state['original']['settings']):

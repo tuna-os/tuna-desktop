@@ -148,6 +148,47 @@ failed service, unavailable policy or incomplete cleanup cannot be a pass.
 The standalone semantic-validator tests exercise those rejection predicates;
 they are not image, GeoClue, network or panel evidence.
 
+### Initial UTC without `/etc/localtime`
+
+The original #1003 run
+[41464644402, job 125360854225](https://github.com/tuna-os/tuna-desktop/actions/runs/41464644402/job/125360854225)
+failed in `autotz save`: `_snapshot` → `_timedate` → `_digest` →
+`native_session.digest`, with `FileNotFoundError(errno=2)` while opening
+`/etc/localtime`. The
+[original artifact 13156389027](https://github.com/tuna-os/tuna-desktop/actions/runs/41464644402/artifacts/13156389027)
+retains the unreplayed failed save and an unqualified result, not an automatic
+timezone observation. No timezone mutation or monitor start had occurred.
+The exception identifies an unresolved localtime file; because save failed
+before retaining a timezone snapshot, it does not establish whether that path
+was absent or a dangling link.
+
+The observer previously assumed every valid initial timezone had a readable
+localtime file. That excludes systemd's documented
+[implicit UTC when `/etc/localtime` is absent](https://www.freedesktop.org/software/systemd/man/latest/localtime.html).
+It now uses `lstat` to distinguish genuine absence from a broken link, and
+admits absence for saving/restoring initial state **only when the real
+timedate1 property is exactly `UTC`**. Its receipt records `present=false`,
+null resolved path/hash, and `matches_zone=false`; it does not invent file
+evidence. A dangling link, non-UTC property with no file, unreadable file,
+or missing zoneinfo for a present localtime still fails.
+
+The Auckland negative controls and New York automatic positive still require
+the actual localtime bytes and matching zoneinfo hash, alongside every
+original-user, daemon, location-agent, live-monitor, method-caller and visible
+clock check. Implicit UTC cannot satisfy those gates. Cleanup first calls the
+real timedate1 `SetTimezone` as before. If the saved file was absent, cleanup
+verifies returned UTC and any newly created UTC file before removing it, then
+requires the original absence/settings in its final readback. Failed writes
+or mismatched files cannot be reported as restored.
+
+`LocaltimeStateControls` in `scripts/tests/test_core_apps_autotz.py` exercises
+these filesystem states, rejection paths and cleanup with temporary files and
+mocked D-Bus. These are regression controls, not native qualification. A new
+source-bound current-build native run must still qualify the original GDM
+session, both full negative windows, actual gsd-datetime/GeoClue/geocoding
+positive, clock/frame, and complete restoration; the original failure remains
+failed and must not be replayed for a green result.
+
 The Core-app profile calls the idempotent guest `save` before preparing this
 source or running Maps/Weather, then calls `run(desktop, manage_fixture=False)`
 for automatic timezone. That mode borrows the same nonce-owned source and
