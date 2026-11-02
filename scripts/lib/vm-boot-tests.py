@@ -4461,6 +4461,79 @@ class InventoryProcessRaces(unittest.TestCase):
         self.assertEqual(self.pids(result), [(600, "tuna-compositor"), (650, "tuna-shell-gtk")])
         self.assertEqual(self.sleeps, [])
 
+    def late_compositor(self, parent=600, group=701, ticks=1800, args=None, other_inode=False):
+        # The first /proc iterator has already captured its entries when 700
+        # is read. The second iterator sees 701, just like a new wake-time PAM
+        # conversation between the helper snapshot and owned-process scan.
+        def spawned(pid, count):
+            if pid == 700 and count == 2:
+                self.process(701, parent, group, ticks, "tuna-compositor",
+                             self.HELPER_ARGS if args is None else args)
+                if other_inode:
+                    other = self.root / "other/tuna-compositor"
+                    other.parent.mkdir()
+                    other.write_bytes(self.binaries["tuna-compositor"].read_bytes())
+                    executable = self.root / "proc/701/exe"
+                    executable.unlink()
+                    executable.symlink_to(other)
+        self.on_readlink = spawned
+        return self.guest()
+
+    def test_helper_born_between_snapshots_is_classified_at_its_scan(self):
+        scope = self.late_compositor()
+        windows = [{"id": 4, "app_id": "org.tuna.VmInput", "rect": [440, 296, 400, 240],
+                    "workspace": 0}]
+        scope["STATE"].write_text(json.dumps({**self.STATE, "windows": windows}))
+        result = scope["inventory"]()
+        self.assertEqual(self.pids(result), [(600, "tuna-compositor"), (650, "tuna-shell-gtk")])
+        self.assertEqual([(p["pid"], p["start_ticks"]) for p in result["processes"]],
+                         [(600, 1500), (650, 1600)])
+        self.assertEqual(result["state"]["windows"], windows)
+        self.assertTrue(result["state"]["locked"])
+        self.assertGreaterEqual(self.readlinks[701], 2)  # read its actual metadata
+        self.assertEqual(self.sleeps, [])
+
+    def test_late_unrelated_or_impostor_compositors_remain_owned_process_mismatches(self):
+        for options in ({"parent": 999}, {"group": 600}, {"ticks": 1400},
+                        {"args": self.DESKTOP_ARGS},
+                        {"args": self.HELPER_ARGS[:-1] + b"\0extra\0"},
+                        {"other_inode": True}):
+            with self.subTest(options=options):
+                self.setUp()
+                result = self.late_compositor(**options)["inventory"]()
+                self.assertEqual(self.pids(result), [(600, "tuna-compositor"),
+                                 (650, "tuna-shell-gtk"), (701, "tuna-compositor")])
+
+    def test_late_helper_cannot_bind_to_reused_desktop_parent_pid(self):
+        scope = self.late_compositor()
+        spawned = self.on_readlink
+        def reused(pid, count):
+            spawned(pid, count)
+            if pid == 701 and count == 2:
+                stat = self.root / "proc/600/stat"
+                stat.write_text(stat.read_text().replace("1500", "1750"))
+        self.on_readlink = reused
+        result = scope["inventory"]()
+        self.assertEqual(self.pids(result), [(600, "tuna-compositor"),
+                         (650, "tuna-shell-gtk"), (701, "tuna-compositor")])
+
+    def test_ambiguous_original_desktop_never_excludes_private_children(self):
+        self.process(701, 2, 2, 1800, "tuna-compositor", self.DESKTOP_ARGS)
+        result = self.guest()["inventory"]()
+        self.assertEqual(self.pids(result), [(600, "tuna-compositor"), (650, "tuna-shell-gtk"),
+                         (700, "tuna-compositor"), (701, "tuna-compositor")])
+
+    def test_classified_helper_pid_reuse_is_not_excluded_by_numeric_pid(self):
+        def reused(pid, count):
+            if pid == 700 and count == 3:
+                (self.root / "proc/700/cmdline").write_bytes(self.DESKTOP_ARGS)
+                stat = self.root / "proc/700/stat"
+                stat.write_text(stat.read_text().replace("1700", "1800"))
+        self.on_readlink = reused
+        result = self.guest()["inventory"]()
+        self.assertEqual(self.pids(result), [(600, "tuna-compositor"),
+                         (650, "tuna-shell-gtk"), (700, "tuna-compositor")])
+
     def test_helper_exiting_after_its_scan_read_is_absent_not_an_owned_compositor(self):
         # Snapshot readlinks 700 twice; the scan's own read is the third.
         def exit_after_scan_read(pid, count):

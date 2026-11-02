@@ -857,6 +857,48 @@ native lifecycle qualification (#265) separately demonstrated locking from
 an unlocked session and two real suspend cycles on the preserved-resource VM
 profile; that evidence does not certify a later candidate automatically.
 
+#### Wake-time process inventory classification
+
+Run `41490837174`, job `125453770508`, on candidate `b8feffef` reached real
+S3 and fresh host GPU resource creation, backing attachment and nonzero
+scanout, but failed `V-SUSPEND`. Original artifact `13170520388` has SHA256
+`a30fbd6ab110c3a863fa92ec079bf47c38a11646f9062ea5b989bb17299f6206`.
+Its `lifecycle/first-resume.json` is already locked and preserves the ordered
+window records and all five original compositor/shell/application process
+identities. The failing identity comparison instead sees one additional
+`tuna-compositor` process, PID `33679`, start ticks `60527`; that process is
+absent from the later repaint inventory. The exact retained PPM body changes
+are `800742/942080` pixels on first resume and `800653/942080` on the last
+locked frame, both above the unchanged 25% fail-closed threshold.
+
+The probe formerly classified private PAM helpers in one `/proc` enumeration
+and then enumerated owned processes separately. A helper born between those
+enumerations could therefore be counted as another desktop compositor.
+**[INFERENCE]** The transient PID is a fresh wake-time PAM helper: the serial
+trace records new password/fingerprint conversations in that interval, but
+the failed artifact does not retain that PID's exact helper flag, parent,
+process group or executable inode. It cannot prove that classification
+retrospectively.
+
+Inventory now reads each scanned compositor's fixed private-helper metadata.
+Exclusion requires the exact private argument shape, live helper state,
+original user's UID, direct parent, own process group, start-time ordering
+and matching executable device/inode. Its parent is reread and must still
+match the unique initial desktop identity, including start ticks; neither a
+numeric PID match nor a reused parent PID is sufficient. Unrelated or
+impostor compositor processes remain identity mismatches. Controlled `/proc`
+regressions cover a helper born between enumerations, unrelated parent/group,
+older start time, wrong arguments/inode, ambiguous desktop identity and PID
+reuse. No application/window comparison, frame threshold, GPU requirement,
+suspend deadline or first-resume lock requirement changes.
+
+The failed run remains failed. A fresh owner-authorized native qualification
+with the corrected installed lifecycle probe must still demonstrate the
+actual first locked wake, exact application geometry/process preservation,
+fresh GPU uploads, stale-auth retirement, fresh authentication and client
+repaint; fixture regressions alone cannot qualify suspend.
+
+
 ### Date & Time restoration and published capability failures
 
 Published-flavor run 41151873652 observed the new Auckland panel time, then
