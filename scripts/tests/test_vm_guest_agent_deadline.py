@@ -93,20 +93,22 @@ class Tests(unittest.TestCase):
             actor.command('guest-ping')
         self.assertTrue(actor.poisoned)
 
-    def test_run_includes_initial_exec_time_in_all_status_deadlines(self):
-        actor, _ = self.actor()
-        seen = []
-        def command(name, **kwargs):
-            seen.append(kwargs['deadline'])
-            if name == 'guest-exec':
-                time.sleep(.015)
-                return {'pid': 51}
-            return {'exited': True, 'exitcode': 0, 'out-data': 'e30='}
-        with mock.patch.object(actor, 'command', side_effect=command):
-            self.assertEqual(actor.run('inventory', timeout=.1), {})
-        self.assertEqual(len(set(seen)), 1)
-        self.assertIsNone(actor.pending_guest_pid)
-        self.assertEqual(actor.guest_exec_state, 'none')
+    def test_caller_deadline_bounds_actual_nested_exec_socket(self):
+        actor, peer = self.actor()
+        def exec_then_stall(peer, stop):
+            request = json.loads(peer.recv(65536))
+            peer.sendall(json.dumps({'return': {'pid': 51}, 'id': request['id']}).encode() + b'\n')
+            peer.recv(65536)
+            stop.wait(.4)
+        self.server(peer, exec_then_stall)
+        began = time.monotonic()
+        actor._caller_deadline = began + .05
+        with self.assertRaises(TimeoutError):
+            actor.run('explicit-sync', 'state', '{}', timeout=30)
+        self.assertLess(time.monotonic() - began, .7)
+        self.assertEqual(actor.pending_guest_pid, 51)
+        self.assertEqual(actor.guest_exec_state, 'known')
+        self.assertTrue(actor.poisoned)
 
     def test_timed_out_exec_is_not_claimed_retired(self):
         actor, _ = self.actor()

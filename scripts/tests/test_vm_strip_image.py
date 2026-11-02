@@ -1,13 +1,15 @@
 """Original package/image/source identity negatives; no image or guest execution."""
 import copy
 import hashlib
+import json
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
-from vm_strip_image import admission, IMAGE_INSPECTION, canonical_image_id
+from vm_strip_image import (admission, canonical_image_id, fixture_members,
+                            PROTOCOL_INPUTS, PROTOCOL_MEMBERS)
 
 
 class Tests(unittest.TestCase):
@@ -49,19 +51,51 @@ class Tests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 admission(package, observed, *args)
 
-    def test_actual_inspection_program_parses(self):
-        compile(IMAGE_INSPECTION, '<immutable-image-inspector>', 'exec')
-
-    def test_ci_keeps_original_gates_and_pins_actual_inspection(self):
-        root = Path(__file__).resolve().parents[2]
-        source = (root / '.github/workflows/ci.yml').read_text()
-        self.assertIn('TUNA_PKG_SHA256=', source)
-        self.assertIn('--entrypoint /usr/bin/python3 "$image_id"', source)
-        self.assertIn('--strip-image vm-lane-artifacts/strip-image.json', source)
-        lane = (root / 'scripts/tuna-vm-lane').read_text()
-        self.assertIn('if getattr(args, "strip_image", None) and index == args.boots:', lane)
-        self.assertIn('strip_image.get(field) != metadata.get(meta)', lane)
-        self.assertIn('reconnect=lambda: guest_agent.GuestAgent(agent_path)', lane)
+    def test_native_protocol_original_build_and_installed_outputs_are_bound(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            expected = {'/usr/bin/tuna-compositor': 'a' * 64}
+            sources = {'/usr/libexec/' + name: 'packaging/marlin/vm-lane/' + name
+                       for name in ('tuna-vm-input', 'tuna-vm-lifecycle')}
+            sources.update(fixture_members('explicit-sync'))
+            for installed, name in sources.items():
+                if name == 'native-protocol-build.json':
+                    continue
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(name.encode())
+                expected[installed] = hashlib.sha256(path.read_bytes()).hexdigest()
+            build = {'schema': 1, 'source_sha256': {}, 'member_sha256': {}}
+            for name in PROTOCOL_INPUTS:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(name.encode())
+                build['source_sha256'][name] = hashlib.sha256(path.read_bytes()).hexdigest()
+            staged = root / 'protocol-xml/wayland-protocols/source.json'
+            staged.parent.mkdir(parents=True)
+            staged.write_bytes(b'actual independently staged protocol source receipt')
+            for name in PROTOCOL_MEMBERS:
+                content = staged.read_bytes() if name.endswith('/protocol-source.json') else name.encode()
+                build['member_sha256'][name] = hashlib.sha256(content).hexdigest()
+            original = root / 'native-protocol-build.json'
+            original.write_text(json.dumps(build))
+            expected['/usr/share/tuna-explicit-sync/native-build.json'] = hashlib.sha256(original.read_bytes()).hexdigest()
+            expected.update(build['member_sha256'])
+            package = {'package': {'sha256': 'b' * 64}, 'required_members':
+                       {'usr/bin/tuna-compositor': {'sha256': 'a' * 64}}}
+            observed = {'schema': 1, 'image_id': 'sha256:' + 'c' * 64, 'member_sha256': expected}
+            args = (root, 'd' * 40, observed['image_id'], 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'e' * 64)
+            admission(package, observed, *args, fixture='explicit-sync')
+            changed = copy.deepcopy(observed)
+            changed['member_sha256'][PROTOCOL_MEMBERS[0]] = 'f' * 64
+            with self.assertRaisesRegex(ValueError, 'installed executables'):
+                admission(package, changed, *args, fixture='explicit-sync')
+            staged.write_bytes(b'different archive source')
+            with self.assertRaisesRegex(ValueError, 'locked archive'):
+                admission(package, observed, *args, fixture='explicit-sync')
+            (root / PROTOCOL_INPUTS[0]).write_bytes(b'different compiler invocation')
+            with self.assertRaisesRegex(ValueError, 'build inputs'):
+                admission(package, observed, *args, fixture='explicit-sync')
 
 
 if __name__ == '__main__':

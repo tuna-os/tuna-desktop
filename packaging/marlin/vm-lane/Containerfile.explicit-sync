@@ -1,22 +1,24 @@
-# Extra CI-only protocol fixture on the existing admitted current-build VM image.
-# No shipped compositor/package replacement and no normal/published profile change.
-# Prepare protocol-xml/wayland-protocols with scripts/tuna-protocol-xml-stage in
-# the locked source build job (or download that exact artifact into this context).
+# Required additional DEV native protocol consumer; ordinary rows are unchanged.
 ARG BASE_IMAGE=localhost/marlin-tuna-vm:ci
 FROM ${BASE_IMAGE} AS syncobj-builder
 COPY protocol-xml/wayland-protocols /build/protocols
 COPY scripts/tuna-explicit-sync-build /build/syncobj/tuna-explicit-sync-build
+COPY scripts/tuna-background-effect-client-build /build/syncobj/tuna-background-effect-client-build
 COPY scripts/lib/tuna-explicit-sync-client.c /build/syncobj/lib/tuna-explicit-sync-client.c
+COPY scripts/lib/tuna-background-effect-client.c /build/syncobj/lib/tuna-background-effect-client.c
 RUN pacman -S --needed --noconfirm gcc pkgconf wayland libdrm mesa libglvnd \
     && WAYLAND_PROTOCOLS_DIR=/build/protocols/protocols \
        bash /build/syncobj/tuna-explicit-sync-build /build/syncobj/out
 
 FROM ${BASE_IMAGE}
 COPY --from=syncobj-builder /build/syncobj/out/tuna-explicit-sync-client /usr/libexec/tuna-explicit-sync-client
+COPY --from=syncobj-builder /build/syncobj/out/tuna-background-effect-client /usr/libexec/tuna-background-effect-client
 COPY --from=syncobj-builder /build/syncobj/out/protocol-source.json /usr/share/tuna-explicit-sync/protocol-source.json
 COPY --from=syncobj-builder /build/syncobj/out/protocol-xml.sha256 /usr/share/tuna-explicit-sync/protocol-xml.sha256
+COPY --from=syncobj-builder /build/syncobj/out/native-build.json /usr/share/tuna-explicit-sync/native-build.json
 COPY --chmod=0755 scripts/lib/tuna-explicit-sync-guest.py /usr/libexec/tuna-vm-explicit-sync
+COPY scripts/lib/background_effect_oracle.py /usr/libexec/background_effect_oracle.py
 RUN sha256sum --check /usr/share/tuna-vm/shipped-payload.sha256 \
     && test "$(pacman -Q tuna-desktop)" = "$(cat /usr/share/tuna-vm/shipped-package.txt)"
 LABEL org.opencontainers.image.title="marlin-tuna-native-explicit-sync-fixture" \
-      org.opencontainers.image.description="CI-only real virtio/virgl timeline, dmabuf-feedback and independent QMP pixel qualification; not physical-GPU or signed-release proof"
+      org.opencontainers.image.description="Required DEV virgl timelines, dmabuf and background effects; no physical-GPU or signed-release claim"
