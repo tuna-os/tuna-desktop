@@ -170,11 +170,48 @@ printed values; raw core dumps are never qualification artifacts.
 The independent GPL-3.0-or-later driver oracle,
 [`r8-import.c`](../tests/color-dmabuf/r8-import.c), uses GBM/EGL/GLES and the
 actual Linux DMA heap without Rust, Smithay, auxiliary samplers or colour math.
-It compares ordinary uploaded RGBA and imported linear R8 pixels with one
-shader while retaining every buffer/image/texture through GPU completion.
+It compares ordinary uploaded RGBA, ordinary uploaded R8 and imported linear
+R8 pixels with one shader while retaining every buffer/image/texture through
+GPU completion. The uploaded R8 control uses the identical nonconstant red
+values and checks all 64 RGBA pixels, distinguishing raw-channel sampling
+from the DMA-BUF importer without bypassing the imported positive.
 Its source, license, compiler/package identities and bounded GDB result accompany
 the original device receipt. A fault in the Rust control alone does not prove a
 driver cause; neither diagnostic can silently remove an existing required gate.
+
+The import follows
+[`EGL_EXT_image_dma_buf_import`](https://registry.khronos.org/EGL/extensions/EXT/EGL_EXT_image_dma_buf_import.txt):
+`EGL_NO_CONTEXT`, a NULL client buffer, one R8 plane, byte offset zero and
+eight-byte pitch for an 8×8 image, with explicit LINEAR modifiers checked
+against the driver's non-external-only advertisement. A page-sized real
+DMA-heap allocation is initialized between CPU WRITE START/END sync ioctls;
+the producer mapping and fd are retained as well as the EGL/GL objects.
+Successful image creation and binding do not establish successful sampling.
+CI run `41275157224` on Ubuntu Noble's Mesa `25.2.8-0ubuntu0.24.04.4`,
+llvmpipe/LLVM 20.1.2 and VKMS accepted that import, then faulted in a llvmpipe
+worker at the first imported-R8 `glFinish`, after the RGBA control passed.
+This failure precedes every auxiliary-sampler and YUV conversion operation.
+One bounded local native run on Linux `6.8.0-147-generic`, VKMS and the same
+runtime Mesa `25.2.8-0ubuntu0.24.04.4` additionally passed the uploaded R8
+control (64 pixels, zero mismatches). GDB observed the driver's own
+`PRIME_FD_TO_HANDLE` succeed with GEM handle 1, then its
+`DRM_IOCTL_MODE_MAP_DUMB` return `-22` (`EINVAL`) three times for that same
+handle before the imported-R8 draw faulted. The faulting byte load used a
+NULL address. No extra application import, GEM-handle close or alternative
+sampling path was introduced for that observation; core files were disabled.
+[Mesa 25.2.8 KMS swrast](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-25.2.8/src/gallium/winsys/sw/kms-dri/kms_dri_sw_winsys.c)
+imports a PRIME fd but later attempts that dumb-map ioctl, returning NULL on
+failure; [`llvmpipe_resource_map`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-25.2.8/src/gallium/drivers/llvmpipe/lp_texture.c)
+stores the returned map as texture data. Both
+[Linux 6.8](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/drm_gem.c#L324-L328)
+and [Linux 7.0](https://github.com/torvalds/linux/blob/v7.0/drivers/gpu/drm/drm_gem.c#L453-L457)
+explicitly reject imported objects in the generic GEM dumb-map helper.
+This establishes the local importer/kernel mapping blocker, not a compositor
+lifetime defect or universal R8/YUV incapability. The CI crash is consistent
+with that source path but its original receipt did not trace the ioctl.
+The imported positive remains failed, not qualified. A virgl result is
+additional named-device evidence, never a replacement for the original
+required device proof without an owner decision.
 
 The isolated `colour` guest route uses the shared VM producer and an opt-in
 virgl device profile, not a second producer or a normal release-admission override.

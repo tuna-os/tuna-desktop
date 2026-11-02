@@ -7,7 +7,7 @@
  * and Linux UAPI headers providing linux/dma-heap.h and linux/dma-buf.h.
  * There is deliberately no software override, alternate context, or skip path.
  * A parent may bound execution and disable cores externally; no signal handler
- * obscures a fault in the driver. All live objects survive both pixel oracles.
+ * obscures a fault in the driver. All live objects survive all pixel oracles.
  */
 #define _GNU_SOURCE
 #include <EGL/egl.h>
@@ -45,7 +45,7 @@ static struct {
 	void *mapping;
 	size_t allocation;
 	GLuint vertex, fragment, program, vbo, fbo;
-	GLuint rgba_texture, r8_texture, target_texture;
+	GLuint rgba_texture, uploaded_r8_texture, r8_texture, target_texture;
 	PFNEGLDESTROYIMAGEKHRPROC destroy_image;
 } state = {
 	.device_fd = -1, .heap_fd = -1, .dma_fd = -1,
@@ -307,7 +307,7 @@ static void texture_parameters(void)
 	GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
 }
 
-static void create_pipeline(uint8_t rgba[PIXELS][4])
+static void create_pipeline(uint8_t rgba[PIXELS][4], const uint8_t r8[PIXELS][4])
 {
 	static const char vertex[] =
 		"#version 100\n"
@@ -317,7 +317,7 @@ static void create_pipeline(uint8_t rgba[PIXELS][4])
 		"#version 100\nprecision mediump float;\n"
 		"varying mediump vec2 v_uv; uniform sampler2D tex;\n"
 		"void main() { gl_FragColor = texture2D(tex, v_uv); }\n";
-	/* Pixel (x,y) is sampled at ((x+.5)/8,(y+.5)/8). Neither oracle has
+	/* Pixel (x,y) is sampled at ((x+.5)/8,(y+.5)/8). No oracle has
 	 * constant input; flipped rows, stale data and wrong strides fail. */
 	static const GLfloat vertices[][4] = {
 		{ -1, -1, 0, 0 }, { 1, -1, 1, 0 },
@@ -359,6 +359,17 @@ static void create_pipeline(uint8_t rgba[PIXELS][4])
 	GL(glBindTexture(GL_TEXTURE_2D, state.rgba_texture));
 	texture_parameters();
 	GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, SIDE, SIDE, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba));
+	/* Distinguish GL R8 sampling from DMA-BUF import with the same values,
+	 * shader, texture parameters and render target, not another context. */
+	uint8_t red[PIXELS];
+	for (unsigned i = 0; i < PIXELS; i++)
+		red[i] = r8[i][0];
+	GL(glGenTextures(1, &state.uploaded_r8_texture));
+	require(state.uploaded_r8_texture != 0, "uploaded R8 texture allocation failed");
+	GL(glBindTexture(GL_TEXTURE_2D, state.uploaded_r8_texture));
+	texture_parameters();
+	GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RED_EXT, SIDE, SIDE, 0,
+		GL_RED_EXT, GL_UNSIGNED_BYTE, red));
 	GL(glGenTextures(1, &state.target_texture));
 	require(state.target_texture != 0, "target texture allocation failed");
 	GL(glBindTexture(GL_TEXTURE_2D, state.target_texture));
@@ -553,8 +564,11 @@ static bool cleanup(void)
 			glDeleteFramebuffers(1, &state.fbo);
 			ok &= cleanup_gl("glDeleteFramebuffers");
 		}
-		GLuint textures[] = { state.rgba_texture, state.r8_texture, state.target_texture };
-		glDeleteTextures(3, textures);
+		GLuint textures[] = {
+			state.rgba_texture, state.uploaded_r8_texture,
+			state.r8_texture, state.target_texture,
+		};
+		glDeleteTextures(4, textures);
 		ok &= cleanup_gl("glDeleteTextures");
 		if (state.vbo) {
 			glDeleteBuffers(1, &state.vbo);
@@ -656,13 +670,14 @@ int main(int argc, char **argv)
 		r8[i][3] = 255;
 	}
 	create_context(device);
-	create_pipeline(rgba);
+	create_pipeline(rgba, r8);
 	draw_and_compare(state.rgba_texture, rgba, "ordinary-rgba-default-shader");
+	draw_and_compare(state.uploaded_r8_texture, r8, "ordinary-r8-same-default-shader");
 	import_capabilities();
 	create_r8(heap, r8);
 	draw_and_compare(state.r8_texture, r8, "dma-heap-linear-r8-same-default-shader");
 	if (!cleanup())
 		return EXIT_FAILURE;
-	puts("R8-REPRO PASS rgba_and_r8_all_64_pixels_exact installed_signed_release_qualified=false");
+	puts("R8-REPRO PASS rgba_uploaded_r8_and_dma_r8_all_64_pixels_exact installed_signed_release_qualified=false");
 	return EXIT_SUCCESS;
 }
