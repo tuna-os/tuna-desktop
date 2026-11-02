@@ -5,25 +5,30 @@ XML slideshow proof (360).
 wait_for/budget nest by tightening (a nested wait can never extend
 its parent), slow-true predicates fail instead of passing late, and
 every accepted paint record is typed, ranged and provenance-bound:
-exact source URI, generation epoch prefix, live stat cross-check of
-parsed FileIdentity dev/ino/size/mtime/ctime, duplicate-free source
+exact source URI, generation epoch prefix, typed FileIdentity metadata,
+stable live stat and SHA256 content checks, duplicate-free owned source
 references, and the exact 1280x800@1.0 producer viewport.
 
 Runs without a compositor/gi/pyatspi: the pure functions are
 AST-extracted from the proof script into a stub namespace.
 """
 import ast
+import hashlib
+import os
+import stat
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 PROOF = ROOT / 'scripts' / 'lib' / 'tuna-stock-slideshow-proof.py'
 
 WANT_FUNCS = {'wait_for', 'budget', 'check_paint', 'check_file_identity',
               'is_plain_int'}
-WANT_GLOBALS = ('_ACTIVE_END', '_FILE_IDENTITY', 'SHOT_W', 'SHOT_H')
+WANT_GLOBALS = ('_ACTIVE_END', '_MAX_IDENTITY_BYTES', 'SHOT_W', 'SHOT_H')
 
 
 def load_proof(tmp):
@@ -46,8 +51,8 @@ def load_proof(tmp):
     code = compile(ast.Module(body=[n for n in tree.body if keep(n)],
                               type_ignores=[]), str(PROOF), 'exec')
     out = Path(tmp)
-    ns = {'time': time, 'math': __import__('math'), 're': __import__('re'),
-          'json': __import__('json'), 'subprocess': __import__('subprocess'),
+    ns = {'time': time, 'math': __import__('math'), 'hashlib': hashlib,
+          'os': os, 'stat': stat, 'json': __import__('json'), 'subprocess': __import__('subprocess'),
           'Path': Path, 'OUT': out,
           'XML': {'light': out / 'light-timeline.xml',
                   'dark': out / 'dark-timeline.xml'},
@@ -60,17 +65,17 @@ def load_proof(tmp):
 def identity_of(path):
     st = Path(path).stat()
     mt, ct = st.st_mtime_ns, st.st_ctime_ns
-    return (f'Some(FileIdentity {{ path: "{path}", dev: {st.st_dev}, '
-            f'ino: {st.st_ino}, bytes: {st.st_size}, '
-            f'modified: ({mt // 1_000_000_000}, {mt % 1_000_000_000}), '
-            f'changed: ({ct // 1_000_000_000}, {ct % 1_000_000_000}) }})')
+    return {'path': str(path),
+            'metadata': {'dev': st.st_dev, 'ino': st.st_ino, 'bytes': st.st_size,
+                         'modified': [mt // 1_000_000_000, mt % 1_000_000_000],
+                         'changed': [ct // 1_000_000_000, ct % 1_000_000_000]},
+            'sha256': list(hashlib.sha256(Path(path).read_bytes()).digest())}
 
 
 def stale_identity_of(path):
-    st = Path(path).stat()
-    return (f'Some(FileIdentity {{ path: "{path}", dev: {st.st_dev}, '
-            f'ino: {st.st_ino}, bytes: {st.st_size}, '
-            f'modified: (1, 2), changed: (3, 4) }})')
+    identity = identity_of(path)
+    identity['metadata'].update(modified=[1, 2], changed=[3, 4])
+    return identity
 
 
 class DeadlineDiscipline(unittest.TestCase):
@@ -249,15 +254,63 @@ class PaintReceipt(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.check(paint, fixed=True)
         paint = self.good_paint()
-        tampered = identity_of(self.frames['light-a']).replace(
-            f'ino: {Path(self.frames["light-a"]).stat().st_ino}',
-            'ino: 999999999')
+        tampered = identity_of(self.frames['light-a'])
+        tampered['metadata']['ino'] = 999999999
         paint['source_identities'] = [
             {'path': frm, 'identity': tampered},
             {'path': self.frames['light-b'],
              'identity': identity_of(self.frames['light-b'])}]
         with self.assertRaises(RuntimeError):
             self.check(paint, fixed=True)
+
+    def test_debug_strings_and_incomplete_or_mistyped_identity_are_refused(self):
+        for bad in (None, 'None', 'Some(FileIdentity { path: "/out/light-timeline.xml" })',
+                    {}, {'path': str(self.xml)}, {'path': str(self.xml), 'metadata': {}, 'sha256': []}):
+            with self.subTest(identity=bad), self.assertRaises(RuntimeError):
+                self.check(self.mutate(root_identity=bad))
+        for key, value in (('path', None), ('sha256', [0] * 31), ('sha256', [True] * 32),
+                           ('sha256', [256] * 32), ('sha256', '00' * 32)):
+            identity = identity_of(self.xml)
+            identity[key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(RuntimeError):
+                self.check(self.mutate(root_identity=identity))
+        for key, value in (('dev', True), ('ino', -1), ('bytes', 64 * 1024 * 1024 + 1),
+                           ('modified', [1, 1_000_000_000]), ('changed', [True, 0])):
+            identity = identity_of(self.xml)
+            identity['metadata'][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(RuntimeError):
+                self.check(self.mutate(root_identity=identity))
+
+    def test_digest_rejects_changed_bytes_even_if_all_stat_metadata_matches(self):
+        identity = identity_of(self.xml)
+        original = self.xml.read_bytes()
+        info = self.xml.stat()
+        try:
+            self.xml.write_bytes(b'x' * len(original))
+            with mock.patch.object(os, 'fstat', return_value=info), mock.patch.object(os, 'stat', return_value=info):
+                with self.assertRaisesRegex(RuntimeError, 'content'):
+                    self.ns['check_file_identity'](identity, 'root', expect_path=str(self.xml))
+        finally:
+            self.xml.write_bytes(original)
+
+    def test_file_metadata_drift_during_digest_is_refused(self):
+        identity = identity_of(self.xml)
+        info = self.xml.stat()
+        changed = SimpleNamespace(**{name: getattr(info, name) for name in
+                                  ('st_mode', 'st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')})
+        changed.st_ctime_ns += 1
+        with mock.patch.object(os, 'fstat', side_effect=[info, changed]):
+            with self.assertRaisesRegex(RuntimeError, 'content'):
+                self.ns['check_file_identity'](identity, 'root', expect_path=str(self.xml))
+
+    def test_foreign_reference_is_refused_before_any_foreign_file_open(self):
+        paint = self.good_paint()
+        foreign = str(Path(self.tmp).parent / 'not-an-owned-frame.png')
+        paint['source_identities'].append({'path': foreign, 'identity': {'path': foreign}})
+        with mock.patch.object(os, 'open', wraps=os.open) as opened:
+            with self.assertRaisesRegex(RuntimeError, 'owned public fixture'):
+                self.check(paint)
+        self.assertNotIn(foreign, [call.args[0] for call in opened.call_args_list])
 
     def test_reference_list_shape_and_duplicates(self):
         with self.assertRaises(RuntimeError):
