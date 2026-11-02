@@ -31,8 +31,9 @@ the gate's detail carries the probe error.
 
 The published-flavor lane reads the installed `tuna-desktop` package version
 with Marlin's native `pacman -Q` into `desktop_package_version` in that evidence
-bundle. Only the known pre-fix `1.0.0beta.1-1` package scopes out **G-DATETIME-CLOCK-TZ** and
-**G-DATETIME-CLOCK-SET**: its panel caches the previous zone, so the timezone
+bundle. Only the known pre-fix `1.0.0beta.1-1` and `1.0.0beta.2-2` packages
+scope out **G-DATETIME-CLOCK-TZ** and **G-DATETIME-CLOCK-SET**:
+their panels cache the previous zone, so the timezone
 probe can also leave the subsequent manual-time panel reading in the wrong
 zone (CI run 41175449180 observed a 39611 s delta). Both probes still run,
 their raw assertions remain in the qualification detail, and their original
@@ -41,7 +42,16 @@ those two panel-follow proofs to the current-build `marlin-vm` lane; it is
 not evidence that the obsolete published shell passed them. All other gates,
 including the baseline panel clock and actual timedated manual-time writes,
 remain enforced. Current-build lanes always enforce every gate, even with
-that package version; newer or unknown published versions also remain strict.
+those package versions; all other or unknown published versions remain strict.
+
+The beta.2-2 exception is source-backed, not inferred from a failed gate:
+that package rebuilds immutable tag `v1.0.0-beta.2`, source
+`1e6ce28f4d5dfd7918ac7340bd93454a9fcc211c`. Its `wall_clock.rs` lacks
+the `/etc/localtime` monitor; #886's merge `414e358eff9bbfc871637696b9382e6578f396ae`
+is 27 commits later. Run 41202327902 already contained the #962 guard but
+read back beta.2-2 (image `d0e65bce…`), so the original beta.1-only match
+correctly stayed strict and exposed the same unsupported panel behavior.
+The beta.2-2 package-recipe rebuild does not bring newer desktop source in.
 
 ## Running
 

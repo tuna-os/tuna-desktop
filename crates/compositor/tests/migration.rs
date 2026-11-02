@@ -320,6 +320,24 @@ fn two_windows_dual() -> Fixture {
     }
 }
 
+/// Unplug `name` as the runtime does: snapshot the layout, drop the
+/// inventory entry, then re-home the windows against the old layout.
+/// `None` when no such output was registered.
+fn unplug(manager: &mut WindowManager, state: &mut State, name: &str) -> Option<usize> {
+    let before = state.output_slices();
+    state
+        .remove_output(name)
+        .then(|| manager.relocate_for_monitors_changed(state, &before))
+}
+
+/// Plug `name` (back) in at `width`x`height` to the right of the row,
+/// re-homing the windows as the runtime does.
+fn replug(manager: &mut WindowManager, state: &mut State, name: &str, width: i32, height: i32) {
+    let before = state.output_slices();
+    state.add_output(name, None, width, height);
+    manager.relocate_for_monitors_changed(state, &before);
+}
+
 /// Right slice bounds: location (1280,0), size 1920x1080.
 fn assert_inside_right(geo: smithay::utils::Rectangle<i32, smithay::utils::Logical>) {
     assert!(
@@ -351,11 +369,16 @@ fn removed_output_shifts_floating_windows_into_survivor() {
     let ws_a = f.manager.model().window(f.id_a).unwrap().workspace;
     let ws_b = f.manager.model().window(f.id_b).unwrap().workspace;
 
+    // Alpha 240 of the 480 and 100 of the 200 free pixels into "left".
+    let alpha_placed = f.manager.geometry(f.id_a).unwrap();
+    assert!(f
+        .manager
+        .move_window(f.id_a, 240 - alpha_placed.loc.x, 100 - alpha_placed.loc.y));
     let alpha_before = f.manager.geometry(f.id_a).unwrap();
-    // Migrate first, then drop the entry: the documented removal order.
-    let moved = f.manager.migrate_output_windows(&mut f.comp.state, "left");
-    assert_eq!(moved, 1, "only alpha sat on the removed slice");
-    assert!(f.comp.state.remove_output("left"));
+    assert_eq!((alpha_before.size.w, alpha_before.size.h), (800, 600));
+    // Drop the entry, then re-home against the layout before it.
+    let moved = unplug(&mut f.manager, &mut f.comp.state, "left");
+    assert_eq!(moved, Some(1), "only alpha sat on the removed output");
 
     // No window is lost: both stay in the model with focus and
     // workspace membership untouched.
@@ -364,14 +387,11 @@ fn removed_output_shifts_floating_windows_into_survivor() {
     assert_eq!(f.manager.model().window(f.id_a).unwrap().workspace, ws_a);
     assert_eq!(f.manager.model().window(f.id_b).unwrap().workspace, ws_b);
 
-    // Alpha shifted size-preserved into the survivor slice; beta is
-    // byte-identical.
+    // Alpha keeps its relative place in the free space of the survivor
+    // (Mutter's move_rect_between_rects): halfway across the 1120 and
+    // 480 free pixels of "right"; beta is byte-identical.
     let alpha = f.manager.geometry(f.id_a).unwrap();
-    assert_eq!(
-        alpha.loc,
-        alpha_before.loc + smithay::utils::Point::from((1280, 0)),
-        "same place relative to its output"
-    );
+    assert_eq!((alpha.loc.x, alpha.loc.y), (1280 + 560, 240));
     assert_eq!(alpha.size, alpha_before.size);
     assert_inside_right(alpha);
     assert_eq!(f.manager.geometry(f.id_b).unwrap(), beta_before);
@@ -391,11 +411,11 @@ fn non_primary_removal_leaves_maximized_geometry_on_new_primary() {
     // Beta parks on the survivor so the floating path moves nothing.
     assert!(f.manager.move_window(f.id_b, 1280, 0));
 
-    // The removed output was not primary, so managed layouts are
-    // already correct and migration touches nothing.
-    let moved = f.manager.migrate_output_windows(&mut f.comp.state, "left");
-    assert_eq!(moved, 0, "non-primary removal re-applies nothing");
-    assert!(f.comp.state.remove_output("left"));
+    // The removed output was not primary, so the maximized geometry is
+    // already right; only alpha's unmaximized rectangle, on the removed
+    // output, moves to the survivor.
+    let moved = unplug(&mut f.manager, &mut f.comp.state, "left");
+    assert_eq!(moved, Some(1), "the restore rectangle follows");
 
     assert_eq!(f.manager.model().windows().count(), 2);
     assert_eq!(
@@ -414,12 +434,10 @@ fn primary_removal_reapplies_maximized_against_new_primary() {
     // Beta parks on the survivor so the floating path moves nothing.
     assert!(f.manager.move_window(f.id_b, 1280, 0));
 
-    // Migration alone must NOT re-apply: the removed output is still
-    // primary at migrate time, and sizing for it would go stale at
-    // failover.
-    let moved = f.manager.migrate_output_windows(&mut f.comp.state, "left");
-    assert_eq!(moved, 0, "maximized windows wait for failover");
-    assert!(f.comp.state.remove_output("left"));
+    // Relocation alone must NOT re-apply the maximized geometry: that
+    // waits for the failover step. Only the restore rectangle moves.
+    let moved = unplug(&mut f.manager, &mut f.comp.state, "left");
+    assert_eq!(moved, Some(1), "maximized windows wait for failover");
     // Stale without the re-apply step: still the dead primary's area.
     assert_eq!(f.manager.geometry(f.id_a).unwrap(), maxed);
 
@@ -456,11 +474,7 @@ fn migrate_unknown_output_moves_nothing() {
     let geo_a = f.manager.geometry(f.id_a).unwrap();
     let geo_b = f.manager.geometry(f.id_b).unwrap();
 
-    assert_eq!(
-        f.manager.migrate_output_windows(&mut f.comp.state, "nope"),
-        0
-    );
-    assert!(!f.comp.state.remove_output("nope"));
+    assert_eq!(unplug(&mut f.manager, &mut f.comp.state, "nope"), None);
 
     // The inventory and every window are untouched.
     assert_eq!(f.manager.model().windows().count(), 2);
@@ -483,8 +497,7 @@ fn migrate_last_output_moves_nothing_and_drops_entry() {
 
     // No survivor exists, so migration moves nothing — and dropping the
     // last entry still succeeds.
-    assert_eq!(manager.migrate_output_windows(&mut comp.state, "only"), 0);
-    assert!(comp.state.remove_output("only"));
+    assert_eq!(unplug(&mut manager, &mut comp.state, "only"), Some(0));
     assert!(
         comp.state.output_infos().is_empty(),
         "last entry drops cleanly"
@@ -493,55 +506,196 @@ fn migrate_last_output_moves_nothing_and_drops_entry() {
     assert_eq!(manager.model().windows().count(), 1);
 }
 
+/// Mutter's `meta_window_update_for_monitors_changed`: a window waits on
+/// the primary while its monitor is unplugged and returns to it, in the
+/// same relative place, when it is plugged back in.
 #[test]
-fn hotplug_remove_and_readd_round_trips_without_restart() {
+fn hotplug_remove_and_readd_returns_windows_to_their_output() {
     let mut f = two_windows_dual();
-    // Beta rides the hotplugged output; removing it must carry beta
-    // back to the survivor with no session restart.
-    assert!(f.manager.move_window(f.id_b, 1280, 0));
+    // Beta rides the hotplugged output, at (1312, 32); removing it must
+    // carry beta to the survivor with no session restart.
+    let placed = f.manager.geometry(f.id_b).unwrap();
+    assert!(f
+        .manager
+        .move_window(f.id_b, 1312 - placed.loc.x, 32 - placed.loc.y));
     let focus_before = f.manager.model().focused();
-    assert_eq!(
-        f.manager.migrate_output_windows(&mut f.comp.state, "right"),
-        1
-    );
-    assert!(f.comp.state.remove_output("right"));
+    let geo_a = f.manager.geometry(f.id_a).unwrap();
+    assert_eq!(unplug(&mut f.manager, &mut f.comp.state, "right"), Some(1));
 
     let infos = f.comp.state.output_infos();
     assert_eq!(infos.len(), 1, "removal shrinks the inventory live");
     assert_eq!(infos[0].name, "left");
     assert_eq!(f.manager.model().windows().count(), 2);
-    let geo_a = f.manager.geometry(f.id_a).unwrap();
-    let geo_b = f.manager.geometry(f.id_b).unwrap();
+    assert_eq!(f.manager.geometry(f.id_a).unwrap(), geo_a);
+    // move_rect_between_rects: (1312, 32) is 32/1120 and 32/480 into the
+    // free space of the 1920x1080 output, so 13 and 13 of the 480x200
+    // left over on the 1280x800 one. Beta was wholly below the 32px panel,
+    // so the constraints keep it there (constrain_fully_onscreen): y 32.
+    let waiting = f.manager.geometry(f.id_b).unwrap();
+    assert_eq!((waiting.loc.x, waiting.loc.y), (13, 32));
+    assert_eq!((waiting.size.w, waiting.size.h), (800, 600));
+    assert_eq!(f.manager.preferred_output(f.id_b), Some("right"));
 
-    // Re-add the same output: the inventory grows back in place and
-    // every window is still where migration left it.
-    f.comp.state.add_output("right", None, 1920, 1080);
+    // Plugged back in: the inventory grows back and beta goes home.
+    replug(&mut f.manager, &mut f.comp.state, "right", 1920, 1080);
     let infos = f.comp.state.output_infos();
     assert_eq!(infos.len(), 2, "re-add restores the inventory live");
     let right = infos.iter().find(|info| info.name == "right").unwrap();
     assert_eq!((right.width, right.height), (1920, 1080));
     assert!(!right.primary, "re-added entry does not steal primary");
-    assert!(f.comp.state.set_primary("right"), "re-added entry is live");
-    assert!(f.comp.state.set_primary("left"));
 
     assert_eq!(f.manager.model().windows().count(), 2);
     assert_eq!(f.manager.model().focused(), focus_before);
     assert_eq!(f.manager.geometry(f.id_a).unwrap(), geo_a);
-    assert_eq!(f.manager.geometry(f.id_b).unwrap(), geo_b);
-    assert_inside_right_or_left(geo_a, geo_b);
+    let home = f.manager.geometry(f.id_b).unwrap();
+    assert_inside_right(home);
+    // From where the unplug would have put it unconstrained, (13, 13):
+    // 13/480 and 13/200 of the free space again, truncated as Mutter's
+    // integer conversion does, is (1310, 31), and the panel constraint
+    // takes it to y 32. From (13, 32) it would land at y 76.
+    assert_eq!((home.loc.x, home.loc.y), (1280 + 30, 32));
 }
 
-/// Both windows sit inside one of the two virtual slices after the
-/// round-trip above (alpha never left "left", beta migrated back).
-fn assert_inside_right_or_left(
-    a: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
-    b: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
-) {
-    for geo in [a, b] {
-        let in_left = geo.loc.x >= 0 && geo.loc.x + geo.size.w <= 1280;
-        let in_right = geo.loc.x >= 1280 && geo.loc.x + geo.size.w <= 1280 + 1920;
-        assert!(in_left || in_right, "window inside a live slice: {geo:?}");
+/// An output moving in the layout (GNOME Settings' arrangement or a
+/// stored configuration) carries its windows along.
+#[test]
+fn moved_output_carries_its_windows() {
+    let mut f = two_windows_dual();
+    assert!(f.manager.move_window(f.id_b, 1280, 0));
+    let geo_a = f.manager.geometry(f.id_a).unwrap();
+    let geo_b = f.manager.geometry(f.id_b).unwrap();
+    let before = f.comp.state.output_slices();
+    // Right goes to the left of the primary.
+    f.comp.state.set_output_location("right", (-1920, 0));
+    assert_eq!(
+        f.manager
+            .relocate_for_monitors_changed(&f.comp.state, &before),
+        1
+    );
+    assert_eq!(f.manager.geometry(f.id_a).unwrap(), geo_a);
+    let moved = f.manager.geometry(f.id_b).unwrap();
+    assert_eq!(
+        moved.loc,
+        geo_b.loc - smithay::utils::Point::from((3200, 0))
+    );
+    assert_eq!(moved.size, geo_b.size);
+}
+
+/// The hotplug storm's arrangement step (#203): three 1024x768 outputs in
+/// a row, then GNOME Settings scales the middle one to 768x576 and moves
+/// it to the end, its neighbour taking its place. Each window follows its
+/// own output (`move_rect_between_rects`) and the next tick's workarea
+/// pass leaves it there: it must not clamp a re-homed window into
+/// whichever output held its new place in the old layout.
+#[test]
+fn rearranged_and_scaled_outputs_carry_their_windows_past_the_next_tick() {
+    let mut comp = TestCompositor::new();
+    for name in ["Virtual-2", "Virtual-3", "Virtual-4"] {
+        comp.state.add_output(name, None, 1024, 768);
     }
+    let mut manager = comp.window_manager();
+    let (conn_b, mut queue_b, mut client_b) = connect(&mut comp);
+    map_toplevel(&mut comp, &conn_b, &mut queue_b, &mut client_b, "B");
+    let (conn_c, mut queue_c, mut client_c) = connect(&mut comp);
+    map_toplevel(&mut comp, &conn_c, &mut queue_c, &mut client_c, "C");
+    manager.reconcile(&mut comp.state);
+    sync_client(&mut comp, &conn_b, &mut queue_b, &mut client_b);
+    sync_client(&mut comp, &conn_c, &mut queue_c, &mut client_c);
+    let id = |manager: &WindowManager, title: &str| {
+        manager
+            .model()
+            .windows()
+            .find(|w| w.title == title)
+            .unwrap()
+            .id
+    };
+    let (id_b, id_c) = (id(&manager, "B"), id(&manager, "C"));
+    // B centred-ish on Virtual-3 and C on Virtual-4, as the storm's GTK
+    // clients are placed: 272 of 544 and 240 of 448 free pixels in.
+    for (window, x) in [(id_b, 1024 + 272), (id_c, 2048 + 272)] {
+        assert!(manager.resize_window(window, 480, 320));
+        let geo = manager.geometry(window).unwrap();
+        assert!(manager.move_window(window, x - geo.loc.x, 240 - geo.loc.y));
+    }
+    manager.reconcile(&mut comp.state);
+    assert_eq!(
+        manager.geometry(id_b).unwrap(),
+        smithay::utils::Rectangle::new((1296, 240).into(), (480, 320).into())
+    );
+
+    // ApplyMonitorsConfig: Virtual-2, then Virtual-4, then Virtual-3 at
+    // scale 4/3.
+    let before = comp.state.output_slices();
+    comp.state.add_output("Virtual-3", None, 768, 576);
+    comp.state.set_output_location("Virtual-3", (2048, 0));
+    comp.state.set_output_location("Virtual-4", (1024, 0));
+    assert_eq!(
+        manager.relocate_for_monitors_changed(&comp.state, &before),
+        2
+    );
+    // B: 272/544 and 240/448 of the free space of 768x576 at (2048,0);
+    // C: the same place on Virtual-4, now at (1024,0).
+    let b = smithay::utils::Rectangle::new((2048 + 144, 137).into(), (480, 320).into());
+    let c = smithay::utils::Rectangle::new((1024 + 272, 240).into(), (480, 320).into());
+    assert_eq!(manager.geometry(id_b).unwrap(), b);
+    assert_eq!(manager.geometry(id_c).unwrap(), c);
+    assert_eq!(manager.preferred_output(id_b), Some("Virtual-3"));
+    assert_eq!(manager.preferred_output(id_c), Some("Virtual-4"));
+
+    // The next tick sees the new workareas and keeps both where they are.
+    manager.reconcile(&mut comp.state);
+    assert_eq!(manager.geometry(id_b).unwrap(), b, "B stays on Virtual-3");
+    assert_eq!(manager.geometry(id_c).unwrap(), c, "C stays on Virtual-4");
+}
+
+/// A window just below the panel on an output that shrinks keeps its
+/// relative place, but never ends under the panel strip: Mutter's move
+/// between monitors runs the constraints (`constrain_fully_onscreen`).
+#[test]
+fn scaled_output_keeps_a_rehomed_window_below_the_panel() {
+    let mut f = two_windows_dual();
+    let geo = f.manager.geometry(f.id_a).unwrap();
+    // 800x600 at (0, 40) on the 1280x800 "left": 40 of the 200 free
+    // pixels down, wholly inside the workarea below the 32px panel.
+    assert!(f.manager.move_window(f.id_a, -geo.loc.x, 40 - geo.loc.y));
+    assert!(f.manager.move_window(f.id_b, 1280, 0));
+    let before = f.comp.state.output_slices();
+    // Scale 1.25: "left" is 1024x640 logical, "right" follows it.
+    f.comp.state.add_output("left", None, 1024, 640);
+    f.comp.state.set_output_location("right", (1024, 0));
+    f.manager
+        .relocate_for_monitors_changed(&f.comp.state, &before);
+    // move_rect_between_rects alone: 40/200 of 40 free pixels, y=8.
+    let alpha = f.manager.geometry(f.id_a).unwrap();
+    assert_eq!((alpha.loc.x, alpha.loc.y), (0, 32));
+    assert_eq!((alpha.size.w, alpha.size.h), (800, 600));
+    f.manager.reconcile(&mut f.comp.state);
+    assert_eq!(f.manager.geometry(f.id_a).unwrap(), alpha);
+}
+
+/// A window larger than the output it lands on keeps its centre's
+/// relative place (the second branch of `move_rect_between_rects`).
+#[test]
+fn window_larger_than_the_survivor_keeps_its_centre_relative() {
+    let mut f = two_windows_dual();
+    // 1600x1000 at (1600, 40) on the 1920x1080 output: its centre is
+    // 1120/1920 and 540/1080 in, and it does not fit the 1280x800 one.
+    assert!(f.manager.resize_window(f.id_b, 1600, 1000));
+    let geo = f.manager.geometry(f.id_b).unwrap();
+    assert!(f
+        .manager
+        .move_window(f.id_b, 1600 - geo.loc.x, 40 - geo.loc.y));
+    let geo = f.manager.geometry(f.id_b).unwrap();
+    assert_eq!(
+        (geo.loc.x, geo.loc.y, geo.size.w, geo.size.h),
+        (1600, 40, 1600, 1000)
+    );
+    assert_eq!(unplug(&mut f.manager, &mut f.comp.state, "right"), Some(1));
+    let moved = f.manager.geometry(f.id_b).unwrap();
+    // The centre lands 1120/1920 of 1280 (746) and 540/1080 of 800
+    // (400) into the survivor.
+    assert_eq!((moved.loc.x, moved.loc.y), (746 - 800, 400 - 500));
+    assert_eq!(moved.size, geo.size);
 }
 
 #[test]
@@ -601,4 +755,59 @@ fn real_output_global_removal_reaches_clients() {
         comp.state.output_infos().is_empty(),
         "real entry drops from the inventory"
     );
+}
+
+/// A real hotplugged output: a protocol `Output` with its registry
+/// global, registered in the inventory as `Runtime` does.
+fn plug_real_output(comp: &mut TestCompositor, name: &str) {
+    let output = Output::new(
+        name.to_owned(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Tuna Desktop".to_owned(),
+            model: "Test".to_owned(),
+        },
+    );
+    let mode = Mode {
+        size: (1280, 800).into(),
+        refresh: 60_000,
+    };
+    output.change_current_state(Some(mode), None, Some(Scale::Integer(1)), None);
+    output.set_preferred(mode);
+    let global = output.create_global::<State>(&comp.display.handle());
+    comp.state.add_output(name, Some(output), 1280, 800);
+    comp.state.note_output_global(name, global);
+}
+
+/// A monitor unplugged right after it was plugged in: GTK binds every
+/// wl_output the moment it is announced, so the bind can reach the
+/// compositor after the output is gone. The client must survive it, as
+/// under Mutter (`wl_global_remove` now, `wl_global_destroy` later) and
+/// niri (the global is destroyed 10 s after it is disabled); destroying
+/// the global at once makes the bind a protocol error that kills the
+/// client (the hotplug storm's GTK clients and shell).
+#[test]
+fn unplug_racing_a_wl_output_bind_keeps_the_client() {
+    let mut comp = TestCompositor::new();
+    comp.state.add_output("left", None, 1280, 800);
+    let (conn, mut queue, mut client) = connect(&mut comp);
+    // Plugged in: the announcement reaches the client, which binds.
+    plug_real_output(&mut comp, "hot-0");
+    comp.display.flush_clients().unwrap();
+    while client.output_names.is_empty() {
+        queue.blocking_dispatch(&mut client).unwrap();
+    }
+    queue.flush().unwrap();
+    let advertised = client.output_names[0];
+    // Unplugged before the compositor reads the bind.
+    assert!(comp.state.remove_output("hot-0"));
+    // The bind is read now; the client stays connected and hears the
+    // removal.
+    sync_client(&mut comp, &conn, &mut queue, &mut client);
+    pump(&mut comp, &mut queue, &mut client, |c| {
+        c.removed_names.contains(&advertised)
+    });
+    // The disabled global waits for the runtime to destroy it later.
+    assert_eq!(comp.state.take_retired_output_globals().len(), 1);
 }

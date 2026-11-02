@@ -32,7 +32,7 @@ runs:
         content=$(cat "$GITHUB_ACTION_PATH/action.yml" "$GITHUB_ACTION_PATH/../../../scripts/ci-install-gtk4-layer-shell" | sha256sum | cut -d' ' -f1)
         echo "key=ci-tool-v1-$TOOL-$VERSION-$identity-$content" >> "$GITHUB_OUTPUT"
         echo "path=$RUNNER_TEMP/ci-tool-$TOOL" >> "$GITHUB_OUTPUT"
-    - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       id: cache
       with:
         path: ${{ steps.identity.outputs.path }}
@@ -64,7 +64,7 @@ runs:
         else
           echo "$TOOL_ROOT/bin" >> "$GITHUB_PATH"
         fi
-    - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+    - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       if: steps.cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
       with:
         path: ${{ steps.identity.outputs.path }}
