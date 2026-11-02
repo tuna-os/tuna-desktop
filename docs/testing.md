@@ -489,6 +489,38 @@ it after a Num Lock change and before the next `gsettings set`. The
 applied. Wait for it after changing the input sources or `xkb-options`
 and before typing.
 
+## Settings bindings in unit tests
+
+Shell unit tests that read GSettings use
+`crates/shell-gtk/src/test_settings.rs`. `SettingsFixture::new(xml)`
+compiles a `<schemalist>` with `glib-compile-schemas --strict` into a
+temporary directory, and `settings(id)` opens it on a private memory
+backend, so no dconf, session bus or host schema is involved and
+parallel tests cannot see each other's writes. Create the fixture inside
+`glib::MainContext::with_thread_default` and use `dispatch_until` when a
+test needs `changed` signals. `background_settings.rs` binds GNOME's
+background, interface and screensaver keys this way.
+
+## Shell state across session transitions
+
+`just proof session-sync-proof` runs the real nested runtime with a
+supervised `ControlClient` observer and a mapped xdg window. The existing
+trusted Rust-only probe injects sleep and seat notifications through the
+same internal handlers as logind and libseat; no IPC command or normal
+binary flag can inject them. The observer reconnects across pause and
+activation and checks that windows, workspaces and overview survive.
+Sleep must lock, dismiss overview and redact the window list. A shell
+disconnected throughout wake must reconnect into the current locked
+state, including when seat activation follows wake.
+
+The GTK CI lane runs this bounded proof and keeps `result.json` and
+`runtime.log` in the `session-sync-proof` artifact (built under
+`$RUNNER_TEMP`, so the later source-freeze gate sees a clean checkout). This qualifies
+runtime/control state propagation on **simulated notifications**, not
+physical VT switching, logind suspend delivery or S3. KMS scanout reset,
+libseat device-fd revocation and libinput resume still need a native
+seat/DRM VM or hardware proof; the nested backend has no such devices.
+
 ## Parity ledger check
 
 The `parity-ledger` job runs `scripts/tuna-ledger` against the test list

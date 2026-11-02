@@ -83,6 +83,8 @@ mod shell_dbus;
 mod shortcut_consent;
 mod sound_feedback;
 mod switcher;
+#[cfg(test)]
+mod test_settings;
 mod transient;
 mod tray;
 mod wall_clock;
@@ -3121,78 +3123,15 @@ fn build(app: &adw::Application) {
                 let Some(bg) = background.as_ref() else {
                     return;
                 };
-                let dark = interface
-                    .as_ref()
-                    .is_some_and(|i| i.string("color-scheme") == "prefer-dark");
-                let text = logic::wallpaper_drop(
-                    &bg.string("picture-uri"),
-                    &bg.string("picture-uri-dark"),
-                    dark,
-                    &bg.string("picture-options"),
-                    &bg.string("primary-color"),
-                    // GNOME 47's accent; older schemas have none (blue).
-                    &interface
-                        .as_ref()
-                        .filter(|i| {
-                            i.settings_schema()
-                                .is_some_and(|schema| schema.has_key("accent-color"))
-                        })
-                        .map(|i| i.string("accent-color").to_string())
-                        .unwrap_or_default(),
-                );
-                let lock_uri = screensaver
-                    .as_ref()
-                    .filter(|s| {
-                        s.settings_schema()
-                            .is_some_and(|schema| schema.has_key("picture-uri"))
-                    })
-                    .map(|s| {
-                        let uri = s.string("picture-uri");
-                        if !uri.starts_with("file://") {
-                            return String::new();
-                        }
-                        // Validate a local native path, then keep a canonical
-                        // escaped URI across the line-based drop. The compositor
-                        // decodes once; literal percent signs remain filename bytes.
-                        gio::File::for_uri(&uri)
-                            .path()
-                            .filter(|path| path.is_absolute())
-                            .map(|path| gio::File::for_path(path).uri().to_string())
-                            .unwrap_or_default()
-                    })
-                    .unwrap_or_default();
-                let picture_settings = |s: &gio::Settings| {
-                    background_settings::picture_settings(
-                        s.string("picture-options").as_str(),
-                        s.string("color-shading-type").as_str(),
-                        s.string("primary-color").as_str(),
-                        s.string("secondary-color").as_str(),
-                    )
-                };
-                let Some(desktop) = picture_settings(bg) else {
-                    return;
-                };
-                let lock = if let Some(settings) = screensaver.as_ref() {
-                    let Some(lock) = picture_settings(settings) else {
-                        return;
-                    };
-                    lock
-                } else {
-                    desktop
-                };
-                let Ok(text) = background_settings::append_metadata(text, &lock_uri, desktop, lock)
+                let Some(text) =
+                    background_settings::drop_text(bg, interface.as_ref(), screensaver.as_ref())
                 else {
                     return;
                 };
-
                 let dir = std::env::var_os("XDG_RUNTIME_DIR")
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(std::env::temp_dir);
-                let path = dir.join("tuna-wallpaper");
-                let tmp = dir.join(".tuna-wallpaper.tmp");
-                if std::fs::write(&tmp, text).is_ok() {
-                    let _ = std::fs::rename(&tmp, &path);
-                }
+                let _ = background_settings::publish_drop(&dir, &text);
             })
         };
         publish();
