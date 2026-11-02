@@ -144,10 +144,24 @@ settings local builds need (`just` lists the recipes):
 | `just disk-guard [--watch [s]]` | frees disk now, or keeps checking every `s` seconds (below) |
 
 Every build uses its own checkout's `target/` (an inherited
-`CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one),
-two jobs, no incremental state, and waits on one machine-wide lock
-(`/tmp/tuna-local-build.lock`), so builds from parallel worktrees queue
-instead of exhausting memory.
+`CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one) and no
+incremental state, with half the host's CPUs as jobs. Builds from every
+worktree share two machine-wide build slots (one per 8 GiB of RAM, at most
+two: `/tmp/tuna-local-build.slot.N`, `TUNA_BUILD_SLOTS`), so two run at
+once and the rest queue instead of exhausting memory; a cold
+`cargo test --workspace` build at six jobs peaks at 6.4 GiB.
+
+When `sccache` is installed (`cargo install --locked sccache`, or a
+release binary on `PATH`) every recipe compiles through it, so a fresh
+worktree reuses the dependencies any other worktree already compiled from
+`~/.cache/sccache` (40 GiB cap): a cold `just build` in a fresh worktree
+takes about 39 s instead of 65 s once another worktree has filled the
+cache. The recipes start its server with no idle timeout;
+`sccache --show-stats` shows the hit rate. The workspace's own crates
+miss, since their paths differ per worktree, and the justfile exports no
+per-worktree `CARGO_*` variable, which would make every crate miss. A bare
+`cargo` in the same worktree reuses the recipes' build without the cache.
+See [environment](environment.md#justfile) for every knob.
 
 The polkit unit tests can be run with
 `timeout 15m just test -p tuna-shell-gtk polkit`. Their fake executable
@@ -162,16 +176,28 @@ handling.
 
 Cleanup is automatic where it is safe:
 
-- `just proof` runs each proof with a fresh `HOME` and XDG directories
-  inside its artifact directory, as on a CI runner, so desktop state in
-  your own home can't leak in. One proof runs at a time machine-wide
-  (`/tmp/tuna-local-proof.lock`). Proofs that need another proof's
-  prebuilt binaries (`--bin-dir`) are refused with the name of their
-  caller. When the proof ends, pass or fail, any process it started is
-  stopped, including daemons that detached from it (`ibus-daemon
-  --daemonize`, `dbus-daemon --fork`): each carries a `TUNA_PROOF_RUN`
-  marker in its environment. A passing proof deletes its artifacts; a
-  failing one keeps them and prints the path;
+- `just proof` runs each proof with a fresh `HOME`, XDG directories and
+  `XDG_RUNTIME_DIR`, and without your `DISPLAY`, `WAYLAND_DISPLAY` or
+  session bus, as on a CI runner, so desktop state in your own session
+  can't leak in. Nested proofs start their own Xvfb through
+  `scripts/lib/tuna-xvfb`, which locks the first free display from `:120`
+  up (plain `Xvfb -displayfd` takes no lock and lands on the low numbers
+  every nested compositor's XWayland claims by lock file, which breaks
+  it), with per-run Wayland sockets, buses and runtime directories. One
+  runs at a time by default; `TUNA_PROOF_SLOTS=N` lets N run at once
+  (`/tmp/tuna-local-proof.slot.N`), but under that load the gtk-shell
+  proof's timing-sensitive stages fail intermittently. Proofs that touch
+  machine-wide state (vkms, seatd, uinput, `sudo` or apt, like
+  `drm-smoke`), and scripts that don't start an Xvfb, run one at a time
+  (`/tmp/tuna-local-proof.lock`). A proof's own `cargo build` waits for a
+  build slot. A proof still running after 45 minutes
+  (`TUNA_PROOF_TIMEOUT`) is stopped and its slot freed. Proofs that need
+  another proof's prebuilt binaries (`--bin-dir`) are refused with the
+  name of their caller. When the proof ends, pass or fail, any process it
+  started is stopped, including daemons that detached from it
+  (`ibus-daemon --daemonize`, `dbus-daemon --fork`): each carries a
+  `TUNA_PROOF_RUN` marker in its environment. A passing proof deletes its
+  artifacts; a failing one keeps them and prints the path;
 - `just gc` deletes the targets of worktrees whose pull request is merged
   or closed, removes those worktrees when they have no uncommitted
   changes, and expires `just ci-artifacts` downloads after six hours. It
