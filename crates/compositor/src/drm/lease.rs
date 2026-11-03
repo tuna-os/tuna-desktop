@@ -84,6 +84,19 @@ pub fn non_desktop(dev: &impl ControlDevice, connector: connector::Handle) -> bo
 
 /// Mutter's `get_connector_description`: the EDID vendor and product
 /// name, else the connector name; empty without an EDID.
+fn remove_first_ended<T>(leases: &mut Vec<T>, lease_id: u32, id_of: fn(&T) -> u32) {
+    // Kernel lessee ids are recycled (every grant here is id 1), and a
+    // disconnect's object destruction is processed asynchronously: the stale
+    // bookkeeping entry for a dead lessee can share its id with a live
+    // lease granted later. The destroyed entry is always the oldest with
+    // that id (an id is only recycled after its lessee is gone), so drop
+    // just the first match; removing every match would untrack the live
+    // lease and its withdrawal would never send `finished`.
+    if let Some(pos) = leases.iter().position(|lease| id_of(lease) == lease_id) {
+        leases.remove(pos);
+    }
+}
+
 pub fn description(edid: Option<&[u8]>, name: &str) -> String {
     let Some(edid) = edid else {
         return String::new();
@@ -454,7 +467,7 @@ impl DrmLeaseHandler for State {
     fn lease_destroyed(&mut self, _node: DrmNode, lease_id: u32) {
         if let Some(device) = self.protocols.drm_lease.as_mut() {
             eprintln!("tuna-compositor: drm-lease: lease {lease_id} ended");
-            device.leases.retain(|lease| lease.id() != lease_id);
+            remove_first_ended(&mut device.leases, lease_id, DrmLease::id);
         }
     }
 }
@@ -463,6 +476,17 @@ smithay::delegate_drm_lease!(State);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn destroy_drops_only_oldest_recycled_id() {
+        struct Entry(u32, &'static str);
+        let mut leases = vec![Entry(1, "stale"), Entry(1, "live"), Entry(2, "other")];
+        remove_first_ended(&mut leases, 1, |entry| entry.0);
+        let tags: Vec<_> = leases.iter().map(|entry| (entry.0, entry.1)).collect();
+        assert_eq!(tags, [(1, "live"), (2, "other")]);
+        remove_first_ended(&mut leases, 9, |entry| entry.0);
+        assert_eq!(leases.len(), 2);
+    }
 
     #[test]
     fn mutter_debug_list_syntax() {
