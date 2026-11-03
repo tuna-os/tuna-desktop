@@ -1379,9 +1379,12 @@ class FixtureLaunch(unittest.TestCase):
     def _prepare_mocks(self, tmp, claim, launched, Child, FakePath):
         shell = {'pid': 111, 'start_ticks': 10, 'boot_id': 'b', 'uid': 1000, 'exe': '/usr/bin/gnome-shell'}
         before = {'settings': {}, 'trees': [{'process': dict(shell), 'role_name': 'application',
-                                             'states': [], 'children': []}]}
+                                             'name': 'shell', 'states': [], 'children': []}]}
         wait = {'settings': {}, 'trees': [{'process': {'pid': 5001}, 'role_name': 'frame',
-                                           'states': [25], 'children': []}]}
+                                           'name': 'first-window', 'states': [25], 'children': []}]}
+        forwarded = {'settings': {}, 'trees': [{'process': {'pid': 5001}, 'role_name': 'window',
+                                                'name': 'second-window', 'states': [25],
+                                                'children': []}]}
         exe_by_pid = {}
         drains = []
 
@@ -1406,7 +1409,7 @@ class FixtureLaunch(unittest.TestCase):
             mock.patch.object(GUEST, 'admission', return_value=({'ready': True, 'session': {'shell': shell},
                                                                  'missing': []}, {'WAYLAND_DISPLAY': 'x'})),
             mock.patch.object(GUEST, 'process_candidates', return_value=[]),
-            mock.patch.object(GUEST, 'public_observation', side_effect=[before, wait]),
+            mock.patch.object(GUEST, 'public_observation', side_effect=[before, wait, forwarded]),
             mock.patch.object(GUEST, 'same_process'),
             mock.patch.object(GUEST, 'load_claim', return_value=claim),
             mock.patch.object(GUEST, 'save'),
@@ -1452,8 +1455,9 @@ class FixtureLaunch(unittest.TestCase):
             self.assertIs(kwargs['stderr'], GUEST.subprocess.PIPE)
         self.assertEqual(len(drains), 4)
         self.assertTrue(all(drain.started for drain in drains))
-        # First Nautilus still waits for its own window before the forward.
-        self.assertEqual(GUEST.public_observation.call_count, 2)
+        # First Nautilus still waits for its own window before the forward,
+        # and the raise waits for the forwarded window first.
+        self.assertEqual(GUEST.public_observation.call_count, 3)
         loop.assert_called_once()
         roles = [entry['role'] for entry in claim['fixture']['launches']]
         self.assertEqual(roles, ['settings', 'files-first', 'files-second', 'settings-raise'])

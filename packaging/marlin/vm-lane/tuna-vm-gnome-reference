@@ -1199,7 +1199,8 @@ def window_context(trees, fixture, shell):
         raise RuntimeError('fixture windows do not have distinct actual AT-SPI identities')
     active = [w for w in windows if 1 in w['states']]
     if not active:
-        raise FixtureNotReady('actual active application window is not yet exposed')
+        states = sorted((w['role'], sorted(set(w['states']) & {1, 12, 23, 25, 30})) for w in windows)
+        raise FixtureNotReady('actual active application window is not yet exposed; window states ' + repr(states))
     if len(active) != 1:
         raise RuntimeError('actual active application window is unavailable or ambiguous')
     shell_nodes = [n for n in flatten(shell_trees) if n['process']['pid'] == shell['pid']]
@@ -1594,6 +1595,17 @@ def prepare(args, directory, deadline, cache):
                 if matching:
                     break
                 time.sleep(min(0.1, deadline.remaining()))
+    # The forward exiting does not mean the second window mapped: raising
+    # before it appears lets the late map steal focus back. Wait for the
+    # forwarded window first, like the first Nautilus wait above.
+    while True:
+        obs = public_observation(environment, admitted, deadline)
+        forwarded = [n for n in flatten(obs['trees'])
+                     if os.path.basename(fixture['directories'][1]) in n['name']
+                     and n['role_name'] in ('frame', 'window') and 25 in n['states']]
+        if forwarded:
+            break
+        time.sleep(min(0.1, deadline.remaining()))
     # Settings launched first for warmup, so the last Nautilus owns focus.
     # Re-invoking the single instance raises its existing Network window
     # through ordinary application activation (no input injection), like
