@@ -377,6 +377,17 @@ class GuestAgent:
     def run(self, action, *arguments, timeout=30):
         if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("finite positive guest-agent operation timeout required")
+        path = "/usr/libexec/tuna-vm-lifecycle"
+        argv = [action, *map(str, arguments)]
+        if action == "gnome-reference":
+            if (len(arguments) != 2 or arguments[0] not in {"admit", "prepare", "observe", "file", "stop"}
+                    or type(arguments[1]) is not str or not 0 < timeout <= 30):
+                raise ValueError("reference action requires one finite operation, JSON and at most 30 seconds")
+            payload = json.loads(arguments[1])
+            if type(payload) is not dict:
+                raise ValueError("reference payload must be a JSON object")
+            path = "/usr/libexec/tuna-vm-gnome-reference"
+            argv = list(arguments)
         deadline = time.monotonic() + timeout
         caller_deadline = getattr(self, "_caller_deadline", None)
         if caller_deadline is not None:
@@ -388,8 +399,8 @@ class GuestAgent:
         # can leave a running child whose PID we never received.
         self.guest_exec_state = "unknown"
         try:
-            pid = self.command("guest-exec", deadline=deadline, path="/usr/libexec/tuna-vm-lifecycle",
-                               arg=[action, *map(str, arguments)], **{"capture-output": True})["pid"]
+            pid = self.command("guest-exec", deadline=deadline, path=path,
+                               arg=argv, **{"capture-output": True})["pid"]
         except BaseException:
             self._poison()
             raise

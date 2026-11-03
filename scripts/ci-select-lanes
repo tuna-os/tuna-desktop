@@ -121,6 +121,8 @@ OWNED = [
     ("docs/nested-session.md", ["arch-package"]),
     ("packaging/marlin/*", ["marlin-image", "marlin-vm"]),
     ("scripts/tuna-vm-lane", ["marlin-vm"]),
+    ("scripts/lib/vm_guest_agent.py", ["marlin-vm"]),
+    ("scripts/lib/vm_gnome_reference.py", ["marlin-vm"]),
     ("scripts/lib/vm_strip_*", ["marlin-vm"]),
     ("scripts/tuna-explicit-sync-*", ["marlin-vm"]),
     ("scripts/tuna-background-effect-client-build", ["marlin-vm"]),
