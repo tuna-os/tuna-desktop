@@ -369,10 +369,14 @@ class Desktop(NativeDesktop):
         self.type_ascii(str(Path(path).parent) + '/')
         self.keys('ret')
         basename = Path(path).name
+        # Nautilus exposes file cells as "<name>. File" (directories as
+        # "<name>. Folder"); the bare name alone never matches. Same
+        # spellings as the data-profile Files cell lookup.
+        spellings = (basename, basename + '. File', basename + '. Folder')
         tree = self.await_state('default-file-visible', lambda: self.tree(files),
-                                lambda value: any(node['showing'] and node['name'] == basename
+                                lambda value: any(node['showing'] and node['name'] in spellings
                                                   for node in value['nodes']))
-        cells = [node for node in tree['nodes'] if node['showing'] and node['name'] == basename
+        cells = [node for node in tree['nodes'] if node['showing'] and node['name'] in spellings
                  and node['role'] in ('table cell', 'list item', 'icon')]
         if len(cells) != 1:
             raise RuntimeError('actual Files default-handler selected cell not unique')
