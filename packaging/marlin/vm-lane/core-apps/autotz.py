@@ -779,6 +779,29 @@ def _watch_start(context, directory, state):
         os.close(output)
 
 
+def _filter_action(kind, sender, destination, path, interface, member,
+                   destinations, geo_destinations, geo_owner):
+    """What the monitor filter does with one incoming message.
+
+    A monitor must never answer: an eavesdropped call that reaches GDBus
+    dispatch triggers an automatic UnknownMethod/UnknownObject error
+    reply, and the bus kills monitors that send. Queue observation
+    traffic for the worker, drop every other call, and pass
+    returns/errors/signals so synchronous bus calls still complete.
+    """
+    relevant = (
+        kind == 'call'
+        and (destination in geo_destinations
+             or (destination in destinations and path == TIME_PATH
+                 and interface == TIME_NAME and member == 'SetTimezone'))
+    ) or (sender == geo_owner and kind in ('return', 'error', 'signal'))
+    if relevant:
+        return 'queue'
+    if kind == 'call':
+        return 'drop'
+    return 'pass'
+
+
 def _monitor(nonce):
     # A kernel alarm also bounds connection setup or a wedged GLib/GIO callback.
     signal.alarm(MONITOR_SECONDS)
@@ -1049,15 +1072,14 @@ def _monitor(nonce):
 
     def received(connection, message, incoming, user_data):
         nonlocal queued, traffic_count
+        kinds = {Gio.DBusMessageType.METHOD_CALL: 'call',
+                 Gio.DBusMessageType.METHOD_RETURN: 'return',
+                 Gio.DBusMessageType.ERROR: 'error',
+                 Gio.DBusMessageType.SIGNAL: 'signal'}
+        kind = kinds.get(message.get_message_type(), '?')
         with lock:
             if traffic_count < 1024:
-                kinds = {Gio.DBusMessageType.METHOD_CALL: 'call',
-                         Gio.DBusMessageType.METHOD_RETURN: 'return',
-                         Gio.DBusMessageType.ERROR: 'error',
-                         Gio.DBusMessageType.SIGNAL: 'signal'}
-                record = {'in': bool(incoming),
-                          't': kinds.get(message.get_message_type(), '?'),
-                          'n': message.get_serial()}
+                record = {'in': bool(incoming), 't': kind, 'n': message.get_serial()}
                 for key, value in (('s', message.get_sender()),
                                    ('d', message.get_destination()),
                                    ('p', message.get_path()),
@@ -1070,17 +1092,13 @@ def _monitor(nonce):
                     traffic_count += 1
         if not incoming:
             return message
-        kind = message.get_message_type()
-        relevant = (
-            kind == Gio.DBusMessageType.METHOD_CALL
-            and (message.get_destination() in geo_destinations
-                 or (message.get_destination() in destinations and message.get_path() == TIME_PATH
-                     and message.get_interface() == TIME_NAME and message.get_member() == 'SetTimezone'))
-        ) or (message.get_sender() == geo_service['unique_owner']
-              and kind in (Gio.DBusMessageType.METHOD_RETURN, Gio.DBusMessageType.ERROR,
-                           Gio.DBusMessageType.SIGNAL))
-        if not relevant:
+        action = _filter_action(kind, message.get_sender(), message.get_destination(),
+                                message.get_path(), message.get_interface(), message.get_member(),
+                                destinations, geo_destinations, geo_service['unique_owner'])
+        if action == 'pass':
             return message
+        if action == 'drop':
+            return None
         # GDBus filters run on the shared I/O worker: never call_sync here, even on another connection.
         with lock:
             if queued >= 256:

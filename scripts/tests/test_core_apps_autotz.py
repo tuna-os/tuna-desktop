@@ -590,5 +590,49 @@ class OriginalMonitorLifetimeControls(unittest.TestCase):
         self.assertEqual(receipt["message"], "x" * 2000)
 
 
+class FilterAction(unittest.TestCase):
+    DESTINATIONS = {"org.freedesktop.timedate1", ":1.10"}
+    GEO = {"org.freedesktop.GeoClue2", ":1.246"}
+    OWNER = ":1.246"
+
+    def decide(self, kind, sender=None, destination=None, path=None, interface=None, member=None):
+        return GUEST._filter_action(kind, sender, destination, path, interface, member,
+                                    self.DESTINATIONS, self.GEO, self.OWNER)
+
+    def test_observation_traffic_is_queued(self):
+        self.assertEqual(self.decide("call", sender=":1.815", destination=":1.246",
+                                     path="/org/freedesktop/GeoClue2/Manager",
+                                     interface="org.freedesktop.GeoClue2.Manager",
+                                     member="GetClient"), "queue")
+        self.assertEqual(self.decide("call", sender=":1.9", destination="org.freedesktop.timedate1",
+                                     path="/org/freedesktop/timedate1",
+                                     interface="org.freedesktop.timedate1",
+                                     member="SetTimezone"), "queue")
+        for kind in ("return", "error", "signal"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.decide(kind, sender=":1.246", destination=":1.815"), "queue")
+
+    def test_unmatched_calls_are_dropped_before_dispatch(self):
+        # Observed kill: the monitor passed the GeoClue Agent GetAll through
+        # to GDBus dispatch, which auto-replied an error the bus kills for.
+        self.assertEqual(self.decide("call", sender=":1.815", destination=":1.108",
+                                     path="/org/freedesktop/GeoClue2/Agent",
+                                     interface="org.freedesktop.DBus.Properties",
+                                     member="GetAll"), "drop")
+        self.assertEqual(self.decide("call", sender=":1.9", destination=":1.10",
+                                     path="/org/freedesktop/timedate1",
+                                     interface="org.freedesktop.timedate1",
+                                     member="SetTime"), "drop")
+
+    def test_bus_control_traffic_still_passes(self):
+        self.assertEqual(self.decide("return", sender="org.freedesktop.DBus",
+                                     destination=":1.814"), "pass")
+        self.assertEqual(self.decide("signal", sender="org.freedesktop.DBus",
+                                     destination=":1.814",
+                                     path="/org/freedesktop/DBus",
+                                     interface="org.freedesktop.DBus", member="NameLost"), "pass")
+        self.assertEqual(self.decide("?", sender=":1.1"), "pass")
+
+
 if __name__ == "__main__":
     unittest.main()
