@@ -3406,7 +3406,8 @@ class Recorder:
                     value = observe(remaining) if observe is not None else None
                     result = {"observation": value}
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-                    result = {"observation_error": type(error).__name__}
+                    result = {"observation_error": type(error).__name__,
+                              "observation_error_detail": str(error)}
                 return {"requested_monotonic_ns": requested,
                         "completed_monotonic_ns": time.monotonic_ns(), **result}
 
