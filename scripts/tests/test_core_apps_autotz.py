@@ -508,6 +508,22 @@ class OriginalMonitorLifetimeControls(unittest.TestCase):
             self.assertEqual(functions, [("autotz.py", "_monitor_status"),
                                          ("autotz.py", "_monitor_liveness")])
 
+    @unittest.skipUnless(os.geteuid() == 0, "production control files require root ownership")
+    def test_error_and_ended_deaths_raise_distinct_reasons(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            state = {"monitor": dict(self.monitor),
+                     "nonce": self.monitor["nonce"], "boot_id": self.monitor["boot_id"]}
+            GUEST._write_json(directory / "ready.json", dict(self.ready))
+            GUEST._write_json(directory / "monitor-ended.json", {"epoch": 1.0})
+            status = GUEST._monitor_status(directory, state)
+            self.assertFalse(status["live"])
+            self.assertEqual(status["unevaluable_reason"],
+                             "owned monitor ended before its observation completed")
+            GUEST._write_json(directory / "monitor-error.json", {"error": "boom", "epoch": 1.0})
+            status = GUEST._monitor_status(directory, state)
+            self.assertEqual(status["unevaluable_reason"], "owned monitor recorded an error")
+
     def test_failure_receipt_appends_validated_cause_sites(self):
         guest_dir = str(Path(GUEST.__file__).resolve().parent.parent / "tuna-native-session")
         sys.path.insert(0, guest_dir)

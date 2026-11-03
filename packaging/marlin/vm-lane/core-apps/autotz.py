@@ -528,8 +528,10 @@ def _monitor_status(directory, state):
         if (monitor.get('nonce') != state['nonce'] or monitor.get('boot_id') != state['boot_id']
                 or monitor.get('argv', [])[-2:] != ['--monitor', state['nonce']]):
             raise RuntimeError('original monitor belongs to another boot/run/nonce')
-        if 'error' in result or 'ended' in result:
-            raise RuntimeError('owned monitor has failed or ended')
+        if 'error' in result:
+            raise RuntimeError('owned monitor recorded an error')
+        if 'ended' in result:
+            raise RuntimeError('owned monitor ended before its observation completed')
         result['liveness'] = _monitor_liveness(monitor, result.get('readiness'))
         result['ready'] = True
         result['live'] = True
