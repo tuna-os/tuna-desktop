@@ -159,6 +159,7 @@ pub mod sleep;
 pub mod slideshow;
 pub mod spring;
 pub mod state;
+mod state_snapshot;
 pub mod supervise;
 pub mod tablet;
 pub mod tablet_actions;
@@ -1480,6 +1481,16 @@ impl TestCompositor {
         self.display
             .handle()
             .insert_client(stream, Arc::new(ClientState::default()))
+            .unwrap()
+    }
+
+    /// Attach the private server-owned input-method connection in native
+    /// protocol fixtures. Public clients must use `add_client`; executable
+    /// names, PIDs and application metadata do not grant this authority.
+    pub fn add_ime_bridge_client(&mut self, stream: UnixStream) -> Client {
+        self.display
+            .handle()
+            .insert_client(stream, Arc::new(ClientState::ime_bridge()))
             .unwrap()
     }
 

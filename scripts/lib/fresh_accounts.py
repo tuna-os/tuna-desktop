@@ -322,6 +322,24 @@ class Journey:
     def _frame(self, name):
         self.qmp.frame(os.path.join(self.out, f"{name}.png"))
 
+    def _prompt(self, kind, step, deadline):
+        observed = None
+        while self.clock() < deadline:
+            try:
+                observed = self._run("greeter-prompt")
+                if self.clock() < deadline and observed.get("prompt") == kind:
+                    self._receipt(f"{step}-{kind}-prompt", observed)
+                    self._frame(f"{step}-{kind}")
+                    if self.clock() < deadline:
+                        return True
+                    break
+            except (OSError, RuntimeError, ValueError):
+                pass
+            self.sleep(1)
+        self._receipt(f"{step}-{kind}-prompt-timeout", observed)
+        self._frame(f"{step}-{kind}-timeout")
+        return False
+
     def _login(self, user, step):
         if not self.native_required:
             return self._login_direct(user, step)
@@ -375,15 +393,16 @@ class Journey:
         return False, f"{user}: no {LOGIN_SERVICE} session after {MAX_LOGIN_ATTEMPTS} GDM attempts"
 
     def _login_direct(self, user, step):
+        deadline = self.clock() + self.login_timeout
         self.qmp.keys("esc")
-        self.sleep(2)
+        if not self._prompt("username", step, deadline):
+            return False, f"{user}: no focused, editable GDM username prompt before login deadline"
         self.qmp.type_text(user)
         self.qmp.keys("ret")
-        self.sleep(2)
-        self._frame(f"{step}-password")
+        if not self._prompt("password", step, deadline):
+            return False, f"{user}: no focused, editable GDM password prompt before login deadline"
         self.qmp.type_text(PASSWORD)
         self.qmp.keys("ret")
-        deadline = self.clock() + self.login_timeout
         observed = None
         while self.clock() < deadline:
             try:
