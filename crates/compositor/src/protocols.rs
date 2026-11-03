@@ -162,8 +162,13 @@ impl Protocols {
             _tablet_manager: TabletManagerState::new::<State>(dh),
             _idle_inhibit: IdleInhibitManagerState::new::<State>(dh),
             _text_input: TextInputManagerState::new::<State>(dh),
-            // Any client may become the input method, as on GNOME.
-            _input_method: InputMethodManagerState::new::<State, _>(dh, |_client| true),
+            // Only the compositor-supervised connection may observe text or
+            // own the seat's input method, just as for its virtual keyboard.
+            _input_method: InputMethodManagerState::new::<State, _>(dh, |client| {
+                client
+                    .get_data::<crate::ClientState>()
+                    .is_some_and(|data| data.ime_bridge)
+            }),
             bridge_cursor_popup: None,
             _gestures: PointerGesturesState::new::<State>(dh),
             _relative_pointer: RelativePointerManagerState::new::<State>(dh),
@@ -803,14 +808,21 @@ impl Dispatch<
                 let Some(keyboard) = state.seat.get_keyboard() else { return };
                 // The physical event has already updated XKB. Do not update
                 // it twice or send it back into the IM grab recursively.
-                let grab = keyboard.with_grab(|serial, grab| {
-                    grab.downcast_ref::<InputMethodKeyboardGrab>().cloned().map(|grab| (serial, grab))
-                }).flatten();
-                if grab.is_some() { keyboard.unset_grab(state); }
-                keyboard.input_forward(state, key.saturating_add(8).into(),
-                    if pressed == 1 { smithay::backend::input::KeyState::Pressed } else { smithay::backend::input::KeyState::Released },
-                    smithay::utils::SERIAL_COUNTER.next_serial(), time, false);
-                if let Some((serial, grab)) = grab { keyboard.set_grab(state, grab, serial); }
+                let ime_grab = keyboard.with_grab(|_, grab| {
+                    grab.downcast_ref::<InputMethodKeyboardGrab>().is_some()
+                }).unwrap_or(false);
+                let key = key.saturating_add(8).into();
+                let pressed = if pressed == 1 {
+                    smithay::backend::input::KeyState::Pressed
+                } else {
+                    smithay::backend::input::KeyState::Released
+                };
+                let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                if ime_grab {
+                    keyboard.input_forward_to_focus(state, key, pressed, serial, time, false);
+                } else {
+                    keyboard.input_forward(state, key, pressed, serial, time, false);
+                }
             }
             // Preserve the bridge's event order: newer physical events may
             // already have updated the compositor state while IBus replies.

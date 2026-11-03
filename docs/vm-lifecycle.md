@@ -21,6 +21,38 @@ The fixture's session environment comes from `environment.d`,
 which gdm-wayland-session imports from the user manager; the per-login Orca
 test secret comes from a user environment generator.
 
+## Installed strip captures
+
+The strip probe binds the original native processes and all three installed
+fixture helpers to the selected package, source and final image. Both PNG and
+PPM acquisitions must pass all 25 original body-color samples; the captures
+remain separate acquisitions, not presentation-latency proof.
+
+A real notification can cover those pixels. Before acquiring a frame, the
+probe may acknowledge its visible banner through ordinary QMP input:
+Super+N, Tab, then Return only after the original shell's public Close
+button is observed focused and sensitive. The read-only AT-SPI observer
+binds the control's bounds to original process/bus identities, never
+notification content. Every pixel check and the existing 10-second capture
+and 120-second phase deadlines remain unchanged. No updater service,
+notification policy or failure log is disabled; acknowledging a banner does
+not qualify the update operation that produced it.
+
+The column-height capture also submits a real critical notification through
+the session's public notification service. It cannot pass until the original
+shell shows the fixed public fixture title, its sensitive Close button receives
+the actual QMP Return action, and the banner disappears. Only a boolean title
+comparison is retained. This control exercises the recovery path even when
+the updater happens to show no banner; it shares the same capture deadline
+and still requires every original PNG and PPM color sample afterward.
+
+Close readiness uses GTK4's actual AT-SPI state mapping: an interactive
+control advertises `SENSITIVE`, the inverse of its `DISABLED` accessibility
+state. GTK4 does not advertise `ENABLED`; requiring that additional bit
+would reject a genuinely focused, interactive button. Both observed bits
+remain in the receipt, but disabled controls remain ineligible. See the
+[GTK4 state mapping](https://github.com/GNOME/gtk/blob/main/gtk/a11y/gtkatspicontext.c).
+
 ## Required independent native automatic timezone
 
 Whenever `marlin-vm` is selected, its matrix also requires `marlin-vm-autotz`.
@@ -71,20 +103,64 @@ version must not opt into the empty-template policy. Neither policy edits
 existing per-user records or replaces a valid saved session choice.
 
 For the general credential-only fixture, GDM's own
-`org.gnome.login-screen disable-user-list=true` in the `gdm` dconf database
-asks directly for the user name. In run 41230684089 the old Tab count to
-"Not listed?" selected the listed `tunaseeded` instead. The private native
-candidate image retains the normal user list and the separately proven
-bounded navigation reset: the native package repair must qualify the
-ordinary greeter, not that fixture shortcut. The native image's installed
-manifest controls only this setup choice; strict candidate and installed-pair
-admission is still required before any native persistence gate.
+`org.gnome.login-screen disable-user-list=true` asks directly for the user name.
+The fixture inserts its `tuna-vm-fresh-accounts` dconf database ahead of the
+preserved vendor profile and requires an actual `gsettings get` readback of
+`true`. The vendor profile need not contain `system-db:gdm`; writing `gdm.d`
+alone did not apply the setting in run 41234017707. In run 41230684089 the old
+Tab count to "Not listed?" selected the listed `tunaseeded` instead.
+The private native candidate retains the normal user list and the separately
+proven bounded navigation reset: its package repair must qualify the ordinary
+greeter, not that fixture shortcut. The installed manifest controls only this
+setup choice; strict candidate and installed-pair admission is still required
+before any native persistence gate.
+
+The process/logind greeter predicate is not an input-readiness predicate.
+In [run 41248530233](https://github.com/tuna-os/tuna-desktop/actions/runs/41248530233),
+artifact `marlin-vm-orca51` (ID `13061267386`, SHA-256
+`1de554a272722c7640b767cde1f75cfa7603910bd7c0c3cda4b4895f38d79af2`)
+retains a black `fresh-accounts/fresh-greeter.png`; its
+`tunastd-first-password.png` still shows **Username**, not Password, when
+the old driver sends the password. The serial journal records
+`pam_faillock(gdm-password:auth): User unknown` at 19.270579 seconds and no
+user session. The standard counterpart reaches a visible Password prompt
+and authenticates both accounts; its later admin sudo failure is separate.
+The run's PR source is `df05bde92cd4392871db9d36d3d3a21ce43b846b`;
+workflow checkout/manifest metadata is the synthetic merge
+`b4d42581e7299323fd6ead9f76dcd94862990f1c`. Both use published Marlin
+base `sha256:6c1e25b1fa9ddc07d7e71f767456839676333d3ebdc332b642a467f56c8ff71b`;
+the Orca test-layer image ID is
+`sha256:0e3b49a6df3ee644fb9ec4f1dc5b0971da0e6d67b4aedbbc0bedcb5ff116b2e8`.
+
+The general credential-only driver waits for the actual greeter's focused,
+visible, showing, editable, sensitive and enabled AT-SPI entry before
+typing each credential. The probe runs as the active non-root greeter UID,
+binds the accessibility bus PID/UID to the original `gnome-shell` process
+and start time, and distinguishes text from password-text roles without
+reading names or entry contents or invoking accessibility actions.
+Prompt receipts and pre-input frames are retained. Service/greeter readiness
+uses the existing greeter deadline; name, password and session readiness share
+one existing login deadline. There is one credential pair per general-mode
+login, no fixed-sleep increase and no authentication retry. The admitted native
+candidate retains its existing bounded stock-user-list attempts. This fixes
+wrong-phase input in the general fixture; old receipts alone do not identify
+which input was lost during startup.
+
+The first native observer run found 1267 distinct GNOME greeter actors,
+exceeding the unchanged 512-node observation budget when hidden actors were
+enumerated. This was not a cycle (maximum depth 15, no duplicate objects).
+The actual focused username entry had all required flags, and every
+non-root ancestor was SHOWING/VISIBLE. Pruning non-SHOWING branches visits
+131 nodes instead, including hidden branch roots, without changing the
+node/depth/time limits. The application metadata root is exempt from this
+prune because it is not a visible component. This follows the existing
+shell-focus observer's SHOWING traversal rule.
 
 | Gate | Actual operation and evidence |
 | --- | --- |
 | V-FRESH-RECORD-FREE-<user> | Before any login: account exists with a home, no `/var/lib/AccountsService/users/<user>`, no GDM automatic/timed login, `wheel` only for the admin |
 | V-FRESH-CONTROL | The same probe classifies the pre-seeded `tunaseeded` as NOT record-free |
-| V-FRESH-LOGIN-<user>-{first,second,reboot} | GDM's user-name prompt, then the password, typed through QMP; exactly one `gdm-password` VT session of that account runs `tuna-compositor` and no `gnome-shell`/`gnome-session` |
+| V-FRESH-LOGIN-<user>-{first,second,reboot} | General fixture: owner-bound focused editable GDM text and password-text prompts precede QMP credentials. Explicitly admitted native candidate: existing bounded stock-user-list navigation. Both require exactly one `gdm-password` VT session of that account running `tuna-compositor` and no `gnome-shell`/`gnome-session` |
 | V-FRESH-SESSION-<user>-{first,second,reboot} | Read AccountsService's effective `Session` over the system bus: it must be `tuna`; if a cache record exists, any saved `Session` must also be `tuna` |
 | V-FRESH-RECORD-CREATED-<user> | Verified private native candidate only: a physical AccountsService record must exist during the first logged-in session; any saved `Session` must be `tuna` |
 | V-FRESH-SUDO-<user> | `sudo -S -k true` as the account with its password: admin succeeds, standard is refused by sudo policy |
@@ -593,7 +669,6 @@ The image appends hashes for the policy and root sudoers file.
 It does not regenerate the existing GDM payload entries.
 Later Orca and GDM layers must preserve that complete receipt.
 These source and parser checks do not qualify the runtime gates.
-
 
 ### Why a first login need not create a cache file
 
