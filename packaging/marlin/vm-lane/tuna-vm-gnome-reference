@@ -1386,7 +1386,17 @@ def main():
         deadline = payload(operation, args)
         cache = {}
         if operation == 'admit':
-            result, _ = admission(args['profile'], deadline, cache)
+            # GDM greeter teardown straddles login: one sample can catch a
+            # lingering greeter session with no shell, or the user session
+            # half-registered. Settle until admission is ready or the
+            # operation budget expires, then report the last state.
+            while True:
+                result, _ = admission(args['profile'], deadline, cache)
+                if result['ready']:
+                    break
+                if deadline.end - time.monotonic() < 1.0:
+                    break
+                time.sleep(0.5)
         else:
             directory = ROOT / args['nonce']
             if operation == 'prepare':
