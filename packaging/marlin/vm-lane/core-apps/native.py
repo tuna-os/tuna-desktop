@@ -226,7 +226,16 @@ def user_operation(operation, arguments):
             raise RuntimeError('real original-user IBus bus unavailable')
         previous = ibus.get_global_engine()
         if previous is None:
-            raise RuntimeError('real original-user IBus has no global engine')
+            # Fresh CI sessions configure no preloaded engines, so the daemon
+            # offers no global engine until one is activated. Establish the
+            # documented xkb baseline exactly like the nested proof's
+            # `ibus engine xkb:us::eng`; the restore below then has a real
+            # original to return to.
+            if not ibus.set_global_engine('xkb:us::eng'):
+                raise RuntimeError('real original-user IBus rejected xkb baseline engine')
+            previous = ibus.get_global_engine()
+            if previous is None:
+                raise RuntimeError('real original-user IBus has no global engine')
         original = previous.get_name()
         requested = 'libpinyin' if arguments['select'] else arguments['original']
         if not ibus.set_global_engine(requested):

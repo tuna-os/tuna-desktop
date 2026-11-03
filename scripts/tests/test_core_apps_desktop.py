@@ -61,5 +61,94 @@ class OpenDefaultCellSpellings(unittest.TestCase):
         self.assertEqual(calls['click'], ['row', 2])
 
 
+class FakeEngine:
+    def __init__(self, name):
+        self._name = name
+
+    def get_name(self):
+        return self._name
+
+    def get_language(self):
+        return 'en'
+
+    def get_longname(self):
+        return self._name
+
+
+class FakeBus:
+    def __init__(self, engines, accept=True):
+        self._engines = list(engines)
+        self._accept = accept
+        self.selected = []
+
+    def is_connected(self):
+        return True
+
+    def get_global_engine(self):
+        return self._engines[-1] if self._engines else None
+
+    def set_global_engine(self, name):
+        self.selected.append(name)
+        if self._accept:
+            self._engines.append(FakeEngine(name))
+        return self._accept
+
+
+class ImeEngineBaseline(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        lane = ROOT / 'packaging' / 'marlin' / 'vm-lane'
+        sys.path.insert(0, str(lane / 'core-apps'))
+        sys.path.insert(0, str(lane / 'tuna-native-session'))
+        try:
+            import native
+            cls.native = native
+        finally:
+            sys.path.remove(str(lane / 'core-apps'))
+            sys.path.remove(str(lane / 'tuna-native-session'))
+            sys.modules.pop('native', None)
+            sys.modules.pop('guest', None)
+            sys.modules.pop('native_session', None)
+
+    def operate(self, bus):
+        import types
+        repository = types.SimpleNamespace(
+            Gio=types.SimpleNamespace(BusType=types.SimpleNamespace(SESSION=1),
+                                      bus_get_sync=lambda *a: object()),
+            GLib=types.SimpleNamespace(),
+            IBus=types.SimpleNamespace(init=lambda: None,
+                                       Bus=types.SimpleNamespace(new=lambda: bus)))
+        gi = types.SimpleNamespace(require_version=lambda *a: None, repository=repository)
+        saved = {name: sys.modules.get(name) for name in ('gi', 'gi.repository')}
+        sys.modules['gi'] = gi
+        sys.modules['gi.repository'] = repository
+        try:
+            return self.native.user_operation('ime-engine', {'select': True})
+        finally:
+            for name, module in saved.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
+
+    def test_engineless_session_establishes_xkb_baseline(self):
+        bus = FakeBus([])
+        observed = self.operate(bus)
+        self.assertEqual(bus.selected, ['xkb:us::eng', 'libpinyin'])
+        self.assertEqual(observed['original'], 'xkb:us::eng')
+        self.assertEqual(observed['actual'], 'libpinyin')
+
+    def test_existing_engine_is_kept_as_original(self):
+        bus = FakeBus([FakeEngine('xkb:us::eng')])
+        observed = self.operate(bus)
+        self.assertEqual(bus.selected, ['libpinyin'])
+        self.assertEqual(observed['original'], 'xkb:us::eng')
+
+    def test_rejected_baseline_still_fails(self):
+        bus = FakeBus([], accept=False)
+        with self.assertRaisesRegex(RuntimeError, 'rejected xkb baseline'):
+            self.operate(bus)
+
+
 if __name__ == '__main__':
     unittest.main()
