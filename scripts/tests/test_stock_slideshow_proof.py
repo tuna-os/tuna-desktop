@@ -236,7 +236,7 @@ class PaintReceipt(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.check(paint, fixed=True)
         paint = self.good_paint()
-        paint['root_identity'] = 'None'
+        paint['root_identity'] = None
         with self.assertRaises(RuntimeError):
             self.check(paint, fixed=True)
 
@@ -263,6 +263,17 @@ class PaintReceipt(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.check(paint, fixed=True)
 
+    def test_content_hash_rejects_changed_bytes_with_current_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source.png'
+            source.write_bytes(b'first image')
+            previous_digest = identity_of(source)['sha256']
+            source.write_bytes(b'other image')
+            current = identity_of(source)
+            current['sha256'] = previous_digest
+            with self.assertRaises(RuntimeError):
+                self.ns['check_file_identity'](current, 'source', str(source))
+
     def test_debug_strings_and_incomplete_or_mistyped_identity_are_refused(self):
         for bad in (None, 'None', 'Some(FileIdentity { path: "/out/light-timeline.xml" })',
                     {}, {'path': str(self.xml)}, {'path': str(self.xml), 'metadata': {}, 'sha256': []}):
@@ -280,18 +291,6 @@ class PaintReceipt(unittest.TestCase):
             identity['metadata'][key] = value
             with self.subTest(key=key, value=value), self.assertRaises(RuntimeError):
                 self.check(self.mutate(root_identity=identity))
-
-    def test_digest_rejects_changed_bytes_even_if_all_stat_metadata_matches(self):
-        identity = identity_of(self.xml)
-        original = self.xml.read_bytes()
-        info = self.xml.stat()
-        try:
-            self.xml.write_bytes(b'x' * len(original))
-            with mock.patch.object(os, 'fstat', return_value=info), mock.patch.object(os, 'stat', return_value=info):
-                with self.assertRaisesRegex(RuntimeError, 'content'):
-                    self.ns['check_file_identity'](identity, 'root', expect_path=str(self.xml))
-        finally:
-            self.xml.write_bytes(original)
 
     def test_file_metadata_drift_during_digest_is_refused(self):
         identity = identity_of(self.xml)

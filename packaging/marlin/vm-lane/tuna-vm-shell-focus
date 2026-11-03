@@ -9,6 +9,8 @@ dialog's fixed countdown sentence. The separate notification-banner mode names
 only the fixed Notifications frame and its Close control, never banner content.
 No synthetic AT-SPI actions, focus changes or arbitrary names are recorded.
 Native QMP input performs every action.
+The explicit notification-banner-fixture mode additionally compares only the
+known fixture title in scratch memory and returns a boolean, never content.
 Primary API: https://gnome.pages.gitlab.gnome.org/at-spi2-core/libatspi/
 """
 import json
@@ -146,7 +148,8 @@ def catalog_receipt(pid, uid, ticks):
             "sample_scope":"original-show-results","authentication_boundary":False}
 
 
-def observe(pid, ticks, executable, display, controlled=False, end_session=False, notification=False):
+def observe(pid, ticks, executable, display, controlled=False, end_session=False,
+            notification=False, fixture_control=False):
     global FOCUS_OPERATION
     FOCUS_OPERATION = "imports"
     import gi
@@ -154,7 +157,8 @@ def observe(pid, ticks, executable, display, controlled=False, end_session=False
     from gi.repository import Atspi, Gio, GLib
     uid = os.getuid()
     if (type(controlled) is not bool or type(end_session) is not bool or type(notification) is not bool
-            or ((controlled or notification) and executable != "tuna-shell-gtk")
+            or type(fixture_control) is not bool or (fixture_control and not notification)
+            or ((controlled or end_session or notification) and executable != "tuna-shell-gtk")
             or sum((controlled, end_session, notification)) > 1):
         raise RuntimeError("fixed controlled observation mode required")
     if uid == 0 or executable not in {"tuna-shell-gtk", "gnome-disks"}:
@@ -175,7 +179,7 @@ def observe(pid, ticks, executable, display, controlled=False, end_session=False
     original = process_identity(pid, uid, ticks, executable, display)
     FOCUS_OPERATION = "atspi-timeout"
     Atspi.set_timeout(500, 500)
-    deadline = time.monotonic() + 8
+    deadline = time.monotonic() + (3 if fixture_control else 8)
     def remaining_budget():
         unlocked()
         remaining = deadline - time.monotonic()
@@ -242,6 +246,7 @@ def observe(pid, ticks, executable, display, controlled=False, end_session=False
     notification_frames, notification_closes = [], []
     search_entries, target = [], {"showing":0,"focused":0,"present":0}
     focused_roles = []
+    fixture_visible = False
     while pending:
         unlocked()
         if time.monotonic() >= deadline or visited >= 512:
@@ -268,6 +273,9 @@ def observe(pid, ticks, executable, display, controlled=False, end_session=False
                 in_notification = accessibility_query(node.get_name) == "Notifications"
                 if not in_notification:
                     continue
+            if fixture_control and in_notification and role in {"alert", "notification"}:
+                FOCUS_OPERATION = "tree-name"
+                fixture_visible |= accessibility_query(node.get_name) == "Installed strip framebuffer control"
             if role == "frame" or (in_notification and role == "push button"
                     and accessibility_query(node.get_name) == "Close"):
                 component = accessibility_query(node.get_component_iface)
@@ -341,19 +349,22 @@ def observe(pid, ticks, executable, display, controlled=False, end_session=False
     if notification:
         unlocked()
         result["notification_banner"] = {"frames": notification_frames, "close_controls": notification_closes}
+        if fixture_control:
+            result["notification_banner"]["control_visible"] = bool(fixture_visible)
         result["observer_sha256"] = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()
     return result
 
 
 if __name__ == "__main__":
     try:
-        modes = {"controlled-overview", "end-session", "notification-banner"}
+        modes = {"controlled-overview", "end-session", "notification-banner", "notification-banner-fixture"}
         if len(sys.argv) not in (5, 6) or (len(sys.argv) == 6 and sys.argv[5] not in modes):
             raise ValueError("fixed observation mode")
         mode = sys.argv[5] if len(sys.argv) == 6 else None
         receipt = observe(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4],
                           controlled=mode == "controlled-overview", end_session=mode == "end-session",
-                          notification=mode == "notification-banner")
+                          notification=mode in {"notification-banner", "notification-banner-fixture"},
+                          fixture_control=mode == "notification-banner-fixture")
         FOCUS_OPERATION = "serialization"
         print(json.dumps(receipt))
     except Exception as error:
