@@ -43,7 +43,7 @@ def admission(package, observed, root, commit, image_id, base_image, *, fixture=
         raise ValueError('image inspection identity differs')
     expected = {'/' + name: data['sha256'] for name, data in package['required_members'].items()
                 if name.startswith('usr/bin/')}
-    for name in ('tuna-vm-input', 'tuna-vm-lifecycle'):
+    for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus'):
         path = Path(root) / 'packaging/marlin/vm-lane' / name
         expected['/usr/libexec/' + name] = hashlib.sha256(path.read_bytes()).hexdigest()
     for installed, source in fixture_members(fixture).items():
@@ -100,7 +100,8 @@ print(json.dumps({"schema":1,"image_id":sys.argv[1],"member_sha256":result}))
 def inspection_program(fixture='lifecycle'):
     names = ['/usr/bin/tuna-' + name for name in
              ('compositor', 'session', 'shell-host', 'shell-gtk', 'ibus-bridge')]
-    names += ['/usr/libexec/tuna-vm-input', '/usr/libexec/tuna-vm-lifecycle']
+    names += ['/usr/libexec/tuna-vm-input', '/usr/libexec/tuna-vm-lifecycle',
+              '/usr/libexec/tuna-vm-shell-focus']
     names += list(fixture_members(fixture))
     if fixture == 'explicit-sync':
         names += list(PROTOCOL_MEMBERS)

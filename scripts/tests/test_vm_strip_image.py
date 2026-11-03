@@ -29,7 +29,7 @@ class Tests(unittest.TestCase):
             fixture = root / 'packaging/marlin/vm-lane'
             fixture.mkdir(parents=True)
             expected = {'/usr/bin/tuna-compositor': 'a' * 64}
-            for name in ('tuna-vm-input', 'tuna-vm-lifecycle'):
+            for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus'):
                 (fixture / name).write_text(name)
                 expected['/usr/libexec/' + name] = hashlib.sha256(name.encode()).hexdigest()
             package = {'package': {'sha256': 'b' * 64}, 'required_members':
@@ -56,7 +56,7 @@ class Tests(unittest.TestCase):
             root = Path(scratch)
             expected = {'/usr/bin/tuna-compositor': 'a' * 64}
             sources = {'/usr/libexec/' + name: 'packaging/marlin/vm-lane/' + name
-                       for name in ('tuna-vm-input', 'tuna-vm-lifecycle')}
+                       for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus')}
             sources.update(fixture_members('explicit-sync'))
             for installed, name in sources.items():
                 if name == 'native-protocol-build.json':

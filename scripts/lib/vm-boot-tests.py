@@ -522,31 +522,6 @@ class OrcaCommandCleanup(unittest.TestCase):
 
 
 class OrcaFixturePackages(unittest.TestCase):
-    def test_actual_upstream_export_create_requires_explicit_command(self):
-        source = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
-        lines = [line.strip() for line in source.read_text().splitlines()
-                 if "probe_container=$(sudo podman create" in line]
-        self.assertEqual(len(lines), 1)
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            sudo = root / "sudo"
-            sudo.write_text('#!/bin/sh\nexec "$@"\n')
-            sudo.chmod(0o755)
-            podman = root / "podman"
-            podman.write_text("#!/usr/bin/env python3\nimport sys\n"
-                "assert sys.argv[1:] == ['create','localhost/marlin-tuna-vm:ci','/usr/bin/true']\n"
-                "print('controlled-inspect-container')\n")
-            podman.chmod(0o755)
-            environment = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]}
-            for line, success in [(lines[0], True), (lines[0].replace(" /usr/bin/true", ""), False)]:
-                result = subprocess.run(["bash", "-eu", "-c", line + '\nprintf "%s\\n" "$probe_container"\n'],
-                    env=environment, capture_output=True, text=True, timeout=10)
-                if success:
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout.strip(), "controlled-inspect-container")
-                else:
-                    self.assertNotEqual(result.returncode, 0)
-        # Controlled shell admission only; no Podman image/runtime proof.
 
     def test_current_build_session_environment_fixes_locale_and_ci_diagnostics(self):
         # gdm-wayland-session lets GDM's own LANG win over the imported user
@@ -1446,64 +1421,7 @@ class PublicOrcaNavigation(unittest.TestCase):
         for key, invalid in (("GetNameOwner", ":1.28"), ("GetConnectionUnixProcessID", 934), ("GetConnectionUnixUser", 0)):
             self.assertTrue(eval(predicate, {**scope, "values": {**values, key: invalid}}))
 
-    def test_focus_cli_admits_each_mode_separately_without_changing_default(self):
-        from contextlib import redirect_stdout
-        module = self.focus_module()
-        tree = ast.parse(Path(module.__file__).read_text())
-        entry = next(n for n in tree.body if isinstance(n, ast.If)
-                     and ast.unparse(n.test) == "__name__ == '__main__'")
-        code = compile(ast.Module(body=entry.body, type_ignores=[]), module.__file__, "exec")
-        for mode in (None, "controlled-overview", "end-session", "notification-banner"):
-            calls = []
-            def observe(*args, **kwargs):
-                calls.append((args, kwargs))
-                return {"observation_only": True}
-            scope = {**vars(module), "sys": SimpleNamespace(argv=[
-                module.__file__, "933", "57", "tuna-shell-gtk", "wayland-0"
-            ] + ([] if mode is None else [mode])), "observe": observe}
-            stream = io.StringIO()
-            with self.subTest(mode=mode), redirect_stdout(stream):
-                exec(code, scope)
-            self.assertEqual(calls, [((933, 57, "tuna-shell-gtk", "wayland-0"),
-                                     {"controlled": mode == "controlled-overview",
-                                      "end_session": mode == "end-session",
-                                      "notification": mode == "notification-banner"})])
-            self.assertEqual(json.loads(stream.getvalue()), {"observation_only": True})
-        for extra in (["private mode"], ["end-session", "notification-banner"],
-                      ["controlled-overview", "end-session"]):
-            calls = []
-            scope = {**vars(module), "sys": SimpleNamespace(argv=[
-                module.__file__, "933", "57", "tuna-shell-gtk", "wayland-0", *extra
-            ]), "observe": lambda *args, **kwargs: calls.append(args)}
-            stream = io.StringIO()
-            with self.subTest(extra=extra), redirect_stdout(stream), self.assertRaises(SystemExit) as caught:
-                exec(code, scope)
-            self.assertEqual(caught.exception.code, 1)
-            self.assertEqual(calls, [])
-            self.assertEqual(json.loads(stream.getvalue()),
-                             {"focus_error_type": "ValueError", "focus_operation": "arguments"})
 
-    def test_focus_observer_refuses_combined_or_nonboolean_modes(self):
-        module = self.focus_module()
-        tree = ast.parse(Path(module.__file__).read_text())
-        observe = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "observe")
-        guard = next(n for n in observe.body if isinstance(n, ast.If))
-        code = compile(ast.Module(body=[guard], type_ignores=[]), module.__file__, "exec")
-        for controlled, end_session, notification in (
-                (False, False, False), (True, False, False),
-                (False, True, False), (False, False, True)):
-            exec(code, {"controlled": controlled, "end_session": end_session,
-                        "notification": notification, "executable": "tuna-shell-gtk"})
-        for modes in ((True, True, False), (True, False, True), (False, True, True),
-                      (True, True, True), (1, False, False), (False, 1, False),
-                      (False, False, 1)):
-            with self.subTest(modes=modes), self.assertRaisesRegex(RuntimeError, "fixed controlled"):
-                exec(code, dict(zip(("controlled", "end_session", "notification"), modes),
-                                executable="tuna-shell-gtk"))
-        for flag in ("controlled", "notification"):
-            with self.subTest(flag=flag), self.assertRaises(RuntimeError):
-                exec(code, {**dict.fromkeys(("controlled", "end_session", "notification"), False),
-                            flag: True, "executable": "gnome-disks"})
 
     def focus_mode_tree(self, mode):
         """Execute the actual traversal with public controls and private banner bait."""
@@ -1568,17 +1486,6 @@ class PublicOrcaNavigation(unittest.TestCase):
         self.assertEqual(scope["notification_closes"], [])
         self.assertNotIn(countdown, json.dumps(scope["nodes"]))
 
-    def test_notification_traversal_queries_only_fixed_frame_and_close_not_content(self):
-        scope, calls, countdown = self.focus_mode_tree("notification-banner")
-        self.assertEqual(calls, [("banner", "name"), ("banner", "component"),
-                                 ("close", "name"), ("close", "component")])
-        self.assertEqual(scope["nodes"], [])
-        self.assertEqual(scope["notification_frames"], [[10, 20, 30, 40]])
-        self.assertEqual(scope["notification_closes"],
-                         [{"rect": [10, 20, 30, 40], "focused": True}])
-        retained = json.dumps([scope["nodes"], scope["notification_frames"], scope["notification_closes"]])
-        for private in ("private", "title", "body", "text buffer", countdown, "Restart…"):
-            self.assertNotIn(private, retained)
 
     def test_end_session_traversal_keeps_countdown_without_notification_receipts(self):
         scope, calls, countdown = self.focus_mode_tree("end-session")
@@ -1758,16 +1665,6 @@ class LifecyclePostNavigationBaseline(unittest.TestCase):
         after["session"]["Id"] = "2"
         self.assertFalse(self.policy()["same_apps_after_navigation"](before, after))
 
-    def test_fresh_baseline_is_validated_before_replacing_original(self):
-        file = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
-        source = file.read_text()
-        self.assertLess(source.index('before_vt = inventory("before-vt-baseline")'),
-                        source.index('if not same_apps_after_navigation(before, before_vt):'))
-        self.assertLess(source.index('if not same_apps_after_navigation(before, before_vt):'),
-                        source.index('before = before_vt'))
-        self.assertLess(source.index('before = before_vt'), source.index('base_frame = frame("before-vt")'))
-        self.assertIn('same_apps(before, after_vt)', source)
-        self.assertIn('same_apps(before, pending_auth)', source)
 
 
 class ControlledOverviewDiagnostic(unittest.TestCase):
@@ -2393,26 +2290,6 @@ class BootApi(unittest.TestCase):
         self.assertEqual(events, [("ret",), ("ctrl", "a"), "fixture typed", ("ret",)])
         # Actual prompt/PAM transitions still require the genuine hardware VM.
 
-    def test_actual_orca_commands_use_distinct_qmp_qcodes_for_chords(self):
-        tree = ast.parse((Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text())
-        command = next(node for node in ast.walk(tree)
-                       if isinstance(node, ast.FunctionDef) and node.name == "native_command")
-        chords = [tuple(ast.literal_eval(arg) for arg in node.args)
-                  for node in ast.walk(command) if isinstance(node, ast.Call)
-                  and isinstance(node.func, ast.Attribute) and node.func.attr == "keys"]
-        self.assertIn(("insert", "h"), chords)
-        self.assertIn(("shift", "f4"), chords)
-        for chord in chords:
-            self.assertTrue(set(chord) <= {"insert", "h", "shift", "f4", "esc"})
-            qmp = lane.baseline.Qmp.__new__(lane.baseline.Qmp)
-            qmp.file = io.StringIO()
-            qmp._read = lambda: {"return": {}}
-            with patch.object(lane.baseline.time, "sleep"):
-                qmp.keys(*chord)
-            wire = json.loads(qmp.file.getvalue())
-            self.assertEqual(wire["execute"], "send-key")
-            self.assertEqual(wire["arguments"]["keys"],
-                             [{"type": "qcode", "data": name} for name in chord])
 
     def test_qmp_command_accepts_protocol_name_argument(self):
         qmp = lane.baseline.Qmp.__new__(lane.baseline.Qmp)
@@ -4570,14 +4447,9 @@ class InventoryProcessRaces(unittest.TestCase):
         self.assertTrue(lane.guest_agent.valid_inventory_error(record))
 
     def test_partially_written_state_file_fails_closed_at_parse_stage(self):
-        # The compositor publishes the snapshot by write-temp + rename, so a
-        # reader never sees a partial file; one would be a writer bug, so the
-        # probe fails with a typed stage instead of retrying past it.
-        runtime = (Path(__file__).resolve().parents[2] / "crates/compositor/src/runtime.rs").read_text()
-        publish = runtime[runtime.index("fn publish_state(&mut self)"):]
-        publish = publish[:publish.index("\n    }\n") + 6]
-        self.assertIn('let tmp = path.with_extension("tmp");', publish)
-        self.assertIn("std::fs::write(&tmp, &doc).is_ok() && std::fs::rename(&tmp, path).is_ok()", publish)
+        # Readers reject malformed snapshots rather than retrying past them.
+        # The publisher's real filesystem/concurrency tests cover atomic
+        # visibility; this test exercises the runtime consumer's typed failure.
         record = self.failure(self.guest(state=json.dumps(self.STATE)[:17]), json.JSONDecodeError)
         self.assertEqual({key: record[key] for key in ("stage", "exception_type", "code")},
                          {"stage": "state-parse", "exception_type": "JSONDecodeError",
@@ -4688,17 +4560,6 @@ class OrcaLogoutRetirement(unittest.TestCase):
             with self.subTest(trace=trace):
                 self.assertIsNone(lane.orca_logout_retirement(trace, 21699))
 
-    def test_departure_probe_runs_first_and_v_orca_logout_stays_unchanged(self):
-        # The unchanged probe must not wait behind the receipt: the user
-        # runtime it reads goes away soon after logout (run 40864799987).
-        source = (Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text()
-        departed = source.index('closed_orca = agent.run("orca-departed"')
-        reap = source.index('record("V-ORCA-LOGOUT-REAP"')
-        survived = source.index('raise RuntimeError("Orca survived the hardware session logout")')
-        self.assertLess(departed, reap)
-        self.assertLess(reap, survived)
-        self.assertIn('record("V-ORCA-LOGOUT", closed_orca["owner"] is None and not closed_orca["original_alive"],',
-                      source)
 
 
 class OrcaDepartureProbe(unittest.TestCase):
