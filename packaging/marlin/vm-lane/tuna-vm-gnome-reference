@@ -1292,7 +1292,7 @@ def prepare(args, directory, deadline, cache):
                  [APPS[1], 'network']):
         deadline.remaining()
         child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, env=environment, user=UID,
+                                 stderr=subprocess.PIPE, env=environment, user=UID,
                                  group=owner.pw_gid, extra_groups=[], start_new_session=True)
         children.append(child)
         secondary = argv == [APPS[0], '--new-window', fixture['directories'][1]]
@@ -1331,7 +1331,13 @@ def prepare(args, directory, deadline, cache):
             for child in children:
                 status = child.poll()
                 if status not in (None, 0):
-                    raise RuntimeError('fixture launcher failed: ' + str(status)) from error
+                    try:
+                        _, err = child.communicate(timeout=5)
+                    except Exception:
+                        err = b''
+                    tail = (err or b'')[-512:].decode('utf-8', errors='replace')
+                    raise RuntimeError('fixture launcher failed: %s status %s stderr %r' % (
+                        child.args[0] if child.args else '<unknown>', status, tail)) from error
             if deadline.end - time.monotonic() < 0.2:
                 raise RuntimeError('actual fixture observation never became ready: ' + str(error)) from error
             time.sleep(min(0.1, deadline.remaining()))
