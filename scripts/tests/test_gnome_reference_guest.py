@@ -1441,24 +1441,47 @@ class FixtureLaunch(unittest.TestCase):
         self.assertEqual(argv[0], [GUEST.APPS[1], 'network'])
         self.assertEqual(argv[1][:2], [GUEST.APPS[0], '--new-window'])
         self.assertEqual(argv[2][:2], [GUEST.APPS[0], '--new-window'])
+        self.assertEqual(argv[3], [GUEST.APPS[1], 'network'])
         self.assertIn('first', argv[1][2])
         self.assertIn('second', argv[2][2])
         self.assertEqual(launched[0][1]['env']['XDG_CURRENT_DESKTOP'], 'Tuna:GNOME')
+        self.assertEqual(launched[3][1]['env']['XDG_CURRENT_DESKTOP'], 'Tuna:GNOME')
         self.assertNotIn('XDG_CURRENT_DESKTOP', launched[1][1]['env'])
         self.assertNotIn('XDG_CURRENT_DESKTOP', launched[2][1]['env'])
         for _, kwargs in launched:
             self.assertIs(kwargs['stderr'], GUEST.subprocess.PIPE)
-        self.assertEqual(len(drains), 3)
+        self.assertEqual(len(drains), 4)
         self.assertTrue(all(drain.started for drain in drains))
         # First Nautilus still waits for its own window before the forward.
         self.assertEqual(GUEST.public_observation.call_count, 2)
         loop.assert_called_once()
         roles = [entry['role'] for entry in claim['fixture']['launches']]
-        self.assertEqual(roles, ['settings', 'files-first', 'files-second'])
-        self.assertEqual([entry['pid'] for entry in claim['fixture']['launches']], [5000, 5001, 5002])
+        self.assertEqual(roles, ['settings', 'files-first', 'files-second', 'settings-raise'])
+        self.assertEqual([entry['pid'] for entry in claim['fixture']['launches']], [5000, 5001, 5002, 5003])
         # Second Nautilus forwards; Settings and first Nautilus are principals.
+        # The transient raise never becomes an owned principal.
         self.assertEqual(len(claim['fixture']['processes']), 2)
         self.assertEqual(len(claim['fixture']['launchers']), 1)
+
+    def test_prepare_raise_failure_is_loud(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claim, launched, Child, FakePath = self._prepare_fixture()
+            self._prepare_mocks(tmp, claim, launched, Child, FakePath)
+            forwarded = GUEST.subprocess.Popen.side_effect
+            spawned = []
+
+            def spawn(argv, **kwargs):
+                child = forwarded(argv, **kwargs)
+                spawned.append(child)
+                if len(spawned) == 4:
+                    child.wait = lambda timeout=None: 1
+                return child
+
+            GUEST.subprocess.Popen.side_effect = spawn
+            with self.assertRaises(RuntimeError) as failure:
+                GUEST.prepare({'profile': 'gnome', 'nonce': NONCE}, Path(tmp),
+                              GUEST.Deadline(3), {})
+            self.assertIn('failed to raise its window', str(failure.exception))
 
     def test_prepare_failure_carries_launches_and_stderr_tails(self):
         with tempfile.TemporaryDirectory() as tmp:

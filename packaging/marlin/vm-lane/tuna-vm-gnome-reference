@@ -1594,6 +1594,26 @@ def prepare(args, directory, deadline, cache):
                 if matching:
                     break
                 time.sleep(min(0.1, deadline.remaining()))
+    # Settings launched first for warmup, so the last Nautilus owns focus.
+    # Re-invoking the single instance raises its existing Network window
+    # through ordinary application activation (no input injection), like
+    # the Nautilus forward. The raise is transient: recorded for launch
+    # diagnostics only, never as an owned principal.
+    deadline.remaining()
+    raise_child = subprocess.Popen(
+        [APPS[1], 'network'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env=dict(environment, XDG_CURRENT_DESKTOP='Tuna:GNOME'),
+        user=UID, group=owner.pw_gid, extra_groups=[], start_new_session=True)
+    children.append(raise_child)
+    raise_drain = StderrDrain(raise_child.stderr)
+    drains['settings-raise'] = raise_drain
+    raise_drain.start()
+    fixture['launches'].append({'role': 'settings-raise', 'pid': raise_child.pid,
+                                'launched_monotonic_ns': time.monotonic_ns()})
+    save(directory, 'claim.json', claim)
+    if raise_child.wait(timeout=deadline.remaining()) != 0:
+        raise RuntimeError('Settings re-invocation failed to raise its window')
     # Existing app process descendants must be the recorded original principals;
     # no process discovered by a name-only scan gains cleanup ownership.
     try:
