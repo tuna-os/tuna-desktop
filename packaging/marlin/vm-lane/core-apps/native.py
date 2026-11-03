@@ -3,6 +3,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -65,6 +66,89 @@ def _ime_summary(log_rows, messages):
             'observer_error_details': details[:3]}
 
 
+IBUS_DAEMON_EXE = '/usr/bin/ibus-daemon'
+IBUS_BUS_NAME = 'org.freedesktop.IBus'
+IBUS_DAEMON_PACKAGE = 'ibus'
+
+
+class ForeignPreeditSender(RuntimeError):
+    """An IBus preedit signal arrived from someone other than the daemon."""
+
+
+def _proc_exe_pids(exe, uid):
+    """PIDs whose resolved executable and owner match exactly.
+
+    Vanished processes are normal mid-scan; only exact resolved-exe and
+    owner matches qualify, never bare process names.
+    """
+    found = []
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.stat().st_uid != uid:
+                continue
+            if str((entry / 'exe').resolve(strict=True)) != exe:
+                continue
+        except (FileNotFoundError, PermissionError, RuntimeError):
+            continue
+        found.append(int(entry.name))
+    return sorted(found)
+
+
+def admit_ibus_daemon(context):
+    """Admit the single original-user IBus daemon principal.
+
+    The IBus bus implements no GetConnectionUnixProcessID, so the daemon
+    cannot be identified through bus credentials; it is admitted
+    out-of-band instead: exactly one uid-owned process with the exact
+    daemon executable, strictly identified, owned by the ibus package.
+    Spoofing the daemon name requires replacing this process, which the
+    per-observation liveness check detects.
+    """
+    pids = _proc_exe_pids(IBUS_DAEMON_EXE, context.uid)
+    if len(pids) != 1:
+        raise RuntimeError('original IBus daemon is not unique: %d processes' % len(pids))
+    identity = process(pids[0], context.uid)
+    if identity['exe'] != IBUS_DAEMON_EXE:
+        raise RuntimeError('original IBus daemon executable changed during admission')
+    package = context.command(['pacman', '-Qqo', IBUS_DAEMON_EXE]).stdout.strip()
+    if package != IBUS_DAEMON_PACKAGE:
+        raise RuntimeError('IBus daemon not owned by ibus package: ' + package)
+    return identity | {'package': package}
+
+
+def check_preedit_sender(value, ibus_owner):
+    """Require a preedit signal to come from the admitted daemon owner."""
+    if value.get('sender') != ibus_owner:
+        raise ForeignPreeditSender('foreign IBus preedit sender: ' + repr(value.get('sender')))
+
+
+def check_preedit_destinations(messages):
+    """Require one composing client per fixture observation.
+
+    Destination unique names cannot be mapped to PIDs on the IBus bus;
+    unanimity plus compositor focus attestation plus typed-input and
+    candidate-content agreement is the actor binding. A second
+    simultaneous composer fails loudly instead of misattributing.
+    """
+    destinations = {message.get('destination') for message in messages}
+    if len(destinations) > 1:
+        raise RuntimeError('multiple simultaneous IBus composers: '
+                           + repr(sorted(destinations, key=repr)))
+
+
+def ibus_owner_binding(log_rows):
+    """The daemon unique name bound at observer admission."""
+    ready = [row for row in log_rows if row.get('ready') is True and row.get('kind') == 'ime']
+    if len(ready) != 1:
+        raise RuntimeError('original IBus observer admission is not unique')
+    owner = ready[0].get('ibus_owner')
+    if not isinstance(owner, str) or not re.fullmatch(r':\d+\.\d+', owner):
+        raise RuntimeError('original IBus observer admission lacks daemon name binding')
+    return owner
+
+
 def _stop(context, kind):
     state = json.loads(RUN_STATE.read_text())
     original = state[kind + '_monitor']
@@ -101,7 +185,11 @@ def monitor(kind, arguments):
                  "type='signal',interface='org.freedesktop.IBus.InputContext',member='UpdatePreeditTextWithMode'"]
     flags = Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION
     bus = Gio.DBusConnection.new_for_address_sync(address, flags, None, None)
-    credentials = Gio.DBusConnection.new_for_address_sync(address, flags, None, None)
+    # Only the session bus (portal) can map names to peer credentials; the
+    # IBus bus answers no credential queries, so it gets no second channel.
+    credentials = None
+    if kind == 'portal':
+        credentials = Gio.DBusConnection.new_for_address_sync(address, flags, None, None)
 
     def unpack(value):
         if isinstance(value, GLib.Variant):
@@ -119,21 +207,27 @@ def monitor(kind, arguments):
                                     Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
         return process(pid, os.geteuid())
     count = 0
+    ibus_owner = None
 
     def collect(value):
         # GIO filters share the message worker: synchronous credential queries
         # here run only after the filter returned, on the main-loop thread.
         try:
-            value['sender_identity'] = owner(value['sender'])
             if kind == 'ime':
-                destination = value['destination']
-                if destination is None:
+                # The IBus bus cannot map names to PIDs, so per-message
+                # credential lookups are impossible here; the sender is
+                # bound to the admitted daemon owner instead, and a foreign
+                # sender retires the observer fail-closed.
+                check_preedit_sender(value, ibus_owner)
+                if value['destination'] is None:
                     raise RuntimeError('real IBus preedit has no original client destination')
-                value['destination_identity'] = owner(destination)
-                target = value['destination_identity']
-                if target['pid'] != arguments['actor']['pid'] and target['exe'] != '/usr/bin/tuna-ibus-bridge':
-                    return False
+            else:
+                value['sender_identity'] = owner(value['sender'])
             print(json.dumps(value), flush=True)
+        except ForeignPreeditSender as error:
+            print(json.dumps({'observer_error_type': type(error).__name__,
+                              'observer_error_detail': str(error)[:500]}), flush=True)
+            os._exit(5)
         except Exception as error:
             print(json.dumps({'observer_error_type': type(error).__name__,
                               'observer_error_detail': str(error)[:500]}), flush=True)
@@ -170,11 +264,24 @@ def monitor(kind, arguments):
             bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
                           'AddMatch', GLib.Variant('(s)', (rule + ",eavesdrop='true'",)), None,
                           Gio.DBusCallFlags.NONE, 2000, None)
+        # ... and without GetConnectionUnixProcessID, so sender PIDs are
+        # unresolvable; bind the daemon by its owned well-known name once,
+        # at admission, instead of per-message credential lookups.
+        ibus_owner = bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus',
+                                   'org.freedesktop.DBus', 'GetNameOwner',
+                                   GLib.Variant('(s)', (IBUS_BUS_NAME,)),
+                                   GLib.VariantType.new('(s)'),
+                                   Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+        if not isinstance(ibus_owner, str) or not re.fullmatch(r':\d+\.\d+', ibus_owner):
+            raise RuntimeError('original IBus daemon owns no unique bus name')
     else:
         bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus.Monitoring',
                       'BecomeMonitor', GLib.Variant('(asu)', (rules, 0)), None,
                       Gio.DBusCallFlags.NONE, 2000, None)
-    print(json.dumps({'ready': True, 'kind': kind, 'uid': os.geteuid()}), flush=True)
+    ready = {'ready': True, 'kind': kind, 'uid': os.geteuid()}
+    if kind == 'ime':
+        ready['ibus_owner'] = ibus_owner
+    print(json.dumps(ready), flush=True)
     GLib.MainLoop().run()
 
 
@@ -497,10 +604,13 @@ def dispatch(operation, arguments, context):
             if previous is not True:
                 raise RuntimeError('previous real IBus monitor not retired')
             IME_LOG.unlink()
+        daemon = admit_ibus_daemon(context)
         state = json.loads(RUN_STATE.read_text())
         state['ime_retired'] = False
+        state['ime_daemon'] = {key: daemon[key] for key in
+                               ('pid', 'uid', 'start_ticks', 'exe', 'exe_sha256', 'cgroup')}
         RUN_STATE.write_text(json.dumps(state))
-        return _spawn(context, 'ime', arguments)
+        return {'monitor': _spawn(context, 'ime', arguments), 'daemon': daemon}
     if operation == 'ime-monitor-stop':
         result = _stop(context, 'ime')
         state = json.loads(RUN_STATE.read_text())
@@ -511,15 +621,36 @@ def dispatch(operation, arguments, context):
         actor = arguments['actor']
         process(actor['pid'], context.uid)
         log_rows = _rows(IME_LOG)
+        admitted = json.loads(RUN_STATE.read_text())
+        # Liveness first: a replaced daemon invalidates the name binding,
+        # and a departed observer leaves only stale rows.
+        try:
+            daemon = admitted.get('ime_daemon')
+            daemon_alive = daemon is not None and process(daemon['pid'], context.uid) == daemon
+        except FileNotFoundError:
+            daemon_alive = False
+        if not daemon_alive:
+            raise RuntimeError('original IBus daemon changed or departed')
+        try:
+            monitor_state = admitted.get('ime_monitor')
+            monitor_alive = (monitor_state is not None
+                             and process(monitor_state['pid'], context.uid) == monitor_state)
+        except FileNotFoundError:
+            monitor_alive = False
+        if not monitor_alive:
+            raise RuntimeError('original IBus bus observer departed or changed')
+        ibus_owner = ibus_owner_binding(log_rows)
         messages = [row for row in log_rows if row.get('member') in
                     ('UpdatePreeditText', 'UpdatePreeditTextWithMode')]
+        foreign = [row for row in messages if row.get('sender') != ibus_owner]
+        if foreign:
+            raise RuntimeError('foreign IBus preedit sender observed: ' + repr(foreign[0].get('sender')))
+        check_preedit_destinations(messages)
         summary = _ime_summary(log_rows, messages)
         latest = messages[-1] if messages else None
         visible = (latest is not None and len(latest['body']) >= 3 and latest['body'][2] is True
                    and isinstance(latest['body'][0], list) and len(latest['body'][0]) >= 3
                    and latest['body'][0][0] == 'IBusText' and bool(latest['body'][0][2]))
-        if latest is not None and latest['sender_identity']['exe'] != '/usr/bin/ibus-daemon':
-            raise RuntimeError('observed preedit is not from the actual original-user IBus daemon')
         from guest import desktop
         shell = desktop('shell-actor', {}, context)
         tree = desktop('tree', {'actor': shell}, context)
@@ -534,6 +665,9 @@ def dispatch(operation, arguments, context):
                 'preedit': latest['body'][0][2] if visible else None,
                 'real_preedit_message': latest,
                 'ime_log_summary': summary,
+                'ibus_owner': ibus_owner,
+                'destination': messages[-1].get('destination') if messages else None,
+                'daemon': daemon,
                 'candidates': candidates, 'shell_actor': shell, 'actual_shell_tree': tree,
                 'actor': actor}
     if operation == 'lock-ui':
