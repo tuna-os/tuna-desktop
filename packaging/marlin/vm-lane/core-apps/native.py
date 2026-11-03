@@ -500,8 +500,11 @@ def dispatch(operation, arguments, context):
     if operation == 'ime-state':
         actor = arguments['actor']
         process(actor['pid'], context.uid)
-        messages = [row for row in _rows(IME_LOG) if row.get('member') in
+        log_rows = _rows(IME_LOG)
+        messages = [row for row in log_rows if row.get('member') in
                     ('UpdatePreeditText', 'UpdatePreeditTextWithMode')]
+        summary = {'rows': len(log_rows), 'preedit_rows': len(messages),
+                   'observer_errors': len([row for row in log_rows if 'observer_error_type' in row])}
         latest = messages[-1] if messages else None
         visible = (latest is not None and len(latest['body']) >= 3 and latest['body'][2] is True
                    and isinstance(latest['body'][0], list) and len(latest['body'][0]) >= 3
@@ -521,6 +524,7 @@ def dispatch(operation, arguments, context):
         return {'preedit_visible': visible,
                 'preedit': latest['body'][0][2] if visible else None,
                 'real_preedit_message': latest,
+                'ime_log_summary': summary,
                 'candidates': candidates, 'shell_actor': shell, 'actual_shell_tree': tree,
                 'actor': actor}
     if operation == 'lock-ui':
