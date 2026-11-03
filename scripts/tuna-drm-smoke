@@ -1081,6 +1081,16 @@ grep -q "drm-lease: [0-9][0-9]* lessee .* disappeared" "$LEASE_LOG" ||
     fail D-LEASE "the compositor did not notice the lessee go"
 # An actual vkms connector state transition, not a synthetic compositor event.
 # Keep the leased native FD open while forcing the owned emulated connector off.
+# vkms sysfs-forced status changes emit no uevents (verified: udevadm monitor
+# stays silent across off/detect); real hardware emits a change event on the
+# card. Synthesize exactly that card event so the compositor's real udev
+# hotplug path fires for the actual connector state change.
+fire_card_change() {
+    sudo udevadm trigger --action=change "/sys/class/drm/$(basename "$CARD")" >/dev/null ||
+        fail D-LEASE "could not synthesize the card change event for $1"
+    sudo udevadm settle --timeout=10 ||
+        fail D-LEASE "udev did not settle the synthesized change event for $1"
+}
 lease_probe --lease "$CONNECTOR" --expect-revoke >"$ARTIFACTS/lease-unplug.jsonl" &
 CLIENT_PID=$!
 end=$(($(date +%s) + 5))
@@ -1092,6 +1102,7 @@ done
 LEASE_FORCED_STATUS="/sys/class/drm/$(basename "$CARD")-$CONNECTOR/status"
 printf 'off\n' | sudo tee "$LEASE_FORCED_STATUS" >/dev/null ||
     fail D-LEASE "could not unplug the owned vkms connector"
+fire_card_change "unplug"
 wait "$CLIENT_PID" || fail D-LEASE "actual emulated connector unplug did not revoke its lease FD"
 CLIENT_PID=""
 jq -se '[.[].event] == ["devices", "leased", "withdrawn", "unplug-revoked"]' \
@@ -1099,6 +1110,7 @@ jq -se '[.[].event] == ["devices", "leased", "withdrawn", "unplug-revoked"]' \
     fail D-LEASE "unexpected actual connector unplug lifecycle"
 printf 'detect\n' | sudo tee "$LEASE_FORCED_STATUS" >/dev/null ||
     fail D-LEASE "could not restore owned vkms connector detection"
+fire_card_change "restore"
 LEASE_FORCED_STATUS=""
 lease_probe --await "$CONNECTOR" >"$ARTIFACTS/lease-replug.jsonl" ||
     fail D-LEASE "actual restored vkms connector was not re-offered"
