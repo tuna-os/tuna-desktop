@@ -1062,6 +1062,37 @@ class ControlledObservationEvidence(unittest.TestCase):
         self.assertIn('last: ObservationTimeout: expired', str(failed.exception))
         self.assertNotIn('first:', str(failed.exception))
 
+    def test_setup_deadline_reports_retained_first_state(self):
+        deadline = GUEST.Deadline(25)
+        calls = []
+
+        def attempt():
+            calls.append(1)
+            if len(calls) == 1:
+                raise GUEST.FixtureNotReady('tab inventory []')
+            raise TimeoutError('guest operation absolute monotonic deadline expired')
+
+        with mock.patch.object(GUEST.time, 'sleep'):
+            with self.assertRaises(RuntimeError) as failed:
+                GUEST.snapshot_until_ready(attempt, [], deadline)
+        message = str(failed.exception)
+        self.assertIn('first: FixtureNotReady: tab inventory []', message)
+        self.assertIn('last: TimeoutError: guest operation absolute monotonic deadline expired', message)
+        self.assertIsInstance(failed.exception.__cause__, TimeoutError)
+
+    def test_setup_deadline_without_state_reports_last(self):
+        deadline = GUEST.Deadline(25)
+
+        def attempt():
+            raise TimeoutError('guest operation absolute monotonic deadline expired')
+
+        with mock.patch.object(GUEST.time, 'sleep'):
+            with self.assertRaises(RuntimeError) as failed:
+                GUEST.snapshot_until_ready(attempt, [], deadline)
+        self.assertIn('last: TimeoutError: guest operation absolute monotonic deadline expired',
+                      str(failed.exception))
+        self.assertNotIn('first:', str(failed.exception))
+
     def test_inactive_settings_counts_as_state_not_timeout(self):
         deadline = GUEST.Deadline(25)
         deadline.end = 0
