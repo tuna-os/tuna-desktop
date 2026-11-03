@@ -1043,7 +1043,11 @@ def network_panel_evidence(window):
         evidence.append({'selected_object': {key: selected[key] for key in keys},
                          'label_objects': [{key: label[key] for key in keys} for label in labels]})
     if not evidence:
-        raise FixtureNotReady('original Settings descendants do not expose selected visible Network panel')
+        tabs = [(n['role_name'], n['name'][:40], sorted(set(n['states']) & {1, 23, 25, 30}))
+                for n in flatten(window['children'])
+                if n['role_name'] in ('list item', 'page tab', 'tree item', 'radio button')][:12]
+        raise FixtureNotReady('original Settings descendants do not expose selected visible Network panel; '
+                              'tab inventory ' + repr(tabs))
     return evidence
 
 
