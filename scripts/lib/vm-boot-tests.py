@@ -4297,13 +4297,46 @@ class InventoryProcessRaces(unittest.TestCase):
 
     def guest(self, state=None, call=None):
         uid = os.getuid()
+        class SnapshotProcPath:
+            """os.PathLike proxy with snapshot, pid-sorted /proc iteration.
+
+            Readdir order and mid-scan birth visibility differ across
+            filesystems, but race hooks address (pid, readlink-count) pairs
+            that only model the designed interleaving under one order.
+            Materialize each fake-/proc-root iterator at creation, numeric
+            pids ascending, so every environment replays the same scan.
+            """
+            def __init__(self, real, root=False):
+                self._real = real
+                self._root = root
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+            def __fspath__(self):
+                return os.fspath(self._real)
+            def __str__(self):
+                return str(self._real)
+            def __eq__(self, other):
+                mine = self._real
+                theirs = other._real if isinstance(other, SnapshotProcPath) else other
+                return mine == theirs
+            def __hash__(self):
+                return hash(self._real)
+            def __truediv__(self, other):
+                return SnapshotProcPath(self._real / other)
+            def iterdir(self):
+                entries = list(self._real.iterdir())
+                if not self._root:
+                    return (SnapshotProcPath(e) for e in entries)
+                entries.sort(key=lambda e: (not e.name.isdigit(),
+                                            int(e.name) if e.name.isdigit() else e.name))
+                return (SnapshotProcPath(e) for e in entries)
         def proc_path(path):
             path = str(path)
             if path == "/proc":
-                return self.root / "proc"
+                return SnapshotProcPath(self.root / "proc", root=True)
             if path.startswith("/proc/"):
-                return self.root / "proc" / path[len("/proc/"):]
-            return Path(path)
+                return SnapshotProcPath(self.root / "proc" / path[len("/proc/"):])
+            return SnapshotProcPath(Path(path))
         def readlink(path):
             target = os.readlink(path)
             pid = int(Path(path).parent.name)
