@@ -1730,7 +1730,7 @@ jobs:
           sudo podman run --rm localhost/marlin-tuna-vm:ci sh -c 'bootc --version; ls -ld /home; ls /usr/lib/bootc/install/ && cat /usr/lib/bootc/install/*' || true
           df -h / /mnt
       - name: Bind installed acceptance to the original package and immutable final image
-        if: matrix.profile == 'lifecycle'
+        if: matrix.profile == 'lifecycle' || matrix.profile == 'explicit-sync'
         run: |
           image_id=$(cat /mnt/vm/image-id)
           owned_container="tuna-strip-inspect-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
