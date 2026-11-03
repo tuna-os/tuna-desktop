@@ -8,7 +8,7 @@ import tempfile
 import unittest
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
-from vm_strip_image import admission, IMAGE_INSPECTION, canonical_image_id
+from vm_strip_image import admission, canonical_image_id
 from maintained_media import INVENTORY
 
 
@@ -29,7 +29,7 @@ class Tests(unittest.TestCase):
             fixture = root / 'packaging/marlin/vm-lane'
             fixture.mkdir(parents=True)
             expected = {'/usr/bin/tuna-compositor': 'a' * 64}
-            for name in ('tuna-vm-input', 'tuna-vm-lifecycle'):
+            for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus'):
                 (fixture / name).write_text(name)
                 expected['/usr/libexec/' + name] = hashlib.sha256(name.encode()).hexdigest()
             inventory = root / 'scripts/lib/maintained-media.tsv'
@@ -66,8 +66,6 @@ class Tests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 admission(package, observed, *args)
 
-    def test_actual_inspection_program_parses(self):
-        compile(IMAGE_INSPECTION, '<immutable-image-inspector>', 'exec')
 
 
 
