@@ -70,6 +70,7 @@ class NativeDesktop:
         except Exception as error:
             state = getattr(agent, 'guest_exec_state', 'none')
             failure = {'request': request, 'error_type': type(error).__name__,
+                       'message': str(error)[:2000],
                        'pending_guest_pid': getattr(agent, 'pending_guest_pid', None),
                        'guest_exec_state': state, 'not_replayed': True,
                        'installed_signed_release_qualified': False}

@@ -172,7 +172,9 @@ def valid_inventory_error(value):
 # stdout; any other action's output (and every stderr) stays private.
 def valid_autotz_error(value):
     required = {"domain", "operation", "exception_type", "sites"}
-    if type(value) is not dict or not required <= set(value) or not set(value) <= required | {"errno", "returncode"}:
+    if type(value) is not dict or not required <= set(value) or not set(value) <= required | {"errno", "returncode", "message"}:
+        return False
+    if "message" in value and (type(value["message"]) is not str or len(value["message"]) > 2000):
         return False
     if value["domain"] not in ("autotz", "desktop", "arguments"):
         return False

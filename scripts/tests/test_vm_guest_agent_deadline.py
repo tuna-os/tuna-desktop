@@ -227,8 +227,11 @@ class Tests(unittest.TestCase):
                  'exception_type': 'RuntimeError',
                  'sites': [{'module': 'autotz.py', 'line': 42, 'function': 'dispatch'}]}
         self.assertTrue(valid_autotz_error(value))
-        for key, invalid in (('message', 'private'), ('operation', '../private'),
-                             ('sites', value['sites'] * 5), ('errno', True)):
+        self.assertTrue(valid_autotz_error({**value, 'message': 'bounded guest detail'}))
+        self.assertTrue(valid_autotz_error({**value, 'message': 'x' * 2000}))
+        for key, invalid in (('traceback', 'private'), ('operation', '../private'),
+                             ('sites', value['sites'] * 5), ('errno', True),
+                             ('message', 'x' * 2001), ('message', 42)):
             with self.subTest(key=key):
                 self.assertFalse(valid_autotz_error({**value, key: invalid}))
 
