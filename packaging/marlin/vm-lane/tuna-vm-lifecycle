@@ -459,8 +459,7 @@ def inventory():
         stage = "state-parse"
         state = json.loads(text)
         stage = "pam-snapshot"
-        _, helpers = classify_pam_helpers(pam_process_snapshot())
-        helper_identities = {row["pid"]: public_auth_identity(row) for row in helpers}
+        desktop, _ = classify_pam_helpers(pam_process_snapshot())
         stage = "process-scan"
         processes = []
         for path in pathlib.Path("/proc").iterdir():
@@ -469,13 +468,22 @@ def inventory():
             try:
                 uid = path.stat().st_uid
                 executable = pathlib.Path(os.readlink(path / "exe")).name
-                if int(path.name) in helper_identities:
-                    observed_helper = auth_process(int(path.name))
-                    # The exact private helper this scan classified, still
-                    # itself or since departed, is never an owned compositor.
-                    if observed_helper is None or (observed_helper["_private"]
-                            and public_auth_identity(observed_helper) == helper_identities[int(path.name)]):
+                if executable == COMPOSITOR and desktop is not None:
+                    observed = auth_process(int(path.name))
+                    if observed is None:
                         continue
+                    # A fresh lock conversation can spawn after pam-snapshot.
+                    # Classify this scan's row, not an earlier list of helper
+                    # PIDs, and bind its parent to the still-live original
+                    # desktop (including start time and executable inode).
+                    if observed["_private"]:
+                        parent = auth_process(desktop["pid"])
+                        if (parent is not None and not parent["_marked"]
+                                and public_auth_identity(parent) == public_auth_identity(desktop)
+                                and classify_pam_helpers([parent, observed])[1]):
+                            continue
+                    uid = observed["uid"]
+                    executable = observed["executable"]
                 if uid != OWNER.pw_uid or executable not in {
                     COMPOSITOR, SHELL_GTK, "gnome-disks",
                     "gnome-system-monitor", "nautilus",
