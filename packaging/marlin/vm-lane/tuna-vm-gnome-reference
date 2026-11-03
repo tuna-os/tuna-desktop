@@ -1291,8 +1291,15 @@ def prepare(args, directory, deadline, cache):
                  [APPS[0], '--new-window', fixture['directories'][1]],
                  [APPS[1], 'network']):
         deadline.remaining()
+        child_env = environment
+        if argv[0] == APPS[1]:
+            # gnome-control-center refuses to start unless the session
+            # advertises GNOME or Unity. The Tuna session lists GNOME as a
+            # compatible desktop for this fixture (same precedent as the GTK
+            # portal proofs); the observed Settings window is unaffected.
+            child_env = dict(environment, XDG_CURRENT_DESKTOP='Tuna:GNOME')
         child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.PIPE, env=environment, user=UID,
+                                 stderr=subprocess.PIPE, env=child_env, user=UID,
                                  group=owner.pw_gid, extra_groups=[], start_new_session=True)
         children.append(child)
         secondary = argv == [APPS[0], '--new-window', fixture['directories'][1]]
