@@ -1628,8 +1628,15 @@ jobs:
           # one with no physical GPU behind it (llvmpipe renders).
           sudo modprobe vgem
           test -c /dev/dri/renderD128
-          sudo chmod 0666 /dev/dri/renderD128
+          # A bare chmod races udev rule re-application (node snaps back to
+          # 0660 root:render); a rule wins deterministically like 99-kvm4all.
+          echo 'KERNEL=="renderD*", MODE="0666"' \
+            | sudo tee /etc/udev/rules.d/99-vgem-render.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --action=change /dev/dri/renderD128
+          sudo udevadm settle --timeout=10
           ls -l /dev/dri/renderD128
+          test -r /dev/dri/renderD128 && test -w /dev/dri/renderD128
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         if: matrix.profile == 'gnome-reference' || matrix.profile == 'tuna-reference'
         with:
