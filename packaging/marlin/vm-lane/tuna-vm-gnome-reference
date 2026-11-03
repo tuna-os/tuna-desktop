@@ -773,7 +773,15 @@ class IdentityObserver:
         info = Path(path).lstat()
         socket_identity = (info.st_dev, info.st_ino, info.st_uid, info.st_mode)
         if address not in self.connections:
-            connection = bus_connection(address, self.deadline, self.Gio)
+            # EXTERNAL auth as root is refused with a broken pipe during the
+            # handshake; authenticate to UID1000 buses as UID1000. Auth binds
+            # at connect time, so later calls reuse this connection as root,
+            # and the pinned-peer check below still verifies the actual peer.
+            os.seteuid(UID)
+            try:
+                connection = bus_connection(address, self.deadline, self.Gio)
+            finally:
+                os.seteuid(0)
             with socket.socket(fileno=os.dup(connection.get_stream().get_socket().get_fd())) as stream:
                 same_process(peer, connection_identity(stream, path))
             if address == 'unix:path=/run/user/1000/bus':

@@ -780,6 +780,37 @@ class ControlledIdentityBoundary(unittest.TestCase):
             self.assertEqual(observer.request(value), [':1.42', principal])
             self.assertEqual(owner.call_args_list[-1], mock.call(self.a11y_bus, ':1.99'))
 
+    def test_bus_connection_authenticates_as_session_uid_and_restores_root(self):
+        observer = self.observer()
+        fresh = 'unix:path=/run/user/1000/at-spi/bus_9'
+        observer.allowed.add(fresh)
+        observer.Gio = object()
+        observer.socket_identities = {address: None for address in observer.allowed}
+        principal = self.principal()
+        lstat = SimpleNamespace(st_dev=1, st_ino=2, st_uid=1000, st_mode=0o100755)
+        patches = lambda: (mock.patch.object(GUEST.os, 'seteuid'),
+                            mock.patch.object(GUEST, 'check_socket_peer', return_value=principal),
+                            mock.patch.object(GUEST, 'connection_identity', return_value=principal),
+                            mock.patch.object(GUEST, 'same_process', return_value=None),
+                            mock.patch.object(GUEST.Path, 'lstat', return_value=lstat),
+                            mock.patch.object(GUEST.os, 'dup', return_value=99),
+                            mock.patch.object(GUEST.socket, 'socket'))
+        connection = mock.Mock()
+        entered = patches()
+        with entered[0] as euid, entered[1], entered[2], entered[3], entered[4], entered[5], entered[6], \
+             mock.patch.object(GUEST, 'bus_connection', return_value=connection) as dial:
+            self.assertIs(observer.connection(fresh), connection)
+        self.assertEqual(dial.call_count, 1)
+        self.assertEqual(euid.call_args_list, [mock.call(1000), mock.call(0)])
+        # Root is restored even when the handshake itself fails.
+        observer.connections.pop(fresh)
+        entered = patches()
+        with entered[0] as euid, entered[1], entered[2], entered[3], entered[4], entered[5], entered[6], \
+             mock.patch.object(GUEST, 'bus_connection', side_effect=RuntimeError('handshake broke')):
+            with self.assertRaisesRegex(RuntimeError, 'handshake broke'):
+                observer.connection(fresh)
+        self.assertEqual(euid.call_args_list, [mock.call(1000), mock.call(0)])
+
     def test_per_message_kernel_credentials_bind_actual_spawned_child_not_socketpair_creator(self):
         controller, child_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         controller.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
