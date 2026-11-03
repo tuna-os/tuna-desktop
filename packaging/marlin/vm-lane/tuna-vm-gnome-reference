@@ -731,6 +731,27 @@ def dbus_call(connection, bus, path, interface, method, parameters, deadline, Gi
         Gio.DBusCallFlags.NO_AUTO_START, millis, None).unpack()
 
 
+STALE_TREE_DBUS_ERRORS = ('org.freedesktop.DBus.Error.UnknownMethod',
+                            'org.freedesktop.DBus.Error.UnknownObject',
+                            'org.freedesktop.DBus.Error.UnknownInterface',
+                            'org.freedesktop.DBus.Error.ServiceUnknown')
+
+
+def stale_tree_message(text):
+    """True when a D-Bus error names an object/interface/service that vanished.
+
+    The observed Shell tree churns while it is walked (a child reference
+    can resolve to an object whose Accessible interface is already gone);
+    such a walk observed no consistent snapshot, so the observation must
+    be retried, never reported. Wedged peers (NoReply) stay fatal: a
+    peer that never answers is a real failure, not a torn read.
+    """
+    return isinstance(text, str) and any(name in text for name in STALE_TREE_DBUS_ERRORS)
+
+
+WORKER_STALE_TREE_EXIT = 11
+
+
 def observe_progress(count, start):
     """Bounded worker heartbeat line, or None between reports.
 
@@ -738,8 +759,10 @@ def observe_progress(count, start):
     tree; without progress markers a killed worker leaves no record of
     how far the walk got before the budget expired.
     """
-    if count <= 0 or count % 2000:
+    if count <= 0 or count % 500:
         return None
+    if count % 2000:
+        return 'observe progress nodes=%d elapsed_ms=%d (early)' % (count, (time.monotonic() - start) * 1000)
     return 'observe progress nodes=%d elapsed_ms=%d' % (count, (time.monotonic() - start) * 1000)
 
 
@@ -1019,11 +1042,16 @@ def session_observe(args, deadline, channel):
         line = observe_progress(count, walk_start)
         if line is not None:
             print(line, file=sys.stderr, flush=True)
-        props = call(bus, unique, path, 'org.freedesktop.DBus.Properties', 'GetAll', variant('(s)', ('org.a11y.atspi.Accessible',)))[0]
-        role = call(bus, unique, path, 'org.a11y.atspi.Accessible', 'GetRoleName')[0]
-        words = call(bus, unique, path, 'org.a11y.atspi.Accessible', 'GetState')[0]
+        try:
+            props = call(bus, unique, path, 'org.freedesktop.DBus.Properties', 'GetAll', variant('(s)', ('org.a11y.atspi.Accessible',)))[0]
+            role = call(bus, unique, path, 'org.a11y.atspi.Accessible', 'GetRoleName')[0]
+            words = call(bus, unique, path, 'org.a11y.atspi.Accessible', 'GetState')[0]
+            children = call(bus, unique, path, 'org.a11y.atspi.Accessible', 'GetChildren')[0]
+        except GLib.GError as error:
+            if stale_tree_message(getattr(error, 'message', '')):
+                raise FixtureNotReady('public AT-SPI tree changed during observation; retrying') from error
+            raise
         states = [index * 32 + bit for index, word in enumerate(words) for bit in range(32) if word & (1 << bit)]
-        children = call(bus, unique, path, 'org.a11y.atspi.Accessible', 'GetChildren')[0]
         name = unvariant(props.get('Name'))
         if not isinstance(name, str) or not isinstance(role, str):
             raise RuntimeError('malformed actual AT-SPI properties')
@@ -1038,6 +1066,7 @@ def session_observe(args, deadline, channel):
                     node['children'].append(tree(child_bus or unique, child_path, depth + 1))
         return node
 
+    print('observe start', file=sys.stderr, flush=True)
     roots = call(bus, registry_name, '/org/a11y/atspi/accessible/root', 'org.a11y.atspi.Accessible', 'GetChildren')[0]
     trees = [tree(name, path) for name, path in roots]
     for bus_name, (_, principal) in owners.items():
@@ -1160,11 +1189,14 @@ def drain_worker_streams(worker, streams):
 def check_worker_status(returncode, stderr_text):
     """Map the UID1000 observer's exit status to a typed failure.
 
-    Exit 10 is the worker's own finite-budget expiry: retryable like a
-    controller-side timeout, never a fixture-state verdict.
+    Exit 10 is the worker's own finite-budget expiry and exit 11 a tree
+    torn by Shell churn mid-walk: both retryable like a controller-side
+    timeout, never a fixture-state verdict.
     """
     if returncode == WORKER_TIMEOUT_EXIT:
         raise ObservationTimeout('worker observation exceeded its finite budget: ' + stderr_text[:1500])
+    if returncode == WORKER_STALE_TREE_EXIT:
+        raise ObservationTimeout('worker AT-SPI tree changed during observation; retrying: ' + stderr_text[:1500])
     if returncode:
         raise RuntimeError('finite UID1000 public observation failed: ' + stderr_text[:3000])
 
@@ -1464,6 +1496,13 @@ def main():
         try:
             with socket.socket(fileno=int(sys.argv[2])) as channel:
                 result = session_observe(value, Deadline(value['budget_s']), channel)
+        except FixtureNotReady:
+            # The worker raises FixtureNotReady only for a tree torn by
+            # Shell churn mid-walk; like a budget overrun it carries no
+            # fixture-state verdict, so the controller retries the whole
+            # observation instead of failing the operation.
+            traceback.print_exc()
+            raise SystemExit(WORKER_STALE_TREE_EXIT)
         except TimeoutError:
             traceback.print_exc()
             raise SystemExit(WORKER_TIMEOUT_EXIT)

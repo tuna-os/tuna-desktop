@@ -1117,11 +1117,102 @@ class ControlledObservationEvidence(unittest.TestCase):
             os.close(out_write)
             os.close(err_write)
 
-    def test_heartbeat_reports_every_two_thousand_nodes(self):
+    def test_stale_tree_names_retry_wedged_peer_stays_fatal(self):
+        for name in ('org.freedesktop.DBus.Error.UnknownMethod',
+                     'org.freedesktop.DBus.Error.UnknownObject',
+                     'org.freedesktop.DBus.Error.UnknownInterface',
+                     'org.freedesktop.DBus.Error.ServiceUnknown'):
+            with self.subTest(name=name):
+                self.assertTrue(GUEST.stale_tree_message('GDBus.Error:' + name + ': gone'))
+        for text in ('GDBus.Error:org.freedesktop.DBus.Error.NoReply: slow peer',
+                     'g-dbus-error-quark: timeout', '', None, 19):
+            with self.subTest(text=text):
+                self.assertFalse(GUEST.stale_tree_message(text))
+
+    def test_worker_stale_tree_exit_maps_to_retryable_timeout(self):
+        with self.assertRaises(GUEST.ObservationTimeout) as timeout:
+            GUEST.check_worker_status(GUEST.WORKER_STALE_TREE_EXIT, 'UnknownMethod on /org/tuna/Shell/a11y/x')
+        self.assertIn('changed during observation', str(timeout.exception))
+
+    def test_worker_main_reports_torn_tree_as_exit_eleven(self):
+        body = io.BytesIO(json.dumps({'compositor': {}, 'budget_s': 5}).encode())
+        with mock.patch.object(GUEST.sys, 'argv', ['guest', '_observe', '99']), \
+             mock.patch.object(GUEST.sys, 'stdin', SimpleNamespace(buffer=body)), \
+             mock.patch.object(GUEST.socket, 'socket'), \
+             mock.patch.object(GUEST.traceback, 'print_exc'), \
+             mock.patch.object(GUEST, 'session_observe', side_effect=GUEST.FixtureNotReady('torn')):
+            with self.assertRaises(SystemExit) as done:
+                GUEST.main()
+        self.assertEqual(done.exception.code, GUEST.WORKER_STALE_TREE_EXIT)
+
+    def test_torn_tree_read_retries_instead_of_crashing(self):
+        user_bus = 'unix:path=/run/user/1000/bus'
+        a11y_bus = 'unix:path=/run/user/1000/at-spi/bus_0'
+
+        class Variant:
+            def __init__(self, signature, value):
+                self.value = value
+            def unpack(self):
+                return self.value
+
+        class FakeGError(Exception):
+            def __init__(self, message):
+                super().__init__(message)
+                self.message = message
+
+        principal = {'pid': 42, 'uid': 1000, 'start_ticks': 123, 'exe': '/usr/bin/dbus-broker',
+                     'exe_sha256': 'a' * 64, 'boot_id': 'controlled-boot'}
+
+        def observe(churn):
+            def identity(channel, deadline, operation, address, name=None, descriptor=None):
+                return principal if operation == 'socket' else [':1.42', principal]
+            streams = [SimpleNamespace(get_stream=lambda: SimpleNamespace(
+                get_socket=lambda: SimpleNamespace(get_fd=lambda: 91))) for _ in range(2)]
+            def call(connection, bus, path, interface, method, parameters, deadline, Gio):
+                if method == 'GetAddress':
+                    return (a11y_bus,)
+                if method == 'GetCurrentState':
+                    return (1, [], [], {})
+                if method == 'GetChildren':
+                    if path == '/org/a11y/atspi/accessible/root':
+                        return ([(':1.50', '/app')],)
+                    self.fail('walk reached past the torn node read')
+                if method == 'GetAll':
+                    raise churn
+                self.fail('unexpected child DBus query: ' + method)
+            modules = {'gi': SimpleNamespace(require_version=lambda *args: None),
+                       'gi.repository': SimpleNamespace(
+                           Gio=object(), GLib=SimpleNamespace(Variant=Variant, GError=FakeGError))}
+            with mock.patch.dict(sys.modules, modules), \
+                 mock.patch.object(GUEST.os, 'geteuid', return_value=1000), \
+                 mock.patch.object(GUEST, 'bus_connection', side_effect=streams), \
+                 mock.patch.object(GUEST, 'identity_request', side_effect=identity), \
+                 mock.patch.object(GUEST, 'dbus_call', side_effect=call), \
+                 mock.patch.object(GUEST, 'read_gio_settings', return_value={}), \
+                 mock.patch.object(GUEST, 'proc_identity', side_effect=AssertionError('unprivileged proc read')), \
+                 mock.patch.object(GUEST, 'check_socket_peer', side_effect=AssertionError('unprivileged identity read')):
+                return GUEST.session_observe({'compositor': principal}, GUEST.Deadline(3), object())
+
+        for name in ('org.freedesktop.DBus.Error.UnknownMethod',
+                     'org.freedesktop.DBus.Error.UnknownObject',
+                     'org.freedesktop.DBus.Error.UnknownInterface',
+                     'org.freedesktop.DBus.Error.ServiceUnknown'):
+            with self.subTest(name=name), self.assertRaises(GUEST.FixtureNotReady):
+                observe(FakeGError('GDBus.Error:' + name + ': No such interface on object at path /org/tuna/Shell/a11y/x'))
+        with self.assertRaises(FakeGError):
+            observe(FakeGError('GDBus.Error:org.freedesktop.DBus.Error.NoReply: wedged peer'))
+
+    def test_heartbeat_reports_walk_progress(self):
         start = GUEST.time.monotonic()
         self.assertIsNone(GUEST.observe_progress(0, start))
         self.assertIsNone(GUEST.observe_progress(1, start))
+        self.assertIsNone(GUEST.observe_progress(499, start))
+        self.assertIsNone(GUEST.observe_progress(501, start))
         self.assertIsNone(GUEST.observe_progress(1999, start))
+        self.assertRegex(GUEST.observe_progress(500, start),
+                         r'^observe progress nodes=500 elapsed_ms=\d+ \(early\)$')
+        self.assertRegex(GUEST.observe_progress(1000, start),
+                         r'^observe progress nodes=1000 elapsed_ms=\d+ \(early\)$')
         line = GUEST.observe_progress(2000, start)
         self.assertRegex(line, r'^observe progress nodes=2000 elapsed_ms=\d+$')
         self.assertRegex(GUEST.observe_progress(4000, start), r'^observe progress nodes=4000 elapsed_ms=\d+$')
