@@ -501,8 +501,12 @@ def _monitor_liveness(monitor, readiness, *, expected_uid=0):
 
 def _require_live_monitor(monitor):
     if monitor is None or monitor.get('ready') is not True or monitor.get('live') is not True:
+        summary = {'reason': monitor.get('unevaluable_reason') if isinstance(monitor, dict) else None,
+                   'error': monitor.get('error') if isinstance(monitor, dict) else None,
+                   'ended': monitor.get('ended') if isinstance(monitor, dict) else None,
+                   'traffic_tail': monitor.get('traffic_tail') if isinstance(monitor, dict) else None}
         error = RuntimeError('automatic-timezone observation unevaluable: original monitor is not live: ' +
-                             json.dumps(monitor))
+                             json.dumps(summary) + ' :: ' + json.dumps(monitor))
         cause = monitor.get('unevaluable_sites') if isinstance(monitor, dict) else None
         if cause:
             # The bounded failure record follows the causal chain: the true
@@ -524,6 +528,16 @@ def _monitor_status(directory, state):
         result['error'] = _read_json(directory / 'monitor-error.json')
     if (directory / 'monitor-ended.json').exists():
         result['ended'] = _read_json(directory / 'monitor-ended.json')
+    traffic = directory / 'monitor-traffic.jsonl'
+    if traffic.exists():
+        tail = []
+        with open(traffic, 'r', encoding='utf-8', errors='replace') as stream:
+            for line in stream.read().splitlines()[-8:]:
+                try:
+                    tail.append(json.loads(line))
+                except ValueError:
+                    continue
+        result['traffic_tail'] = tail
     try:
         if (monitor.get('nonce') != state['nonce'] or monitor.get('boot_id') != state['boot_id']
                 or monitor.get('argv', [])[-2:] != ['--monitor', state['nonce']]):
@@ -809,7 +823,10 @@ def _monitor(nonce):
                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     geo_descriptor = os.open(directory / 'geoclue.jsonl',
                              os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    traffic_descriptor = os.open(directory / 'monitor-traffic.jsonl',
+                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     lock = threading.Lock()
+    traffic_count = 0
     loop = GLib.MainLoop()
     queued = 0
     event_count = 0
@@ -1031,7 +1048,26 @@ def _monitor(nonce):
         return GLib.SOURCE_REMOVE
 
     def received(connection, message, incoming, user_data):
-        nonlocal queued
+        nonlocal queued, traffic_count
+        with lock:
+            if traffic_count < 1024:
+                kinds = {Gio.DBusMessageType.METHOD_CALL: 'call',
+                         Gio.DBusMessageType.METHOD_RETURN: 'return',
+                         Gio.DBusMessageType.ERROR: 'error',
+                         Gio.DBusMessageType.SIGNAL: 'signal'}
+                record = {'in': bool(incoming),
+                          't': kinds.get(message.get_message_type(), '?'),
+                          'n': message.get_serial()}
+                for key, value in (('s', message.get_sender()),
+                                   ('d', message.get_destination()),
+                                   ('p', message.get_path()),
+                                   ('i', message.get_interface()),
+                                   ('m', message.get_member())):
+                    if value is not None:
+                        record[key] = value
+                raw = (json.dumps(record, separators=(',', ':')) + '\n').encode()
+                if os.write(traffic_descriptor, raw) == len(raw):
+                    traffic_count += 1
         if not incoming:
             return message
         kind = message.get_message_type()
@@ -1099,6 +1135,7 @@ def _monitor(nonce):
         credentials.close_sync(None)
         os.close(descriptor)
         os.close(geo_descriptor)
+        os.close(traffic_descriptor)
 
 
 def _restore_timezone(context, directory, state):

@@ -524,6 +524,24 @@ class OriginalMonitorLifetimeControls(unittest.TestCase):
             status = GUEST._monitor_status(directory, state)
             self.assertEqual(status["unevaluable_reason"], "owned monitor recorded an error")
 
+    @unittest.skipUnless(os.geteuid() == 0, "production control files require root ownership")
+    def test_traffic_tail_relays_last_records(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            state = {"monitor": dict(self.monitor),
+                     "nonce": self.monitor["nonce"], "boot_id": self.monitor["boot_id"]}
+            GUEST._write_json(directory / "ready.json", dict(self.ready))
+            log = directory / "monitor-traffic.jsonl"
+            lines = [json.dumps({"in": True, "t": "call", "n": index}) for index in range(10)]
+            lines.insert(3, "not-json{")
+            log.write_text("\n".join(lines) + "\n")
+            log.chmod(0o600)
+            status = GUEST._monitor_status(directory, state)
+            self.assertEqual([record["n"] for record in status["traffic_tail"]],
+                             [3, 4, 5, 6, 7, 8, 9])
+            with self.assertRaisesRegex(RuntimeError, "traffic_tail"):
+                GUEST._require_live_monitor(dict(status, live=False))
+
     def test_failure_receipt_appends_validated_cause_sites(self):
         guest_dir = str(Path(GUEST.__file__).resolve().parent.parent / "tuna-native-session")
         sys.path.insert(0, guest_dir)
