@@ -634,7 +634,7 @@ class ActualPodmanLoadControl(unittest.TestCase):
             try:
                 subprocess.run(['sudo', 'podman', 'build', '--network=none', '--pull=never', '-t', tag, str(root)], check=True)
                 image = product.podman(root, 'image', 'inspect', tag, '--format', '{{.Id}}')
-                self.assertTrue(product.image_digest(image))
+                self.assertTrue(product.hex_value(image, 64))
                 subprocess.run(['sudo', 'podman', 'save', '--format', 'oci-archive', '--output', str(root / 'actual.oci.tar'), image], check=True)
                 subprocess.run(['sudo', 'podman', 'rmi', tag], check=True)
                 product.podman(root, 'load', '--input', root / 'actual.oci.tar')
