@@ -1200,7 +1200,12 @@ def window_context(trees, fixture, shell):
     active = [w for w in windows if 1 in w['states']]
     if not active:
         states = sorted((w['role'], sorted(set(w['states']) & {1, 12, 23, 25, 30})) for w in windows)
-        raise FixtureNotReady('actual active application window is not yet exposed; window states ' + repr(states))
+        shell_nodes = [n for n in flatten(shell_trees) if n['process']['pid'] == shell['pid']]
+        focused = sorted({n['name'] for n in shell_nodes if 12 in n['states']})[:8]
+        selected = sorted({n['name'] for n in shell_nodes if 23 in n['states']})[:8]
+        raise FixtureNotReady('actual active application window is not yet exposed; window states '
+                              + repr(states) + '; shell focused ' + repr(focused)
+                              + ' selected ' + repr(selected))
     if len(active) != 1:
         raise RuntimeError('actual active application window is unavailable or ambiguous')
     shell_nodes = [n for n in flatten(shell_trees) if n['process']['pid'] == shell['pid']]
@@ -1444,19 +1449,49 @@ class StderrDrain(threading.Thread):
         return bytes(self.tail[-limit:]).decode('utf-8', errors='replace')
 
 
-def fixture_launch_plan(directories):
-    """Ordered (argv, role) fixture launches; Settings first.
+NAUTILUS_BUS_NAME = 'org.gnome.Nautilus'
 
-    Settings cold-starts slowest, so it launches before either Nautilus
-    invocation: its warmup overlaps the first-Nautilus GApplication wait
-    instead of serializing behind it inside the fixed prepare budget.
-    The second Nautilus still forwards to the first; roles are stable.
+
+def wait_bus_name(name, environment, owner_gid, deadline):
+    """Wait until a GApplication owns its session-bus name.
+
+    A full accessibility-tree walk costs seconds under load; name
+    ownership is the actual second-launch forward precondition and
+    answers in milliseconds over the session bus.
+    """
+    argv = ['/usr/bin/gdbus', 'call', '--session', '--dest', 'org.freedesktop.DBus',
+           '--object-path', '/org/freedesktop/DBus',
+           '--method', 'org.freedesktop.DBus.NameHasOwner', name]
+    while True:
+        budget = deadline.remaining()
+        completed = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=budget, env=environment,
+                                   user=UID, group=owner_gid, extra_groups=[],
+                                   start_new_session=True)
+        if completed.returncode:
+            raise RuntimeError('session bus name query failed: '
+                               + completed.stderr.decode(errors='replace')[:500])
+        if completed.stdout.decode(errors='replace').strip() == '(true,)':
+            return
+        time.sleep(min(0.05, max(0.0, deadline.end - time.monotonic())))
+
+
+def fixture_launch_plan(directories):
+    """Ordered (argv, role) fixture launches; Settings last.
+
+    The last mapped window owns focus on both reference shells, so
+    Settings launches after both Nautilus invocations: no background
+    controller can activate an already-mapped window (focus-stealing
+    prevention denies token-less present requests), making mapping
+    order the only robust focus primitive. The first Nautilus still
+    primes its GApplication name on the session bus before the second
+    forwards; roles are stable.
     """
     if len(directories) != 2:
         raise ValueError('fixture requires exactly two owned directories')
-    return [([APPS[1], 'network'], 'settings'),
-            ([APPS[0], '--new-window', directories[0]], 'files-first'),
-            ([APPS[0], '--new-window', directories[1]], 'files-second')]
+    return [([APPS[0], '--new-window', directories[0]], 'files-first'),
+            ([APPS[0], '--new-window', directories[1]], 'files-second'),
+            ([APPS[1], 'network'], 'settings')]
 
 
 def snapshot_until_ready(snapshot_fn, children, deadline):
@@ -1489,8 +1524,15 @@ def snapshot_until_ready(snapshot_fn, children, deadline):
         started = time.monotonic()
         try:
             result = snapshot_fn()
-            if result['selection']['active_windows'][0]['role'] != 'settings':
-                raise FixtureNotReady('original Settings Network window is not actually active')
+            owner = result['selection']['active_windows'][0]
+            if owner['role'] != 'settings':
+                # Error-path introspection must never mask the verdict:
+                # defensive gets, since a malformed active record is still
+                # "Settings is not active".
+                identity = (owner.get('role'), owner.get('name'),
+                            (owner.get('process') or {}).get('pid'))
+                raise FixtureNotReady('original Settings Network window is not actually active; active='
+                                      + repr(identity))
             return result
         except FixtureNotReady as error:
             attempt_ms.append(int((time.monotonic() - started) * 1000))
@@ -1586,46 +1628,21 @@ def prepare(args, directory, deadline, cache):
         if secondary:
             if child.wait(timeout=deadline.remaining()) != 0:
                 raise RuntimeError('second Nautilus invocation failed to forward its window')
+            # The forward exiting does not mean the second window mapped:
+            # Settings launches next and must map strictly last to own
+            # focus, so wait for the forwarded window first.
+            while True:
+                obs = public_observation(environment, admitted, deadline)
+                forwarded = [n for n in flatten(obs['trees'])
+                             if os.path.basename(fixture['directories'][1]) in n['name']
+                             and n['role_name'] in ('frame', 'window') and 25 in n['states']]
+                if forwarded:
+                    break
+                time.sleep(min(0.1, deadline.remaining()))
         # First Nautilus must own its GApplication name before second launch.
         if argv[0] == APPS[0] and not nautilus_primed:
             nautilus_primed = True
-            while True:
-                obs = public_observation(environment, admitted, deadline)
-                matching = [n for n in flatten(obs['trees']) if n['process']['pid'] == child.pid and n['role_name'] in ('frame', 'window') and 25 in n['states']]
-                if matching:
-                    break
-                time.sleep(min(0.1, deadline.remaining()))
-    # The forward exiting does not mean the second window mapped: raising
-    # before it appears lets the late map steal focus back. Wait for the
-    # forwarded window first, like the first Nautilus wait above.
-    while True:
-        obs = public_observation(environment, admitted, deadline)
-        forwarded = [n for n in flatten(obs['trees'])
-                     if os.path.basename(fixture['directories'][1]) in n['name']
-                     and n['role_name'] in ('frame', 'window') and 25 in n['states']]
-        if forwarded:
-            break
-        time.sleep(min(0.1, deadline.remaining()))
-    # Settings launched first for warmup, so the last Nautilus owns focus.
-    # Re-invoking the single instance raises its existing Network window
-    # through ordinary application activation (no input injection), like
-    # the Nautilus forward. The raise is transient: recorded for launch
-    # diagnostics only, never as an owned principal.
-    deadline.remaining()
-    raise_child = subprocess.Popen(
-        [APPS[1], 'network'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        env=dict(environment, XDG_CURRENT_DESKTOP='Tuna:GNOME'),
-        user=UID, group=owner.pw_gid, extra_groups=[], start_new_session=True)
-    children.append(raise_child)
-    raise_drain = StderrDrain(raise_child.stderr)
-    drains['settings-raise'] = raise_drain
-    raise_drain.start()
-    fixture['launches'].append({'role': 'settings-raise', 'pid': raise_child.pid,
-                                'launched_monotonic_ns': time.monotonic_ns()})
-    save(directory, 'claim.json', claim)
-    if raise_child.wait(timeout=deadline.remaining()) != 0:
-        raise RuntimeError('Settings re-invocation failed to raise its window')
+            wait_bus_name(NAUTILUS_BUS_NAME, environment, owner.pw_gid, deadline)
     # Existing app process descendants must be the recorded original principals;
     # no process discovered by a name-only scan gains cleanup ownership.
     try:

@@ -1024,6 +1024,17 @@ class ControlledAtspi(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(RuntimeError):
                 GUEST.window_context(trees, fixture, shell)
 
+    def test_unexposed_active_window_reports_states_and_shell_focus(self):
+        trees, fixture, shell = self.context()
+        trees[2]['children'][0]['states'] = [25, 30]
+        trees[0]['children'][0]['states'] = [12, 23, 25, 30]
+        with self.assertRaises(GUEST.FixtureNotReady) as failed:
+            GUEST.window_context(trees, fixture, shell)
+        message = str(failed.exception)
+        self.assertIn('actual active application window is not yet exposed', message)
+        self.assertIn("window states [('files-first', [25, 30])", message)
+        self.assertIn("shell focused ['Files'] selected ['Files']", message)
+
 
 class ControlledObservationEvidence(unittest.TestCase):
     """Timeout/state evidence semantics; not native qualification."""
@@ -1122,12 +1133,27 @@ class ControlledObservationEvidence(unittest.TestCase):
         deadline.end = 0
 
         def attempt():
+            return {'selection': {'active_windows': [
+                {'role': 'files-first', 'name': 'first', 'process': {'pid': 5001}}]}}
+
+        with mock.patch.object(GUEST.time, 'sleep'):
+            with self.assertRaises(RuntimeError) as failed:
+                GUEST.snapshot_until_ready(attempt, [], deadline)
+        self.assertIn('original Settings Network window is not actually active', str(failed.exception))
+        self.assertIn("active=('files-first', 'first', 5001)", str(failed.exception))
+
+    def test_inactive_settings_without_identity_still_reports(self):
+        deadline = GUEST.Deadline(25)
+        deadline.end = 0
+
+        def attempt():
             return {'selection': {'active_windows': [{'role': 'files-first'}]}}
 
         with mock.patch.object(GUEST.time, 'sleep'):
             with self.assertRaises(RuntimeError) as failed:
                 GUEST.snapshot_until_ready(attempt, [], deadline)
         self.assertIn('original Settings Network window is not actually active', str(failed.exception))
+        self.assertIn("active=('files-first', None, None)", str(failed.exception))
 
     def test_ready_snapshot_returns_without_sleep(self):
         deadline = GUEST.Deadline(25)
@@ -1285,13 +1311,63 @@ class ControlledObservationEvidence(unittest.TestCase):
                          'observe slow-call bus=:1.5 path=/org/a11y/atspi/accessible/1 method=GetAll elapsed_ms=1900')
 
 
+class WaitBusName(unittest.TestCase):
+    def completed(self, stdout, returncode=0, stderr=b''):
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def test_owned_name_returns_without_sleep(self):
+        deadline = GUEST.Deadline(25)
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               return_value=self.completed(b'(true,)\n')) as ran, \
+                mock.patch.object(GUEST.time, 'sleep') as slept:
+            GUEST.wait_bus_name('org.gnome.Nautilus', {'WAYLAND_DISPLAY': 'x'}, 1000, deadline)
+        self.assertEqual(ran.call_count, 1)
+        argv, kwargs = ran.call_args[0][0], ran.call_args[1]
+        self.assertEqual(argv, ['/usr/bin/gdbus', 'call', '--session', '--dest', 'org.freedesktop.DBus',
+                                '--object-path', '/org/freedesktop/DBus',
+                                '--method', 'org.freedesktop.DBus.NameHasOwner',
+                                'org.gnome.Nautilus'])
+        self.assertEqual(kwargs['env'], {'WAYLAND_DISPLAY': 'x'})
+        self.assertEqual(kwargs['user'], GUEST.UID)
+        self.assertEqual(kwargs['group'], 1000)
+        self.assertGreater(kwargs['timeout'], 0)
+        slept.assert_not_called()
+
+    def test_unowned_name_polls_until_owned(self):
+        deadline = GUEST.Deadline(25)
+        with mock.patch.object(GUEST.subprocess, 'run', side_effect=[
+                self.completed(b'(false,)\n'), self.completed(b'(true,)\n')]) as ran, \
+                mock.patch.object(GUEST.time, 'sleep') as slept:
+            GUEST.wait_bus_name('org.gnome.Nautilus', {}, 1000, deadline)
+        self.assertEqual(ran.call_count, 2)
+        slept.assert_called_once()
+
+    def test_bus_query_failure_is_loud(self):
+        deadline = GUEST.Deadline(25)
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               return_value=self.completed(b'', 1, b'no bus')), \
+                mock.patch.object(GUEST.time, 'sleep'):
+            with self.assertRaises(RuntimeError) as failed:
+                GUEST.wait_bus_name('org.gnome.Nautilus', {}, 1000, deadline)
+        self.assertIn('session bus name query failed', str(failed.exception))
+
+    def test_expired_deadline_raises_timeout(self):
+        deadline = GUEST.Deadline(25)
+        deadline.end = 0
+        with mock.patch.object(GUEST.subprocess, 'run') as ran, \
+                mock.patch.object(GUEST.time, 'sleep'):
+            with self.assertRaises(TimeoutError):
+                GUEST.wait_bus_name('org.gnome.Nautilus', {}, 1000, deadline)
+        ran.assert_not_called()
+
+
 class FixtureLaunch(unittest.TestCase):
-    def test_settings_launches_first_with_stable_roles(self):
+    def test_settings_launches_last_with_stable_roles(self):
         plan = GUEST.fixture_launch_plan(['/d/first', '/d/second'])
-        self.assertEqual([role for _, role in plan], ['settings', 'files-first', 'files-second'])
-        self.assertEqual(plan[0][0], [GUEST.APPS[1], 'network'])
-        self.assertEqual(plan[1][0], [GUEST.APPS[0], '--new-window', '/d/first'])
-        self.assertEqual(plan[2][0], [GUEST.APPS[0], '--new-window', '/d/second'])
+        self.assertEqual([role for _, role in plan], ['files-first', 'files-second', 'settings'])
+        self.assertEqual(plan[0][0], [GUEST.APPS[0], '--new-window', '/d/first'])
+        self.assertEqual(plan[1][0], [GUEST.APPS[0], '--new-window', '/d/second'])
+        self.assertEqual(plan[2][0], [GUEST.APPS[1], 'network'])
         with self.assertRaises(ValueError):
             GUEST.fixture_launch_plan(['/d/only'])
         with self.assertRaises(ValueError):
@@ -1380,8 +1456,6 @@ class FixtureLaunch(unittest.TestCase):
         shell = {'pid': 111, 'start_ticks': 10, 'boot_id': 'b', 'uid': 1000, 'exe': '/usr/bin/gnome-shell'}
         before = {'settings': {}, 'trees': [{'process': dict(shell), 'role_name': 'application',
                                              'name': 'shell', 'states': [], 'children': []}]}
-        wait = {'settings': {}, 'trees': [{'process': {'pid': 5001}, 'role_name': 'frame',
-                                           'name': 'first-window', 'states': [25], 'children': []}]}
         forwarded = {'settings': {}, 'trees': [{'process': {'pid': 5001}, 'role_name': 'window',
                                                 'name': 'second-window', 'states': [25],
                                                 'children': []}]}
@@ -1409,7 +1483,8 @@ class FixtureLaunch(unittest.TestCase):
             mock.patch.object(GUEST, 'admission', return_value=({'ready': True, 'session': {'shell': shell},
                                                                  'missing': []}, {'WAYLAND_DISPLAY': 'x'})),
             mock.patch.object(GUEST, 'process_candidates', return_value=[]),
-            mock.patch.object(GUEST, 'public_observation', side_effect=[before, wait, forwarded]),
+            mock.patch.object(GUEST, 'public_observation', side_effect=[before, forwarded]),
+            mock.patch.object(GUEST, 'wait_bus_name'),
             mock.patch.object(GUEST, 'same_process'),
             mock.patch.object(GUEST, 'load_claim', return_value=claim),
             mock.patch.object(GUEST, 'save'),
@@ -1428,12 +1503,12 @@ class FixtureLaunch(unittest.TestCase):
         for entered in patches:
             entered.start()
             self.addCleanup(entered.stop)
-        return shell, before, wait, exe_by_pid, drains, launched
+        return shell, before, exe_by_pid, drains, launched
 
-    def test_prepare_launches_settings_before_either_nautilus(self):
+    def test_prepare_launches_settings_last_without_raise(self):
         with tempfile.TemporaryDirectory() as tmp:
             claim, launched, Child, FakePath = self._prepare_fixture()
-            shell, before, wait, exe_by_pid, drains, _ = self._prepare_mocks(
+            shell, before, exe_by_pid, drains, _ = self._prepare_mocks(
                 tmp, claim, launched, Child, FakePath)
             with mock.patch.object(GUEST, 'snapshot_until_ready',
                                    return_value={'selection': {}, 'snapshot': True}) as loop:
@@ -1441,51 +1516,41 @@ class FixtureLaunch(unittest.TestCase):
                                          GUEST.Deadline(3), {})
         self.assertTrue(response['ready'])
         argv = [call[0] for call in launched]
-        self.assertEqual(argv[0], [GUEST.APPS[1], 'network'])
+        self.assertEqual(len(argv), 3)
+        self.assertEqual(argv[0][:2], [GUEST.APPS[0], '--new-window'])
         self.assertEqual(argv[1][:2], [GUEST.APPS[0], '--new-window'])
-        self.assertEqual(argv[2][:2], [GUEST.APPS[0], '--new-window'])
-        self.assertEqual(argv[3], [GUEST.APPS[1], 'network'])
-        self.assertIn('first', argv[1][2])
-        self.assertIn('second', argv[2][2])
-        self.assertEqual(launched[0][1]['env']['XDG_CURRENT_DESKTOP'], 'Tuna:GNOME')
-        self.assertEqual(launched[3][1]['env']['XDG_CURRENT_DESKTOP'], 'Tuna:GNOME')
+        self.assertEqual(argv[2], [GUEST.APPS[1], 'network'])
+        self.assertIn('first', argv[0][2])
+        self.assertIn('second', argv[1][2])
+        self.assertEqual(launched[2][1]['env']['XDG_CURRENT_DESKTOP'], 'Tuna:GNOME')
+        self.assertNotIn('XDG_CURRENT_DESKTOP', launched[0][1]['env'])
         self.assertNotIn('XDG_CURRENT_DESKTOP', launched[1][1]['env'])
-        self.assertNotIn('XDG_CURRENT_DESKTOP', launched[2][1]['env'])
         for _, kwargs in launched:
             self.assertIs(kwargs['stderr'], GUEST.subprocess.PIPE)
-        self.assertEqual(len(drains), 4)
+        self.assertEqual(len(drains), 3)
         self.assertTrue(all(drain.started for drain in drains))
-        # First Nautilus still waits for its own window before the forward,
-        # and the raise waits for the forwarded window first.
-        self.assertEqual(GUEST.public_observation.call_count, 3)
+        # First Nautilus primes its bus name (no tree walk); only the
+        # pre-launch inventory and the forwarded-window wait walk trees.
+        GUEST.wait_bus_name.assert_called_once_with(
+            GUEST.NAUTILUS_BUS_NAME, mock.ANY, 1000, mock.ANY)
+        self.assertEqual(GUEST.public_observation.call_count, 2)
         loop.assert_called_once()
         roles = [entry['role'] for entry in claim['fixture']['launches']]
-        self.assertEqual(roles, ['settings', 'files-first', 'files-second', 'settings-raise'])
-        self.assertEqual([entry['pid'] for entry in claim['fixture']['launches']], [5000, 5001, 5002, 5003])
+        self.assertEqual(roles, ['files-first', 'files-second', 'settings'])
+        self.assertEqual([entry['pid'] for entry in claim['fixture']['launches']], [5000, 5001, 5002])
         # Second Nautilus forwards; Settings and first Nautilus are principals.
-        # The transient raise never becomes an owned principal.
         self.assertEqual(len(claim['fixture']['processes']), 2)
         self.assertEqual(len(claim['fixture']['launchers']), 1)
 
-    def test_prepare_raise_failure_is_loud(self):
+    def test_prepare_bus_prime_failure_is_loud(self):
         with tempfile.TemporaryDirectory() as tmp:
             claim, launched, Child, FakePath = self._prepare_fixture()
             self._prepare_mocks(tmp, claim, launched, Child, FakePath)
-            forwarded = GUEST.subprocess.Popen.side_effect
-            spawned = []
-
-            def spawn(argv, **kwargs):
-                child = forwarded(argv, **kwargs)
-                spawned.append(child)
-                if len(spawned) == 4:
-                    child.wait = lambda timeout=None: 1
-                return child
-
-            GUEST.subprocess.Popen.side_effect = spawn
+            GUEST.wait_bus_name.side_effect = RuntimeError('bus prime nope')
             with self.assertRaises(RuntimeError) as failure:
                 GUEST.prepare({'profile': 'gnome', 'nonce': NONCE}, Path(tmp),
                               GUEST.Deadline(3), {})
-            self.assertIn('failed to raise its window', str(failure.exception))
+            self.assertIn('bus prime nope', str(failure.exception))
 
     def test_prepare_failure_carries_launches_and_stderr_tails(self):
         with tempfile.TemporaryDirectory() as tmp:
