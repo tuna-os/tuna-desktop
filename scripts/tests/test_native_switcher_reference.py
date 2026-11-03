@@ -764,9 +764,9 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
             self.assertTrue(all(size < 262144 for size in guest.wire_sizes))
             self.assertTrue(any(offset > 0 for _, offset, _ in guest.file_requests))
             self.assertTrue(all(limit <= 262144 for _, _, limit in guest.file_requests))
-            self.assertEqual(len(receipt['wire_responses']), 16)  # +2 settle polls (one per commit)
+            self.assertEqual(len(receipt['wire_responses']), 18)  # +2 settle polls, +2 dismiss observes
             self.assertEqual(receipt['settle_polls'],
-                             {'applications-released': 1, 'windows-released': 1})
+                             {'overview-dismiss': 1, 'applications-released': 1, 'windows-released': 1})
             first = receipt['wire_responses'][0]
             raw = (root / first['artifact']['path']).read_bytes()
             self.assertGreater(len(raw), 262144)
@@ -884,6 +884,24 @@ class SettlePollTests(unittest.TestCase):
         self.assertEqual(snapshot, 'stale')  # caller require() still fails on this
         self.assertGreaterEqual(polls, 5)  # ~15s / (1.9s observe + 1s gap)
         self.assertTrue(sleeps)
+
+    def test_overview_search_visible_matches_either_shell(self):
+        tuna = {'selection': {'objects': [
+            {'role_name': 'window', 'name': 'Search', 'states': [25, 30], 'children': [
+                {'role_name': 'search box', 'name': 'Search', 'states': [25, 30], 'children': []}]}]}}
+        self.assertTrue(proof.overview_search_visible(tuna))
+        gnome = {'selection': {'objects': [
+            {'role_name': 'entry', 'name': 'Type to search', 'states': [25, 30], 'children': []}]}}
+        self.assertTrue(proof.overview_search_visible(gnome))
+
+    def test_overview_search_hidden_or_absent_is_desktop(self):
+        hidden = {'selection': {'objects': [
+            {'role_name': 'search box', 'name': 'Search', 'states': [30], 'children': []}]}}
+        self.assertFalse(proof.overview_search_visible(hidden))
+        desktop = {'selection': {'objects': [
+            {'role_name': 'push button', 'name': 'Activities', 'states': [25, 30], 'children': []}]}}
+        self.assertFalse(proof.overview_search_visible(desktop))
+        self.assertFalse(proof.overview_search_visible({'selection': {'objects': []}}))
 
     def test_predicate_sees_every_observation_in_order(self):
         seen = []

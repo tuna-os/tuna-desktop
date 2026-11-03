@@ -828,6 +828,28 @@ def retain_base_evidence(source, out):
             'scope': 'retained actual normal-CI preflight output; JSON validation is not cryptographic signature verification'}
 
 
+def overview_search_visible(snapshot):
+    """Whether the shell trees show a visible overview search entry.
+
+    Both shells expose the overview search as a visible AT-SPI entry (`search box`
+    on Tuna, `entry` under GNOME Shell's St.Entry); neither shows a search entry
+    on the plain desktop. A switcher commit under an open overview parks instead
+    of applying, freezing AT-SPI window-active forever, so the baseline must be
+    overview-free on both legs.
+    """
+    found = []
+
+    def walk(nodes):
+        for node in nodes:
+            states = set(node.get('states', []))
+            if (node.get('role_name') in ('search box', 'entry') and 25 in states and 30 in states):
+                found.append(node)
+            walk(node.get('children', []))
+
+    walk(snapshot.get('selection', {}).get('objects', []))
+    return bool(found)
+
+
 def poll_until_settled(observe_fn, predicate, timeout_s, clock, sleep_fn):
     """Poll `observe_fn()` until `predicate` holds or `timeout_s` elapses.
 
@@ -939,6 +961,16 @@ def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
         receipt['actions'] = [choose_binding(initial['settings'], action)
                               for action in ('switch-applications', 'switch-windows')]
         physical.pointer_outside()
+        # Both shells greet a login with the overview; a switcher commit under it
+        # parks instead of applying. Dismiss to the desktop before baselining.
+        physical.tap('esc')
+        _, dismiss_polls = poll_until_settled(
+            observe, lambda snap: not overview_search_visible(snap), 15,
+            time.monotonic, time.sleep)
+        receipt.setdefault('settle_polls', {})['overview-dismiss'] = dismiss_polls
+        dismissed = observe()
+        require(not overview_search_visible(dismissed),
+                'overview did not dismiss before baseline; switcher commits would park')
         baseline = capture('before')
         require(active_role(baseline) == 'settings', 'baseline is not actual active Settings')
         app, window = receipt['actions']
@@ -1140,7 +1172,9 @@ def validate_commands(receipt):
     require(pointer == [{'type': 'abs', 'data': {'axis': 'x', 'value': 32767}},
                         {'type': 'abs', 'data': {'axis': 'y', 'value': 32767}}], 'pointer was not identically moved outside popup')
     # Reconstruct the exact fixed action sequence rather than accepting arbitrary QMP history.
-    expected = []
+    # The leading Escape dismisses the login-greeting overview so the baseline is the
+    # desktop; without it switcher commits park and AT-SPI window-active freezes.
+    expected = [('esc', True), ('esc', False)]
     for index, action in enumerate(receipt['actions']):
         expected.extend((key, True) for key in action['modifiers'])
         expected.extend(((action['key'], True), (action['key'], False)))
@@ -1155,10 +1189,11 @@ def validate_commands(receipt):
             'member includes extra pointer commands or combined/unrecorded input')
     app_count = len(receipt['actions'][0]['modifiers'])
     window_count = len(receipt['actions'][1]['modifiers'])
-    app_trigger_count = 1 + app_count + 2
+    # One pointer command plus the overview-dismiss Escape tap precede the baseline.
+    app_trigger_count = 3 + app_count + 2
     app_release_count = app_trigger_count + 2 + app_count
     window_trigger_count = app_release_count + window_count + 2
-    prefixes = [1, app_trigger_count, app_trigger_count + 2,
+    prefixes = [3, app_trigger_count, app_trigger_count + 2,
                 app_release_count, window_trigger_count, window_trigger_count + window_count]
     for index, phase in enumerate(receipt['phases']):
         held_at_frame = set()
