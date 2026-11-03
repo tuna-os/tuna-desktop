@@ -758,7 +758,7 @@ class RequiredSourceInputs(unittest.TestCase):
     def product_pair(self):
         """Real Git lineage with controlled image bytes, not native GUI proof."""
         from vm_strip_image import admission
-        for name in ("tuna-vm-input", "tuna-vm-lifecycle"):
+        for name in ("tuna-vm-input", "tuna-vm-lifecycle", "tuna-vm-shell-focus"):
             path = self.repo / "packaging/marlin/vm-lane" / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(("controlled " + name).encode())
@@ -768,7 +768,7 @@ class RequiredSourceInputs(unittest.TestCase):
                    "required_members": {"usr/bin/tuna-compositor": {"sha256": "6" * 64}},
                    "pkginfo": {"pkgname": "tuna"}, "member_count": 1, "decompressed_bytes": 8192}
         members = {"/usr/bin/tuna-compositor": "6" * 64}
-        for name in ("tuna-vm-input", "tuna-vm-lifecycle"):
+        for name in ("tuna-vm-input", "tuna-vm-lifecycle", "tuna-vm-shell-focus"):
             members["/usr/libexec/" + name] = contract.digest(
                 (self.repo / "packaging/marlin/vm-lane" / name).read_bytes())
         observed = {"schema": 1, "image_id": IMAGE, "member_sha256": members}
