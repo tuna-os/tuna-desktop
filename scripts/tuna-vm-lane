@@ -4133,8 +4133,8 @@ def repeat_boots(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--profile", choices=("lifecycle", "gnome-reference", "tuna-reference"), default="lifecycle",
-                    help="explicit paired DEV member; ordinary Tuna lifecycle remains the default")
+    ap.add_argument("--profile", choices=("lifecycle", "autotz", "gnome-reference", "tuna-reference"), default="lifecycle",
+                    help="ordinary lifecycle (default), required independent native automatic-timezone consumer, or explicit paired DEV member")
     ap.add_argument("--reference-base-evidence",
                     help="actual normal-CI raw index and successful platform cosign verification directory")
     ap.add_argument("--disk", required=True)
@@ -4144,8 +4144,6 @@ def main():
                     help="after the assertions, record the feature tour video")
     ap.add_argument("--strip-edge", action="store_true", help="explicit four-actor stationary edge consumer on final boot")
     ap.add_argument("--strip-image", help="exact same-run package/final-image receipt; installed strip acceptance on final tour boot")
-    ap.add_argument("--profile", choices=("lifecycle", "autotz"), default="lifecycle",
-                    help="required independent native automatic-timezone consumer")
     ap.add_argument("--published", action="store_true",
                     help="the disk holds the published marlin:tuna flavor; released-build gaps qualify "
                          "where the current-build lanes prove the newer behavior")
@@ -4176,7 +4174,7 @@ def main():
             ap.error("native autotz requires KVM, exact installed image admission and one pristine boot")
     if a.fresh_gdm_trace and not a.fresh_accounts:
         ap.error("--fresh-gdm-trace requires --fresh-accounts")
-    if a.profile != "lifecycle":
+    if a.profile in ("gnome-reference", "tuna-reference"):
         if not a.reference_base_evidence:
             ap.error("the paired consumer requires --reference-base-evidence")
         if (not a.require_kvm or a.tour or a.boots != 1 or a.soak or a.fresh_accounts
