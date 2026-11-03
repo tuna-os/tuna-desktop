@@ -146,14 +146,24 @@ def main():
         while True:
             if browser_process is not None and browser_process.poll() is not None:
                 raise AssertionError(f"browser exited during {label}")
-            subprocess.run(["scrot", str(path)], env=environment, check=True)
+            # scrot refuses to overwrite: without -o, iterations after the
+            # first write label_NNN.png while this loop re-reads the stale
+            # first shot forever, so the poll only passes when the very
+            # first screenshot already shows paint.
+            subprocess.run(["scrot", "-o", str(path)], env=environment, check=True)
             image = Image.open(path).convert("RGB")
             colors = image.getcolors(image.width * image.height) or []
             # Solid fixture pixels establish actual page rendering, not only a
             # compositor diagnostic write or a CDP target's existence. CDP
             # targets exist before first paint, so poll for the painted
             # content (software rendering is slow) instead of single-shotting.
-            visible = sum(count for count, color in colors if color in ((23, 54, 93), (138, 33, 28)))
+            # First paint frames differ from the settled color by a few LSB
+            # (observed: (21, 55, 96) settling to (23, 54, 93)), so match
+            # with a small tolerance instead of exact equality.
+            targets = ((23, 54, 93), (138, 33, 28))
+            visible = sum(count for count, color in colors
+                          if any(max(abs(color[i] - target[i]) for i in range(3)) <= 2
+                                 for target in targets))
             if visible >= 500:
                 return path
             if time.monotonic() >= deadline:
@@ -193,15 +203,63 @@ def main():
         tabs("browser-ready-" + str(len(processes)))
         return windows(ready)[0]
 
+    def settle(window, label):
+        # The shell reframes a mapped window (observed: 800x600 at (240, 116)
+        # becomes 768x558 at (256, 137) ~100ms after map), so a rect read at
+        # launch-ready is stale by gesture time and the press misses into the
+        # background. Aim only once the rect stops moving.
+        deadline = time.monotonic() + 20
+        stable_since = None
+        last_rect = None
+        while time.monotonic() < deadline:
+            if browser_process is not None and browser_process.poll() is not None:
+                raise AssertionError(f"browser exited during {label}")
+            os.kill(args.compositor_pid, 0)
+            document = state()
+            current = next((w for w in windows(document) if w["id"] == window["id"]), None)
+            if current is None:
+                raise AssertionError(f"fixture window vanished during {label}")
+            if current["rect"] != last_rect:
+                last_rect = list(current["rect"])
+                stable_since = time.monotonic()
+            elif time.monotonic() - stable_since >= 0.5:
+                (art / f"{label}.json").write_text(json.dumps(document, indent=2))
+                return current
+            time.sleep(.05)
+        raise AssertionError(f"window never settled during {label}; see {art}")
+
     def detach(window, label):
         old = trace()
         x, y, width, height = window["rect"]
-        move(x + args.tab_x, y + args.tab_y)
-        input_("mousedown", 1)
-        # Intermediate physical motion crosses the tabstrip threshold with
-        # the button held; CDP is observation only, never the input source.
-        for dy in (15, 45, 90, 160):
-            move(x + args.tab_x + 25, y + args.tab_y + dy)
+        # A press can land while Chromium's drag controller is still
+        # unwinding a previous drag (observed after Escape-cancel: the press
+        # activates the tab but no drag starts), so retry the gesture when
+        # no new drag object appears instead of burning the 20s window wait.
+        for attempt in range(3):
+            move(x + args.tab_x, y + args.tab_y)
+            input_("mousedown", 1)
+            # Intermediate physical motion crosses the tabstrip threshold with
+            # the button held; CDP is observation only, never the input source.
+            # The waypoints descend through the window and exit below its bottom
+            # edge: Chromium only tears the tab off once the drag reaches out of
+            # the source window, and the descent must be gradual (teleporting
+            # from mid-window to outside leaves the tab docked as an in-strip
+            # reorder, so the last in-window motion lands near the bottom edge).
+            for step in (1, 2, 3, 4, 5):
+                dy = (height + 60) * step // 5
+                move(x + args.tab_x + 25, y + args.tab_y + dy)
+            start_deadline = time.monotonic() + 3
+            while time.monotonic() < start_deadline:
+                if trace()["create"] > old["create"]:
+                    break
+                time.sleep(.05)
+            else:
+                input_("mouseup", 1)
+                time.sleep(2)
+                continue
+            break
+        else:
+            raise AssertionError(f"browser never started a drag during {label}; see {art}")
         document = wait(lambda d: len(windows(d)) == 2 and d["client_dnd_active"], label)
         counts = trace()
         assert counts["create"] > old["create"] and counts["attach"] > old["attach"], "browser fallback is not xdg_toplevel_drag acceptance"
@@ -237,6 +295,7 @@ def main():
         baseline_ids = {window["id"] for window in initial["windows"]}
         origin = launch()
         capture("01-initial-tabs")
+        origin = settle(origin, "01b-window-settled")
         detached = detach(origin, "02-detached-held")
         # Position away from screen edges, then compare a second real motion.
         move(850, 550)
@@ -265,6 +324,9 @@ def main():
             move(x + args.tab_x, y + args.tab_y + dy)
         ox, oy, _, _ = origin["rect"]
         move(ox + args.tab_x + 160, oy + args.tab_y)
+        # Chromium merges the dragged tab on motion over the strip, not on
+        # enter alone, so jiggle after arrival to deliver that motion.
+        move(ox + args.tab_x + 166, oy + args.tab_y + 3)
         wait(lambda d: len(windows(d)) == 1, "07-reattached-held")
         input_("mouseup", 1)
         reattached = wait(lambda d: len(windows(d)) == 1 and not d["client_dnd_active"], "08-reattached")
