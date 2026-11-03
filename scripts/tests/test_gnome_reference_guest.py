@@ -955,6 +955,28 @@ class ControlledAtspi(unittest.TestCase):
         trees[0]['children'][0]['states'] = []
         self.assertEqual(GUEST.window_context(trees, fixture, shell)[1]['selected'], [])
 
+    def test_selected_network_button_carries_panel_identity_like_legacy_list_item(self):
+        # Observed GNOME 51.1 tree: the sidebar exposes categories as buttons,
+        # the selected Network button carrying its own label identity.
+        for role in ('button', 'list item'):
+            trees, fixture, shell = self.context()
+            window = trees[2]['children'][0]
+            row = window['children'][0]
+            row['role_name'] = role
+            row['name'] = 'Network'
+            with self.subTest(role=role):
+                windows, selection = GUEST.window_context(trees, fixture, shell)
+                evidence = selection['active_windows'][0]['panel_evidence'][0]
+                self.assertEqual(evidence['selected_object']['atspi']['path'], '/settings/network/nav')
+                self.assertEqual(evidence['label_objects'][0]['name'], 'Network')
+        trees, fixture, shell = self.context()
+        row = trees[2]['children'][0]['children'][0]
+        row['role_name'] = 'button'
+        row['name'] = 'Network'
+        row['states'] = [25, 30]
+        with self.assertRaises(RuntimeError):
+            GUEST.window_context(trees, fixture, shell)
+
     def test_network_label_requires_selected_visible_original_descendant_not_window_title(self):
         for change in ('unselected', 'hidden-label', 'foreign-label', 'title-only'):
             trees, fixture, shell = self.context()
@@ -1453,6 +1475,69 @@ class FixtureLaunch(unittest.TestCase):
         self.assertIn('"role": "files-second"', message)
         self.assertIn('stderr_tails=', message)
         self.assertIn('tail-', message)
+
+
+class AdmissionGreeterTeardown(unittest.TestCase):
+    def _greeter(self, state):
+        return {'Id': '1', 'User': '60578', 'Name': 'gdm-greeter', 'Class': 'greeter',
+                'Service': 'gdm-launch-environment', 'Type': 'wayland', 'Active': 'no',
+                'Remote': 'no', 'Seat': 'seat0', 'State': state, 'VTNr': '1'}
+
+    def _user(self):
+        return {'Id': '3', 'User': '1000', 'Name': 'tuna-test', 'Class': 'user',
+                'Service': 'gdm-password', 'Type': 'wayland', 'Active': 'yes',
+                'Remote': 'no', 'Seat': 'seat0', 'State': 'active', 'VTNr': '7'}
+
+    def _mocks(self, greeter_state):
+        queries = []
+
+        def candidates(paths, uid, deadline):
+            queries.append((tuple(paths), uid))
+            if tuple(paths) == ('/usr/bin/gnome-shell',) and uid == 1000:
+                return [{'exe': '/usr/bin/gnome-shell', 'pid': 200, 'uid': 1000,
+                         'start_ticks': 5, 'boot_id': 'b', 'exe_sha256': '1' * 64}]
+            return []
+
+        def packaged(identity, deadline, cache):
+            package = {'/usr/bin/gdm': ('gdm', '51.1-1'),
+                       '/usr/bin/dbus-broker': ('dbus-broker', '36-1'),
+                       }.get(identity['exe'], ('gnome-shell', '51.1-1'))
+            return dict(identity, package={'name': package[0], 'version': package[1]})
+
+        patches = [
+            mock.patch.object(GUEST, 'sessions',
+                              return_value=[self._greeter(greeter_state), self._user()]),
+            mock.patch.object(GUEST, 'payload_integrity', return_value={'ready': True}),
+            mock.patch.object(GUEST, 'run',
+                              return_value='MainPID=1\nActiveState=active\nSubState=running\nFragmentPath=/gdm'),
+            mock.patch.object(GUEST, 'proc_identity', return_value={'exe': '/usr/bin/gdm', 'pid': 1}),
+            mock.patch.object(GUEST, 'packaged', side_effect=packaged),
+            mock.patch.object(GUEST, 'process_candidates', side_effect=candidates),
+            mock.patch.object(GUEST, 'session_environment', return_value={'WAYLAND_DISPLAY': 'wayland-0'}),
+            mock.patch.object(GUEST, 'check_socket_peer', return_value={'exe': '/usr/bin/dbus-broker'}),
+            mock.patch.object(GUEST, 'native_gpu', return_value={}),
+            mock.patch.object(GUEST, 'Path',
+                              side_effect=lambda *parts: SimpleNamespace(read_text=lambda: 'tty7')),
+        ]
+        for entered in patches:
+            entered.start()
+            self.addCleanup(entered.stop)
+        return queries
+
+    def test_closing_greeter_is_skipped_without_shell_probe(self):
+        queries = self._mocks('closing')
+        admitted, environment = GUEST.admission('gnome', GUEST.Deadline(3), {})
+        self.assertTrue(admitted['ready'], admitted.get('missing'))
+        self.assertEqual(admitted['gdm']['greeters'], [])
+        self.assertEqual(environment, {'WAYLAND_DISPLAY': 'wayland-0'})
+        self.assertNotIn(60578, [uid for _, uid in queries])
+
+    def test_live_greeter_without_shell_still_fails(self):
+        self._mocks('online')
+        admitted, _ = GUEST.admission('gnome', GUEST.Deadline(3), {})
+        self.assertFalse(admitted['ready'])
+        self.assertTrue(any('greeter shell is not unique' in entry for entry in admitted['missing']),
+                        admitted.get('missing'))
 
 
 if __name__ == '__main__':
