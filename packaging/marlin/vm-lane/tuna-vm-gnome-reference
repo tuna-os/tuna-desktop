@@ -445,7 +445,9 @@ def admission(profile, deadline, cache):
                 raise RuntimeError('foreign/non-native GDM greeter session')
             shells = process_candidates(('/usr/bin/gnome-shell',), uid, deadline)
             if len(shells) != 1:
-                raise RuntimeError('original GDM greeter shell is not unique')
+                observed = sorted((shell['pid'], shell.get('start_ticks')) for shell in shells)
+                raise RuntimeError('original GDM greeter shell is not unique: '
+                                   f'{len(shells)} under uid {uid} pid/start {observed}')
             shell = packaged(shells[0], deadline, cache)
             if shell['package']['name'] != 'gnome-shell' or not version_51_1(shell['package']['version']):
                 raise RuntimeError('stock GNOME51.1 greeter principal absent')
