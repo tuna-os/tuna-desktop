@@ -3095,20 +3095,46 @@ def await_login(agent, deadline):
     return False, login
 
 
-def gdm_login(qmp, agent_path, out, record):
-    """Drive the shipped GDM greeter's user list and password prompt; never
-    an autologin, initial or preselected session."""
+def await_reference_login(agent, deadline, *, profile):
+    """Only the independent observer admits paired native session principals."""
+    from vm_gnome_reference import session_status
+    observed = None
+    while time.monotonic() < deadline:
+        observed = session_status(agent, profile=profile)
+        if observed["ready"]:
+            return True, observed
+        # logind appears before the compositor, user bus and DRM device are
+        # ready. Keep observing this same PAM login without typing again.
+        time.sleep(1)
+    return False, observed if observed and observed["session"]["started"] else None
+
+
+def gdm_login(qmp, agent_path, out, record, *, reference_profile=None):
+    """Drive the original stock GDM user list and password prompt.
+
+    Paired DEV fixtures alone save a session choice; normal Tuna fixtures
+    still prove the shipped fallback without preselection.
+    """
+    if reference_profile not in (None, "tuna", "gnome"):
+        raise ValueError("unknown native login profile")
+    if reference_profile is not None:
+        from vm_gnome_reference import session_status
     agent = None
     deadline = time.monotonic() + 120
     greeter = {}
+    greeter_error = None
     while time.monotonic() < deadline:
         try:
             if agent is None:
                 agent = guest_agent.GuestAgent(agent_path)
-            greeter = agent.run("greeter")
-            if greeter_ready(greeter):
+            greeter = (session_status(agent, profile=reference_profile) if reference_profile is not None
+                       else agent.run("greeter"))
+            greeter_error = None
+            ready = greeter["gdm"]["ready"] if reference_profile is not None else greeter_ready(greeter)
+            if ready:
                 break
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, ValueError) as error:
+            greeter_error = str(error)
             if agent is not None:
                 agent.close()
                 agent = None
@@ -3116,9 +3142,11 @@ def gdm_login(qmp, agent_path, out, record):
     else:
         if agent is not None:
             agent.close()
+        with open(os.path.join(out, "greeter-before-login.json"), "w") as stream:
+            json.dump({"last_observation": greeter, "last_error": greeter_error}, stream, indent=2)
         raise RuntimeError("shipped GDM greeter did not become ready")
     try:
-        provenance = agent.run("payload")
+        provenance = greeter if reference_profile is not None else agent.run("payload")
         with open(os.path.join(out, "shipped-payload.json"), "w") as stream:
             json.dump(provenance, stream, indent=2)
         with open(os.path.join(out, "greeter-before-login.json"), "w") as stream:
@@ -3127,10 +3155,14 @@ def gdm_login(qmp, agent_path, out, record):
         qmp.frame(os.path.join(out, "V-GDM-GREETER.png"))
         # The logout check compares the repainted greeter with this frame.
         qmp.cmd("screendump", filename=os.path.join(out, "greeter-before-login.ppm"), format="ppm")
-        ok, detail = greeter_list_ok(greeter)
-        record("V-GREETER-LIST", ok, detail)
-        ok, detail = fallback_session_ok(greeter)
-        record("V-GDM-FALLBACK", ok, detail)
+        if reference_profile is not None:
+            record("V-REFERENCE-STOCK-GDM", greeter["gdm"]["ready"],
+                   "original packaged stock GDM greeter admitted by the independent reference observer")
+        else:
+            ok, detail = greeter_list_ok(greeter)
+            record("V-GREETER-LIST", ok, detail)
+            ok, detail = fallback_session_ok(greeter)
+            record("V-GDM-FALLBACK", ok, detail)
         # gnome-shell 51.0 js/gdm/loginDialog.js: _showUserList() gives the
         # user list key focus, which moves to its first item, and activating
         # that item begins password verification. tunaOS's GDM login gate
@@ -3152,20 +3184,23 @@ def gdm_login(qmp, agent_path, out, record):
             qmp.frame(os.path.join(out, f"gdm-attempt-{attempt}.png"))
             qmp.type_text("tuna")
             qmp.keys("ret")
-            started, login = await_login(agent, time.monotonic() + 60)
+            if reference_profile is not None:
+                started, login = await_reference_login(agent, time.monotonic() + 60, profile=reference_profile)
+            else:
+                started, login = await_login(agent, time.monotonic() + 60)
             if started:
                 record("V-GDM-LOGIN", True,
                        f"shipped non-root GDM greeter → user list (selection attempt {attempt}) → password PAM "
-                       "login → real non-root gdm-password Tuna Desktop session; payload hashes unchanged")
+                       f"login → real non-root gdm-password {'stock GNOME 51.1' if reference_profile == 'gnome' else 'Tuna Desktop'} "
+                       "session; original payload identities verified")
                 return True
             if login is not None:
-                # A session started without the Tuna Desktop compositor; never type into it.
+                # A real session started but failed admission; never type into it.
                 with open(os.path.join(out, "gdm-login-session.json"), "w") as stream:
                     json.dump(login, stream, indent=2)
-                raise RuntimeError(f"GDM PAM login started a {login['session'].get('Service')} session "
-                                   f"running {login['desktop']} instead of Tuna Desktop "
-                                   f"(GDM fallback session {greeter.get('fallback_session')!r})")
-        raise RuntimeError("graphical GDM PAM login did not produce a Tuna Desktop session")
+                raise RuntimeError(f"GDM PAM login started a session that did not admit {reference_profile or 'tuna'}; "
+                                   "see gdm-login-session.json")
+        raise RuntimeError(f"graphical GDM PAM login did not produce an admitted {reference_profile or 'tuna'} session")
     finally:
         agent.close()
 
@@ -3925,6 +3960,70 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
     return (*result, agent_path) if guest_agent else result
 
 
+def run_wm_reference(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
+    """Retain the genuine paired consumer's actual member receipt."""
+    from vm_gnome_reference import run
+    target = os.path.join(out, "wm-reference")
+    os.makedirs(target, exist_ok=True)
+    run(qmp, agent, target, record, profile=profile, provenance=provenance,
+        base_evidence_dir=base_evidence_dir)
+    record("V-WM-REFERENCE", True,
+           "genuine native switcher consumer completed; individual observed phase gates remain mandatory")
+
+
+def native_reference_lane(args):
+    """Run either paired member through the same native producer and observer."""
+    profile = "gnome" if args.profile == "gnome-reference" else "tuna"
+    out = os.path.abspath(args.out)
+    scratch = os.path.join(out, ".scratch")
+    os.makedirs(scratch, exist_ok=True)
+    results = {}
+
+    def record(test_id, ok, desc):
+        results[test_id] = (ok, desc)
+        log(f"{test_id} {'pass' if ok else 'FAIL'}: {desc}")
+
+    provenance = dict(value.split("=", 1) for value in args.meta)
+    vm, qmp_path, serial_path, kvm, agent_path = boot(
+        os.path.abspath(args.disk), out, scratch, args.timeout, True, guest_agent=True)
+    provenance.update({"profile": args.profile, "kvm": kvm,
+                       "resolution": f"{WIDTH}x{HEIGHT}",
+                       "gpu_profile": baseline.GPU_PROFILE,
+                       "gpu_devices": baseline.gpu_devices()})
+    agent = None
+    try:
+        qmp = baseline.Qmp(qmp_path)
+        gdm_login(qmp, agent_path, out, record, reference_profile=profile)
+        agent = guest_agent.GuestAgent(agent_path)
+        run_wm_reference(qmp, agent, out, record, profile=profile, provenance=provenance,
+                         base_evidence_dir=args.reference_base_evidence)
+        qmp.cmd("quit")
+    except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        record("V-NATIVE-REFERENCE", False, str(error))
+    finally:
+        if agent is not None:
+            agent.close()
+        if vm.poll() is None:
+            vm.terminate()
+        try:
+            vm.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            vm.kill()
+            vm.wait(timeout=10)
+        with open(os.path.join(out, "assertions.txt"), "w") as stream:
+            for test_id, (ok, desc) in results.items():
+                stream.write(f"{test_id} {'pass' if ok else 'fail'} {desc}\n")
+        with open(os.path.join(out, "manifest.json"), "w") as stream:
+            json.dump({"lane": f"native-{'gnome51' if profile == 'gnome' else 'tuna'}-reference", **provenance,
+                       "disk": os.path.basename(args.disk),
+                       "captured_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                       "assertions": {key: {"pass": value[0], "detail": value[1]}
+                                      for key, value in results.items()}}, stream, indent=2)
+        shutil.rmtree(scratch, ignore_errors=True)
+    if any(not ok for ok, _ in results.values()):
+        sys.exit("tuna-vm-lane: paired native reference consumer failed")
+
+
 def fresh_accounts_lane(args):
     """tunaOS#4092: one boot (with an in-guest reboot) of the record-free
     standard/admin account journey; distinct from the default lane's
@@ -4044,8 +4143,10 @@ def repeat_boots(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--profile", choices=("lifecycle", "core-apps"), default="lifecycle",
-                    help="ordinary lifecycle or required complete native Core consumer")
+    ap.add_argument("--profile", choices=("lifecycle", "core-apps", "gnome-reference", "tuna-reference"), default="lifecycle",
+                    help="ordinary lifecycle (default), required complete native Core consumer, or explicit paired DEV member")
+    ap.add_argument("--reference-base-evidence",
+                    help="actual normal-CI raw index and successful platform cosign verification directory")
     ap.add_argument("--disk", required=True)
     ap.add_argument("--out", default="vm-lane-artifacts")
     ap.add_argument("--timeout", type=int, default=900)
@@ -4083,6 +4184,14 @@ def main():
             ap.error("native Core requires KVM, exact installed image admission and one pristine boot")
     if a.fresh_gdm_trace and not a.fresh_accounts:
         ap.error("--fresh-gdm-trace requires --fresh-accounts")
+    if a.profile in ("gnome-reference", "tuna-reference"):
+        if not a.reference_base_evidence:
+            ap.error("the paired consumer requires --reference-base-evidence")
+        if (not a.require_kvm or a.tour or a.boots != 1 or a.soak or a.fresh_accounts
+                or a.published or a.strip_image or a.strip_edge):
+            ap.error("paired reference profiles require KVM and their own single pristine boot")
+        native_reference_lane(a)
+        return
     if a.fresh_accounts:
         if a.tour or a.boots != 1 or a.soak or a.strip_image or a.published:
             ap.error("--fresh-accounts is its own single current-build boot")
