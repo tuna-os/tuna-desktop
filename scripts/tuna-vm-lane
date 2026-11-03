@@ -4220,7 +4220,8 @@ def main():
                     record("V-AUTOTZ", isinstance(consumer, dict) and consumer.get("qualified") is True,
                            "required independent native automatic-timezone consumer completed")
                 except Exception as error:
-                    record("V-AUTOTZ", False, f"native automatic-timezone consumer failed: {type(error).__name__}")
+                    record("V-AUTOTZ", False,
+                           f"native automatic-timezone consumer failed: {type(error).__name__}: {error}")
             if a.soak and manager_ready:
                 run_soak(qmp, vm, agent_path, out, record, a.soak, a.soak_warmup, a.soak_interval,
                          a.soak_revision)

@@ -101,7 +101,8 @@ def error_receipt(error, arguments):
                                      site['function'])):
                 sites.append(site)
         sites = sites[-4:]
-    result = {'domain': domain, 'operation': operation, 'exception_type': type(error).__name__, 'sites': sites}
+    result = {'domain': domain, 'operation': operation, 'exception_type': type(error).__name__,
+              'message': str(error)[:2000], 'sites': sites}
     for name in ('errno', 'returncode'):
         value = getattr(error, name, None)
         if type(value) is int and -4095 <= value <= 4095:

@@ -555,6 +555,22 @@ class OriginalMonitorLifetimeControls(unittest.TestCase):
         self.assertEqual(len(receipt["sites"]), 4)
         self.assertEqual(receipt["sites"][0]["line"], 101)
 
+    def test_failure_receipt_carries_bounded_message(self):
+        guest_dir = str(Path(GUEST.__file__).resolve().parent.parent / "tuna-native-session")
+        sys.path.insert(0, guest_dir)
+        try:
+            import autotz_guest
+        finally:
+            sys.path.remove(guest_dir)
+            sys.modules.pop("autotz_guest", None)
+            sys.modules.pop("native_session", None)
+        receipt = autotz_guest.error_receipt(RuntimeError("owned monitor recorded an error"),
+                                             ["autotz", "configure"])
+        self.assertEqual(receipt["exception_type"], "RuntimeError")
+        self.assertEqual(receipt["message"], "owned monitor recorded an error")
+        receipt = autotz_guest.error_receipt(RuntimeError("x" * 5000), ["autotz", "snapshot"])
+        self.assertEqual(receipt["message"], "x" * 2000)
+
 
 if __name__ == "__main__":
     unittest.main()
