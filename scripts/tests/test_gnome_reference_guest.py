@@ -6,6 +6,7 @@ none claims a stock GDM, GNOME, accessibility or physical-input runtime result.
 import base64
 import copy
 import gzip
+import re
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -18,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -1259,6 +1261,198 @@ class ControlledObservationEvidence(unittest.TestCase):
     def test_slow_call_line_names_bus_path_and_method(self):
         self.assertEqual(GUEST.slow_call_line(':1.5', '/org/a11y/atspi/accessible/1', 'GetAll', 1900),
                          'observe slow-call bus=:1.5 path=/org/a11y/atspi/accessible/1 method=GetAll elapsed_ms=1900')
+
+
+class FixtureLaunch(unittest.TestCase):
+    def test_settings_launches_first_with_stable_roles(self):
+        plan = GUEST.fixture_launch_plan(['/d/first', '/d/second'])
+        self.assertEqual([role for _, role in plan], ['settings', 'files-first', 'files-second'])
+        self.assertEqual(plan[0][0], [GUEST.APPS[1], 'network'])
+        self.assertEqual(plan[1][0], [GUEST.APPS[0], '--new-window', '/d/first'])
+        self.assertEqual(plan[2][0], [GUEST.APPS[0], '--new-window', '/d/second'])
+        with self.assertRaises(ValueError):
+            GUEST.fixture_launch_plan(['/d/only'])
+        with self.assertRaises(ValueError):
+            GUEST.fixture_launch_plan(['/d/a', '/d/b', '/d/c'])
+
+    def test_stderr_drain_never_blocks_and_keeps_bounded_tail(self):
+        read_fd, write_fd = os.pipe()
+        payload = bytes(byte % 251 for byte in range(200000))
+        def write_all():
+            with os.fdopen(write_fd, 'wb') as stream:
+                stream.write(payload)
+        writer = threading.Thread(target=write_all)
+        writer.start()
+        drain = GUEST.StderrDrain(os.fdopen(read_fd, 'rb'))
+        drain.run()
+        writer.join(timeout=10)
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(len(drain.tail), GUEST.StderrDrain.KEEP)
+        self.assertEqual(bytes(drain.tail), payload[-GUEST.StderrDrain.KEEP:])
+        self.assertEqual(drain.text(limit=8), payload[-8:].decode('utf-8', errors='replace'))
+
+    def test_snapshot_retry_reports_attempts_and_durations(self):
+        with self.assertRaises(RuntimeError) as failure:
+            GUEST.snapshot_until_ready(
+                mock.Mock(side_effect=GUEST.FixtureNotReady('inventory nope')),
+                [], GUEST.Deadline(0.05))
+        self.assertRegex(str(failure.exception),
+                         r'last: FixtureNotReady: inventory nope; attempts=1 attempt_ms=\[\d+\]$')
+        with self.assertRaises(RuntimeError) as timeout:
+            GUEST.snapshot_until_ready(
+                mock.Mock(side_effect=TimeoutError('deadline gone')), [], GUEST.Deadline(0.05))
+        self.assertRegex(str(timeout.exception), r'last: TimeoutError: deadline gone; attempts=1 attempt_ms=\[\d+\]$')
+
+        def distinct_not_ready():
+            raise GUEST.FixtureNotReady('inventory nope')
+
+        with self.assertRaises(RuntimeError) as repeated:
+            GUEST.snapshot_until_ready(distinct_not_ready, [], GUEST.Deadline(1))
+        message = str(repeated.exception)
+        self.assertIn('first: FixtureNotReady: inventory nope', message)
+        match = re.search(r'; attempts=(\d+) attempt_ms=\[([\d, ]*)\]$', message)
+        self.assertIsNotNone(match)
+        durations = [entry for entry in match.group(2).split(',') if entry.strip()]
+        self.assertGreaterEqual(int(match.group(1)), 2)
+        self.assertEqual(len(durations), int(match.group(1)))
+
+    def _prepare_fixture(self):
+        claim = {'nonce': NONCE, 'profile': 'gnome',
+                 'fixture': {'processes': [], 'launchers': [], 'directories': [], 'directory_identities': []}}
+        launched = []
+
+        class Child:
+            def __init__(self, argv, **kwargs):
+                self.args = argv
+                self.pid = 5000 + len(launched)
+                self.stderr = io.BytesIO(b'stderr-for-pid-%d' % self.pid)
+                launched.append((argv, kwargs))
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        real_path = Path
+
+        class FakePath:
+            def __init__(self, real):
+                self._real = real_path(real)
+
+            def __truediv__(self, other):
+                return FakePath(str(self._real / other))
+
+            def __str__(self):
+                return str(self._real)
+
+            def __fspath__(self):
+                return str(self._real)
+
+            def mkdir(self, mode=0o777):
+                os.makedirs(self._real, mode=mode, exist_ok=True)
+
+        return claim, launched, Child, FakePath
+
+    def _prepare_mocks(self, tmp, claim, launched, Child, FakePath):
+        shell = {'pid': 111, 'start_ticks': 10, 'boot_id': 'b', 'uid': 1000, 'exe': '/usr/bin/gnome-shell'}
+        before = {'settings': {}, 'trees': [{'process': dict(shell), 'role_name': 'application',
+                                             'states': [], 'children': []}]}
+        wait = {'settings': {}, 'trees': [{'process': {'pid': 5001}, 'role_name': 'frame',
+                                           'states': [25], 'children': []}]}
+        exe_by_pid = {}
+        drains = []
+
+        class Drain:
+            def __init__(self, stream):
+                self.stream = stream
+                drains.append(self)
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+            def text(self, limit=2048):
+                return 'tail-%d' % len(drains)
+
+        def spawn(argv, **kwargs):
+            child = Child(argv, **kwargs)
+            exe_by_pid[child.pid] = argv[0]
+            return child
+
+        patches = [
+            mock.patch.object(GUEST, 'admission', return_value=({'ready': True, 'session': {'shell': shell},
+                                                                 'missing': []}, {'WAYLAND_DISPLAY': 'x'})),
+            mock.patch.object(GUEST, 'process_candidates', return_value=[]),
+            mock.patch.object(GUEST, 'public_observation', side_effect=[before, wait]),
+            mock.patch.object(GUEST, 'same_process'),
+            mock.patch.object(GUEST, 'load_claim', return_value=claim),
+            mock.patch.object(GUEST, 'save'),
+            mock.patch.object(GUEST, 'private_directory',
+                              side_effect=lambda path, uid, create=False: {'path': str(path)}),
+            mock.patch.object(GUEST.pwd, 'getpwnam', return_value=SimpleNamespace(pw_gid=1000)),
+            mock.patch.object(GUEST.subprocess, 'Popen', side_effect=spawn),
+            mock.patch.object(GUEST, 'proc_identity',
+                              side_effect=lambda pid, uid: {'exe': exe_by_pid[pid], 'pid': pid}),
+            mock.patch.object(GUEST, 'packaged', side_effect=lambda identity, deadline, cache: identity),
+            mock.patch.object(GUEST, 'retained_files', return_value=['prepare.json']),
+            mock.patch.object(GUEST, 'StderrDrain', Drain),
+            mock.patch.object(GUEST, 'Path', side_effect=lambda *parts: FakePath(tmp)),
+            mock.patch('os.chown'),
+        ]
+        for entered in patches:
+            entered.start()
+            self.addCleanup(entered.stop)
+        return shell, before, wait, exe_by_pid, drains, launched
+
+    def test_prepare_launches_settings_before_either_nautilus(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claim, launched, Child, FakePath = self._prepare_fixture()
+            shell, before, wait, exe_by_pid, drains, _ = self._prepare_mocks(
+                tmp, claim, launched, Child, FakePath)
+            with mock.patch.object(GUEST, 'snapshot_until_ready',
+                                   return_value={'selection': {}, 'snapshot': True}) as loop:
+                response = GUEST.prepare({'profile': 'gnome', 'nonce': NONCE}, Path(tmp),
+                                         GUEST.Deadline(3), {})
+        self.assertTrue(response['ready'])
+        argv = [call[0] for call in launched]
+        self.assertEqual(argv[0], [GUEST.APPS[1], 'network'])
+        self.assertEqual(argv[1][:2], [GUEST.APPS[0], '--new-window'])
+        self.assertEqual(argv[2][:2], [GUEST.APPS[0], '--new-window'])
+        self.assertIn('first', argv[1][2])
+        self.assertIn('second', argv[2][2])
+        self.assertEqual(launched[0][1]['env']['XDG_CURRENT_DESKTOP'], 'Tuna:GNOME')
+        self.assertNotIn('XDG_CURRENT_DESKTOP', launched[1][1]['env'])
+        self.assertNotIn('XDG_CURRENT_DESKTOP', launched[2][1]['env'])
+        for _, kwargs in launched:
+            self.assertIs(kwargs['stderr'], GUEST.subprocess.PIPE)
+        self.assertEqual(len(drains), 3)
+        self.assertTrue(all(drain.started for drain in drains))
+        # First Nautilus still waits for its own window before the forward.
+        self.assertEqual(GUEST.public_observation.call_count, 2)
+        loop.assert_called_once()
+        roles = [entry['role'] for entry in claim['fixture']['launches']]
+        self.assertEqual(roles, ['settings', 'files-first', 'files-second'])
+        self.assertEqual([entry['pid'] for entry in claim['fixture']['launches']], [5000, 5001, 5002])
+        # Second Nautilus forwards; Settings and first Nautilus are principals.
+        self.assertEqual(len(claim['fixture']['processes']), 2)
+        self.assertEqual(len(claim['fixture']['launchers']), 1)
+
+    def test_prepare_failure_carries_launches_and_stderr_tails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claim, launched, Child, FakePath = self._prepare_fixture()
+            self._prepare_mocks(tmp, claim, launched, Child, FakePath)
+            with mock.patch.object(GUEST, 'snapshot_until_ready',
+                                   side_effect=RuntimeError('actual fixture observation never became ready: nope')):
+                with self.assertRaises(RuntimeError) as failure:
+                    GUEST.prepare({'profile': 'gnome', 'nonce': NONCE}, Path(tmp),
+                                  GUEST.Deadline(3), {})
+        message = str(failure.exception)
+        self.assertIn('never became ready: nope; launches=', message)
+        self.assertIn('"role": "settings"', message)
+        self.assertIn('"role": "files-second"', message)
+        self.assertIn('stderr_tails=', message)
+        self.assertIn('tail-', message)
 
 
 if __name__ == '__main__':
