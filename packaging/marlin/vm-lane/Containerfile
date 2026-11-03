@@ -109,7 +109,7 @@ RUN mkdir -p /usr/share/tuna-vm \
     && test "$(readlink -f /etc/systemd/system/display-manager.service)" = /usr/lib/systemd/system/gdm.service \
     && ! grep -Eiq '^[[:space:]]*(AutomaticLoginEnable|TimedLoginEnable)[[:space:]]*=[[:space:]]*(true|yes|y|1)[[:space:]]*$' /etc/gdm/custom.conf \
     && grep -qx 'FallbackSession=tuna' /etc/gdm/custom.conf \
-    && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test \
+    && useradd -M -d /home/tuna-test -s /bin/bash -U -G wheel tuna-test \
     && echo 'tuna-test:tuna' | chpasswd \
     && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-fresh-accounts /usr/libexec/tuna-vm-input /usr/libexec/tuna-vm-shell-focus \
          /usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token \
