@@ -481,6 +481,64 @@ class OriginalMonitorLifetimeControls(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unevaluable"):
                 GUEST._require_live_monitor(GUEST._monitor_status(directory, state))
 
+    def test_unevaluable_status_names_its_causal_origin(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            state = {"monitor": dict(self.monitor, nonce="b" * 32),
+                     "nonce": "a" * 32, "boot_id": self.monitor["boot_id"]}
+            status = GUEST._monitor_status(directory, state)
+            self.assertFalse(status["live"])
+            functions = [(site["module"], site["function"]) for site in status["unevaluable_sites"]]
+            self.assertEqual(functions, [("autotz.py", "_monitor_status")])
+            with self.assertRaisesRegex(RuntimeError, "unevaluable") as raised:
+                GUEST._require_live_monitor(status)
+            self.assertEqual(raised.exception.autotz_cause_sites, status["unevaluable_sites"])
+
+    @unittest.skipUnless(os.geteuid() == 0, "production control files require root ownership")
+    def test_dead_monitor_origin_is_the_liveness_check(self):
+        impossible = int(Path("/proc/sys/kernel/pid_max").read_text().strip())
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            state = {"monitor": dict(self.monitor, pid=impossible),
+                     "nonce": self.monitor["nonce"], "boot_id": self.monitor["boot_id"]}
+            GUEST._write_json(directory / "ready.json", dict(self.ready, pid=impossible))
+            status = GUEST._monitor_status(directory, state)
+            self.assertFalse(status["live"])
+            functions = [(site["module"], site["function"]) for site in status["unevaluable_sites"]]
+            self.assertEqual(functions, [("autotz.py", "_monitor_status"),
+                                         ("autotz.py", "_monitor_liveness")])
+
+    def test_failure_receipt_appends_validated_cause_sites(self):
+        guest_dir = str(Path(GUEST.__file__).resolve().parent.parent / "tuna-native-session")
+        sys.path.insert(0, guest_dir)
+        try:
+            import autotz_guest
+        finally:
+            sys.path.remove(guest_dir)
+            sys.modules.pop("autotz_guest", None)
+            sys.modules.pop("native_session", None)
+        cause = [{"module": "autotz.py", "line": 490, "function": "_monitor_liveness"},
+                 {"module": "autotz.py", "line": 655, "function": "_proc_identity"}]
+        error = RuntimeError("unevaluable")
+        error.autotz_cause_sites = cause
+        receipt = autotz_guest.error_receipt(error, ["autotz", "configure"])
+        self.assertEqual(receipt["sites"], cause)
+        error = RuntimeError("unevaluable")
+        error.autotz_cause_sites = cause + [{"module": "evil.py", "line": 1, "function": "f"},
+                                            {"module": "autotz.py", "line": 0, "function": "f"},
+                                            {"module": "autotz.py", "line": 1, "function": "bad-name!"},
+                                            "not-a-site",
+                                            {"module": "autotz.py", "line": 491, "function": "_monitor_status",
+                                             "extra": 1}]
+        receipt = autotz_guest.error_receipt(error, ["autotz", "watch-start"])
+        self.assertEqual(receipt["sites"], cause)
+        error = RuntimeError("unevaluable")
+        error.autotz_cause_sites = [{"module": "autotz.py", "line": 100 + index,
+                                     "function": "frame%d" % index} for index in range(5)]
+        receipt = autotz_guest.error_receipt(error, ["autotz", "snapshot"])
+        self.assertEqual(len(receipt["sites"]), 4)
+        self.assertEqual(receipt["sites"][0]["line"], 101)
+
 
 if __name__ == "__main__":
     unittest.main()

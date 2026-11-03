@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import xml.etree.ElementTree as ET
 
 UNIT = 'org.gnome.SettingsDaemon.Datetime.service'
@@ -500,8 +501,14 @@ def _monitor_liveness(monitor, readiness, *, expected_uid=0):
 
 def _require_live_monitor(monitor):
     if monitor is None or monitor.get('ready') is not True or monitor.get('live') is not True:
-        raise RuntimeError('automatic-timezone observation unevaluable: original monitor is not live: ' +
-                           json.dumps(monitor))
+        error = RuntimeError('automatic-timezone observation unevaluable: original monitor is not live: ' +
+                             json.dumps(monitor))
+        cause = monitor.get('unevaluable_sites') if isinstance(monitor, dict) else None
+        if cause:
+            # The bounded failure record follows the causal chain: the true
+            # origin (liveness line) displaces the generic requirement frame.
+            error.autotz_cause_sites = cause
+        raise error
 
 
 def _monitor_status(directory, state):
@@ -528,6 +535,10 @@ def _monitor_status(directory, state):
         result['live'] = True
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         result['unevaluable_reason'] = str(error)
+        result['unevaluable_sites'] = [
+            {'module': Path(frame.filename).name, 'line': frame.lineno, 'function': frame.name}
+            for frame in traceback.extract_tb(error.__traceback__)
+            if Path(frame.filename).resolve().parent == Path(__file__).resolve().parent][-2:]
     return result
 
 
