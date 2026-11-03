@@ -142,15 +142,23 @@ def main():
         from PIL import Image
 
         path = art / f"{label}.png"
-        subprocess.run(["scrot", str(path)], env=environment, check=True)
-        image = Image.open(path).convert("RGB")
-        colors = image.getcolors(image.width * image.height) or []
-        # Solid fixture pixels establish actual page rendering, not only a
-        # compositor diagnostic write or a CDP target's existence.
-        visible = sum(count for count, color in colors if color in ((23, 54, 93), (138, 33, 28)))
-        if visible < 500:
-            raise AssertionError(f"no visible real fixture content in {label}")
-        return path
+        deadline = time.monotonic() + 20
+        while True:
+            if browser_process is not None and browser_process.poll() is not None:
+                raise AssertionError(f"browser exited during {label}")
+            subprocess.run(["scrot", str(path)], env=environment, check=True)
+            image = Image.open(path).convert("RGB")
+            colors = image.getcolors(image.width * image.height) or []
+            # Solid fixture pixels establish actual page rendering, not only a
+            # compositor diagnostic write or a CDP target's existence. CDP
+            # targets exist before first paint, so poll for the painted
+            # content (software rendering is slow) instead of single-shotting.
+            visible = sum(count for count, color in colors if color in ((23, 54, 93), (138, 33, 28)))
+            if visible >= 500:
+                return path
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"no visible real fixture content in {label}")
+            time.sleep(0.2)
 
     def trace():
         return trace_counts((art / "browser.log").read_text(errors="replace"))
