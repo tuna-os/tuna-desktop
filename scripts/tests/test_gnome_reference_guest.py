@@ -1001,5 +1001,131 @@ class ControlledAtspi(unittest.TestCase):
                 GUEST.window_context(trees, fixture, shell)
 
 
+class ControlledObservationEvidence(unittest.TestCase):
+    """Timeout/state evidence semantics; not native qualification."""
+
+    def test_observation_timeout_retries_as_fixture_not_ready(self):
+        self.assertTrue(issubclass(GUEST.ObservationTimeout, GUEST.FixtureNotReady))
+        with self.assertRaises(GUEST.FixtureNotReady):
+            raise GUEST.ObservationTimeout('expired')
+
+    def test_worker_timeout_exit_maps_to_retryable_timeout(self):
+        self.assertIsNone(GUEST.check_worker_status(0, 'anything'))
+        with self.assertRaises(GUEST.ObservationTimeout) as timeout:
+            GUEST.check_worker_status(GUEST.WORKER_TIMEOUT_EXIT, 'observe progress nodes=2000 elapsed_ms=24000')
+        self.assertIn('nodes=2000', str(timeout.exception))
+        with self.assertRaises(RuntimeError) as failed:
+            GUEST.check_worker_status(1, 'boom')
+        self.assertNotIsInstance(failed.exception, GUEST.FixtureNotReady)
+        self.assertIn('boom', str(failed.exception))
+
+    def test_worker_main_reports_own_deadline_as_exit_ten(self):
+        body = io.BytesIO(json.dumps({'compositor': {}, 'budget_s': 5}).encode())
+        with mock.patch.object(GUEST.sys, 'argv', ['guest', '_observe', '99']), \
+             mock.patch.object(GUEST.sys, 'stdin', SimpleNamespace(buffer=body)), \
+             mock.patch.object(GUEST.socket, 'socket'), \
+             mock.patch.object(GUEST.traceback, 'print_exc'), \
+             mock.patch.object(GUEST, 'session_observe', side_effect=TimeoutError('expired')):
+            with self.assertRaises(SystemExit) as done:
+                GUEST.main()
+        self.assertEqual(done.exception.code, GUEST.WORKER_TIMEOUT_EXIT)
+
+    def test_first_state_error_survives_later_timeouts(self):
+        deadline = GUEST.Deadline(25)
+        calls = []
+
+        def attempt():
+            calls.append(1)
+            if len(calls) == 1:
+                raise GUEST.FixtureNotReady('tab inventory []')
+            deadline.end = 0
+            raise GUEST.ObservationTimeout('finite public observation deadline expired')
+
+        with mock.patch.object(GUEST.time, 'sleep'):
+            with self.assertRaises(RuntimeError) as failed:
+                GUEST.snapshot_until_ready(attempt, [], deadline)
+        message = str(failed.exception)
+        self.assertIn('first: FixtureNotReady: tab inventory []', message)
+        self.assertIn('last: ObservationTimeout: finite public observation deadline expired', message)
+        self.assertIsInstance(failed.exception.__cause__, GUEST.ObservationTimeout)
+
+    def test_timeout_only_run_reports_last_without_first(self):
+        deadline = GUEST.Deadline(25)
+        deadline.end = 0
+
+        def attempt():
+            raise GUEST.ObservationTimeout('expired')
+
+        with mock.patch.object(GUEST.time, 'sleep'):
+            with self.assertRaises(RuntimeError) as failed:
+                GUEST.snapshot_until_ready(attempt, [], deadline)
+        self.assertIn('last: ObservationTimeout: expired', str(failed.exception))
+        self.assertNotIn('first:', str(failed.exception))
+
+    def test_inactive_settings_counts_as_state_not_timeout(self):
+        deadline = GUEST.Deadline(25)
+        deadline.end = 0
+
+        def attempt():
+            return {'selection': {'active_windows': [{'role': 'files-first'}]}}
+
+        with mock.patch.object(GUEST.time, 'sleep'):
+            with self.assertRaises(RuntimeError) as failed:
+                GUEST.snapshot_until_ready(attempt, [], deadline)
+        self.assertIn('original Settings Network window is not actually active', str(failed.exception))
+
+    def test_ready_snapshot_returns_without_sleep(self):
+        deadline = GUEST.Deadline(25)
+        expected = {'selection': {'active_windows': [{'role': 'settings'}]}}
+        with mock.patch.object(GUEST.time, 'sleep') as slept:
+            self.assertIs(GUEST.snapshot_until_ready(lambda: expected, [], deadline), expected)
+        slept.assert_not_called()
+
+    def test_drain_recovers_pipe_bytes_without_blocking(self):
+        out_read, out_write = os.pipe()
+        err_read, err_write = os.pipe()
+        os.write(out_write, b'{"partial": true')
+        os.write(err_write, b'observe progress nodes=2000 elapsed_ms=24000')
+        os.close(out_write)
+        os.close(err_write)
+        out_stream = os.fdopen(out_read, 'rb')
+        err_stream = os.fdopen(err_read, 'rb')
+        try:
+            worker = SimpleNamespace(stdout=out_stream, stderr=err_stream)
+            streams = {out_stream: bytearray(), err_stream: bytearray()}
+            GUEST.drain_worker_streams(worker, streams)
+            self.assertEqual(bytes(streams[out_stream]), b'{"partial": true')
+            self.assertEqual(bytes(streams[err_stream]), b'observe progress nodes=2000 elapsed_ms=24000')
+        finally:
+            out_stream.close()
+            err_stream.close()
+
+    def test_drain_leaves_empty_pipes_alone(self):
+        out_read, out_write = os.pipe()
+        err_read, err_write = os.pipe()
+        out_stream = os.fdopen(out_read, 'rb')
+        err_stream = os.fdopen(err_read, 'rb')
+        try:
+            worker = SimpleNamespace(stdout=out_stream, stderr=err_stream)
+            streams = {out_stream: bytearray(b'kept'), err_stream: bytearray()}
+            GUEST.drain_worker_streams(worker, streams)
+            self.assertEqual(bytes(streams[out_stream]), b'kept')
+            self.assertEqual(bytes(streams[err_stream]), b'')
+        finally:
+            out_stream.close()
+            err_stream.close()
+            os.close(out_write)
+            os.close(err_write)
+
+    def test_heartbeat_reports_every_two_thousand_nodes(self):
+        start = GUEST.time.monotonic()
+        self.assertIsNone(GUEST.observe_progress(0, start))
+        self.assertIsNone(GUEST.observe_progress(1, start))
+        self.assertIsNone(GUEST.observe_progress(1999, start))
+        line = GUEST.observe_progress(2000, start)
+        self.assertRegex(line, r'^observe progress nodes=2000 elapsed_ms=\d+$')
+        self.assertRegex(GUEST.observe_progress(4000, start), r'^observe progress nodes=4000 elapsed_ms=\d+$')
+
+
 if __name__ == '__main__':
     unittest.main()
