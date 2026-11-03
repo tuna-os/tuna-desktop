@@ -6,6 +6,9 @@ root controller owns private receipts; a finite unprivileged child reads the
 already-existing user and accessibility buses.  No Tuna state files are read.
 """
 import base64
+import array
+import ctypes
+import fcntl
 import gzip
 import hashlib
 import json
@@ -22,7 +25,9 @@ import stat
 import struct
 import subprocess
 import sys
+import threading
 import time
+import traceback
 
 ROOT = Path('/run/tuna-vm-gnome-reference')
 FILES = ('claim.json', 'prepare.json', 'snapshot.json', 'stop.json', 'failure.json')
@@ -51,6 +56,17 @@ class Deadline:
 
 class FixtureNotReady(RuntimeError):
     """Actual startup window inventory is incomplete, never native admission."""
+
+
+class ObservationTimeout(FixtureNotReady):
+    """One full public observation exceeded its finite budget.
+
+    The fixture itself is unchanged: no window state was observed, so a
+    retry re-runs the same observation instead of acting on partial data.
+    """
+
+
+WORKER_TIMEOUT_EXIT = 10
 
 
 
@@ -329,6 +345,42 @@ def pci_identity(device):
     raise RuntimeError('actual native DRM node has no PCI ancestor')
 
 
+class DrmVersion(ctypes.Structure):
+    _fields_ = [('major', ctypes.c_int), ('minor', ctypes.c_int), ('patchlevel', ctypes.c_int),
+                ('name_len', ctypes.c_size_t), ('name', ctypes.c_void_p),
+                ('date_len', ctypes.c_size_t), ('date', ctypes.c_void_p),
+                ('desc_len', ctypes.c_size_t), ('desc', ctypes.c_void_p)]
+
+
+def drm_driver(entry):
+    """Read the kernel DRM driver's name, not its sysfs bus parent's driver."""
+    expected = entry.stat()
+    descriptor = os.open(entry, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        actual = os.fstat(descriptor)
+        if not stat.S_ISCHR(actual.st_mode) or (actual.st_rdev, actual.st_dev, actual.st_ino) != (
+                expected.st_rdev, expected.st_dev, expected.st_ino):
+            raise RuntimeError('DRM driver query changed the original device identity')
+        # Linux DRM_IOCTL_VERSION is _IOWR('d', 0, struct drm_version).
+        request = 0xC0006400 | (ctypes.sizeof(DrmVersion) << 16)
+        version = DrmVersion()
+        fcntl.ioctl(descriptor, request, version, True)
+        length = version.name_len
+        if not 0 < length <= 256:
+            raise RuntimeError('actual DRM driver name length exceeds bound')
+        name = ctypes.create_string_buffer(length + 1)
+        version.name = ctypes.addressof(name)
+        fcntl.ioctl(descriptor, request, version, True)
+        if version.name_len != length:
+            raise RuntimeError('actual DRM driver name changed during query')
+        driver = name.raw[:length].decode('ascii')
+        if not re.fullmatch('[A-Za-z0-9_-]{1,256}', driver):
+            raise RuntimeError('actual DRM driver name malformed')
+        return driver
+    finally:
+        os.close(descriptor)
+
+
 def native_gpu(compositor, deadline):
     same_process(compositor, proc_identity(compositor['pid'], UID))
     devices = []
@@ -354,7 +406,7 @@ def native_gpu(compositor, deadline):
                     'enabled': (connector / 'enabled').read_text().strip(),
                     'modes': (connector / 'modes').read_text().splitlines()})
         devices.append({'fd': int(entry.name), 'path': target, 'major': major, 'minor': minor,
-            'sysfs_device': str(device), 'driver': (device / 'driver').resolve(strict=True).name,
+            'sysfs_device': str(device), 'driver': drm_driver(entry),
             'pci': pci_identity(device), 'connectors': connectors})
     if not any(Path(d['path']).name.startswith('card') and any(c['status'] == 'connected' and c['enabled'] == 'enabled' and c['modes'] for c in d['connectors']) for d in devices):
         raise RuntimeError('original compositor lacks actual native DRM card fd with connected enabled output')
@@ -393,7 +445,9 @@ def admission(profile, deadline, cache):
                 raise RuntimeError('foreign/non-native GDM greeter session')
             shells = process_candidates(('/usr/bin/gnome-shell',), uid, deadline)
             if len(shells) != 1:
-                raise RuntimeError('original GDM greeter shell is not unique')
+                observed = sorted((shell['pid'], shell.get('start_ticks')) for shell in shells)
+                raise RuntimeError('original GDM greeter shell is not unique: '
+                                   f'{len(shells)} under uid {uid} pid/start {observed}')
             shell = packaged(shells[0], deadline, cache)
             if shell['package']['name'] != 'gnome-shell' or not version_51_1(shell['package']['version']):
                 raise RuntimeError('stock GNOME51.1 greeter principal absent')
@@ -509,6 +563,16 @@ def save(directory, name, value):
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+def retain_failure(directory, operation, result):
+    """Preserve the first terminal operation failure through cleanup/retrieval."""
+    if operation == 'file':
+        return
+    try:
+        read_bytes(directory / 'failure.json')
+    except FileNotFoundError:
+        save(directory, 'failure.json', result)
+
 
 
 def retained_files(directory, pending=()):
@@ -628,6 +692,9 @@ def check_socket_peer(path, uid, deadline):
         stream.settimeout(min(1, deadline.remaining()))
         stream.connect(path)
         pid, peer_uid, _ = struct.unpack('3i', stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+    after = Path(path).lstat()
+    if (info.st_dev, info.st_ino, info.st_uid, info.st_mode) != (after.st_dev, after.st_ino, after.st_uid, after.st_mode):
+        raise RuntimeError('public socket changed during kernel peer observation')
     if peer_uid != uid:
         raise RuntimeError('bus server peer has foreign UID')
     return proc_identity(pid, uid)
@@ -653,7 +720,290 @@ def read_gio_settings(Gio):
     }
 
 
-def session_observe(args, deadline):
+def bus_path(address):
+    match = re.fullmatch(r'unix:path=([^,;]+)(?:,guid=[0-9a-f]+)?', address)
+    if not match or not match[1].startswith('/run/user/1000/'):
+        raise RuntimeError('public bus address is not the existing owned runtime socket')
+    return match[1]
+
+
+def dbus_call(connection, bus, path, interface, method, parameters, deadline, Gio):
+    millis = max(1, min(2000, int(deadline.remaining() * 1000)))
+    started = time.monotonic()
+    try:
+        return connection.call_sync(bus, path, interface, method, parameters, None,
+            Gio.DBusCallFlags.NO_AUTO_START, millis, None).unpack()
+    finally:
+        elapsed = time.monotonic() - started
+        if elapsed >= SLOW_CALL_S:
+            print(slow_call_line(bus, path, method, int(elapsed * 1000)), file=sys.stderr, flush=True)
+
+
+STALE_TREE_DBUS_ERRORS = ('org.freedesktop.DBus.Error.UnknownMethod',
+                            'org.freedesktop.DBus.Error.UnknownObject',
+                            'org.freedesktop.DBus.Error.UnknownInterface',
+                            'org.freedesktop.DBus.Error.ServiceUnknown')
+
+
+def stale_tree_message(text):
+    """True when a D-Bus error names an object/interface/service that vanished.
+
+    The observed Shell tree churns while it is walked (a child reference
+    can resolve to an object whose Accessible interface is already gone);
+    such a walk observed no consistent snapshot, so the observation must
+    be retried, never reported. Wedged peers (NoReply) stay fatal: a
+    peer that never answers is a real failure, not a torn read.
+    """
+    return isinstance(text, str) and any(name in text for name in STALE_TREE_DBUS_ERRORS)
+
+
+WORKER_STALE_TREE_EXIT = 11
+
+
+def observe_progress(count, start):
+    """Bounded worker heartbeat line, or None between reports.
+
+    The UID1000 worker emits no stdout/stderr while walking the AT-SPI
+    tree; without progress markers a killed worker leaves no record of
+    how far the walk got before the budget expired.
+    """
+    if count <= 0 or count % 500:
+        return None
+    if count % 2000:
+        return 'observe progress nodes=%d elapsed_ms=%d (early)' % (count, (time.monotonic() - start) * 1000)
+    return 'observe progress nodes=%d elapsed_ms=%d' % (count, (time.monotonic() - start) * 1000)
+
+
+SLOW_WALK_BEAT_S = 5.0
+SLOW_CALL_S = 1.0
+
+
+def walk_beat(count, start, last_beat, now, path):
+    """Time-based stall marker line, or None while the walk breathes.
+
+    Count-based heartbeats stay silent on a slow subtree (fewer than 500
+    nodes per budget); a killed worker then leaves no record of where the
+    walk stalled. This beats at least every SLOW_WALK_BEAT_S naming the
+    current path, so the next tail shows the wedged peer instead of
+    silence.
+    """
+    if now - last_beat < SLOW_WALK_BEAT_S:
+        return None
+    return 'observe slow-walk nodes=%d elapsed_ms=%d path=%s' % (count, (now - start) * 1000, path)
+
+
+def slow_call_line(bus, path, method, elapsed_ms):
+    """One stderr line naming a D-Bus call that answered slowly but under its cap."""
+    return 'observe slow-call bus=%s path=%s method=%s elapsed_ms=%d' % (bus, path, method, elapsed_ms)
+
+
+def bus_connection(address, deadline, Gio):
+    cancellable = Gio.Cancellable()
+    timer = threading.Timer(deadline.remaining(), cancellable.cancel)
+    timer.daemon = True
+    timer.start()
+    try:
+        return Gio.DBusConnection.new_for_address_sync(address,
+            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT |
+            Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, cancellable)
+    finally:
+        timer.cancel()
+
+
+def connection_identity(stream, path):
+    """Read the actual connected descriptor, never a caller-supplied PID."""
+    if stream.family != socket.AF_UNIX or stream.type != socket.SOCK_STREAM or stream.getpeername() != path:
+        raise RuntimeError('descriptor is not connected to the fixed public bus socket')
+    pid, uid, _ = struct.unpack('3i', stream.getsockopt(
+        socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+    if uid != UID:
+        raise RuntimeError('public bus connected descriptor has foreign UID')
+    return proc_identity(pid, UID)
+
+
+class IdentityObserver:
+    """Root-only identity observation, scoped to this finite child's two buses."""
+    def __init__(self, admitted, deadline):
+        if os.geteuid() != 0:
+            raise RuntimeError('identity observation requires root controller')
+        import gi
+        gi.require_version('Gio', '2.0')
+        from gi.repository import Gio, GLib
+        self.Gio, self.GLib = Gio, GLib
+        self.admitted, self.deadline = admitted, deadline
+        self.connections = {}
+        self.pinned = {}
+        self.socket_identities = {}
+        self.principals = {}
+        self.allowed = {'unix:path=/run/user/1000/bus'}
+        self.requests = 0
+        self.a11y_address = None
+
+    def call(self, connection, bus, path, interface, method, parameters=None):
+        return dbus_call(connection, bus, path, interface, method, parameters,
+                         self.deadline, self.Gio)
+
+    def connection(self, address):
+        if address not in self.allowed:
+            raise RuntimeError('identity request names an unobserved public bus')
+        path = bus_path(address)
+        peer = check_socket_peer(path, UID, self.deadline)
+        info = Path(path).lstat()
+        socket_identity = (info.st_dev, info.st_ino, info.st_uid, info.st_mode)
+        if address not in self.connections:
+            # EXTERNAL auth as root is refused with a broken pipe during the
+            # handshake; authenticate to UID1000 buses as UID1000. Auth binds
+            # at connect time, so later calls reuse this connection as root,
+            # and the pinned-peer check below still verifies the actual peer.
+            os.seteuid(UID)
+            try:
+                connection = bus_connection(address, self.deadline, self.Gio)
+            finally:
+                os.seteuid(0)
+            with socket.socket(fileno=os.dup(connection.get_stream().get_socket().get_fd())) as stream:
+                same_process(peer, connection_identity(stream, path))
+            if address == 'unix:path=/run/user/1000/bus':
+                same_process(self.admitted['session']['user_bus']['peer'], peer)
+            self.connections[address] = connection
+            self.pinned[address] = peer
+            self.socket_identities[address] = socket_identity
+        same_process(self.pinned[address], peer)
+        if self.socket_identities[address] != socket_identity:
+            raise RuntimeError('pinned public bus socket identity changed')
+        return self.connections[address]
+
+    def owner(self, address, name):
+        connection = self.connection(address)
+        def query(method, value):
+            return self.call(connection, 'org.freedesktop.DBus', '/org/freedesktop/DBus',
+                'org.freedesktop.DBus', method, self.GLib.Variant('(s)', (value,)))[0]
+        unique = query('GetNameOwner', name)
+        pid = query('GetConnectionUnixProcessID', unique)
+        if query('GetConnectionUnixUser', unique) != UID:
+            raise RuntimeError('AT-SPI/public session peer is not actual UID1000')
+        principal = proc_identity(pid, UID)
+        if query('GetNameOwner', name) != unique or query('GetConnectionUnixProcessID', unique) != pid:
+            raise RuntimeError('public bus owner changed during identity observation')
+        same_process(principal, proc_identity(pid, UID))
+        self.connection(address)
+        previous = self.principals.setdefault(principal['pid'], principal)
+        same_process(previous, principal)
+        return unique, principal
+
+    def request(self, value, descriptor=None):
+        if not isinstance(value, dict) or set(value) != {'operation', 'address', 'name'}:
+            raise RuntimeError('invalid fixed identity request')
+        operation, address, name = (value[key] for key in ('operation', 'address', 'name'))
+        self.deadline.remaining()
+        self.requests += 1
+        if self.requests > 12010 or not isinstance(address, str) or address not in self.allowed:
+            raise RuntimeError('identity request exceeds fixed bus/observation bound')
+        if operation == 'socket' and name is None and descriptor is not None:
+            self.connection(address)
+            with socket.socket(fileno=os.dup(descriptor)) as stream:
+                principal = connection_identity(stream, bus_path(address))
+            same_process(self.pinned[address], principal)
+            self.connection(address)
+            self.principals.setdefault(principal['pid'], principal)
+            return principal
+        if operation == 'owner' and descriptor is None and isinstance(name, str):
+            if address == 'unix:path=/run/user/1000/bus':
+                allowed = name in ('org.a11y.Bus', 'org.gnome.Mutter.DisplayConfig')
+            else:
+                allowed = name == 'org.a11y.atspi.Registry'
+                if not allowed and re.fullmatch(r':[0-9]+\.[0-9]+', name):
+                    registry, principal = self.owner(address, 'org.a11y.atspi.Registry')
+                    roots = self.call(self.connections[address], registry,
+                        '/org/a11y/atspi/accessible/root', 'org.a11y.atspi.Accessible', 'GetChildren')[0]
+                    if len(roots) > 6000:
+                        raise RuntimeError('actual registry exceeds finite public tree bound')
+                    allowed = name in {bus for bus, path in roots}
+                    same_process(principal, self.owner(address, 'org.a11y.atspi.Registry')[1])
+            if not allowed:
+                raise RuntimeError('identity request names a non-observation principal')
+            unique, principal = self.owner(address, name)
+            if address == 'unix:path=/run/user/1000/bus' and name == 'org.a11y.Bus':
+                actual = self.call(self.connections[address], unique, '/org/a11y/bus',
+                                   'org.a11y.Bus', 'GetAddress')[0]
+                bus_path(actual)
+                if self.a11y_address is not None and self.a11y_address != actual:
+                    raise RuntimeError('independently observed accessibility bus address changed')
+                self.a11y_address = actual
+                self.allowed.add(actual)
+            return [unique, principal]
+        raise RuntimeError('unsupported fixed identity request')
+
+    def verify(self, observation):
+        for address in self.connections:
+            self.connection(address)
+        atspi = observation['atspi']
+        values = [atspi[key] for key in ('registry', 'session_bus_peer', 'bus_peer', 'launcher')]
+        values.extend(atspi['peers'])
+        values.extend(node['process'] for node in flatten(observation['trees']))
+        for principal in values:
+            expected = self.principals.get(principal['pid'])
+            if expected is None:
+                raise RuntimeError('child returned an independently unobserved principal')
+            same_process(expected, principal)
+        for principal in self.principals.values():
+            self.deadline.remaining()
+            same_process(principal, proc_identity(principal['pid'], UID))
+
+    def close(self):
+        for connection in self.connections.values():
+            connection.close_sync(None)
+
+
+def dispatch_identity(channel, observer, worker_identity, worker_gid, deadline):
+    """Authenticate each sender using kernel per-message credentials, not socketpair creator."""
+    descriptors = array.array('i')
+    space = socket.CMSG_SPACE(4 * descriptors.itemsize) + socket.CMSG_SPACE(struct.calcsize('3i'))
+    raw, ancillary, flags, _ = channel.recvmsg(65536, space)
+    try:
+        credentials = []
+        invalid_ancillary = False
+        for level, kind, data in ancillary:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                descriptors.frombytes(data)
+            elif level == socket.SOL_SOCKET and kind == socket.SCM_CREDENTIALS and len(data) == struct.calcsize('3i'):
+                credentials.append(struct.unpack('3i', data))
+            else:
+                invalid_ancillary = True
+        if not raw and not ancillary and not flags:
+            return False
+        if flags or invalid_ancillary or len(credentials) != 1:
+            raise RuntimeError('truncated or unauthenticated identity request')
+        if credentials[0] != (worker_identity['pid'], UID, worker_gid):
+            raise RuntimeError('identity request sender is not the pinned observation child')
+        same_process(worker_identity, proc_identity(worker_identity['pid'], UID))
+        value = json.loads(raw)
+        expected_descriptors = 1 if isinstance(value, dict) and value.get('operation') == 'socket' else 0
+        if len(descriptors) != expected_descriptors:
+            raise RuntimeError('identity request has missing or excessive descriptors')
+        result = observer.request(value, descriptors[0] if descriptors else None)
+        same_process(worker_identity, proc_identity(worker_identity['pid'], UID))
+        channel.settimeout(deadline.remaining())
+        channel.sendall(json.dumps({'value': result}).encode())
+        return True
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
+def identity_request(channel, deadline, operation, address, name=None, descriptor=None):
+    channel.settimeout(deadline.remaining())
+    data = json.dumps({'operation': operation, 'address': address, 'name': name}).encode()
+    ancillary = [] if descriptor is None else [
+        (socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [descriptor]))]
+    if channel.sendmsg([data], ancillary) != len(data):
+        raise RuntimeError('short identity request')
+    result = json.loads(channel.recv(65536))
+    if set(result) != {'value'}:
+        raise RuntimeError('root identity observation rejected request')
+    return result['value']
+
+
+def session_observe(args, deadline, channel):
     """Read Gio and AT-SPI only, as the existing session owner (no autolaunch)."""
     if os.geteuid() != UID:
         raise RuntimeError('public observation requires actual UID1000')
@@ -665,31 +1015,23 @@ def session_observe(args, deadline):
         return GLib.Variant(signature, values)
 
     def connect(address):
-        # Addresses come only from fixed existing user bus or public a11y Bus.
-        match = re.fullmatch(r'unix:path=([^,;]+)(?:,guid=[0-9a-f]+)?', address)
-        if not match or not match[1].startswith('/run/user/1000/'):
-            raise RuntimeError('public bus address is not the existing owned runtime socket')
-        peer = check_socket_peer(match[1], UID, deadline)
-        connection = Gio.DBusConnection.new_for_address_sync(address,
-            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+        bus_path(address)
+        connection = bus_connection(address, deadline, Gio)
+        peer = identity_request(channel, deadline, 'socket', address,
+                                descriptor=connection.get_stream().get_socket().get_fd())
         return connection, peer
 
     def call(connection, bus, path, interface, method, parameters=None):
-        millis = max(1, min(2000, int(deadline.remaining() * 1000)))
-        return connection.call_sync(bus, path, interface, method, parameters, None,
-            Gio.DBusCallFlags.NO_AUTO_START, millis, None).unpack()
+        return dbus_call(connection, bus, path, interface, method, parameters, deadline, Gio)
 
     def owner(connection, bus):
-        unique = call(connection, 'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'GetNameOwner', variant('(s)', (bus,)))[0]
-        pid = call(connection, 'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'GetConnectionUnixProcessID', variant('(s)', (unique,)))[0]
-        uid = call(connection, 'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'GetConnectionUnixUser', variant('(s)', (unique,)))[0]
-        if uid != UID:
-            raise RuntimeError('AT-SPI/public session peer is not actual UID1000')
-        return unique, proc_identity(pid, UID)
+        address = 'unix:path=/run/user/1000/bus' if connection is session_bus else a11y_address
+        return identity_request(channel, deadline, 'owner', address, bus)
 
     session_bus, session_peer = connect('unix:path=/run/user/1000/bus')
     a11y_owner, a11y_launcher = owner(session_bus, 'org.a11y.Bus')
     address = call(session_bus, a11y_owner, '/org/a11y/bus', 'org.a11y.Bus', 'GetAddress')[0]
+    a11y_address = address
     bus, bus_peer = connect(address)
     registry_name, registry = owner(bus, 'org.a11y.atspi.Registry')
     peers = {p['pid']: p for p in (session_peer, a11y_launcher, bus_peer, registry)}
@@ -711,9 +1053,11 @@ def session_observe(args, deadline):
     owners = {}
     visited = set()
     count = 0
+    walk_start = time.monotonic()
+    last_beat = walk_start
 
     def tree(bus_name, path, depth=0):
-        nonlocal count
+        nonlocal count, last_beat
         deadline.remaining()
         if depth > 64 or count >= 6000:
             raise RuntimeError('public AT-SPI tree exceeded finite observation bound')
@@ -727,11 +1071,25 @@ def session_observe(args, deadline):
             raise RuntimeError('cyclic/duplicate public AT-SPI tree')
         visited.add(key)
         count += 1
-        props = call(bus, unique, path, 'org.freedesktop.DBus.Properties', 'GetAll', variant('(s)', ('org.a11y.atspi.Accessible',)))[0]
-        role = call(bus, unique, path, 'org.a11y.atspi.Accessible', 'GetRoleName')[0]
-        words = call(bus, unique, path, 'org.a11y.atspi.Accessible', 'GetState')[0]
+        line = observe_progress(count, walk_start)
+        if line is not None:
+            print(line, file=sys.stderr, flush=True)
+            last_beat = time.monotonic()
+        else:
+            beat = walk_beat(count, walk_start, last_beat, time.monotonic(), path)
+            if beat is not None:
+                print(beat, file=sys.stderr, flush=True)
+                last_beat = time.monotonic()
+        try:
+            props = call(bus, unique, path, 'org.freedesktop.DBus.Properties', 'GetAll', variant('(s)', ('org.a11y.atspi.Accessible',)))[0]
+            role = call(bus, unique, path, 'org.a11y.atspi.Accessible', 'GetRoleName')[0]
+            words = call(bus, unique, path, 'org.a11y.atspi.Accessible', 'GetState')[0]
+            children = call(bus, unique, path, 'org.a11y.atspi.Accessible', 'GetChildren')[0]
+        except GLib.GError as error:
+            if stale_tree_message(getattr(error, 'message', '')):
+                raise FixtureNotReady('public AT-SPI tree changed during observation; retrying') from error
+            raise
         states = [index * 32 + bit for index, word in enumerate(words) for bit in range(32) if word & (1 << bit)]
-        children = call(bus, unique, path, 'org.a11y.atspi.Accessible', 'GetChildren')[0]
         name = unvariant(props.get('Name'))
         if not isinstance(name, str) or not isinstance(role, str):
             raise RuntimeError('malformed actual AT-SPI properties')
@@ -746,11 +1104,15 @@ def session_observe(args, deadline):
                     node['children'].append(tree(child_bus or unique, child_path, depth + 1))
         return node
 
+    print('observe start', file=sys.stderr, flush=True)
     roots = call(bus, registry_name, '/org/a11y/atspi/accessible/root', 'org.a11y.atspi.Accessible', 'GetChildren')[0]
     trees = [tree(name, path) for name, path in roots]
+    print('observe walk-complete nodes=%d elapsed_ms=%d owners=%d' % (
+        count, (time.monotonic() - walk_start) * 1000, len(owners)), file=sys.stderr, flush=True)
     for bus_name, (_, principal) in owners.items():
         _, current = owner(bus, bus_name)
         same_process(principal, current)
+    print('observe owners-verified count=%d' % len(owners), file=sys.stderr, flush=True)
     return unvariant({'settings': current_settings,
         'atspi': {'address': address, 'registry': registry, 'peers': list(peers.values()),
                   'session_bus_peer': session_peer, 'bus_peer': bus_peer, 'launcher': a11y_launcher},
@@ -779,7 +1141,13 @@ def network_panel_evidence(window):
         evidence.append({'selected_object': {key: selected[key] for key in keys},
                          'label_objects': [{key: label[key] for key in keys} for label in labels]})
     if not evidence:
-        raise FixtureNotReady('original Settings descendants do not expose selected visible Network panel')
+        tabs = [(n['role_name'], n['name'][:40], sorted(set(n['states']) & {1, 23, 25, 30}))
+                for n in flatten(window['children'])
+                if n['role_name'] in ('list item', 'page tab', 'tree item', 'radio button')][:12]
+        full = [(n['role_name'], n['name'][:30], sorted(set(n['states']) & {1, 23, 25, 30}))
+                for n in flatten(window['children'])][:60]
+        raise FixtureNotReady('original Settings descendants do not expose selected visible Network panel; '
+                              'tab inventory ' + repr(tabs) + '; subtree ' + repr(full))
     return evidence
 
 
@@ -835,25 +1203,106 @@ def window_context(trees, fixture, shell):
     return windows, selection
 
 
+def drain_worker_streams(worker, streams):
+    """Best-effort nonblocking read of a stopped worker's pipes.
+
+    Never raises and never blocks: after a SIGKILL the pipes hold only
+    whatever the worker already wrote, and an empty pipe must not stall
+    failure reporting.
+    """
+    for stream in (worker.stdout, worker.stderr):
+        try:
+            fd = stream.fileno()
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            while len(streams[stream]) <= MAX_BYTES:
+                try:
+                    data = os.read(fd, 65536)
+                except (BlockingIOError, InterruptedError):
+                    break
+                if not data:
+                    break
+                streams[stream].extend(data)
+        except (OSError, ValueError):
+            pass
+
+
+def check_worker_status(returncode, stderr_text):
+    """Map the UID1000 observer's exit status to a typed failure.
+
+    Exit 10 is the worker's own finite-budget expiry and exit 11 a tree
+    torn by Shell churn mid-walk: both retryable like a controller-side
+    timeout, never a fixture-state verdict.
+    """
+    if returncode == WORKER_TIMEOUT_EXIT:
+        raise ObservationTimeout('worker observation exceeded its finite budget: ' + stderr_text[:1500])
+    if returncode == WORKER_STALE_TREE_EXIT:
+        raise ObservationTimeout('worker AT-SPI tree changed during observation; retrying: ' + stderr_text[:1500])
+    if returncode:
+        raise RuntimeError('finite UID1000 public observation failed: ' + stderr_text[:3000])
+
+
 def public_observation(environment, admitted, deadline):
     worker_args = {'compositor': admitted['session']['compositor']}
     owner = pwd.getpwnam('tuna-test')
-    command = ['/usr/bin/python3', str(Path(__file__).resolve()), '_observe']
-    worker = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              env=environment, user=UID, group=owner.pw_gid, extra_groups=[], start_new_session=True)
+    observer = IdentityObserver(admitted, deadline)
+    controller, child_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    controller.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    command = ['/usr/bin/python3', str(Path(__file__).resolve()), '_observe', str(child_channel.fileno())]
+    worker = None
     try:
-        remaining = deadline.remaining()
-        raw, errors = worker.communicate(json.dumps(dict(worker_args, budget_s=min(25, remaining))).encode(),
-                                         timeout=max(0.001, remaining - 0.1))
-    except BaseException:
-        worker.kill()
-        worker.communicate(timeout=0.1)
-        raise
-    if worker.returncode:
-        raise RuntimeError('finite UID1000 public observation failed: ' + errors.decode(errors='replace')[:3000])
-    if len(raw) > MAX_BYTES:
-        raise RuntimeError('public observation exceeded byte bound')
-    return json.loads(raw)
+        worker = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=environment, user=UID, group=owner.pw_gid, extra_groups=[], start_new_session=True,
+            pass_fds=(child_channel.fileno(),))
+        child_channel.close()
+        worker_identity = proc_identity(worker.pid, UID)
+        worker.stdin.write(json.dumps(dict(worker_args, budget_s=min(25, deadline.remaining()))).encode())
+        worker.stdin.close()
+        streams = {worker.stdout: bytearray(), worker.stderr: bytearray()}
+        pending = [controller, *streams]
+        while pending:
+            ready, _, _ = select.select(pending, [], [], deadline.remaining())
+            if not ready:
+                # Retryable: the prepare loop treats one overrun observation
+                # like any other not-yet-ready fixture state instead of
+                # failing the whole operation on a single slow attempt. The
+                # worker's partial stderr is the only record of how far the
+                # walk got, so recover it before reporting the timeout.
+                worker.kill()
+                try:
+                    worker.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+                drain_worker_streams(worker, streams)
+                tail = bytes(streams[worker.stderr])[-1500:].decode('utf-8', errors='replace')
+                raise ObservationTimeout('finite public observation deadline expired; worker stderr tail: ' + repr(tail))
+            for stream in ready:
+                if stream is controller:
+                    if not dispatch_identity(controller, observer, worker_identity, owner.pw_gid, deadline):
+                        pending.remove(controller)
+                else:
+                    data = os.read(stream.fileno(), 65536)
+                    if not data:
+                        pending.remove(stream)
+                    else:
+                        streams[stream].extend(data)
+                        if len(streams[stream]) > MAX_BYTES:
+                            raise RuntimeError('public observation exceeded byte bound')
+        worker.wait(timeout=deadline.remaining())
+        check_worker_status(worker.returncode, streams[worker.stderr].decode(errors='replace'))
+        observation = json.loads(streams[worker.stdout])
+        observer.verify(observation)
+        return observation
+    finally:
+        if worker is not None:
+            if worker.poll() is None:
+                worker.kill()
+                worker.wait(timeout=0.1)
+            for stream in (worker.stdin, worker.stdout, worker.stderr):
+                stream.close()
+        controller.close()
+        child_channel.close()
+        observer.close()
 
 
 def snapshot(args, claim, admitted, environment, deadline, cache):
@@ -957,6 +1406,53 @@ def cleanup(args, claim, directory, deadline):
     return receipt
 
 
+def snapshot_until_ready(snapshot_fn, children, deadline):
+    """Poll one full observation until the fixture is ready or time runs out.
+
+    Observation timeouts carry no fixture-state verdict: a slow walk that
+    expires the budget must never overwrite the first actual not-ready
+    state (tab inventory, window roles), which is the actionable cause.
+    The final error therefore names the first state error plus the last
+    attempt, so a red run always reports what the fixture was doing.
+    A bare deadline expiry in observation setup (fork/identity/package
+    verification under load) reports the same way: the budget is gone
+    so there is nothing to retry, but the retained first state is still
+    the cause — never a naked deadline.
+    """
+    first_state_error = None
+
+    def unready(error):
+        detail = 'last: %s: %s' % (type(error).__name__, error)
+        if first_state_error is not None and first_state_error is not error:
+            detail = 'first: %s: %s; %s' % (type(first_state_error).__name__, first_state_error, detail)
+        return RuntimeError('actual fixture observation never became ready: ' + detail)
+
+    while True:
+        try:
+            result = snapshot_fn()
+            if result['selection']['active_windows'][0]['role'] != 'settings':
+                raise FixtureNotReady('original Settings Network window is not actually active')
+            return result
+        except FixtureNotReady as error:
+            if not isinstance(error, ObservationTimeout) and first_state_error is None:
+                first_state_error = error
+            for child in children:
+                status = child.poll()
+                if status not in (None, 0):
+                    try:
+                        _, err = child.communicate(timeout=5)
+                    except Exception:
+                        err = b''
+                    tail = (err or b'')[-512:].decode('utf-8', errors='replace')
+                    raise RuntimeError('fixture launcher failed: %s status %s stderr %r' % (
+                        child.args[0] if child.args else '<unknown>', status, tail)) from error
+            if deadline.end - time.monotonic() < 0.2:
+                raise unready(error) from error
+            time.sleep(min(0.1, max(0.0, deadline.end - time.monotonic())))
+        except TimeoutError as error:
+            raise unready(error) from error
+
+
 def prepare(args, directory, deadline, cache):
     admitted, environment = admission(args['profile'], deadline, cache)
     if not admitted['ready']:
@@ -995,8 +1491,15 @@ def prepare(args, directory, deadline, cache):
                  [APPS[0], '--new-window', fixture['directories'][1]],
                  [APPS[1], 'network']):
         deadline.remaining()
+        child_env = environment
+        if argv[0] == APPS[1]:
+            # gnome-control-center refuses to start unless the session
+            # advertises GNOME or Unity. The Tuna session lists GNOME as a
+            # compatible desktop for this fixture (same precedent as the GTK
+            # portal proofs); the observed Settings window is unaffected.
+            child_env = dict(environment, XDG_CURRENT_DESKTOP='Tuna:GNOME')
         child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, env=environment, user=UID,
+                                 stderr=subprocess.PIPE, env=child_env, user=UID,
                                  group=owner.pw_gid, extra_groups=[], start_new_session=True)
         children.append(child)
         secondary = argv == [APPS[0], '--new-window', fixture['directories'][1]]
@@ -1025,24 +1528,8 @@ def prepare(args, directory, deadline, cache):
                 time.sleep(min(0.1, deadline.remaining()))
     # Existing app process descendants must be the recorded original principals;
     # no process discovered by a name-only scan gains cleanup ownership.
-    while True:
-        try:
-            result = snapshot(args, claim, admitted, environment, deadline, cache)
-            if result['selection']['active_windows'][0]['role'] != 'settings':
-                raise FixtureNotReady('original Settings Network window is not actually active')
-            break
-        except FixtureNotReady as error:
-            for child in children:
-                status = child.poll()
-                if status not in (None, 0):
-                    raise RuntimeError('fixture launcher failed: ' + str(status)) from error
-            save(directory, 'failure.json', {'schema': 1, 'ready': False,
-                'operation': 'prepare', 'nonce': args['nonce'], 'profile': args['profile'],
-                'error': str(error), 'observed_monotonic_ns': time.monotonic_ns(), 'clock_domain': CLOCK})
-            if deadline.end - time.monotonic() < 0.2:
-                raise RuntimeError('actual fixture observation never became ready: ' + str(error)) from error
-            time.sleep(min(0.1, deadline.remaining()))
-    (directory / 'failure.json').unlink(missing_ok=True)
+    result = snapshot_until_ready(
+        lambda: snapshot(args, claim, admitted, environment, deadline, cache), children, deadline)
     result['files'] = retained_files(directory, ('snapshot.json',))
     save(directory, 'snapshot.json', result)
     response = {'schema': 1, 'nonce': args['nonce'], 'profile': args['profile'], 'ready': True,
@@ -1053,11 +1540,23 @@ def prepare(args, directory, deadline, cache):
 
 
 def main():
-    if len(sys.argv) == 2 and sys.argv[1] == '_observe':
+    if len(sys.argv) == 3 and sys.argv[1] == '_observe':
         value = json.loads(sys.stdin.buffer.read(65537))
         if set(value) != {'compositor', 'budget_s'}:
             raise ValueError('fixed observation arguments required')
-        result = session_observe(value, Deadline(value['budget_s']))
+        try:
+            with socket.socket(fileno=int(sys.argv[2])) as channel:
+                result = session_observe(value, Deadline(value['budget_s']), channel)
+        except FixtureNotReady:
+            # The worker raises FixtureNotReady only for a tree torn by
+            # Shell churn mid-walk; like a budget overrun it carries no
+            # fixture-state verdict, so the controller retries the whole
+            # observation instead of failing the operation.
+            traceback.print_exc()
+            raise SystemExit(WORKER_STALE_TREE_EXIT)
+        except TimeoutError:
+            traceback.print_exc()
+            raise SystemExit(WORKER_TIMEOUT_EXIT)
         print(json.dumps(result))
         return
     if os.geteuid() != 0 or len(sys.argv) != 3:
@@ -1071,7 +1570,17 @@ def main():
         deadline = payload(operation, args)
         cache = {}
         if operation == 'admit':
-            result, _ = admission(args['profile'], deadline, cache)
+            # GDM greeter teardown straddles login: one sample can catch a
+            # lingering greeter session with no shell, or the user session
+            # half-registered. Settle until admission is ready or the
+            # operation budget expires, then report the last state.
+            while True:
+                result, _ = admission(args['profile'], deadline, cache)
+                if result['ready']:
+                    break
+                if deadline.end - time.monotonic() < 1.0:
+                    break
+                time.sleep(0.5)
         else:
             directory = ROOT / args['nonce']
             if operation == 'prepare':
@@ -1112,7 +1621,7 @@ def main():
         if owned_directory and directory is not None:
             try:
                 private_directory(directory, 0)
-                save(directory, 'failure.json', result)
+                retain_failure(directory, operation, result)
                 result['files'] = retained_files(directory)
             except (OSError, RuntimeError) as saving:
                 result['retention_error'] = str(saving)

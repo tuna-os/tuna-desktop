@@ -9,6 +9,7 @@ import gzip
 import hashlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -88,6 +89,48 @@ class Arguments(unittest.TestCase):
             self.assertFalse(GUEST.allowed_receipt(name))
         with self.assertRaises(RuntimeError):
             GUEST.wire_bytes({'controlled_large_value': 'x' * (GUEST.MAX_WIRE_BYTES + 1)}, 'admit')
+
+
+class DrmDriverObservation(unittest.TestCase):
+    def test_actual_character_device_ioctl_uses_kernel_name_not_bus_driver(self):
+        calls = []
+        def kernel_version(descriptor, request, version, mutate):
+            self.assertTrue(stat.S_ISCHR(os.fstat(descriptor).st_mode))
+            self.assertTrue(mutate)
+            calls.append(request)
+            if version.name:
+                GUEST.ctypes.memmove(version.name, b'virtio_gpu', 10)
+            version.name_len = 10
+            return 0
+        with mock.patch.object(GUEST.fcntl, 'ioctl', side_effect=kernel_version):
+            self.assertEqual(GUEST.drm_driver(Path('/dev/null')), 'virtio_gpu')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+
+    def test_real_non_drm_ioctl_failure_has_no_sysfs_or_bus_fallback(self):
+        with self.assertRaises(OSError):
+            GUEST.drm_driver(Path('/dev/null'))
+
+    def test_regular_device_substitution_is_rejected_before_ioctl(self):
+        with tempfile.NamedTemporaryFile() as file:
+            with mock.patch.object(GUEST.fcntl, 'ioctl') as query:
+                with self.assertRaisesRegex(RuntimeError, 'original device identity'):
+                    GUEST.drm_driver(Path(file.name))
+                query.assert_not_called()
+
+    def test_driver_query_bounds_and_changed_length_fail_closed(self):
+        for length in (0, 257):
+            with self.subTest(length=length):
+                def malformed(descriptor, request, version, mutate):
+                    version.name_len = length
+                with mock.patch.object(GUEST.fcntl, 'ioctl', side_effect=malformed):
+                    with self.assertRaisesRegex(RuntimeError, 'length exceeds bound'):
+                        GUEST.drm_driver(Path('/dev/null'))
+        def changed(descriptor, request, version, mutate):
+            version.name_len = 11 if version.name else 10
+        with mock.patch.object(GUEST.fcntl, 'ioctl', side_effect=changed):
+            with self.assertRaisesRegex(RuntimeError, 'changed during query'):
+                GUEST.drm_driver(Path('/dev/null'))
 
 
 class RealFilesystem(unittest.TestCase):
@@ -571,6 +614,300 @@ class ControlledGio(unittest.TestCase):
                 GUEST.read_gio_settings(api)
 
 
+class ControlledIdentityBoundary(unittest.TestCase):
+    """Controlled root/child transport semantics; not native qualification."""
+    user_bus = 'unix:path=/run/user/1000/bus'
+    a11y_bus = 'unix:path=/run/user/1000/at-spi/bus_0'
+
+    def principal(self, pid=42):
+        return {'pid': pid, 'uid': 1000, 'start_ticks': 123, 'exe': '/usr/bin/dbus-broker',
+                'exe_sha256': 'a' * 64, 'boot_id': 'controlled-boot'}
+
+    def observer(self):
+        value = GUEST.IdentityObserver.__new__(GUEST.IdentityObserver)
+        value.deadline = GUEST.Deadline(3)
+        value.allowed = {self.user_bus, self.a11y_bus}
+        value.requests = 0
+        value.connections = {self.user_bus: object(), self.a11y_bus: object()}
+        value.principals = {}
+        value.pinned = {address: self.principal() for address in value.allowed}
+        value.GLib = SimpleNamespace(Variant=lambda signature, values: values)
+        value.a11y_address = self.a11y_bus
+        return value
+
+    def test_child_reads_public_objects_but_never_proc_or_privileged_socket_identity(self):
+        class Variant:
+            def __init__(self, signature, value):
+                self.value = value
+            def unpack(self):
+                return self.value
+        connections = [object(), object()]
+        credentials = []
+        principal = self.principal()
+        def identity(channel, deadline, operation, address, name=None, descriptor=None):
+            credentials.append((operation, address, name, descriptor))
+            return principal if operation == 'socket' else [':1.42', principal]
+        # Controlled Gio stream descriptors are transferred, not interpreted by
+        # the UID1000 worker. The root-side real-FD test below covers the kernel.
+        streams = [SimpleNamespace(get_stream=lambda: SimpleNamespace(
+            get_socket=lambda: SimpleNamespace(get_fd=lambda: 91))) for _ in connections]
+        def call(connection, bus, path, interface, method, parameters, deadline, Gio):
+            if method == 'GetAddress':
+                return (self.a11y_bus,)
+            if method == 'GetCurrentState':
+                return (1, [], [], {})
+            if method == 'GetChildren':
+                return ([],)
+            self.fail('unexpected child DBus identity query: ' + method)
+        modules = {'gi': SimpleNamespace(require_version=lambda *args: None),
+                   'gi.repository': SimpleNamespace(Gio=object(), GLib=SimpleNamespace(Variant=Variant))}
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(GUEST.os, 'geteuid', return_value=1000), \
+             mock.patch.object(GUEST, 'bus_connection', side_effect=streams), \
+             mock.patch.object(GUEST, 'identity_request', side_effect=identity), \
+             mock.patch.object(GUEST, 'dbus_call', side_effect=call), \
+             mock.patch.object(GUEST, 'read_gio_settings', return_value={}), \
+             mock.patch.object(GUEST, 'proc_identity', side_effect=AssertionError('unprivileged proc read')), \
+             mock.patch.object(GUEST, 'check_socket_peer', side_effect=AssertionError('unprivileged identity read')):
+            result = GUEST.session_observe({'compositor': principal}, GUEST.Deadline(3), object())
+        self.assertEqual(result['atspi']['session_bus_peer'], principal)
+        self.assertEqual([entry[0] for entry in credentials], ['socket', 'owner', 'socket', 'owner', 'owner'])
+        self.assertEqual([entry[3] for entry in credentials if entry[0] == 'socket'], [91, 91])
+
+    def test_root_reads_actual_transferred_descriptor_not_reported_pid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = str(Path(temporary) / 'bus')
+            other_path = str(Path(temporary) / 'different-bus')
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server, \
+                 socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as other, \
+                 socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client, \
+                 socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as wrong:
+                server.bind(path)
+                server.listen(1)
+                other.bind(other_path)
+                other.listen(1)
+                client.connect(path)
+                wrong.connect(other_path)
+                left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                try:
+                    descriptors = GUEST.array.array('i', [client.fileno()])
+                    left.sendmsg([b'actual-fd'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptors)])
+                    raw, ancillary, flags, _ = right.recvmsg(64, socket.CMSG_SPACE(descriptors.itemsize))
+                    received = GUEST.array.array('i')
+                    received.frombytes(ancillary[0][2])
+                    self.assertEqual(raw, b'actual-fd')
+                    self.assertEqual(flags, 0)
+                    with socket.socket(fileno=received[0]) as transferred, mock.patch.object(GUEST, 'UID', os.getuid()):
+                        actual = GUEST.connection_identity(transferred, path)
+                        self.assertEqual(actual['pid'], os.getpid())
+                        with self.assertRaisesRegex(RuntimeError, 'fixed public bus'):
+                            GUEST.connection_identity(wrong, path)
+                    observer = self.observer()
+                    observer.pinned[self.user_bus] = actual
+                    with mock.patch.object(observer, 'connection'), \
+                         mock.patch.object(GUEST, 'bus_path', return_value=path), \
+                         mock.patch.object(GUEST, 'UID', os.getuid()):
+                        value = {'operation': 'socket', 'address': self.user_bus, 'name': None}
+                        self.assertEqual(observer.request(value, client.fileno()), actual)
+                        with self.assertRaisesRegex(RuntimeError, 'fixed public bus'):
+                            observer.request(value, wrong.fileno())
+                        with tempfile.TemporaryFile() as regular, self.assertRaises(OSError):
+                            observer.request(value, regular.fileno())
+                finally:
+                    left.close()
+                    right.close()
+
+    def test_foreign_kernel_uid_cannot_trigger_proc_identity(self):
+        stream = SimpleNamespace(family=socket.AF_UNIX, type=socket.SOCK_STREAM,
+            getpeername=lambda: '/run/user/1000/bus',
+            getsockopt=lambda *args: GUEST.struct.pack('3i', 42, 999, 999))
+        with mock.patch.object(GUEST, 'proc_identity') as query:
+            with self.assertRaisesRegex(RuntimeError, 'foreign UID'):
+                GUEST.connection_identity(stream, '/run/user/1000/bus')
+            query.assert_not_called()
+
+    def test_no_pid_exe_generic_name_address_or_unbounded_request_authority(self):
+        observer = self.observer()
+        valid = {'operation': 'owner', 'address': self.user_bus, 'name': 'org.a11y.Bus'}
+        invalid = [dict(valid, pid=42), dict(valid, exe='/usr/bin/dbus-broker'),
+                   dict(valid, operation='exec'), dict(valid, address='unix:path=/tmp/bus'),
+                   dict(valid, address='unix:path=/run/user/1000/other'),
+                   dict(valid, name='org.freedesktop.systemd1'),
+                   dict(valid, name=':1.42'), dict(valid, address=self.a11y_bus, name='org.arbitrary.Service')]
+        with mock.patch.object(observer, 'owner') as owner, mock.patch.object(observer, 'connection') as connect:
+            for value in invalid:
+                with self.subTest(value=value), self.assertRaises(RuntimeError):
+                    observer.request(value)
+            owner.assert_not_called()
+            connect.assert_not_called()
+            observer.requests = 12010
+            with self.assertRaisesRegex(RuntimeError, 'bound'):
+                observer.request(valid)
+            observer.requests = 0
+            observer.deadline.end = 0
+            with self.assertRaises(TimeoutError):
+                observer.request(valid)
+            owner.assert_not_called()
+
+    def test_owner_is_root_bus_query_and_full_generation_is_checked_before_after(self):
+        for changed in (None, 'owner', 'pid', 'uid', 'generation'):
+            observer = self.observer()
+            principal = self.principal()
+            names = iter([':1.42', ':1.43' if changed == 'owner' else ':1.42'])
+            pids = iter([42, 43 if changed == 'pid' else 42])
+            def call(connection, bus, path, interface, method, parameters):
+                return ({'GetNameOwner': lambda: next(names),
+                         'GetConnectionUnixProcessID': lambda: next(pids),
+                         'GetConnectionUnixUser': lambda: 999 if changed == 'uid' else 1000}[method](),)
+            identities = [principal, dict(principal, start_ticks=124) if changed == 'generation' else principal]
+            with self.subTest(changed=changed), mock.patch.object(observer, 'connection', return_value=object()), \
+                 mock.patch.object(observer, 'call', side_effect=call), \
+                 mock.patch.object(GUEST, 'proc_identity', side_effect=identities) as query:
+                if changed:
+                    with self.assertRaises(RuntimeError):
+                        observer.owner(self.a11y_bus, ':1.42')
+                else:
+                    self.assertEqual(observer.owner(self.a11y_bus, ':1.42'), (':1.42', principal))
+                    self.assertEqual(query.call_args_list, [mock.call(42, 1000), mock.call(42, 1000)])
+
+    def test_registry_membership_refreshes_for_later_fixture_apps_without_arbitrary_name_fallback(self):
+        observer = self.observer()
+        principal = self.principal()
+        value = {'operation': 'owner', 'address': self.a11y_bus, 'name': ':1.99'}
+        with mock.patch.object(observer, 'owner', return_value=(':1.42', principal)) as owner, \
+             mock.patch.object(observer, 'call', side_effect=[([],), ([(':1.99', '/actual/root')],)]):
+            with self.assertRaisesRegex(RuntimeError, 'non-observation principal'):
+                observer.request(value)
+            self.assertEqual(observer.request(value), [':1.42', principal])
+            self.assertEqual(owner.call_args_list[-1], mock.call(self.a11y_bus, ':1.99'))
+
+    def test_bus_connection_authenticates_as_session_uid_and_restores_root(self):
+        observer = self.observer()
+        fresh = 'unix:path=/run/user/1000/at-spi/bus_9'
+        observer.allowed.add(fresh)
+        observer.Gio = object()
+        observer.socket_identities = {address: None for address in observer.allowed}
+        principal = self.principal()
+        lstat = SimpleNamespace(st_dev=1, st_ino=2, st_uid=1000, st_mode=0o100755)
+        patches = lambda: (mock.patch.object(GUEST.os, 'seteuid'),
+                            mock.patch.object(GUEST, 'check_socket_peer', return_value=principal),
+                            mock.patch.object(GUEST, 'connection_identity', return_value=principal),
+                            mock.patch.object(GUEST, 'same_process', return_value=None),
+                            mock.patch.object(GUEST.Path, 'lstat', return_value=lstat),
+                            mock.patch.object(GUEST.os, 'dup', return_value=99),
+                            mock.patch.object(GUEST.socket, 'socket'))
+        connection = mock.Mock()
+        entered = patches()
+        with entered[0] as euid, entered[1], entered[2], entered[3], entered[4], entered[5], entered[6], \
+             mock.patch.object(GUEST, 'bus_connection', return_value=connection) as dial:
+            self.assertIs(observer.connection(fresh), connection)
+        self.assertEqual(dial.call_count, 1)
+        self.assertEqual(euid.call_args_list, [mock.call(1000), mock.call(0)])
+        # Root is restored even when the handshake itself fails.
+        observer.connections.pop(fresh)
+        entered = patches()
+        with entered[0] as euid, entered[1], entered[2], entered[3], entered[4], entered[5], entered[6], \
+             mock.patch.object(GUEST, 'bus_connection', side_effect=RuntimeError('handshake broke')):
+            with self.assertRaisesRegex(RuntimeError, 'handshake broke'):
+                observer.connection(fresh)
+        self.assertEqual(euid.call_args_list, [mock.call(1000), mock.call(0)])
+
+    def test_per_message_kernel_credentials_bind_actual_spawned_child_not_socketpair_creator(self):
+        controller, child_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        controller.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        controller.settimeout(3)
+        code = ('import socket,sys; s=socket.socket(fileno=int(sys.argv[1])); '
+                's.sendall(b\'{"operation":"owner","address":"unix:path=/run/user/1000/bus",'
+                '"name":"org.a11y.Bus"}\'); s.recv(65536)')
+        child = subprocess.Popen([sys.executable, '-c', code, str(child_channel.fileno())],
+                                 pass_fds=(child_channel.fileno(),), stdin=subprocess.DEVNULL)
+        child_channel.close()
+        try:
+            principal = GUEST.proc_identity(child.pid, os.getuid())
+            observer = SimpleNamespace(request=mock.Mock(return_value=[':1.42', self.principal()]))
+            with mock.patch.object(GUEST, 'UID', os.getuid()):
+                self.assertTrue(GUEST.dispatch_identity(controller, observer, principal, os.getgid(), GUEST.Deadline(3)))
+            child.wait(timeout=3)
+            self.assertEqual(child.returncode, 0)
+            observer.request.assert_called_once_with(
+                {'operation': 'owner', 'address': self.user_bus, 'name': 'org.a11y.Bus'}, None)
+        finally:
+            controller.close()
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=3)
+
+    def test_truncated_forged_and_excessive_ancillary_packets_close_every_received_fd(self):
+        principal = self.principal(os.getpid())
+        for failure in ('truncated', 'control-truncated', 'sender', 'missing-credentials',
+                        'missing-fd', 'extra-fd', 'owner-fd'):
+            with self.subTest(failure=failure), tempfile.TemporaryFile() as file:
+                descriptors = [os.dup(file.fileno()) for _ in range(2 if failure == 'extra-fd' else 1)]
+                if failure == 'missing-fd':
+                    for descriptor in descriptors:
+                        os.close(descriptor)
+                    descriptors = []
+                credentials = GUEST.struct.pack('3i',
+                    principal['pid'] + (1 if failure == 'sender' else 0), 1000, 1000)
+                ancillary = [] if failure == 'missing-credentials' else [
+                    (socket.SOL_SOCKET, socket.SCM_CREDENTIALS, credentials)]
+                if descriptors:
+                    ancillary.append((socket.SOL_SOCKET, socket.SCM_RIGHTS, GUEST.array.array('i', descriptors).tobytes()))
+                operation = 'owner' if failure == 'owner-fd' else 'socket'
+                raw = json.dumps({'operation': operation, 'address': self.user_bus, 'name': None}).encode()
+                flags = {'truncated': socket.MSG_TRUNC, 'control-truncated': socket.MSG_CTRUNC}.get(failure, 0)
+                channel = SimpleNamespace(recvmsg=lambda *args: (raw, ancillary, flags, None))
+                observer = SimpleNamespace(request=mock.Mock())
+                with mock.patch.object(GUEST, 'proc_identity', return_value=principal):
+                    with self.assertRaises(RuntimeError):
+                        GUEST.dispatch_identity(channel, observer, principal, 1000, GUEST.Deadline(3))
+                observer.request.assert_not_called()
+                for descriptor in descriptors:
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptor)
+
+    def test_root_rejects_unobserved_or_changed_child_process_receipts(self):
+        observer = self.observer()
+        principal = self.principal()
+        observer.principals = {42: principal}
+        observation = {'trees': [], 'atspi': dict.fromkeys(
+            ('registry', 'session_bus_peer', 'bus_peer', 'launcher'), principal)}
+        observation['atspi']['peers'] = [principal]
+        with mock.patch.object(observer, 'connection'), mock.patch.object(GUEST, 'proc_identity', return_value=principal):
+            observer.verify(observation)
+            for changed in (dict(principal, pid=43), dict(principal, exe_sha256='b' * 64)):
+                observation['atspi']['registry'] = changed
+                with self.assertRaises(RuntimeError):
+                    observer.verify(observation)
+
+    def test_missing_file_and_later_cleanup_never_replace_first_terminal_prepare_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            first = {'schema': 1, 'operation': 'prepare', 'error': 'original controlled permission failure'}
+            GUEST.save(directory, 'failure.json', first)
+            actual_read = GUEST.read_bytes
+            with mock.patch.object(GUEST, 'read_bytes', side_effect=lambda path: actual_read(path, os.getuid())):
+                GUEST.retain_failure(directory, 'stop', {'operation': 'stop', 'error': 'later cleanup failure'})
+                with mock.patch.object(GUEST, 'ROOT', directory.parent), \
+                     mock.patch.object(GUEST, 'load_claim', return_value={}), \
+                     mock.patch.object(GUEST, 'private_directory'), \
+                     mock.patch.object(GUEST, 'retrieve_file', side_effect=FileNotFoundError('snapshot.json')), \
+                     mock.patch.object(GUEST.os, 'geteuid', return_value=0), \
+                     mock.patch.object(sys, 'argv', ['helper', 'file', json.dumps({'nonce': NONCE, 'name': 'snapshot.json'})]), \
+                     mock.patch.object(sys, 'stdout', new_callable=io.StringIO), \
+                     mock.patch.object(GUEST, 'retained_files', return_value=['failure.json']), \
+                     mock.patch.object(GUEST, 'retain_failure', wraps=GUEST.retain_failure) as retain:
+                    with self.assertRaises(SystemExit):
+                        GUEST.main()
+                    self.assertEqual(retain.call_args.args[1], 'file')
+            self.assertEqual(json.loads((directory / 'failure.json').read_bytes()), first)
+            clean = directory / 'fresh'
+            clean.mkdir()
+            GUEST.retain_failure(clean, 'prepare', first)
+            self.assertEqual(json.loads((clean / 'failure.json').read_bytes()), first)
+            GUEST.retain_failure(clean, 'file', {'operation': 'file'})
+            self.assertEqual(json.loads((clean / 'failure.json').read_bytes()), first)
+
+
 class ControlledAtspi(unittest.TestCase):
     """Semantic validation of controlled public-object data, not native evidence."""
     def context(self):
@@ -662,6 +999,266 @@ class ControlledAtspi(unittest.TestCase):
                 trees[1]['children'].append(copy.deepcopy(trees[1]['children'][0]))
             with self.subTest(change=change), self.assertRaises(RuntimeError):
                 GUEST.window_context(trees, fixture, shell)
+
+
+class ControlledObservationEvidence(unittest.TestCase):
+    """Timeout/state evidence semantics; not native qualification."""
+
+    def test_observation_timeout_retries_as_fixture_not_ready(self):
+        self.assertTrue(issubclass(GUEST.ObservationTimeout, GUEST.FixtureNotReady))
+        with self.assertRaises(GUEST.FixtureNotReady):
+            raise GUEST.ObservationTimeout('expired')
+
+    def test_worker_timeout_exit_maps_to_retryable_timeout(self):
+        self.assertIsNone(GUEST.check_worker_status(0, 'anything'))
+        with self.assertRaises(GUEST.ObservationTimeout) as timeout:
+            GUEST.check_worker_status(GUEST.WORKER_TIMEOUT_EXIT, 'observe progress nodes=2000 elapsed_ms=24000')
+        self.assertIn('nodes=2000', str(timeout.exception))
+        with self.assertRaises(RuntimeError) as failed:
+            GUEST.check_worker_status(1, 'boom')
+        self.assertNotIsInstance(failed.exception, GUEST.FixtureNotReady)
+        self.assertIn('boom', str(failed.exception))
+
+    def test_worker_main_reports_own_deadline_as_exit_ten(self):
+        body = io.BytesIO(json.dumps({'compositor': {}, 'budget_s': 5}).encode())
+        with mock.patch.object(GUEST.sys, 'argv', ['guest', '_observe', '99']), \
+             mock.patch.object(GUEST.sys, 'stdin', SimpleNamespace(buffer=body)), \
+             mock.patch.object(GUEST.socket, 'socket'), \
+             mock.patch.object(GUEST.traceback, 'print_exc'), \
+             mock.patch.object(GUEST, 'session_observe', side_effect=TimeoutError('expired')):
+            with self.assertRaises(SystemExit) as done:
+                GUEST.main()
+        self.assertEqual(done.exception.code, GUEST.WORKER_TIMEOUT_EXIT)
+
+    def test_first_state_error_survives_later_timeouts(self):
+        deadline = GUEST.Deadline(25)
+        calls = []
+
+        def attempt():
+            calls.append(1)
+            if len(calls) == 1:
+                raise GUEST.FixtureNotReady('tab inventory []')
+            deadline.end = 0
+            raise GUEST.ObservationTimeout('finite public observation deadline expired')
+
+        with mock.patch.object(GUEST.time, 'sleep'):
+            with self.assertRaises(RuntimeError) as failed:
+                GUEST.snapshot_until_ready(attempt, [], deadline)
+        message = str(failed.exception)
+        self.assertIn('first: FixtureNotReady: tab inventory []', message)
+        self.assertIn('last: ObservationTimeout: finite public observation deadline expired', message)
+        self.assertIsInstance(failed.exception.__cause__, GUEST.ObservationTimeout)
+
+    def test_timeout_only_run_reports_last_without_first(self):
+        deadline = GUEST.Deadline(25)
+        deadline.end = 0
+
+        def attempt():
+            raise GUEST.ObservationTimeout('expired')
+
+        with mock.patch.object(GUEST.time, 'sleep'):
+            with self.assertRaises(RuntimeError) as failed:
+                GUEST.snapshot_until_ready(attempt, [], deadline)
+        self.assertIn('last: ObservationTimeout: expired', str(failed.exception))
+        self.assertNotIn('first:', str(failed.exception))
+
+    def test_setup_deadline_reports_retained_first_state(self):
+        deadline = GUEST.Deadline(25)
+        calls = []
+
+        def attempt():
+            calls.append(1)
+            if len(calls) == 1:
+                raise GUEST.FixtureNotReady('tab inventory []')
+            raise TimeoutError('guest operation absolute monotonic deadline expired')
+
+        with mock.patch.object(GUEST.time, 'sleep'):
+            with self.assertRaises(RuntimeError) as failed:
+                GUEST.snapshot_until_ready(attempt, [], deadline)
+        message = str(failed.exception)
+        self.assertIn('first: FixtureNotReady: tab inventory []', message)
+        self.assertIn('last: TimeoutError: guest operation absolute monotonic deadline expired', message)
+        self.assertIsInstance(failed.exception.__cause__, TimeoutError)
+
+    def test_setup_deadline_without_state_reports_last(self):
+        deadline = GUEST.Deadline(25)
+
+        def attempt():
+            raise TimeoutError('guest operation absolute monotonic deadline expired')
+
+        with mock.patch.object(GUEST.time, 'sleep'):
+            with self.assertRaises(RuntimeError) as failed:
+                GUEST.snapshot_until_ready(attempt, [], deadline)
+        self.assertIn('last: TimeoutError: guest operation absolute monotonic deadline expired',
+                      str(failed.exception))
+        self.assertNotIn('first:', str(failed.exception))
+
+    def test_inactive_settings_counts_as_state_not_timeout(self):
+        deadline = GUEST.Deadline(25)
+        deadline.end = 0
+
+        def attempt():
+            return {'selection': {'active_windows': [{'role': 'files-first'}]}}
+
+        with mock.patch.object(GUEST.time, 'sleep'):
+            with self.assertRaises(RuntimeError) as failed:
+                GUEST.snapshot_until_ready(attempt, [], deadline)
+        self.assertIn('original Settings Network window is not actually active', str(failed.exception))
+
+    def test_ready_snapshot_returns_without_sleep(self):
+        deadline = GUEST.Deadline(25)
+        expected = {'selection': {'active_windows': [{'role': 'settings'}]}}
+        with mock.patch.object(GUEST.time, 'sleep') as slept:
+            self.assertIs(GUEST.snapshot_until_ready(lambda: expected, [], deadline), expected)
+        slept.assert_not_called()
+
+    def test_drain_recovers_pipe_bytes_without_blocking(self):
+        out_read, out_write = os.pipe()
+        err_read, err_write = os.pipe()
+        os.write(out_write, b'{"partial": true')
+        os.write(err_write, b'observe progress nodes=2000 elapsed_ms=24000')
+        os.close(out_write)
+        os.close(err_write)
+        out_stream = os.fdopen(out_read, 'rb')
+        err_stream = os.fdopen(err_read, 'rb')
+        try:
+            worker = SimpleNamespace(stdout=out_stream, stderr=err_stream)
+            streams = {out_stream: bytearray(), err_stream: bytearray()}
+            GUEST.drain_worker_streams(worker, streams)
+            self.assertEqual(bytes(streams[out_stream]), b'{"partial": true')
+            self.assertEqual(bytes(streams[err_stream]), b'observe progress nodes=2000 elapsed_ms=24000')
+        finally:
+            out_stream.close()
+            err_stream.close()
+
+    def test_drain_leaves_empty_pipes_alone(self):
+        out_read, out_write = os.pipe()
+        err_read, err_write = os.pipe()
+        out_stream = os.fdopen(out_read, 'rb')
+        err_stream = os.fdopen(err_read, 'rb')
+        try:
+            worker = SimpleNamespace(stdout=out_stream, stderr=err_stream)
+            streams = {out_stream: bytearray(b'kept'), err_stream: bytearray()}
+            GUEST.drain_worker_streams(worker, streams)
+            self.assertEqual(bytes(streams[out_stream]), b'kept')
+            self.assertEqual(bytes(streams[err_stream]), b'')
+        finally:
+            out_stream.close()
+            err_stream.close()
+            os.close(out_write)
+            os.close(err_write)
+
+    def test_stale_tree_names_retry_wedged_peer_stays_fatal(self):
+        for name in ('org.freedesktop.DBus.Error.UnknownMethod',
+                     'org.freedesktop.DBus.Error.UnknownObject',
+                     'org.freedesktop.DBus.Error.UnknownInterface',
+                     'org.freedesktop.DBus.Error.ServiceUnknown'):
+            with self.subTest(name=name):
+                self.assertTrue(GUEST.stale_tree_message('GDBus.Error:' + name + ': gone'))
+        for text in ('GDBus.Error:org.freedesktop.DBus.Error.NoReply: slow peer',
+                     'g-dbus-error-quark: timeout', '', None, 19):
+            with self.subTest(text=text):
+                self.assertFalse(GUEST.stale_tree_message(text))
+
+    def test_worker_stale_tree_exit_maps_to_retryable_timeout(self):
+        with self.assertRaises(GUEST.ObservationTimeout) as timeout:
+            GUEST.check_worker_status(GUEST.WORKER_STALE_TREE_EXIT, 'UnknownMethod on /org/tuna/Shell/a11y/x')
+        self.assertIn('changed during observation', str(timeout.exception))
+
+    def test_worker_main_reports_torn_tree_as_exit_eleven(self):
+        body = io.BytesIO(json.dumps({'compositor': {}, 'budget_s': 5}).encode())
+        with mock.patch.object(GUEST.sys, 'argv', ['guest', '_observe', '99']), \
+             mock.patch.object(GUEST.sys, 'stdin', SimpleNamespace(buffer=body)), \
+             mock.patch.object(GUEST.socket, 'socket'), \
+             mock.patch.object(GUEST.traceback, 'print_exc'), \
+             mock.patch.object(GUEST, 'session_observe', side_effect=GUEST.FixtureNotReady('torn')):
+            with self.assertRaises(SystemExit) as done:
+                GUEST.main()
+        self.assertEqual(done.exception.code, GUEST.WORKER_STALE_TREE_EXIT)
+
+    def test_torn_tree_read_retries_instead_of_crashing(self):
+        user_bus = 'unix:path=/run/user/1000/bus'
+        a11y_bus = 'unix:path=/run/user/1000/at-spi/bus_0'
+
+        class Variant:
+            def __init__(self, signature, value):
+                self.value = value
+            def unpack(self):
+                return self.value
+
+        class FakeGError(Exception):
+            def __init__(self, message):
+                super().__init__(message)
+                self.message = message
+
+        principal = {'pid': 42, 'uid': 1000, 'start_ticks': 123, 'exe': '/usr/bin/dbus-broker',
+                     'exe_sha256': 'a' * 64, 'boot_id': 'controlled-boot'}
+
+        def observe(churn):
+            def identity(channel, deadline, operation, address, name=None, descriptor=None):
+                return principal if operation == 'socket' else [':1.42', principal]
+            streams = [SimpleNamespace(get_stream=lambda: SimpleNamespace(
+                get_socket=lambda: SimpleNamespace(get_fd=lambda: 91))) for _ in range(2)]
+            def call(connection, bus, path, interface, method, parameters, deadline, Gio):
+                if method == 'GetAddress':
+                    return (a11y_bus,)
+                if method == 'GetCurrentState':
+                    return (1, [], [], {})
+                if method == 'GetChildren':
+                    if path == '/org/a11y/atspi/accessible/root':
+                        return ([(':1.50', '/app')],)
+                    self.fail('walk reached past the torn node read')
+                if method == 'GetAll':
+                    raise churn
+                self.fail('unexpected child DBus query: ' + method)
+            modules = {'gi': SimpleNamespace(require_version=lambda *args: None),
+                       'gi.repository': SimpleNamespace(
+                           Gio=object(), GLib=SimpleNamespace(Variant=Variant, GError=FakeGError))}
+            with mock.patch.dict(sys.modules, modules), \
+                 mock.patch.object(GUEST.os, 'geteuid', return_value=1000), \
+                 mock.patch.object(GUEST, 'bus_connection', side_effect=streams), \
+                 mock.patch.object(GUEST, 'identity_request', side_effect=identity), \
+                 mock.patch.object(GUEST, 'dbus_call', side_effect=call), \
+                 mock.patch.object(GUEST, 'read_gio_settings', return_value={}), \
+                 mock.patch.object(GUEST, 'proc_identity', side_effect=AssertionError('unprivileged proc read')), \
+                 mock.patch.object(GUEST, 'check_socket_peer', side_effect=AssertionError('unprivileged identity read')):
+                return GUEST.session_observe({'compositor': principal}, GUEST.Deadline(3), object())
+
+        for name in ('org.freedesktop.DBus.Error.UnknownMethod',
+                     'org.freedesktop.DBus.Error.UnknownObject',
+                     'org.freedesktop.DBus.Error.UnknownInterface',
+                     'org.freedesktop.DBus.Error.ServiceUnknown'):
+            with self.subTest(name=name), self.assertRaises(GUEST.FixtureNotReady):
+                observe(FakeGError('GDBus.Error:' + name + ': No such interface on object at path /org/tuna/Shell/a11y/x'))
+        with self.assertRaises(FakeGError):
+            observe(FakeGError('GDBus.Error:org.freedesktop.DBus.Error.NoReply: wedged peer'))
+
+    def test_heartbeat_reports_walk_progress(self):
+        start = GUEST.time.monotonic()
+        self.assertIsNone(GUEST.observe_progress(0, start))
+        self.assertIsNone(GUEST.observe_progress(1, start))
+        self.assertIsNone(GUEST.observe_progress(499, start))
+        self.assertIsNone(GUEST.observe_progress(501, start))
+        self.assertIsNone(GUEST.observe_progress(1999, start))
+        self.assertRegex(GUEST.observe_progress(500, start),
+                         r'^observe progress nodes=500 elapsed_ms=\d+ \(early\)$')
+        self.assertRegex(GUEST.observe_progress(1000, start),
+                         r'^observe progress nodes=1000 elapsed_ms=\d+ \(early\)$')
+        line = GUEST.observe_progress(2000, start)
+        self.assertRegex(line, r'^observe progress nodes=2000 elapsed_ms=\d+$')
+        self.assertRegex(GUEST.observe_progress(4000, start), r'^observe progress nodes=4000 elapsed_ms=\d+$')
+
+    def test_slow_walk_beat_names_the_stalled_path(self):
+        start = 1000.0
+        self.assertIsNone(GUEST.walk_beat(10, start, start, start + 4.9, '/org/a11y/atspi/x'))
+        self.assertRegex(GUEST.walk_beat(10, start, start, start + 5.0, '/org/a11y/atspi/x'),
+                         r'^observe slow-walk nodes=10 elapsed_ms=5000 path=/org/a11y/atspi/x$')
+        self.assertRegex(GUEST.walk_beat(499, start, start, start + 24.0, '/root/child'),
+                         r'^observe slow-walk nodes=499 elapsed_ms=24000 path=/root/child$')
+
+    def test_slow_call_line_names_bus_path_and_method(self):
+        self.assertEqual(GUEST.slow_call_line(':1.5', '/org/a11y/atspi/accessible/1', 'GetAll', 1900),
+                         'observe slow-call bus=:1.5 path=/org/a11y/atspi/accessible/1 method=GetAll elapsed_ms=1900')
 
 
 if __name__ == '__main__':

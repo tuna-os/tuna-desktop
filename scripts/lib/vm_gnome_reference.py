@@ -618,7 +618,8 @@ def retain_guest_files(agent, profile, nonce, out, receipt):
                 names.add(guest_filename(name))
             except Exception as error:
                 receipt['retrieval_errors'].append({'stage': 'guest-file-manifest', 'message': str(error)})
-    for name in names:
+    # Retain the causal operation failure before any absent receipt probes.
+    for name in sorted(names, key=lambda name: (name != 'failure.json', name)):
         try:
             if name not in FILES and name in receipt['guest_files']:
                 retained_file(out, receipt['guest_files'][name])

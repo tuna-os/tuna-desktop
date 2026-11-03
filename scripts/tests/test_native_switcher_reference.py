@@ -551,6 +551,13 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
                     proof.verify_platform_image('/unused-controlled-output', invalid)
                 run.assert_not_called()
 
+    def test_process_without_actual_positive_elapsed_time_is_not_verified_evidence(self):
+        output = json.dumps(self.cosign).encode()
+        witness = json.loads(self.verification(output))
+        witness['end_host_monotonic_ns'] = witness['begin_host_monotonic_ns']
+        with self.assertRaisesRegex(ValueError, 'process/output'):
+            proof.validate_platform_verification(output, json.dumps(witness).encode(), proof.PINNED_PLATFORM)
+
     def test_shared_platform_parser_requires_modern_envelope_and_matching_witness(self):
         platform = 'sha256:' + 'a' * 64
         signatures = copy.deepcopy(self.cosign)
@@ -792,6 +799,26 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
             guest = ControlledGuest(failure=failure)
             with self.subTest(failure=failure), self.assertRaises(ValueError):
                 proof.guest_call(guest, 'prepare', 'gnome', 'a' * 32)
+
+    def test_causal_failure_is_retained_before_any_missing_prepare_or_snapshot_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = {'error': {'message': 'prepare failed'}, 'cleanup_errors': [],
+                       'retrieval_errors': [], 'guest_files': {}}
+            original = json.dumps({'operation': 'prepare', 'error': 'original causal failure'}).encode()
+            calls = []
+            def retrieve(agent, profile, nonce, name):
+                calls.append(name)
+                if name == 'failure.json':
+                    return original
+                raise FileNotFoundError(name)
+            with patch.object(proof, 'retrieve_guest_file', side_effect=retrieve):
+                proof.retain_guest_files(object(), 'gnome', 'a' * 32, root, receipt)
+            self.assertEqual(calls[0], 'failure.json')
+            self.assertEqual((root / 'guest/failure.json').read_bytes(), original)
+            self.assertEqual(receipt['guest_files']['failure.json']['sha256'], proof.digest(original))
+            self.assertEqual({error['name'] for error in receipt['retrieval_errors']},
+                             {'claim.json', 'prepare.json', 'snapshot.json', 'stop.json'})
 
     def test_network_panel_requires_actual_selected_gtk_ancestry_not_a_window_title(self):
         value = snapshot()
