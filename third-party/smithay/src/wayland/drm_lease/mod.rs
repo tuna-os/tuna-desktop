@@ -632,10 +632,16 @@ impl DrmLeaseState {
             + Dispatch<wp_drm_lease_v1::WpDrmLeaseV1, DrmLeaseData, D>
             + 'static,
     {
+        // Kernel lessee ids are recycled, so several entries can share one
+        // id: a dead incarnation whose object destruction is still queued
+        // plus the live lease that recycled it. The live incarnation is
+        // always the newest (an id is only recycled after its lessee is
+        // gone), so a compositor-initiated revoke targets the last match;
+        // revoking an older entry by id would kill the live lessee.
         let pos = self
             .active_leases
             .iter()
-            .position(|lease| lease.lease_id.get() == id)?;
+            .rposition(|lease| lease.lease_id.get() == id)?;
         // Never re-offer resources or report a completed revocation until
         // the kernel has actually withdrawn the lessee's authority.
         if let Err(error) = self.active_leases[pos].force_close() {
@@ -652,6 +658,32 @@ impl DrmLeaseState {
         let lease = self.active_leases.remove(pos);
         self.resume_internal::<D>(Some(&lease.connectors));
         Some(lease)
+    }
+
+    /// Drop a dead incarnation without touching the kernel: a newer entry
+    /// with the same id proves this one's lessee is gone (an id is only
+    /// recycled after its lessee is gone), so revoking by id would kill
+    /// the live lessee. Mark it revoked so later drops stay silent too.
+    fn remove_stale_lease<D>(&mut self, pos: usize) -> DrmLeaseRef
+    where
+        D: DrmLeaseHandler
+            + GlobalDispatch<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1, DrmLeaseDeviceGlobalData>
+            + Dispatch<wp_drm_lease_connector_v1::WpDrmLeaseConnectorV1, DrmNode, D>
+            + Dispatch<wp_drm_lease_device_v1::WpDrmLeaseDeviceV1, DrmNode, D>
+            + Dispatch<wp_drm_lease_request_v1::WpDrmLeaseRequestV1, DrmLeaseRequestData, D>
+            + Dispatch<wp_drm_lease_v1::WpDrmLeaseV1, DrmLeaseData, D>
+            + 'static,
+    {
+        let lease = self.active_leases.remove(pos);
+        lease.revoked.store(true, Ordering::Release);
+        drop(
+            lease
+                .obj
+                .upgrade()
+                .and_then(|obj| obj.lock().unwrap().take()),
+        );
+        self.resume_internal::<D>(Some(&lease.connectors));
+        lease
     }
 
     /// End an active lease from the compositor's side: the client gets
@@ -1102,11 +1134,37 @@ where
     fn destroyed(
         state: &mut D,
         _client: wayland_server::backend::ClientId,
-        _resource: &wp_drm_lease_v1::WpDrmLeaseV1,
+        resource: &wp_drm_lease_v1::WpDrmLeaseV1,
         data: &DrmLeaseData,
     ) {
         let drm_lease_state = state.drm_lease_state(data.node);
-        if let Some(lease_ref) = drm_lease_state.remove_lease::<D>(data.id) {
+        // Match the destroyed OBJECT, not its recycled id: an async destroy
+        // for a dead incarnation must not consume the live lease that
+        // recycled its id (its fd would be revoked early and its
+        // withdrawal would never send `finished`).
+        let pos = drm_lease_state.active_leases.iter().position(|lease| {
+            lease.obj.upgrade().is_some_and(|obj| {
+                obj.lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|obj| obj.id() == resource.id())
+            })
+        });
+        // Already cleaned (a kernel-truth path removed the ref while the
+        // destroy was queued): nothing left to do for either side.
+        let Some(pos) = pos else { return };
+        let id = drm_lease_state.active_leases[pos].lease_id.get();
+        debug_assert_eq!(id, data.id, "destroyed lease object names its own incarnation");
+        // A newer entry with the same id proves this incarnation is dead,
+        // so revoking by id would kill the live lessee: drop the ref
+        // without touching the kernel.
+        let stale = drm_lease_state.active_leases[pos + 1..]
+            .iter()
+            .any(|lease| lease.lease_id.get() == id);
+        if stale {
+            let lease_ref = drm_lease_state.remove_stale_lease::<D>(pos);
+            state.lease_destroyed(data.node, lease_ref.lease_id.get());
+        } else if let Some(lease_ref) = drm_lease_state.remove_lease::<D>(id) {
             state.lease_destroyed(data.node, lease_ref.lease_id.get());
         }
     }

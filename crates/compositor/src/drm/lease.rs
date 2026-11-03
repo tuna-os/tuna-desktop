@@ -467,7 +467,30 @@ impl DrmLeaseHandler for State {
     fn lease_destroyed(&mut self, _node: DrmNode, lease_id: u32) {
         if let Some(device) = self.protocols.drm_lease.as_mut() {
             eprintln!("tuna-compositor: drm-lease: lease {lease_id} ended");
-            remove_first_ended(&mut device.leases, lease_id, DrmLease::id);
+            // The destroyed object can be a stale incarnation whose entry a
+            // kernel-truth path already removed while the id was recycled by
+            // a live lease: only drop when more entries are tracked than the
+            // kernel lists live, never untracking the live entry (or its
+            // withdrawal would never send `finished`). A failed kernel query
+            // (no master while paused) keeps everything; resume retires it.
+            let live = device
+                .fd
+                .list_lessees()
+                .map(|lessees| {
+                    lessees
+                        .iter()
+                        .filter(|lessee| lessee.get() == lease_id)
+                        .count()
+                })
+                .unwrap_or(usize::MAX);
+            let tracked = device
+                .leases
+                .iter()
+                .filter(|lease| lease.id() == lease_id)
+                .count();
+            if tracked > live {
+                remove_first_ended(&mut device.leases, lease_id, DrmLease::id);
+            }
         }
     }
 }
