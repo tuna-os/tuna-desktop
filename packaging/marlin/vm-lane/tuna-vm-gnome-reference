@@ -727,8 +727,14 @@ def bus_path(address):
 
 def dbus_call(connection, bus, path, interface, method, parameters, deadline, Gio):
     millis = max(1, min(2000, int(deadline.remaining() * 1000)))
-    return connection.call_sync(bus, path, interface, method, parameters, None,
-        Gio.DBusCallFlags.NO_AUTO_START, millis, None).unpack()
+    started = time.monotonic()
+    try:
+        return connection.call_sync(bus, path, interface, method, parameters, None,
+            Gio.DBusCallFlags.NO_AUTO_START, millis, None).unpack()
+    finally:
+        elapsed = time.monotonic() - started
+        if elapsed >= SLOW_CALL_S:
+            print(slow_call_line(bus, path, method, int(elapsed * 1000)), file=sys.stderr, flush=True)
 
 
 STALE_TREE_DBUS_ERRORS = ('org.freedesktop.DBus.Error.UnknownMethod',
@@ -764,6 +770,29 @@ def observe_progress(count, start):
     if count % 2000:
         return 'observe progress nodes=%d elapsed_ms=%d (early)' % (count, (time.monotonic() - start) * 1000)
     return 'observe progress nodes=%d elapsed_ms=%d' % (count, (time.monotonic() - start) * 1000)
+
+
+SLOW_WALK_BEAT_S = 5.0
+SLOW_CALL_S = 1.0
+
+
+def walk_beat(count, start, last_beat, now, path):
+    """Time-based stall marker line, or None while the walk breathes.
+
+    Count-based heartbeats stay silent on a slow subtree (fewer than 500
+    nodes per budget); a killed worker then leaves no record of where the
+    walk stalled. This beats at least every SLOW_WALK_BEAT_S naming the
+    current path, so the next tail shows the wedged peer instead of
+    silence.
+    """
+    if now - last_beat < SLOW_WALK_BEAT_S:
+        return None
+    return 'observe slow-walk nodes=%d elapsed_ms=%d path=%s' % (count, (now - start) * 1000, path)
+
+
+def slow_call_line(bus, path, method, elapsed_ms):
+    """One stderr line naming a D-Bus call that answered slowly but under its cap."""
+    return 'observe slow-call bus=%s path=%s method=%s elapsed_ms=%d' % (bus, path, method, elapsed_ms)
 
 
 def bus_connection(address, deadline, Gio):
@@ -1023,9 +1052,10 @@ def session_observe(args, deadline, channel):
     visited = set()
     count = 0
     walk_start = time.monotonic()
+    last_beat = walk_start
 
     def tree(bus_name, path, depth=0):
-        nonlocal count
+        nonlocal count, last_beat
         deadline.remaining()
         if depth > 64 or count >= 6000:
             raise RuntimeError('public AT-SPI tree exceeded finite observation bound')
@@ -1042,6 +1072,12 @@ def session_observe(args, deadline, channel):
         line = observe_progress(count, walk_start)
         if line is not None:
             print(line, file=sys.stderr, flush=True)
+            last_beat = time.monotonic()
+        else:
+            beat = walk_beat(count, walk_start, last_beat, time.monotonic(), path)
+            if beat is not None:
+                print(beat, file=sys.stderr, flush=True)
+                last_beat = time.monotonic()
         try:
             props = call(bus, unique, path, 'org.freedesktop.DBus.Properties', 'GetAll', variant('(s)', ('org.a11y.atspi.Accessible',)))[0]
             role = call(bus, unique, path, 'org.a11y.atspi.Accessible', 'GetRoleName')[0]
@@ -1069,9 +1105,12 @@ def session_observe(args, deadline, channel):
     print('observe start', file=sys.stderr, flush=True)
     roots = call(bus, registry_name, '/org/a11y/atspi/accessible/root', 'org.a11y.atspi.Accessible', 'GetChildren')[0]
     trees = [tree(name, path) for name, path in roots]
+    print('observe walk-complete nodes=%d elapsed_ms=%d owners=%d' % (
+        count, (time.monotonic() - walk_start) * 1000, len(owners)), file=sys.stderr, flush=True)
     for bus_name, (_, principal) in owners.items():
         _, current = owner(bus, bus_name)
         same_process(principal, current)
+    print('observe owners-verified count=%d' % len(owners), file=sys.stderr, flush=True)
     return unvariant({'settings': current_settings,
         'atspi': {'address': address, 'registry': registry, 'peers': list(peers.values()),
                   'session_bus_peer': session_peer, 'bus_peer': bus_peer, 'launcher': a11y_launcher},

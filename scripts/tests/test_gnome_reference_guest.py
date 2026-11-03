@@ -1217,6 +1217,18 @@ class ControlledObservationEvidence(unittest.TestCase):
         self.assertRegex(line, r'^observe progress nodes=2000 elapsed_ms=\d+$')
         self.assertRegex(GUEST.observe_progress(4000, start), r'^observe progress nodes=4000 elapsed_ms=\d+$')
 
+    def test_slow_walk_beat_names_the_stalled_path(self):
+        start = 1000.0
+        self.assertIsNone(GUEST.walk_beat(10, start, start, start + 4.9, '/org/a11y/atspi/x'))
+        self.assertRegex(GUEST.walk_beat(10, start, start, start + 5.0, '/org/a11y/atspi/x'),
+                         r'^observe slow-walk nodes=10 elapsed_ms=5000 path=/org/a11y/atspi/x$')
+        self.assertRegex(GUEST.walk_beat(499, start, start, start + 24.0, '/root/child'),
+                         r'^observe slow-walk nodes=499 elapsed_ms=24000 path=/root/child$')
+
+    def test_slow_call_line_names_bus_path_and_method(self):
+        self.assertEqual(GUEST.slow_call_line(':1.5', '/org/a11y/atspi/accessible/1', 'GetAll', 1900),
+                         'observe slow-call bus=:1.5 path=/org/a11y/atspi/accessible/1 method=GetAll elapsed_ms=1900')
+
 
 if __name__ == '__main__':
     unittest.main()
