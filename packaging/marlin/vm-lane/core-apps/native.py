@@ -75,11 +75,10 @@ class ForeignPreeditSender(RuntimeError):
     """An IBus preedit signal arrived from someone other than the daemon."""
 
 
-def _proc_exe_pids(exe, uid):
-    """PIDs whose resolved executable and owner match exactly.
+def _proc_pids(uid, match):
+    """PIDs whose owner matches and whose resolved executable matches.
 
-    Vanished processes are normal mid-scan; only exact resolved-exe and
-    owner matches qualify, never bare process names.
+    Vanished processes are normal mid-scan.
     """
     found = []
     for entry in Path('/proc').iterdir():
@@ -88,7 +87,7 @@ def _proc_exe_pids(exe, uid):
         try:
             if entry.stat().st_uid != uid:
                 continue
-            if str((entry / 'exe').resolve(strict=True)) != exe:
+            if not match((entry / 'exe').resolve(strict=True)):
                 continue
         except (FileNotFoundError, PermissionError, RuntimeError):
             continue
@@ -96,26 +95,46 @@ def _proc_exe_pids(exe, uid):
     return sorted(found)
 
 
-def admit_ibus_daemon(context):
-    """Admit the single original-user IBus daemon principal.
+def _proc_exe_pids(exe, uid):
+    """PIDs with exactly the given resolved executable and owner."""
+    return _proc_pids(uid, lambda path: str(path) == exe)
 
-    The IBus bus implements no GetConnectionUnixProcessID, so the daemon
-    cannot be identified through bus credentials; it is admitted
-    out-of-band instead: exactly one uid-owned process with the exact
-    daemon executable, strictly identified, owned by the ibus package.
-    Spoofing the daemon name requires replacing this process, which the
-    per-observation liveness check detects.
+
+def _proc_basename_pids(name, uid):
+    """PIDs with the given resolved executable basename and owner.
+
+    Discovery only: trust comes from the package ownership verified at
+    admission, never from the name that found the process.
+    """
+    return _proc_pids(uid, lambda path: path.name == name)
+
+
+def admit_ibus_daemons(context):
+    """Admit the original-user IBus daemon principals as a set.
+
+    The IBus bus implements no GetConnectionUnixProcessID, so daemons
+    cannot be identified through bus credentials; they are admitted
+    out-of-band instead. The bridge and the session manager can race at
+    login and leave two genuine daemons behind one bus file, so the set
+    admits every uid-owned ibus-daemon executable: each member is
+    strictly identified and must be owned by the ibus package, which a
+    spoof binary cannot satisfy. Swapping the serving daemon requires
+    replacing an admitted member, which the per-observation liveness
+    check detects; identical binaries are interchangeable by construction.
     """
     pids = _proc_exe_pids(IBUS_DAEMON_EXE, context.uid)
-    if len(pids) != 1:
-        raise RuntimeError('original IBus daemon is not unique: %d processes' % len(pids))
-    identity = process(pids[0], context.uid)
-    if identity['exe'] != IBUS_DAEMON_EXE:
-        raise RuntimeError('original IBus daemon executable changed during admission')
-    package = context.command(['pacman', '-Qqo', IBUS_DAEMON_EXE]).stdout.strip()
-    if package != IBUS_DAEMON_PACKAGE:
-        raise RuntimeError('IBus daemon not owned by ibus package: ' + package)
-    return identity | {'package': package}
+    if not pids:
+        pids = _proc_basename_pids('ibus-daemon', context.uid)
+    if not pids:
+        raise RuntimeError('no original-user IBus daemon process')
+    daemons = []
+    for pid in pids:
+        identity = process(pid, context.uid)
+        package = context.command(['pacman', '-Qqo', identity['exe']]).stdout.strip()
+        if package != IBUS_DAEMON_PACKAGE:
+            raise RuntimeError('IBus daemon not owned by ibus package: ' + package)
+        daemons.append(identity | {'package': package})
+    return sorted(daemons, key=lambda daemon: daemon['pid'])
 
 
 def check_preedit_sender(value, ibus_owner):
@@ -604,13 +623,14 @@ def dispatch(operation, arguments, context):
             if previous is not True:
                 raise RuntimeError('previous real IBus monitor not retired')
             IME_LOG.unlink()
-        daemon = admit_ibus_daemon(context)
+        daemons = admit_ibus_daemons(context)
         state = json.loads(RUN_STATE.read_text())
         state['ime_retired'] = False
-        state['ime_daemon'] = {key: daemon[key] for key in
-                               ('pid', 'uid', 'start_ticks', 'exe', 'exe_sha256', 'cgroup')}
+        state['ime_daemons'] = [{key: daemon[key] for key in
+                                 ('pid', 'uid', 'start_ticks', 'exe', 'exe_sha256', 'cgroup')}
+                                for daemon in daemons]
         RUN_STATE.write_text(json.dumps(state))
-        return {'monitor': _spawn(context, 'ime', arguments), 'daemon': daemon}
+        return {'monitor': _spawn(context, 'ime', arguments), 'daemons': daemons}
     if operation == 'ime-monitor-stop':
         result = _stop(context, 'ime')
         state = json.loads(RUN_STATE.read_text())
@@ -625,12 +645,14 @@ def dispatch(operation, arguments, context):
         # Liveness first: a replaced daemon invalidates the name binding,
         # and a departed observer leaves only stale rows.
         try:
-            daemon = admitted.get('ime_daemon')
-            daemon_alive = daemon is not None and process(daemon['pid'], context.uid) == daemon
+            daemons = admitted.get('ime_daemons')
+            daemons_alive = (isinstance(daemons, list) and bool(daemons)
+                             and all(process(daemon['pid'], context.uid) == daemon
+                                     for daemon in daemons))
         except FileNotFoundError:
-            daemon_alive = False
-        if not daemon_alive:
-            raise RuntimeError('original IBus daemon changed or departed')
+            daemons_alive = False
+        if not daemons_alive:
+            raise RuntimeError('original IBus daemons changed or departed')
         try:
             monitor_state = admitted.get('ime_monitor')
             monitor_alive = (monitor_state is not None
@@ -667,7 +689,7 @@ def dispatch(operation, arguments, context):
                 'ime_log_summary': summary,
                 'ibus_owner': ibus_owner,
                 'destination': messages[-1].get('destination') if messages else None,
-                'daemon': daemon,
+                'daemons': daemons,
                 'candidates': candidates, 'shell_actor': shell, 'actual_shell_tree': tree,
                 'actor': actor}
     if operation == 'lock-ui':

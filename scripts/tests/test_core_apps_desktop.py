@@ -353,44 +353,55 @@ class ImeDaemonAdmission(unittest.TestCase):
             sys.modules.pop('guest', None)
             sys.modules.pop('native_session', None)
 
-    def admit(self, pids, identity, package='ibus\n'):
+    def admit(self, pids, identities, package='ibus\n', basename_pids=None):
         import types
         from unittest import mock
         context = types.SimpleNamespace(
             uid=1000, command=mock.Mock(return_value=types.SimpleNamespace(stdout=package)))
+        by_pid = {identity['pid']: identity for identity in identities}
         with mock.patch.object(self.native, '_proc_exe_pids', return_value=pids), \
-                mock.patch.object(self.native, 'process', return_value=identity):
+                mock.patch.object(self.native, '_proc_basename_pids',
+                                  return_value=basename_pids if basename_pids is not None else []), \
+                mock.patch.object(self.native, 'process',
+                                  side_effect=lambda pid, uid: by_pid[pid]):
             try:
-                return context, self.native.admit_ibus_daemon(context), None
+                return context, self.native.admit_ibus_daemons(context), None
             except RuntimeError as error:
                 return context, None, error
 
-    def identity(self, pid=4321):
+    def identity(self, pid=4321, exe='/usr/bin/ibus-daemon'):
         return {'pid': pid, 'uid': 1000, 'start_ticks': 7,
-                'exe': '/usr/bin/ibus-daemon', 'exe_sha256': 'ab' * 32,
+                'exe': exe, 'exe_sha256': 'ab' * 32,
                 'cgroup': ['0::/user.slice']}
 
     def test_unique_packaged_daemon_admits(self):
-        context, daemon, error = self.admit([4321], self.identity())
+        context, daemons, error = self.admit([4321], [self.identity()])
         self.assertIsNone(error)
-        self.assertEqual(daemon['package'], 'ibus')
-        self.assertEqual(daemon['pid'], 4321)
+        self.assertEqual(len(daemons), 1)
+        self.assertEqual(daemons[0]['package'], 'ibus')
+        self.assertEqual(daemons[0]['pid'], 4321)
         context.command.assert_called_once_with(['pacman', '-Qqo', '/usr/bin/ibus-daemon'])
 
-    def test_missing_or_duplicate_daemon_refused(self):
-        _, _, error = self.admit([], self.identity())
-        self.assertIn('not unique: 0', str(error))
-        _, _, error = self.admit([4321, 4322], self.identity())
-        self.assertIn('not unique: 2', str(error))
+    def test_duplicate_daemons_admit_as_sorted_set(self):
+        context, daemons, error = self.admit([4322, 4321],
+                                             [self.identity(4321), self.identity(4322)])
+        self.assertIsNone(error)
+        self.assertEqual([daemon['pid'] for daemon in daemons], [4321, 4322])
+        self.assertEqual(context.command.call_count, 2)
 
-    def test_changed_executable_refused(self):
-        other = self.identity()
-        other['exe'] = '/usr/bin/ibus-daemon-swapped'
-        _, _, error = self.admit([4321], other)
-        self.assertIn('changed during admission', str(error))
+    def test_missing_daemon_refused(self):
+        _, _, error = self.admit([], [])
+        self.assertIn('no original-user IBus daemon process', str(error))
+
+    def test_basename_fallback_admits_relocated_daemon(self):
+        identity = self.identity(exe='/usr/libexec/ibus-daemon')
+        context, daemons, error = self.admit([], [identity], basename_pids=[4321])
+        self.assertIsNone(error)
+        self.assertEqual(daemons[0]['exe'], '/usr/libexec/ibus-daemon')
+        context.command.assert_called_once_with(['pacman', '-Qqo', '/usr/libexec/ibus-daemon'])
 
     def test_foreign_package_refused(self):
-        _, _, error = self.admit([4321], self.identity(), package='not-ibus\n')
+        _, _, error = self.admit([4321], [self.identity()], package='not-ibus\n')
         self.assertIn('not owned by ibus package', str(error))
 
 
@@ -445,7 +456,7 @@ class ImeStateDispatch(unittest.TestCase):
 
     def admitted(self):
         monitor = {'pid': 200, 'uid': 1000}
-        return {'ime_daemon': self.daemon(), 'ime_monitor': monitor,
+        return {'ime_daemons': [self.daemon()], 'ime_monitor': monitor,
                 'observed': {100: self.daemon(), 200: monitor}}
 
     def test_bound_preedit_observes_visible_text(self):
@@ -458,7 +469,7 @@ class ImeStateDispatch(unittest.TestCase):
         self.assertEqual(response['preedit'], 'nihao')
         self.assertEqual(response['ibus_owner'], ':1.9')
         self.assertEqual(response['destination'], ':1.50')
-        self.assertEqual(response['daemon'], self.daemon())
+        self.assertEqual(response['daemons'], [self.daemon()])
         self.assertEqual(response['candidates'], ['你好'])
 
     def test_departed_daemon_refused(self):
@@ -466,7 +477,7 @@ class ImeStateDispatch(unittest.TestCase):
         observed = admitted.pop('observed')
         observed[100] = FileNotFoundError()
         rows = [{'ready': True, 'kind': 'ime', 'uid': 1000, 'ibus_owner': ':1.9'}]
-        with self.assertRaisesRegex(RuntimeError, 'daemon changed or departed'):
+        with self.assertRaisesRegex(RuntimeError, 'daemons changed or departed'):
             self.operate(rows, admitted, observed=observed)
 
     def test_changed_observer_refused(self):
@@ -495,13 +506,13 @@ class ImeStateDispatch(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'multiple simultaneous IBus composers'):
             self.operate(rows, admitted, observed=admitted.pop('observed'))
 
-    def test_monitor_start_admits_daemon_and_strips_package_for_liveness(self):
+    def test_monitor_start_admits_daemons_and_strips_package_for_liveness(self):
         import types
         from unittest import mock
-        daemon = dict(self.daemon(), package='ibus')
+        daemons = [dict(self.daemon(), package='ibus')]
         monitor = {'pid': 200, 'uid': 1000}
         context = types.SimpleNamespace(uid=1000)
-        with mock.patch.object(self.native, 'admit_ibus_daemon', return_value=daemon), \
+        with mock.patch.object(self.native, 'admit_ibus_daemons', return_value=daemons), \
                 mock.patch.object(self.native, '_spawn', return_value=monitor) as spawned, \
                 mock.patch.object(self.native, 'RUN_STATE') as run, \
                 mock.patch.object(self.native, 'IME_LOG') as log:
@@ -510,13 +521,13 @@ class ImeStateDispatch(unittest.TestCase):
             response = self.native.dispatch('ime-monitor-start', {'actor': {'pid': 300}},
                                             context)
         spawned.assert_called_once()
-        self.assertEqual(response, {'monitor': monitor, 'daemon': daemon})
+        self.assertEqual(response, {'monitor': monitor, 'daemons': daemons})
         written = json.loads(run.write_text.call_args[0][0])
         self.assertFalse(written['ime_retired'])
         # RUN_STATE keeps pure process identity so per-observation
         # liveness compares equal; the package rides the response only.
-        self.assertNotIn('package', written['ime_daemon'])
-        self.assertEqual(written['ime_daemon'], self.daemon())
+        self.assertNotIn('package', written['ime_daemons'][0])
+        self.assertEqual(written['ime_daemons'], [self.daemon()])
 
 
 if __name__ == '__main__':
