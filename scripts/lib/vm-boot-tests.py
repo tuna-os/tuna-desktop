@@ -2341,6 +2341,68 @@ class BootApi(unittest.TestCase):
             with self.assertRaises(ValueError):
                 lane.boot("disk.raw", "/out", "/scratch", 30, observer_records="/out/observer-records.log")
 
+    def test_explicit_sync_boot_uses_pure_virtio_gpu_gl(self):
+        env = {"LIBGL_ALWAYS_SOFTWARE": "1", "GALLIUM_DRIVER": "llvmpipe"}
+        with patch.object(lane.os.path, "exists", return_value=True), patch.object(lane.os, "access", return_value=True), patch.object(lane.subprocess, "Popen") as spawn, patch.dict(lane.os.environ, env, clear=False):
+            lane.boot("disk.raw", "/out", "/scratch", 30, explicit_sync_gpu=True)
+            command = spawn.call_args.args[0]
+            self.assertEqual(command[command.index("-display") + 1], "egl-headless")
+            self.assertIn("pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1", command)
+            self.assertIn(f"virtio-gpu-gl-pci,bus=tuna-gpu-port,xres={lane.WIDTH},yres={lane.HEIGHT}", command)
+            self.assertFalse(any("virtio-vga" in value for value in command))
+
+    def test_explicit_sync_devices_match_the_receipt_launcher(self):
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        try:
+            import explicit_sync_vm
+        finally:
+            sys.path.remove(os.path.dirname(os.path.abspath(__file__)))
+        self.assertEqual(explicit_sync_vm.gpu_devices(lane.WIDTH, lane.HEIGHT),
+                         lane.gpu_devices_for_receipt(True))
+
+    def test_explicit_sync_boot_refuses_without_software_gl_launcher(self):
+        with patch.object(lane.os.path, "exists", return_value=True), patch.object(lane.os, "access", return_value=True), patch.object(lane.subprocess, "Popen"), patch.dict(lane.os.environ, {}, clear=True):
+            with self.assertRaises(RuntimeError):
+                lane.boot("disk.raw", "/out", "/scratch", 30, explicit_sync_gpu=True)
+
+    def test_surface_wait_enables_scanout_trace_before_probing(self):
+        calls = []
+
+        class ProbeQmp:
+            def cmd(self, command, **args):
+                calls.append((command, args))
+                return {}
+
+        with tempfile.TemporaryDirectory() as out:
+            os.makedirs(os.path.join(out, ".scratch"))
+            with open(os.path.join(out, ".scratch", "surface-probe.ppm"), "wb") as stream:
+                stream.write(b"P6\n1 1\n255\n\x00\x00\x00")
+            lane.wait_for_surface(ProbeQmp(), out, lane.time.monotonic() + 5)
+        traced = [args["name"] for command, args in calls if command == "trace-event-set-state"]
+        self.assertIn("virtio_gpu_cmd_set_scanout", traced)
+        self.assertIn("virtio_gpu_cmd_set_scanout_blob", traced)
+        self.assertTrue(all(args.get("enable") is True for command, args in calls
+                            if command == "trace-event-set-state"))
+        self.assertTrue(any(command == "screendump" for command, _ in calls))
+
+    def test_surface_wait_proceeds_when_trace_is_unavailable(self):
+        calls = []
+
+        class DeafQmp:
+            def cmd(self, command, **args):
+                calls.append(command)
+                if command == "trace-event-set-state":
+                    raise RuntimeError("unknown trace event")
+                return {}
+
+        with tempfile.TemporaryDirectory() as out:
+            os.makedirs(os.path.join(out, ".scratch"))
+            with open(os.path.join(out, ".scratch", "surface-probe.ppm"), "wb") as stream:
+                stream.write(b"P6\n1 1\n255\n\x00\x00\x00")
+            lane.wait_for_surface(DeafQmp(), out, lane.time.monotonic() + 5)
+        self.assertIn("screendump", calls)
+
 
 class NativeMouseSelection(unittest.TestCase):
     def mouse(self, name="QEMU Virtio Mouse", absolute=False, current=False, index=8):

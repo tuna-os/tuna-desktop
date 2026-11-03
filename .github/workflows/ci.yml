@@ -1786,6 +1786,13 @@ jobs:
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
           --meta "tuna_package=$(basename arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)"
           --meta "commit=${{ github.sha }}"
+      - name: Record the host virgl stack under diagnosis
+        if: matrix.profile == 'explicit-sync'
+        run: |
+          qemu-system-x86_64 --version | head -1
+          dpkg -l | grep -E 'virgl|mesa' | awk '{print $2, $3}' | head -8
+          ls -l /dev/dri/renderD128
+          qemu-system-x86_64 -trace help 2>/dev/null | grep -E 'virtio_gpu_cmd_(set_scanout|res_create|res_unref|res_back)' | head -10
       - name: Prove all native timelines, DMA buffers and background effects
         if: matrix.profile == 'explicit-sync'
         run: >-

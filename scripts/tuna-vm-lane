@@ -3104,6 +3104,17 @@ def wait_for_surface(qmp, out, deadline):
     never a fixed sleep — and fails loudly when no frame ever arrives.
     """
     probe = os.path.join(out, ".scratch", "surface-probe.ppm")
+    gpu_events = ("virtio_gpu_cmd_set_scanout", "virtio_gpu_cmd_set_scanout_blob",
+                  "virtio_gpu_cmd_res_create_2d", "virtio_gpu_cmd_res_create_3d",
+                  "virtio_gpu_cmd_res_unref", "virtio_gpu_cmd_res_back_attach",
+                  "virtio_gpu_cmd_res_back_detach")
+    for event in gpu_events:
+        try:
+            qmp.cmd("trace-event-set-state", name=event, enable=True)
+        except (OSError, RuntimeError, ValueError, KeyError) as error:
+            # Tracing is diagnostic; the surface verdict must not depend on it.
+            log(f"surface wait: scanout trace {event} unavailable: {error}")
+            break
     while time.monotonic() < deadline:
         try:
             qmp.cmd("screendump", filename=probe, format="ppm")
@@ -3926,8 +3937,11 @@ def run_soak(qmp, vm, agent_path, out, record, seconds, warmup, interval, revisi
 
 def gpu_devices_for_receipt(explicit_sync=False):
     if explicit_sync:
+        # Pure virtio-gpu, no VGA compatibility: the leg only observes
+        # post-render frames, and the VGA-to-GL console transition is one
+        # more state machine between the guest scanout and the QMP surface.
         return ["-device", "pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1",
-                "-device", "virtio-vga-gl,bus=tuna-gpu-port,x-pcie-pm-no-soft-reset=on,"
+                "-device", "virtio-gpu-gl-pci,bus=tuna-gpu-port,"
                            f"xres={WIDTH},yres={HEIGHT}"]
     return baseline.gpu_devices()
 
@@ -4475,7 +4489,7 @@ def main():
         "resolution": f"{WIDTH}x{HEIGHT}",
         "kvm": kvm,
         "qemu": qemu_version,
-        "gpu_profile": "virtio-vga-gl-virgl-llvmpipe-v1" if a.explicit_sync else baseline.GPU_PROFILE,
+        "gpu_profile": "virtio-gpu-gl-virgl-llvmpipe-v1" if a.explicit_sync else baseline.GPU_PROFILE,
         "gpu_devices": gpu_devices_for_receipt(a.explicit_sync),
         "gpu_display": "egl-headless" if a.explicit_sync else "none",
         "session_up_s": round(elapsed) if drm and shell else None,
