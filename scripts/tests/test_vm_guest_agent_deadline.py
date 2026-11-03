@@ -228,6 +228,35 @@ class Tests(unittest.TestCase):
         self.assertIsNone(actor.pending_guest_pid)
         self.assertEqual(actor.guest_exec_state, 'none')
 
+    def test_reference_invalid_operation_never_starts_guest_child(self):
+        actor, _ = self.actor()
+        for arguments, timeout in (
+                (("exec", "{}"), 30), (("observe", "[]"), 30),
+                (("observe", "{}"), 31), (("observe", "{}"), 0),
+                (("observe", "{}"), float("nan")), (("observe",), 30)):
+            with self.subTest(arguments=arguments, timeout=timeout):
+                with mock.patch.object(actor, "command") as command:
+                    with self.assertRaises(ValueError):
+                        actor.run("gnome-reference", *arguments, timeout=timeout)
+                    command.assert_not_called()
+                self.assertIsNone(actor.pending_guest_pid)
+                self.assertFalse(actor.poisoned)
+
+    def test_reference_timeout_preserves_original_child_for_retirement(self):
+        actor, _ = self.actor()
+        def command(name, **kwargs):
+            if name == "guest-exec":
+                self.assertEqual(kwargs["path"], "/usr/libexec/tuna-vm-gnome-reference")
+                self.assertEqual(kwargs["arg"], ["observe", '{"nonce":"owned"}'])
+                return {"pid": 52}
+            return {"exited": False}
+        with mock.patch.object(actor, "command", side_effect=command):
+            with self.assertRaisesRegex(TimeoutError, "retirement unconfirmed"):
+                actor.run("gnome-reference", "observe", '{"nonce":"owned"}', timeout=.03)
+        self.assertEqual(actor.pending_guest_pid, 52)
+        self.assertEqual(actor.guest_exec_state, "known")
+        self.assertTrue(actor.poisoned)
+
     def test_timed_out_exec_is_not_claimed_retired(self):
         actor, _ = self.actor()
         def command(name, **kwargs):

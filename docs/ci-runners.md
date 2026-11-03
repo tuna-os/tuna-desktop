@@ -35,9 +35,9 @@ schedule, dispatch or a pull request whose head repository is
 
 | Runner | Lanes |
 | --- | --- |
-| `tuna-ci-24.04` | select-lanes, check, fprint-phase-proof, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, parity-ledger, docs-shots, ci-gate |
+| `tuna-ci-24.04` | select-lanes, check, fprint-phase-proof, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, native-reference-context, parity-ledger, docs-shots, ci-gate |
 | `tuna-ci-26.04` | journey, orca-speech, portal-security, remote-security, niri-parity |
-| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (both matrix legs), marlin-image |
+| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (both lifecycle legs and both paired reference members), marlin-image, gdm51-native-package |
 
 Why the always-hosted lanes stay hosted:
 
@@ -56,6 +56,12 @@ Why the always-hosted lanes stay hosted:
   with a `packages: write` token. Publishing stays on GitHub's ephemeral VMs
   so a compromised long-lived node (or its shared image store) can never
   sign or push a release image.
+
+The required `gdm51-native-package` factory remains GitHub-hosted and feeds
+only the ordinary lifecycle images' final GDM overlay and fresh-account
+admission. The paired GNOME/Tuna members keep their shared
+`Containerfile.reference`, original `104870` platform payload and stock GDM;
+they do not apply that overlay or relax the original byte inventory.
 
 journey once failed self-hosted in "Qualify disposable Debian lifecycle"
 (`end of file on stdin at conffile prompt`); that came from #899 changing
