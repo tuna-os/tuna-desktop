@@ -1021,7 +1021,7 @@ env -u DISPLAY -u WAYLAND_DISPLAY \
     --shell-bin "$ROOT/target/debug/tuna-shell-host" >"$LEASE_LOG" 2>&1 &
 COMP_PID=$!
 end=$(($(date +%s) + 30))
-until grep -q 'drm-lease: wp_drm_lease_device_v1 advertised' "$LEASE_LOG" 2>/dev/null &&
+until grep -q 'drm-lease: [0-9][0-9]* wp_drm_lease_device_v1 advertised' "$LEASE_LOG" 2>/dev/null &&
     [ -S "$RUNTIME/tuna-drm-lease" ]; do
     kill -0 "$COMP_PID" 2>/dev/null || fail D-LEASE "the lease session exited during startup"
     [ "$(date +%s)" -le "$end" ] || fail D-LEASE "the lease session never advertised its lease device"
@@ -1077,7 +1077,7 @@ lease_probe --lease "$CONNECTOR" --close-fd >"$ARTIFACTS/lease-close.jsonl" ||
 jq -se '[.[].event] == ["devices", "leased", "withdrawn", "finished", "reoffered"]' \
     "$ARTIFACTS/lease-close.jsonl" >/dev/null ||
     fail D-LEASE "unexpected lease sequence: $(cat "$ARTIFACTS/lease-close.jsonl")"
-grep -q "drm-lease: lessee .* disappeared" "$LEASE_LOG" ||
+grep -q "drm-lease: [0-9][0-9]* lessee .* disappeared" "$LEASE_LOG" ||
     fail D-LEASE "the compositor did not notice the lessee go"
 # An actual vkms connector state transition, not a synthetic compositor event.
 # Keep the leased native FD open while forcing the owned emulated connector off.

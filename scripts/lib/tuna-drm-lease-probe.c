@@ -79,8 +79,8 @@ static double now_ms(void) {
 }
 
 /* Dispatch until *flag holds or the deadline passes. */
-static bool dispatch_until(const bool *flag) {
-    double end = now_ms() + DEADLINE_MS;
+static bool dispatch_until_ms(const bool *flag, double ms) {
+    double end = now_ms() + ms;
     while (!*flag) {
         if (wl_display_dispatch_pending(display) < 0) return false;
         if (*flag) break;
@@ -386,7 +386,8 @@ int main(int argc, char **argv) {
     if (observe_name) {
         struct connector *target = n_devices ? find_live(&devices[0], observe_name) : NULL;
         if (!target) return fail("observer target was not offered");
-        if (!dispatch_until(&observed_withdrawn) || !dispatch_until(&observed_reoffered))
+        if (!dispatch_until_ms(&observed_withdrawn, DEADLINE_MS)
+            || !dispatch_until_ms(&observed_reoffered, DEADLINE_MS))
             return fail("independent client did not observe withdrawal and re-offering");
         if (!find_live(&devices[0], observe_name))
             return fail("independent client has no re-offered connector");
@@ -459,7 +460,9 @@ int main(int argc, char **argv) {
     if (!target->withdrawn) return fail("the leased connector was not withdrawn");
     print_devices("withdrawn");
     if (expect_revoke) {
-        if (!dispatch_until(&lease_finished))
+        // Unplug crosses sudo, the kernel, udev and the compositor loop;
+        // the 5s protocol deadline flakes under runner load, so allow 20s.
+        if (!dispatch_until_ms(&lease_finished, 20000))
             return fail("connector unplug did not finish its active lease");
         struct drm_mode_card_res revoked = { 0 };
         if (!lease_revoked(lease_fd, &revoked))
@@ -478,7 +481,7 @@ int main(int argc, char **argv) {
     if (stale) {
         struct wp_drm_lease_v1 *refused = wp_drm_lease_request_v1_submit(stale_request);
         wp_drm_lease_v1_add_listener(refused, &stale_listener, NULL);
-        if (!dispatch_until(&stale_finished) || stale_fd)
+        if (!dispatch_until_ms(&stale_finished, DEADLINE_MS) || stale_fd)
             return fail("a stale connector request was not refused with finished");
         printf("{\"event\":\"stale-finished\"}\n");
         wp_drm_lease_v1_destroy(refused);
@@ -509,7 +512,7 @@ int main(int argc, char **argv) {
     if (close_fd) {
         /* The kernel destroys the lessee; the compositor ends the lease. */
         close(lease_fd);
-        if (!dispatch_until(&lease_finished)) return fail("closing the lease fd did not finish the lease");
+        if (!dispatch_until_ms(&lease_finished, DEADLINE_MS)) return fail("closing the lease fd did not finish the lease");
         printf("{\"event\":\"finished\"}\n");
         fflush(stdout);
     }

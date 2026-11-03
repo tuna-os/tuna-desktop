@@ -650,7 +650,11 @@ impl DrmLeaseState {
             // errno on stderr with the other lease diagnostics, or the
             // reason a withdrawal never completes is unobservable.
             eprintln!(
-                "tuna-compositor: drm-lease: kernel revoke of lease {id} failed: {error} (errno {})",
+                "tuna-compositor: drm-lease: {} kernel revoke of lease {id} failed: {error} (errno {})",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
                 error.raw_os_error().unwrap_or(-1)
             );
             return None;

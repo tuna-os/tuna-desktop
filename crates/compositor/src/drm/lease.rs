@@ -38,6 +38,15 @@ use crate::State;
 /// shared session environment must not take a monitor away from Tuna.
 pub const DEBUG_LEASE_CONNECTORS_ENV: &str = "TUNA_DEBUG_LEASE_CONNECTORS";
 
+/// Wall-clock milliseconds for lease diagnostics, so unplug/withdraw/end
+/// lines correlate with the timestamped CI log around them.
+pub(crate) fn wall_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 /// Connector names from a [`DEBUG_LEASE_CONNECTORS_ENV`] value, split on
 /// `:` as Mutter's `g_strsplit`; unset or empty names nothing.
 pub fn parse_lease_connectors(raw: Option<&str>) -> Vec<String> {
@@ -258,7 +267,7 @@ impl LeaseDevice {
             .map(DrmLease::id)
             .collect();
         for handle in gone {
-            eprintln!("tuna-compositor: drm-lease: withdrew connector {handle:?}");
+            eprintln!("tuna-compositor: drm-lease: {} withdrew connector {handle:?}", wall_ms());
             self.state.withdraw_connector(handle);
             self.connectors.retain(|c| *c != handle);
         }
@@ -270,8 +279,8 @@ impl LeaseDevice {
                 continue;
             }
             eprintln!(
-                "tuna-compositor: drm-lease: offering connector {} ({:?})",
-                connector.name, connector.description
+                "tuna-compositor: drm-lease: {} offering connector {} ({:?})",
+                wall_ms(), connector.name, connector.description
             );
             self.connectors.push(connector.handle);
             self.state.add_connector::<State>(
@@ -298,7 +307,7 @@ impl LeaseDevice {
             .filter(|id| !lessees.iter().any(|lessee| lessee.get() == *id))
             .collect();
         for id in ended {
-            eprintln!("tuna-compositor: drm-lease: lessee {id} disappeared");
+            eprintln!("tuna-compositor: drm-lease: {} lessee {id} disappeared", wall_ms());
             self.end_lease(id);
         }
     }
@@ -322,7 +331,7 @@ impl LeaseDevice {
     /// Session active again: offer the connectors for lease again.
     pub fn resume(&mut self) {
         if let Err(error) = self.fd.list_lessees() {
-            eprintln!("tuna-compositor: drm-lease: session has no lease authority: {error}");
+            eprintln!("tuna-compositor: drm-lease: {} session has no lease authority: {error}", wall_ms());
             self.paused = true;
             return;
         }
@@ -448,7 +457,7 @@ impl DrmLeaseHandler for State {
             return Err(LeaseRejected::default());
         };
         device.lease_resources(&request).map_err(|reason| {
-            eprintln!("tuna-compositor: drm-lease: lease refused: {reason}");
+            eprintln!("tuna-compositor: drm-lease: {} lease refused: {reason}", wall_ms());
             LeaseRejected::default()
         })
     }
@@ -456,7 +465,8 @@ impl DrmLeaseHandler for State {
     fn new_active_lease(&mut self, _node: DrmNode, lease: DrmLease) {
         if let Some(device) = self.protocols.drm_lease.as_mut() {
             eprintln!(
-                "tuna-compositor: drm-lease: lease {} of {:?}",
+                "tuna-compositor: drm-lease: {} lease {} of {:?}",
+                wall_ms(),
                 lease.id(),
                 lease.connectors().collect::<Vec<_>>()
             );
@@ -466,7 +476,7 @@ impl DrmLeaseHandler for State {
 
     fn lease_destroyed(&mut self, _node: DrmNode, lease_id: u32) {
         if let Some(device) = self.protocols.drm_lease.as_mut() {
-            eprintln!("tuna-compositor: drm-lease: lease {lease_id} ended");
+            eprintln!("tuna-compositor: drm-lease: {} lease {lease_id} ended", wall_ms());
             // The destroyed object can be a stale incarnation whose entry a
             // kernel-truth path already removed while the id was recycled by
             // a live lease: only drop when more entries are tracked than the

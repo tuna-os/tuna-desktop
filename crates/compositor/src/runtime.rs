@@ -985,7 +985,8 @@ impl Runtime {
                 match drm.lease_device(&dh) {
                     Ok(device) => {
                         eprintln!(
-                            "tuna-compositor: drm-lease: wp_drm_lease_device_v1 advertised ({} connector(s) for lease)",
+                            "tuna-compositor: drm-lease: {} wp_drm_lease_device_v1 advertised ({} connector(s) for lease)",
+                            crate::drm::lease::wall_ms(),
                             device.connector_count()
                         );
                         state.protocols.drm_lease = Some(device);
