@@ -248,6 +248,21 @@ class ImeMonitorSubscription(unittest.TestCase):
         self.assertEqual(method, 'BecomeMonitor')
         self.assertEqual(parameters[0], '(asu)')
 
+    def test_ime_summary_relays_distinct_bounded_error_details(self):
+        rows = [{'observer_error_type': 'RuntimeError', 'observer_error_detail': 'b-detail'},
+                {'observer_error_type': 'RuntimeError', 'observer_error_detail': 'a-detail'},
+                {'observer_error_type': 'RuntimeError', 'observer_error_detail': 'b-detail'},
+                {'observer_error_type': 'RuntimeError'},
+                {'member': 'UpdatePreeditText'}]
+        summary = self.native._ime_summary(rows, [rows[-1]])
+        self.assertEqual(summary['rows'], 5)
+        self.assertEqual(summary['preedit_rows'], 1)
+        self.assertEqual(summary['observer_errors'], 4)
+        self.assertEqual(summary['observer_error_details'], ['a-detail', 'b-detail'])
+        long = self.native._ime_summary(
+            [{'observer_error_type': 'E', 'observer_error_detail': 'z' * 500}], [])
+        self.assertEqual(long['observer_error_details'], ['z' * 200])
+
 
 if __name__ == '__main__':
     unittest.main()

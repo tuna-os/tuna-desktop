@@ -56,6 +56,15 @@ def _rows(path):
     return [json.loads(line) for line in complete.splitlines()]
 
 
+def _ime_summary(log_rows, messages):
+    observer_errors = [row for row in log_rows if 'observer_error_type' in row]
+    details = sorted({str(row.get('observer_error_detail', ''))[:200] for row in observer_errors
+                      if row.get('observer_error_detail')})
+    return {'rows': len(log_rows), 'preedit_rows': len(messages),
+            'observer_errors': len(observer_errors),
+            'observer_error_details': details[:3]}
+
+
 def _stop(context, kind):
     state = json.loads(RUN_STATE.read_text())
     original = state[kind + '_monitor']
@@ -126,7 +135,8 @@ def monitor(kind, arguments):
                     return False
             print(json.dumps(value), flush=True)
         except Exception as error:
-            print(json.dumps({'observer_error_type': type(error).__name__}), flush=True)
+            print(json.dumps({'observer_error_type': type(error).__name__,
+                              'observer_error_detail': str(error)[:500]}), flush=True)
         return False
 
     def receive(connection, message, incoming, unused):
@@ -503,8 +513,7 @@ def dispatch(operation, arguments, context):
         log_rows = _rows(IME_LOG)
         messages = [row for row in log_rows if row.get('member') in
                     ('UpdatePreeditText', 'UpdatePreeditTextWithMode')]
-        summary = {'rows': len(log_rows), 'preedit_rows': len(messages),
-                   'observer_errors': len([row for row in log_rows if 'observer_error_type' in row])}
+        summary = _ime_summary(log_rows, messages)
         latest = messages[-1] if messages else None
         visible = (latest is not None and len(latest['body']) >= 3 and latest['body'][2] is True
                    and isinstance(latest['body'][0], list) and len(latest['body'][0]) >= 3
