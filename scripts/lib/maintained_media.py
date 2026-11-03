@@ -229,12 +229,14 @@ def identity(args):
 def assertions(blob):
     lines = blob.decode("utf-8").splitlines()
     require(bool(lines), "empty producer assertions")
-    seen = set()
     for line in lines:
         fields = line.split(maxsplit=2)
-        require(len(fields) == 3 and fields[0] not in seen and fields[1] == "pass" and fields[2],
+        # One gate ID may pass more than once for distinct sub-scenarios:
+        # the GTK shell proof re-passes G-POINTER-TRACE-PRIVATE for the
+        # locked scene and again for the D-Bus lock ripple. Every recorded
+        # line must still be a well-formed pass.
+        require(len(fields) == 3 and fields[1] == "pass" and fields[2],
                 "producer assertion did not pass: " + line)
-        seen.add(fields[0])
 
 
 def evidence(root, name):

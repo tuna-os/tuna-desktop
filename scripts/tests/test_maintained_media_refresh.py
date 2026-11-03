@@ -287,5 +287,22 @@ class Tests(unittest.TestCase):
         self.assertEqual(json.loads(base64.b64decode(documents[0]['evidence']['image_receipt'])), original)
 
 
+class ProducerAssertions(unittest.TestCase):
+    def test_repeated_gate_passes_for_distinct_subscenarios(self):
+        blob = ("G-POINTER-TRACE-PRIVATE pass actual locked scene omits pointer coordinates\n"
+                "G-X11-CLEANUP pass graceful shutdown removes owned listening sockets\n"
+                "G-POINTER-TRACE-PRIVATE pass D-Bus lock during ripple redacts cursor diagnostics\n").encode()
+        self.assertIsNone(maintained_media.assertions(blob))
+
+    def test_non_pass_or_malformed_line_rejected(self):
+        for blob in (b"",
+                     b"G-X11-CLEANUP fail owned socket survived shutdown\n",
+                     b"G-X11-CLEANUP pass\n",
+                     b"G-X11-CLEANUP\n",
+                     b"G-X11-CLEANUP pass ok\nG-X11-CLEANUP fail regressed\n"):
+            with self.subTest(blob=blob), self.assertRaises(ValueError):
+                maintained_media.assertions(blob)
+
+
 if __name__ == '__main__':
     unittest.main()
