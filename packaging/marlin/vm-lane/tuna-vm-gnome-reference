@@ -1046,8 +1046,10 @@ def network_panel_evidence(window):
         tabs = [(n['role_name'], n['name'][:40], sorted(set(n['states']) & {1, 23, 25, 30}))
                 for n in flatten(window['children'])
                 if n['role_name'] in ('list item', 'page tab', 'tree item', 'radio button')][:12]
+        full = [(n['role_name'], n['name'][:30], sorted(set(n['states']) & {1, 23, 25, 30}))
+                for n in flatten(window['children'])][:60]
         raise FixtureNotReady('original Settings descendants do not expose selected visible Network panel; '
-                              'tab inventory ' + repr(tabs))
+                              'tab inventory ' + repr(tabs) + '; subtree ' + repr(full))
     return evidence
 
 
