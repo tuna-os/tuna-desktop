@@ -828,6 +828,27 @@ def retain_base_evidence(source, out):
             'scope': 'retained actual normal-CI preflight output; JSON validation is not cryptographic signature verification'}
 
 
+def poll_until_settled(observe_fn, predicate, timeout_s, clock, sleep_fn):
+    """Poll `observe_fn()` until `predicate` holds or `timeout_s` elapses.
+
+    Returns the last snapshot plus the poll count. Each `observe()` is itself a
+    multi-second AT-SPI dump under bus saturation, so the loop sleeps 1s between
+    attempts to let focus events propagate instead of dump-starving the bus.
+    Timeout returns the last snapshot (the caller still gates on it); it never
+    passes a check by itself.
+    """
+    polls, start = 0, clock()
+    while True:
+        snapshot = observe_fn()
+        polls += 1
+        if predicate(snapshot):
+            break
+        if clock() - start >= timeout_s:
+            break
+        sleep_fn(1.0)
+    return snapshot, polls
+
+
 def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
     """Collect a real member. Any missing observation or cleanup is a hard failure."""
     profile_name(profile)
@@ -881,6 +902,24 @@ def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
         require(sorted(physical.held) == item['held_keys'], 'owned held keys changed during capture')
         return after
 
+    def capture_settled(phase, predicate, timeout_s, *, _observe=None, _capture=None,
+                        _clock=time.monotonic, _sleep=time.sleep):
+        """Poll validated observations until `predicate` holds, then take the phase capture.
+
+        Each `observe()` takes ~2s under AT-SPI bus saturation (Tracker miners plus the
+        dump traffic itself), so a fixed sub-second settle after modifier release samples a
+        stale cache: the commit's focus event cannot propagate within 0.5s. Polling waits
+        for the actual event (same `require` gates below still apply) instead of sampling
+        faster than the harness can measure. On timeout the last observation is returned
+        and the caller's `require` fails with its unchanged message. Poll attempts are
+        recorded in `receipt['settle_polls']` as durable settling evidence.
+        """
+        observe_fn = _observe or observe
+        capture_fn = _capture or capture
+        _, polls = poll_until_settled(observe_fn, predicate, timeout_s, _clock, _sleep)
+        receipt.setdefault('settle_polls', {})[phase] = polls
+        return capture_fn(phase)
+
     try:
         validate_provenance(provenance)
         receipt['base_verification'] = retain_base_evidence(base_evidence_dir, out)
@@ -908,14 +947,14 @@ def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
         physical.tap('down')
         capture('applications-down-held', True, anchor)
         require(not physical.release(), 'application modifier release failed')
-        time.sleep(0.5)
-        committed = capture('applications-released')
+        committed = capture_settled('applications-released',
+                                    lambda snap: active_role(snap).startswith('files-'), 15)
         require(active_role(committed).startswith('files-'), 'app switch did not activate an actual original Files window')
         anchor = physical.begin(window)
         capture('windows-held', True, anchor)
         require(not physical.release(), 'window modifier release failed')
-        time.sleep(0.5)
-        final = capture('windows-released')
+        final = capture_settled('windows-released',
+                                lambda snap: active_role(snap) != active_role(committed), 15)
         require(active_role(final) != active_role(committed),
                 'window switch did not activate a different actual original window')
         validate_phase_context(receipt)

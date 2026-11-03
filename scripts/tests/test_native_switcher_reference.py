@@ -764,7 +764,9 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
             self.assertTrue(all(size < 262144 for size in guest.wire_sizes))
             self.assertTrue(any(offset > 0 for _, offset, _ in guest.file_requests))
             self.assertTrue(all(limit <= 262144 for _, _, limit in guest.file_requests))
-            self.assertEqual(len(receipt['wire_responses']), 14)
+            self.assertEqual(len(receipt['wire_responses']), 16)  # +2 settle polls (one per commit)
+            self.assertEqual(receipt['settle_polls'],
+                             {'applications-released': 1, 'windows-released': 1})
             first = receipt['wire_responses'][0]
             raw = (root / first['artifact']['path']).read_bytes()
             self.assertGreater(len(raw), 262144)
@@ -837,6 +839,61 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
         selected = settings['panel_evidence'][0]['selected_object']
         selected['role_name'] = 'button'
         proof.validate_network_panel(settings)
+
+
+class SettlePollTests(unittest.TestCase):
+    def test_first_poll_satisfied_never_sleeps(self):
+        sleeps = []
+        snapshot, polls = proof.poll_until_settled(
+            lambda: 'fresh', lambda snap: snap == 'fresh', 15,
+            clock=lambda: 0.0, sleep_fn=sleeps.append)
+        self.assertEqual((snapshot, polls, sleeps), ('fresh', 1, []))
+
+    def test_stale_cache_settles_on_third_poll(self):
+        now, sleeps = [0.0], []
+        script = iter(['stale', 'stale', 'fresh'])
+
+        def observe():
+            snap = next(script)
+            now[0] += 1.9  # each observe is itself a multi-second AT-SPI dump
+            return snap
+
+        def sleep(secs):
+            sleeps.append(secs)
+            now[0] += secs
+
+        snapshot, polls = proof.poll_until_settled(
+            observe, lambda snap: snap == 'fresh', 15, clock=lambda: now[0], sleep_fn=sleep)
+        self.assertEqual(snapshot, 'fresh')
+        self.assertEqual(polls, 3)
+        self.assertEqual(sleeps, [1.0, 1.0])
+
+    def test_timeout_returns_last_snapshot_without_passing(self):
+        now, sleeps = [0.0], []
+
+        def observe():
+            now[0] += 1.9
+            return 'stale'
+
+        def sleep(secs):
+            sleeps.append(secs)
+            now[0] += secs
+
+        snapshot, polls = proof.poll_until_settled(
+            observe, lambda snap: snap == 'fresh', 15, clock=lambda: now[0], sleep_fn=sleep)
+        self.assertEqual(snapshot, 'stale')  # caller require() still fails on this
+        self.assertGreaterEqual(polls, 5)  # ~15s / (1.9s observe + 1s gap)
+        self.assertTrue(sleeps)
+
+    def test_predicate_sees_every_observation_in_order(self):
+        seen = []
+        snapshot, polls = proof.poll_until_settled(
+            lambda: seen.append(len(seen)) or len(seen),
+            lambda snap: seen.append(('check', snap)) or snap >= 2, 15,
+            clock=lambda: 0.0, sleep_fn=lambda secs: None)
+        self.assertEqual([entry for entry in seen if isinstance(entry, tuple)],
+                         [('check', 1), ('check', 3)])
+        self.assertEqual((snapshot, polls), (3, 2))
 
 
 if __name__ == '__main__':
