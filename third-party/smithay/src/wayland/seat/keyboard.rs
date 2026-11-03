@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt, sync::atomic::Ordering};
 
-use tracing::{error, instrument, trace, warn};
+use tracing::{instrument, trace, warn};
 use wayland_server::{
     backend::{ClientId, ObjectId},
     protocol::{

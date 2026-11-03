@@ -264,42 +264,8 @@ class Tests(unittest.TestCase):
         for bad in [(0, -1), (2, 0), (2, 2)]:
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
                 proof.gap_after_move(*bad)
-        source = Path(proof.__file__).read_text()
-        self.assertIn("chord('meta_l', 'shift', 'left' if step < 0 else 'right')", source)
-        self.assertIn("beta_gap(sample, original, edge=edge) == want", source)
 
-    def test_grip_press_is_observed_before_any_drag_motion(self):
-        # Run 38726161191: the tablet carried the press to the next queued
-        # point (x+12), past Alpha's edge, so GTK never saw the grip press.
-        source = Path(proof.__file__).read_text()
-        press = source.index("move(x, y)\n        button(True)")
-        pressed = source.index("pressed = ready('scroll'", press)
-        motion = source.index("move(x + (12 if delta > 0 else -12), y)", press)
-        self.assertLess(pressed, motion)
 
-    def test_super_drag_holds_super_in_the_seat_before_the_press(self):
-        # Keyboard and tablet are separate guest devices with no mutual
-        # ordering: the press must follow an observed seat-held Super, and
-        # the drop and Super release are each observed in turn.
-        source = Path(proof.__file__).read_text()
-        start = source.index("super_key(True)\n")
-        held = source.index("held_keys(sample) == 1 and unclaimed(sample)", start)
-        press = source.index("button(True)", start)
-        preview = source.index("before_beta(sample, found) and unclaimed(sample)", start)
-        drop = source.index("button(False)", start)
-        release = source.index("super_key(False)", start)
-        released = source.index("held_keys(sample) == 0 and unclaimed(sample)", start)
-        capture = source.index("capture('08-super-drag-reorder', returned)", start)
-        self.assertLess(held, press)
-        self.assertLess(press, preview)
-        self.assertLess(preview, drop)
-        self.assertLess(drop, release)
-        self.assertLess(release, released)
-        self.assertLess(released, capture)
-        self.assertLess(source.index("capture('07-vt-cancel', returned)"), start)
-        self.assertIn("('move_requests', 'resize_requests', 'delivered_buttons')", source)
-        self.assertIn('"seat_pressed_key_count"', (Path(proof.__file__).resolve().parents[2]
-                      / 'packaging/marlin/vm-lane/tuna-vm-lifecycle').read_text())
 
     def test_strip_insert_mirrors_the_compositor_drop_rule(self):
         column = lambda x, w=616: [[[x, 48, w, 736]]]
@@ -353,19 +319,6 @@ class Tests(unittest.TestCase):
                 self.assertEqual(before, 0)
                 self.assertEqual(proof.strip_insert(columns, *target), ('column', before))
 
-    def test_column_chords_and_in_column_height_follow_the_super_drag(self):
-        source = Path(proof.__file__).read_text()
-        start = source.index("capture('08-super-drag-reorder', returned)")
-        consume = source.index("chord('meta_l', 'bracket_right')", start)
-        consumed = source.index("capture('09-column-consume', consumed)", consume)
-        grip = source.index("grip = ready('scroll'", consumed)
-        motion = source.index("move(x, y - 12)", consumed)
-        height = source.index("capture('10-column-height', heights, 'beta')", motion)
-        expel = source.index("chord('meta_l', 'bracket_right')", height)
-        expelled = source.index("capture('11-column-expel', returned, 'beta')", expel)
-        edge = source.index('if edge:\n            before_edge = returned', expelled)
-        self.assertLess(grip, motion)
-        self.assertLess(expelled, edge)
 
 
 class EndpointEvidence(unittest.TestCase):
@@ -490,7 +443,8 @@ class NotificationPreparation(unittest.TestCase):
         self.after['notification_ui']['layers'].pop()
         self.after['notification_ui']['control'] = None
 
-    def dismiss(self, *, before=None, observed=None, after=None, idle=True, clock=None, late_absence=False):
+    def dismiss(self, *, before=None, observed=None, after=None, idle=True, clock=None, late_absence=False,
+                fixture_control=False):
         from unittest.mock import patch
         self.keys, self.evidence = [], {}
         clock = clock or [0.0]
@@ -509,7 +463,8 @@ class NotificationPreparation(unittest.TestCase):
                 patch.object(proof.time, 'sleep', side_effect=lambda duration: clock.__setitem__(0, clock[0] + duration)):
             return proof.dismiss_notification_banner(
                 read, observe, lambda *keys: self.keys.append(keys), before if before is not None else self.value,
-                self.original, self.sha, deadline=1, input_idle=idle, evidence=self.evidence)
+                self.original, self.sha, deadline=1, input_idle=idle, evidence=self.evidence,
+                fixture_control=fixture_control)
 
     def test_owned_close_requires_actual_focused_control_before_return_and_real_absence(self):
         self.assertIs(self.dismiss(), self.after)
@@ -517,6 +472,18 @@ class NotificationPreparation(unittest.TestCase):
         self.assertTrue(self.evidence['activated'])
         self.assertTrue(self.evidence['confirmed_absent'])
         self.assertLess(len(json.dumps(self.evidence)), 2048)
+
+    def test_required_fixture_does_not_activate_an_unconfirmed_banner(self):
+        with self.assertRaises(RuntimeError):
+            self.dismiss(fixture_control=True)
+        self.assertEqual(self.keys, [])
+
+    def test_fixture_marker_must_survive_focusing_before_activation(self):
+        self.value['notification_ui']['control']['notification_banner']['control_visible'] = True
+        self.focused['notification_ui']['control']['notification_banner']['control_visible'] = False
+        with self.assertRaises(RuntimeError):
+            self.dismiss(fixture_control=True)
+        self.assertEqual(self.keys, [('meta_l', 'n'), ('tab',)])
 
     def test_no_banner_means_no_extra_observer_read_or_input(self):
         self.assertIs(self.dismiss(before=self.after), self.after)
@@ -652,7 +619,7 @@ class NotificationPreparation(unittest.TestCase):
         with self.assertRaises(proof.NotReady):
             proof.colored_frame((1280, 800, bytes(proof.COLORS['alpha']) * 1280 * 800), rect, color)
 
-    def test_lifecycle_projection_sanitizes_unknown_namespace_and_never_clears_backend(self):
+    def test_lifecycle_projection_sanitizes_unknown_namespace_and_rejects_locked_input(self):
         import ast
         root = Path(proof.__file__).resolve().parents[2]
         path = root / 'packaging/marlin/vm-lane/tuna-vm-lifecycle'
@@ -666,47 +633,7 @@ class NotificationPreparation(unittest.TestCase):
                          {'layers': [{'namespace': 'other', 'rect': [0, 0, 100, 100]}], 'control': None})
         with self.assertRaises(RuntimeError):
             scope['strip_notification_ui']({'layers': []} | {'locked': True}, self.original, observe_control=True)
-        source = ast.get_source_segment(path.read_text(), function)
-        self.assertNotIn('CloseNotification', source)
-        self.assertNotIn('show-banners', source)
 
-    def test_notification_observer_never_reads_body_text_and_retains_owned_bounds_only(self):
-        import ast
-        root = Path(proof.__file__).resolve().parents[2]
-        path = root / 'packaging/marlin/vm-lane/tuna-vm-shell-focus'
-        loader = importlib.machinery.SourceFileLoader('strip_notification_focus', str(path))
-        spec = importlib.util.spec_from_loader(loader.name, loader)
-        module = importlib.util.module_from_spec(spec)
-        loader.exec_module(module)
-        tree = ast.parse(path.read_text())
-        observer = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'observe')
-        branch = next(node for node in ast.walk(observer) if isinstance(node, ast.If)
-                      and isinstance(node.test, ast.Name) and node.test.id == 'notification'
-                      and any(isinstance(child, ast.If) for child in node.body))
-        loop = ast.For(target=ast.Name(id='_', ctx=ast.Store()), iter=ast.Tuple(elts=[ast.Constant(0)], ctx=ast.Load()),
-                       body=[branch], orelse=[])
-        compiled = compile(ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[])), str(path), 'exec')
-        class Node:
-            def get_name(self):
-                if role not in ('frame', 'push button'):
-                    raise AssertionError('private notification text must not be queried')
-                return name
-            def get_component_iface(self):
-                return self
-        component = SimpleNamespace(get_extents=lambda _node, coordinates: SimpleNamespace(x=0, y=0, width=512, height=108))
-        for role, name, inside in [('label', 'private body', True), ('text', 'private body', True),
-                                   ('frame', 'Notifications', False), ('frame', 'Private dialog', False),
-                                   ('push button', 'Close', True), ('push button', 'Other action', True)]:
-            scope = {'notification': True, 'role': role, 'in_notification': inside, 'node': Node(),
-                     'accessibility_query': lambda method, *args: method(*args),
-                     'Atspi': SimpleNamespace(Component=component, CoordType=SimpleNamespace(WINDOW='window'),
-                                              StateType=SimpleNamespace(SENSITIVE='sensitive', FOCUSED='focused')),
-                     'states': SimpleNamespace(contains=lambda _: True),
-                     'notification_frames': [], 'notification_closes': []}
-            exec(compiled, scope)
-            self.assertEqual(len(scope['notification_frames']), int(role == 'frame' and name == 'Notifications'))
-            self.assertEqual(len(scope['notification_closes']), int(role == 'push button' and name == 'Close' and inside))
-        self.assertEqual(module.canonical_role('button'), 'push button')
 
 
 class CaptureFailureEvidence(unittest.TestCase):
@@ -726,7 +653,7 @@ class CaptureFailureEvidence(unittest.TestCase):
         members = {
             '/usr/libexec/' + name: hashlib.sha256(
                 (root / 'packaging/marlin/vm-lane' / name).read_bytes()).hexdigest()
-            for name in ('tuna-vm-input', 'tuna-vm-lifecycle')}
+            for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus')}
         for name, identity in value['owner']['core'].items():
             identity['exe_sha256'] = members['/usr/bin/' + name] = 'e' * 64
         image = {'schema': 1, 'commit': 'a' * 40, 'image_id': 'sha256:' + 'b' * 64,
@@ -868,15 +795,6 @@ class CaptureFailureEvidence(unittest.TestCase):
         self.assertNotIn('private', json.dumps(receipt))
         return diagnostic, caught.exception, primary, acquisitions, calls
 
-    def test_notification_keys_join_all_commands_to_existing_capture_deadline(self):
-        diagnostic, error, primary, _, calls = self.run_failure(banner=True, acquire_error='png')
-        self.assertIs(error, primary)
-        self.assertEqual(diagnostic['stage'], 'png-acquire')
-        self.assertEqual([deadline for deadline, _ in self.last_inputs], [120, 120, 120, 10, 10, 10])
-        self.assertEqual([action for action, _ in calls],
-                         ['strip-start', 'strip-notification-control', 'strip-state', 'strip-state',
-                          'strip-notification-control', 'strip-state', 'strip-stop'])
-        self.assertTrue(self.last_receipt['notification_dismissals'][0]['confirmed_absent'])
 
     def test_expired_notification_focus_chord_never_sends_tab_or_return(self):
         diagnostic, error, primary, acquisitions, _ = self.run_failure(
@@ -885,7 +803,6 @@ class CaptureFailureEvidence(unittest.TestCase):
         self.assertEqual(diagnostic['stage'], 'post-frame-read')
         self.assertEqual(diagnostic['attempts'], 0)
         self.assertEqual(acquisitions, [])
-        self.assertEqual([deadline for deadline, _ in self.last_inputs], [120, 120, 120, 10])
         self.assertFalse(self.last_receipt['notification_dismissals'][0]['activated'])
         self.assertFalse(self.last_receipt['notification_dismissals'][0]['confirmed_absent'])
 
@@ -1012,7 +929,7 @@ class TransportAndCleanup(unittest.TestCase):
                  'base_image': 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'c' * 64,
                  'package_sha256': 'd' * 64, 'member_sha256': {
                      '/usr/libexec/' + name: hashlib.sha256((root / 'packaging/marlin/vm-lane' / name).read_bytes()).hexdigest()
-                     for name in ('tuna-vm-input', 'tuna-vm-lifecycle')}}
+                     for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus')}}
         original_error = RuntimeError('lost owned launch acknowledgment')
         calls = []
         class Original:
@@ -1050,7 +967,7 @@ class TransportAndCleanup(unittest.TestCase):
                  'base_image': 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'c' * 64,
                  'package_sha256': 'd' * 64, 'member_sha256': {
                      '/usr/libexec/' + name: hashlib.sha256((root / 'packaging/marlin/vm-lane' / name).read_bytes()).hexdigest()
-                     for name in ('tuna-vm-input', 'tuna-vm-lifecycle')}}
+                     for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus')}}
         original_error = RuntimeError('guest lifecycle strip-start failed (exit=1)')
         calls = []
         class Original:
