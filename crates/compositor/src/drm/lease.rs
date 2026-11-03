@@ -267,7 +267,10 @@ impl LeaseDevice {
             .map(DrmLease::id)
             .collect();
         for handle in gone {
-            eprintln!("tuna-compositor: drm-lease: {} withdrew connector {handle:?}", wall_ms());
+            eprintln!(
+                "tuna-compositor: drm-lease: {} withdrew connector {handle:?}",
+                wall_ms()
+            );
             self.state.withdraw_connector(handle);
             self.connectors.retain(|c| *c != handle);
         }
@@ -280,7 +283,9 @@ impl LeaseDevice {
             }
             eprintln!(
                 "tuna-compositor: drm-lease: {} offering connector {} ({:?})",
-                wall_ms(), connector.name, connector.description
+                wall_ms(),
+                connector.name,
+                connector.description
             );
             self.connectors.push(connector.handle);
             self.state.add_connector::<State>(
@@ -307,7 +312,10 @@ impl LeaseDevice {
             .filter(|id| !lessees.iter().any(|lessee| lessee.get() == *id))
             .collect();
         for id in ended {
-            eprintln!("tuna-compositor: drm-lease: {} lessee {id} disappeared", wall_ms());
+            eprintln!(
+                "tuna-compositor: drm-lease: {} lessee {id} disappeared",
+                wall_ms()
+            );
             self.end_lease(id);
         }
     }
@@ -331,7 +339,10 @@ impl LeaseDevice {
     /// Session active again: offer the connectors for lease again.
     pub fn resume(&mut self) {
         if let Err(error) = self.fd.list_lessees() {
-            eprintln!("tuna-compositor: drm-lease: {} session has no lease authority: {error}", wall_ms());
+            eprintln!(
+                "tuna-compositor: drm-lease: {} session has no lease authority: {error}",
+                wall_ms()
+            );
             self.paused = true;
             return;
         }
@@ -457,7 +468,10 @@ impl DrmLeaseHandler for State {
             return Err(LeaseRejected::default());
         };
         device.lease_resources(&request).map_err(|reason| {
-            eprintln!("tuna-compositor: drm-lease: {} lease refused: {reason}", wall_ms());
+            eprintln!(
+                "tuna-compositor: drm-lease: {} lease refused: {reason}",
+                wall_ms()
+            );
             LeaseRejected::default()
         })
     }
@@ -476,7 +490,10 @@ impl DrmLeaseHandler for State {
 
     fn lease_destroyed(&mut self, _node: DrmNode, lease_id: u32) {
         if let Some(device) = self.protocols.drm_lease.as_mut() {
-            eprintln!("tuna-compositor: drm-lease: {} lease {lease_id} ended", wall_ms());
+            eprintln!(
+                "tuna-compositor: drm-lease: {} lease {lease_id} ended",
+                wall_ms()
+            );
             // The destroyed object can be a stale incarnation whose entry a
             // kernel-truth path already removed while the id was recycled by
             // a live lease: only drop when more entries are tracked than the
