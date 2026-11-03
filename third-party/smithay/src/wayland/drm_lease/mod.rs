@@ -640,6 +640,13 @@ impl DrmLeaseState {
         // the kernel has actually withdrawn the lessee's authority.
         if let Err(error) = self.active_leases[pos].force_close() {
             tracing::error!(?error, id, "Keeping resources withdrawn after failed lease revocation");
+            // The compositor configures no tracing subscriber: repeat the
+            // errno on stderr with the other lease diagnostics, or the
+            // reason a withdrawal never completes is unobservable.
+            eprintln!(
+                "tuna-compositor: drm-lease: kernel revoke of lease {id} failed: {error} (errno {})",
+                error.raw_os_error().unwrap_or(-1)
+            );
             return None;
         }
         let lease = self.active_leases.remove(pos);
