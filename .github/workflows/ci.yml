@@ -1610,7 +1610,15 @@ jobs:
       - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core zstd libegl1 libgl1-mesa-dri libgbm1
       - name: Install the owned native protocol virgl launcher
         if: matrix.profile == 'explicit-sync'
-        run: sudo apt-get install -y --no-install-recommends qemu-system-gui xvfb xauth libgl1-mesa-dri libegl-mesa0
+        run: |
+          sudo apt-get install -y --no-install-recommends libegl-mesa0
+          # egl-headless copies guest virgl output back to a DisplaySurface
+          # for QMP screendump, but needs a DRM render node; vgem provides
+          # one with no physical GPU behind it (llvmpipe renders).
+          sudo modprobe vgem
+          test -c /dev/dri/renderD128
+          sudo chmod 0666 /dev/dri/renderD128
+          ls -l /dev/dri/renderD128
       - name: Build the Marlin Tuna Desktop image and the VM test layer
         run: |
           cp arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst ./tuna.pkg.tar.zst
@@ -1722,7 +1730,6 @@ jobs:
       - name: Prove all native timelines, DMA buffers and background effects
         if: matrix.profile == 'explicit-sync'
         run: >-
-          xvfb-run -a -s '-screen 0 1280x800x24'
           env LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
           scripts/tuna-vm-lane --disk /mnt/vm/disk.raw --out vm-lane-artifacts
           --explicit-sync --require-kvm --strip-image vm-lane-artifacts/strip-image.json

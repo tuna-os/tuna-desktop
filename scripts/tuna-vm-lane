@@ -3094,7 +3094,29 @@ def await_login(agent, deadline):
     return False, login
 
 
-def gdm_login(qmp, agent_path, out, record):
+def wait_for_surface(qmp, out, deadline):
+    """Poll QMP screendump until virgl produces its first frame.
+
+    egl-headless copies guest virgl output back to a DisplaySurface for
+    screendump, but the surface exists only after the guest renders its
+    first frame; firmware and early boot have nothing to dump. This waits
+    for real guest rendering like greeter_ready waits for the greeter —
+    never a fixed sleep — and fails loudly when no frame ever arrives.
+    """
+    probe = os.path.join(out, ".scratch", "surface-probe.ppm")
+    while time.monotonic() < deadline:
+        try:
+            qmp.cmd("screendump", filename=probe, format="ppm")
+            if os.path.exists(probe) and os.path.getsize(probe) > 0:
+                return
+        except (OSError, RuntimeError, ValueError) as error:
+            if "no surface" not in str(error):
+                raise
+        time.sleep(1)
+    raise RuntimeError("virgl display produced no QMP surface; guest never rendered a frame")
+
+
+def gdm_login(qmp, agent_path, out, record, wait_surface=False):
     """Drive the shipped GDM greeter's user list and password prompt; never
     an autologin, initial or preselected session."""
     agent = None
@@ -3123,6 +3145,8 @@ def gdm_login(qmp, agent_path, out, record):
         with open(os.path.join(out, "greeter-before-login.json"), "w") as stream:
             json.dump(greeter, stream, indent=2)
         time.sleep(5)
+        if wait_surface:
+            wait_for_surface(qmp, out, time.monotonic() + 120)
         qmp.frame(os.path.join(out, "V-GDM-GREETER.png"))
         # The logout check compares the repainted greeter with this frame.
         qmp.cmd("screendump", filename=os.path.join(out, "greeter-before-login.ppm"), format="ppm")
@@ -3887,10 +3911,16 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
     gpu_devices = gpu_devices_for_receipt(explicit_sync_gpu)
     gpu_display = "none"
     if explicit_sync_gpu:
-        if (not os.environ.get("DISPLAY") or os.environ.get("LIBGL_ALWAYS_SOFTWARE") != "1"
+        if (os.environ.get("LIBGL_ALWAYS_SOFTWARE") != "1"
                 or os.environ.get("GALLIUM_DRIVER") != "llvmpipe"):
-            raise RuntimeError("explicit-sync GPU profile requires its owned Xvfb/software-GL launcher")
-        gpu_display = "gtk,gl=on"
+            raise RuntimeError("explicit-sync GPU profile requires its owned software-GL launcher (llvmpipe)")
+        if not os.access("/dev/dri/renderD128", os.R_OK | os.W_OK):
+            raise RuntimeError("explicit-sync GPU profile requires a readable+writable "
+                               "/dev/dri/renderD128 (modprobe vgem)")
+        # egl-headless copies guest virgl output back to a DisplaySurface, so
+        # QMP screendump keeps working; gtk,gl=on never produces a QMP
+        # surface (a GL console has no software framebuffer).
+        gpu_display = "egl-headless"
     qemu = ["qemu-system-x86_64", "-machine", "q35", "-m", "6144", "-smp", "4",
             "-bios", ovmf, "-snapshot",
             "-drive", f"file={disk},format=raw,if=virtio,cache=unsafe",
@@ -4145,7 +4175,7 @@ def main():
     try:
         qmp = baseline.Qmp(qmp_path)
         try:
-            login_ok = gdm_login(qmp, agent_path, out, record)
+            login_ok = gdm_login(qmp, agent_path, out, record, wait_surface=a.explicit_sync)
         except (OSError, RuntimeError, ValueError) as error:
             record("V-GDM-LOGIN", False, str(error))
             login_ok = False
@@ -4336,6 +4366,7 @@ def main():
         "qemu": qemu_version,
         "gpu_profile": "virtio-vga-gl-virgl-llvmpipe-v1" if a.explicit_sync else baseline.GPU_PROFILE,
         "gpu_devices": gpu_devices_for_receipt(a.explicit_sync),
+        "gpu_display": "egl-headless" if a.explicit_sync else "none",
         "session_up_s": round(elapsed) if drm and shell else None,
         "drm_session_paused": paused,
         "captured_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
