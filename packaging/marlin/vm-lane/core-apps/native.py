@@ -151,9 +151,19 @@ def monitor(kind, arguments):
             return None
         return message
     bus.add_filter(receive, None)
-    bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus.Monitoring',
-                  'BecomeMonitor', GLib.Variant('(asu)', (rules, 0)), None,
-                  Gio.DBusCallFlags.NONE, 2000, None)
+    if kind == 'ime':
+        # ibus-daemon is its own bus implementation without
+        # org.freedesktop.DBus.Monitoring (BecomeMonitor is UnknownMethod),
+        # but it honors eavesdrop match rules, which deliver the daemon's
+        # client-destined preedit signals to this observer.
+        for rule in rules:
+            bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+                          'AddMatch', GLib.Variant('(s)', (rule + ",eavesdrop='true'",)), None,
+                          Gio.DBusCallFlags.NONE, 2000, None)
+    else:
+        bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus.Monitoring',
+                      'BecomeMonitor', GLib.Variant('(asu)', (rules, 0)), None,
+                      Gio.DBusCallFlags.NONE, 2000, None)
     print(json.dumps({'ready': True, 'kind': kind, 'uid': os.geteuid()}), flush=True)
     GLib.MainLoop().run()
 
