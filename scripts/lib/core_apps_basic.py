@@ -48,6 +48,16 @@ def _text_bytes(receipt):
     return base64.b64decode(receipt['base64'], validate=True)
 
 
+def metadata_label(details, text):
+    # The details view shows the face family twice: once as the header
+    # title (nested panels) and once as the Name metadata value (inside
+    # a list row). Only a list row ancestor identifies the metadata
+    # value; panel ancestors match the title too and break uniqueness.
+    return unique(details, lambda node: node['role'] == 'label' and node.get('text') == text
+                  and any(parent['role'] in ('list item', 'row') for parent in node['ancestors']),
+                  'actual font metadata name label')
+
+
 def _fonts(desktop):
     actor = desktop.start('org.gnome.font-viewer', 'Fonts')
     evidence = {'before': desktop.guest('basic', 'font-state')}
@@ -76,9 +86,7 @@ def _fonts(desktop):
     content(desktop, actor, 'font-installer-completed', 'Installed')
     press(desktop, actor, ('Info', 'Font Details'))
     details = content(desktop, actor, 'font-real-source-details', 'Name', 'Noto Sans CJK JP', 'Style', 'Regular')
-    label = unique(details, lambda node: node['role'] == 'label' and node.get('text') == 'Noto Sans CJK JP'
-                   and any(parent['role'] in ('list item', 'row', 'panel') for parent in node['ancestors']),
-                   'actual font metadata name label')
+    label = metadata_label(details, 'Noto Sans CJK JP')
     desktop.click_path(actor, label['path'])
     desktop.keys('ctrl', 'a')
     desktop.keys('ctrl', 'c')
