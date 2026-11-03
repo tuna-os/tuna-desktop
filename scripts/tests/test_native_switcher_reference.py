@@ -829,6 +829,15 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'descendant'):
             proof.validate_network_panel(settings)
 
+    def test_network_panel_accepts_button_role_navigation(self):
+        value = snapshot()
+        settings = next(w for w in value['windows'] if w['role'] == 'settings')
+        navigation = settings['accessibility_tree']['children'][0]
+        navigation['role_name'] = 'button'
+        selected = settings['panel_evidence'][0]['selected_object']
+        selected['role_name'] = 'button'
+        proof.validate_network_panel(settings)
+
 
 if __name__ == '__main__':
     unittest.main()

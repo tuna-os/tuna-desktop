@@ -298,7 +298,7 @@ def validate_network_panel(window):
         selected = entry['selected_object']
         node = nodes.get(atspi_id(selected))
         require(node is not None and leaf(node) == selected
-                and selected['role_name'] in ('list item', 'page tab', 'tree item', 'radio button')
+                and selected['role_name'] in ('list item', 'page tab', 'tree item', 'radio button', 'button')
                 and {23, 25, 30} <= set(selected['states']),
                 'Network panel selection is not actual original navigation evidence')
         descendants, pending = {}, [node]
