@@ -1124,7 +1124,10 @@ def public_observation(environment, admitted, deadline):
         while pending:
             ready, _, _ = select.select(pending, [], [], deadline.remaining())
             if not ready:
-                raise TimeoutError('finite public observation deadline expired')
+                # Retryable: the prepare loop treats one overrun observation
+                # like any other not-yet-ready fixture state instead of
+                # failing the whole operation on a single slow attempt.
+                raise FixtureNotReady('finite public observation deadline expired')
             for stream in ready:
                 if stream is controller:
                     if not dispatch_identity(controller, observer, worker_identity, owner.pw_gid, deadline):
