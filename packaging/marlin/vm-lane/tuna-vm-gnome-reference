@@ -1204,12 +1204,13 @@ def network_panel_evidence(window):
     return evidence
 
 
-def window_context(trees, fixture, shell):
+def window_context(trees, fixture, shell, require_shell=True):
     windows = []
     shell_trees = [node for node in trees if node['process']['pid'] == shell['pid']]
-    if len(shell_trees) != 1:
+    if require_shell and len(shell_trees) != 1:
         raise RuntimeError('original Shell public AT-SPI application tree unavailable or ambiguous')
-    same_process(shell, shell_trees[0]['process'])
+    if require_shell:
+        same_process(shell, shell_trees[0]['process'])
     principals = {p['pid']: p for p in fixture['processes']}
     for node in flatten(trees):
         principal = node['process']
@@ -1260,6 +1261,34 @@ def window_context(trees, fixture, shell):
                  'focused': [leaf(n) for n in shell_nodes if 12 in n['states']],
                  'active_windows': active}
     return windows, selection
+
+
+def light_readiness(claim, admitted, environment, deadline):
+    """Cheap fixture-only readiness gate for prepare's retry loop.
+
+    Walks fixture applications only (no Shell tree, no identity
+    re-validation): a full public_observation burst on every retry starves
+    GNOME Control Center's slow session registration — CI rounds measured
+    Settings mapping only after polling stopped — so the heavy walk runs
+    once, only after this light gate passes. Raises FixtureNotReady with
+    the real fixture inventory until ready; returns the light
+    (windows, selection) on success. Full snapshot validation is unchanged
+    and still runs on every attempt that passes this gate.
+    """
+    observation = public_observation(environment, admitted, deadline, only_exes=set(APPS))
+    return window_context(observation['trees'], claim['fixture'], admitted['session']['shell'],
+                          require_shell=False)
+
+
+def readiness_probe(args, claim, admitted, environment, deadline, cache):
+    """Two-stage prepare attempt: light gate, then one full snapshot confirm.
+
+    Full validation is never skipped: the returned result is a genuine full
+    snapshot. The light gate only decides whether the heavy walk is worth
+    one attempt yet, keeping retry traffic off g-c-c's registration path.
+    """
+    light_readiness(claim, admitted, environment, deadline)
+    return snapshot(args, claim, admitted, environment, deadline, cache)
 
 
 def drain_worker_streams(worker, streams):
@@ -1872,7 +1901,7 @@ def prepare(args, directory, deadline, cache):
             # Settings launches next and must map strictly last to own
             # focus, so wait for the forwarded window first.
             while True:
-                obs = public_observation(environment, admitted, deadline)
+                obs = public_observation(environment, admitted, deadline, only_exes=set(APPS))
                 forwarded = [n for n in flatten(obs['trees'])
                              if os.path.basename(fixture['directories'][1]) in n['name']
                              and n['role_name'] in ('frame', 'window') and 25 in n['states']]
@@ -1887,7 +1916,8 @@ def prepare(args, directory, deadline, cache):
     # no process discovered by a name-only scan gains cleanup ownership.
     try:
         result = snapshot_until_ready(
-            lambda: snapshot(args, claim, admitted, environment, deadline, cache), children, deadline)
+            lambda: readiness_probe(args, claim, admitted, environment, deadline, cache),
+            children, deadline)
     except Exception as error:
         tails = {role: drain.text() for role, drain in drains.items()}
         statuses = format_child_status(children, fixture_launch_plan(fixture['directories']))

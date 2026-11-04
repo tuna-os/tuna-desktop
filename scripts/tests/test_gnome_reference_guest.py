@@ -1045,6 +1045,58 @@ class ControlledAtspi(unittest.TestCase):
         self.assertIn("window states [('files-first', [25, 30])", message)
         self.assertIn("shell focused ['Files'] selected ['Files']", message)
 
+    def test_light_context_skips_shell_tree_requirement(self):
+        trees, fixture, shell = self.context()
+        windows, selection = GUEST.window_context(trees[1:], fixture, shell, require_shell=False)
+        self.assertEqual(len(windows), 3)
+        self.assertEqual(selection['active_windows'][0]['role'], 'settings')
+        self.assertEqual(selection['selected'], [])
+        self.assertEqual(selection['focused'], [])
+
+    def test_full_context_still_requires_original_shell_tree(self):
+        trees, fixture, shell = self.context()
+        with self.assertRaises(RuntimeError) as failed:
+            GUEST.window_context(trees[1:], fixture, shell)
+        self.assertEqual(str(failed.exception),
+                         'original Shell public AT-SPI application tree unavailable or ambiguous')
+
+    def test_light_context_reports_incomplete_inventory_as_not_ready(self):
+        trees, fixture, shell = self.context()
+        trees[2]['children'] = []
+        with self.assertRaises(GUEST.FixtureNotReady) as failed:
+            GUEST.window_context(trees[1:], fixture, shell, require_shell=False)
+        self.assertIn('actual fixture window inventory is incomplete', str(failed.exception))
+
+    def test_light_readiness_walks_fixture_applications_only(self):
+        trees, fixture, shell = self.context()
+        claim = {'fixture': fixture}
+        admitted = {'session': {'shell': shell}}
+        environment, deadline = object(), object()
+        with mock.patch.object(GUEST, 'public_observation',
+                               return_value={'trees': trees[1:]}) as observed:
+            windows, selection = GUEST.light_readiness(claim, admitted, environment, deadline)
+        observed.assert_called_once_with(environment, admitted, deadline,
+                                         only_exes=set(GUEST.APPS))
+        self.assertEqual(len(windows), 3)
+        self.assertEqual(selection['active_windows'][0]['role'], 'settings')
+
+    def test_probe_gates_full_snapshot_behind_light_readiness(self):
+        args, claim, admitted, environment, deadline, cache = (object() for _ in range(6))
+        stale = GUEST.FixtureNotReady('actual fixture window inventory is incomplete')
+        with mock.patch.object(GUEST, 'light_readiness', side_effect=stale) as light, \
+             mock.patch.object(GUEST, 'snapshot') as full:
+            with self.assertRaises(GUEST.FixtureNotReady):
+                GUEST.readiness_probe(args, claim, admitted, environment, deadline, cache)
+            light.assert_called_once_with(claim, admitted, environment, deadline)
+            full.assert_not_called()
+        confirmed = {'selection': {'active_windows': [{'role': 'settings'}]}}
+        with mock.patch.object(GUEST, 'light_readiness', return_value=None) as light, \
+             mock.patch.object(GUEST, 'snapshot', return_value=confirmed) as full:
+            self.assertIs(GUEST.readiness_probe(args, claim, admitted, environment, deadline, cache),
+                          confirmed)
+            light.assert_called_once_with(claim, admitted, environment, deadline)
+            full.assert_called_once_with(args, claim, admitted, environment, deadline, cache)
+
 
 class ControlledObservationEvidence(unittest.TestCase):
     """Timeout/state evidence semantics; not native qualification."""
