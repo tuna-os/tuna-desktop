@@ -501,7 +501,7 @@ class ControlledClaims(unittest.TestCase):
 
 class ControlledAdmission(unittest.TestCase):
     """Controlled service/logind replies exercise login routing, not real GDM."""
-    def admit(self, started, native=True, integrity=True):
+    def admit(self, started, native=True, integrity=True, lingering_greeter=False, greeter_shells=None):
         boot = 'controlled-boot'
         def identity(pid, uid, exe, package):
             return {'pid': pid, 'uid': uid, 'start_ticks': pid, 'exe': exe,
@@ -517,9 +517,14 @@ class ControlledAdmission(unittest.TestCase):
         login = {'Id': 'c1', 'User': '120', 'Name': 'gdm', 'Class': 'greeter',
                  'Service': 'gdm-launch-environment', 'Type': 'wayland', 'Active': 'yes',
                  'Remote': 'no', 'Seat': 'seat0', 'State': 'active', 'VTNr': '2'}
+        listed = [current, login] if started and lingering_greeter else ([current] if started else [login])
+        if greeter_shells == 'ambiguous':
+            shells = [greeter, identity(21, 120, '/usr/bin/gnome-shell', 'gnome-shell')]
+        else:
+            shells = greeter_shells if greeter_shells is not None else [greeter]
         def candidates(paths, uid, deadline):
             if uid == 120:
-                return [greeter]
+                return shells
             if '/usr/bin/gnome-shell' in paths:
                 return [shell] if native else []
             return []
@@ -527,7 +532,7 @@ class ControlledAdmission(unittest.TestCase):
             if value == '/sys/class/tty/tty0/active':
                 return SimpleNamespace(read_text=lambda: 'tty2\n')
             return Path(value)
-        with mock.patch.object(GUEST, 'sessions', return_value=[current] if started else [login]), \
+        with mock.patch.object(GUEST, 'sessions', return_value=listed), \
              mock.patch.object(GUEST, 'payload_integrity', return_value={'ready': integrity}), \
              mock.patch.object(GUEST, 'run', return_value='MainPID=10\nActiveState=active\nSubState=running\n'), \
              mock.patch.object(GUEST, 'proc_identity', side_effect=lambda pid, uid: gdm), \
@@ -566,6 +571,26 @@ class ControlledAdmission(unittest.TestCase):
         actual = self.admit(True, integrity=False)
         self.assertFalse(actual['ready'])
         self.assertFalse(actual['gdm']['ready'])
+
+    def test_post_login_shell_less_greeter_is_teardown_residue(self):
+        actual = self.admit(True, lingering_greeter=True, greeter_shells=[])
+        self.assertTrue(actual['ready'])
+        self.assertTrue(actual['gdm']['available'])
+        self.assertFalse(actual['gdm']['ready'])
+        self.assertEqual(actual['gdm']['greeters'], [])
+        self.assertEqual(actual['missing'], [])
+
+    def test_post_login_ambiguous_greeter_shells_stay_fatal(self):
+        actual = self.admit(True, lingering_greeter=True, greeter_shells='ambiguous')
+        self.assertFalse(actual['ready'])
+        self.assertFalse(actual['gdm']['ready'])
+        self.assertTrue(any('not unique: 2' in entry for entry in actual['missing']))
+
+    def test_pre_login_shell_less_greeter_stays_fatal(self):
+        actual = self.admit(False, greeter_shells=[])
+        self.assertFalse(actual['ready'])
+        self.assertFalse(actual['gdm']['ready'])
+        self.assertTrue(any('not unique: 0' in entry for entry in actual['missing']))
 
 
 class ControlledGio(unittest.TestCase):
@@ -1967,12 +1992,17 @@ class AdmissionGreeterTeardown(unittest.TestCase):
         self.assertEqual(environment, {'WAYLAND_DISPLAY': 'wayland-0'})
         self.assertNotIn(60578, [uid for _, uid in queries])
 
-    def test_live_greeter_without_shell_still_fails(self):
+    def test_post_login_shell_less_greeter_is_skipped_residue(self):
+        # Contract change (round-19 run 41871251657): post-login, logind
+        # can list the greeter session as live after its shell exited;
+        # failing admission then is a teardown race, not a missing
+        # principal. Pre-login shell-less greeters still fail (see
+        # ControlledAdmission), as do ambiguous (>1 shell) ones.
         self._mocks('online')
-        admitted, _ = GUEST.admission('gnome', GUEST.Deadline(3), {})
-        self.assertFalse(admitted['ready'])
-        self.assertTrue(any('greeter shell is not unique' in entry for entry in admitted['missing']),
-                        admitted.get('missing'))
+        admitted, environment = GUEST.admission('gnome', GUEST.Deadline(3), {})
+        self.assertTrue(admitted['ready'], admitted.get('missing'))
+        self.assertEqual(admitted['gdm']['greeters'], [])
+        self.assertEqual(environment, {'WAYLAND_DISPLAY': 'wayland-0'})
 
 
 if __name__ == '__main__':

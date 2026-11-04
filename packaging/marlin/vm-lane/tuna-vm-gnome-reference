@@ -458,6 +458,15 @@ def admission(profile, deadline, cache):
                 raise RuntimeError('foreign/non-native GDM greeter session')
             shells = process_candidates(('/usr/bin/gnome-shell',), uid, deadline)
             if len(shells) != 1:
+                if candidates and not shells:
+                    # Post-login teardown residue: logind still lists the
+                    # greeter session (not yet 'closing') after its shell
+                    # exited. The user session is up, so this entry carries
+                    # no input/session state worth validating; skip it the
+                    # way 'closing' sessions are skipped. Multiple shells
+                    # stay fatal (ambiguous principal), as does a missing
+                    # shell before any user session started.
+                    continue
                 observed = sorted((shell['pid'], shell.get('start_ticks')) for shell in shells)
                 raise RuntimeError('original GDM greeter shell is not unique: '
                                    f'{len(shells)} under uid {uid} pid/start {observed}')
