@@ -2347,6 +2347,7 @@ class BootApi(unittest.TestCase):
             lane.boot("disk.raw", "/out", "/scratch", 30, explicit_sync_gpu=True)
             command = spawn.call_args.args[0]
             self.assertEqual(command[command.index("-display") + 1], "egl-headless")
+            self.assertEqual(command[command.index("-vga") + 1], "none")
             self.assertIn("pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1", command)
             self.assertIn(f"virtio-gpu-gl-pci,bus=tuna-gpu-port,xres={lane.WIDTH},yres={lane.HEIGHT}", command)
             self.assertFalse(any("virtio-vga" in value for value in command))
