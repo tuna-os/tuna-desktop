@@ -2341,7 +2341,7 @@ class BootApi(unittest.TestCase):
             with self.assertRaises(ValueError):
                 lane.boot("disk.raw", "/out", "/scratch", 30, observer_records="/out/observer-records.log")
 
-    def test_explicit_sync_boot_uses_pure_virtio_gpu_gl(self):
+    def test_explicit_sync_boot_uses_solo_virgl_vga(self):
         env = {"LIBGL_ALWAYS_SOFTWARE": "1", "GALLIUM_DRIVER": "llvmpipe"}
         with patch.object(lane.os.path, "exists", return_value=True), patch.object(lane.os, "access", return_value=True), patch.object(lane.subprocess, "Popen") as spawn, patch.dict(lane.os.environ, env, clear=False):
             lane.boot("disk.raw", "/out", "/scratch", 30, explicit_sync_gpu=True)
@@ -2349,8 +2349,8 @@ class BootApi(unittest.TestCase):
             self.assertEqual(command[command.index("-display") + 1], "egl-headless")
             self.assertEqual(command[command.index("-vga") + 1], "none")
             self.assertIn("pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1", command)
-            self.assertIn(f"virtio-gpu-gl-pci,bus=tuna-gpu-port,xres={lane.WIDTH},yres={lane.HEIGHT}", command)
-            self.assertFalse(any("virtio-vga" in value for value in command))
+            self.assertIn(f"virtio-vga-gl,bus=tuna-gpu-port,x-pcie-pm-no-soft-reset=on,xres={lane.WIDTH},yres={lane.HEIGHT}", command)
+            self.assertFalse(any("virtio-gpu-gl-pci" in value for value in command))
 
     def test_explicit_sync_devices_match_the_receipt_launcher(self):
         import sys

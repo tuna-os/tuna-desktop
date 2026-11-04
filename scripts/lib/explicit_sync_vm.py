@@ -51,7 +51,7 @@ def gpu_devices(width, height):
     # profile names this configuration.
     return ['-vga', 'none',
             '-device', 'pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1',
-            '-device', 'virtio-gpu-gl-pci,bus=tuna-gpu-port,'
+            '-device', 'virtio-vga-gl,bus=tuna-gpu-port,x-pcie-pm-no-soft-reset=on,'
                        f'xres={width},yres={height}']
 
 
@@ -81,7 +81,7 @@ def run(qmp, agent_factory, out, image, inventory, vm):
     destination.mkdir(mode=0o700, exist_ok=False)
     nonce = secrets.token_hex(16)
     receipt = {'schema': 1, 'scope': 'native emulated virtio/virgl DRM ioctl timelines and actual dmabuf pixels',
-               'gpu_profile': 'virtio-gpu-gl-virgl-llvmpipe-v2', 'nonce': nonce,
+               'gpu_profile': 'virtio-vga-gl-solo-virgl-llvmpipe-v3', 'nonce': nonce,
                'image_admission': image, 'session_owner': owner, 'captures': {}, 'complete': False,
                'physical_gpu_qualified': False, 'installed_signed_release_qualified': False}
     latest = {}

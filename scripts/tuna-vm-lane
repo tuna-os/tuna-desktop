@@ -3937,16 +3937,17 @@ def run_soak(qmp, vm, agent_path, out, record, seconds, warmup, interval, revisi
 
 def gpu_devices_for_receipt(explicit_sync=False):
     if explicit_sync:
-        # Pure virtio-gpu, no VGA compatibility: the leg only observes
-        # post-render frames, and the VGA-to-GL console transition is one
-        # more state machine between the guest scanout and the QMP surface.
-        # QEMU's default std VGA must also go: as the boot VGA it becomes
-        # the guest's card0, and primary_gpu hands the compositor that
-        # KMS-only bochs node instead of virtio-gpu, leaving EGL without a
-        # device and explicit sync disabled (run 41732259581).
+        # Solo VGA-compatible virgl: the 3D device itself is the boot VGA,
+        # so the guest has one GPU (card0, render-capable) and the lane
+        # keeps its VGA-text initial surface. QEMU's default std VGA must
+        # go (as boot VGA it became a KMS-only card0 and primary_gpu
+        # handed the compositor bochs instead of virtio-gpu, leaving EGL
+        # without a device: run 41732259581), but -vga none with a
+        # non-VGA virtio-gpu-gl-pci leaves no boot VGA at all and the
+        # greeter never presents (run 41866163092).
         return ["-vga", "none",
                 "-device", "pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1",
-                "-device", "virtio-gpu-gl-pci,bus=tuna-gpu-port,"
+                "-device", "virtio-vga-gl,bus=tuna-gpu-port,x-pcie-pm-no-soft-reset=on,"
                            f"xres={WIDTH},yres={HEIGHT}"]
     return baseline.gpu_devices()
 
@@ -4494,7 +4495,7 @@ def main():
         "resolution": f"{WIDTH}x{HEIGHT}",
         "kvm": kvm,
         "qemu": qemu_version,
-        "gpu_profile": "virtio-gpu-gl-virgl-llvmpipe-v2" if a.explicit_sync else baseline.GPU_PROFILE,
+        "gpu_profile": "virtio-vga-gl-solo-virgl-llvmpipe-v3" if a.explicit_sync else baseline.GPU_PROFILE,
         "gpu_devices": gpu_devices_for_receipt(a.explicit_sync),
         "gpu_display": "egl-headless" if a.explicit_sync else "none",
         "session_up_s": round(elapsed) if drm and shell else None,
