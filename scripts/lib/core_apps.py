@@ -444,6 +444,13 @@ class Desktop(NativeDesktop):
         monitor_started = False
         try:
             self.click_path(actor, field['path'])
+            # Keys typed before focus lands never reach the engine: no
+            # preedit rows, and the engine idles while the await burns the
+            # budget (run 41865506509 attempts 1-2). Settle the
+            # exact field first; selection and typing follow only then.
+            self.await_state('real-ime-field-focused', lambda: self.tree(actor),
+                             lambda value: any(node['path'] == field['path'] and node['focused']
+                                               and node['editable'] for node in value['nodes']))
             self.keys('ctrl', 'a')
             self.guest('desktop', 'ime-monitor-start', actor=actor)
             monitor_started = True

@@ -550,5 +550,98 @@ class HostImeOcrProvisioning(unittest.TestCase):
         self.assertIn('tesseract-ocr-chi-sim', ocr[0]['run'])
 
 
+class ImeFieldFocusSettle(unittest.TestCase):
+    """ime() settles the exact editable field before selecting or typing.
+
+    Keys typed before focus lands never reach the engine: the monitor
+    stays idle (one row, zero preedit rows) while the preedit await burns
+    the budget (run 41865506509 attempts 1-2).
+    """
+    def rig(self):
+        import base64
+        import tempfile
+        from unittest import mock
+        import types
+        order = []
+        field = {'path': [1], 'name': 'Search', 'text': '', 'role': 'text',
+                 'editable': True, 'showing': True, 'sensitive': True, 'focused': True}
+        actor = {'id': 'org.example.app', 'kind': 'app'}
+        desktop = core_apps.Desktop.__new__(core_apps.Desktop)
+        desktop._ime = {}
+        desktop._sequence = 41
+        desktop.out = Path(tempfile.mkdtemp(prefix='ime-focus-'))
+        desktop.select = lambda target: None
+        desktop.tree = lambda target: {'nodes': [dict(field)], 'state': {}}
+        desktop.observe = lambda label, target: {'nodes': [dict(field)], 'state': {},
+                                                 'frame_path': str(desktop.out / 'frame.png')}
+        desktop._field_pixels = lambda *args: (0, 0, 8, 8)
+        desktop.clipboard = lambda: {'base64': base64.b64encode('你好'.encode()).decode()}
+
+        def guest(domain, operation, **kwargs):
+            order.append(operation)
+            return {'original': 'xkb:us::eng'}
+
+        def await_state(label, read, predicate, timeout=10):
+            order.append(label)
+            if label == 'real-ime-field-focused':
+                value = read()
+                assert predicate(value), 'rigged field must satisfy the focus predicate'
+                return value
+            if label == 'real-native-libpinyin-preedit':
+                return {'preedit': '你好'}
+            return {'nodes': [{'path': [1], 'focused': True, 'text': '你好'}]}
+
+        desktop.guest = guest
+        desktop.await_state = await_state
+        desktop.click_path = lambda target, path: order.append('click')
+        desktop.keys = lambda *chords: order.append(('keys',) + chords)
+        desktop.type_ascii = lambda text: order.append(('type', text))
+        pil = types.ModuleType('PIL')
+        pil.Image = mock.MagicMock()
+        completed = mock.Mock(stdout='你好')
+        return desktop, actor, field, order, pil, completed
+
+    def test_typing_waits_for_exact_focused_editable_field(self):
+        import sys
+        from unittest import mock
+        desktop, actor, field, order, pil, completed = self.rig()
+        with mock.patch.dict(sys.modules, {'PIL': pil}), \
+             mock.patch.object(core_apps.subprocess, 'run', return_value=completed) as ocr:
+            evidence = desktop.ime(actor, field['name'], field_path=field['path'])
+        self.assertEqual(evidence['preedit_ocr'], '你好')
+        self.assertEqual(evidence['actual_input'], 'physical-nihao-space')
+        legend = ['click' if entry == 'click' else entry[0] if isinstance(entry, tuple) else entry
+                  for entry in order]
+        self.assertEqual(legend[:6], ['ime-engine', 'click', 'real-ime-field-focused',
+                                     'keys', 'ime-monitor-start', 'type'])
+        ocr.assert_called_once()
+        self.assertIn('-l', ocr.call_args.args[0])
+
+    def test_focus_predicate_rejects_wrong_unfocused_and_readonly_fields(self):
+        from unittest import mock
+        desktop, actor, field, order, pil, completed = self.rig()
+        predicates = {}
+        real_await = desktop.await_state
+
+        def capture(label, read, predicate, timeout=10):
+            predicates[label] = predicate
+            return real_await(label, read, predicate, timeout)
+
+        desktop.await_state = capture
+        import sys
+        with mock.patch.dict(sys.modules, {'PIL': pil}), \
+             mock.patch.object(core_apps.subprocess, 'run', return_value=completed):
+            desktop.ime(actor, field['name'], field_path=field['path'])
+        focused = predicates['real-ime-field-focused']
+        tree = lambda node: {'nodes': [node]}
+        self.assertTrue(focused(tree(dict(field))))
+        stray = dict(field, path=[2])
+        self.assertFalse(focused(tree(stray)))
+        blurred = dict(field, focused=False)
+        self.assertFalse(focused(tree(blurred)))
+        readonly = dict(field, editable=False)
+        self.assertFalse(focused(tree(readonly)))
+
+
 if __name__ == '__main__':
     unittest.main()
