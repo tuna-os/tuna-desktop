@@ -530,5 +530,25 @@ class ImeStateDispatch(unittest.TestCase):
         self.assertEqual(written['ime_daemons'], [self.daemon()])
 
 
+class HostImeOcrProvisioning(unittest.TestCase):
+    """The core-apps leg's host OCR step must stay provisioned in CI.
+
+    Desktop.ime() shells out to host tesseract with `-l eng+chi_sim` to
+    verify the rendered preedit field; without the runner packages the
+    whole Core matrix fails as FileNotFoundError with zero completed apps.
+    """
+    def test_marlin_vm_installs_host_ocr_for_core_apps(self):
+        import yaml
+        workflow = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
+        job = workflow['jobs']['marlin-vm']
+        legs = [row['artifact'] for row in job['strategy']['matrix']['include']]
+        self.assertIn('native-core-apps', legs)
+        ocr = [step for step in job['steps']
+               if step.get('if') == "matrix.profile == 'core-apps'"
+               and 'tesseract-ocr' in step.get('run', '')]
+        self.assertEqual(len(ocr), 1)
+        self.assertIn('tesseract-ocr-chi-sim', ocr[0]['run'])
+
+
 if __name__ == '__main__':
     unittest.main()
