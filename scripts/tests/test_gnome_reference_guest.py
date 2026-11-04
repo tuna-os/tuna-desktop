@@ -1391,6 +1391,41 @@ class BusPrecheck(unittest.TestCase):
             GUEST.precheck_bus_names({}, 1000, deadline)
         self.assertEqual(checked.call_count, 2)
 
+    def test_owner_probe_reports_pid_exe_and_ppid(self):
+        runs = [self.completed(b"(':1.7',)\n"), self.completed(b'(uint32 2940,)\n')]
+        stat = '2940 (gnome-control-c) S 2174 2940 0 0\n'
+        with mock.patch.object(GUEST.subprocess, 'run', side_effect=runs) as ran, \
+                mock.patch.object(GUEST.os, 'readlink', return_value='/usr/bin/gnome-control-center'), \
+                mock.patch('builtins.open', mock.mock_open(read_data=stat)):
+            probed = GUEST.bus_name_owner_probe('org.gnome.Settings', {}, 1000)
+        self.assertEqual(probed, {'name': 'org.gnome.Settings', 'pid': 2940,
+                                  'exe': '/usr/bin/gnome-control-center', 'ppid': 2174})
+        self.assertEqual(ran.call_count, 2)
+        methods = [call[0][0][-2] for call in ran.call_args_list]
+        self.assertEqual(methods, ['org.freedesktop.DBus.GetNameOwner',
+                                   'org.freedesktop.DBus.GetConnectionUnixProcessID'])
+
+    def test_owner_probe_unowned_is_none_and_errors_are_dicts(self):
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               return_value=self.completed(b'', 1, b'NameHasNoOwner')):
+            self.assertIsNone(GUEST.bus_name_owner_probe('org.gnome.Settings', {}, 1000))
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               return_value=self.completed(b'', 1, b'no bus')):
+            probed = GUEST.bus_name_owner_probe('org.gnome.Settings', {}, 1000)
+        self.assertEqual(probed['name'], 'org.gnome.Settings')
+        self.assertIn('no bus', probed['error'])
+        with mock.patch.object(GUEST.subprocess, 'run', side_effect=OSError('gone')):
+            probed = GUEST.bus_name_owner_probe('org.gnome.Settings', {}, 1000)
+        self.assertIn('gone', probed['error'])
+
+    def test_owner_probe_vanished_owner_is_reported(self):
+        runs = [self.completed(b"(':1.7',)\n"), self.completed(b'(uint32 2940,)\n')]
+        with mock.patch.object(GUEST.subprocess, 'run', side_effect=runs), \
+                mock.patch.object(GUEST.os, 'readlink', side_effect=OSError('gone')):
+            probed = GUEST.bus_name_owner_probe('org.gnome.Settings', {}, 1000)
+        self.assertEqual(probed['pid'], 2940)
+        self.assertIn('vanished', probed['error'])
+
     def test_child_status_separates_running_handoff_and_reuse(self):
         running = SimpleNamespace(pid=101, poll=lambda: None)
         handoff = SimpleNamespace(pid=102, poll=lambda: 0)
@@ -1566,6 +1601,7 @@ class FixtureLaunch(unittest.TestCase):
             mock.patch.object(GUEST, 'public_observation', side_effect=[before, forwarded]),
             mock.patch.object(GUEST, 'wait_bus_name'),
             mock.patch.object(GUEST, 'precheck_bus_names'),
+            mock.patch.object(GUEST, 'bus_name_owner_probe', return_value=None),
             mock.patch.object(GUEST, 'same_process'),
             mock.patch.object(GUEST, 'load_claim', return_value=claim),
             mock.patch.object(GUEST, 'save'),

@@ -1485,6 +1485,44 @@ def bus_name_owned(name, environment, owner_gid, deadline):
     return completed.stdout.decode(errors='replace').strip() == '(true,)'
 
 
+def bus_name_owner_probe(name, environment, owner_gid):
+    """Best-effort owner of a session-bus name: pid, exe, ppid. Never raises.
+
+    On failure returns None when the name is unowned, else a dict describing
+    the query error. A fast silent launcher exit with a foreign owner here is
+    a handoff to a session-restored zombie, not a broken launch.
+    """
+    def query(method, value):
+        completed = subprocess.run(
+            ['/usr/bin/gdbus', 'call', '--session', '--dest', 'org.freedesktop.DBus',
+             '--object-path', '/org/freedesktop/DBus', '--method',
+             'org.freedesktop.DBus.' + method, "'%s'" % value],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=10, env=environment, user=UID, group=owner_gid, extra_groups=[],
+            start_new_session=True)
+        if completed.returncode:
+            return None, completed.stderr.decode(errors='replace')
+        return completed.stdout.decode(errors='replace').strip(), ''
+    try:
+        unique, err = query('GetNameOwner', name)
+        if unique is None:
+            if 'NameHasNoOwner' in err:
+                return None
+            return {'name': name, 'error': err[:200]}
+        pid_text, err = query('GetConnectionUnixProcessID', unique.strip("()' "))
+        if pid_text is None:
+            return {'name': name, 'error': err[:200]}
+        pid = int(re.search(r'uint32\s+(\d+)', pid_text).group(1))
+        try:
+            exe = os.readlink('/proc/%d/exe' % pid)
+            ppid = int(open('/proc/%d/stat' % pid).read().rsplit(') ', 1)[1].split()[1])
+        except OSError as missing:
+            return {'name': name, 'pid': pid, 'error': 'owner vanished: %s' % missing}
+        return {'name': name, 'pid': pid, 'exe': exe, 'ppid': ppid}
+    except Exception as failed:
+        return {'name': name, 'error': '%s: %s' % (type(failed).__name__, failed)}
+
+
 def precheck_bus_names(environment, owner_gid, deadline):
     """Refuse fixture launch when a GApplication name is already owned.
 
@@ -1684,7 +1722,8 @@ def prepare(args, directory, deadline, cache):
             bucket = fixture['launchers'] if secondary else fixture['processes']
             bucket.append(identity)
             fixture['launches'].append({'role': role, 'pid': child.pid,
-                                        'launched_monotonic_ns': launched_ns})
+                                        'launched_monotonic_ns': launched_ns,
+                                        'desktop': child_env.get('XDG_CURRENT_DESKTOP')})
             save(directory, 'claim.json', claim)
             bucket[-1] = packaged(identity, deadline, cache)
             save(directory, 'claim.json', claim)
@@ -1717,15 +1756,17 @@ def prepare(args, directory, deadline, cache):
     except Exception as error:
         tails = {role: drain.text() for role, drain in drains.items()}
         statuses = format_child_status(children, fixture_launch_plan(fixture['directories']))
+        owners = {bus_name: bus_name_owner_probe(bus_name, environment, owner.pw_gid)
+                  for bus_name in (NAUTILUS_BUS_NAME, SETTINGS_BUS_NAME)}
         try:
             final = public_observation(environment, admitted, Deadline(3))
             census = fixture_node_summary(final['trees'])
         except Exception as census_error:
             census = 'unavailable: %s: %s' % (type(census_error).__name__, census_error)
-        raise RuntimeError('%s; launches=%s; stderr_tails=%s; child_status=%s; fixture_census=%s' % (
+        raise RuntimeError('%s; launches=%s; stderr_tails=%s; child_status=%s; bus_owners=%s; fixture_census=%s' % (
             error, json.dumps(fixture['launches'], sort_keys=True),
             json.dumps(tails, sort_keys=True), json.dumps(statuses, sort_keys=True),
-            json.dumps(census, sort_keys=True))) from error
+            json.dumps(owners, sort_keys=True), json.dumps(census, sort_keys=True))) from error
     result['files'] = retained_files(directory, ('snapshot.json',))
     save(directory, 'snapshot.json', result)
     response = {'schema': 1, 'nonce': args['nonce'], 'profile': args['profile'], 'ready': True,
