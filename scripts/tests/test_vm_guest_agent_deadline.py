@@ -233,7 +233,8 @@ class Tests(unittest.TestCase):
         for arguments, timeout in (
                 (("exec", "{}"), 30), (("observe", "[]"), 30),
                 (("observe", "{}"), 31), (("observe", "{}"), 0),
-                (("observe", "{}"), float("nan")), (("observe",), 30)):
+                (("observe", "{}"), float("nan")), (("observe",), 30),
+                (("prepare", "{}"), 71), (("prepare", "{}"), 0)):
             with self.subTest(arguments=arguments, timeout=timeout):
                 with mock.patch.object(actor, "command") as command:
                     with self.assertRaises(ValueError):
@@ -241,6 +242,19 @@ class Tests(unittest.TestCase):
                     command.assert_not_called()
                 self.assertIsNone(actor.pending_guest_pid)
                 self.assertFalse(actor.poisoned)
+
+    def test_reference_prepare_headroom_starts_child_within_cap(self):
+        actor, _ = self.actor()
+
+        def command(name, **kwargs):
+            if name == 'guest-exec':
+                return {'pid': 51}
+            return {'exited': True, 'exitcode': 0, 'out-data': 'e30='}
+
+        with mock.patch.object(actor, 'command', side_effect=command) as started:
+            self.assertEqual(actor.run("gnome-reference", "prepare", "{}", timeout=70), {})
+        started.assert_called()
+        self.assertIsNone(actor.pending_guest_pid)
 
     def test_reference_timeout_preserves_original_child_for_retirement(self):
         actor, _ = self.actor()

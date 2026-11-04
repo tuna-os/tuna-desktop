@@ -370,9 +370,13 @@ class GuestAgent:
         path = "/usr/libexec/tuna-vm-lifecycle"
         argv = [action, *map(str, arguments)]
         if action == "gnome-reference":
+            # Prepare alone gets headroom (60s guest budget for fixture startup
+            # under a saturated bus); all other ops keep the 30s transport cap.
+            timeout_cap = 70 if arguments[:1] == ("prepare",) else 30
             if (len(arguments) != 2 or arguments[0] not in {"admit", "prepare", "observe", "file", "stop"}
-                    or type(arguments[1]) is not str or not 0 < timeout <= 30):
-                raise ValueError("reference action requires one finite operation, JSON and at most 30 seconds")
+                    or type(arguments[1]) is not str or not 0 < timeout <= timeout_cap):
+                raise ValueError("reference action requires one finite operation, JSON and at most %d seconds"
+                                 % timeout_cap)
             payload = json.loads(arguments[1])
             if type(payload) is not dict:
                 raise ValueError("reference payload must be a JSON object")
