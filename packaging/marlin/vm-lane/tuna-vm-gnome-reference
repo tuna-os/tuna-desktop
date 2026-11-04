@@ -1450,6 +1450,51 @@ class StderrDrain(threading.Thread):
 
 
 NAUTILUS_BUS_NAME = 'org.gnome.Nautilus'
+SETTINGS_BUS_NAME = 'org.gnome.Settings'
+
+
+def bus_name_owned(name, environment, owner_gid, deadline):
+    """Whether a session-bus name already has an owner (single check, no wait)."""
+    argv = ['/usr/bin/gdbus', 'call', '--session', '--dest', 'org.freedesktop.DBus',
+           '--object-path', '/org/freedesktop/DBus',
+           '--method', 'org.freedesktop.DBus.NameHasOwner', name]
+    completed = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=deadline.remaining(), env=environment,
+                               user=UID, group=owner_gid, extra_groups=[],
+                               start_new_session=True)
+    if completed.returncode:
+        raise RuntimeError('session bus name query failed: '
+                           + completed.stderr.decode(errors='replace')[:500])
+    return completed.stdout.decode(errors='replace').strip() == '(true,)'
+
+
+def precheck_bus_names(environment, owner_gid, deadline):
+    """Refuse fixture launch when a GApplication name is already owned.
+
+    A session-restored instance owns the bus name without a recorded fixture
+    process; launching into that hands off (exit 0, no owned window) and the
+    inventory can never complete. Failing here names the race instead.
+    """
+    for bus_name in (NAUTILUS_BUS_NAME, SETTINGS_BUS_NAME):
+        if bus_name_owned(bus_name, environment, owner_gid, deadline):
+            raise RuntimeError('preexisting %s bus-name owner refused; session-restore race?' % bus_name)
+
+
+def format_child_status(children, plan):
+    """Per-role launcher liveness for failure retention: exit status plus live exe.
+
+    Distinguishes windowless-but-running (status None, original exe) from a
+    handoff exit (status 0) and from PID reuse (status None, foreign exe).
+    """
+    statuses = {}
+    for (argv, role), child in zip(plan, children):
+        status = child.poll()
+        try:
+            exe = os.readlink('/proc/%d/exe' % child.pid)
+        except OSError:
+            exe = '<exited>'
+        statuses[role] = {'pid': child.pid, 'status': status, 'exe': exe, 'argv0': argv[0]}
+    return statuses
 
 
 def wait_bus_name(name, environment, owner_gid, deadline):
@@ -1562,6 +1607,7 @@ def prepare(args, directory, deadline, cache):
         raise RuntimeError('cannot prepare unadmitted native session: ' + '; '.join(admitted['missing']))
     if process_candidates(APPS, UID, deadline):
         raise RuntimeError('preexisting Files/Settings process refused; no unrelated process will be killed')
+    precheck_bus_names(environment, pwd.getpwnam('tuna-test').pw_gid, deadline)
     # Also inspect public inventory before launching, not just Linux process names.
     before = public_observation(environment, admitted, deadline)
     shell_roots = [node for node in before['trees'] if node['process']['pid'] == admitted['session']['shell']['pid']]
@@ -1650,9 +1696,10 @@ def prepare(args, directory, deadline, cache):
             lambda: snapshot(args, claim, admitted, environment, deadline, cache), children, deadline)
     except Exception as error:
         tails = {role: drain.text() for role, drain in drains.items()}
-        raise RuntimeError('%s; launches=%s; stderr_tails=%s' % (
+        statuses = format_child_status(children, fixture_launch_plan(fixture['directories']))
+        raise RuntimeError('%s; launches=%s; stderr_tails=%s; child_status=%s' % (
             error, json.dumps(fixture['launches'], sort_keys=True),
-            json.dumps(tails, sort_keys=True))) from error
+            json.dumps(tails, sort_keys=True), json.dumps(statuses, sort_keys=True))) from error
     result['files'] = retained_files(directory, ('snapshot.json',))
     save(directory, 'snapshot.json', result)
     response = {'schema': 1, 'nonce': args['nonce'], 'profile': args['profile'], 'ready': True,

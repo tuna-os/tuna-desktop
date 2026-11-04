@@ -1361,6 +1361,60 @@ class WaitBusName(unittest.TestCase):
         ran.assert_not_called()
 
 
+class BusPrecheck(unittest.TestCase):
+    def completed(self, stdout, returncode=0, stderr=b''):
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def test_owned_and_free_names_answer_once(self):
+        deadline = GUEST.Deadline(25)
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               return_value=self.completed(b'(true,)\n')) as ran:
+            self.assertTrue(GUEST.bus_name_owned('org.gnome.Settings', {}, 1000, deadline))
+        self.assertEqual(ran.call_count, 1)
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               return_value=self.completed(b'(false,)\n')):
+            self.assertFalse(GUEST.bus_name_owned('org.gnome.Settings', {}, 1000, deadline))
+
+    def test_bus_query_failure_is_loud(self):
+        deadline = GUEST.Deadline(25)
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               return_value=self.completed(b'', 1, b'no bus')):
+            with self.assertRaisesRegex(RuntimeError, 'session bus name query failed'):
+                GUEST.bus_name_owned('org.gnome.Settings', {}, 1000, deadline)
+
+    def test_precheck_refuses_owned_name_and_passes_free(self):
+        deadline = GUEST.Deadline(25)
+        with mock.patch.object(GUEST, 'bus_name_owned', side_effect=[False, True]):
+            with self.assertRaisesRegex(RuntimeError, 'preexisting org.gnome.Settings bus-name owner'):
+                GUEST.precheck_bus_names({}, 1000, deadline)
+        with mock.patch.object(GUEST, 'bus_name_owned', return_value=False) as checked:
+            GUEST.precheck_bus_names({}, 1000, deadline)
+        self.assertEqual(checked.call_count, 2)
+
+    def test_child_status_separates_running_handoff_and_reuse(self):
+        running = SimpleNamespace(pid=101, poll=lambda: None)
+        handoff = SimpleNamespace(pid=102, poll=lambda: 0)
+        reused = SimpleNamespace(pid=103, poll=lambda: None)
+        plan = [(['/usr/bin/nautilus'], 'files-first'),
+                (['/usr/bin/gnome-control-center'], 'settings'),
+                (['/usr/bin/nautilus'], 'files-second')]
+
+        def readlink(path):
+            if '101' in path:
+                return '/usr/bin/nautilus'
+            if '103' in path:
+                return '/usr/bin/other'
+            raise OSError('gone')
+
+        with mock.patch.object(GUEST.os, 'readlink', side_effect=readlink):
+            statuses = GUEST.format_child_status([running, handoff, reused], plan)
+        self.assertEqual(statuses['files-first'], {'pid': 101, 'status': None,
+                                                   'exe': '/usr/bin/nautilus', 'argv0': '/usr/bin/nautilus'})
+        self.assertEqual(statuses['settings']['status'], 0)
+        self.assertEqual(statuses['settings']['exe'], '<exited>')
+        self.assertEqual(statuses['files-second']['exe'], '/usr/bin/other')
+
+
 class FixtureLaunch(unittest.TestCase):
     def test_settings_launches_last_with_stable_roles(self):
         plan = GUEST.fixture_launch_plan(['/d/first', '/d/second'])
@@ -1485,6 +1539,7 @@ class FixtureLaunch(unittest.TestCase):
             mock.patch.object(GUEST, 'process_candidates', return_value=[]),
             mock.patch.object(GUEST, 'public_observation', side_effect=[before, forwarded]),
             mock.patch.object(GUEST, 'wait_bus_name'),
+            mock.patch.object(GUEST, 'precheck_bus_names'),
             mock.patch.object(GUEST, 'same_process'),
             mock.patch.object(GUEST, 'load_claim', return_value=claim),
             mock.patch.object(GUEST, 'save'),
