@@ -435,6 +435,21 @@ def active_role(snapshot):
     return snapshot['selection']['active_windows'][0]['role']
 
 
+def normalize_admission(admission):
+    """Admission minus transitional GDM greeter presence.
+
+    Greeters tear down asynchronously after login; an admission taken seconds
+    before prepare can legitimately list one more greeter than every later
+    observation while all security-relevant principals (session, shell,
+    compositor, buses, processes) stay identical. Comparisons use this so a
+    benign teardown mid-run is not misread as fixture substitution.
+    """
+    normalized = copy.deepcopy(admission)
+    if isinstance(normalized.get('gdm'), dict):
+        normalized['gdm']['greeters'] = []
+    return normalized
+
+
 def stable_context(snapshot):
     """Fixture identity across observations: same session, windows, and focus.
 
@@ -445,8 +460,8 @@ def stable_context(snapshot):
     not change is which session, which processes, which windows, and which of
     them is active. Replay protection stays separate (observed_monotonic_ns).
     """
-    context = {key: snapshot[key] for key in ('profile', 'nonce', 'admission', 'settings',
-                                              'atspi', 'fixture')}
+    context = {key: snapshot[key] for key in ('profile', 'nonce', 'settings', 'atspi', 'fixture')}
+    context['admission'] = normalize_admission(snapshot['admission'])
     context['windows'] = [(w['role'], w['atspi'], w['process']) for w in snapshot['windows']]
     context['active'] = [(w['role'], w['atspi'], w['process'])
                          for w in snapshot['selection']['active_windows']]
@@ -932,7 +947,9 @@ def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
         receipt.setdefault('observations', []).append(value)
         validate_snapshot(value, profile, nonce)
         if initial is not None:
-            for field in ('admission', 'settings', 'fixture'):
+            require(normalize_admission(value['admission']) == normalize_admission(initial['admission']),
+                    'original member admission changed')
+            for field in ('settings', 'fixture'):
                 require(value[field] == initial[field], 'original member ' + field + ' changed')
             require([(w['role'], w['atspi'], w['process']) for w in value['windows']] ==
                     [(w['role'], w['atspi'], w['process']) for w in initial['windows']],
@@ -1000,7 +1017,8 @@ def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
         receipt['prepare'] = prepared
         require(prepared.get('ready') is True and prepared.get('nonce') == nonce, 'fixture prepare rejected')
         initial = validate_snapshot(prepared['snapshot'], profile, nonce)
-        require(initial['admission'] == receipt['admission'] == prepared['admission']
+        require(normalize_admission(initial['admission']) == normalize_admission(receipt['admission'])
+                == normalize_admission(prepared['admission'])
                 and initial['fixture'] == prepared['fixture']
                 and initial['fixture']['processes'] == prepared['processes'],
                 'prepared fixture/admission does not match actual original observation')

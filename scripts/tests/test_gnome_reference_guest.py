@@ -1521,6 +1521,64 @@ class FixtureCensus(unittest.TestCase):
         self.assertEqual(summary[0]['name'], 'n' * 60)
 
 
+class QuietIndexers(unittest.TestCase):
+    def completed(self, stdout, returncode=0, stderr=b''):
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def schemas_present(self):
+        return (GUEST.TRACKER_SCHEMA + '\norg.foo.Bar\n').encode()
+
+    def test_absent_schema_returns_gracefully(self):
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               return_value=self.completed(b'org.foo.Bar\n')) as ran:
+            self.assertEqual(GUEST.quiet_indexers({}, 1000, GUEST.Deadline(25)),
+                             {'miners': 'absent'})
+        self.assertEqual(ran.call_count, 1)
+
+    def test_happy_path_sets_reads_back_and_resets_miners(self):
+        keys = ('index-recursive-directories\nindex-single-directories\nthrottle\n').encode()
+        runs = [self.completed(self.schemas_present()), self.completed(keys),
+                self.completed(b''), self.completed(b''),
+                self.completed(b'[]\n'), self.completed(b'@as []\n')]
+        with mock.patch.object(GUEST.subprocess, 'run', side_effect=runs) as ran, \
+                mock.patch.object(GUEST, '_cmdline_pids', side_effect=[[222, 111], []]) as scanned, \
+                mock.patch.object(GUEST.os, 'kill') as killed:
+            result = GUEST.quiet_indexers({}, 1000, GUEST.Deadline(25))
+        self.assertEqual(result, {'miners': 'idled', 'index_dirs': [], 'killed': [111, 222]})
+        set_argv = [call[0][0] for call in ran.call_args_list[2:4]]
+        self.assertEqual(set_argv[0][1:], ['set', GUEST.TRACKER_SCHEMA, 'index-recursive-directories', '[]'])
+        self.assertEqual(set_argv[1][1:], ['set', GUEST.TRACKER_SCHEMA, 'index-single-directories', '[]'])
+        self.assertEqual(killed.call_args_list,
+                         [mock.call(222, GUEST.signal.SIGTERM), mock.call(111, GUEST.signal.SIGTERM)])
+        self.assertEqual(scanned.call_count, 2)
+
+    def test_schema_drift_missing_keys_and_bad_readback_are_loud(self):
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               side_effect=[self.completed(self.schemas_present()),
+                                             self.completed(b'throttle\n')]):
+            with self.assertRaisesRegex(RuntimeError, 'schema drift'):
+                GUEST.quiet_indexers({}, 1000, GUEST.Deadline(25))
+        with mock.patch.object(GUEST.subprocess, 'run', return_value=self.completed(b'', 1, b'no bus')):
+            with self.assertRaisesRegex(RuntimeError, 'gsettings'):
+                GUEST.quiet_indexers({}, 1000, GUEST.Deadline(25))
+
+    def test_survivors_fail_loudly(self):
+        keys = ('index-recursive-directories\nindex-single-directories\n').encode()
+        runs = [self.completed(self.schemas_present()), self.completed(keys),
+                self.completed(b''), self.completed(b''),
+                self.completed(b'[]\n'), self.completed(b'[]\n')]
+        with mock.patch.object(GUEST.subprocess, 'run', side_effect=runs), \
+                mock.patch.object(GUEST, '_cmdline_pids', return_value=[111]), \
+                mock.patch.object(GUEST.os, 'kill'):
+            with self.assertRaisesRegex(RuntimeError, 'survived SIGTERM'):
+                GUEST.quiet_indexers({}, 1000, GUEST.Deadline(0.15))
+
+    def test_cmdline_scan_finds_own_test_process(self):
+        found = GUEST._cmdline_pids(r'test_gnome_reference_guest', os.getuid())
+        self.assertIn(os.getpid(), found)
+        self.assertEqual(GUEST._cmdline_pids(r'no-such-process-xyz-123', os.getuid()), [])
+
+
 class FixtureLaunch(unittest.TestCase):
     def test_settings_launches_last_with_stable_roles(self):
         plan = GUEST.fixture_launch_plan(['/d/first', '/d/second'])
@@ -1647,6 +1705,8 @@ class FixtureLaunch(unittest.TestCase):
             mock.patch.object(GUEST, 'wait_bus_name'),
             mock.patch.object(GUEST, 'precheck_bus_names'),
             mock.patch.object(GUEST, 'bus_name_owner_probe', return_value=None),
+            mock.patch.object(GUEST, 'quiet_indexers',
+                              return_value={'miners': 'idled', 'index_dirs': [], 'killed': []}),
             mock.patch.object(GUEST, 'same_process'),
             mock.patch.object(GUEST, 'load_claim', return_value=claim),
             mock.patch.object(GUEST, 'save'),
@@ -1714,6 +1774,18 @@ class FixtureLaunch(unittest.TestCase):
                 GUEST.prepare({'profile': 'tuna', 'nonce': NONCE}, Path(tmp),
                               GUEST.Deadline(3), {})
         self.assertEqual(launched[2][1]['env']['XDG_CURRENT_DESKTOP'], 'Tuna:GNOME')
+
+    def test_prepare_quiets_indexers_and_retains_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claim, launched, Child, FakePath = self._prepare_fixture()
+            self._prepare_mocks(tmp, claim, launched, Child, FakePath)
+            with mock.patch.object(GUEST, 'snapshot_until_ready',
+                                   return_value={'selection': {}, 'snapshot': True}):
+                GUEST.prepare({'profile': 'gnome', 'nonce': NONCE}, Path(tmp),
+                              GUEST.Deadline(3), {})
+        GUEST.quiet_indexers.assert_called_once()
+        self.assertEqual(claim['fixture']['indexers_quiet'],
+                         {'miners': 'idled', 'index_dirs': [], 'killed': []})
 
     def test_prepare_bus_prime_failure_is_loud(self):
         with tempfile.TemporaryDirectory() as tmp:

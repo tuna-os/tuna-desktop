@@ -222,7 +222,10 @@ class ControlledGuest:
             raise AssertionError('foreign guest request')
         self.calls.append(op)
         if op == 'admit':
-            return admission(self.profile)
+            admitted = admission(self.profile)
+            if self.failure == 'greeter-flap':
+                admitted['gdm']['greeters'] = [{'uid': 60578, 'shells': 1}]
+            return admitted
         if op == 'prepare':
             if self.failure == 'prepare':
                 raise RuntimeError('controlled prepare failure')
@@ -407,6 +410,13 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
             self.assertIn('controlled prepare failure', receipt['error']['message'])
             self.assertTrue((Path(directory) / 'prepare-failed.png').exists())
             self.assertEqual(guest.frame_count, 1)
+
+    def test_greeter_flap_between_admit_and_prepare_stays_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receipt, _, _ = self.collect(Path(directory), failure='greeter-flap')
+            self.assertTrue(receipt['ready'])
+            self.assertEqual(len(receipt['admission']['gdm']['greeters']), 1)
+            self.assertEqual(receipt['prepare']['admission']['gdm']['greeters'], [])
 
     def test_prepare_budget_exceeds_observe_budget(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -912,6 +922,16 @@ class SettlePollTests(unittest.TestCase):
         self.assertEqual(snapshot, 'stale')  # caller require() still fails on this
         self.assertGreaterEqual(polls, 5)  # ~15s / (1.9s observe + 1s gap)
         self.assertTrue(sleeps)
+
+    def test_normalize_admission_tolerates_only_greeter_teardown(self):
+        base = admission('gnome')
+        flapped = copy.deepcopy(base)
+        flapped['gdm']['greeters'] = [{'uid': 60578, 'shells': 1}]
+        self.assertEqual(proof.normalize_admission(base), proof.normalize_admission(flapped))
+        self.assertEqual(flapped['gdm']['greeters'], [{'uid': 60578, 'shells': 1}])
+        substituted = copy.deepcopy(base)
+        substituted['session']['shell'] = process('evil-shell', 999, 'gnome')
+        self.assertNotEqual(proof.normalize_admission(base), proof.normalize_admission(substituted))
 
     def test_stable_context_ignores_live_content_but_not_identity(self):
         def snapshot(**overrides):

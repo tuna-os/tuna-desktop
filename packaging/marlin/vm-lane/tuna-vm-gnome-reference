@@ -1554,6 +1554,78 @@ def bus_name_owner_probe(name, environment, owner_gid):
         return {'name': name, 'error': '%s: %s' % (type(failed).__name__, failed)}
 
 
+TRACKER_SCHEMA = 'org.freedesktop.Tracker3.Miner.Files'
+TRACKER_INDEX_KEYS = ('index-recursive-directories', 'index-single-directories')
+
+
+def _cmdline_pids(pattern, uid):
+    """PIDs of `uid` processes whose command line matches (covers renames)."""
+    found = []
+    for directory in Path('/proc').iterdir():
+        if not directory.name.isdigit():
+            continue
+        try:
+            if directory.stat().st_uid != uid:
+                continue
+            cmdline = (directory / 'cmdline').read_bytes().replace(b'\0', b' ').decode(errors='replace')
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if re.search(pattern, cmdline):
+            found.append(int(directory.name))
+    return found
+
+
+def _gsettings(environment, owner_gid, deadline, *argv):
+    completed = subprocess.run(['/usr/bin/gsettings', *argv], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=deadline.remaining(), env=environment,
+                               user=UID, group=owner_gid, extra_groups=[], start_new_session=True)
+    if completed.returncode:
+        raise RuntimeError('gsettings %s failed: %s' % (
+            ' '.join(argv), completed.stderr.decode(errors='replace')[:500]))
+    return completed.stdout.decode(errors='replace')
+
+
+def quiet_indexers(environment, owner_gid, deadline):
+    """Idle Tracker miners so the fixture runs quiet on both legs.
+
+    Walks slow monotonically within a run (2.6s to 5s) while our own gaps
+    widen, and Nautilus reports connecting to the file miner every round:
+    the fresh-user first-index ramps exogenous bus/disk/CPU load that stalls
+    fixture startup (measured 46s Settings stall) and starves observations.
+    Emptying the miner's indexed directories (user-scoped dconf on the
+    discarded test VM) idles it without breaking activation: Nautilus keeps
+    connecting successfully to an idle miner instead of retrying a masked
+    one. Miners already mid-index are reset with SIGTERM so they restart
+    idle; survivors fail loudly rather than run loud. Indexing affects
+    search only, never the window listing or focus under reference.
+    """
+    schemas = _gsettings(environment, owner_gid, deadline, 'list-schemas')
+    if TRACKER_SCHEMA not in schemas.split():
+        return {'miners': 'absent'}
+    keys = _gsettings(environment, owner_gid, deadline, 'list-keys', TRACKER_SCHEMA).split()
+    missing = [key for key in TRACKER_INDEX_KEYS if key not in keys]
+    if missing:
+        raise RuntimeError('tracker schema drift, refusing silent skip: missing %s' % ','.join(missing))
+    for key in TRACKER_INDEX_KEYS:
+        _gsettings(environment, owner_gid, deadline, 'set', TRACKER_SCHEMA, key, '[]')
+    readback = {key: _gsettings(environment, owner_gid, deadline, 'get', TRACKER_SCHEMA, key).strip()
+                for key in TRACKER_INDEX_KEYS}
+    if any(value not in ('[]', '@as []') for value in readback.values()):
+        raise RuntimeError('tracker index dirs did not land: %r' % (readback,))
+    targets = _cmdline_pids(r'tracker|localsearch', UID)
+    for pid in targets:
+        os.kill(pid, signal.SIGTERM)
+    while True:
+        survivors = _cmdline_pids(r'tracker|localsearch', UID)
+        if not survivors:
+            break
+        if deadline.remaining() < 0.2:
+            raise RuntimeError('tracker miners survived SIGTERM: %r' % (survivors,))
+        time.sleep(0.1)
+    return {'miners': 'idled', 'index_dirs': [], 'killed': sorted(targets)}
+
+
 def precheck_bus_names(environment, owner_gid, deadline):
     """Refuse fixture launch when a GApplication name is already owned.
 
@@ -1703,6 +1775,7 @@ def prepare(args, directory, deadline, cache):
     if process_candidates(APPS, UID, deadline):
         raise RuntimeError('preexisting Files/Settings process refused; no unrelated process will be killed')
     precheck_bus_names(environment, pwd.getpwnam('tuna-test').pw_gid, deadline)
+    indexers_quiet = quiet_indexers(environment, pwd.getpwnam('tuna-test').pw_gid, deadline)
     # Also inspect public inventory before launching, not just Linux process names.
     before = public_observation(environment, admitted, deadline)
     shell_roots = [node for node in before['trees'] if node['process']['pid'] == admitted['session']['shell']['pid']]
@@ -1719,6 +1792,7 @@ def prepare(args, directory, deadline, cache):
     fixture = claim['fixture']
     fixture['directories'] = [str(base / 'first'), str(base / 'second')]
     fixture['launchers'] = []
+    fixture['indexers_quiet'] = indexers_quiet
     claim['admission'] = admitted
     claim['settings'] = before['settings']
     save(directory, 'claim.json', claim)
