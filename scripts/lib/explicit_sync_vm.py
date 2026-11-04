@@ -49,9 +49,8 @@ def verify_native_payload(image, state=None):
 def gpu_devices(width, height):
     # Must match the lane's explicit-sync boot devices exactly; the receipt
     # profile names this configuration.
-    return ['-vga', 'none',
-            '-device', 'pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1',
-            '-device', 'virtio-vga-gl,bus=tuna-gpu-port,x-pcie-pm-no-soft-reset=on,'
+    return ['-device', 'pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1',
+            '-device', 'virtio-gpu-gl-pci,bus=tuna-gpu-port,'
                        f'xres={width},yres={height}']
 
 
@@ -81,7 +80,7 @@ def run(qmp, agent_factory, out, image, inventory, vm):
     destination.mkdir(mode=0o700, exist_ok=False)
     nonce = secrets.token_hex(16)
     receipt = {'schema': 1, 'scope': 'native emulated virtio/virgl DRM ioctl timelines and actual dmabuf pixels',
-               'gpu_profile': 'virtio-vga-gl-solo-virgl-llvmpipe-v3', 'nonce': nonce,
+               'gpu_profile': 'std-vga-plus-virtio-gl-render-v4', 'nonce': nonce,
                'image_admission': image, 'session_owner': owner, 'captures': {}, 'complete': False,
                'physical_gpu_qualified': False, 'installed_signed_release_qualified': False}
     latest = {}
