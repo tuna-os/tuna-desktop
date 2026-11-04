@@ -886,6 +886,32 @@ class SettlePollTests(unittest.TestCase):
         self.assertGreaterEqual(polls, 5)  # ~15s / (1.9s observe + 1s gap)
         self.assertTrue(sleeps)
 
+    def test_stable_context_ignores_live_content_but_not_identity(self):
+        def snapshot(**overrides):
+            window = {'role': 'settings', 'atspi': {'bus_name': 'b', 'path': '/w'},
+                      'process': {'pid': 1}, 'name': 'Settings', 'states': [1, 25, 30],
+                      'accessibility_tree': {'children': []}, 'panel_evidence': []}
+            base = {'profile': 'tuna', 'nonce': 'n', 'admission': {}, 'settings': {},
+                    'atspi': {}, 'fixture': {}, 'windows': [window],
+                    'selection': {'active_windows': [window], 'selected': [], 'objects': []}}
+            base.update(overrides)
+            return base
+
+        before = snapshot()
+        churned = snapshot()
+        churned['windows'][0] = dict(churned['windows'][0], states=[25, 30],
+                                     accessibility_tree={'children': [{'x': 1}]})
+        churned['selection'] = {'active_windows': churned['windows'], 'selected': [{'y': 2}],
+                                'objects': []}
+        self.assertEqual(proof.stable_context(before), proof.stable_context(churned))
+        moved = snapshot()
+        moved['selection'] = {'active_windows': [dict(moved['windows'][0], role='files-first')],
+                              'selected': [], 'objects': []}
+        self.assertNotEqual(proof.stable_context(before), proof.stable_context(moved))
+        swapped = snapshot()
+        swapped['windows'] = [dict(swapped['windows'][0], process={'pid': 2})]
+        self.assertNotEqual(proof.stable_context(before), proof.stable_context(swapped))
+
     def test_overview_search_visible_matches_either_shell(self):
         tuna = {'selection': {'objects': [
             {'role_name': 'window', 'name': 'Search', 'states': [25, 30], 'children': [

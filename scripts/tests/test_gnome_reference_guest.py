@@ -1404,6 +1404,8 @@ class BusPrecheck(unittest.TestCase):
         methods = [call[0][0][-2] for call in ran.call_args_list]
         self.assertEqual(methods, ['org.freedesktop.DBus.GetNameOwner',
                                    'org.freedesktop.DBus.GetConnectionUnixProcessID'])
+        values = [call[0][0][-1] for call in ran.call_args_list]
+        self.assertEqual(values, ["'org.gnome.Settings'", "':1.7'"])
 
     def test_owner_probe_unowned_is_none_and_errors_are_dicts(self):
         with mock.patch.object(GUEST.subprocess, 'run',
@@ -1639,8 +1641,8 @@ class FixtureLaunch(unittest.TestCase):
         self.assertEqual(argv[2], [GUEST.APPS[1], 'network'])
         self.assertIn('first', argv[0][2])
         self.assertIn('second', argv[1][2])
-        # The GNOME leg keeps its true session desktop; only Tuna overrides.
-        self.assertNotIn('XDG_CURRENT_DESKTOP', launched[2][1]['env'])
+        # Both legs supply the desktop explicitly; the session env has none.
+        self.assertEqual(launched[2][1]['env']['XDG_CURRENT_DESKTOP'], 'GNOME')
         self.assertNotIn('XDG_CURRENT_DESKTOP', launched[0][1]['env'])
         self.assertNotIn('XDG_CURRENT_DESKTOP', launched[1][1]['env'])
         for _, kwargs in launched:

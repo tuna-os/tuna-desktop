@@ -1509,7 +1509,8 @@ def bus_name_owner_probe(name, environment, owner_gid):
             if 'NameHasNoOwner' in err:
                 return None
             return {'name': name, 'error': err[:200]}
-        pid_text, err = query('GetConnectionUnixProcessID', unique.strip("()' "))
+        unique_name = re.search(r':[\d.]+', unique).group(0)
+        pid_text, err = query('GetConnectionUnixProcessID', unique_name)
         if pid_text is None:
             return {'name': name, 'error': err[:200]}
         pid = int(re.search(r'uint32\s+(\d+)', pid_text).group(1))
@@ -1697,15 +1698,16 @@ def prepare(args, directory, deadline, cache):
     for argv, role in fixture_launch_plan(fixture['directories']):
         deadline.remaining()
         child_env = environment
-        if argv[0] == APPS[1] and args['profile'] == 'tuna':
-            # gnome-control-center refuses to start unless the session
-            # advertises GNOME or Unity. The Tuna session lists GNOME as a
-            # compatible desktop for this fixture (same precedent as the GTK
-            # portal proofs); the observed Settings window is unaffected.
-            # The GNOME leg keeps its true session desktop: lying to a
-            # GNOME-session child about its desktop is unneeded there and
-            # perturbs undefined behavior switches.
-            child_env = dict(environment, XDG_CURRENT_DESKTOP='Tuna:GNOME')
+        if argv[0] == APPS[1]:
+            # gnome-control-center refuses to start unless the desktop
+            # advertises GNOME or Unity ("Running gnome-control-center is
+            # only supported under GNOME and Unity", exit 1). The session
+            # environment carries no XDG_CURRENT_DESKTOP at all (proven by
+            # retained null launch desktops), so the fixture must supply
+            # it: genuine GNOME on the GNOME leg, GNOME-compatible on Tuna
+            # (same precedent as the GTK portal proofs).
+            desktop = 'GNOME' if args['profile'] == 'gnome' else 'Tuna:GNOME'
+            child_env = dict(environment, XDG_CURRENT_DESKTOP=desktop)
         child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.PIPE, env=child_env, user=UID,
                                  group=owner.pw_gid, extra_groups=[], start_new_session=True)

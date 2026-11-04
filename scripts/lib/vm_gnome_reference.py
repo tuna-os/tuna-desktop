@@ -433,8 +433,21 @@ def active_role(snapshot):
 
 
 def stable_context(snapshot):
-    return {key: snapshot[key] for key in ('profile', 'nonce', 'admission', 'settings', 'atspi',
-                                           'windows', 'selection', 'fixture')}
+    """Fixture identity across observations: same session, windows, and focus.
+
+    Compares identities, never live content. Window records carry full
+    accessibility trees and panel evidence, and selection carries live shell
+    UI state; Tracker churn, live panels, and fade animations legitimately
+    change those between two observations of one unmoved fixture. What must
+    not change is which session, which processes, which windows, and which of
+    them is active. Replay protection stays separate (observed_monotonic_ns).
+    """
+    context = {key: snapshot[key] for key in ('profile', 'nonce', 'admission', 'settings',
+                                              'atspi', 'fixture')}
+    context['windows'] = [(w['role'], w['atspi'], w['process']) for w in snapshot['windows']]
+    context['active'] = [(w['role'], w['atspi'], w['process'])
+                         for w in snapshot['selection']['active_windows']]
+    return context
 
 
 def shell_nodes(snapshot):
