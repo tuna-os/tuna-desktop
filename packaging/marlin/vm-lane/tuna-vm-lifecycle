@@ -1705,13 +1705,36 @@ def tour_public_ui():
 
     No compositor snapshot, debug property, text/value API or accessibility
     action participates. Object paths below are explicitly AT-SPI identities.
+
+    Failures print one bounded record (vm_guest_agent.FAILURE_RECORDS);
+    the traceback text itself never leaves the guest.
     """
+    try:
+        return _tour_public_ui()
+    except Exception as error:
+        print(json.dumps({"tour_public_ui_error": inventory_error(error)}))
+        raise SystemExit(1) from None
+
+
+def _tour_public_ui():
     if os.geteuid() == 0:
         session = owner_login_session()
         if (session.get("User") != str(OWNER.pw_uid) or session.get("Type") != "wayland"
                 or session.get("Class") != "user" or session.get("Service") != LOGIN_SERVICE):
             raise RuntimeError("tour requires the original GDM Wayland session")
-        observed = json.loads(call(sys.executable, __file__, "tour-public-ui", user=True))
+        try:
+            observed = json.loads(call(sys.executable, __file__, "tour-public-ui", user=True))
+        except subprocess.CalledProcessError as error:
+            # Forward the user-context record (with its own crash frames)
+            # instead of reporting the re-exec line.
+            try:
+                forwarded = json.loads((error.stdout or "").strip() or "{}")
+            except ValueError:
+                forwarded = {}
+            if type(forwarded) is dict and set(forwarded) == {"tour_public_ui_error"}:
+                print(json.dumps(forwarded))
+                raise SystemExit(1) from None
+            raise
         if observed["principal"]["session_id"] != session["Id"]:
             raise RuntimeError("tour shell is not in the original GDM session")
         if session != owner_login_session():

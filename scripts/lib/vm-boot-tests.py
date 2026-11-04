@@ -4770,7 +4770,7 @@ class InventoryProcessRaces(unittest.TestCase):
         self.assertEqual(caught.exception.code, 1)
         return output.getvalue()
 
-    def transport(self, output, **status):
+    def transport(self, output, action="inventory", **status):
         import contextlib
         actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
         failure = {"exited": True, "exitcode": 1, "out-data": base64.b64encode(output.encode()).decode(),
@@ -4778,7 +4778,7 @@ class InventoryProcessRaces(unittest.TestCase):
         log = io.StringIO()
         with contextlib.redirect_stdout(log), patch.object(actor, "command", side_effect=[{"pid": 10}, failure]):
             with self.assertRaises(RuntimeError) as caught:
-                actor.run("inventory")
+                actor.run(action)
         self.assertNotIn("private", str(caught.exception) + log.getvalue())
         return str(caught.exception), log.getvalue()
 
@@ -4821,6 +4821,25 @@ class InventoryProcessRaces(unittest.TestCase):
         self.assertEqual(self.transport(json.dumps({"inventory_error": record, "extra": "private"}))[0], generic)
         self.assertEqual(self.transport(json.dumps({"inventory_error": record}), **{"out-truncated": True})[0], generic)
         self.assertEqual(self.transport("private " * 600)[0], generic)
+
+    def test_tour_public_ui_failure_record_surfaces_unstaged_only(self):
+        record = {"stage": "unstaged", "exception_type": "RuntimeError",
+                  "code": "observation-exception", "frames": [["_tour_public_ui", 1790]]}
+        self.assertTrue(lane.guest_agent.valid_tour_public_ui_error(record))
+        message, log = self.transport(json.dumps({"tour_public_ui_error": record}), action="tour-public-ui")
+        self.assertEqual(message, "guest lifecycle tour-public-ui failed (exit=1): " + json.dumps(record))
+        self.assertEqual(log, "")
+        generic = "guest lifecycle tour-public-ui failed (exit=1)"
+        invalid = [None, [], {}, {**record, "message": "private"},
+                   {**record, "stage": "state-read"}, {**record, "stage": "private"},
+                   {**record, "exception_type": "private"}, {**record, "code": "private"},
+                   {k: v for k, v in record.items() if k != "frames"}]
+        for value in invalid:
+            with self.subTest(value=value):
+                output = json.dumps({"tour_public_ui_error": value})
+                self.assertEqual(self.transport(output, action="tour-public-ui")[0], generic)
+
+
 class OrcaLogoutRetirement(unittest.TestCase):
     """#836: the compositor's session-end receipt for its own Orca group."""
     RECEIPT = ("tuna-compositor: screen reader retired pid=21699 terminated=true "

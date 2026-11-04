@@ -167,12 +167,21 @@ def valid_inventory_error(value):
         and type(frame[1]) is int and 0 < frame[1] <= 1000000 for frame in frames)
 
 
+def valid_tour_public_ui_error(value):
+    """The tour observer's bounded crash record: same shape as inventory's,
+    but the observer sets no stage, so only unstaged records validate."""
+    if type(value) is not dict or value.get("stage") != "unstaged":
+        return False
+    return valid_inventory_error(value)
+
+
 # Lifecycle actions whose failure prints one bounded, validated record on
 # stdout; any other action's output (and every stderr) stays private.
 FAILURE_RECORDS = {"orca-read": ("orca_read_error", valid_orca_read_error),
                    "strip-stop": ("strip_stop_error", valid_strip_stop_error),
                    "delayed-auth-state": ("delayed_auth_error", valid_delayed_auth_error),
-                   "inventory": ("inventory_error", valid_inventory_error)}
+                   "inventory": ("inventory_error", valid_inventory_error),
+                   "tour-public-ui": ("tour_public_ui_error", valid_tour_public_ui_error)}
 # Records that must be the whole output and are logged before raising, so a
 # caller's cleanup failure cannot hide them.
 LOGGED_FAILURE_RECORDS = {"delayed-auth-state", "inventory"}

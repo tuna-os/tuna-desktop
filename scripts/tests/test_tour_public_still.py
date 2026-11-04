@@ -1,9 +1,14 @@
 """Tour public-still error evidence keeps the causal message, not just the type."""
+import ast
 import importlib.machinery
 import importlib.util
+import io
+import json
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
+import traceback
 import unittest
 
 
@@ -45,6 +50,41 @@ class PublicStillErrorEvidence(unittest.TestCase):
 
 def _raise(remaining):
     raise RuntimeError("probe-detail-xyz")
+
+
+class TourObserverFailureRecord(unittest.TestCase):
+    def guest(self):
+        path = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+        tree = ast.parse(path.read_text())
+        wanted = [node for node in tree.body
+                  if isinstance(node, ast.FunctionDef)
+                  and node.name in {"tour_public_ui", "_tour_public_ui", "inventory_error"}
+                  or isinstance(node, ast.Assign)
+                  and any(isinstance(target, ast.Name) and target.id == "INVENTORY_STAGES"
+                          for target in node.targets)]
+        scope = {"json": json, "traceback": traceback}
+        exec(compile(ast.Module(body=wanted, type_ignores=[]), str(path), "exec"), scope)
+        return scope
+
+    def test_observer_crash_prints_bounded_record_and_exits_one(self):
+        scope = self.guest()
+
+        def crash():
+            raise RuntimeError("private boom")
+
+        scope["_tour_public_ui"] = crash
+        output = io.StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as caught:
+            scope["tour_public_ui"]()
+        self.assertEqual(caught.exception.code, 1)
+        root = json.loads(output.getvalue())
+        self.assertEqual(set(root), {"tour_public_ui_error"})
+        record = root["tour_public_ui_error"]
+        self.assertEqual({key: record[key] for key in ("stage", "exception_type", "code")},
+                         {"stage": "unstaged", "exception_type": "RuntimeError",
+                          "code": "observation-exception"})
+        self.assertNotIn("private", output.getvalue())
+        self.assertNotIn("Traceback", output.getvalue())
 
 
 if __name__ == "__main__":
