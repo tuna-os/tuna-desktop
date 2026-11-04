@@ -56,9 +56,9 @@ def profile_name(profile):
 def guest_call(agent, op, profile, nonce=None, *, retention=None, **payload):
     require(op in ('admit', 'prepare', 'observe', 'file', 'stop'), 'unknown fixed operation')
     profile_name(profile)
-    # Prepare alone gets headroom: fixture startup under a saturated session bus
-    # needs air between readiness samples. All other ops stay at 25s/30s.
-    budget, timeout = (60, 70) if op == 'prepare' else (25, 30)
+    # Prepare alone gets headroom (measured 46s stall; 120s budget / 130s transport).
+    # All other ops stay at 25s/30s.
+    budget, timeout = (120, 130) if op == 'prepare' else (25, 30)
     body = {'budget_s': budget, **payload}
     if op != 'file':
         body['profile'] = profile

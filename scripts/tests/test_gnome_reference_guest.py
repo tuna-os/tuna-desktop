@@ -49,9 +49,9 @@ class Arguments(unittest.TestCase):
 
     def test_prepare_alone_gets_headroom_others_stay_capped(self):
         base = {'profile': 'gnome', 'nonce': NONCE}
-        self.assertGreater(GUEST.payload('prepare', {**base, 'budget_s': 60}).remaining(), 0)
+        self.assertGreater(GUEST.payload('prepare', {**base, 'budget_s': 120}).remaining(), 0)
         with self.assertRaises(ValueError):
-            GUEST.payload('prepare', {**base, 'budget_s': 61})
+            GUEST.payload('prepare', {**base, 'budget_s': 121})
         with self.assertRaises(ValueError):
             GUEST.payload('observe', {**base, 'budget_s': 26})
         with self.assertRaises(ValueError):
@@ -1108,7 +1108,7 @@ class ControlledObservationEvidence(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 GUEST.snapshot_until_ready(attempt, [], deadline)
         slept.assert_called_once_with(GUEST.READINESS_POLL_GAP_S)
-        self.assertEqual(GUEST.READINESS_POLL_GAP_S, 2.0)
+        self.assertEqual(GUEST.READINESS_POLL_GAP_S, 10.0)
 
     def test_timeout_only_run_reports_last_without_first(self):
         deadline = GUEST.Deadline(25)

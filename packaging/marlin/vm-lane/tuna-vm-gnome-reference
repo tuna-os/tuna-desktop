@@ -100,10 +100,11 @@ def payload(operation, value):
         if not allowed_receipt(value.get('name')):
             raise ValueError('receipt name is not allowlisted')
         file_range(value.get('offset', 0), value.get('limit', MAX_CHUNK_BYTES))
-    # Prepare alone gets headroom: fixture startup under a saturated session
-    # bus needs air between readiness samples, and launches alone burn ~8s.
-    # Observe/file/stop stay at 25s so a hung walk still fails fast.
-    cap = 60 if operation == 'prepare' else 25
+    # Prepare alone gets headroom (measured 46s Settings stall under GNOME
+    # autostart contention; 120s gives 2.5x margin): fixture startup needs air
+    # between readiness samples, and launches alone burn ~8s. Observe/file/stop
+    # stay at 25s so a hung walk still fails fast.
+    cap = 120 if operation == 'prepare' else 25
     return Deadline(value.get('budget_s', 20), cap)
 
 
@@ -1624,10 +1625,13 @@ def fixture_launch_plan(directories):
             ([APPS[1], 'network'], 'settings')]
 
 
-# Gap between readiness samples. A full AT-SPI walk saturates the session bus
-# the fixture needs to start; sampling with 100ms gaps hammers it (observer
-# effect), while 2s gaps let startup progress between samples.
-READINESS_POLL_GAP_S = 2.0
+# Gap between readiness samples. A full AT-SPI walk is a 2.6s solid call burst
+# on the session bus the fixture needs to start; tight gaps keep the bus
+# saturated (observer effect - every startup call queues behind our bursts),
+# stretching startup past the deadline. 10s gaps drop our duty cycle to ~20%,
+# letting startup progress between samples; the first sample is immediate so
+# the fast path pays nothing.
+READINESS_POLL_GAP_S = 10.0
 
 
 def snapshot_until_ready(snapshot_fn, children, deadline):

@@ -208,7 +208,7 @@ class ControlledGuest:
         return value
 
     def run(self, route, op, payload, *, timeout):
-        budget_cap, timeout_cap = (60, 70) if op == 'prepare' else (25, 30)
+        budget_cap, timeout_cap = (120, 130) if op == 'prepare' else (25, 30)
         if route != 'gnome-reference' or timeout > timeout_cap:
             raise AssertionError('unbounded/nonfixed guest route')
         args = json.loads(payload)
@@ -412,7 +412,7 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             _, guest, _ = self.collect(Path(directory))
             budgets = dict((op, (budget, timeout)) for op, budget, timeout in guest.budgets)
-            self.assertEqual(budgets['prepare'], (60, 70))
+            self.assertEqual(budgets['prepare'], (120, 130))
             self.assertEqual(budgets['observe'], (25, 30))
             self.assertEqual(budgets['file'], (25, 30))
 
