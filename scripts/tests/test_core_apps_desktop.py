@@ -242,6 +242,7 @@ class ImeMonitorSubscription(unittest.TestCase):
         self.assertEqual(ready['ready'], True)
         self.assertEqual(ready['kind'], 'ime')
         self.assertEqual(ready['ibus_owner'], ':1.9')
+        self.assertEqual(ready['address'], 'unix:path=/fixture/ibus')
         # One channel: the IBus bus answers no credential queries.
         self.assertEqual(len(connections), 1)
         calls = connections[0].calls
@@ -431,7 +432,7 @@ class ImeStateDispatch(unittest.TestCase):
         from unittest import mock
         actor = actor if actor is not None else {'pid': 300, 'window_id': 7}
         observed = observed if observed is not None else {}
-        context = types.SimpleNamespace(uid=1000)
+        context = types.SimpleNamespace(uid=1000, environment=lambda: {})
         state = {'native_keyboard_windows': [{'window_id': 7, 'client_pid': 300,
                                               'client_uid': 1000, 'actual_keyboard_focus': True}]}
         tree = {'nodes': [{'showing': True, 'name': '你好',
@@ -447,9 +448,14 @@ class ImeStateDispatch(unittest.TestCase):
             return observed.get(pid, {'pid': pid, 'uid': uid})
 
         guest = types.SimpleNamespace(desktop=desktop)
+        engine = {'pid': 400, 'ppid': 100, 'bus_address': 'unix:path=/fixture/engine-bus'}
         with mock.patch.object(self.native, 'process', side_effect=identify), \
                 mock.patch.object(self.native, '_rows', return_value=rows), \
                 mock.patch.object(self.native, 'RUN_STATE') as run, \
+                mock.patch.object(self.native, '_ibus_engine_wiring', return_value=engine), \
+                mock.patch.object(self.native, '_ppid', return_value=1), \
+                mock.patch.object(self.native.subprocess, 'check_output',
+                                  return_value='unix:path=/fixture/file-bus\n'), \
                 mock.patch.dict(sys.modules, {'guest': guest}):
             run.read_text.return_value = json.dumps(run_state)
             return self.native.dispatch('ime-state', {'actor': actor}, context)
@@ -471,6 +477,55 @@ class ImeStateDispatch(unittest.TestCase):
         self.assertEqual(response['destination'], ':1.50')
         self.assertEqual(response['daemons'], [self.daemon()])
         self.assertEqual(response['candidates'], ['你好'])
+
+    def test_wiring_binds_monitor_file_engine_and_daemon_parents(self):
+        admitted = self.admitted()
+        rows = [{'ready': True, 'kind': 'ime', 'uid': 1000, 'ibus_owner': ':1.9',
+                 'address': 'unix:path=/fixture/monitor-bus'}]
+        response = self.operate(rows, admitted, observed=admitted.pop('observed'))
+        self.assertEqual(response['ibus_wiring'],
+                         {'monitor_address': 'unix:path=/fixture/monitor-bus',
+                          'file_address': 'unix:path=/fixture/file-bus',
+                          'engine': {'pid': 400, 'ppid': 100,
+                                     'bus_address': 'unix:path=/fixture/engine-bus'},
+                          'daemon_parents': {100: 1}})
+
+    def test_engine_wiring_skips_unreadable_owned_processes(self):
+        import pathlib
+        import tempfile
+        from unittest import mock
+        root = pathlib.Path(tempfile.mkdtemp(prefix='ibus-proc-'))
+        owner = os.geteuid()
+
+        def process(pid, exe):
+            entry = root / str(pid)
+            entry.mkdir()
+            entry.joinpath('exe').symlink_to(exe)
+            fields = ' '.join(['S'] + [str(index) for index in range(1, 22)])
+            entry.joinpath('stat').write_text(f'{pid} (proc) {fields}\n')
+            entry.joinpath('environ').write_bytes(b'IBUS_ADDRESS=unix:path=/fixture/bus\0')
+
+        process(4242, '/usr/lib/ibus-libpinyin/ibus-engine-libpinyin')
+        process(5150, '/usr/bin/bwrap')
+        real_readlink = os.readlink
+
+        def readlink(path):
+            if str(path).endswith('5150/exe'):
+                raise PermissionError(13, 'Permission denied', str(path))
+            return real_readlink(path)
+
+        with mock.patch.object(os, 'readlink', side_effect=readlink):
+            found = self.native._ibus_engine_wiring(owner, root)
+        self.assertEqual(found, {'pid': 4242, 'ppid': 1,
+                                 'bus_address': 'unix:path=/fixture/bus'})
+        self.assertIsNone(self.native._ibus_engine_wiring(owner + 1, root))
+
+    def test_ppid_reads_parent_or_nothing(self):
+        import pathlib
+        from unittest import mock
+        self.assertEqual(self.native._ppid(os.getpid()), os.getppid())
+        with mock.patch.object(pathlib.Path, 'read_text', side_effect=FileNotFoundError()):
+            self.assertIsNone(self.native._ppid(os.getpid()))
 
     def test_departed_daemon_refused(self):
         admitted = self.admitted()

@@ -300,8 +300,42 @@ def monitor(kind, arguments):
     ready = {'ready': True, 'kind': kind, 'uid': os.geteuid()}
     if kind == 'ime':
         ready['ibus_owner'] = ibus_owner
+        ready['address'] = address
     print(json.dumps(ready), flush=True)
     GLib.MainLoop().run()
+
+
+def _ppid(pid):
+    try:
+        return int((Path('/proc') / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()[1])
+    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, IndexError):
+        return None
+
+
+def _ibus_engine_wiring(uid, proc_root=Path('/proc')):
+    """Owned libpinyin engine process with its parent and bus address.
+
+    With two ibus-daemons behind one bus file (#1014), the engine may sit
+    on a different bus than the bridge or the monitor; recording which
+    daemon spawned it (ppid) and which bus it joined (IBUS_ADDRESS) makes
+    that split visible. Unreadable processes are skipped like the tour
+    shell scan: an unverifiable process never counts.
+    """
+    for path in proc_root.glob('[0-9]*'):
+        try:
+            if path.stat().st_uid != uid:
+                continue
+            if os.readlink(path / 'exe') != '/usr/lib/ibus-libpinyin/ibus-engine-libpinyin':
+                continue
+            stat = (path / 'stat').read_text().rsplit(')', 1)[1].split()
+            raw = (path / 'environ').read_bytes()
+            addresses = [entry.split(b'=', 1)[1].decode() for entry in raw.split(b'\0')
+                         if entry.startswith(b'IBUS_ADDRESS=')]
+            return {'pid': int(path.name), 'ppid': int(stat[1]),
+                    'bus_address': addresses[0] if len(addresses) == 1 else None}
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+    return None
 
 
 def user_operation(operation, arguments):
@@ -683,11 +717,22 @@ def dispatch(operation, arguments, context):
             raise RuntimeError('real preedit native seat focus belongs to another client')
         candidates = [node['name'] for node in tree['nodes'] if node['showing']
                       and any(parent['name'] == 'Input Method Candidates' for parent in node['ancestors'])]
+        try:
+            file_address = subprocess.check_output(['ibus', 'address'], text=True, timeout=3,
+                                                   user=context.uid,
+                                                   env=context.environment()).strip() or None
+        except (OSError, subprocess.SubprocessError):
+            file_address = None
+        wiring = {'monitor_address': log_rows[0].get('address') if log_rows else None,
+                  'file_address': file_address,
+                  'engine': _ibus_engine_wiring(context.uid),
+                  'daemon_parents': {daemon['pid']: _ppid(daemon['pid']) for daemon in daemons}}
         return {'preedit_visible': visible,
                 'preedit': latest['body'][0][2] if visible else None,
                 'real_preedit_message': latest,
                 'ime_log_summary': summary,
                 'ibus_owner': ibus_owner,
+                'ibus_wiring': wiring,
                 'destination': messages[-1].get('destination') if messages else None,
                 'daemons': daemons,
                 'candidates': candidates, 'shell_actor': shell, 'actual_shell_tree': tree,
