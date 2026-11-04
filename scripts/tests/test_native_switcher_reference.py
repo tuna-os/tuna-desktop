@@ -159,6 +159,8 @@ class ControlledGuest:
         self.profile, self.failure = profile, failure
         self.nonce, self.files, self.calls, self.keys = None, {}, [], set()
         self.budgets = []
+        self.order = []
+        self.overview_open = True
         self.active, self.action, self.stamp = 'settings', 0, 0
         self.frame_count, self.stopped, self.capture_changed = 0, False, False
         self.stop_value = None
@@ -221,11 +223,16 @@ class ControlledGuest:
         elif args.get('profile') != self.profile:
             raise AssertionError('foreign guest request')
         self.calls.append(op)
+        self.order.append(op)
         if op == 'admit':
             admitted = admission(self.profile)
             if self.failure == 'greeter-flap':
                 admitted['gdm']['greeters'] = [{'uid': 60578, 'shells': 1}]
             return admitted
+        if op == 'overview':
+            return {'schema': 1, 'ready': True, 'operation': 'overview', 'profile': self.profile,
+                    'nonce': args['nonce'], 'overview_open': self.overview_open, 'shell_pid': 200,
+                    'observed_monotonic_ns': 1, 'clock_domain': 'guest CLOCK_MONOTONIC'}
         if op == 'prepare':
             if self.failure == 'prepare':
                 raise RuntimeError('controlled prepare failure')
@@ -287,6 +294,9 @@ class ControlledGuest:
             if event['type'] != 'key':
                 continue
             key, down = event['data']['key']['data'], event['data']['down']
+            self.order.append(('input', key, down))
+            if key == 'esc' and down:
+                self.overview_open = False
             if down:
                 self.keys.add(key)
                 if key in ('tab', 'f6'):
@@ -425,6 +435,29 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
             self.assertEqual(budgets['prepare'], (240, 250))
             self.assertEqual(budgets['observe'], (25, 30))
             self.assertEqual(budgets['file'], (25, 30))
+            self.assertEqual(budgets['overview'], (25, 30))
+
+    def test_gnome_dismisses_overview_before_prepare(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receipt, guest, _ = self.collect(Path(directory), 'gnome')
+        self.assertTrue(receipt['ready'])
+        self.assertIn('pre-prepare-overview-dismiss', receipt['settle_polls'])
+        self.assertFalse(guest.overview_open)
+        prepare_at = guest.order.index('prepare')
+        esc_at = next(index for index, entry in enumerate(guest.order)
+                      if entry == ('input', 'esc', True))
+        self.assertLess(esc_at, prepare_at)
+
+    def test_tuna_dismisses_overview_before_prepare(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receipt, guest, _ = self.collect(Path(directory), 'tuna')
+        self.assertTrue(receipt['ready'])
+        self.assertIn('pre-prepare-overview-dismiss', receipt['settle_polls'])
+        self.assertFalse(guest.overview_open)
+        prepare_at = guest.order.index('prepare')
+        esc_at = next(index for index, entry in enumerate(guest.order)
+                      if entry == ('input', 'esc', True))
+        self.assertLess(esc_at, prepare_at)
 
     def test_controlled_collection_brackets_real_retained_png_bytes_and_input_bounds(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -803,8 +836,9 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
             self.assertTrue(all(limit <= 262144 for _, _, limit in guest.file_requests))
             self.assertEqual(len(receipt['wire_responses']), 20)  # +2 settle, +2 dismiss, +2 settle-stable
             self.assertEqual(receipt['settle_polls'],
-                             {'overview-dismiss': 1, 'overview-settle': 2,
-                              'applications-released': 1, 'windows-released': 1})
+                             {'pre-prepare-overview-dismiss': 1, 'overview-dismiss': 1,
+                              'overview-settle': 2, 'applications-released': 1,
+                              'windows-released': 1})
             first = receipt['wire_responses'][0]
             raw = (root / first['artifact']['path']).read_bytes()
             self.assertGreater(len(raw), 262144)

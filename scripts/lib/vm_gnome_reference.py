@@ -54,7 +54,7 @@ def profile_name(profile):
 
 
 def guest_call(agent, op, profile, nonce=None, *, retention=None, **payload):
-    require(op in ('admit', 'prepare', 'observe', 'file', 'stop'), 'unknown fixed operation')
+    require(op in ('admit', 'prepare', 'observe', 'file', 'stop', 'overview'), 'unknown fixed operation')
     profile_name(profile)
     # Prepare alone gets headroom (round-18: GNOME Settings stayed absent
     # from every poll walk for 107s; 240s budget / 250s transport tests
@@ -1006,6 +1006,24 @@ def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
         receipt['admission'] = session_status(agent, profile=profile)
         validate_admission(receipt['admission'], profile)
         validate_topology(receipt)
+        # Both shells greet a login with the overview, and the stock one
+        # clears window ACTIVE states while prepare's readiness requires
+        # active Settings: without a dismiss the fixture maps but can never
+        # become ready (round-20: 21 attempts all saw three inactive
+        # windows). Dismiss to the desktop on both legs before the fixture
+        # launches; the pair contract requires identical physical input,
+        # and the tuna leg's active-clean prepare is unaffected (its
+        # overview keeps ACTIVE, so closed-or-open both confirm). The
+        # baseline dismiss below stays as the switcher-phase guard.
+        physical.tap('esc')
+        _, pre_polls = poll_until_settled(
+            lambda: guest_call(agent, 'overview', profile, nonce),
+            lambda result: result.get('overview_open') is False, 15,
+            time.monotonic, time.sleep)
+        receipt.setdefault('settle_polls', {})['pre-prepare-overview-dismiss'] = pre_polls
+        dismissed = guest_call(agent, 'overview', profile, nonce)
+        require(dismissed.get('overview_open') is False,
+                'overview did not dismiss before prepare; Settings could never activate')
         attempted = True  # prepare may fail after claiming ownership.
         try:
             prepared = guest_call(agent, 'prepare', profile, nonce, retention=(out, receipt))
@@ -1235,13 +1253,19 @@ def validate_commands(receipt):
         require(command.get('held_after') == sorted(held), 'fabricated command held-after set')
         previous = command['end_ns']
     require(not held, 'member leaves owned physical keys pressed')
-    pointer = commands[0]['events']
+    # Fixed physical protocol: a pre-prepare Escape dismisses the
+    # login-greeting overview so the fixture can activate, then the pointer
+    # moves outside popups, then the baseline Escape re-verifies the desktop
+    # before the switcher actions.
+    require(len(commands) >= 5, 'member physical protocol is incomplete')
+    pointer = commands[2]['events']
     require(pointer == [{'type': 'abs', 'data': {'axis': 'x', 'value': 32767}},
                         {'type': 'abs', 'data': {'axis': 'y', 'value': 32767}}], 'pointer was not identically moved outside popup')
     # Reconstruct the exact fixed action sequence rather than accepting arbitrary QMP history.
-    # The leading Escape dismisses the login-greeting overview so the baseline is the
-    # desktop; without it switcher commits park and AT-SPI window-active freezes.
-    expected = [('esc', True), ('esc', False)]
+    # The leading Escape pair dismisses the login-greeting overview before prepare so the
+    # fixture maps active; the second pair re-verifies the desktop at baseline, without
+    # which switcher commits park and AT-SPI window-active freezes.
+    expected = [('esc', True), ('esc', False), ('esc', True), ('esc', False)]
     for index, action in enumerate(receipt['actions']):
         expected.extend((key, True) for key in action['modifiers'])
         expected.extend(((action['key'], True), (action['key'], False)))
@@ -1251,16 +1275,17 @@ def validate_commands(receipt):
     actual = [(event['data']['key']['data'], event['data']['down'])
               for c in commands for event in c['events'] if event['type'] == 'key']
     require(actual == expected, 'physical action sequence differs from fixed configured protocol')
+    keyed = [command for index, command in enumerate(commands) if index != 2]
     require(len(commands) == len(expected) + 1
-            and all(len(c['events']) == 1 and c['events'][0]['type'] == 'key' for c in commands[1:]),
+            and all(len(c['events']) == 1 and c['events'][0]['type'] == 'key' for c in keyed),
             'member includes extra pointer commands or combined/unrecorded input')
     app_count = len(receipt['actions'][0]['modifiers'])
     window_count = len(receipt['actions'][1]['modifiers'])
-    # One pointer command plus the overview-dismiss Escape tap precede the baseline.
-    app_trigger_count = 3 + app_count + 2
+    # Two Escape taps (pre-prepare, baseline) plus one pointer command precede the baseline.
+    app_trigger_count = 5 + app_count + 2
     app_release_count = app_trigger_count + 2 + app_count
     window_trigger_count = app_release_count + window_count + 2
-    prefixes = [3, app_trigger_count, app_trigger_count + 2,
+    prefixes = [5, app_trigger_count, app_trigger_count + 2,
                 app_release_count, window_trigger_count, window_trigger_count + window_count]
     for index, phase in enumerate(receipt['phases']):
         held_at_frame = set()

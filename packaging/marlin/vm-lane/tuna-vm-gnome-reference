@@ -85,10 +85,10 @@ def wayland_basename(value):
     return value
 
 def payload(operation, value):
-    if operation not in ('admit', 'prepare', 'observe', 'file', 'stop') or not isinstance(value, dict):
+    if operation not in ('admit', 'prepare', 'observe', 'file', 'stop', 'overview') or not isinstance(value, dict):
         raise ValueError('fixed operation and JSON object required')
     allowed = {'budget_s', 'nonce', 'name', 'offset', 'limit'} if operation == 'file' else {'profile', 'budget_s'}
-    if operation in ('prepare', 'observe', 'stop'):
+    if operation in ('prepare', 'observe', 'stop', 'overview'):
         allowed.add('nonce')
     if set(value) - allowed:
         raise ValueError('unexpected operation arguments')
@@ -1960,6 +1960,30 @@ def prepare(args, directory, deadline, cache):
     return response
 
 
+def overview_state(args, deadline, cache):
+    """Claim-free shell overview visibility for the pre-prepare dismiss.
+
+    No fixture exists yet, so there is no claim to load and no window
+    inventory to validate: admit the session, walk the admitted session
+    shell's tree only, and report whether a visible overview search entry
+    is present. The pid filter keeps greeter-residue shells (same exe,
+    other uid) out of the verdict. Read-only; never launches, never
+    mutates.
+    """
+    admitted, environment = admission(args['profile'], deadline, cache)
+    if not admitted['ready']:
+        raise RuntimeError('cannot read overview of unadmitted native session: '
+                           + '; '.join(admitted['missing']))
+    shell = admitted['session']['shell']
+    observation = public_observation(environment, admitted, deadline, only_exes={shell['exe']})
+    trees = [node for node in observation['trees'] if node['process']['pid'] == shell['pid']]
+    found = any(node['role_name'] in ('search box', 'entry') and 25 in node['states'] and 30 in node['states']
+                for node in flatten(trees))
+    return {'schema': 1, 'ready': True, 'operation': 'overview', 'profile': args['profile'],
+            'nonce': args['nonce'], 'overview_open': found, 'shell_pid': shell['pid'],
+            'observed_monotonic_ns': time.monotonic_ns(), 'clock_domain': CLOCK}
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == '_observe':
         value = json.loads(sys.stdin.buffer.read(65537))
@@ -2005,6 +2029,8 @@ def main():
                 if deadline.end - time.monotonic() < 1.0:
                     break
                 time.sleep(0.5)
+        elif operation == 'overview':
+            result = overview_state(args, deadline, cache)
         else:
             directory = ROOT / args['nonce']
             if operation == 'prepare':

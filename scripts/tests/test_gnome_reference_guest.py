@@ -34,7 +34,7 @@ NONCE = 'a' * 32
 
 class Arguments(unittest.TestCase):
     def test_all_fixed_operations_and_finite_local_budget(self):
-        for op in ('admit', 'prepare', 'observe', 'stop', 'file'):
+        for op in ('admit', 'prepare', 'observe', 'stop', 'file', 'overview'):
             value = {'budget_s': 25}
             if op != 'file':
                 value['profile'] = 'gnome'
@@ -56,6 +56,10 @@ class Arguments(unittest.TestCase):
             GUEST.payload('observe', {**base, 'budget_s': 26})
         with self.assertRaises(ValueError):
             GUEST.payload('stop', {**base, 'budget_s': 60})
+        with self.assertRaises(ValueError):
+            GUEST.payload('overview', {**base, 'budget_s': 26})
+        with self.assertRaises(ValueError):
+            GUEST.payload('overview', {'profile': 'gnome', 'budget_s': 25})
 
     def test_no_override_exec_alias_path_or_nonce_coercion(self):
         for extra in ('command', 'env', 'client_name', 'unsafeEval', 'TUNA_STATE', 'WAYLAND_DEBUG'):
@@ -591,6 +595,71 @@ class ControlledAdmission(unittest.TestCase):
         self.assertFalse(actual['ready'])
         self.assertFalse(actual['gdm']['ready'])
         self.assertTrue(any('not unique: 0' in entry for entry in actual['missing']))
+
+
+class OverviewState(unittest.TestCase):
+    def arrange(self, trees, ready=True):
+        shell = {'pid': 30, 'uid': 1000, 'exe': '/usr/bin/gnome-shell'}
+        admitted = {'ready': ready, 'missing': [] if ready else ['gdm: nope'],
+                    'session': {'shell': shell}}
+        observation = {'trees': trees}
+        patches = [mock.patch.object(GUEST, 'admission', return_value=(admitted, {})),
+                   mock.patch.object(GUEST, 'public_observation', return_value=observation)]
+        for entered in patches:
+            entered.start()
+            self.addCleanup(entered.stop)
+        return shell
+
+    def tree(self, pid, role, states, children=()):
+        return {'atspi': {'bus_name': ':1.9', 'path': '/shell', 'id_domain': 'AT-SPI'},
+                'name': 'GNOME Shell', 'role_name': role, 'states': states,
+                'process': {'pid': pid, 'uid': 1000, 'exe': '/usr/bin/gnome-shell'},
+                'children': list(children)}
+
+    def test_visible_search_entry_reports_open(self):
+        entry = self.tree(30, 'entry', [25, 30])
+        self.arrange([self.tree(30, 'application', [], [entry])])
+        args = {'profile': 'gnome', 'budget_s': 25, 'nonce': NONCE}
+        result = GUEST.overview_state(args, GUEST.Deadline(3), {})
+        self.assertTrue(result['overview_open'])
+        self.assertEqual(result['shell_pid'], 30)
+        self.assertEqual(result['nonce'], NONCE)
+        self.assertTrue(result['ready'])
+
+    def test_plain_desktop_reports_closed(self):
+        self.arrange([self.tree(30, 'application', [])])
+        args = {'profile': 'gnome', 'budget_s': 25, 'nonce': NONCE}
+        result = GUEST.overview_state(args, GUEST.Deadline(3), {})
+        self.assertFalse(result['overview_open'])
+
+    def test_greeter_residue_entry_does_not_count(self):
+        residue = self.tree(20, 'application', [], [self.tree(20, 'entry', [25, 30])])
+        desktop = self.tree(30, 'application', [])
+        shell = self.arrange([residue, desktop])
+        self.assertEqual(shell['pid'], 30)
+        args = {'profile': 'gnome', 'budget_s': 25, 'nonce': NONCE}
+        result = GUEST.overview_state(args, GUEST.Deadline(3), {})
+        self.assertFalse(result['overview_open'])
+
+    def test_unadmitted_session_refuses_overview(self):
+        self.arrange([], ready=False)
+        args = {'profile': 'gnome', 'budget_s': 25, 'nonce': NONCE}
+        with self.assertRaises(RuntimeError) as failed:
+            GUEST.overview_state(args, GUEST.Deadline(3), {})
+        self.assertIn('unadmitted native session', str(failed.exception))
+
+    def test_main_dispatches_overview_without_claim(self):
+        reported = {'schema': 1, 'ready': True, 'overview_open': False}
+        argv = ['tuna-vm-gnome-reference', 'overview',
+               json.dumps({'profile': 'gnome', 'budget_s': 25, 'nonce': NONCE})]
+        with mock.patch.object(GUEST.sys, 'argv', argv), \
+             mock.patch('os.geteuid', return_value=0), \
+             mock.patch.object(GUEST, 'overview_state', return_value=reported) as state, \
+             mock.patch.object(GUEST, 'load_claim') as claim:
+            GUEST.main()
+            state.assert_called_once()
+            self.assertEqual(state.call_args.args[0]['nonce'], NONCE)
+            claim.assert_not_called()
 
 
 class ControlledGio(unittest.TestCase):
