@@ -1131,6 +1131,23 @@ def flatten(nodes):
         yield from flatten(node['children'])
 
 
+def fixture_node_summary(trees):
+    """Compact per-node census of every fixture-exe node, any role or states.
+
+    On inventory failure this separates truly-absent (no node) from
+    present-but-filtered (wrong role, hidden states): the inventory only
+    admits visible frame/window/dialog, so a splash/utility/hidden Settings
+    node is silently skipped there but shows up here.
+    """
+    summary = []
+    for node in flatten(trees):
+        if node['process']['exe'] in APPS:
+            summary.append({'exe': node['process']['exe'], 'pid': node['process']['pid'],
+                            'role': node['role_name'], 'name': node['name'][:60],
+                            'states': sorted(set(node['states']) & {1, 12, 23, 25, 30})})
+    return summary
+
+
 def network_panel_evidence(window):
     evidence = []
     keys = ('atspi', 'name', 'role_name', 'states', 'process')
@@ -1642,11 +1659,14 @@ def prepare(args, directory, deadline, cache):
     for argv, role in fixture_launch_plan(fixture['directories']):
         deadline.remaining()
         child_env = environment
-        if argv[0] == APPS[1]:
+        if argv[0] == APPS[1] and args['profile'] == 'tuna':
             # gnome-control-center refuses to start unless the session
             # advertises GNOME or Unity. The Tuna session lists GNOME as a
             # compatible desktop for this fixture (same precedent as the GTK
             # portal proofs); the observed Settings window is unaffected.
+            # The GNOME leg keeps its true session desktop: lying to a
+            # GNOME-session child about its desktop is unneeded there and
+            # perturbs undefined behavior switches.
             child_env = dict(environment, XDG_CURRENT_DESKTOP='Tuna:GNOME')
         child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.PIPE, env=child_env, user=UID,
@@ -1697,9 +1717,15 @@ def prepare(args, directory, deadline, cache):
     except Exception as error:
         tails = {role: drain.text() for role, drain in drains.items()}
         statuses = format_child_status(children, fixture_launch_plan(fixture['directories']))
-        raise RuntimeError('%s; launches=%s; stderr_tails=%s; child_status=%s' % (
+        try:
+            final = public_observation(environment, admitted, Deadline(3))
+            census = fixture_node_summary(final['trees'])
+        except Exception as census_error:
+            census = 'unavailable: %s: %s' % (type(census_error).__name__, census_error)
+        raise RuntimeError('%s; launches=%s; stderr_tails=%s; child_status=%s; fixture_census=%s' % (
             error, json.dumps(fixture['launches'], sort_keys=True),
-            json.dumps(tails, sort_keys=True), json.dumps(statuses, sort_keys=True))) from error
+            json.dumps(tails, sort_keys=True), json.dumps(statuses, sort_keys=True),
+            json.dumps(census, sort_keys=True))) from error
     result['files'] = retained_files(directory, ('snapshot.json',))
     save(directory, 'snapshot.json', result)
     response = {'schema': 1, 'nonce': args['nonce'], 'profile': args['profile'], 'ready': True,

@@ -1415,6 +1415,32 @@ class BusPrecheck(unittest.TestCase):
         self.assertEqual(statuses['files-second']['exe'], '/usr/bin/other')
 
 
+class FixtureCensus(unittest.TestCase):
+    def test_summary_includes_every_fixture_node_regardless_of_role_or_states(self):
+        trees = [
+            {'process': {'exe': '/usr/bin/nautilus', 'pid': 1}, 'role_name': 'frame',
+             'name': 'first', 'states': [25, 30], 'children': []},
+            {'process': {'exe': '/usr/bin/gnome-control-center', 'pid': 2}, 'role_name': 'window',
+             'name': 'Settings', 'states': [], 'children': [
+                {'process': {'exe': '/usr/bin/gnome-control-center', 'pid': 2}, 'role_name': 'label',
+                 'name': 'x', 'states': [25], 'children': []}]},
+            {'process': {'exe': '/usr/bin/gnome-shell', 'pid': 3}, 'role_name': 'window',
+             'name': 'shell', 'states': [25, 30], 'children': []},
+        ]
+        summary = GUEST.fixture_node_summary(trees)
+        self.assertEqual([(entry['pid'], entry['role'], entry['states']) for entry in summary],
+                         [(1, 'frame', [25, 30]), (2, 'window', []), (2, 'label', [25])])
+
+    def test_summary_truncates_names_and_ignores_foreign_exes(self):
+        trees = [{'process': {'exe': '/usr/bin/other', 'pid': 9}, 'role_name': 'frame',
+                  'name': 'y', 'states': [25, 30], 'children': []},
+                 {'process': {'exe': '/usr/bin/nautilus', 'pid': 1}, 'role_name': 'frame',
+                  'name': 'n' * 100, 'states': [25], 'children': []}]
+        summary = GUEST.fixture_node_summary(trees)
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]['name'], 'n' * 60)
+
+
 class FixtureLaunch(unittest.TestCase):
     def test_settings_launches_last_with_stable_roles(self):
         plan = GUEST.fixture_launch_plan(['/d/first', '/d/second'])
@@ -1577,7 +1603,8 @@ class FixtureLaunch(unittest.TestCase):
         self.assertEqual(argv[2], [GUEST.APPS[1], 'network'])
         self.assertIn('first', argv[0][2])
         self.assertIn('second', argv[1][2])
-        self.assertEqual(launched[2][1]['env']['XDG_CURRENT_DESKTOP'], 'Tuna:GNOME')
+        # The GNOME leg keeps its true session desktop; only Tuna overrides.
+        self.assertNotIn('XDG_CURRENT_DESKTOP', launched[2][1]['env'])
         self.assertNotIn('XDG_CURRENT_DESKTOP', launched[0][1]['env'])
         self.assertNotIn('XDG_CURRENT_DESKTOP', launched[1][1]['env'])
         for _, kwargs in launched:
@@ -1596,6 +1623,16 @@ class FixtureLaunch(unittest.TestCase):
         # Second Nautilus forwards; Settings and first Nautilus are principals.
         self.assertEqual(len(claim['fixture']['processes']), 2)
         self.assertEqual(len(claim['fixture']['launchers']), 1)
+
+    def test_prepare_tuna_profile_overrides_settings_desktop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claim, launched, Child, FakePath = self._prepare_fixture()
+            self._prepare_mocks(tmp, claim, launched, Child, FakePath)
+            with mock.patch.object(GUEST, 'snapshot_until_ready',
+                                   return_value={'selection': {}, 'snapshot': True}):
+                GUEST.prepare({'profile': 'tuna', 'nonce': NONCE}, Path(tmp),
+                              GUEST.Deadline(3), {})
+        self.assertEqual(launched[2][1]['env']['XDG_CURRENT_DESKTOP'], 'Tuna:GNOME')
 
     def test_prepare_bus_prime_failure_is_loud(self):
         with tempfile.TemporaryDirectory() as tmp:

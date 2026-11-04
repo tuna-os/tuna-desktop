@@ -764,9 +764,10 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
             self.assertTrue(all(size < 262144 for size in guest.wire_sizes))
             self.assertTrue(any(offset > 0 for _, offset, _ in guest.file_requests))
             self.assertTrue(all(limit <= 262144 for _, _, limit in guest.file_requests))
-            self.assertEqual(len(receipt['wire_responses']), 18)  # +2 settle polls, +2 dismiss observes
+            self.assertEqual(len(receipt['wire_responses']), 20)  # +2 settle, +2 dismiss, +2 settle-stable
             self.assertEqual(receipt['settle_polls'],
-                             {'overview-dismiss': 1, 'applications-released': 1, 'windows-released': 1})
+                             {'overview-dismiss': 1, 'overview-settle': 2,
+                              'applications-released': 1, 'windows-released': 1})
             first = receipt['wire_responses'][0]
             raw = (root / first['artifact']['path']).read_bytes()
             self.assertGreater(len(raw), 262144)
@@ -902,6 +903,48 @@ class SettlePollTests(unittest.TestCase):
             {'role_name': 'push button', 'name': 'Activities', 'states': [25, 30], 'children': []}]}}
         self.assertFalse(proof.overview_search_visible(desktop))
         self.assertFalse(proof.overview_search_visible({'selection': {'objects': []}}))
+
+    def test_stable_pair_returns_after_two_polls_without_sleep(self):
+        sleeps = []
+        snapshot, polls = proof.poll_until_stable(
+            lambda: 'same', lambda snap: snap, 15,
+            clock=lambda: 0.0, sleep_fn=sleeps.append)
+        self.assertEqual((snapshot, polls, sleeps), ('same', 2, []))
+
+    def test_changing_context_settles_on_third_poll(self):
+        now, sleeps = [0.0], []
+        script = iter(['a', 'b', 'b'])
+
+        def observe():
+            snap = next(script)
+            now[0] += 1.9
+            return snap
+
+        def sleep(secs):
+            sleeps.append(secs)
+            now[0] += secs
+
+        snapshot, polls = proof.poll_until_stable(
+            observe, lambda snap: snap, 15, clock=lambda: now[0], sleep_fn=sleep)
+        self.assertEqual(snapshot, 'b')
+        self.assertEqual(polls, 3)
+        self.assertEqual(sleeps, [1.0])
+
+    def test_unstable_context_times_out_with_last_snapshot(self):
+        now, seen = [0.0], []
+
+        def observe():
+            now[0] += 1.9
+            seen.append(len(seen))
+            return len(seen)
+
+        def sleep(secs):
+            now[0] += secs
+
+        snapshot, polls = proof.poll_until_stable(
+            observe, lambda snap: snap, 15, clock=lambda: now[0], sleep_fn=sleep)
+        self.assertEqual(snapshot, len(seen))  # caller still gates on a fresh capture
+        self.assertGreaterEqual(polls, 5)
 
     def test_predicate_sees_every_observation_in_order(self):
         seen = []

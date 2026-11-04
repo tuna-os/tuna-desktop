@@ -850,6 +850,29 @@ def overview_search_visible(snapshot):
     return bool(found)
 
 
+def poll_until_stable(observe_fn, key_fn, timeout_s, clock, sleep_fn):
+    """Poll `observe_fn()` until two consecutive `key_fn` values agree.
+
+    Dismissing the overview starts a close animation: the search entry vanishes
+    before window states and selection settle, so a single overview-free
+    observation is not a stable baseline. Returns the last snapshot plus the
+    poll count; on timeout the caller still gates on a fresh capture.
+    """
+    polls, start = 0, clock()
+    previous = key_fn(observe_fn())
+    polls += 1
+    while True:
+        snapshot = observe_fn()
+        polls += 1
+        if key_fn(snapshot) == previous:
+            break
+        previous = key_fn(snapshot)
+        if clock() - start >= timeout_s:
+            break
+        sleep_fn(1.0)
+    return snapshot, polls
+
+
 def poll_until_settled(observe_fn, predicate, timeout_s, clock, sleep_fn):
     """Poll `observe_fn()` until `predicate` holds or `timeout_s` elapses.
 
@@ -971,6 +994,8 @@ def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
         dismissed = observe()
         require(not overview_search_visible(dismissed),
                 'overview did not dismiss before baseline; switcher commits would park')
+        _, settle_polls = poll_until_stable(observe, stable_context, 15, time.monotonic, time.sleep)
+        receipt.setdefault('settle_polls', {})['overview-settle'] = settle_polls
         baseline = capture('before')
         require(active_role(baseline) == 'settings', 'baseline is not actual active Settings')
         app, window = receipt['actions']
