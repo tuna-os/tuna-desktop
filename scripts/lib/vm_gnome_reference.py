@@ -56,13 +56,16 @@ def profile_name(profile):
 def guest_call(agent, op, profile, nonce=None, *, retention=None, **payload):
     require(op in ('admit', 'prepare', 'observe', 'file', 'stop'), 'unknown fixed operation')
     profile_name(profile)
-    body = {'budget_s': 25, **payload}
+    # Prepare alone gets headroom: fixture startup under a saturated session bus
+    # needs air between readiness samples. All other ops stay at 25s/30s.
+    budget, timeout = (60, 70) if op == 'prepare' else (25, 30)
+    body = {'budget_s': budget, **payload}
     if op != 'file':
         body['profile'] = profile
     if nonce is not None:
         require(re.fullmatch('[0-9a-f]{32}', nonce) is not None, 'invalid claim nonce')
         body['nonce'] = nonce
-    value = agent.run('gnome-reference', op, json.dumps(body, sort_keys=True), timeout=30)
+    value = agent.run('gnome-reference', op, json.dumps(body, sort_keys=True), timeout=timeout)
     require(isinstance(value, dict), 'guest operation returned no object')
     require(('response_file' in value) == (op in ('prepare', 'observe', 'stop')),
             'fixed operation did not use its required immutable response-file envelope')
@@ -986,7 +989,14 @@ def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
         validate_admission(receipt['admission'], profile)
         validate_topology(receipt)
         attempted = True  # prepare may fail after claiming ownership.
-        prepared = guest_call(agent, 'prepare', profile, nonce, retention=(out, receipt))
+        try:
+            prepared = guest_call(agent, 'prepare', profile, nonce, retention=(out, receipt))
+        except BaseException:
+            try:
+                qmp.frame(str(out / 'prepare-failed.png'))
+            except BaseException:
+                pass
+            raise
         receipt['prepare'] = prepared
         require(prepared.get('ready') is True and prepared.get('nonce') == nonce, 'fixture prepare rejected')
         initial = validate_snapshot(prepared['snapshot'], profile, nonce)

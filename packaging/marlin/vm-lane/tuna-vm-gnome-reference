@@ -42,9 +42,9 @@ CLOCK = 'guest CLOCK_MONOTONIC'
 
 
 class Deadline:
-    def __init__(self, seconds):
-        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or not 0 < seconds <= 25:
-            raise ValueError('budget_s must be finite, positive and <=25')
+    def __init__(self, seconds, cap=25):
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or not 0 < seconds <= cap:
+            raise ValueError('budget_s must be finite, positive and <=%s' % cap)
         self.end = time.monotonic() + seconds
 
     def remaining(self):
@@ -100,7 +100,11 @@ def payload(operation, value):
         if not allowed_receipt(value.get('name')):
             raise ValueError('receipt name is not allowlisted')
         file_range(value.get('offset', 0), value.get('limit', MAX_CHUNK_BYTES))
-    return Deadline(value.get('budget_s', 20))
+    # Prepare alone gets headroom: fixture startup under a saturated session
+    # bus needs air between readiness samples, and launches alone burn ~8s.
+    # Observe/file/stop stay at 25s so a hung walk still fails fast.
+    cap = 60 if operation == 'prepare' else 25
+    return Deadline(value.get('budget_s', 20), cap)
 
 
 def run(argv, deadline):
@@ -1112,6 +1116,9 @@ def session_observe(args, deadline, channel):
 
     print('observe start', file=sys.stderr, flush=True)
     roots = call(bus, registry_name, '/org/a11y/atspi/accessible/root', 'org.a11y.atspi.Accessible', 'GetChildren')[0]
+    if args.get('only_exes') is not None:
+        roots = admit_roots_by_owner(roots, owners, peers, set(args['only_exes']),
+                                     lambda name: owner(bus, name))
     trees = [tree(name, path) for name, path in roots]
     print('observe walk-complete nodes=%d elapsed_ms=%d owners=%d' % (
         count, (time.monotonic() - walk_start) * 1000, len(owners)), file=sys.stderr, flush=True)
@@ -1123,6 +1130,26 @@ def session_observe(args, deadline, channel):
         'atspi': {'address': address, 'registry': registry, 'peers': list(peers.values()),
                   'session_bus_peer': session_peer, 'bus_peer': bus_peer, 'launcher': a11y_launcher},
         'trees': trees, 'observed_monotonic_ns': time.monotonic_ns(), 'clock_domain': CLOCK})
+
+
+def admit_roots_by_owner(roots, owners, peers, only_exes, resolve):
+    """Pre-filter AT-SPI roots by owner exe, resolving owners once.
+
+    `resolve(bus_name)` returns (unique, principal); resolutions are cached in
+    `owners`/`peers` exactly as the tree walk does, so descending later reuses
+    them. Roots outside `only_exes` are dropped before any subtree walk: the
+    failure census only needs fixture exes, and skipping the giant shell tree
+    keeps it fast under saturation.
+    """
+    admitted = []
+    for name, path in roots:
+        if name not in owners:
+            unique, principal = resolve(name)
+            owners[name] = (unique, principal)
+            peers[principal['pid']] = principal
+        if owners[name][1]['exe'] in only_exes:
+            admitted.append((name, path))
+    return admitted
 
 
 def flatten(nodes):
@@ -1273,8 +1300,10 @@ def check_worker_status(returncode, stderr_text):
         raise RuntimeError('finite UID1000 public observation failed: ' + stderr_text[:3000])
 
 
-def public_observation(environment, admitted, deadline):
+def public_observation(environment, admitted, deadline, only_exes=None):
     worker_args = {'compositor': admitted['session']['compositor']}
+    if only_exes is not None:
+        worker_args['only_exes'] = sorted(only_exes)
     owner = pwd.getpwnam('tuna-test')
     observer = IdentityObserver(admitted, deadline)
     controller, child_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -1595,6 +1624,12 @@ def fixture_launch_plan(directories):
             ([APPS[1], 'network'], 'settings')]
 
 
+# Gap between readiness samples. A full AT-SPI walk saturates the session bus
+# the fixture needs to start; sampling with 100ms gaps hammers it (observer
+# effect), while 2s gaps let startup progress between samples.
+READINESS_POLL_GAP_S = 2.0
+
+
 def snapshot_until_ready(snapshot_fn, children, deadline):
     """Poll one full observation until the fixture is ready or time runs out.
 
@@ -1651,7 +1686,7 @@ def snapshot_until_ready(snapshot_fn, children, deadline):
                         child.args[0] if child.args else '<unknown>', status, tail)) from error
             if deadline.end - time.monotonic() < 0.2:
                 raise unready(error) from error
-            time.sleep(min(0.1, max(0.0, deadline.end - time.monotonic())))
+            time.sleep(min(READINESS_POLL_GAP_S, max(0.0, deadline.end - time.monotonic())))
         except TimeoutError as error:
             attempt_ms.append(int((time.monotonic() - started) * 1000))
             raise unready(error) from error
@@ -1745,7 +1780,7 @@ def prepare(args, directory, deadline, cache):
                              and n['role_name'] in ('frame', 'window') and 25 in n['states']]
                 if forwarded:
                     break
-                time.sleep(min(0.1, deadline.remaining()))
+                time.sleep(min(READINESS_POLL_GAP_S, deadline.remaining()))
         # First Nautilus must own its GApplication name before second launch.
         if argv[0] == APPS[0] and not nautilus_primed:
             nautilus_primed = True
@@ -1761,7 +1796,7 @@ def prepare(args, directory, deadline, cache):
         owners = {bus_name: bus_name_owner_probe(bus_name, environment, owner.pw_gid)
                   for bus_name in (NAUTILUS_BUS_NAME, SETTINGS_BUS_NAME)}
         try:
-            final = public_observation(environment, admitted, Deadline(3))
+            final = public_observation(environment, admitted, Deadline(10), only_exes=set(APPS))
             census = fixture_node_summary(final['trees'])
         except Exception as census_error:
             census = 'unavailable: %s: %s' % (type(census_error).__name__, census_error)
@@ -1781,8 +1816,11 @@ def prepare(args, directory, deadline, cache):
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == '_observe':
         value = json.loads(sys.stdin.buffer.read(65537))
-        if set(value) != {'compositor', 'budget_s'}:
+        if set(value) - {'compositor', 'budget_s', 'only_exes'} or 'compositor' not in value or 'budget_s' not in value:
             raise ValueError('fixed observation arguments required')
+        if 'only_exes' in value and (not isinstance(value['only_exes'], list)
+                                     or not all(isinstance(item, str) for item in value['only_exes'])):
+            raise ValueError('only_exes must be a list of strings')
         try:
             with socket.socket(fileno=int(sys.argv[2])) as channel:
                 result = session_observe(value, Deadline(value['budget_s']), channel)

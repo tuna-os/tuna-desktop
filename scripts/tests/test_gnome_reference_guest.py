@@ -47,6 +47,16 @@ class Arguments(unittest.TestCase):
             with self.subTest(budget=budget), self.assertRaises(ValueError):
                 GUEST.payload('admit', {'profile': 'gnome', 'budget_s': budget})
 
+    def test_prepare_alone_gets_headroom_others_stay_capped(self):
+        base = {'profile': 'gnome', 'nonce': NONCE}
+        self.assertGreater(GUEST.payload('prepare', {**base, 'budget_s': 60}).remaining(), 0)
+        with self.assertRaises(ValueError):
+            GUEST.payload('prepare', {**base, 'budget_s': 61})
+        with self.assertRaises(ValueError):
+            GUEST.payload('observe', {**base, 'budget_s': 26})
+        with self.assertRaises(ValueError):
+            GUEST.payload('stop', {**base, 'budget_s': 60})
+
     def test_no_override_exec_alias_path_or_nonce_coercion(self):
         for extra in ('command', 'env', 'client_name', 'unsafeEval', 'TUNA_STATE', 'WAYLAND_DEBUG'):
             with self.subTest(extra=extra), self.assertRaises(ValueError):
@@ -1084,6 +1094,22 @@ class ControlledObservationEvidence(unittest.TestCase):
         self.assertIn('last: ObservationTimeout: finite public observation deadline expired', message)
         self.assertIsInstance(failed.exception.__cause__, GUEST.ObservationTimeout)
 
+    def test_readiness_backoff_gives_startup_air_between_samples(self):
+        deadline = GUEST.Deadline(25)
+        calls = []
+
+        def attempt():
+            calls.append(1)
+            if len(calls) == 1:
+                raise GUEST.FixtureNotReady('tab inventory []')
+            raise TimeoutError('expired')
+
+        with mock.patch.object(GUEST.time, 'sleep') as slept:
+            with self.assertRaises(RuntimeError):
+                GUEST.snapshot_until_ready(attempt, [], deadline)
+        slept.assert_called_once_with(GUEST.READINESS_POLL_GAP_S)
+        self.assertEqual(GUEST.READINESS_POLL_GAP_S, 2.0)
+
     def test_timeout_only_run_reports_last_without_first(self):
         deadline = GUEST.Deadline(25)
         deadline.end = 0
@@ -1467,6 +1493,23 @@ class FixtureCensus(unittest.TestCase):
         summary = GUEST.fixture_node_summary(trees)
         self.assertEqual([(entry['pid'], entry['role'], entry['states']) for entry in summary],
                          [(1, 'frame', [25, 30]), (2, 'window', []), (2, 'label', [25])])
+
+    def test_admit_roots_resolves_once_and_drops_foreign_exes(self):
+        resolved = []
+
+        def resolve(bus_name):
+            resolved.append(bus_name)
+            exe = {'a': '/usr/bin/nautilus', 'b': '/usr/bin/gnome-shell'}[bus_name]
+            return 'u-' + bus_name, {'pid': 10 + len(resolved), 'exe': exe}
+
+        owners = {'a': ('u-a', {'pid': 1, 'exe': '/usr/bin/nautilus'})}
+        peers = {}
+        admitted = GUEST.admit_roots_by_owner(
+            [('a', '/r1'), ('b', '/r2')], owners, peers, {'/usr/bin/nautilus'}, resolve)
+        self.assertEqual(admitted, [('a', '/r1')])
+        self.assertEqual(resolved, ['b'])
+        self.assertIn('b', owners)
+        self.assertEqual(peers[11]['exe'], '/usr/bin/gnome-shell')
 
     def test_summary_truncates_names_and_ignores_foreign_exes(self):
         trees = [{'process': {'exe': '/usr/bin/other', 'pid': 9}, 'role_name': 'frame',

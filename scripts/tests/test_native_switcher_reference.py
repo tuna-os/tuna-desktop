@@ -158,6 +158,7 @@ class ControlledGuest:
     def __init__(self, profile='gnome', failure=None):
         self.profile, self.failure = profile, failure
         self.nonce, self.files, self.calls, self.keys = None, {}, [], set()
+        self.budgets = []
         self.active, self.action, self.stamp = 'settings', 0, 0
         self.frame_count, self.stopped, self.capture_changed = 0, False, False
         self.stop_value = None
@@ -207,11 +208,13 @@ class ControlledGuest:
         return value
 
     def run(self, route, op, payload, *, timeout):
-        if route != 'gnome-reference' or timeout > 30:
+        budget_cap, timeout_cap = (60, 70) if op == 'prepare' else (25, 30)
+        if route != 'gnome-reference' or timeout > timeout_cap:
             raise AssertionError('unbounded/nonfixed guest route')
         args = json.loads(payload)
-        if args['budget_s'] > 25:
+        if args['budget_s'] > budget_cap:
             raise AssertionError('unbounded guest request')
+        self.budgets.append((op, args['budget_s'], timeout))
         if op == 'file':
             if set(args) != {'nonce', 'name', 'offset', 'limit', 'budget_s'} or not 0 < args['limit'] <= 262144:
                 raise AssertionError('file operation accepts no profile or arbitrary fields')
@@ -221,6 +224,8 @@ class ControlledGuest:
         if op == 'admit':
             return admission(self.profile)
         if op == 'prepare':
+            if self.failure == 'prepare':
+                raise RuntimeError('controlled prepare failure')
             self.nonce = args['nonce']
             value = self.observe()
             self.store('claim.json', {'schema': 1, 'profile': self.profile, 'nonce': self.nonce,
@@ -388,6 +393,28 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
         for profile in ('gnome', 'tuna'):
             self.collect(root / profile, profile)
         return root / 'gnome/member.json', root / 'tuna/member.json'
+
+    def test_prepare_failure_retains_screendump_and_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guest, clock, records = ControlledGuest(failure='prepare'), Clock(), []
+            base = self.base_evidence(directory)
+            with patch.object(proof.time, 'monotonic_ns', clock.ns), patch.object(proof.time, 'sleep', clock.sleep):
+                with self.assertRaises(RuntimeError):
+                    proof.run(guest, guest, directory, lambda *r: records.append(r),
+                              profile='gnome', provenance=provenance('gnome'), base_evidence_dir=base)
+            receipt = json.loads((Path(directory) / 'member.json').read_bytes())
+            self.assertFalse(receipt['ready'])
+            self.assertIn('controlled prepare failure', receipt['error']['message'])
+            self.assertTrue((Path(directory) / 'prepare-failed.png').exists())
+            self.assertEqual(guest.frame_count, 1)
+
+    def test_prepare_budget_exceeds_observe_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, guest, _ = self.collect(Path(directory))
+            budgets = dict((op, (budget, timeout)) for op, budget, timeout in guest.budgets)
+            self.assertEqual(budgets['prepare'], (60, 70))
+            self.assertEqual(budgets['observe'], (25, 30))
+            self.assertEqual(budgets['file'], (25, 30))
 
     def test_controlled_collection_brackets_real_retained_png_bytes_and_input_bounds(self):
         with tempfile.TemporaryDirectory() as directory:
