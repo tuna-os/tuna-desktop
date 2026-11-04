@@ -370,9 +370,10 @@ class GuestAgent:
         path = "/usr/libexec/tuna-vm-lifecycle"
         argv = [action, *map(str, arguments)]
         if action == "gnome-reference":
-            # Prepare alone gets headroom (120s guest budget for fixture startup
-            # under a saturated bus); all other ops keep the 30s transport cap.
-            timeout_cap = 130 if arguments[:1] == ("prepare",) else 30
+            # Prepare alone gets headroom (240s guest budget: round-18 showed
+            # GNOME Settings absent from every poll walk for 107s); all other
+            # ops keep the 30s transport cap.
+            timeout_cap = 250 if arguments[:1] == ("prepare",) else 30
             if (len(arguments) != 2 or arguments[0] not in {"admit", "prepare", "observe", "file", "stop"}
                     or type(arguments[1]) is not str or not 0 < timeout <= timeout_cap):
                 raise ValueError("reference action requires one finite operation, JSON and at most %d seconds"

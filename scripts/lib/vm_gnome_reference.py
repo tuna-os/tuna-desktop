@@ -56,9 +56,10 @@ def profile_name(profile):
 def guest_call(agent, op, profile, nonce=None, *, retention=None, **payload):
     require(op in ('admit', 'prepare', 'observe', 'file', 'stop'), 'unknown fixed operation')
     profile_name(profile)
-    # Prepare alone gets headroom (measured 46s stall; 120s budget / 130s transport).
-    # All other ops stay at 25s/30s.
-    budget, timeout = (120, 130) if op == 'prepare' else (25, 30)
+    # Prepare alone gets headroom (round-18: GNOME Settings stayed absent
+    # from every poll walk for 107s; 240s budget / 250s transport tests
+    # slow-registration against poll-suppression). All other ops stay at 25s/30s.
+    budget, timeout = (240, 250) if op == 'prepare' else (25, 30)
     body = {'budget_s': budget, **payload}
     if op != 'file':
         body['profile'] = profile

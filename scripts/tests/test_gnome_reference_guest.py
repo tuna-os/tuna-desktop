@@ -49,9 +49,9 @@ class Arguments(unittest.TestCase):
 
     def test_prepare_alone_gets_headroom_others_stay_capped(self):
         base = {'profile': 'gnome', 'nonce': NONCE}
-        self.assertGreater(GUEST.payload('prepare', {**base, 'budget_s': 120}).remaining(), 0)
+        self.assertGreater(GUEST.payload('prepare', {**base, 'budget_s': 240}).remaining(), 0)
         with self.assertRaises(ValueError):
-            GUEST.payload('prepare', {**base, 'budget_s': 121})
+            GUEST.payload('prepare', {**base, 'budget_s': 241})
         with self.assertRaises(ValueError):
             GUEST.payload('observe', {**base, 'budget_s': 26})
         with self.assertRaises(ValueError):
@@ -1680,11 +1680,14 @@ class FixtureLaunch(unittest.TestCase):
                 mock.Mock(side_effect=GUEST.FixtureNotReady('inventory nope')),
                 [], GUEST.Deadline(0.05))
         self.assertRegex(str(failure.exception),
-                         r'last: FixtureNotReady: inventory nope; attempts=1 attempt_ms=\[\d+\]$')
+                         r'last: FixtureNotReady: inventory nope; attempts=1 attempt_ms=\[\d+\] '
+                         r'outcomes=\[FixtureNotReady: inventory nope\]$')
         with self.assertRaises(RuntimeError) as timeout:
             GUEST.snapshot_until_ready(
                 mock.Mock(side_effect=TimeoutError('deadline gone')), [], GUEST.Deadline(0.05))
-        self.assertRegex(str(timeout.exception), r'last: TimeoutError: deadline gone; attempts=1 attempt_ms=\[\d+\]$')
+        self.assertRegex(str(timeout.exception),
+                         r'last: TimeoutError: deadline gone; attempts=1 attempt_ms=\[\d+\] '
+                         r'outcomes=\[TimeoutError: deadline gone\]$')
 
         def distinct_not_ready():
             raise GUEST.FixtureNotReady('inventory nope')
@@ -1693,11 +1696,37 @@ class FixtureLaunch(unittest.TestCase):
             GUEST.snapshot_until_ready(distinct_not_ready, [], GUEST.Deadline(1))
         message = str(repeated.exception)
         self.assertIn('first: FixtureNotReady: inventory nope', message)
-        match = re.search(r'; attempts=(\d+) attempt_ms=\[([\d, ]*)\]$', message)
+        match = re.search(r'; attempts=(\d+) attempt_ms=\[([\d, ]*)\] outcomes=\[(.*)\]$', message)
         self.assertIsNotNone(match)
         durations = [entry for entry in match.group(2).split(',') if entry.strip()]
         self.assertGreaterEqual(int(match.group(1)), 2)
         self.assertEqual(len(durations), int(match.group(1)))
+        outcomes = match.group(3).split('|')
+        self.assertEqual(len(outcomes), int(match.group(1)))
+        self.assertTrue(all(entry == 'FixtureNotReady: inventory nope' for entry in outcomes))
+
+    def test_snapshot_retry_outcomes_reveal_mid_budget_fixture_movement(self):
+        calls = []
+
+        def moving_fixture():
+            calls.append(1)
+            if len(calls) < 3:
+                raise GUEST.FixtureNotReady('actual fixture window inventory is incomplete')
+            raise GUEST.FixtureNotReady('original Settings Network window is not actually active')
+
+        with mock.patch.object(GUEST, 'READINESS_POLL_GAP_S', 0):
+            with self.assertRaises(RuntimeError) as failure:
+                GUEST.snapshot_until_ready(moving_fixture, [], GUEST.Deadline(0.3))
+        message = str(failure.exception)
+        self.assertIn('first: FixtureNotReady: actual fixture window inventory is incomplete', message)
+        match = re.search(r'outcomes=\[(.*)\]$', message)
+        self.assertIsNotNone(match)
+        outcomes = match.group(1).split('|')
+        self.assertGreaterEqual(len(outcomes), 3)
+        self.assertEqual(outcomes[0], 'FixtureNotReady: actual fixture window inventory is incomplete')
+        self.assertEqual(outcomes[1], 'FixtureNotReady: actual fixture window inventory is incomplete')
+        self.assertTrue(all(entry == 'FixtureNotReady: original Settings Network window is not actually active'
+                              for entry in outcomes[2:]))
 
     def _prepare_fixture(self):
         claim = {'nonce': NONCE, 'profile': 'gnome',

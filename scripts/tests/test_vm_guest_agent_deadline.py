@@ -234,7 +234,7 @@ class Tests(unittest.TestCase):
                 (("exec", "{}"), 30), (("observe", "[]"), 30),
                 (("observe", "{}"), 31), (("observe", "{}"), 0),
                 (("observe", "{}"), float("nan")), (("observe",), 30),
-                (("prepare", "{}"), 131), (("prepare", "{}"), 0)):
+                (("prepare", "{}"), 251), (("prepare", "{}"), 0)):
             with self.subTest(arguments=arguments, timeout=timeout):
                 with mock.patch.object(actor, "command") as command:
                     with self.assertRaises(ValueError):
@@ -252,7 +252,7 @@ class Tests(unittest.TestCase):
             return {'exited': True, 'exitcode': 0, 'out-data': 'e30='}
 
         with mock.patch.object(actor, 'command', side_effect=command) as started:
-            self.assertEqual(actor.run("gnome-reference", "prepare", "{}", timeout=130), {})
+            self.assertEqual(actor.run("gnome-reference", "prepare", "{}", timeout=250), {})
         started.assert_called()
         self.assertIsNone(actor.pending_guest_pid)
 

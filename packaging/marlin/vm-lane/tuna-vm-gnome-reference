@@ -100,11 +100,13 @@ def payload(operation, value):
         if not allowed_receipt(value.get('name')):
             raise ValueError('receipt name is not allowlisted')
         file_range(value.get('offset', 0), value.get('limit', MAX_CHUNK_BYTES))
-    # Prepare alone gets headroom (measured 46s Settings stall under GNOME
-    # autostart contention; 120s gives 2.5x margin): fixture startup needs air
-    # between readiness samples, and launches alone burn ~8s. Observe/file/stop
-    # stay at 25s so a hung walk still fails fast.
-    cap = 120 if operation == 'prepare' else 25
+    # Prepare alone gets headroom (round-18: GNOME Settings stayed absent
+    # from every poll walk for 107s then mapped fully seconds after polling
+    # stopped, so 240s tests slow-registration against poll-suppression):
+    # fixture startup needs air between readiness samples, and launches
+    # alone burn ~8s. Observe/file/stop stay at 25s so a hung walk still
+    # fails fast.
+    cap = 240 if operation == 'prepare' else 25
     return Deadline(value.get('budget_s', 20), cap)
 
 
@@ -1764,16 +1766,24 @@ def snapshot_until_ready(snapshot_fn, children, deadline):
     the cause — never a naked deadline.
     Attempt counts and per-attempt milliseconds ride along so a red run
     also reports whether the budget went to many fast attempts or a few
-    slow walks.
+    slow walks. The per-attempt outcome sequence (error type plus message
+    head) rides along too, so a red run shows whether every attempt saw
+    the same not-ready state or the fixture moved mid-budget.
     """
     first_state_error = None
     attempt_ms = []
+    outcomes = []
+
+    def record(error):
+        attempt_ms.append(int((time.monotonic() - started) * 1000))
+        outcomes.append(('%s: %s' % (type(error).__name__, error))[:100].replace('|', '/'))
 
     def unready(error):
         detail = 'last: %s: %s' % (type(error).__name__, error)
         if first_state_error is not None and first_state_error is not error:
             detail = 'first: %s: %s; %s' % (type(first_state_error).__name__, first_state_error, detail)
-        detail += '; attempts=%d attempt_ms=%s' % (len(attempt_ms), attempt_ms)
+        detail += '; attempts=%d attempt_ms=%s outcomes=[%s]' % (
+            len(attempt_ms), attempt_ms, '|'.join(outcomes))
         return RuntimeError('actual fixture observation never became ready: ' + detail)
 
     while True:
@@ -1791,7 +1801,7 @@ def snapshot_until_ready(snapshot_fn, children, deadline):
                                       + repr(identity))
             return result
         except FixtureNotReady as error:
-            attempt_ms.append(int((time.monotonic() - started) * 1000))
+            record(error)
             if not isinstance(error, ObservationTimeout) and first_state_error is None:
                 first_state_error = error
             for child in children:
@@ -1808,7 +1818,7 @@ def snapshot_until_ready(snapshot_fn, children, deadline):
                 raise unready(error) from error
             time.sleep(min(READINESS_POLL_GAP_S, max(0.0, deadline.end - time.monotonic())))
         except TimeoutError as error:
-            attempt_ms.append(int((time.monotonic() - started) * 1000))
+            record(error)
             raise unready(error) from error
 
 
