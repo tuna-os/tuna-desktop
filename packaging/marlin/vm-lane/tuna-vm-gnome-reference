@@ -1255,15 +1255,15 @@ def window_context(trees, fixture, shell, require_shell=True):
     if len(set(ids)) != 3:
         raise RuntimeError('fixture windows do not have distinct actual AT-SPI identities')
     active = [w for w in windows if 1 in w['states']]
-    if not active:
-        states = sorted((w['role'], sorted(set(w['states']) & {1, 12, 23, 25, 30})) for w in windows)
-        shell_nodes = [n for n in flatten(shell_trees) if n['process']['pid'] == shell['pid']]
-        focused = sorted({n['name'] for n in shell_nodes if 12 in n['states']})[:8]
-        selected = sorted({n['name'] for n in shell_nodes if 23 in n['states']})[:8]
-        raise FixtureNotReady('actual active application window is not yet exposed; window states '
-                              + repr(states) + '; shell focused ' + repr(focused)
-                              + ' selected ' + repr(selected))
-    if len(active) != 1:
+    # No active fixture window is an observable member-flow state, not a
+    # fatal one (round-23: the app switcher holds a shell grab while Super
+    # is held, so every held-phase observation legitimately sees three
+    # visible-but-inactive windows; a post-commit gap looks the same). The
+    # inventory above is intact, and the selection below carries the same
+    # window states plus shell focused/selected evidence the old raise
+    # formatted, so return it and let the host predicates judge readiness.
+    # Prepare still requires active Settings via snapshot_until_ready.
+    if len(active) > 1:
         raise RuntimeError('actual active application window is unavailable or ambiguous')
     shell_nodes = [n for n in flatten(shell_trees) if n['process']['pid'] == shell['pid']]
     leaf = lambda n: {k: n[k] for k in ('atspi', 'name', 'role_name', 'states', 'process')}
@@ -1799,8 +1799,9 @@ def snapshot_until_ready(snapshot_fn, children, deadline):
         started = time.monotonic()
         try:
             result = snapshot_fn()
-            owner = result['selection']['active_windows'][0]
-            if owner['role'] != 'settings':
+            seen = result['selection']['active_windows']
+            owner = seen[0] if seen else {}
+            if owner.get('role') != 'settings':
                 # Error-path introspection must never mask the verdict:
                 # defensive gets, since a malformed active record is still
                 # "Settings is not active".

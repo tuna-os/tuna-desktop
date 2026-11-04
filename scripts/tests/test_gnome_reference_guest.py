@@ -1128,16 +1128,51 @@ class ControlledAtspi(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(RuntimeError):
                 GUEST.window_context(trees, fixture, shell)
 
-    def test_unexposed_active_window_reports_states_and_shell_focus(self):
+    def test_inactive_fixture_returns_observable_switcher_state(self):
+        # Round-23: the app switcher holds a shell grab while Super is
+        # held, so no-active-window is a pollable observation (host
+        # predicates judge readiness), not FixtureNotReady. The states and
+        # shell focus the old raise formatted ride in the observation.
         trees, fixture, shell = self.context()
         trees[2]['children'][0]['states'] = [25, 30]
         trees[0]['children'][0]['states'] = [12, 23, 25, 30]
-        with self.assertRaises(GUEST.FixtureNotReady) as failed:
-            GUEST.window_context(trees, fixture, shell)
+        windows, selection = GUEST.window_context(trees, fixture, shell)
+        self.assertEqual(selection['active_windows'], [])
+        self.assertEqual(sorted(w['role'] for w in windows), ['files-first', 'files-second', 'settings'])
+        self.assertTrue(all(25 in w['states'] and 30 in w['states'] for w in windows))
+        settings = [w for w in windows if w['role'] == 'settings'][0]
+        self.assertTrue(settings['panel_evidence'])
+        self.assertEqual([n['name'] for n in selection['selected']], ['Files'])
+        self.assertEqual([n['name'] for n in selection['focused']], ['Files'])
+
+    def test_until_ready_retries_empty_active_until_settings(self):
+        seen = [{'selection': {'active_windows': []}} for _ in range(2)]
+        seen.append({'selection': {'active_windows': [{'role': 'settings'}]}})
+        calls = []
+        def probe():
+            calls.append(True)
+            return seen[min(len(calls) - 1, 2)]
+        with mock.patch.object(GUEST, 'READINESS_POLL_GAP_S', 0):
+            result = GUEST.snapshot_until_ready(probe, [], GUEST.Deadline(20))
+        self.assertEqual(result, seen[2])
+        self.assertEqual(len(calls), 3)
+
+    def test_until_ready_reports_persistent_empty_active_as_not_ready(self):
+        calls = []
+        def probe():
+            calls.append(True)
+            return {'selection': {'active_windows': []}}
+        deadline = GUEST.Deadline(20)
+        deadline.end = GUEST.time.monotonic() + 0.25
+        with mock.patch.object(GUEST, 'READINESS_POLL_GAP_S', 0):
+            with self.assertRaises(RuntimeError) as failed:
+                GUEST.snapshot_until_ready(probe, [], deadline)
         message = str(failed.exception)
-        self.assertIn('actual active application window is not yet exposed', message)
-        self.assertIn("window states [('files-first', [25, 30])", message)
-        self.assertIn("shell focused ['Files'] selected ['Files']", message)
+        self.assertIn('never became ready', message)
+        self.assertIn('attempts=', message)
+        self.assertIsInstance(failed.exception.__cause__, GUEST.FixtureNotReady)
+        self.assertIn('not actually active', str(failed.exception.__cause__))
+        self.assertGreater(len(calls), 1)
 
     def test_light_context_skips_shell_tree_requirement(self):
         trees, fixture, shell = self.context()

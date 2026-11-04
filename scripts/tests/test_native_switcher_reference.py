@@ -1064,5 +1064,25 @@ class SettlePollTests(unittest.TestCase):
         self.assertEqual((snapshot, polls), (3, 2))
 
 
+class EmptyActiveTests(unittest.TestCase):
+    # Round-23: no active window (switcher grab, commit gap) is an
+    # observable state. Predicates must poll through it, never crash.
+    def snap(self, role):
+        active = [] if role == '' else [{'role': role}]
+        return {'selection': {'active_windows': active}}
+
+    def test_active_role_empty_is_gap_not_crash(self):
+        self.assertEqual(proof.active_role(self.snap('')), '')
+        self.assertEqual(proof.active_role(self.snap('settings')), 'settings')
+        self.assertFalse(''.startswith('files-'))
+
+    def test_released_to_different_excludes_gap(self):
+        committed = self.snap('files-first')
+        self.assertFalse(proof.released_to_different(self.snap(''), committed))
+        self.assertFalse(proof.released_to_different(self.snap('files-first'), committed))
+        self.assertTrue(proof.released_to_different(self.snap('files-second'), committed))
+        self.assertTrue(proof.released_to_different(self.snap('settings'), committed))
+
+
 if __name__ == '__main__':
     unittest.main()

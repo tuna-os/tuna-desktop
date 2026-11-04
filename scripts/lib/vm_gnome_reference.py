@@ -433,7 +433,23 @@ def validate_snapshot(value, profile, nonce):
 
 
 def active_role(snapshot):
-    return snapshot['selection']['active_windows'][0]['role']
+    # Empty active is an observable state (round-23: switcher grab while a
+    # modifier is held, or a post-commit gap), never a crash: '' keeps the
+    # applications-released startswith predicate polling and fails the
+    # baseline/settings requires honestly. Callers testing "a different
+    # window activated" must exclude '' explicitly (see windows-released).
+    windows = snapshot['selection']['active_windows']
+    return windows[0]['role'] if windows else ''
+
+
+def released_to_different(snapshot, committed):
+    """A different window is actually active after release.
+
+    A commit gap (no active window) never qualifies: '' differs from every
+    role string, so it must be excluded explicitly or a gap observation
+    would satisfy "a different window activated".
+    """
+    return active_role(snapshot) not in ('', active_role(committed))
 
 
 def normalize_admission(admission):
@@ -1071,8 +1087,8 @@ def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
         capture('windows-held', True, anchor)
         require(not physical.release(), 'window modifier release failed')
         final = capture_settled('windows-released',
-                                lambda snap: active_role(snap) != active_role(committed), 15)
-        require(active_role(final) != active_role(committed),
+                                lambda snap: released_to_different(snap, committed), 15)
+        require(released_to_different(final, committed),
                 'window switch did not activate a different actual original window')
         validate_phase_context(receipt)
     except BaseException as error:
