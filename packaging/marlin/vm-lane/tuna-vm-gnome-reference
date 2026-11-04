@@ -1643,6 +1643,8 @@ def format_child_status(children, plan):
 
     Distinguishes windowless-but-running (status None, original exe) from a
     handoff exit (status 0) and from PID reuse (status None, foreign exe).
+    Live processes also report scheduler state and wait channel: D-state is a
+    disk stall, S-state on a socket/futex a peer stall, R-state live work.
     """
     statuses = {}
     for (argv, role), child in zip(plan, children):
@@ -1651,7 +1653,20 @@ def format_child_status(children, plan):
             exe = os.readlink('/proc/%d/exe' % child.pid)
         except OSError:
             exe = '<exited>'
-        statuses[role] = {'pid': child.pid, 'status': status, 'exe': exe, 'argv0': argv[0]}
+        record = {'pid': child.pid, 'status': status, 'exe': exe, 'argv0': argv[0]}
+        if status is None and exe != '<exited>':
+            try:
+                state_line = next(line for line in
+                                  open('/proc/%d/status' % child.pid).read().splitlines()
+                                  if line.startswith('State:'))
+                record['state'] = state_line.split()[1]
+            except (OSError, StopIteration):
+                record['state'] = '?'
+            try:
+                record['wchan'] = open('/proc/%d/wchan' % child.pid).read().strip() or '?'
+            except OSError:
+                record['wchan'] = '?'
+        statuses[role] = record
     return statuses
 
 
@@ -1821,6 +1836,11 @@ def prepare(args, directory, deadline, cache):
             # (same precedent as the GTK portal proofs).
             desktop = 'GNOME' if args['profile'] == 'gnome' else 'Tuna:GNOME'
             child_env = dict(environment, XDG_CURRENT_DESKTOP=desktop)
+            if args['profile'] == 'gnome':
+                # Diagnostic until the GNOME-leg first-map stall is root-caused:
+                # GApplication lifecycle lines (register/activate/open) with
+                # timestamps localize the stall to a phase boundary.
+                child_env['G_MESSAGES_DEBUG'] = 'GApplication'
         child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.PIPE, env=child_env, user=UID,
                                  group=owner.pw_gid, extra_groups=[], start_new_session=True)

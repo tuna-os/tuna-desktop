@@ -1469,13 +1469,28 @@ class BusPrecheck(unittest.TestCase):
                 return '/usr/bin/other'
             raise OSError('gone')
 
-        with mock.patch.object(GUEST.os, 'readlink', side_effect=readlink):
+        with mock.patch.object(GUEST.os, 'readlink', side_effect=readlink), \
+                mock.patch('builtins.open', side_effect=OSError('gone')):
             statuses = GUEST.format_child_status([running, handoff, reused], plan)
-        self.assertEqual(statuses['files-first'], {'pid': 101, 'status': None,
-                                                   'exe': '/usr/bin/nautilus', 'argv0': '/usr/bin/nautilus'})
+        self.assertEqual(statuses['files-first']['pid'], 101)
+        self.assertEqual(statuses['files-first']['exe'], '/usr/bin/nautilus')
+        self.assertEqual((statuses['files-first']['state'], statuses['files-first']['wchan']), ('?', '?'))
         self.assertEqual(statuses['settings']['status'], 0)
         self.assertEqual(statuses['settings']['exe'], '<exited>')
+        self.assertNotIn('state', statuses['settings'])
         self.assertEqual(statuses['files-second']['exe'], '/usr/bin/other')
+
+    def test_child_status_reports_scheduler_state_and_wchan(self):
+        running = SimpleNamespace(pid=101, poll=lambda: None)
+        plan = [(['/usr/bin/gnome-control-center'], 'settings')]
+        status = 'Name:\tgnome-control-center\nState:\tS (sleeping)\nPid:\t101\n'
+        with mock.patch.object(GUEST.os, 'readlink', return_value='/usr/bin/gnome-control-center'), \
+                mock.patch('builtins.open', mock.mock_open(read_data=status)) as opened:
+            opened.side_effect = [mock.mock_open(read_data=status).return_value,
+                                  mock.mock_open(read_data='poll_schedule_timeout').return_value]
+            statuses = GUEST.format_child_status([running], plan)
+        self.assertEqual(statuses['settings']['state'], 'S')
+        self.assertEqual(statuses['settings']['wchan'], 'poll_schedule_timeout')
 
 
 class FixtureCensus(unittest.TestCase):
@@ -1746,6 +1761,7 @@ class FixtureLaunch(unittest.TestCase):
         self.assertIn('second', argv[1][2])
         # Both legs supply the desktop explicitly; the session env has none.
         self.assertEqual(launched[2][1]['env']['XDG_CURRENT_DESKTOP'], 'GNOME')
+        self.assertEqual(launched[2][1]['env']['G_MESSAGES_DEBUG'], 'GApplication')
         self.assertNotIn('XDG_CURRENT_DESKTOP', launched[0][1]['env'])
         self.assertNotIn('XDG_CURRENT_DESKTOP', launched[1][1]['env'])
         for _, kwargs in launched:
@@ -1774,6 +1790,7 @@ class FixtureLaunch(unittest.TestCase):
                 GUEST.prepare({'profile': 'tuna', 'nonce': NONCE}, Path(tmp),
                               GUEST.Deadline(3), {})
         self.assertEqual(launched[2][1]['env']['XDG_CURRENT_DESKTOP'], 'Tuna:GNOME')
+        self.assertNotIn('G_MESSAGES_DEBUG', launched[2][1]['env'])
 
     def test_prepare_quiets_indexers_and_retains_record(self):
         with tempfile.TemporaryDirectory() as tmp:
