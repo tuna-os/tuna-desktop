@@ -1075,6 +1075,60 @@ class SettlePollTests(unittest.TestCase):
         self.assertEqual((snapshot, polls), (3, 2))
 
 
+class PhaseContextTests(unittest.TestCase):
+    # Round-25 GNOME shape: the top-bar clock stays selected from baseline,
+    # while held, and after release; the St switcher item is an unnamed
+    # visible 'button' with the names on sibling labels.
+    def gnome_phases(self):
+        base = snapshot(held=False)
+        shell = base['selection']['shell_process']
+        clock = node(shell, 'clock', '05', 'button', [8, 11, 23, 24, 30])
+        base['selection']['selected'] = [copy.deepcopy(clock)]
+        base['selection']['objects'] = [{**copy.deepcopy(clock), 'children': []}]
+
+        def held(stamp, window_mode=False):
+            snap = snapshot(held=True, stamp=stamp, window_mode=window_mode)
+            item = node(shell, 'st-item-%d' % stamp, '', 'button', [8, 9, 10, 11, 23, 24, 25, 30])
+            snap['selection']['selected'] = [copy.deepcopy(clock), item]
+            tree = snap['selection']['objects'][0]
+            tree['children'].append(copy.deepcopy(clock))
+            tree['children'].append(copy.deepcopy(item))
+            return snap, item
+
+        def released_after():
+            snap = snapshot(held=False)
+            snap['selection']['selected'] = [copy.deepcopy(clock)]
+            return snap
+
+        app, app_item = held(1)
+        down, _ = held(2)
+        down['selection']['objects'][0]['children'].append(copy.deepcopy(app_item))
+        win, _ = held(4, window_mode=True)
+        idle = snapshot(held=False)
+        return [{'phase': 'before', 'before': base, 'after': base},
+                {'phase': 'applications-held', 'before': app, 'after': idle},
+                {'phase': 'applications-down-held', 'before': down, 'after': idle},
+                {'phase': 'applications-released', 'before': idle, 'after': released_after()},
+                {'phase': 'windows-held', 'before': win, 'after': idle},
+                {'phase': 'windows-released', 'before': idle, 'after': released_after()}]
+
+    def test_persistent_baseline_selection_is_not_switcher_evidence(self):
+        proof.validate_phase_context({'phases': self.gnome_phases()})
+
+    def test_stale_popup_selection_still_fails_release(self):
+        phases = self.gnome_phases()
+        stuck = phases[2]['before']['selection']['selected'][1]
+        phases[3]['after']['selection']['selected'].append(copy.deepcopy(stuck))
+        with self.assertRaisesRegex(ValueError, 'release left the old Shell popup selected'):
+            proof.validate_phase_context({'phases': phases})
+
+    def test_held_without_new_selection_fails(self):
+        phases = self.gnome_phases()
+        phases[1]['before']['selection']['selected'] = phases[1]['before']['selection']['selected'][:1]
+        with self.assertRaisesRegex(ValueError, 'no observed Shell switcher selection'):
+            proof.validate_phase_context({'phases': phases})
+
+
 class EmptyActiveTests(unittest.TestCase):
     # Round-23: no active window (switcher grab, commit gap) is an
     # observable state. Predicates must poll through it, never crash.

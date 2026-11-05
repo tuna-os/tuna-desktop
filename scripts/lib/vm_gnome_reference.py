@@ -503,28 +503,38 @@ def validate_phase_context(receipt):
     require([p['phase'] for p in phases] == list(PHASES), 'missing fixed phase context')
     baseline = shell_nodes(phases[0]['before'])
     visible = lambda n: 25 in n['states'] and 30 in n['states']
-    item_role = lambda n: n['role_name'].lower() in ('push button', 'list item')
+    # Both shells' switcher items are buttons (round-25: GNOME St exposes
+    # role 'button' with the app/window names on sibling labels, while GTK
+    # exposes named 'push button'/'list item' directly).
+    item_role = lambda n: n['role_name'].lower() in ('push button', 'list item', 'button')
+    label_role = lambda n: n['role_name'].lower() == 'label'
     baseline_visible = {key for key, node in baseline.items() if visible(node)}
+    # The shell may carry a persistent selection (round-25: GNOME keeps the
+    # top-bar clock selected at baseline); only newly-selected nodes are
+    # switcher-popup evidence, and only those must clear on release.
+    baseline_selected = {atspi_id(n) for n in phases[0]['before']['selection']['selected']}
     for index in (1, 2, 4):
         snapshot = phases[index]['before']
-        selected = snapshot['selection']['selected']
+        selected = [n for n in snapshot['selection']['selected'] if atspi_id(n) not in baseline_selected]
         require(bool(selected), 'no observed Shell switcher selection')
         for node in selected:
-            require(visible(node) and item_role(node) and bool(node['name'])
-                    and atspi_id(node) not in baseline_visible,
-                    'held selection is not a newly showing named Shell switcher item')
+            require(visible(node) and item_role(node) and atspi_id(node) not in baseline_visible,
+                    'held selection is not a newly showing Shell switcher item')
         # Validate actual popup structure without assigning Shell object IDs to
         # application windows. GNOME St.Button and GTK ListItem remain distinct.
         items = [n for key, n in shell_nodes(snapshot).items()
-                 if key not in baseline_visible and visible(n) and item_role(n) and n['name']]
-        require(len(items) >= 2, 'held Shell popup lacks actual named switcher item context')
+                 if key not in baseline_visible and visible(n)
+                 and (item_role(n) or (label_role(n) and n['name']))]
+        require(len(items) >= 2, 'held Shell popup lacks actual switcher item context')
+        require(any(n['name'] for n in items), 'held Shell popup shows no named switcher item')
     app = phases[1]['before']['selection']
     down = phases[2]['before']['selection']
     require(app != down, 'physical Down produced no observed switcher selection/tree change')
     require(all(atspi_id(n) in shell_nodes(phases[2]['before']) for n in app['selected']),
             'Down did not retain the same actual application popup objects')
     for held_index, released_index in ((2, 3), (4, 5)):
-        old = {atspi_id(n) for n in phases[held_index]['before']['selection']['selected']}
+        old = ({atspi_id(n) for n in phases[held_index]['before']['selection']['selected']}
+               - baseline_selected)
         released = phases[released_index]['after']['selection']['selected']
         require(not old.intersection(atspi_id(n) for n in released), 'release left the old Shell popup selected')
 
