@@ -7,12 +7,14 @@ import io
 import json
 import os
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
 from vm_strip_image import admission, canonical_image_id, fixture_members, inspection_program
+from maintained_media import INVENTORY
 
 
 class Tests(unittest.TestCase):
@@ -35,14 +37,29 @@ class Tests(unittest.TestCase):
             for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus'):
                 (fixture / name).write_text(name)
                 expected['/usr/libexec/' + name] = hashlib.sha256(name.encode()).hexdigest()
+            inventory = root / 'scripts/lib/maintained-media.tsv'
+            inventory.parent.mkdir(parents=True)
+            inventory.write_bytes(INVENTORY.read_bytes())
+            def git(*arguments):
+                return subprocess.check_output(['git', '-C', str(root), *arguments],
+                                               text=True, stderr=subprocess.PIPE).strip()
+            git('init', '-q')
+            git('config', 'user.name', 'Controlled immutable image admission')
+            git('config', 'user.email', 'controlled@example.invalid')
+            git('add', '.')
+            git('commit', '-qm', 'Actual fixture source snapshot')
+            commit = git('rev-parse', 'HEAD')
             package = {'package': {'sha256': 'b' * 64}, 'required_members':
                        {'usr/bin/tuna-compositor': {'sha256': 'a' * 64}}}
             observed = {'schema': 1, 'image_id': 'sha256:' + 'c' * 64, 'member_sha256': expected}
-            args = (root, 'd' * 40, observed['image_id'], 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'e' * 64)
+            args = (root, commit, observed['image_id'], 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'e' * 64)
             receipt = admission(package, observed, *args)
             self.assertFalse(receipt['installed_signed_release_qualified'])
+            self.assertEqual(receipt['commit'], commit)
+            self.assertEqual(receipt['capture_commit'], commit)
+            self.assertEqual(receipt['built_tree'], git('rev-parse', 'HEAD^{tree}'))
             with self.assertRaises(ValueError):
-                admission(package, observed, root, 'd' * 40, 'c' * 64, args[-1])
+                admission(package, observed, root, commit, 'c' * 64, args[-1])
             for key, value in [('schema', 2), ('image_id', 'sha256:' + 'f' * 64),
                                ('member_sha256', {**expected, '/unrelated': 'a' * 64}),
                                ('member_sha256', {**expected, '/usr/bin/tuna-compositor': 'f' * 64})]:
@@ -67,10 +84,22 @@ class Tests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(source)
                 expected[installed] = hashlib.sha256(path.read_bytes()).hexdigest()
+            inventory = root / 'scripts/lib/maintained-media.tsv'
+            inventory.parent.mkdir(parents=True)
+            inventory.write_bytes(INVENTORY.read_bytes())
+            def git(*arguments):
+                return subprocess.check_output(['git', '-C', str(root), *arguments],
+                                               text=True, stderr=subprocess.PIPE).strip()
+            git('init', '-q')
+            git('config', 'user.name', 'Controlled immutable image admission')
+            git('config', 'user.email', 'controlled@example.invalid')
+            git('add', '.')
+            git('commit', '-qm', 'Actual fixture source snapshot')
+            commit = git('rev-parse', 'HEAD')
             package = {'package': {'sha256': 'b' * 64}, 'required_members':
                        {'usr/bin/tuna-compositor': {'sha256': 'a' * 64}}}
             observed = {'schema': 1, 'image_id': 'sha256:' + 'c' * 64, 'member_sha256': expected}
-            args = (root, 'd' * 40, observed['image_id'], 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'e' * 64)
+            args = (root, commit, observed['image_id'], 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'e' * 64)
             self.assertEqual(admission(package, observed, *args, fixture='core-apps')['member_sha256'], expected)
             for installed in sources:
                 with self.subTest(member=installed):
@@ -126,6 +155,7 @@ class Tests(unittest.TestCase):
             victim.symlink_to(root / members[0].lstrip('/'))
             with self.assertRaises(OSError):
                 inspect()
+
 
 
 if __name__ == '__main__':

@@ -151,6 +151,18 @@ requires terminal failed-redial I/O before judging native-output revocation.
 All eleven deliberate closure fixtures use that convention. No production
 state transition, polling interval, acceptance guard or test is removed.
 
+The maintained-media check additionally needs read-only Actions access to
+authenticate the exact uploaded source-artifact bytes before replaying
+receipts against proposed canonical media; dependency auditing remains
+tokenless and fatal. Its real recording tests require FFmpeg (including
+`ffprobe`) and Pillow in the check job, not just in a capture producer.
+The GDM 51 final overlay belongs to the lifecycle images after the
+distribution/Orca branches. The paired GNOME/Tuna reference rows retain
+their separately admitted immutable base, while lifecycle image receipts
+retain the verified native platform digest rather than rereading a mutable
+tag after the build. These are source and admission contracts, not a claim
+that this merge has runtime or current-image qualification.
+
 ## Queue supersession and closed pull requests
 
 Every PR-triggered workflow already has native workflow/ref (or PR-number)

@@ -54,15 +54,19 @@ def profile_name(profile):
 
 
 def guest_call(agent, op, profile, nonce=None, *, retention=None, **payload):
-    require(op in ('admit', 'prepare', 'observe', 'file', 'stop'), 'unknown fixed operation')
+    require(op in ('admit', 'prepare', 'observe', 'file', 'stop', 'overview'), 'unknown fixed operation')
     profile_name(profile)
-    body = {'budget_s': 25, **payload}
+    # Prepare alone gets headroom (round-18: GNOME Settings stayed absent
+    # from every poll walk for 107s; 240s budget / 250s transport tests
+    # slow-registration against poll-suppression). All other ops stay at 25s/30s.
+    budget, timeout = (240, 250) if op == 'prepare' else (25, 30)
+    body = {'budget_s': budget, **payload}
     if op != 'file':
         body['profile'] = profile
     if nonce is not None:
         require(re.fullmatch('[0-9a-f]{32}', nonce) is not None, 'invalid claim nonce')
         body['nonce'] = nonce
-    value = agent.run('gnome-reference', op, json.dumps(body, sort_keys=True), timeout=30)
+    value = agent.run('gnome-reference', op, json.dumps(body, sort_keys=True), timeout=timeout)
     require(isinstance(value, dict), 'guest operation returned no object')
     require(('response_file' in value) == (op in ('prepare', 'observe', 'stop')),
             'fixed operation did not use its required immutable response-file envelope')
@@ -298,7 +302,7 @@ def validate_network_panel(window):
         selected = entry['selected_object']
         node = nodes.get(atspi_id(selected))
         require(node is not None and leaf(node) == selected
-                and selected['role_name'] in ('list item', 'page tab', 'tree item', 'radio button')
+                and selected['role_name'] in ('list item', 'page tab', 'tree item', 'radio button', 'button')
                 and {23, 25, 30} <= set(selected['states']),
                 'Network panel selection is not actual original navigation evidence')
         descendants, pending = {}, [node]
@@ -422,19 +426,66 @@ def validate_snapshot(value, profile, nonce):
             require((23 if field == 'selected' else 12) in node['states'],
                     'selection/focus has no actual accessibility state')
     active = selection.get('active_windows')
-    require(isinstance(active, list) and len(active) == 1, 'missing unambiguous active GTK app window')
-    require(1 in active[0]['states'], 'active app window lacks actual ACTIVE accessibility state')
-    require(atspi_id(active[0]) in ids and active[0] in windows, 'active app window not independently observed')
+    # Zero active is observable (round-23: switcher grab, commit gap);
+    # only ambiguity (two active) is a contradiction.
+    require(isinstance(active, list) and len(active) <= 1, 'ambiguous active GTK app windows')
+    if active:
+        require(1 in active[0]['states'], 'active app window lacks actual ACTIVE accessibility state')
+        require(atspi_id(active[0]) in ids and active[0] in windows, 'active app window not independently observed')
     return value
 
 
 def active_role(snapshot):
-    return snapshot['selection']['active_windows'][0]['role']
+    # Empty active is an observable state (round-23: switcher grab while a
+    # modifier is held, or a post-commit gap), never a crash: '' keeps the
+    # applications-released startswith predicate polling and fails the
+    # baseline/settings requires honestly. Callers testing "a different
+    # window activated" must exclude '' explicitly (see windows-released).
+    windows = snapshot['selection']['active_windows']
+    return windows[0]['role'] if windows else ''
+
+
+def released_to_different(snapshot, committed):
+    """A different window is actually active after release.
+
+    A commit gap (no active window) never qualifies: '' differs from every
+    role string, so it must be excluded explicitly or a gap observation
+    would satisfy "a different window activated".
+    """
+    return active_role(snapshot) not in ('', active_role(committed))
+
+
+def normalize_admission(admission):
+    """Admission minus transitional GDM greeter presence.
+
+    Greeters tear down asynchronously after login; an admission taken seconds
+    before prepare can legitimately list one more greeter than every later
+    observation while all security-relevant principals (session, shell,
+    compositor, buses, processes) stay identical. Comparisons use this so a
+    benign teardown mid-run is not misread as fixture substitution.
+    """
+    normalized = copy.deepcopy(admission)
+    if isinstance(normalized.get('gdm'), dict):
+        normalized['gdm']['greeters'] = []
+    return normalized
 
 
 def stable_context(snapshot):
-    return {key: snapshot[key] for key in ('profile', 'nonce', 'admission', 'settings', 'atspi',
-                                           'windows', 'selection', 'fixture')}
+    """Fixture identity across observations: same session, windows, and focus.
+
+    Compares identities, never live content. Window records carry full
+    accessibility trees and panel evidence, and selection carries live shell
+    UI state; Tracker churn, live panels, and fade animations legitimately
+    change those between two observations of one unmoved fixture. What must
+    not change is which session, which processes, which windows, and which of
+    them is active. Replay protection stays separate (observed_monotonic_ns).
+    """
+    context = {key: snapshot[key] for key in ('profile', 'nonce', 'settings', 'atspi', 'fixture')}
+    context['admission'] = normalize_admission(snapshot['admission'])
+    context['windows'] = [(w['role'], w['atspi'], w['process']) for w in snapshot['windows']]
+    context['active'] = [(w['role'], w['atspi'], w['process'])
+                         for w in snapshot['selection']['active_windows']]
+    return context
 
 
 def shell_nodes(snapshot):
@@ -452,28 +503,38 @@ def validate_phase_context(receipt):
     require([p['phase'] for p in phases] == list(PHASES), 'missing fixed phase context')
     baseline = shell_nodes(phases[0]['before'])
     visible = lambda n: 25 in n['states'] and 30 in n['states']
-    item_role = lambda n: n['role_name'].lower() in ('push button', 'list item')
+    # Both shells' switcher items are buttons (round-25: GNOME St exposes
+    # role 'button' with the app/window names on sibling labels, while GTK
+    # exposes named 'push button'/'list item' directly).
+    item_role = lambda n: n['role_name'].lower() in ('push button', 'list item', 'button')
+    label_role = lambda n: n['role_name'].lower() == 'label'
     baseline_visible = {key for key, node in baseline.items() if visible(node)}
+    # The shell may carry a persistent selection (round-25: GNOME keeps the
+    # top-bar clock selected at baseline); only newly-selected nodes are
+    # switcher-popup evidence, and only those must clear on release.
+    baseline_selected = {atspi_id(n) for n in phases[0]['before']['selection']['selected']}
     for index in (1, 2, 4):
         snapshot = phases[index]['before']
-        selected = snapshot['selection']['selected']
+        selected = [n for n in snapshot['selection']['selected'] if atspi_id(n) not in baseline_selected]
         require(bool(selected), 'no observed Shell switcher selection')
         for node in selected:
-            require(visible(node) and item_role(node) and bool(node['name'])
-                    and atspi_id(node) not in baseline_visible,
-                    'held selection is not a newly showing named Shell switcher item')
+            require(visible(node) and item_role(node) and atspi_id(node) not in baseline_visible,
+                    'held selection is not a newly showing Shell switcher item')
         # Validate actual popup structure without assigning Shell object IDs to
         # application windows. GNOME St.Button and GTK ListItem remain distinct.
         items = [n for key, n in shell_nodes(snapshot).items()
-                 if key not in baseline_visible and visible(n) and item_role(n) and n['name']]
-        require(len(items) >= 2, 'held Shell popup lacks actual named switcher item context')
+                 if key not in baseline_visible and visible(n)
+                 and (item_role(n) or (label_role(n) and n['name']))]
+        require(len(items) >= 2, 'held Shell popup lacks actual switcher item context')
+        require(any(n['name'] for n in items), 'held Shell popup shows no named switcher item')
     app = phases[1]['before']['selection']
     down = phases[2]['before']['selection']
     require(app != down, 'physical Down produced no observed switcher selection/tree change')
     require(all(atspi_id(n) in shell_nodes(phases[2]['before']) for n in app['selected']),
             'Down did not retain the same actual application popup objects')
     for held_index, released_index in ((2, 3), (4, 5)):
-        old = {atspi_id(n) for n in phases[held_index]['before']['selection']['selected']}
+        old = ({atspi_id(n) for n in phases[held_index]['before']['selection']['selected']}
+               - baseline_selected)
         released = phases[released_index]['after']['selection']['selected']
         require(not old.intersection(atspi_id(n) for n in released), 'release left the old Shell popup selected')
 
@@ -828,6 +889,72 @@ def retain_base_evidence(source, out):
             'scope': 'retained actual normal-CI preflight output; JSON validation is not cryptographic signature verification'}
 
 
+def overview_search_visible(snapshot):
+    """Whether the shell trees show a visible overview search entry.
+
+    Both shells expose the overview search as a visible AT-SPI entry (`search box`
+    on Tuna, `entry` under GNOME Shell's St.Entry); neither shows a search entry
+    on the plain desktop. A switcher commit under an open overview parks instead
+    of applying, freezing AT-SPI window-active forever, so the baseline must be
+    overview-free on both legs.
+    """
+    found = []
+
+    def walk(nodes):
+        for node in nodes:
+            states = set(node.get('states', []))
+            if (node.get('role_name') in ('search box', 'entry') and 25 in states and 30 in states):
+                found.append(node)
+            walk(node.get('children', []))
+
+    walk(snapshot.get('selection', {}).get('objects', []))
+    return bool(found)
+
+
+def poll_until_stable(observe_fn, key_fn, timeout_s, clock, sleep_fn):
+    """Poll `observe_fn()` until two consecutive `key_fn` values agree.
+
+    Dismissing the overview starts a close animation: the search entry vanishes
+    before window states and selection settle, so a single overview-free
+    observation is not a stable baseline. Returns the last snapshot plus the
+    poll count; on timeout the caller still gates on a fresh capture.
+    """
+    polls, start = 0, clock()
+    previous = key_fn(observe_fn())
+    polls += 1
+    while True:
+        snapshot = observe_fn()
+        polls += 1
+        if key_fn(snapshot) == previous:
+            break
+        previous = key_fn(snapshot)
+        if clock() - start >= timeout_s:
+            break
+        sleep_fn(1.0)
+    return snapshot, polls
+
+
+def poll_until_settled(observe_fn, predicate, timeout_s, clock, sleep_fn):
+    """Poll `observe_fn()` until `predicate` holds or `timeout_s` elapses.
+
+    Returns the last snapshot plus the poll count. Each `observe()` is itself a
+    multi-second AT-SPI dump under bus saturation, so the loop sleeps 1s between
+    attempts to let focus events propagate instead of dump-starving the bus.
+    Timeout returns the last snapshot (the caller still gates on it); it never
+    passes a check by itself.
+    """
+    polls, start = 0, clock()
+    while True:
+        snapshot = observe_fn()
+        polls += 1
+        if predicate(snapshot):
+            break
+        if clock() - start >= timeout_s:
+            break
+        sleep_fn(1.0)
+    return snapshot, polls
+
+
 def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
     """Collect a real member. Any missing observation or cleanup is a hard failure."""
     profile_name(profile)
@@ -850,7 +977,9 @@ def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
         receipt.setdefault('observations', []).append(value)
         validate_snapshot(value, profile, nonce)
         if initial is not None:
-            for field in ('admission', 'settings', 'fixture'):
+            require(normalize_admission(value['admission']) == normalize_admission(initial['admission']),
+                    'original member admission changed')
+            for field in ('settings', 'fixture'):
                 require(value[field] == initial[field], 'original member ' + field + ' changed')
             require([(w['role'], w['atspi'], w['process']) for w in value['windows']] ==
                     [(w['role'], w['atspi'], w['process']) for w in initial['windows']],
@@ -881,6 +1010,24 @@ def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
         require(sorted(physical.held) == item['held_keys'], 'owned held keys changed during capture')
         return after
 
+    def capture_settled(phase, predicate, timeout_s, *, _observe=None, _capture=None,
+                        _clock=time.monotonic, _sleep=time.sleep):
+        """Poll validated observations until `predicate` holds, then take the phase capture.
+
+        Each `observe()` takes ~2s under AT-SPI bus saturation (Tracker miners plus the
+        dump traffic itself), so a fixed sub-second settle after modifier release samples a
+        stale cache: the commit's focus event cannot propagate within 0.5s. Polling waits
+        for the actual event (same `require` gates below still apply) instead of sampling
+        faster than the harness can measure. On timeout the last observation is returned
+        and the caller's `require` fails with its unchanged message. Poll attempts are
+        recorded in `receipt['settle_polls']` as durable settling evidence.
+        """
+        observe_fn = _observe or observe
+        capture_fn = _capture or capture
+        _, polls = poll_until_settled(observe_fn, predicate, timeout_s, _clock, _sleep)
+        receipt.setdefault('settle_polls', {})[phase] = polls
+        return capture_fn(phase)
+
     try:
         validate_provenance(provenance)
         receipt['base_verification'] = retain_base_evidence(base_evidence_dir, out)
@@ -888,18 +1035,56 @@ def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
         receipt['admission'] = session_status(agent, profile=profile)
         validate_admission(receipt['admission'], profile)
         validate_topology(receipt)
+        # Both shells greet a login with the overview, and the stock one
+        # clears window ACTIVE states while prepare's readiness requires
+        # active Settings: without a dismiss the fixture maps but can never
+        # become ready (round-20: 21 attempts all saw three inactive
+        # windows). Dismiss to the desktop on both legs before the fixture
+        # launches; the pair contract requires identical physical input,
+        # and the tuna leg's active-clean prepare is unaffected (its
+        # overview keeps ACTIVE, so closed-or-open both confirm). The
+        # baseline dismiss below stays as the switcher-phase guard.
+        physical.tap('esc')
+        _, pre_polls = poll_until_settled(
+            lambda: guest_call(agent, 'overview', profile, nonce),
+            lambda result: result.get('overview_open') is False, 15,
+            time.monotonic, time.sleep)
+        receipt.setdefault('settle_polls', {})['pre-prepare-overview-dismiss'] = pre_polls
+        dismissed = guest_call(agent, 'overview', profile, nonce)
+        require(dismissed.get('overview_open') is False,
+                'overview did not dismiss before prepare; Settings could never activate')
         attempted = True  # prepare may fail after claiming ownership.
-        prepared = guest_call(agent, 'prepare', profile, nonce, retention=(out, receipt))
+        try:
+            prepared = guest_call(agent, 'prepare', profile, nonce, retention=(out, receipt))
+        except BaseException:
+            try:
+                qmp.frame(str(out / 'prepare-failed.png'))
+            except BaseException:
+                pass
+            raise
         receipt['prepare'] = prepared
         require(prepared.get('ready') is True and prepared.get('nonce') == nonce, 'fixture prepare rejected')
         initial = validate_snapshot(prepared['snapshot'], profile, nonce)
-        require(initial['admission'] == receipt['admission'] == prepared['admission']
+        require(normalize_admission(initial['admission']) == normalize_admission(receipt['admission'])
+                == normalize_admission(prepared['admission'])
                 and initial['fixture'] == prepared['fixture']
                 and initial['fixture']['processes'] == prepared['processes'],
                 'prepared fixture/admission does not match actual original observation')
         receipt['actions'] = [choose_binding(initial['settings'], action)
                               for action in ('switch-applications', 'switch-windows')]
         physical.pointer_outside()
+        # Both shells greet a login with the overview; a switcher commit under it
+        # parks instead of applying. Dismiss to the desktop before baselining.
+        physical.tap('esc')
+        _, dismiss_polls = poll_until_settled(
+            observe, lambda snap: not overview_search_visible(snap), 15,
+            time.monotonic, time.sleep)
+        receipt.setdefault('settle_polls', {})['overview-dismiss'] = dismiss_polls
+        dismissed = observe()
+        require(not overview_search_visible(dismissed),
+                'overview did not dismiss before baseline; switcher commits would park')
+        _, settle_polls = poll_until_stable(observe, stable_context, 15, time.monotonic, time.sleep)
+        receipt.setdefault('settle_polls', {})['overview-settle'] = settle_polls
         baseline = capture('before')
         require(active_role(baseline) == 'settings', 'baseline is not actual active Settings')
         app, window = receipt['actions']
@@ -908,15 +1093,15 @@ def run(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
         physical.tap('down')
         capture('applications-down-held', True, anchor)
         require(not physical.release(), 'application modifier release failed')
-        time.sleep(0.5)
-        committed = capture('applications-released')
+        committed = capture_settled('applications-released',
+                                    lambda snap: active_role(snap).startswith('files-'), 15)
         require(active_role(committed).startswith('files-'), 'app switch did not activate an actual original Files window')
         anchor = physical.begin(window)
         capture('windows-held', True, anchor)
         require(not physical.release(), 'window modifier release failed')
-        time.sleep(0.5)
-        final = capture('windows-released')
-        require(active_role(final) != active_role(committed),
+        final = capture_settled('windows-released',
+                                lambda snap: released_to_different(snap, committed), 15)
+        require(released_to_different(final, committed),
                 'window switch did not activate a different actual original window')
         validate_phase_context(receipt)
     except BaseException as error:
@@ -1023,7 +1208,8 @@ def validate_member(path, expected):
     prepared = receipt['prepare']
     initial = validate_snapshot(prepared['snapshot'], expected, nonce)
     require(prepared.get('ready') is True and prepared.get('profile') == expected and prepared.get('nonce') == nonce
-            and prepared['admission'] == initial['admission'] == receipt['admission']
+            and normalize_admission(prepared['admission']) == normalize_admission(initial['admission'])
+            == normalize_admission(receipt['admission'])
             and prepared['fixture'] == initial['fixture'] and prepared['processes'] == initial['fixture']['processes'],
             'retained preparation is not the actual same admitted fixture')
     validate_cleanup(receipt['cleanup'], expected, nonce, receipt['prepare'])
@@ -1031,7 +1217,12 @@ def validate_member(path, expected):
     require([p.get('phase') for p in phases] == list(PHASES), 'missing or reordered actual capture phases')
     baseline = phases[0]['before']
     require(initial['observed_monotonic_ns'] < baseline['observed_monotonic_ns'], 'initial preparation snapshot was replayed')
-    for field in ('admission', 'settings', 'fixture'):
+    # Admission compares greeter-tolerant like the member flow: GDM greeter
+    # teardown straddles login (round-26: both R25 members carried a
+    # lingering session-1 greeter in the receipt admission only).
+    require(normalize_admission(initial['admission']) == normalize_admission(baseline['admission']),
+            'prepared fixture/config differs from baseline')
+    for field in ('settings', 'fixture'):
         require(initial[field] == baseline[field], 'prepared fixture/config differs from baseline')
     prior_guest = 0
     prior_host = receipt['begin_ns']
@@ -1040,7 +1231,9 @@ def validate_member(path, expected):
             snap = validate_snapshot(phase[side], expected, nonce)
             require(snap['observed_monotonic_ns'] > prior_guest, 'replayed/nonmonotonic guest observations')
             prior_guest = snap['observed_monotonic_ns']
-            for field in ('admission', 'settings', 'fixture'):
+            require(normalize_admission(snap['admission']) == normalize_admission(baseline['admission']),
+                    'original fixed fixture/config changed')
+            for field in ('settings', 'fixture'):
                 require(snap[field] == baseline[field], 'original fixed fixture/config changed')
             require([(w['role'], w['atspi'], w['process']) for w in snap['windows']] ==
                     [(w['role'], w['atspi'], w['process']) for w in initial['windows']],
@@ -1097,11 +1290,19 @@ def validate_commands(receipt):
         require(command.get('held_after') == sorted(held), 'fabricated command held-after set')
         previous = command['end_ns']
     require(not held, 'member leaves owned physical keys pressed')
-    pointer = commands[0]['events']
+    # Fixed physical protocol: a pre-prepare Escape dismisses the
+    # login-greeting overview so the fixture can activate, then the pointer
+    # moves outside popups, then the baseline Escape re-verifies the desktop
+    # before the switcher actions.
+    require(len(commands) >= 5, 'member physical protocol is incomplete')
+    pointer = commands[2]['events']
     require(pointer == [{'type': 'abs', 'data': {'axis': 'x', 'value': 32767}},
                         {'type': 'abs', 'data': {'axis': 'y', 'value': 32767}}], 'pointer was not identically moved outside popup')
     # Reconstruct the exact fixed action sequence rather than accepting arbitrary QMP history.
-    expected = []
+    # The leading Escape pair dismisses the login-greeting overview before prepare so the
+    # fixture maps active; the second pair re-verifies the desktop at baseline, without
+    # which switcher commits park and AT-SPI window-active freezes.
+    expected = [('esc', True), ('esc', False), ('esc', True), ('esc', False)]
     for index, action in enumerate(receipt['actions']):
         expected.extend((key, True) for key in action['modifiers'])
         expected.extend(((action['key'], True), (action['key'], False)))
@@ -1111,15 +1312,17 @@ def validate_commands(receipt):
     actual = [(event['data']['key']['data'], event['data']['down'])
               for c in commands for event in c['events'] if event['type'] == 'key']
     require(actual == expected, 'physical action sequence differs from fixed configured protocol')
+    keyed = [command for index, command in enumerate(commands) if index != 2]
     require(len(commands) == len(expected) + 1
-            and all(len(c['events']) == 1 and c['events'][0]['type'] == 'key' for c in commands[1:]),
+            and all(len(c['events']) == 1 and c['events'][0]['type'] == 'key' for c in keyed),
             'member includes extra pointer commands or combined/unrecorded input')
     app_count = len(receipt['actions'][0]['modifiers'])
     window_count = len(receipt['actions'][1]['modifiers'])
-    app_trigger_count = 1 + app_count + 2
+    # Two Escape taps (pre-prepare, baseline) plus one pointer command precede the baseline.
+    app_trigger_count = 5 + app_count + 2
     app_release_count = app_trigger_count + 2 + app_count
     window_trigger_count = app_release_count + window_count + 2
-    prefixes = [1, app_trigger_count, app_trigger_count + 2,
+    prefixes = [5, app_trigger_count, app_trigger_count + 2,
                 app_release_count, window_trigger_count, window_trigger_count + window_count]
     for index, phase in enumerate(receipt['phases']):
         held_at_frame = set()
@@ -1153,6 +1356,23 @@ def paired_settings(snapshot):
     value = copy.deepcopy(snapshot['settings'])
     # DisplayConfig serial is an observation generation, not a scale/topology setting.
     value['display_config'].pop('serial')
+    # Monitor vendor/model/serial are compositor EDID identity (round-26:
+    # stock mutter passes QEMU EDID through, tuna-compositor synthesizes
+    # its own); the pair compares collection conditions (connector, modes,
+    # scales, layout), never implementation identity.
+    for monitor in value['display_config']['monitors']:
+        monitor[0] = monitor[0][:1]
+        # Per-monitor identity/advertisements, not conditions: display-name
+        # is EDID text, min-refresh-rate/rgb-range are mutter-only
+        # advertisements, while the active color-mode (still compared)
+        # describes actual rendering. Unknown future properties fail loudly.
+        for key in ('display-name', 'min-refresh-rate', 'rgb-range', 'supported-color-modes'):
+            monitor[2].pop(key, None)
+    for logical in value['display_config']['logical_monitors']:
+        logical[5] = [entry[:1] for entry in logical[5]]
+    # Mutter-only capability flags are implementation facts, not collection
+    # conditions; unknown future properties still fail loudly below.
+    value['display_config']['properties'].pop('supports-changing-layout-mode', None)
     return value
 
 
@@ -1161,12 +1381,25 @@ def original_apps(snapshot):
             for w in snapshot['windows']}
 
 
-def selected_context(receipt):
-    # Accessibility names/roles/states are context evidence, never GTK/WM identity joins.
-    return [{'phase': p['phase'], 'active_role': active_role(p['before']),
-             'selected_names': [n['name'] for n in p['before']['selection']['selected']],
-             'held_keys': p['held_keys'], 'requested_minimum_hold_ns': p['requested_minimum_hold_ns']}
-            for p in receipt['phases']]
+def switch_sequence(receipt):
+    # What the pair must share: the same physical input per phase, the same
+    # activation outcomes on settled phases, and the same selection
+    # appeared/cleared pattern. Shell-UI presentation is never portable
+    # (round-26: GNOME St keeps the clock selected with unnamed switcher
+    # buttons and deactivates under a switcher grab, while tuna-shell names
+    # its selections and keeps ACTIVE), so names and held-phase active
+    # roles stay per-leg evidence. Accessibility names/roles/states are
+    # context evidence, never GTK/WM identity joins.
+    baseline_selected = {atspi_id(n) for n in receipt['phases'][0]['before']['selection']['selected']}
+    sequence = []
+    for p in receipt['phases']:
+        selected = [n for n in p['before']['selection']['selected'] if atspi_id(n) not in baseline_selected]
+        sequence.append({'phase': p['phase'],
+                         'active_role': active_role(p['before']) if not p['held_keys'] else None,
+                         'has_new_selection': bool(selected),
+                         'held_keys': p['held_keys'],
+                         'requested_minimum_hold_ns': p['requested_minimum_hold_ns']})
+    return sequence
 
 
 def compare(gnome_receipt_path, tuna_receipt_path, out):
@@ -1189,7 +1422,7 @@ def compare(gnome_receipt_path, tuna_receipt_path, out):
         require(original_apps(left) == original_apps(right), 'original packaged Files/Settings ELF/package mismatch')
         require(paired_settings(left) == paired_settings(right), 'actual bindings/filters/scales/config differ')
         require(gnome['actions'] == tuna['actions'], 'actual configured actions differ')
-        require(selected_context(gnome) == selected_context(tuna), 'actual selected context/held phases differ')
+        require(switch_sequence(gnome) == switch_sequence(tuna), 'actual switch sequence/held phases differ')
         lp, rp = gnome['provenance'], tuna['provenance']
         require(lp['base_image'] == rp['base_image'] and lp['commit'] == rp['commit'],
                 'paired members differ in actual pinned base/source context')
