@@ -33,6 +33,13 @@ TOOLS = (
 FONT_URL = ('https://raw.githubusercontent.com/notofonts/noto-cjk/'
             'f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf')
 FONT_SHA256 = '68a3fc98800b2a27b371f2fb79991daf3633bd89309d4ffaa6946fd587f375b5'
+# System CJK coverage for real session processes (IME preedit, OCR): a
+# different face from the Fonts control above, so the Fonts proof keeps its
+# pristine precondition (fc-match 'Noto Sans CJK JP' must not resolve to the
+# control family before the user-install flow runs).
+SYSTEM_FONT_URL = ('https://raw.githubusercontent.com/notofonts/noto-cjk/'
+                   'f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf')
+SYSTEM_FONT_SHA256 = '2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b'
 
 
 def output(*argv):
@@ -97,15 +104,23 @@ def main():
                     '--output', str(font), FONT_URL], check=True)
     if sha256(font) != FONT_SHA256:
         raise RuntimeError('immutable official font payload bytes differ')
-    # The payload doubles as the portal control document, but fontconfig
-    # never scans the data directory (round-1004: preedit rendered as tofu
-    # because no process could resolve CJK coverage). Link it into the
-    # system font path so every session process sees it from first boot,
-    # independent of the per-user font test flow that runs later.
-    system_font = Path('/usr/share/fonts/NotoSansCJKjp-Regular.otf')
-    if system_font.is_symlink() or system_font.exists():
-        system_font.unlink()
-    system_font.symlink_to(font)
+    # The control payload doubles as the portal control document and must stay
+    # out of fontconfig's view: the Fonts proof requires fc-match
+    # 'Noto Sans CJK JP' to miss the control family until the user-install
+    # flow runs (round-1004: linking the control itself failed that gate).
+    # Real session processes still need CJK coverage from first boot
+    # (round-1004: preedit rendered as tofu with no resolvable CJK face), so
+    # install the Simplified Chinese face system-wide instead: it renders the
+    # IME preedit for OCR but never satisfies the JP-family precondition.
+    system_font = root / 'NotoSansCJKsc-Regular.otf'
+    subprocess.run(['curl', '--fail', '--location', '--proto', '=https', '--tlsv1.2',
+                    '--output', str(system_font), SYSTEM_FONT_URL], check=True)
+    if sha256(system_font) != SYSTEM_FONT_SHA256:
+        raise RuntimeError('immutable official system font payload bytes differ')
+    link = Path('/usr/share/fonts/NotoSansCJKsc-Regular.otf')
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(system_font)
     subprocess.run(['fc-cache', '-f'], check=True)
     # Standard per-user XDG directories are established by tmpfiles before GDM,
     # not a replacement media indexer or a private product application launch.
@@ -146,7 +161,9 @@ def main():
         'cached_original_package_archives': archives,
         'normal_sync_metadata': output('pacman', '-Si', *APPS, *TOOLS),
         'font': {'url': FONT_URL, 'sha256': FONT_SHA256, 'bytes': font.stat().st_size,
-                 'installed': str(system_font)},
+                 'control_only_not_installed': True},
+        'system_font': {'url': SYSTEM_FONT_URL, 'sha256': SYSTEM_FONT_SHA256,
+                        'bytes': system_font.stat().st_size, 'installed': str(link)},
         'account': {'name': 'tuna-test', 'uid': uid, 'groups': groups,
                     'groups_before': account_groups_before, 'groups_after': account_groups_after,
                     'added_groups': sorted(set(account_groups_after) - set(account_groups_before)),
