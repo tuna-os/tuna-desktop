@@ -6,11 +6,13 @@
 //! app has a text field focused it grabs the keyboard and sends each
 //! key to an IBus input context (`ProcessKeyEvent`); IBus's preedit and
 //! commits go to the app, and keys IBus does not take go back through
-//! the virtual keyboard only this client is allowed. Without IBus it
-//! starts `ibus-daemon --panel disable`, as GNOME Shell does. The
-//! compositor starts ibus-x11 separately once its own XWayland is ready,
-//! so XIM never connects to the inherited host DISPLAY. One
-//! GLib main loop drives both the Wayland socket and IBus's bus.
+//! the virtual keyboard only this client is allowed. Without a session
+//! daemon it waits (bounded) for the session's own `ibus-daemon` and
+//! exits if none appears, so this bridge can never fork a second bus;
+//! the compositor restarts it. The compositor starts ibus-x11 separately
+//! once its own XWayland is ready, so XIM never connects to the
+//! inherited host DISPLAY. One GLib main loop drives both the Wayland
+//! socket and IBus's bus.
 //!
 //! IBus also hears what GNOME Shell tells it about the field: the text
 //! around the cursor (`SetSurroundingText`, and the engine's
@@ -226,8 +228,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// The IBus bus, starting the daemon when none runs (GNOME Shell's
-/// `ibus-daemon --panel disable`).
+/// The session IBus bus, waited for and never forked.
+///
+/// The session owns exactly one `ibus-daemon` (GNOME's user unit). A
+/// second daemon forked here would own a second bus, and the session
+/// would split across the two: engines selected through `ibus
+/// address`, bus observers, and this bridge's input context would not
+/// all share one bus, so keys bypass the engine and no preedit ever
+/// arrives (round-1004: a `--daemonize` fork here raced the session
+/// unit, and the IME leg saw zero preedit rows with a healthy
+/// libpinyin engine). Wait for the session daemon instead, and exit
+/// non-zero on expiry so the compositor's bounded restart re-attaches
+/// once the daemon is up.
 fn ibus_connection() -> Result<gio::DBusConnection, Box<dyn std::error::Error>> {
     let connect = |address: &str| {
         gio::DBusConnection::for_address_sync(
@@ -238,24 +250,19 @@ fn ibus_connection() -> Result<gio::DBusConnection, Box<dyn std::error::Error>> 
             None::<&gio::Cancellable>,
         )
     };
-    if let Some(address) = ibus_address() {
-        if let Ok(bus) = connect(&address) {
-            return Ok(bus);
-        }
-    }
-    std::process::Command::new("ibus-daemon")
-        .args(["--panel", "disable", "--daemonize"])
-        .status()?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
         if let Some(address) = ibus_address() {
             if let Ok(bus) = connect(&address) {
                 return Ok(bus);
             }
         }
+        if Instant::now() >= deadline {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(200));
     }
-    Err("ibus-daemon did not come up".into())
+    Err("session ibus-daemon did not come up".into())
 }
 
 /// The bridge's IBus input context.
