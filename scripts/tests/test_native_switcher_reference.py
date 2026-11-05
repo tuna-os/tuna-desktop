@@ -605,6 +605,18 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
                 with self.assertRaises((ValueError, KeyError)):
                     proof.validate_member(root / 'member.json', 'gnome')
 
+    def test_member_tolerates_gdm_greeter_teardown(self):
+        # Round-26: both R25 members carried a lingering session-1 greeter
+        # in the receipt admission only; like the member flow, validation
+        # compares greeter-tolerant admission everywhere.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original, _, _ = self.collect(root)
+            changed = copy.deepcopy(original)
+            changed['admission']['gdm']['greeters'] = [{'logind': {'Id': '1'}}]
+            proof.save_json(root / 'member.json', changed)
+            proof.validate_member(root / 'member.json', 'gnome')
+
     def test_pair_rejects_actual_scale_and_original_package_context_differences(self):
         for difference in ('scale', 'app-package'):
             with self.subTest(difference=difference), tempfile.TemporaryDirectory() as directory:
@@ -1127,6 +1139,68 @@ class PhaseContextTests(unittest.TestCase):
         phases[1]['before']['selection']['selected'] = phases[1]['before']['selection']['selected'][:1]
         with self.assertRaisesRegex(ValueError, 'no observed Shell switcher selection'):
             proof.validate_phase_context({'phases': phases})
+
+
+class PairParityTests(unittest.TestCase):
+    def seq_receipt(self, shape):
+        shell = process('gnome-shell', 200)
+
+        def build(index, name):
+            return node(shell, 'sel-%d' % index, name, 'button', [23])
+        phases = []
+        for name, active, selected, held in shape:
+            phases.append({'phase': name,
+                           'before': {'selection': {
+                               'active_windows': [] if active is None else [{'role': active}],
+                               'selected': [build(i, n) for i, n in enumerate(selected)]}},
+                           'held_keys': held,
+                           'requested_minimum_hold_ns': 500000000 if held else 0})
+        return {'phases': phases}
+
+    def gnome_shape(self):
+        return [('before', 'settings', ['05'], []),
+                ('applications-held', None, ['05', ''], ['meta_l']),
+                ('applications-down-held', None, ['05', ''], ['meta_l']),
+                ('applications-released', 'files-second', ['05'], []),
+                ('windows-held', None, ['05', ''], ['alt']),
+                ('windows-released', 'settings', ['05'], [])]
+
+    def tuna_shape(self):
+        return [('before', 'settings', [], []),
+                ('applications-held', 'settings', ['Files: second'], ['meta_l']),
+                ('applications-down-held', 'settings', ['Files: second', 'second'], ['meta_l']),
+                ('applications-released', 'files-second', [], []),
+                ('windows-held', 'files-second', ['Settings: Settings'], ['alt']),
+                ('windows-released', 'settings', [], [])]
+
+    def test_switch_sequence_matches_across_shell_presentation(self):
+        # Round-26: St clock/unnamed buttons vs named selections and grab
+        # deactivation vs kept ACTIVE still describe the same switches.
+        self.assertEqual(proof.switch_sequence(self.seq_receipt(self.gnome_shape())),
+                         proof.switch_sequence(self.seq_receipt(self.tuna_shape())))
+
+    def test_switch_sequence_rejects_different_outcomes_or_input(self):
+        gnome = self.seq_receipt(self.gnome_shape())
+        diverged = self.seq_receipt(self.tuna_shape())
+        diverged['phases'][3]['before']['selection']['active_windows'][0]['role'] = 'files-first'
+        self.assertNotEqual(proof.switch_sequence(gnome), proof.switch_sequence(diverged))
+        diverged = self.seq_receipt(self.tuna_shape())
+        diverged['phases'][1]['held_keys'] = ['alt']
+        self.assertNotEqual(proof.switch_sequence(gnome), proof.switch_sequence(diverged))
+
+    def test_paired_settings_ignores_display_identity_but_keeps_rendering(self):
+        left, right = snapshot(), snapshot()
+        for snap in (left, right):
+            snap['settings']['display_config']['monitors'][0][2]['color-mode'] = 0
+        display = right['settings']['display_config']
+        display['monitors'][0][0] = ['Virtual-1', 'Tuna Desktop', 'Virtual-1', 'Virtual-1']
+        display['monitors'][0][2].update({'display-name': 'Virtual-1', 'min-refresh-rate': 50,
+                                           'rgb-range': 1, 'supported-color-modes': [0]})
+        display['logical_monitors'][0][5] = [['Virtual-1', 'Tuna Desktop', 'Virtual-1', 'Virtual-1']]
+        display['properties']['supports-changing-layout-mode'] = True
+        self.assertEqual(proof.paired_settings(left), proof.paired_settings(right))
+        right['settings']['display_config']['monitors'][0][2]['color-mode'] = 2
+        self.assertNotEqual(proof.paired_settings(left), proof.paired_settings(right))
 
 
 class EmptyActiveTests(unittest.TestCase):

@@ -1208,7 +1208,8 @@ def validate_member(path, expected):
     prepared = receipt['prepare']
     initial = validate_snapshot(prepared['snapshot'], expected, nonce)
     require(prepared.get('ready') is True and prepared.get('profile') == expected and prepared.get('nonce') == nonce
-            and prepared['admission'] == initial['admission'] == receipt['admission']
+            and normalize_admission(prepared['admission']) == normalize_admission(initial['admission'])
+            == normalize_admission(receipt['admission'])
             and prepared['fixture'] == initial['fixture'] and prepared['processes'] == initial['fixture']['processes'],
             'retained preparation is not the actual same admitted fixture')
     validate_cleanup(receipt['cleanup'], expected, nonce, receipt['prepare'])
@@ -1216,7 +1217,12 @@ def validate_member(path, expected):
     require([p.get('phase') for p in phases] == list(PHASES), 'missing or reordered actual capture phases')
     baseline = phases[0]['before']
     require(initial['observed_monotonic_ns'] < baseline['observed_monotonic_ns'], 'initial preparation snapshot was replayed')
-    for field in ('admission', 'settings', 'fixture'):
+    # Admission compares greeter-tolerant like the member flow: GDM greeter
+    # teardown straddles login (round-26: both R25 members carried a
+    # lingering session-1 greeter in the receipt admission only).
+    require(normalize_admission(initial['admission']) == normalize_admission(baseline['admission']),
+            'prepared fixture/config differs from baseline')
+    for field in ('settings', 'fixture'):
         require(initial[field] == baseline[field], 'prepared fixture/config differs from baseline')
     prior_guest = 0
     prior_host = receipt['begin_ns']
@@ -1225,7 +1231,9 @@ def validate_member(path, expected):
             snap = validate_snapshot(phase[side], expected, nonce)
             require(snap['observed_monotonic_ns'] > prior_guest, 'replayed/nonmonotonic guest observations')
             prior_guest = snap['observed_monotonic_ns']
-            for field in ('admission', 'settings', 'fixture'):
+            require(normalize_admission(snap['admission']) == normalize_admission(baseline['admission']),
+                    'original fixed fixture/config changed')
+            for field in ('settings', 'fixture'):
                 require(snap[field] == baseline[field], 'original fixed fixture/config changed')
             require([(w['role'], w['atspi'], w['process']) for w in snap['windows']] ==
                     [(w['role'], w['atspi'], w['process']) for w in initial['windows']],
@@ -1348,6 +1356,23 @@ def paired_settings(snapshot):
     value = copy.deepcopy(snapshot['settings'])
     # DisplayConfig serial is an observation generation, not a scale/topology setting.
     value['display_config'].pop('serial')
+    # Monitor vendor/model/serial are compositor EDID identity (round-26:
+    # stock mutter passes QEMU EDID through, tuna-compositor synthesizes
+    # its own); the pair compares collection conditions (connector, modes,
+    # scales, layout), never implementation identity.
+    for monitor in value['display_config']['monitors']:
+        monitor[0] = monitor[0][:1]
+        # Per-monitor identity/advertisements, not conditions: display-name
+        # is EDID text, min-refresh-rate/rgb-range are mutter-only
+        # advertisements, while the active color-mode (still compared)
+        # describes actual rendering. Unknown future properties fail loudly.
+        for key in ('display-name', 'min-refresh-rate', 'rgb-range', 'supported-color-modes'):
+            monitor[2].pop(key, None)
+    for logical in value['display_config']['logical_monitors']:
+        logical[5] = [entry[:1] for entry in logical[5]]
+    # Mutter-only capability flags are implementation facts, not collection
+    # conditions; unknown future properties still fail loudly below.
+    value['display_config']['properties'].pop('supports-changing-layout-mode', None)
     return value
 
 
@@ -1356,12 +1381,25 @@ def original_apps(snapshot):
             for w in snapshot['windows']}
 
 
-def selected_context(receipt):
-    # Accessibility names/roles/states are context evidence, never GTK/WM identity joins.
-    return [{'phase': p['phase'], 'active_role': active_role(p['before']),
-             'selected_names': [n['name'] for n in p['before']['selection']['selected']],
-             'held_keys': p['held_keys'], 'requested_minimum_hold_ns': p['requested_minimum_hold_ns']}
-            for p in receipt['phases']]
+def switch_sequence(receipt):
+    # What the pair must share: the same physical input per phase, the same
+    # activation outcomes on settled phases, and the same selection
+    # appeared/cleared pattern. Shell-UI presentation is never portable
+    # (round-26: GNOME St keeps the clock selected with unnamed switcher
+    # buttons and deactivates under a switcher grab, while tuna-shell names
+    # its selections and keeps ACTIVE), so names and held-phase active
+    # roles stay per-leg evidence. Accessibility names/roles/states are
+    # context evidence, never GTK/WM identity joins.
+    baseline_selected = {atspi_id(n) for n in receipt['phases'][0]['before']['selection']['selected']}
+    sequence = []
+    for p in receipt['phases']:
+        selected = [n for n in p['before']['selection']['selected'] if atspi_id(n) not in baseline_selected]
+        sequence.append({'phase': p['phase'],
+                         'active_role': active_role(p['before']) if not p['held_keys'] else None,
+                         'has_new_selection': bool(selected),
+                         'held_keys': p['held_keys'],
+                         'requested_minimum_hold_ns': p['requested_minimum_hold_ns']})
+    return sequence
 
 
 def compare(gnome_receipt_path, tuna_receipt_path, out):
@@ -1384,7 +1422,7 @@ def compare(gnome_receipt_path, tuna_receipt_path, out):
         require(original_apps(left) == original_apps(right), 'original packaged Files/Settings ELF/package mismatch')
         require(paired_settings(left) == paired_settings(right), 'actual bindings/filters/scales/config differ')
         require(gnome['actions'] == tuna['actions'], 'actual configured actions differ')
-        require(selected_context(gnome) == selected_context(tuna), 'actual selected context/held phases differ')
+        require(switch_sequence(gnome) == switch_sequence(tuna), 'actual switch sequence/held phases differ')
         lp, rp = gnome['provenance'], tuna['provenance']
         require(lp['base_image'] == rp['base_image'] and lp['commit'] == rp['commit'],
                 'paired members differ in actual pinned base/source context')
