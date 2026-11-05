@@ -1638,7 +1638,7 @@ jobs:
         with:
           cosign-release: v3.1.4
       - name: Resolve and verify the current native media base before product selection
-        if: matrix.profile == 'lifecycle'
+        if: matrix.profile == 'lifecycle' || matrix.profile == 'core-apps'
         run: |
           sudo apt-get install -y --no-install-recommends skopeo
           mkdir -p vm-lane-artifacts/native-base
@@ -1766,7 +1766,7 @@ jobs:
           trap - EXIT
           sudo chown -R "$(id -u):$(id -g)" vm-lane-artifacts/gdm51
       - name: Inspect the actual final native image without rebuilding it
-        if: matrix.profile == 'lifecycle'
+        if: matrix.profile == 'lifecycle' || matrix.profile == 'core-apps'
         run: |
           sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}' > /mnt/vm/image-id-observed
           scripts/tuna-vm-strip-image --canonical-image-id "$(cat /mnt/vm/image-id-observed)" | tee /mnt/vm/image-id

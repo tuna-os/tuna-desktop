@@ -81,7 +81,8 @@ class CoreNativeRouting(unittest.TestCase):
         import sys
         with tempfile.TemporaryDirectory() as out:
             receipt = Path(out) / "image.json"
-            receipt.write_text(json.dumps({"commit": "a" * 40, "image_id": "sha256:" + "b" * 64,
+            receipt.write_text(json.dumps({"commit": "a" * 40, "capture_commit": "a" * 40,
+                                          "image_id": "sha256:" + "b" * 64,
                                           "base_image": "base@sha256:" + "c" * 64}))
             argv = ["tuna-vm-lane", "--profile", "core-apps", "--disk", "original.raw",
                     "--out", out, "--require-kvm", "--strip-image", str(receipt)]
