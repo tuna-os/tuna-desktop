@@ -530,6 +530,17 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             proof.validate_snapshot(value, 'gnome', 'a' * 32)
 
+    def test_empty_active_windows_is_observable_but_two_is_ambiguous(self):
+        # Round-23/24: switcher grab and commit gaps observe zero active;
+        # only two-active is a contradiction.
+        value = snapshot(held=True)
+        proof.validate_snapshot(value, 'gnome', 'a' * 32)
+        value['selection']['active_windows'] = []
+        proof.validate_snapshot(value, 'gnome', 'a' * 32)
+        value['selection']['active_windows'] = [value['windows'][0], value['windows'][1]]
+        with self.assertRaisesRegex(ValueError, 'ambiguous active GTK app windows'):
+            proof.validate_snapshot(value, 'gnome', 'a' * 32)
+
     def test_configured_bindings_are_read_not_rewritten_and_unsupported_action_fails(self):
         settings = snapshot()['settings']
         original = copy.deepcopy(settings)

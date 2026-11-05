@@ -426,9 +426,12 @@ def validate_snapshot(value, profile, nonce):
             require((23 if field == 'selected' else 12) in node['states'],
                     'selection/focus has no actual accessibility state')
     active = selection.get('active_windows')
-    require(isinstance(active, list) and len(active) == 1, 'missing unambiguous active GTK app window')
-    require(1 in active[0]['states'], 'active app window lacks actual ACTIVE accessibility state')
-    require(atspi_id(active[0]) in ids and active[0] in windows, 'active app window not independently observed')
+    # Zero active is observable (round-23: switcher grab, commit gap);
+    # only ambiguity (two active) is a contradiction.
+    require(isinstance(active, list) and len(active) <= 1, 'ambiguous active GTK app windows')
+    if active:
+        require(1 in active[0]['states'], 'active app window lacks actual ACTIVE accessibility state')
+        require(atspi_id(active[0]) in ids and active[0] in windows, 'active app window not independently observed')
     return value
 
 
