@@ -740,5 +740,40 @@ class ImeFieldFocusSettle(unittest.TestCase):
         self.assertFalse(focused(tree(readonly)))
 
 
+class PreeditInkIsolation(unittest.TestCase):
+    """_isolate_preedit_ink() crops an entry capture to the composition ink.
+
+    The full entry carries tesseract-hostile decorations (search icon,
+    clear button, Pango's composition underline); the underline spans
+    the composition width, so it locates the text without geometry
+    constants. No underline means no isolation: the caller falls back
+    to the whole crop.
+    """
+
+    def entry(self, text_left, text_width, underline=True):
+        from PIL import Image, ImageDraw
+        image = Image.new('RGB', (200, 40), 'white')
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((8, 12, 24, 28), outline='black', width=2)
+        draw.text((text_left, 8), 'ab', fill='black')
+        if underline:
+            draw.line([(text_left, 30), (text_left + text_width, 30)], fill='black', width=2)
+        return image
+
+    def test_underlined_composition_isolates_to_text_span(self):
+        isolated = core_apps._isolate_preedit_ink(self.entry(60, 80))
+        self.assertIsNotNone(isolated)
+        # The 60..140 underline span locates the text; the icon at the
+        # left edge and the empty right side stay out of the ink.
+        self.assertEqual(isolated.size, (81, 22))
+
+    def test_plain_capture_falls_back_to_whole_crop(self):
+        self.assertIsNone(core_apps._isolate_preedit_ink(self.entry(60, 80, underline=False)))
+
+    def test_blank_capture_falls_back_to_whole_crop(self):
+        from PIL import Image
+        self.assertIsNone(core_apps._isolate_preedit_ink(Image.new('RGB', (60, 20), 'white')))
+
+
 if __name__ == '__main__':
     unittest.main()

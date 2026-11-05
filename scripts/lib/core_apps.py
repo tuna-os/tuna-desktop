@@ -23,6 +23,61 @@ SHIFTED_KEYS = {'!': '1', '@': '2', '#': '3', '$': '4', '%': '5', '^': '6', '&':
 GUEST_MODULES = ('guest', 'native', 'basic', 'data', 'media', 'system', 'web', 'autotz', 'geoclue_fixture')
 
 
+def _isolate_preedit_ink(crop):
+    """Crop an IME field capture down to the composition's own ink.
+
+    The entry crop carries decorations tesseract cannot survive: the
+    search icon, the clear button, and Pango's composition underline,
+    which merges with CJK glyph bottoms at this size (round-1004: the
+    full-entry crop OCR'd as latin garbage while the field visibly
+    showed the exact preedit). The underline spans the composition
+    width, so it locates the text without any geometry constants: a
+    bottom dark row holding one dominant run marks the composition,
+    and the enclosing dark-column cluster is its ink. Returns None
+    when no composition underline is found so the caller falls back
+    to the whole crop; the exact-equality OCR gate is unchanged.
+    Isolation is best-effort sensor preparation, never load-bearing:
+    any inspection failure also falls back to the whole crop.
+    """
+    try:
+        gray = crop.convert('L')
+        width, height = gray.size
+        ink = gray.load()
+        dark = lambda x, y: ink[x, y] < 150  # noqa: E731
+        rows = [y for y in range(height) if any(dark(x, y) for x in range(width))]
+        if not rows:
+            return None
+        span = None
+        for line in rows[-3:]:
+            runs = []
+            x = 0
+            while x < width:
+                if dark(x, line):
+                    start = x
+                    while x < width and dark(x, line):
+                        x += 1
+                    runs.append((start, x - 1))
+                else:
+                    x += 1
+            if not runs:
+                continue
+            longest = max(stop - start + 1 for start, stop in runs)
+            total = sum(stop - start + 1 for start, stop in runs)
+            if longest >= 12 and longest >= 0.9 * total:
+                span = max(runs, key=lambda row: row[1] - row[0])
+                break
+        if span is None:
+            return None
+        columns = {x for x in range(width) if any(dark(x, y) for y in rows)}
+        left, right = span
+        while left - 1 in columns:
+            left -= 1
+        while right + 1 in columns:
+            right += 1
+        return crop.crop((left, rows[0], right + 1, rows[-1] + 1))
+    except Exception:
+        return None
+
 
 class Desktop(NativeDesktop):
     def __init__(self, qmp, agent_factory, out, metadata, select_mouse, nonce=None,
@@ -475,8 +530,14 @@ class Desktop(NativeDesktop):
             from PIL import Image
             crop = self.out / f'{self._sequence + 1:05d}-original-preedit-field.png'
             with Image.open(rendered['frame_path']) as frame:
-                frame.crop((x, y, x + width, y + height)).save(crop)
-            ocr = subprocess.run(['tesseract', str(crop), 'stdout', '-l', 'eng+chi_sim', '--psm', '7'],
+                field_crop = frame.crop((x, y, x + width, y + height))
+                field_crop.save(crop)
+            isolated = _isolate_preedit_ink(field_crop)
+            isolated_path = None
+            if isolated is not None:
+                isolated_path = self.out / f'{self._sequence + 1:05d}-original-preedit-ink.png'
+                isolated.save(isolated_path)
+            ocr = subprocess.run(['tesseract', str(isolated_path or crop), 'stdout', '-l', 'eng+chi_sim', '--psm', '7'],
                                  text=True, capture_output=True, check=True, timeout=10).stdout
             normalize = lambda value: ''.join(character.casefold() for character in
                 unicodedata.normalize('NFKC', value) if character.isalnum())
@@ -493,7 +554,9 @@ class Desktop(NativeDesktop):
             if base64.b64decode(copied['base64']).decode() != expected:
                 raise RuntimeError('actual IME consumer clipboard did not equal committed Unicode')
             evidence = {'actor': actor, 'field': field, 'composition': composition,
-                        'preedit_frame': rendered, 'preedit_field_frame': str(crop), 'preedit_ocr': ocr,
+                        'preedit_frame': rendered, 'preedit_field_frame': str(crop),
+                        'preedit_ink_frame': str(isolated_path) if isolated_path is not None else None,
+                        'preedit_ocr': ocr,
                         'committed': committed, 'clipboard': copied, 'engine': engine,
                         'actual_input': 'physical-nihao-space', 'portal_only': actor.get('kind') == 'picker'}
             if actor.get('kind') == 'app':
