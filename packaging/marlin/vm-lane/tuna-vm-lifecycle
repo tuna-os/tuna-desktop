@@ -1700,6 +1700,186 @@ def shell_controls():
             "public_controls": receipt["public_controls"]}
 
 
+def _tour_shell_candidates(owner_uid, proc_root=pathlib.Path("/proc")):
+    """Owned tuna-shell-gtk processes with readable display identity.
+
+    The observer runs unprivileged, so setuid/non-dumpable processes owned
+    by the session user (bubblewrap, helpers) expose no exe link: skipping
+    them is safe because an unverifiable process can never count as the
+    shell, and a genuinely missing shell still fails the uniqueness check.
+    """
+    candidates = []
+    for path in proc_root.glob("[0-9]*"):
+        try:
+            if path.stat().st_uid != owner_uid:
+                continue
+            executable = os.readlink(path / "exe")
+            if executable != "/usr/bin/tuna-shell-gtk":
+                continue
+            fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
+            with (path / "environ").open("rb") as stream:
+                raw = stream.read(131073)
+            displays = [entry.split(b"=", 1)[1].decode() for entry in raw.split(b"\0")
+                        if entry.startswith(b"WAYLAND_DISPLAY=")]
+            session_ids = [entry.split(b"=", 1)[1].decode() for entry in raw.split(b"\0")
+                           if entry.startswith(b"XDG_SESSION_ID=")]
+            if len(raw) > 131072 or len(displays) != 1 or len(session_ids) != 1:
+                raise RuntimeError("tour shell display identity exceeds bound")
+            candidates.append({"pid": int(path.name), "uid": owner_uid,
+                               "start_ticks": int(fields[19]), "executable": executable,
+                               "display": displays[0], "session_id": session_ids[0]})
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+    return candidates
+
+
+def tour_public_ui():
+    """One finite read-only AT-SPI observation, including the lock frame only.
+
+    No compositor snapshot, debug property, text/value API or accessibility
+    action participates. Object paths below are explicitly AT-SPI identities.
+
+    Failures print one bounded record (vm_guest_agent.FAILURE_RECORDS);
+    the traceback text itself never leaves the guest.
+    """
+    try:
+        return _tour_public_ui()
+    except Exception as error:
+        print(json.dumps({"tour_public_ui_error": inventory_error(error)}))
+        raise SystemExit(1) from None
+
+
+def _tour_public_ui():
+    if os.geteuid() == 0:
+        session = owner_login_session()
+        if (session.get("User") != str(OWNER.pw_uid) or session.get("Type") != "wayland"
+                or session.get("Class") != "user" or session.get("Service") != LOGIN_SERVICE):
+            raise RuntimeError("tour requires the original GDM Wayland session")
+        try:
+            observed = json.loads(call(sys.executable, __file__, "tour-public-ui", user=True))
+        except subprocess.CalledProcessError as error:
+            # Forward the user-context record (with its own crash frames)
+            # instead of reporting the re-exec line.
+            try:
+                forwarded = json.loads((error.stdout or "").strip() or "{}")
+            except ValueError:
+                forwarded = {}
+            if type(forwarded) is dict and set(forwarded) == {"tour_public_ui_error"}:
+                print(json.dumps(forwarded))
+                raise SystemExit(1) from None
+            raise
+        if observed["principal"]["session_id"] != session["Id"]:
+            raise RuntimeError("tour shell is not in the original GDM session")
+        if session != owner_login_session():
+            raise RuntimeError("tour public observation crossed a session change")
+        observed["session"] = session
+        return observed
+    if os.geteuid() != OWNER.pw_uid:
+        raise RuntimeError("tour observer requires the ordinary session owner")
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi, Gio, GLib
+    started = time.monotonic_ns()
+    deadline = time.monotonic() + 8
+
+    def remaining():
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise TimeoutError("tour public observation deadline")
+        return max(1, min(500, int(value * 1000)))
+
+    def query(method, *args):
+        Atspi.set_timeout(remaining(), remaining())
+        result = method(*args)
+        remaining()
+        return result
+
+    def principal():
+        candidates = _tour_shell_candidates(OWNER.pw_uid)
+        if len(candidates) != 1:
+            raise RuntimeError("one original tour shell is required")
+        return candidates[0]
+
+    original = principal()
+    desktop = query(Atspi.get_desktop, 0)
+    count = query(desktop.get_child_count)
+    if not 0 <= count <= 64:
+        raise RuntimeError("tour accessibility desktop exceeds bound")
+    apps = []
+    for index in range(count):
+        app = query(desktop.get_child_at_index, index)
+        if app is not None and query(app.get_process_id) == original["pid"]:
+            apps.append(app)
+    if len(apps) != 1:
+        raise RuntimeError("one original tour AT-SPI application is required")
+    app = apps[0]
+    owner = app.app.bus_name
+    import re
+    if type(owner) is not str or re.fullmatch(r":\d+\.\d+", owner) is None:
+        raise RuntimeError("tour AT-SPI owner must be unique")
+    session_bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+
+    def bus_call(bus, destination, path, interface, method, parameters):
+        result = bus.call_sync(destination, path, interface, method, parameters, None,
+                               Gio.DBusCallFlags.NONE, remaining(), None)
+        remaining()
+        return result.unpack()[0]
+
+    address = bus_call(session_bus, "org.a11y.Bus", "/org/a11y/bus",
+                       "org.a11y.Bus", "GetAddress", None)
+    bus = Gio.DBusConnection.new_for_address_sync(address,
+        Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+        None, None)
+
+    def credentials():
+        values = [bus_call(bus, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                           "org.freedesktop.DBus", method, GLib.Variant("(s)", (owner,)))
+                  for method in ("GetNameOwner", "GetConnectionUnixProcessID", "GetConnectionUnixUser")]
+        if values != [owner, original["pid"], original["uid"]]:
+            raise RuntimeError("tour original AT-SPI owner credentials disagree")
+        return {"owner": owner, "bus_pid": values[1], "bus_uid": values[2]}
+
+    authority = credentials()
+    allowed = {("frame", "App Grid"), ("frame", "Lock Screen"), ("slider", "Volume"),
+               ("push button", "Settings"), ("push button", "Lock Screen"),
+               ("push button", "Previous month"), ("push button", "Next month")}
+    controls, pending, visited = [], [(app, 0)], 0
+    while pending:
+        node, depth = pending.pop()
+        remaining()
+        visited += 1
+        if visited > 1024 or depth > 32:
+            raise RuntimeError("tour public tree exceeds bound")
+        query(node.clear_cache)
+        states = query(node.get_state_set)
+        showing, visible = states.contains(Atspi.StateType.SHOWING), states.contains(Atspi.StateType.VISIBLE)
+        if depth > 0 and not (showing and visible):
+            continue
+        role = query(node.get_role_name)
+        role = "push button" if role == "button" else role
+        name = query(node.get_name) if role in {"frame", "slider", "push button"} else None
+        if showing and visible and (role, name) in allowed:
+            component = query(node.get_component_iface)
+            rect = query(Atspi.Component.get_extents, component, Atspi.CoordType.SCREEN)
+            controls.append({"label": name, "role": role, "showing": True, "visible": True,
+                             "extents": [rect.x, rect.y, rect.width, rect.height]})
+        # Never query lock descendants (passwords, user labels or auth messages).
+        if role == "frame" and name == "Lock Screen":
+            continue
+        children = query(node.get_child_count)
+        if not 0 <= children <= 1024 or visited + len(pending) + children > 1024:
+            raise RuntimeError("tour public children exceed bound")
+        for index in range(children):
+            child = query(node.get_child_at_index, index)
+            if child is not None:
+                pending.append((child, depth + 1))
+    if original != principal() or authority != credentials():
+        raise RuntimeError("tour original public UI principal changed")
+    return {"schema": 1, "method": "public-at-spi", "principal": original,
+            "atspi": authority, "controls": controls,
+            "started_monotonic_ns": started, "completed_monotonic_ns": time.monotonic_ns()}
+
+
 def speech_capture_profile(name):
     # Fixed CI-only real recorder profiles, never production reader settings.
     if type(name) is not str or name not in {"native-command", "public-navigation"}:
@@ -2540,6 +2720,11 @@ def main():
     if sys.argv[1] == "background-user-diagnostics":
         print(json.dumps(background_user_diagnostics()))
         return
+    if sys.argv[1] == "tour-public-ui" and os.geteuid() == OWNER.pw_uid and OWNER.pw_uid != 0:
+        if len(sys.argv) != 2:
+            raise ValueError("tour public observation takes no arguments")
+        print(json.dumps(tour_public_ui()))
+        return
     if os.geteuid() != 0 or OWNER.pw_uid == 0:
         raise RuntimeError("probe must be root and session owner must not be root")
     action = sys.argv[1]
@@ -3163,6 +3348,10 @@ print(json.dumps(result))
         result = {"requested": "session manager logout" if owned else "terminate session"}
     elif action == "shell-controls":
         result = shell_controls()
+    elif action == "tour-public-ui":
+        if len(sys.argv) != 2:
+            raise ValueError("tour public observation takes no arguments")
+        result = tour_public_ui()
     elif action == "login-session":
         # Before Tuna Desktop writes its state snapshot: which desktop the
         # login actually started, by fixed process name only.

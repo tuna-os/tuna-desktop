@@ -6,6 +6,7 @@ none claims a stock GDM, GNOME, accessibility or physical-input runtime result.
 import base64
 import copy
 import gzip
+import re
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -18,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -32,7 +34,7 @@ NONCE = 'a' * 32
 
 class Arguments(unittest.TestCase):
     def test_all_fixed_operations_and_finite_local_budget(self):
-        for op in ('admit', 'prepare', 'observe', 'stop', 'file'):
+        for op in ('admit', 'prepare', 'observe', 'stop', 'file', 'overview'):
             value = {'budget_s': 25}
             if op != 'file':
                 value['profile'] = 'gnome'
@@ -44,6 +46,20 @@ class Arguments(unittest.TestCase):
         for budget in (0, -1, 25.1, True, '20', float('nan'), float('inf')):
             with self.subTest(budget=budget), self.assertRaises(ValueError):
                 GUEST.payload('admit', {'profile': 'gnome', 'budget_s': budget})
+
+    def test_prepare_alone_gets_headroom_others_stay_capped(self):
+        base = {'profile': 'gnome', 'nonce': NONCE}
+        self.assertGreater(GUEST.payload('prepare', {**base, 'budget_s': 240}).remaining(), 0)
+        with self.assertRaises(ValueError):
+            GUEST.payload('prepare', {**base, 'budget_s': 241})
+        with self.assertRaises(ValueError):
+            GUEST.payload('observe', {**base, 'budget_s': 26})
+        with self.assertRaises(ValueError):
+            GUEST.payload('stop', {**base, 'budget_s': 60})
+        with self.assertRaises(ValueError):
+            GUEST.payload('overview', {**base, 'budget_s': 26})
+        with self.assertRaises(ValueError):
+            GUEST.payload('overview', {'profile': 'gnome', 'budget_s': 25})
 
     def test_no_override_exec_alias_path_or_nonce_coercion(self):
         for extra in ('command', 'env', 'client_name', 'unsafeEval', 'TUNA_STATE', 'WAYLAND_DEBUG'):
@@ -489,7 +505,7 @@ class ControlledClaims(unittest.TestCase):
 
 class ControlledAdmission(unittest.TestCase):
     """Controlled service/logind replies exercise login routing, not real GDM."""
-    def admit(self, started, native=True, integrity=True):
+    def admit(self, started, native=True, integrity=True, lingering_greeter=False, greeter_shells=None):
         boot = 'controlled-boot'
         def identity(pid, uid, exe, package):
             return {'pid': pid, 'uid': uid, 'start_ticks': pid, 'exe': exe,
@@ -505,9 +521,14 @@ class ControlledAdmission(unittest.TestCase):
         login = {'Id': 'c1', 'User': '120', 'Name': 'gdm', 'Class': 'greeter',
                  'Service': 'gdm-launch-environment', 'Type': 'wayland', 'Active': 'yes',
                  'Remote': 'no', 'Seat': 'seat0', 'State': 'active', 'VTNr': '2'}
+        listed = [current, login] if started and lingering_greeter else ([current] if started else [login])
+        if greeter_shells == 'ambiguous':
+            shells = [greeter, identity(21, 120, '/usr/bin/gnome-shell', 'gnome-shell')]
+        else:
+            shells = greeter_shells if greeter_shells is not None else [greeter]
         def candidates(paths, uid, deadline):
             if uid == 120:
-                return [greeter]
+                return shells
             if '/usr/bin/gnome-shell' in paths:
                 return [shell] if native else []
             return []
@@ -515,7 +536,7 @@ class ControlledAdmission(unittest.TestCase):
             if value == '/sys/class/tty/tty0/active':
                 return SimpleNamespace(read_text=lambda: 'tty2\n')
             return Path(value)
-        with mock.patch.object(GUEST, 'sessions', return_value=[current] if started else [login]), \
+        with mock.patch.object(GUEST, 'sessions', return_value=listed), \
              mock.patch.object(GUEST, 'payload_integrity', return_value={'ready': integrity}), \
              mock.patch.object(GUEST, 'run', return_value='MainPID=10\nActiveState=active\nSubState=running\n'), \
              mock.patch.object(GUEST, 'proc_identity', side_effect=lambda pid, uid: gdm), \
@@ -554,6 +575,91 @@ class ControlledAdmission(unittest.TestCase):
         actual = self.admit(True, integrity=False)
         self.assertFalse(actual['ready'])
         self.assertFalse(actual['gdm']['ready'])
+
+    def test_post_login_shell_less_greeter_is_teardown_residue(self):
+        actual = self.admit(True, lingering_greeter=True, greeter_shells=[])
+        self.assertTrue(actual['ready'])
+        self.assertTrue(actual['gdm']['available'])
+        self.assertFalse(actual['gdm']['ready'])
+        self.assertEqual(actual['gdm']['greeters'], [])
+        self.assertEqual(actual['missing'], [])
+
+    def test_post_login_ambiguous_greeter_shells_stay_fatal(self):
+        actual = self.admit(True, lingering_greeter=True, greeter_shells='ambiguous')
+        self.assertFalse(actual['ready'])
+        self.assertFalse(actual['gdm']['ready'])
+        self.assertTrue(any('not unique: 2' in entry for entry in actual['missing']))
+
+    def test_pre_login_shell_less_greeter_stays_fatal(self):
+        actual = self.admit(False, greeter_shells=[])
+        self.assertFalse(actual['ready'])
+        self.assertFalse(actual['gdm']['ready'])
+        self.assertTrue(any('not unique: 0' in entry for entry in actual['missing']))
+
+
+class OverviewState(unittest.TestCase):
+    def arrange(self, trees, ready=True):
+        shell = {'pid': 30, 'uid': 1000, 'exe': '/usr/bin/gnome-shell'}
+        admitted = {'ready': ready, 'missing': [] if ready else ['gdm: nope'],
+                    'session': {'shell': shell}}
+        observation = {'trees': trees}
+        patches = [mock.patch.object(GUEST, 'admission', return_value=(admitted, {})),
+                   mock.patch.object(GUEST, 'public_observation', return_value=observation)]
+        for entered in patches:
+            entered.start()
+            self.addCleanup(entered.stop)
+        return shell
+
+    def tree(self, pid, role, states, children=()):
+        return {'atspi': {'bus_name': ':1.9', 'path': '/shell', 'id_domain': 'AT-SPI'},
+                'name': 'GNOME Shell', 'role_name': role, 'states': states,
+                'process': {'pid': pid, 'uid': 1000, 'exe': '/usr/bin/gnome-shell'},
+                'children': list(children)}
+
+    def test_visible_search_entry_reports_open(self):
+        entry = self.tree(30, 'entry', [25, 30])
+        self.arrange([self.tree(30, 'application', [], [entry])])
+        args = {'profile': 'gnome', 'budget_s': 25, 'nonce': NONCE}
+        result = GUEST.overview_state(args, GUEST.Deadline(3), {})
+        self.assertTrue(result['overview_open'])
+        self.assertEqual(result['shell_pid'], 30)
+        self.assertEqual(result['nonce'], NONCE)
+        self.assertTrue(result['ready'])
+
+    def test_plain_desktop_reports_closed(self):
+        self.arrange([self.tree(30, 'application', [])])
+        args = {'profile': 'gnome', 'budget_s': 25, 'nonce': NONCE}
+        result = GUEST.overview_state(args, GUEST.Deadline(3), {})
+        self.assertFalse(result['overview_open'])
+
+    def test_greeter_residue_entry_does_not_count(self):
+        residue = self.tree(20, 'application', [], [self.tree(20, 'entry', [25, 30])])
+        desktop = self.tree(30, 'application', [])
+        shell = self.arrange([residue, desktop])
+        self.assertEqual(shell['pid'], 30)
+        args = {'profile': 'gnome', 'budget_s': 25, 'nonce': NONCE}
+        result = GUEST.overview_state(args, GUEST.Deadline(3), {})
+        self.assertFalse(result['overview_open'])
+
+    def test_unadmitted_session_refuses_overview(self):
+        self.arrange([], ready=False)
+        args = {'profile': 'gnome', 'budget_s': 25, 'nonce': NONCE}
+        with self.assertRaises(RuntimeError) as failed:
+            GUEST.overview_state(args, GUEST.Deadline(3), {})
+        self.assertIn('unadmitted native session', str(failed.exception))
+
+    def test_main_dispatches_overview_without_claim(self):
+        reported = {'schema': 1, 'ready': True, 'overview_open': False}
+        argv = ['tuna-vm-gnome-reference', 'overview',
+               json.dumps({'profile': 'gnome', 'budget_s': 25, 'nonce': NONCE})]
+        with mock.patch.object(GUEST.sys, 'argv', argv), \
+             mock.patch('os.geteuid', return_value=0), \
+             mock.patch.object(GUEST, 'overview_state', return_value=reported) as state, \
+             mock.patch.object(GUEST, 'load_claim') as claim:
+            GUEST.main()
+            state.assert_called_once()
+            self.assertEqual(state.call_args.args[0]['nonce'], NONCE)
+            claim.assert_not_called()
 
 
 class ControlledGio(unittest.TestCase):
@@ -953,6 +1059,28 @@ class ControlledAtspi(unittest.TestCase):
         trees[0]['children'][0]['states'] = []
         self.assertEqual(GUEST.window_context(trees, fixture, shell)[1]['selected'], [])
 
+    def test_selected_network_button_carries_panel_identity_like_legacy_list_item(self):
+        # Observed GNOME 51.1 tree: the sidebar exposes categories as buttons,
+        # the selected Network button carrying its own label identity.
+        for role in ('button', 'list item'):
+            trees, fixture, shell = self.context()
+            window = trees[2]['children'][0]
+            row = window['children'][0]
+            row['role_name'] = role
+            row['name'] = 'Network'
+            with self.subTest(role=role):
+                windows, selection = GUEST.window_context(trees, fixture, shell)
+                evidence = selection['active_windows'][0]['panel_evidence'][0]
+                self.assertEqual(evidence['selected_object']['atspi']['path'], '/settings/network/nav')
+                self.assertEqual(evidence['label_objects'][0]['name'], 'Network')
+        trees, fixture, shell = self.context()
+        row = trees[2]['children'][0]['children'][0]
+        row['role_name'] = 'button'
+        row['name'] = 'Network'
+        row['states'] = [25, 30]
+        with self.assertRaises(RuntimeError):
+            GUEST.window_context(trees, fixture, shell)
+
     def test_network_label_requires_selected_visible_original_descendant_not_window_title(self):
         for change in ('unselected', 'hidden-label', 'foreign-label', 'title-only'):
             trees, fixture, shell = self.context()
@@ -999,6 +1127,104 @@ class ControlledAtspi(unittest.TestCase):
                 trees[1]['children'].append(copy.deepcopy(trees[1]['children'][0]))
             with self.subTest(change=change), self.assertRaises(RuntimeError):
                 GUEST.window_context(trees, fixture, shell)
+
+    def test_inactive_fixture_returns_observable_switcher_state(self):
+        # Round-23: the app switcher holds a shell grab while Super is
+        # held, so no-active-window is a pollable observation (host
+        # predicates judge readiness), not FixtureNotReady. The states and
+        # shell focus the old raise formatted ride in the observation.
+        trees, fixture, shell = self.context()
+        trees[2]['children'][0]['states'] = [25, 30]
+        trees[0]['children'][0]['states'] = [12, 23, 25, 30]
+        windows, selection = GUEST.window_context(trees, fixture, shell)
+        self.assertEqual(selection['active_windows'], [])
+        self.assertEqual(sorted(w['role'] for w in windows), ['files-first', 'files-second', 'settings'])
+        self.assertTrue(all(25 in w['states'] and 30 in w['states'] for w in windows))
+        settings = [w for w in windows if w['role'] == 'settings'][0]
+        self.assertTrue(settings['panel_evidence'])
+        self.assertEqual([n['name'] for n in selection['selected']], ['Files'])
+        self.assertEqual([n['name'] for n in selection['focused']], ['Files'])
+
+    def test_until_ready_retries_empty_active_until_settings(self):
+        seen = [{'selection': {'active_windows': []}} for _ in range(2)]
+        seen.append({'selection': {'active_windows': [{'role': 'settings'}]}})
+        calls = []
+        def probe():
+            calls.append(True)
+            return seen[min(len(calls) - 1, 2)]
+        with mock.patch.object(GUEST, 'READINESS_POLL_GAP_S', 0):
+            result = GUEST.snapshot_until_ready(probe, [], GUEST.Deadline(20))
+        self.assertEqual(result, seen[2])
+        self.assertEqual(len(calls), 3)
+
+    def test_until_ready_reports_persistent_empty_active_as_not_ready(self):
+        calls = []
+        def probe():
+            calls.append(True)
+            return {'selection': {'active_windows': []}}
+        deadline = GUEST.Deadline(20)
+        deadline.end = GUEST.time.monotonic() + 0.25
+        with mock.patch.object(GUEST, 'READINESS_POLL_GAP_S', 0):
+            with self.assertRaises(RuntimeError) as failed:
+                GUEST.snapshot_until_ready(probe, [], deadline)
+        message = str(failed.exception)
+        self.assertIn('never became ready', message)
+        self.assertIn('attempts=', message)
+        self.assertIsInstance(failed.exception.__cause__, GUEST.FixtureNotReady)
+        self.assertIn('not actually active', str(failed.exception.__cause__))
+        self.assertGreater(len(calls), 1)
+
+    def test_light_context_skips_shell_tree_requirement(self):
+        trees, fixture, shell = self.context()
+        windows, selection = GUEST.window_context(trees[1:], fixture, shell, require_shell=False)
+        self.assertEqual(len(windows), 3)
+        self.assertEqual(selection['active_windows'][0]['role'], 'settings')
+        self.assertEqual(selection['selected'], [])
+        self.assertEqual(selection['focused'], [])
+
+    def test_full_context_still_requires_original_shell_tree(self):
+        trees, fixture, shell = self.context()
+        with self.assertRaises(RuntimeError) as failed:
+            GUEST.window_context(trees[1:], fixture, shell)
+        self.assertEqual(str(failed.exception),
+                         'original Shell public AT-SPI application tree unavailable or ambiguous')
+
+    def test_light_context_reports_incomplete_inventory_as_not_ready(self):
+        trees, fixture, shell = self.context()
+        trees[2]['children'] = []
+        with self.assertRaises(GUEST.FixtureNotReady) as failed:
+            GUEST.window_context(trees[1:], fixture, shell, require_shell=False)
+        self.assertIn('actual fixture window inventory is incomplete', str(failed.exception))
+
+    def test_light_readiness_walks_fixture_applications_only(self):
+        trees, fixture, shell = self.context()
+        claim = {'fixture': fixture}
+        admitted = {'session': {'shell': shell}}
+        environment, deadline = object(), object()
+        with mock.patch.object(GUEST, 'public_observation',
+                               return_value={'trees': trees[1:]}) as observed:
+            windows, selection = GUEST.light_readiness(claim, admitted, environment, deadline)
+        observed.assert_called_once_with(environment, admitted, deadline,
+                                         only_exes=set(GUEST.APPS))
+        self.assertEqual(len(windows), 3)
+        self.assertEqual(selection['active_windows'][0]['role'], 'settings')
+
+    def test_probe_gates_full_snapshot_behind_light_readiness(self):
+        args, claim, admitted, environment, deadline, cache = (object() for _ in range(6))
+        stale = GUEST.FixtureNotReady('actual fixture window inventory is incomplete')
+        with mock.patch.object(GUEST, 'light_readiness', side_effect=stale) as light, \
+             mock.patch.object(GUEST, 'snapshot') as full:
+            with self.assertRaises(GUEST.FixtureNotReady):
+                GUEST.readiness_probe(args, claim, admitted, environment, deadline, cache)
+            light.assert_called_once_with(claim, admitted, environment, deadline)
+            full.assert_not_called()
+        confirmed = {'selection': {'active_windows': [{'role': 'settings'}]}}
+        with mock.patch.object(GUEST, 'light_readiness', return_value=None) as light, \
+             mock.patch.object(GUEST, 'snapshot', return_value=confirmed) as full:
+            self.assertIs(GUEST.readiness_probe(args, claim, admitted, environment, deadline, cache),
+                          confirmed)
+            light.assert_called_once_with(claim, admitted, environment, deadline)
+            full.assert_called_once_with(args, claim, admitted, environment, deadline, cache)
 
 
 class ControlledObservationEvidence(unittest.TestCase):
@@ -1049,6 +1275,22 @@ class ControlledObservationEvidence(unittest.TestCase):
         self.assertIn('last: ObservationTimeout: finite public observation deadline expired', message)
         self.assertIsInstance(failed.exception.__cause__, GUEST.ObservationTimeout)
 
+    def test_readiness_backoff_gives_startup_air_between_samples(self):
+        deadline = GUEST.Deadline(25)
+        calls = []
+
+        def attempt():
+            calls.append(1)
+            if len(calls) == 1:
+                raise GUEST.FixtureNotReady('tab inventory []')
+            raise TimeoutError('expired')
+
+        with mock.patch.object(GUEST.time, 'sleep') as slept:
+            with self.assertRaises(RuntimeError):
+                GUEST.snapshot_until_ready(attempt, [], deadline)
+        slept.assert_called_once_with(GUEST.READINESS_POLL_GAP_S)
+        self.assertEqual(GUEST.READINESS_POLL_GAP_S, 10.0)
+
     def test_timeout_only_run_reports_last_without_first(self):
         deadline = GUEST.Deadline(25)
         deadline.end = 0
@@ -1098,12 +1340,27 @@ class ControlledObservationEvidence(unittest.TestCase):
         deadline.end = 0
 
         def attempt():
+            return {'selection': {'active_windows': [
+                {'role': 'files-first', 'name': 'first', 'process': {'pid': 5001}}]}}
+
+        with mock.patch.object(GUEST.time, 'sleep'):
+            with self.assertRaises(RuntimeError) as failed:
+                GUEST.snapshot_until_ready(attempt, [], deadline)
+        self.assertIn('original Settings Network window is not actually active', str(failed.exception))
+        self.assertIn("active=('files-first', 'first', 5001)", str(failed.exception))
+
+    def test_inactive_settings_without_identity_still_reports(self):
+        deadline = GUEST.Deadline(25)
+        deadline.end = 0
+
+        def attempt():
             return {'selection': {'active_windows': [{'role': 'files-first'}]}}
 
         with mock.patch.object(GUEST.time, 'sleep'):
             with self.assertRaises(RuntimeError) as failed:
                 GUEST.snapshot_until_ready(attempt, [], deadline)
         self.assertIn('original Settings Network window is not actually active', str(failed.exception))
+        self.assertIn("active=('files-first', None, None)", str(failed.exception))
 
     def test_ready_snapshot_returns_without_sleep(self):
         deadline = GUEST.Deadline(25)
@@ -1259,6 +1516,597 @@ class ControlledObservationEvidence(unittest.TestCase):
     def test_slow_call_line_names_bus_path_and_method(self):
         self.assertEqual(GUEST.slow_call_line(':1.5', '/org/a11y/atspi/accessible/1', 'GetAll', 1900),
                          'observe slow-call bus=:1.5 path=/org/a11y/atspi/accessible/1 method=GetAll elapsed_ms=1900')
+
+
+class WaitBusName(unittest.TestCase):
+    def completed(self, stdout, returncode=0, stderr=b''):
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def test_owned_name_returns_without_sleep(self):
+        deadline = GUEST.Deadline(25)
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               return_value=self.completed(b'(true,)\n')) as ran, \
+                mock.patch.object(GUEST.time, 'sleep') as slept:
+            GUEST.wait_bus_name('org.gnome.Nautilus', {'WAYLAND_DISPLAY': 'x'}, 1000, deadline)
+        self.assertEqual(ran.call_count, 1)
+        argv, kwargs = ran.call_args[0][0], ran.call_args[1]
+        self.assertEqual(argv, ['/usr/bin/gdbus', 'call', '--session', '--dest', 'org.freedesktop.DBus',
+                                '--object-path', '/org/freedesktop/DBus',
+                                '--method', 'org.freedesktop.DBus.NameHasOwner',
+                                'org.gnome.Nautilus'])
+        self.assertEqual(kwargs['env'], {'WAYLAND_DISPLAY': 'x'})
+        self.assertEqual(kwargs['user'], GUEST.UID)
+        self.assertEqual(kwargs['group'], 1000)
+        self.assertGreater(kwargs['timeout'], 0)
+        slept.assert_not_called()
+
+    def test_unowned_name_polls_until_owned(self):
+        deadline = GUEST.Deadline(25)
+        with mock.patch.object(GUEST.subprocess, 'run', side_effect=[
+                self.completed(b'(false,)\n'), self.completed(b'(true,)\n')]) as ran, \
+                mock.patch.object(GUEST.time, 'sleep') as slept:
+            GUEST.wait_bus_name('org.gnome.Nautilus', {}, 1000, deadline)
+        self.assertEqual(ran.call_count, 2)
+        slept.assert_called_once()
+
+    def test_bus_query_failure_is_loud(self):
+        deadline = GUEST.Deadline(25)
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               return_value=self.completed(b'', 1, b'no bus')), \
+                mock.patch.object(GUEST.time, 'sleep'):
+            with self.assertRaises(RuntimeError) as failed:
+                GUEST.wait_bus_name('org.gnome.Nautilus', {}, 1000, deadline)
+        self.assertIn('session bus name query failed', str(failed.exception))
+
+    def test_expired_deadline_raises_timeout(self):
+        deadline = GUEST.Deadline(25)
+        deadline.end = 0
+        with mock.patch.object(GUEST.subprocess, 'run') as ran, \
+                mock.patch.object(GUEST.time, 'sleep'):
+            with self.assertRaises(TimeoutError):
+                GUEST.wait_bus_name('org.gnome.Nautilus', {}, 1000, deadline)
+        ran.assert_not_called()
+
+
+class BusPrecheck(unittest.TestCase):
+    def completed(self, stdout, returncode=0, stderr=b''):
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def test_owned_and_free_names_answer_once(self):
+        deadline = GUEST.Deadline(25)
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               return_value=self.completed(b'(true,)\n')) as ran:
+            self.assertTrue(GUEST.bus_name_owned('org.gnome.Settings', {}, 1000, deadline))
+        self.assertEqual(ran.call_count, 1)
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               return_value=self.completed(b'(false,)\n')):
+            self.assertFalse(GUEST.bus_name_owned('org.gnome.Settings', {}, 1000, deadline))
+
+    def test_bus_query_failure_is_loud(self):
+        deadline = GUEST.Deadline(25)
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               return_value=self.completed(b'', 1, b'no bus')):
+            with self.assertRaisesRegex(RuntimeError, 'session bus name query failed'):
+                GUEST.bus_name_owned('org.gnome.Settings', {}, 1000, deadline)
+
+    def test_precheck_refuses_owned_name_and_passes_free(self):
+        deadline = GUEST.Deadline(25)
+        with mock.patch.object(GUEST, 'bus_name_owned', side_effect=[False, True]):
+            with self.assertRaisesRegex(RuntimeError, 'preexisting org.gnome.Settings bus-name owner'):
+                GUEST.precheck_bus_names({}, 1000, deadline)
+        with mock.patch.object(GUEST, 'bus_name_owned', return_value=False) as checked:
+            GUEST.precheck_bus_names({}, 1000, deadline)
+        self.assertEqual(checked.call_count, 2)
+
+    def test_owner_probe_reports_pid_exe_and_ppid(self):
+        runs = [self.completed(b"(':1.7',)\n"), self.completed(b'(uint32 2940,)\n')]
+        stat = '2940 (gnome-control-c) S 2174 2940 0 0\n'
+        with mock.patch.object(GUEST.subprocess, 'run', side_effect=runs) as ran, \
+                mock.patch.object(GUEST.os, 'readlink', return_value='/usr/bin/gnome-control-center'), \
+                mock.patch('builtins.open', mock.mock_open(read_data=stat)):
+            probed = GUEST.bus_name_owner_probe('org.gnome.Settings', {}, 1000)
+        self.assertEqual(probed, {'name': 'org.gnome.Settings', 'pid': 2940,
+                                  'exe': '/usr/bin/gnome-control-center', 'ppid': 2174})
+        self.assertEqual(ran.call_count, 2)
+        methods = [call[0][0][-2] for call in ran.call_args_list]
+        self.assertEqual(methods, ['org.freedesktop.DBus.GetNameOwner',
+                                   'org.freedesktop.DBus.GetConnectionUnixProcessID'])
+        values = [call[0][0][-1] for call in ran.call_args_list]
+        self.assertEqual(values, ["'org.gnome.Settings'", "':1.7'"])
+
+    def test_owner_probe_unowned_is_none_and_errors_are_dicts(self):
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               return_value=self.completed(b'', 1, b'NameHasNoOwner')):
+            self.assertIsNone(GUEST.bus_name_owner_probe('org.gnome.Settings', {}, 1000))
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               return_value=self.completed(b'', 1, b'no bus')):
+            probed = GUEST.bus_name_owner_probe('org.gnome.Settings', {}, 1000)
+        self.assertEqual(probed['name'], 'org.gnome.Settings')
+        self.assertIn('no bus', probed['error'])
+        with mock.patch.object(GUEST.subprocess, 'run', side_effect=OSError('gone')):
+            probed = GUEST.bus_name_owner_probe('org.gnome.Settings', {}, 1000)
+        self.assertIn('gone', probed['error'])
+
+    def test_owner_probe_vanished_owner_is_reported(self):
+        runs = [self.completed(b"(':1.7',)\n"), self.completed(b'(uint32 2940,)\n')]
+        with mock.patch.object(GUEST.subprocess, 'run', side_effect=runs), \
+                mock.patch.object(GUEST.os, 'readlink', side_effect=OSError('gone')):
+            probed = GUEST.bus_name_owner_probe('org.gnome.Settings', {}, 1000)
+        self.assertEqual(probed['pid'], 2940)
+        self.assertIn('vanished', probed['error'])
+
+    def test_child_status_separates_running_handoff_and_reuse(self):
+        running = SimpleNamespace(pid=101, poll=lambda: None)
+        handoff = SimpleNamespace(pid=102, poll=lambda: 0)
+        reused = SimpleNamespace(pid=103, poll=lambda: None)
+        plan = [(['/usr/bin/nautilus'], 'files-first'),
+                (['/usr/bin/gnome-control-center'], 'settings'),
+                (['/usr/bin/nautilus'], 'files-second')]
+
+        def readlink(path):
+            if '101' in path:
+                return '/usr/bin/nautilus'
+            if '103' in path:
+                return '/usr/bin/other'
+            raise OSError('gone')
+
+        with mock.patch.object(GUEST.os, 'readlink', side_effect=readlink), \
+                mock.patch('builtins.open', side_effect=OSError('gone')):
+            statuses = GUEST.format_child_status([running, handoff, reused], plan)
+        self.assertEqual(statuses['files-first']['pid'], 101)
+        self.assertEqual(statuses['files-first']['exe'], '/usr/bin/nautilus')
+        self.assertEqual((statuses['files-first']['state'], statuses['files-first']['wchan']), ('?', '?'))
+        self.assertEqual(statuses['settings']['status'], 0)
+        self.assertEqual(statuses['settings']['exe'], '<exited>')
+        self.assertNotIn('state', statuses['settings'])
+        self.assertEqual(statuses['files-second']['exe'], '/usr/bin/other')
+
+    def test_child_status_reports_scheduler_state_and_wchan(self):
+        running = SimpleNamespace(pid=101, poll=lambda: None)
+        plan = [(['/usr/bin/gnome-control-center'], 'settings')]
+        status = 'Name:\tgnome-control-center\nState:\tS (sleeping)\nPid:\t101\n'
+        with mock.patch.object(GUEST.os, 'readlink', return_value='/usr/bin/gnome-control-center'), \
+                mock.patch('builtins.open', mock.mock_open(read_data=status)) as opened:
+            opened.side_effect = [mock.mock_open(read_data=status).return_value,
+                                  mock.mock_open(read_data='poll_schedule_timeout').return_value]
+            statuses = GUEST.format_child_status([running], plan)
+        self.assertEqual(statuses['settings']['state'], 'S')
+        self.assertEqual(statuses['settings']['wchan'], 'poll_schedule_timeout')
+
+
+class FixtureCensus(unittest.TestCase):
+    def test_summary_includes_every_fixture_node_regardless_of_role_or_states(self):
+        trees = [
+            {'process': {'exe': '/usr/bin/nautilus', 'pid': 1}, 'role_name': 'frame',
+             'name': 'first', 'states': [25, 30], 'children': []},
+            {'process': {'exe': '/usr/bin/gnome-control-center', 'pid': 2}, 'role_name': 'window',
+             'name': 'Settings', 'states': [], 'children': [
+                {'process': {'exe': '/usr/bin/gnome-control-center', 'pid': 2}, 'role_name': 'label',
+                 'name': 'x', 'states': [25], 'children': []}]},
+            {'process': {'exe': '/usr/bin/gnome-shell', 'pid': 3}, 'role_name': 'window',
+             'name': 'shell', 'states': [25, 30], 'children': []},
+        ]
+        summary = GUEST.fixture_node_summary(trees)
+        self.assertEqual([(entry['pid'], entry['role'], entry['states']) for entry in summary],
+                         [(1, 'frame', [25, 30]), (2, 'window', []), (2, 'label', [25])])
+
+    def test_admit_roots_resolves_once_and_drops_foreign_exes(self):
+        resolved = []
+
+        def resolve(bus_name):
+            resolved.append(bus_name)
+            exe = {'a': '/usr/bin/nautilus', 'b': '/usr/bin/gnome-shell'}[bus_name]
+            return 'u-' + bus_name, {'pid': 10 + len(resolved), 'exe': exe}
+
+        owners = {'a': ('u-a', {'pid': 1, 'exe': '/usr/bin/nautilus'})}
+        peers = {}
+        admitted = GUEST.admit_roots_by_owner(
+            [('a', '/r1'), ('b', '/r2')], owners, peers, {'/usr/bin/nautilus'}, resolve)
+        self.assertEqual(admitted, [('a', '/r1')])
+        self.assertEqual(resolved, ['b'])
+        self.assertIn('b', owners)
+        self.assertEqual(peers[11]['exe'], '/usr/bin/gnome-shell')
+
+    def test_summary_truncates_names_and_ignores_foreign_exes(self):
+        trees = [{'process': {'exe': '/usr/bin/other', 'pid': 9}, 'role_name': 'frame',
+                  'name': 'y', 'states': [25, 30], 'children': []},
+                 {'process': {'exe': '/usr/bin/nautilus', 'pid': 1}, 'role_name': 'frame',
+                  'name': 'n' * 100, 'states': [25], 'children': []}]
+        summary = GUEST.fixture_node_summary(trees)
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]['name'], 'n' * 60)
+
+
+class QuietIndexers(unittest.TestCase):
+    def completed(self, stdout, returncode=0, stderr=b''):
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def schemas_present(self):
+        return (GUEST.TRACKER_SCHEMA + '\norg.foo.Bar\n').encode()
+
+    def test_absent_schema_returns_gracefully(self):
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               return_value=self.completed(b'org.foo.Bar\n')) as ran:
+            self.assertEqual(GUEST.quiet_indexers({}, 1000, GUEST.Deadline(25)),
+                             {'miners': 'absent'})
+        self.assertEqual(ran.call_count, 1)
+
+    def test_happy_path_sets_reads_back_and_resets_miners(self):
+        keys = ('index-recursive-directories\nindex-single-directories\nthrottle\n').encode()
+        runs = [self.completed(self.schemas_present()), self.completed(keys),
+                self.completed(b''), self.completed(b''),
+                self.completed(b'[]\n'), self.completed(b'@as []\n')]
+        with mock.patch.object(GUEST.subprocess, 'run', side_effect=runs) as ran, \
+                mock.patch.object(GUEST, '_cmdline_pids', side_effect=[[222, 111], []]) as scanned, \
+                mock.patch.object(GUEST.os, 'kill') as killed:
+            result = GUEST.quiet_indexers({}, 1000, GUEST.Deadline(25))
+        self.assertEqual(result, {'miners': 'idled', 'index_dirs': [], 'killed': [111, 222]})
+        set_argv = [call[0][0] for call in ran.call_args_list[2:4]]
+        self.assertEqual(set_argv[0][1:], ['set', GUEST.TRACKER_SCHEMA, 'index-recursive-directories', '[]'])
+        self.assertEqual(set_argv[1][1:], ['set', GUEST.TRACKER_SCHEMA, 'index-single-directories', '[]'])
+        self.assertEqual(killed.call_args_list,
+                         [mock.call(222, GUEST.signal.SIGTERM), mock.call(111, GUEST.signal.SIGTERM)])
+        self.assertEqual(scanned.call_count, 2)
+
+    def test_schema_drift_missing_keys_and_bad_readback_are_loud(self):
+        with mock.patch.object(GUEST.subprocess, 'run',
+                               side_effect=[self.completed(self.schemas_present()),
+                                             self.completed(b'throttle\n')]):
+            with self.assertRaisesRegex(RuntimeError, 'schema drift'):
+                GUEST.quiet_indexers({}, 1000, GUEST.Deadline(25))
+        with mock.patch.object(GUEST.subprocess, 'run', return_value=self.completed(b'', 1, b'no bus')):
+            with self.assertRaisesRegex(RuntimeError, 'gsettings'):
+                GUEST.quiet_indexers({}, 1000, GUEST.Deadline(25))
+
+    def test_survivors_fail_loudly(self):
+        keys = ('index-recursive-directories\nindex-single-directories\n').encode()
+        runs = [self.completed(self.schemas_present()), self.completed(keys),
+                self.completed(b''), self.completed(b''),
+                self.completed(b'[]\n'), self.completed(b'[]\n')]
+        with mock.patch.object(GUEST.subprocess, 'run', side_effect=runs), \
+                mock.patch.object(GUEST, '_cmdline_pids', return_value=[111]), \
+                mock.patch.object(GUEST.os, 'kill'):
+            with self.assertRaisesRegex(RuntimeError, 'survived SIGTERM'):
+                GUEST.quiet_indexers({}, 1000, GUEST.Deadline(0.15))
+
+    def test_cmdline_scan_finds_own_test_process(self):
+        found = GUEST._cmdline_pids(r'test_gnome_reference_guest', os.getuid())
+        self.assertIn(os.getpid(), found)
+        self.assertEqual(GUEST._cmdline_pids(r'no-such-process-xyz-123', os.getuid()), [])
+
+
+class FixtureLaunch(unittest.TestCase):
+    def test_settings_launches_last_with_stable_roles(self):
+        plan = GUEST.fixture_launch_plan(['/d/first', '/d/second'])
+        self.assertEqual([role for _, role in plan], ['files-first', 'files-second', 'settings'])
+        self.assertEqual(plan[0][0], [GUEST.APPS[0], '--new-window', '/d/first'])
+        self.assertEqual(plan[1][0], [GUEST.APPS[0], '--new-window', '/d/second'])
+        self.assertEqual(plan[2][0], [GUEST.APPS[1], 'network'])
+        with self.assertRaises(ValueError):
+            GUEST.fixture_launch_plan(['/d/only'])
+        with self.assertRaises(ValueError):
+            GUEST.fixture_launch_plan(['/d/a', '/d/b', '/d/c'])
+
+    def test_stderr_drain_never_blocks_and_keeps_bounded_tail(self):
+        read_fd, write_fd = os.pipe()
+        payload = bytes(byte % 251 for byte in range(200000))
+        def write_all():
+            with os.fdopen(write_fd, 'wb') as stream:
+                stream.write(payload)
+        writer = threading.Thread(target=write_all)
+        writer.start()
+        drain = GUEST.StderrDrain(os.fdopen(read_fd, 'rb'))
+        drain.run()
+        writer.join(timeout=10)
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(len(drain.tail), GUEST.StderrDrain.KEEP)
+        self.assertEqual(bytes(drain.tail), payload[-GUEST.StderrDrain.KEEP:])
+        self.assertEqual(drain.text(limit=8), payload[-8:].decode('utf-8', errors='replace'))
+
+    def test_snapshot_retry_reports_attempts_and_durations(self):
+        with self.assertRaises(RuntimeError) as failure:
+            GUEST.snapshot_until_ready(
+                mock.Mock(side_effect=GUEST.FixtureNotReady('inventory nope')),
+                [], GUEST.Deadline(0.05))
+        self.assertRegex(str(failure.exception),
+                         r'last: FixtureNotReady: inventory nope; attempts=1 attempt_ms=\[\d+\] '
+                         r'outcomes=\[FixtureNotReady: inventory nope\]$')
+        with self.assertRaises(RuntimeError) as timeout:
+            GUEST.snapshot_until_ready(
+                mock.Mock(side_effect=TimeoutError('deadline gone')), [], GUEST.Deadline(0.05))
+        self.assertRegex(str(timeout.exception),
+                         r'last: TimeoutError: deadline gone; attempts=1 attempt_ms=\[\d+\] '
+                         r'outcomes=\[TimeoutError: deadline gone\]$')
+
+        def distinct_not_ready():
+            raise GUEST.FixtureNotReady('inventory nope')
+
+        with self.assertRaises(RuntimeError) as repeated:
+            GUEST.snapshot_until_ready(distinct_not_ready, [], GUEST.Deadline(1))
+        message = str(repeated.exception)
+        self.assertIn('first: FixtureNotReady: inventory nope', message)
+        match = re.search(r'; attempts=(\d+) attempt_ms=\[([\d, ]*)\] outcomes=\[(.*)\]$', message)
+        self.assertIsNotNone(match)
+        durations = [entry for entry in match.group(2).split(',') if entry.strip()]
+        self.assertGreaterEqual(int(match.group(1)), 2)
+        self.assertEqual(len(durations), int(match.group(1)))
+        outcomes = match.group(3).split('|')
+        self.assertEqual(len(outcomes), int(match.group(1)))
+        self.assertTrue(all(entry == 'FixtureNotReady: inventory nope' for entry in outcomes))
+
+    def test_snapshot_retry_outcomes_reveal_mid_budget_fixture_movement(self):
+        calls = []
+
+        def moving_fixture():
+            calls.append(1)
+            if len(calls) < 3:
+                raise GUEST.FixtureNotReady('actual fixture window inventory is incomplete')
+            raise GUEST.FixtureNotReady('original Settings Network window is not actually active')
+
+        with mock.patch.object(GUEST, 'READINESS_POLL_GAP_S', 0):
+            with self.assertRaises(RuntimeError) as failure:
+                GUEST.snapshot_until_ready(moving_fixture, [], GUEST.Deadline(0.3))
+        message = str(failure.exception)
+        self.assertIn('first: FixtureNotReady: actual fixture window inventory is incomplete', message)
+        match = re.search(r'outcomes=\[(.*)\]$', message)
+        self.assertIsNotNone(match)
+        outcomes = match.group(1).split('|')
+        self.assertGreaterEqual(len(outcomes), 3)
+        self.assertEqual(outcomes[0], 'FixtureNotReady: actual fixture window inventory is incomplete')
+        self.assertEqual(outcomes[1], 'FixtureNotReady: actual fixture window inventory is incomplete')
+        self.assertTrue(all(entry == 'FixtureNotReady: original Settings Network window is not actually active'
+                              for entry in outcomes[2:]))
+
+    def _prepare_fixture(self):
+        claim = {'nonce': NONCE, 'profile': 'gnome',
+                 'fixture': {'processes': [], 'launchers': [], 'directories': [], 'directory_identities': []}}
+        launched = []
+
+        class Child:
+            def __init__(self, argv, **kwargs):
+                self.args = argv
+                self.pid = 5000 + len(launched)
+                self.stderr = io.BytesIO(b'stderr-for-pid-%d' % self.pid)
+                launched.append((argv, kwargs))
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        real_path = Path
+
+        class FakePath:
+            def __init__(self, real):
+                self._real = real_path(real)
+
+            def __truediv__(self, other):
+                return FakePath(str(self._real / other))
+
+            def __str__(self):
+                return str(self._real)
+
+            def __fspath__(self):
+                return str(self._real)
+
+            def mkdir(self, mode=0o777):
+                os.makedirs(self._real, mode=mode, exist_ok=True)
+
+        return claim, launched, Child, FakePath
+
+    def _prepare_mocks(self, tmp, claim, launched, Child, FakePath):
+        shell = {'pid': 111, 'start_ticks': 10, 'boot_id': 'b', 'uid': 1000, 'exe': '/usr/bin/gnome-shell'}
+        before = {'settings': {}, 'trees': [{'process': dict(shell), 'role_name': 'application',
+                                             'name': 'shell', 'states': [], 'children': []}]}
+        forwarded = {'settings': {}, 'trees': [{'process': {'pid': 5001}, 'role_name': 'window',
+                                                'name': 'second-window', 'states': [25],
+                                                'children': []}]}
+        exe_by_pid = {}
+        drains = []
+
+        class Drain:
+            def __init__(self, stream):
+                self.stream = stream
+                drains.append(self)
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+            def text(self, limit=2048):
+                return 'tail-%d' % len(drains)
+
+        def spawn(argv, **kwargs):
+            child = Child(argv, **kwargs)
+            exe_by_pid[child.pid] = argv[0]
+            return child
+
+        patches = [
+            mock.patch.object(GUEST, 'admission', return_value=({'ready': True, 'session': {'shell': shell},
+                                                                 'missing': []}, {'WAYLAND_DISPLAY': 'x'})),
+            mock.patch.object(GUEST, 'process_candidates', return_value=[]),
+            mock.patch.object(GUEST, 'public_observation', side_effect=[before, forwarded]),
+            mock.patch.object(GUEST, 'wait_bus_name'),
+            mock.patch.object(GUEST, 'precheck_bus_names'),
+            mock.patch.object(GUEST, 'bus_name_owner_probe', return_value=None),
+            mock.patch.object(GUEST, 'quiet_indexers',
+                              return_value={'miners': 'idled', 'index_dirs': [], 'killed': []}),
+            mock.patch.object(GUEST, 'same_process'),
+            mock.patch.object(GUEST, 'load_claim', return_value=claim),
+            mock.patch.object(GUEST, 'save'),
+            mock.patch.object(GUEST, 'private_directory',
+                              side_effect=lambda path, uid, create=False: {'path': str(path)}),
+            mock.patch.object(GUEST.pwd, 'getpwnam', return_value=SimpleNamespace(pw_gid=1000)),
+            mock.patch.object(GUEST.subprocess, 'Popen', side_effect=spawn),
+            mock.patch.object(GUEST, 'proc_identity',
+                              side_effect=lambda pid, uid: {'exe': exe_by_pid[pid], 'pid': pid}),
+            mock.patch.object(GUEST, 'packaged', side_effect=lambda identity, deadline, cache: identity),
+            mock.patch.object(GUEST, 'retained_files', return_value=['prepare.json']),
+            mock.patch.object(GUEST, 'StderrDrain', Drain),
+            mock.patch.object(GUEST, 'Path', side_effect=lambda *parts: FakePath(tmp)),
+            mock.patch('os.chown'),
+        ]
+        for entered in patches:
+            entered.start()
+            self.addCleanup(entered.stop)
+        return shell, before, exe_by_pid, drains, launched
+
+    def test_prepare_launches_settings_last_without_raise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claim, launched, Child, FakePath = self._prepare_fixture()
+            shell, before, exe_by_pid, drains, _ = self._prepare_mocks(
+                tmp, claim, launched, Child, FakePath)
+            with mock.patch.object(GUEST, 'snapshot_until_ready',
+                                   return_value={'selection': {}, 'snapshot': True}) as loop:
+                response = GUEST.prepare({'profile': 'gnome', 'nonce': NONCE}, Path(tmp),
+                                         GUEST.Deadline(3), {})
+        self.assertTrue(response['ready'])
+        argv = [call[0] for call in launched]
+        self.assertEqual(len(argv), 3)
+        self.assertEqual(argv[0][:2], [GUEST.APPS[0], '--new-window'])
+        self.assertEqual(argv[1][:2], [GUEST.APPS[0], '--new-window'])
+        self.assertEqual(argv[2], [GUEST.APPS[1], 'network'])
+        self.assertIn('first', argv[0][2])
+        self.assertIn('second', argv[1][2])
+        # Both legs supply the desktop explicitly; the session env has none.
+        self.assertEqual(launched[2][1]['env']['XDG_CURRENT_DESKTOP'], 'GNOME')
+        self.assertEqual(launched[2][1]['env']['G_MESSAGES_DEBUG'], 'GApplication')
+        self.assertNotIn('XDG_CURRENT_DESKTOP', launched[0][1]['env'])
+        self.assertNotIn('XDG_CURRENT_DESKTOP', launched[1][1]['env'])
+        for _, kwargs in launched:
+            self.assertIs(kwargs['stderr'], GUEST.subprocess.PIPE)
+        self.assertEqual(len(drains), 3)
+        self.assertTrue(all(drain.started for drain in drains))
+        # First Nautilus primes its bus name (no tree walk); only the
+        # pre-launch inventory and the forwarded-window wait walk trees.
+        GUEST.wait_bus_name.assert_called_once_with(
+            GUEST.NAUTILUS_BUS_NAME, mock.ANY, 1000, mock.ANY)
+        self.assertEqual(GUEST.public_observation.call_count, 2)
+        loop.assert_called_once()
+        roles = [entry['role'] for entry in claim['fixture']['launches']]
+        self.assertEqual(roles, ['files-first', 'files-second', 'settings'])
+        self.assertEqual([entry['pid'] for entry in claim['fixture']['launches']], [5000, 5001, 5002])
+        # Second Nautilus forwards; Settings and first Nautilus are principals.
+        self.assertEqual(len(claim['fixture']['processes']), 2)
+        self.assertEqual(len(claim['fixture']['launchers']), 1)
+
+    def test_prepare_tuna_profile_overrides_settings_desktop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claim, launched, Child, FakePath = self._prepare_fixture()
+            self._prepare_mocks(tmp, claim, launched, Child, FakePath)
+            with mock.patch.object(GUEST, 'snapshot_until_ready',
+                                   return_value={'selection': {}, 'snapshot': True}):
+                GUEST.prepare({'profile': 'tuna', 'nonce': NONCE}, Path(tmp),
+                              GUEST.Deadline(3), {})
+        self.assertEqual(launched[2][1]['env']['XDG_CURRENT_DESKTOP'], 'Tuna:GNOME')
+        self.assertNotIn('G_MESSAGES_DEBUG', launched[2][1]['env'])
+
+    def test_prepare_quiets_indexers_and_retains_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claim, launched, Child, FakePath = self._prepare_fixture()
+            self._prepare_mocks(tmp, claim, launched, Child, FakePath)
+            with mock.patch.object(GUEST, 'snapshot_until_ready',
+                                   return_value={'selection': {}, 'snapshot': True}):
+                GUEST.prepare({'profile': 'gnome', 'nonce': NONCE}, Path(tmp),
+                              GUEST.Deadline(3), {})
+        GUEST.quiet_indexers.assert_called_once()
+        self.assertEqual(claim['fixture']['indexers_quiet'],
+                         {'miners': 'idled', 'index_dirs': [], 'killed': []})
+
+    def test_prepare_bus_prime_failure_is_loud(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claim, launched, Child, FakePath = self._prepare_fixture()
+            self._prepare_mocks(tmp, claim, launched, Child, FakePath)
+            GUEST.wait_bus_name.side_effect = RuntimeError('bus prime nope')
+            with self.assertRaises(RuntimeError) as failure:
+                GUEST.prepare({'profile': 'gnome', 'nonce': NONCE}, Path(tmp),
+                              GUEST.Deadline(3), {})
+            self.assertIn('bus prime nope', str(failure.exception))
+
+    def test_prepare_failure_carries_launches_and_stderr_tails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claim, launched, Child, FakePath = self._prepare_fixture()
+            self._prepare_mocks(tmp, claim, launched, Child, FakePath)
+            with mock.patch.object(GUEST, 'snapshot_until_ready',
+                                   side_effect=RuntimeError('actual fixture observation never became ready: nope')):
+                with self.assertRaises(RuntimeError) as failure:
+                    GUEST.prepare({'profile': 'gnome', 'nonce': NONCE}, Path(tmp),
+                                  GUEST.Deadline(3), {})
+        message = str(failure.exception)
+        self.assertIn('never became ready: nope; launches=', message)
+        self.assertIn('"role": "settings"', message)
+        self.assertIn('"role": "files-second"', message)
+        self.assertIn('stderr_tails=', message)
+        self.assertIn('tail-', message)
+
+
+class AdmissionGreeterTeardown(unittest.TestCase):
+    def _greeter(self, state):
+        return {'Id': '1', 'User': '60578', 'Name': 'gdm-greeter', 'Class': 'greeter',
+                'Service': 'gdm-launch-environment', 'Type': 'wayland', 'Active': 'no',
+                'Remote': 'no', 'Seat': 'seat0', 'State': state, 'VTNr': '1'}
+
+    def _user(self):
+        return {'Id': '3', 'User': '1000', 'Name': 'tuna-test', 'Class': 'user',
+                'Service': 'gdm-password', 'Type': 'wayland', 'Active': 'yes',
+                'Remote': 'no', 'Seat': 'seat0', 'State': 'active', 'VTNr': '7'}
+
+    def _mocks(self, greeter_state):
+        queries = []
+
+        def candidates(paths, uid, deadline):
+            queries.append((tuple(paths), uid))
+            if tuple(paths) == ('/usr/bin/gnome-shell',) and uid == 1000:
+                return [{'exe': '/usr/bin/gnome-shell', 'pid': 200, 'uid': 1000,
+                         'start_ticks': 5, 'boot_id': 'b', 'exe_sha256': '1' * 64}]
+            return []
+
+        def packaged(identity, deadline, cache):
+            package = {'/usr/bin/gdm': ('gdm', '51.1-1'),
+                       '/usr/bin/dbus-broker': ('dbus-broker', '36-1'),
+                       }.get(identity['exe'], ('gnome-shell', '51.1-1'))
+            return dict(identity, package={'name': package[0], 'version': package[1]})
+
+        patches = [
+            mock.patch.object(GUEST, 'sessions',
+                              return_value=[self._greeter(greeter_state), self._user()]),
+            mock.patch.object(GUEST, 'payload_integrity', return_value={'ready': True}),
+            mock.patch.object(GUEST, 'run',
+                              return_value='MainPID=1\nActiveState=active\nSubState=running\nFragmentPath=/gdm'),
+            mock.patch.object(GUEST, 'proc_identity', return_value={'exe': '/usr/bin/gdm', 'pid': 1}),
+            mock.patch.object(GUEST, 'packaged', side_effect=packaged),
+            mock.patch.object(GUEST, 'process_candidates', side_effect=candidates),
+            mock.patch.object(GUEST, 'session_environment', return_value={'WAYLAND_DISPLAY': 'wayland-0'}),
+            mock.patch.object(GUEST, 'check_socket_peer', return_value={'exe': '/usr/bin/dbus-broker'}),
+            mock.patch.object(GUEST, 'native_gpu', return_value={}),
+            mock.patch.object(GUEST, 'Path',
+                              side_effect=lambda *parts: SimpleNamespace(read_text=lambda: 'tty7')),
+        ]
+        for entered in patches:
+            entered.start()
+            self.addCleanup(entered.stop)
+        return queries
+
+    def test_closing_greeter_is_skipped_without_shell_probe(self):
+        queries = self._mocks('closing')
+        admitted, environment = GUEST.admission('gnome', GUEST.Deadline(3), {})
+        self.assertTrue(admitted['ready'], admitted.get('missing'))
+        self.assertEqual(admitted['gdm']['greeters'], [])
+        self.assertEqual(environment, {'WAYLAND_DISPLAY': 'wayland-0'})
+        self.assertNotIn(60578, [uid for _, uid in queries])
+
+    def test_post_login_shell_less_greeter_is_skipped_residue(self):
+        # Contract change (round-19 run 41871251657): post-login, logind
+        # can list the greeter session as live after its shell exited;
+        # failing admission then is a teardown race, not a missing
+        # principal. Pre-login shell-less greeters still fail (see
+        # ControlledAdmission), as do ambiguous (>1 shell) ones.
+        self._mocks('online')
+        admitted, environment = GUEST.admission('gnome', GUEST.Deadline(3), {})
+        self.assertTrue(admitted['ready'], admitted.get('missing'))
+        self.assertEqual(admitted['gdm']['greeters'], [])
+        self.assertEqual(environment, {'WAYLAND_DISPLAY': 'wayland-0'})
 
 
 if __name__ == '__main__':
