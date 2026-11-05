@@ -97,6 +97,16 @@ def main():
                     '--output', str(font), FONT_URL], check=True)
     if sha256(font) != FONT_SHA256:
         raise RuntimeError('immutable official font payload bytes differ')
+    # The payload doubles as the portal control document, but fontconfig
+    # never scans the data directory (round-1004: preedit rendered as tofu
+    # because no process could resolve CJK coverage). Link it into the
+    # system font path so every session process sees it from first boot,
+    # independent of the per-user font test flow that runs later.
+    system_font = Path('/usr/share/fonts/NotoSansCJKjp-Regular.otf')
+    if system_font.is_symlink() or system_font.exists():
+        system_font.unlink()
+    system_font.symlink_to(font)
+    subprocess.run(['fc-cache', '-f'], check=True)
     # Standard per-user XDG directories are established by tmpfiles before GDM,
     # not a replacement media indexer or a private product application launch.
     (root / 'user-dirs.dirs').write_text(
@@ -135,7 +145,8 @@ def main():
         'before': before, 'after': after, 'added': added, 'changed': changed, 'removed': removed,
         'cached_original_package_archives': archives,
         'normal_sync_metadata': output('pacman', '-Si', *APPS, *TOOLS),
-        'font': {'url': FONT_URL, 'sha256': FONT_SHA256, 'bytes': font.stat().st_size},
+        'font': {'url': FONT_URL, 'sha256': FONT_SHA256, 'bytes': font.stat().st_size,
+                 'installed': str(system_font)},
         'account': {'name': 'tuna-test', 'uid': uid, 'groups': groups,
                     'groups_before': account_groups_before, 'groups_after': account_groups_after,
                     'added_groups': sorted(set(account_groups_after) - set(account_groups_before)),
