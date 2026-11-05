@@ -312,6 +312,39 @@ def _ppid(pid):
         return None
 
 
+def _cmdline(pid, proc_root=Path('/proc')):
+    """Bounded process command line, or None when unreadable."""
+    try:
+        raw = (proc_root / str(pid) / 'cmdline').read_bytes()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+    text = raw.replace(b'\0', b' ').decode('utf-8', errors='replace').strip()
+    return text[:500] if text else None
+
+
+def _ibus_app_wiring(pid, uid, proc_root=Path('/proc')):
+    """App-side IBus join: which bus and IM module the composing client sees.
+
+    Zero preedit rows with a healthy engine means the keys never reached it:
+    either the app talks to a different daemon than the engine (#1014), or
+    the app bypasses IBus entirely (GTK_IM_MODULE). Unreadable values stay
+    None: an unverifiable join never counts.
+    """
+    entry = proc_root / str(pid)
+    try:
+        if entry.stat().st_uid != uid:
+            return None
+        raw = (entry / 'environ').read_bytes()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+    values = {}
+    for key in ('IBUS_ADDRESS', 'GTK_IM_MODULE'):
+        found = [item.split(b'=', 1)[1].decode('utf-8', errors='replace') for item in raw.split(b'\0')
+                 if item.startswith(key.encode() + b'=')]
+        values[key.lower()] = found[0] if len(found) == 1 else None
+    return {'pid': pid, **values}
+
+
 def _ibus_engine_wiring(uid, proc_root=Path('/proc')):
     """Owned libpinyin engine process with its parent and bus address.
 
@@ -717,6 +750,20 @@ def dispatch(operation, arguments, context):
             raise RuntimeError('real preedit native seat focus belongs to another client')
         candidates = [node['name'] for node in tree['nodes'] if node['showing']
                       and any(parent['name'] == 'Input Method Candidates' for parent in node['ancestors'])]
+        # Focused editable contents distinguish "typed keys never arrived"
+        # (empty) from "keys bypassed the engine" (literal text committed).
+        # Password fields never leave the guest; text is bounded.
+        focused_editables = []
+        for node in tree['nodes']:
+            if len(focused_editables) >= 8:
+                break
+            if not (node.get('focused') and node.get('editable')):
+                continue
+            if 'password' in str(node.get('role', '')):
+                continue
+            text = node.get('text')
+            focused_editables.append({'path': node.get('path'), 'name': node.get('name'),
+                                      'text': text[:120] if isinstance(text, str) else text})
         try:
             file_address = subprocess.check_output(['ibus', 'address'], text=True, timeout=3,
                                                    user=context.uid,
@@ -726,13 +773,16 @@ def dispatch(operation, arguments, context):
         wiring = {'monitor_address': log_rows[0].get('address') if log_rows else None,
                   'file_address': file_address,
                   'engine': _ibus_engine_wiring(context.uid),
-                  'daemon_parents': {daemon['pid']: _ppid(daemon['pid']) for daemon in daemons}}
+                  'app': _ibus_app_wiring(actor['pid'], context.uid),
+                  'daemon_parents': {daemon['pid']: _ppid(daemon['pid']) for daemon in daemons},
+                  'daemon_cmdlines': {daemon['pid']: _cmdline(daemon['pid']) for daemon in daemons}}
         return {'preedit_visible': visible,
                 'preedit': latest['body'][0][2] if visible else None,
                 'real_preedit_message': latest,
                 'ime_log_summary': summary,
                 'ibus_owner': ibus_owner,
                 'ibus_wiring': wiring,
+                'focused_editables': focused_editables,
                 'destination': messages[-1].get('destination') if messages else None,
                 'daemons': daemons,
                 'candidates': candidates, 'shell_actor': shell, 'actual_shell_tree': tree,

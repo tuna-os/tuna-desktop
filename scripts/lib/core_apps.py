@@ -455,10 +455,15 @@ class Desktop(NativeDesktop):
             self.guest('desktop', 'ime-monitor-start', actor=actor)
             monitor_started = True
             self.type_ascii('nihao')
+            # Healthy ime-state polls round-trip in ~2s (run 41887740732:
+            # six polls over 9s); the default 10s budget starves the sixth
+            # poll with a misleading guest-exec TimeoutError instead of an
+            # honest readiness expiry. 30s fits ~15 polls.
             composition = self.await_state('real-native-libpinyin-preedit',
                                             lambda: self.guest('desktop', 'ime-state', actor=actor),
                                             lambda value: value['preedit_visible']
-                                            and expected in value['candidates'])
+                                            and expected in value['candidates'],
+                                            timeout=30)
             rendered = self.observe('original-app-visible-preedit', actor)
             current = [node for node in rendered['nodes'] if node['path'] == field['path']
                        and node['focused'] and node['editable']]

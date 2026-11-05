@@ -436,7 +436,10 @@ class ImeStateDispatch(unittest.TestCase):
         state = {'native_keyboard_windows': [{'window_id': 7, 'client_pid': 300,
                                               'client_uid': 1000, 'actual_keyboard_focus': True}]}
         tree = {'nodes': [{'showing': True, 'name': '你好',
-                           'ancestors': [{'name': 'Input Method Candidates'}]}]}
+                           'ancestors': [{'name': 'Input Method Candidates'}]},
+                          {'showing': True, 'name': 'Search', 'role': 'text',
+                           'path': [1, 2], 'focused': True, 'editable': True,
+                           'text': '', 'ancestors': []}]}
 
         def desktop(operation, arguments, _context):
             return {'shell': True} if operation == 'shell-actor' else (
@@ -449,11 +452,15 @@ class ImeStateDispatch(unittest.TestCase):
 
         guest = types.SimpleNamespace(desktop=desktop)
         engine = {'pid': 400, 'ppid': 100, 'bus_address': 'unix:path=/fixture/engine-bus'}
+        app = {'pid': 300, 'ibus_address': 'unix:path=/fixture/app-bus', 'gtk_im_module': 'ibus'}
         with mock.patch.object(self.native, 'process', side_effect=identify), \
                 mock.patch.object(self.native, '_rows', return_value=rows), \
                 mock.patch.object(self.native, 'RUN_STATE') as run, \
                 mock.patch.object(self.native, '_ibus_engine_wiring', return_value=engine), \
+                mock.patch.object(self.native, '_ibus_app_wiring', return_value=app), \
                 mock.patch.object(self.native, '_ppid', return_value=1), \
+                mock.patch.object(self.native, '_cmdline',
+                                  return_value='ibus-daemon --daemonize --xim'), \
                 mock.patch.object(self.native.subprocess, 'check_output',
                                   return_value='unix:path=/fixture/file-bus\n'), \
                 mock.patch.dict(sys.modules, {'guest': guest}):
@@ -488,7 +495,12 @@ class ImeStateDispatch(unittest.TestCase):
                           'file_address': 'unix:path=/fixture/file-bus',
                           'engine': {'pid': 400, 'ppid': 100,
                                      'bus_address': 'unix:path=/fixture/engine-bus'},
-                          'daemon_parents': {100: 1}})
+                          'app': {'pid': 300, 'ibus_address': 'unix:path=/fixture/app-bus',
+                                  'gtk_im_module': 'ibus'},
+                          'daemon_parents': {100: 1},
+                          'daemon_cmdlines': {100: 'ibus-daemon --daemonize --xim'}})
+        self.assertEqual(response['focused_editables'],
+                         [{'path': [1, 2], 'name': 'Search', 'text': ''}])
 
     def test_engine_wiring_skips_unreadable_owned_processes(self):
         import pathlib
@@ -519,6 +531,36 @@ class ImeStateDispatch(unittest.TestCase):
         self.assertEqual(found, {'pid': 4242, 'ppid': 1,
                                  'bus_address': 'unix:path=/fixture/bus'})
         self.assertIsNone(self.native._ibus_engine_wiring(owner + 1, root))
+
+    def test_app_wiring_reads_bus_and_im_module_or_nothing(self):
+        import pathlib
+        import tempfile
+        root = pathlib.Path(tempfile.mkdtemp(prefix='ibus-app-proc-'))
+        owner = os.geteuid()
+        entry = root / '300'
+        entry.mkdir()
+        entry.joinpath('environ').write_bytes(
+            b'GTK_IM_MODULE=ibus\0IBUS_ADDRESS=unix:path=/fixture/app-bus\0OTHER=1\0')
+        self.assertEqual(self.native._ibus_app_wiring(300, owner, root),
+                         {'pid': 300, 'ibus_address': 'unix:path=/fixture/app-bus',
+                          'gtk_im_module': 'ibus'})
+        self.assertIsNone(self.native._ibus_app_wiring(999, owner, root))
+        self.assertIsNone(self.native._ibus_app_wiring(300, owner + 1, root))
+        entry.joinpath('environ').write_bytes(b'OTHER=1\0')
+        self.assertEqual(self.native._ibus_app_wiring(300, owner, root),
+                         {'pid': 300, 'ibus_address': None, 'gtk_im_module': None})
+
+    def test_cmdline_is_bounded_or_nothing(self):
+        import pathlib
+        import tempfile
+        root = pathlib.Path(tempfile.mkdtemp(prefix='cmdline-proc-'))
+        entry = root / '100'
+        entry.mkdir()
+        entry.joinpath('cmdline').write_bytes(b'ibus-daemon\0--daemonize\0--xim\0')
+        self.assertEqual(self.native._cmdline(100, root), 'ibus-daemon --daemonize --xim')
+        self.assertIsNone(self.native._cmdline(999, root))
+        entry.joinpath('cmdline').write_bytes(b'x' * 600)
+        self.assertEqual(len(self.native._cmdline(100, root)), 500)
 
     def test_ppid_reads_parent_or_nothing(self):
         import pathlib
