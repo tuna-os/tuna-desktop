@@ -64,6 +64,17 @@ def formatted_result_matches(text, value, separators):
     return (digits != text) == separators
 
 
+def clipboard_result_matches(text, value):
+    """Copied arithmetic value independent of display grouping.
+
+    Calculator copies the raw digits while displaying the grouped form;
+    either shape proves the copy path carried the value, since the
+    display oracle separately pins grouping presence.
+    """
+    digits = ''.join(character for character in (text or '') if character in '0123456789')
+    return digits == str(value)
+
+
 def metadata_label(details, text):
     # The details view shows the face family twice: once as the header
     # title (nested panels) and once as the Name metadata value (inside
@@ -160,7 +171,7 @@ def _calculator(desktop):
         desktop.keys('ctrl', 'a')
         desktop.keys('ctrl', 'c')
         copied = desktop.clipboard()
-        require(formatted_result_matches(_text_bytes(copied).decode(), value, desired),
+        require(clipboard_result_matches(_text_bytes(copied).decode(), value),
                 'actual calculator result/clipboard differs from arithmetic oracle')
         return {'expression': expression, 'mathematical_result': value,
                 'formatted': {'digits': str(value), 'grouped': bool(desired and value >= 10000)},

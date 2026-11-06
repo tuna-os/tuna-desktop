@@ -56,6 +56,15 @@ class FormattedArithmeticResult(unittest.TestCase):
     def test_small_result_needs_no_separator(self):
         self.assertTrue(core_apps_basic.formatted_result_matches('703', 703, True))
 
+    def test_raw_digit_clipboard_matches(self):
+        self.assertTrue(core_apps_basic.clipboard_result_matches('56088', 56088))
+
+    def test_grouped_clipboard_matches(self):
+        self.assertTrue(core_apps_basic.clipboard_result_matches('56 088', 56088))
+
+    def test_wrong_digit_clipboard_rejected(self):
+        self.assertFalse(core_apps_basic.clipboard_result_matches('56089', 56088))
+
 
 if __name__ == '__main__':
     unittest.main()
