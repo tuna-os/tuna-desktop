@@ -244,14 +244,23 @@ def _loupe(desktop):
     # do_action refused). The pill toggle stays keyboard-focusable while
     # hidden, so Tab reaches it by its real focus — observed from the
     # tree, never by pointer bounds — and Space opens its popover.
-    for _ in range(25):
-        window = desktop.tree(actor)
+    attempts = 0
+    while True:
+        if attempts >= 25:
+            require(False, 'actual Image Viewer zoom row never took keyboard focus')
+        attempts += 1
+        try:
+            window = desktop.tree(actor)
+        except RuntimeError:
+            # Same transient a11y churn class as the ev24 Fonts flap: one
+            # walk fails while the subject re-renders. Re-read without
+            # advancing focus — the row may already hold it — inside the
+            # attempt budget instead of failing fast.
+            continue
         if any(node.get('focused') and node.get('name') == 'Zoom to Specific Level'
                and node.get('role') in ('button', 'toggle button') for node in nodes(window)):
             break
         desktop.keys('tab')
-    else:
-        require(False, 'actual Image Viewer zoom row never took keyboard focus')
     desktop.keys('spc')
     zoom_entry = unique(desktop.tree(actor),
         lambda node: node['showing'] and node['editable'] and node['name'] == 'Custom Zoom Level',
