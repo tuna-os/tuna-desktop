@@ -681,7 +681,12 @@ class Desktop(NativeDesktop):
         if after_buffers != buffers:
             raise RuntimeError('original editable buffer changed/retired across locked input and unlock')
         resumed_before = self.guest('desktop', 'app-input', actor=actor, phase='unlocked-focused')
-        self.keys('tab')
+        # A lone modifier proves post-unlock emission without moving
+        # focus: Tab walks out of the window (run 42168094423 lost
+        # seat focus on Tab, failing the focus-pinned observation),
+        # while Shift emits press/release into the app and changes
+        # nothing focus- or buffer-wise (the tour's no-op probe).
+        self.keys('shift')
         resumed = self.await_state('actual-original-app-postunlock-fresh-emission',
             lambda: self.guest('desktop', 'app-input', actor=actor, phase='unlocked-focused'),
             lambda value: self._emission_advanced(resumed_before, value))
