@@ -789,6 +789,46 @@ class PreeditInkIsolation(unittest.TestCase):
         from PIL import Image
         self.assertIsNone(core_apps._isolate_preedit_ink(Image.new('RGB', (60, 20), 'white')))
 
+
+class PickerAcceptGesture(unittest.TestCase):
+    def picker_tree(self, default):
+        cell = {'path': [0, 1], 'name': 'principal.png. File', 'role': 'table cell',
+                'showing': True, 'sensitive': True, 'selected': True, 'default': False}
+        accept = {'path': [1], 'name': 'Open', 'role': 'push button',
+                  'showing': True, 'sensitive': True, 'default': default}
+        return {'nodes': [cell, accept]}
+
+    def desktop(self, default):
+        calls = {}
+        desktop = core_apps.Desktop.__new__(core_apps.Desktop)
+        desktop.tree = lambda actor: dict(self.picker_tree(default))
+        desktop.guest = lambda *a, **k: calls.setdefault('guest', []).append((a, k)) or {}
+        desktop.keys = lambda *keys: calls.setdefault('keys', []).append(keys)
+        desktop.state = lambda: {'focused': 7, 'windows': []}
+
+        def await_state(label, read, predicate, timeout=10):
+            value = read()
+            if predicate(value):
+                return value
+            raise TimeoutError('not ready: ' + label)
+        desktop.await_state = await_state
+        picker = {'window_id': 9}
+        actor = {'window_id': 7}
+        return desktop, calls, picker, actor
+
+    def test_open_accepts_without_default_button(self):
+        desktop, calls, picker, actor = self.desktop(default=False)
+        result = desktop._accept_picker(actor, picker, 'fixture/principal.png', save=False)
+        self.assertIn(('ret',), calls.get('keys', []))
+        self.assertNotIn('press', [a[1] for a in calls.get('guest', [])])
+        self.assertEqual(result['picker'], picker)
+
+    def test_save_still_presses_default_button(self):
+        desktop, calls, picker, actor = self.desktop(default=True)
+        desktop._accept_picker(actor, picker, 'fixture/out.png', save=True)
+        pressed = [a for a in calls.get('guest', []) if a[0][1] == 'press']
+        self.assertEqual(len(pressed), 1)
+
     def realistic_entry(self, text_left=60, text_width=80, border=False, caret=False):
         # Pango-realistic geometry: the composition sits directly above its
         # underline (Calculator round-1004: a detached widget border below

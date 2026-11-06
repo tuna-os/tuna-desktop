@@ -440,6 +440,19 @@ class Desktop(NativeDesktop):
         return picker
 
     def _accept_picker(self, actor, picker, path, save):
+        if not save:
+            # The ordinary keyboard accept gesture for an open dialog is
+            # Return on the focused file cell (row activation opens the
+            # selection); this file chooser offers no default button, so
+            # there is no locale-independent default control to press.
+            # Dismissal plus caller focus proves the acceptance.
+            self.keys('ret')
+            self.await_state('picker-caller-focus-restored', self.state,
+                             lambda value: value['focused'] == actor['window_id']
+                             and not any(row['id'] == picker['window_id'] for row in value['windows']))
+            return {'picker': picker, 'path': str(path), 'save': save,
+                    'accepted_via': 'keyboard-row-activation',
+                    'caller': self.tree(actor), 'consent': 'actual-native-accept'}
         tree = self.await_state('picker-real-default-accept-control', lambda: self.tree(picker),
                                 lambda value: len([node for node in value['nodes'] if node['showing']
                                     and node['sensitive'] and node['default']
