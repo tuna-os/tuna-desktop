@@ -27,33 +27,35 @@ def _isolate_preedit_ink(crop):
     """Crop an IME field capture down to the composition's own ink.
 
     The entry crop carries decorations tesseract cannot survive: the
-    search icon, the clear button, Pango's composition underline (which
-    merges with CJK glyph bottoms at this size), and the blinking text
-    caret (round-1004: the full-entry crop OCR'd as latin garbage while
-    the field visibly showed the exact preedit, and a caret-blink frame
-    broke the first isolation attempt). The underline spans the
-    composition width, so it locates the text without any geometry
-    constants: a bottom dark row holding one dominant run marks the
-    composition, and the enclosing dark-column cluster is its ink.
-    Caret-only rows (at most two adjacent dark pixels top or bottom)
-    are trimmed so blink frames isolate identically, and a white quiet
-    zone is added for the line finder. Returns None when no composition
-    underline is found so the caller falls back to the whole crop; the
-    exact-equality OCR gate is unchanged. Isolation is best-effort
-    sensor preparation, never load-bearing: any inspection failure
-    also falls back to the whole crop.
+    search icon, the clear button, a detached widget border below the
+    text, Pango's composition underline (which merges with CJK glyph
+    bottoms at this size), and the blinking text caret (round-1004: the
+    full-entry crop OCR'd as latin garbage while the field visibly
+    showed the exact preedit, a caret-blink frame broke the first
+    isolation attempt, and Calculator's border plus caret-merged glyphs
+    broke the second). The underline spans the composition width, so it
+    locates the text without any geometry constants, but only when
+    glyph ink sits directly above it: a dominant run underlines the
+    composition, while a border underlines whitespace. Caret columns
+    hugging the composition edge are excluded so a caret merged with
+    the last glyph cannot corrupt the OCR read, and the region is
+    doubled to tesseract's operating envelope for small CJK. Caret-only
+    rows (at most two adjacent dark pixels top or bottom) are trimmed
+    so blink frames isolate identically, and a white quiet zone is added
+    for the line finder. Returns None when no composition underline is
+    found so the caller falls back to the whole crop; the exact-equality
+    OCR gate is unchanged. Isolation is best-effort sensor preparation,
+    never load-bearing: any inspection failure also falls back to the
+    whole crop.
     """
     try:
-        from PIL import ImageOps
+        from PIL import Image, ImageOps
         gray = crop.convert('L')
         width, height = gray.size
         ink = gray.load()
         dark = lambda x, y: ink[x, y] < 150  # noqa: E731
-        rows = [y for y in range(height) if any(dark(x, y) for x in range(width))]
-        if not rows:
-            return None
-        span = None
-        for line in rows[-3:]:
+
+        def runs_in(line):
             runs = []
             x = 0
             while x < width:
@@ -64,22 +66,93 @@ def _isolate_preedit_ink(crop):
                     runs.append((start, x - 1))
                 else:
                     x += 1
+            return runs
+
+        def dominant(line):
+            runs = runs_in(line)
             if not runs:
-                continue
+                return None
             longest = max(stop - start + 1 for start, stop in runs)
             total = sum(stop - start + 1 for start, stop in runs)
             if longest >= 12 and longest >= 0.9 * total:
-                span = max(runs, key=lambda row: row[1] - row[0])
+                return max(runs, key=lambda row: row[1] - row[0])
+            return None
+
+        rows = [y for y in range(height) if any(dark(x, y) for x in range(width))]
+        if not rows:
+            return None
+        span = None
+        anchor = None
+        for line in reversed(rows):
+            run = dominant(line)
+            if run is None:
+                continue
+            # The composition's glyphs sit directly above its underline;
+            # a widget border has only whitespace (or the caret) above it.
+            # Only ink overlapping the run's own columns vouches: far-away
+            # decorations must not admit a stranger's underline. Caret-only
+            # rows cannot vouch: they hold at most two pixels.
+            start, stop = run
+            above = [y for y in rows if line - 4 <= y < line and dominant(y) is None
+                     and sum(1 for x in range(start, stop + 1) if dark(x, y)) >= 3]
+            if above and max(x for y in above for x in range(start, stop + 1) if dark(x, y)) - min(
+                    x for y in above for x in range(start, stop + 1) if dark(x, y)) >= 2:
+                span = run
+                anchor = above + [line]
                 break
         if span is None:
+            for line in rows[-3:]:
+                if dominant(line) is not None:
+                    span = dominant(line)
+                    break
+        if span is None:
             return None
-        columns = {x for x in range(width) if any(dark(x, y) for y in rows)}
+        # An anchored span expands only through composition rows, so a
+        # detached full-width border cannot drag the cluster sideways; the
+        # legacy fallback keeps the historical whole-capture expansion.
+        expansion = rows if anchor is None else anchor
+        columns = {x for x in range(width) if any(dark(x, y) for y in expansion)}
         left, right = span
         while left - 1 in columns:
             left -= 1
         while right + 1 in columns:
             right += 1
-        inner = [y for y in range(height) if any(dark(x, y) for x in range(left, right + 1))]
+        in_range = {y for y in rows if any(dark(x, y) for x in range(left, right + 1))}
+        if anchor is None:
+            inner = sorted(in_range)
+        else:
+            # The composition block is one connected run around the span;
+            # rows past a wider whitespace gap belong to other widgets.
+            # The anchor already holds the span line itself.
+            inner = set(anchor)
+            while True:
+                frontier = {y for y in in_range if y not in inner
+                            and any(abs(y - z) <= 2 for z in inner)}
+                if not frontier:
+                    break
+                inner |= frontier
+            inner = sorted(inner)
+        # A caret is a full-height one-or-two-pixel column; glyph strokes
+        # never span the whole block. An edge caret is not composition ink.
+        line_like = {y for y in inner if sum(
+            1 for x in range(left, right + 1) if dark(x, y)) >= 0.9 * (right - left + 1)}
+        cover = [y for y in inner if y not in line_like]
+        if cover:
+            caret = [x for x in range(left, right + 1)
+                     if sum(1 for y in cover if dark(x, y)) >= 0.85 * len(cover)
+                     and all(dark(x, y) for y in (cover[0], cover[-1]))]
+            groups = []
+            for x in caret:
+                if groups and x == groups[-1][1] + 1:
+                    groups[-1][1] += 1
+                else:
+                    groups.append([x, x])
+            for low, high in groups:
+                if high - low + 1 <= 2:
+                    if low == left:
+                        left = high + 1
+                    elif high == right:
+                        right = low - 1
         while len(inner) > 1:
             top = [x for x in range(left, right + 1) if dark(x, inner[0])]
             if len(top) <= 2 and (not top or max(top) - min(top) <= 1):
@@ -92,9 +165,10 @@ def _isolate_preedit_ink(crop):
                 inner.pop()
             else:
                 break
-        if not inner:
+        if not inner or left > right:
             return None
         region = crop.crop((left, inner[0], right + 1, inner[-1] + 1))
+        region = region.resize((region.width * 2, region.height * 2), Image.NEAREST)
         return ImageOps.expand(region.convert('L'), border=10, fill='white')
     except Exception:
         return None

@@ -768,15 +768,19 @@ class PreeditInkIsolation(unittest.TestCase):
         self.assertIsNotNone(isolated)
         # The 60..140 underline span locates the text; the icon at the
         # left edge and the empty right side stay out of the ink, with
-        # a white quiet zone added for the line finder.
-        self.assertEqual(isolated.size, (101, 40))
+        # a white quiet zone added for the line finder. The region is
+        # doubled for tesseract's small-CJK operating envelope.
+        self.assertEqual(isolated.size, (182, 60))
 
     def test_blink_caret_frame_isolates_compatibly(self):
         blink = core_apps._isolate_preedit_ink(self.entry(60, 80, caret=True))
         self.assertIsNotNone(blink)
-        # The adjacent caret column may widen the ink by a pixel, but
-        # the text origin and scale stay put: no reflow, no rescale.
-        self.assertEqual(blink.size, (102, 42))
+        # The edge caret is not composition ink: the blink frame isolates
+        # byte-identically to the caretless one, so the OCR read cannot
+        # depend on the blink phase. Origin and scale stay put throughout.
+        self.assertEqual(blink.size, (182, 60))
+        plain = core_apps._isolate_preedit_ink(self.entry(60, 80))
+        self.assertEqual(list(blink.getdata()), list(plain.getdata()))
 
     def test_plain_capture_falls_back_to_whole_crop(self):
         self.assertIsNone(core_apps._isolate_preedit_ink(self.entry(60, 80, underline=False)))
@@ -784,6 +788,43 @@ class PreeditInkIsolation(unittest.TestCase):
     def test_blank_capture_falls_back_to_whole_crop(self):
         from PIL import Image
         self.assertIsNone(core_apps._isolate_preedit_ink(Image.new('RGB', (60, 20), 'white')))
+
+    def realistic_entry(self, text_left=60, text_width=80, border=False, caret=False):
+        # Pango-realistic geometry: the composition sits directly above its
+        # underline (Calculator round-1004: a detached widget border below
+        # the composition must not hijack the span, and a caret merged with
+        # the last glyph must not enter the ink).
+        from PIL import Image, ImageDraw
+        image = Image.new('RGB', (200, 50), 'white')
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((8, 12, 24, 28), outline='black', width=2)
+        draw.text((text_left, 18), 'ab', fill='black')
+        text_end = text_left + int(draw.textlength('ab'))
+        draw.line([(text_left, 30), (text_end, 30)], fill='black', width=2)
+        if border:
+            draw.line([(0, 44), (199, 44)], fill='black', width=2)
+        if caret:
+            draw.line([(text_end + 1, 18), (text_end + 1, 32)], fill='black', width=1)
+        return image
+
+    def test_detached_widget_border_does_not_hijack_span(self):
+        # The field's own bottom border is the lowest dominant run, but it
+        # underlines nothing: isolation must match the borderless capture.
+        plain = core_apps._isolate_preedit_ink(self.realistic_entry())
+        bordered = core_apps._isolate_preedit_ink(self.realistic_entry(border=True))
+        self.assertIsNotNone(plain)
+        self.assertIsNotNone(bordered)
+        self.assertEqual(bordered.size, plain.size)
+
+    def test_caret_merged_with_last_glyph_is_excluded(self):
+        # A caret directly after the last glyph would merge with it under
+        # OCR: isolation must match the caretless capture exactly.
+        plain = core_apps._isolate_preedit_ink(self.realistic_entry())
+        merged = core_apps._isolate_preedit_ink(self.realistic_entry(caret=True))
+        self.assertIsNotNone(plain)
+        self.assertIsNotNone(merged)
+        self.assertEqual(merged.size, plain.size)
+        self.assertEqual(list(merged.getdata()), list(plain.getdata()))
 
 
 if __name__ == '__main__':
