@@ -680,12 +680,21 @@ class Desktop(NativeDesktop):
                          if node['editable'] and node['text'] is not None}
         if after_buffers != buffers:
             raise RuntimeError('original editable buffer changed/retired across locked input and unlock')
+        # Seat focus is still settling from the unlock teardown here
+        # (runs 42168094423/42175619772 saw it on the app one moment
+        # and gone the next); the focus-pinned observation below
+        # needs it settled, so await it explicitly instead of racing
+        # the restore.
+        self.await_state('actual-original-app-postunlock-refocused',
+                         lambda: self.state(unlocked=False),
+                         lambda value: any(row['window_id'] == actor['window_id']
+                                           and row['actual_keyboard_focus'] is True
+                                           for row in value['native_keyboard_windows']))
         resumed_before = self.guest('desktop', 'app-input', actor=actor, phase='unlocked-focused')
         # A lone modifier proves post-unlock emission without moving
-        # focus: Tab walks out of the window (run 42168094423 lost
-        # seat focus on Tab, failing the focus-pinned observation),
-        # while Shift emits press/release into the app and changes
-        # nothing focus- or buffer-wise (the tour's no-op probe).
+        # focus: Shift emits press/release into the app and changes
+        # nothing focus- or buffer-wise (the tour's no-op probe),
+        # while Tab would walk out of the window.
         self.keys('shift')
         resumed = self.await_state('actual-original-app-postunlock-fresh-emission',
             lambda: self.guest('desktop', 'app-input', actor=actor, phase='unlocked-focused'),
