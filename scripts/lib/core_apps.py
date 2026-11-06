@@ -49,7 +49,7 @@ def _isolate_preedit_ink(crop):
     whole crop.
     """
     try:
-        from PIL import Image, ImageOps
+        from PIL import Image, ImageFilter, ImageOps
         gray = crop.convert('L')
         width, height = gray.size
         ink = gray.load()
@@ -168,7 +168,13 @@ def _isolate_preedit_ink(crop):
         if not inner or left > right:
             return None
         region = crop.crop((left, inner[0], right + 1, inner[-1] + 1))
+        # NEAREST preserves the exact pixel topology, then a one-pixel
+        # blur re-antialiases the block steps into stroke gradients the
+        # line finder expects: smooth upscalers smear the composition
+        # underline into neighboring glyph bottoms at this size and
+        # tesseract misreads the merge (round-1004 Fonts ev20: 你妇).
         region = region.resize((region.width * 2, region.height * 2), Image.NEAREST)
+        region = region.filter(ImageFilter.GaussianBlur(1))
         return ImageOps.expand(region.convert('L'), border=10, fill='white')
     except Exception:
         return None
