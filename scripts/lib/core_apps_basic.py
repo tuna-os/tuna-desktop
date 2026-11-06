@@ -48,6 +48,22 @@ def _text_bytes(receipt):
     return base64.b64decode(receipt['base64'], validate=True)
 
 
+def formatted_result_matches(text, value, separators):
+    """Calculator display arithmetic oracle independent of the grouping glyph.
+
+    The app groups with its session locale's separator (a space on the
+    qualification image, a comma elsewhere); the oracle pins the digit
+    sequence and whether grouping is present, never the locale's exact
+    glyph. Numbers below 10000 carry no grouping either way.
+    """
+    digits = ''.join(character for character in (text or '') if character in '0123456789')
+    if digits != str(value):
+        return False
+    if value < 10000:
+        return True
+    return (digits != text) == separators
+
+
 def metadata_label(details, text):
     # The details view shows the face family twice: once as the header
     # title (nested panels) and once as the Name metadata value (inside
@@ -137,15 +153,17 @@ def _calculator(desktop):
         desktop.keys('ctrl', 'a')
         desktop.type_ascii(expression)
         desktop.keys('ret')
-        wanted = f'{value:,}' if desired else str(value)
         observed = desktop.await_state(label, lambda: desktop.observe(label, current),
             lambda snapshot: any(node['object_path'] == display['object_path'] and node['focused']
-                                 and node['text'] == wanted for node in snapshot['nodes']))
+                                 and formatted_result_matches(node['text'], value, desired)
+                                 for node in snapshot['nodes']))
         desktop.keys('ctrl', 'a')
         desktop.keys('ctrl', 'c')
         copied = desktop.clipboard()
-        require(_text_bytes(copied) == wanted.encode(), 'actual calculator result/clipboard differs from arithmetic oracle')
-        return {'expression': expression, 'mathematical_result': value, 'formatted': wanted,
+        require(formatted_result_matches(_text_bytes(copied).decode(), value, desired),
+                'actual calculator result/clipboard differs from arithmetic oracle')
+        return {'expression': expression, 'mathematical_result': value,
+                'formatted': {'digits': str(value), 'grouped': bool(desired and value >= 10000)},
                 'original_display': observed, 'clipboard': copied}
     evidence = {'original_settings': original, 'ime': ime,
                 'negative_changed_operand': enter(actor, '7*8', 56, 'calculator-distinct-operands')}

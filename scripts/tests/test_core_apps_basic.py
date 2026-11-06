@@ -34,5 +34,28 @@ class FontMetadataLabel(unittest.TestCase):
             core_apps_basic.metadata_label(self.details(title), 'Noto Sans CJK JP')
 
 
+class FormattedArithmeticResult(unittest.TestCase):
+    def test_space_grouped_result_matches(self):
+        self.assertTrue(core_apps_basic.formatted_result_matches('56 088', 56088, True))
+
+    def test_comma_grouped_result_matches(self):
+        self.assertTrue(core_apps_basic.formatted_result_matches('56,088', 56088, True))
+
+    def test_ungrouped_result_rejected_when_separators_desired(self):
+        self.assertFalse(core_apps_basic.formatted_result_matches('56088', 56088, True))
+
+    def test_plain_result_matches_when_separators_off(self):
+        self.assertTrue(core_apps_basic.formatted_result_matches('56088', 56088, False))
+
+    def test_grouped_result_rejected_when_separators_off(self):
+        self.assertFalse(core_apps_basic.formatted_result_matches('56 088', 56088, False))
+
+    def test_wrong_digits_rejected(self):
+        self.assertFalse(core_apps_basic.formatted_result_matches('56 089', 56088, True))
+
+    def test_small_result_needs_no_separator(self):
+        self.assertTrue(core_apps_basic.formatted_result_matches('703', 703, True))
+
+
 if __name__ == '__main__':
     unittest.main()
