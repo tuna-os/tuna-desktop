@@ -27,19 +27,24 @@ def _isolate_preedit_ink(crop):
     """Crop an IME field capture down to the composition's own ink.
 
     The entry crop carries decorations tesseract cannot survive: the
-    search icon, the clear button, and Pango's composition underline,
-    which merges with CJK glyph bottoms at this size (round-1004: the
-    full-entry crop OCR'd as latin garbage while the field visibly
-    showed the exact preedit). The underline spans the composition
-    width, so it locates the text without any geometry constants: a
-    bottom dark row holding one dominant run marks the composition,
-    and the enclosing dark-column cluster is its ink. Returns None
-    when no composition underline is found so the caller falls back
-    to the whole crop; the exact-equality OCR gate is unchanged.
-    Isolation is best-effort sensor preparation, never load-bearing:
-    any inspection failure also falls back to the whole crop.
+    search icon, the clear button, Pango's composition underline (which
+    merges with CJK glyph bottoms at this size), and the blinking text
+    caret (round-1004: the full-entry crop OCR'd as latin garbage while
+    the field visibly showed the exact preedit, and a caret-blink frame
+    broke the first isolation attempt). The underline spans the
+    composition width, so it locates the text without any geometry
+    constants: a bottom dark row holding one dominant run marks the
+    composition, and the enclosing dark-column cluster is its ink.
+    Caret-only rows (at most two adjacent dark pixels top or bottom)
+    are trimmed so blink frames isolate identically, and a white quiet
+    zone is added for the line finder. Returns None when no composition
+    underline is found so the caller falls back to the whole crop; the
+    exact-equality OCR gate is unchanged. Isolation is best-effort
+    sensor preparation, never load-bearing: any inspection failure
+    also falls back to the whole crop.
     """
     try:
+        from PIL import ImageOps
         gray = crop.convert('L')
         width, height = gray.size
         ink = gray.load()
@@ -74,7 +79,23 @@ def _isolate_preedit_ink(crop):
             left -= 1
         while right + 1 in columns:
             right += 1
-        return crop.crop((left, rows[0], right + 1, rows[-1] + 1))
+        inner = [y for y in range(height) if any(dark(x, y) for x in range(left, right + 1))]
+        while len(inner) > 1:
+            top = [x for x in range(left, right + 1) if dark(x, inner[0])]
+            if len(top) <= 2 and (not top or max(top) - min(top) <= 1):
+                inner.pop(0)
+            else:
+                break
+        while len(inner) > 1:
+            bottom = [x for x in range(left, right + 1) if dark(x, inner[-1])]
+            if len(bottom) <= 2 and (not bottom or max(bottom) - min(bottom) <= 1):
+                inner.pop()
+            else:
+                break
+        if not inner:
+            return None
+        region = crop.crop((left, inner[0], right + 1, inner[-1] + 1))
+        return ImageOps.expand(region.convert('L'), border=10, fill='white')
     except Exception:
         return None
 

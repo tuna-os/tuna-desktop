@@ -750,7 +750,7 @@ class PreeditInkIsolation(unittest.TestCase):
     to the whole crop.
     """
 
-    def entry(self, text_left, text_width, underline=True):
+    def entry(self, text_left, text_width, underline=True, caret=False):
         from PIL import Image, ImageDraw
         image = Image.new('RGB', (200, 40), 'white')
         draw = ImageDraw.Draw(image)
@@ -758,14 +758,25 @@ class PreeditInkIsolation(unittest.TestCase):
         draw.text((text_left, 8), 'ab', fill='black')
         if underline:
             draw.line([(text_left, 30), (text_left + text_width, 30)], fill='black', width=2)
+        if caret:
+            draw.line([(text_left + text_width + 1, 8), (text_left + text_width + 1, 31)],
+                      fill='black', width=1)
         return image
 
     def test_underlined_composition_isolates_to_text_span(self):
         isolated = core_apps._isolate_preedit_ink(self.entry(60, 80))
         self.assertIsNotNone(isolated)
         # The 60..140 underline span locates the text; the icon at the
-        # left edge and the empty right side stay out of the ink.
-        self.assertEqual(isolated.size, (81, 22))
+        # left edge and the empty right side stay out of the ink, with
+        # a white quiet zone added for the line finder.
+        self.assertEqual(isolated.size, (101, 40))
+
+    def test_blink_caret_frame_isolates_compatibly(self):
+        blink = core_apps._isolate_preedit_ink(self.entry(60, 80, caret=True))
+        self.assertIsNotNone(blink)
+        # The adjacent caret column may widen the ink by a pixel, but
+        # the text origin and scale stay put: no reflow, no rescale.
+        self.assertEqual(blink.size, (102, 42))
 
     def test_plain_capture_falls_back_to_whole_crop(self):
         self.assertIsNone(core_apps._isolate_preedit_ink(self.entry(60, 80, underline=False)))
