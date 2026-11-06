@@ -235,10 +235,14 @@ def _loupe(desktop):
         lambda: desktop.guest('basic', 'viewer-state', relative='principal.png', app_id=actor['id']),
         lambda value: value['preferences']['show-properties'] is desired)
     desktop.keys('tab')
-    # The zoom row and its inner toggle share one name, but neither exposes
-    # a working accessible action (both reject the press); the ordinary
-    # pointer click on the resolved control is the faithful gesture, as for
-    # the preference switch.
+    # The zoom row and its inner toggle live inside the Main Menu: clicking
+    # them while the menu is closed lands on the image underneath (their
+    # closed-menu bounds point there) and no zoom entry ever appears
+    # (round-1004 ev21: observed 0 entries). The menu button is the
+    # ordinary visible gesture; AT-SPI press drives it with no coordinate
+    # mapping, and the zoom row is re-resolved after the menu opens so the
+    # pointer click lands on its real open-menu bounds.
+    press(desktop, actor, 'Main Menu', roles=('button',))
     zoom_control = control(desktop, actor, 'Zoom to Specific Level')
     desktop.click_path(actor, zoom_control['path'])
     zoom_entry = unique(desktop.tree(actor),
