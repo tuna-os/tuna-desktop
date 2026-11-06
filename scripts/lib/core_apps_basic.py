@@ -266,7 +266,12 @@ def _loupe(desktop):
         lambda node: node['showing'] and node['editable'] and node['name'] == 'Custom Zoom Level',
         'original Image Viewer custom zoom entry')
     original_zoom = zoom_entry['text']
-    require(original_zoom is not None and original_zoom.isascii(),
+    # Loupe renders the percent with a narrow no-break space the physical
+    # ASCII typer cannot emit (round-1004 ev26: '71.88\u202f%'); the
+    # restorable form keeps the digits and percent sign, which the entry
+    # parses back to the same level.
+    restorable = original_zoom.replace('\u202f', '').replace(' ', '') if original_zoom else ''
+    require(restorable and restorable.isascii(),
             'original numeric zoom cannot be restored by its ordinary native input')
     try:
         evidence['ime'] = desktop.ime(actor, zoom_entry['name'], field_path=zoom_entry['path'])
@@ -274,8 +279,12 @@ def _loupe(desktop):
         desktop.click_path(actor, zoom_entry['path'])
         desktop.keys('ctrl', 'a')
         desktop.keys('backspace')
-        desktop.type_ascii(original_zoom)
+        desktop.type_ascii(restorable)
         desktop.keys('ret')
+        desktop.await_state('loupe-real-zoom-restored', lambda: desktop.tree(actor),
+            lambda value: any(node.get('path') == zoom_entry['path']
+                and ''.join((node.get('text') or '').split()) == restorable
+                for node in nodes(value)))
         desktop.keys('esc')
     desktop.keys('ctrl', '1')
     def probe(current, stage):
