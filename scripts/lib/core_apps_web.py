@@ -56,6 +56,15 @@ def content(desktop, actor, label, *phrases, timeout=10):
 
 def unique(observation, predicate, description):
     matches = [node for node in nodes(observation) if predicate(node)]
+    if len(matches) != 1:
+        # A container proxy (activatable preference row) and the leaf widget it
+        # forwards to can share one name and role; the actionable control is
+        # the deepest node. Genuinely distinct duplicates still fail below.
+        paths = [list(node.get("path", [])) for node in matches]
+        leaves = [node for node, path in zip(matches, paths)
+                  if not any(other != path and other[:len(path)] == path for other in paths)]
+        if len(leaves) == 1:
+            return leaves[0]
     require(len(matches) == 1, f"expected unique actual {description}, observed {len(matches)}")
     return matches[0]
 
