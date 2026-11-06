@@ -235,7 +235,12 @@ def _loupe(desktop):
         lambda: desktop.guest('basic', 'viewer-state', relative='principal.png', app_id=actor['id']),
         lambda value: value['preferences']['show-properties'] is desired)
     desktop.keys('tab')
-    press(desktop, actor, 'Zoom to Specific Level')
+    # The zoom row and its inner toggle share one name, but neither exposes
+    # a working accessible action (both reject the press); the ordinary
+    # pointer click on the resolved control is the faithful gesture, as for
+    # the preference switch.
+    zoom_control = control(desktop, actor, 'Zoom to Specific Level')
+    desktop.click_path(actor, zoom_control['path'])
     zoom_entry = unique(desktop.tree(actor),
         lambda node: node['showing'] and node['editable'] and node['name'] == 'Custom Zoom Level',
         'original Image Viewer custom zoom entry')
