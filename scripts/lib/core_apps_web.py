@@ -54,22 +54,28 @@ def content(desktop, actor, label, *phrases, timeout=10):
                                lambda row: all(" ".join(phrase.split()) in " ".join(words(row).split()) for phrase in phrases), timeout=timeout)
 
 
-def unique(observation, predicate, description):
+def unique(observation, predicate, description, outermost=False):
     matches = [node for node in nodes(observation) if predicate(node)]
     if len(matches) != 1:
-        # A container proxy (activatable preference row) and the leaf widget it
-        # forwards to can share one name and role; the actionable control is
-        # the deepest node. Genuinely distinct duplicates still fail below.
+        # A container proxy (activatable row) and the leaf widget it forwards
+        # to can share one name and role. Pointer clicks drive the precise
+        # leaf; AT-SPI actions drive the proxy row, whose activation the
+        # toolkit forwards while a leaf indicator may expose no action at
+        # all. Genuinely distinct duplicates still fail below either way.
         paths = [list(node.get("path", [])) for node in matches]
-        leaves = [node for node, path in zip(matches, paths)
-                  if not any(other != path and other[:len(path)] == path for other in paths)]
-        if len(leaves) == 1:
-            return leaves[0]
+        if outermost:
+            keeps = [node for node, path in zip(matches, paths)
+                     if not any(other != path and path[:len(other)] == other for other in paths)]
+        else:
+            keeps = [node for node, path in zip(matches, paths)
+                     if not any(other != path and other[:len(path)] == path for other in paths)]
+        if len(keeps) == 1:
+            return keeps[0]
     require(len(matches) == 1, f"expected unique actual {description}, observed {len(matches)}")
     return matches[0]
 
 
-def control(desktop, actor, names, roles=None):
+def control(desktop, actor, names, roles=None, outermost=False):
     tree = desktop.tree(actor)
     if isinstance(names, str):
         names = (names,)
@@ -77,11 +83,11 @@ def control(desktop, actor, names, roles=None):
         roles = ("push button", "button", "toggle button", "page tab", "menu item", "check menu item",
                  "radio menu item", "link", "list item", "row", "check box", "switch")
     return unique(tree, lambda n: n.get("name") in names and n.get("sensitive") and
-                  (roles is None or n.get("role") in roles), "/".join(names))
+                  (roles is None or n.get("role") in roles), "/".join(names), outermost=outermost)
 
 
 def press(desktop, actor, names, roles=None):
-    node = control(desktop, actor, names, roles)
+    node = control(desktop, actor, names, roles, outermost=True)
     return desktop.press(actor, node["name"], role=node["role"])
 
 

@@ -51,6 +51,28 @@ class NestedProxyResolution(unittest.TestCase):
                        'preference switch')
         self.assertEqual(found['path'], [0, 1, 0])
 
+    def test_outermost_prefers_proxy_row(self):
+        row = node('Zoom to Specific Level', 'button', [0, 2, 2])
+        widget = node('Zoom to Specific Level', 'toggle button', [0, 2, 2, 0])
+        found = unique(self.tree([row, widget]),
+                       lambda n: n.get('name') == 'Zoom to Specific Level',
+                       'zoom control', outermost=True)
+        self.assertEqual(found['path'], [0, 2, 2])
+
+    def test_press_targets_proxy_row(self):
+        from core_apps_web import press
+        row = node('Zoom to Specific Level', 'button', [0, 2, 2])
+        widget = node('Zoom to Specific Level', 'toggle button', [0, 2, 2, 0])
+        calls = {}
+
+        class Desktop:
+            def tree(self, actor):
+                return {'nodes': [row, widget]}
+            def press(self, actor, name, role=None):
+                calls['press'] = (name, role)
+        press(Desktop(), {'id': 'org.gnome.Loupe'}, 'Zoom to Specific Level')
+        self.assertEqual(calls['press'], ('Zoom to Specific Level', 'button'))
+
 
 if __name__ == '__main__':
     unittest.main()
