@@ -235,17 +235,24 @@ def _loupe(desktop):
         lambda: desktop.guest('basic', 'viewer-state', relative='principal.png', app_id=actor['id']),
         lambda value: value['preferences']['show-properties'] is desired)
     desktop.keys('tab')
-    # The zoom row and its inner toggle live inside the Main Menu: clicking
-    # them while the menu is closed lands on the image underneath (their
-    # closed-menu bounds point there) and no zoom entry ever appears
-    # (round-1004 ev21: observed 0 entries). Loupe chrome rejects AT-SPI
-    # actions outright (ev22: do_action refused on the menu button too),
-    # so the menu opens with an ordinary pointer click on its visible
-    # header button; the zoom row is re-resolved after the menu opens so
-    # its click lands on real open-menu bounds.
-    desktop.click(actor, 'Main Menu', role='button')
-    zoom_control = control(desktop, actor, 'Zoom to Specific Level')
-    desktop.click_path(actor, zoom_control['path'])
+    # The zoom row is not in the Main Menu at all (round-1004 ev23: the
+    # opened menu holds New Window/Open/Print/Rotate/Help items only, per
+    # Loupe's primary_menu model). It lives in the floating zoom pill,
+    # which Loupe hides until hovered, so a pointer click at its reported
+    # bounds falls through to the image underneath and the entry never
+    # appears; Loupe chrome also rejects AT-SPI actions outright (ev22:
+    # do_action refused). The pill toggle stays keyboard-focusable while
+    # hidden, so Tab reaches it by its real focus — observed from the
+    # tree, never by pointer bounds — and Space opens its popover.
+    for _ in range(25):
+        window = desktop.tree(actor)
+        if any(node.get('focused') and node.get('name') == 'Zoom to Specific Level'
+               and node.get('role') in ('button', 'toggle button') for node in nodes(window)):
+            break
+        desktop.keys('tab')
+    else:
+        require(False, 'actual Image Viewer zoom row never took keyboard focus')
+    desktop.keys('spc')
     zoom_entry = unique(desktop.tree(actor),
         lambda node: node['showing'] and node['editable'] and node['name'] == 'Custom Zoom Level',
         'original Image Viewer custom zoom entry')
