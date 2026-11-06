@@ -157,7 +157,7 @@ def _calculator(desktop):
         lambda value: any('division by zero' in (node.get('text') or node['name']).lower()
                           for node in nodes(value)))
     def probe(current, stage):
-        expression, value = {'baseline': ('123*456', 56088), 'scale150': ('19*37', 703),
+        expression, value = {'baseline': ('123*456', 56088), 'scale125': ('19*37', 703),
                              'after-unlock': ('17*43', 731), 'after-restart': ('23*29', 667)}[stage]
         settings = desktop.guest('basic', 'calculator-state')
         require(settings['settings']['show-thousands'] is desired, 'actual calculator preference did not persist')

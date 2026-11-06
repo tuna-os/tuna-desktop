@@ -596,11 +596,14 @@ class Desktop(NativeDesktop):
                 self.type_ascii(previous)
             else:
                 self.keys('backspace')
-        scales = self.guest('desktop', 'display-scale', scale=1.5)
+        # The 1280x800 QEMU output offers [1.0, 1.25, 4/3, 5/3]
+        # (compositor's pinned supported_scales contract); 1.5 is not
+        # offered, so the temporary scale is 125 percent.
+        scales = self.guest('desktop', 'display-scale', scale=1.25)
         self.scale = scales['scale']
         try:
-            scaled = probe(actor, 'scale150')
-            scaled_frame = self.observe('crosscut-scale150-' + actor['id'], actor)
+            scaled = probe(actor, 'scale125')
+            scaled_frame = self.observe('crosscut-scale125-' + actor['id'], actor)
         finally:
             restored_scale = self.guest('desktop', 'display-scale', scale=1.0)
             self.scale = restored_scale['scale']
@@ -663,7 +666,7 @@ class Desktop(NativeDesktop):
         replacement = self.restart(actor, actor['search_name'])
         persisted = (restart_probe or probe)(replacement, 'after-restart')
         result = {'baseline': baseline, 'baseline_observation': before,
-                  'scale150': scaled, 'scale150_observation': scaled_frame,
+                  'scale125': scaled, 'scale125_observation': scaled_frame,
                   'display_scale_before_after': [scales, restored_scale],
                   'prelock_server_emission_before': emission_before,
                   'prelock_positive_server_emission': positive,

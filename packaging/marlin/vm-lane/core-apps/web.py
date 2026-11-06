@@ -624,7 +624,7 @@ def _map_tiles(context):
 def _map_image(arguments, context):
     from PIL import Image, ImageStat
     stage = arguments.get("stage")
-    require(stage in ("baseline", "scale150", "after-unlock", "after-restart"), "unknown map export stage")
+    require(stage in ("baseline", "scale125", "after-unlock", "after-restart"), "unknown map export stage")
     path = context.path("web/map-" + stage + ".png")
     if not path.exists():
         return {"ready": False, "path": str(path), "distinction": "native-export-not-yet-written"}
