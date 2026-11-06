@@ -799,9 +799,15 @@ def dispatch(operation, arguments, context):
         if len(passwords) > 1:
             raise RuntimeError('original actual lock password control not unique')
         # No text, title, field contents or private accessibility tree leaves
-        # this root-only readiness action.
+        # this root-only readiness action: only role/visibility/focus
+        # flags, so a false readiness still shows whether the control
+        # is absent, hidden, insensitive or merely unfocused.
+        nodes = [{'role': node['role'], 'showing': node['showing'],
+                  'sensitive': node['sensitive'], 'focused': node['focused']}
+                 for node in tree['nodes'] if 'password' in node['role']]
         return {'locked': True, 'shell_identity': actor,
-                'password_field_ready': len(passwords) == 1 and passwords[0]['focused']}
+                'password_field_ready': len(passwords) == 1 and passwords[0]['focused'],
+                'password_nodes': nodes}
     if operation == 'retire-frontends':
         from guest import APP_PACKAGES
         actors = arguments['actors']

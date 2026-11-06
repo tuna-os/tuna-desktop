@@ -647,7 +647,10 @@ class Desktop(NativeDesktop):
         if not (capture['connect_exit'] == 0 and 0 < capture['capture_exit'] < 124
                 and 0 < capture['input_exit'] < 124 and not capture['capture_file']):
             raise RuntimeError('reachable ordinary clients did not genuinely deny capture/virtual input under lock')
-        self.qmp.keys('esc')
+        # Return alone reveals the prompt (the tour's proven pattern):
+        # Escape would cancel an already-up prompt and race the
+        # subsequent Return against the cancel teardown, leaving the
+        # entry unfocused even though the prompt is displayed.
         self.qmp.keys('ret')
         self.await_state('real-lock-password-field-ready',
                          lambda: self.guest('desktop', 'lock-ui'), lambda value: value['password_field_ready'])
