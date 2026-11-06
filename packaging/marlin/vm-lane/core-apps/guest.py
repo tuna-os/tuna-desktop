@@ -123,11 +123,33 @@ def desktop(operation, arguments, context):
         if app_id not in APP_PACKAGES:
             raise ValueError('app is outside exact installed Core inventory')
         value = context.actor({'app_id': app_id}, 'discover')
+        binding = 'well-known-bus-name'
+        if value.get('ready') is False and arguments.get('window_id') is not None:
+            # A mapped real surface whose client never owned the well-known bus
+            # name stays undiscoverable by name forever; bind the compositor's
+            # kernel-attested live peer for that exact surface instead. The
+            # downstream package/code/surface checks below are unchanged, and a
+            # socket peer cannot be squatted the way a bus name can.
+            state = desktop('state', {}, context)
+            surface = [row for row in state['windows']
+                       if row['id'] == arguments['window_id'] and row['app_id'] == app_id]
+            native = [row for row in state['native_keyboard_windows']
+                      if row['window_id'] == arguments['window_id']]
+            if (len(surface) == 1 and not state['locked'] and len(native) == 1
+                    and native[0]['client_uid'] == context.uid):
+                try:
+                    peer = process(native[0]['client_pid'], context.uid)
+                except FileNotFoundError:
+                    return dict(value, surface={'window_id': arguments['window_id'],
+                                                'peer': 'departed'})
+                value = {'pid': peer['pid'], 'uid': peer['uid'], 'session_bus': None}
+                binding = 'compositor-attested-client-pid'
         if value.get('ready') is False:
             return value
         actual = process(value['pid'], context.uid)
         inventory = context.read_control('inventory')['apps'][app_id]
-        actor = actual | inventory | {'id': app_id, 'kind': 'app', 'session_bus': value['session_bus']}
+        actor = actual | inventory | {'id': app_id, 'kind': 'app',
+                                      'session_bus': value['session_bus'], 'binding': binding}
         state = desktop('state', {}, context)
         windows = [row for row in state['windows'] if row['app_id'] == app_id
                    and (arguments.get('window_id') is None or row['id'] == arguments['window_id'])]
