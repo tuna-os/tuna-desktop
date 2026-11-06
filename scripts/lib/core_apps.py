@@ -297,6 +297,17 @@ class Desktop(NativeDesktop):
     def select(self, actor):
         state = self.state()
         window = self._window(actor, state)
+        if state['focused'] == actor['window_id'] and not any(
+                row['window_id'] == actor['window_id'] and row['actual_keyboard_focus'] is True
+                for row in state['native_keyboard_windows']):
+            # Marker/seat split: the marker can restore (post-unlock it
+            # does) while seat keyboard focus stays nowhere, and every
+            # focus-pinned observation then fails. Step away so the
+            # cycle below restores both through the validated
+            # switcher; switcher-consumed keys never reach client
+            # emission counters.
+            self.keys('alt', 'tab')
+            state = self.state()
         if state['focused'] != actor['window_id']:
             x, y, width, height = window['rect']
             if width <= 0 or height <= 0:
