@@ -253,10 +253,16 @@ def worker(directory, case, attempt, gate, ready):
         uid = owner['uid']
         account = pwd.getpwuid(uid)
         runtime = Path('/run/user', str(uid))
-        sockets = [path for path in runtime.glob('wayland-*') if stat.S_ISSOCK(path.stat().st_mode)]
+        # The session compositor listens on its default socket,
+        # tuna-nested-<pid> (tuna-session passes no --socket); a display
+        # manager's wayland-N is the other shape.
+        sockets = sorted({path for pattern in ('wayland-*', 'tuna-nested-' + str(owner['pid']))
+                          for path in runtime.glob(pattern) if stat.S_ISSOCK(path.stat().st_mode)})
         devices = list(Path('/dev/dri').glob('renderD*'))
-        if len(sockets) != 1 or len(devices) != 1:
-            raise RuntimeError('one actual session Wayland socket and DRM render node required')
+        if len(sockets) != 1:
+            raise RuntimeError('one actual session Wayland socket required')
+        if len(devices) != 1:
+            raise RuntimeError('one DRM render node required')
         client = BACKGROUND_CLIENT if case == 'background-effect' else CLIENT
         client_hash = state['background_client_sha256'] if case == 'background-effect' else state['client_sha256']
         if (digest(client) != client_hash or digest(__file__) != state['guest_helper_sha256']
