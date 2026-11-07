@@ -91,6 +91,15 @@ done
 # GTK3 uses its installed public GDK exporter against the same real provider,
 # with live-parent input controls and an actually revoked handle negative.
 python3 /repo/scripts/lib/tuna-gtk3-portal-proof.py /out
+# Nautilus's service exits after 12 s without a window (its GApplication
+# inactivity-timeout), so its file operations must follow the last FileChooser
+# journey directly; the slower browser drag proof runs after them.
+python3 /repo/scripts/lib/tuna-nautilus-file-operations.py > /out/nautilus-operations.log 2>&1
+if grep -qE 'Failed to open service channel Wayland connection|Compositor service channel missing' /out/nautilus.log; then
+    cat /out/nautilus.log
+    echo 'Nautilus fell back after native service-channel failure' >&2
+    exit 1
+fi
 browser="$(command -v chromium-browser || command -v chromium)"
 python3 /repo/scripts/tuna-toplevel-drag-proof --browser "$browser" \
     --compositor-pid "$compositor_pid" --state "$TUNA_COMPOSITOR_STATE" \
@@ -98,12 +107,6 @@ python3 /repo/scripts/tuna-toplevel-drag-proof --browser "$browser" \
     --wayland-display "$WAYLAND_DISPLAY" \
     --source-revision "$(cat /out/observer-source-revision.txt)" \
     --source-status /out/observer-source-status.txt
-python3 /repo/scripts/lib/tuna-nautilus-file-operations.py > /out/nautilus-operations.log 2>&1
-if grep -qE 'Failed to open service channel Wayland connection|Compositor service channel missing' /out/nautilus.log; then
-    cat /out/nautilus.log
-    echo 'Nautilus fell back after native service-channel failure' >&2
-    exit 1
-fi
 for decision in cancel grant; do
     python3 /repo/scripts/lib/tuna-portal-screenshot-client.py "/out/screenshot-$decision.png" "$decision" >"/out/screenshot-$decision.log" 2>&1 & shot_client=$!
     end=$((SECONDS + 15))
