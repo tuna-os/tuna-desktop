@@ -73,9 +73,11 @@ HOME_PRIV="$ARTIFACTS/home"
 RUN_PRIV="$(mktemp -d /tmp/tuna-orca.XXXXXX)"
 CONF_PRIV="$ARTIFACTS/config"
 DATA_PRIV="$ARTIFACTS/data"
+CACHE_PRIV="$ARTIFACTS/cache"
+STATE_PRIV="$ARTIFACTS/state"
 mkdir -p "$HOME_PRIV" "$RUN_PRIV" "$CONF_PRIV/speech-dispatcher/modules" \
-    "$DATA_PRIV/applications" "$ARTIFACTS/speechd"
-chmod 700 "$RUN_PRIV"
+    "$DATA_PRIV/applications" "$ARTIFACTS/speechd" "$CACHE_PRIV" "$STATE_PRIV"
+chmod 700 "$RUN_PRIV" "$HOME_PRIV" "$CONF_PRIV" "$DATA_PRIV" "$CACHE_PRIV" "$STATE_PRIV"
 ORIG_HOME="$HOME"
 TUNA_COMPOSITOR_STATE="$CSTATE"
 XDG_RUNTIME_DIR="$RUN_PRIV"
@@ -84,7 +86,13 @@ HOME="$HOME_PRIV"
 GSETTINGS_BACKEND=keyfile
 XDG_CONFIG_HOME="$CONF_PRIV"
 XDG_DATA_HOME="$DATA_PRIV"
+# Absolute inherited XDG state/cache roots take precedence over HOME in
+# the compositor's settings upgrade and shell state readers. Override
+# both rather than touching user state or bypassing migration checks.
+XDG_CACHE_HOME="$CACHE_PRIV"
+XDG_STATE_HOME="$STATE_PRIV"
 export TUNA_COMPOSITOR_STATE XDG_RUNTIME_DIR HOME GSETTINGS_BACKEND XDG_CONFIG_HOME XDG_DATA_HOME
+export XDG_CACHE_HOME XDG_STATE_HOME
 PY=/usr/bin/python3
 [ -x "$PY" ] || PY=python3
 BIN_DIR="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
@@ -145,6 +153,27 @@ said() {
         fail "$gate" "$(tr '\n' ' ' <"$ARTIFACTS/said.err")"
     # Let the rest of the step's speech land before the next mark.
     sleep 1
+}
+
+# These ASCII fixtures test every character echo, not typing speed. Orca
+# cancels pending speech on each press (KeyboardEvent._present); a fixed
+# xdotool delay races speech-dispatcher/sd_generic under load. Run 41148163143
+# lost s/p/e/e/c this way. Acknowledge each actual utterance before the next
+# key can cancel it, retaining the full ordered assertion and exact counts.
+type_echo() {
+    gate="$1"
+    name="$2"
+    text="$3"
+    echo_as="$4"
+    mark "$name"
+    wanted=""
+    for character in $(printf '%s' "$text" | fold -w 1); do
+        xdotool type --clearmodifiers --delay 0 "$character"
+        wanted="$wanted ${echo_as:-$character}"
+        # shellcheck disable=SC2086
+        "$PY" "$LIB" expect "$SPOKEN" "$name" 30 $wanted >/dev/null 2>"$ARTIFACTS/said.err" ||
+            fail "$gate" "$(tr '\n' ' ' <"$ARTIFACTS/said.err")"
+    done
 }
 
 # The lock screen's password goes through a real PAM stack: pam_wrapper
@@ -310,8 +339,7 @@ step search super
 cstate '.overview_open == true' "overview open" ||
     fail G-ORCA-SPEECH-SEARCH "Super did not open the overview"
 said G-ORCA-SPEECH-SEARCH search "Search" "entry" "Type to search."
-mark search-type
-xdotool type --delay 150 speech
+type_echo G-ORCA-SPEECH-SEARCH search-type speech ""
 said G-ORCA-SPEECH-SEARCH search-type s p e e c h
 step search-result Down
 said G-ORCA-SPEECH-SEARCH search-result "Speech Probe" "button."
@@ -403,10 +431,23 @@ pass G-ORCA-SPEECH-NOTIFY "arrival: 'Notification, Tuna Proof, Build finished, A
 sleep 4
 
 # ---- G-ORCA-SPEECH-LOCK
+# Orca speaks the bullets the entry inserts only when the last key it
+# heard is printable (typing echo), and the compositor sends its
+# KeyboardMonitor no key while locked: that last key is Super+L's L.
+# `xdotool key super+l` releases Super before L, so a lock engaging
+# between the two releases left Super last and Orca silent ("Not
+# speaking inserted string due to lack of cause"). Super stays down
+# until the lock holds the keyboard.
+heard="$(jq -r '.a11y_keyboard.normal_events' "$CSTATE")"
+mark lock
+xdotool keydown super key l
+if ! cstate '.locked == true and .a11y_keyboard.locked == true' "locked"; then
+    xdotool keyup super
+    fail G-ORCA-SPEECH-LOCK "Super+L did not lock the session"
+fi
+xdotool keyup super
 # The curtain and then its unlock prompt, one step: Orca may name the
 # lock screen as it maps or once the prompt takes the focus.
-step lock super+l
-cstate '.locked == true' "locked" || fail G-ORCA-SPEECH-LOCK "Super+L did not lock the session"
 sleep 2
 xdotool key Return
 said G-ORCA-SPEECH-LOCK lock "Lock Screen" "Password" "password text."
@@ -418,6 +459,20 @@ for _ in $(seq 1 100); do
     sleep 0.2
 done
 [ "$asked" = 1 ] || fail G-ORCA-SPEECH-LOCK "the unlock prompt never asked PAM's password question"
+# Run 41151873648/job 124396764753 reached this real prompt with the
+# registry active and the KeyboardMonitor owner present, but no bullets
+# were spoken. Committed mask announcements must work with raw key
+# forwarding still suspended; a registered listener is not that proof.
+cstate '.locked == true and .a11y_keyboard.locked == true and .a11y_keyboard.owner != null' \
+    "locked keyboard privacy boundary" ||
+    fail G-ORCA-SPEECH-LOCK "the keyboard privacy boundary is not locked"
+LOCK_KEY_EVENTS="$(jq -r '.a11y_keyboard.normal_events' "$CSTATE")"
+# With Super held, only Super, L and L's release can reach Orca before
+# the lock, in that order; under the lock, keys not yet sent are dropped.
+# Two or more forwarded means Orca heard the L.
+forwarded=$(($(jq -r '.a11y_keyboard.normal_events' "$CSTATE") - heard))
+[ "$forwarded" -ge 2 ] ||
+    fail G-ORCA-SPEECH-LOCK "Orca's KeyboardMonitor got $forwarded of Super+L's keys before the lock, not the L: no printable last key for its typing echo"
 mark lock-type
 xdotool type --clearmodifiers --delay 200 "$UNLOCK_PASSWORD"
 bullets="$(printf '%s' "$UNLOCK_PASSWORD" | sed 's/./● /g')"
@@ -428,6 +483,9 @@ said G-ORCA-SPEECH-LOCK lock-type $bullets
 count="$("$PY" "$LIB" count "$SPOKEN" lock-type "●")"
 [ "$count" -eq "${#UNLOCK_PASSWORD}" ] ||
     fail G-ORCA-SPEECH-LOCK "$count bullets spoken for a ${#UNLOCK_PASSWORD}-character password"
+cstate ".locked == true and .a11y_keyboard.locked == true and .a11y_keyboard.normal_events == $LOCK_KEY_EVENTS" \
+    "masked speech without raw keyboard events" ||
+    fail G-ORCA-SPEECH-LOCK "typing disclosed keyboard events while locked"
 step lock-unlock Return
 cstate '.locked == false' "unlocked" 20 ||
     fail G-ORCA-SPEECH-LOCK "the typed password did not unlock the session"

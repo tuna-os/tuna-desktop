@@ -8,7 +8,7 @@
 use super::*;
 use std::collections::BTreeMap;
 use std::fs as stdfs;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{symlink, DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 
 fn identity() -> Identity {
@@ -21,7 +21,11 @@ fn identity() -> Identity {
 }
 
 fn mkdir(path: &Path) {
-    stdfs::create_dir_all(path).unwrap();
+    stdfs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(path)
+        .unwrap();
     chmod(path, 0o700);
 }
 
@@ -46,6 +50,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
+        chmod(root.path(), 0o700);
         let home = root.path().join("home");
         mkdir(&home);
         let pairs = resolved(&[("HOME", &home)]);
@@ -210,6 +215,7 @@ fn fresh_and_current_only_states_are_unchanged_for_every_pair() {
 #[test]
 fn missing_bases_are_not_created() {
     let root = tempfile::tempdir().unwrap();
+    chmod(root.path(), 0o700);
     let home = root.path().join("missing-home");
     let before = snapshot(root.path());
     let user = identity();
@@ -669,6 +675,7 @@ fn relative_config_and_cache_preserve_nonadoption_but_block_old_only() {
         .prefix(".adoption-relative-")
         .tempdir_in(&cwd)
         .unwrap();
+    chmod(root.path(), 0o700);
     let relative = root.path().strip_prefix(&cwd).unwrap();
     let home = relative.join("home");
     let cache = relative.join("cache");
@@ -700,6 +707,7 @@ fn relative_cache_migration_does_not_redirect_to_home_cache() {
         .prefix(".adoption-relative-")
         .tempdir_in(&cwd)
         .unwrap();
+    chmod(root.path(), 0o700);
     let home = root.path().join("home");
     let cache = root.path().strip_prefix(&cwd).unwrap().join("cache");
     mkdir(&home.join(".cache/roost"));

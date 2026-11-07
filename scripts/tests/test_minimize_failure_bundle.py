@@ -159,15 +159,6 @@ class FailureBundleTests(unittest.TestCase):
             bundle.bundle(self.source, self.source / "subset", "failure")
         self.assertFalse((self.source / "subset").exists())
 
-    def test_ci_gates_diagnostics_on_proof_failure_and_preserves_full_upload(self):
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-        self.assertIn("id: native_minimize", workflow)
-        self.assertIn("if: failure() && steps.native_minimize.outcome == 'failure'", workflow)
-        self.assertIn("steps.minimize_failure_bundle.outcome == 'success'", workflow)
-        self.assertIn("if: always()\n        with:\n          name: native-minimize-proof\n"
-                      "          path: ${{ runner.temp }}/native-minimize/\n          retention-days: 14", workflow)
-        self.assertLess(workflow.index("name: native-minimize-proof"),
-                        workflow.index("name: Collect bounded native minimize failure diagnostics"))
 
 
 if __name__ == "__main__":

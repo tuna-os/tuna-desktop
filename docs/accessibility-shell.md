@@ -4,6 +4,12 @@ The GTK shell consumes `org.gnome.desktop.a11y always-show-universal-access-stat
 
 This implements menu settings and visibility. It does not implement AccessX, or compositor visual alerts. Those remain separately recorded capability gaps; a toggle state alone proves no functional assistive feature. Screen Reader (also Super+Alt+S) starts the distribution Orca in a hardware session, or in a nested one started with `--screen-reader`; what Orca says on the shell is gated by `scripts/tuna-orca-speech-proof` (P-A11Y-06).
 
+The Orca search proof waits for each character's actual speech-dispatcher
+utterance before sending the next character, then checks the complete ordered
+`s p e e c h` sequence. This tests character echo rather than typing speed:
+Orca cancels pending speech on each keypress, so a fixed input delay can drop
+letters when the speech sink is busy.
+
 ## Screen magnifier (#349)
 
 The shell mirrors `screen-magnifier-enabled` and every `org.gnome.desktop.a11y.magnifier` key into the session snapshot `$XDG_RUNTIME_DIR/tuna-magnifier.json` (see the `tuna-magnifier` crate), now and on every change. Super+Alt+8 (toggle, autorepeat ignored) and Super+Alt+=/- (factor plus/minus one, rounded) are media-keys schema keys: in the session gsd-media-keys handles them and flips the same settings; without it (the nested preview) the shell binds them itself. Key defaults and ranges match [gsettings-desktop-schemas 51.0](https://github.com/GNOME/gsettings-desktop-schemas/blob/51.0/schemas/org.gnome.desktop.a11y.magnifier.gschema.xml.in).
@@ -43,6 +49,8 @@ The GTK shell journey (`scripts/tuna-gtk-shell-proof`, or only these gates with 
 - **G-FOCUS-RING-TIMEOUT:** `keyboard-focus-visible-timeout` decides when the indication clears after a real key, while the control keeps keyboard focus (checked in the accessible tree). The default (-1) clears it at the toolkit's three seconds (measured 3.0 s). A value of 2 clears it at 2 s (measured 2.1 s). A value of 5 outlasts GTK 4.14's own three-second timer and clears at 5 s (measured 5.1 s). A value of 0 never clears it during an 8 s window.
 - **G-A11Y-MENU-RESTART:** with every menu feature off and `always-show-universal-access-status` off, the indicator is hidden. Turning always-show on shows it live. Real keys then open the menu (Ctrl+Alt+Tab, Tab to Accessibility, Enter, Tab to Visual Alerts) and Space turns Visual Alerts on. With always-show turned off again, the indicator stays up for the enabled feature. The proof then sends SIGTERM to the shell and the compositor's supervisor restarts it. The restarted shell shows the indicator, and its menu, opened with real keys again, shows Visual Alerts checked. Space turns it off and the indicator hides live.
 - **G-SHELL-STABLE** still fails on any shell exit, except one: it allows exactly one `ShellExited`, and only inside the log byte range of G-A11Y-MENU-RESTART's deliberate restart (from the kill until the restarted shell's indicator is confirmed). An exit anywhere else, or a second exit inside that range, fails it.
+
+Onset and expiration are separate assertions: the indication must first appear within **0.8 s** of `xdotool key` returning, and then satisfy the unchanged timeout window (default 2.8–3.9 s, 2-second setting 1.8–2.9 s, 5-second setting 4.8–5.9 s, zero with no observed expiration during 8 s). A failed check prints the control's measured `lit_from` and `lit_until`; late onset is a `G-FOCUS-RING` failure, not evidence that the timeout cleared the ring. Regression fixtures preserve both bounds and distinguish the captured late-onset cases from genuine early expiration.
 
 Scope and remaining differences from GNOME 51:
 
