@@ -16,7 +16,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use zbus::zvariant::{Structure, Value};
+use futures_lite::StreamExt;
+use zbus::{Structure, Variant};
 
 const REGISTRY: &str = "org.a11y.atspi.Registry";
 const REGISTRY_PATH: &str = "/org/a11y/atspi/registry";
@@ -125,54 +126,65 @@ impl FocusCaretTracker {
 }
 
 /// The accessibility bus (`org.a11y.Bus.GetAddress` on the session bus).
-fn connect() -> zbus::Result<zbus::blocking::Connection> {
-    let session = zbus::blocking::Connection::session()?;
-    let address: String = session
-        .call_method(
-            Some("org.a11y.Bus"),
-            "/org/a11y/bus",
-            Some("org.a11y.Bus"),
-            "GetAddress",
-            &(),
-        )?
-        .body()
-        .deserialize()?;
-    zbus::blocking::connection::Builder::address(address.as_str())?
-        .method_timeout(TIMEOUT)
-        .build()
+fn connect() -> zbus::Result<zbus::Connection> {
+    zbus::block_on(async {
+        let session = zbus::Connection::session().await?;
+        let address: String = session
+            .call_method(
+                Some("org.a11y.Bus"),
+                "/org/a11y/bus",
+                Some("org.a11y.Bus"),
+                "GetAddress",
+                &(),
+            )
+            .await?
+            .body()
+            .deserialize()?;
+        zbus::connection::Builder::address(address.as_str())
+            .method_timeout(TIMEOUT)
+            .build()
+            .await
+    })
 }
 
 /// `Atspi.EventListener.register` / `deregister` against the registry
 /// daemon: the current three-argument form, else the older one.
-fn registry_call(conn: &zbus::blocking::Connection, method: &str, event: &str) {
-    let full = conn.call_method(
-        Some(REGISTRY),
-        REGISTRY_PATH,
-        Some(REGISTRY),
-        method,
-        &(event, Vec::<String>::new(), ""),
-    );
-    if full.is_err() {
-        let _ = conn.call_method(
-            Some(REGISTRY),
-            REGISTRY_PATH,
-            Some(REGISTRY),
-            method,
-            &(event,),
-        );
-    }
+fn registry_call(conn: &zbus::Connection, method: &str, event: &str) {
+    zbus::block_on(async {
+        let full = conn
+            .call_method(
+                Some(REGISTRY),
+                REGISTRY_PATH,
+                Some(REGISTRY),
+                method,
+                &(event, Vec::<String>::new(), ""),
+            )
+            .await;
+        if full.is_err() {
+            let _ = conn
+                .call_method(
+                    Some(REGISTRY),
+                    REGISTRY_PATH,
+                    Some(REGISTRY),
+                    method,
+                    &(event,),
+                )
+                .await;
+        }
+    })
 }
 
-fn signals(
-    conn: &zbus::blocking::Connection,
-    member: &str,
-) -> zbus::Result<zbus::blocking::MessageIterator> {
+fn signals(conn: &zbus::Connection, member: &str) -> zbus::Result<zbus::MessageStream> {
     let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
-        .interface("org.a11y.atspi.Event.Object")?
-        .member(member)?
-        .build();
-    zbus::blocking::MessageIterator::for_match_rule(rule, conn, Some(256))
+        .interface("org.a11y.atspi.Event.Object")
+        .member(member)
+        .build()?;
+    zbus::block_on(zbus::MessageStream::for_match_rule(
+        rule,
+        conn,
+        std::num::NonZeroUsize::new(256),
+    ))
 }
 
 fn run(
@@ -182,12 +194,14 @@ fn run(
 ) -> zbus::Result<()> {
     let conn = connect()?;
     for (member, caret) in [("StateChanged", false), ("TextCaretMoved", true)] {
-        let events = signals(&conn, member)?;
+        let mut events = signals(&conn, member)?;
         let (conn, shared, wake) = (conn.clone(), shared.clone(), wake.clone());
         std::thread::Builder::new()
             .name(format!("tuna-atspi-{member}"))
             .spawn(move || {
-                for message in events {
+                // One item at a time: the handling below makes its own
+                // `block_on` calls.
+                while let Some(message) = zbus::block_on(events.next()) {
                     let Ok(message) = message else {
                         break;
                     };
@@ -256,7 +270,7 @@ fn run(
 
 /// One accessible object: its bus name and path.
 struct Object<'a> {
-    conn: &'a zbus::blocking::Connection,
+    conn: &'a zbus::Connection,
     name: String,
     path: String,
 }
@@ -264,17 +278,16 @@ struct Object<'a> {
 impl Object<'_> {
     fn call<B>(&self, iface: &str, method: &str, body: &B) -> Option<zbus::Message>
     where
-        B: serde::ser::Serialize + zbus::zvariant::DynamicType,
+        B: serde::ser::Serialize + zbus::DynamicType,
     {
-        self.conn
-            .call_method(
-                Some(self.name.as_str()),
-                self.path.as_str(),
-                Some(iface),
-                method,
-                body,
-            )
-            .ok()
+        zbus::block_on(self.conn.call_method(
+            Some(self.name.as_str()),
+            self.path.as_str(),
+            Some(iface),
+            method,
+            body,
+        ))
+        .ok()
     }
 
     fn role(&self) -> Option<u32> {
@@ -298,11 +311,11 @@ impl Object<'_> {
             &("org.a11y.atspi.Accessible", "Parent"),
         )?;
         let body = reply.body();
-        let value: zbus::zvariant::OwnedValue = body.deserialize().ok()?;
-        let Value::Structure(parent) = &*value else {
+        let value: zbus::OwnedVariant = body.deserialize().ok()?;
+        let Variant::Structure(parent) = &*value else {
             return None;
         };
-        let [Value::Str(name), Value::ObjectPath(path)] = parent.fields() else {
+        let [Variant::Str(name), Variant::ObjectPath(path)] = parent.fields() else {
             return None;
         };
         if path.as_str() == "/org/a11y/atspi/null" {
@@ -346,12 +359,16 @@ impl Object<'_> {
     }
 }
 
-fn pid_of(conn: &zbus::blocking::Connection, sender: &str) -> Option<u32> {
+fn pid_of(conn: &zbus::Connection, sender: &str) -> Option<u32> {
     let name = zbus::names::BusName::try_from(sender).ok()?;
-    zbus::blocking::fdo::DBusProxy::new(conn)
-        .ok()?
-        .get_connection_unix_process_id(name)
-        .ok()
+    zbus::block_on(async {
+        zbus::fdo::DBusProxy::new(conn)
+            .await
+            .ok()?
+            .get_connection_unix_process_id(name)
+            .await
+            .ok()
+    })
 }
 
 /// The event's kind string and `detail1`, whatever the body's
@@ -360,12 +377,14 @@ fn kind_and_detail(message: &zbus::Message) -> Option<(String, i32)> {
     let body = message.body();
     let event: Structure<'_> = body.deserialize().ok()?;
     match event.fields() {
-        [Value::Str(kind), Value::I32(detail1), ..] => Some((kind.as_str().to_owned(), *detail1)),
+        [Variant::Str(kind), Variant::I32(detail1), ..] => {
+            Some((kind.as_str().to_owned(), *detail1))
+        }
         _ => None,
     }
 }
 
-fn source<'a>(conn: &'a zbus::blocking::Connection, message: &zbus::Message) -> Option<Object<'a>> {
+fn source<'a>(conn: &'a zbus::Connection, message: &zbus::Message) -> Option<Object<'a>> {
     let header = message.header();
     Some(Object {
         conn,
@@ -382,9 +401,13 @@ fn rect_of(reply: &zbus::Message) -> Option<(i32, i32, i32, i32)> {
     }
     let fields: Structure<'_> = body.deserialize().ok()?;
     match fields.fields() {
-        [Value::I32(x), Value::I32(y), Value::I32(w), Value::I32(h)] => Some((*x, *y, *w, *h)),
-        [Value::Structure(inner)] => match inner.fields() {
-            [Value::I32(x), Value::I32(y), Value::I32(w), Value::I32(h)] => Some((*x, *y, *w, *h)),
+        [Variant::I32(x), Variant::I32(y), Variant::I32(w), Variant::I32(h)] => {
+            Some((*x, *y, *w, *h))
+        }
+        [Variant::Structure(inner)] => match inner.fields() {
+            [Variant::I32(x), Variant::I32(y), Variant::I32(w), Variant::I32(h)] => {
+                Some((*x, *y, *w, *h))
+            }
             _ => None,
         },
         _ => None,
@@ -395,7 +418,7 @@ fn rect_of(reply: &zbus::Message) -> Option<(i32, i32, i32, i32)> {
 type Located = ((i32, i32, i32, i32), Option<u32>);
 
 /// `_updateFocus`: a focused (or selected) component's window extents.
-fn focus_extents(conn: &zbus::blocking::Connection, message: &zbus::Message) -> Option<Located> {
+fn focus_extents(conn: &zbus::Connection, message: &zbus::Message) -> Option<Located> {
     let (kind, detail1) = kind_and_detail(message)?;
     if !matches!(kind.as_str(), "focused" | "selected") || detail1 != 1 {
         return None;
@@ -414,7 +437,7 @@ fn focus_extents(conn: &zbus::blocking::Connection, message: &zbus::Message) -> 
 
 /// `_updateCaret`: the caret character's window extents; a 0x0 box
 /// (offset not translatable) is ignored, as in GNOME.
-fn caret_extents(conn: &zbus::blocking::Connection, message: &zbus::Message) -> Option<Located> {
+fn caret_extents(conn: &zbus::Connection, message: &zbus::Message) -> Option<Located> {
     let (_, offset) = kind_and_detail(message)?;
     let object = source(conn, message)?;
     let reply = object.call(

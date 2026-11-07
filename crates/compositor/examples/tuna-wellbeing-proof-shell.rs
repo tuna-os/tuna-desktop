@@ -112,7 +112,7 @@ fn main() {
         std::process::id(),
         parent
     );
-    let bus = zbus::blocking::Connection::session().unwrap();
+    let bus = zbus::block_on(zbus::Connection::session()).unwrap();
     let mut generation = 0;
     loop {
         if unsafe { libc::getppid() } != parent {
@@ -169,15 +169,14 @@ fn main() {
                     "capture" => {
                         let filename = value["filename"].as_str().unwrap();
                         assert!(PathBuf::from(filename).is_absolute());
-                        let result = bus
-                            .call_method(
-                                Some("org.gnome.Shell.Screenshot"),
-                                "/org/gnome/Shell/Screenshot",
-                                Some("org.gnome.Shell.Screenshot"),
-                                "Screenshot",
-                                &(false, false, filename),
-                            )
-                            .unwrap();
+                        let result = zbus::block_on(bus.call_method(
+                            Some("org.gnome.Shell.Screenshot"),
+                            "/org/gnome/Shell/Screenshot",
+                            Some("org.gnome.Shell.Screenshot"),
+                            "Screenshot",
+                            &(false, false, filename),
+                        ))
+                        .unwrap();
                         let (success, used): (bool, String) = result.body().deserialize().unwrap();
                         assert!(success);
                         assert_eq!(used, filename);

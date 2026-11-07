@@ -276,7 +276,7 @@ impl OrientationShare {
 /// an absent service every few seconds so hotplug just works. Every
 /// failure degrades to [`SensorSample::ABSENT`], never to a rotation.
 pub struct SensorPoller {
-    connection: Option<zbus::blocking::Connection>,
+    connection: Option<zbus::Connection>,
     claimed: bool,
     next_retry: Instant,
     last: Option<SensorSample>,
@@ -292,13 +292,13 @@ impl SensorPoller {
         }
     }
 
-    fn proxy(connection: &zbus::blocking::Connection) -> zbus::Result<zbus::blocking::Proxy<'_>> {
-        zbus::blocking::Proxy::new(
+    fn proxy(connection: &zbus::Connection) -> zbus::Result<zbus::Proxy<'_>> {
+        zbus::block_on(zbus::Proxy::new(
             connection,
             SENSOR_BUS_NAME,
             SENSOR_OBJECT_PATH,
             SENSOR_INTERFACE,
-        )
+        ))
     }
 
     fn release(&mut self) {
@@ -308,7 +308,7 @@ impl SensorPoller {
         self.claimed = false;
         if let Some(connection) = &self.connection {
             if let Ok(proxy) = Self::proxy(connection) {
-                let _ = proxy.call_method("ReleaseAccelerometer", &());
+                let _ = zbus::block_on(proxy.call_method("ReleaseAccelerometer", &()));
             }
         }
     }
@@ -324,7 +324,7 @@ impl SensorPoller {
     pub fn poll(&mut self, inhibited: bool) -> Option<SensorSample> {
         let now = Instant::now();
         if self.connection.is_none() && now >= self.next_retry {
-            match zbus::blocking::Connection::system() {
+            match zbus::block_on(zbus::Connection::system()) {
                 Ok(connection) => self.connection = Some(connection),
                 Err(e) => {
                     eprintln!("tuna-compositor: orientation: no system bus: {e}");
@@ -343,10 +343,7 @@ impl SensorPoller {
 
     /// Run one sensor call against a short-lived proxy (each borrow
     /// ends before the next, so failures can drop the connection).
-    fn with_proxy<T>(
-        &self,
-        call: impl FnOnce(&zbus::blocking::Proxy<'_>) -> zbus::Result<T>,
-    ) -> Option<T> {
+    fn with_proxy<T>(&self, call: impl FnOnce(&zbus::Proxy<'_>) -> zbus::Result<T>) -> Option<T> {
         let connection = self.connection.as_ref()?;
         let proxy = Self::proxy(connection).ok()?;
         call(&proxy).ok()
@@ -356,7 +353,8 @@ impl SensorPoller {
         if self.connection.is_none() {
             return SensorSample::ABSENT;
         }
-        let present: Option<bool> = self.with_proxy(|proxy| proxy.get_property("HasAccelerometer"));
+        let present: Option<bool> =
+            self.with_proxy(|proxy| zbus::block_on(proxy.get_property("HasAccelerometer")));
         let Some(present) = present else {
             // The service is absent or vanished (hotplug): retry later.
             self.drop_connection(now);
@@ -365,14 +363,18 @@ impl SensorPoller {
         if inhibited {
             self.release();
         } else if present && !self.claimed {
-            match self.with_proxy(|proxy| proxy.call_method("ClaimAccelerometer", &())) {
+            match self
+                .with_proxy(|proxy| zbus::block_on(proxy.call_method("ClaimAccelerometer", &())))
+            {
                 Some(_) => self.claimed = true,
                 None => eprintln!("tuna-compositor: orientation: claim failed"),
             }
         }
         let orientation = if present {
-            self.with_proxy(|proxy| proxy.get_property::<String>("AccelerometerOrientation"))
-                .and_then(|value| SensorOrientation::parse(&value))
+            self.with_proxy(|proxy| {
+                zbus::block_on(proxy.get_property::<String>("AccelerometerOrientation"))
+            })
+            .and_then(|value| SensorOrientation::parse(&value))
         } else {
             None
         };

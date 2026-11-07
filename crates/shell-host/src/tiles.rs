@@ -63,11 +63,12 @@ pub struct RadioState {
 /// radio flags and reads them back. Owned by the probe owner
 /// ([`TileSet`]), mirroring [`crate::watcher::WatcherBus`]: a
 /// disconnected edge until [`NetworkRadio::ensure`] connects, and
-/// blocking-proxy calls throughout, so a taken name or no bus reads
-/// as `None`/`false` — never a hang.
+/// proxy calls driven to completion with [`zbus::block_on`]
+/// throughout, so a taken name or no bus reads as `None`/`false` —
+/// never a hang.
 #[derive(Debug)]
 pub struct NetworkRadio {
-    conn: Option<zbus::blocking::Connection>,
+    conn: Option<zbus::Connection>,
 }
 
 impl NetworkRadio {
@@ -91,17 +92,10 @@ impl NetworkRadio {
             return true;
         }
         let builder = match address {
-            Some(address) => zbus::blocking::connection::Builder::address(address),
-            None => zbus::blocking::connection::Builder::session(),
+            Some(address) => zbus::connection::Builder::address(address),
+            None => zbus::connection::Builder::session(),
         };
-        let builder = match builder {
-            Ok(builder) => builder.method_timeout(RADIO_TIMEOUT),
-            Err(e) => {
-                eprintln!("tuna-shell-host: network radio bus unavailable: {e}");
-                return false;
-            }
-        };
-        match builder.build() {
+        match zbus::block_on(builder.method_timeout(RADIO_TIMEOUT).build()) {
             Ok(conn) => {
                 self.conn = Some(conn);
                 true
@@ -113,20 +107,20 @@ impl NetworkRadio {
         }
     }
 
-    /// Blocking proxy for the NetworkManager object (the watcher.rs
-    /// call shape: [`zbus::blocking::Proxy::new`], then property or
-    /// method calls). `None` without a bus.
-    fn proxy(&self) -> Option<zbus::blocking::Proxy<'_>> {
+    /// Proxy for the NetworkManager object (the watcher.rs call
+    /// shape: [`zbus::Proxy::new`], then property or method calls).
+    /// `None` without a bus.
+    fn proxy(&self) -> Option<zbus::Proxy<'_>> {
         let conn = self.conn.as_ref()?;
-        zbus::blocking::Proxy::new(conn, NM_NAME, NM_PATH, NM_IFACE).ok()
+        zbus::block_on(zbus::Proxy::new(conn, NM_NAME, NM_PATH, NM_IFACE)).ok()
     }
 
     /// Current radio flags. `None` when the bus is absent or the
     /// service does not answer within the short timeout.
     pub fn snapshot(&self) -> Option<RadioState> {
         let proxy = self.proxy()?;
-        let wireless: bool = proxy.get_property("WirelessEnabled").ok()?;
-        let networking: bool = proxy.get_property("NetworkingEnabled").ok()?;
+        let wireless: bool = zbus::block_on(proxy.get_property("WirelessEnabled")).ok()?;
+        let networking: bool = zbus::block_on(proxy.get_property("NetworkingEnabled")).ok()?;
         Some(RadioState {
             wireless,
             networking,
@@ -139,7 +133,7 @@ impl NetworkRadio {
         let Some(proxy) = self.proxy() else {
             return false;
         };
-        proxy.set_property("WirelessEnabled", enabled).is_ok()
+        zbus::block_on(proxy.set_property("WirelessEnabled", enabled)).is_ok()
     }
 
     /// Set every radio via `Enable`. True once the service accepts
@@ -148,7 +142,7 @@ impl NetworkRadio {
         let Some(proxy) = self.proxy() else {
             return false;
         };
-        proxy.call::<&str, _, ()>("Enable", &(enabled,)).is_ok()
+        zbus::block_on(proxy.call::<&str, _, ()>("Enable", &(enabled,))).is_ok()
     }
 }
 
@@ -182,12 +176,12 @@ impl Default for SoundState {
 /// D-Bus caller behind the sound tile: toggles output mute and sets
 /// output volume, then reads them back. Owned by the probe owner
 /// ([`TileSet`]), mirroring [`NetworkRadio`]: a disconnected edge
-/// until [`SoundMixer::ensure`] connects, and blocking-proxy calls
-/// throughout, so a taken name or no bus reads as `None`/`false` —
-/// never a hang.
+/// until [`SoundMixer::ensure`] connects, and proxy calls driven to
+/// completion with [`zbus::block_on`] throughout, so a taken name or
+/// no bus reads as `None`/`false` — never a hang.
 #[derive(Debug)]
 pub struct SoundMixer {
-    conn: Option<zbus::blocking::Connection>,
+    conn: Option<zbus::Connection>,
 }
 
 impl SoundMixer {
@@ -211,17 +205,10 @@ impl SoundMixer {
             return true;
         }
         let builder = match address {
-            Some(address) => zbus::blocking::connection::Builder::address(address),
-            None => zbus::blocking::connection::Builder::session(),
+            Some(address) => zbus::connection::Builder::address(address),
+            None => zbus::connection::Builder::session(),
         };
-        let builder = match builder {
-            Ok(builder) => builder.method_timeout(SOUND_TIMEOUT),
-            Err(e) => {
-                eprintln!("tuna-shell-host: sound mixer bus unavailable: {e}");
-                return false;
-            }
-        };
-        match builder.build() {
+        match zbus::block_on(builder.method_timeout(SOUND_TIMEOUT).build()) {
             Ok(conn) => {
                 self.conn = Some(conn);
                 true
@@ -233,20 +220,20 @@ impl SoundMixer {
         }
     }
 
-    /// Blocking proxy for the sound-server control object (the
-    /// watcher.rs call shape: [`zbus::blocking::Proxy::new`], then
-    /// property calls). `None` without a bus.
-    fn proxy(&self) -> Option<zbus::blocking::Proxy<'_>> {
+    /// Proxy for the sound-server control object (the watcher.rs call
+    /// shape: [`zbus::Proxy::new`], then property calls). `None`
+    /// without a bus.
+    fn proxy(&self) -> Option<zbus::Proxy<'_>> {
         let conn = self.conn.as_ref()?;
-        zbus::blocking::Proxy::new(conn, SND_NAME, SND_PATH, SND_IFACE).ok()
+        zbus::block_on(zbus::Proxy::new(conn, SND_NAME, SND_PATH, SND_IFACE)).ok()
     }
 
     /// Current output state. `None` when the bus is absent or the
     /// service does not answer within the short timeout.
     pub fn snapshot(&self) -> Option<SoundState> {
         let proxy = self.proxy()?;
-        let muted: bool = proxy.get_property("Muted").ok()?;
-        let volume: f64 = proxy.get_property("Volume").ok()?;
+        let muted: bool = zbus::block_on(proxy.get_property("Muted")).ok()?;
+        let volume: f64 = zbus::block_on(proxy.get_property("Volume")).ok()?;
         Some(SoundState { muted, volume })
     }
 
@@ -256,7 +243,7 @@ impl SoundMixer {
         let Some(proxy) = self.proxy() else {
             return false;
         };
-        proxy.set_property("Muted", muted).is_ok()
+        zbus::block_on(proxy.set_property("Muted", muted)).is_ok()
     }
 
     /// Set output volume (`0.0..=1.0`). True once the service accepts
@@ -265,7 +252,7 @@ impl SoundMixer {
         let Some(proxy) = self.proxy() else {
             return false;
         };
-        proxy.set_property("Volume", volume.clamp(0.0, 1.0)).is_ok()
+        zbus::block_on(proxy.set_property("Volume", volume.clamp(0.0, 1.0))).is_ok()
     }
 }
 
@@ -1351,28 +1338,22 @@ mod tests {
         /// Serve the stub on the private bus, retrying while the
         /// daemon starts listening. Returns the serving connection
         /// (kept alive by the caller) and the shared output.
-        fn serve_stub(
-            address: &str,
-        ) -> Option<(zbus::blocking::Connection, Arc<Mutex<StubOutput>>)> {
+        fn serve_stub(address: &str) -> Option<(zbus::Connection, Arc<Mutex<StubOutput>>)> {
             let output = Arc::new(Mutex::new(StubOutput {
                 muted: false,
                 volume: 1.0,
             }));
             for _ in 0..50 {
-                let builder = zbus::blocking::connection::Builder::address(address).ok()?;
                 let stub = StubSound {
                     output: output.clone(),
                 };
-                let builder = match builder.serve_at(SND_PATH, stub) {
-                    Ok(builder) => builder,
-                    Err(_) => return None,
-                };
-                match builder.build() {
+                let builder = zbus::connection::Builder::address(address).serve_at(SND_PATH, stub);
+                match zbus::block_on(builder.build()) {
                     Ok(conn) => {
-                        match conn.request_name_with_flags(
+                        match zbus::block_on(conn.request_name_with_flags(
                             SND_NAME,
-                            zbus::fdo::RequestNameFlags::DoNotQueue.into(),
-                        ) {
+                            zbus::fdo::RequestNameFlags::DO_NOT_QUEUE,
+                        )) {
                             Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
                                 return Some((conn, output));
                             }
@@ -1642,28 +1623,22 @@ mod tests {
         /// Serve the stub on the private bus, retrying while the
         /// daemon starts listening. Returns the serving connection
         /// (kept alive by the caller) and the shared flags.
-        fn serve_stub(
-            address: &str,
-        ) -> Option<(zbus::blocking::Connection, Arc<Mutex<StubFlags>>)> {
+        fn serve_stub(address: &str) -> Option<(zbus::Connection, Arc<Mutex<StubFlags>>)> {
             let flags = Arc::new(Mutex::new(StubFlags {
                 wireless: true,
                 networking: true,
             }));
             for _ in 0..50 {
-                let builder = zbus::blocking::connection::Builder::address(address).ok()?;
                 let stub = StubNm {
                     flags: flags.clone(),
                 };
-                let builder = match builder.serve_at(NM_PATH, stub) {
-                    Ok(builder) => builder,
-                    Err(_) => return None,
-                };
-                match builder.build() {
+                let builder = zbus::connection::Builder::address(address).serve_at(NM_PATH, stub);
+                match zbus::block_on(builder.build()) {
                     Ok(conn) => {
-                        match conn.request_name_with_flags(
+                        match zbus::block_on(conn.request_name_with_flags(
                             NM_NAME,
-                            zbus::fdo::RequestNameFlags::DoNotQueue.into(),
-                        ) {
+                            zbus::fdo::RequestNameFlags::DO_NOT_QUEUE,
+                        )) {
                             Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
                                 return Some((conn, flags));
                             }

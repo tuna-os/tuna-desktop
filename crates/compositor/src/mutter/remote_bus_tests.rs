@@ -7,7 +7,7 @@ use super::*;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use zbus::blocking::Connection;
+use zbus::Connection;
 
 const RD: &str = "org.gnome.Mutter.RemoteDesktop";
 const SESSION: &str = "org.gnome.Mutter.RemoteDesktop.Session";
@@ -33,11 +33,12 @@ fn bus() -> Bus {
     Bus(child, address.trim().to_owned())
 }
 fn connect(bus: &Bus) -> Connection {
-    zbus::blocking::connection::Builder::address(bus.1.as_str())
-        .unwrap()
-        .method_timeout(Duration::from_secs(5))
-        .build()
-        .unwrap()
+    zbus::block_on(
+        zbus::connection::Builder::address(bus.1.as_str())
+            .method_timeout(Duration::from_secs(5))
+            .build(),
+    )
+    .unwrap()
 }
 fn call<B>(
     conn: &Connection,
@@ -47,37 +48,46 @@ fn call<B>(
     body: &B,
 ) -> zbus::Result<zbus::Message>
 where
-    B: serde::Serialize + zbus::zvariant::DynamicType,
+    B: serde::Serialize + zbus::DynamicType,
 {
-    conn.call_method(Some(RD), path, Some(iface), method, body)
+    zbus::block_on(conn.call_method(Some(RD), path, Some(iface), method, body))
 }
 fn session<B>(conn: &Connection, method: &str, body: &B) -> zbus::Result<zbus::Message>
 where
-    B: serde::Serialize + zbus::zvariant::DynamicType,
+    B: serde::Serialize + zbus::DynamicType,
 {
     call(conn, PATH, SESSION, method, body)
 }
+/// The error reply's description; zbus 6 reports fdo-named replies as
+/// `Error::FDO`, any other name as `Error::MethodError`.
 #[track_caller]
 fn assert_error(result: zbus::Result<zbus::Message>, name: &str) -> String {
+    let expected = format!("org.freedesktop.DBus.Error.{name}");
     match result {
         Err(zbus::Error::MethodError(error, message, _)) => {
-            assert_eq!(error.as_str(), format!("org.freedesktop.DBus.Error.{name}"));
+            assert_eq!(error.as_str(), expected);
             message.unwrap_or_default()
+        }
+        Err(zbus::Error::FDO(error)) => {
+            assert_eq!(zbus::DBusError::name(&*error).as_str(), expected);
+            zbus::DBusError::description(&*error)
+                .unwrap_or_default()
+                .to_owned()
         }
         other => panic!("expected {name}, got {other:?}"),
     }
 }
-fn no_options() -> HashMap<&'static str, Value<'static>> {
+fn no_options() -> HashMap<&'static str, Variant<'static>> {
     HashMap::new()
 }
-fn mime_options(types: &[&str]) -> HashMap<&'static str, Value<'static>> {
+fn mime_options(types: &[&str]) -> HashMap<&'static str, Variant<'static>> {
     HashMap::from([(
         "mime-types",
-        Value::from(types.iter().map(|t| t.to_string()).collect::<Vec<_>>()),
+        Variant::from(types.iter().map(|t| t.to_string()).collect::<Vec<_>>()),
     )])
 }
 fn fd(message: zbus::Result<zbus::Message>) -> std::fs::File {
-    let fd: zbus::zvariant::OwnedFd = message.unwrap().body().deserialize().unwrap();
+    let fd: zbus::OwnedFd = message.unwrap().body().deserialize().unwrap();
     std::fs::File::from(std::os::fd::OwnedFd::from(fd))
 }
 /// Every session signal `conn` receives, as (member, message).
@@ -85,38 +95,49 @@ fn signals(conn: &Connection) -> std::sync::mpsc::Receiver<(String, zbus::Messag
     let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .interface(SESSION)
-        .unwrap()
-        .build();
-    let iterator = zbus::blocking::MessageIterator::for_match_rule(rule, conn, Some(64)).unwrap();
+        .build()
+        .unwrap();
+    let mut stream = zbus::block_on(zbus::MessageStream::for_match_rule(
+        rule,
+        conn,
+        std::num::NonZeroUsize::new(64),
+    ))
+    .unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        for message in iterator.flatten() {
-            let member = message
-                .header()
-                .member()
-                .map(|m| m.to_string())
-                .unwrap_or_default();
-            if tx.send((member, message)).is_err() {
-                return;
+        use futures_lite::StreamExt as _;
+        zbus::block_on(async {
+            while let Some(message) = stream.next().await {
+                let Ok(message) = message else {
+                    continue;
+                };
+                let member = message
+                    .header()
+                    .member()
+                    .map(|m| m.to_string())
+                    .unwrap_or_default();
+                if tx.send((member, message)).is_err() {
+                    return;
+                }
             }
-        }
+        })
     });
     rx
 }
 /// SelectionOwnerChanged's mime types (`(as)`) and session-is-owner.
 fn owner_changed(message: &zbus::Message) -> (Vec<String>, bool) {
-    let options: HashMap<String, OwnedValue> = message.body().deserialize().unwrap();
-    let Value::Structure(tuple) = &*options["mime-types"] else {
+    let options: HashMap<String, OwnedVariant> = message.body().deserialize().unwrap();
+    let Variant::Structure(tuple) = &*options["mime-types"] else {
         panic!("mime-types is not a tuple: {options:?}");
     };
     assert_eq!(tuple.signature().to_string(), "(as)");
-    let Value::Array(array) = &tuple.fields()[0] else {
+    let Variant::Array(array) = &tuple.fields()[0] else {
         panic!("not an array");
     };
     let types = array
         .iter()
         .map(|v| match v {
-            Value::Str(s) => s.to_string(),
+            Variant::Str(s) => s.to_string(),
             _ => panic!("not a string"),
         })
         .collect();
@@ -149,16 +170,14 @@ fn only_the_installed_remote_desktop_daemon_may_create_sessions() {
         signals: crate::dbus_signals::SignalQueue::new("test-mutter-signals"),
         next_id,
     };
-    let _server = zbus::blocking::connection::Builder::address(bus.1.as_str())
-        .unwrap()
-        .serve_at("/org/gnome/Mutter/RemoteDesktop", remote_desktop)
-        .unwrap()
-        .serve_at("/org/gnome/Mutter/ScreenCast", screencast)
-        .unwrap()
-        .name(RD)
-        .unwrap()
-        .build()
-        .unwrap();
+    let _server = zbus::block_on(
+        zbus::connection::Builder::address(bus.1.as_str())
+            .serve_at("/org/gnome/Mutter/RemoteDesktop", remote_desktop)
+            .serve_at("/org/gnome/Mutter/ScreenCast", screencast)
+            .name(RD)
+            .build(),
+    )
+    .unwrap();
     let caller = connect(&bus);
     let create = |conn: &Connection| {
         call(
@@ -177,11 +196,11 @@ fn only_the_installed_remote_desktop_daemon_may_create_sessions() {
         "org.gnome.RemoteDesktop.Handover",
         "org.gnome.RemoteDesktop.Headless",
     ] {
-        caller.request_name(name).unwrap();
+        zbus::block_on(caller.request_name(name)).unwrap();
     }
     assert_error(create(&caller), "AccessDenied");
     // Nor may it open the ScreenCast session grd links to its grant.
-    let linked = HashMap::from([("remote-desktop-session-id", Value::from("tuna-remote-1"))]);
+    let linked = HashMap::from([("remote-desktop-session-id", Variant::from("tuna-remote-1"))]);
     assert_error(
         call(
             &caller,
@@ -204,23 +223,22 @@ fn session_clipboard_and_keysyms_are_owned_bounded_and_revocable() {
     let authority = crate::capture_security::Authority::default();
     let grant = remote_desktop::RemoteGrant::new(1, owner.unique_name().unwrap().to_string());
     let (to_loop, from_dbus) = calloop::channel::channel();
-    let _server = zbus::blocking::connection::Builder::address(bus.1.as_str())
-        .unwrap()
-        .serve_at(
-            PATH,
-            remote_desktop::RemoteSession {
-                grant: grant.clone(),
-                authority: authority.clone(),
-                captures: Default::default(),
-                outputs: Default::default(),
-                to_loop,
-            },
-        )
-        .unwrap()
-        .name(RD)
-        .unwrap()
-        .build()
-        .unwrap();
+    let _server = zbus::block_on(
+        zbus::connection::Builder::address(bus.1.as_str())
+            .serve_at(
+                PATH,
+                remote_desktop::RemoteSession {
+                    grant: grant.clone(),
+                    authority: authority.clone(),
+                    captures: Default::default(),
+                    outputs: Default::default(),
+                    to_loop,
+                },
+            )
+            .name(RD)
+            .build(),
+    )
+    .unwrap();
 
     // The loop: the session registry, a selection owner that answers
     // reads with "local text", and the input queue.
@@ -291,7 +309,7 @@ fn session_clipboard_and_keysyms_are_owned_bounded_and_revocable() {
     assert_error(session(&owner, "SelectionRead", &("text/plain",)), "Failed");
     assert_error(session(&owner, "SetSelection", &(no_options(),)), "Failed");
     // Garbage options never enable it.
-    let garbage = HashMap::from([("mime-types", Value::from(7u32))]);
+    let garbage = HashMap::from([("mime-types", Variant::from(7u32))]);
     assert_error(
         session(&owner, "EnableClipboard", &(garbage,)),
         "InvalidArgs",
@@ -534,8 +552,8 @@ fn linked_monitor_streams_carry_the_eis_mapping_id_grd_requires() {
         "tuna-monitor-Virtual-1"
     );
     let pair = |key: &str| match &*parameters[key] {
-        Value::Structure(s) => match s.fields() {
-            [Value::I32(a), Value::I32(b)] => (*a, *b),
+        Variant::Structure(s) => match s.fields() {
+            [Variant::I32(a), Variant::I32(b)] => (*a, *b),
             other => panic!("{key}: {other:?}"),
         },
         other => panic!("{key}: {other:?}"),
@@ -677,27 +695,25 @@ fn linked_screencast_records_after_remote_start_and_serves_stream_start_stop() {
         .lock()
         .unwrap()
         .push((capture.clone(), OwnedObjectPath::try_from(SC_PATH).unwrap()));
-    let _server = zbus::blocking::connection::Builder::address(bus.1.as_str())
-        .unwrap()
-        .serve_at(
-            PATH,
-            remote_desktop::RemoteSession {
-                grant: grant.clone(),
-                authority: authority.clone(),
-                captures: captures.clone(),
-                outputs: Default::default(),
-                to_loop: to_loop.clone(),
-            },
-        )
-        .unwrap()
-        .serve_at(SC_PATH, capture)
-        .unwrap()
-        .name(RD)
-        .unwrap()
-        .build()
-        .unwrap();
+    let _server = zbus::block_on(
+        zbus::connection::Builder::address(bus.1.as_str())
+            .serve_at(
+                PATH,
+                remote_desktop::RemoteSession {
+                    grant: grant.clone(),
+                    authority: authority.clone(),
+                    captures: captures.clone(),
+                    outputs: Default::default(),
+                    to_loop: to_loop.clone(),
+                },
+            )
+            .serve_at(SC_PATH, capture)
+            .name(RD)
+            .build(),
+    )
+    .unwrap();
     let (seen, stop, event_loop_thread) = cast_requests(from_dbus);
-    let sc = |conn: &Connection, method: &str, body: &(&str, HashMap<&str, Value>)| {
+    let sc = |conn: &Connection, method: &str, body: &(&str, HashMap<&str, Variant>)| {
         call(conn, SC_PATH, SC_SESSION, method, body)
     };
     let stream =
@@ -751,19 +767,18 @@ fn linked_screencast_records_after_remote_start_and_serves_stream_start_stop() {
     ];
     expect_requests(&seen, &expected);
     // Its parameters carry the mapping id grd needs.
-    let parameters: OwnedValue = owner
-        .call_method(
-            Some(RD),
-            late.as_str(),
-            Some("org.freedesktop.DBus.Properties"),
-            "Get",
-            &(SC_STREAM, "Parameters"),
-        )
-        .unwrap()
-        .body()
-        .deserialize()
-        .unwrap();
-    let parameters: HashMap<String, OwnedValue> = parameters.try_into().unwrap();
+    let parameters: OwnedVariant = zbus::block_on(owner.call_method(
+        Some(RD),
+        late.as_str(),
+        Some("org.freedesktop.DBus.Properties"),
+        "Get",
+        &(SC_STREAM, "Parameters"),
+    ))
+    .unwrap()
+    .body()
+    .deserialize()
+    .unwrap();
+    let parameters: HashMap<String, OwnedVariant> = parameters.try_into().unwrap();
     assert_eq!(
         <&str>::try_from(&parameters["mapping-id"]).unwrap(),
         "tuna-monitor-Virtual-1"
@@ -818,14 +833,13 @@ fn a_plain_session_streams_after_start_and_ends_with_its_stream() {
     let (to_loop, from_dbus) = calloop::channel::channel();
     let capture = capture_session(3, &owner_name, &authority, None, &to_loop);
     let stopped = capture.stopped.clone();
-    let _server = zbus::blocking::connection::Builder::address(bus.1.as_str())
-        .unwrap()
-        .serve_at(SC_PATH, capture)
-        .unwrap()
-        .name(RD)
-        .unwrap()
-        .build()
-        .unwrap();
+    let _server = zbus::block_on(
+        zbus::connection::Builder::address(bus.1.as_str())
+            .serve_at(SC_PATH, capture)
+            .name(RD)
+            .build(),
+    )
+    .unwrap();
     let (seen, stop, event_loop_thread) = cast_requests(from_dbus);
     let record = |conn: &Connection| {
         call(

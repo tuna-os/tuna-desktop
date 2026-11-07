@@ -44,8 +44,11 @@
 //! supporting restore is asked.
 
 use std::hash::{BuildHasher, Hasher};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+use futures_lite::StreamExt;
 
 use zbus::object_server::SignalEmitter;
 use zbus::{interface, ObjectServer};
@@ -232,7 +235,7 @@ pub enum Act {
     Suspend,
 }
 
-/// Carries out an [`Act`]; blocking, so it runs off the bus executor.
+/// Carries out an [`Act`]; blocking, so it runs off the bus runtime.
 type Performer = Arc<dyn Fn(Act) + Send + Sync>;
 
 /// The live policy: org.gnome.desktop.lockdown `disable-log-out` and
@@ -306,14 +309,10 @@ impl Manager {
         // gsm_manager_logout replies at once; Shutdown and Reboot answer
         // when the end of the session is confirmed or cancelled.
         if kind == EndSession::Logout {
-            conn.executor()
-                .spawn(
-                    async move {
-                        let _ = answered.await;
-                    },
-                    "tuna-end-session-answer",
-                )
-                .detach();
+            zruntime::spawn(async move {
+                let _ = answered.await;
+            })
+            .detach();
             return Ok(());
         }
         answered.await
@@ -348,7 +347,7 @@ impl Manager {
         let path = inhibitor.path.clone();
         let cookie = inhibitor.cookie;
         let _ = server.at(path.as_str(), InhibitorNode(inhibitor)).await;
-        if let Ok(path) = zbus::zvariant::ObjectPath::try_from(path.as_str()) {
+        if let Ok(path) = zbus::ObjectPath::try_from(path.as_str()) {
             let _ = Manager::inhibitor_added(&emitter, path).await;
         }
         if changed {
@@ -387,13 +386,13 @@ impl Manager {
             .unwrap_or(false)
     }
 
-    fn get_inhibitors(&self) -> Vec<zbus::zvariant::OwnedObjectPath> {
+    fn get_inhibitors(&self) -> Vec<zbus::OwnedObjectPath> {
         self.registry
             .lock()
             .map(|r| r.paths())
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|p| zbus::zvariant::OwnedObjectPath::try_from(p).ok())
+            .filter_map(|p| zbus::OwnedObjectPath::try_from(p).ok())
             .collect()
     }
 
@@ -455,13 +454,13 @@ impl Manager {
     #[zbus(signal)]
     async fn inhibitor_added(
         emitter: &SignalEmitter<'_>,
-        id: zbus::zvariant::ObjectPath<'_>,
+        id: zbus::ObjectPath<'_>,
     ) -> zbus::Result<()>;
 
     #[zbus(signal)]
     async fn inhibitor_removed(
         emitter: &SignalEmitter<'_>,
-        id: zbus::zvariant::ObjectPath<'_>,
+        id: zbus::ObjectPath<'_>,
     ) -> zbus::Result<()>;
 }
 
@@ -471,7 +470,7 @@ async fn retire(server: &ObjectServer, emitter: &SignalEmitter<'_>, gone: &[Inhi
         let _ = server
             .remove::<InhibitorNode, _>(inhibitor.path.as_str())
             .await;
-        if let Ok(path) = zbus::zvariant::ObjectPath::try_from(inhibitor.path.as_str()) {
+        if let Ok(path) = zbus::ObjectPath::try_from(inhibitor.path.as_str()) {
             let _ = Manager::inhibitor_removed(emitter, path).await;
         }
     }
@@ -557,7 +556,7 @@ pub enum EndSessionError {
 
 impl zbus::DBusError for EndSessionError {
     fn create_reply(&self, call: &zbus::message::Header<'_>) -> zbus::Result<zbus::Message> {
-        zbus::Message::error(call, self.name())?.build(&(self.description().unwrap_or(""),))
+        zbus::Message::error(call, self.name()).build(&(self.description().unwrap_or(""),))
     }
 
     fn name(&self) -> zbus::names::ErrorName<'_> {
@@ -589,7 +588,7 @@ impl std::fmt::Display for EndSessionError {
 impl std::error::Error for EndSessionError {}
 
 /// Run blocking work (a `gsettings` read, a logind call) on its own
-/// thread so the connection's executor keeps serving inhibitors.
+/// thread so the connection's runtime keeps serving inhibitors.
 async fn off_executor<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
@@ -658,23 +657,26 @@ fn perform(act: Act) {
         Act::End(EndSession::Reboot) => ("Reboot", None),
         Act::Suspend => ("SuspendWithFlags", Some(SD_LOGIND_SKIP_INHIBITORS)),
     };
-    let result = zbus::blocking::Connection::system().and_then(|system| {
-        let logind = zbus::blocking::Proxy::new(
+    let result = zbus::block_on(async {
+        let system = zbus::Connection::system().await?;
+        let logind = zbus::Proxy::new(
             &system,
             "org.freedesktop.login1",
             "/org/freedesktop/login1",
             "org.freedesktop.login1.Manager",
-        )?;
+        )
+        .await?;
         match flags {
             // gsm_systemd_suspend: interactive authorization, no reply value.
             Some(flags) => logind
                 .call_with_flags::<_, _, ()>(
                     method,
-                    zbus::proxy::MethodFlags::AllowInteractiveAuth.into(),
+                    zbus::proxy::MethodFlags::ALLOW_INTERACTIVE_AUTH,
                     &(flags,),
                 )
+                .await
                 .map(|_| ()),
-            None => logind.call::<_, _, ()>(method, &(true,)),
+            None => logind.call::<_, _, ()>(method, &(true,)).await,
         }
     });
     match result {
@@ -709,7 +711,6 @@ impl PendingDialog {
     /// The confirmed end of the session, or `None` when the dialog was
     /// cancelled or closed or the shell left the bus.
     async fn answer(self) -> Option<EndSession> {
-        use futures_lite::StreamExt;
         let Self {
             mut answers,
             mut owners,
@@ -765,19 +766,19 @@ async fn open_dialog(
     let answers = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .interface(END_SESSION_DIALOG_IFACE)
-        .and_then(|b| b.path(END_SESSION_DIALOG_PATH))
-        .map(|b| b.build())
+        .path(END_SESSION_DIALOG_PATH)
+        .build()
         .map_err(|_| EndSessionError::Cancelled)?;
-    let answers = zbus::MessageStream::for_match_rule(answers, conn, Some(16))
+    let answers = zbus::MessageStream::for_match_rule(answers, conn, NonZeroUsize::new(16))
         .await
         .map_err(|_| EndSessionError::Cancelled)?;
     let owners = dbus
         .receive_name_owner_changed_with_args(&[(0, SHELL_NAME)])
         .await
         .map_err(|_| EndSessionError::Cancelled)?;
-    let paths: Vec<zbus::zvariant::ObjectPath<'_>> = inhibitors
+    let paths: Vec<zbus::ObjectPath<'_>> = inhibitors
         .iter()
-        .filter_map(|p| zbus::zvariant::ObjectPath::try_from(p.as_str()).ok())
+        .filter_map(|p| zbus::ObjectPath::try_from(p.as_str()).ok())
         .collect();
     if let Err(e) = conn
         .call_method(
@@ -807,7 +808,7 @@ impl InhibitorNode {
         self.0.app_id.clone()
     }
 
-    fn get_client_id(&self) -> Result<zbus::zvariant::OwnedObjectPath, InhibitorError> {
+    fn get_client_id(&self) -> Result<zbus::OwnedObjectPath, InhibitorError> {
         Err(InhibitorError::NotSet("Value is not set".into()))
     }
 
@@ -823,7 +824,7 @@ impl InhibitorNode {
 /// Serve the manager on `conn` and drop each caller's inhibitors when
 /// its unique name leaves the bus. Returns the thread watching for that.
 fn serve_on(
-    conn: &zbus::blocking::Connection,
+    conn: &zbus::Connection,
     registry: Arc<Mutex<Registry>>,
     share: Share,
     active: bool,
@@ -841,7 +842,7 @@ fn serve_on(
 /// [`serve_on`] with the end-session policy reader and the performer
 /// (tests pin the one and record the other).
 fn serve_with(
-    conn: &zbus::blocking::Connection,
+    conn: &zbus::Connection,
     registry: Arc<Mutex<Registry>>,
     share: Share,
     active: bool,
@@ -850,64 +851,75 @@ fn serve_with(
 ) -> zbus::Result<std::thread::JoinHandle<()>> {
     let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
-        .sender("org.freedesktop.DBus")?
-        .interface("org.freedesktop.DBus")?
-        .member("NameOwnerChanged")?
-        .path("/org/freedesktop/DBus")?
-        .build();
-    let departures = zbus::blocking::MessageIterator::for_match_rule(rule, conn, Some(64))?;
-    conn.object_server().at(
-        PATH,
-        Manager {
-            registry: registry.clone(),
-            share: share.clone(),
-            active: AtomicBool::new(active),
-            policy,
-            perform,
-            dialogs: Arc::default(),
-        },
-    )?;
+        .sender("org.freedesktop.DBus")
+        .interface("org.freedesktop.DBus")
+        .member("NameOwnerChanged")
+        .path("/org/freedesktop/DBus")
+        .build()?;
+    let mut departures = zbus::block_on(async {
+        let departures =
+            zbus::MessageStream::for_match_rule(rule, conn, NonZeroUsize::new(64)).await?;
+        conn.object_server()
+            .at(
+                PATH,
+                Manager {
+                    registry: registry.clone(),
+                    share: share.clone(),
+                    active: AtomicBool::new(active),
+                    policy,
+                    perform,
+                    dialogs: Arc::default(),
+                },
+            )
+            .await?;
+        zbus::Result::Ok(departures)
+    })?;
     let conn = conn.clone();
     std::thread::Builder::new()
         .name("tuna-session-inhibitors".into())
         .spawn(move || {
-            for message in departures {
-                let Ok(message) = message else {
-                    continue;
-                };
-                let Ok((name, _old, new)) =
-                    message.body().deserialize::<(String, String, String)>()
-                else {
-                    continue;
-                };
-                if !new.is_empty() || !name.starts_with(':') {
-                    continue;
-                }
-                let (gone, changed) = {
-                    let Ok(mut registry) = registry.lock() else {
-                        return;
+            zbus::block_on(async {
+                while let Some(message) = departures.next().await {
+                    let Ok(message) = message else {
+                        continue;
                     };
-                    if !registry.holds(&name) {
+                    let Ok((name, _old, new)) =
+                        message.body().deserialize::<(String, String, String)>()
+                    else {
+                        continue;
+                    };
+                    if !new.is_empty() || !name.starts_with(':') {
                         continue;
                     }
-                    let gone = registry.vanished(&name);
-                    let actions = registry.inhibited_actions();
-                    (
-                        gone,
-                        share.inhibited.swap(actions, Ordering::AcqRel) != actions,
-                    )
-                };
-                let Ok(manager) = conn.object_server().interface::<_, Manager>(PATH) else {
-                    return;
-                };
-                let emitter = manager.signal_emitter().clone();
-                zbus::block_on(async {
-                    retire(conn.object_server().inner(), &emitter, &gone).await;
+                    let (gone, changed) = {
+                        let Ok(mut registry) = registry.lock() else {
+                            return;
+                        };
+                        if !registry.holds(&name) {
+                            continue;
+                        }
+                        let gone = registry.vanished(&name);
+                        let actions = registry.inhibited_actions();
+                        (
+                            gone,
+                            share.inhibited.swap(actions, Ordering::AcqRel) != actions,
+                        )
+                    };
+                    let Ok(manager) = conn.object_server().interface::<_, Manager>(PATH).await
+                    else {
+                        return;
+                    };
+                    let emitter = manager.signal_emitter().clone();
+                    retire(conn.object_server(), &emitter, &gone).await;
                     if changed {
-                        let _ = manager.get().inhibited_actions_changed(&emitter).await;
+                        let _ = manager
+                            .get()
+                            .await
+                            .inhibited_actions_changed(&emitter)
+                            .await;
                     }
-                });
-            }
+                }
+            });
         })
         .map_err(|e| zbus::Error::Failure(e.to_string()))
 }
@@ -916,45 +928,49 @@ fn serve_with(
 /// (`gsm-systemd.c`); without logind the session counts as active, as
 /// gnome-session's null system does. Follows later changes into the
 /// served `SessionIsActive`.
-fn follow_logind_session(session: zbus::blocking::Connection) -> bool {
-    let Ok(system) = zbus::blocking::Connection::system() else {
+fn follow_logind_session(session: zbus::Connection) -> bool {
+    let Ok((system, active, mut changes)) = zbus::block_on(async {
+        let system = zbus::Connection::system().await?;
+        let path = crate::logind_session::current_session_path(&system).await?;
+        let logind_session = zbus::Proxy::new(
+            &system,
+            "org.freedesktop.login1",
+            path,
+            "org.freedesktop.login1.Session",
+        )
+        .await?;
+        let active = logind_session
+            .get_property::<bool>("Active")
+            .await
+            .unwrap_or(true);
+        let changes = logind_session
+            .receive_property_changed::<bool>("Active")
+            .await;
+        zbus::Result::Ok((system, active, changes))
+    }) else {
         return true;
     };
-    let Ok(path) = crate::logind_session::current_session_path(&system) else {
-        return true;
-    };
-    let Ok(logind_session) = zbus::blocking::Proxy::new(
-        &system,
-        "org.freedesktop.login1",
-        path,
-        "org.freedesktop.login1.Session",
-    ) else {
-        return true;
-    };
-    let active = logind_session
-        .get_property::<bool>("Active")
-        .unwrap_or(true);
-    let changes = logind_session.receive_property_changed::<bool>("Active");
     let _ = std::thread::Builder::new()
         .name("tuna-session-active".into())
         .spawn(move || {
             let _system = system;
-            for change in changes {
-                let Ok(active) = change.get() else {
-                    continue;
-                };
-                let Ok(manager) = session.object_server().interface::<_, Manager>(PATH) else {
-                    return;
-                };
-                zbus::block_on(async {
-                    let node = manager.get();
+            zbus::block_on(async {
+                while let Some(change) = changes.next().await {
+                    let Ok(active) = change.get().await else {
+                        continue;
+                    };
+                    let Ok(manager) = session.object_server().interface::<_, Manager>(PATH).await
+                    else {
+                        return;
+                    };
+                    let node = manager.get().await;
                     if node.active.swap(active, Ordering::AcqRel) != active {
                         let _ = node
                             .session_is_active_changed(manager.signal_emitter())
                             .await;
                     }
-                });
-            }
+                }
+            });
         });
     active
 }
@@ -968,7 +984,7 @@ pub fn start() -> Share {
     let _ = std::thread::Builder::new()
         .name("tuna-session-manager".into())
         .spawn(move || {
-            let conn = match zbus::blocking::Connection::session() {
+            let conn = match zbus::block_on(zbus::Connection::session()) {
                 Ok(conn) => conn,
                 Err(e) => {
                     eprintln!("tuna-compositor: session manager: no session bus: {e}");
@@ -984,8 +1000,8 @@ pub fn start() -> Share {
                     return;
                 }
             };
-            let flags = zbus::fdo::RequestNameFlags::DoNotQueue.into();
-            match conn.request_name_with_flags(NAME, flags) {
+            let flags = zbus::fdo::RequestNameFlags::DO_NOT_QUEUE;
+            match zbus::block_on(conn.request_name_with_flags(NAME, flags)) {
                 Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
                     eprintln!("tuna-compositor: serving {NAME} (inhibitors, session activity)");
                     let _ = watcher.join();
@@ -1088,12 +1104,13 @@ mod tests {
             }
         }
 
-        fn connect(&self) -> zbus::blocking::Connection {
-            zbus::blocking::connection::Builder::address(self.address.as_str())
-                .expect("test address parses")
-                .method_timeout(Duration::from_secs(5))
-                .build()
-                .expect("test peer connects")
+        fn connect(&self) -> zbus::Connection {
+            zbus::block_on(
+                zbus::connection::Builder::address(self.address.as_str())
+                    .method_timeout(Duration::from_secs(5))
+                    .build(),
+            )
+            .expect("test peer connects")
         }
     }
 
@@ -1113,18 +1130,16 @@ mod tests {
     }
 
     /// Uncached, so every property read asks the service.
-    fn proxy<'a>(
-        conn: &zbus::blocking::Connection,
-        path: &'a str,
-        interface: &'a str,
-    ) -> zbus::blocking::Proxy<'a> {
-        zbus::blocking::proxy::Builder::new(conn)
-            .destination(NAME)
-            .and_then(|b| b.path(path))
-            .and_then(|b| b.interface(interface))
-            .map(|b| b.cache_properties(zbus::proxy::CacheProperties::No))
-            .and_then(|b| b.build())
-            .unwrap()
+    fn proxy<'a>(conn: &zbus::Connection, path: &'a str, interface: &'a str) -> zbus::Proxy<'a> {
+        zbus::block_on(
+            zbus::proxy::Builder::<zbus::Proxy<'a>>::new(conn)
+                .destination(NAME)
+                .path(path)
+                .interface(interface)
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1134,30 +1149,33 @@ mod tests {
         let share = Share::default();
         let registry = Arc::new(Mutex::new(Registry::default()));
         let _watcher = serve_on(&service, registry, share.clone(), true).unwrap();
-        service.request_name(NAME).unwrap();
+        zbus::block_on(service.request_name(NAME)).unwrap();
 
         let observer = bus.connect();
         let manager = proxy(&observer, PATH, "org.gnome.SessionManager");
-        assert!(manager.get_property::<bool>("SessionIsActive").unwrap());
-        assert_eq!(manager.get_property::<u32>("InhibitedActions").unwrap(), 0);
+        assert!(zbus::block_on(manager.get_property::<bool>("SessionIsActive")).unwrap());
+        assert_eq!(
+            zbus::block_on(manager.get_property::<u32>("InhibitedActions")).unwrap(),
+            0
+        );
         // GNOME Settings hides "Reopen Windows After Login" on this.
-        assert!(!manager.get_property::<bool>("RestoreSupported").unwrap());
-        let added = manager.receive_signal("InhibitorAdded").unwrap();
+        assert!(!zbus::block_on(manager.get_property::<bool>("RestoreSupported")).unwrap());
+        let mut added = zbus::block_on(manager.receive_signal("InhibitorAdded")).unwrap();
 
         // gsd-screensaver-proxy's call for a video player's
         // org.freedesktop.ScreenSaver.Inhibit.
         let player = bus.connect();
         let as_player = proxy(&player, PATH, "org.gnome.SessionManager");
-        let cookie: u32 = as_player
-            .call(
-                "Inhibit",
-                &("org.example.Player", 0u32, "Playing video", FLAG_IDLE),
-            )
-            .unwrap();
+        let cookie: u32 = zbus::block_on(as_player.call(
+            "Inhibit",
+            &("org.example.Player", 0u32, "Playing video", FLAG_IDLE),
+        ))
+        .unwrap();
         assert_ne!(cookie, 0);
-        let refused = as_player
-            .call::<_, _, u32>("Inhibit", &("org.example.Player", 0u32, "", FLAG_IDLE))
-            .unwrap_err();
+        let refused = zbus::block_on(
+            as_player.call::<_, _, u32>("Inhibit", &("org.example.Player", 0u32, "", FLAG_IDLE)),
+        )
+        .unwrap_err();
         match refused {
             zbus::Error::MethodError(name, Some(message), _) => {
                 assert_eq!(name.as_str(), "org.gnome.SessionManager.GeneralError");
@@ -1166,54 +1184,54 @@ mod tests {
             other => panic!("unexpected refusal {other:?}"),
         }
         assert!(share.idle_inhibited());
-        let inhibited: bool = manager.call("IsInhibited", &(FLAG_IDLE,)).unwrap();
+        let inhibited: bool = zbus::block_on(manager.call("IsInhibited", &(FLAG_IDLE,))).unwrap();
         assert!(inhibited);
-        let inhibited: bool = manager.call("IsInhibited", &(FLAG_SUSPEND,)).unwrap();
+        let inhibited: bool =
+            zbus::block_on(manager.call("IsInhibited", &(FLAG_SUSPEND,))).unwrap();
         assert!(!inhibited);
-        let paths: Vec<zbus::zvariant::OwnedObjectPath> =
-            manager.call("GetInhibitors", &()).unwrap();
+        let paths: Vec<zbus::OwnedObjectPath> =
+            zbus::block_on(manager.call("GetInhibitors", &())).unwrap();
         assert_eq!(paths.len(), 1);
-        let announced = added.into_iter().next().unwrap();
-        let (announced,): (zbus::zvariant::OwnedObjectPath,) =
-            announced.body().deserialize().unwrap();
+        let announced = zbus::block_on(added.next()).unwrap();
+        let (announced,): (zbus::OwnedObjectPath,) = announced.body().deserialize().unwrap();
         assert_eq!(announced, paths[0]);
         let node = proxy(
             &observer,
             paths[0].as_str(),
             "org.gnome.SessionManager.Inhibitor",
         );
-        let reason: String = node.call("GetReason", &()).unwrap();
-        let flags: u32 = node.call("GetFlags", &()).unwrap();
-        let app: String = node.call("GetAppId", &()).unwrap();
+        let reason: String = zbus::block_on(node.call("GetReason", &())).unwrap();
+        let flags: u32 = zbus::block_on(node.call("GetFlags", &())).unwrap();
+        let app: String = zbus::block_on(node.call("GetAppId", &())).unwrap();
         assert_eq!(
             (reason.as_str(), flags, app.as_str()),
             ("Playing video", FLAG_IDLE, "org.example.Player")
         );
         // Another caller's suspend inhibitor survives the player leaving.
-        let other: u32 = manager
-            .call(
-                "Inhibit",
-                &("org.example.Copy", 0u32, "Copying", FLAG_SUSPEND),
-            )
-            .unwrap();
+        let other: u32 = zbus::block_on(manager.call(
+            "Inhibit",
+            &("org.example.Copy", 0u32, "Copying", FLAG_SUSPEND),
+        ))
+        .unwrap();
         assert_eq!(
-            manager.get_property::<u32>("InhibitedActions").unwrap(),
+            zbus::block_on(manager.get_property::<u32>("InhibitedActions")).unwrap(),
             FLAG_IDLE | FLAG_SUSPEND
         );
 
         drop(as_player);
         drop(player);
         wait_until("the player's inhibitor to go", || !share.idle_inhibited());
-        let paths: Vec<zbus::zvariant::OwnedObjectPath> =
-            manager.call("GetInhibitors", &()).unwrap();
+        let paths: Vec<zbus::OwnedObjectPath> =
+            zbus::block_on(manager.call("GetInhibitors", &())).unwrap();
         assert_eq!(paths.len(), 1);
-        assert!(node.call::<_, _, String>("GetReason", &()).is_err());
+        assert!(zbus::block_on(node.call::<_, _, String>("GetReason", &())).is_err());
 
-        manager.call::<_, _, ()>("Uninhibit", &(other,)).unwrap();
-        assert_eq!(manager.get_property::<u32>("InhibitedActions").unwrap(), 0);
-        let invalid = manager
-            .call::<_, _, ()>("Uninhibit", &(other,))
-            .unwrap_err();
+        zbus::block_on(manager.call::<_, _, ()>("Uninhibit", &(other,))).unwrap();
+        assert_eq!(
+            zbus::block_on(manager.get_property::<u32>("InhibitedActions")).unwrap(),
+            0
+        );
+        let invalid = zbus::block_on(manager.call::<_, _, ()>("Uninhibit", &(other,))).unwrap_err();
         assert!(
             matches!(&invalid, zbus::Error::MethodError(name, Some(message), _)
                 if name.as_str() == "org.gnome.SessionManager.GeneralError"
@@ -1308,7 +1326,7 @@ mod tests {
             kind: u32,
             timestamp: u32,
             seconds: u32,
-            inhibitors: Vec<zbus::zvariant::OwnedObjectPath>,
+            inhibitors: Vec<zbus::OwnedObjectPath>,
         ) {
             self.0.lock().unwrap().push((
                 kind,
@@ -1319,16 +1337,15 @@ mod tests {
         }
     }
 
-    fn answer(shell: &zbus::blocking::Connection, signal: &str) {
-        shell
-            .emit_signal(
-                None::<&str>,
-                END_SESSION_DIALOG_PATH,
-                END_SESSION_DIALOG_IFACE,
-                signal,
-                &(),
-            )
-            .unwrap();
+    fn answer(shell: &zbus::Connection, signal: &str) {
+        zbus::block_on(shell.emit_signal(
+            None::<&str>,
+            END_SESSION_DIALOG_PATH,
+            END_SESSION_DIALOG_IFACE,
+            signal,
+            &(),
+        ))
+        .unwrap();
     }
 
     fn call_in_thread(
@@ -1339,10 +1356,12 @@ mod tests {
         let caller = bus.connect();
         std::thread::spawn(move || {
             let manager = proxy(&caller, PATH, "org.gnome.SessionManager");
-            match mode {
-                Some(mode) => manager.call::<_, _, ()>(method, &(mode,)),
-                None => manager.call::<_, _, ()>(method, &()),
-            }
+            zbus::block_on(async {
+                match mode {
+                    Some(mode) => manager.call::<_, _, ()>(method, &(mode,)).await,
+                    None => manager.call::<_, _, ()>(method, &()).await,
+                }
+            })
         })
     }
 
@@ -1366,14 +1385,16 @@ mod tests {
     }
 
     /// GNOME Shell on `bus`: its end-session dialog, recording `Open`.
-    fn fake_shell(bus: &TestBus) -> (zbus::blocking::Connection, Opened) {
+    fn fake_shell(bus: &TestBus) -> (zbus::Connection, Opened) {
         let shell = bus.connect();
         let opened: Opened = Arc::default();
-        shell
-            .object_server()
-            .at(END_SESSION_DIALOG_PATH, FakeDialog(opened.clone()))
-            .unwrap();
-        shell.request_name(SHELL_NAME).unwrap();
+        zbus::block_on(
+            shell
+                .object_server()
+                .at(END_SESSION_DIALOG_PATH, FakeDialog(opened.clone())),
+        )
+        .unwrap();
+        zbus::block_on(shell.request_name(SHELL_NAME)).unwrap();
         (shell, opened)
     }
 
@@ -1388,7 +1409,7 @@ mod tests {
         let registry = Arc::new(Mutex::new(Registry::default()));
         let _watcher =
             serve_with(&service, registry, Share::default(), true, policy, perform).unwrap();
-        service.request_name(NAME).unwrap();
+        zbus::block_on(service.request_name(NAME)).unwrap();
         let (shell, opened) = fake_shell(&bus);
 
         // systemActions.js activateSuspend: SuspendAsync, no dialog.
@@ -1476,19 +1497,18 @@ mod tests {
         let (perform, performed) = recorder();
         let _watcher =
             serve_with(&service, registry, Share::default(), true, policy, perform).unwrap();
-        service.request_name(NAME).unwrap();
+        zbus::block_on(service.request_name(NAME)).unwrap();
 
         let (shell, opened) = fake_shell(&bus);
 
         // An application holds a logout inhibitor: its path reaches Open.
         let app = bus.connect();
         let as_app = proxy(&app, PATH, "org.gnome.SessionManager");
-        let _cookie: u32 = as_app
-            .call(
-                "Inhibit",
-                &("org.example.Editor", 0u32, "Unsaved", FLAG_LOGOUT),
-            )
-            .unwrap();
+        let _cookie: u32 = zbus::block_on(as_app.call(
+            "Inhibit",
+            &("org.example.Editor", 0u32, "Unsaved", FLAG_LOGOUT),
+        ))
+        .unwrap();
 
         // gsd-media-keys' Shutdown (power-button-action interactive): the
         // dialog opens with gsm-shell.c's arguments and the call waits.
@@ -1542,7 +1562,7 @@ mod tests {
         // A shell leaving the bus fails a waiting Shutdown.
         let pending = call_in_thread(&bus, "Shutdown", None);
         wait_until("the last dialog", || opened.lock().unwrap().len() == 5);
-        shell.release_name(SHELL_NAME).unwrap();
+        zbus::block_on(shell.release_name(SHELL_NAME)).unwrap();
         assert_eq!(error_name(pending.join().unwrap()), CANCELLED);
 
         // disable-log-out refuses Shutdown before any dialog.

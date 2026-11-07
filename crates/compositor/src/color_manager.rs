@@ -826,7 +826,7 @@ struct Registered {
 }
 
 struct Colord {
-    conn: zbus::blocking::Connection,
+    conn: zbus::Connection,
     share: Arc<ColorShare>,
     icc_dir: Option<PathBuf>,
     /// Profiles this client created: id → object path.
@@ -836,9 +836,11 @@ struct Colord {
     devices: Vec<Registered>,
 }
 
-fn error_name(e: &zbus::Error) -> Option<&str> {
+fn error_name(e: &zbus::Error) -> Option<String> {
+    use zbus::DBusError as _;
     match e {
-        zbus::Error::MethodError(name, _, _) => Some(name.as_str()),
+        zbus::Error::MethodError(name, _, _) => Some(name.to_string()),
+        zbus::Error::FDO(e) => Some(e.name().to_string()),
         _ => None,
     }
 }
@@ -856,10 +858,10 @@ fn run(
     tx: std::sync::mpsc::Sender<Event>,
 ) {
     let builder = match &bus {
-        Bus::System => zbus::blocking::connection::Builder::system(),
-        Bus::Address(address) => zbus::blocking::connection::Builder::address(address.as_str()),
+        Bus::System => zbus::connection::Builder::system(),
+        Bus::Address(address) => zbus::connection::Builder::address(address.as_str()),
     };
-    let conn = match builder.and_then(|b| b.method_timeout(Duration::from_secs(15)).build()) {
+    let conn = match zbus::block_on(builder.method_timeout(Duration::from_secs(15)).build()) {
         Ok(conn) => conn,
         Err(e) => {
             eprintln!("tuna-compositor: colour: no system bus for colord: {e}");
@@ -868,13 +870,13 @@ fn run(
         }
     };
     // cd_client_get_has_server: colord activates on its first call.
-    if let Err(e) = conn.call_method(
+    if let Err(e) = zbus::block_on(conn.call_method(
         Some(CD_SERVICE),
         CD_PATH,
         Some(CD_SERVICE),
         "GetDevices",
         &(),
-    ) {
+    )) {
         eprintln!("tuna-compositor: colour: There is no colord server available: {e}");
         share.set_status(ColordStatus::Unavailable(e.to_string()));
         return;
@@ -930,46 +932,58 @@ fn run(
     }
 }
 
-fn spawn_signal_forwarders(conn: &zbus::blocking::Connection, tx: std::sync::mpsc::Sender<Event>) {
+fn spawn_signal_forwarders(conn: &zbus::Connection, tx: std::sync::mpsc::Sender<Event>) {
+    use futures_lite::StreamExt as _;
     let changed = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .sender(CD_SERVICE)
-        .and_then(|b| b.interface(CD_SERVICE))
-        .and_then(|b| b.member("DeviceChanged"))
-        .map(|b| b.build());
+        .interface(CD_SERVICE)
+        .member("DeviceChanged")
+        .build();
     if let Ok(rule) = changed {
-        if let Ok(iter) = zbus::blocking::MessageIterator::for_match_rule(rule, conn, Some(64)) {
+        if let Ok(mut stream) = zbus::block_on(zbus::MessageStream::for_match_rule(
+            rule,
+            conn,
+            std::num::NonZeroUsize::new(64),
+        )) {
             let tx = tx.clone();
             let _ = std::thread::Builder::new()
                 .name("tuna-colord-signals".into())
                 .spawn(move || {
-                    for message in iter.flatten() {
-                        if let Ok(path) = message
-                            .body()
-                            .deserialize::<zbus::zvariant::OwnedObjectPath>()
-                        {
-                            if tx.send(Event::DeviceChanged(path.to_string())).is_err() {
-                                return;
+                    zbus::block_on(async move {
+                        while let Some(message) = stream.next().await {
+                            let Ok(message) = message else { continue };
+                            if let Ok(path) = message.body().deserialize::<zbus::OwnedObjectPath>()
+                            {
+                                if tx.send(Event::DeviceChanged(path.to_string())).is_err() {
+                                    return;
+                                }
                             }
                         }
-                    }
+                    })
                 });
         }
     }
-    if let Ok(proxy) = zbus::blocking::fdo::DBusProxy::new(conn) {
-        if let Ok(stream) = proxy.receive_name_owner_changed_with_args(&[(0, CD_SERVICE)]) {
-            let _ = std::thread::Builder::new()
-                .name("tuna-colord-owner".into())
-                .spawn(move || {
-                    for signal in stream {
+    let owner = zbus::block_on(async {
+        zbus::fdo::DBusProxy::new(conn)
+            .await?
+            .receive_name_owner_changed_with_args(&[(0, CD_SERVICE)])
+            .await
+    });
+    if let Ok(mut stream) = owner {
+        let _ = std::thread::Builder::new()
+            .name("tuna-colord-owner".into())
+            .spawn(move || {
+                zbus::block_on(async move {
+                    while let Some(signal) = stream.next().await {
                         let Ok(args) = signal.args() else { continue };
                         let owned = args.new_owner().is_some();
                         if tx.send(Event::ColordOwner(owned)).is_err() {
                             return;
                         }
                     }
-                });
-        }
+                })
+            });
     }
 }
 
@@ -995,10 +1009,12 @@ impl Colord {
         body: &B,
     ) -> zbus::Result<zbus::message::Message>
     where
-        B: serde::Serialize + zbus::zvariant::DynamicType,
+        B: serde::Serialize + zbus::DynamicType,
     {
-        self.conn
-            .call_method(Some(CD_SERVICE), path, Some(iface), method, body)
+        zbus::block_on(
+            self.conn
+                .call_method(Some(CD_SERVICE), path, Some(iface), method, body),
+        )
     }
 
     fn object_path(
@@ -1011,25 +1027,23 @@ impl Colord {
         let reply = self.call(path, iface, method, &(arg,))?;
         Ok(reply
             .body()
-            .deserialize::<zbus::zvariant::OwnedObjectPath>()?
+            .deserialize::<zbus::OwnedObjectPath>()?
             .to_string())
     }
 
     fn property<T>(&self, path: &str, iface: &str, name: &str) -> Option<T>
     where
-        T: TryFrom<zbus::zvariant::OwnedValue>,
+        T: TryFrom<zbus::OwnedVariant>,
     {
-        let reply = self
-            .conn
-            .call_method(
-                Some(CD_SERVICE),
-                path,
-                Some("org.freedesktop.DBus.Properties"),
-                "Get",
-                &(iface, name),
-            )
-            .ok()?;
-        let value: zbus::zvariant::OwnedValue = reply.body().deserialize().ok()?;
+        let reply = zbus::block_on(self.conn.call_method(
+            Some(CD_SERVICE),
+            path,
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &(iface, name),
+        ))
+        .ok()?;
+        let value: zbus::OwnedVariant = reply.body().deserialize().ok()?;
         T::try_from(value).ok()
     }
 
@@ -1057,7 +1071,7 @@ impl Colord {
             .and_then(|reply| {
                 Ok(reply
                     .body()
-                    .deserialize::<zbus::zvariant::OwnedObjectPath>()?
+                    .deserialize::<zbus::OwnedObjectPath>()?
                     .to_string())
             });
         let path = match created {
@@ -1141,7 +1155,7 @@ impl Colord {
         let mut props: HashMap<&str, &str> = HashMap::new();
         props.insert("Filename", &filename);
         props.insert("FILE_checksum", &checksum);
-        let fd = zbus::zvariant::Fd::from(std::os::fd::AsFd::as_fd(&file));
+        let fd = zbus::Fd::from(std::os::fd::AsFd::as_fd(&file));
         let created = self
             .call(
                 CD_PATH,
@@ -1152,7 +1166,7 @@ impl Colord {
             .and_then(|reply| {
                 Ok(reply
                     .body()
-                    .deserialize::<zbus::zvariant::OwnedObjectPath>()?
+                    .deserialize::<zbus::OwnedObjectPath>()?
                     .to_string())
             });
         let object_path = match created {
@@ -1234,7 +1248,7 @@ impl Colord {
             return;
         };
         let connector = self.devices[index].monitor.identity.connector.clone();
-        let profiles: Vec<zbus::zvariant::OwnedObjectPath> = self
+        let profiles: Vec<zbus::OwnedObjectPath> = self
             .property(&path, CD_DEVICE, "Profiles")
             .unwrap_or_default();
         let Some(default) = profiles.first().map(|p| p.to_string()) else {
@@ -1305,14 +1319,14 @@ impl Colord {
     fn delete_all(&mut self) {
         for r in &self.devices {
             if let Some(path) = &r.device_path {
-                let object = zbus::zvariant::ObjectPath::try_from(path.as_str());
+                let object = zbus::ObjectPath::try_from(path.as_str());
                 if let Ok(object) = object {
                     let _ = self.call(CD_PATH, CD_SERVICE, "DeleteDevice", &(object,));
                 }
             }
         }
         for path in self.owned_profiles.values() {
-            if let Ok(object) = zbus::zvariant::ObjectPath::try_from(path.as_str()) {
+            if let Ok(object) = zbus::ObjectPath::try_from(path.as_str()) {
                 let _ = self.call(CD_PATH, CD_SERVICE, "DeleteProfile", &(object,));
             }
         }
@@ -1373,7 +1387,7 @@ impl MutterColorManager {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(object_server)] server: &zbus::ObjectServer,
         #[zbus(connection)] conn: &zbus::Connection,
-    ) -> zbus::fdo::Result<zbus::zvariant::OwnedObjectPath> {
+    ) -> zbus::fdo::Result<zbus::OwnedObjectPath> {
         let owner = header
             .sender()
             .map(|s| s.to_string())
@@ -1388,7 +1402,7 @@ impl MutterColorManager {
                     zbus::fdo::Error::Failed(e)
                 }
             })?;
-        let path = zbus::zvariant::OwnedObjectPath::try_from(session.object_path.clone())
+        let path = zbus::OwnedObjectPath::try_from(session.object_path.clone())
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let object = CalibrationObject {
             share: self.share.clone(),
@@ -1410,44 +1424,52 @@ fn watch_owner(conn: zbus::Connection, share: Arc<ColorShare>, owner: String) {
     let _ = std::thread::Builder::new()
         .name("tuna-calibration-owner".into())
         .spawn(move || {
-            let conn = zbus::blocking::Connection::from(conn);
-            let Ok(proxy) = zbus::blocking::fdo::DBusProxy::new(&conn) else {
-                return;
-            };
-            let Ok(stream) = proxy.receive_name_owner_changed_with_args(&[(0, owner.as_str())])
-            else {
-                return;
-            };
-            // The caller may already be gone.
-            let gone = |proxy: &zbus::blocking::fdo::DBusProxy<'_>| {
-                zbus::names::BusName::try_from(owner.as_str())
-                    .ok()
-                    .is_some_and(|name| !proxy.name_has_owner(name).unwrap_or(false))
-            };
-            let close = |share: &ColorShare| {
-                for path in share.owner_vanished(&owner) {
-                    if let Ok(path) = zbus::zvariant::ObjectPath::try_from(path.as_str()) {
-                        let _ = conn.object_server().remove::<CalibrationObject, _>(path);
+            use futures_lite::StreamExt as _;
+            zbus::block_on(async move {
+                let Ok(proxy) = zbus::fdo::DBusProxy::new(&conn).await else {
+                    return;
+                };
+                let Ok(mut stream) = proxy
+                    .receive_name_owner_changed_with_args(&[(0, owner.as_str())])
+                    .await
+                else {
+                    return;
+                };
+                // The caller may already be gone.
+                let gone = match zbus::names::BusName::try_from(owner.as_str()) {
+                    Ok(name) => !proxy.name_has_owner(name).await.unwrap_or(false),
+                    Err(_) => false,
+                };
+                if gone {
+                    close_owner_sessions(&conn, &share, &owner).await;
+                    return;
+                }
+                while let Some(signal) = stream.next().await {
+                    if signal.args().is_ok_and(|a| a.new_owner().is_none()) {
+                        eprintln!(
+                            "tuna-compositor: colour: D-Bus client with active sessions vanished"
+                        );
+                        close_owner_sessions(&conn, &share, &owner).await;
+                        return;
+                    }
+                    if share.sessions().iter().all(|s| s.owner != owner) {
+                        return;
                     }
                 }
-            };
-            if gone(&proxy) {
-                close(&share);
-                return;
-            }
-            for signal in stream {
-                if signal.args().is_ok_and(|a| a.new_owner().is_none()) {
-                    eprintln!(
-                        "tuna-compositor: colour: D-Bus client with active sessions vanished"
-                    );
-                    close(&share);
-                    return;
-                }
-                if share.sessions().iter().all(|s| s.owner != owner) {
-                    return;
-                }
-            }
+            })
         });
+}
+
+/// Drop `owner`'s calibration sessions and their objects.
+async fn close_owner_sessions(conn: &zbus::Connection, share: &ColorShare, owner: &str) {
+    for path in share.owner_vanished(owner) {
+        if let Ok(path) = zbus::ObjectPath::try_from(path.as_str()) {
+            let _ = conn
+                .object_server()
+                .remove::<CalibrationObject, _>(path)
+                .await;
+        }
+    }
 }
 
 /// One calibration session object.
@@ -1482,7 +1504,7 @@ impl CalibrationObject {
         #[zbus(object_server)] server: &zbus::ObjectServer,
     ) -> zbus::fdo::Result<()> {
         self.share.stop_calibration(&self.object_path);
-        if let Ok(path) = zbus::zvariant::ObjectPath::try_from(self.object_path.as_str()) {
+        if let Ok(path) = zbus::ObjectPath::try_from(self.object_path.as_str()) {
             let _ = server.remove::<CalibrationObject, _>(path).await;
         }
         Ok(())

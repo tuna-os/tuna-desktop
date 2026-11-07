@@ -5,22 +5,27 @@
 //! The lock lives in the compositor (see [`crate::lock`]), so the hint is
 //! reported from here rather than from the shell.
 
-use zbus::zvariant::OwnedObjectPath;
+use zbus::OwnedObjectPath;
 
 /// This process's logind session object, found as `gsm-systemd.c` and
 /// `loginManager.js` find it: `XDG_SESSION_ID`, else the session of this PID.
-pub(crate) fn current_session_path(
-    system: &zbus::blocking::Connection,
+pub(crate) async fn current_session_path(
+    system: &zbus::Connection,
 ) -> zbus::Result<OwnedObjectPath> {
-    let manager = zbus::blocking::Proxy::new(
+    let manager = zbus::Proxy::new(
         system,
         "org.freedesktop.login1",
         "/org/freedesktop/login1",
         "org.freedesktop.login1.Manager",
-    )?;
+    )
+    .await?;
     match std::env::var("XDG_SESSION_ID") {
-        Ok(id) if !id.is_empty() => manager.call("GetSession", &(id.as_str(),)),
-        _ => manager.call("GetSessionByPID", &(std::process::id(),)),
+        Ok(id) if !id.is_empty() => manager.call("GetSession", &(id.as_str(),)).await,
+        _ => {
+            manager
+                .call("GetSessionByPID", &(std::process::id(),))
+                .await
+        }
     }
 }
 
@@ -29,6 +34,7 @@ pub use monitor::{Request, Session};
 
 #[cfg(feature = "drm")]
 mod monitor {
+    use futures_lite::StreamExt;
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
@@ -48,7 +54,7 @@ mod monitor {
 
     pub struct Session {
         wake: crate::wake::Wake,
-        connection: zbus::blocking::Connection,
+        connection: zbus::Connection,
         /// The latest signal wins, as GNOME handles them in order.
         pending: Arc<AtomicU8>,
         hint: Option<mpsc::Sender<bool>>,
@@ -58,31 +64,39 @@ mod monitor {
 
     impl Session {
         pub fn start() -> zbus::Result<Self> {
-            let connection = zbus::blocking::connection::Builder::system()?
-                .method_timeout(Duration::from_secs(5))
-                .build()?;
-            let path = super::current_session_path(&connection)?;
+            let (connection, path) = zbus::block_on(async {
+                let connection = zbus::connection::Builder::system()
+                    .method_timeout(Duration::from_secs(5))
+                    .build()
+                    .await?;
+                let path = super::current_session_path(&connection).await?;
+                zbus::Result::Ok((connection, path))
+            })?;
             Self::from_connection(connection, path)
         }
 
         fn from_connection(
-            connection: zbus::blocking::Connection,
-            path: zbus::zvariant::OwnedObjectPath,
+            connection: zbus::Connection,
+            path: zbus::OwnedObjectPath,
         ) -> zbus::Result<Self> {
             // A proxy on the well-known name accepts signals from its
             // owner only, never from another connection on the bus.
-            let proxy = zbus::blocking::Proxy::new(
-                &connection,
-                "org.freedesktop.login1",
-                path,
-                "org.freedesktop.login1.Session",
-            )?;
-            let lock = proxy.receive_signal("Lock")?;
-            let unlock = proxy.receive_signal("Unlock")?;
+            let (proxy, lock, unlock) = zbus::block_on(async {
+                let proxy = zbus::Proxy::new(
+                    &connection,
+                    "org.freedesktop.login1",
+                    path,
+                    "org.freedesktop.login1.Session",
+                )
+                .await?;
+                let lock = proxy.receive_signal("Lock").await?;
+                let unlock = proxy.receive_signal("Unlock").await?;
+                zbus::Result::Ok((proxy, lock, unlock))
+            })?;
             let wake = crate::wake::Wake::default();
             let pending = Arc::new(AtomicU8::new(NONE));
             let mut workers = Vec::with_capacity(3);
-            for (signals, request, name) in [
+            for (mut signals, request, name) in [
                 (lock, LOCK, "tuna-logind-lock"),
                 (unlock, UNLOCK, "tuna-logind-unlock"),
             ] {
@@ -93,10 +107,12 @@ mod monitor {
                         .name(name.into())
                         .spawn(move || {
                             let _completion = wake.completion();
-                            for _ in signals {
-                                pending.store(request, Ordering::Release);
-                                wake.signal();
-                            }
+                            zbus::block_on(async {
+                                while signals.next().await.is_some() {
+                                    pending.store(request, Ordering::Release);
+                                    wake.signal();
+                                }
+                            });
                         })?,
                 );
             }
@@ -108,7 +124,9 @@ mod monitor {
                     .name("tuna-logind-hint".into())
                     .spawn(move || {
                         for locked in hints {
-                            if let Err(error) = proxy.call_method("SetLockedHint", &(locked,)) {
+                            if let Err(error) =
+                                zbus::block_on(proxy.call_method("SetLockedHint", &(locked,)))
+                            {
                                 eprintln!(
                                     "tuna-compositor: logind SetLockedHint({locked}) failed: {error}"
                                 );
@@ -154,9 +172,9 @@ mod monitor {
 
     impl Drop for Session {
         fn drop(&mut self) {
-            // Closing ends the signal iterators and fails any call in
+            // Closing ends the signal streams and fails any call in
             // flight; dropping the sender ends the hint worker.
-            let _ = self.connection.clone().close();
+            let _ = zbus::block_on(self.connection.clone().close());
             self.hint = None;
             for worker in self.workers.drain(..) {
                 let _ = worker.join();
@@ -214,32 +232,29 @@ mod monitor {
                 .read_line(&mut address)
                 .unwrap();
             let connect = || {
-                zbus::blocking::connection::Builder::address(address.trim())
-                    .unwrap()
-                    .method_timeout(Duration::from_secs(10))
-                    .build()
-                    .unwrap()
+                zbus::block_on(
+                    zbus::connection::Builder::address(address.trim())
+                        .method_timeout(Duration::from_secs(10))
+                        .build(),
+                )
+                .unwrap()
             };
             let hints = Arc::new(Mutex::new(Vec::new()));
             let owner = connect();
-            owner
-                .object_server()
-                .at(PATH, FakeSession(hints.clone()))
-                .unwrap();
-            owner.request_name("org.freedesktop.login1").unwrap();
+            zbus::block_on(owner.object_server().at(PATH, FakeSession(hints.clone()))).unwrap();
+            zbus::block_on(owner.request_name("org.freedesktop.login1")).unwrap();
             let attacker = connect();
             let mut session =
                 Session::from_connection(connect(), PATH.try_into().unwrap()).unwrap();
-            let emit = |connection: &zbus::blocking::Connection, name: &str| {
-                connection
-                    .emit_signal(
-                        None::<()>,
-                        PATH,
-                        "org.freedesktop.login1.Session",
-                        name,
-                        &(),
-                    )
-                    .unwrap();
+            let emit = |connection: &zbus::Connection, name: &str| {
+                zbus::block_on(connection.emit_signal(
+                    None::<()>,
+                    PATH,
+                    "org.freedesktop.login1.Session",
+                    name,
+                    &(),
+                ))
+                .unwrap();
             };
 
             emit(&attacker, "Lock");

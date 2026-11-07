@@ -20,8 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use zbus::message::Header;
-use zbus::zvariant::{OwnedValue, Value};
-use zbus::{fdo, interface, Connection};
+use zbus::{fdo, interface, Connection, OwnedVariant, Variant};
 
 use crate::mutter::{WindowSnapshot, Windows};
 
@@ -61,32 +60,32 @@ pub fn desktop_app_id(id: u64, app: Option<&str>) -> String {
 }
 
 /// One window's `a{sv}`, keyed like GNOME Shell's.
-pub fn window_properties(window: &WindowSnapshot) -> HashMap<String, OwnedValue> {
+pub fn window_properties(window: &WindowSnapshot) -> HashMap<String, OwnedVariant> {
     let mut props = HashMap::new();
-    let mut put = |key: &str, value: Value<'_>| {
-        if let Ok(value) = OwnedValue::try_from(value) {
+    let mut put = |key: &str, value: Variant<'_>| {
+        if let Ok(value) = OwnedVariant::try_from(value) {
             props.insert(key.to_owned(), value);
         }
     };
     if let Some(id) = &window.sandboxed_app_id {
-        put("sandboxed-app-id", Value::from(id.clone()));
+        put("sandboxed-app-id", Variant::from(id.clone()));
     }
-    put("title", Value::from(window.title.clone()));
-    put("app-id", Value::from(app_id(window)));
-    put("client-type", Value::from(u32::from(window.x11)));
-    put("is-hidden", Value::from(window.hidden));
-    put("has-focus", Value::from(window.focused));
-    put("width", Value::from(window.width.max(0) as u32));
-    put("height", Value::from(window.height.max(0) as u32));
+    put("title", Variant::from(window.title.clone()));
+    put("app-id", Variant::from(app_id(window)));
+    put("client-type", Variant::from(u32::from(window.x11)));
+    put("is-hidden", Variant::from(window.hidden));
+    put("has-focus", Variant::from(window.focused));
+    put("width", Variant::from(window.width.max(0) as u32));
+    put("height", Variant::from(window.height.max(0) as u32));
     if let Some(class) = window.app_id.as_ref().filter(|_| window.x11) {
-        put("wm-class", Value::from(class.clone()));
+        put("wm-class", Variant::from(class.clone()));
     }
     props
 }
 
 /// GetWindows enumeration has a different eligibility rule from the app
 /// list: a standalone application's auxiliary windows do not become pickable.
-fn pickable_windows(windows: &[WindowSnapshot]) -> HashMap<u64, HashMap<String, OwnedValue>> {
+fn pickable_windows(windows: &[WindowSnapshot]) -> HashMap<u64, HashMap<String, OwnedVariant>> {
     windows
         .iter()
         .filter(|w| w.introspect_eligible)
@@ -95,7 +94,7 @@ fn pickable_windows(windows: &[WindowSnapshot]) -> HashMap<u64, HashMap<String, 
 }
 
 /// Running apps keyed by app id, each with the seats it has focus on.
-pub fn running_apps(windows: &[WindowSnapshot]) -> HashMap<String, HashMap<String, OwnedValue>> {
+pub fn running_apps(windows: &[WindowSnapshot]) -> HashMap<String, HashMap<String, OwnedVariant>> {
     let standalone: HashSet<_> = windows
         .iter()
         .filter(|w| w.standalone)
@@ -116,13 +115,13 @@ pub fn running_apps(windows: &[WindowSnapshot]) -> HashMap<String, HashMap<Strin
         .map(|(id, (focused, sandboxed_app_id))| {
             let mut props = HashMap::new();
             if let Some(id) = sandboxed_app_id {
-                if let Ok(value) = OwnedValue::try_from(Value::from(id)) {
+                if let Ok(value) = OwnedVariant::try_from(Variant::from(id)) {
                     props.insert("sandboxed-app-id".to_owned(), value);
                 }
             }
             if focused {
                 let seats = vec!["seat0".to_owned()];
-                if let Ok(value) = OwnedValue::try_from(Value::from(seats)) {
+                if let Ok(value) = OwnedVariant::try_from(Variant::from(seats)) {
                     props.insert("active-on-seats".to_owned(), value);
                 }
             }
@@ -167,7 +166,7 @@ impl Service {
         &self,
         #[zbus(connection)] conn: &Connection,
         #[zbus(header)] header: Header<'_>,
-    ) -> fdo::Result<HashMap<u64, HashMap<String, OwnedValue>>> {
+    ) -> fdo::Result<HashMap<u64, HashMap<String, OwnedVariant>>> {
         self.check_caller(conn, &header).await?;
         Ok(pickable_windows(&self.snapshot()))
     }
@@ -176,7 +175,7 @@ impl Service {
         &self,
         #[zbus(connection)] conn: &Connection,
         #[zbus(header)] header: Header<'_>,
-    ) -> fdo::Result<HashMap<String, HashMap<String, OwnedValue>>> {
+    ) -> fdo::Result<HashMap<String, HashMap<String, OwnedVariant>>> {
         self.check_caller(conn, &header).await?;
         Ok(running_apps(&self.snapshot()))
     }
@@ -216,7 +215,7 @@ impl Forwarded {
         caller: String,
         #[zbus(connection)] conn: &Connection,
         #[zbus(header)] header: Header<'_>,
-    ) -> fdo::Result<HashMap<u64, HashMap<String, OwnedValue>>> {
+    ) -> fdo::Result<HashMap<u64, HashMap<String, OwnedVariant>>> {
         self.0.check_forwarded(conn, &header, &caller).await?;
         Ok(pickable_windows(&self.0.snapshot()))
     }
@@ -226,7 +225,7 @@ impl Forwarded {
         caller: String,
         #[zbus(connection)] conn: &Connection,
         #[zbus(header)] header: Header<'_>,
-    ) -> fdo::Result<HashMap<String, HashMap<String, OwnedValue>>> {
+    ) -> fdo::Result<HashMap<String, HashMap<String, OwnedVariant>>> {
         self.0.check_forwarded(conn, &header, &caller).await?;
         Ok(running_apps(&self.0.snapshot()))
     }
@@ -240,7 +239,7 @@ pub struct Handle {
     pub windows: Windows,
     animations_enabled: Arc<AtomicBool>,
     screen_size: Arc<Mutex<(i32, i32)>>,
-    conn: Arc<OnceLock<zbus::blocking::Connection>>,
+    conn: Arc<OnceLock<zbus::Connection>>,
     signals: crate::dbus_signals::SignalQueue,
 }
 
@@ -260,12 +259,12 @@ impl Handle {
     /// Queue one signal on the served connection, if any.
     fn emit<B>(&self, interface: &'static str, member: &'static str, body: B)
     where
-        B: serde::Serialize + zbus::zvariant::DynamicType + Send + Sync + 'static,
+        B: serde::Serialize + zbus::DynamicType + Send + Sync + 'static,
     {
         let Some(conn) = self.conn.get() else {
             return;
         };
-        let conn = conn.inner().clone();
+        let conn = conn.clone();
         self.signals.emit(async move {
             conn.emit_signal(None::<()>, PATH, interface, member, &body)
                 .await
@@ -277,7 +276,7 @@ impl Handle {
         if self.animations_enabled.swap(enabled, Ordering::AcqRel) == enabled {
             return;
         }
-        let changed = HashMap::from([("AnimationsEnabled", Value::from(enabled))]);
+        let changed = HashMap::from([("AnimationsEnabled", Variant::from(enabled))]);
         self.emit(
             "org.freedesktop.DBus.Properties",
             "PropertiesChanged",
@@ -295,7 +294,7 @@ impl Handle {
         }
         *current = size;
         drop(current);
-        let changed = HashMap::from([("ScreenSize", Value::from(size))]);
+        let changed = HashMap::from([("ScreenSize", Variant::from(size))]);
         self.emit(
             "org.freedesktop.DBus.Properties",
             "PropertiesChanged",
@@ -329,10 +328,8 @@ pub fn start(screen_size: (i32, i32), authority: crate::capture_security::Author
     let served = handle.clone();
     let _ = std::thread::Builder::new()
         .name("tuna-introspect".into())
-        .spawn(move || {
-            match zbus::blocking::connection::Builder::session()
-                .and_then(|builder| serve(builder, &served, authority))
-            {
+        .spawn(
+            move || match serve(zbus::connection::Builder::session(), &served, authority) {
                 Ok(true) => {
                     eprintln!("tuna-compositor: serving {NAME}");
                     loop {
@@ -341,8 +338,8 @@ pub fn start(screen_size: (i32, i32), authority: crate::capture_security::Author
                 }
                 Ok(false) => eprintln!("tuna-compositor: {NAME} is taken; introspection off"),
                 Err(e) => eprintln!("tuna-compositor: introspect: no session bus: {e}"),
-            }
-        });
+            },
+        );
     handle
 }
 
@@ -351,7 +348,7 @@ pub fn start(screen_size: (i32, i32), authority: crate::capture_security::Author
 /// `Ok(false)` when another owner (a real GNOME Shell) has the name; on
 /// success `handle` keeps the connection and signals changes on it.
 pub fn serve(
-    builder: zbus::blocking::connection::Builder<'_>,
+    builder: zbus::connection::Builder<'_>,
     handle: &Handle,
     authority: crate::capture_security::Authority,
 ) -> zbus::Result<bool> {
@@ -362,12 +359,16 @@ pub fn serve(
         animations_enabled: handle.animations_enabled.clone(),
         unrestricted: std::env::var(UNRESTRICTED_ENV).is_ok_and(|v| v == "1"),
     };
-    let conn = builder
-        .serve_at(PATH, service.clone())?
-        .serve_at(PATH, Forwarded(service))?
-        .build()?;
-    let flags = zbus::fdo::RequestNameFlags::DoNotQueue.into();
-    if conn.request_name_with_flags(NAME, flags)? != zbus::fdo::RequestNameReply::PrimaryOwner {
+    let conn = zbus::block_on(
+        builder
+            .serve_at(PATH, service.clone())
+            .serve_at(PATH, Forwarded(service))
+            .build(),
+    )?;
+    let flags = zbus::fdo::RequestNameFlags::DO_NOT_QUEUE;
+    if zbus::block_on(conn.request_name_with_flags(NAME, flags))?
+        != zbus::fdo::RequestNameReply::PrimaryOwner
+    {
         return Ok(false);
     }
     let _ = handle.conn.set(conn);
@@ -420,44 +421,49 @@ mod tests {
     /// window list, then each ScreenSize value, the last one last.
     #[test]
     fn queued_publication_arrives_in_order() {
+        use futures_lite::StreamExt as _;
         let (server_end, client_end) = std::os::unix::net::UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || {
-            zbus::blocking::connection::Builder::async_io_unix_stream(server_end)
-                .server(zbus::Guid::generate())
-                .unwrap()
-                .p2p()
-                .build()
-                .unwrap()
+            zbus::block_on(
+                zbus::connection::Builder::unix_stream(server_end)
+                    .server(zbus::Guid::generate())
+                    .p2p()
+                    .build(),
+            )
+            .unwrap()
         });
-        let client = zbus::blocking::connection::Builder::async_io_unix_stream(client_end)
-            .p2p()
-            .build()
-            .unwrap();
+        let client = zbus::block_on(
+            zbus::connection::Builder::unix_stream(client_end)
+                .p2p()
+                .build(),
+        )
+        .unwrap();
         let rule = zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
             .path(PATH)
-            .unwrap()
-            .build();
-        let mut received =
-            zbus::blocking::MessageIterator::for_match_rule(rule, &client, Some(64)).unwrap();
+            .build()
+            .unwrap();
+        let mut received = zbus::block_on(zbus::MessageStream::for_match_rule(
+            rule,
+            &client,
+            std::num::NonZeroUsize::new(64),
+        ))
+        .unwrap();
         let handle = Handle::default();
         handle.conn.set(server.join().unwrap()).unwrap();
         handle.publish(vec![window(1, Some("org.gnome.Editor"), true)]);
         for width in [800, 1024, 1920] {
             handle.publish_screen_size((width, 1080));
         }
-        let mut next = || received.next().unwrap().unwrap();
+        let mut next = || zbus::block_on(received.next()).unwrap().unwrap();
         let members: Vec<String> = (0..2)
             .map(|_| next().header().member().unwrap().to_string())
             .collect();
         assert_eq!(members, ["WindowsChanged", "RunningApplicationsChanged"]);
         for width in [800, 1024, 1920] {
             let message = next();
-            let (iface, changed, _): (
-                String,
-                HashMap<String, zbus::zvariant::OwnedValue>,
-                Vec<String>,
-            ) = message.body().deserialize().unwrap();
+            let (iface, changed, _): (String, HashMap<String, zbus::OwnedVariant>, Vec<String>) =
+                message.body().deserialize().unwrap();
             assert_eq!(iface, INTERFACE);
             let size: (i32, i32) = changed["ScreenSize"].clone().try_into().unwrap();
             assert_eq!(size, (width, 1080));
