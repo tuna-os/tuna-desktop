@@ -603,9 +603,8 @@ class Stress:
         self.start_system_bus()
         self.install_search_provider()
         pam = self.start_pam()
-        self.launch(["Xvfb", "-displayfd", "1", "-screen", "0", f"{WIDTH}x{HEIGHT}x24",
-                     "-nolisten", "tcp"], "xvfb")
-
+        self.launch([str(ROOT / "scripts/lib/tuna-xvfb"), "-displayfd", "1", "-screen", "0",
+                     f"{WIDTH}x{HEIGHT}x24", "-nolisten", "tcp"], "xvfb")
         def display_number():
             return next((line for line in (self.out / "xvfb.log").read_text().splitlines()
                          if line.isdigit()), None)

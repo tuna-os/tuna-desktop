@@ -1,0 +1,1123 @@
+{
+  "schema": 1,
+  "started": "2026-10-31T14:53:21.258858+00:00",
+  "variants": [
+    {
+      "variant": "yellowfin",
+      "base": "Based on AlmaLinux Kitten 10",
+      "rollout": {
+        "status": "admitted",
+        "package_target": "el10"
+      },
+      "qualification": "not-qualified",
+      "runtime": "failed",
+      "flavors": [
+        {
+          "id": "tuna",
+          "stage": 2,
+          "platforms": [
+            "linux/amd64"
+          ],
+          "build_image": true,
+          "build_iso": false,
+          "build_qcow2": false,
+          "luks_e2e": false
+        }
+      ],
+      "published_tag": "ghcr.io/tuna-os/yellowfin:tuna",
+      "registry": {
+        "argv": [
+          "skopeo",
+          "inspect",
+          "--no-tags",
+          "--override-arch",
+          "amd64",
+          "docker://ghcr.io/tuna-os/yellowfin:tuna"
+        ],
+        "exit": 0,
+        "stdout": "{\n    \"Name\": \"ghcr.io/tuna-os/yellowfin\",\n    \"Digest\": \"sha256:355f66da7929059fc046527da6177e4958d97dab9546d62ca3d5ac53bc4daa4f\",\n    \"RepoTags\": [],\n    \"Created\": \"2026-10-31T08:22:25.010249685Z\",\n    \"DockerVersion\": \"\",\n    \"Labels\": {\n        \"containers.bootc\": \"1\",\n        \"io.bootc\": \"1\",\n        \"io.buildah.version\": \"1.42.1\",\n        \"org.opencontainers.image.title\": \"TunaOS yellowfin (tuna)\",\n        \"org.opencontainers.image.vendor\": \"tuna-os\",\n        \"org.opencontainers.image.version\": \"2a35aac\",\n        \"ostree.bootable\": \"1\"\n    },\n    \"Architecture\": \"amd64\",\n    \"Os\": \"linux\",\n    \"Layers\": [\n        \"sha256:72209bd0d7abfd5842b8985de57dcbb4d1f7aab800e1d6640dae505fc623b4cb\",\n        \"sha256:9af730da9d0c4ddd21d33b6cd8e36fdfb3d2486f85351481a669cdd58762d0d9\",\n        \"sha256:5efcffb9b85479e00e11c8850e5681e309dfde3a2071c4f73fb03d5edaa2d5d5\",\n        \"sha256:dcc2ad179063a74a94b6cb21d682a4bf4f65a46ceaef14b81d354a3136d3d835\",\n        \"sha256:1fddc160a3b4bd076f390efdd7fd63b61e5702132683eb200e631d0dc87d6ac8\",\n        \"sha256:68632c3bf200bdfb4378529efbb5e169b596358b4753812b7889be7388400380\",\n        \"sha256:5a74fc897449615fb02154df156ac5e6eafa61a512abdd2c3ed34990957bc234\",\n        \"sha256:114c738df4fb9183c268cb5dbc547a5df83d84e987f1299679bd6a82e059321e\",\n        \"sha256:f787318ab315be5bf60f4edb3a5fde3a6e4b62aaa0cdee53eb4290245dff7aa7\",\n        \"sha256:c0f8d15ae72b7d04d3319cd5754ac28efb000aae9995e76ea5a5fff69262c880\",\n        \"sha256:3e864a6b73bb9e8811df81e9a5de8ba9655e296a53d583f5b76c3286ea37fe5a\",\n        \"sha256:3d644d1e01a42292ffb3564b18941f3f314afe5d357440d50557ebf54e560bb7\",\n        \"sha256:965b3df131785645f60a1e008eaebd5d942f11c4733d3bc354f8a4b6727a83fa\",\n        \"sha256:298164f57990dbe634c161059ab29db41bae41a96f2dc29e59df75ec05c8a810\",\n        \"sha256:b006b1b8c5c5908289fa60829bbfaec8fa780217b91704d314e3a5257a664e10\",\n        \"sha256:68598b6f4ecb5aa4d155bbedcdadeef74a9a335ed64d4bd279903bb306630ad0\",\n        \"sha256:c4718b65865e81302925970f41cbb4d07054f57014227431802e721fbfe3c275\",\n        \"sha256:1b9b94f95836374af8bea9e817a47b9f0cc3da3c5a8819c476640c3eeaf200b5\",\n        \"sha256:d8237b5aef0980ac32db5d52a0b29e34de2790e09fecf64ec34d681b7edefff6\",\n        \"sha256:bf65d42b3be7f054d5169c7b96076fdac324a7010c9ffc5cc4e2a97075560ec3\",\n        \"sha256:dad662c41d5a5b5e6e3c7ecd13eb3e45b4a5f84d7022888ce7fbbce63b338118\",\n        \"sha256:953fd5311e12a0cbf5a004fc9e6fb6835e306ea9e27c245ef646a4deb137f024\",\n        \"sha256:64003550a0f893d63d2a883dfbede685714b1edd6d00f1d0e94526cec9a88189\",\n        \"sha256:fb6ec6969a238ce14f9d9c3b098f92234e03de6bd139e972eebf34b1da4b0604\",\n        \"sha256:eb1a434bc4631491e2976d249ff0bf0ee01e4b2c7007930c1cd07c61a46e91ea\",\n        \"sha256:e0b37073ac5ea1d4f14538fb17e89025edd8604a445e0f312bc58c5fe9819cec\",\n        \"sha256:1e99375ff964485b231d66ee97b2e21af9c0b5498c5f1363f1107bc3e7513646\",\n        \"sha256:7279d5c851bafed061576d3491b00e42112c4b4d798fc826a0bff654e24c087c\",\n        \"sha256:bbca028244a5e66bd6ba9aa37336df300bc142b27891fd034383031719e91ccc\",\n        \"sha256:b0cdd804cff9f26061836cdcd1aa153433c102ee394602f05e473b062fcc6eba\",\n        \"sha256:8c02c081d26bb87f4a262da60c41fbd4d046d02b8a7570f69fff281fb104df12\",\n        \"sha256:5e3cd60f6790116010fb9dc67e0faaa8004182ed5c981aabe041dd023e62f3ad\",\n        \"sha256:df40ad83a93b8097b54ccb8504cdb0294875af0f5162a6fef4e1de72e6c508ae\",\n        \"sha256:70b9e274c0570e25b0087174f74df5fdd0f0e6bbfd4e6ac73098e4a1bed50646\",\n        \"sha256:1ec95f78d11d1c438ca0fdadd3e2962571669e3afe11541a3cda05531c061b0b\",\n        \"sha256:01d5976deeb5e32da0b6dcbf8b496e676120d6994a9d731cd1de5b93f5af114f\",\n        \"sha256:d6048d15d677288bd011fea1df0c2b85be3c0cc2725042e9aa11a3e27a60cdeb\",\n        \"sha256:71dcfd9980b975d29ac9a3459897612ee72fe5f9f8ae492c84377bf56d80f7b7\",\n        \"sha256:4a7f897e0d5aeefeca4b0ab155bcce6ad438b5d3d29d9aff7cb7cf892f390f48\",\n        \"sha256:cf8918636a4bf8d4fa3fe260fb0fe7ccf6adfae956994ec7ed3781d4ef5438bc\",\n        \"sha256:4ed6390dbca0a6ba7d4371abb5b3cb5d7225c650b0dd51bff3a6312c2cb44a67\",\n        \"sha256:2cfb60ae2a98c6b6194b69d19788df94c13475e3b85aaf60cab7f99872d7b403\",\n        \"sha256:7867aa3bdeb6fe13ffffe05e41237571f938eff4ff5ae63546fe6fd56d0e3159\",\n        \"sha256:579f5c63a7d088ba79ef4d797854a230a69195cb02fb6f61dfdc45c32eebc2a6\",\n        \"sha256:be008e79278a70d08d8f0b73c9c1e1e5723df30df1c8d3d8d53f1ae6a1804da4\",\n        \"sha256:9441587943bf3563f6addfc9b93a74afcb29b42a3e035189c1dd29cf097793a6\",\n        \"sha256:76f37e1fb40a532d193ee426207f9f475e93dda75982c0fc182e5dcd95e3a6c1\",\n        \"sha256:427c9244e7a6fd7ff7c200637b68d63df5d3b32ad93ca7fb6daace97208a27c1\",\n        \"sha256:64295a4a653631bf84750308e4f1c6cce421ccac9c63193c0a403dd7d6b874ff\",\n        \"sha256:d1eaeb62971c9db9b4469ed75dea01c91524b232bb8eac428c12e4f1e193c69f\",\n        \"sha256:9c60bdd841be2a18ec670ac793a739b359a70c0bdfd300aa0b178fd66ba23b4e\",\n        \"sha256:3447c91317eed1ba8edfcc3f6a29459f8a1bd41f2dc5918016fe97ef87611324\",\n        \"sha256:632b9432c42ebdfb1dd70da449a947a95da6b5848b1c2aa512e480bc0e6ad9ee\",\n        \"sha256:f0e40f714e90df688836808943b8cf2dd204cbe88a5919e47af5f010683e7c14\",\n        \"sha256:612e017e928d8b778c8a50c4ceda6e90ac0fe089cb0e8db7a4d5c5992a2a5a3b\",\n        \"sha256:fe860444310f11bf53cc67f721ea965c673cc67e3cd8533f6a8d943a69a7a1a9\",\n        \"sha256:94ccf7714839f4fa9763f77b48f083c4c21ff67ef0d3399991b439eced08436c\",\n        \"sha256:6d22a88ef508f2deae10cfcc7584a5395c9aa1182ed3a82e3d35b8f94285dc35\",\n        \"sha256:32f2bcb1ba6aef04c5d013ac2c1740fc1f59837e1ca67c1228b4b26cf72d91d3\",\n        \"sha256:197fc2eacbdbf6e765b78518b83291b9324c16f0f7b3d0104a2439e85b3be1e5\",\n        \"sha256:8b6d7e972e1b642322c2c70d5a02ad3d30713d0603f039a7cc83ab1edfb6b349\",\n        \"sha256:a201f50f668c412cd9059bc73b785643d90d71e5578169e7d62157d87dde4933\",\n        \"sha256:66dfbb31e672d3acfa670049b63d33d8fefbee7f433f487df158beab3872f24d\",\n        \"sha256:dd6d4b27c652b8f5c04edfb2c6b2d323676a4c2b6aa4cfb94bd20d0a4cd2138a\",\n        \"sha256:298ea120ab2664dae330c07f11ff7969717eb1bed6ffbbaa22884c26d1a1dd2c\"\n    ],\n    \"LayersData\": [\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:72209bd0d7abfd5842b8985de57dcbb4d1f7aab800e1d6640dae505fc623b4cb\",\n            \"Size\": 20542268,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:9af730da9d0c4ddd21d33b6cd8e36fdfb3d2486f85351481a669cdd58762d0d9\",\n            \"Size\": 40475952,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:5efcffb9b85479e00e11c8850e5681e309dfde3a2071c4f73fb03d5edaa2d5d5\",\n            \"Size\": 18733389,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:dcc2ad179063a74a94b6cb21d682a4bf4f65a46ceaef14b81d354a3136d3d835\",\n            \"Size\": 14162789,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:1fddc160a3b4bd076f390efdd7fd63b61e5702132683eb200e631d0dc87d6ac8\",\n            \"Size\": 5764487,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:68632c3bf200bdfb4378529efbb5e169b596358b4753812b7889be7388400380\",\n            \"Size\": 5297916,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:5a74fc897449615fb02154df156ac5e6eafa61a512abdd2c3ed34990957bc234\",\n            \"Size\": 10098775,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:114c738df4fb9183c268cb5dbc547a5df83d84e987f1299679bd6a82e059321e\",\n            \"Size\": 14225348,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:f787318ab315be5bf60f4edb3a5fde3a6e4b62aaa0cdee53eb4290245dff7aa7\",\n            \"Size\": 5466845,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:c0f8d15ae72b7d04d3319cd5754ac28efb000aae9995e76ea5a5fff69262c880\",\n            \"Size\": 5129416,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:3e864a6b73bb9e8811df81e9a5de8ba9655e296a53d583f5b76c3286ea37fe5a\",\n            \"Size\": 2008406,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:3d644d1e01a42292ffb3564b18941f3f314afe5d357440d50557ebf54e560bb7\",\n            \"Size\": 6748610,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:965b3df131785645f60a1e008eaebd5d942f11c4733d3bc354f8a4b6727a83fa\",\n            \"Size\": 3790040,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:298164f57990dbe634c161059ab29db41bae41a96f2dc29e59df75ec05c8a810\",\n            \"Size\": 12717942,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:b006b1b8c5c5908289fa60829bbfaec8fa780217b91704d314e3a5257a664e10\",\n            \"Size\": 7944639,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:68598b6f4ecb5aa4d155bbedcdadeef74a9a335ed64d4bd279903bb306630ad0\",\n            \"Size\": 14761366,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:c4718b65865e81302925970f41cbb4d07054f57014227431802e721fbfe3c275\",\n            \"Size\": 5831815,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:1b9b94f95836374af8bea9e817a47b9f0cc3da3c5a8819c476640c3eeaf200b5\",\n            \"Size\": 17789325,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:d8237b5aef0980ac32db5d52a0b29e34de2790e09fecf64ec34d681b7edefff6\",\n            \"Size\": 41219629,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:bf65d42b3be7f054d5169c7b96076fdac324a7010c9ffc5cc4e2a97075560ec3\",\n            \"Size\": 7227122,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:dad662c41d5a5b5e6e3c7ecd13eb3e45b4a5f84d7022888ce7fbbce63b338118\",\n            \"Size\": 4030799,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:953fd5311e12a0cbf5a004fc9e6fb6835e306ea9e27c245ef646a4deb137f024\",\n            \"Size\": 8255258,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:64003550a0f893d63d2a883dfbede685714b1edd6d00f1d0e94526cec9a88189\",\n            \"Size\": 6805907,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:fb6ec6969a238ce14f9d9c3b098f92234e03de6bd139e972eebf34b1da4b0604\",\n            \"Size\": 6267067,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:eb1a434bc4631491e2976d249ff0bf0ee01e4b2c7007930c1cd07c61a46e91ea\",\n            \"Size\": 4169341,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:e0b37073ac5ea1d4f14538fb17e89025edd8604a445e0f312bc58c5fe9819cec\",\n            \"Size\": 317815898,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:1e99375ff964485b231d66ee97b2e21af9c0b5498c5f1363f1107bc3e7513646\",\n            \"Size\": 8919105,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:7279d5c851bafed061576d3491b00e42112c4b4d798fc826a0bff654e24c087c\",\n            \"Size\": 8117357,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:bbca028244a5e66bd6ba9aa37336df300bc142b27891fd034383031719e91ccc\",\n            \"Size\": 4065972,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:b0cdd804cff9f26061836cdcd1aa153433c102ee394602f05e473b062fcc6eba\",\n            \"Size\": 88999299,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:8c02c081d26bb87f4a262da60c41fbd4d046d02b8a7570f69fff281fb104df12\",\n            \"Size\": 13062723,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:5e3cd60f6790116010fb9dc67e0faaa8004182ed5c981aabe041dd023e62f3ad\",\n            \"Size\": 10782480,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:df40ad83a93b8097b54ccb8504cdb0294875af0f5162a6fef4e1de72e6c508ae\",\n            \"Size\": 13656932,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:70b9e274c0570e25b0087174f74df5fdd0f0e6bbfd4e6ac73098e4a1bed50646\",\n            \"Size\": 10591346,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:1ec95f78d11d1c438ca0fdadd3e2962571669e3afe11541a3cda05531c061b0b\",\n            \"Size\": 14928271,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:01d5976deeb5e32da0b6dcbf8b496e676120d6994a9d731cd1de5b93f5af114f\",\n            \"Size\": 6518912,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:d6048d15d677288bd011fea1df0c2b85be3c0cc2725042e9aa11a3e27a60cdeb\",\n            \"Size\": 21067012,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:71dcfd9980b975d29ac9a3459897612ee72fe5f9f8ae492c84377bf56d80f7b7\",\n            \"Size\": 8019613,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:4a7f897e0d5aeefeca4b0ab155bcce6ad438b5d3d29d9aff7cb7cf892f390f48\",\n            \"Size\": 14419678,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:cf8918636a4bf8d4fa3fe260fb0fe7ccf6adfae956994ec7ed3781d4ef5438bc\",\n            \"Size\": 8533769,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:4ed6390dbca0a6ba7d4371abb5b3cb5d7225c650b0dd51bff3a6312c2cb44a67\",\n            \"Size\": 7964458,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:2cfb60ae2a98c6b6194b69d19788df94c13475e3b85aaf60cab7f99872d7b403\",\n            \"Size\": 2609490,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:7867aa3bdeb6fe13ffffe05e41237571f938eff4ff5ae63546fe6fd56d0e3159\",\n            \"Size\": 5616968,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:579f5c63a7d088ba79ef4d797854a230a69195cb02fb6f61dfdc45c32eebc2a6\",\n            \"Size\": 95156565,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:be008e79278a70d08d8f0b73c9c1e1e5723df30df1c8d3d8d53f1ae6a1804da4\",\n            \"Size\": 15703857,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:9441587943bf3563f6addfc9b93a74afcb29b42a3e035189c1dd29cf097793a6\",\n            \"Size\": 23851171,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:76f37e1fb40a532d193ee426207f9f475e93dda75982c0fc182e5dcd95e3a6c1\",\n            \"Size\": 22198861,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:427c9244e7a6fd7ff7c200637b68d63df5d3b32ad93ca7fb6daace97208a27c1\",\n            \"Size\": 16476352,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:64295a4a653631bf84750308e4f1c6cce421ccac9c63193c0a403dd7d6b874ff\",\n            \"Size\": 33114358,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:d1eaeb62971c9db9b4469ed75dea01c91524b232bb8eac428c12e4f1e193c69f\",\n            \"Size\": 19017441,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:9c60bdd841be2a18ec670ac793a739b359a70c0bdfd300aa0b178fd66ba23b4e\",\n            \"Size\": 31166295,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:3447c91317eed1ba8edfcc3f6a29459f8a1bd41f2dc5918016fe97ef87611324\",\n            \"Size\": 31038469,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:632b9432c42ebdfb1dd70da449a947a95da6b5848b1c2aa512e480bc0e6ad9ee\",\n            \"Size\": 38701903,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:f0e40f714e90df688836808943b8cf2dd204cbe88a5919e47af5f010683e7c14\",\n            \"Size\": 49133394,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:612e017e928d8b778c8a50c4ceda6e90ac0fe089cb0e8db7a4d5c5992a2a5a3b\",\n            \"Size\": 26525141,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:fe860444310f11bf53cc67f721ea965c673cc67e3cd8533f6a8d943a69a7a1a9\",\n            \"Size\": 30025135,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:94ccf7714839f4fa9763f77b48f083c4c21ff67ef0d3399991b439eced08436c\",\n            \"Size\": 158591085,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:6d22a88ef508f2deae10cfcc7584a5395c9aa1182ed3a82e3d35b8f94285dc35\",\n            \"Size\": 91676216,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:32f2bcb1ba6aef04c5d013ac2c1740fc1f59837e1ca67c1228b4b26cf72d91d3\",\n            \"Size\": 16056022,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:197fc2eacbdbf6e765b78518b83291b9324c16f0f7b3d0104a2439e85b3be1e5\",\n            \"Size\": 9869232,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:8b6d7e972e1b642322c2c70d5a02ad3d30713d0603f039a7cc83ab1edfb6b349\",\n            \"Size\": 22497107,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:a201f50f668c412cd9059bc73b785643d90d71e5578169e7d62157d87dde4933\",\n            \"Size\": 3534098,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:66dfbb31e672d3acfa670049b63d33d8fefbee7f433f487df158beab3872f24d\",\n            \"Size\": 45399555,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:dd6d4b27c652b8f5c04edfb2c6b2d323676a4c2b6aa4cfb94bd20d0a4cd2138a\",\n            \"Size\": 42826597,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:298ea120ab2664dae330c07f11ff7969717eb1bed6ffbbaa22884c26d1a1dd2c\",\n            \"Size\": 226,\n            \"Annotations\": null\n        }\n    ],\n    \"Env\": [\n        \"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n    ]\n}\n",
+        "stderr": ""
+      },
+      "image": "ghcr.io/tuna-os/yellowfin@sha256:355f66da7929059fc046527da6177e4958d97dab9546d62ca3d5ac53bc4daa4f",
+      "image_metadata": {
+        "Name": "ghcr.io/tuna-os/yellowfin",
+        "Digest": "sha256:355f66da7929059fc046527da6177e4958d97dab9546d62ca3d5ac53bc4daa4f",
+        "RepoTags": [],
+        "Created": "2026-10-31T08:22:25.010249685Z",
+        "DockerVersion": "",
+        "Labels": {
+          "containers.bootc": "1",
+          "io.bootc": "1",
+          "io.buildah.version": "1.42.1",
+          "org.opencontainers.image.title": "TunaOS yellowfin (tuna)",
+          "org.opencontainers.image.vendor": "tuna-os",
+          "org.opencontainers.image.version": "2a35aac",
+          "ostree.bootable": "1"
+        },
+        "Architecture": "amd64",
+        "Os": "linux",
+        "Layers": [
+          "sha256:72209bd0d7abfd5842b8985de57dcbb4d1f7aab800e1d6640dae505fc623b4cb",
+          "sha256:9af730da9d0c4ddd21d33b6cd8e36fdfb3d2486f85351481a669cdd58762d0d9",
+          "sha256:5efcffb9b85479e00e11c8850e5681e309dfde3a2071c4f73fb03d5edaa2d5d5",
+          "sha256:dcc2ad179063a74a94b6cb21d682a4bf4f65a46ceaef14b81d354a3136d3d835",
+          "sha256:1fddc160a3b4bd076f390efdd7fd63b61e5702132683eb200e631d0dc87d6ac8",
+          "sha256:68632c3bf200bdfb4378529efbb5e169b596358b4753812b7889be7388400380",
+          "sha256:5a74fc897449615fb02154df156ac5e6eafa61a512abdd2c3ed34990957bc234",
+          "sha256:114c738df4fb9183c268cb5dbc547a5df83d84e987f1299679bd6a82e059321e",
+          "sha256:f787318ab315be5bf60f4edb3a5fde3a6e4b62aaa0cdee53eb4290245dff7aa7",
+          "sha256:c0f8d15ae72b7d04d3319cd5754ac28efb000aae9995e76ea5a5fff69262c880",
+          "sha256:3e864a6b73bb9e8811df81e9a5de8ba9655e296a53d583f5b76c3286ea37fe5a",
+          "sha256:3d644d1e01a42292ffb3564b18941f3f314afe5d357440d50557ebf54e560bb7",
+          "sha256:965b3df131785645f60a1e008eaebd5d942f11c4733d3bc354f8a4b6727a83fa",
+          "sha256:298164f57990dbe634c161059ab29db41bae41a96f2dc29e59df75ec05c8a810",
+          "sha256:b006b1b8c5c5908289fa60829bbfaec8fa780217b91704d314e3a5257a664e10",
+          "sha256:68598b6f4ecb5aa4d155bbedcdadeef74a9a335ed64d4bd279903bb306630ad0",
+          "sha256:c4718b65865e81302925970f41cbb4d07054f57014227431802e721fbfe3c275",
+          "sha256:1b9b94f95836374af8bea9e817a47b9f0cc3da3c5a8819c476640c3eeaf200b5",
+          "sha256:d8237b5aef0980ac32db5d52a0b29e34de2790e09fecf64ec34d681b7edefff6",
+          "sha256:bf65d42b3be7f054d5169c7b96076fdac324a7010c9ffc5cc4e2a97075560ec3",
+          "sha256:dad662c41d5a5b5e6e3c7ecd13eb3e45b4a5f84d7022888ce7fbbce63b338118",
+          "sha256:953fd5311e12a0cbf5a004fc9e6fb6835e306ea9e27c245ef646a4deb137f024",
+          "sha256:64003550a0f893d63d2a883dfbede685714b1edd6d00f1d0e94526cec9a88189",
+          "sha256:fb6ec6969a238ce14f9d9c3b098f92234e03de6bd139e972eebf34b1da4b0604",
+          "sha256:eb1a434bc4631491e2976d249ff0bf0ee01e4b2c7007930c1cd07c61a46e91ea",
+          "sha256:e0b37073ac5ea1d4f14538fb17e89025edd8604a445e0f312bc58c5fe9819cec",
+          "sha256:1e99375ff964485b231d66ee97b2e21af9c0b5498c5f1363f1107bc3e7513646",
+          "sha256:7279d5c851bafed061576d3491b00e42112c4b4d798fc826a0bff654e24c087c",
+          "sha256:bbca028244a5e66bd6ba9aa37336df300bc142b27891fd034383031719e91ccc",
+          "sha256:b0cdd804cff9f26061836cdcd1aa153433c102ee394602f05e473b062fcc6eba",
+          "sha256:8c02c081d26bb87f4a262da60c41fbd4d046d02b8a7570f69fff281fb104df12",
+          "sha256:5e3cd60f6790116010fb9dc67e0faaa8004182ed5c981aabe041dd023e62f3ad",
+          "sha256:df40ad83a93b8097b54ccb8504cdb0294875af0f5162a6fef4e1de72e6c508ae",
+          "sha256:70b9e274c0570e25b0087174f74df5fdd0f0e6bbfd4e6ac73098e4a1bed50646",
+          "sha256:1ec95f78d11d1c438ca0fdadd3e2962571669e3afe11541a3cda05531c061b0b",
+          "sha256:01d5976deeb5e32da0b6dcbf8b496e676120d6994a9d731cd1de5b93f5af114f",
+          "sha256:d6048d15d677288bd011fea1df0c2b85be3c0cc2725042e9aa11a3e27a60cdeb",
+          "sha256:71dcfd9980b975d29ac9a3459897612ee72fe5f9f8ae492c84377bf56d80f7b7",
+          "sha256:4a7f897e0d5aeefeca4b0ab155bcce6ad438b5d3d29d9aff7cb7cf892f390f48",
+          "sha256:cf8918636a4bf8d4fa3fe260fb0fe7ccf6adfae956994ec7ed3781d4ef5438bc",
+          "sha256:4ed6390dbca0a6ba7d4371abb5b3cb5d7225c650b0dd51bff3a6312c2cb44a67",
+          "sha256:2cfb60ae2a98c6b6194b69d19788df94c13475e3b85aaf60cab7f99872d7b403",
+          "sha256:7867aa3bdeb6fe13ffffe05e41237571f938eff4ff5ae63546fe6fd56d0e3159",
+          "sha256:579f5c63a7d088ba79ef4d797854a230a69195cb02fb6f61dfdc45c32eebc2a6",
+          "sha256:be008e79278a70d08d8f0b73c9c1e1e5723df30df1c8d3d8d53f1ae6a1804da4",
+          "sha256:9441587943bf3563f6addfc9b93a74afcb29b42a3e035189c1dd29cf097793a6",
+          "sha256:76f37e1fb40a532d193ee426207f9f475e93dda75982c0fc182e5dcd95e3a6c1",
+          "sha256:427c9244e7a6fd7ff7c200637b68d63df5d3b32ad93ca7fb6daace97208a27c1",
+          "sha256:64295a4a653631bf84750308e4f1c6cce421ccac9c63193c0a403dd7d6b874ff",
+          "sha256:d1eaeb62971c9db9b4469ed75dea01c91524b232bb8eac428c12e4f1e193c69f",
+          "sha256:9c60bdd841be2a18ec670ac793a739b359a70c0bdfd300aa0b178fd66ba23b4e",
+          "sha256:3447c91317eed1ba8edfcc3f6a29459f8a1bd41f2dc5918016fe97ef87611324",
+          "sha256:632b9432c42ebdfb1dd70da449a947a95da6b5848b1c2aa512e480bc0e6ad9ee",
+          "sha256:f0e40f714e90df688836808943b8cf2dd204cbe88a5919e47af5f010683e7c14",
+          "sha256:612e017e928d8b778c8a50c4ceda6e90ac0fe089cb0e8db7a4d5c5992a2a5a3b",
+          "sha256:fe860444310f11bf53cc67f721ea965c673cc67e3cd8533f6a8d943a69a7a1a9",
+          "sha256:94ccf7714839f4fa9763f77b48f083c4c21ff67ef0d3399991b439eced08436c",
+          "sha256:6d22a88ef508f2deae10cfcc7584a5395c9aa1182ed3a82e3d35b8f94285dc35",
+          "sha256:32f2bcb1ba6aef04c5d013ac2c1740fc1f59837e1ca67c1228b4b26cf72d91d3",
+          "sha256:197fc2eacbdbf6e765b78518b83291b9324c16f0f7b3d0104a2439e85b3be1e5",
+          "sha256:8b6d7e972e1b642322c2c70d5a02ad3d30713d0603f039a7cc83ab1edfb6b349",
+          "sha256:a201f50f668c412cd9059bc73b785643d90d71e5578169e7d62157d87dde4933",
+          "sha256:66dfbb31e672d3acfa670049b63d33d8fefbee7f433f487df158beab3872f24d",
+          "sha256:dd6d4b27c652b8f5c04edfb2c6b2d323676a4c2b6aa4cfb94bd20d0a4cd2138a",
+          "sha256:298ea120ab2664dae330c07f11ff7969717eb1bed6ffbbaa22884c26d1a1dd2c"
+        ],
+        "LayersData": [
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:72209bd0d7abfd5842b8985de57dcbb4d1f7aab800e1d6640dae505fc623b4cb",
+            "Size": 20542268,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:9af730da9d0c4ddd21d33b6cd8e36fdfb3d2486f85351481a669cdd58762d0d9",
+            "Size": 40475952,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:5efcffb9b85479e00e11c8850e5681e309dfde3a2071c4f73fb03d5edaa2d5d5",
+            "Size": 18733389,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:dcc2ad179063a74a94b6cb21d682a4bf4f65a46ceaef14b81d354a3136d3d835",
+            "Size": 14162789,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:1fddc160a3b4bd076f390efdd7fd63b61e5702132683eb200e631d0dc87d6ac8",
+            "Size": 5764487,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:68632c3bf200bdfb4378529efbb5e169b596358b4753812b7889be7388400380",
+            "Size": 5297916,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:5a74fc897449615fb02154df156ac5e6eafa61a512abdd2c3ed34990957bc234",
+            "Size": 10098775,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:114c738df4fb9183c268cb5dbc547a5df83d84e987f1299679bd6a82e059321e",
+            "Size": 14225348,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:f787318ab315be5bf60f4edb3a5fde3a6e4b62aaa0cdee53eb4290245dff7aa7",
+            "Size": 5466845,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:c0f8d15ae72b7d04d3319cd5754ac28efb000aae9995e76ea5a5fff69262c880",
+            "Size": 5129416,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:3e864a6b73bb9e8811df81e9a5de8ba9655e296a53d583f5b76c3286ea37fe5a",
+            "Size": 2008406,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:3d644d1e01a42292ffb3564b18941f3f314afe5d357440d50557ebf54e560bb7",
+            "Size": 6748610,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:965b3df131785645f60a1e008eaebd5d942f11c4733d3bc354f8a4b6727a83fa",
+            "Size": 3790040,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:298164f57990dbe634c161059ab29db41bae41a96f2dc29e59df75ec05c8a810",
+            "Size": 12717942,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:b006b1b8c5c5908289fa60829bbfaec8fa780217b91704d314e3a5257a664e10",
+            "Size": 7944639,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:68598b6f4ecb5aa4d155bbedcdadeef74a9a335ed64d4bd279903bb306630ad0",
+            "Size": 14761366,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:c4718b65865e81302925970f41cbb4d07054f57014227431802e721fbfe3c275",
+            "Size": 5831815,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:1b9b94f95836374af8bea9e817a47b9f0cc3da3c5a8819c476640c3eeaf200b5",
+            "Size": 17789325,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:d8237b5aef0980ac32db5d52a0b29e34de2790e09fecf64ec34d681b7edefff6",
+            "Size": 41219629,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:bf65d42b3be7f054d5169c7b96076fdac324a7010c9ffc5cc4e2a97075560ec3",
+            "Size": 7227122,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:dad662c41d5a5b5e6e3c7ecd13eb3e45b4a5f84d7022888ce7fbbce63b338118",
+            "Size": 4030799,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:953fd5311e12a0cbf5a004fc9e6fb6835e306ea9e27c245ef646a4deb137f024",
+            "Size": 8255258,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:64003550a0f893d63d2a883dfbede685714b1edd6d00f1d0e94526cec9a88189",
+            "Size": 6805907,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:fb6ec6969a238ce14f9d9c3b098f92234e03de6bd139e972eebf34b1da4b0604",
+            "Size": 6267067,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:eb1a434bc4631491e2976d249ff0bf0ee01e4b2c7007930c1cd07c61a46e91ea",
+            "Size": 4169341,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:e0b37073ac5ea1d4f14538fb17e89025edd8604a445e0f312bc58c5fe9819cec",
+            "Size": 317815898,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:1e99375ff964485b231d66ee97b2e21af9c0b5498c5f1363f1107bc3e7513646",
+            "Size": 8919105,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:7279d5c851bafed061576d3491b00e42112c4b4d798fc826a0bff654e24c087c",
+            "Size": 8117357,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:bbca028244a5e66bd6ba9aa37336df300bc142b27891fd034383031719e91ccc",
+            "Size": 4065972,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:b0cdd804cff9f26061836cdcd1aa153433c102ee394602f05e473b062fcc6eba",
+            "Size": 88999299,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:8c02c081d26bb87f4a262da60c41fbd4d046d02b8a7570f69fff281fb104df12",
+            "Size": 13062723,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:5e3cd60f6790116010fb9dc67e0faaa8004182ed5c981aabe041dd023e62f3ad",
+            "Size": 10782480,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:df40ad83a93b8097b54ccb8504cdb0294875af0f5162a6fef4e1de72e6c508ae",
+            "Size": 13656932,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:70b9e274c0570e25b0087174f74df5fdd0f0e6bbfd4e6ac73098e4a1bed50646",
+            "Size": 10591346,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:1ec95f78d11d1c438ca0fdadd3e2962571669e3afe11541a3cda05531c061b0b",
+            "Size": 14928271,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:01d5976deeb5e32da0b6dcbf8b496e676120d6994a9d731cd1de5b93f5af114f",
+            "Size": 6518912,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:d6048d15d677288bd011fea1df0c2b85be3c0cc2725042e9aa11a3e27a60cdeb",
+            "Size": 21067012,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:71dcfd9980b975d29ac9a3459897612ee72fe5f9f8ae492c84377bf56d80f7b7",
+            "Size": 8019613,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:4a7f897e0d5aeefeca4b0ab155bcce6ad438b5d3d29d9aff7cb7cf892f390f48",
+            "Size": 14419678,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:cf8918636a4bf8d4fa3fe260fb0fe7ccf6adfae956994ec7ed3781d4ef5438bc",
+            "Size": 8533769,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:4ed6390dbca0a6ba7d4371abb5b3cb5d7225c650b0dd51bff3a6312c2cb44a67",
+            "Size": 7964458,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:2cfb60ae2a98c6b6194b69d19788df94c13475e3b85aaf60cab7f99872d7b403",
+            "Size": 2609490,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:7867aa3bdeb6fe13ffffe05e41237571f938eff4ff5ae63546fe6fd56d0e3159",
+            "Size": 5616968,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:579f5c63a7d088ba79ef4d797854a230a69195cb02fb6f61dfdc45c32eebc2a6",
+            "Size": 95156565,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:be008e79278a70d08d8f0b73c9c1e1e5723df30df1c8d3d8d53f1ae6a1804da4",
+            "Size": 15703857,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:9441587943bf3563f6addfc9b93a74afcb29b42a3e035189c1dd29cf097793a6",
+            "Size": 23851171,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:76f37e1fb40a532d193ee426207f9f475e93dda75982c0fc182e5dcd95e3a6c1",
+            "Size": 22198861,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:427c9244e7a6fd7ff7c200637b68d63df5d3b32ad93ca7fb6daace97208a27c1",
+            "Size": 16476352,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:64295a4a653631bf84750308e4f1c6cce421ccac9c63193c0a403dd7d6b874ff",
+            "Size": 33114358,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:d1eaeb62971c9db9b4469ed75dea01c91524b232bb8eac428c12e4f1e193c69f",
+            "Size": 19017441,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:9c60bdd841be2a18ec670ac793a739b359a70c0bdfd300aa0b178fd66ba23b4e",
+            "Size": 31166295,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:3447c91317eed1ba8edfcc3f6a29459f8a1bd41f2dc5918016fe97ef87611324",
+            "Size": 31038469,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:632b9432c42ebdfb1dd70da449a947a95da6b5848b1c2aa512e480bc0e6ad9ee",
+            "Size": 38701903,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:f0e40f714e90df688836808943b8cf2dd204cbe88a5919e47af5f010683e7c14",
+            "Size": 49133394,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:612e017e928d8b778c8a50c4ceda6e90ac0fe089cb0e8db7a4d5c5992a2a5a3b",
+            "Size": 26525141,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:fe860444310f11bf53cc67f721ea965c673cc67e3cd8533f6a8d943a69a7a1a9",
+            "Size": 30025135,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:94ccf7714839f4fa9763f77b48f083c4c21ff67ef0d3399991b439eced08436c",
+            "Size": 158591085,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:6d22a88ef508f2deae10cfcc7584a5395c9aa1182ed3a82e3d35b8f94285dc35",
+            "Size": 91676216,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:32f2bcb1ba6aef04c5d013ac2c1740fc1f59837e1ca67c1228b4b26cf72d91d3",
+            "Size": 16056022,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:197fc2eacbdbf6e765b78518b83291b9324c16f0f7b3d0104a2439e85b3be1e5",
+            "Size": 9869232,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:8b6d7e972e1b642322c2c70d5a02ad3d30713d0603f039a7cc83ab1edfb6b349",
+            "Size": 22497107,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:a201f50f668c412cd9059bc73b785643d90d71e5578169e7d62157d87dde4933",
+            "Size": 3534098,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:66dfbb31e672d3acfa670049b63d33d8fefbee7f433f487df158beab3872f24d",
+            "Size": 45399555,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:dd6d4b27c652b8f5c04edfb2c6b2d323676a4c2b6aa4cfb94bd20d0a4cd2138a",
+            "Size": 42826597,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:298ea120ab2664dae330c07f11ff7969717eb1bed6ffbbaa22884c26d1a1dd2c",
+            "Size": 226,
+            "Annotations": null
+          }
+        ],
+        "Env": [
+          "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ]
+      },
+      "runner_exit": 1,
+      "manifest": "yellowfin/manifest.json",
+      "manifest_sha256": "6fe11d3790178b56f8ea514774c6e390eceea01454234850e21f145b4b967bb2",
+      "steps": {
+        "greeter-user-list": "pass",
+        "greeter-password": "pass",
+        "session-is-tuna": "pass",
+        "portal-availability": "pass",
+        "desktop": "pass",
+        "overview": "pass",
+        "app-grid": "pass",
+        "search-files": "pass",
+        "launch-files": "pass",
+        "launch-settings": "fail",
+        "alt-tab-switcher": "pass",
+        "alt-tab-commit": "pass",
+        "alt-tab-back": "pass",
+        "settings-appearance": "pass",
+        "settings-dark-style": "fail",
+        "settings-wallpaper": "fail",
+        "quick-settings": "fail",
+        "quick-settings-night-light": "fail",
+        "quick-settings-sliders": "not-exercised",
+        "notify-send": "fail",
+        "notification-banner": "pass",
+        "date-menu": "pass",
+        "lock": "fail",
+        "unlock-refused": "pass",
+        "unlock": "pass",
+        "power-menu": "pass",
+        "logout-dialog": "pass",
+        "logout": "pass"
+      },
+      "cleanup": {
+        "deleted": true,
+        "result": [
+          {
+            "name": "tuna-q-variant-yellowfin-1031145321",
+            "deleted": true,
+            "removed": [
+              "virtualmachine.kubevirt.io/tuna-q-variant-yellowfin-1031145321",
+              "virtualmachineinstance.kubevirt.io/tuna-q-variant-yellowfin-1031145321",
+              "persistentvolumeclaim/tuna-q-variant-yellowfin-1031145321-bootc-disk"
+            ]
+          }
+        ],
+        "still_listed": [],
+        "stderr": ""
+      },
+      "guest": {
+        "packages": [
+          "tuna-desktop-1.0.0~beta.1-1.el10.x86_64",
+          "gdm-47.0-32.el10.x86_64",
+          "gnome-shell-49.5-18.el10.alma.1.x86_64",
+          "gnome-control-center-47.7-18.el10.x86_64",
+          "nautilus-47.6-3.el10.x86_64",
+          "libnotify-0.8.6-1.el10.x86_64"
+        ],
+        "kernel": "6.12.0-273.el10.x86_64",
+        "drm_driver": "bochs-drm",
+        "modes": [
+          "1280x800",
+          "1920x1440",
+          "2560x1080"
+        ],
+        "sessions_offered": [
+          "Name=Tuna Desktop"
+        ],
+        "gdm_custom_conf": [
+          "FallbackSession=tuna"
+        ],
+        "boot_id": "8f0db87e-fb0c-4565-a014-653ecf3c93e2",
+        "account": "tuna-test:x:1000:1000::/var/home/tuna-test:/bin/bash"
+      }
+    },
+    {
+      "variant": "albacore",
+      "base": "Based on AlmaLinux 10",
+      "rollout": {
+        "status": "admitted",
+        "package_target": "el10"
+      },
+      "qualification": "not-qualified",
+      "runtime": "running",
+      "flavors": [
+        {
+          "id": "tuna",
+          "stage": 2,
+          "platforms": [
+            "linux/amd64"
+          ],
+          "build_image": true,
+          "build_iso": false,
+          "build_qcow2": false,
+          "luks_e2e": false
+        }
+      ],
+      "published_tag": "ghcr.io/tuna-os/albacore:tuna",
+      "registry": {
+        "argv": [
+          "skopeo",
+          "inspect",
+          "--no-tags",
+          "--override-arch",
+          "amd64",
+          "docker://ghcr.io/tuna-os/albacore:tuna"
+        ],
+        "exit": 0,
+        "stdout": "{\n    \"Name\": \"ghcr.io/tuna-os/albacore\",\n    \"Digest\": \"sha256:b68a195dbc6e079bbab6b330086e6420d860f5364d1f2232e5f377bc6cdf2a13\",\n    \"RepoTags\": [],\n    \"Created\": \"2026-10-30T10:04:26.930029117Z\",\n    \"DockerVersion\": \"\",\n    \"Labels\": {\n        \"containers.bootc\": \"1\",\n        \"io.bootc\": \"1\",\n        \"io.buildah.version\": \"1.42.1\",\n        \"org.opencontainers.image.title\": \"TunaOS albacore (tuna)\",\n        \"org.opencontainers.image.vendor\": \"tuna-os\",\n        \"org.opencontainers.image.version\": \"86446f6\",\n        \"ostree.bootable\": \"1\"\n    },\n    \"Architecture\": \"amd64\",\n    \"Os\": \"linux\",\n    \"Layers\": [\n        \"sha256:d57f4b2913edde0fcecd893ca52cde3ffb2c3be783e8ae0d09b884d6611a7283\",\n        \"sha256:9af730da9d0c4ddd21d33b6cd8e36fdfb3d2486f85351481a669cdd58762d0d9\",\n        \"sha256:5efcffb9b85479e00e11c8850e5681e309dfde3a2071c4f73fb03d5edaa2d5d5\",\n        \"sha256:cb34dc2b5422690f052ebf044e3b65a9f6f144c5abf717066a41daf5c91dee62\",\n        \"sha256:003c80ab698c33085972befac8a52cff88b117ec6d439fb9ad0aeb6aa3c0a424\",\n        \"sha256:1fddc160a3b4bd076f390efdd7fd63b61e5702132683eb200e631d0dc87d6ac8\",\n        \"sha256:68632c3bf200bdfb4378529efbb5e169b596358b4753812b7889be7388400380\",\n        \"sha256:5a74fc897449615fb02154df156ac5e6eafa61a512abdd2c3ed34990957bc234\",\n        \"sha256:8fb296f3d6405777b656e552672e3bff11ab1eed1ec7d4b93b13d92807c144a5\",\n        \"sha256:114c738df4fb9183c268cb5dbc547a5df83d84e987f1299679bd6a82e059321e\",\n        \"sha256:f787318ab315be5bf60f4edb3a5fde3a6e4b62aaa0cdee53eb4290245dff7aa7\",\n        \"sha256:d2091621e73bf35b7918b79ce9c6a63eda1e8d49b693921ba3a917b4af5466ad\",\n        \"sha256:c0f8d15ae72b7d04d3319cd5754ac28efb000aae9995e76ea5a5fff69262c880\",\n        \"sha256:3e864a6b73bb9e8811df81e9a5de8ba9655e296a53d583f5b76c3286ea37fe5a\",\n        \"sha256:3d644d1e01a42292ffb3564b18941f3f314afe5d357440d50557ebf54e560bb7\",\n        \"sha256:3958af4462daf68712e51aa253d9f9844f264393b19ffe04f061edc717985b56\",\n        \"sha256:6f20855add8d99340d951fe0dd3c480d4dba8b4d8a6ac502146a882e56f2f31d\",\n        \"sha256:5e3f4cf7a39d15332b48883f4e5b8861a147f9a0c18a7c10b12655b2f9062d7f\",\n        \"sha256:be4eef51a105f232f95b262035de0266e9a6d530f1792fcd8b3f67882d04c770\",\n        \"sha256:c4718b65865e81302925970f41cbb4d07054f57014227431802e721fbfe3c275\",\n        \"sha256:1b9b94f95836374af8bea9e817a47b9f0cc3da3c5a8819c476640c3eeaf200b5\",\n        \"sha256:e9b5cc670ddd17f136b94e39c44616502123b3082628f5d7a4b6818e3c1b071a\",\n        \"sha256:ca610e14f1114836ba2164c4009b6343db41293e01d668a8783ac3bcd11e9f5a\",\n        \"sha256:bb354624df20523a5f141e21cb62f13c6e1fad5b667c7f1e48c156495594791d\",\n        \"sha256:291aef508c8ebb9a602b56efa2868d51aa1cd7e9effb063fef9d9fcbcb6c3d71\",\n        \"sha256:cecc5026320782e57fe1905e77690d6dd23d10493affca5a77bbb6a920eb8ed8\",\n        \"sha256:7b0f3b0b1c3c181e362ce88a290c5d1558b8aacf74e920f5a9f3f724905ae2cb\",\n        \"sha256:1ca4032b138a2c9551e98b19e09f5b2950f77fce5c04e91cc5cc580f5234695d\",\n        \"sha256:f24a9d0672c82d0228c3f03a813238cf0942df0528024e8854ed6b2620f66fea\",\n        \"sha256:8561b1d070353f440cc2dd3aa80b1cc32e6f5a258e7be6b2f82a4ef802ef8647\",\n        \"sha256:2bfe8b7a1851c548e20612ed12c8d582b8ab1610a79599272f74e03e67216bbf\",\n        \"sha256:8c02c081d26bb87f4a262da60c41fbd4d046d02b8a7570f69fff281fb104df12\",\n        \"sha256:9cf697d6921551b2b8eeb61299c5285af82dccd2f94509c58cfc6f8b9a1f546e\",\n        \"sha256:e72e99cc269f6b84b11b9929f12c84fd1a6ceb3f558a0f723d6e1eb4d7317b3f\",\n        \"sha256:2ec18f798ddb620a8d3a8a0a9e24a02d9c1682cb0cb4e343478aaed32bfc2792\",\n        \"sha256:5308cf0bd2bb9d801cfe645e0d23fa4697732b0f8646873016f9d2f14e48d25f\",\n        \"sha256:287b1104d9a155426a5f44cdb3a2ff7bc996cc2bf1020f13d9820aa8ba7fed1f\",\n        \"sha256:4bbbc98dfa08bae10af2f0b82454339f4e994cdc03bbb15afbcb5c1accb38bf4\",\n        \"sha256:2db240217f13ba519734e647e82f0625bad743ab2a1ef5d3d5d12b675611c841\",\n        \"sha256:354d7662c517227cf6fd5328625dc60725f802d00ad3c458a97ea5ea78304756\",\n        \"sha256:522b9639876b37f27f6236fe31ec34ac62fdeb9f7799b5190d60bdc0a0eb91d6\",\n        \"sha256:cdd5afb639f53832bea787828fad9e8d8752956bf9eb2b0b61a7c8718cff0487\",\n        \"sha256:95592e2a449e7d1272fcd5c4e343b08162a23868536068a266b563f0ef319c40\",\n        \"sha256:b180514f250a81de7d44223b50b78691d0db849accb004c647687c01c3507369\",\n        \"sha256:0486fa826e55fba94cf25ca990cdea776b947d83bbee85273748882bd75c00de\",\n        \"sha256:0c0fa79a09350e7b820ac885da1f2b12d7282ff85f9cf58f2936d2ae6a9f5f4d\",\n        \"sha256:68940b6d4f2f94531082f921864cca7166e1280538ec008600659a8bbf95681e\",\n        \"sha256:aaf13b3cc495901cf10d17cad093aabc7de220c93be9cc214b03a6a9ffb05051\",\n        \"sha256:7ad4ea1168e9fb099398704d6a3dfe3566d62628e00d00a78403744afc146acb\",\n        \"sha256:7707ee919eb8458d8caf409236dec1db15474529f53959405f56138a9159af44\",\n        \"sha256:eae6d8418d9579abae4b9e712d7e4e4d8ebf77b5127095d44a68119947092371\",\n        \"sha256:4abb877c60b2cb3ba1aefef8a7074a6233481addec1eeaae9efa891a94ec802a\",\n        \"sha256:f55ab3b672ee9a98dfb1c4dd15e8c6f953db3514095704f5c13cf68a870b7bbd\",\n        \"sha256:4399629f3e98d93f5c6ce4e6068b41bb3fa72beaa441105bb58775a062ceb15f\",\n        \"sha256:d4fc5317e19593c67670f4f993a587133bc3d2d427b69ff2f2679567ce779c06\",\n        \"sha256:734ce10c6df0aa9d959c1864acbc63c41da1bc07228020461993d79cb12527a4\",\n        \"sha256:49510a7b4ac5999e494afe9e0529af47f04da8315ae198ce25955f45a31df592\",\n        \"sha256:632696ff1698ab1eddccec96797336f3ed096f048481ca8bbc619b2ab09e2bb7\",\n        \"sha256:71e3d32b30a360d754e4459639b5ae6caeb280707504d8944be872b82f8c8fe6\",\n        \"sha256:dbfed3d25b12df063487e8172793321c0aa2e03e23ef322097c11991d142e9f5\",\n        \"sha256:715be81f69a09329264fd005677d1a06fa3ea28fab8d86394dc784dc7a4cdef8\",\n        \"sha256:782a4675bb93fc84d89c1b3eec57960f115c8bd1dc41058c5202574eed956cf4\",\n        \"sha256:268cb1c414b19b944bcfbf8ee4b7b0784b68060ebc7100b0b36c8e563f764544\",\n        \"sha256:a0e65a30deeae654c98a2627f5b337d59d2774d76cced5f81162164dd925f3cc\",\n        \"sha256:0e4abe93ad9ce3795444faefc3d74158632637bf717edc7daea71bf9f8948049\"\n    ],\n    \"LayersData\": [\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:d57f4b2913edde0fcecd893ca52cde3ffb2c3be783e8ae0d09b884d6611a7283\",\n            \"Size\": 20542269,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:9af730da9d0c4ddd21d33b6cd8e36fdfb3d2486f85351481a669cdd58762d0d9\",\n            \"Size\": 40475952,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:5efcffb9b85479e00e11c8850e5681e309dfde3a2071c4f73fb03d5edaa2d5d5\",\n            \"Size\": 18733389,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:cb34dc2b5422690f052ebf044e3b65a9f6f144c5abf717066a41daf5c91dee62\",\n            \"Size\": 7171317,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:003c80ab698c33085972befac8a52cff88b117ec6d439fb9ad0aeb6aa3c0a424\",\n            \"Size\": 14161540,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:1fddc160a3b4bd076f390efdd7fd63b61e5702132683eb200e631d0dc87d6ac8\",\n            \"Size\": 5764487,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:68632c3bf200bdfb4378529efbb5e169b596358b4753812b7889be7388400380\",\n            \"Size\": 5297916,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:5a74fc897449615fb02154df156ac5e6eafa61a512abdd2c3ed34990957bc234\",\n            \"Size\": 10098775,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:8fb296f3d6405777b656e552672e3bff11ab1eed1ec7d4b93b13d92807c144a5\",\n            \"Size\": 3965475,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:114c738df4fb9183c268cb5dbc547a5df83d84e987f1299679bd6a82e059321e\",\n            \"Size\": 14225348,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:f787318ab315be5bf60f4edb3a5fde3a6e4b62aaa0cdee53eb4290245dff7aa7\",\n            \"Size\": 5466845,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:d2091621e73bf35b7918b79ce9c6a63eda1e8d49b693921ba3a917b4af5466ad\",\n            \"Size\": 6639006,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:c0f8d15ae72b7d04d3319cd5754ac28efb000aae9995e76ea5a5fff69262c880\",\n            \"Size\": 5129416,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:3e864a6b73bb9e8811df81e9a5de8ba9655e296a53d583f5b76c3286ea37fe5a\",\n            \"Size\": 2008406,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:3d644d1e01a42292ffb3564b18941f3f314afe5d357440d50557ebf54e560bb7\",\n            \"Size\": 6748610,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:3958af4462daf68712e51aa253d9f9844f264393b19ffe04f061edc717985b56\",\n            \"Size\": 7544526,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:6f20855add8d99340d951fe0dd3c480d4dba8b4d8a6ac502146a882e56f2f31d\",\n            \"Size\": 41869286,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:5e3f4cf7a39d15332b48883f4e5b8861a147f9a0c18a7c10b12655b2f9062d7f\",\n            \"Size\": 12712930,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:be4eef51a105f232f95b262035de0266e9a6d530f1792fcd8b3f67882d04c770\",\n            \"Size\": 14761383,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:c4718b65865e81302925970f41cbb4d07054f57014227431802e721fbfe3c275\",\n            \"Size\": 5831815,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:1b9b94f95836374af8bea9e817a47b9f0cc3da3c5a8819c476640c3eeaf200b5\",\n            \"Size\": 17789325,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:e9b5cc670ddd17f136b94e39c44616502123b3082628f5d7a4b6818e3c1b071a\",\n            \"Size\": 4056573,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:ca610e14f1114836ba2164c4009b6343db41293e01d668a8783ac3bcd11e9f5a\",\n            \"Size\": 5798705,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:bb354624df20523a5f141e21cb62f13c6e1fad5b667c7f1e48c156495594791d\",\n            \"Size\": 88845445,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:291aef508c8ebb9a602b56efa2868d51aa1cd7e9effb063fef9d9fcbcb6c3d71\",\n            \"Size\": 8922902,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:cecc5026320782e57fe1905e77690d6dd23d10493affca5a77bbb6a920eb8ed8\",\n            \"Size\": 8261385,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:7b0f3b0b1c3c181e362ce88a290c5d1558b8aacf74e920f5a9f3f724905ae2cb\",\n            \"Size\": 4166299,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:1ca4032b138a2c9551e98b19e09f5b2950f77fce5c04e91cc5cc580f5234695d\",\n            \"Size\": 8173640,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:f24a9d0672c82d0228c3f03a813238cf0942df0528024e8854ed6b2620f66fea\",\n            \"Size\": 7975450,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:8561b1d070353f440cc2dd3aa80b1cc32e6f5a258e7be6b2f82a4ef802ef8647\",\n            \"Size\": 14425918,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:2bfe8b7a1851c548e20612ed12c8d582b8ab1610a79599272f74e03e67216bbf\",\n            \"Size\": 318939333,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:8c02c081d26bb87f4a262da60c41fbd4d046d02b8a7570f69fff281fb104df12\",\n            \"Size\": 13062723,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:9cf697d6921551b2b8eeb61299c5285af82dccd2f94509c58cfc6f8b9a1f546e\",\n            \"Size\": 14285965,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:e72e99cc269f6b84b11b9929f12c84fd1a6ceb3f558a0f723d6e1eb4d7317b3f\",\n            \"Size\": 10797818,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:2ec18f798ddb620a8d3a8a0a9e24a02d9c1682cb0cb4e343478aaed32bfc2792\",\n            \"Size\": 10208872,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:5308cf0bd2bb9d801cfe645e0d23fa4697732b0f8646873016f9d2f14e48d25f\",\n            \"Size\": 8841335,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:287b1104d9a155426a5f44cdb3a2ff7bc996cc2bf1020f13d9820aa8ba7fed1f\",\n            \"Size\": 7988854,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:4bbbc98dfa08bae10af2f0b82454339f4e994cdc03bbb15afbcb5c1accb38bf4\",\n            \"Size\": 7732074,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:2db240217f13ba519734e647e82f0625bad743ab2a1ef5d3d5d12b675611c841\",\n            \"Size\": 2604785,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:354d7662c517227cf6fd5328625dc60725f802d00ad3c458a97ea5ea78304756\",\n            \"Size\": 13153519,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:522b9639876b37f27f6236fe31ec34ac62fdeb9f7799b5190d60bdc0a0eb91d6\",\n            \"Size\": 20422973,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:cdd5afb639f53832bea787828fad9e8d8752956bf9eb2b0b61a7c8718cff0487\",\n            \"Size\": 5604411,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:95592e2a449e7d1272fcd5c4e343b08162a23868536068a266b563f0ef319c40\",\n            \"Size\": 14717569,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:b180514f250a81de7d44223b50b78691d0db849accb004c647687c01c3507369\",\n            \"Size\": 16382619,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:0486fa826e55fba94cf25ca990cdea776b947d83bbee85273748882bd75c00de\",\n            \"Size\": 23880823,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:0c0fa79a09350e7b820ac885da1f2b12d7282ff85f9cf58f2936d2ae6a9f5f4d\",\n            \"Size\": 24191903,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:68940b6d4f2f94531082f921864cca7166e1280538ec008600659a8bbf95681e\",\n            \"Size\": 33084123,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:aaf13b3cc495901cf10d17cad093aabc7de220c93be9cc214b03a6a9ffb05051\",\n            \"Size\": 30170121,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:7ad4ea1168e9fb099398704d6a3dfe3566d62628e00d00a78403744afc146acb\",\n            \"Size\": 34635082,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:7707ee919eb8458d8caf409236dec1db15474529f53959405f56138a9159af44\",\n            \"Size\": 18800860,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:eae6d8418d9579abae4b9e712d7e4e4d8ebf77b5127095d44a68119947092371\",\n            \"Size\": 30210374,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:4abb877c60b2cb3ba1aefef8a7074a6233481addec1eeaae9efa891a94ec802a\",\n            \"Size\": 25779595,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:f55ab3b672ee9a98dfb1c4dd15e8c6f953db3514095704f5c13cf68a870b7bbd\",\n            \"Size\": 38478558,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:4399629f3e98d93f5c6ce4e6068b41bb3fa72beaa441105bb58775a062ceb15f\",\n            \"Size\": 93283724,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:d4fc5317e19593c67670f4f993a587133bc3d2d427b69ff2f2679567ce779c06\",\n            \"Size\": 49178726,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:734ce10c6df0aa9d959c1864acbc63c41da1bc07228020461993d79cb12527a4\",\n            \"Size\": 237991025,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:49510a7b4ac5999e494afe9e0529af47f04da8315ae198ce25955f45a31df592\",\n            \"Size\": 158591085,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:632696ff1698ab1eddccec96797336f3ed096f048481ca8bbc619b2ab09e2bb7\",\n            \"Size\": 17292980,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:71e3d32b30a360d754e4459639b5ae6caeb280707504d8944be872b82f8c8fe6\",\n            \"Size\": 45726935,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:dbfed3d25b12df063487e8172793321c0aa2e03e23ef322097c11991d142e9f5\",\n            \"Size\": 11262384,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:715be81f69a09329264fd005677d1a06fa3ea28fab8d86394dc784dc7a4cdef8\",\n            \"Size\": 27081609,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:782a4675bb93fc84d89c1b3eec57960f115c8bd1dc41058c5202574eed956cf4\",\n            \"Size\": 3232740,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:268cb1c414b19b944bcfbf8ee4b7b0784b68060ebc7100b0b36c8e563f764544\",\n            \"Size\": 39522931,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:a0e65a30deeae654c98a2627f5b337d59d2774d76cced5f81162164dd925f3cc\",\n            \"Size\": 37964126,\n            \"Annotations\": null\n        },\n        {\n            \"MIMEType\": \"application/vnd.oci.image.layer.v1.tar+zstd\",\n            \"Digest\": \"sha256:0e4abe93ad9ce3795444faefc3d74158632637bf717edc7daea71bf9f8948049\",\n            \"Size\": 225,\n            \"Annotations\": null\n        }\n    ],\n    \"Env\": [\n        \"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n    ]\n}\n",
+        "stderr": ""
+      },
+      "image": "ghcr.io/tuna-os/albacore@sha256:b68a195dbc6e079bbab6b330086e6420d860f5364d1f2232e5f377bc6cdf2a13",
+      "image_metadata": {
+        "Name": "ghcr.io/tuna-os/albacore",
+        "Digest": "sha256:b68a195dbc6e079bbab6b330086e6420d860f5364d1f2232e5f377bc6cdf2a13",
+        "RepoTags": [],
+        "Created": "2026-10-30T10:04:26.930029117Z",
+        "DockerVersion": "",
+        "Labels": {
+          "containers.bootc": "1",
+          "io.bootc": "1",
+          "io.buildah.version": "1.42.1",
+          "org.opencontainers.image.title": "TunaOS albacore (tuna)",
+          "org.opencontainers.image.vendor": "tuna-os",
+          "org.opencontainers.image.version": "86446f6",
+          "ostree.bootable": "1"
+        },
+        "Architecture": "amd64",
+        "Os": "linux",
+        "Layers": [
+          "sha256:d57f4b2913edde0fcecd893ca52cde3ffb2c3be783e8ae0d09b884d6611a7283",
+          "sha256:9af730da9d0c4ddd21d33b6cd8e36fdfb3d2486f85351481a669cdd58762d0d9",
+          "sha256:5efcffb9b85479e00e11c8850e5681e309dfde3a2071c4f73fb03d5edaa2d5d5",
+          "sha256:cb34dc2b5422690f052ebf044e3b65a9f6f144c5abf717066a41daf5c91dee62",
+          "sha256:003c80ab698c33085972befac8a52cff88b117ec6d439fb9ad0aeb6aa3c0a424",
+          "sha256:1fddc160a3b4bd076f390efdd7fd63b61e5702132683eb200e631d0dc87d6ac8",
+          "sha256:68632c3bf200bdfb4378529efbb5e169b596358b4753812b7889be7388400380",
+          "sha256:5a74fc897449615fb02154df156ac5e6eafa61a512abdd2c3ed34990957bc234",
+          "sha256:8fb296f3d6405777b656e552672e3bff11ab1eed1ec7d4b93b13d92807c144a5",
+          "sha256:114c738df4fb9183c268cb5dbc547a5df83d84e987f1299679bd6a82e059321e",
+          "sha256:f787318ab315be5bf60f4edb3a5fde3a6e4b62aaa0cdee53eb4290245dff7aa7",
+          "sha256:d2091621e73bf35b7918b79ce9c6a63eda1e8d49b693921ba3a917b4af5466ad",
+          "sha256:c0f8d15ae72b7d04d3319cd5754ac28efb000aae9995e76ea5a5fff69262c880",
+          "sha256:3e864a6b73bb9e8811df81e9a5de8ba9655e296a53d583f5b76c3286ea37fe5a",
+          "sha256:3d644d1e01a42292ffb3564b18941f3f314afe5d357440d50557ebf54e560bb7",
+          "sha256:3958af4462daf68712e51aa253d9f9844f264393b19ffe04f061edc717985b56",
+          "sha256:6f20855add8d99340d951fe0dd3c480d4dba8b4d8a6ac502146a882e56f2f31d",
+          "sha256:5e3f4cf7a39d15332b48883f4e5b8861a147f9a0c18a7c10b12655b2f9062d7f",
+          "sha256:be4eef51a105f232f95b262035de0266e9a6d530f1792fcd8b3f67882d04c770",
+          "sha256:c4718b65865e81302925970f41cbb4d07054f57014227431802e721fbfe3c275",
+          "sha256:1b9b94f95836374af8bea9e817a47b9f0cc3da3c5a8819c476640c3eeaf200b5",
+          "sha256:e9b5cc670ddd17f136b94e39c44616502123b3082628f5d7a4b6818e3c1b071a",
+          "sha256:ca610e14f1114836ba2164c4009b6343db41293e01d668a8783ac3bcd11e9f5a",
+          "sha256:bb354624df20523a5f141e21cb62f13c6e1fad5b667c7f1e48c156495594791d",
+          "sha256:291aef508c8ebb9a602b56efa2868d51aa1cd7e9effb063fef9d9fcbcb6c3d71",
+          "sha256:cecc5026320782e57fe1905e77690d6dd23d10493affca5a77bbb6a920eb8ed8",
+          "sha256:7b0f3b0b1c3c181e362ce88a290c5d1558b8aacf74e920f5a9f3f724905ae2cb",
+          "sha256:1ca4032b138a2c9551e98b19e09f5b2950f77fce5c04e91cc5cc580f5234695d",
+          "sha256:f24a9d0672c82d0228c3f03a813238cf0942df0528024e8854ed6b2620f66fea",
+          "sha256:8561b1d070353f440cc2dd3aa80b1cc32e6f5a258e7be6b2f82a4ef802ef8647",
+          "sha256:2bfe8b7a1851c548e20612ed12c8d582b8ab1610a79599272f74e03e67216bbf",
+          "sha256:8c02c081d26bb87f4a262da60c41fbd4d046d02b8a7570f69fff281fb104df12",
+          "sha256:9cf697d6921551b2b8eeb61299c5285af82dccd2f94509c58cfc6f8b9a1f546e",
+          "sha256:e72e99cc269f6b84b11b9929f12c84fd1a6ceb3f558a0f723d6e1eb4d7317b3f",
+          "sha256:2ec18f798ddb620a8d3a8a0a9e24a02d9c1682cb0cb4e343478aaed32bfc2792",
+          "sha256:5308cf0bd2bb9d801cfe645e0d23fa4697732b0f8646873016f9d2f14e48d25f",
+          "sha256:287b1104d9a155426a5f44cdb3a2ff7bc996cc2bf1020f13d9820aa8ba7fed1f",
+          "sha256:4bbbc98dfa08bae10af2f0b82454339f4e994cdc03bbb15afbcb5c1accb38bf4",
+          "sha256:2db240217f13ba519734e647e82f0625bad743ab2a1ef5d3d5d12b675611c841",
+          "sha256:354d7662c517227cf6fd5328625dc60725f802d00ad3c458a97ea5ea78304756",
+          "sha256:522b9639876b37f27f6236fe31ec34ac62fdeb9f7799b5190d60bdc0a0eb91d6",
+          "sha256:cdd5afb639f53832bea787828fad9e8d8752956bf9eb2b0b61a7c8718cff0487",
+          "sha256:95592e2a449e7d1272fcd5c4e343b08162a23868536068a266b563f0ef319c40",
+          "sha256:b180514f250a81de7d44223b50b78691d0db849accb004c647687c01c3507369",
+          "sha256:0486fa826e55fba94cf25ca990cdea776b947d83bbee85273748882bd75c00de",
+          "sha256:0c0fa79a09350e7b820ac885da1f2b12d7282ff85f9cf58f2936d2ae6a9f5f4d",
+          "sha256:68940b6d4f2f94531082f921864cca7166e1280538ec008600659a8bbf95681e",
+          "sha256:aaf13b3cc495901cf10d17cad093aabc7de220c93be9cc214b03a6a9ffb05051",
+          "sha256:7ad4ea1168e9fb099398704d6a3dfe3566d62628e00d00a78403744afc146acb",
+          "sha256:7707ee919eb8458d8caf409236dec1db15474529f53959405f56138a9159af44",
+          "sha256:eae6d8418d9579abae4b9e712d7e4e4d8ebf77b5127095d44a68119947092371",
+          "sha256:4abb877c60b2cb3ba1aefef8a7074a6233481addec1eeaae9efa891a94ec802a",
+          "sha256:f55ab3b672ee9a98dfb1c4dd15e8c6f953db3514095704f5c13cf68a870b7bbd",
+          "sha256:4399629f3e98d93f5c6ce4e6068b41bb3fa72beaa441105bb58775a062ceb15f",
+          "sha256:d4fc5317e19593c67670f4f993a587133bc3d2d427b69ff2f2679567ce779c06",
+          "sha256:734ce10c6df0aa9d959c1864acbc63c41da1bc07228020461993d79cb12527a4",
+          "sha256:49510a7b4ac5999e494afe9e0529af47f04da8315ae198ce25955f45a31df592",
+          "sha256:632696ff1698ab1eddccec96797336f3ed096f048481ca8bbc619b2ab09e2bb7",
+          "sha256:71e3d32b30a360d754e4459639b5ae6caeb280707504d8944be872b82f8c8fe6",
+          "sha256:dbfed3d25b12df063487e8172793321c0aa2e03e23ef322097c11991d142e9f5",
+          "sha256:715be81f69a09329264fd005677d1a06fa3ea28fab8d86394dc784dc7a4cdef8",
+          "sha256:782a4675bb93fc84d89c1b3eec57960f115c8bd1dc41058c5202574eed956cf4",
+          "sha256:268cb1c414b19b944bcfbf8ee4b7b0784b68060ebc7100b0b36c8e563f764544",
+          "sha256:a0e65a30deeae654c98a2627f5b337d59d2774d76cced5f81162164dd925f3cc",
+          "sha256:0e4abe93ad9ce3795444faefc3d74158632637bf717edc7daea71bf9f8948049"
+        ],
+        "LayersData": [
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:d57f4b2913edde0fcecd893ca52cde3ffb2c3be783e8ae0d09b884d6611a7283",
+            "Size": 20542269,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:9af730da9d0c4ddd21d33b6cd8e36fdfb3d2486f85351481a669cdd58762d0d9",
+            "Size": 40475952,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:5efcffb9b85479e00e11c8850e5681e309dfde3a2071c4f73fb03d5edaa2d5d5",
+            "Size": 18733389,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:cb34dc2b5422690f052ebf044e3b65a9f6f144c5abf717066a41daf5c91dee62",
+            "Size": 7171317,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:003c80ab698c33085972befac8a52cff88b117ec6d439fb9ad0aeb6aa3c0a424",
+            "Size": 14161540,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:1fddc160a3b4bd076f390efdd7fd63b61e5702132683eb200e631d0dc87d6ac8",
+            "Size": 5764487,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:68632c3bf200bdfb4378529efbb5e169b596358b4753812b7889be7388400380",
+            "Size": 5297916,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:5a74fc897449615fb02154df156ac5e6eafa61a512abdd2c3ed34990957bc234",
+            "Size": 10098775,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:8fb296f3d6405777b656e552672e3bff11ab1eed1ec7d4b93b13d92807c144a5",
+            "Size": 3965475,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:114c738df4fb9183c268cb5dbc547a5df83d84e987f1299679bd6a82e059321e",
+            "Size": 14225348,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:f787318ab315be5bf60f4edb3a5fde3a6e4b62aaa0cdee53eb4290245dff7aa7",
+            "Size": 5466845,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:d2091621e73bf35b7918b79ce9c6a63eda1e8d49b693921ba3a917b4af5466ad",
+            "Size": 6639006,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:c0f8d15ae72b7d04d3319cd5754ac28efb000aae9995e76ea5a5fff69262c880",
+            "Size": 5129416,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:3e864a6b73bb9e8811df81e9a5de8ba9655e296a53d583f5b76c3286ea37fe5a",
+            "Size": 2008406,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:3d644d1e01a42292ffb3564b18941f3f314afe5d357440d50557ebf54e560bb7",
+            "Size": 6748610,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:3958af4462daf68712e51aa253d9f9844f264393b19ffe04f061edc717985b56",
+            "Size": 7544526,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:6f20855add8d99340d951fe0dd3c480d4dba8b4d8a6ac502146a882e56f2f31d",
+            "Size": 41869286,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:5e3f4cf7a39d15332b48883f4e5b8861a147f9a0c18a7c10b12655b2f9062d7f",
+            "Size": 12712930,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:be4eef51a105f232f95b262035de0266e9a6d530f1792fcd8b3f67882d04c770",
+            "Size": 14761383,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:c4718b65865e81302925970f41cbb4d07054f57014227431802e721fbfe3c275",
+            "Size": 5831815,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:1b9b94f95836374af8bea9e817a47b9f0cc3da3c5a8819c476640c3eeaf200b5",
+            "Size": 17789325,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:e9b5cc670ddd17f136b94e39c44616502123b3082628f5d7a4b6818e3c1b071a",
+            "Size": 4056573,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:ca610e14f1114836ba2164c4009b6343db41293e01d668a8783ac3bcd11e9f5a",
+            "Size": 5798705,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:bb354624df20523a5f141e21cb62f13c6e1fad5b667c7f1e48c156495594791d",
+            "Size": 88845445,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:291aef508c8ebb9a602b56efa2868d51aa1cd7e9effb063fef9d9fcbcb6c3d71",
+            "Size": 8922902,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:cecc5026320782e57fe1905e77690d6dd23d10493affca5a77bbb6a920eb8ed8",
+            "Size": 8261385,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:7b0f3b0b1c3c181e362ce88a290c5d1558b8aacf74e920f5a9f3f724905ae2cb",
+            "Size": 4166299,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:1ca4032b138a2c9551e98b19e09f5b2950f77fce5c04e91cc5cc580f5234695d",
+            "Size": 8173640,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:f24a9d0672c82d0228c3f03a813238cf0942df0528024e8854ed6b2620f66fea",
+            "Size": 7975450,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:8561b1d070353f440cc2dd3aa80b1cc32e6f5a258e7be6b2f82a4ef802ef8647",
+            "Size": 14425918,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:2bfe8b7a1851c548e20612ed12c8d582b8ab1610a79599272f74e03e67216bbf",
+            "Size": 318939333,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:8c02c081d26bb87f4a262da60c41fbd4d046d02b8a7570f69fff281fb104df12",
+            "Size": 13062723,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:9cf697d6921551b2b8eeb61299c5285af82dccd2f94509c58cfc6f8b9a1f546e",
+            "Size": 14285965,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:e72e99cc269f6b84b11b9929f12c84fd1a6ceb3f558a0f723d6e1eb4d7317b3f",
+            "Size": 10797818,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:2ec18f798ddb620a8d3a8a0a9e24a02d9c1682cb0cb4e343478aaed32bfc2792",
+            "Size": 10208872,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:5308cf0bd2bb9d801cfe645e0d23fa4697732b0f8646873016f9d2f14e48d25f",
+            "Size": 8841335,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:287b1104d9a155426a5f44cdb3a2ff7bc996cc2bf1020f13d9820aa8ba7fed1f",
+            "Size": 7988854,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:4bbbc98dfa08bae10af2f0b82454339f4e994cdc03bbb15afbcb5c1accb38bf4",
+            "Size": 7732074,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:2db240217f13ba519734e647e82f0625bad743ab2a1ef5d3d5d12b675611c841",
+            "Size": 2604785,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:354d7662c517227cf6fd5328625dc60725f802d00ad3c458a97ea5ea78304756",
+            "Size": 13153519,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:522b9639876b37f27f6236fe31ec34ac62fdeb9f7799b5190d60bdc0a0eb91d6",
+            "Size": 20422973,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:cdd5afb639f53832bea787828fad9e8d8752956bf9eb2b0b61a7c8718cff0487",
+            "Size": 5604411,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:95592e2a449e7d1272fcd5c4e343b08162a23868536068a266b563f0ef319c40",
+            "Size": 14717569,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:b180514f250a81de7d44223b50b78691d0db849accb004c647687c01c3507369",
+            "Size": 16382619,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:0486fa826e55fba94cf25ca990cdea776b947d83bbee85273748882bd75c00de",
+            "Size": 23880823,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:0c0fa79a09350e7b820ac885da1f2b12d7282ff85f9cf58f2936d2ae6a9f5f4d",
+            "Size": 24191903,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:68940b6d4f2f94531082f921864cca7166e1280538ec008600659a8bbf95681e",
+            "Size": 33084123,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:aaf13b3cc495901cf10d17cad093aabc7de220c93be9cc214b03a6a9ffb05051",
+            "Size": 30170121,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:7ad4ea1168e9fb099398704d6a3dfe3566d62628e00d00a78403744afc146acb",
+            "Size": 34635082,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:7707ee919eb8458d8caf409236dec1db15474529f53959405f56138a9159af44",
+            "Size": 18800860,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:eae6d8418d9579abae4b9e712d7e4e4d8ebf77b5127095d44a68119947092371",
+            "Size": 30210374,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:4abb877c60b2cb3ba1aefef8a7074a6233481addec1eeaae9efa891a94ec802a",
+            "Size": 25779595,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:f55ab3b672ee9a98dfb1c4dd15e8c6f953db3514095704f5c13cf68a870b7bbd",
+            "Size": 38478558,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:4399629f3e98d93f5c6ce4e6068b41bb3fa72beaa441105bb58775a062ceb15f",
+            "Size": 93283724,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:d4fc5317e19593c67670f4f993a587133bc3d2d427b69ff2f2679567ce779c06",
+            "Size": 49178726,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:734ce10c6df0aa9d959c1864acbc63c41da1bc07228020461993d79cb12527a4",
+            "Size": 237991025,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:49510a7b4ac5999e494afe9e0529af47f04da8315ae198ce25955f45a31df592",
+            "Size": 158591085,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:632696ff1698ab1eddccec96797336f3ed096f048481ca8bbc619b2ab09e2bb7",
+            "Size": 17292980,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:71e3d32b30a360d754e4459639b5ae6caeb280707504d8944be872b82f8c8fe6",
+            "Size": 45726935,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:dbfed3d25b12df063487e8172793321c0aa2e03e23ef322097c11991d142e9f5",
+            "Size": 11262384,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:715be81f69a09329264fd005677d1a06fa3ea28fab8d86394dc784dc7a4cdef8",
+            "Size": 27081609,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:782a4675bb93fc84d89c1b3eec57960f115c8bd1dc41058c5202574eed956cf4",
+            "Size": 3232740,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:268cb1c414b19b944bcfbf8ee4b7b0784b68060ebc7100b0b36c8e563f764544",
+            "Size": 39522931,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:a0e65a30deeae654c98a2627f5b337d59d2774d76cced5f81162164dd925f3cc",
+            "Size": 37964126,
+            "Annotations": null
+          },
+          {
+            "MIMEType": "application/vnd.oci.image.layer.v1.tar+zstd",
+            "Digest": "sha256:0e4abe93ad9ce3795444faefc3d74158632637bf717edc7daea71bf9f8948049",
+            "Size": 225,
+            "Annotations": null
+          }
+        ],
+        "Env": [
+          "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ]
+      }
+    }
+  ],
+  "qualification": "No v1 pass inferred from registry/package availability or unreviewed frames.",
+  "source": {
+    "repository": "tuna-os/tunaOS",
+    "revision": "124cc32623ce084580a2ef888350be07bd83508d",
+    "path": "tunaos.toml",
+    "sha256": "853397599185c7f84d1e32bab44d3abd46396ecdb4aaf69594f80f3dd345e54b"
+  }
+}

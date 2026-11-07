@@ -61,6 +61,14 @@ shell owner PID/UID/start identity, requiring empty inventory, false capability,
 unsupported positive operations and successful harmless resets. Neither proves
 real panel luminance or physical logind permissions.
 
+At the controlled post-`idle-brightness` restore boundary, sysfs readback can
+precede completion of the owned asynchronous logind transaction. The proof
+retries only the exact side-effect-free `brightness update already pending`
+refusal, pacing attempts by up to 50ms within the same five-second absolute
+deadline and 100-attempt cap. Every attempt keeps principal/signal verification
+and its receipt; unrelated errors fail immediately and accepted operations are
+never repeated. This admission pacing changes no device policy or assertion.
+
 Display power saving is the compositor's: DisplayConfig `PowerSaveMode`
 follows Mutter 51 (`crates/compositor/src/power_save.rs`). gsd's blank (3)
 stops scanout and turns every CRTC off on hardware; its unblank (0) repaints
@@ -68,6 +76,13 @@ and modesets back; -1 is ignored. `G-POWER-SAVE-MODE` drives gsd 51's
 dim → blank → unblank → undim sequence in the nested proof: the dim lowers
 the controlled backlight, the blank stops frames while the pointer moves,
 the unblank repaints and the undim restores the exact user baseline.
+
+The power-save proof waits for an in-flight idle-brightness transaction
+before both dimming and undimming. Only a
+`brightness update already pending` refusal permits another admission
+attempt, within the existing ten-second bound. Other errors fail immediately;
+an accepted call must still complete its own transaction and satisfy the
+unchanged backlight and scanout assertions.
 
 Issue #355 remains open for physical hardware, connector association on other
 backlight topologies, persistence across shell restart, cloned-monitor policy,
