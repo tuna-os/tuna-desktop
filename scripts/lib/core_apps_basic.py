@@ -301,21 +301,28 @@ def _loupe(desktop):
         # gate below instead of passing silently.
         engine = desktop.guest('desktop', 'ime-engine', select=True)
         try:
+            # Loupe's entry filters insert-text to at most 4 BYTES when it
+            # holds no decimal point (image_view.rs connect_insert_text),
+            # and silently drops longer commits: the two-character 你好
+            # (6 bytes) is rejected by the real app (round-1004 ev30: the
+            # candidate window rendered, space consumed it, the entry
+            # stayed empty). One libpinyin syllable commits one character
+            # (3 bytes), which the real entry accepts.
             # The entry holds the current zoom level; select it so the
             # commit replaces it, exactly as ime() does for ordinary fields.
             desktop.keys('ctrl', 'a')
-            desktop.type_ascii('nihao')
+            desktop.type_ascii('ni')
             desktop.keys('spc')
             committed = desktop.await_state('loupe-real-zoom-commit', lambda: desktop.tree(actor),
                 lambda value: any(node.get('path') == zoom_entry['path'] and node.get('focused')
-                    and node.get('text') == '你好' for node in nodes(value)))
+                    and node.get('text') == '你' for node in nodes(value)))
             desktop.keys('ctrl', 'a')
             desktop.keys('ctrl', 'c')
             copied = desktop.clipboard()
-            require(base64.b64decode(copied['base64']).decode() == '你好',
+            require(base64.b64decode(copied['base64']).decode() == '你',
                     'actual zoom entry clipboard did not equal committed Unicode')
             evidence['ime'] = {'actor': actor, 'field': zoom_entry, 'committed': committed,
-                'clipboard': copied, 'engine': engine, 'actual_input': 'physical-nihao-space',
+                'clipboard': copied, 'engine': engine, 'actual_input': 'physical-ni-space',
                 'grab_held_oracle': 'seat/bus unattributable under open popover grab; commit+clipboard prove the chain'}
         finally:
             desktop.guest('desktop', 'ime-engine', select=False, original=engine['original'])

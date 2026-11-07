@@ -28,6 +28,11 @@
 #     session's stderr (tuna-compositor:, tuna-shell-gtk:) reaches the
 #     QEMU serial log the lane asserts on. The serial login prompt is
 #     masked in this test layer so it cannot overwrite journal evidence.
+#   - uupd (the base image's Universal Blue updater) masked: it cannot update
+#     a CI-installed image, fails, restarts about every minute and posts a
+#     notify-send banner each time, which spoils the strip lane's
+#     controlled-notification framebuffer proofs (round-1004: V-STRIP-INSTALLED
+#     capture timed out on stacked uupd banners once marlin:gnome rotated).
 #   - tuna-vm-fresh-accounts (tunaOS#4092): only when the lane passes the
 #     tuna.vm.fresh-accounts credential, record-free standard and admin
 #     accounts made with useradd at boot, plus a pre-seeded control;
@@ -121,7 +126,7 @@ RUN mkdir -p /usr/share/tuna-vm \
          'TUNA_PERF_TRACE=1' \
          '# Fixed public-query/catalog diagnostics only in this controlled CI session.' \
          'TUNA_VM_PUBLIC_SEARCH_DIAGNOSTICS=1' >> /usr/share/tuna-vm/environment.conf \
-    && systemctl mask serial-getty@ttyS0.service \
+    && systemctl mask serial-getty@ttyS0.service uupd.timer uupd.service \
     && systemctl enable tuna-vm-health.service tuna-vm-fresh-accounts.service \
     && systemctl add-wants multi-user.target qemu-guest-agent.service \
     && sha256sum --check /usr/share/tuna-vm/shipped-payload.sha256 \
