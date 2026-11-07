@@ -68,6 +68,20 @@ impl NotificationsBox {
         &self.scroller
     }
 
+    /// Reads how tall the box would draw with nothing scrolled away (its
+    /// preferred height at the width it draws), 0 while hidden.
+    pub fn natural_height(&self) -> impl Fn() -> i32 + 'static {
+        let (scroller, list) = (self.scroller.clone(), self.list.clone());
+        move || {
+            if !scroller.is_visible() {
+                return 0;
+            }
+            let width = scroller.width().max(WIDTH);
+            let (_, natural, _, _) = list.measure(gtk::Orientation::Vertical, width);
+            natural
+        }
+    }
+
     /// Show `entries`, rebuilding only when they changed. With none the
     /// box hides (`_updateVisibility`).
     pub fn show(&self, entries: &[LockEntry]) {

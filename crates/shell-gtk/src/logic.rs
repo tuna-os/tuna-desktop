@@ -158,6 +158,29 @@ pub fn lock_offsets(height: i32) -> (i32, i32) {
     ((third + 9).max(0), (third - 61).max(0))
 }
 
+/// GNOME's `.unlock-dialog-clock` top margin: the clock and prompt stack
+/// starts this far above the clock's time.
+pub const LOCK_CLOCK_MARGIN: i32 = 150;
+
+/// GNOME 51's UnlockDialogLayout with its NotificationsBox: the box takes
+/// the bottom of the screen as tall as it is, though never closer than a
+/// tenth of the height to the top of the stack (`maxNotificationsHeight`),
+/// and the clock and prompt stack rises when the box would reach into
+/// it (`stackY`). `stack_top` is where the stack sits with no
+/// notifications. Returns how far the stack rises and how tall the box
+/// draws (the rest of it scrolls).
+pub fn lock_notifications_layout(
+    height: i32,
+    stack_top: i32,
+    stack_height: i32,
+    notifications: i32,
+) -> (i32, i32) {
+    let room = (height - height / 10 - stack_height).max(0);
+    let shown = notifications.clamp(0, room);
+    let top = stack_top.min(height - stack_height - shown);
+    ((stack_top - top).max(0), shown)
+}
+
 /// The user's display name for the unlock prompt: the GECOS real name,
 /// else the login name (GNOME's user widget, without AccountsService).
 pub fn real_name() -> String {
@@ -275,6 +298,23 @@ mod tests {
         assert_eq!(display_name("Ada Lovelace,,,", "ada"), "Ada Lovelace");
         assert_eq!(display_name("", "ada"), "ada");
         assert_eq!(display_name(",,,", "ada"), "ada");
+    }
+
+    #[test]
+    fn lock_notifications_push_the_clock_up_like_unlock_dialog_layout() {
+        // 800 rows, the stack 125 down and 450 tall: 225 rows below it.
+        let layout = |n| lock_notifications_layout(800, 125, 450, n);
+        assert_eq!(layout(0), (0, 0));
+        // Fits below the stack: nothing moves.
+        assert_eq!(layout(225), (0, 225));
+        // Taller: the stack rises as far as the box reaches into it...
+        assert_eq!(layout(250), (25, 250));
+        // ...until it is a tenth of the height from the top; the rest of
+        // the box scrolls.
+        assert_eq!(layout(270), (45, 270));
+        assert_eq!(layout(1000), (45, 270));
+        // A stack too tall for the screen leaves the box no room.
+        assert_eq!(lock_notifications_layout(800, 125, 760, 200), (85, 0));
     }
 
     #[test]
