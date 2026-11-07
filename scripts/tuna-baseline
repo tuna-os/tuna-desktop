@@ -31,10 +31,14 @@ BOOT_TIMEOUT = 900
 GPU_PROFILE = "virtio-vga-pcie-pm-preserved-v1"
 
 
-def gpu_devices():
-    """One shared GPU topology for native GNOME and every Tuna Desktop boot caller."""
+def gpu_devices(outputs=1):
+    """One shared GPU topology for native GNOME and every Tuna Desktop boot caller.
+
+    outputs > 1 adds virtio-gpu scanouts (disconnected until the host's
+    display connects them) for the app-integration lane's hotplug proof."""
+    heads = f",id=tuna-gpu,max_outputs={outputs}" if outputs > 1 else ""
     return ["-device", "pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1",
-            "-device", f"virtio-vga,bus=tuna-gpu-port,x-pcie-pm-no-soft-reset=on,xres={WIDTH},yres={HEIGHT}"]
+            "-device", f"virtio-vga,bus=tuna-gpu-port,x-pcie-pm-no-soft-reset=on,xres={WIDTH},yres={HEIGHT}{heads}"]
 
 
 def log(msg):
