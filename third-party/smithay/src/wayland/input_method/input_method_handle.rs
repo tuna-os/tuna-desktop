@@ -9,7 +9,10 @@ use wayland_protocols_misc::zwp_input_method_v2::server::{
     zwp_input_method_v2::{self, ZwpInputMethodV2},
     zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2,
 };
-use wayland_server::{backend::ClientId, protocol::wl_surface::WlSurface};
+use wayland_server::{
+    backend::{ClientId, ObjectId},
+    protocol::wl_surface::WlSurface,
+};
 use wayland_server::{
     protocol::wl_keyboard::KeymapFormat, Client, DataInit, Dispatch, DisplayHandle, Resource,
 };
@@ -55,16 +58,17 @@ pub struct InputMethodHandle {
 }
 
 impl InputMethodHandle {
-    pub(super) fn add_instance(&self, instance: &ZwpInputMethodV2) {
+    pub(super) fn add_instance(&self, instance: &ZwpInputMethodV2) -> bool {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(instance) = inner.instance.as_mut() {
-            instance.serial = 0;
-            instance.object.unavailable();
+        if inner.instance.is_some() {
+            instance.unavailable();
+            false
         } else {
             inner.instance = Some(Instance {
                 object: instance.clone(),
                 serial: 0,
             });
+            true
         }
     }
 
@@ -167,12 +171,24 @@ impl InputMethodHandle {
 /// User data of ZwpInputMethodV2 object
 pub struct InputMethodUserData<D: SeatHandler> {
     pub(super) handle: InputMethodHandle,
+    pub(super) children: Mutex<Vec<ObjectId>>,
     pub(crate) text_input_handle: TextInputHandle,
     pub(crate) keyboard_handle: KeyboardHandle<D>,
     pub(crate) popup_geometry_callback: fn(&D, &WlSurface) -> Rectangle<i32, Logical>,
     pub(crate) new_popup: fn(&mut D, PopupSurface),
     pub(crate) popup_repositioned: fn(&mut D, PopupSurface),
     pub(crate) dismiss_popup: fn(&mut D, PopupSurface),
+}
+
+impl<D: SeatHandler> InputMethodUserData<D> {
+    fn track_child(&self, child: &impl Resource) {
+        let mut children = self.children.lock().unwrap();
+        if let Some(handle) = child.handle().upgrade() {
+            // Released children need not accumulate for the lifetime of an IM.
+            children.retain(|id| handle.object_info(id.clone()).is_ok());
+        }
+        children.push(child.id());
+    }
 }
 
 impl<D: SeatHandler> fmt::Debug for InputMethodUserData<D> {
@@ -204,6 +220,50 @@ where
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
     ) {
+        // An unavailable object is not the seat's input method, even if it
+        // belongs to the same client as the live one.
+        let owns_instance = data
+            .handle
+            .inner
+            .lock()
+            .unwrap()
+            .instance
+            .as_ref()
+            .is_some_and(|instance| instance.object == *seat);
+        let blocked_grab = owns_instance
+            && matches!(&request, zwp_input_method_v2::Request::GrabKeyboard { .. })
+            && data
+                .keyboard_handle
+                .with_grab(|_, grab| grab.downcast_ref::<InputMethodKeyboardGrab>().is_none())
+                .unwrap_or(false);
+        if !owns_instance || blocked_grab {
+            // Unavailable objects and a grab denied by current compositor
+            // ownership remain inert. Register NewIDs without taking roles,
+            // replacing the seat grab or sending keyboard metadata.
+            match request {
+                zwp_input_method_v2::Request::GetInputPopupSurface { id, .. } => {
+                    let child = data_init.init(
+                        id,
+                        InputMethodPopupSurfaceUserData {
+                            alive_tracker: AliveTracker::default(),
+                        },
+                    );
+                    data.track_child(&child);
+                }
+                zwp_input_method_v2::Request::GrabKeyboard { keyboard } => {
+                    let child = data_init.init(
+                        keyboard,
+                        InputMethodKeyboardUserData {
+                            handle: data.handle.inner.lock().unwrap().keyboard_grab.clone(),
+                            keyboard_handle: data.keyboard_handle.clone(),
+                        },
+                    );
+                    data.track_child(&child);
+                }
+                _ => {}
+            }
+            return;
+        }
         match request {
             zwp_input_method_v2::Request::CommitString { text } => {
                 data.text_input_handle.with_active_text_input(|ti, _surface| {
@@ -267,6 +327,7 @@ where
                         alive_tracker: AliveTracker::default(),
                     },
                 );
+                data.track_child(&instance);
                 let popup_rect = Arc::new(Mutex::new(input_method.popup_handle.rectangle));
                 let popup = PopupSurface::new(instance, surface, popup_rect, parent);
                 input_method.popup_handle.surface = Some(popup.clone());
@@ -276,11 +337,9 @@ where
             }
             zwp_input_method_v2::Request::GrabKeyboard { keyboard } => {
                 let input_method = data.handle.inner.lock().unwrap();
-                data.keyboard_handle.set_grab(
-                    state,
-                    input_method.keyboard_grab.clone(),
-                    SERIAL_COUNTER.next_serial(),
-                );
+                let serial = SERIAL_COUNTER.next_serial();
+                data.keyboard_handle
+                    .set_grab(state, input_method.keyboard_grab.clone(), serial);
                 let instance = data_init.init(
                     keyboard,
                     InputMethodKeyboardUserData {
@@ -288,8 +347,10 @@ where
                         keyboard_handle: data.keyboard_handle.clone(),
                     },
                 );
+                data.track_child(&instance);
                 let mut keyboard = input_method.keyboard_grab.inner.lock().unwrap();
                 keyboard.grab = Some(instance.clone());
+                keyboard.serial = Some(serial);
                 keyboard.text_input_handle = data.text_input_handle.clone();
                 let guard = data.keyboard_handle.arc.internal.lock().unwrap();
                 instance.repeat_info(guard.repeat_rate, guard.repeat_delay);
@@ -321,12 +382,46 @@ where
     }
 
     fn destroyed(
-        _state: &mut D,
+        state: &mut D,
         _client: ClientId,
-        _input_method: &ZwpInputMethodV2,
+        input_method: &ZwpInputMethodV2,
         data: &InputMethodUserData<D>,
     ) {
-        data.handle.inner.lock().unwrap().instance = None;
-        data.text_input_handle.leave();
+        let retired = {
+            let mut inner = data.handle.inner.lock().unwrap();
+            if inner
+                .instance
+                .as_ref()
+                .is_some_and(|instance| instance.object == *input_method)
+            {
+                inner.instance = None;
+                let serial = {
+                    let mut keyboard = inner.keyboard_grab.inner.lock().unwrap();
+                    keyboard.grab = None;
+                    keyboard.serial.take()
+                };
+                Some((serial, inner.popup_handle.surface.take()))
+            } else {
+                None
+            }
+        };
+        // Callouts may re-enter IM/keyboard state; never hold its locks here.
+        if let Some((serial, popup)) = retired {
+            if serial.is_some_and(|serial| data.keyboard_handle.has_grab(serial)) {
+                data.keyboard_handle.unset_grab(state);
+            }
+            if let Some(popup) = popup.filter(|popup| popup.get_parent().is_some()) {
+                (data.dismiss_popup)(state, popup);
+            }
+            data.text_input_handle.leave();
+        }
+        // Destroy only this resource's children, including inert NewIDs.
+        // Already-released IDs are expected and do not affect another owner.
+        let children = std::mem::take(&mut *data.children.lock().unwrap());
+        if let Some(handle) = input_method.handle().upgrade() {
+            for child in children {
+                let _ = handle.destroy_object::<D>(&child);
+            }
+        }
     }
 }

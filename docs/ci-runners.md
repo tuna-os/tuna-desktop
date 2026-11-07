@@ -35,9 +35,9 @@ schedule, dispatch or a pull request whose head repository is
 
 | Runner | Lanes |
 | --- | --- |
-| `tuna-ci-24.04` | select-lanes, check, fprint-phase-proof, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, parity-ledger, docs-shots, ci-gate |
+| `tuna-ci-24.04` | select-lanes, check, fprint-phase-proof, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, native-reference-context, parity-ledger, docs-shots, ci-gate |
 | `tuna-ci-26.04` | journey, orca-speech, portal-security, remote-security, niri-parity |
-| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (both matrix legs), marlin-image |
+| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (pull requests: the primary lifecycle leg only; push, schedule and dispatch add the Orca 51 leg and both paired reference members), marlin-image (push, schedule and dispatch only), gdm51-native-package |
 
 Why the always-hosted lanes stay hosted:
 
@@ -57,6 +57,12 @@ Why the always-hosted lanes stay hosted:
   so a compromised long-lived node (or its shared image store) can never
   sign or push a release image.
 
+The required `gdm51-native-package` factory remains GitHub-hosted and feeds
+only the ordinary lifecycle images' final GDM overlay and fresh-account
+admission. The paired GNOME/Tuna members keep their shared
+`Containerfile.reference`, original `104870` platform payload and stock GDM;
+they do not apply that overlay or relax the original byte inventory.
+
 journey once failed self-hosted in "Qualify disposable Debian lifecycle"
 (`end of file on stdin at conffile prompt`); that came from #899 changing
 the tuna-lock conffile, which fails hosted runs too, not from the runners
@@ -65,6 +71,116 @@ remote-security, niri-parity) use the pods' rootless podman.
 
 Other workflows (`stress`, `fuzz`, `baseline`, …) still use GitHub-hosted
 runners; the same aliases can move them.
+
+## Private GTK AT-SPI comparison dependency
+
+`grid-cancel-comparison` stages Ubuntu GTK `4.14.5+ds-0ubuntu0.10` with
+upstream commit `21d3eb76b68d6758122eddaf00b5823f9b2d7f34` using the existing
+workflow-owned `ci-tool` action. The installer checks both Ubuntu source
+archive hashes and the patch hash; it retains the license, Ubuntu patch
+series, build options, compiler identity and runtime ELF hash/build ID.
+The host GTK and runner image are not replaced. Only this job activates the
+private library through `LD_LIBRARY_PATH`, identically for the unchanged old
+and fixed product roles. Cache publication remains restricted to trusted main.
+
+Before either product role runs, `gtk-atspi-root-proof` uses separate private
+D-Bus/Xvfb sessions to require stock GTK's actual SIGSEGV negative control and
+the repaired runtime's real AT-SPI behavior: named visible children resolve,
+an invisible-tail index and an index with all windows hidden return remote
+InvalidArgument, and valid children remain queryable after remapping.
+The proof checks the mapped patched ELF against the source-build receipt.
+Its receipts and build provenance accompany the comparison artifact; core
+dumps are disabled for this dependency fixture. This toolkit regression proof
+is not product acceptance: the old-negative/fixed-positive Escape comparison
+and all selected exact-head lanes must still pass.
+
+## Keep required checks on the workflow's tested source
+
+The `check` job uses `actions/checkout`'s default PR merge ref, like the
+native DRM and VM lanes. Its workflow and required test scripts must come
+from that same tree. In run
+[`41274593021`](https://github.com/tuna-os/tuna-desktop/actions/runs/41274593021),
+the merge-ref workflow invoked `scripts/lib/a11y-focus-proof-tests.py`,
+but the explicit older head checkout lacked it, so `check` stopped with
+`[Errno 2] No such file or directory`. Checking out the merge ref preserves
+the real predicate suite instead of adding a placeholder or making it
+optional. The check job exports its actual checked commit as `tested_sha`;
+the authentication, fingerprint and grid comparison proofs check out that
+exact output. Their admission receipts bind it to the checkout and commit
+tree separately from the API's triggering `head_sha` (the PR head, not its
+merge tree). Lane selection remains head-only because it computes the PR
+diff. Record the actual tested commit in evidence, never interchange it with
+the triggering head.
+
+The same run's `drm-smoke` passed output, shell, idle, frame pacing, scale
+and monitor-mode gates, then failed `D-COLORD` before its private colour
+service became ready; `colord.log` was empty. That does not establish a
+compositor colour regression or a passing colour gate. Readiness is judged
+by the real private-bus `GetDevices` reply within the unchanged 30 seconds,
+not by unprivileged `kill -0` of a potentially root-owned sudo launcher
+(which can return EPERM for a live process). There is no unbounded wait.
+The private bus and every colour, gamma and restart assertion remain required.
+
+The changed-source hosted run
+[`41390839901`](https://github.com/tuna-os/tuna-desktop/actions/runs/41390839901)
+subsequently passed all 19 DRM assertions, including the actual colord,
+gamma, calibration and restart gates. It exposed two separate prerequisite
+defects: `check` reached its real strip-capture tests but lacked Pillow
+(`ModuleNotFoundError: PIL`), and the pinned Orca factory entry point was
+invoked as an executable despite its non-executable source mode
+(`Permission denied`, exit 126). Declare `python3-pil` in the check job's
+existing apt dependencies and run that consumer with `/usr/bin/python3`.
+Invoke the unchanged pinned factory through Bash, like the GDM native
+factory. Neither a self-hosted preinstalled dependency nor a cache hit is a
+dependency declaration; do not skip the consumer or replace the pinned build.
+
+In [CI 41395937699](https://github.com/tuna-os/tuna-desktop/actions/runs/41395937699),
+both native profiles passed all 32 fresh-account gates and 14 strip cases,
+and the real typed slideshow/SVG and pinned Orca journeys passed. The
+required check still failed
+`control::tests::native_outputs_cleared_on_failed_redial_and_transport_loss`:
+the fixture merely dropped one peer descriptor, then treated any polling
+error as proof of transport loss. An open duplicate instead means transient
+`WouldBlock`, for which retaining the current inventory is correct.
+
+Deliberate peer-loss fixtures must use the file's existing `shutdown(Both)`
+convention before dropping the descriptor: a concurrent fork can retain a
+copy until exec. The regression now deliberately retains a duplicate,
+distinguishes open-endpoint `WouldBlock` from actual shutdown/EOF, and
+requires terminal failed-redial I/O before judging native-output revocation.
+All eleven deliberate closure fixtures use that convention. No production
+state transition, polling interval, acceptance guard or test is removed.
+
+The maintained-media check additionally needs read-only Actions access to
+authenticate the exact uploaded source-artifact bytes before replaying
+receipts against proposed canonical media; dependency auditing remains
+tokenless and fatal. Its real recording tests require FFmpeg (including
+`ffprobe`) and Pillow in the check job, not just in a capture producer.
+The GDM 51 final overlay belongs to the lifecycle images after the
+distribution/Orca branches. The paired GNOME/Tuna reference rows retain
+their separately admitted immutable base, while lifecycle image receipts
+retain the verified native platform digest rather than rereading a mutable
+tag after the build. These are source and admission contracts, not a claim
+that this merge has runtime or current-image qualification.
+
+## What a pull request runs
+
+Hosted minutes are the scarce resource, so a pull request pays only for what
+it can affect:
+
+- `select-lanes` and `check` always run; a **draft** pull request runs nothing
+  else (marking it ready for review starts the proof lanes).
+- Every proof lane waits for `check` (`needs: check`, directly or through
+  `arch-package`), so a red `check` does not also burn the lanes.
+- `scripts/ci-select-lanes` picks the lanes: docs, other non-runtime files and
+  the tooling of other workflows (its `NO_LANE` list) pick none, a lane's own
+  proof script picks that lane, an edit confined to some lane jobs of `ci.yml`
+  picks those lanes, and any other code picks `gtk-shell` plus a rotating
+  slice. Shared CI inputs still pick every lane.
+- A newer push supersedes the older run (`concurrency` with
+  `cancel-in-progress`, except for `main`).
+- `marlin-tuna-nightly` qualifies the published image on schedule and
+  dispatch only; dispatch it on a branch to test a change to it.
 
 ## Queue supersession and closed pull requests
 
@@ -489,6 +605,19 @@ Every job evaluated afterwards uses its original GitHub-hosted label
 (`ubuntu-latest` / `ubuntu-26.04`); assertions are identical on both.
 Re-run queued runs as in [Drain](#drain-maintenance-on-karnataka).
 `gh variable delete CI_RUNNERS -R tuna-os/tuna-desktop` switches back.
+
+On 2026-11-02, the five `tuna-ci-26.04` jobs in PR #985's run
+`41274593021` remained queued without an assigned runner. Read-only ARC
+inspection found all four existing 26.04 runner pods in `ErrImageNeverPull`
+for approximately 24 hours: their `imagePullPolicy: Never` image
+`localhost/tuna-ci-runner:26.04-2.338.2-202610310435` was absent on
+`karnataka`. This is a runner-image provisioning failure, not evidence that
+the queued journey, Orca, portal, remote or niri gates passed or failed.
+The existing `CI_RUNNERS=hosted` rollback switch was enabled for newly
+evaluated jobs, without creating runners, loading images or changing gate
+coverage. That switch does not repair ARC or move already queued jobs.
+The reviewed source correction must get a new changed-head run; retain its
+predecessor's actual VM receipts before retiring only that obsolete PR run.
 
 Full removal:
 

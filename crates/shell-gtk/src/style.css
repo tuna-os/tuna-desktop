@@ -968,6 +968,23 @@ window.tuna-audio-device-selection {
   background-color: rgba(121, 160, 208, 0.12);
 }
 
+/* GNOME 51's Dialog.ListSection in the end-session dialog
+   (_dialogs.scss .dialog-list): a centered heading over the inhibiting
+   applications, at most 200px tall, each a 64px icon beside its bold
+   name and caption-sized reason. */
+.tuna-end-session .dialog-list-title {
+  font-weight: 700;
+}
+
+.tuna-end-session .dialog-list-item-title {
+  font-weight: 700;
+}
+
+.tuna-end-session .dialog-list-item-description {
+  font-size: 9pt;
+  color: #f2f2f2;
+}
+
 /* GNOME 51's Run a Command dialog (_dialogs.scss .run-dialog): a 24em
    card, the entry padded 12px x 9px, a caption-sized dimmed hint. */
 .tuna-run-dialog .run-dialog {

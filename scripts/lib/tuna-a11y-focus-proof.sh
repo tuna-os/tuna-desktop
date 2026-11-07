@@ -29,7 +29,11 @@ a11y_focus_timeline() {
 
 # jq over a timeline's per-control summary.
 a11y_focus_check() {
-    jq -e --arg c "$2" ".controls[\$c] | $3" "$ARTIFACTS/focus-ring-$1.json" >/dev/null
+    if jq -e --arg c "$2" ".controls[\$c] | $3" "$ARTIFACTS/focus-ring-$1.json" >/dev/null; then
+        return 0
+    fi
+    jq --arg c "$2" '{control: $c, observation: .controls[$c]}' "$ARTIFACTS/focus-ring-$1.json" >&2
+    return 1
 }
 
 a11y_focus_dump() {
@@ -88,19 +92,23 @@ a11y_focus_ring_proof() {
     a11y_focus_timeline five 7 shift+Tab "act=$act" "clock=$clock"
     a11y_focus_dump five
     focused "$ARTIFACTS/a11y-focus-five.json" Activities ||
-        fail G-FOCUS-RING-TIMEOUT "Shift+Tab did not return focus to Activities"
-    a11y_focus_check five act '.lit_from != null and .lit_from <= 0.8 and .lit_until != null and .lit_until >= 4.8 and .lit_until <= 5.9' ||
+        fail G-FOCUS-RING "Shift+Tab did not return focus to Activities"
+    a11y_focus_check five act '.lit_from != null and .lit_from <= 0.8' ||
+        fail G-FOCUS-RING "Shift+Tab did not light Activities within 0.8 s (5 s setting)"
+    a11y_focus_check five act '.lit_until != null and .lit_until >= 4.8 and .lit_until <= 5.9' ||
         fail G-FOCUS-RING-TIMEOUT "a 5 s timeout did not keep the indication past the toolkit's 3 s"
 
     # Zero: forever.
     gsettings set "$A11Y_INTERFACE" "$A11Y_FOCUS_KEY" 0
     sleep 0.5
     a11y_focus_timeline forever 8 Tab "act=$act" "clock=$clock"
-    a11y_focus_check forever clock '.lit_from != null and .lit_from <= 0.8 and .lit_until == null' ||
+    a11y_focus_check forever clock '.lit_from != null and .lit_from <= 0.8' ||
+        fail G-FOCUS-RING "Tab did not light the clock within 0.8 s (zero timeout)"
+    a11y_focus_check forever clock '.lit_until == null' ||
         fail G-FOCUS-RING-TIMEOUT "a zero timeout let the indication clear within 8 s"
     a11y_focus_dump forever
     focused "$ARTIFACTS/a11y-focus-forever.json" "Date and Time" ||
-        fail G-FOCUS-RING-TIMEOUT "Tab did not move focus to the clock"
+        fail G-FOCUS-RING "Tab did not move focus to the clock"
     xdotool key Escape
     sleep 1
     gsettings reset "$A11Y_INTERFACE" "$A11Y_FOCUS_KEY"
