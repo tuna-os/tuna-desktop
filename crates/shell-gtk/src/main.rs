@@ -80,6 +80,7 @@ mod brightness;
 mod brightness_service;
 mod bt_menu;
 mod calendar;
+mod dash_motion;
 mod display_change;
 mod events;
 mod fd_watch;
