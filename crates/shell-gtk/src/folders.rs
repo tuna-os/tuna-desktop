@@ -882,6 +882,7 @@ mod tests {
 
     #[test]
     fn closed_and_dragging_preserve_folder_refresh_until_ready() {
+        let _dispatch = crate::test_dispatch_guard();
         let watch = FolderWatch {
             root: None,
             backend: None,
@@ -901,6 +902,7 @@ mod tests {
 
     #[test]
     fn retained_folder_watch_memory_changes_and_subscription_removal() {
+        let _dispatch = crate::test_dispatch_guard();
         let context = glib::MainContext::new();
         context
             .with_thread_default(|| {
@@ -948,6 +950,7 @@ mod tests {
 
     #[test]
     fn folder_changes_wake_the_overview_without_compositor_traffic() {
+        let _dispatch = crate::test_dispatch_guard();
         let context = glib::MainContext::new();
         context
             .with_thread_default(|| {
@@ -980,6 +983,7 @@ mod tests {
 
     #[test]
     fn retained_folder_watch_preserves_root_priority_and_rejects_path_escape() {
+        let _dispatch = crate::test_dispatch_guard();
         let fixture = TestSchemas::new();
         let backend = gio::memory_settings_backend_new();
         let watch = FolderWatch::with_source(Some(fixture.source.clone()), Some(backend));
@@ -996,6 +1000,7 @@ mod tests {
 
     #[test]
     fn retained_folder_watch_keyfile_external_atomic_write() {
+        let _dispatch = crate::test_dispatch_guard();
         let context = glib::MainContext::new();
         let dir =
             std::env::temp_dir().join(format!("tuna-folder-watch-{}", glib::uuid_string_random()));
@@ -1090,6 +1095,7 @@ mod tests {
 
     #[test]
     fn create_observer_real_keyfile_records_each_actual_setter_and_file() {
+        let _dispatch = crate::test_dispatch_guard();
         let (_fixture, trace, _root, _child) = observed_keyfile_create(false);
         assert_eq!(trace.expected_name, "Unnamed Folder");
         assert_eq!(trace.expected_apps, ["one.desktop", "two.desktop"]);
@@ -1133,6 +1139,7 @@ mod tests {
 
     #[test]
     fn create_refused_name_does_not_publish_or_write_apps() {
+        let _dispatch = crate::test_dispatch_guard();
         let (_fixture, trace, root, child) = observed_keyfile_create(true);
         // Deliberately restrictive real schema: not an attribution of the old CI failure.
         assert_eq!(trace.events.len(), 1);
@@ -1153,6 +1160,7 @@ mod tests {
 
     #[test]
     fn create_refused_apps_does_not_publish_or_change_existing_children() {
+        let _dispatch = crate::test_dispatch_guard();
         let (_fixture, trace, root, child) =
             observed_keyfile_create_with_refusal(false, true, false);
         assert_eq!(trace.events.len(), 2);
@@ -1172,6 +1180,7 @@ mod tests {
 
     #[test]
     fn create_refused_root_does_not_report_success_or_remove_existing_children() {
+        let _dispatch = crate::test_dispatch_guard();
         let (_fixture, trace, root, child) =
             observed_keyfile_create_with_refusal(false, false, true);
         assert_eq!(trace.events.len(), 3);
@@ -1198,6 +1207,7 @@ mod tests {
 
     #[test]
     fn create_existing_id_or_empty_members_leaves_existing_folder_untouched() {
+        let _dispatch = crate::test_dispatch_guard();
         let fixture = TestSchemas::new();
         let backend = gio::memory_settings_backend_new();
         let root = gio::Settings::new_full(
@@ -1238,6 +1248,7 @@ mod tests {
 
     #[test]
     fn create_preserves_root_change_dispatched_during_child_initialization() {
+        let _dispatch = crate::test_dispatch_guard();
         let fixture = TestSchemas::new();
         let backend = gio::memory_settings_backend_new();
         let root = gio::Settings::new_full(
@@ -1251,17 +1262,25 @@ mod tests {
             Some("/org/gnome/desktop/app-folders/folders/Live/"),
         );
         root.set_strv("folder-children", ["Existing"]).unwrap();
+        // Drive the concurrent root change synchronously from child
+        // initialization itself: `changed` signal dispatch is not guaranteed
+        // synchronous under parallel tests, but the re-read before publication
+        // must preserve a same-process change however it arrives.
         let changing_root = root.clone();
-        child.connect_changed(Some("name"), move |_, _| {
-            changing_root
-                .set_strv("folder-children", ["Existing", "Other"])
-                .unwrap();
-        });
-        // Gio requires reading this key after connecting for changed delivery.
-        let _ = child.string("name");
         let one = app("one", "One", &[]);
         assert_eq!(
-            create_with_settings(&[&one], "Live", &root, || child.clone(), None),
+            create_with_settings(
+                &[&one],
+                "Live",
+                &root,
+                || {
+                    changing_root
+                        .set_strv("folder-children", ["Existing", "Other"])
+                        .unwrap();
+                    child.clone()
+                },
+                None
+            ),
             Some("Live".to_owned())
         );
         assert_eq!(
@@ -1275,6 +1294,7 @@ mod tests {
 
     #[test]
     fn create_refuses_name_changed_by_actual_apps_setter_callback() {
+        let _dispatch = crate::test_dispatch_guard();
         let fixture = TestSchemas::new();
         let backend = gio::memory_settings_backend_new();
         let root = gio::Settings::new_full(
@@ -1311,6 +1331,7 @@ mod tests {
 
     #[test]
     fn create_observer_actual_file_replacement_distinguishes_later_loss() {
+        let _dispatch = crate::test_dispatch_guard();
         let (_fixture, mut trace, root, child) = observed_keyfile_create(false);
         assert_eq!(trace.events[0]["setter_result"], true);
         let path = trace
@@ -1346,6 +1367,7 @@ mod tests {
 
     #[test]
     fn create_file_observation_refuses_symlink_and_excess_file_before_read() {
+        let _dispatch = crate::test_dispatch_guard();
         use std::os::unix::fs::symlink;
         let (fixture, trace, _root, _child) = observed_keyfile_create(false);
         let config = trace.proof_config.as_ref().unwrap();
@@ -1369,6 +1391,7 @@ mod tests {
 
     #[test]
     fn folder_lists_change_like_gnome() {
+        let _dispatch = crate::test_dispatch_guard();
         let v = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         // Adding: joins apps, leaves the exclusions.
         let (apps, excluded) = with_app(&v(&["a.desktop"]), &v(&["b.desktop"]), "b.desktop");
@@ -1402,6 +1425,7 @@ mod tests {
 
     #[test]
     fn folders_take_apps_by_id_and_category_minus_exclusions() {
+        let _dispatch = crate::test_dispatch_guard();
         let utilities = Folder {
             id: "Utilities".into(),
             name: "Utilities".into(),
@@ -1435,6 +1459,7 @@ mod tests {
 
     #[test]
     fn first_run_folders_follow_gnome_51() {
+        let _dispatch = crate::test_dispatch_guard();
         let installed = vec![
             app(
                 "org.freedesktop.MalcontentControl",
@@ -1460,6 +1485,7 @@ mod tests {
 
     #[test]
     fn dash_favorites_leave_the_grid() {
+        let _dispatch = crate::test_dispatch_guard();
         let utilities = Folder {
             id: "Utilities".into(),
             name: "Utilities".into(),
