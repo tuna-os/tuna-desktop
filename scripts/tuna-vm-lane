@@ -3996,8 +3996,8 @@ def gpu_devices_for_receipt(explicit_sync=False):
         # (run 41866163092). The session compositor now selects the
         # rendering virtio-gpu over the KMS-only bochs boot GPU (run
         # 42336367004: card0 bochs has no EGL device, so explicit sync and
-        # dmabuf feedback were off); presenting that output to the VGA
-        # console QMP can capture needs a secondary-GPU scanout copy.
+        # dmabuf feedback were off); its secondary GPU copy shows the frames
+        # on bochs's monitor, the VGA console QMP captures.
         return ["-device", "pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1",
                 "-device", "virtio-gpu-gl-pci,bus=tuna-gpu-port,"
                            f"xres={WIDTH},yres={HEIGHT}"]

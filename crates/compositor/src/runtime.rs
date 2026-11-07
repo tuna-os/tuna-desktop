@@ -1024,15 +1024,16 @@ impl Runtime {
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
                 handle
                     .insert_source(sources.drm, |event, metadata, rt: &mut Runtime| {
-                        let flip = match &mut rt.backend {
-                            Backend::Drm(drm) => drm.borrow_mut().on_drm_event(event, metadata),
-                            Backend::Winit(_) => None,
-                        };
-                        if let Some(flip) = flip {
-                            rt.page_flipped(flip);
-                        }
+                        rt.on_drm_event(None, event, metadata);
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                for (index, notifier) in sources.secondary.into_iter().enumerate() {
+                    handle
+                        .insert_source(notifier, move |event, metadata, rt: &mut Runtime| {
+                            rt.on_drm_event(Some(index), event, metadata);
+                        })
+                        .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                }
                 if let Some(udev) = sources.udev {
                     handle
                         .insert_source(udev, |event, _, rt: &mut Runtime| {
@@ -5328,6 +5329,23 @@ impl Runtime {
         Ok(!self.exit)
     }
 
+    /// A DRM event of the primary GPU (`gpu` None) or a secondary one.
+    #[cfg(feature = "drm")]
+    fn on_drm_event(
+        &mut self,
+        gpu: Option<usize>,
+        event: smithay::backend::drm::DrmEvent,
+        metadata: &mut Option<smithay::backend::drm::DrmEventMetadata>,
+    ) {
+        let flip = match &mut self.backend {
+            Backend::Drm(drm) => drm.borrow_mut().on_drm_event(gpu, event, metadata),
+            Backend::Winit(_) => None,
+        };
+        if let Some(flip) = flip {
+            self.page_flipped(flip);
+        }
+    }
+
     /// A page flip completed (hardware): mark what the frame drew
     /// presented with the kernel's vblank time and sequence, and on the
     /// primary output advance fifo barriers and commit timers (#89).
@@ -6443,8 +6461,9 @@ impl Runtime {
                         continue;
                     }
                     // Account for changes since this particular swapchain buffer
-                    // was submitted, including intervening frames.
-                    let (mut dmabuf, age) = match out.surface.next_buffer() {
+                    // (or secondary GPU copy texture) was submitted, including
+                    // intervening frames.
+                    let (mut buffer, age) = match out.next_render_target(renderer) {
                         Ok(buffer) => buffer,
                         Err(e) => {
                             eprintln!("tuna-compositor: drm: next_buffer {}: {e}", out.name);
@@ -6517,8 +6536,8 @@ impl Runtime {
                     };
                     let cost;
                     let sync = {
-                        let mut target = renderer
-                            .bind(&mut dmabuf)
+                        let mut target = buffer
+                            .bind(renderer)
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                         let mut frame = renderer
                             .render(
@@ -6576,13 +6595,15 @@ impl Runtime {
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?
                     };
                     let feedback = crate::frame_timing::take_feedback(&mine, &out.output);
-                    if let Err(e) = out.surface.queue_buffer(
-                        Some(sync),
-                        Some(crate::native_repaint::scanout_damage_rotated(
+                    if let Err(e) = out.queue_render_target(
+                        renderer,
+                        buffer,
+                        sync,
+                        crate::native_repaint::scanout_damage_rotated(
                             &damage,
                             output_transform,
                             (logical.w, logical.h),
-                        )),
+                        ),
                         feedback,
                     ) {
                         eprintln!("tuna-compositor: drm: queue_buffer {}: {e}", out.name);
