@@ -301,6 +301,9 @@ def _loupe(desktop):
         # gate below instead of passing silently.
         engine = desktop.guest('desktop', 'ime-engine', select=True)
         try:
+            # The entry holds the current zoom level; select it so the
+            # commit replaces it, exactly as ime() does for ordinary fields.
+            desktop.keys('ctrl', 'a')
             desktop.type_ascii('nihao')
             desktop.keys('spc')
             committed = desktop.await_state('loupe-real-zoom-commit', lambda: desktop.tree(actor),
