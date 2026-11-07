@@ -62,7 +62,7 @@ jobs:
             echo 'lanes=[]' >> "$GITHUB_OUTPUT"
           elif [ -n "$BASE_SHA" ]; then
             git fetch --no-tags --quiet origin "$BASE_SHA"
-            git diff --name-only "$BASE_SHA...HEAD" | scripts/ci-select-lanes --changed - >> "$GITHUB_OUTPUT"
+            git diff --name-only "$BASE_SHA...HEAD" | scripts/ci-select-lanes --changed - --base "$BASE_SHA" >> "$GITHUB_OUTPUT"
           else
             scripts/ci-select-lanes >> "$GITHUB_OUTPUT"
           fi
