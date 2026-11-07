@@ -43,9 +43,16 @@ int main(int argc, char **argv) {
             ei_event_unref(event);
         }
         if (keyboard && pointer) {
-            /* Keep the connection alive until all frames have been dispatched. */
-            for (int i = 0; i < 10; i++) { ei_dispatch(ei); usleep(20000); }
+            /* Flushing frames does not acknowledge compositor/GTK delivery.
+             * Keep the grant live until the parent observes that receipt. */
+            ei_dispatch(ei);
             puts("libei keyboard and absolute pointer/button frames sent");
+            fflush(stdout);
+            struct pollfd ack = {.fd = STDIN_FILENO, .events = POLLIN};
+            char received;
+            if (poll(&ack, 1, 15000) <= 0 ||
+                read(STDIN_FILENO, &received, 1) != 1 || received != '\n')
+                return 6;
             ei_unref(ei);
             return 0;
         }

@@ -7,6 +7,11 @@
 #   --a11y-focus-only runs panel readiness, G-FOCUS-RING, G-FOCUS-RING-TIMEOUT,
 #   G-A11Y-MENU-RESTART and G-SHELL-STABLE only.
 #   --folder-dnd-only runs panel readiness and the unchanged G-FOLDER-DND gate.
+#   --grid-hover-only runs panel readiness, G-GRID-HOVER, G-GRID-REORDER,
+#   and G-SHELL-STABLE only.
+#   --keyboard-routes-only runs panel readiness and the P-A11Y-02 keyboard
+#   route gates (G-PANEL-MENU-KEYS, G-QS-MENU-KEY, G-NOTIFICATION-KEYS,
+#   G-SCREENSHOT-CTRL-C) only.
 #   --grid-cancel-only --grid-cancel-admission FILE is an exact CI comparison slice.
 #   --expect-grid-cancel-old-negative is permitted only in that admitted slice.
 #
@@ -45,6 +50,9 @@
 #                  it jumps, and Reduced Motion keeps only the fades
 #   G-LAUNCH-ZOOM  launching from the grid zooms the icon and label out
 #                  over 250 ms
+#   G-GRID-ACTIVATE-RUNNING a running app's grid tile raises its window
+#                  without launching it again or zooming; Ctrl+click
+#                  opens a new window with the zoom (AppIcon.activate)
 #   G-GRID-FADE    Show Apps fades the grid in over 400 ms after 100 ms
 #   G-APP-FOLDERS  GNOME's app-folders settings group the app grid: the
 #                  folder replaces its apps and opens to show them
@@ -216,6 +224,18 @@
 #   G-POWER-DIALOG Power Off… opens the 60 s end-session dialog, and
 #                  Cancel closes it with nothing done
 #   G-POWER-OFF    confirming the dialog asks logind to power off
+#   G-END-SESSION-RESTART, G-END-SESSION-POWEROFF, G-END-SESSION-LOGOUT
+#                  Restart…, Power Off… and Log Out… ask
+#                  org.gnome.SessionManager (the compositor's) for Reboot,
+#                  Shutdown and Logout(0) as GNOME Shell 51's
+#                  systemActions.js; the manager opens the shell's
+#                  EndSessionDialog (type, 0, 60, inhibitors), which lists
+#                  the application holding a logout inhibitor and counts
+#                  down from 60 in GNOME's ten-second steps; Cancel leaves
+#                  the session and logind untouched; confirming reaches the
+#                  manager, which asks the logind stub itself (Reboot,
+#                  PowerOff) or, for Log Out (last), ends the compositor
+#                  through its orderly shutdown (#589)
 #   G-LOCKDOWN-LOG-OUT disable-log-out flipped live removes Log Out…,
 #                  Restart… and Power Off… from the open power menu,
 #                  keeps Suspend, and restores them (#357)
@@ -246,6 +266,17 @@
 #                  the system menu, Enter opens quick settings, Escape
 #                  unwinds and returns focus to the client; the
 #                  backward chord starts on the last control
+#   G-PANEL-MENU-KEYS Down on a focused panel button opens its menu with
+#                  focus inside; Left/Right at an open menu's edge switch
+#                  to the neighbouring panel menu (popupMenu.js, panelMenu.js)
+#   G-QS-MENU-KEY  Shift+F10 / Menu open quick settings' power and toggle
+#                  menus (St popup-menu)
+#   G-NOTIFICATION-KEYS Delete closes a focused banner or list group,
+#                  Escape expires a focused banner, Enter/Escape expand and
+#                  collapse a list group with focus kept (messageList.js,
+#                  messageTray.js, calendar.js)
+#   G-WINDOW-MENU-KEYS Up/Down walk the window menu's rows
+#   G-SCREENSHOT-CTRL-C Ctrl+C captures in the screenshot UI (screenshot.js)
 #   G-KEY-BRIGHTNESS the brightness key steps the backlight through logind
 #   G-SCREENSHOT-UI  Print opens the screenshot UI; Screen + Capture saves
 #   G-SCREENSHOT-UI-WINDOW Window shows GNOME's window selector, the
@@ -381,6 +412,8 @@ HEIGHT=800
 INSTALLED_PACKAGE=0
 SCREENSHOT_KEYS_ONLY=0
 A11Y_FOCUS_ONLY=0
+GRID_HOVER_ONLY=0
+KEYBOARD_ROUTES_ONLY=0
 GRID_CANCEL_ONLY=0
 FOLDER_DND_ONLY=0
 GRID_CANCEL_OLD_NEGATIVE=0
@@ -395,14 +428,19 @@ while [ $# -gt 0 ]; do
         --screenshot-keys-only) SCREENSHOT_KEYS_ONLY=1; shift ;;
         --a11y-focus-only) A11Y_FOCUS_ONLY=1; shift ;;
         --folder-dnd-only) FOLDER_DND_ONLY=1; shift ;;
+        --grid-hover-only) GRID_HOVER_ONLY=1; shift ;;
+        --keyboard-routes-only) KEYBOARD_ROUTES_ONLY=1; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
-        --help|-h) sed -n '2,19p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,22p' "$0"; exit 0 ;;
         *) echo "tuna-gtk-shell-proof: unknown argument $1" >&2; exit 1 ;;
     esac
 done
+if [ "$GRID_HOVER_ONLY" = 1 ] && { [ "$SCREENSHOT_KEYS_ONLY" = 1 ] || [ "$A11Y_FOCUS_ONLY" = 1 ] || [ "$GRID_CANCEL_ONLY" = 1 ] || [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || [ -n "$GRID_CANCEL_ADMISSION" ]; }; then
+    echo "--grid-hover-only cannot be combined with other focused or grid admission flags" >&2; exit 1
+fi
 if [ "$GRID_CANCEL_ONLY" = 1 ]; then
-    if [ "$INSTALLED_PACKAGE" != 0 ] || [ "$SCREENSHOT_KEYS_ONLY" != 0 ] || [ "$A11Y_FOCUS_ONLY" != 0 ] || [ -z "$GRID_CANCEL_ADMISSION" ]; then
+    if [ "$INSTALLED_PACKAGE" != 0 ] || [ "$SCREENSHOT_KEYS_ONLY" != 0 ] || [ "$A11Y_FOCUS_ONLY" != 0 ] || [ "$KEYBOARD_ROUTES_ONLY" != 0 ] || [ -z "$GRID_CANCEL_ADMISSION" ]; then
         echo "grid comparison requires an admitted source-mode tuple" >&2; exit 1
     fi
 elif [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || [ -n "$GRID_CANCEL_ADMISSION" ]; then
@@ -563,6 +601,8 @@ HOT_CORNER_PID=""
 OCCLUSION_PIDS=""
 A11Y_INPUT_PID=""
 CURSOR_PID=""
+END_INHIBITOR_PID=""
+END_MONITOR_PID=""
 IME_PIDS=""
 GSD_MEDIA_KEYS_PID=""
 GSD_BUS_PID=""
@@ -578,6 +618,7 @@ cleanup() {
     if [ -n "$HOT_CORNER_PID" ]; then kill "$HOT_CORNER_PID" 2>/dev/null || true; fi
     if [ -n "$A11Y_INPUT_PID" ]; then kill "$A11Y_INPUT_PID" 2>/dev/null || true; fi
     if [ -n "$CURSOR_PID" ]; then kill "$CURSOR_PID" 2>/dev/null || true; fi
+    for end_pid in $END_INHIBITOR_PID $END_MONITOR_PID; do kill "$end_pid" 2>/dev/null || true; done
     # shellcheck disable=SC2086
     if [ -n "$OCCLUSION_PIDS" ]; then kill $OCCLUSION_PIDS 2>/dev/null || true; fi
     # shellcheck disable=SC2086
@@ -688,8 +729,91 @@ cstate() {
     return 1
 }
 
+# Select the rendered icon through actual accessibility bounds, including
+# the descendant button; distribution app catalogs change grid allocation.
+grid_origin() {
+    grid_namespace="${1:-tuna-shell-appgrid}"
+    cstate ".layers | any(.namespace == \"$grid_namespace\")" "grid layer" || fail G-GRID-DRAG-PAGE "grid layer missing"
+    grid_origin_x="$(jq --arg namespace "$grid_namespace" '.layers[] | select(.namespace == $namespace) | .rect[0]' "$CSTATE")"
+    grid_origin_y="$(jq --arg namespace "$grid_namespace" '.layers[] | select(.namespace == $namespace) | .rect[1]' "$CSTATE")"
+}
+grid_point() {
+    jq -er --arg name "$2" --argjson ox "$grid_origin_x" --argjson oy "$grid_origin_y" --argjson edge "${3:--1}" '[.[] | select(.showing and (.role == "push button" or .role == "button") and .name == $name and (.bounds[2] > 0) and (.bounds[3] > 0))][0].bounds | select(length == 4) | "\((.[0] + $ox + (if $edge >= 0 then $edge else .[2] / 2 end)) | floor) \((.[1] + $oy + .[3] / 2) | floor)"' "$1"
+}
+
+grid_hover_proof() {
+# GNOME's grid reorder: an app dropped on another tile's edge takes its
+# place, and the grid is saved to org.gnome.shell app-picker-layout.
+# The earlier folder drop persisted its catalog. Give this reorder proof
+# an explicit starting order before asserting exact positions 0, 1 and 2.
+gsettings set org.gnome.shell app-picker-layout "[{'tuna-move-One.desktop': <{'position': <0>}>, 'tuna-move-Three.desktop': <{'position': <1>}>, 'tuna-move-Two.desktop': <{'position': <2>}>}]"
+for n in One Two Three; do
+    printf '[Desktop Entry]\nName=AAA Move %s\nExec=true\nType=Application\n' "$n" \
+        >"$XDG_DATA_HOME/applications/tuna-move-$n.desktop"
+done
+sleep 1.5
+xdotool key super+a
+cstate '.overview_open and .overview_app_grid' "app grid" || fail G-GRID-REORDER "Super+A did not show the app grid"
+sleep 1.5
+# By name the cells read One, Three, Two: Two (third cell) onto the left
+# edge of One (first cell, x 146-259).
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-before-hover.json" 20 || fail G-GRID-HOVER "baseline dump failed"
+grid_origin
+layout_before_hover="$(gsettings get org.gnome.shell app-picker-layout)"
+grid_coordinates="$(grid_point "$ARTIFACTS/a11y-grid-before-hover.json" "AAA Move Two")" || fail G-GRID-HOVER "source tile bounds missing"
+read -r source_x source_y <<EOF
+$grid_coordinates
+EOF
+grid_coordinates="$(grid_point "$ARTIFACTS/a11y-grid-before-hover.json" "AAA Move One" 4)" || fail G-GRID-HOVER "target edge bounds missing"
+read -r target_x target_y <<EOF
+$grid_coordinates
+EOF
+xdotool mousemove --window "$WID" "$source_x" "$source_y"
+sleep 0.3
+xdotool mousedown 1
+sleep 0.1
+# Recognize the drag before crossing to the target, as in the page proof.
+for step in $(seq 1 6); do
+    xdotool mousemove --window "$WID" $((source_x - step * 10)) "$source_y"
+    sleep 0.05
+done
+sleep 0.25
+xdotool mousemove --window "$WID" "$target_x" "$target_y"
+sleep 0.35
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-live-hover.json" 20 || fail G-GRID-HOVER "hover dump failed"
+before_x="$(jq '[.[] | select(.showing and (.role == "push button" or .role == "button") and .name == "AAA Move One")][0].bounds[0]' "$ARTIFACTS/a11y-grid-before-hover.json")"
+after_x="$(jq '[.[] | select(.showing and (.role == "push button" or .role == "button") and .name == "AAA Move One")][0].bounds[0]' "$ARTIFACTS/a11y-grid-live-hover.json")"
+scrot "$ARTIFACTS/11g-grid-live-hover.png" >/dev/null
+[ "$after_x" -gt "$before_x" ] || fail G-GRID-HOVER "the neighboring tile did not reflow while the button remained down"
+[ "$(gsettings get org.gnome.shell app-picker-layout)" = "$layout_before_hover" ] || fail G-GRID-HOVER "hover persisted an unfinished drag"
+scrot "$ARTIFACTS/11g-grid-live-hover.png" >/dev/null
+# Reflow puts the dragged tile in the vacant slot. Dropping on its own
+# center commits the preview instead of treating it as a cancelled drag.
+release_point="$(grid_point "$ARTIFACTS/a11y-grid-live-hover.json" "AAA Move Two")"
+# shellcheck disable=SC2086
+xdotool mousemove --window "$WID" $release_point
+xdotool mouseup 1
+sleep 1.5
+pass G-GRID-HOVER "a tile edge reflows after the 200ms delay while dragging, with persistence deferred to drop"
+scrot "$ARTIFACTS/11g-grid-reordered.png" >/dev/null
+layout="$(gsettings get org.gnome.shell app-picker-layout)"
+case "$layout" in
+    *"'tuna-move-Two.desktop': <{'position': <0>}>"*) ;;
+    *) fail G-GRID-REORDER "the moved app is not first in app-picker-layout: $(echo "$layout" | cut -c1-200)" ;;
+esac
+case "$layout" in
+    *"'tuna-move-One.desktop': <{'position': <1>}>"*"'tuna-move-Three.desktop': <{'position': <2>}>"* | \
+        *"'tuna-move-Three.desktop': <{'position': <2>}>"*"'tuna-move-One.desktop': <{'position': <1>}>"*) ;;
+    *) fail G-GRID-REORDER "the apps it displaced did not each move one place on" ;;
+esac
+pass G-GRID-REORDER "an app dropped on a tile's edge takes its place and the grid is saved as GNOME saves it"
+xdotool key Escape
+cstate '.overview_open | not' "closed" || { xdotool key Escape; cstate '.overview_open | not' "closed" || fail G-GRID-REORDER "overview stayed open"; }
+}
+
 . "$ROOT/scripts/lib/tuna-screenshot-keys-proof.sh"
 . "$ROOT/scripts/lib/tuna-a11y-focus-proof.sh"
+. "$ROOT/scripts/lib/tuna-keyboard-routes-proof.sh"
 
 # Select the rendered icon through actual accessibility bounds, including
 # the descendant button; distribution app catalogs change grid allocation.
@@ -821,10 +945,20 @@ SESSION_ISOLATION
 
 [ -n "$DISPLAY_ARG" ] && DISPLAY="$DISPLAY_ARG" && export DISPLAY
 if ! xdotool getdisplaygeometry >/dev/null 2>&1; then
-    DISPLAY="${DISPLAY_ARG:-:96}"
-    export DISPLAY
-    Xvfb "$DISPLAY" -screen 0 "${WIDTH}x${HEIGHT}x24" >"$ARTIFACTS/xvfb.log" 2>&1 &
-    OWNED_XVFB=$!
+    if [ -n "$DISPLAY_ARG" ]; then
+        Xvfb "$DISPLAY_ARG" -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp >"$ARTIFACTS/xvfb.log" 2>&1 &
+        OWNED_XVFB=$!
+    else
+        # tuna-xvfb picks a free display and locks it, so concurrent proofs never collide.
+        rm -f "$ARTIFACTS/xvfb-display"
+        "$ROOT/scripts/lib/tuna-xvfb" -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp \
+            3>"$ARTIFACTS/xvfb-display" >"$ARTIFACTS/xvfb.log" 2>&1 &
+        OWNED_XVFB=$!
+        for _ in $(seq 1 30); do [ -s "$ARTIFACTS/xvfb-display" ] && break; sleep 1; done
+        [ -s "$ARTIFACTS/xvfb-display" ] || { echo "tuna-gtk-shell-proof: Xvfb did not allocate a display" >&2; exit 1; }
+        DISPLAY=":$(cat "$ARTIFACTS/xvfb-display")"
+        export DISPLAY
+    fi
     for _ in $(seq 1 30); do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 1; done
 fi
 
@@ -1172,9 +1306,23 @@ export TUNA_PROOF_SWIPE_INPUT
 TUNA_ANIMATION_CLOCK="$ARTIFACTS/animation-clock"
 rm -f "$TUNA_ANIMATION_CLOCK"
 export TUNA_ANIMATION_CLOCK
+# Only the ordinary complete clean source build can supply current-run media
+# provenance. Comparison binaries, installed/partial proofs and inherited shell
+# overrides remain useful diagnostics but cannot qualify canonical media.
+MEDIA_SOURCE=0
+"$PY" "$ROOT/scripts/lib/gtk_media_source.py" invalidate "$ROOT" "$ARTIFACTS"
+if [ "$INSTALLED_PACKAGE" = 0 ] && [ "$SCREENSHOT_KEYS_ONLY" = 0 ] &&
+   [ "$A11Y_FOCUS_ONLY" = 0 ] && [ "$KEYBOARD_ROUTES_ONLY" = 0 ] &&
+   [ "$GRID_CANCEL_ONLY" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ] &&
+   [ -z "${TUNA_PROOF_SHELL_BIN:-}" ] && [ -z "${TUNA_SHELL_BIN:-}" ] &&
+   [ -n "${GITHUB_RUN_ID:-}" ] && [ -n "${GITHUB_RUN_ATTEMPT:-}" ] &&
+   [ -n "${GITHUB_SHA:-}" ]; then
+    "$PY" "$ROOT/scripts/lib/gtk_media_source.py" begin "$ROOT" "$ARTIFACTS"
+    MEDIA_SOURCE=1
+fi
 if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
     cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host
-    if [ "$SCREENSHOT_KEYS_ONLY" = 0 ] && [ "$A11Y_FOCUS_ONLY" = 0 ] && [ "$FOLDER_DND_ONLY" = 0 ]; then
+    if [ "$SCREENSHOT_KEYS_ONLY" = 0 ] && [ "$A11Y_FOCUS_ONLY" = 0 ] && [ "$FOLDER_DND_ONLY" = 0 ] && [ "$GRID_HOVER_ONLY" = 0 ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example icon-probe
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example shortcut-inhibit-client
     fi
@@ -1209,6 +1357,9 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 [ -n "$WID" ] || fail G-PANEL "no nested window"
+if [ "$MEDIA_SOURCE" = 1 ]; then
+    "$PY" "$ROOT/scripts/lib/gtk_media_source.py" launch "$ROOT" "$ARTIFACTS" "$COMPOSITOR_PID"
+fi
 if [ "$INSTALLED_PACKAGE" = 1 ]; then
     # The installed launcher intentionally opens GNOME's startup overview.
     # Authenticate the original installed session before any physical input.
@@ -1257,6 +1408,15 @@ fi
 # controls; that also proves the accessible tree.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel.json" 60 ||
     fail A11Y-PANEL "shell never registered on the accessibility bus"
+if [ "$KEYBOARD_ROUTES_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "keyboard routes desktop ready" ||
+        fail G-PANEL-MENU-KEYS "desktop never became ready"
+    sleep 2
+    keyboard_panel_menu_proof
+    keyboard_notification_proof
+    keyboard_screenshot_proof
+    exit 0
+fi
 if [ "$SCREENSHOT_KEYS_ONLY" = 1 ]; then
     cstate '.active_workspace != null and .locked == false' "screenshot desktop ready" ||
         fail G-SCREENSHOT-KEYS "desktop never became ready"
@@ -1304,6 +1464,16 @@ if [ "$FOLDER_DND_ONLY" = 1 ]; then
     cstate '.active_workspace != null and .locked == false' "folder desktop ready" ||
         fail G-FOLDER-DND "desktop never became ready"
     folder_dnd_proof
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
+    exit 0
+fi
+if [ "$GRID_HOVER_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "grid hover desktop ready" ||
+        fail G-GRID-HOVER "desktop never became ready"
+    # Let the startup cover settle before opening the grid.
+    sleep 3
+    grid_hover_proof
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
     exit 0
@@ -1687,7 +1857,10 @@ xdotool mouseup 1
 # GTK requests the move after its drag threshold. The compositor uses
 # the initiating press coordinates; retain the strict distance bounds
 # while checking the real asynchronous client and pointer journey.
-cstate ".windows[] | select(.app_id == \"tuna-test-beta\") | (.rect[0] - $bx) >= 75 and (.rect[0] - $bx) <= 150 and (.rect[1] - $by) >= 30 and (.rect[1] - $by) <= 60" "drag" ||
+# A bounded intermediate displacement can pass while later motions are still
+# queued. Observe the last pointer endpoint too before deriving the next
+# header target from this snapshot; otherwise that target can land on Gamma.
+cstate "(.pointer_position == [$((bx + 270)), $((by + 80))]) and (.windows[] | select(.app_id == \"tuna-test-beta\") | (.rect[0] - $bx) >= 75 and (.rect[0] - $bx) <= 150 and (.rect[1] - $by) >= 30 and (.rect[1] - $by) <= 60)" "drag and final pointer delivered" ||
     fail G-APP-DRAG "dragging Beta's header bar did not move it by the drag distance"
 pass G-APP-DRAG "dragging an app's header bar moves the window (#58)"
 
@@ -1749,19 +1922,42 @@ EOF2
     cstate ".windows[] | select(.app_id == \"tuna-test-beta\") | .rect[2] == $bw and .rect[3] == $bh and .rect[0] < $bx" "dropped floating" ||
         fail G-EDGE-TILING-OFF "the window tiled or resized with edge-tiling off"
     cp "$CSTATE" "$ARTIFACTS/edge-tiling-off.json"
-    # Drag it back where it was, for the journey's later header clicks.
-    read -r nx ny <<EOF2
-$(jq -r '.windows[] | select(.app_id == "tuna-test-beta") | .rect | "\(.[0]) \(.[1])"' "$CSTATE")
+    # GTK must request the native move while the button is still held.
+    # Sending the whole restore before that round trip can retire the
+    # implicit grab first. Admission and completion share the original 20s.
+    restore_end=$(($(date +%s) + 20))
+    read -r restore_id nx ny <<EOF2
+$(jq -r '.windows[] | select(.app_id == "tuna-test-beta") | "\(.id) \(.rect[0]) \(.rect[1])"' "$CSTATE")
 EOF2
     xdotool mousemove --window "$WID" $((nx + 140)) $((ny + 20))
     xdotool mousedown 1
+    xdotool mousemove --window "$WID" $((nx + 151)) $((ny + 20))
+    restore_wait=$((restore_end - $(date +%s)))
+    if [ "$restore_wait" -lt 0 ] ||
+        ! cstate ".interactive_move_window == $restore_id and .pointer_position == [$((nx + 151)), $((ny + 20))]" "Beta restore move admitted" "$restore_wait"; then
+        fail G-EDGE-TILING-OFF "GTK never acquired Beta's native restore move"
+    fi
+    cp "$CSTATE" "$ARTIFACTS/edge-tiling-restore-admission.json"
+    restore_geometry="$(jq -er --argjson id "$restore_id" \
+        --argjson x "$((nx + 151))" --argjson y "$((ny + 20))" '
+        select(.interactive_move_window == $id and .pointer_position == [$x, $y]) |
+        .pointer_position as $p | first(.windows[] | select(.id == $id)) |
+        "\($p[0] | round) \($p[1] | round) \(.rect[0]) \(.rect[1])"
+        ' "$ARTIFACTS/edge-tiling-restore-admission.json")" ||
+        fail G-EDGE-TILING-OFF "native restore move geometry changed before observation"
+    read -r restore_px restore_py restore_wx restore_wy <<EOF2
+$restore_geometry
+EOF2
     for step in 1 2 3 4 5 6 7 8; do
-        xdotool mousemove --window "$WID" $((nx + 140 + (bx - nx) * step / 8)) $((ny + 20 + (by - ny) * step / 8))
+        xdotool mousemove --window "$WID" $((restore_px + (bx - restore_wx) * step / 8)) $((restore_py + (by - restore_wy) * step / 8))
         sleep 0.05
     done
     xdotool mouseup 1
-    cstate ".windows[] | select(.app_id == \"tuna-test-beta\") | .rect[0] >= 0 and .rect[1] >= 32" "beta restored" ||
+    restore_wait=$((restore_end - $(date +%s)))
+    if [ "$restore_wait" -lt 0 ] ||
+        ! cstate ".interactive_move_window == null and .pointer_position == [$((restore_px + bx - restore_wx)), $((restore_py + by - restore_wy))] and (.windows[] | select(.app_id == \"tuna-test-beta\") | .rect[0] >= 0 and .rect[1] >= 32)" "beta restored" "$restore_wait"; then
         fail G-EDGE-TILING-OFF "could not drag the window back into the work area"
+    fi
     gsettings reset org.gnome.mutter edge-tiling
     cstate '.multitasking.edge_tiling' "edge tiling restored" ||
         fail G-EDGE-TILING-OFF "resetting edge-tiling did not reach the compositor"
@@ -2488,6 +2684,28 @@ root, shell_pid, shell_start, compositor_pid, output = sys.argv[1:]
 root = pathlib.Path(root)
 def digest(path):
     return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+def shell_identity():
+    return pathlib.Path(f"/proc/{shell_pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+gtk_runtime = None
+if os.environ.get("TUNA_CI_GTK_ROOT"):
+    if shell_identity() != shell_start:
+        raise SystemExit("owned GTK shell identity changed before runtime observation")
+    staged = pathlib.Path(os.environ["TUNA_CI_GTK_ROOT"]).resolve()
+    build = json.loads((staged / "usr/local/share/doc/tuna-ci-gtk4-atspi-root/source-build-receipt.json").read_text())
+    expected = (staged / build["runtime_relative_path"]).resolve()
+    mapped = {pathlib.Path(line.split()[-1]).resolve()
+              for line in pathlib.Path(f"/proc/{shell_pid}/maps").read_text().splitlines()
+              if "/libgtk-4.so." in line}
+    if mapped != {expected} or digest(expected) != build["runtime_sha256"]:
+        raise SystemExit("owned GTK shell did not map the exact private repaired runtime")
+    notes = subprocess.check_output(["readelf", "-n", str(expected)], text=True, timeout=10)
+    ids = [line.split("Build ID:", 1)[1].strip() for line in notes.splitlines() if "Build ID:" in line]
+    if ids != [build["runtime_build_id"]] or shell_identity() != shell_start:
+        raise SystemExit("owned GTK runtime build ID or shell identity mismatch")
+    gtk_runtime = {"path": str(expected), "sha256": build["runtime_sha256"],
+                   "build_id": ids[0], "upstream_commit": build["upstream_commit"]}
+elif os.environ.get("TUNA_PROOF_BINARY_SOURCE_COMMIT") and os.environ.get("CI"):
+    raise SystemExit("CI comparison requires the exact private GTK runtime")
 def git(*args):
     return subprocess.check_output(["git", "-C", str(root), *args]).decode().strip()
 receipt = {
@@ -2500,6 +2718,7 @@ receipt = {
     "run": os.environ.get("GITHUB_RUN_ID"), "attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
     "runtime": os.environ["XDG_RUNTIME_DIR"],
     "shell": {"pid": int(shell_pid), "start": shell_start, "binary_sha256": digest(f"/proc/{shell_pid}/exe")},
+    "gtk_runtime": gtk_runtime,
     "compositor": {"pid": int(compositor_pid), "binary_sha256": digest(f"/proc/{compositor_pid}/exe")},
 }
 pathlib.Path(output).write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
@@ -2534,18 +2753,44 @@ for step in $(seq 1 6); do
     sleep 0.05
 done
 # Keep the actual button held, but leave timed page hints and tile hover
-# targets before slow AT-SPI/screenshot/state acquisition. GTK shows the
-# hint once it hears the drag: poll the bound child's tree, no fixed sleep.
+# targets before slow AT-SPI/screenshot/state acquisition. Preview creation
+# precedes the normal arrow's fade-out: wait for both sides of that transition
+# before admitting the active first-page tree, within the same preview budget.
 xdotool mousemove --window "$WID" "$grid_neutral_x" "$grid_neutral_y"
 grid_peek_end=$(($(date +%s) + 10))
 until grid_cancel_dump "$ARTIFACTS/a11y-folder-page-peek.json" &&
-    showing "$ARTIFACTS/a11y-folder-page-peek.json" "Next page preview"; do
+    showing "$ARTIFACTS/a11y-folder-page-peek.json" "Next page preview" &&
+    ! showing "$ARTIFACTS/a11y-folder-page-peek.json" "Next Page" &&
+    ! showing "$ARTIFACTS/a11y-folder-page-peek.json" "Previous Page"; do
     [ "$(date +%s)" -lt "$grid_peek_end" ] ||
-        fail G-GRID-DRAG-CANCEL "real local folder drag has no neighboring-page hint"
+        fail G-GRID-DRAG-CANCEL "real local folder drag did not replace its page arrow with a neighboring-page hint"
     sleep 0.1
 done
+# A source-tree gap can be covered by the real preview after drag begins
+# (the old comparison binary allocates a much wider hint). Re-select from
+# the active allocation, keeping the same owner and first-page contents.
+grid_neutral_wait=$((grid_peek_end - $(date +%s)))
+if [ "$grid_neutral_wait" -lt 0 ] ||
+    ! cstate '.client_dnd_active == true and .overview_open and .overview_app_grid and (.locked == false)' "real folder drag active" "$grid_neutral_wait"; then
+    fail G-GRID-DRAG-CANCEL "native client drag never acquired grab"
+fi
+neutral_coordinates="$("$PY" "$ROOT/scripts/lib/tuna_grid_cancel_proof.py" active-neutral \
+    "$grid_cancel_pid" "$grid_cancel_start" "$ARTIFACTS/a11y-folder-page-peek.json" \
+    "$CSTATE" "$ARTIFACTS/a11y-folder-page-source.json" \
+    "$ARTIFACTS/grid-cancel-active-neutral-point.json")" ||
+    fail G-GRID-DRAG-CANCEL "no actual neutral region in the active first page"
+read -r grid_neutral_x grid_neutral_y <<EOF
+$neutral_coordinates
+EOF
+xdotool mousemove --window "$WID" "$grid_neutral_x" "$grid_neutral_y"
+grid_neutral_wait=$((grid_peek_end - $(date +%s)))
+if [ "$grid_neutral_wait" -lt 0 ] ||
+    ! cstate ".client_dnd_active == true and .overview_open and .overview_app_grid and (.locked == false) and (.pointer_position == [$grid_neutral_x, $grid_neutral_y])" "real folder drag active at observed neutral point" "$grid_neutral_wait"; then
+    fail G-GRID-DRAG-CANCEL "native drag never reached the active neutral point"
+fi
+grid_cancel_dump "$ARTIFACTS/a11y-folder-page-peek.json" ||
+    fail G-GRID-DRAG-CANCEL "active neutral dump failed"
 scrot "$ARTIFACTS/11h-folder-page-peek.png" >/dev/null
-cstate ".client_dnd_active == true and .overview_open and .overview_app_grid and (.locked == false) and (.pointer_position == [$grid_neutral_x, $grid_neutral_y])" "real folder drag active at observed neutral point" || fail G-GRID-DRAG-CANCEL "native client drag never acquired grab"
 cp "$CSTATE" "$ARTIFACTS/grid-cancel-before-escape.json"
 "$PY" "$ROOT/scripts/lib/tuna_grid_cancel_proof.py" neutral-check \
     "$grid_cancel_pid" "$grid_cancel_start" "$ARTIFACTS/a11y-folder-page-peek.json" \
@@ -2698,73 +2943,7 @@ sleep 1.5
 
 folder_dnd_proof
 
-# GNOME's grid reorder: an app dropped on another tile's edge takes its
-# place, and the grid is saved to org.gnome.shell app-picker-layout.
-# The earlier folder drop persisted its catalog. Give this reorder proof
-# an explicit starting order before asserting exact positions 0, 1 and 2.
-gsettings set org.gnome.shell app-picker-layout "[{'tuna-move-One.desktop': <{'position': <0>}>, 'tuna-move-Three.desktop': <{'position': <1>}>, 'tuna-move-Two.desktop': <{'position': <2>}>}]"
-for n in One Two Three; do
-    printf '[Desktop Entry]\nName=AAA Move %s\nExec=true\nType=Application\n' "$n" \
-        >"$XDG_DATA_HOME/applications/tuna-move-$n.desktop"
-done
-sleep 1.5
-xdotool key super+a
-cstate '.overview_open and .overview_app_grid' "app grid" || fail G-GRID-REORDER "Super+A did not show the app grid"
-sleep 1.5
-# By name the cells read One, Three, Two: Two (third cell) onto the left
-# edge of One (first cell, x 146-259).
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-before-hover.json" 20 || fail G-GRID-HOVER "baseline dump failed"
-grid_origin
-layout_before_hover="$(gsettings get org.gnome.shell app-picker-layout)"
-grid_coordinates="$(grid_point "$ARTIFACTS/a11y-grid-before-hover.json" "AAA Move Two")" || fail G-GRID-HOVER "source tile bounds missing"
-read -r source_x source_y <<EOF
-$grid_coordinates
-EOF
-grid_coordinates="$(grid_point "$ARTIFACTS/a11y-grid-before-hover.json" "AAA Move One" 4)" || fail G-GRID-HOVER "target edge bounds missing"
-read -r target_x target_y <<EOF
-$grid_coordinates
-EOF
-xdotool mousemove --window "$WID" "$source_x" "$source_y"
-sleep 0.3
-xdotool mousedown 1
-sleep 0.1
-# Recognize the drag before crossing to the target, as in the page proof.
-for step in $(seq 1 6); do
-    xdotool mousemove --window "$WID" $((source_x - step * 10)) "$source_y"
-    sleep 0.05
-done
-sleep 0.25
-xdotool mousemove --window "$WID" "$target_x" "$target_y"
-sleep 0.35
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-live-hover.json" 20 || fail G-GRID-HOVER "hover dump failed"
-before_x="$(jq '[.[] | select(.showing and (.role == "push button" or .role == "button") and .name == "AAA Move One")][0].bounds[0]' "$ARTIFACTS/a11y-grid-before-hover.json")"
-after_x="$(jq '[.[] | select(.showing and (.role == "push button" or .role == "button") and .name == "AAA Move One")][0].bounds[0]' "$ARTIFACTS/a11y-grid-live-hover.json")"
-scrot "$ARTIFACTS/11g-grid-live-hover.png" >/dev/null
-[ "$after_x" -gt "$before_x" ] || fail G-GRID-HOVER "the neighboring tile did not reflow while the button remained down"
-[ "$(gsettings get org.gnome.shell app-picker-layout)" = "$layout_before_hover" ] || fail G-GRID-HOVER "hover persisted an unfinished drag"
-scrot "$ARTIFACTS/11g-grid-live-hover.png" >/dev/null
-# Reflow puts the dragged tile in the vacant slot. Dropping on its own
-# center commits the preview instead of treating it as a cancelled drag.
-release_point="$(grid_point "$ARTIFACTS/a11y-grid-live-hover.json" "AAA Move Two")"
-# shellcheck disable=SC2086
-xdotool mousemove --window "$WID" $release_point
-xdotool mouseup 1
-sleep 1.5
-pass G-GRID-HOVER "a tile edge reflows after the 200ms delay while dragging, with persistence deferred to drop"
-scrot "$ARTIFACTS/11g-grid-reordered.png" >/dev/null
-layout="$(gsettings get org.gnome.shell app-picker-layout)"
-case "$layout" in
-    *"'tuna-move-Two.desktop': <{'position': <0>}>"*) ;;
-    *) fail G-GRID-REORDER "the moved app is not first in app-picker-layout: $(echo "$layout" | cut -c1-200)" ;;
-esac
-case "$layout" in
-    *"'tuna-move-One.desktop': <{'position': <1>}>"*"'tuna-move-Three.desktop': <{'position': <2>}>"* | \
-        *"'tuna-move-Three.desktop': <{'position': <2>}>"*"'tuna-move-One.desktop': <{'position': <1>}>"*) ;;
-    *) fail G-GRID-REORDER "the apps it displaced did not each move one place on" ;;
-esac
-pass G-GRID-REORDER "an app dropped on a tile's edge takes its place and the grid is saved as GNOME saves it"
-xdotool key Escape
-cstate '.overview_open | not' "closed" || { xdotool key Escape; cstate '.overview_open | not' "closed" || fail G-GRID-REORDER "overview stayed open"; }
+grid_hover_proof
 # Moving an item to another page leaves its old page short; a catalog
 # rebuild must respect those saved page boundaries instead of flattening.
 "$PY" "$ROOT/scripts/lib/grid-target-settled-tests.py" >"$ARTIFACTS/grid-target-settled-tests.log" 2>&1 ||
@@ -3026,6 +3205,87 @@ cstate '.layers | all(.namespace != "tuna-shell-launch-zoom")' "launch zoom gone
     fail G-LAUNCH-ZOOM "the launch zoom's surface outlived its animation"
 pass G-LAUNCH-ZOOM "a launch from the grid zooms its icon out over 250 ms and leaves nothing behind"
 
+# GNOME's AppIcon.activate (appDisplay.js:3053-3071): a running app's
+# grid tile raises its window and neither launches it again nor zooms;
+# Ctrl+click opens a new window (here, shell_app_open_new_window's
+# relaunch) with the zoom. A test app with an unfocused window gets a
+# visible desktop entry for the gate, then its hidden one back.
+running_app="$(jq -r '.focused as $f | [.windows[] | select((.app_id // "") | startswith("tuna-test-"))]
+    | group_by(.app_id) | map(select(all(.[]; .id != $f))) | (.[0] // []) | (.[0].app_id // empty)' "$CSTATE")"
+[ -n "$running_app" ] || fail G-GRID-ACTIVATE-RUNNING "no unfocused test app window to raise"
+running_raise="$(jq -r --arg a "$running_app" '[.windows[] | select(.app_id == $a) | .id] | min' "$CSTATE")"
+running_count="$(jq -r --arg a "$running_app" '[.windows[] | select(.app_id == $a)] | length' "$CSTATE")"
+running_desktop="$XDG_DATA_HOME/applications/$running_app.desktop"
+cp "$running_desktop" "$ARTIFACTS/running-app-hidden.desktop"
+RUNNING_MARKER="$ARTIFACTS/running-app-relaunched"
+rm -f "$RUNNING_MARKER"
+printf '[Desktop Entry]\nName=Tuna Running Probe\nExec=touch %s\nType=Application\n' "$RUNNING_MARKER" >"$running_desktop"
+sleep 1.5
+# The tile, on whichever grid page holds it: its centre on the output
+# from the App Grid window's own nodes (the dash lists the app too).
+running_tile() {
+    jq -er --arg name "Tuna Running Probe" --argjson ox "$grid_origin_x" --argjson oy "$grid_origin_y" --argjson width "$WIDTH" '
+        [foreach .[] as $n (null; if $n.role == "frame" then $n.name else . end; [., $n])]
+        | map(select(.[0] == "App Grid") | .[1]
+            | select(.showing and (.role == "push button" or .role == "button") and .name == $name
+                and .bounds[2] > 0 and .bounds[3] > 0
+                and .bounds[0] + $ox >= 0 and .bounds[0] + $ox + .bounds[2] <= $width))
+        | first | .bounds | "\((.[0] + $ox + .[2] / 2) | floor) \((.[1] + $oy + .[3] / 2) | floor)"' "$1"
+}
+running_open_grid() {
+    xdotool key super+a
+    cstate '.overview_open and .overview_app_grid' "app grid" || fail G-GRID-ACTIVATE-RUNNING "Super+A did not show the app grid"
+    sleep 1.5
+    grid_origin
+    running_point=""
+    for running_page in 2 3 4; do
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-running-grid.json" 20 ||
+            fail G-GRID-ACTIVATE-RUNNING "accessibility dump failed"
+        running_point="$(running_tile "$ARTIFACTS/a11y-running-grid.json")" && break
+        running_point=""
+        # Not on this page: turn to the next, if there is one.
+        showing "$ARTIFACTS/a11y-running-grid.json" "Page $running_page" || break
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-running-page.json" 20 \
+            --press "Page $running_page" >/dev/null || fail G-GRID-ACTIVATE-RUNNING "could not turn to page $running_page"
+        sleep 0.5
+    done
+    [ -n "$running_point" ] || fail G-GRID-ACTIVATE-RUNNING "the running app has no grid tile"
+}
+running_open_grid
+running_mark="$(log_mark)"
+# shellcheck disable=SC2086
+xdotool mousemove --window "$WID" $running_point click 1
+cstate ".focused == $running_raise and (.overview_open | not)" "running app raised" ||
+    fail G-GRID-ACTIVATE-RUNNING "clicking the running app's tile did not raise its window and close the overview"
+sleep 1.5
+cstate "[.windows[] | select(.app_id == \"$running_app\")] | length == $running_count" "no new window" ||
+    fail G-GRID-ACTIVATE-RUNNING "clicking the running app's tile opened another window"
+[ -e "$RUNNING_MARKER" ] && fail G-GRID-ACTIVATE-RUNNING "clicking the running app's tile launched it again"
+log_has "$running_mark" "grid-anim launch-zoom" &&
+    fail G-GRID-ACTIVATE-RUNNING "raising a running app drew the launch zoom"
+cstate '.layers | all(.namespace != "tuna-shell-launch-zoom")' "no launch zoom" ||
+    fail G-GRID-ACTIVATE-RUNNING "raising a running app mapped a launch zoom surface"
+# Ctrl+click: can_open_new_window (no SingleMainWindow, no action) and
+# open_new_window launches the app again, with the zoom.
+running_open_grid
+running_mark="$(log_mark)"
+xdotool keydown Control_L
+sleep 0.3
+# shellcheck disable=SC2086
+xdotool mousemove --window "$WID" $running_point click 1
+sleep 0.3
+xdotool keyup Control_L
+log_wait "$running_mark" "grid-anim launch-zoom settle" ||
+    fail G-GRID-ACTIVATE-RUNNING "Ctrl+click on the running app drew no launch zoom"
+anim_end=$(($(date +%s) + 10))
+until [ -e "$RUNNING_MARKER" ] || [ "$(date +%s)" -gt "$anim_end" ]; do sleep 0.3; done
+[ -e "$RUNNING_MARKER" ] || fail G-GRID-ACTIVATE-RUNNING "Ctrl+click on the running app did not open a new window"
+cstate '.overview_open | not' "closed after Ctrl+click" ||
+    fail G-GRID-ACTIVATE-RUNNING "the overview stayed open after Ctrl+click"
+cp "$ARTIFACTS/running-app-hidden.desktop" "$running_desktop"
+sleep 1.5
+pass G-GRID-ACTIVATE-RUNNING "a running app's grid tile raises its window without relaunching or zooming; Ctrl+click opens another with the zoom"
+
 # Notifications (#56). Close whatever the grid left open first (#97).
 xdotool key Escape
 if ! cstate '.overview_open | not' "closed" 3; then
@@ -3277,6 +3537,11 @@ for label in "Wi-Fi" "Wired" "Bluetooth" "Power Mode" "Brightness" "Volume"; do
         fail G-QS-SERVICES "no '$label' control with its daemon on the bus"
 done
 pass G-QS-SERVICES "quick settings shows a tile per service on the bus"
+# Its menu toggles exist while their daemons are on the bus.
+xdotool key Escape
+sleep 1
+keyboard_quick_settings_proof
+open_qs
 
 # An external writer must update both DND chrome and the banner policy.
 gsettings set org.gnome.desktop.notifications show-banners true
@@ -4898,11 +5163,13 @@ window_a="$(jq '.focused' "$CSTATE")"
 cstate '.keyboard.layout == "German"' "German before per-window" ||
     fail G-INPUT-PER-WINDOW "the two-source list did not keep German active"
 xdotool key super+space
-cstate '.keyboard.layout == "English (US)"' "window A tap" ||
-    fail G-INPUT-PER-WINDOW "Super+Space did not switch in window A"
+cstate '.keyboard.layout == "English (US)" and (.layers | all(.namespace != "tuna-input-source-switcher"))' "window A tap and modal retired" ||
+    fail G-INPUT-PER-WINDOW "Super+Space did not switch in window A and retire its modal"
 xdotool key super+space
-cstate '.keyboard.layout == "German"' "window A on German" ||
-    fail G-INPUT-PER-WINDOW "window A did not switch back to German"
+# Source activation and the popup's Wayland unmap arrive over different
+# connections. A new source alone does not prove normal shortcuts own keys.
+cstate '.keyboard.layout == "German" and (.layers | all(.namespace != "tuna-input-source-switcher"))' "window A on German and modal retired" ||
+    fail G-INPUT-PER-WINDOW "window A did not switch back to German and retire its modal"
 xdotool key alt+Tab
 cstate ".focused != $window_a and .focused != null" "window B focused" ||
     fail G-INPUT-PER-WINDOW "Alt+Tab did not focus another window"
@@ -8072,6 +8339,7 @@ showing "$ARTIFACTS/a11y-panel-returned.json" "Previous month" ||
 xdotool key Escape
 sleep 1
 pass G-PANEL-FOCUS "Ctrl+Alt+Tab walks the bar, Enter opens menus, Escape unwinds and returns focus"
+keyboard_panel_menu_proof
 # Both directions are rebound, then walk every overview state.
 gsettings set org.gnome.shell.keybindings shift-overview-up "['<Super>F8']"
 gsettings set org.gnome.shell.keybindings shift-overview-down "['<Super>F7']"
@@ -8142,6 +8410,7 @@ sleep 1.5
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-wm-menu.json" 20 ||
     fail G-WM-KEYS "accessibility dump failed"
 showing "$ARTIFACTS/a11y-wm-menu.json" "Hide" || fail G-WM-KEYS "Alt+Space opened no window menu"
+keyboard_window_menu_proof "$ARTIFACTS/a11y-wm-menu.json"
 xdotool key Escape
 sleep 1
 before_w="$(jq -r '.focused_rect[2]' "$CSTATE")"
@@ -9430,6 +9699,7 @@ dims="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -
 pass G-SCREENSHOT-UI "Print opens GNOME's screenshot UI; Screen and Capture save the whole screen"
 
 screenshot_keys_proof
+keyboard_screenshot_proof
 
 # GNOME's window selector: Window lays the windows out as previews with
 # the focused one chosen; choosing another test window and Capture saves
@@ -9949,7 +10219,17 @@ EOF
     fail G-POWER-SAVE-MODE "idle-brightness $power_idle and 1 dim aaa-other alike ($power_dimmed_other)"
 gsettings set org.gnome.settings-daemon.plugins.power idle-brightness 1
 [ "$(power_save_get)" = "(<0>,)" ] || fail G-POWER-SAVE-MODE "PowerSaveMode did not start on"
-shell_dimming true || fail G-POWER-SAVE-MODE "SetDimming(true) refused"
+end=$(($(date +%s) + 10))
+until power_dim_error="$(gdbus call --session --dest org.gnome.Shell.Brightness \
+    --object-path /org/gnome/Shell/Brightness \
+    --method org.gnome.Shell.Brightness.SetDimming true 2>&1 >/dev/null)"; do
+    case "$power_dim_error" in
+        *"brightness update already pending"*) ;;
+        *) fail G-POWER-SAVE-MODE "SetDimming(true) refused: $power_dim_error" ;;
+    esac
+    [ "$(date +%s)" -le "$end" ] || fail G-POWER-SAVE-MODE "SetDimming(true) stayed pending"
+    sleep 0.2
+done
 end=$(($(date +%s) + 10))
 until [ "$(cat "$power_other/brightness")" = "$power_dimmed_other" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
 if ! { [ "$(cat "$power_other/brightness")" = "$power_dimmed_other" ] &&
@@ -10034,12 +10314,15 @@ for _attempt in 1 2 3 4 5 6 7 8 9 10; do
 done
 showing "$ARTIFACTS/a11y-notification-focus-before.json" "Focus Proof Banner" || fail G-NOTIFICATION-FOCUS-KEY "no active banner to focus"
 fkey_tap Super_L ffc3 || fail G-NOTIFICATION-FOCUS-KEY "Super+F6 tap failed"
-sleep 0.5
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-notification-focus.json" 20 || fail G-NOTIFICATION-FOCUS-KEY "a11y dump failed"
-jq -e '.[] | select(.showing and .focused and .name == "Focus Proof Banner")' "$ARTIFACTS/a11y-notification-focus.json" >/dev/null || fail G-NOTIFICATION-FOCUS-KEY "the banner did not get keyboard focus"
+# The layer keyboard-enter and AT-SPI focus events can trail presentation
+# under load. Observe the exact card rather than assuming a fixed delay.
+kr_until 'any(.[]; .showing and .focused and .name == "Focus Proof Banner")' 5 \
+    "$ARTIFACTS/a11y-notification-focus.json" ||
+    fail G-NOTIFICATION-FOCUS-KEY "the banner did not get keyboard focus"
 xdotool key Escape
 gsettings reset org.gnome.shell.keybindings focus-active-notification
 pass G-NOTIFICATION-FOCUS-KEY "the rebound key focuses the active banner; Escape restores client input"
+keyboard_notification_proof
 
 # With animations off the transient surfaces (#501) appear and go at
 # once: the OSD, a banner and a panel menu each log "instant".
@@ -10178,6 +10461,148 @@ end=$(($(date +%s) + 10))
 until grep -q PowerOff "$POWER_LOG" 2>/dev/null || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
 grep -q PowerOff "$POWER_LOG" || fail G-POWER-OFF "logind never got PowerOff"
 pass G-POWER-OFF "confirming the dialog asks logind to power off"
+
+# End session through org.gnome.SessionManager (#589, P-SY-07). As GNOME
+# Shell 51's systemActions.js, Restart…, Power Off… and Log Out… ask the
+# session manager (here the compositor's) for Reboot, Shutdown and
+# Logout(0); the manager opens the shell's EndSessionDialog with the 60 s
+# countdown and its logout inhibitors, and carries the confirmed end of the
+# session out itself. dbus-monitor records the session bus traffic, and the
+# logind stub records which process asked it.
+bus_owner() {
+    gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.GetNameOwner "$1" 2>/dev/null | sed -n "s/^('\(.*\)',)$/\1/p"
+}
+bus_pid() {
+    gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.GetConnectionUnixProcessID "$1" 2>/dev/null |
+        sed -n 's/^(uint32 \([0-9]*\),)$/\1/p'
+}
+# Poll the shell's tree until the jq filter holds: the dialog opens after
+# the session manager's round trip.
+end_dump_until() {
+    end_until=$(($(date +%s) + $3))
+    while :; do
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-$1.json" 5 >/dev/null 2>&1 &&
+            jq -e "$2" "$ARTIFACTS/a11y-$1.json" >/dev/null && return 0
+        [ "$(date +%s)" -gt "$end_until" ] && return 1
+        sleep 0.5
+    done
+}
+end_bus() {
+    "$PY" "$ROOT/scripts/lib/tuna-end-session-bus.py" "$END_BUS_LOG" "$end_bus_mark" \
+        "$END_SHELL" "$END_MANAGER" "$@" 2>>"$ARTIFACTS/end-session-bus-checks.log"
+}
+end_monitor() {
+    END_BUS_LOG="$ARTIFACTS/end-session-bus-$1.log"
+    dbus-monitor --session "type='method_call',interface='org.gnome.SessionManager'" \
+        "type='method_call',interface='org.gnome.SessionManager.EndSessionDialog'" \
+        "type='signal',interface='org.gnome.SessionManager.EndSessionDialog'" \
+        "type='method_return'" "type='error'" >"$END_BUS_LOG" 2>&1 &
+    END_MONITOR_PID=$!
+    sleep 1
+}
+END_MANAGER=$(bus_owner org.gnome.SessionManager)
+END_SHELL=$(bus_owner org.gnome.Shell)
+MANAGER_PID=$(bus_pid "$END_MANAGER")
+if [ -z "$MANAGER_PID" ] || [ "$(cat "/proc/$MANAGER_PID/comm" 2>/dev/null)" != tuna-compositor ]; then
+    fail G-END-SESSION-RESTART "org.gnome.SessionManager is not the compositor's (pid '${MANAGER_PID}')"
+fi
+[ "$MANAGER_PID" != "$(bus_pid "$END_SHELL")" ] ||
+    fail G-END-SESSION-RESTART "the shell owns org.gnome.SessionManager"
+# An installed application holds a logout inhibitor (listed), a service a
+# logout inhibitor and the application an idle one (both left out, as
+# endSessionDialog.js _onInhibitorLoaded).
+printf '[Desktop Entry]\nName=Proof Editor\nExec=true\nIcon=text-editor\nType=Application\n' \
+    >"$XDG_DATA_HOME/applications/tuna-end-session-editor.desktop"
+"$PY" -c '
+from gi.repository import Gio, GLib
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+for app, reason, flags in (("tuna-end-session-editor", "Unsaved document", 1),
+                           ("tuna-end-session-sync", "Background sync", 1),
+                           ("tuna-end-session-editor", "Playing video", 8)):
+    bus.call_sync("org.gnome.SessionManager", "/org/gnome/SessionManager",
+                  "org.gnome.SessionManager", "Inhibit",
+                  GLib.Variant("(susu)", (app, 0, reason, flags)), None, 0, 5000, None)
+print("ready", flush=True)
+GLib.MainLoop().run()
+' >"$ARTIFACTS/end-session-inhibitors.log" 2>&1 &
+END_INHIBITOR_PID=$!
+for _ in $(seq 1 20); do grep -q ready "$ARTIFACTS/end-session-inhibitors.log" && break; sleep 0.3; done
+grep -q ready "$ARTIFACTS/end-session-inhibitors.log" ||
+    fail G-END-SESSION-RESTART "the inhibiting application did not inhibit: $(cat "$ARTIFACTS/end-session-inhibitors.log")"
+end_monitor dialogs
+# $1 gate, $2 tag, $3 menu row, $4 manager method, $5 Open type, $6 the
+# countdown's verb phrase, $7 the confirm button (empty: Cancel only).
+end_session_gate() {
+    end_bus_mark=$(($(wc -l <"$END_BUS_LOG") + 1))
+    power_mark=$(wc -l <"$POWER_LOG")
+    open_power_menu "end-$2" || fail "$1" "could not open the power menu"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-$2-press.json" 20 \
+        --press "$3" || fail "$1" "could not press $3"
+    end_dump_until "end-$2-open" "any(.[]; .showing and (.name | test(\"$6 automatically in 60 seconds\")))" 10 ||
+        fail "$1" "$3 showed no 60 s countdown"
+    end_dump_until "end-$2-apps" 'any(.[]; .showing and .name == "Some applications are busy or have unsaved work")
+        and any(.[]; .showing and .name == "Proof Editor") and any(.[]; .showing and .name == "Unsaved document")' 10 ||
+        fail "$1" "the dialog does not list the inhibiting application"
+    for left_out in "Background sync" "Playing video"; do
+        hidden "$ARTIFACTS/a11y-end-$2-apps.json" "$left_out" ||
+            fail "$1" "the dialog lists '$left_out', which inhibits no logout of an application"
+    done
+    end_bus open "$4" "$5" some ||
+        fail "$1" "$3 did not reach $4 on org.gnome.SessionManager and its Open($5, 0, 60, inhibitors)"
+    # GNOME shows the countdown in steps of ten until the last ten seconds.
+    end_dump_until "end-$2-50" "any(.[]; .showing and (.name | test(\"$6 automatically in 50 seconds\")))" 15 ||
+        fail "$1" "the countdown did not step from 60 to 50 seconds"
+    scrot "$ARTIFACTS/22-end-session-$2.png" >/dev/null
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-$2-cancel.json" 20 \
+        --press "Cancel" || fail "$1" "could not press Cancel"
+    end_dump_until "end-$2-cancelled" '(any(.[]; .showing and (.name | test("automatically in"))) | not)' 5 ||
+        fail "$1" "the dialog stayed open after Cancel"
+    end_bus signal Canceled || fail "$1" "Cancel emitted no Canceled"
+    if [ "$4" = Logout ]; then
+        end_bus returned Logout || fail "$1" "Logout(0) was not answered once the dialog opened"
+    else
+        end_bus cancelled "$4" || fail "$1" "the manager did not fail $4 as cancelled"
+    fi
+    sleep 1
+    [ "$(wc -l <"$POWER_LOG")" = "$power_mark" ] || fail "$1" "Cancel still reached logind: $(tail -n 1 "$POWER_LOG")"
+    kill -0 "$COMPOSITOR_PID" 2>/dev/null || fail "$1" "Cancel ended the session"
+    [ "$(bus_owner org.gnome.SessionManager)" = "$END_MANAGER" ] || fail "$1" "the session manager left after Cancel"
+    [ -n "$7" ] || return 0
+    end_bus_mark=$(($(wc -l <"$END_BUS_LOG") + 1))
+    open_power_menu "end-$2-again" || fail "$1" "could not reopen the power menu"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-$2-press-again.json" 20 \
+        --press "$3" || fail "$1" "could not press $3 again"
+    end_dump_until "end-$2-reopened" "any(.[]; .showing and (.name | test(\"$6 automatically in\")))" 10 ||
+        fail "$1" "$3 did not reopen the dialog"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-$2-confirm.json" 20 \
+        --press "$7" || fail "$1" "could not press $7"
+}
+
+end_session_gate G-END-SESSION-RESTART restart "Restart…" Reboot 2 "will restart" Restart
+end=$(($(date +%s) + 10))
+until grep -q "^Reboot True pid=$MANAGER_PID$" "$POWER_LOG" || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
+grep -q "^Reboot True pid=$MANAGER_PID$" "$POWER_LOG" ||
+    fail G-END-SESSION-RESTART "the session manager never asked logind to reboot: $(cat "$POWER_LOG")"
+end_bus signal ConfirmedReboot || fail G-END-SESSION-RESTART "Restart emitted no ConfirmedReboot"
+end_bus returned Reboot || fail G-END-SESSION-RESTART "the manager did not answer Reboot once confirmed"
+pass G-END-SESSION-RESTART "Restart… asks org.gnome.SessionManager.Reboot, whose dialog lists the inhibiting app and counts down from 60; Cancel leaves the session, Restart has the manager ask logind Reboot(true)"
+
+end_session_gate G-END-SESSION-POWEROFF poweroff "Power Off…" Shutdown 1 "will power off" "Power Off"
+end=$(($(date +%s) + 10))
+until grep -q "^PowerOff True pid=$MANAGER_PID$" "$POWER_LOG" || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
+grep -q "^PowerOff True pid=$MANAGER_PID$" "$POWER_LOG" ||
+    fail G-END-SESSION-POWEROFF "the session manager never asked logind to power off: $(cat "$POWER_LOG")"
+end_bus signal ConfirmedShutdown || fail G-END-SESSION-POWEROFF "Power Off emitted no ConfirmedShutdown"
+end_bus returned Shutdown || fail G-END-SESSION-POWEROFF "the manager did not answer Shutdown once confirmed"
+pass G-END-SESSION-POWEROFF "Power Off… asks org.gnome.SessionManager.Shutdown, whose dialog lists the inhibiting app and counts down from 60; Cancel leaves the session, Power Off has the manager ask logind PowerOff(true)"
+
+# Log Out…'s confirmation ends the session, so it runs last (below).
+end_session_gate G-END-SESSION-LOGOUT logout "Log Out…" Logout 0 "logged out" ""
+kill "$END_INHIBITOR_PID" 2>/dev/null || true
+kill "$END_MONITOR_PID" 2>/dev/null || true
+rm -f "$XDG_DATA_HOME/applications/tuna-end-session-editor.desktop"
 
 # Administrative lockdown (#357, P-ST-05): GNOME 51's org.gnome.desktop.lockdown
 # keys flipped live, the shell's real behaviour observed, then restored.
@@ -10348,6 +10773,10 @@ open_power_menu power-menu-3 || fail G-SUSPEND-LOCK "could not reopen the power 
 end=$(($(date +%s) + 10))
 until grep -q Suspend "$POWER_LOG" 2>/dev/null || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
 grep -q Suspend "$POWER_LOG" || fail G-SUSPEND-LOCK "logind never got Suspend"
+# GNOME Shell 51 suspends through org.gnome.SessionManager.Suspend, which
+# asks logind SuspendWithFlags(SD_LOGIND_SKIP_INHIBITORS) (#589).
+grep -q "^SuspendWithFlags 16 pid=$MANAGER_PID$" "$POWER_LOG" ||
+    fail G-SUSPEND-LOCK "Suspend did not reach logind through the session manager: $(cat "$POWER_LOG")"
 cstate '.locked' "locked" 10 || fail G-SUSPEND-LOCK "PrepareForSleep did not lock the session"
 cstate 'has("pointer_position") and has("pointer_fullscreen_blocked") and .pointer_position == null and .pointer_fullscreen_blocked == null and has("cursor") and .cursor == null' "locked pointer diagnostics redacted" ||
     fail G-POINTER-TRACE-PRIVATE "credential input retained pointer diagnostics"
@@ -11150,15 +11579,45 @@ if [ "$INSTALLED_PACKAGE" = 1 ]; then
     pass G-INSTALLED-RECOVERY "original installed compositor recovers with a new package-owned GTK shell"
 fi
 
+# G-END-SESSION-LOGOUT, last: confirming Log Out… has the session manager
+# end the compositor, the session leader, through its orderly shutdown,
+# as gnome-session's exit ends a GNOME session (#589).
+end_monitor logout-confirm
+end_bus_mark=1
+END_SHELL=$(bus_owner org.gnome.Shell)
+logout_mark=$(log_mark)
+open_power_menu end-logout-final || fail G-END-SESSION-LOGOUT "could not open the power menu to log out"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-logout-final.json" 20 \
+    --press "Log Out…" || fail G-END-SESSION-LOGOUT "could not press Log Out…"
+end_dump_until end-logout-final-open 'any(.[]; .showing and (.name | test("logged out automatically in 60 seconds")))' 10 ||
+    fail G-END-SESSION-LOGOUT "Log Out… showed no 60 s countdown"
+end_bus open Logout 0 none || fail G-END-SESSION-LOGOUT "Log Out… did not reach Logout(0) and Open(0, 0, 60, [])"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-logout-confirm.json" 20 \
+    --press "Log Out" >/dev/null 2>&1 || true
+end=$(($(date +%s) + 20))
+while kill -0 "$COMPOSITOR_PID" 2>/dev/null && [ "$(date +%s)" -le "$end" ]; do sleep 0.3; done
+kill -0 "$COMPOSITOR_PID" 2>/dev/null && fail G-END-SESSION-LOGOUT "confirming Log Out did not end the session"
+wait "$COMPOSITOR_PID" || fail G-END-SESSION-LOGOUT "the compositor did not exit gracefully on Log Out"
+COMPOSITOR_PID=""
+kill "$END_MONITOR_PID" 2>/dev/null || true
+end_bus signal ConfirmedLogout || fail G-END-SESSION-LOGOUT "Log Out emitted no ConfirmedLogout"
+log_wait "$logout_mark" "session manager: Logout confirmed" 1 ||
+    fail G-END-SESSION-LOGOUT "the session manager never took the confirmation"
+log_wait "$logout_mark" "session manager: ending the session" 1 ||
+    fail G-END-SESSION-LOGOUT "the session manager did not end the session"
+pass G-END-SESSION-LOGOUT "Log Out… asks org.gnome.SessionManager.Logout(0), answered once its dialog opens (listing the inhibiting app, counting down from 60); Cancel leaves the session; Log Out has the manager end the compositor gracefully"
+
 if [ -n "${x11_display:-}" ]; then
-    kill "$COMPOSITOR_PID"
-    wait "$COMPOSITOR_PID" || fail G-X11-CLEANUP "compositor did not exit gracefully"
-    COMPOSITOR_PID=""
+    # Log Out above ended the compositor through its orderly shutdown.
     display_number="${x11_display#:}"
     if [ -e "/tmp/.X11-unix/X$display_number" ] || [ -e "/tmp/.X$display_number-lock" ]; then
         fail G-X11-CLEANUP "owned socket or display lock survived shutdown"
     fi
     pass G-X11-CLEANUP "graceful shutdown removes owned listening sockets and display lock"
+fi
+
+if [ "$MEDIA_SOURCE" = 1 ]; then
+    "$PY" "$ROOT/scripts/lib/gtk_media_source.py" finish "$ROOT" "$ARTIFACTS"
 fi
 
 echo "tuna-gtk-shell-proof: OK, artifacts in $ARTIFACTS"
