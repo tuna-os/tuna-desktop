@@ -4,6 +4,7 @@ import json
 import importlib.util
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
 import time
@@ -98,9 +99,31 @@ if mode == 'eis':
         interface, 'ConnectToEIS', GLib.Variant('(oa{sv})', (session, {})), None,
         Gio.DBusCallFlags.NONE, 30000, None, None)
     fd = fds.get(reply.unpack()[0])
-    try: subprocess.run(['/out/remote-ei', str(fd)], pass_fds=(fd,), check=True, timeout=15)
-    finally: os.close(fd)
-    out.with_suffix('.eis-input.json').write_text(json.dumps(delivered(38, before_eis)))
+    process = subprocess.Popen(['/out/remote-ei', str(fd)], pass_fds=(fd,),
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    deadline = time.monotonic() + 15
+    try:
+        if not select.select([process.stdout], [], [], 15)[0]:
+            raise RuntimeError('libei sender did not send its frames within 15 seconds')
+        receipt = process.stdout.readline()
+        if receipt != b'libei keyboard and absolute pointer/button frames sent\n':
+            raise RuntimeError('libei sender exited before sending frames: ' + repr(receipt))
+        print(receipt.decode(), end='', flush=True)
+        # EIS disconnect revokes queued input. Observe the actual GTK receipt
+        # before allowing the sender to close, not after a fixed 200 ms sleep.
+        state = delivered(38, before_eis)
+        process.stdin.write(b'\n')
+        process.stdin.flush()
+        if process.wait(timeout=max(0, deadline - time.monotonic())) != 0:
+            raise RuntimeError('libei sender failed after delivery acknowledgement')
+        out.with_suffix('.eis-input.json').write_text(json.dumps(state))
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        process.stdin.close()
+        process.stdout.close()
+        os.close(fd)
 elif mode in ('revoke', 'backend-disconnect'):
     # Require a clean seat baseline; expose only the aggregate count.
     # Legacy notify calls queue input; GTK's key-down delivery can be

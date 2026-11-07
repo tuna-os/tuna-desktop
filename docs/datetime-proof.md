@@ -31,17 +31,20 @@ the gate's detail carries the probe error.
 
 The published-flavor lane reads the installed `tuna-desktop` package version
 with Marlin's native `pacman -Q` into `desktop_package_version` in that evidence
-bundle. Only the known pre-fix `1.0.0beta.1-1` package scopes out **G-DATETIME-CLOCK-TZ** and
-**G-DATETIME-CLOCK-SET**: its panel caches the previous zone, so the timezone
-probe can also leave the subsequent manual-time panel reading in the wrong
-zone (CI run 41175449180 observed a 39611 s delta). Both probes still run,
-their raw assertions remain in the qualification detail, and their original
-measurements remain in the evidence. The qualification explicitly delegates
-those two panel-follow proofs to the current-build `marlin-vm` lane; it is
-not evidence that the obsolete published shell passed them. All other gates,
-including the baseline panel clock and actual timedated manual-time writes,
-remain enforced. Current-build lanes always enforce every gate, even with
-that package version; newer or unknown published versions also remain strict.
+bundle. This is provenance, not a capability exemption: every gate records
+its actual verdict, including **G-DATETIME-CLOCK-TZ** and
+**G-DATETIME-CLOCK-SET**. Unsupported or unevaluable panel-follow results
+remain failures even for known older packages. Current-build success does
+not replace qualification of the published binary, and the original
+measurements and partial failures remain in the evidence.
+
+The known beta.2-2 package rebuilds immutable tag `v1.0.0-beta.2`, source
+`1e6ce28f4d5dfd7918ac7340bd93454a9fcc211c`. Its `wall_clock.rs` lacks
+the `/etc/localtime` monitor; #886's merge
+`414e358eff9bbfc871637696b9382e6578f396ae` is later. A package-recipe revision
+alone does not bring that newer desktop source into the published image.
+A replacement release needs its own source/package/image binding and actual
+panel-follow proof; changing a version allowlist is not a repair.
 
 ## Running
 
