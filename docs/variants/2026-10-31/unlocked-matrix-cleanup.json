@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "matrix": "unlocked-matrix/matrix.json",
+  "finished": "2026-11-01T00:21:25.839795+00:00",
+  "fail_stop": "Grouper cleanup returned cluster-unreachable circuit-breaker errors; driver refused to create Marlin/Flounder/Flounder-sid afterward.",
+  "access_prerequisite": "A subsequent kubectl --request-timeout=30s get --raw=/livez returned ok and the resource listing showed only one owned Grouper VM/VMI/PVC left. No cluster configuration was changed.",
+  "recovery": {
+    "name": "tuna-q-variant-grouper-31215908",
+    "deleted": true,
+    "removed": [
+      "virtualmachine.kubevirt.io/tuna-q-variant-grouper-31215908",
+      "virtualmachineinstance.kubevirt.io/tuna-q-variant-grouper-31215908",
+      "persistentvolumeclaim/tuna-q-variant-grouper-31215908-bootc-disk"
+    ],
+    "post_delete_corral_list_prefix_tuna_q_variant": []
+  },
+  "scope": "Only the exact owned Grouper VM/disk were deleted. punjab, soak and every other owner resource remain untouched.",
+  "next_sequence": "The three not-yet-attempted published subjects Marlin, Flounder and Flounder-sid use the new batched native coordinator with unchanged consent/active/withdrawal bounds; Albacore remains owner-deferred."
+}
