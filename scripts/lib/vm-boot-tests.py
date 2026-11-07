@@ -3022,10 +3022,7 @@ class TourViewPredicates(unittest.TestCase):
                 patch.object(lane.time, "sleep", advance):
             recorder = lane.Recorder(SimpleNamespace(cmd=command), directory,
                                      timeout=TourRecorderTests.SCHEDULING_TIMEOUT)
-            # The exact-PNG decode is a real ffmpeg process bounded by what is
-            # left of this deadline on the frozen clock: give it the tour's
-            # alt-tab budget, not 4.75 real seconds that a loaded host misses.
-            self.assertTrue(recorder.await_still("alt-tab", lane.switcher_shown, timeout=10, settle=0))
+            self.assertTrue(recorder.await_still("alt-tab", lane.switcher_shown, timeout=5, settle=0))
             self.assertTrue(recorder.still_confirmations["alt-tab"]["confirmed"])
             self.assertTrue(recorder.still_confirmations["alt-tab"]["evidence"]["exact_png"])
             deadline = now[0] + 0.05
