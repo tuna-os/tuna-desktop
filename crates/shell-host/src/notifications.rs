@@ -910,6 +910,19 @@ impl NotificationCenter {
         notification_policy::plays_sound(&policy, &n.sound).then(|| n.sound.clone())
     }
 
+    /// Whether `id`'s banner opens expanded as it comes on screen:
+    /// critical, or its source's `force-expanded` at that moment
+    /// (messageTray.js `_updateShowingNotification` auto-expands both).
+    pub fn banner_opens_expanded(&self, id: u64) -> bool {
+        let Some(n) = self.history.iter().find(|n| n.id == id) else {
+            return false;
+        };
+        n.urgency == Urgency::Critical
+            || self
+                .policy_for((!n.app_id.is_empty()).then_some(n.app_id.as_str()))
+                .force_expanded
+    }
+
     /// Mark notifications seen (a banner shown, the list opened).
     pub fn acknowledge(&mut self, ids: &[u64]) {
         let mut changed = false;
@@ -1152,6 +1165,23 @@ mod tests {
         let expanded = |id| c.history().iter().find(|n| n.id == id).unwrap().expanded;
         assert!(expanded(mail));
         assert!(!expanded(chat));
+    }
+
+    #[test]
+    fn force_expanded_is_read_as_the_banner_shows() {
+        let (mut c, store) = policed();
+        let mail = c.deliver(incoming("org.example.Mail", "Mail", Urgency::Normal));
+        let alarm = c.deliver(incoming("org.example.Chat", "Alarm", Urgency::Critical));
+        let generic = c.deliver(incoming("", "Generic", Urgency::Normal));
+        assert!(!c.banner_opens_expanded(mail));
+        // Critical always opens expanded.
+        assert!(c.banner_opens_expanded(alarm));
+        // The key switched on while the banner waits reaches it.
+        store.set("org.example.Mail", |a| a.force_expanded = true);
+        assert!(c.banner_opens_expanded(mail));
+        // The generic policy never forces it; unknown ids open collapsed.
+        assert!(!c.banner_opens_expanded(generic));
+        assert!(!c.banner_opens_expanded(9999));
     }
 
     #[test]

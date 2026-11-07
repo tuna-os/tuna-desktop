@@ -28,20 +28,25 @@
 #                        menu's list; enabling the app brings it back
 #                        there at once, with no banner (messageTray.js
 #                        _onSourceEnableChanged hides, never drops)
+#   G-NOTIFY-EXPANDED    a banner opens collapsed (one body line, no
+#                        action buttons) unless critical or its app's
+#                        force-expanded is on, read as it shows; the
+#                        pointer coming onto it expands and holds it
+#                        (messageTray.js _expandBanner)
 
 NL_SCHEMA=org.gnome.desktop.notifications
 NL_APP_SCHEMA=org.gnome.desktop.notifications.application
-NL_APPS="tuna-lock-private tuna-lock-detailed tuna-lock-hidden tuna-lock-off tuna-sound-on tuna-sound-muted"
+NL_APPS="tuna-lock-private tuna-lock-detailed tuna-lock-hidden tuna-lock-off tuna-sound-on tuna-sound-muted tuna-expand-plain tuna-expand-forced"
 
 nl_app() { printf '%s:/org/gnome/desktop/notifications/application/%s/' "$NL_APP_SCHEMA" "$1"; }
 
 # Notify as installed app $1: summary $2, body $3, urgency byte $4, more
-# hints $5, replacing $6. Prints the id.
+# hints $5, replacing $6, actions $7. Prints the id.
 nl_notify() {
     nl_out=$(gdbus call --session --dest org.freedesktop.Notifications \
         --object-path /org/freedesktop/Notifications \
         --method org.freedesktop.Notifications.Notify \
-        -- "Tuna Lock Proof" "${6:-0}" "" "$2" "$3" "[]" \
+        -- "Tuna Lock Proof" "${6:-0}" "" "$2" "$3" "${7:-[]}" \
         "{'desktop-entry': <'$1'>, 'urgency': <byte $4>${5:+, $5}}" -1) || return 1
     printf '%s %s\n' "$1" "$nl_out" >>"$ARTIFACTS/notify-lock.log"
     printf '%s\n' "$nl_out" | sed -n 's/.*uint32 \([0-9][0-9]*\).*/\1/p'
@@ -294,10 +299,68 @@ notify_lock_proof() {
     nl_close "$nl_listed"
     nl_close "$nl_off_again"
     pass G-NOTIFY-RESTORE "a disabled app's notification stays out of the list; enabling the app brings it back at once, with no banner"
+    # Expanded banners: collapsed is one body line and no actions.
+    gsettings set "$(nl_app tuna-expand-forced)" force-expanded true
+    nl_long="A long body that runs on well past the single line a collapsed banner keeps, so only an expanded banner shows the rest of it."
+    nl_body_h() { # tree: the body label's height
+        jq -r --arg b "$nl_long" '[.[] | select(.showing and .name == $b and .role == "label" and .bounds != null) | .bounds[3]][0] // empty' "$1"
+    }
+    nl_expand_step() { # app summary urgency expect(collapsed|expanded) message
+        xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2))
+        nl_id=$(nl_notify "$1" "$2" "$nl_long" "$3" "" 0 "['reply', 'Reply']") ||
+            fail G-NOTIFY-EXPANDED "Notify failed"
+        nl_until "expand-$1-$3" "any(.[]; .showing and .name == \"$2\")" G-NOTIFY-EXPANDED ||
+            fail G-NOTIFY-EXPANDED "no banner for \"$2\""
+        sleep 0.5
+        nl_dump "expand-$1-$3" G-NOTIFY-EXPANDED
+        nl_h=$(nl_body_h "$nl_tree")
+        [ -n "$nl_h" ] || fail G-NOTIFY-EXPANDED "\"$2\" shows no body"
+        if [ "$4" = expanded ]; then
+            button_showing "$nl_tree" "Reply" || fail G-NOTIFY-EXPANDED "$5: no action button"
+            [ "$nl_h" -gt $((nl_line_h * 3 / 2)) ] ||
+                fail G-NOTIFY-EXPANDED "$5: the body is $nl_h px, one line is $nl_line_h px"
+        else
+            button_showing "$nl_tree" "Reply" && fail G-NOTIFY-EXPANDED "$5: the action shows collapsed"
+            nl_line_h=$nl_h
+        fi
+        nl_shot "expand-$1-$3"
+    }
+    nl_expand_step tuna-expand-plain "Plain Banner" 1 collapsed "a plain banner opened expanded"
+    # The pointer onto the banner expands it, and holds it there.
+    xdotool mousemove --window "$WID" $((WIDTH / 2)) 60
+    nl_until expand-hover 'any(.[]; .showing and .name == "Reply" and (.role == "push button" or .role == "button"))' G-NOTIFY-EXPANDED ||
+        fail G-NOTIFY-EXPANDED "the pointer on a banner did not expand it"
+    nl_hover_h=$(nl_body_h "$nl_tree")
+    [ "${nl_hover_h:-0}" -gt $((nl_line_h * 3 / 2)) ] ||
+        fail G-NOTIFY-EXPANDED "hover showed the actions but the body stayed ${nl_hover_h:-0} px"
+    nl_shot expand-hover
+    sleep 5
+    nl_dump expand-held G-NOTIFY-EXPANDED
+    showing "$nl_tree" "Plain Banner" || fail G-NOTIFY-EXPANDED "the banner under the pointer timed out"
+    # Off it, the banner goes.
+    xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2))
+    sleep 1.5
+    nl_dump expand-left G-NOTIFY-EXPANDED
+    showing "$nl_tree" "Plain Banner" && fail G-NOTIFY-EXPANDED "the banner stayed once the pointer left it"
+    nl_close "$nl_id"
+    sleep 1
+    nl_expand_step tuna-expand-forced "Forced Banner" 1 expanded "force-expanded"
+    nl_close "$nl_id"
+    sleep 1
+    nl_expand_step tuna-expand-plain "Critical Banner" 2 expanded "a critical banner"
+    nl_close "$nl_id"
+    sleep 1
+    # The key is read as each banner shows.
+    gsettings set "$(nl_app tuna-expand-forced)" force-expanded false
+    sleep 1
+    nl_expand_step tuna-expand-forced "Unforced Banner" 1 collapsed "force-expanded off still opened expanded"
+    nl_close "$nl_id"
+    sleep 1
+    pass G-NOTIFY-EXPANDED "banners open collapsed (one body line, no actions) unless critical or force-expanded, read as each shows; the pointer expands a banner and holds it until it leaves"
 
     # As found for the gates after.
     for nl_id in $NL_APPS; do
-        for nl_key in enable enable-sound-alerts show-in-lock-screen details-in-lock-screen application-id; do
+        for nl_key in enable enable-sound-alerts show-in-lock-screen details-in-lock-screen force-expanded application-id; do
             gsettings reset "$(nl_app "$nl_id")" "$nl_key"
         done
         rm -f "$nl_desktop_dir/$nl_id.desktop"
