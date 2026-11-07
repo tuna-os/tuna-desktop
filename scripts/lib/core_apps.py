@@ -458,10 +458,14 @@ class Desktop(NativeDesktop):
             self.replace(picker, 'File Name', Path(path).name)
         elif not directory:
             basename = Path(path).name
-            tree = self.await_state('picker-actual-content-cell', lambda: self.tree(picker),
-                                    lambda value: any(node['showing'] and node['role'] == 'table cell'
-                                                      and node['name'] in (basename, basename + '. File')
-                                                      for node in value['nodes']))
+            try:
+                tree = self.await_state('picker-actual-content-cell', lambda: self.tree(picker),
+                                        lambda value: any(node['showing'] and node['role'] == 'table cell'
+                                                          and node['name'] in (basename, basename + '. File')
+                                                          for node in value['nodes']))
+            except TimeoutError:
+                self._picker_listing_diagnostic(picker)
+                raise
             cells = [node for node in tree['nodes'] if node['showing'] and node['role'] == 'table cell'
                      and node['name'] in (basename, basename + '. File')]
             if len(cells) != 1:
@@ -471,6 +475,29 @@ class Desktop(NativeDesktop):
                              lambda value: any(node['path'] == cells[0]['path'] and node['selected']
                                                for node in value['nodes']))
         return picker
+
+    def _picker_listing_diagnostic(self, picker):
+        """Ground truth for a chooser that lists no content cell.
+
+        An empty listing is ambiguous between a wrong folder and the app's
+        own filter hiding the file (run 42390576348: Papers' chooser read
+        Folder is Empty). Retain the pixels, then the filter menu's options
+        and its pixels. Best effort only: the original timeout still fails.
+        """
+        try:
+            self.observe('picker-content-cell-missing', picker)
+            tree = self.tree(picker)
+            filters = [node for node in tree['nodes'] if node['showing'] and node['role'] == 'toggle button'
+                       and node['sensitive'] and node['name'] not in ('', 'Search Current Folder', 'View Options',
+                                                                       'Search Everywhere')]
+            self.retain('picker-filter-candidates', {'candidates': filters})
+            if len(filters) == 1:
+                self.click_path(picker, filters[0]['path'])
+                self.retain('picker-filter-options', self.tree(picker))
+                self.observe('picker-filter-options-open', picker)
+                self.keys('esc')
+        except Exception as error:
+            self.retain('picker-diagnostic-error', {'error_type': type(error).__name__})
 
     def _accept_picker(self, actor, picker, path, save):
         if not save:
