@@ -1,0 +1,265 @@
+#!/usr/bin/python3
+"""CI-only, opt-in first-login observer. Never enable GDM debug or read bus arguments."""
+import json
+import os
+import pathlib
+import pwd
+import re
+import selectors
+import signal
+import subprocess
+import sys
+import time
+
+DIRECTORY = pathlib.Path("/run/tuna-vm-gdm-trace")
+UNIT = "tuna-vm-gdm-trace.service"
+OBJECT = "/org/freedesktop/Accounts/User1001"
+INTERFACE = "org.freedesktop.Accounts.User"
+METHODS = ("SetSession", "SetSessionType", "SetXSession")
+RULES = tuple(f"type='method_call',path='{OBJECT}',interface='{INTERFACE}',member='{method}'"
+              for method in METHODS) + (
+    "type='method_return'", "type='error'",
+    "type='signal',interface='org.freedesktop.DBus',member='NameLost'",
+)
+SECONDS = 90
+INPUT_BOUND = 1024 * 1024
+EVENT_BOUND = 128
+UNIQUE_NAME = re.compile(r":[0-9]+\.[0-9]+")
+MARKERS = {
+    "GdmSessionWorker: saving account details for user tunastd": "saving-account-details",
+    "GdmSessionWorker: session name set to tuna": "session-name-tuna",
+    "could not save session and language settings": "save-failed",
+    "GdmSessionWorker: state SESSION_OPENED": "session-opened",
+}
+
+
+def save(name, value):
+    temporary = DIRECTORY / f"{name}.tmp"
+    temporary.write_text(json.dumps(value))
+    temporary.replace(DIRECTORY / name)
+
+
+class Headers:
+    """dbus-monitor --profile emits tab-separated headers, never message bodies.
+
+    Calls correlate by (sender, serial), replies by (destination, reply_serial).
+    Unrelated reply headers are discarded; no arguments or error text are read.
+    """
+    def __init__(self):
+        self.pending = {}
+        self.events = []
+
+    def add(self, line):
+        fields = line.split("\t")
+        if len(self.events) >= EVENT_BOUND:
+            return
+        if len(fields) == 8 and fields[0] == "mc":
+            _, _, serial, sender, destination, path, interface, member = fields
+            if (path != OBJECT or interface != INTERFACE or member not in METHODS
+                    or not serial.isdecimal() or not UNIQUE_NAME.fullmatch(sender)
+                    or not (destination == "org.freedesktop.Accounts" or UNIQUE_NAME.fullmatch(destination))):
+                return
+            event = {"kind": "call", "sender": sender, "serial": int(serial),
+                     "destination": destination, "object": OBJECT, "member": member}
+            self.pending[sender, serial] = member
+            self.events.append(event)
+        elif len(fields) == 6 and fields[0] in ("mr", "err"):
+            kind, _, serial, sender, destination, reply_serial = fields
+            member = self.pending.pop((destination, reply_serial), None)
+            if member is not None and serial.isdecimal() and (UNIQUE_NAME.fullmatch(sender)
+                                                                           or sender == "org.freedesktop.DBus"):
+                self.events.append({"kind": "return" if kind == "mr" else "error", "sender": sender,
+                                    "destination": destination, "reply_serial": int(reply_serial),
+                                    "member": member})
+
+
+def observe():
+    stopped = False
+
+    def stop(*_):
+        nonlocal stopped
+        stopped = True
+
+    signal.signal(signal.SIGTERM, stop)
+    headers = Headers()
+    started = time.time()
+    deadline = time.monotonic() + SECONDS
+    reason = "deadline"
+    monitor = None
+    try:
+        monitor = subprocess.Popen(["dbus-monitor", "--system", "--profile", *RULES],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL)
+        with selectors.DefaultSelector() as selector:
+            selector.register(monitor.stdout, selectors.EVENT_READ)
+            buffer, received, ready = b"", 0, False
+            while not stopped and time.monotonic() < deadline:
+                if not selector.select(0.1):
+                    continue
+                chunk = os.read(monitor.stdout.fileno(), 4096)
+                if not chunk:
+                    reason = "monitor-exited"
+                    break
+                received += len(chunk)
+                if received > INPUT_BOUND:
+                    reason = "input-bound"
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    # The first profile header is emitted only after BecomeMonitor.
+                    if not ready and line.startswith(b"#type\t"):
+                        save("ready.json", {"ready": True})
+                        ready = True
+                    if len(line) <= 1024:
+                        headers.add(line.decode(errors="replace"))
+                if len(buffer) > 4096:
+                    reason = "line-bound"
+                    break
+                if len(headers.events) >= EVENT_BOUND:
+                    reason = "event-bound"
+                    break
+            if stopped:
+                reason = "stopped"
+    except (OSError, ValueError) as error:
+        reason = type(error).__name__
+    finally:
+        if monitor is not None:
+            if monitor.poll() is None:
+                monitor.terminate()
+            try:
+                monitor.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                monitor.kill()
+                monitor.wait()
+            monitor.stdout.close()
+        save("receipt.json", {"object": OBJECT, "profile": "headers-only", "started": started,
+                              "stop": reason, "events": headers.events,
+                              "pending_replies": len(headers.pending), "seconds_bound": SECONDS})
+
+
+def bounded_journal(argv):
+    """Hard limits on journal subprocess time and bytes, before JSON decoding."""
+    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL)
+    deadline, output = time.monotonic() + 3, bytearray()
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while time.monotonic() < deadline:
+                if not selector.select(0.05):
+                    continue
+                chunk = os.read(process.stdout.fileno(), 4096)
+                if not chunk:
+                    return process.wait(timeout=max(0.01, deadline - time.monotonic())), bytes(output)
+                output.extend(chunk)
+                if len(output) > 65536:
+                    return "journal-output-bound", b""
+        return "journal-time-bound", b""
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        process.stdout.close()
+
+
+def worker_markers(started):
+    """Read only existing allowlisted journal entries; missing debug is inconclusive."""
+    pids = []
+    for path in pathlib.Path("/proc").iterdir():
+        if not path.name.isdecimal():
+            continue
+        try:
+            if ((path / "comm").read_text().strip() != "gdm-session-wor"
+                    or (path / "exe").resolve().name != "gdm-session-worker"):
+                continue
+            with (path / "cmdline").open("rb") as stream:
+                argv0 = stream.read(256).split(b"\0", 1)[0]
+            if argv0 == b"gdm-session-worker [pam/gdm-password]":
+                pids.append(int(path.name))
+        except (OSError, RuntimeError):
+            continue
+    result = {"debug_enabled_by_probe": False, "pids": sorted(pids), "markers": [],
+              "availability": "unavailable-or-debug-disabled"}
+    if not pids:
+        return result
+    # --grep filters in journalctl before output; the JSON projection below still
+    # checks full equality and emits fixed labels, not journal messages.
+    pattern = "|".join(re.escape(message) for message in MARKERS)
+    try:
+        status, output = bounded_journal(
+            ["journalctl", "--no-pager", "--output=json", "--output-fields=MESSAGE,_PID",
+             "--since", f"@{started:.6f}", "--lines=128", f"--grep={pattern}",
+             *(f"_PID={pid}" for pid in sorted(pids))])
+        if isinstance(status, str):
+            result["availability"] = status
+            return result
+        result["returncode"] = status
+        if status not in (0, 1):
+            result["availability"] = "journal-query-failed"
+            return result
+        for line in output.splitlines():
+            entry = json.loads(line)
+            message = entry.get("MESSAGE", "")
+            if not isinstance(message, str):
+                continue
+            # GDM may prepend its fixed log domain.
+            message = message.removeprefix("Gdm: ")
+            if message in MARKERS and str(entry.get("_PID")) in {str(pid) for pid in pids}:
+                result["markers"].append({"pid": int(entry["_PID"]), "marker": MARKERS[message]})
+        if result["markers"]:
+            result["availability"] = "allowlisted-markers-observed"
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        result["availability"] = type(error).__name__
+    return result
+
+
+def command(action):
+    if action == "start":
+        if pwd.getpwnam("tunastd").pw_uid != 1001:
+            return {"error": "fixture-uid-not-1001"}
+        # One observer per snapshot boot, never replace or reuse a prior trace.
+        DIRECTORY.mkdir(mode=0o700)
+        run = subprocess.run(["systemd-run", f"--unit={UNIT}", "--property=Type=exec",
+                              "--property=RuntimeMaxSec=95", "--property=TimeoutStopSec=3",
+                              "--property=StandardOutput=null", "--property=StandardError=null",
+                              sys.executable, str(pathlib.Path(__file__).resolve()), "observe"],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, timeout=5, check=False)
+        if run.returncode != 0:
+            return {"error": "observer-start-failed", "returncode": run.returncode}
+        # Resource readiness only: no change to GDM login retries/deadlines.
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if (DIRECTORY / "ready.json").is_file():
+                return {"ready": True, "object": OBJECT, "seconds_bound": SECONDS}
+            if (DIRECTORY / "receipt.json").is_file():
+                break
+            time.sleep(0.02)
+        return {"error": "observer-not-ready"}
+    if action == "stop":
+        subprocess.run(["systemctl", "stop", UNIT], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=5, check=False)
+        path = DIRECTORY / "receipt.json"
+        if not path.is_file():
+            return {"error": "observer-receipt-unavailable"}
+        result = json.loads(path.read_text())
+        result["worker"] = worker_markers(result["started"])
+        return result
+    raise ValueError("unknown trace action")
+
+
+if __name__ == "__main__":
+    try:
+        if os.geteuid() != 0:
+            raise PermissionError()
+        if sys.argv[1:] == ["observe"]:
+            observe()
+        elif len(sys.argv) == 2:
+            print(json.dumps(command(sys.argv[1])))
+        else:
+            raise ValueError()
+    except Exception as error:
+        # Never export stderr/exception text, bus bodies, or journal messages.
+        print(json.dumps({"error": type(error).__name__}))
+        raise SystemExit(1) from None

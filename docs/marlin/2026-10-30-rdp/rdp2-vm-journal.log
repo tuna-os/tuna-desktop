@@ -1,0 +1,106 @@
+2026-10-30T16:32:33+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[4984]: [RDP.CLIPRDR] Relieving CLIPRDR filename restriction
+2026-10-30T16:32:33+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[4897]: tuna-compositor: screen cast 2: Unconnected -> Connecting
+2026-10-30T16:32:33+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[4897]: tuna-compositor: screen cast 2: Connecting -> Paused
+2026-10-30T16:32:33+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[4984]: [RDP.CLIPRDR] Client capabilities: long format names, stream file clip, file clip no file paths, huge file support
+2026-10-30T16:32:33+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[4897]: tuna-compositor: screen cast 2: Paused -> Streaming
+2026-10-30T16:32:33+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[4984]: [RDP.RDPGFX] CapsAdvertise: Accepting capability set with version RDPGFX_CAPVERSION_107, Client cap flags: H264 (AVC444): true, H264 (AVC420): true
+2026-10-30T16:35:52+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[4984]: [16:35:52:811] [4984:00001656] [ERROR][com.freerdp.core.peer] - [rdp_set_error_info]: ERRINFO_LOGOFF_BY_USER [0x0001000C]
+2026-10-30T16:35:52+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[4984]: [RDP] Network or intentional disconnect, stopping session
+2026-10-30T16:35:52+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[4897]: tuna-compositor: screen cast 2: Streaming -> Paused
+2026-10-30T16:35:52+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[4897]: tuna-compositor: screen cast 2: Paused -> Unconnected
+2026-10-30T16:35:52+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[4984]: Failed to stop: GDBus.Error:org.freedesktop.DBus.Error.AccessDenied: remote session is not owned by caller
+2026-10-30T16:41:14+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[4984]: RDP server stopped
+2026-10-30T16:41:14+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[4984]: [16:35:52:811] [4984:00001656] [INFO][com.freerdp.core] - [rdp_print_errinfo]: ERRINFO_LOGOFF_BY_USER (0x0000000C):The disconnection was initiated by the user logging off their session on the server.
+2026-10-30T16:41:47+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: RDP server started
+2026-10-30T16:42:57+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [RDP.CLIPRDR] Relieving CLIPRDR filename restriction
+2026-10-30T16:42:57+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [RDP.CLIPRDR] Client capabilities: long format names, stream file clip, file clip no file paths, huge file support
+2026-10-30T16:42:57+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [RDP.RDPGFX] CapsAdvertise: Accepting capability set with version RDPGFX_CAPVERSION_107, Client cap flags: H264 (AVC444): true, H264 (AVC420): true
+2026-10-30T16:42:57+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 2: Unconnected -> Connecting
+2026-10-30T16:42:57+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 2: Connecting -> Paused
+2026-10-30T16:42:57+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 2: Paused -> Streaming
+2026-10-30T16:47:48+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [16:47:48:128] [9056:000026ae] [ERROR][com.freerdp.core.peer] - [rdp_set_error_info]: ERRINFO_LOGOFF_BY_USER [0x0001000C]
+2026-10-30T16:47:48+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [RDP] Network or intentional disconnect, stopping session
+2026-10-30T16:47:48+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 2: Streaming -> Paused
+2026-10-30T16:47:48+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 2: Paused -> Unconnected
+2026-10-30T16:47:48+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: Failed to stop: GDBus.Error:org.freedesktop.DBus.Error.AccessDenied: remote session is not owned by caller
+2026-10-30T16:47:56+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [RDP.CLIPRDR] Relieving CLIPRDR filename restriction
+2026-10-30T16:47:56+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [RDP.CLIPRDR] Client capabilities: long format names, stream file clip, file clip no file paths, huge file support
+2026-10-30T16:47:56+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 5: Unconnected -> Connecting
+2026-10-30T16:47:56+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 5: Connecting -> Paused
+2026-10-30T16:47:56+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [RDP.RDPGFX] CapsAdvertise: Accepting capability set with version RDPGFX_CAPVERSION_107, Client cap flags: H264 (AVC444): true, H264 (AVC420): true
+2026-10-30T16:47:56+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 5: Paused -> Streaming
+2026-10-30T16:48:37+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [16:48:37:325] [9056:00002360] [ERROR][com.freerdp.core.peer] - [rdp_set_error_info]: ERRINFO_RPC_INITIATED_DISCONNECT [0x00010001]
+2026-10-30T16:48:37+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 5: Streaming -> Paused
+2026-10-30T16:48:37+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 5: Paused -> Unconnected
+2026-10-30T16:48:37+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: display power save mode 3
+2026-10-30T16:49:07+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: display power save mode 0
+2026-10-30T16:49:15+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: Failed to start remote desktop session: GDBus.Error:org.freedesktop.DBus.Error.AccessDenied: session locked
+2026-10-30T16:49:15+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [16:49:15:901] [9056:00002360] [ERROR][com.freerdp.core.peer] - [rdp_set_error_info]: ERRINFO_RPC_INITIATED_DISCONNECT [0x00010001]
+2026-10-30T16:49:37+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: display power save mode 3
+2026-10-30T16:49:54+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: display power save mode 0
+2026-10-30T16:50:19+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [RDP.CLIPRDR] Relieving CLIPRDR filename restriction
+2026-10-30T16:50:19+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [RDP.CLIPRDR] Client capabilities: long format names, stream file clip, file clip no file paths, huge file support
+2026-10-30T16:50:19+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 8: Unconnected -> Connecting
+2026-10-30T16:50:19+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 8: Connecting -> Paused
+2026-10-30T16:50:19+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [RDP.RDPGFX] CapsAdvertise: Accepting capability set with version RDPGFX_CAPVERSION_107, Client cap flags: H264 (AVC444): true, H264 (AVC420): true
+2026-10-30T16:50:19+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 8: Paused -> Streaming
+2026-10-30T16:50:52+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [16:50:52:818] [9056:00002360] [ERROR][com.freerdp.core.peer] - [rdp_set_error_info]: ERRINFO_RPC_INITIATED_DISCONNECT [0x00010001]
+2026-10-30T16:50:52+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 8: Streaming -> Paused
+2026-10-30T16:50:52+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 8: Paused -> Unconnected
+2026-10-30T16:50:52+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: Failed to stop: GDBus.Error:org.freedesktop.DBus.Error.AccessDenied: remote session is not owned by caller
+2026-10-30T16:50:52+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: RDP server stopped
+2026-10-30T16:50:52+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [16:47:48:128] [9056:000026ae] [INFO][com.freerdp.core] - [rdp_print_errinfo]: ERRINFO_LOGOFF_BY_USER (0x0000000C):The disconnection was initiated by the user logging off their session on the server.
+2026-10-30T16:50:52+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [16:48:37:325] [9056:00002360] [INFO][com.freerdp.core] - [rdp_print_errinfo]: ERRINFO_RPC_INITIATED_DISCONNECT (0x00000001):The disconnection was initiated by an administrative tool on the server in another session.
+2026-10-30T16:50:52+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [16:49:15:901] [9056:00002360] [INFO][com.freerdp.core] - [rdp_print_errinfo]: ERRINFO_RPC_INITIATED_DISCONNECT (0x00000001):The disconnection was initiated by an administrative tool on the server in another session.
+2026-10-30T16:50:52+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[9056]: [16:50:52:818] [9056:00002360] [INFO][com.freerdp.core] - [rdp_print_errinfo]: ERRINFO_RPC_INITIATED_DISCONNECT (0x00000001):The disconnection was initiated by an administrative tool on the server in another session.
+2026-10-30T16:51:28+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12323]: RDP server started
+2026-10-30T16:51:41+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12323]: [RDP.CLIPRDR] Relieving CLIPRDR filename restriction
+2026-10-30T16:51:41+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12323]: [RDP.CLIPRDR] Client capabilities: long format names, stream file clip, file clip no file paths, huge file support
+2026-10-30T16:51:41+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 11: Unconnected -> Connecting
+2026-10-30T16:51:41+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 11: Connecting -> Paused
+2026-10-30T16:51:41+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12323]: [RDP.RDPGFX] CapsAdvertise: Accepting capability set with version RDPGFX_CAPVERSION_107, Client cap flags: H264 (AVC444): true, H264 (AVC420): true
+2026-10-30T16:51:41+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 11: Paused -> Streaming
+2026-10-30T16:52:04+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12323]: [16:52:04:507] [12323:00003023] [ERROR][com.freerdp.core.peer] - [rdp_set_error_info]: ERRINFO_RPC_INITIATED_DISCONNECT [0x00010001]
+2026-10-30T16:52:04+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12323]: Failed to stop: GDBus.Error:org.freedesktop.DBus.Error.AccessDenied: remote session is not owned by caller
+2026-10-30T16:52:04+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 11: Streaming -> Paused
+2026-10-30T16:52:04+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12323]: RDP server stopped
+2026-10-30T16:52:04+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 11: Paused -> Unconnected
+2026-10-30T16:52:04+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12323]: [16:52:04:507] [12323:00003023] [INFO][com.freerdp.core] - [rdp_print_errinfo]: ERRINFO_RPC_INITIATED_DISCONNECT (0x00000001):The disconnection was initiated by an administrative tool on the server in another session.
+2026-10-30T16:52:04+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12553]: RDP server started
+2026-10-30T16:52:18+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12553]: [RDP.CLIPRDR] Relieving CLIPRDR filename restriction
+2026-10-30T16:52:18+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12553]: [RDP.CLIPRDR] Client capabilities: long format names, stream file clip, file clip no file paths, huge file support
+2026-10-30T16:52:18+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 14: Unconnected -> Connecting
+2026-10-30T16:52:18+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 14: Connecting -> Paused
+2026-10-30T16:52:18+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12553]: [RDP.RDPGFX] CapsAdvertise: Accepting capability set with version RDPGFX_CAPVERSION_107, Client cap flags: H264 (AVC444): true, H264 (AVC420): true
+2026-10-30T16:52:18+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 14: Paused -> Streaming
+2026-10-30T16:55:46+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 14: Streaming -> Paused
+2026-10-30T16:55:46+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[8970]: tuna-compositor: screen cast 14: Paused -> Unconnected
+2026-10-30T16:55:46+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12553]:  16:55:46 | WARN | Connection error: socket disconnected
+2026-10-30T16:55:46+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12553]:       ... | WARN | failed to send message: Broken pipe
+2026-10-30T16:55:46+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12553]: [16:55:46:319] [12553:00003109] [ERROR][com.freerdp.core.peer] - [rdp_set_error_info]: ERRINFO_RPC_INITIATED_DISCONNECT [0x00010001]
+2026-10-30T16:55:46+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12553]: RDP server stopped
+2026-10-30T16:55:46+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[12553]: [16:55:46:319] [12553:00003109] [INFO][com.freerdp.core] - [rdp_print_errinfo]: ERRINFO_RPC_INITIATED_DISCONNECT (0x00000001):The disconnection was initiated by an administrative tool on the server in another session.
+2026-10-30T16:56:20+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[14654]: RDP server started
+2026-10-30T16:57:09+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[14654]: [RDP.CLIPRDR] Relieving CLIPRDR filename restriction
+2026-10-30T16:57:09+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[14654]: [RDP.CLIPRDR] Client capabilities: long format names, stream file clip, file clip no file paths, huge file support
+2026-10-30T16:57:09+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[14654]: [RDP.RDPGFX] CapsAdvertise: Accepting capability set with version RDPGFX_CAPVERSION_107, Client cap flags: H264 (AVC444): true, H264 (AVC420): true
+2026-10-30T16:57:09+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[14564]: tuna-compositor: screen cast 2: Unconnected -> Connecting
+2026-10-30T16:57:09+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[14564]: tuna-compositor: screen cast 2: Connecting -> Paused
+2026-10-30T16:57:09+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[14564]: tuna-compositor: screen cast 2: Paused -> Streaming
+2026-10-30T16:57:42+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[14654]: [16:57:42:491] [14654:00003c3f] [ERROR][com.freerdp.core.peer] - [rdp_set_error_info]: ERRINFO_LOGOFF_BY_USER [0x0001000C]
+2026-10-30T16:57:42+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[14654]: [RDP] Network or intentional disconnect, stopping session
+2026-10-30T16:57:42+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[14564]: tuna-compositor: screen cast 2: Streaming -> Paused
+2026-10-30T16:57:42+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[14564]: tuna-compositor: screen cast 2: Paused -> Unconnected
+2026-10-30T16:58:09+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[14654]: [RDP.CLIPRDR] Relieving CLIPRDR filename restriction
+2026-10-30T16:58:09+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[14654]: [RDP.CLIPRDR] Client capabilities: long format names, stream file clip, file clip no file paths, huge file support
+2026-10-30T16:58:09+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[14654]: [RDP.RDPGFX] CapsAdvertise: Accepting capability set with version RDPGFX_CAPVERSION_107, Client cap flags: H264 (AVC444): true, H264 (AVC420): true
+2026-10-30T16:58:09+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[14564]: tuna-compositor: screen cast 5: Unconnected -> Connecting
+2026-10-30T16:58:09+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[14564]: tuna-compositor: screen cast 5: Connecting -> Paused
+2026-10-30T16:58:09+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[14564]: tuna-compositor: screen cast 5: Paused -> Streaming
+2026-10-30T16:58:31+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[14654]: [16:58:31:739] [14654:0000393e] [ERROR][com.freerdp.core.peer] - [rdp_set_error_info]: ERRINFO_RPC_INITIATED_DISCONNECT [0x00010001]
+2026-10-30T16:58:31+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[14564]: tuna-compositor: screen cast 5: Streaming -> Paused
+2026-10-30T16:58:31+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[14564]: tuna-compositor: screen cast 5: Paused -> Unconnected
+2026-10-30T16:58:31+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[14564]: tuna-compositor: display power save mode 3
+2026-10-30T16:58:43+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[14654]: Failed to start remote desktop session: GDBus.Error:org.freedesktop.DBus.Error.AccessDenied: session locked
+2026-10-30T16:58:43+00:00 tuna-q-rdp2 gnome-remote-desktop-daemon[14654]: [16:58:43:116] [14654:0000393e] [ERROR][com.freerdp.core.peer] - [rdp_set_error_info]: ERRINFO_RPC_INITIATED_DISCONNECT [0x00010001]
+2026-10-30T16:59:02+00:00 tuna-q-rdp2 /usr/lib/gdm-wayland-session[14564]: tuna-compositor: display power save mode 0
