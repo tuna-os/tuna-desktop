@@ -692,6 +692,22 @@ class Desktop(NativeDesktop):
                 self.guest('desktop', 'ime-monitor-stop')
             self.guest('desktop', 'ime-engine', select=False, original=engine['original'])
 
+    def record_ime(self, actor, evidence):
+        """Register an app's IME proof gathered by its own domain consumer.
+
+        Image Viewer's only editable field is a popover entry that ime()
+        cannot drive (the popover grab hides seat focus from its oracle), so
+        _loupe composes through it itself; result() still requires the proof
+        to be registered against the exact original app.
+        """
+        if actor.get('kind') != 'app' or evidence.get('actor') != actor:
+            raise RuntimeError('domain IME proof must belong to the exact original app actor')
+        committed = evidence.get('committed')
+        copied = evidence.get('clipboard')
+        if not isinstance(committed, dict) or not isinstance(copied, dict) or not evidence.get('engine'):
+            raise RuntimeError('domain IME proof lacks its commit, clipboard or engine evidence')
+        self._ime[actor['id']] = evidence
+
     @staticmethod
     def _binding_identity(value):
         return value | {'resources': [{key: data for key, data in row.items()

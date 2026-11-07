@@ -871,5 +871,42 @@ class PickerAcceptGesture(unittest.TestCase):
         self.assertEqual(list(merged.getdata()), list(plain.getdata()))
 
 
+class DomainImeRegistration(unittest.TestCase):
+    """A domain-owned IME proof (Loupe's popover entry) must reach result().
+
+    Run 42337013327: every Loupe step passed, then result() refused the
+    whole app because the proof never entered the desktop's IME registry.
+    """
+    def desktop(self):
+        desktop = core_apps.Desktop.__new__(core_apps.Desktop)
+        desktop._ime = {}
+        return desktop
+
+    def proof(self, actor):
+        return {'actor': actor, 'committed': {'nodes': []}, 'clipboard': {'base64': '5L2g'},
+                'engine': {'actual': 'libpinyin'}}
+
+    def test_registers_exact_app_proof(self):
+        desktop = self.desktop()
+        actor = {'id': 'org.gnome.Loupe', 'kind': 'app'}
+        desktop.record_ime(actor, self.proof(actor))
+        self.assertEqual(desktop._ime['org.gnome.Loupe'], self.proof(actor))
+
+    def test_rejects_foreign_actor_picker_and_missing_evidence(self):
+        actor = {'id': 'org.gnome.Loupe', 'kind': 'app'}
+        desktop = self.desktop()
+        with self.assertRaises(RuntimeError):
+            desktop.record_ime(actor, self.proof({'id': 'other', 'kind': 'app'}))
+        picker = {'id': 'picker', 'kind': 'picker'}
+        with self.assertRaises(RuntimeError):
+            desktop.record_ime(picker, self.proof(picker))
+        for key in ('committed', 'clipboard', 'engine'):
+            incomplete = self.proof(actor)
+            del incomplete[key]
+            with self.assertRaises(RuntimeError):
+                desktop.record_ime(actor, incomplete)
+        self.assertEqual(desktop._ime, {})
+
+
 if __name__ == '__main__':
     unittest.main()

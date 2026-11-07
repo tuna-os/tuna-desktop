@@ -324,6 +324,7 @@ def _loupe(desktop):
             evidence['ime'] = {'actor': actor, 'field': zoom_entry, 'committed': committed,
                 'clipboard': copied, 'engine': engine, 'actual_input': 'physical-ni-space',
                 'grab_held_oracle': 'seat/bus unattributable under open popover grab; commit+clipboard prove the chain'}
+            desktop.record_ime(actor, evidence['ime'])
         finally:
             desktop.guest('desktop', 'ime-engine', select=False, original=engine['original'])
     finally:
