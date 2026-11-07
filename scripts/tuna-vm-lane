@@ -2690,7 +2690,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         menu_identities.append(value["session"]["Id"])
         return {"session": value["session"]["Id"],
                 "compositor": [(p["pid"], p["start_ticks"]) for p in value["processes"]
-                               if guest_role(p["executable"]) == "tuna-compositor"]}
+                               if p["executable"] == "tuna-compositor"]}
 
     menu = {}
     agent.run("power-button-start")
