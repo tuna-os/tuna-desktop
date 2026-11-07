@@ -569,6 +569,7 @@ mod search_tests {
             argv: vec!["true".into()],
             icon: None,
             categories: Vec::new(),
+            new_window: Default::default(),
         }
     }
 

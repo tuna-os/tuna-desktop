@@ -73,45 +73,165 @@ pub(crate) mod test_peer;
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
+
+    fn isolated(test: &str) -> bool {
+        const CHILD: &str = "TUNA_CONTROL_READINESS_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(test) {
+            return false;
+        }
+        // A sibling test's concurrent fork can inherit our socket until exec.
+        // Create the watched descriptors only after this exact-test child execs.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--test-threads=1"])
+            .env(CHILD, test)
+            .status()
+            .unwrap();
+        assert!(status.success(), "readiness child failed: {status}");
+        true
+    }
+
+    fn registered_fds(readiness: &ControlReadiness) -> Vec<RawFd> {
+        // Inspect only this still-owned epoll instance, never process-wide fd
+        // counts or a closed descriptor number that another thread could reuse.
+        std::fs::read_to_string(format!("/proc/self/fdinfo/{}", readiness.0.as_raw_fd()))
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("tfd:"))
+            .map(|entry| entry.split_whitespace().next().unwrap().parse().unwrap())
+            .collect()
+    }
+
     #[test]
     fn accepted_control_socket_wakes_drains_and_closure_retires_interest() {
-        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
+        if isolated(
+            "control_readiness::tests::accepted_control_socket_wakes_drains_and_closure_retires_interest",
+        ) {
+            return;
+        }
+        fn members(readiness: &ControlReadiness) -> usize {
+            std::fs::read_to_string(format!("/proc/self/fdinfo/{}", readiness.0.as_raw_fd()))
+                .unwrap()
+                .lines()
+                .filter(|line| line.starts_with("tfd:"))
+                .count()
+        }
+        fn inner_receipts(readiness: &ControlReadiness) -> usize {
+            let mut events = [epoll::Event {
+                flags: epoll::EventFlags::empty(),
+                data: epoll::EventData::new_u64(0),
+            }; 1];
+            epoll::wait(
+                &readiness.0,
+                &mut events,
+                Some(&rustix::event::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                }),
+            )
+            .unwrap()
+        }
+
+        let (receiver, mut sender) = UnixStream::pair().unwrap();
         receiver.set_nonblocking(true).unwrap();
+        sender.set_nonblocking(true).unwrap();
+        let inherited_description = receiver.try_clone().unwrap();
         let readiness = ControlReadiness::new(&receiver).unwrap();
-        let mut event_loop = calloop::EventLoop::<usize>::try_new().unwrap();
+        assert_eq!(members(&readiness), 1);
+        let mut event_loop =
+            calloop::EventLoop::<(Option<UnixStream>, [u8; 16], usize)>::try_new().unwrap();
         event_loop
             .handle()
-            .insert_source(readiness.source().unwrap(), |_, fd, count| {
-                drain(fd).unwrap();
-                *count += 1;
-                Ok(calloop::PostAction::Continue)
-            })
+            .insert_source(
+                readiness.source().unwrap(),
+                |_, fd, (receiver, bytes, used)| {
+                    drain(fd).unwrap();
+                    if let Some(receiver) = receiver.as_mut() {
+                        loop {
+                            assert!(*used < bytes.len(), "unexpected extra control input");
+                            match receiver.read(&mut bytes[*used..]) {
+                                Ok(0) => break,
+                                Ok(count) => *used += count,
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                    break
+                                }
+                                Err(error) => panic!("control consumer failed: {error}"),
+                            }
+                        }
+                    }
+                    Ok(calloop::PostAction::Continue)
+                },
+            )
             .unwrap();
-        let mut count = 0;
+        let mut consumer = (Some(receiver), [0; 16], 0);
         sender.write_all(b"hello").unwrap();
         event_loop
-            .dispatch(Some(Duration::from_secs(1)), &mut count)
+            .dispatch(Some(Duration::from_secs(1)), &mut consumer)
             .unwrap();
-        assert_eq!(count, 1);
-        let mut buffer = [0; 16];
-        assert_eq!(receiver.read(&mut buffer).unwrap(), 5);
-        event_loop
-            .dispatch(Some(Duration::ZERO), &mut count)
-            .unwrap();
-        assert_eq!(count, 1, "drained socket must not spin");
+        assert_eq!(&consumer.1[..consumer.2], b"hello");
+        assert_eq!(
+            inner_receipts(&readiness),
+            0,
+            "consumed bytes must not leave inner readiness"
+        );
         sender.write_all(b"again").unwrap();
         event_loop
-            .dispatch(Some(Duration::from_secs(1)), &mut count)
+            .dispatch(Some(Duration::from_secs(1)), &mut consumer)
             .unwrap();
-        assert_eq!(count, 2);
-        drop(receiver);
-        event_loop
-            .dispatch(Some(Duration::ZERO), &mut count)
-            .unwrap();
-        assert_eq!(count, 2, "closed original fd must remove interest");
+        assert_eq!(&consumer.1[..consumer.2], b"helloagain");
+        assert_eq!(inner_receipts(&readiness), 0);
+
+        drop(consumer.0.take());
+        assert_eq!(
+            members(&readiness),
+            1,
+            "another reference keeps the file description registered"
+        );
+        assert_eq!(
+            sender.read(&mut [0_u8; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "closing one descriptor must not fake last-peer closure"
+        );
+        drop(inherited_description);
         test_peer::wait_for_peer_close(&mut sender, Duration::from_secs(1))
-            .expect("watch must not hold the peer alive");
+            .expect("watch must not hold the last peer description alive");
+        assert_eq!(
+            members(&readiness),
+            0,
+            "last-description closure removes kernel interest"
+        );
+        assert_eq!(inner_receipts(&readiness), 0);
+        event_loop
+            .dispatch(Some(Duration::ZERO), &mut consumer)
+            .unwrap();
+        assert_eq!(&consumer.1[..consumer.2], b"helloagain");
+    }
+
+    #[test]
+    fn retained_socket_reference_keeps_interest_until_last_close() {
+        if isolated(
+            "control_readiness::tests::retained_socket_reference_keeps_interest_until_last_close",
+        ) {
+            return;
+        }
+        let (receiver, mut sender) = UnixStream::pair().unwrap();
+        let readiness = ControlReadiness::new(&receiver).unwrap();
+        let registered = receiver.as_raw_fd();
+        let duplicate = receiver.try_clone().unwrap();
+        drop(receiver);
+        // A leaked socket reference must remain visible to both independent
+        // observations used by the retirement regression above.
+        assert_eq!(registered_fds(&readiness), vec![registered]);
+        assert_eq!(
+            test_peer::wait_for_peer_close(&mut sender, Duration::from_millis(20))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        drop(duplicate);
+        assert!(registered_fds(&readiness).is_empty());
+        test_peer::wait_for_peer_close(&mut sender, Duration::from_secs(1)).unwrap();
     }
 }
