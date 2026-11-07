@@ -158,6 +158,9 @@ class ControlledGuest:
     def __init__(self, profile='gnome', failure=None):
         self.profile, self.failure = profile, failure
         self.nonce, self.files, self.calls, self.keys = None, {}, [], set()
+        self.budgets = []
+        self.order = []
+        self.overview_open = True
         self.active, self.action, self.stamp = 'settings', 0, 0
         self.frame_count, self.stopped, self.capture_changed = 0, False, False
         self.stop_value = None
@@ -207,20 +210,32 @@ class ControlledGuest:
         return value
 
     def run(self, route, op, payload, *, timeout):
-        if route != 'gnome-reference' or timeout > 30:
+        budget_cap, timeout_cap = (240, 250) if op == 'prepare' else (25, 30)
+        if route != 'gnome-reference' or timeout > timeout_cap:
             raise AssertionError('unbounded/nonfixed guest route')
         args = json.loads(payload)
-        if args['budget_s'] > 25:
+        if args['budget_s'] > budget_cap:
             raise AssertionError('unbounded guest request')
+        self.budgets.append((op, args['budget_s'], timeout))
         if op == 'file':
             if set(args) != {'nonce', 'name', 'offset', 'limit', 'budget_s'} or not 0 < args['limit'] <= 262144:
                 raise AssertionError('file operation accepts no profile or arbitrary fields')
         elif args.get('profile') != self.profile:
             raise AssertionError('foreign guest request')
         self.calls.append(op)
+        self.order.append(op)
         if op == 'admit':
-            return admission(self.profile)
+            admitted = admission(self.profile)
+            if self.failure == 'greeter-flap':
+                admitted['gdm']['greeters'] = [{'uid': 60578, 'shells': 1}]
+            return admitted
+        if op == 'overview':
+            return {'schema': 1, 'ready': True, 'operation': 'overview', 'profile': self.profile,
+                    'nonce': args['nonce'], 'overview_open': self.overview_open, 'shell_pid': 200,
+                    'observed_monotonic_ns': 1, 'clock_domain': 'guest CLOCK_MONOTONIC'}
         if op == 'prepare':
+            if self.failure == 'prepare':
+                raise RuntimeError('controlled prepare failure')
             self.nonce = args['nonce']
             value = self.observe()
             self.store('claim.json', {'schema': 1, 'profile': self.profile, 'nonce': self.nonce,
@@ -279,6 +294,9 @@ class ControlledGuest:
             if event['type'] != 'key':
                 continue
             key, down = event['data']['key']['data'], event['data']['down']
+            self.order.append(('input', key, down))
+            if key == 'esc' and down:
+                self.overview_open = False
             if down:
                 self.keys.add(key)
                 if key in ('tab', 'f6'):
@@ -389,6 +407,58 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
             self.collect(root / profile, profile)
         return root / 'gnome/member.json', root / 'tuna/member.json'
 
+    def test_prepare_failure_retains_screendump_and_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guest, clock, records = ControlledGuest(failure='prepare'), Clock(), []
+            base = self.base_evidence(directory)
+            with patch.object(proof.time, 'monotonic_ns', clock.ns), patch.object(proof.time, 'sleep', clock.sleep):
+                with self.assertRaises(RuntimeError):
+                    proof.run(guest, guest, directory, lambda *r: records.append(r),
+                              profile='gnome', provenance=provenance('gnome'), base_evidence_dir=base)
+            receipt = json.loads((Path(directory) / 'member.json').read_bytes())
+            self.assertFalse(receipt['ready'])
+            self.assertIn('controlled prepare failure', receipt['error']['message'])
+            self.assertTrue((Path(directory) / 'prepare-failed.png').exists())
+            self.assertEqual(guest.frame_count, 1)
+
+    def test_greeter_flap_between_admit_and_prepare_stays_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receipt, _, _ = self.collect(Path(directory), failure='greeter-flap')
+            self.assertTrue(receipt['ready'])
+            self.assertEqual(len(receipt['admission']['gdm']['greeters']), 1)
+            self.assertEqual(receipt['prepare']['admission']['gdm']['greeters'], [])
+
+    def test_prepare_budget_exceeds_observe_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, guest, _ = self.collect(Path(directory))
+            budgets = dict((op, (budget, timeout)) for op, budget, timeout in guest.budgets)
+            self.assertEqual(budgets['prepare'], (240, 250))
+            self.assertEqual(budgets['observe'], (25, 30))
+            self.assertEqual(budgets['file'], (25, 30))
+            self.assertEqual(budgets['overview'], (25, 30))
+
+    def test_gnome_dismisses_overview_before_prepare(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receipt, guest, _ = self.collect(Path(directory), 'gnome')
+        self.assertTrue(receipt['ready'])
+        self.assertIn('pre-prepare-overview-dismiss', receipt['settle_polls'])
+        self.assertFalse(guest.overview_open)
+        prepare_at = guest.order.index('prepare')
+        esc_at = next(index for index, entry in enumerate(guest.order)
+                      if entry == ('input', 'esc', True))
+        self.assertLess(esc_at, prepare_at)
+
+    def test_tuna_dismisses_overview_before_prepare(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receipt, guest, _ = self.collect(Path(directory), 'tuna')
+        self.assertTrue(receipt['ready'])
+        self.assertIn('pre-prepare-overview-dismiss', receipt['settle_polls'])
+        self.assertFalse(guest.overview_open)
+        prepare_at = guest.order.index('prepare')
+        esc_at = next(index for index, entry in enumerate(guest.order)
+                      if entry == ('input', 'esc', True))
+        self.assertLess(esc_at, prepare_at)
+
     def test_controlled_collection_brackets_real_retained_png_bytes_and_input_bounds(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -460,6 +530,17 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             proof.validate_snapshot(value, 'gnome', 'a' * 32)
 
+    def test_empty_active_windows_is_observable_but_two_is_ambiguous(self):
+        # Round-23/24: switcher grab and commit gaps observe zero active;
+        # only two-active is a contradiction.
+        value = snapshot(held=True)
+        proof.validate_snapshot(value, 'gnome', 'a' * 32)
+        value['selection']['active_windows'] = []
+        proof.validate_snapshot(value, 'gnome', 'a' * 32)
+        value['selection']['active_windows'] = [value['windows'][0], value['windows'][1]]
+        with self.assertRaisesRegex(ValueError, 'ambiguous active GTK app windows'):
+            proof.validate_snapshot(value, 'gnome', 'a' * 32)
+
     def test_configured_bindings_are_read_not_rewritten_and_unsupported_action_fails(self):
         settings = snapshot()['settings']
         original = copy.deepcopy(settings)
@@ -523,6 +604,18 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
                 proof.save_json(root / 'member.json', changed)
                 with self.assertRaises((ValueError, KeyError)):
                     proof.validate_member(root / 'member.json', 'gnome')
+
+    def test_member_tolerates_gdm_greeter_teardown(self):
+        # Round-26: both R25 members carried a lingering session-1 greeter
+        # in the receipt admission only; like the member flow, validation
+        # compares greeter-tolerant admission everywhere.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original, _, _ = self.collect(root)
+            changed = copy.deepcopy(original)
+            changed['admission']['gdm']['greeters'] = [{'logind': {'Id': '1'}}]
+            proof.save_json(root / 'member.json', changed)
+            proof.validate_member(root / 'member.json', 'gnome')
 
     def test_pair_rejects_actual_scale_and_original_package_context_differences(self):
         for difference in ('scale', 'app-package'):
@@ -764,7 +857,11 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
             self.assertTrue(all(size < 262144 for size in guest.wire_sizes))
             self.assertTrue(any(offset > 0 for _, offset, _ in guest.file_requests))
             self.assertTrue(all(limit <= 262144 for _, _, limit in guest.file_requests))
-            self.assertEqual(len(receipt['wire_responses']), 14)
+            self.assertEqual(len(receipt['wire_responses']), 20)  # +2 settle, +2 dismiss, +2 settle-stable
+            self.assertEqual(receipt['settle_polls'],
+                             {'pre-prepare-overview-dismiss': 1, 'overview-dismiss': 1,
+                              'overview-settle': 2, 'applications-released': 1,
+                              'windows-released': 1})
             first = receipt['wire_responses'][0]
             raw = (root / first['artifact']['path']).read_bytes()
             self.assertGreater(len(raw), 262144)
@@ -828,6 +925,302 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
         settings['panel_evidence'][0]['label_objects'][0]['atspi']['path'] = '/foreign/network-label'
         with self.assertRaisesRegex(ValueError, 'descendant'):
             proof.validate_network_panel(settings)
+
+    def test_network_panel_accepts_button_role_navigation(self):
+        value = snapshot()
+        settings = next(w for w in value['windows'] if w['role'] == 'settings')
+        navigation = settings['accessibility_tree']['children'][0]
+        navigation['role_name'] = 'button'
+        selected = settings['panel_evidence'][0]['selected_object']
+        selected['role_name'] = 'button'
+        proof.validate_network_panel(settings)
+
+
+class SettlePollTests(unittest.TestCase):
+    def test_first_poll_satisfied_never_sleeps(self):
+        sleeps = []
+        snapshot, polls = proof.poll_until_settled(
+            lambda: 'fresh', lambda snap: snap == 'fresh', 15,
+            clock=lambda: 0.0, sleep_fn=sleeps.append)
+        self.assertEqual((snapshot, polls, sleeps), ('fresh', 1, []))
+
+    def test_stale_cache_settles_on_third_poll(self):
+        now, sleeps = [0.0], []
+        script = iter(['stale', 'stale', 'fresh'])
+
+        def observe():
+            snap = next(script)
+            now[0] += 1.9  # each observe is itself a multi-second AT-SPI dump
+            return snap
+
+        def sleep(secs):
+            sleeps.append(secs)
+            now[0] += secs
+
+        snapshot, polls = proof.poll_until_settled(
+            observe, lambda snap: snap == 'fresh', 15, clock=lambda: now[0], sleep_fn=sleep)
+        self.assertEqual(snapshot, 'fresh')
+        self.assertEqual(polls, 3)
+        self.assertEqual(sleeps, [1.0, 1.0])
+
+    def test_timeout_returns_last_snapshot_without_passing(self):
+        now, sleeps = [0.0], []
+
+        def observe():
+            now[0] += 1.9
+            return 'stale'
+
+        def sleep(secs):
+            sleeps.append(secs)
+            now[0] += secs
+
+        snapshot, polls = proof.poll_until_settled(
+            observe, lambda snap: snap == 'fresh', 15, clock=lambda: now[0], sleep_fn=sleep)
+        self.assertEqual(snapshot, 'stale')  # caller require() still fails on this
+        self.assertGreaterEqual(polls, 5)  # ~15s / (1.9s observe + 1s gap)
+        self.assertTrue(sleeps)
+
+    def test_normalize_admission_tolerates_only_greeter_teardown(self):
+        base = admission('gnome')
+        flapped = copy.deepcopy(base)
+        flapped['gdm']['greeters'] = [{'uid': 60578, 'shells': 1}]
+        self.assertEqual(proof.normalize_admission(base), proof.normalize_admission(flapped))
+        self.assertEqual(flapped['gdm']['greeters'], [{'uid': 60578, 'shells': 1}])
+        substituted = copy.deepcopy(base)
+        substituted['session']['shell'] = process('evil-shell', 999, 'gnome')
+        self.assertNotEqual(proof.normalize_admission(base), proof.normalize_admission(substituted))
+
+    def test_stable_context_ignores_live_content_but_not_identity(self):
+        def snapshot(**overrides):
+            window = {'role': 'settings', 'atspi': {'bus_name': 'b', 'path': '/w'},
+                      'process': {'pid': 1}, 'name': 'Settings', 'states': [1, 25, 30],
+                      'accessibility_tree': {'children': []}, 'panel_evidence': []}
+            base = {'profile': 'tuna', 'nonce': 'n', 'admission': {}, 'settings': {},
+                    'atspi': {}, 'fixture': {}, 'windows': [window],
+                    'selection': {'active_windows': [window], 'selected': [], 'objects': []}}
+            base.update(overrides)
+            return base
+
+        before = snapshot()
+        churned = snapshot()
+        churned['windows'][0] = dict(churned['windows'][0], states=[25, 30],
+                                     accessibility_tree={'children': [{'x': 1}]})
+        churned['selection'] = {'active_windows': churned['windows'], 'selected': [{'y': 2}],
+                                'objects': []}
+        self.assertEqual(proof.stable_context(before), proof.stable_context(churned))
+        moved = snapshot()
+        moved['selection'] = {'active_windows': [dict(moved['windows'][0], role='files-first')],
+                              'selected': [], 'objects': []}
+        self.assertNotEqual(proof.stable_context(before), proof.stable_context(moved))
+        swapped = snapshot()
+        swapped['windows'] = [dict(swapped['windows'][0], process={'pid': 2})]
+        self.assertNotEqual(proof.stable_context(before), proof.stable_context(swapped))
+
+    def test_overview_search_visible_matches_either_shell(self):
+        tuna = {'selection': {'objects': [
+            {'role_name': 'window', 'name': 'Search', 'states': [25, 30], 'children': [
+                {'role_name': 'search box', 'name': 'Search', 'states': [25, 30], 'children': []}]}]}}
+        self.assertTrue(proof.overview_search_visible(tuna))
+        gnome = {'selection': {'objects': [
+            {'role_name': 'entry', 'name': 'Type to search', 'states': [25, 30], 'children': []}]}}
+        self.assertTrue(proof.overview_search_visible(gnome))
+
+    def test_overview_search_hidden_or_absent_is_desktop(self):
+        hidden = {'selection': {'objects': [
+            {'role_name': 'search box', 'name': 'Search', 'states': [30], 'children': []}]}}
+        self.assertFalse(proof.overview_search_visible(hidden))
+        desktop = {'selection': {'objects': [
+            {'role_name': 'push button', 'name': 'Activities', 'states': [25, 30], 'children': []}]}}
+        self.assertFalse(proof.overview_search_visible(desktop))
+        self.assertFalse(proof.overview_search_visible({'selection': {'objects': []}}))
+
+    def test_stable_pair_returns_after_two_polls_without_sleep(self):
+        sleeps = []
+        snapshot, polls = proof.poll_until_stable(
+            lambda: 'same', lambda snap: snap, 15,
+            clock=lambda: 0.0, sleep_fn=sleeps.append)
+        self.assertEqual((snapshot, polls, sleeps), ('same', 2, []))
+
+    def test_changing_context_settles_on_third_poll(self):
+        now, sleeps = [0.0], []
+        script = iter(['a', 'b', 'b'])
+
+        def observe():
+            snap = next(script)
+            now[0] += 1.9
+            return snap
+
+        def sleep(secs):
+            sleeps.append(secs)
+            now[0] += secs
+
+        snapshot, polls = proof.poll_until_stable(
+            observe, lambda snap: snap, 15, clock=lambda: now[0], sleep_fn=sleep)
+        self.assertEqual(snapshot, 'b')
+        self.assertEqual(polls, 3)
+        self.assertEqual(sleeps, [1.0])
+
+    def test_unstable_context_times_out_with_last_snapshot(self):
+        now, seen = [0.0], []
+
+        def observe():
+            now[0] += 1.9
+            seen.append(len(seen))
+            return len(seen)
+
+        def sleep(secs):
+            now[0] += secs
+
+        snapshot, polls = proof.poll_until_stable(
+            observe, lambda snap: snap, 15, clock=lambda: now[0], sleep_fn=sleep)
+        self.assertEqual(snapshot, len(seen))  # caller still gates on a fresh capture
+        self.assertGreaterEqual(polls, 5)
+
+    def test_predicate_sees_every_observation_in_order(self):
+        seen = []
+        snapshot, polls = proof.poll_until_settled(
+            lambda: seen.append(len(seen)) or len(seen),
+            lambda snap: seen.append(('check', snap)) or snap >= 2, 15,
+            clock=lambda: 0.0, sleep_fn=lambda secs: None)
+        self.assertEqual([entry for entry in seen if isinstance(entry, tuple)],
+                         [('check', 1), ('check', 3)])
+        self.assertEqual((snapshot, polls), (3, 2))
+
+
+class PhaseContextTests(unittest.TestCase):
+    # Round-25 GNOME shape: the top-bar clock stays selected from baseline,
+    # while held, and after release; the St switcher item is an unnamed
+    # visible 'button' with the names on sibling labels.
+    def gnome_phases(self):
+        base = snapshot(held=False)
+        shell = base['selection']['shell_process']
+        clock = node(shell, 'clock', '05', 'button', [8, 11, 23, 24, 30])
+        base['selection']['selected'] = [copy.deepcopy(clock)]
+        base['selection']['objects'] = [{**copy.deepcopy(clock), 'children': []}]
+
+        def held(stamp, window_mode=False):
+            snap = snapshot(held=True, stamp=stamp, window_mode=window_mode)
+            item = node(shell, 'st-item-%d' % stamp, '', 'button', [8, 9, 10, 11, 23, 24, 25, 30])
+            snap['selection']['selected'] = [copy.deepcopy(clock), item]
+            tree = snap['selection']['objects'][0]
+            tree['children'].append(copy.deepcopy(clock))
+            tree['children'].append(copy.deepcopy(item))
+            return snap, item
+
+        def released_after():
+            snap = snapshot(held=False)
+            snap['selection']['selected'] = [copy.deepcopy(clock)]
+            return snap
+
+        app, app_item = held(1)
+        down, _ = held(2)
+        down['selection']['objects'][0]['children'].append(copy.deepcopy(app_item))
+        win, _ = held(4, window_mode=True)
+        idle = snapshot(held=False)
+        return [{'phase': 'before', 'before': base, 'after': base},
+                {'phase': 'applications-held', 'before': app, 'after': idle},
+                {'phase': 'applications-down-held', 'before': down, 'after': idle},
+                {'phase': 'applications-released', 'before': idle, 'after': released_after()},
+                {'phase': 'windows-held', 'before': win, 'after': idle},
+                {'phase': 'windows-released', 'before': idle, 'after': released_after()}]
+
+    def test_persistent_baseline_selection_is_not_switcher_evidence(self):
+        proof.validate_phase_context({'phases': self.gnome_phases()})
+
+    def test_stale_popup_selection_still_fails_release(self):
+        phases = self.gnome_phases()
+        stuck = phases[2]['before']['selection']['selected'][1]
+        phases[3]['after']['selection']['selected'].append(copy.deepcopy(stuck))
+        with self.assertRaisesRegex(ValueError, 'release left the old Shell popup selected'):
+            proof.validate_phase_context({'phases': phases})
+
+    def test_held_without_new_selection_fails(self):
+        phases = self.gnome_phases()
+        phases[1]['before']['selection']['selected'] = phases[1]['before']['selection']['selected'][:1]
+        with self.assertRaisesRegex(ValueError, 'no observed Shell switcher selection'):
+            proof.validate_phase_context({'phases': phases})
+
+
+class PairParityTests(unittest.TestCase):
+    def seq_receipt(self, shape):
+        shell = process('gnome-shell', 200)
+
+        def build(index, name):
+            return node(shell, 'sel-%d' % index, name, 'button', [23])
+        phases = []
+        for name, active, selected, held in shape:
+            phases.append({'phase': name,
+                           'before': {'selection': {
+                               'active_windows': [] if active is None else [{'role': active}],
+                               'selected': [build(i, n) for i, n in enumerate(selected)]}},
+                           'held_keys': held,
+                           'requested_minimum_hold_ns': 500000000 if held else 0})
+        return {'phases': phases}
+
+    def gnome_shape(self):
+        return [('before', 'settings', ['05'], []),
+                ('applications-held', None, ['05', ''], ['meta_l']),
+                ('applications-down-held', None, ['05', ''], ['meta_l']),
+                ('applications-released', 'files-second', ['05'], []),
+                ('windows-held', None, ['05', ''], ['alt']),
+                ('windows-released', 'settings', ['05'], [])]
+
+    def tuna_shape(self):
+        return [('before', 'settings', [], []),
+                ('applications-held', 'settings', ['Files: second'], ['meta_l']),
+                ('applications-down-held', 'settings', ['Files: second', 'second'], ['meta_l']),
+                ('applications-released', 'files-second', [], []),
+                ('windows-held', 'files-second', ['Settings: Settings'], ['alt']),
+                ('windows-released', 'settings', [], [])]
+
+    def test_switch_sequence_matches_across_shell_presentation(self):
+        # Round-26: St clock/unnamed buttons vs named selections and grab
+        # deactivation vs kept ACTIVE still describe the same switches.
+        self.assertEqual(proof.switch_sequence(self.seq_receipt(self.gnome_shape())),
+                         proof.switch_sequence(self.seq_receipt(self.tuna_shape())))
+
+    def test_switch_sequence_rejects_different_outcomes_or_input(self):
+        gnome = self.seq_receipt(self.gnome_shape())
+        diverged = self.seq_receipt(self.tuna_shape())
+        diverged['phases'][3]['before']['selection']['active_windows'][0]['role'] = 'files-first'
+        self.assertNotEqual(proof.switch_sequence(gnome), proof.switch_sequence(diverged))
+        diverged = self.seq_receipt(self.tuna_shape())
+        diverged['phases'][1]['held_keys'] = ['alt']
+        self.assertNotEqual(proof.switch_sequence(gnome), proof.switch_sequence(diverged))
+
+    def test_paired_settings_ignores_display_identity_but_keeps_rendering(self):
+        left, right = snapshot(), snapshot()
+        for snap in (left, right):
+            snap['settings']['display_config']['monitors'][0][2]['color-mode'] = 0
+        display = right['settings']['display_config']
+        display['monitors'][0][0] = ['Virtual-1', 'Tuna Desktop', 'Virtual-1', 'Virtual-1']
+        display['monitors'][0][2].update({'display-name': 'Virtual-1', 'min-refresh-rate': 50,
+                                           'rgb-range': 1, 'supported-color-modes': [0]})
+        display['logical_monitors'][0][5] = [['Virtual-1', 'Tuna Desktop', 'Virtual-1', 'Virtual-1']]
+        display['properties']['supports-changing-layout-mode'] = True
+        self.assertEqual(proof.paired_settings(left), proof.paired_settings(right))
+        right['settings']['display_config']['monitors'][0][2]['color-mode'] = 2
+        self.assertNotEqual(proof.paired_settings(left), proof.paired_settings(right))
+
+
+class EmptyActiveTests(unittest.TestCase):
+    # Round-23: no active window (switcher grab, commit gap) is an
+    # observable state. Predicates must poll through it, never crash.
+    def snap(self, role):
+        active = [] if role == '' else [{'role': role}]
+        return {'selection': {'active_windows': active}}
+
+    def test_active_role_empty_is_gap_not_crash(self):
+        self.assertEqual(proof.active_role(self.snap('')), '')
+        self.assertEqual(proof.active_role(self.snap('settings')), 'settings')
+        self.assertFalse(''.startswith('files-'))
+
+    def test_released_to_different_excludes_gap(self):
+        committed = self.snap('files-first')
+        self.assertFalse(proof.released_to_different(self.snap(''), committed))
+        self.assertFalse(proof.released_to_different(self.snap('files-first'), committed))
+        self.assertTrue(proof.released_to_different(self.snap('files-second'), committed))
+        self.assertTrue(proof.released_to_different(self.snap('settings'), committed))
 
 
 if __name__ == '__main__':

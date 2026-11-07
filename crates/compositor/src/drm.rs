@@ -623,6 +623,7 @@ impl DrmBackend {
                 OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
             )
             .map_err(|e| err("open drm device")(format!("{}: {e}", path.display())))?;
+        eprintln!("tuna-compositor: drm: opened {}", path.display());
         let fd = DrmDeviceFd::new(DeviceFd::from(fd));
         let (mut drm, drm_notifier) =
             DrmDevice::new(fd.clone(), true).map_err(|e| err("drm device")(e.to_string()))?;

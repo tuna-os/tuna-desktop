@@ -5,21 +5,25 @@
 #   scripts/tuna-docs-shots collect <journey-dir> <app-dir> <scroll-dir> [--dest DIR]
 #   scripts/tuna-docs-shots regen [--dest DIR] [--display :N]
 #
-# `collect` copies the curated frame set out of harness artifact
-# directories (the same ones CI uploads) under stable names; CI uploads
-# the result as the `docs-shots` artifact. `regen` re-runs all three
-# harnesses locally first. Both fail when any source frame is missing,
-# so a set is never stale or partial. The committed docs/shots set was
-# removed (#506); the docs use docs/walkthrough.md instead. Without
-# --dest, frames go to target/docs-shots.
+# `collect` preserves the seven legacy artifact frames, not canonical media.
+# It checks every source before copying; existence alone is not freshness.
+# `regen` runs those proof harnesses first. Both remain staging-only diagnostics;
+# docs/shots was removed (#506), and no historical docs may be overwritten.
+# Default staging output is target/docs-shots.
+# Canonical media uses `receipt ARTIFACT --bundle KIND`, `intake ARTIFACT...`
+# and `freshness --bundle KIND` with exact current-run identity flags.
+# `scripts/lib/maintained_media.py --help` documents the receipt/outcome schema.
 set -eu
 
 unset CDPATH
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+case "${1:-}" in
+    receipt|intake|freshness|source-inputs) exec python3 "$ROOT/scripts/lib/maintained_media.py" "$@" ;;
+esac
 DEST="$ROOT/target/docs-shots"
 
 usage() {
-    sed -n '2,14p' "$0"
+    sed -n '2,15p' "$0"
 }
 
 # dest src — copy one frame or fail loudly.
@@ -39,6 +43,21 @@ collect() {
         exit 1
     fi
     JOURNEY="$1"; APP="$2"; SCROLL="$3"
+    python3 - "$ROOT" "$DEST" "$JOURNEY" "$APP" "$SCROLL" <<'VALIDATE'
+from pathlib import Path
+import sys
+root, dest, journey, app, scroll = (Path(value).resolve() for value in sys.argv[1:])
+if dest.is_relative_to(root / "docs"):
+    sys.exit("tuna-docs-shots: legacy collect cannot overwrite maintained or historical docs; use receipted intake")
+for directory, names in (
+    (journey, ("01-baseline.png", "02-overview.png", "03-search.png")),
+    (app, ("02-app.png", "03-tiled.png")),
+    (scroll, ("02-strip.png", "04-wheel.png")),
+):
+    for name in names:
+        if not (directory / name).is_file():
+            sys.exit("tuna-docs-shots: missing source frame " + str(directory / name))
+VALIDATE
     mkdir -p "$DEST"
     pick desktop-baseline.png "$JOURNEY/01-baseline.png"
     pick overview.png "$JOURNEY/02-overview.png"

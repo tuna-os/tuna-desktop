@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import time
+import traceback
 import background_effect_oracle as background
 
 ROOT = Path('/run/tuna-explicit-sync-proof')
@@ -578,13 +579,43 @@ def dispatch(action, value):
     return retire(directory, state, action == 'cleanup')
 
 
+def failure_record(error):
+    """Fixed type plus this helper's own (function, line) frames; never
+    exception text, argv, paths, subprocess output or locals."""
+    oserrors = {'OSError', 'FileNotFoundError', 'PermissionError', 'ProcessLookupError'}
+    types = oserrors | {'RuntimeError', 'ValueError', 'TypeError', 'KeyError', 'IndexError',
+                        'AttributeError', 'StopIteration', 'JSONDecodeError', 'UnicodeDecodeError',
+                        'CalledProcessError', 'TimeoutExpired'}
+    kind = type(error).__name__
+    result = {'stage': 'unstaged', 'exception_type': kind if kind in types else 'OtherError',
+              'code': 'observation-exception'}
+    number = getattr(error, 'errno', None)
+    if kind in oserrors and type(number) is int and 0 <= number <= 4095:
+        result['errno'] = number
+    returncode = getattr(error, 'returncode', None)
+    if kind == 'CalledProcessError' and type(returncode) is int and -255 <= returncode <= 255:
+        result['returncode'] = returncode
+    source = failure_record.__code__.co_filename
+    result['frames'] = [[frame.name, frame.lineno]
+                        for frame in traceback.extract_tb(error.__traceback__)
+                        if frame.filename == source and type(frame.lineno) is int
+                        and 0 < frame.lineno <= 1000000 and len(frame.name) <= 64
+                        and frame.name.isascii() and frame.name.isidentifier()][-16:]
+    return result
+
+
 def main():
-    if os.geteuid() != 0:
-        raise RuntimeError('CI guest-agent root principal required')
-    if len(sys.argv) != 3:
-        raise ValueError('one fixed operation and one bounded JSON argument required')
-    action, raw = sys.argv[1:]
-    print(json.dumps(dispatch(action, request(action, raw))))
+    try:
+        if os.geteuid() != 0:
+            raise RuntimeError('CI guest-agent root principal required')
+        if len(sys.argv) != 3:
+            raise ValueError('one fixed operation and one bounded JSON argument required')
+        action, raw = sys.argv[1:]
+        print(json.dumps(dispatch(action, request(action, raw))))
+    except Exception as error:
+        # One bounded record on stdout for the host's failure diagnostics.
+        print(json.dumps({'explicit_sync_error': failure_record(error)}))
+        raise SystemExit(1) from None
 
 
 if __name__ == '__main__':

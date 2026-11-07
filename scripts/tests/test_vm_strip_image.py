@@ -4,12 +4,14 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
 from vm_strip_image import (admission, canonical_image_id, fixture_members,
                             PROTOCOL_INPUTS, PROTOCOL_MEMBERS)
+from maintained_media import INVENTORY
 
 
 class Tests(unittest.TestCase):
@@ -32,14 +34,29 @@ class Tests(unittest.TestCase):
             for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus'):
                 (fixture / name).write_text(name)
                 expected['/usr/libexec/' + name] = hashlib.sha256(name.encode()).hexdigest()
+            inventory = root / 'scripts/lib/maintained-media.tsv'
+            inventory.parent.mkdir(parents=True)
+            inventory.write_bytes(INVENTORY.read_bytes())
+            def git(*arguments):
+                return subprocess.check_output(['git', '-C', str(root), *arguments],
+                                               text=True, stderr=subprocess.PIPE).strip()
+            git('init', '-q')
+            git('config', 'user.name', 'Controlled immutable image admission')
+            git('config', 'user.email', 'controlled@example.invalid')
+            git('add', '.')
+            git('commit', '-qm', 'Actual fixture source snapshot')
+            commit = git('rev-parse', 'HEAD')
             package = {'package': {'sha256': 'b' * 64}, 'required_members':
                        {'usr/bin/tuna-compositor': {'sha256': 'a' * 64}}}
             observed = {'schema': 1, 'image_id': 'sha256:' + 'c' * 64, 'member_sha256': expected}
-            args = (root, 'd' * 40, observed['image_id'], 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'e' * 64)
+            args = (root, commit, observed['image_id'], 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'e' * 64)
             receipt = admission(package, observed, *args)
             self.assertFalse(receipt['installed_signed_release_qualified'])
+            self.assertEqual(receipt['commit'], commit)
+            self.assertEqual(receipt['capture_commit'], commit)
+            self.assertEqual(receipt['built_tree'], git('rev-parse', 'HEAD^{tree}'))
             with self.assertRaises(ValueError):
-                admission(package, observed, root, 'd' * 40, 'c' * 64, args[-1])
+                admission(package, observed, root, commit, 'c' * 64, args[-1])
             for key, value in [('schema', 2), ('image_id', 'sha256:' + 'f' * 64),
                                ('member_sha256', {**expected, '/unrelated': 'a' * 64}),
                                ('member_sha256', {**expected, '/usr/bin/tuna-compositor': 'f' * 64})]:
@@ -83,8 +100,20 @@ class Tests(unittest.TestCase):
             expected.update(build['member_sha256'])
             package = {'package': {'sha256': 'b' * 64}, 'required_members':
                        {'usr/bin/tuna-compositor': {'sha256': 'a' * 64}}}
+            inventory = root / 'scripts/lib/maintained-media.tsv'
+            inventory.parent.mkdir(parents=True, exist_ok=True)
+            inventory.write_bytes(INVENTORY.read_bytes())
+            def git(*arguments):
+                return subprocess.check_output(['git', '-C', str(root), *arguments],
+                                               text=True, stderr=subprocess.PIPE).strip()
+            git('init', '-q')
+            git('config', 'user.name', 'Controlled immutable image admission')
+            git('config', 'user.email', 'controlled@example.invalid')
+            git('add', '.')
+            git('commit', '-qm', 'Actual fixture source snapshot')
             observed = {'schema': 1, 'image_id': 'sha256:' + 'c' * 64, 'member_sha256': expected}
-            args = (root, 'd' * 40, observed['image_id'], 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'e' * 64)
+            args = (root, git('rev-parse', 'HEAD'), observed['image_id'],
+                    'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'e' * 64)
             admission(package, observed, *args, fixture='explicit-sync')
             changed = copy.deepcopy(observed)
             changed['member_sha256'][PROTOCOL_MEMBERS[0]] = 'f' * 64
@@ -96,6 +125,7 @@ class Tests(unittest.TestCase):
             (root / PROTOCOL_INPUTS[0]).write_bytes(b'different compiler invocation')
             with self.assertRaisesRegex(ValueError, 'build inputs'):
                 admission(package, observed, *args, fixture='explicit-sync')
+
 
 
 if __name__ == '__main__':

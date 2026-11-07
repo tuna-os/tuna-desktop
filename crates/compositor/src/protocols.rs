@@ -312,13 +312,25 @@ pub fn renderer_main_device(
     renderer: &smithay::backend::renderer::gles::GlesRenderer,
 ) -> Option<libc::dev_t> {
     use std::os::unix::fs::MetadataExt;
-    let device =
-        smithay::backend::egl::EGLDevice::device_for_display(renderer.egl_context().display())
-            .ok()?;
-    let path = device
+    let device = match smithay::backend::egl::EGLDevice::device_for_display(
+        renderer.egl_context().display(),
+    ) {
+        Ok(device) => device,
+        Err(error) => {
+            eprintln!("tuna-compositor: renderer has no EGL device: {error}");
+            return None;
+        }
+    };
+    let path = match device
         .render_device_path()
         .or_else(|_| device.drm_device_path())
-        .ok()?;
+    {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("tuna-compositor: renderer EGL device has no DRM node: {error}");
+            return None;
+        }
+    };
     std::fs::metadata(path).ok().map(|meta| meta.rdev())
 }
 

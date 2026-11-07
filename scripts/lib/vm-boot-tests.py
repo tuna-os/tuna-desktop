@@ -3024,6 +3024,21 @@ def tour_frame(fill, boxes=()):
     return bytes(px)
 
 
+def tour_png(pixels):
+    """Encode real RGB PNG bytes so confirmation consumes the retained image."""
+    import struct
+    import zlib
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+    stride = lane.WIDTH * 3
+    raw = b"".join(b"\0" + pixels[start:start + stride]
+                   for start in range(0, len(pixels), stride))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", lane.WIDTH, lane.HEIGHT, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
 class TourViewPredicates(unittest.TestCase):
     GREY, NAVY, WHITE = (36, 36, 40), (8, 24, 52), (250, 250, 250)
     WINDOWS = (190, 140, 1085, 690, WHITE)
@@ -3059,7 +3074,7 @@ class TourViewPredicates(unittest.TestCase):
             if path.name == "probe.ppm":
                 path.write_bytes(header + (probes.pop(0) if len(probes) > 1 else probes[0]))
             else:
-                path.write_bytes(b"png pixels")
+                path.write_bytes(tour_png(probes[-1]))
         now = [0.0]
         def advance(seconds):
             now[0] += seconds
@@ -3071,6 +3086,8 @@ class TourViewPredicates(unittest.TestCase):
             recorder = lane.Recorder(SimpleNamespace(cmd=command), directory,
                                      timeout=TourRecorderTests.SCHEDULING_TIMEOUT)
             self.assertTrue(recorder.await_still("alt-tab", lane.switcher_shown, timeout=5, settle=0))
+            self.assertTrue(recorder.still_confirmations["alt-tab"]["confirmed"])
+            self.assertTrue(recorder.still_confirmations["alt-tab"]["evidence"]["exact_png"])
             deadline = now[0] + 0.05
             self.assertFalse(recorder.await_still("overview-windows", lane.overview_windows_shown,
                                                   timeout=0.05, settle=0))
@@ -3079,6 +3096,182 @@ class TourViewPredicates(unittest.TestCase):
             self.assertEqual(recorder.unconfirmed, ["overview-windows"])
             self.assertEqual(sorted(p.name for p in Path(recorder.dir).iterdir()),
                              ["f000000.png", "f000001.png"])
+            recorder.close()
+
+    def test_matching_readiness_cannot_confirm_a_different_retained_png(self):
+        header = f"P6\n{lane.WIDTH} {lane.HEIGHT}\n255\n".encode()
+        ready = tour_frame(self.NAVY, self.SWITCHER)
+        wrong = tour_png(tour_frame(self.NAVY, [self.WINDOWS]))
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(
+                header + ready if args["format"] == "ppm" else wrong)
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            self.assertFalse(recorder.await_still("alt-tab", lane.switcher_shown, timeout=10, settle=0))
+            receipt = recorder.still_confirmations["alt-tab"]
+            self.assertTrue(receipt["evidence"]["exact_png"])
+            self.assertFalse(receipt["confirmed"])
+            self.assertEqual(recorder.unconfirmed, ["alt-tab"])
+            self.assertEqual(recorder.n, 1)  # No retry can replace the missed frame.
+            self.assertEqual(receipt["png_sha256"], lane.baseline.sha256(
+                Path(recorder.dir) / "f000000.png"))
+            recorder.close()
+
+    def test_exact_overview_png_is_confirmed_without_changing_calibrated_floors(self):
+        pixels = tour_frame(self.GREY, [(180, 108, 1100, 660, self.NAVY),
+                                       (440, 420, 840, 670, self.WHITE)])
+        header = f"P6\n{lane.WIDTH} {lane.HEIGHT}\n255\n".encode()
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(
+                header + pixels if args["format"] == "ppm" else tour_png(pixels))
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            self.assertTrue(recorder.await_still(
+                "overview-windows", lane.overview_windows_shown, timeout=10, settle=0))
+            self.assertEqual(recorder.unconfirmed, [])
+            self.assertEqual(recorder.still_confirmations["overview-windows"]["png_sha256"],
+                             lane.baseline.sha256(Path(recorder.dir) / "f000000.png"))
+            recorder.close()
+
+
+class TourPublicConfirmationTests(unittest.TestCase):
+    """Fault-injected public observations, not native UI qualification."""
+
+    CONTROLS = {
+        "app-grid": [("frame", "App Grid")],
+        "quick-settings": [("slider", "Volume"), ("push button", "Settings"), ("push button", "Lock Screen")],
+        "calendar": [("push button", "Previous month"), ("push button", "Next month")],
+        "lock": [("frame", "Lock Screen")],
+    }
+
+    def observation(self, card):
+        return {"schema": 1, "method": "public-at-spi",
+                "session": {"Id": "2", "User": "1000", "Type": "wayland", "Class": "user",
+                            "Service": "gdm-password", "VTNr": "2"},
+                "principal": {"pid": 123, "uid": 1000, "start_ticks": 42,
+                              "executable": "/usr/bin/tuna-shell-gtk",
+                              "display": "wayland-0", "session_id": "2"},
+                "atspi": {"owner": ":1.5", "bus_pid": 123, "bus_uid": 1000},
+                "controls": [{"role": role, "label": label, "showing": True, "visible": True,
+                              "extents": [10, 10, 300, 200]} for role, label in self.CONTROLS[card]],
+                "started_monotonic_ns": 100, "completed_monotonic_ns": 200}
+
+    def capture(self, card, change=None):
+        events = []
+        image = tour_png(tour_frame((8, 24, 52)))
+        observations = [self.observation(card), self.observation(card)]
+        if change is not None:
+            change(observations)
+        def command(name, **args):
+            events.append(name)
+            if name == "screendump":
+                Path(args["filename"]).write_bytes(image)
+        def observe(timeout):
+            events.append("observe")
+            return observations.pop(0)
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            confirmed = recorder.public_still(card, observe)
+            recorder.qmp.cmd("send-key")
+            receipt = recorder.still_confirmations[card]
+            self.assertEqual(receipt["png_sha256"],
+                             lane.baseline.sha256(Path(recorder.dir) / "f000000.png"))
+            self.assertEqual(receipt["frame_index"], 0)
+            self.assertEqual(events, ["observe", "screendump", "observe", "send-key"])
+            evidence = receipt["evidence"]
+            self.assertLessEqual(evidence["before"]["completed_monotonic_ns"],
+                                 receipt["capture_requested_monotonic_ns"])
+            self.assertLessEqual(receipt["capture_completed_monotonic_ns"],
+                                 evidence["after"]["requested_monotonic_ns"])
+            self.assertEqual(recorder.unconfirmed, [] if confirmed else [card])
+            recorder.close()
+            return confirmed, receipt
+
+    def test_real_quick_settings_accessible_lock_screen_label_confirms_exact_capture(self):
+        self.assertTrue(self.capture("quick-settings")[0])
+        def obsolete_label(values):
+            for value in values:
+                for control in value["controls"]:
+                    if control["label"] == "Lock Screen":
+                        control["label"] = "Lock"
+        self.assertFalse(self.capture("quick-settings", obsolete_label)[0])
+
+    def test_calendar_without_optional_events_card_still_has_positive_navigation(self):
+        self.assertTrue(self.capture("calendar")[0])
+        for label in ("Previous month", "Next month"):
+            def missing(values, label=label):
+                for value in values:
+                    value["controls"] = [control for control in value["controls"] if control["label"] != label]
+            with self.subTest(missing=label):
+                self.assertFalse(self.capture("calendar", missing)[0])
+
+    def test_each_public_hero_requires_positive_visible_capture_bracket(self):
+        for card in self.CONTROLS:
+            with self.subTest(card=card):
+                self.assertTrue(self.capture(card)[0])
+                for side in (0, 1):
+                    self.assertFalse(self.capture(
+                        card, lambda values, side=side: values[side].update(controls=[]))[0])
+
+    def test_tags_private_state_and_unrelated_controls_are_not_confirmation(self):
+        for card in self.CONTROLS:
+            def wrong(values):
+                for value in values:
+                    value.update(tag=card, locked=True, overview_app_grid=True, controls=[
+                        {"role": "push button", "label": "Take Screenshot", "showing": True,
+                         "visible": True, "extents": [10, 10, 100, 100]}])
+            with self.subTest(card=card):
+                self.assertFalse(self.capture(card, wrong)[0])
+
+    def test_changed_session_or_original_atspi_owner_rejects_the_frame(self):
+        for key in ("session", "principal", "atspi"):
+            with self.subTest(identity=key):
+                self.assertFalse(self.capture("lock", lambda values: values[1].update({key: {}}))[0])
+
+    def test_offscreen_hidden_and_zero_sized_controls_fail(self):
+        for change in ({"showing": False}, {"visible": False}, {"extents": [0, 0, 0, 0]},
+                       {"extents": [lane.WIDTH, 0, 100, 100]}):
+            def wrong(values):
+                values[1]["controls"][0].update(change)
+            self.assertFalse(self.capture("app-grid", wrong)[0])
+
+    def test_matching_but_missing_original_authority_is_not_public_ui_proof(self):
+        for key in ("session", "principal", "atspi"):
+            def wrong(values):
+                for value in values:
+                    value[key] = {}
+            self.assertFalse(self.capture("lock", wrong)[0])
+
+    def test_late_positive_snapshot_cannot_extend_confirmation_deadline(self):
+        now, observations = [0.0], []
+        image = tour_png(tour_frame((8, 24, 52)))
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(image)
+        def observe(timeout):
+            observations.append(timeout)
+            now[0] += 6
+            return self.observation("lock")
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(lane.time, "monotonic", lambda: now[0]):
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            self.assertFalse(recorder.public_still("lock", observe))
+            self.assertEqual(len(observations), 2)
+            self.assertLess(observations[1], observations[0])
+            receipt = recorder.still_confirmations["lock"]
+            self.assertFalse(receipt["evidence"]["within_deadline"])
+            self.assertEqual(recorder.n, 1)
+            self.assertEqual(recorder.unconfirmed, ["lock"])
+            recorder.close()
+
+    def test_missing_observer_preserves_diagnostic_but_never_confirms(self):
+        image = tour_png(tour_frame((8, 24, 52)))
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(image)
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            self.assertFalse(recorder.public_still("app-grid", None))
+            self.assertEqual(recorder.unconfirmed, ["app-grid"])
+            self.assertEqual((Path(recorder.dir) / "f000000.png").read_bytes(), image)
             recorder.close()
 
 
@@ -4640,7 +4833,7 @@ class InventoryProcessRaces(unittest.TestCase):
         self.assertEqual(caught.exception.code, 1)
         return output.getvalue()
 
-    def transport(self, output, **status):
+    def transport(self, output, action="inventory", **status):
         import contextlib
         actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
         failure = {"exited": True, "exitcode": 1, "out-data": base64.b64encode(output.encode()).decode(),
@@ -4648,7 +4841,7 @@ class InventoryProcessRaces(unittest.TestCase):
         log = io.StringIO()
         with contextlib.redirect_stdout(log), patch.object(actor, "command", side_effect=[{"pid": 10}, failure]):
             with self.assertRaises(RuntimeError) as caught:
-                actor.run("inventory")
+                actor.run(action)
         self.assertNotIn("private", str(caught.exception) + log.getvalue())
         return str(caught.exception), log.getvalue()
 
@@ -4691,6 +4884,40 @@ class InventoryProcessRaces(unittest.TestCase):
         self.assertEqual(self.transport(json.dumps({"inventory_error": record, "extra": "private"}))[0], generic)
         self.assertEqual(self.transport(json.dumps({"inventory_error": record}), **{"out-truncated": True})[0], generic)
         self.assertEqual(self.transport("private " * 600)[0], generic)
+
+    def test_tour_public_ui_failure_record_surfaces_unstaged_only(self):
+        record = {"stage": "unstaged", "exception_type": "RuntimeError",
+                  "code": "observation-exception", "frames": [["_tour_public_ui", 1790]]}
+        self.assertTrue(lane.guest_agent.valid_tour_public_ui_error(record))
+        message, log = self.transport(json.dumps({"tour_public_ui_error": record}), action="tour-public-ui")
+        self.assertEqual(message, "guest lifecycle tour-public-ui failed (exit=1): " + json.dumps(record))
+        self.assertEqual(log, "")
+        generic = "guest lifecycle tour-public-ui failed (exit=1)"
+        invalid = [None, [], {}, {**record, "message": "private"},
+                   {**record, "stage": "state-read"}, {**record, "stage": "private"},
+                   {**record, "exception_type": "private"}, {**record, "code": "private"},
+                   {k: v for k, v in record.items() if k != "frames"}]
+        for value in invalid:
+            with self.subTest(value=value):
+                output = json.dumps({"tour_public_ui_error": value})
+                self.assertEqual(self.transport(output, action="tour-public-ui")[0], generic)
+
+    def test_explicit_sync_failure_record_is_logged_and_unstaged_only(self):
+        record = {"stage": "unstaged", "exception_type": "CalledProcessError", "returncode": 1,
+                  "code": "observation-exception", "frames": [["initialize", 175]]}
+        message, log = self.transport(json.dumps({"explicit_sync_error": record}), action="explicit-sync")
+        self.assertEqual(message, "guest lifecycle explicit-sync failed (exit=1): " + json.dumps(record))
+        self.assertEqual(log, "tuna-vm-lane: explicit-sync failure " + json.dumps(record) + "\n")
+        generic = "guest lifecycle explicit-sync failed (exit=1)"
+        for value in (None, {}, {**record, "message": "private"}, {**record, "stage": "state-read"},
+                      {**record, "exception_type": "private"}):
+            with self.subTest(value=value):
+                output = json.dumps({"explicit_sync_error": value})
+                self.assertEqual(self.transport(output, action="explicit-sync")[0], generic)
+        self.assertEqual(self.transport(json.dumps({"explicit_sync_error": record, "extra": "private"}),
+                                        action="explicit-sync")[0], generic)
+
+
 class OrcaLogoutRetirement(unittest.TestCase):
     """#836: the compositor's session-end receipt for its own Orca group."""
     RECEIPT = ("tuna-compositor: screen reader retired pid=21699 terminated=true "
