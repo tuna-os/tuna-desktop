@@ -244,9 +244,9 @@ def _loupe(desktop):
     # do_action refused). The pill toggle stays keyboard-focusable while
     # hidden, so Tab reaches it by its real focus — observed from the
     # tree, never by pointer bounds — and Space opens its popover.
-    # Seat focus settles before the popover opens: ime skips its own
-    # select below, whose step-away would fire on the popover grab and
-    # dismiss the submenu it must type into (round-1004 ev27).
+    # Seat focus settles before the popover opens: no select runs while
+    # the grab is held, whose step-away would fire on the missing seat
+    # focus and dismiss the submenu being typed into (round-1004 ev27).
     desktop.select(actor)
     attempts = 0
     while True:
@@ -290,8 +290,32 @@ def _loupe(desktop):
     require(restorable and restorable.isascii(),
             'original numeric zoom cannot be restored by its ordinary native input')
     try:
-        evidence['ime'] = desktop.ime(actor, zoom_entry['name'], field_path=zoom_entry['path'],
-                                      select_first=False, click_to_focus=False)
+        # The open zoom popover holds a pointer/keyboard grab, so seat
+        # focus stays unattributable and the bus/OCR oracle cannot run
+        # here (round-1004 ev29: actual_keyboard_focus False for the whole
+        # composition window; reported entry bounds are closed-layout
+        # positions, not the open popover's pixels). The end-to-end chain
+        # is proven without it: focused keys reach the entry, the engine
+        # converts, the commit lands in the entry, and the clipboard
+        # carries it out. A bypassed engine or lost keys fail the commit
+        # gate below instead of passing silently.
+        engine = desktop.guest('desktop', 'ime-engine', select=True)
+        try:
+            desktop.type_ascii('nihao')
+            desktop.keys('spc')
+            committed = desktop.await_state('loupe-real-zoom-commit', lambda: desktop.tree(actor),
+                lambda value: any(node.get('path') == zoom_entry['path'] and node.get('focused')
+                    and node.get('text') == '你好' for node in nodes(value)))
+            desktop.keys('ctrl', 'a')
+            desktop.keys('ctrl', 'c')
+            copied = desktop.clipboard()
+            require(base64.b64decode(copied['base64']).decode() == '你好',
+                    'actual zoom entry clipboard did not equal committed Unicode')
+            evidence['ime'] = {'actor': actor, 'field': zoom_entry, 'committed': committed,
+                'clipboard': copied, 'engine': engine, 'actual_input': 'physical-nihao-space',
+                'grab_held_oracle': 'seat/bus unattributable under open popover grab; commit+clipboard prove the chain'}
+        finally:
+            desktop.guest('desktop', 'ime-engine', select=False, original=engine['original'])
     finally:
         # The entry holds focus from the keyboard walk and ime's own
         # focus gates; a pointer click is best-effort refocus only when
