@@ -6,7 +6,9 @@ githubConfigSecret: tuna-ci-github
 runnerGroup: tuna-desktop-karnataka
 runnerScaleSetName: tuna-ci-24.04
 minRunners: 1
-maxRunners: 10
+# Shares karnataka with long-lived KubeVirt VMs: 6 x 5Gi requests (14Gi
+# limits) plus the 26.04 set's 3 keep CI inside the node's free memory.
+maxRunners: 6
 
 controllerServiceAccount:
   namespace: arc-systems
@@ -32,7 +34,7 @@ template:
     enableServiceLinks: false
     containers:
       - name: runner
-        image: localhost/tuna-ci-runner:24.04-2.338.2-202610310435
+        image: localhost/tuna-ci-runner:24.04-2.338.2-202611070451
         imagePullPolicy: Never
         command: ["/home/runner/run.sh"]
         # ARC uses this as the runner's work folder: /home/runner/work, as on

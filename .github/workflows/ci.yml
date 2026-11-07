@@ -397,7 +397,10 @@ jobs:
   journey:
     # Same choice as select-lanes' runs-on, on the Ubuntu 26.04 runners.
     runs-on: &runner-26 ${{ vars.CI_RUNNERS != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'tuna-ci-26.04' || 'ubuntu-26.04' }}
-    needs: [select-lanes, check]
+    # Runs beside check: self-hosted minutes are free, and a red check still
+    # fails ci-gate. (fprint-phase-proof, grid-cancel-comparison and
+    # gtk-shell stay behind check: they check out its tested_sha output.)
+    needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'journey')
     timeout-minutes: 60
     steps:
@@ -523,7 +526,7 @@ jobs:
 
   app-content:
     runs-on: *runner-24
-    needs: [select-lanes, check]
+    needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'app-content')
     timeout-minutes: 25
     steps:
@@ -559,7 +562,7 @@ jobs:
 
   scroll-proof:
     runs-on: *runner-24
-    needs: [select-lanes, check]
+    needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'scroll-proof')
     timeout-minutes: 25
     steps:
@@ -1090,7 +1093,7 @@ jobs:
     # against the nested session that owns the screen reader. Ubuntu
     # 24.04's Orca 46 predates GNOME's KeyboardMonitor.
     runs-on: *runner-26
-    needs: [select-lanes, check]
+    needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'orca-speech')
     timeout-minutes: 45
     steps:

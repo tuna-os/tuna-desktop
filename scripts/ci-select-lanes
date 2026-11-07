@@ -32,6 +32,7 @@ import argparse
 import fnmatch
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -185,11 +186,55 @@ def rotation(run_number, size):
     return [ROTATION[(start + i) % len(ROTATION)] for i in range(size)]
 
 
+def _download_steps(job):
+    return [step.get("with", {}) for step in job.get("steps", [])
+            if "actions/download-artifact" in str(step.get("uses", ""))]
+
+
+def _upload_names(job):
+    return [str(step.get("with", {}).get("name", "")) for step in job.get("steps", [])
+            if "actions/upload-artifact" in str(step.get("uses", ""))]
+
+
+def _needs(job):
+    needs = job.get("needs", [])
+    return {needs} if isinstance(needs, str) else set(needs)
+
+
+def artifact_consumers(jobs):
+    """job -> the jobs that download an artifact it uploads.
+
+    A consumer must also list the producer in `needs:` (GitHub only lets a
+    job download what an earlier job of the run uploaded) and either
+    download an artifact by a name the producer uploads or select one by an
+    id taken from `needs.<producer>.outputs`. An upload name that is a
+    `${{ }}` expression, such as a matrix artifact, matches any download
+    name its literal parts fit.
+    """
+    consumers = {name: set() for name in jobs}
+    for producer, produced in jobs.items():
+        patterns = [re.compile(".*".join(re.escape(part) for part in re.split(r"\$\{\{.*?\}\}", upload)))
+                    for upload in _upload_names(produced)]
+        for consumer, job in jobs.items():
+            if producer not in _needs(job):
+                continue
+            for download in _download_steps(job):
+                name = str(download.get("name", ""))
+                by_name = bool(name) and any(pattern.fullmatch(name) for pattern in patterns)
+                by_output = f"needs.{producer}.outputs." in str(download)
+                if by_name or by_output:
+                    consumers[producer].add(consumer)
+    return consumers
+
+
 def workflow_lanes(base_text, head_text):
     """Lanes whose job definition differs between two ci.yml texts.
 
     YAML anchors are resolved before comparing, so editing an anchored
-    `runs-on` or checkout block changes every job that aliases it. Returns
+    `runs-on` or checkout block changes every job that aliases it. A changed
+    job also selects the jobs that download its artifacts, transitively
+    (artifact_consumers): an edit to arch-package reruns the lanes that
+    install its package, an edit to check reruns parity-ledger. Returns
     None (caller falls back to every lane) when the files cannot be compared,
     when anything outside `jobs:` (triggers, concurrency, permissions) or the
     select-lanes job changed, or when a job is not a known lane.
@@ -202,16 +247,24 @@ def workflow_lanes(base_text, head_text):
         return None
     if base != head:
         return None
-    lanes = set()
-    for name in set(base_jobs) | set(head_jobs):
-        if base_jobs.get(name) == head_jobs.get(name):
+    jobs = {**base_jobs, **head_jobs}
+    consumers = artifact_consumers(jobs)
+    affected, pending = set(), []
+    for name in jobs:
+        if base_jobs.get(name) != head_jobs.get(name):
+            if name == "select-lanes" or (name not in WORKFLOW_JOB_LANE
+                                          and name not in WORKFLOW_ALWAYS_ON_JOBS):
+                return None
+            pending.append(name)
+    while pending:
+        name = pending.pop()
+        if name in affected:
             continue
-        if name in WORKFLOW_ALWAYS_ON_JOBS:
-            continue
-        if name == "select-lanes" or name not in WORKFLOW_JOB_LANE:
-            return None
-        lanes.add(WORKFLOW_JOB_LANE[name])
-    return lanes
+        affected.add(name)
+        pending.extend(consumers.get(name, ()))
+    if any(name not in WORKFLOW_JOB_LANE and name not in WORKFLOW_ALWAYS_ON_JOBS for name in affected):
+        return None
+    return {WORKFLOW_JOB_LANE[name] for name in affected if name in WORKFLOW_JOB_LANE}
 
 
 def workflow_texts(base):

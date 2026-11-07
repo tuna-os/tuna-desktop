@@ -642,6 +642,9 @@ To drive the published image through GDM in a KubeVirt VM with keyboard
 and pointer input and save a console frame for every step, see
 [Published-image journey through Corral](corral-journey.md).
 
+To try guest-side code in a running VM before pushing, without the CI
+queue or an image rebuild, see [Fast iteration on karnataka](ci-fast-iteration.md).
+
 ## Pointer motion barriers and input aids
 
 Backend motion is coalesced once per output frame, but a raw non-motion
