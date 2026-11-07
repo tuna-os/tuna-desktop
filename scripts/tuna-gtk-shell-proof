@@ -5757,6 +5757,11 @@ if gsettings list-keys org.gnome.desktop.peripherals.touchpad | grep -qx disable
 else
     pointer_wheel_note="$pointer_wheel_note; host touchpad schema predates disable-while-typing-timeout"
 fi
+set_pointer_keys
+if [ -n "$pointer_mouse_wheel_keys" ]; then
+    gsettings set org.gnome.desktop.peripherals.mouse scroll-wheel-emulation-button 2
+    gsettings set org.gnome.desktop.peripherals.mouse scroll-wheel-emulation-button-lock true
+fi
 cstate ".pointer_device_settings == {
     \"mouse_accel_profile\": \"Default\",
     \"touchpad\": {\"send_events\": \"DisabledOnExternalMouse\", \"click_method\": \"Areas\",
