@@ -327,7 +327,7 @@ class NativePointerMotion(unittest.TestCase):
         runtime = (ROOT / "crates/compositor/src/runtime.rs").read_text()
         callback = runtime.split(
             ".insert_source(sources.input, |event, _, rt: &mut Runtime| {", 1)[1].split(
-                "if let Some(udev) = sources.udev", 1)[0]
+                ".map_err(|e| RuntimeError::Loop(e.to_string()))?;", 1)[0]
         # Every libinput callback runs before the frame may deliver motion to
         # the manager. A later delta must start at DRM's accumulated position,
         # not the stale manager position. Once drained, manager constraints win.
