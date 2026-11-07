@@ -2,7 +2,7 @@
 # tuna-scroll-proof — scroll-mode strip proof inside the nested session.
 #
 # Usage:
-#   scripts/tuna-scroll-proof [--display :98] [--artifacts DIR] [--socket NAME]
+#   scripts/tuna-scroll-proof [--display :N] [--artifacts DIR] [--socket NAME]
 #
 # Starts a private Xvfb (unless DISPLAY already works), builds and runs
 # the nested compositor with its supervised shell, then opens three
@@ -45,6 +45,7 @@ LOG="$ARTIFACTS/nested.log"
 OWNED_XVFB=""
 COMPOSITOR_PID=""
 CHROMIUM_PID=""
+OWNED_RUNTIME=""
 
 cleanup() {
     if [ -n "$CHROMIUM_PID" ] && kill -0 "$CHROMIUM_PID" 2>/dev/null; then
@@ -59,8 +60,16 @@ cleanup() {
         kill "$OWNED_XVFB" 2>/dev/null || true
         wait "$OWNED_XVFB" 2>/dev/null || true
     fi
+    if [ -n "$OWNED_RUNTIME" ]; then rm -rf "$OWNED_RUNTIME" || true; fi
 }
 trap cleanup EXIT INT TERM
+# The session's sockets and runtime files (wallpaper, control socket)
+# are fixed names below XDG_RUNTIME_DIR; a private one keeps concurrent
+# runs apart. Short path: Unix sockets cap at 108 bytes.
+OWNED_RUNTIME="$(mktemp -d /tmp/tuna-scroll-rt.XXXXXX)"
+chmod 0700 "$OWNED_RUNTIME"
+XDG_RUNTIME_DIR="$OWNED_RUNTIME"
+export XDG_RUNTIME_DIR
 
 display_works() {
     xdotool getdisplaygeometry >/dev/null 2>&1
@@ -71,11 +80,25 @@ if [ -n "$DISPLAY_ARG" ]; then
     export DISPLAY
 fi
 if ! display_works; then
-    DISPLAY=":98"
-    export DISPLAY
-    echo "tuna-scroll-proof: starting Xvfb on $DISPLAY"
-    Xvfb "$DISPLAY" -screen 0 "${WIDTH}x${HEIGHT}x24" >"$ARTIFACTS/xvfb.log" 2>&1 &
-    OWNED_XVFB=$!
+    if [ -n "$DISPLAY_ARG" ]; then
+        echo "tuna-scroll-proof: starting Xvfb on $DISPLAY"
+        Xvfb "$DISPLAY" -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp >"$ARTIFACTS/xvfb.log" 2>&1 &
+        OWNED_XVFB=$!
+    else
+        # tuna-xvfb picks a free display and locks it, so concurrent runs never collide.
+        rm -f "$ARTIFACTS/xvfb-display"
+        "$ROOT/scripts/lib/tuna-xvfb" -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp \
+            3>"$ARTIFACTS/xvfb-display" >"$ARTIFACTS/xvfb.log" 2>&1 &
+        OWNED_XVFB=$!
+        for _ in $(seq 1 30); do [ -s "$ARTIFACTS/xvfb-display" ] && break; sleep 1; done
+        if [ ! -s "$ARTIFACTS/xvfb-display" ]; then
+            echo "tuna-scroll-proof: Xvfb did not allocate a display" >&2
+            exit 1
+        fi
+        DISPLAY=":$(cat "$ARTIFACTS/xvfb-display")"
+        export DISPLAY
+        echo "tuna-scroll-proof: started Xvfb on $DISPLAY"
+    fi
     for _ in $(seq 1 30); do
         display_works && break
         sleep 1
@@ -91,6 +114,14 @@ echo "tuna-scroll-proof: building"
 cargo build --quiet --manifest-path "$ROOT/Cargo.toml" \
     -p tuna-compositor -p tuna-shell-host
 
+# One browser, three green pages: three xdg-toplevels in map order.
+PW_ENV="${RUNNER_TEMP:-/tmp}/tuna-pw-scroll-$$"
+python3 -m venv "$PW_ENV"
+"$PW_ENV/bin/pip" install --quiet playwright pillow
+"$PW_ENV/bin/python" -m playwright install --with-deps chromium
+# Finish network/package preparation before starting a real session. A slow
+# download must not leave it idle through the unchanged five-minute lock.
+#
 echo "tuna-scroll-proof: starting compositor on socket $SOCKET"
 "$ROOT/target/debug/tuna-compositor" --socket "$SOCKET" \
     --shell-bin "$ROOT/target/debug/tuna-shell-host" \
@@ -126,11 +157,6 @@ WAYLAND_DISPLAY="$SOCKET" cargo run --quiet --manifest-path "$ROOT/Cargo.toml" \
     -p tuna-compositor --example frame_callback_clock -- "$ARTIFACTS/frame-probe.shm" \
     >"$ARTIFACTS/frame-callback-clock.log" 2>&1
 
-# One browser, three green pages: three xdg-toplevels in map order.
-PW_ENV="${RUNNER_TEMP:-/tmp}/tuna-pw-scroll-$$"
-python3 -m venv "$PW_ENV"
-"$PW_ENV/bin/pip" install --quiet playwright pillow
-"$PW_ENV/bin/python" -m playwright install --with-deps chromium
 
 READY="$ARTIFACTS/chromium-ready"
 rm -f "$READY"
@@ -194,21 +220,15 @@ scrot "$ARTIFACTS/01-float.png" >/dev/null
 echo "tuna-scroll-proof: shot 01-float.png"
 
 # Whole-session toggle into the strip.
-# Deterministic wait (docs/development.md timing rule): a busy runner
-# with Chromium starting can take well over a fixed sleep to apply it.
-# A key can be lost while the nested window is still settling its X
-# focus: with no mode line after 10 s, press once more (a second press
-# only after silence, so a slow first one is not undone).
+# Submit one physical chord and wait for its observed mode transition. Do not
+# toggle again on silence: that can undo an already accepted slow transition.
 toggle_mode() {
     want="$1"
     xdotool windowfocus --sync "$WID"
     xdotool key Super_L+Shift+t
-    for i in $(seq 1 40); do
+    for _ in $(seq 1 40); do
         [ "$(grep -c "session mode now $want" "$LOG")" -ge "$2" ] && return 0
-        if [ "$i" = 20 ]; then
-            xdotool windowfocus --sync "$WID"
-            xdotool key Super_L+Shift+t
-        fi
+        kill -0 "$COMPOSITOR_PID" 2>/dev/null || return 1
         sleep 0.5
     done
     return 1

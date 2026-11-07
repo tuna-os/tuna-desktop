@@ -528,7 +528,6 @@ cd_call() {
 end=$(($(date +%s) + 30))
 until cd_call --object-path /org/freedesktop/ColorManager \
     --method org.freedesktop.ColorManager.GetDevices >/dev/null 2>&1; do
-    kill -0 "$COLORD_PID" 2>/dev/null || fail D-COLORD "colord exited: $(tail -5 "$ARTIFACTS/colord.log")"
     [ "$(date +%s)" -le "$end" ] || fail D-COLORD "colord never served the private system bus"
     sleep 0.2
 done

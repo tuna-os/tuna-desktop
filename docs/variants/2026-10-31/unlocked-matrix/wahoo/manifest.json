@@ -1,0 +1,45 @@
+{
+  "schema": 2,
+  "started": "2026-10-31T23:12:32+00:00",
+  "runner": "scripts/tuna-corral-journey",
+  "runner_sha256": "97721d7a15781fb2f46ebd3f034715de616a9371bb1ed40f0747da628ab7c1a9",
+  "scope": "qualification-core",
+  "corral": "corral v0.7.0+36.g76b6dd5 (commit 76b6dd52d35d, built 2026-10-30T08:31:57Z, go1.27.0)",
+  "image": {
+    "ref": "ghcr.io/tuna-os/wahoo@sha256:865ec5320f25ae368316f07b4d3b49b5e0600308e5bc50b973ace90a5b53a46d"
+  },
+  "vm": {
+    "name": "tuna-q-variant-wahoo-31215908",
+    "namespace": "corral-vms",
+    "backend": "kubevirt",
+    "requested": {
+      "cpu": 4,
+      "mem": "6G",
+      "disk": "40Gi",
+      "node": "karnataka"
+    }
+  },
+  "console": "corral console page (noVNC), Playwright Chromium, 1:1; frames are the canvas pixels",
+  "steps": [],
+  "error": "RuntimeError: corral bootc create tuna-q-variant-wahoo-31215908 --image ghcr.io/tuna-os/wahoo@sha256:865ec5320f25ae368316f07b4d3b49b5e0600308e5bc50b973ace90a5b53a46d --cpu 4 --mem 6G --disk 40Gi -n corral-vms --user tuna-test --password-stdin --tag purpose=tuna-corral-journey --node karnataka exited 1:  --storage-class string      StorageClass for the disk PVC (default: cluster preference)\n      --sudo                      Run the local build's podman under sudo \u2014 bootc install needs root (off-cluster backends only)\n      --tag stringArray           Tag the VM as key=value (key alone means key=true), stored as label corral.dev/tag.<key> (repeatable; KubeVirt only)\n      --user string               Create a login user in the installed image\n\nGlobal Flags:\n      --context string     Corral context to build for (default: the selected context)\n  -n, --namespace string   Namespace (KubeVirt only) (default \"corral-vms\")\n\nbootc build: bootc build failed: builder reported failure (CORRAL_BUILD_FAIL provision) \u2014 if the builder actually finished after this failed, retry with --resume\nexit status 1",
+  "failure_capture": {
+    "exit": 1,
+    "stderr": "instance \"tuna-q-variant-wahoo-31215908\" does not exist\n"
+  },
+  "cleanup": {
+    "deleted": true,
+    "result": [
+      {
+        "name": "tuna-q-variant-wahoo-31215908",
+        "deleted": true,
+        "removed": [
+          "persistentvolumeclaim/tuna-q-variant-wahoo-31215908-bootc-disk",
+          "secret/tuna-q-variant-wahoo-31215908-bootc-builder-cloudinit"
+        ]
+      }
+    ],
+    "still_listed": [],
+    "failures": []
+  },
+  "finished": "2026-10-31T23:17:46+00:00"
+}
